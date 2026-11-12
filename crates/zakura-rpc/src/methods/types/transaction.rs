@@ -151,10 +151,72 @@ pub(super) struct CoinbaseResourceUsage {
     pub(super) shielded_action_counts: ShieldedActionCounts,
 }
 
+/// Where the miner's share of a coinbase is paid.
 #[derive(Clone, Copy)]
 enum MinerRewardAddress {
+    /// A shielded output, which the coinbase needs a proof for.
     Ironwood(::orchard::Address),
     Transparent(TransparentAddress),
+}
+
+impl MinerRewardAddress {
+    /// Returns the address that the coinbase at `height` pays the miner's reward to.
+    fn new(
+        net: &Network,
+        height: Height,
+        miner_params: &MinerParams,
+    ) -> Result<Self, TransactionError> {
+        match miner_params.addr() {
+            MinerAddress::Unified {
+                orchard,
+                transparent,
+                ..
+            } => {
+                let fallback = || transparent.map(Self::Transparent);
+                // Orchard receivers are payable through Ironwood after NU6.3.
+                // Earlier templates use the transparent receiver, if present.
+                let reward_address =
+                    if NetworkUpgrade::current(net, height) >= NetworkUpgrade::Nu6_3 {
+                        orchard.map(Self::Ironwood).or_else(fallback)
+                    } else {
+                        fallback()
+                    };
+
+                reward_address.ok_or_else(|| {
+                    TransactionError::CoinbaseConstruction(
+                        "Miner address needs an Ironwood-compatible or transparent receiver; \
+                         Sapling coinbase construction is not supported"
+                            .to_string(),
+                    )
+                })
+            }
+            MinerAddress::Sapling(_) => Err(TransactionError::CoinbaseConstruction(
+                "Sapling coinbase construction is not supported; use a unified or \
+                 transparent miner address"
+                    .to_string(),
+            )),
+            MinerAddress::Transparent(addr) => Ok(Self::Transparent(*addr)),
+            MinerAddress::Tex(_) => Err(TransactionError::CoinbaseConstruction(
+                "Address not supported for miner rewards".to_string(),
+            )),
+        }
+    }
+}
+
+/// Returns whether building the coinbase at `height` for this miner creates a proof.
+///
+/// A proof takes seconds and several cores. Without one, the coinbase is built in well under
+/// a millisecond. A miner address that no coinbase can pay needs no proof either: building
+/// for it fails at once.
+pub(crate) fn coinbase_needs_proof(
+    net: &Network,
+    height: Height,
+    miner_params: &MinerParams,
+) -> bool {
+    matches!(
+        MinerRewardAddress::new(net, height, miner_params),
+        Ok(MinerRewardAddress::Ironwood(_))
+    )
 }
 
 /// Fee-independent outputs that determine a coinbase transaction's shape.
@@ -170,44 +232,7 @@ impl CoinbasePlan {
         miner_params: &MinerParams,
         block_subsidy: Amount<NonNegative>,
     ) -> Result<Self, TransactionError> {
-        let upgrade = NetworkUpgrade::current(net, height);
-        let miner_reward_address = match miner_params.addr() {
-            MinerAddress::Unified {
-                orchard,
-                transparent,
-                ..
-            } => {
-                let fallback = || transparent.map(MinerRewardAddress::Transparent);
-                // Orchard receivers are payable through Ironwood after NU6.3.
-                // Earlier templates use the transparent receiver, if present.
-                let reward_address = if upgrade >= NetworkUpgrade::Nu6_3 {
-                    orchard.map(MinerRewardAddress::Ironwood).or_else(fallback)
-                } else {
-                    fallback()
-                };
-
-                reward_address.ok_or_else(|| {
-                    TransactionError::CoinbaseConstruction(
-                        "Miner address needs an Ironwood-compatible or transparent receiver; \
-                         Sapling coinbase construction is not supported"
-                            .to_string(),
-                    )
-                })?
-            }
-            MinerAddress::Sapling(_) => {
-                return Err(TransactionError::CoinbaseConstruction(
-                    "Sapling coinbase construction is not supported; use a unified or \
-                     transparent miner address"
-                        .to_string(),
-                ));
-            }
-            MinerAddress::Transparent(addr) => MinerRewardAddress::Transparent(*addr),
-            MinerAddress::Tex(_) => {
-                return Err(TransactionError::CoinbaseConstruction(
-                    "Address not supported for miner rewards".to_string(),
-                ));
-            }
-        };
+        let miner_reward_address = MinerRewardAddress::new(net, height, miner_params)?;
 
         let mut funding_stream_outputs = funding_stream_values(height, net, block_subsidy)?
             .into_iter()

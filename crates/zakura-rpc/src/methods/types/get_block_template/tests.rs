@@ -27,7 +27,15 @@ use zakura_script::Sigops;
 use crate::client::TransactionTemplate;
 use crate::config::mining::{default_miner_address, MinerAddressType};
 
-use super::{MinerAddress, MinerParams, TemplatePreparationQueue};
+use super::{MinerAddress, MinerParams, PreparationKey, TemplatePreparationQueue};
+
+impl PreparationKey for u8 {
+    type Key = u8;
+
+    fn preparation_key(&self) -> u8 {
+        *self
+    }
+}
 
 #[test]
 fn template_rejection_targets_work_and_ignores_old_parents() {
@@ -107,6 +115,33 @@ fn template_preparation_queue_keeps_the_latest_pending_template() {
     assert!(queue.enqueue(3).is_none());
     assert_eq!(worker.next(), Some(3));
     assert_eq!(worker.next(), None);
+}
+
+/// A template that is being prepared, or is already waiting, is not queued again, so a template
+/// that many requests share is prepared once.
+#[test]
+fn template_preparation_queue_skips_a_template_it_already_holds() {
+    let queue = TemplatePreparationQueue::<u8>::default();
+
+    let (_first, mut worker) = queue.enqueue(1).expect("an idle queue admits a worker");
+    assert!(queue.enqueue(1).is_none());
+    assert_eq!(
+        worker.next(),
+        None,
+        "the running template is not queued again"
+    );
+
+    let (_first, mut worker) = queue.enqueue(1).expect("a released queue admits a worker");
+    assert!(queue.enqueue(2).is_none());
+    assert!(queue.enqueue(1).is_none());
+    assert!(queue.enqueue(2).is_none());
+    assert_eq!(worker.next(), Some(2), "the pending template is kept once");
+    assert!(queue.enqueue(2).is_none());
+    assert_eq!(
+        worker.next(),
+        None,
+        "the template now running is not queued again"
+    );
 }
 
 /// A loop that ends without taking its next template still releases the worker slot.
@@ -519,6 +554,33 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
     assert!(tx.ironwood_shielded_data().is_some());
     assert!(tx.sapling_outputs().next().is_none());
     assert!(tx.orchard_shielded_data().is_none());
+    Ok(())
+}
+
+/// A coinbase needs a proof only when it pays the miner to a shielded receiver: a unified
+/// address is paid at its transparent receiver before Ironwood activates, and at its shielded
+/// one from then on.
+#[test]
+fn coinbase_needs_proof_only_for_a_shielded_payout() -> anyhow::Result<()> {
+    let net = shielded_coinbase_testnet();
+    let ironwood_height = NetworkUpgrade::Nu6_3
+        .activation_height(&net)
+        .expect("NU6.3 activation height is configured");
+    let last_transparent_height = ironwood_height.previous()?;
+    let params = MinerParams::from(
+        MinerAddress::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Unified),
+        )
+        .expect("hard-coded unified miner address is valid"),
+    );
+
+    assert!(!super::coinbase_needs_proof(
+        &net,
+        last_transparent_height,
+        &params
+    ));
+    assert!(super::coinbase_needs_proof(&net, ironwood_height, &params));
     Ok(())
 }
 

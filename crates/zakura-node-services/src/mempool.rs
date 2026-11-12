@@ -2,7 +2,7 @@
 //!
 //! A service that manages known unmined Zcash transactions.
 
-use std::{collections::HashSet, fmt, net::SocketAddr};
+use std::{collections::HashSet, fmt, net::SocketAddr, sync::Arc};
 
 use tokio::sync::oneshot;
 use zakura_chain::{
@@ -16,12 +16,17 @@ use crate::BoxError;
 mod gossip;
 mod mempool_change;
 mod service_trait;
+mod snapshot;
 mod transaction_dependencies;
 
 pub use self::{
     gossip::Gossip,
     mempool_change::{MempoolChange, MempoolChangeKind, MempoolTxSubscriber},
     service_trait::MempoolService,
+    snapshot::{
+        MempoolHeld, MempoolSnapshot, MempoolSnapshotReceiver, MempoolSnapshotSender,
+        MempoolTipProgress, MempoolTipStage, MempoolTipWork,
+    },
     transaction_dependencies::TransactionDependencies,
 };
 
@@ -211,11 +216,11 @@ pub enum Response {
     // TODO: make the Transactions response return VerifiedUnminedTx,
     //       and remove the FullTransactions variant
     FullTransactions {
-        /// All [`VerifiedUnminedTx`]s in the mempool
-        transactions: Vec<VerifiedUnminedTx>,
+        /// An immutable transaction list shared until the verified set changes.
+        transactions: Arc<Vec<VerifiedUnminedTx>>,
 
         /// All transaction dependencies in the mempool
-        transaction_dependencies: TransactionDependencies,
+        transaction_dependencies: Arc<TransactionDependencies>,
 
         /// Last seen chain tip hash by mempool service
         last_seen_tip_hash: zakura_chain::block::Hash,

@@ -471,7 +471,7 @@ async fn test_rpc_response_data_for_network(network: &Network) {
         .expect_request_that(|request| matches!(request, mempool::Request::FullTransactions))
         .map(|responder| {
             responder.respond(mempool::Response::FullTransactions {
-                transactions: vec![],
+                transactions: vec![].into(),
                 transaction_dependencies: Default::default(),
                 last_seen_tip_hash: blocks[blocks.len() - 1].hash(),
             });
@@ -1241,7 +1241,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
                 .expect_request(mempool::Request::FullTransactions)
                 .await
                 .respond(mempool::Response::FullTransactions {
-                    transactions: vec![],
+                    transactions: vec![].into(),
                     transaction_dependencies: Default::default(),
                     // tip hash needs to match chain info for long poll requests
                     last_seen_tip_hash: fake_tip_hash,
@@ -1313,9 +1313,10 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .parse()
         .expect("unexpected invalid LongPollId");
 
-    // Fake the ChainInfo response. This ID names another tip, so the node answers with
-    // coinbase-only work on the current tip without asking the mempool.
+    // Fake the ChainInfo and mempool responses. This ID names another tip and the mempool is
+    // empty, so the node answers with coinbase-only work on the current tip.
     let mock_read_state_request_handler = make_mock_read_state_request_handler();
+    let mock_mempool_request_handler = make_mock_mempool_request_handler();
 
     let get_block_template_fut = rpc_mock_state.get_block_template(
         GetBlockTemplateParameters {
@@ -1325,8 +1326,11 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .into(),
     );
 
-    let (get_block_template, ..) =
-        tokio::join!(get_block_template_fut, mock_read_state_request_handler,);
+    let (get_block_template, ..) = tokio::join!(
+        get_block_template_fut,
+        mock_mempool_request_handler,
+        mock_read_state_request_handler,
+    );
 
     let GetBlockTemplateResponse::TemplateMode(get_block_template) =
         get_block_template.expect("unexpected error in getblocktemplate RPC call")

@@ -1,8 +1,9 @@
 //! The `mining_template` JSONL trace table.
 //!
 //! Each `getblocktemplate` call gets a process-wide `request_id`. A long poll that sees a new
-//! tip writes `gbt_tip_woke` and then `gbt_empty_returned` for the coinbase-only template it
-//! returns. Every other template a call returns writes `gbt_full_returned`.
+//! tip writes `gbt_tip_woke`, followed by `gbt_empty_returned` for a coinbase-only answer, with
+//! the reason it holds no mempool transactions, or `gbt_full_returned` for an answer built
+//! from the mempool. Other returned templates also write `gbt_full_returned`.
 
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -32,12 +33,36 @@ pub(crate) enum WaitReason {
     /// The call returned without waiting.
     #[default]
     Immediate,
+    /// A chain tip notification woke the call.
+    Tip,
     /// The periodic mempool check timer fired.
     Timer,
     /// A template rejection changed the rejection state.
     Rejection,
     /// The template's time range expired.
     MaxTime,
+}
+
+/// Why a long poll's first answer on a new tip is the coinbase-only template.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EmptyReason {
+    /// A shielded coinbase built in advance saves the miner its proof time.
+    CoinbaseBuiltAhead,
+    /// As many long polls as may build a full first answer at once were already doing so.
+    NoBuildSlot,
+    /// The mempool holds no transactions for the new tip.
+    MempoolEmpty,
+    /// The mempool reported more work to remove the new block's transactions than it is
+    /// expected to finish within the wait for it.
+    MempoolWorkHeavy,
+    /// The mempool answered a request while it was still on an older tip.
+    MempoolOnOlderTip,
+    /// The mempool neither published its transactions for the new tip nor answered a request
+    /// within the wait for it.
+    MempoolWaitElapsed,
+    /// The request to the mempool failed.
+    MempoolError,
 }
 
 /// How long one template build waited to start, and how long it ran.
@@ -64,6 +89,7 @@ enum MiningTemplateEvent<'a> {
         request_id: u64,
         tip_hash: JsonlDisplay<'a, block::Hash>,
         work_id: &'a str,
+        reason: EmptyReason,
         permit_wait_us: u64,
         build_us: u64,
     },
@@ -100,17 +126,20 @@ impl MiningTemplateTrace {
         });
     }
 
-    /// Records that request `request_id` returned the coinbase-only `template` for a new tip.
+    /// Records that request `request_id` returned the coinbase-only `template` for a new tip,
+    /// because of `reason`.
     pub(crate) fn empty_returned(
         &self,
         request_id: u64,
         template: &BlockTemplateResponse,
+        reason: EmptyReason,
         build: BuildTimes,
     ) {
         self.0.emit_event(|| MiningTemplateEvent::EmptyReturned {
             request_id,
             tip_hash: JsonlDisplay(&template.previous_block_hash),
             work_id: &template.work_id,
+            reason,
             permit_wait_us: saturating_micros(build.wait),
             build_us: saturating_micros(build.run),
         });

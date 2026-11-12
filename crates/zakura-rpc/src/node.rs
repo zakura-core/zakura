@@ -18,13 +18,14 @@ use std::sync::{Arc, Mutex};
 use futures::{future::BoxFuture, FutureExt};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tower::{buffer::Buffer, BoxError};
+use tracing::Instrument;
 
 use zakura_chain::{block, chain_sync_status::ChainSyncStatus, parameters::Network};
 use zakura_consensus::RouterError;
 use zakura_network::AddressBook;
-use zakura_node_services::mempool;
 #[cfg(feature = "indexer-rpc")]
 use zakura_node_services::mempool::MempoolTxSubscriber;
+use zakura_node_services::mempool::{self, MempoolSnapshotReceiver};
 use zakura_state::{LatestChainTip, ReadStateService};
 
 #[cfg(feature = "indexer-rpc")]
@@ -86,6 +87,8 @@ impl ChainSyncStatus for NodeSyncStatus {
 pub struct NodeRpcServices {
     /// The buffered mempool service.
     pub mempool: NodeMempool,
+    /// The snapshots that mempool publishes.
+    pub mempool_snapshots: MempoolSnapshotReceiver,
     /// The buffered state service.
     pub state: NodeState,
     /// The read-only state service.
@@ -119,6 +122,7 @@ pub fn new_rpc_impl(
 ) -> (NodeRpcImpl, JoinHandle<()>) {
     let NodeRpcServices {
         mempool,
+        mempool_snapshots,
         state,
         read_state,
         block_verifier_router,
@@ -134,6 +138,7 @@ pub fn new_rpc_impl(
         build_version,
         user_agent,
         mempool,
+        mempool_snapshots,
         state,
         read_state,
         block_verifier_router,
@@ -147,6 +152,11 @@ pub fn new_rpc_impl(
     let rpc_impl = rpc_impl
         .with_pending_blocks(pending_blocks)
         .with_end_of_support_height(end_of_support_height);
+
+    // Build each new tip's mining template ahead of the requests for it. The task ends by
+    // itself: at once without a miner address, otherwise when the chain tip channel closes or
+    // the node shuts down.
+    tokio::spawn(rpc_impl.clone().run_template_builder().in_current_span());
 
     (rpc_impl, rpc_tx_queue_handle)
 }

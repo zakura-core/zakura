@@ -2855,7 +2855,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "17.0.0"
+version = "17.0.1"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -3060,7 +3060,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.2.1"
+version = "6.0.0"
 dependencies = [
  "base64",
  "bytes",
@@ -3480,7 +3480,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "16.0.0"
+version = "16.0.1"
 dependencies = [
  "chrono",
  "derive-new",
@@ -3589,7 +3589,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "clap",
  "eyre",

@@ -45,6 +45,23 @@ fn mining_order_prefers_fee_per_cost_over_absolute_fee() {
 }
 
 #[test]
+fn mining_snapshot_lists_transactions_in_mining_order() {
+    let mut factory = TxFactory::new();
+    let mut verified = VerifiedSet::default();
+    let low = insert(&mut verified, factory.tx(10_000), Vec::new());
+    let high = insert(&mut verified, factory.tx(40_000), Vec::new());
+    let middle = insert(&mut verified, factory.tx(20_000), Vec::new());
+
+    let (transactions, _) = verified.mining_snapshot();
+    let snapshot_ids: Vec<_> = transactions
+        .iter()
+        .map(|tx| tx.transaction.id().mined_id())
+        .collect();
+    assert_eq!(snapshot_ids, vec![high, middle, low]);
+    assert_eq!(snapshot_ids, ids(&verified));
+}
+
+#[test]
 fn equal_mining_scores_prefer_older_entries_then_txid() {
     let mut factory = TxFactory::new();
     let mut verified = VerifiedSet::default();

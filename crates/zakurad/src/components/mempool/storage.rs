@@ -20,12 +20,16 @@ use zakura_chain::{
     transaction::{self, zip317, Hash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
+#[cfg(test)]
 use zakura_node_services::mempool::TransactionDependencies;
+use zakura_node_services::mempool::{MempoolHeld, MempoolTipWork};
 use zcash_script::solver;
 
 use self::{
     eviction_list::EvictionList,
-    verified_set::{VerifiedSet, MAX_MEMPOOL_ANCESTORS, MAX_MEMPOOL_PACKAGE_TRANSACTIONS},
+    verified_set::{
+        MiningSnapshot, VerifiedSet, MAX_MEMPOOL_ANCESTORS, MAX_MEMPOOL_PACKAGE_TRANSACTIONS,
+    },
 };
 use super::{
     config, downloads::TransactionDownloadVerifyError, pending_outputs::PendingOutputs,
@@ -813,16 +817,18 @@ impl Storage {
         self.verified.transactions()
     }
 
-    /// Returns transactions by descending ancestor-package fee per cost, with
-    /// older insertion times and then TXIDs breaking ties.
-    ///
-    /// Scores include all unconfirmed ancestors. Template selection must account
-    /// for parents it has already selected and emit them before their children.
-    pub(super) fn mining_transactions(&self) -> impl Iterator<Item = &VerifiedUnminedTx> {
-        self.verified.mining_transactions()
+    /// Returns shared immutable transaction metadata and dependencies for this revision.
+    pub fn mining_snapshot(&mut self) -> MiningSnapshot {
+        self.verified.mining_snapshot()
+    }
+
+    /// Returns the current shared lists without rebuilding them after a mutation.
+    pub fn cached_mining_snapshot(&self) -> Option<MiningSnapshot> {
+        self.verified.cached_mining_snapshot()
     }
 
     /// Returns a reference to the [`TransactionDependencies`] in the verified set.
+    #[cfg(test)]
     pub fn transaction_dependencies(&self) -> &TransactionDependencies {
         self.verified.transaction_dependencies()
     }
@@ -841,6 +847,44 @@ impl Storage {
     /// Returns the number of transactions in the mempool.
     pub fn transaction_count(&self) -> usize {
         self.verified.transaction_count()
+    }
+
+    /// Returns what the mempool holds now, for readers estimating a new block's work.
+    pub fn held(&self) -> MempoolHeld {
+        MempoolHeld {
+            transactions: self.transaction_count(),
+            parts: self.verified.scanned_parts(),
+        }
+    }
+
+    /// Returns what the mempool holds and how much work it is to remove the mined,
+    /// conflicting and expired transactions of a block with `block_transactions`.
+    ///
+    /// See [`MempoolTipWork`] for what each part counts. The outputs of the mined
+    /// transactions the mempool held are estimated rather than looked up: the mempool counts
+    /// this before it starts on the block, and a lookup for each mined transaction delays
+    /// that start by milliseconds on large blocks.
+    pub fn tip_work(&self, block_transactions: &[impl AsRef<Transaction>]) -> MempoolTipWork {
+        let checked_parts: usize = block_transactions
+            .iter()
+            .map(|transaction| verified_set::checked_parts(transaction.as_ref()))
+            .sum();
+
+        // At most this many of the block's transactions can be held ones, each creating the
+        // average number of outputs of a held transaction.
+        let held_transactions = self.transaction_count();
+        let held_output_parts = block_transactions
+            .len()
+            .min(held_transactions)
+            .saturating_mul(self.verified.created_output_count())
+            .checked_div(held_transactions)
+            .unwrap_or(0);
+
+        MempoolTipWork {
+            mempool_transactions: held_transactions,
+            block_parts: checked_parts.saturating_add(held_output_parts),
+            mempool_parts: self.verified.scanned_parts(),
+        }
     }
 
     /// Returns the cost of the transactions in the mempool, according to ZIP-401.

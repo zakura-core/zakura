@@ -11,22 +11,28 @@ pub mod zip317;
 mod tests;
 
 pub(crate) mod prepared_candidates;
+pub(crate) mod shared_template;
 pub(crate) mod trace;
 use prepared_candidates::PreparedCandidateResolver;
+use shared_template::{SharedTemplate, SharedTemplateJson};
 
 use std::{
     collections::{HashSet, VecDeque},
     fmt::{self},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 use crate::server::jsonrpc::RpcResult;
-use crate::server::jsonrpc::{ErrorCode, ErrorObject};
+use crate::server::jsonrpc::{is_writing_result, ErrorCode, ErrorObject};
 use derive_new::new;
 use getset::{CopyGetters, Getters};
 use rand_10::Rng;
-use tokio::sync::{mpsc, watch, Semaphore};
+use serde_json::value::RawValue;
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tower::{Service, ServiceExt};
 use zcash_protocol::memo::MemoBytes;
 
@@ -62,15 +68,17 @@ use crate::{
         mining::{ZAKURA_COINBASE_MARKER, ZAKURA_COINBASE_SEPARATOR},
     },
     methods::types::{
-        default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
+        default_roots::DefaultRoots,
+        long_poll::LongPollId,
+        transaction::{coinbase_needs_proof, TransactionTemplate},
     },
     server::error::{LegacyCode, MapError, OkOrError},
     EarlyMinedBlock, EarlyMinedBlockChannel, PendingBlockRegistry,
 };
 
 use constants::{
-    CAPABILITIES_FIELD, MAX_TIME_SINCE_CHAIN_TIP, MUTABLE_FIELD, NONCE_RANGE_FIELD,
-    NOT_SYNCED_ERROR_CODE,
+    CAPABILITIES_FIELD, MAX_FULL_FIRST_ANSWERS, MAX_TIME_SINCE_CHAIN_TIP, MUTABLE_FIELD,
+    NONCE_RANGE_FIELD, NOT_SYNCED_ERROR_CODE,
 };
 pub use miner_address::MinerAddress;
 pub use parameters::{
@@ -90,6 +98,41 @@ const MAX_PREPARED_WORK_IDS: usize = 64;
 const MAX_TEMPLATE_BUILDS: usize = 1;
 /// Bound admission waits without cancelling an already running proof.
 const TEMPLATE_BUILD_WAIT: Duration = Duration::from_secs(30);
+
+/// The work a template build does, which decides where it runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TemplateBuildWork {
+    /// No proof is created, so the build takes well under a millisecond and runs where it
+    /// was asked for.
+    ///
+    /// Handing so short a build to another thread costs more than the build: the thread has
+    /// to be found and scheduled while the node is busy with the block that prompted the
+    /// template.
+    ProofFree,
+
+    /// A proof is created for a shielded miner reward, which takes seconds, so the build runs
+    /// on a blocking thread.
+    Proof,
+
+    /// Parses and retains a shared template's block content. Use the same admission bound as
+    /// construction and a blocking thread because the template may contain a full block.
+    RetainedContent,
+}
+
+impl TemplateBuildWork {
+    /// Returns the work of a build that creates the coinbase at `height` for this miner.
+    pub(crate) fn for_coinbase(
+        net: &Network,
+        height: block::Height,
+        miner_params: &MinerParams,
+    ) -> Self {
+        if coinbase_needs_proof(net, height, miner_params) {
+            Self::Proof
+        } else {
+            Self::ProofFree
+        }
+    }
+}
 
 /// Rejections for the current template parent. Overflow fails closed until the tip changes.
 #[derive(Clone, Debug, Default)]
@@ -167,37 +210,66 @@ impl TemplateRejections {
 /// `running` admits exactly one preparation loop, and that loop does not take its next template
 /// until the previous template's verification has actually finished, so at most one speculative
 /// verification is ever in flight. Templates that arrive meanwhile replace `pending` rather than
-/// queueing behind it: only the newest is worth preparing.
+/// queueing behind it: only the newest is worth preparing. A template that is being prepared or
+/// is already pending is not queued again, so a template served many times is prepared once.
 #[derive(Clone, Debug)]
-struct TemplatePreparationQueue<T>(Arc<Mutex<TemplatePreparationState<T>>>);
+struct TemplatePreparationQueue<T: PreparationKey>(Arc<Mutex<TemplatePreparationState<T>>>);
+
+/// Names a template, so the preparation queue can tell when the same one is queued again.
+pub(crate) trait PreparationKey {
+    /// What names the template.
+    type Key: Clone + Eq + fmt::Debug;
+
+    /// Returns what names this template.
+    fn preparation_key(&self) -> Self::Key;
+}
+
+impl PreparationKey for BlockTemplateResponse {
+    type Key = String;
+
+    fn preparation_key(&self) -> String {
+        self.work_id.clone()
+    }
+}
 
 #[derive(Debug)]
-struct TemplatePreparationState<T> {
-    running: bool,
+struct TemplatePreparationState<T: PreparationKey> {
+    /// The template being prepared, while a loop runs.
+    running: Option<T::Key>,
     pending: Option<T>,
 }
 
-impl<T> Default for TemplatePreparationQueue<T> {
+impl<T: PreparationKey> Default for TemplatePreparationQueue<T> {
     fn default() -> Self {
         Self(Arc::new(Mutex::new(TemplatePreparationState {
-            running: false,
+            running: None,
             pending: None,
         })))
     }
 }
 
-impl<T> TemplatePreparationQueue<T> {
+impl<T: PreparationKey> TemplatePreparationQueue<T> {
     /// Queues `template`, and returns it with the worker slot when no loop is running.
+    ///
+    /// Drops `template` when it is the one being prepared or already pending.
     fn enqueue(&self, template: T) -> Option<(T, PreparationWorker<T>)> {
         let mut state = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.running {
-            state.pending = Some(template);
+        let key = template.preparation_key();
+        if let Some(running) = &state.running {
+            let already_queued = *running == key
+                || state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.preparation_key() == key);
+            if !already_queued {
+                state.pending = Some(template);
+            }
             None
         } else {
-            state.running = true;
+            state.running = Some(key);
             drop(state);
             Some((
                 template,
@@ -215,9 +287,7 @@ impl<T> TemplatePreparationQueue<T> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let next = state.pending.take();
-        if next.is_none() {
-            state.running = false;
-        }
+        state.running = next.as_ref().map(PreparationKey::preparation_key);
         next
     }
 }
@@ -227,12 +297,12 @@ impl<T> TemplatePreparationQueue<T> {
 /// The loop must release the slot however it ends, including a `break` or a panic. Leaving
 /// `running` set would stop every later template from ever being prepared, so the release is a
 /// `Drop` rather than something each exit has to remember.
-pub(crate) struct PreparationWorker<T> {
+pub(crate) struct PreparationWorker<T: PreparationKey> {
     queue: TemplatePreparationQueue<T>,
     released: bool,
 }
 
-impl<T> PreparationWorker<T> {
+impl<T: PreparationKey> PreparationWorker<T> {
     /// Returns the newest queued template, releasing the slot when there is none.
     pub(crate) fn next(&mut self) -> Option<T> {
         let next = self.queue.next_or_finish();
@@ -241,7 +311,7 @@ impl<T> PreparationWorker<T> {
     }
 }
 
-impl<T> Drop for PreparationWorker<T> {
+impl<T: PreparationKey> Drop for PreparationWorker<T> {
     fn drop(&mut self) {
         if self.released {
             return;
@@ -252,7 +322,7 @@ impl<T> Drop for PreparationWorker<T> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.pending = None;
-        state.running = false;
+        state.running = None;
     }
 }
 
@@ -457,6 +527,58 @@ pub struct BlockTemplateResponse {
     #[serde(rename = "submitold")]
     #[getset(get_copy = "pub")]
     pub(crate) submit_old: Option<bool>,
+
+    /// The JSON of this template's answer, when the template was taken from the store that
+    /// requests share, so that the answer is encoded once for all of them.
+    ///
+    /// It describes the template as it was taken, with this `submit_old`. It is set as the
+    /// template is returned to its caller, and the template is not changed after that.
+    #[serde(skip)]
+    #[new(default)]
+    pub(crate) shared_json: SharedJson,
+}
+
+/// The JSON a [`BlockTemplateResponse`] shares with other answers from the same template, if it
+/// shares any.
+///
+/// It is a copy of what the template's fields already say, so it takes no part in comparing
+/// templates.
+#[derive(Clone, Default)]
+pub(crate) struct SharedJson(Option<Arc<SharedTemplateJson>>);
+
+impl From<Arc<SharedTemplateJson>> for SharedJson {
+    fn from(json: Arc<SharedTemplateJson>) -> Self {
+        Self(Some(json))
+    }
+}
+
+impl PartialEq for SharedJson {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SharedJson {}
+
+impl BlockTemplateResponse {
+    /// Whether this template carries the times and difficulty that a template built from
+    /// `chain_info` would: it was built on the same chain state, in the same second of the
+    /// node's clock.
+    pub(crate) fn has_times_of(&self, chain_info: &GetBlockTemplateChainInfo) -> bool {
+        self.cur_time == chain_info.cur_time
+            && self.min_time == chain_info.min_time
+            && self.max_time == chain_info.max_time
+            && self.bits == chain_info.expected_difficulty
+    }
+
+    /// Returns this template's answer as finished JSON, if it shares one and is being written
+    /// into an RPC response.
+    fn shared_response_json(&self) -> Option<&RawValue> {
+        if !is_writing_result() {
+            return None;
+        }
+        self.shared_json.0.as_ref()?.get_or_encode(self)
+    }
 }
 
 impl fmt::Debug for BlockTemplateResponse {
@@ -653,6 +775,8 @@ impl BlockTemplateResponse {
             work_id: new_work_id(),
 
             submit_old,
+
+            shared_json: SharedJson::default(),
         })
     }
 }
@@ -663,7 +787,7 @@ fn new_work_id() -> String {
     hex::encode(bytes)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(untagged)]
 /// A `getblocktemplate` RPC response.
 pub enum GetBlockTemplateResponse {
@@ -672,6 +796,21 @@ pub enum GetBlockTemplateResponse {
 
     /// `getblocktemplate` RPC request in proposal mode.
     ProposalMode(BlockProposalResponse),
+}
+
+/// Serializes the response as its template or its proposal result, with nothing around it.
+impl serde::Serialize for GetBlockTemplateResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            // A template that long polls share is megabytes of JSON that is the same for each
+            // of them, so it is written from the copy they share.
+            Self::TemplateMode(template) => match template.shared_response_json() {
+                Some(json) => json.serialize(serializer),
+                None => template.serialize(serializer),
+            },
+            Self::ProposalMode(proposal) => proposal.serialize(serializer),
+        }
+    }
 }
 
 impl GetBlockTemplateResponse {
@@ -837,6 +976,9 @@ where
     /// Shared by foreground construction and long-poll coinbase precomputation.
     template_build_slots: Arc<Semaphore>,
 
+    /// Limits how many long polls answered on a new tip build a full template at once.
+    full_first_answer_slots: Arc<Semaphore>,
+
     /// Retains failures so late subscribers cannot miss template withdrawal.
     pub(crate) template_rejections: watch::Sender<TemplateRejections>,
 
@@ -845,6 +987,25 @@ where
 
     /// Records the stages of each template this handler returns.
     pub(crate) trace: trace::MiningTemplateTrace,
+
+    /// The newest full template, shared by requests that ask for the same work.
+    pub(crate) shared_template: SharedTemplate,
+
+    /// How many long polls have waited for their work to change and are not answered yet.
+    waiting_long_polls: Arc<AtomicUsize>,
+
+    /// Whether this node has been asked for a template since it started. Until it has, the
+    /// node builds no template ahead of requests.
+    template_requested: Arc<AtomicBool>,
+}
+
+/// A long poll that has waited for its work to change, until it is dropped.
+pub(crate) struct WaitingLongPoll(Arc<AtomicUsize>);
+
+impl Drop for WaitingLongPoll {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -875,9 +1036,13 @@ where
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
             template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),
+            full_first_answer_slots: Arc::new(Semaphore::new(MAX_FULL_FIRST_ANSWERS)),
             template_rejections: watch::channel(TemplateRejections::default()).0,
             speculation_breaker: SpeculationBreaker::default(),
             trace: trace::MiningTemplateTrace::default(),
+            shared_template: SharedTemplate::default(),
+            waiting_long_polls: Arc::default(),
+            template_requested: Arc::default(),
         }
     }
 
@@ -886,9 +1051,13 @@ where
         self.pending_blocks = pending_blocks;
     }
 
-    /// Runs bounded proof work off the async worker, retaining capacity across cancellation.
+    /// Runs one template build at a time across RPC clones, where its `work` belongs.
+    ///
+    /// A proof build runs off the async worker and keeps its capacity until it finishes, even
+    /// if the caller stops waiting for it.
     pub(crate) async fn run_template_build<T: Send + 'static>(
         &self,
+        work: TemplateBuildWork,
         build: impl FnOnce() -> T + Send + 'static,
     ) -> RpcResult<T> {
         let permit = tokio::time::timeout(
@@ -904,13 +1073,70 @@ where
         })?
         .map_misc_error()?;
 
-        tokio::task::spawn_blocking(move || {
-            // Dropping the RPC future cannot release capacity while this job still owns work.
-            let _permit = permit;
-            build()
-        })
-        .await
-        .map_misc_error()
+        match work {
+            TemplateBuildWork::ProofFree => {
+                let _permit = permit;
+                // A panic becomes an RPC error, as it does when the build runs on a blocking
+                // thread.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(build))
+                    .map_err(|panic| {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .map(ToString::to_string)
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_default();
+                        format!("mining template construction panicked: {message}")
+                    })
+                    .map_misc_error()
+            }
+            TemplateBuildWork::Proof | TemplateBuildWork::RetainedContent => {
+                tokio::task::spawn_blocking(move || {
+                    // Dropping the RPC future cannot release capacity while this job still owns work.
+                    let _permit = permit;
+                    build()
+                })
+                .await
+                .map_misc_error()
+            }
+        }
+    }
+
+    /// Reserves one of the [`MAX_FULL_FIRST_ANSWERS`] places for a long poll that answers on a
+    /// new tip with the full template, or returns `None` when they are all taken.
+    ///
+    /// The caller holds the place from before it reads the mempool's transactions until its
+    /// template is built, so a tip change that wakes many long polls starts a bounded amount
+    /// of that work. This never waits: a long poll that gets `None` answers with the
+    /// coinbase-only template. Dropping the place releases it.
+    pub(crate) fn try_reserve_full_first_answer(&self) -> Option<OwnedSemaphorePermit> {
+        self.full_first_answer_slots
+            .clone()
+            .try_acquire_owned()
+            .ok()
+    }
+
+    /// Counts a long poll as waiting for its work to change. Its request holds the returned
+    /// value until it has an answer.
+    pub(crate) fn long_poll_waiting(&self) -> WaitingLongPoll {
+        self.waiting_long_polls.fetch_add(1, Ordering::SeqCst);
+        WaitingLongPoll(self.waiting_long_polls.clone())
+    }
+
+    /// Whether a long poll that waited for its work to change has not been answered yet.
+    ///
+    /// A change of tip wakes every such long poll, and each answers on the new tip itself.
+    pub(crate) fn has_waiting_long_poll(&self) -> bool {
+        self.waiting_long_polls.load(Ordering::SeqCst) > 0
+    }
+
+    /// Records that this node has been asked for a template.
+    pub(crate) fn note_template_requested(&self) {
+        self.template_requested.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this node has been asked for a template since it started.
+    pub(crate) fn template_requested(&self) -> bool {
+        self.template_requested.load(Ordering::Relaxed)
     }
 
     pub(crate) fn reserve_mined_submission(
@@ -969,11 +1195,16 @@ where
     }
 
     /// Randomizes the coinbase data, if miner parameters are set.
+    ///
+    /// The handler gets its own shared template slot, so a clone with the old miner parameters
+    /// cannot hand it a template with their coinbase.
     pub fn randomize_coinbase_data(&mut self) {
         if let Some(miner_params) = &mut self.miner_params {
             miner_params.randomize_data();
             miner_params.randomize_memo();
         }
+        self.shared_template = SharedTemplate::default();
+        self.waiting_long_polls = Arc::default();
     }
 }
 
@@ -1194,7 +1425,7 @@ where
 pub async fn fetch_mempool_transactions<Mempool>(
     mempool: Mempool,
     chain_tip_hash: block::Hash,
-) -> RpcResult<Option<(Vec<VerifiedUnminedTx>, TransactionDependencies)>>
+) -> RpcResult<Option<(Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>)>>
 where
     Mempool: Service<
             mempool::Request,

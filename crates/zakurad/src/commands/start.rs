@@ -720,6 +720,7 @@ impl StartCmd {
         );
         let mempool = mempool.with_trace(template_path_trace.clone());
         let mempool_verification_finished = mempool.verification_finished();
+        let mempool_snapshots = mempool.snapshots();
         let mempool = spawn_buffer(
             BoxService::new(mempool),
             mempool::downloads::MAX_INBOUND_CONCURRENCY,
@@ -759,6 +760,7 @@ impl StartCmd {
             user_agent(),
             zakura_rpc::node::NodeRpcServices {
                 mempool: mempool.clone(),
+                mempool_snapshots,
                 state: state.clone(),
                 read_state: read_only_state_service.clone(),
                 block_verifier_router: block_verifier_router.clone(),
@@ -883,8 +885,11 @@ impl StartCmd {
         node_tasks.track(&block_gossip_task_handle);
 
         info!("spawning mempool queue checker task");
-        let mempool_queue_checker_task_handle =
-            mempool::QueueChecker::spawn(mempool.clone(), mempool_verification_finished);
+        let mempool_queue_checker_task_handle = mempool::QueueChecker::spawn(
+            mempool.clone(),
+            mempool_verification_finished,
+            latest_chain_tip.clone(),
+        );
         node_tasks.track(&mempool_queue_checker_task_handle);
 
         info!("spawning mempool transaction gossip task");

@@ -63,6 +63,7 @@ fn rpc_over(node: &VctFastSyncedNode, network: &Network) -> (TestRpc, tokio::tas
         "0.0.1",
         "historical treestate integration test",
         MockService::build().for_unit_tests(),
+        zakura_node_services::mempool::MempoolSnapshotSender::new().subscribe(),
         MockService::build().for_unit_tests(),
         Buffer::new(node.read_state.clone(), 1),
         MockService::build().for_unit_tests(),

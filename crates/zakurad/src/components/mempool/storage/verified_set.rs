@@ -5,12 +5,13 @@ use std::{
     cmp::Reverse,
     collections::{BTreeSet, HashMap, HashSet},
     hash::Hash,
+    sync::Arc,
 };
 
 use zakura_chain::{
     block::Height,
     ironwood, orchard, sapling, sprout,
-    transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
 use zakura_node_services::mempool::TransactionDependencies;
@@ -36,6 +37,9 @@ type EvictionCandidate = (
     transaction::Hash,
 );
 
+/// Metadata and dependencies copied together on the first request after a mutation.
+pub(super) type MiningSnapshot = (Arc<Vec<VerifiedUnminedTx>>, Arc<TransactionDependencies>);
+
 /// An ancestor-package fee per cost, highest first, followed by the oldest
 /// insertion time and transaction hash.
 type MiningCandidate = (
@@ -54,6 +58,20 @@ mod mining_tests;
 #[allow(unused_imports)]
 use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 
+/// Returns the number of parts of a block's `transaction` that the mempool collects one by
+/// one to check its own transactions against: the transparent outputs it spends and the
+/// nullifiers it reveals.
+///
+/// The outputs it creates are not counted here: the mempool only touches them when it held
+/// the transaction, see [`VerifiedSet::held_output_parts`].
+pub(super) fn checked_parts(transaction: &Transaction) -> usize {
+    transaction.inputs().len()
+        + transaction.sprout_nullifiers().count()
+        + transaction.sapling_nullifiers().count()
+        + transaction.orchard_nullifiers().count()
+        + transaction.ironwood_nullifiers().count()
+}
+
 /// The set of verified transactions stored in the mempool.
 ///
 /// This also caches the all the spent outputs from the transactions in the mempool. The spent
@@ -70,6 +88,9 @@ use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 pub struct VerifiedSet {
     /// The set of verified transactions in the mempool.
     transactions: HashMap<transaction::Hash, VerifiedUnminedTx>,
+
+    /// Lazily rebuilt after any transaction or dependency mutation.
+    mining_snapshot: Option<MiningSnapshot>,
 
     /// One current eviction candidate per transaction, ordered cheapest first.
     eviction_order: BTreeSet<EvictionCandidate>,
@@ -124,6 +145,26 @@ impl Drop for VerifiedSet {
 }
 
 impl VerifiedSet {
+    /// Returns immutable lists from the same verified-set revision, with the
+    /// transactions in [`Self::mining_transactions`] order.
+    pub fn mining_snapshot(&mut self) -> MiningSnapshot {
+        if let Some(snapshot) = &self.mining_snapshot {
+            return snapshot.clone();
+        }
+
+        let snapshot = (
+            Arc::new(self.mining_transactions().cloned().collect()),
+            Arc::new(self.transaction_dependencies.clone()),
+        );
+        self.mining_snapshot = Some(snapshot.clone());
+        snapshot
+    }
+
+    /// Returns the current shared lists only if a reader already requested them.
+    pub fn cached_mining_snapshot(&self) -> Option<MiningSnapshot> {
+        self.mining_snapshot.clone()
+    }
+
     /// Returns a reference to the [`HashMap`] of [`VerifiedUnminedTx`]s in the set.
     pub fn transactions(&self) -> &HashMap<transaction::Hash, VerifiedUnminedTx> {
         &self.transactions
@@ -162,6 +203,25 @@ impl VerifiedSet {
         self.transactions.len()
     }
 
+    /// Returns the number of parts of its transactions that the mempool checks against a new
+    /// block: the transparent outputs they spend and the nullifiers they reveal.
+    ///
+    /// The outputs they create are not counted: a block only touches the outputs of the
+    /// transactions it mines (see [`Self::created_output_count`]).
+    pub fn scanned_parts(&self) -> usize {
+        self.spent_outpoints.len()
+            + self.sprout_nullifiers.len()
+            + self.sapling_nullifiers.len()
+            + self.orchard_nullifiers.len()
+            + self.ironwood_nullifiers.len()
+    }
+
+    /// Returns the number of transparent outputs created by the transactions in the set:
+    /// the outputs it removes one by one when a block mines those transactions.
+    pub fn created_output_count(&self) -> usize {
+        self.created_outputs.len()
+    }
+
     /// Returns the total cost of the verified transactions in the set.
     ///
     /// [ZIP-401]: https://zips.z.cash/zip-0401
@@ -187,6 +247,7 @@ impl VerifiedSet {
     ///
     /// Also clears all internal caches.
     pub fn clear(&mut self) {
+        self.mining_snapshot = None;
         self.transactions.clear();
         self.eviction_order.clear();
         self.mining_order.clear();
@@ -260,6 +321,7 @@ impl VerifiedSet {
         height: Option<Height>,
     ) -> Result<(), SameEffectsTipRejectionError> {
         let ancestors = self.check_insert(&transaction.transaction, &spent_mempool_outpoints)?;
+        self.mining_snapshot = None;
         let affected = self.dependency_group(ancestors);
         self.remove_ordering_candidates(&affected);
 
@@ -590,6 +652,7 @@ impl VerifiedSet {
     /// Clears a list of mined transaction ids from the lists of dependencies for
     /// any other transactions in the mempool and removes their dependents.
     pub fn clear_mined_dependencies(&mut self, mined_ids: &HashSet<transaction::Hash>) {
+        self.mining_snapshot = None;
         let affected: HashSet<_> = mined_ids
             .iter()
             .filter(|id| self.transactions.contains_key(id))
@@ -637,6 +700,7 @@ impl VerifiedSet {
     ///
     /// Also removes the outputs of any removed transactions from the internal caches.
     pub(super) fn remove(&mut self, key_to_remove: &transaction::Hash) -> Vec<VerifiedUnminedTx> {
+        self.mining_snapshot = None;
         let affected = self.dependency_group([*key_to_remove]);
         self.remove_ordering_candidates(&affected);
         let removed_transactions: Vec<_> = self
@@ -938,6 +1002,168 @@ impl MempoolMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mining_snapshot_reuses_metadata_until_insertion() {
+        use super::super::fixtures::TxFactory;
+
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        let empty = verified.mining_snapshot();
+        let reused = verified.mining_snapshot();
+        assert!(Arc::ptr_eq(&empty.0, &reused.0));
+        assert!(Arc::ptr_eq(&empty.1, &reused.1));
+
+        let tx = factory.tx(10_000);
+        verified
+            .insert(tx.clone(), vec![], &mut pending, None)
+            .unwrap();
+        let populated = verified.mining_snapshot();
+        assert!(!Arc::ptr_eq(&empty.0, &populated.0));
+        assert!(
+            empty.0.is_empty(),
+            "existing readers keep their immutable view"
+        );
+        assert_eq!(populated.0.len(), 1);
+
+        assert!(verified.insert(tx, vec![], &mut pending, None).is_err());
+        let after_rejection = verified.mining_snapshot();
+        assert!(Arc::ptr_eq(&populated.0, &after_rejection.0));
+        assert!(Arc::ptr_eq(&populated.1, &after_rejection.1));
+    }
+
+    /// The set's count of scanned parts is the sum of its transactions' spent outputs and
+    /// revealed nullifiers, as transactions are added and removed. The outputs they create are
+    /// not counted.
+    #[test]
+    fn scanned_parts_count_the_spends_and_nullifiers_of_the_transactions_held() {
+        use super::super::fixtures::TxFactory;
+
+        let scanned_parts = |transaction: &Transaction| {
+            transaction.spent_outpoints().count()
+                + transaction.sprout_nullifiers().count()
+                + transaction.sapling_nullifiers().count()
+                + transaction.orchard_nullifiers().count()
+                + transaction.ironwood_nullifiers().count()
+        };
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        assert_eq!(verified.scanned_parts(), 0);
+
+        let first = factory.tx_with(10_000, 3, 0);
+        let second = factory.tx(10_000);
+        let first_id = first.transaction.id().mined_id();
+        let first_parts = scanned_parts(first.transaction.transaction());
+        let second_parts = scanned_parts(second.transaction.transaction());
+        assert!(
+            first_parts > 0 && second_parts > 0,
+            "every transaction spends or reveals something"
+        );
+        assert!(
+            !first.transaction.transaction().outputs().is_empty(),
+            "the transaction creates outputs, which are not counted"
+        );
+
+        verified.insert(first, vec![], &mut pending, None).unwrap();
+        verified.insert(second, vec![], &mut pending, None).unwrap();
+        assert_eq!(verified.scanned_parts(), first_parts + second_parts);
+
+        assert_eq!(verified.remove_all([first_id]).len(), 1);
+        assert_eq!(verified.scanned_parts(), second_parts);
+    }
+
+    #[test]
+    fn mining_snapshot_refreshes_after_removal_and_clear() {
+        use super::super::fixtures::TxFactory;
+
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        let first = factory.tx(10_000);
+        let first_id = first.transaction.id().mined_id();
+        verified.insert(first, vec![], &mut pending, None).unwrap();
+        verified
+            .insert(factory.tx(10_000), vec![], &mut pending, None)
+            .unwrap();
+        let before = verified.mining_snapshot();
+
+        assert_eq!(verified.remove_all([first_id]).len(), 1);
+        let after_removal = verified.mining_snapshot();
+        assert_eq!(before.0.len(), 2);
+        assert_eq!(after_removal.0.len(), 1);
+        assert!(after_removal
+            .0
+            .iter()
+            .all(|tx| tx.transaction.id().mined_id() != first_id));
+        assert!(!Arc::ptr_eq(&before.0, &after_removal.0));
+
+        verified.clear();
+        let after_clear = verified.mining_snapshot();
+        assert!(after_clear.0.is_empty());
+        assert!(after_clear.1.dependencies().is_empty());
+        assert_eq!(after_removal.0.len(), 1);
+    }
+
+    #[test]
+    fn mining_snapshot_refreshes_when_only_dependencies_change() {
+        use super::super::fixtures::TxFactory;
+
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        let parent = factory.tx_with(10_000, 1, 0);
+        let parent_id = parent.transaction.id().mined_id();
+        let child = factory.tx(10_000);
+        let child_id = child.transaction.id().mined_id();
+        verified.insert(parent, vec![], &mut pending, None).unwrap();
+        verified
+            .insert(
+                child,
+                vec![transparent::OutPoint::from_usize(parent_id, 0)],
+                &mut pending,
+                None,
+            )
+            .unwrap();
+        let before = verified.mining_snapshot();
+        assert!(before.1.direct_dependencies(&child_id).contains(&parent_id));
+
+        verified.clear_mined_dependencies(&HashSet::from([parent_id]));
+        let after = verified.mining_snapshot();
+        assert_eq!(before.0.len(), after.0.len());
+        assert!(after.1.direct_dependencies(&child_id).is_empty());
+        assert!(before.1.direct_dependencies(&child_id).contains(&parent_id));
+        assert!(!Arc::ptr_eq(&before.1, &after.1));
+    }
+
+    #[test]
+    fn mining_snapshot_removes_descendants_together() {
+        use super::super::fixtures::TxFactory;
+
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        let parent = factory.tx_with(10_000, 1, 0);
+        let parent_id = parent.transaction.id().mined_id();
+        verified.insert(parent, vec![], &mut pending, None).unwrap();
+        verified
+            .insert(
+                factory.tx(10_000),
+                vec![transparent::OutPoint::from_usize(parent_id, 0)],
+                &mut pending,
+                None,
+            )
+            .unwrap();
+        let before = verified.mining_snapshot();
+
+        assert_eq!(verified.remove(&parent_id).len(), 2);
+        let after = verified.mining_snapshot();
+        assert!(after.0.is_empty());
+        assert!(after.1.dependencies().is_empty());
+        assert_eq!(before.0.len(), 2);
+        assert_eq!(before.1.dependencies().len(), 1);
+    }
 
     #[test]
     fn selection_rescores_only_changed_groups() {

@@ -168,7 +168,9 @@ async fn delayed_completion(early_inventory: bool, ordering: RelayOrdering) {
                     zakura_rpc::config::mining::Config {
                         optimistic_block_inventory: early_inventory, ..Default::default()
                     },
-                    false, "test", "miner relay test", mempool, state.clone(), read_state,
+                    false, "test", "miner relay test", mempool,
+                    zakura_node_services::mempool::MempoolSnapshotSender::new().subscribe(),
+                    state.clone(), read_state,
                     verifier.clone(), MockSyncStatus::default(), latest_tip,
                     MockAddressBookPeers::default(), log_rx, Some(mining_sender),
                 );

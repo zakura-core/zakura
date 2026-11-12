@@ -16,6 +16,47 @@ use zakura_chain::parameters::subsidy::FundingStreamReceiver::{self, *};
 /// <https://github.com/zcash/zcash/blob/420f8dfe38fd6b2465a665324366c2ae14aa98f4/src/rpc/mining.cpp#L626>
 pub const MEMPOOL_LONG_POLL_INTERVAL: u64 = 5;
 
+/// How long a long poll answered on a new tip waits for the mempool's transactions before it
+/// falls back to the coinbase-only template.
+///
+/// The bound keeps a lagging mempool from holding back work on the new tip. On a Mainnet node
+/// running this code, over 46 new blocks with up to 7 transactions waiting, we have not
+/// observed worse than 3.5 ms from the node seeing a new block to returning the full template.
+/// The mempool's part of that was at most 0.3 ms. A long poll only waits when the mempool
+/// reports light work (see [`NEW_TIP_MEMPOOL_LIGHT_WORK`]), so a short bound costs few full
+/// first answers.
+pub const NEW_TIP_MEMPOOL_WAIT: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The most work the mempool may report for a new block for a long poll answered on that tip
+/// to wait for the mempool's transactions. Above it, the long poll answers with the
+/// coinbase-only template at once.
+///
+/// The mempool reports the work when it starts on a block (see `MempoolTipWork::work`): the
+/// transparent outputs spent and the nullifiers revealed by the block's transactions, the
+/// outputs created by those of them it held, the outputs spent and nullifiers revealed by its
+/// own, which it checks against the block's, and one for each transaction it holds. It
+/// handles these one by one, so their number predicts how long it takes to have its
+/// transactions for the block ready.
+///
+/// The limit is set so that the wait is only started when the mempool is expected to finish
+/// within [`NEW_TIP_MEMPOOL_WAIT`]. On an isolated regtest node, the time from reporting the
+/// work to publishing the block's transactions was 1.1 to 1.5 µs for each part: 1,817 parts
+/// took 1.1 ms, 39,276 parts 54 to 59 ms, and 79,275 parts 80 to 93 ms. At the slowest rate,
+/// this limit is about 4.5 ms. A long poll that waits and then answers coinbase-only delays
+/// work on the new tip for nothing.
+pub const NEW_TIP_MEMPOOL_LIGHT_WORK: usize = 3_000;
+
+/// How many long polls answered on a new tip may build a full template at the same time.
+///
+/// Each one may ask the mempool, selects from its transactions and queues a template build.
+/// Without a limit, every long poll woken by one tip change would do that at once. A long
+/// poll over the limit answers with the coinbase-only template instead of waiting.
+///
+/// Three covers a pool that keeps a few long polls open on one node. The limit stays small
+/// because templates are built one at a time: a larger one queues more builds, some for a tip
+/// a reorg has already replaced, ahead of work on the newest tip.
+pub const MAX_FULL_FIRST_ANSWERS: usize = 3;
+
 /// The maximum number of times `getblocktemplate` rebuilds a template that was
 /// superseded by a tip, parent selection, or rejection revision change.
 ///

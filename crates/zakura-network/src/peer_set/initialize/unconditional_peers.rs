@@ -298,10 +298,27 @@ fn warn_about_addrs_over_the_ip_limit(dial_targets: &[DialTarget], config: &Conf
 ///
 /// Only the first failure since the last healthy connection is worth an operator's
 /// attention: a peer without a listener fails every dial.
+///
+/// A peer that moves to the v2 protocol closes its legacy connection without a fault.
+/// Its v2 connection is in the registry, so the next check counts it as connected, and
+/// that close is not a failure.
 fn log_failed_attempt(peer: &RedialState, error: &BoxError, expose_peer_addresses: bool) {
+    let peer_label = peer.target.label(expose_peer_addresses);
+
+    if error
+        .downcast_ref::<peer::HandshakeError>()
+        .is_some_and(peer::HandshakeError::is_neutral_disconnect)
+    {
+        debug!(
+            peer = %peer_label,
+            ?error,
+            "an unconditional peer closed its legacy connection neutrally"
+        );
+        return;
+    }
+
     metrics::counter!("peer.unconditional.dial.failed.total").increment(1);
 
-    let peer_label = peer.target.label(expose_peer_addresses);
     if peer.attempts <= 1 {
         info!(
             peer = %peer_label,

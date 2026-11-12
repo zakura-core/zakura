@@ -65,7 +65,7 @@ impl Own for Smoke {
 }
 
 impl Own for Storage {
-    /// The storage harness's, then `header-sync/bounded-adversary-progress`.
+    /// The storage harness's, then `bounded-adversary-progress`.
     fn own() -> Vec<Property<Without<Self>>> {
         let mut properties = storage_properties();
         properties.push(bounded_adversary_progress());
@@ -137,11 +137,6 @@ impl<S: Subsystem> HasView for Without<S> {
     /// `S`'s stamps.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
         self.0.stamps_after(after)
-    }
-
-    /// `S`'s store snapshot.
-    fn snapshot(&self) -> Option<serde_json::Value> {
-        self.0.snapshot()
     }
 }
 

@@ -54,7 +54,7 @@ impl EvictionList {
         }
         // > Add the txid and the current time to RecentlyEvicted, dropping the oldest entry
         // > in RecentlyEvicted if necessary to keep it to at most eviction_memory_entries entries.
-        if self.len(now) >= self.max_size {
+        if self.len() >= self.max_size {
             self.pop_front();
         }
         self.unique_entries.insert(key, now);
@@ -73,22 +73,16 @@ impl EvictionList {
         false
     }
 
-    /// Get the size of the list.
-    //
-    // Note: if this method being mutable becomes an issue, it's possible
-    // to compute the number of expired transactions and subtract,
-    // at the cost of `O(len + expired)` performance each time the method is called.
-    //
-    // Currently the performance is `O(expired)` for the first call, then `O(1)` until the next expiry.
-    pub fn len(&mut self, now: Instant) -> usize {
-        self.prune_old(now);
+    /// The number of entries, counting expired ones that
+    /// [`Self::prune_old`] has not dropped yet.
+    pub fn len(&self) -> usize {
         self.unique_entries.len()
     }
 
-    /// Prune TXIDs that are older than `eviction_time` ago.
+    /// Drops the TXIDs that expired at `now`.
     ///
-    // This method is public because ZIP-401 states about pruning:
-    // > This MAY be done periodically,
+    /// ZIP-401 allows this to happen periodically, and the pool core does it
+    /// on every input.
     pub fn prune_old(&mut self, now: Instant) {
         while let Some(txid) = self.front() {
             let evicted_at = self

@@ -38,7 +38,6 @@ fn insert(storage: &mut Storage, tx: &VerifiedUnminedTx, spent: Vec<OutPoint>) -
             tx.clone(),
             spent,
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now(),
         )
@@ -70,7 +69,6 @@ fn full_mempool_evicts_lowest_fee_transaction() {
         newcomer.clone(),
         vec![],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -79,7 +77,7 @@ fn full_mempool_evicts_lowest_fee_transaction() {
     assert_eq!(evicted, [b].into());
     assert_eq!(ids(&storage), [a, c, newcomer.transaction.id()].into());
     assert_eq!(
-        storage.rejection_error(&b, crate::Instant::now()),
+        storage.rejection(&b, crate::Instant::now()),
         Some(ExactTipRejectionError::Evicted.into()),
     );
 }
@@ -101,7 +99,6 @@ fn full_mempool_rejects_fee_within_increment_without_changes() {
         newcomer.clone(),
         vec![],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -113,11 +110,11 @@ fn full_mempool_rejects_fee_within_increment_without_changes() {
     assert!(evicted.is_empty());
     assert_eq!(ids(&storage), before);
     assert_eq!(storage.total_cost(), before_cost);
-    assert!(before.iter().all(|tx_id| storage
-        .rejection_error(tx_id, crate::Instant::now())
-        .is_none()));
+    assert!(before
+        .iter()
+        .all(|tx_id| storage.rejection(tx_id, crate::Instant::now()).is_none()));
     assert_eq!(
-        storage.rejection_error(&newcomer.transaction.id(), crate::Instant::now()),
+        storage.rejection(&newcomer.transaction.id(), crate::Instant::now()),
         Some(ExactTipRejectionError::BelowEvictionCost.into()),
     );
 }
@@ -139,7 +136,6 @@ fn transaction_that_needs_its_ancestors_evicted_is_rejected() {
         newcomer,
         vec![first_output(&parent)],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -171,7 +167,6 @@ fn high_fee_child_protects_low_fee_parent() {
         newcomer.clone(),
         vec![],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -199,7 +194,6 @@ fn low_fee_child_is_evicted_without_its_parent() {
         newcomer.clone(),
         vec![],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -229,7 +223,6 @@ fn evicting_a_parent_evicts_its_descendants() {
         newcomer.clone(),
         vec![],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -246,7 +239,6 @@ fn evicting_a_parent_evicts_its_descendants() {
         large.clone(),
         vec![],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -298,7 +290,6 @@ fn three_transaction_chain_evicts_its_cheap_tail() {
         newcomer.clone(),
         vec![],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -329,7 +320,6 @@ fn transaction_with_too_many_ancestors_is_rejected() {
             child,
             vec![first_output(&tail)],
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now()
         ),
@@ -355,7 +345,6 @@ fn newcomer_never_evicts_its_ancestors() {
         newcomer.clone(),
         vec![first_output(&parent)],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -382,7 +371,6 @@ fn equal_eviction_costs_evict_the_newest_transaction() {
         newcomer,
         vec![],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -411,28 +399,24 @@ fn rejections_clear_when_a_block_frees_space() {
             rejected.clone(),
             vec![],
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now()
         ),
         Err(ExactTipRejectionError::BelowEvictionCost.into())
     );
-    assert!(storage.contains_rejected(&cheap_id, crate::Instant::now()));
+    assert!(storage
+        .rejection(&cheap_id, crate::Instant::now())
+        .is_some());
 
     // A block mines one transaction, which frees space and clears the tip rejections.
-    storage.reject_and_remove_same_effects(
-        &[mined_id.mined_id()].into(),
-        Vec::<Arc<zakura_chain::transaction::Transaction>>::new(),
-        crate::Instant::now(),
-    );
-    storage.clear_tip_rejections(crate::Instant::now());
+    storage.mine(&[mined_id.mined_id()].into(), crate::Instant::now());
+    storage.clear_tip_rejections();
 
     assert_eq!(
         storage.insert(
             cheap.clone(),
             vec![],
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now()
         ),
@@ -446,7 +430,6 @@ fn rejections_clear_when_a_block_frees_space() {
             rejected,
             vec![],
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now()
         ),
@@ -476,7 +459,6 @@ fn third_child_is_rejected_without_changing_the_pool() {
         sibling,
         vec![output(&parent, MAX_MEMPOOL_ANCESTORS)],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -527,7 +509,6 @@ fn joining_groups_counts_existing_children_and_rejects_atomically() {
         joined,
         vec![output(&a, 1), first_output(&b)],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -564,7 +545,6 @@ fn triangle_counts_shared_grandchild_once() {
         underpaying,
         vec![],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -579,7 +559,6 @@ fn triangle_counts_shared_grandchild_once() {
         newcomer.clone(),
         vec![],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -615,11 +594,8 @@ fn mining_a_parent_releases_capacity_for_another_grandchild() {
     insert(&mut storage, &child, vec![first_output(&parent)]);
     let grandchild = factory.tx_with(10_000, 1, 0);
     insert(&mut storage, &grandchild, vec![first_output(&child)]);
-    let mined = [parent.transaction.id().mined_id()].into();
-    storage.clear_mined_dependencies(&mined);
-    storage.reject_and_remove_same_effects(
-        &mined,
-        Vec::<Arc<zakura_chain::transaction::Transaction>>::new(),
+    storage.mine(
+        &[parent.transaction.id().mined_id()].into(),
         crate::Instant::now(),
     );
     let next = factory.tx(10_000);
@@ -681,7 +657,6 @@ fn higher_fee_conflicting_transaction_does_not_replace_or_evict() {
             replacement,
             vec![],
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now(),
         );
@@ -761,7 +736,6 @@ fn ancestor_package_rate_must_outbid_victims_for_every_group_shape() {
                 child,
                 spent.clone(),
                 None,
-                &mut |_, _| {},
                 crate::Instant::now(),
                 chrono::Utc::now(),
             );
@@ -779,7 +753,6 @@ fn ancestor_package_rate_must_outbid_victims_for_every_group_shape() {
             child.clone(),
             spent,
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now(),
         );
@@ -806,7 +779,6 @@ fn ancestor_package_pricing_does_not_apply_with_spare_capacity() {
             child.clone(),
             spent,
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now(),
         );
@@ -830,7 +802,6 @@ fn rich_ancestors_do_not_subsidize_an_underpaying_child() {
         child,
         vec![first_output(&tail)],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -845,7 +816,6 @@ fn rich_ancestors_do_not_subsidize_an_underpaying_child() {
         child.clone(),
         vec![first_output(&tail)],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -875,7 +845,6 @@ fn ancestor_package_must_outbid_every_victim_before_any_eviction() {
             child,
             vec![first_output(&parent)],
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now(),
         );
@@ -892,7 +861,6 @@ fn ancestor_package_must_outbid_every_victim_before_any_eviction() {
         child.clone(),
         vec![first_output(&parent)],
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
@@ -918,7 +886,6 @@ fn rebuilding_an_evicted_chain_requires_a_higher_package_rate() {
             insufficient,
             vec![first_output(&tail)],
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now(),
         );
@@ -934,7 +901,6 @@ fn rebuilding_an_evicted_chain_requires_a_higher_package_rate() {
                 child,
                 vec![first_output(&tail)],
                 None,
-                &mut |_, _| {},
                 crate::Instant::now(),
                 chrono::Utc::now()
             )
@@ -946,7 +912,6 @@ fn rebuilding_an_evicted_chain_requires_a_higher_package_rate() {
             factory.tx(standalone_fee),
             vec![],
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now(),
         );
@@ -1004,7 +969,6 @@ fn rejecting_a_padded_variant_does_not_reject_the_original() {
             padded,
             vec![],
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now()
         ),
@@ -1015,7 +979,6 @@ fn rejecting_a_padded_variant_does_not_reject_the_original() {
             original.clone(),
             vec![],
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now()
         ),
@@ -1140,7 +1103,7 @@ proptest! {
                 .map(|tx| (tx.transaction.id(), VerifiedSet::eviction_cost(tx)))
                 .collect();
 
-            let (result, evicted) = storage.insert_with_evicted_ids(tx, vec![], None, &mut |_, _| {}, crate::Instant::now(), chrono::Utc::now());
+            let (result, evicted) = storage.insert_with_evicted_ids(tx, vec![], None, crate::Instant::now(), chrono::Utc::now());
 
             prop_assert!(storage.total_cost() <= limit_txs * COST);
 
@@ -1200,8 +1163,7 @@ proptest! {
                     .collect();
                 let mined = roots[parent_picks.first().map_or(0, |pick| pick.index(roots.len()))];
                 let mined: HashSet<_> = [mined].into();
-                storage.clear_mined_dependencies(&mined);
-                storage.reject_and_remove_same_effects(&mined, Vec::<Arc<zakura_chain::transaction::Transaction>>::new(), crate::Instant::now());
+                storage.mine(&mined, crate::Instant::now());
                 storage.verified.assert_dependency_groups_are_bounded();
                 continue;
             }
@@ -1222,7 +1184,7 @@ proptest! {
             let expected = reference_eviction(&storage, &tx, &parents);
             let before = ids(&storage);
 
-            let (result, evicted) = storage.insert_with_evicted_ids(tx.clone(), spent, None, &mut |_, _| {}, crate::Instant::now(), chrono::Utc::now());
+            let (result, evicted) = storage.insert_with_evicted_ids(tx.clone(), spent, None, crate::Instant::now(), chrono::Utc::now());
             storage.verified.assert_dependency_groups_are_bounded();
             prop_assert!(storage.total_cost() <= limit_txs * COST);
 

@@ -83,6 +83,11 @@ impl PendingOutputs {
         self.waiting.retain(|_, chan| chan.receiver_count() > 0);
         self.prune_cadence.pruned(self.waiting.len());
     }
+
+    /// Clears the inner [`HashMap`] of queued pending output requests.
+    pub fn clear(&mut self) {
+        self.waiting.clear();
+    }
 }
 
 #[cfg(test)]

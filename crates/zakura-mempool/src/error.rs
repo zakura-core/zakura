@@ -5,7 +5,7 @@
 
 use thiserror::Error;
 
-#[cfg(any(test, feature = "proptest-impl"))]
+#[cfg(test)]
 use proptest_derive::Arbitrary;
 
 use crate::storage::{
@@ -15,8 +15,8 @@ use crate::storage::{
 
 /// Mempool errors. `E` is the verification error a cached rejection holds.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "proptest-impl"), proptest(no_bound))]
+#[cfg_attr(test, derive(Arbitrary))]
+#[cfg_attr(test, proptest(no_bound))]
 pub enum MempoolError<E> {
     /// Transaction rejected based on its authorizing data (scripts, proofs,
     /// signatures). The rejection is valid for the current chain tip.
@@ -89,7 +89,6 @@ impl<E> From<RejectionError<E>> for MempoolError<E> {
             RejectionError::ExactTip(error) => Self::StorageExactTip(error),
             RejectionError::SameEffectsTip(error) => Self::StorageEffectsTip(error),
             RejectionError::SameEffectsChain(error) => Self::StorageEffectsChain(error),
-            RejectionError::NonStandardTransaction(error) => Self::NonStandardTransaction(error),
         }
     }
 }

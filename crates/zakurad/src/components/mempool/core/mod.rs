@@ -97,6 +97,18 @@ impl Exempt {
     }
 }
 
+/// The pool core's settings, from the node's `[mempool]` section, read as
+/// today's pool reads them.
+pub(crate) fn core_config(config: &Config) -> zakura_mempool::Config {
+    zakura_mempool::Config {
+        tx_cost_limit: config.tx_cost_limit,
+        eviction_memory_time: config.eviction_memory_time,
+        max_datacarrier_bytes: config
+            .max_datacarrier_bytes
+            .unwrap_or(super::config::DEFAULT_MAX_DATACARRIER_BYTES),
+    }
+}
+
 /// Starts the pool core and everything that connects it to the node.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
@@ -202,7 +214,7 @@ pub(crate) fn assemble(
         current,
     );
     let core = PoolCore::new(
-        config,
+        &core_config(config),
         start,
         events,
         chain_transitions.generation(),

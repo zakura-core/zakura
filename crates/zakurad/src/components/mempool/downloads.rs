@@ -1682,8 +1682,8 @@ mod tests {
         );
 
         let mut storage = super::super::storage::Storage::new(&super::super::Config::default());
-        super::super::reject_if_needed(&mut storage, tx_id, error);
-        assert!(!storage.contains_rejected(&tx_id, crate::components::mempool::storage_now()));
+        storage.reject_if_needed(tx_id, error);
+        assert!(!storage.contains_rejected(&tx_id));
     }
 
     /// A transaction served by a peer in a cooldown must not be verified, even

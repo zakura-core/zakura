@@ -1,9 +1,8 @@
 use std::{pin::Pin, sync::Arc};
 
 use chrono::Utc;
+use proptest::prelude::*;
 use tower::ServiceExt;
-
-pub use zakura_mempool::arbitrary::standard_verified_unmined_tx_strategy;
 
 use super::{
     downloads::TransactionDownloadVerifyError, error::MempoolError, queue_source_log_label,
@@ -15,11 +14,11 @@ use crate::{
     BoxError,
 };
 use zakura_chain::{
-    amount::Amount,
+    amount::{Amount, NonNegative},
     block::{self, Height},
-    parameters::Network,
-    transaction::Transaction,
-    transparent,
+    parameters::{Network, NetworkKind},
+    transaction::{Transaction, UnminedTx, VerifiedUnminedTx},
+    transparent::{self, Address},
 };
 use zakura_node_services::mempool::QueueSource;
 use zakura_state::{ChainTipBlock, ChainTipSender};
@@ -349,4 +348,40 @@ where
             Err(error) => error.unbox_mempool_error(),
         }
     }
+}
+
+/// Return a [`VerifiedUnminedTx`] strategy with outputs and inputs adjusted to pass standardness.
+pub fn standard_verified_unmined_tx_strategy() -> BoxedStrategy<VerifiedUnminedTx> {
+    any::<Transaction>()
+        .prop_map(|mut transaction| {
+            standardize_transaction(&mut transaction);
+
+            let unmined_tx = UnminedTx::from(transaction);
+            let miner_fee = unmined_tx.conventional_fee();
+
+            VerifiedUnminedTx::new(unmined_tx, miner_fee, 0, 0, std::sync::Arc::new(vec![]))
+                .expect("standardized transaction should pass ZIP-317 checks")
+        })
+        .boxed()
+}
+
+/// Mutate a transaction so its transparent inputs/outputs pass standardness checks.
+pub fn standardize_transaction(transaction: &mut Transaction) {
+    let lock_script = standard_lock_script();
+    let output_value = Amount::<NonNegative>::try_from(10_000).expect("valid amount");
+
+    for input in transaction.inputs_mut() {
+        if let transparent::Input::PrevOut { unlock_script, .. } = input {
+            *unlock_script = transparent::Script::new(&[]);
+        }
+    }
+
+    for output in transaction.outputs_mut() {
+        output.lock_script = lock_script.clone();
+        output.value = output_value;
+    }
+}
+
+fn standard_lock_script() -> transparent::Script {
+    Address::from_pub_key_hash(NetworkKind::Mainnet, [0u8; 20]).script()
 }

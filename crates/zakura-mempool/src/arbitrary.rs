@@ -1,4 +1,4 @@
-//! Generators for property tests of the pool and its users.
+//! Generators for the storage property tests.
 
 use proptest::prelude::*;
 

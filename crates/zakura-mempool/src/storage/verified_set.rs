@@ -8,7 +8,7 @@ use zakura_rt::collections::{HashMap, HashSet};
 use zakura_chain::{
     block::Height,
     ironwood, orchard, sapling, sprout,
-    transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, UnminedTx, VerifiedUnminedTx},
     transparent,
 };
 use zakura_node_services::mempool::TransactionDependencies;
@@ -39,9 +39,6 @@ type MiningCandidate = (
     Option<DateTime<Utc>>,
     transaction::Hash,
 );
-
-#[cfg(feature = "mempool-bench")]
-pub mod benchmarks;
 
 #[cfg(test)]
 mod mining_tests;
@@ -93,8 +90,8 @@ pub struct VerifiedSet {
     /// The total cost of the verified transactions in the set.
     total_cost: u64,
 
-    /// The metric totals for verified transactions in the set.
-    metrics: MempoolMetrics,
+    /// The fee-weight totals for verified transactions in the set.
+    weights: WeightTotals,
 
     /// The set of spent out points by the verified transactions.
     spent_outpoints: HashSet<transparent::OutPoint>,
@@ -110,13 +107,6 @@ pub struct VerifiedSet {
 
     /// The set of revealed Ironwood nullifiers.
     ironwood_nullifiers: HashSet<ironwood::Nullifier>,
-}
-
-impl Drop for VerifiedSet {
-    fn drop(&mut self) {
-        // zero the metrics on drop
-        self.clear()
-    }
 }
 
 impl VerifiedSet {
@@ -148,11 +138,6 @@ impl VerifiedSet {
         self.created_outputs.get(outpoint).cloned()
     }
 
-    /// Returns true if a tx in the set has spent the output at the provided outpoint.
-    pub fn has_spent_outpoint(&self, outpoint: &transparent::OutPoint) -> bool {
-        self.spent_outpoints.contains(outpoint)
-    }
-
     /// Returns the number of verified transactions in the set.
     pub fn transaction_count(&self) -> usize {
         self.transactions.len()
@@ -171,6 +156,12 @@ impl VerifiedSet {
     /// is based on the [`MEMPOOL_TRANSACTION_COST_THRESHOLD`].
     pub fn total_serialized_size(&self) -> usize {
         self.transactions_serialized_size
+    }
+
+    /// The sizes and unpaid actions of the transactions in the set, by fee
+    /// weight.
+    pub fn weights(&self) -> &WeightTotals {
+        &self.weights
     }
 
     /// Returns `true` if the set of verified transactions contains the transaction with the
@@ -195,8 +186,7 @@ impl VerifiedSet {
         self.created_outputs.clear();
         self.transactions_serialized_size = 0;
         self.total_cost = 0;
-        self.metrics = MempoolMetrics::default();
-        self.report_metrics();
+        self.weights = WeightTotals::default();
     }
 
     /// Returns the mempool ancestors of `transaction`, or an error if
@@ -249,13 +239,11 @@ impl VerifiedSet {
     /// Two transactions have a spend conflict if they spend the same UTXO or if they reveal the
     /// same nullifier.
     ///
-    /// `outputs` is called with each transparent output the transaction creates. `time` is
-    /// stamped on the transaction as its insertion time.
+    /// `time` is stamped on the transaction as its insertion time.
     pub fn insert(
         &mut self,
         mut transaction: VerifiedUnminedTx,
         spent_mempool_outpoints: Vec<transparent::OutPoint>,
-        outputs: &mut dyn FnMut(&transparent::OutPoint, &transparent::Output),
         height: Option<Height>,
         time: DateTime<Utc>,
     ) -> Result<(), SameEffectsTipRejectionError> {
@@ -267,11 +255,10 @@ impl VerifiedSet {
         self.transaction_dependencies
             .add(tx_id, spent_mempool_outpoints);
 
-        // Inserts the transaction's outputs into the internal caches and reports them to the caller.
+        // Inserts the transaction's outputs into the internal caches.
         let tx = &transaction.transaction.transaction();
         for (index, output) in tx.outputs().iter().cloned().enumerate() {
             let outpoint = transparent::OutPoint::from_usize(tx_id, index);
-            outputs(&outpoint, &output);
             self.created_outputs.insert(outpoint, output);
         }
         self.spent_outpoints.extend(tx.spent_outpoints());
@@ -284,11 +271,9 @@ impl VerifiedSet {
         self.total_cost += transaction.cost();
         transaction.time = Some(time);
         transaction.height = height;
-        self.metrics.add_transaction(&transaction);
+        self.weights.add_transaction(&transaction);
         self.transactions.insert(tx_id, transaction);
         self.insert_ordering_candidates(&self.dependency_group([tx_id]));
-
-        self.report_metrics();
 
         Ok(())
     }
@@ -601,32 +586,6 @@ impl VerifiedSet {
         self.insert_ordering_candidates(&affected);
     }
 
-    /// Removes the listed transactions and their descendants.
-    ///
-    /// Returns all removed unmined IDs. Missing IDs, duplicate IDs, and IDs
-    /// already removed as descendants are ignored.
-    pub(super) fn remove_all(
-        &mut self,
-        tx_ids: impl IntoIterator<Item = transaction::Hash>,
-    ) -> HashSet<UnminedTxId> {
-        let mut removed_transactions = HashSet::new();
-
-        for key_to_remove in tx_ids {
-            if !self.transactions.contains_key(&key_to_remove) {
-                // A previous removal may already have removed this descendant.
-                continue;
-            }
-
-            removed_transactions.extend(
-                self.remove(&key_to_remove)
-                    .into_iter()
-                    .map(|tx| tx.transaction.id()),
-            );
-        }
-
-        removed_transactions
-    }
-
     /// Accepts a transaction id for a transaction to remove from the verified set.
     ///
     /// Removes the transaction and any transactions that directly or indirectly
@@ -645,14 +604,13 @@ impl VerifiedSet {
             .iter()
             .chain(std::iter::once(key_to_remove))
             .filter_map(|key_to_remove| {
-                let Some(removed_tx) = self.transactions.remove(key_to_remove) else {
-                    tracing::warn!(?key_to_remove, "invalid transaction key");
-                    return None;
-                };
+                // The dependencies only name stored transactions, so this
+                // skips nothing unless they are out of step.
+                let removed_tx = self.transactions.remove(key_to_remove)?;
 
                 self.transactions_serialized_size -= removed_tx.transaction.size();
                 self.total_cost -= removed_tx.cost();
-                self.metrics.remove_transaction(&removed_tx);
+                self.weights.remove_transaction(&removed_tx);
                 self.remove_outputs(&removed_tx.transaction);
 
                 Some(removed_tx)
@@ -660,7 +618,6 @@ impl VerifiedSet {
             .collect();
 
         self.insert_ordering_candidates(&affected);
-        self.report_metrics();
         removed_transactions
     }
 
@@ -753,64 +710,6 @@ impl VerifiedSet {
             set.remove(&item);
         }
     }
-
-    /// Report the current mempool metrics.
-    fn report_metrics(&self) {
-        metrics::gauge!(
-            "zcash.mempool.actions.unpaid",
-            "bk" => "< 0.2",
-        )
-        .set(self.metrics.unpaid_actions_with_weight_lt20pct as f64);
-        metrics::gauge!(
-            "zcash.mempool.actions.unpaid",
-            "bk" => "< 0.4",
-        )
-        .set(self.metrics.unpaid_actions_with_weight_lt40pct as f64);
-        metrics::gauge!(
-            "zcash.mempool.actions.unpaid",
-            "bk" => "< 0.6",
-        )
-        .set(self.metrics.unpaid_actions_with_weight_lt60pct as f64);
-        metrics::gauge!(
-            "zcash.mempool.actions.unpaid",
-            "bk" => "< 0.8",
-        )
-        .set(self.metrics.unpaid_actions_with_weight_lt80pct as f64);
-        metrics::gauge!(
-            "zcash.mempool.actions.unpaid",
-            "bk" => "< 1",
-        )
-        .set(self.metrics.unpaid_actions_with_weight_lt1 as f64);
-        metrics::gauge!("zcash.mempool.actions.paid").set(self.metrics.paid_actions as f64);
-        metrics::gauge!("zcash.mempool.size.transactions",).set(self.transaction_count() as f64);
-        metrics::gauge!(
-            "zcash.mempool.size.weighted",
-            "bk" => "< 1",
-        )
-        .set(self.metrics.size_with_weight_lt1 as f64);
-        metrics::gauge!(
-            "zcash.mempool.size.weighted",
-            "bk" => "1",
-        )
-        .set(self.metrics.size_with_weight_eq1 as f64);
-        metrics::gauge!(
-            "zcash.mempool.size.weighted",
-            "bk" => "> 1",
-        )
-        .set(self.metrics.size_with_weight_gt1 as f64);
-        metrics::gauge!(
-            "zcash.mempool.size.weighted",
-            "bk" => "> 2",
-        )
-        .set(self.metrics.size_with_weight_gt2 as f64);
-        metrics::gauge!(
-            "zcash.mempool.size.weighted",
-            "bk" => "> 3",
-        )
-        .set(self.metrics.size_with_weight_gt3 as f64);
-        metrics::gauge!("zcash.mempool.size.bytes",).set(self.transactions_serialized_size as f64);
-        metrics::gauge!("zcash.mempool.cost.bytes").set(self.total_cost as f64);
-    }
 }
 
 /// The packages that the mempool evicts to make room for an incoming transaction.
@@ -829,23 +728,35 @@ pub(super) struct EvictionVictims {
     pub cheapest: Option<EvictionCost>,
 }
 
-/// The aggregate values for mempool metrics.
+/// The sizes and actions of a set of transactions, by ZIP-317 fee weight
+/// ratio, for the pool's metrics.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct MempoolMetrics {
-    unpaid_actions_with_weight_lt20pct: u32,
-    unpaid_actions_with_weight_lt40pct: u32,
-    unpaid_actions_with_weight_lt60pct: u32,
-    unpaid_actions_with_weight_lt80pct: u32,
-    unpaid_actions_with_weight_lt1: u32,
-    paid_actions: u32,
-    size_with_weight_lt1: usize,
-    size_with_weight_eq1: usize,
-    size_with_weight_gt1: usize,
-    size_with_weight_gt2: usize,
-    size_with_weight_gt3: usize,
+pub struct WeightTotals {
+    /// Unpaid actions of transactions with a fee weight below 0.2.
+    pub unpaid_actions_with_weight_lt20pct: u32,
+    /// Unpaid actions of transactions with a fee weight from 0.2 to below 0.4.
+    pub unpaid_actions_with_weight_lt40pct: u32,
+    /// Unpaid actions of transactions with a fee weight from 0.4 to below 0.6.
+    pub unpaid_actions_with_weight_lt60pct: u32,
+    /// Unpaid actions of transactions with a fee weight from 0.6 to below 0.8.
+    pub unpaid_actions_with_weight_lt80pct: u32,
+    /// Unpaid actions of transactions with a fee weight from 0.8 to below 1.
+    pub unpaid_actions_with_weight_lt1: u32,
+    /// Paid actions of every transaction.
+    pub paid_actions: u32,
+    /// Serialized size of transactions with a fee weight below 1.
+    pub size_with_weight_lt1: usize,
+    /// Serialized size of transactions with a fee weight of exactly 1.
+    pub size_with_weight_eq1: usize,
+    /// Serialized size of transactions with a fee weight above 1, up to 2.
+    pub size_with_weight_gt1: usize,
+    /// Serialized size of transactions with a fee weight above 2, up to 3.
+    pub size_with_weight_gt2: usize,
+    /// Serialized size of transactions with a fee weight above 3.
+    pub size_with_weight_gt3: usize,
 }
 
-impl MempoolMetrics {
+impl WeightTotals {
     /// Add a verified transaction's contribution to the metric totals.
     fn add_transaction(&mut self, transaction: &VerifiedUnminedTx) {
         self.add(Self::for_transaction(transaction));
@@ -873,35 +784,35 @@ impl MempoolMetrics {
         unpaid_actions: u32,
         size: usize,
     ) -> Self {
-        let mut metrics = Self {
+        let mut totals = Self {
             paid_actions: conventional_actions - unpaid_actions,
             ..Default::default()
         };
 
         if fee_weight_ratio > 3.0 {
-            metrics.size_with_weight_gt3 = size;
+            totals.size_with_weight_gt3 = size;
         } else if fee_weight_ratio > 2.0 {
-            metrics.size_with_weight_gt2 = size;
+            totals.size_with_weight_gt2 = size;
         } else if fee_weight_ratio > 1.0 {
-            metrics.size_with_weight_gt1 = size;
+            totals.size_with_weight_gt1 = size;
         } else if fee_weight_ratio == 1.0 {
-            metrics.size_with_weight_eq1 = size;
+            totals.size_with_weight_eq1 = size;
         } else {
-            metrics.size_with_weight_lt1 = size;
+            totals.size_with_weight_lt1 = size;
             if fee_weight_ratio < 0.2 {
-                metrics.unpaid_actions_with_weight_lt20pct = unpaid_actions;
+                totals.unpaid_actions_with_weight_lt20pct = unpaid_actions;
             } else if fee_weight_ratio < 0.4 {
-                metrics.unpaid_actions_with_weight_lt40pct = unpaid_actions;
+                totals.unpaid_actions_with_weight_lt40pct = unpaid_actions;
             } else if fee_weight_ratio < 0.6 {
-                metrics.unpaid_actions_with_weight_lt60pct = unpaid_actions;
+                totals.unpaid_actions_with_weight_lt60pct = unpaid_actions;
             } else if fee_weight_ratio < 0.8 {
-                metrics.unpaid_actions_with_weight_lt80pct = unpaid_actions;
+                totals.unpaid_actions_with_weight_lt80pct = unpaid_actions;
             } else {
-                metrics.unpaid_actions_with_weight_lt1 = unpaid_actions;
+                totals.unpaid_actions_with_weight_lt1 = unpaid_actions;
             }
         }
 
-        metrics
+        totals
     }
 
     /// Add another set of metric totals to this set.
@@ -939,6 +850,10 @@ impl MempoolMetrics {
 mod tests {
     use super::*;
 
+    /// The node's default limit on one transaction's size, which bounds the
+    /// cost of a newcomer and so how many victims it can need.
+    const MAX_TRANSACTION_BYTES: u64 = 250_000;
+
     #[test]
     fn selection_rescores_only_changed_groups() {
         use std::sync::atomic::Ordering;
@@ -955,31 +870,18 @@ mod tests {
                 transparent::OutPoint::from_usize(tx.transaction.id().mined_id(), 0)
             };
             verified
-                .insert(
-                    parent.clone(),
-                    vec![],
-                    &mut |_, _| {},
-                    None,
-                    chrono::Utc::now(),
-                )
+                .insert(parent.clone(), vec![], None, chrono::Utc::now())
                 .unwrap();
             verified
                 .insert(
                     child.clone(),
                     vec![output(&parent)],
-                    &mut |_, _| {},
                     None,
                     chrono::Utc::now(),
                 )
                 .unwrap();
             verified
-                .insert(
-                    grandchild,
-                    vec![output(&child)],
-                    &mut |_, _| {},
-                    None,
-                    chrono::Utc::now(),
-                )
+                .insert(grandchild, vec![output(&child)], None, chrono::Utc::now())
                 .unwrap();
         }
         let limit = verified.total_cost();
@@ -998,11 +900,9 @@ mod tests {
         let incoming = factory.tx_with(1_000_000, 0, 240_000);
         let victims = verified.select_eviction_victims(&incoming, &HashSet::new(), limit);
         let roots = victims.roots.expect("high fee selects enough victims");
-        let max_victims = usize::try_from(
-            super::super::super::config::DEFAULT_MAX_TRANSACTION_BYTES
-                .div_ceil(MEMPOOL_TRANSACTION_COST_THRESHOLD),
-        )
-        .expect("default transaction limit fits in usize");
+        let max_victims =
+            usize::try_from(MAX_TRANSACTION_BYTES.div_ceil(MEMPOOL_TRANSACTION_COST_THRESHOLD))
+                .expect("default transaction limit fits in usize");
         assert!(roots.len() <= max_victims);
         let local_score_budget = 2 * (MAX_MEMPOOL_PACKAGE_TRANSACTIONS - 1) * roots.len();
         assert!(verified.eviction_score_evaluations.load(Ordering::Relaxed) <= local_score_budget);
@@ -1035,11 +935,11 @@ mod tests {
             (2.5, 12, 0, 80),
             (3.5, 13, 0, 90),
         ];
-        let mut metrics = MempoolMetrics::default();
+        let mut totals = WeightTotals::default();
 
         for &(fee_weight_ratio, conventional_actions, unpaid_actions, size) in &transaction_metrics
         {
-            metrics.add(MempoolMetrics::for_values(
+            totals.add(WeightTotals::for_values(
                 fee_weight_ratio,
                 conventional_actions,
                 unpaid_actions,
@@ -1048,8 +948,8 @@ mod tests {
         }
 
         assert_eq!(
-            metrics,
-            MempoolMetrics {
+            totals,
+            WeightTotals {
                 unpaid_actions_with_weight_lt20pct: 4,
                 unpaid_actions_with_weight_lt40pct: 3,
                 unpaid_actions_with_weight_lt60pct: 2,
@@ -1067,7 +967,7 @@ mod tests {
         for &(fee_weight_ratio, conventional_actions, unpaid_actions, size) in
             transaction_metrics.iter().rev()
         {
-            metrics.remove(MempoolMetrics::for_values(
+            totals.remove(WeightTotals::for_values(
                 fee_weight_ratio,
                 conventional_actions,
                 unpaid_actions,
@@ -1075,6 +975,6 @@ mod tests {
             ));
         }
 
-        assert_eq!(metrics, MempoolMetrics::default());
+        assert_eq!(totals, WeightTotals::default());
     }
 }

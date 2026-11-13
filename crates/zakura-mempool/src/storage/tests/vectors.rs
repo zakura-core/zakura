@@ -2,14 +2,14 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::{hint::black_box, iter, time::Instant};
+use std::iter;
 
 use eyre::Result;
 
 use transparent::OutPoint;
 use zakura_chain::{
     amount::{Amount, NonNegative},
-    block::{Block, Height},
+    block::Height,
     parameters::Network,
 };
 
@@ -17,9 +17,6 @@ use zakura_chain::transparent;
 
 use super::{ExactTipRejectionError, MempoolError, Storage};
 use crate::storage::*;
-
-use super::super::{config::Config, fixtures::TxFactory};
-use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 
 /// Eviction memory time used for tests. Most tests won't care about this
 /// so we use a large enough value that will never be reached in the tests.
@@ -112,7 +109,7 @@ fn oversized_policy_rejection_is_cached_by_exact_id() {
     );
 
     assert_eq!(
-        storage.rejection_error(&tx_id, crate::Instant::now()),
+        storage.rejection(&tx_id, crate::Instant::now()),
         Some(MempoolError::StorageExactTip(
             ExactTipRejectionError::FailedStandard(rejection)
         ))
@@ -124,7 +121,9 @@ fn oversized_policy_rejection_is_cached_by_exact_id() {
         .expect("test selected a witnessed transaction");
     different_auth_digest.0[0] ^= 1;
     assert_eq!(different_authorizing_data.mined_id(), tx_id.mined_id());
-    assert!(!storage.contains_rejected(&different_authorizing_data, crate::Instant::now()));
+    assert!(!storage
+        .rejection(&different_authorizing_data, crate::Instant::now())
+        .is_some());
 }
 
 #[test]
@@ -151,67 +150,19 @@ fn mempool_storage_crud_exact_mainnet() {
         unmined_tx.clone(),
         Vec::new(),
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
 
     // Check that it is in the mempool, and not rejected.
-    assert!(storage.contains_transaction_exact(&unmined_tx.transaction.id().mined_id()));
+    assert!(storage.contains(&unmined_tx.transaction.id().mined_id()));
 
     // Remove tx
     let removal_count = storage.remove_exact(&iter::once(unmined_tx.transaction.id()).collect());
 
     // Check that it is /not/ in the mempool.
     assert_eq!(removal_count, 1);
-    assert!(!storage.contains_transaction_exact(&unmined_tx.transaction.id().mined_id()));
-}
-
-/// `transactions_exact` must not return a same-effects variant whose authorizing
-/// data differs from the requested ID.
-#[test]
-fn transactions_exact_ignores_different_authorizing_data() {
-    let _init_guard = zakura_test::init();
-
-    let mut storage: Storage = Storage::new(&config::Config {
-        tx_cost_limit: u64::MAX,
-        eviction_memory_time: EVICTION_MEMORY_TIME,
-        ..Default::default()
-    });
-    let unmined_tx = Network::Mainnet
-        .unmined_transactions_in_blocks(..)
-        .find(|transaction| transaction.transaction.id().auth_digest().is_some())
-        .expect("mainnet test vectors contain a witnessed transaction");
-    let tx_id = unmined_tx.transaction.id();
-    storage
-        .insert(
-            unmined_tx,
-            Vec::new(),
-            None,
-            &mut |_, _| {},
-            crate::Instant::now(),
-            chrono::Utc::now(),
-        )
-        .expect("test transaction fits in the mempool");
-
-    let mut different_authorizing_data = tx_id;
-    different_authorizing_data
-        .auth_digest_mut()
-        .expect("test selected a witnessed transaction")
-        .0[0] ^= 1;
-    assert_eq!(different_authorizing_data.mined_id(), tx_id.mined_id());
-
-    let exact: Vec<_> = storage
-        .transactions_exact(HashSet::from([tx_id]))
-        .map(UnminedTx::id)
-        .collect();
-    assert_eq!(exact, vec![tx_id]);
-    assert_eq!(
-        storage
-            .transactions_exact(HashSet::from([different_authorizing_data]))
-            .count(),
-        0
-    );
+    assert!(!storage.contains(&unmined_tx.transaction.id().mined_id()));
 }
 
 #[test]
@@ -256,7 +207,6 @@ fn mempool_storage_basic_for_network(network: Network) -> Result<()> {
             unmined_transaction.clone(),
             Vec::new(),
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now(),
         );
@@ -281,14 +231,11 @@ fn mempool_storage_basic_for_network(network: Network) -> Result<()> {
 
     // Test if the actual number of inserted/rejected transactions is consistent.
     assert!(storage.verified.transaction_count() <= maybe_inserted_transactions.len());
-    assert!(
-        storage.rejected_transaction_count(crate::Instant::now())
-            >= some_rejected_transactions.len()
-    );
+    assert!(storage.rejected_count() >= some_rejected_transactions.len());
 
     // Test if rejected transactions were actually rejected.
     for tx in some_rejected_transactions.iter() {
-        assert!(!storage.contains_transaction_exact(&tx.transaction.id().mined_id()));
+        assert!(!storage.contains(&tx.transaction.id().mined_id()));
     }
 
     // Query all the ids we have for rejected, get back `total - MEMPOOL_SIZE`
@@ -338,30 +285,28 @@ fn mempool_storage_crud_same_effects_mainnet() {
         unmined_tx_1.clone(),
         Vec::new(),
         None,
-        &mut |_, _| {},
         crate::Instant::now(),
         chrono::Utc::now(),
     );
 
     // Check that it is in the mempool, and not rejected.
-    assert!(storage.contains_transaction_exact(&unmined_tx_1.transaction.id().mined_id()));
+    assert!(storage.contains(&unmined_tx_1.transaction.id().mined_id()));
 
     // Reject and remove mined tx
     let removal_count = storage
-        .reject_and_remove_same_effects(
+        .mine(
             &iter::once(unmined_tx_1.transaction.id().mined_id()).collect(),
-            vec![unmined_tx_1.transaction.transaction().clone()],
             crate::Instant::now(),
         )
-        .total_len();
+        .len();
 
     // Check that it is /not/ in the mempool as a verified transaction.
     assert_eq!(removal_count, 1);
-    assert!(!storage.contains_transaction_exact(&unmined_tx_1.transaction.id().mined_id()));
+    assert!(!storage.contains(&unmined_tx_1.transaction.id().mined_id()));
 
     // Check that it's rejection is cached in the chain_rejected_same_effects' `Mined` eviction list.
     assert_eq!(
-        storage.rejection_error(&unmined_tx_1.transaction.id(), crate::Instant::now()),
+        storage.rejection(&unmined_tx_1.transaction.id(), crate::Instant::now()),
         Some(SameEffectsChainRejectionError::Mined.into())
     );
     assert_eq!(
@@ -369,7 +314,6 @@ fn mempool_storage_crud_same_effects_mainnet() {
             unmined_tx_1,
             Vec::new(),
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now()
         ),
@@ -394,7 +338,6 @@ fn mempool_storage_crud_same_effects_mainnet() {
             unmined_tx_2.clone(),
             Vec::new(),
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now()
         ),
@@ -402,24 +345,24 @@ fn mempool_storage_crud_same_effects_mainnet() {
     );
 
     // Check that it is in the mempool, and not rejected.
-    assert!(storage.contains_transaction_exact(&unmined_tx_2.transaction.id().mined_id()));
+    assert!(storage.contains(&unmined_tx_2.transaction.id().mined_id()));
 
-    // Reject and remove duplicate spend tx
-    let removal_count = storage
-        .reject_and_remove_same_effects(
-            &HashSet::new(),
-            vec![unmined_tx_2.transaction.transaction().clone()],
-            crate::Instant::now(),
-        )
-        .total_len();
+    // The pool core finds that a block spent its inputs. Storage removes it and
+    // caches it as a duplicate spend.
+    let mined_id = unmined_tx_2.transaction.id().mined_id();
+    assert!(storage.remove_one(&mined_id).is_some());
+    storage.reject_effects_chain(
+        mined_id,
+        SameEffectsChainRejectionError::DuplicateSpend,
+        crate::Instant::now(),
+    );
 
     // Check that it is /not/ in the mempool as a verified transaction.
-    assert_eq!(removal_count, 1);
-    assert!(!storage.contains_transaction_exact(&unmined_tx_2.transaction.id().mined_id()));
+    assert!(!storage.contains(&unmined_tx_2.transaction.id().mined_id()));
 
     // Check that it's rejection is cached in the chain_rejected_same_effects' `SpendConflict` eviction list.
     assert_eq!(
-        storage.rejection_error(&unmined_tx_2.transaction.id(), crate::Instant::now()),
+        storage.rejection(&unmined_tx_2.transaction.id(), crate::Instant::now()),
         Some(SameEffectsChainRejectionError::DuplicateSpend.into())
     );
     assert_eq!(
@@ -427,61 +370,6 @@ fn mempool_storage_crud_same_effects_mainnet() {
             unmined_tx_2,
             Vec::new(),
             None,
-            &mut |_, _| {},
-            crate::Instant::now(),
-            chrono::Utc::now()
-        ),
-        Err(SameEffectsChainRejectionError::DuplicateSpend.into())
-    );
-}
-
-#[test]
-fn mempool_removes_ironwood_duplicate_spends() {
-    let _init_guard = zakura_test::init();
-
-    let mut storage: Storage = Storage::new(&config::Config {
-        tx_cost_limit: 160_000_000,
-        eviction_memory_time: EVICTION_MEMORY_TIME,
-        ..Default::default()
-    });
-
-    let action = ironwood_action();
-    let mempool_tx = verified_ironwood_v6_tx(Height(1), action.clone());
-    let mempool_id = mempool_tx.transaction.id();
-
-    assert_eq!(
-        storage.insert(
-            mempool_tx.clone(),
-            Vec::new(),
-            None,
-            &mut |_, _| {},
-            crate::Instant::now(),
-            chrono::Utc::now()
-        ),
-        Ok(mempool_id)
-    );
-    assert!(storage.contains_transaction_exact(&mempool_id.mined_id()));
-
-    let removal_count = storage
-        .reject_and_remove_same_effects(
-            &HashSet::new(),
-            vec![ironwood_v6_tx(Height(2), action)],
-            crate::Instant::now(),
-        )
-        .total_len();
-
-    assert_eq!(removal_count, 1);
-    assert!(!storage.contains_transaction_exact(&mempool_id.mined_id()));
-    assert_eq!(
-        storage.rejection_error(&mempool_id, crate::Instant::now()),
-        Some(SameEffectsChainRejectionError::DuplicateSpend.into())
-    );
-    assert_eq!(
-        storage.insert(
-            mempool_tx,
-            Vec::new(),
-            None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now()
         ),
@@ -511,7 +399,6 @@ fn mempool_rejects_ironwood_conflict_on_insert() {
             first_mempool_tx,
             Vec::new(),
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now()
         ),
@@ -523,139 +410,18 @@ fn mempool_rejects_ironwood_conflict_on_insert() {
             second_mempool_tx,
             Vec::new(),
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now()
         ),
         Err(SameEffectsTipRejectionError::SpendConflict.into())
     );
 
-    assert!(storage.contains_transaction_exact(&first_mempool_id.mined_id()));
-    assert!(!storage.contains_transaction_exact(&second_mempool_id.mined_id()));
+    assert!(storage.contains(&first_mempool_id.mined_id()));
+    assert!(!storage.contains(&second_mempool_id.mined_id()));
     assert_eq!(
-        storage.rejection_error(&second_mempool_id, crate::Instant::now()),
+        storage.rejection(&second_mempool_id, crate::Instant::now()),
         Some(SameEffectsTipRejectionError::SpendConflict.into())
     );
-}
-
-#[test]
-fn mempool_expired_basic() -> Result<()> {
-    let _init_guard = zakura_test::init();
-    for network in Network::iter() {
-        mempool_expired_basic_for_network(network)?;
-    }
-    Ok(())
-}
-
-fn mempool_expired_basic_for_network(network: Network) -> Result<()> {
-    // Create an empty storage
-    let mut storage: Storage = Storage::new(&config::Config {
-        tx_cost_limit: 160_000_000,
-        eviction_memory_time: EVICTION_MEMORY_TIME,
-        ..Default::default()
-    });
-
-    let block: Block = network.test_block(982681, 925483).unwrap();
-
-    // Get a test transaction
-    let tx = &*(block.transactions[1]).clone();
-
-    // Change the expiration height of the test transaction
-    let mut tx = tx.clone();
-    *tx.expiry_height_mut() = zakura_chain::block::Height(1);
-
-    let tx_id = tx.unmined_id();
-
-    // Insert the transaction into the mempool, with a fake zero miner fee and sigops
-    storage.insert(
-        VerifiedUnminedTx::new(
-            tx.into(),
-            Amount::try_from(1_000_000).expect("valid amount"),
-            0,
-            0,
-            std::sync::Arc::new(vec![]),
-        )
-        .expect("verification should pass"),
-        Vec::new(),
-        None,
-        &mut |_, _| {},
-        crate::Instant::now(),
-        chrono::Utc::now(),
-    )?;
-
-    assert_eq!(storage.transaction_count(), 1);
-
-    // Get everything available in mempool now
-    let everything_in_mempool: HashSet<UnminedTxId> = storage.tx_ids().collect();
-    assert_eq!(everything_in_mempool.len(), 1);
-    assert!(everything_in_mempool.contains(&tx_id));
-
-    // remove_expired_transactions() will return what was removed
-    let expired = storage.remove_expired_transactions(Height(1), crate::Instant::now());
-    assert!(expired.contains(&tx_id));
-    let everything_in_mempool: HashSet<UnminedTxId> = storage.tx_ids().collect();
-    assert_eq!(everything_in_mempool.len(), 0);
-
-    Ok(())
-}
-
-#[test]
-fn mempool_expiration_reports_removed_dependent_transactions() -> Result<()> {
-    let _init_guard = zakura_test::init();
-    let mut storage = Storage::new(&config::Config {
-        tx_cost_limit: 160_000_000,
-        eviction_memory_time: EVICTION_MEMORY_TIME,
-        ..Default::default()
-    });
-    let block: Block = Network::Mainnet.test_block(982681, 925483).unwrap();
-
-    let mut parent = block.transactions[1].as_ref().clone();
-    *parent.expiry_height_mut() = Height(1);
-    let parent_id = parent.unmined_id();
-    let parent_mined_id = parent_id.mined_id();
-    assert!(
-        !parent.outputs().is_empty(),
-        "test parent transaction should have an output"
-    );
-
-    let mut dependent = block.transactions[2].as_ref().clone();
-    *dependent.expiry_height_mut() = Height(2);
-    let dependent_id = dependent.unmined_id();
-
-    let verified = |tx| {
-        VerifiedUnminedTx::new(
-            tx,
-            Amount::try_from(1_000_000).expect("valid amount"),
-            0,
-            0,
-            std::sync::Arc::new(vec![]),
-        )
-        .expect("verification should pass")
-    };
-
-    storage.insert(
-        verified(parent.into()),
-        Vec::new(),
-        None,
-        &mut |_, _| {},
-        crate::Instant::now(),
-        chrono::Utc::now(),
-    )?;
-    storage.insert(
-        verified(dependent.into()),
-        vec![OutPoint::from_usize(parent_mined_id, 0)],
-        None,
-        &mut |_, _| {},
-        crate::Instant::now(),
-        chrono::Utc::now(),
-    )?;
-
-    let removed = storage.remove_expired_transactions(Height(1), crate::Instant::now());
-
-    assert_eq!(removed, HashSet::from([parent_id, dependent_id]));
-    assert_eq!(storage.transaction_count(), 0);
-
-    Ok(())
 }
 
 /// Check that the transaction dependencies are updated when transactions with spent mempool outputs
@@ -710,7 +476,6 @@ fn mempool_removes_dependent_transactions() -> Result<()> {
                 unmined_tx.clone(),
                 fake_spent_outpoints,
                 None,
-                &mut |_, _| {},
                 crate::Instant::now(),
                 chrono::Utc::now(),
             )
@@ -841,97 +606,4 @@ fn standard_script_kind_rejects_nonstandard() {
         kind.is_none(),
         "non-standard script should be classified as None"
     );
-}
-
-#[test]
-fn same_effects_lookup_returns_only_requested_stored_transactions() {
-    let mut factory = TxFactory::new();
-    let mut storage = Storage::new(&Config::default());
-    let transactions = [factory.tx(10_000), factory.tx(10_000), factory.tx(10_000)];
-    let ids = transactions.each_ref().map(|tx| tx.transaction.id());
-    for tx in transactions {
-        storage
-            .insert(
-                tx,
-                Vec::new(),
-                None,
-                &mut |_, _| {},
-                crate::Instant::now(),
-                chrono::Utc::now(),
-            )
-            .unwrap();
-    }
-    let missing = factory.tx(10_000).transaction.id().mined_id();
-    let requested = HashSet::from([ids[0].mined_id(), missing, ids[2].mined_id()]);
-    let found: HashSet<_> = storage
-        .transactions_same_effects(requested)
-        .map(UnminedTx::id)
-        .collect();
-    assert_eq!(found, HashSet::from([ids[0], ids[2]]));
-    assert_eq!(storage.transactions_same_effects(HashSet::new()).count(), 0);
-    assert_eq!(
-        storage
-            .transactions_same_effects(HashSet::from([missing]))
-            .count(),
-        0
-    );
-}
-
-/// Compares selection cost at realistic pool sizes. Run the same harness on
-/// control and candidate; request-set cloning is included in both timings.
-#[test]
-#[ignore = "manual performance measurement; run with --release --ignored --nocapture"]
-#[allow(clippy::print_stdout, reason = "manual benchmark results")]
-fn benchmark_mempool_txid_lookup() {
-    const ITERATIONS: u32 = 500;
-    const SAMPLES: usize = 21;
-    let config = Config::default();
-    let default_count = config.tx_cost_limit / MEMPOOL_TRANSACTION_COST_THRESHOLD;
-    let mut factory = TxFactory::new();
-    for count in [0, default_count / 8, default_count] {
-        let mut storage = Storage::new(&config);
-        let mut stored = Vec::new();
-        for _ in 0..count {
-            let tx = factory.tx(10_000);
-            stored.push(tx.transaction.id().mined_id());
-            storage
-                .insert(
-                    tx,
-                    Vec::new(),
-                    None,
-                    &mut |_, _| {},
-                    crate::Instant::now(),
-                    chrono::Utc::now(),
-                )
-                .unwrap();
-        }
-        let missing = factory.tx(10_000).transaction.id().mined_id();
-        let hit = stored.first().copied().unwrap_or(missing);
-        let mixed = stored.iter().copied().take(15).chain([missing]).collect();
-        for (name, requested) in [
-            ("hit", HashSet::from([hit])),
-            ("miss", HashSet::from([missing])),
-            ("mixed", mixed),
-        ] {
-            let expected = storage.transactions_same_effects(requested.clone()).count();
-            let mut samples = Vec::with_capacity(SAMPLES);
-            for _ in 0..SAMPLES {
-                let start = Instant::now();
-                for _ in 0..ITERATIONS {
-                    let found = storage
-                        .transactions_same_effects(black_box(requested.clone()))
-                        .count();
-                    assert_eq!(black_box(found), expected);
-                }
-                samples.push(start.elapsed() / ITERATIONS);
-            }
-            samples.sort();
-            println!(
-                "lookup transactions={count} case={name} median_ns={} min_ns={} max_ns={}",
-                samples[SAMPLES / 2].as_nanos(),
-                samples[0].as_nanos(),
-                samples[SAMPLES - 1].as_nanos(),
-            );
-        }
-    }
 }

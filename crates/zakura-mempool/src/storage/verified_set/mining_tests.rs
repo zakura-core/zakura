@@ -10,7 +10,7 @@ fn insert(
 ) -> transaction::Hash {
     let id = tx.transaction.id().mined_id();
     verified
-        .insert(tx, spent, &mut |_, _| {}, None, chrono::Utc::now())
+        .insert(tx, spent, None, chrono::Utc::now())
         .unwrap();
     id
 }
@@ -138,7 +138,7 @@ fn failed_insert_does_not_change_mining_order() {
     insert(&mut verified, tx.clone(), Vec::new());
     let before = verified.mining_order.clone();
     assert_eq!(
-        verified.insert(tx, Vec::new(), &mut |_, _| {}, None, chrono::Utc::now()),
+        verified.insert(tx, Vec::new(), None, chrono::Utc::now()),
         Err(SameEffectsTipRejectionError::SpendConflict)
     );
     assert_eq!(verified.mining_order, before);

@@ -51,7 +51,7 @@ use crate::{
     config::Config,
     storage::{
         ExactTipRejectionError, RejectionError, SameEffectsChainRejectionError,
-        SameEffectsTipRejectionError, Storage,
+        SameEffectsTipRejectionError, Storage, StorageStats,
     },
     Instant, MempoolError,
 };
@@ -647,9 +647,9 @@ impl<E: VerifyError> MempoolState<E> {
         let verify_again = transition.is_reorg() || transition.rules_change;
         if verify_again {
             self.mark_reset();
-            self.storage.clear_rejections(now);
+            self.storage.clear_rejections();
         } else {
-            self.storage.clear_tip_rejections(now);
+            self.storage.clear_tip_rejections();
         }
         // What the whole batch mined, and what in the pool conflicts with it,
         // are worked out before anything is removed. A pooled transaction that
@@ -682,12 +682,8 @@ impl<E: VerifyError> MempoolState<E> {
                 // Its dependents stay. Their parent is on the chain now.
                 self.remove_one(key, RemovalReason::Mined);
             }
-            // The chain-scoped lists are keyed by mined id.
-            self.storage.reject(
-                UnminedTxId::Legacy(*hash),
-                SameEffectsChainRejectionError::Mined.into(),
-                now,
-            );
+            self.storage
+                .reject_effects_chain(*hash, SameEffectsChainRejectionError::Mined, now);
         }
         // Today's pool cancels the download and verification of anything a
         // block mined. The undecided ones end here, and a fetch still out is
@@ -713,9 +709,9 @@ impl<E: VerifyError> MempoolState<E> {
         }
         for conflict in conflicting {
             self.remove_with_dependents(conflict.mined_id(), RemovalReason::Conflicted);
-            self.storage.reject(
-                conflict,
-                SameEffectsChainRejectionError::DuplicateSpend.into(),
+            self.storage.reject_effects_chain(
+                conflict.mined_id(),
+                SameEffectsChainRejectionError::DuplicateSpend,
                 now,
             );
         }
@@ -748,7 +744,7 @@ impl<E: VerifyError> MempoolState<E> {
         self.applied = generation;
         self.tip = tip;
         self.mark_reset();
-        self.storage.clear_rejections(self.now);
+        self.storage.clear_rejections();
         // Expiry needs no verifier, only the new tip. Only the expired
         // transaction goes. A block the core missed may have mined it first,
         // and then what spends its outputs is still valid, so its dependents
@@ -841,7 +837,14 @@ impl<E: VerifyError> MempoolState<E> {
         for key in keys {
             self.remove_one(key, RemovalReason::Deactivated);
         }
-        self.storage.clear(self.now);
+        // Every pooled transaction was removed, so storage is empty and only
+        // its rejection lists are left.
+        self.storage.clear_rejections();
+        debug_assert_eq!(
+            self.storage.transaction_count(),
+            0,
+            "storage held only the pool"
+        );
         debug_assert_eq!(self.hidden_cost, 0, "every hidden transaction was removed");
         // Nobody is left waiting on a pool that is off.
         let mut waiting: Vec<WaiterId> = self
@@ -918,6 +921,11 @@ impl<E: VerifyError> MempoolState<E> {
             self.storage.mining_transactions().cloned().collect(),
             self.storage.transaction_dependencies().clone(),
         )
+    }
+
+    /// What storage holds, for the pool's metrics.
+    pub fn storage_stats(&self) -> StorageStats {
+        self.storage.stats()
     }
 
     /// The earliest time an input would apply a deadline, if any is set.
@@ -1101,8 +1109,7 @@ impl<E: VerifyError> MempoolState<E> {
                 "a hidden transaction holds its body, and a visible one is in storage"
             );
             assert_eq!(
-                self.storage
-                    .contains_transaction_exact(&pooled.id.mined_id()),
+                self.storage.contains(&pooled.id.mined_id()),
                 pooled.hidden.is_none(),
                 "storage holds exactly the visible pool"
             );
@@ -1142,6 +1149,7 @@ impl<E: VerifyError> MempoolState<E> {
             self.now = now;
         }
         let now = self.now;
+        self.storage.prune_rejections(now);
         // Each admission can have a deadline for its stage and one for its
         // slot. Whichever was due first decides it. When both were due at the
         // same moment, the stage's own deadline decides.
@@ -1222,11 +1230,8 @@ impl<E: VerifyError> MempoolState<E> {
                         .expect("a parked transaction holds the verifier's missing-input error");
                     self.remove_with_dependents(tx_id.mined_id(), RemovalReason::Invalidated);
                     // Remembered like a new transaction's missing parent.
-                    self.storage.reject(
-                        tx_id,
-                        ExactTipRejectionError::FailedVerification(error).into(),
-                        now,
-                    );
+                    self.storage
+                        .reject_exact(tx_id, ExactTipRejectionError::FailedVerification(error));
                 }
                 _ => {}
             }
@@ -1474,7 +1479,6 @@ impl<E: VerifyError> MempoolState<E> {
                     tx.clone(),
                     pool_inputs,
                     Some(self.tip.height),
-                    &mut |_, _| {},
                     now,
                     wall,
                 );
@@ -1608,8 +1612,11 @@ impl<E: VerifyError> MempoolState<E> {
                 if self.reached(expiry) {
                     self.set_hidden(key, Some(Hidden::Queued));
                     self.remove_with_dependents(hash, RemovalReason::Expired);
-                    self.storage
-                        .reject(tx_id, SameEffectsChainRejectionError::Expired.into(), now);
+                    self.storage.reject_effects_chain(
+                        hash,
+                        SameEffectsChainRejectionError::Expired,
+                        now,
+                    );
                     return;
                 }
                 // Today's insertion limits, as for a new transaction. A parent
@@ -1694,11 +1701,8 @@ impl<E: VerifyError> MempoolState<E> {
                 if wait_over {
                     self.set_hidden(key, Some(Hidden::Queued));
                     self.remove_with_dependents(hash, RemovalReason::Invalidated);
-                    self.storage.reject(
-                        tx_id,
-                        ExactTipRejectionError::FailedVerification(error).into(),
-                        now,
-                    );
+                    self.storage
+                        .reject_exact(tx_id, ExactTipRejectionError::FailedVerification(error));
                     return;
                 }
                 let mut on: Vec<transaction::Hash> = Vec::new();
@@ -1911,9 +1915,9 @@ impl<E: VerifyError> MempoolState<E> {
             } else if let Some(key) = self.pooled.get(&tx_id.mined_id()).copied() {
                 self.remove_one(key, RemovalReason::Expired);
             }
-            self.storage.reject(
-                tx_id,
-                SameEffectsChainRejectionError::Expired.into(),
+            self.storage.reject_effects_chain(
+                tx_id.mined_id(),
+                SameEffectsChainRejectionError::Expired,
                 self.now,
             );
         }
@@ -2218,7 +2222,7 @@ impl<E: VerifyError> MempoolState<E> {
 
     /// The cached rejection that covers `tx_id` now, if any.
     fn cached_rejection(&self, tx_id: UnminedTxId) -> Option<MempoolError<E>> {
-        self.storage.rejection_error(&tx_id, self.now)
+        self.storage.rejection(&tx_id, self.now)
     }
 
     /// Whether the tip has reached `expiry`.

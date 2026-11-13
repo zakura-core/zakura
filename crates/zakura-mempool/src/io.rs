@@ -25,6 +25,9 @@
 //! and comes back as an input with both readings. See
 //! [`MempoolState::outcome`] for how the machine uses them.
 //!
+//! The machine emits no metrics. After each flush the task reads what storage
+//! holds and emits today's pool metrics under today's names.
+//!
 //! Every name the task uses for time, tasks and channels comes from
 //! `zakura_rt`, so it builds and runs under the simulator.
 
@@ -52,6 +55,7 @@ use crate::{
     machine::{
         Effect, JobId, Limits, MempoolState, Outcome, OutputAnswer, Step, VerifyError, WaiterId,
     },
+    storage::{SameEffectsTipRejectionError, StorageStats},
 };
 
 #[cfg(test)]
@@ -142,6 +146,8 @@ pub struct PoolCore<E, V> {
     /// Answers to commands, sent once the steps before them are published,
     /// so no caller hears of a change before readers can see it.
     replies: Vec<Box<dyn FnOnce() + Send>>,
+    /// What storage held when its metrics were last emitted.
+    emitted: StorageStats,
 }
 
 impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
@@ -208,6 +214,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             published: None,
             steps: Vec::new(),
             replies: Vec::new(),
+            emitted: StorageStats::default(),
         }
     }
 
@@ -479,6 +486,66 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                     }
                 }
             }
+        }
+        self.emit_storage_metrics();
+    }
+
+    /// Emits what storage holds under today's pool metric names, if it
+    /// changed since the last emission. Counters grow by what storage counted
+    /// since then.
+    fn emit_storage_metrics(&mut self) {
+        let stats = self.machine.storage_stats();
+        if stats == self.emitted {
+            return;
+        }
+        let last = std::mem::replace(&mut self.emitted, stats);
+        let stats = &self.emitted;
+
+        // Metrics take `f64`. Counts and sizes this small convert exactly, and
+        // a metric tolerates rounding above 2^53.
+        let weights = &stats.weights;
+        for (bucket, unpaid) in [
+            ("< 0.2", weights.unpaid_actions_with_weight_lt20pct),
+            ("< 0.4", weights.unpaid_actions_with_weight_lt40pct),
+            ("< 0.6", weights.unpaid_actions_with_weight_lt60pct),
+            ("< 0.8", weights.unpaid_actions_with_weight_lt80pct),
+            ("< 1", weights.unpaid_actions_with_weight_lt1),
+        ] {
+            metrics::gauge!("zcash.mempool.actions.unpaid", "bk" => bucket).set(f64::from(unpaid));
+        }
+        metrics::gauge!("zcash.mempool.actions.paid").set(f64::from(weights.paid_actions));
+        metrics::gauge!("zcash.mempool.size.transactions").set(stats.transactions as f64);
+        for (bucket, size) in [
+            ("< 1", weights.size_with_weight_lt1),
+            ("1", weights.size_with_weight_eq1),
+            ("> 1", weights.size_with_weight_gt1),
+            ("> 2", weights.size_with_weight_gt2),
+            ("> 3", weights.size_with_weight_gt3),
+        ] {
+            metrics::gauge!("zcash.mempool.size.weighted", "bk" => bucket).set(size as f64);
+        }
+        metrics::gauge!("zcash.mempool.size.bytes").set(stats.serialized_size as f64);
+        metrics::gauge!("zcash.mempool.cost.bytes").set(stats.cost as f64);
+
+        metrics::gauge!("mempool.rejected.transaction.ids").set(stats.rejected as f64);
+        // This is just an approximation, as today.
+        let item_size = std::mem::size_of::<(
+            zakura_chain::transaction::Hash,
+            SameEffectsTipRejectionError,
+        )>();
+        metrics::gauge!("mempool.rejected.transaction.ids.bytes")
+            .set(stats.rejected.saturating_mul(item_size) as f64);
+
+        metrics::gauge!("zcash.mempool.eviction_cost.floor").set(stats.eviction_cost_floor);
+        let evicted = stats.evicted.saturating_sub(last.evicted);
+        if evicted > 0 {
+            metrics::counter!("zcash.mempool.evicted").increment(evicted);
+        }
+        let below = stats
+            .below_eviction_cost
+            .saturating_sub(last.below_eviction_cost);
+        if below > 0 {
+            metrics::counter!("zcash.mempool.rejected.below_eviction_cost").increment(below);
         }
     }
 

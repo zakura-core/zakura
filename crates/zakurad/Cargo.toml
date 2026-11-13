@@ -139,7 +139,6 @@ max_level_debug = ["tracing/max_level_debug"]
 proptest-impl = [
     "proptest",
     "proptest-derive",
-    "zakura-mempool/proptest-impl",
     "zakura-consensus/proptest-impl",
     "zakura-state/proptest-impl",
     "zakura-network/proptest-impl",
@@ -147,7 +146,7 @@ proptest-impl = [
 ]
 
 # Criterion benchmarks for verified mempool storage, without network or crypto.
-mempool-bench = ["proptest-impl", "zakura-mempool/mempool-bench"]
+mempool-bench = ["proptest-impl"]
 
 # Build the zakura-checkpoints utility for checkpoint generation tests
 zakura-checkpoints = [
@@ -250,7 +249,6 @@ zakura-test = { path = "../zakura-test", version = "4.0.0" }
 # zakura-storage is never published, so packaging drops it.
 zakura-storage = { path = "../zakura-storage", features = ["driver-fidelity"] }
 zakura-node-services = { path = "../zakura-node-services", version = "5.2.3", features = ["rpc-client", "test-support"] }
-zakura-mempool = { path = "../zakura-mempool", version = "0.1.0", features = ["proptest-impl"] }
 
 # Used by the checkpoint generation tests via the zakura-checkpoints feature
 # (the binaries in this crate won't be built unless their features are enabled).

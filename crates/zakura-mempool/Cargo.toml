@@ -15,16 +15,6 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
-# Arbitrary impls and generators for property tests.
-proptest-impl = [
-    "proptest",
-    "proptest-derive",
-    "zakura-chain/proptest-impl",
-]
-
-# The storage benchmark harness and its fixtures.
-mempool-bench = ["proptest-impl"]
-
 [dependencies]
 zakura-chain = { path = "../zakura-chain", version = "15.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.2.3" }
@@ -34,12 +24,7 @@ zcash_script = { workspace = true }
 
 chrono = { workspace = true }
 metrics = { workspace = true }
-serde = { workspace = true, features = ["serde_derive"] }
 thiserror = { workspace = true }
-tracing = { workspace = true }
-
-proptest = { workspace = true, optional = true }
-proptest-derive = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures = { workspace = true }

@@ -37,7 +37,6 @@ impl Fixture {
                     factory.tx(fee),
                     Vec::new(),
                     None,
-                    &mut |_, _| {},
                     crate::Instant::now(),
                     chrono::Utc::now(),
                 )
@@ -56,7 +55,6 @@ impl Fixture {
                     tx.clone(),
                     spent.clone(),
                     None,
-                    &mut |_, _| {},
                     crate::Instant::now(),
                     chrono::Utc::now(),
                 )
@@ -83,7 +81,6 @@ impl Fixture {
             black_box(tx),
             black_box(spent),
             None,
-            &mut |_, _| {},
             crate::Instant::now(),
             chrono::Utc::now(),
         ));
@@ -93,7 +90,7 @@ impl Fixture {
         elapsed
     }
 
-    /// Includes descendant removal, index updates, and metrics. Restoring the
+    /// Includes descendant removal and index updates. Restoring the
     /// package and dropping the returned IDs are outside the timed section.
     fn delete_package(&mut self) -> Duration {
         let root = self.package[0].0.transaction.id().mined_id();
@@ -107,7 +104,6 @@ impl Fixture {
                     tx.clone(),
                     spent.clone(),
                     None,
-                    &mut |_, _| {},
                     crate::Instant::now(),
                     chrono::Utc::now(),
                 )
@@ -119,12 +115,10 @@ impl Fixture {
     /// Models mined-parent removal while retaining its unmined descendants.
     fn confirm_parent(&mut self) -> Duration {
         let root = self.package[0].0.transaction.id().mined_id();
-        let mined = [root].into_iter().collect();
         let start = Instant::now();
-        self.storage.clear_mined_dependencies(black_box(&mined));
-        let removed = black_box(self.storage.verified.remove_all(black_box([root])));
+        let removed = black_box(self.storage.remove_one(black_box(&root)));
         let elapsed = start.elapsed();
-        assert_eq!(removed.len(), 1);
+        assert!(removed.is_some());
 
         // Restore the original graph, including the children that stayed in
         // the pool. All cleanup and reinsertion are outside the timed section.
@@ -139,7 +133,6 @@ impl Fixture {
                     tx.clone(),
                     spent.clone(),
                     None,
-                    &mut |_, _| {},
                     crate::Instant::now(),
                     chrono::Utc::now(),
                 )
@@ -197,7 +190,6 @@ fn benchmark_mempool_mining_index_mutations() {
                             tx.clone(),
                             spent.clone(),
                             None,
-                            &mut |_, _| {},
                             crate::Instant::now(),
                             chrono::Utc::now(),
                         )
@@ -249,8 +241,9 @@ fn full_block(factory: &mut TxFactory) -> (Block, Vec<VerifiedUnminedTx>) {
     (block, members)
 }
 
-/// Measures the full mined-transaction cleanup path for a serialized 2 MB
-/// block, including the coinbase TXID that is absent from the mempool.
+/// Measures storage's part of a serialized 2 MB block: removing and caching
+/// each mined transaction, including the coinbase TXID that is absent from the
+/// mempool. The pool core's search for conflicts is outside it.
 #[test]
 #[ignore = "manual performance measurement; run with --release --ignored --nocapture"]
 #[allow(clippy::print_stdout, reason = "manual benchmark results")]
@@ -277,7 +270,6 @@ fn benchmark_mempool_full_block_deletion() {
                     factory.tx(10_000),
                     Vec::new(),
                     None,
-                    &mut |_, _| {},
                     crate::Instant::now(),
                     chrono::Utc::now(),
                 )
@@ -289,7 +281,6 @@ fn benchmark_mempool_full_block_deletion() {
                     tx.clone(),
                     Vec::new(),
                     None,
-                    &mut |_, _| {},
                     crate::Instant::now(),
                     chrono::Utc::now(),
                 )
@@ -301,17 +292,10 @@ fn benchmark_mempool_full_block_deletion() {
             .map(|tx| tx.unmined_id().mined_id())
             .collect();
         let mut sample = || {
-            let transactions = block.transactions.clone();
             let start = Instant::now();
-            storage.clear_mined_dependencies(black_box(&mined));
-            let removed = black_box(storage.reject_and_remove_same_effects(
-                black_box(&mined),
-                black_box(transactions),
-                crate::Instant::now(),
-            ));
+            let removed = black_box(storage.mine(black_box(&mined), crate::Instant::now()));
             let elapsed = start.elapsed();
-            assert_eq!(removed.mined.len(), members.len());
-            assert!(removed.invalidated.is_empty());
+            assert_eq!(removed.len(), members.len());
             assert_eq!(storage.transaction_count(), background_count);
             storage.chain_rejected_same_effects.clear();
             for tx in &members {
@@ -320,7 +304,6 @@ fn benchmark_mempool_full_block_deletion() {
                         tx.clone(),
                         Vec::new(),
                         None,
-                        &mut |_, _| {},
                         crate::Instant::now(),
                         chrono::Utc::now(),
                     )

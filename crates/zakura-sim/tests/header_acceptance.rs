@@ -7001,7 +7001,7 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
     (
         "FrameRef",
         "src/harness/header_acceptance/companions.rs",
-        "rejected_page",
+        "rejected_frame",
         "src/harness/header_acceptance/companions.rs",
         "the_rejected_page_joins_its_judged_frame",
     ),
@@ -7886,10 +7886,10 @@ fn every_ref_has_a_one_key_off_control() {
     let templated: Vec<_> = REF_CONTROLS
         .iter()
         .map(|entry| match entry {
-            ("FrameRef", file, "rejected_page", ..) => (
+            ("FrameRef", file, "rejected_frame", ..) => (
                 "FrameRef",
                 *file,
-                "rejected_page",
+                "rejected_frame",
                 companions,
                 "a_template_control",
             ),
@@ -7912,7 +7912,7 @@ fn every_ref_has_a_one_key_off_control() {
         control_gaps(&planted, &refs, &templated),
         [format!(
             "{companions} a_template_control has no typed FrameRef control reaching \
-             {companions} rejected_page"
+             {companions} rejected_frame"
         )]
     );
 

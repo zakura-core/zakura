@@ -230,7 +230,6 @@ src/harness/header_acceptance/evaluate.rs	same_run	run.meta.harness!=harness
 src/harness/header_acceptance/inventory.rs	each_inventory_change_is_an_inventory_error	contract.id!=ContractId::C22
 src/harness/header_acceptance/inventory.rs	each_inventory_change_is_an_inventory_error	id!=ContractId::C22
 src/harness/header_acceptance/required.rs	allows	test==*t
-src/harness/header_acceptance/required.rs	required_keys	(property.clone(),name.clone())
 src/harness/header_acceptance/required.rs	required_keys	contract.id==id
 src/harness/header_acceptance/rows.rs	attach_history_passes	property==target
 src/harness/header_acceptance/rows.rs	machine_row	property==REACTOR

@@ -26,6 +26,7 @@ use zakura_sim::{
                 ResultRecord, TestOutcome, TestRan,
             },
             reasons::{NA_REASONS, NOT_HEADER},
+            refs::PlantedRef,
             required::{gate_rule, required_keys, Inventories, Registered, GATE_OBLIGATIONS},
             rows::{self, NativeClass, HEADER_HARNESSES},
             sim_test, Approval, CaseRef, CaseRun, Expected, ExpectedId, ExpectedResult, Found,
@@ -366,19 +367,23 @@ fn committed_required(manifest: &Manifest) -> BTreeMap<Key, BTreeSet<Gate>> {
     let native = native_dirs();
     let coverage = coverage_triples();
     let contracts = header_acceptance::contract_table();
-    let planted_harnesses: BTreeMap<(String, String), String> = planted
+    let planted_ref = |property: &String, name: &String| PlantedRef {
+        property: property.clone(),
+        name: name.clone(),
+    };
+    let planted_harnesses: Vec<(PlantedRef, String)> = planted
         .iter()
         .filter_map(|(property, name)| {
             let harness = header_acceptance::planted_harness(&repo(), property, name).ok()?;
-            Some(((property.clone(), name.clone()), harness))
+            Some((planted_ref(property, name), harness))
         })
         .collect();
-    let harness_caught: BTreeSet<(String, String)> = planted
+    let harness_caught: Vec<PlantedRef> = planted
         .iter()
         .filter(|(property, name)| {
             header_acceptance::planted_harness_caught(&repo(), property, name).unwrap_or(false)
         })
-        .cloned()
+        .map(|(property, name)| planted_ref(property, name))
         .collect();
     required_keys(&Inventories {
         registered: &registered,
@@ -7602,6 +7607,20 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/rows.rs",
         "a_duplicate_s_result_joins_its_whole_case",
     ),
+    (
+        "PlantedRef",
+        "src/harness/header_acceptance/required.rs",
+        "harness_of",
+        "src/harness/header_acceptance/required.rs",
+        "a_case_s_harness_joins_its_whole_case",
+    ),
+    (
+        "PlantedRef",
+        "src/harness/header_acceptance/required.rs",
+        "is_harness_caught",
+        "src/harness/header_acceptance/required.rs",
+        "a_harness_caught_case_joins_its_whole_case",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.
@@ -8907,6 +8926,12 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "lists",
         "property",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/required.rs",
+        "one_case_keys",
+        "harness",
+        "the test's machine classifier, naming one harness, not a join",
     ),
     (
         "src/harness/header_acceptance/tool.rs",

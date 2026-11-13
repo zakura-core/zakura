@@ -3021,19 +3021,23 @@ pub fn committed_required(
     let planted = planted_cases(repo)?;
     let native = native_dirs(repo)?;
     let coverage = coverage_tests();
-    let planted_harnesses: BTreeMap<(String, String), String> = planted
+    let planted_ref = |property: &String, name: &String| PlantedRef {
+        property: property.clone(),
+        name: name.clone(),
+    };
+    let planted_harnesses: Vec<(PlantedRef, String)> = planted
         .iter()
         .filter_map(|(property, name)| {
             let harness = super::planted_harness(repo, property, name).ok()?;
-            Some(((property.clone(), name.clone()), harness))
+            Some((planted_ref(property, name), harness))
         })
         .collect();
-    let harness_caught: BTreeSet<(String, String)> = planted
+    let harness_caught: Vec<PlantedRef> = planted
         .iter()
         .filter(|(property, name)| {
             super::planted_harness_caught(repo, property, name).unwrap_or(false)
         })
-        .cloned()
+        .map(|(property, name)| planted_ref(property, name))
         .collect();
     Ok(required_keys(&Inventories {
         registered: &registered,

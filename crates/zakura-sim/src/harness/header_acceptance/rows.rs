@@ -1249,13 +1249,6 @@ pub fn native_open(until: &'static str) -> Expected {
     )
 }
 
-/// `key`'s expected result with the gates `gates`: the transitional `Open`
-/// [`owed_open`] writes for it.
-fn owed(key: Key, gates: &[Gate]) -> ExpectedResult {
-    let open = owed_open(&key).expect("every key a row calls owed for has an owed_open entry");
-    result(vec![key], gates, open)
-}
-
 /// The witness and bypass tests `COVERAGE` names for a header row, each an
 /// executed `Passes`. Listed here by hand, so the static check compares them
 /// with `COVERAGE`.
@@ -1353,15 +1346,23 @@ pub struct StandingExclusion {
 }
 
 /// The approved standing exclusions of passing, catch and missing-source
-/// keys: `headers/long-payload-closes`' catch, by Adam's hdr-14.5 ruling.
-/// The two `over-owed-closes` catch exclusions still await approval, so
-/// they block.
-pub static STANDING_EXCLUSIONS: &[StandingExclusion] = &[StandingExclusion {
-    key: ("catch", "header-sync/s5v9/headers/long-payload-closes", ""),
-    owner: "hdr-14",
-    reason: LONG_PAGE_UNREACHED,
-    approval: HDR_14_5_RULING,
-}];
+/// keys: `headers/long-payload-closes`' catch, by Adam's hdr-14.5 ruling,
+/// and `sim/no-livelock`'s catch, by his hdr-14.4 one. The two
+/// `over-owed-closes` catch exclusions still await approval, so they block.
+pub static STANDING_EXCLUSIONS: &[StandingExclusion] = &[
+    StandingExclusion {
+        key: ("catch", "header-sync/s5v9/headers/long-payload-closes", ""),
+        owner: "hdr-14",
+        reason: LONG_PAGE_UNREACHED,
+        approval: HDR_14_5_RULING,
+    },
+    StandingExclusion {
+        key: ("catch", "sim/no-livelock", ""),
+        owner: "hdr-14",
+        reason: LIVELOCK_UNCATCHABLE,
+        approval: LIVELOCK_RULING,
+    },
+];
 
 /// Whether `exclusions` grants `key` exactly the standing `Open` `expected`.
 pub fn exclusion_granted(exclusions: &[StandingExclusion], key: &Key, expected: &Expected) -> bool {
@@ -1397,22 +1398,25 @@ const OPERATION_IDS_UNREACHED: &str =
      storage operations and logs their submissions and completions, so only storage-fake code \
      can break the rule and no production patch can";
 
-/// Why `sim/no-livelock`'s catch is still owed.
-const SIM_WIDE_CATCH: &str = "the sim-wide IDs' bypasses run on test-only harnesses, so a \
-                              header-harness catch or an approved Open is still owed";
+/// Why `sim/no-livelock` has no planted catch: a node spin never ends by
+/// itself, so a case's `Draft` run can't complete. The step loop's detector
+/// is shown on a header fixture by
+/// `tests/header_hold_release.rs::a_spin_with_a_held_reply_open_violates_no_livelock`.
+const LIVELOCK_UNCATCHABLE: &str =
+    "a planted livelock keeps a node task ready at one instant, and the step loop moves the \
+     clock only once no task is ready, so the spin never ends by itself: its Draft run, which \
+     must complete past the stop, runs to its budget and then to the drain's bound, the \
+     harness failure DrainBound; no header fixture holds finite work at one instant near the \
+     limit (honest recoveries take about 480 of 5,000 steps), so no honest patch spins long \
+     enough and then stops. The detector itself is shown on the held-locator header fixture \
+     by tests/header_hold_release.rs::a_spin_with_a_held_reply_open_violates_no_livelock, \
+     whose test-only Spinning harness violates sim/no-livelock with no panic and no harness \
+     failure";
 
-/// The transitional `Open` each transitional passing or catch key owes,
-/// whole: its reason, owner and the PR it waits for, written from the
-/// plan's PR table. `sim/no-livelock`'s catch is hdr-14.4's.
-/// [`Key::covers`] takes a transitional `Open` on such a key only if it's
-/// exactly this one.
-pub fn owed_open(key: &Key) -> Option<Expected> {
-    let (reason, until) = match key {
-        Key::Catch { property } if property == SIM_WIDE[1] => (SIM_WIDE_CATCH, "hdr-14.4"),
-        _ => return None,
-    };
-    Some(transitional(reason, "Adam's side", until))
-}
+/// Adam's approval of `sim/no-livelock`'s catch exclusion.
+const LIVELOCK_RULING: Approval = Approval::Adam {
+    record: "Adam, 2026-11-12, hdr-14.4 sim/no-livelock catch exclusion",
+};
 
 /// Every native mutation directory there has been, written apart from
 /// `NATIVE_MUTATIONS`, so a mutation whose directory and classification are
@@ -2911,7 +2915,16 @@ fn hand_written_rows() -> Vec<Row> {
     // (`TEST_ONLY_WITNESSES`), so its counted history is a liveness
     // fixture, which declares `BoundedAdversary` from its start.
     let mut livelock = holds(SIM_WIDE[1], NONE, HOLD_WITNESSES);
-    livelock.push(owed(Key::catch(SIM_WIDE[1]), NONE));
+    livelock.push(result(
+        vec![Key::catch(SIM_WIDE[1])],
+        NONE,
+        Expected::Open {
+            reason: LIVELOCK_UNCATCHABLE,
+            owner: "hdr-14",
+            approval: LIVELOCK_RULING,
+            until: None,
+        },
+    ));
     rows.push(sim_row(SIM_WIDE[1], node_harnesses, livelock));
 
     rows
@@ -3293,22 +3306,215 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
             until: None,
         },
     },
+    // `outstanding-work-bounded`'s bound table, row by row.
+    bound_passes(
+        "gate-5/bound-table/work-slots/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/work-slots/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/reservation-maps/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/reservation-maps/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/request-deadlines/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/request-deadlines/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/locator-reads/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/locator-reads/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/locator-reads/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/node-execution-slots/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/node-execution-slots/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/publisher-capacity-waits/cleanup",
+        obligation::BOUND_WAITS_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/close-deadlines/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/storage-calls/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/port-futures/conservation",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/cached-offers/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/supplier-order/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/completed-targets/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/subscriber-cursors/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/subscriber-subscriptions/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/publisher-tasks/cleanup",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/sessions/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/serving-peer-budgets/cleanup",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
     GateRequirement {
-        name: "gate-5/bound-table",
+        name: "gate-5/bound-table/repair-reservation",
         gates: G5,
         expected: Expected::Open {
-            reason: obligation::GATE_5_BOUND_TABLE,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-9d.1"),
+            reason: obligation::BOUND_REPAIR_RESERVATION,
+            owner: obligation::BOUND_OWNER,
+            approval: PLAN,
+            until: None,
         },
     },
+    bound_open(
+        "gate-5/bound-table/reservation",
+        obligation::bound_unshown::RESERVATION,
+    ),
+    bound_open(
+        "gate-5/bound-table/locator-reads/per-peer",
+        obligation::bound_unshown::LOCATOR_PER_PEER,
+    ),
+    bound_open(
+        "gate-5/bound-table/calls-per-round",
+        obligation::bound_unshown::CALLS_PER_ROUND,
+    ),
+    bound_open(
+        "gate-5/bound-table/detached-headers",
+        obligation::bound_unshown::DETACHED,
+    ),
+    bound_open(
+        "gate-5/bound-table/departed-strikes",
+        obligation::bound_unshown::STRIKES,
+    ),
+    bound_open(
+        "gate-5/bound-table/pending-closes",
+        obligation::bound_unshown::PENDING_CLOSES,
+    ),
+    bound_open(
+        "gate-5/bound-table/status-cadences",
+        obligation::bound_unshown::CADENCES,
+    ),
+    bound_open(
+        "gate-5/bound-table/publisher-tombstones",
+        obligation::bound_unshown::TOMBSTONES,
+    ),
+    bound_open(
+        "gate-5/bound-table/publisher-jobs",
+        obligation::bound_unshown::JOBS,
+    ),
+    bound_open(
+        "gate-5/bound-table/subscription-slots",
+        obligation::bound_unshown::SUBSCRIPTION_SLOTS,
+    ),
+    bound_open(
+        "gate-5/bound-table/sent-cursor-ring",
+        obligation::bound_unshown::SENT_RING,
+    ),
+    bound_open(
+        "gate-5/bound-table/peer-execution-slots",
+        obligation::bound_unshown::PEER_EXECUTION,
+    ),
+    bound_open(
+        "gate-5/bound-table/node-output",
+        obligation::bound_unshown::NODE_OUTPUT,
+    ),
+    bound_open(
+        "gate-5/bound-table/peer-output",
+        obligation::bound_unshown::PEER_OUTPUT,
+    ),
+    bound_open(
+        "gate-5/bound-table/response-counts",
+        obligation::bound_unshown::RESPONSE_COUNTS,
+    ),
+    bound_open(
+        "gate-5/bound-table/retained-path-leases",
+        obligation::bound_unshown::LEASES,
+    ),
+    bound_open(
+        "gate-5/bound-table/readmission-cooldowns",
+        obligation::bound_unshown::COOLDOWNS,
+    ),
+    bound_open(
+        "gate-5/bound-table/pruned-peers",
+        obligation::bound_unshown::PRUNED_PEERS,
+    ),
+    bound_open(
+        "gate-5/bound-table/vct-repair",
+        obligation::bound_unshown::VCT_REPAIR,
+    ),
     GateRequirement {
         name: "gate-5/mixed-witness",
         gates: G5,
         expected: Expected::Passes { test: MIXED_TEST },
     },
 ];
+
+/// A bound-table row's requirement `name`, met by `test`'s pass.
+const fn bound_passes(name: &'static str, test: TestRef) -> GateRequirement {
+    GateRequirement {
+        name,
+        gates: G5,
+        expected: Expected::Passes { test },
+    }
+}
+
+/// A bound-table row's requirement `name` with no fixture evidence: the
+/// standing exclusion for `reason`, which blocks until Adam approves it.
+const fn bound_open(name: &'static str, reason: &'static str) -> GateRequirement {
+    GateRequirement {
+        name,
+        gates: G5,
+        expected: Expected::Open {
+            reason,
+            owner: obligation::BOUND_OWNER,
+            approval: Approval::Pending,
+            until: None,
+        },
+    }
+}
 
 /// The [`GATE_REQUIREMENTS`] as expected results.
 pub fn requirement_results() -> Vec<ExpectedResult> {
@@ -3734,6 +3940,7 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "each_node_harness_s_missing_sources_are_its_own_test_s",
     "delivered_obligations_verify_on_their_evidence",
     "every_node_history_lists_its_not_applicable_reports",
+    "a_missing_bound_row_blocks",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.

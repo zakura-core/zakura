@@ -549,7 +549,7 @@ fn every_required_key_is_covered_once_with_its_gates() {
             reason: "replaced",
             owner: "test",
             approval: Approval::Pending,
-            until: Some("hdr-14.4"),
+            until: Some("hdr-14.8"),
         };
         m.expected.push(open);
     });
@@ -2998,11 +2998,8 @@ fn every_narrowing_entry_has_a_test_or_its_pr() {
 /// refuses.
 ///
 /// hdr-14.8's frozen-head run is still to come, and the node cleanup keys
-/// wait for its per-run cleanup record. hdr-14.4 and hdr-9d.1 merged
-/// without the evidence their rows wait for: `sim/no-livelock`'s
-/// header-harness catch, and the bound table's per-row fixtures. They stay here, named, until those are built or Adam
-/// approves standing exclusions for them.
-const OPEN_PRS: &[&str] = &["hdr-14.4", "hdr-14.8", "hdr-9d.1"];
+/// wait for its per-run cleanup record.
+const OPEN_PRS: &[&str] = &["hdr-14.8"];
 
 #[test]
 fn every_transitional_row_names_an_open_pr() {
@@ -3019,8 +3016,19 @@ fn every_transitional_row_names_an_open_pr() {
         *owner = "";
     }
     assert!(!open_errors(&ownerless).is_empty());
+    // No catch key is transitional any more, so the control makes
+    // `sim/no-livelock`'s standing exclusion a transitional Open first.
     let livelock = "sim/no-livelock";
     let mut replaced = manifest.expected.clone();
+    let open = replaced
+        .iter_mut()
+        .find(|r| r.keys.contains(&Key::catch(livelock)))
+        .expect("sim/no-livelock's catch key is covered");
+    let Expected::Open { until, .. } = &mut open.expected else {
+        panic!("sim/no-livelock's catch is an Open");
+    };
+    *until = Some("hdr-14.8");
+    assert_eq!(open_errors(&replaced), Vec::<String>::new());
     let caught = replaced
         .iter()
         .find_map(|r| match r.expected {
@@ -9553,4 +9561,52 @@ fn every_node_history_lists_its_not_applicable_reports() {
         Vec::<String>::new(),
         "every group lists a judged history"
     );
+}
+
+/// The bound table's obligations are per row: every row of
+/// `outstanding-work-bounded`'s table has its own required key, so one
+/// row's evidence dropped, or swapped for another row's test or for an
+/// unapproved Open, leaves that key uncovered while every other row still
+/// verifies.
+#[test]
+fn a_missing_bound_row_blocks() {
+    let manifest = Manifest::committed();
+    let required = committed_required(&manifest);
+    let bound: Vec<Key> = required
+        .keys()
+        .filter(|key| {
+            matches!(key, Key::Requirement { name } if name.starts_with("gate-5/bound-table/"))
+        })
+        .cloned()
+        .collect();
+    assert!(bound.len() > 1, "{bound:?}");
+    assert_eq!(coverage_errors(&manifest, &required), Vec::<String>::new());
+    let row = Key::Requirement {
+        name: "gate-5/bound-table/work-slots/release-reuse".into(),
+    };
+    assert!(bound.contains(&row));
+    // The row's result dropped.
+    let mut dropped = manifest.clone();
+    dropped
+        .expected
+        .retain(|result| !result.keys.contains(&row));
+    let errors = coverage_errors(&dropped, &required);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    // The row's test swapped for the at-limit row's.
+    let mut swapped = manifest.clone();
+    let at = covering(&swapped, &row);
+    swapped.expected[at].expected = Expected::Passes {
+        test: header_acceptance::required::BOUND_LIMIT_TEST,
+    };
+    assert_eq!(coverage_errors(&swapped, &required).len(), 1);
+    // The row's test replaced by an exclusion Adam hasn't approved.
+    let mut excluded = manifest.clone();
+    let at = covering(&excluded, &row);
+    excluded.expected[at].expected = Expected::Open {
+        reason: "no release",
+        owner: header_acceptance::required::BOUND_OWNER,
+        approval: Approval::Pending,
+        until: None,
+    };
+    assert_eq!(coverage_errors(&excluded, &required).len(), 1);
 }

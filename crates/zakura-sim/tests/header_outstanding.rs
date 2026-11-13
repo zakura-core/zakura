@@ -7,7 +7,7 @@
 
 mod support;
 
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use support::{
     inputs,
@@ -22,7 +22,7 @@ use zakura_sim::{
         header_sync::{Storage, StorageScenario},
         run_prepared, HarnessError, Subsystem,
     },
-    observe::{StorageFact, StorageResult},
+    observe::{Entry, ReactorCall, ReactorFact, StorageFact, StorageRequest, StorageResult},
     MemorySink, Observation, Plan, PlanInput, RunReport, StepCtx,
 };
 
@@ -134,18 +134,34 @@ fn the_witnesses_hold_under_generated_plans() {
 /// mirrors sit below the node, so the node serves each of them, and storage
 /// holds every serving read until 8 are submitted, so the reads fill the
 /// node's 8 execution slots and the rest wait. Each row reaches its limit
-/// and no further. The harness's step budget ends these runs before release
-/// and reuse, which the committed witnesses cover at their own scale.
+/// and no further. In the slot fixture the 16 rounds' reservations, staged
+/// capacity entries and request deadlines, one per round, reach 16 with
+/// them. Each run then releases and reuses its row, which
+/// [`the_limit_fixtures_release_and_reuse_their_bounds`] checks.
 #[test]
 fn the_limit_fixtures_reach_and_hold_their_bounds() {
-    for (stem, row, limit, sessions) in [
-        ("header-outstanding-slot-limit", "work slots", 16, 17),
-        ("header-outstanding-locator-limit", "locator reads", 16, 17),
+    let per_round = ["reservations", "staged capacity", "request deadlines"];
+    for (stem, row, limit, sessions, also) in [
+        (
+            "header-outstanding-slot-limit",
+            "work slots",
+            16,
+            17,
+            &per_round[..],
+        ),
+        (
+            "header-outstanding-locator-limit",
+            "locator reads",
+            16,
+            17,
+            &[][..],
+        ),
         (
             "header-outstanding-serving-limit",
             "node execution slots",
             8,
             11,
+            &[][..],
         ),
     ] {
         let scenario = scenario(stem);
@@ -166,12 +182,291 @@ fn the_limit_fixtures_reach_and_hold_their_bounds() {
         held(stem, &report);
         let peaks = evidence.peaks();
         assert_eq!(peaks.get(row), Some(&limit), "{stem}: {peaks:?}");
+        for also in also {
+            assert_eq!(peaks.get(also), Some(&limit), "{stem}: {also}: {peaks:?}");
+        }
         assert_eq!(
             peaks.get("session handles"),
             Some(&sessions),
             "{stem}: {peaks:?}"
         );
     }
+}
+
+/// The bound-table rows judged by membership or cleanup, as the rule's
+/// peaks name them: each key must name something that still holds what
+/// the entry is for, so a key kept past that breaks the row.
+const MEMBERSHIP_ROWS: [&str; 15] = [
+    "request deadlines",
+    "close deadlines",
+    "locator reads",
+    "storage calls",
+    "port futures",
+    "cached offers",
+    "supplier order",
+    "completed targets",
+    "subscriber unaccepted cursors",
+    "subscriber live subscriptions",
+    "subscriber ended keys",
+    "publisher tasks",
+    "session handles",
+    "scheduling state",
+    "expired serving peer budgets",
+];
+
+/// Gate 5's membership and cleanup witnesses: across the committed
+/// witnesses, each of which holds the property under its committed Plan,
+/// every membership or cleanup row held at least one key while the rule
+/// judged it, so the rule saw entries come and go rather than an empty
+/// container. A row's keep bypasses under
+/// `qa/planted/header-sync/outstanding-work-bounded/`, where it has any,
+/// show it breaks.
+#[test]
+fn each_membership_row_holds_keys_in_a_committed_witness() {
+    let mut peaks = std::collections::BTreeMap::<&str, usize>::new();
+    for stem in WITNESSES {
+        let scenario = scenario(stem);
+        let prepared = Storage::prepare(&scenario);
+        let evidence = prepared.outstanding.clone();
+        let plan =
+            fs::read(fixture(stem, "plan")).unwrap_or_else(|error| panic!("{stem}: {error}"));
+        let report = run_prepared::<Storage>(
+            &scenario,
+            prepared,
+            Plan::from_fuzz(&plan),
+            &mut MemorySink::default(),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{stem}: {error}"));
+        held(stem, &report);
+        for (row, peak) in evidence.peaks() {
+            let most = peaks.entry(row).or_default();
+            *most = (*most).max(peak);
+        }
+    }
+    let empty: Vec<&str> = MEMBERSHIP_ROWS
+        .into_iter()
+        .filter(|row| peaks.get(row).copied().unwrap_or(0) == 0)
+        .collect();
+    assert_eq!(empty, Vec::<&str>::new(), "{peaks:?}");
+}
+
+/// One limit fixture's row as its log shows it: which entry opens a unit of
+/// the row, and for which party, and which entry releases one.
+struct RowUnits {
+    /// The fixture's stem.
+    stem: &'static str,
+    /// The row's limit.
+    limit: usize,
+    /// The parties that want a unit, one more than the limit can hold.
+    parties: usize,
+    /// The party an entry opens a unit for, if it opens one.
+    opens: fn(&Entry) -> Option<String>,
+    /// Whether an entry releases a unit.
+    releases: fn(&Entry) -> bool,
+}
+
+/// What a limit fixture's log shows of its row.
+#[derive(Debug, PartialEq, Eq)]
+struct RowUse {
+    /// The most units open at once.
+    peak: usize,
+    /// The distinct parties that held a unit.
+    parties: usize,
+    /// The log index of the first release, if any.
+    first_release: Option<usize>,
+    /// The log index where the last party to get its first unit got it,
+    /// with how many units were open just before.
+    last_first_open: Option<(usize, usize)>,
+}
+
+/// Reads `row`'s units from `entries`, in log order.
+fn row_use(row: &RowUnits, entries: &[Entry]) -> RowUse {
+    let mut open = 0usize;
+    let mut peak = 0;
+    let mut seen = BTreeSet::new();
+    let mut first_release = None;
+    let mut last_first_open = None;
+    for (at, entry) in entries.iter().enumerate() {
+        if let Some(party) = (row.opens)(entry) {
+            if seen.insert(party) {
+                last_first_open = Some((at, open));
+            }
+            open += 1;
+            peak = peak.max(open);
+        } else if (row.releases)(entry) {
+            open = open.saturating_sub(1);
+            first_release.get_or_insert(at);
+        }
+    }
+    RowUse {
+        peak,
+        parties: seen.len(),
+        first_release,
+        last_first_open,
+    }
+}
+
+/// Each limit fixture's row, read from its log: work slots by rounds
+/// started and retired, locator reads by locator calls dispatched and
+/// locators returned, and node execution slots by serving reads submitted
+/// and pages returned.
+fn limit_rows() -> [RowUnits; 3] {
+    [
+        RowUnits {
+            stem: "header-outstanding-slot-limit",
+            limit: 16,
+            parties: 17,
+            opens: |entry| match &entry.obs {
+                Observation::Reactor {
+                    event: ReactorFact::Started { request, .. },
+                    ..
+                } => Some(request.peer.clone()),
+                _ => None,
+            },
+            releases: |entry| {
+                matches!(
+                    &entry.obs,
+                    Observation::Reactor {
+                        event: ReactorFact::Retired { .. },
+                        ..
+                    }
+                )
+            },
+        },
+        RowUnits {
+            stem: "header-outstanding-locator-limit",
+            limit: 16,
+            parties: 17,
+            opens: |entry| match &entry.obs {
+                Observation::Reactor {
+                    event:
+                        ReactorFact::Dispatched {
+                            port: ReactorCall::Locator { peer, .. },
+                            ..
+                        },
+                    ..
+                } => Some(peer.clone()),
+                _ => None,
+            },
+            releases: |entry| {
+                matches!(
+                    &entry.obs,
+                    Observation::Storage {
+                        instance: 0,
+                        fact: StorageFact::Completed {
+                            result: StorageResult::Locator { .. },
+                            ..
+                        },
+                        ..
+                    }
+                )
+            },
+        },
+        RowUnits {
+            stem: "header-outstanding-serving-limit",
+            limit: 8,
+            parties: 11,
+            opens: |entry| match &entry.obs {
+                Observation::Storage {
+                    instance: 0,
+                    fact:
+                        StorageFact::Submitted {
+                            request:
+                                StorageRequest::ReadHeaderPath {
+                                    lease: Some(lease), ..
+                                },
+                            ..
+                        },
+                    ..
+                } => Some(lease.peer.clone()),
+                _ => None,
+            },
+            releases: |entry| {
+                matches!(
+                    &entry.obs,
+                    Observation::Storage {
+                        instance: 0,
+                        fact: StorageFact::Completed {
+                            result: StorageResult::Page { .. },
+                            ..
+                        },
+                        ..
+                    }
+                )
+            },
+        },
+    ]
+}
+
+/// Gate 5's bound-table rows for work slots, locator reads and node
+/// execution slots, by their limit fixtures' logs: each row reaches its
+/// limit and no further while one more party waits, so the next is denied,
+/// and that party gets its first unit only after a release, with fewer than
+/// the limit open, so a released unit is reused.
+#[test]
+fn the_limit_fixtures_release_and_reuse_their_bounds() {
+    for row in limit_rows() {
+        let stem = row.stem;
+        let scenario = scenario(stem);
+        let plan =
+            fs::read(fixture(stem, "plan")).unwrap_or_else(|error| panic!("{stem}: {error}"));
+        let report = run(stem, &scenario, Plan::from_fuzz(&plan));
+        let used = row_use(&row, report.log.entries());
+        assert_eq!(
+            (used.peak, used.parties),
+            (row.limit, row.parties),
+            "{stem}: {used:?}"
+        );
+        let (Some(release), Some((reused, open))) = (used.first_release, used.last_first_open)
+        else {
+            panic!("{stem}: the row released and reused a unit: {used:?}");
+        };
+        assert!(
+            release < reused && open < row.limit,
+            "{stem}: the waiting party's first unit came after a release: {used:?}"
+        );
+    }
+}
+
+/// A row read with no release, or whose waiting party got its unit before
+/// any release, fails the reuse check's conditions, so the check sees the
+/// release it claims.
+#[test]
+fn the_reuse_check_needs_a_release_before_the_waiting_party() {
+    let row = RowUnits {
+        stem: "control",
+        limit: 1,
+        parties: 2,
+        opens: |entry| match &entry.obs {
+            Observation::TaskSpawned { task } => Some(task.clone()),
+            _ => None,
+        },
+        releases: |entry| matches!(&entry.obs, Observation::TaskExited { .. }),
+    };
+    let spawned = |task: &str| Observation::TaskSpawned {
+        task: task.to_owned(),
+    };
+    let exited = |task: &str| Observation::TaskExited {
+        task: task.to_owned(),
+        exit: zakura_sim::observe::Exit::Completed,
+    };
+    let read = |log: Vec<Observation>| {
+        let mut observed = zakura_sim::ObservationLog::default();
+        for obs in log {
+            observed.push(obs);
+        }
+        row_use(&row, observed.entries())
+    };
+    let reused = read(vec![spawned("a"), exited("a"), spawned("b")]);
+    assert_eq!(reused.first_release, Some(1));
+    assert_eq!(reused.last_first_open, Some((2, 0)));
+    let never = read(vec![spawned("a"), spawned("b")]);
+    assert_eq!((never.peak, never.first_release), (2, None));
+    let early = read(vec![spawned("a"), spawned("b"), exited("a")]);
+    assert!(early
+        .last_first_open
+        .is_some_and(|(at, _)| Some(at) < early.first_release));
 }
 
 /// Checks one capacity-waits run: no violation or harness failure, the

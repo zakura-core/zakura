@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-mempool/src/io.rs b/crates/zakura-mempool/src/io.rs
+index e349c97c64..f66f8c9c87 100644
+--- a/crates/zakura-mempool/src/io.rs
++++ b/crates/zakura-mempool/src/io.rs
+@@ -386,7 +386,9 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
+                 }
+                 Effect::Verdict { waiter, verdict } => {
+                     if let Some(reply) = self.verdicts.remove(&waiter) {
+-                        let _ = reply.send(verdict);
++                        if !matches!(verdict, Verdict::Rejected(_)) {
++                            let _ = reply.send(verdict);
++                        }
+                     }
+                 }
+                 Effect::OutputReady { waiter, output, .. } => {

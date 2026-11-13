@@ -27,6 +27,7 @@ sync_wire = "sync/wire"
 block_sync_storage = "block-sync/storage"
 discovery_wire = "discovery/wire"
 header_sync_wire = "header-sync/wire"
+pool_core = "pool/core"
 
 [features]
 # Tells AddressSanitizer about each coroutine stack switch, which cargo-fuzz's
@@ -168,6 +169,13 @@ bench = false
 [[bin]]
 name = "header_sync_wire"
 path = "fuzz_targets/header_sync_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pool_core"
+path = "fuzz_targets/pool_core.rs"
 test = false
 doc = false
 bench = false

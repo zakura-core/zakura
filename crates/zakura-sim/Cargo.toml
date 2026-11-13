@@ -32,6 +32,8 @@ chrono = { workspace = true }
 zakura-chain = { path = "../zakura-chain" }
 zakura-network = { path = "../zakura-network", features = ["p2p-fuzz"] }
 zakura-node-services = { path = "../zakura-node-services" }
+# The pool core and its storage, for the pool harness.
+zakura-mempool = { path = "../zakura-mempool" }
 zakura-quic = { path = "../zakura-quic" }
 # Scripted peers draw their handshake nonces from the runtime's RNG, whose
 # traits come from `rand`.

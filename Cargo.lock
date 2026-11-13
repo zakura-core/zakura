@@ -3482,6 +3482,7 @@ dependencies = [
  "toml",
  "zakura-chain",
  "zakura-header-chain",
+ "zakura-mempool",
  "zakura-network",
  "zakura-node-services",
  "zakura-quic",

@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-mempool/src/io.rs b/crates/zakura-mempool/src/io.rs
+index e349c97c64..ea3b9c06b3 100644
+--- a/crates/zakura-mempool/src/io.rs
++++ b/crates/zakura-mempool/src/io.rs
+@@ -371,9 +371,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
+     fn finish(&mut self, step: Step) {
+         let Step { effects, changes } = step;
+         self.publish(changes);
+-        if let Some(cooldowns) = self.machine.cooldowns_if_changed() {
+-            self.inbox.publish_cooldowns(cooldowns);
+-        }
++        let _ = self.machine.cooldowns_if_changed();
+         for effect in effects {
+             match effect {
+                 Effect::Start {

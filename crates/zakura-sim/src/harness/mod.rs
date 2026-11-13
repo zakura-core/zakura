@@ -25,6 +25,7 @@ pub mod header_sync;
 pub mod header_work;
 pub mod machine;
 pub mod policy;
+pub mod pool;
 mod record;
 pub mod scenario;
 pub mod sync;
@@ -582,6 +583,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<discovery_service::DiscoveryWire>(),
     entry::<sync::SyncStorage>(),
     entry::<sync_wire::SyncWire>(),
+    entry::<pool::PoolCoreHarness>(),
 ];
 
 /// The harness named `name`.

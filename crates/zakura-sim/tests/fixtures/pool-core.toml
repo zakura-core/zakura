@@ -1,0 +1,31 @@
+# The committed fuzz input `pool-core.bin`: the default pool scenario's two
+# prefix bytes and no Plan bytes.
+harness = "pool/core"
+generator = 1
+sha256 = "c42522128b49193de8cd45d8f7589cd7e085e65f138640d57d4482e5f7189623"
+scenario_sha256 = "dab65106c910fbd65e44bf1bf3a0cbeacd074c04cbb7d093e8a5c656e1ff5aee"
+source = "crates/zakura-sim/tests/pool_core.rs"
+
+[[witness]]
+property = "pool/verdict-for-every-submission"
+expect = "holds"
+
+[[witness]]
+property = "pool/supplier-charged"
+expect = "holds"
+
+[[witness]]
+property = "pool/admissions-within-limits"
+expect = "holds"
+
+[[witness]]
+property = "pool/consistent"
+expect = "holds"
+
+[[witness]]
+property = "pool/log-complete"
+expect = "holds"
+
+[[witness]]
+property = "pool/survives-reorg"
+expect = "holds"

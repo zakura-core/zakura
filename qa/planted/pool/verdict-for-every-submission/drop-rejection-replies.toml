@@ -1,0 +1,5 @@
+# Drops the reply to every rejected submission, so its caller sees the core
+# as stopped.
+input = "crates/zakura-sim/tests/fixtures/pool-core.bin"
+# The harness drives the pool core and the storage under it.
+checks = ["crates/zakura-mempool/src"]

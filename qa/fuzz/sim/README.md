@@ -69,6 +69,10 @@ whose target has no harness or no campaign.
   its real transport on simulated QUIC. Its two-byte prefix picks a saved
   Plan's scenario or the default one. Its committed seeds are
   `crates/zakura-sim/tests/fixtures/header-wire-*.bin`.
+- `pool_core` runs `pool/core`, the pool core task behind its port with
+  scripted submitters, a modeled verifier and a chain script. Its two-byte
+  prefix sets the verifier's delay and picks an upgrade, a reorg and a
+  resync. Its committed seed is `crates/zakura-sim/tests/fixtures/pool-core.bin`.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 - `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only

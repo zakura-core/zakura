@@ -156,6 +156,19 @@ const OVER_MARGIN: &str = "requests_past_twice_the_serving_limit_reach_over_marg
 /// The witness that no scenario reaches an [`unreachable`] row.
 const UNREACHED: &str = "ids_no_scenario_reaches_stay_not_applicable";
 
+/// A `pool/core` property's row: the committed seed holds it in
+/// `tests/pool_core.rs`, and the planted patch `bypass` violates it.
+const fn pool(property: &'static str, bypass: &'static str) -> Coverage {
+    Coverage {
+        property,
+        passing: passes(
+            "tests/pool_core.rs",
+            "the_pool_core_seed_holds_every_pool_property",
+        ),
+        bypass: Bypass::Planted(bypass),
+    }
+}
+
 /// The file of `header-sync/wire`'s witness tests (P3d).
 const HEADER_WITNESSES: &str = "tests/header_wire_witness.rs";
 
@@ -382,6 +395,21 @@ pub static COVERAGE: &[Coverage] = &[
         passing: passes("tests/witness.rs", "discovery_wait_complete_lost_wakeup"),
         bypass: Bypass::Planted("lost-wakeup"),
     },
+    pool(
+        crate::domain::pool::VERDICT_FOR_EVERY_SUBMISSION,
+        "drop-rejection-replies",
+    ),
+    pool(
+        crate::domain::pool::SUPPLIER_CHARGED,
+        "skip-cooldown-publish",
+    ),
+    pool(
+        crate::domain::pool::ADMISSIONS_WITHIN_LIMITS,
+        "source-limit-off-by-one",
+    ),
+    pool(crate::domain::pool::CONSISTENT, "ignore-spend-conflicts"),
+    pool(crate::domain::pool::LOG_COMPLETE, "drop-removals-from-log"),
+    pool(crate::domain::pool::SURVIVES_REORG, "never-revalidate"),
     Coverage {
         property: crate::domain::discovery::LATE_RESPONSE_ADMITTED,
         passing: passes(

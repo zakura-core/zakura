@@ -157,6 +157,7 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
             input: include_bytes!("fixtures/block-work-owner-cap.bin").to_vec(),
         }),
         "discovery-wait-complete" => value(discovery::Scenario::default()),
+        "pool-core" => value(zakura_sim::harness::pool::PoolScenario::default()),
         "discovery-verification-capacity" => value(discovery::CapacityScenario::default()),
         "discovery-record-book" => value(zakura_sim::record::machine::MachineScenario {
             input: include_bytes!("fixtures/discovery-record-book.bin").to_vec(),

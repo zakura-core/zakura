@@ -117,6 +117,21 @@ enum BodyDecodePanic {
     AfterTransactionConversion,
 }
 
+/// Returns the checksum in a message header: the first four bytes of SHA-256 applied twice to
+/// `body`.
+///
+/// This is the same value as [`sha256d::Checksum::from`]. It is calculated with `ring`, whose
+/// SHA-256 uses assembly for the instructions each CPU has. On CPUs without SHA instructions it
+/// hashes about twice as fast as `sha2`, and messages, especially blocks sent to peers, are the
+/// largest inputs this node hashes.
+fn message_checksum(body: &[u8]) -> sha256d::Checksum {
+    let first = ring::digest::digest(&ring::digest::SHA256, body);
+    let second = ring::digest::digest(&ring::digest::SHA256, first.as_ref());
+    let mut checksum = [0; 4];
+    checksum.copy_from_slice(&second.as_ref()[..4]);
+    sha256d::Checksum(checksum)
+}
+
 /// Checksums of the large `block` messages this node sent most recently.
 ///
 /// Every peer that requests a block is sent the same body, so the checksum in the message
@@ -326,7 +341,7 @@ impl Codec {
     fn body_checksum(&self, msg: &Message, body: &[u8]) -> sha256d::Checksum {
         let block = match msg {
             Message::Block(block) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => block,
-            _ => return sha256d::Checksum::from(body),
+            _ => return message_checksum(body),
         };
 
         let hash = block.hash();
@@ -335,7 +350,7 @@ impl Codec {
             return checksum;
         }
 
-        let checksum = sha256d::Checksum::from(body);
+        let checksum = message_checksum(body);
         block_checksums.insert(hash, body.len(), checksum);
         checksum
     }
@@ -576,7 +591,7 @@ impl Decoder for Codec {
                     let body = src.split_to(body_len);
                     self.state = DecodeState::Head;
 
-                    if checksum != sha256d::Checksum::from(&body[..]) {
+                    if checksum != message_checksum(&body[..]) {
                         return Err(Parse(
                             "supplied message checksum does not match computed checksum",
                         ));

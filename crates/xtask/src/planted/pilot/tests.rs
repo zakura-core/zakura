@@ -839,6 +839,45 @@ fn patches_come_from_the_pinned_revision() {
     remove_worktree(&root, &tree).expect("the worktree is removed");
 }
 
+/// The feedback runner's inputs from the tree must match `HEAD`: a changed,
+/// new or missing file fails, naming it.
+#[test]
+fn tree_inputs_must_be_committed() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+    let git_ok = |args: &[&str]| {
+        let status = git(root)
+            .args(["-c", "user.name=pilot", "-c", "user.email=pilot@test"])
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    };
+    fs::create_dir(root.join("q")).expect("q is made");
+    fs::write(root.join("q/list.toml"), "a = 1\n").expect("the list is written");
+    fs::write(root.join("case.toml"), "b = 1\n").expect("the case is written");
+    git_ok(&["init", "-q"]);
+    git_ok(&["add", "."]);
+    git_ok(&["commit", "-q", "-m", "inputs"]);
+    let paths = [PathBuf::from("q/list.toml"), PathBuf::from("case.toml")];
+    check_committed(root, &paths).expect("the inputs are HEAD's");
+
+    fs::write(root.join("q/list.toml"), "a = 2\n").expect("the list is changed");
+    fs::write(root.join("new.toml"), "c = 1\n").expect("a new file is written");
+    let why = check_committed(
+        root,
+        &[paths[0].clone(), paths[1].clone(), "new.toml".into()],
+    )
+    .expect_err("a changed and a new file differ")
+    .to_string();
+    assert!(why.contains("q/list.toml, new.toml differ"), "{why}");
+    fs::remove_file(root.join("case.toml")).expect("the case is removed");
+    let why = check_committed(root, &paths[1..])
+        .expect_err("a missing file differs")
+        .to_string();
+    assert!(why.contains("case.toml"), "{why}");
+}
+
 /// The committed catalogue.
 fn committed_catalogue() -> Catalogue {
     let root = crate::repo_root().expect("xtask lives in the workspace");
@@ -1991,9 +2030,10 @@ fn libfuzzer_flags_name_fuzz_targets() {
     check_libfuzzer_args(&bounds, &targets).expect("the catalogue's flags name targets");
     check_libfuzzer_args(&committed_list().bounds, &targets)
         .expect("the list's flags name targets");
-    bounds
-        .libfuzzer_args
-        .insert("no_such_target".to_owned(), vec!["-len_control=0".to_owned()]);
+    bounds.libfuzzer_args.insert(
+        "no_such_target".to_owned(),
+        vec!["-len_control=0".to_owned()],
+    );
     let error = check_libfuzzer_args(&bounds, &targets).expect_err("an unknown target fails");
     assert!(error.contains("no_such_target"), "{error}");
 }

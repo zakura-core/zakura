@@ -198,8 +198,9 @@ must run its input's harness. A case listed twice, a typed case and a nested
 case fail. The runner then builds the runner tree's `HEAD`, as
 `planted --targets` does: each original campaign runs `HEAD`, and each
 mutant runs `HEAD` with the case's patch. The list's cases come from the
-runner's tree, and `HEAD`'s checkout must hold the same patches, inputs and
-production files, so commit any change to a case first. The simulator builds
+runner's tree. The list and each case's `.toml` must match `HEAD`, and
+`HEAD`'s checkout must hold the same patches, inputs and production files,
+so commit any change to the list or a case first. The simulator builds
 with the checkout's own toolchain. Each fuzz build must name the checkout's
 commit, lockfiles and the case's target and harness. An original's source
 digest must be the checkout's, and a mutant's must differ.

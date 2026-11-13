@@ -43,8 +43,10 @@
 //! the catalogue: planted cases on fuzz targets that pass the
 //! protocol-state collector. It builds the runner's own `HEAD`, as
 //! `planted --targets` does, and each case's mutant is `HEAD` with the
-//! case's patch. The list's cases are read from the tree the runner runs
-//! from, and the checkout of `HEAD` must hold the same files. Each seed
+//! case's patch. The list and its cases are read from the tree the runner
+//! runs from. The list and each case's file must match `HEAD`, and the
+//! checkout of `HEAD` must hold the same patches, inputs and production
+//! files. Each seed
 //! runs in both arms, semantic feedback on and off, which differ only in
 //! their store, name and feedback mode. The fuzzer must log the arm's mode
 //! at startup. It writes `feedback.json`, with `discovery.json`'s rows and
@@ -444,6 +446,16 @@ fn feedback_comparison(repo_root: &Path, flags: Flags, work: &Path) -> Result<Co
         ..
     } = flags;
     let (bytes, list) = feedback::read(repo_root)?;
+    // The pins check each case's patch, input and production files at
+    // `HEAD`. The list and each case's file come from the tree, so they
+    // must match `HEAD` too.
+    let mut read_from_tree = vec![PathBuf::from(feedback::LIST)];
+    read_from_tree.extend(
+        list.cases
+            .iter()
+            .map(|case| case.patch.with_extension("toml")),
+    );
+    check_committed(repo_root, &read_from_tree)?;
     let cases = select(&list.cases, &only)?;
     let seeds = select_allocated(&list.bounds.seeds, &seeds, "seed")?;
     let arms = select_allocated(&list.bounds.feedback_arms, &arms, "arm")?;
@@ -2101,6 +2113,33 @@ fn check_pins(tree: &Path, revision: &str, cases: &[&Case]) -> Result<(), BoxErr
     } else {
         Err(format!(
             "frozen inputs differ from the cases' hashes: {}",
+            differ.join(", ")
+        )
+        .into())
+    }
+}
+
+/// Fails unless each of `paths`, relative to `repo_root`, holds in the
+/// tree exactly what it holds at `HEAD`.
+fn check_committed(repo_root: &Path, paths: &[PathBuf]) -> Result<(), BoxError> {
+    let mut differ = Vec::new();
+    for path in paths {
+        let name = path
+            .to_str()
+            .ok_or_else(|| format!("{} isn't UTF-8", path.display()))?;
+        let committed = git(repo_root)
+            .args(["show", &format!("HEAD:{name}")])
+            .output()?;
+        let tree = fs::read(repo_root.join(path)).ok();
+        if !committed.status.success() || tree.as_deref() != Some(&committed.stdout[..]) {
+            differ.push(name.to_owned());
+        }
+    }
+    if differ.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} differ from HEAD; commit them first, so the run's inputs are HEAD's",
             differ.join(", ")
         )
         .into())

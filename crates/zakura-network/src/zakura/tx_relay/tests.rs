@@ -994,7 +994,11 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                     if let Ok(reserved) = pool.reserve(id(n), source, intent, now) {
                         legacy_held.push((reserved, n, peer));
                     }
-                    Vec::new()
+                    // A reservation returns its answer. What the deadlines
+                    // it found due caused is taken straight after.
+                    let step = pool.effects();
+                    ledger.absorb(&step);
+                    reactor.pool_step(&step, now, &mut pool)
                 }
                 // It brings its body, waits, or gives up.
                 13 if !legacy_held.is_empty() => {
@@ -1265,4 +1269,54 @@ fn an_id_waiting_for_a_busy_announcer_holds_no_core_slot() {
     let effects = reactor.not_found(s[1], id(10), secs(200), &mut pool);
     assert_eq!(effects, vec![ask(s[1], 1)]);
     assert_eq!(pool.slots_in_use(), 1);
+}
+
+// Cases from the eleventh review.
+
+#[test]
+fn an_announcement_that_finds_a_deadline_due_passes_on_what_it_caused() {
+    // One slot at the core.
+    let mut pool = PoolModel::new(Height(100), Generation(0)).with_limits(1, 5, 1);
+    let mut reactor = ReactorModel::new(MAX_TX);
+    let first = reactor.connect(v2(1), false, MAX_REQUESTS_PER_PEER);
+    let second = reactor.connect(v2(2), false, MAX_REQUESTS_PER_PEER);
+
+    // Transaction 1 is pooled. Transaction 2 comes in through the reactor
+    // and takes the slot. A reorg then queues transaction 1's check behind
+    // it.
+    reactor.announce(first, id(1), 300, secs(0), &mut pool);
+    reactor.tx(first, tx(1), secs(0), &mut pool);
+    finish(&mut pool, &mut reactor, Outcome::Pass, secs(0));
+    reactor.announce(first, id(2), 300, secs(0), &mut pool);
+    reactor.tx(first, tx(2), secs(0), &mut pool);
+    reactor.take_pool_steps();
+    let step = pool.transition(
+        ModelTransition {
+            disconnected: 1,
+            connected: vec![ModelBlock::default()],
+            tip: Height(100),
+            generation: Generation(1),
+            rules_change: false,
+        },
+        secs(1),
+    );
+    assert!(step.started().is_empty(), "the slot is taken");
+    reactor.pool_step(&step, secs(1), &mut pool);
+    assert_eq!(reactor.verifying(&v2(1)), 1);
+
+    // The last input is another peer's announcement, after transaction 2's
+    // deadline. The reservation it makes is what finds the deadline due.
+    reactor.announce(second, id(3), 300, T_VERIFY + secs(1), &mut pool);
+
+    // No tick follows. The reactor has the verdict, so the first peer's
+    // quota is free, and the caller has the job the timeout made room for.
+    assert_eq!(reactor.verifying(&v2(1)), 0);
+    let started: usize = reactor
+        .take_pool_steps()
+        .iter()
+        .map(|step| step.started().len())
+        .sum();
+    assert_eq!(started, 1, "transaction 1's check is handed to the caller");
+    pool.assert_invariants();
+    reactor.assert_invariants();
 }

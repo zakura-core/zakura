@@ -1153,6 +1153,7 @@ fn every_submission_gets_exactly_one_verdict_and_the_limits_hold() {
                     if let Ok(reservation) = model.reserve(id(n), peer(p), intent, now) {
                         reservations.push((reservation.id, n, p));
                     }
+                    record(model.effects(), &mut jobs, &mut verdicts);
                 }
                 3..=4 if !reservations.is_empty() => {
                     let pick = rng.pick(reservations.len());
@@ -2835,7 +2836,7 @@ fn a_random_run_with_small_limits_always_drains() {
             now += Duration::from_millis(rng.next(9_000));
             let n = u16::try_from(rng.next(12)).expect("small");
             let p = u16::try_from(rng.next(4)).expect("small");
-            match rng.next(14) {
+            match rng.next(16) {
                 0..=3 => {
                     let source = if p == 0 { Source::Node } else { peer(p) };
                     let intent = if rng.next(2) == 0 {
@@ -2846,6 +2847,7 @@ fn a_random_run_with_small_limits_always_drains() {
                     if let Ok(reservation) = model.reserve(id(n), source, intent, now) {
                         granted.push((reservation.id, n, p, reservation.wants_body));
                     }
+                    run.record(model.effects());
                 }
                 4..=6 if !granted.is_empty() => {
                     let (reservation, n, p, wants_body) =
@@ -2926,6 +2928,21 @@ fn a_random_run_with_small_limits_always_drains() {
                     if let OutputAnswer::Waiting(waiter) = model.await_output(output(n, 0), now) {
                         run.output_waits.push((waiter, output(n, 0)));
                     }
+                    run.record(model.effects());
+                }
+                // The adapter asks which of a few ids are rejected.
+                15 => {
+                    let asked: HashSet<_> = [id(n), id((n + 1) % 12)].into_iter().collect();
+                    let rejected = model.rejected_ids(&asked, now);
+                    assert!(rejected.is_subset(&asked));
+                    run.record(model.effects());
+                }
+                // The outcome of a job the model cancelled arrives late,
+                // in the middle of everything else.
+                14 if !run.cancelled.is_empty() => {
+                    let job = run.cancelled.swap_remove(rng.pick(run.cancelled.len()));
+                    let read = stable(generation);
+                    run.record(model.outcome(job, Outcome::Pass, read, read, now));
                 }
                 13 if !run.output_waits.is_empty() => {
                     let pick = rng.pick(run.output_waits.len());
@@ -3790,12 +3807,13 @@ fn a_reservation_sees_the_deadlines_that_are_due_whether_or_not_a_tick_came_firs
     let (waiter, _) = bring_in(&mut direct, tx(1), legacy(1));
     let without_tick = direct.reserve(id(1), peer(2), Intent::Fetch, late).is_ok();
     assert!(with_tick && without_tick);
-    // The earlier submission's verdict is not lost. It comes with the next
-    // step.
+    // The earlier submission's verdict is there to take at once, with no
+    // later input needed to bring it out.
     assert_eq!(
-        direct.tick(late).verdict(waiter),
+        direct.effects().verdict(waiter),
         Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
     );
+    direct.assert_invariants();
 }
 
 #[test]
@@ -3881,4 +3899,71 @@ fn an_older_time_from_a_caller_does_not_turn_the_models_clock_back() {
         Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
     );
     assert!(model.visible().is_empty());
+}
+
+// Cases from the eleventh review.
+
+#[test]
+fn a_reservation_hands_over_at_once_what_its_deadlines_caused() {
+    // One slot.
+    let mut model = new_model().with_limits(1, 5, 1);
+    admit(&mut model, tx(1), 1, 0);
+    let (waiter, _) = bring_in(&mut model, tx(2), legacy(2));
+    let step = model.transition(reorg(1, 100), secs(1));
+    assert!(step.started().is_empty(), "the slot is taken");
+
+    // A reservation is the first input to see the admission's deadline. It
+    // decides the admission and starts the check that was waiting.
+    let late = T_VERIFY + secs(1);
+    let _ = model.reserve(id(3), peer(3), Intent::Fetch, late);
+    let step = model.effects();
+    assert_eq!(
+        step.verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
+    );
+    assert_eq!(step.started().len(), 1, "the check starts now, not later");
+    model.assert_invariants();
+
+    // The next input, at that check's own deadline, cancels a job the
+    // caller has known about all along.
+    let started = step.started()[0];
+    let step = model.tick(late + T_VERIFY);
+    assert!(step.effects.contains(&Effect::Cancel(started)));
+    assert!(step.started().is_empty());
+}
+
+#[test]
+#[should_panic(expected = "an input's effects were left uncollected")]
+fn effects_left_uncollected_fail_the_invariants() {
+    let mut model = new_model();
+    bring_in(&mut model, tx(1), legacy(1));
+    let _ = model.reserve(id(2), peer(2), Intent::Fetch, T_VERIFY + secs(1));
+    model.assert_invariants();
+}
+
+#[test]
+fn the_rejection_query_sees_the_deadlines_that_are_due_whether_or_not_a_tick_came_first() {
+    let asked: HashSet<_> = [id(2)].into_iter().collect();
+    let parked = |model: &mut PoolModel| {
+        let (waiter, job) = bring_in(model, child_of(2, 1), legacy(1));
+        model.outcome(job, missing(1), stable(0), stable(0), secs(0));
+        waiter
+    };
+
+    // With a tick first.
+    let mut ticked = new_model();
+    parked(&mut ticked);
+    ticked.tick(T_PARK);
+    assert_eq!(ticked.rejected_ids(&asked, T_PARK), asked);
+
+    // Without one. The query is the first input to see the time, and it
+    // decides the wait for the parent the same way.
+    let mut direct = new_model();
+    let waiter = parked(&mut direct);
+    assert_eq!(direct.rejected_ids(&asked, T_PARK), asked);
+    assert_eq!(
+        direct.effects().verdict(waiter),
+        Some(rejected(RejectionScope::ExactTip, Charge::None))
+    );
+    direct.assert_invariants();
 }

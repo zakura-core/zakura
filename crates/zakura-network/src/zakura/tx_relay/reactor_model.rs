@@ -258,8 +258,7 @@ impl ReactorModel {
                 self.wanted_of.insert(id, key);
             }
         }
-        self.pump(now, pool);
-        self.take_effects()
+        self.finish(now, pool)
     }
 
     /// `session` sent a `Tx` that decodes to `tx`.
@@ -271,7 +270,7 @@ impl ReactorModel {
         pool: &mut PoolModel,
     ) -> Vec<RelayEffect> {
         if !self.answered(session, tx.id, now, pool) {
-            return self.take_effects();
+            return self.finish(now, pool);
         }
         let id = tx.id;
         let peer = self.sessions[&session].peer.clone();
@@ -302,8 +301,7 @@ impl ReactorModel {
                 }
             }
         }
-        self.pump(now, pool);
-        self.take_effects()
+        self.finish(now, pool)
     }
 
     /// `session` sent a `NotFound` for `id`.
@@ -315,7 +313,7 @@ impl ReactorModel {
         pool: &mut PoolModel,
     ) -> Vec<RelayEffect> {
         if !self.answered(session, id, now, pool) {
-            return self.take_effects();
+            return self.finish(now, pool);
         }
         if let Some(key) = self.wanted_of.get(&id).copied() {
             let asking_it = matches!(
@@ -326,8 +324,7 @@ impl ReactorModel {
                 self.move_on(key, now, pool);
             }
         }
-        self.pump(now, pool);
-        self.take_effects()
+        self.finish(now, pool)
     }
 
     /// Something the pool did after another input: verdicts for bodies this
@@ -339,8 +336,7 @@ impl ReactorModel {
         pool: &mut PoolModel,
     ) -> Vec<RelayEffect> {
         self.verdicts(step, now, pool);
-        self.pump(now, pool);
-        self.take_effects()
+        self.finish(now, pool)
     }
 
     /// Time passed.
@@ -358,8 +354,7 @@ impl ReactorModel {
                 _ => {}
             }
         }
-        self.pump(now, pool);
-        self.take_effects()
+        self.finish(now, pool)
     }
 
     /// `session` ended. Only that session goes: a replacement of the same
@@ -389,8 +384,7 @@ impl ReactorModel {
                 self.move_on(key, now, pool);
             }
         }
-        self.pump(now, pool);
-        self.take_effects()
+        self.finish(now, pool)
     }
 
     // Observations.
@@ -795,6 +789,28 @@ impl ReactorModel {
         self.wanted
             .get_mut(&key)
             .expect("the caller names a wanted id")
+    }
+
+    /// The one way out of an input. Some calls into the pool return an
+    /// answer and no step, and what the pool's deadlines caused during them
+    /// is collected here, so no verdict or job start waits for a later
+    /// input. Then every idle id that has someone to ask is asked.
+    fn finish(&mut self, now: ModelTime, pool: &mut PoolModel) -> Vec<RelayEffect> {
+        loop {
+            let step = pool.effects();
+            if !step.is_empty() {
+                self.route(step, now, pool);
+                continue;
+            }
+            self.pump(now, pool);
+            // The pump can reserve, which can find a deadline due.
+            let step = pool.effects();
+            if step.is_empty() {
+                break;
+            }
+            self.route(step, now, pool);
+        }
+        self.take_effects()
     }
 
     fn fresh(&mut self) -> u64 {

@@ -333,6 +333,11 @@ impl Step {
         })
     }
 
+    /// Whether the input caused nothing.
+    pub fn is_empty(&self) -> bool {
+        self.effects.is_empty() && self.changes.is_empty()
+    }
+
     /// The jobs this step started.
     pub fn started(&self) -> Vec<JobId> {
         self.effects
@@ -650,8 +655,9 @@ impl PoolModel {
     ///
     /// Like every input, this first applies the deadlines that are due, so
     /// its answer does not depend on whether a tick came just before it.
-    /// It returns no step. What those deadlines caused is returned with the
-    /// next step. The same holds for [`Self::await_output`],
+    /// Its own return value is the answer to the caller. What the deadlines
+    /// caused is in [`Self::effects`], which the caller takes right after.
+    /// The same holds for [`Self::await_output`], [`Self::rejected_ids`],
     /// [`Self::violation`] and [`Self::activate`].
     pub fn reserve(
         &mut self,
@@ -1205,6 +1211,19 @@ impl PoolModel {
         self.start_revalidations();
     }
 
+    /// What the last call to [`Self::reserve`], [`Self::await_output`],
+    /// [`Self::rejected_ids`], [`Self::violation`] or [`Self::activate`]
+    /// caused beside its answer:
+    /// the verdicts of deadlines it found due, and the jobs it started.
+    ///
+    /// Every input has effects, and these five have an answer of their own
+    /// as well. The caller takes this straight after each of them, so no
+    /// verdict or job start waits for some later input.
+    /// [`Self::assert_invariants`] fails if one was left.
+    pub fn effects(&mut self) -> Step {
+        self.take_step()
+    }
+
     // Observations.
 
     /// Undecided transactions, plus running revalidations.
@@ -1281,7 +1300,20 @@ impl PoolModel {
 
     /// [`super::PoolHandle::rejected_ids`]: the members of `ids` a cached
     /// rejection covers at `now`. Takes no slot.
-    pub fn rejected_ids(&self, ids: &HashSet<UnminedTxId>, now: ModelTime) -> HashSet<UnminedTxId> {
+    ///
+    /// This is a command to the core like the others, so it goes through
+    /// the same boundary: the deadlines that are due are applied first, and
+    /// what they caused is in [`Self::effects`]. A transaction whose wait
+    /// for a parent has just ended is in the answer whether or not a tick
+    /// came before the query.
+    pub fn rejected_ids(
+        &mut self,
+        ids: &HashSet<UnminedTxId>,
+        now: ModelTime,
+    ) -> HashSet<UnminedTxId> {
+        self.enter(now);
+        self.start_revalidations();
+        let now = self.now;
         ids.iter()
             .copied()
             .filter(|id| self.cached_rejection(*id, now).is_some())
@@ -1336,6 +1368,11 @@ impl PoolModel {
             "the rejection lists' limits"
         );
         assert!(self.cooldowns.len() <= MAX_COOLDOWNS, "the cooldown limit");
+        assert!(
+            self.step.is_empty(),
+            "an input's effects were left uncollected: {:?}",
+            self.step
+        );
         // Nothing that can start is left waiting. A queued revalidation
         // with room and no hidden parent would have been started by the
         // input that made it startable, and a retry or deadline that is due
@@ -1361,6 +1398,12 @@ impl PoolModel {
                         *deadline > self.now,
                         "a revalidation past its deadline was left running"
                     ),
+                    Some(Hidden::Parked { .. }) => assert!(
+                        pooled
+                            .missing_since
+                            .is_some_and(|since| since.saturating_add(T_PARK) > self.now),
+                        "a hidden transaction was left parked past its wait for a parent"
+                    ),
                     _ => {}
                 }
             }
@@ -1369,6 +1412,14 @@ impl PoolModel {
                     assert!(
                         deadline > self.now,
                         "a verification past its deadline was left running"
+                    );
+                }
+                if matches!(admission.stage, Stage::Parked { .. }) {
+                    assert!(
+                        admission
+                            .missing_since
+                            .is_some_and(|since| since.saturating_add(T_PARK) > self.now),
+                        "a transaction was left parked past its wait for a parent"
                     );
                 }
                 assert!(

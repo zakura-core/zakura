@@ -1262,7 +1262,9 @@ fn a_kill_that_fails_unpatched_is_a_property_finding() {
             r#"{{"properties":[{{"property":"{NAMED}","outcome":"held","violations":{violations},"end_found":0}}],"snapshot":null}}"#
         )
     };
-    let judged = |line: Option<&str>| judge_unpatched(NAMED, KillTrace::Shrunk, line, "exited 1").0;
+    let judged = |line: Option<&str>| {
+        judge_unpatched(NAMED, KillTrace::Shrunk, "replay", line, "exited 1").0
+    };
     assert_eq!(judged(Some(&report("[]"))), OnUnpatched::Holds);
     assert_eq!(
         judged(Some(&report(r#"[{"step":3}]"#))),
@@ -1271,7 +1273,14 @@ fn a_kill_that_fails_unpatched_is_a_property_finding() {
     assert_eq!(judged(None), OnUnpatched::Undecided);
     assert_eq!(judged(Some("not json")), OnUnpatched::Undecided);
     assert_eq!(
-        judge_unpatched(OTHER, KillTrace::Shrunk, Some(&report("[]")), "exited 1").0,
+        judge_unpatched(
+            OTHER,
+            KillTrace::Shrunk,
+            "replay",
+            Some(&report("[]")),
+            "exited 1"
+        )
+        .0,
         OnUnpatched::Undecided,
         "a report without the ID judges nothing"
     );
@@ -2206,7 +2215,7 @@ fn the_unpatched_build_reruns_a_kills_input() {
     fs::create_dir_all(&dir).unwrap();
     let check = |which, trace: &Path| {
         runner
-            .replay_unpatched(
+            .run_unpatched(
                 &lanes,
                 "block-sync/storage",
                 which,
@@ -2221,8 +2230,17 @@ fn the_unpatched_build_reruns_a_kills_input() {
 
     let rerun = check(KillTrace::Confirmed, &confirmed);
     assert_eq!(rerun.outcome, OnUnpatched::Violated, "{}", rerun.detail);
+    assert!(rerun.log.ends_with("unpatched-confirmed-record.log"));
     let replayed = check(KillTrace::Shrunk, &shrunk);
     assert_eq!(replayed.outcome, OnUnpatched::Undecided);
+    assert!(
+        replayed
+            .detail
+            .starts_with("the unpatched `zakura-sim replay` of the shrunk trace wrote no report"),
+        "{}",
+        replayed.detail
+    );
+    assert!(replayed.log.ends_with("unpatched-shrunk-replay.log"));
     let calls = fs::read_to_string(&calls).unwrap();
     let calls: Vec<&str> = calls.lines().collect();
     assert_eq!(calls.len(), 2);

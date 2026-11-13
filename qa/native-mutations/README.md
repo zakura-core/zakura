@@ -30,15 +30,15 @@ a harness whose runs take seconds.
 `--generate-mode libfuzzer` runs one campaign per seed for
 `--generate-seconds` instead, from an empty corpus and with no exclusions.
 A kill must confirm in a fresh process, and the loop shrinks its trace
-within ten of the harness's runs, and at least two minutes. The loop then
-replays the confirmed trace, and the shrunk one if the shrink finished, on
-the unpatched build. If the unpatched build violates the same ID on the
-confirmed trace, the lane is `baseline-fails`, because the bug is in the
-pinned revision. A violation on either trace is a property finding in the
-report. The shrink keeps the ID's violation but not the mutant's part in
-it, so a violation on the shrunk trace alone leaves the kill. One
-search per harness and seed runs on the unpatched build first, and one that
-a run failure ended reruns alone. A confirmed violation there is a property
+within ten of the harness's runs, and at least two minutes. The unpatched
+build then reruns the confirmed trace's input with `zakura-sim record`, and
+replays the shrunk trace if the shrink finished. If the unpatched build
+violates the same ID on the confirmed trace, the lane is `baseline-fails`,
+because the bug is in the pinned revision. A violation on either trace is
+a property finding in the report. The shrink keeps the ID's violation but
+not the mutant's part in it, so a violation on the shrunk trace alone leaves
+the kill. One search per harness and seed runs on the unpatched build
+first, and one that a run failure ended reruns alone. A confirmed violation there is a property
 finding in the report. Any other search that isn't clean is a generator
 baseline failure. Either way that lane is `baseline-fails`. A property that
 no generator harness reaches has a `[[no-generator]]` record in

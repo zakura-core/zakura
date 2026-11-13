@@ -9,6 +9,7 @@ from its header arriving to its peers being told.
 """
 
 import calendar
+import collections
 import json
 import os
 import re
@@ -22,6 +23,9 @@ ANNOUNCEMENT = re.compile(
 # blocks of the last few minutes.
 INITIAL_LOOKBACK_BYTES = 8 * 1024 * 1024
 MAX_READ_BYTES = 256 * 1024 * 1024
+
+# A block announcement from the node log: unix time, height and hash.
+Block = collections.namedtuple("Block", "time height hash")
 
 
 class FileFollower:
@@ -65,7 +69,7 @@ class FileFollower:
 
 
 def parse_announcement(line):
-    """`(unix_time, height, hash)` for a block announcement log line, else `None`."""
+    """The `Block` a block announcement log line reports, else `None`."""
     if ANNOUNCEMENT_MARKER not in line:
         return None
     match = ANNOUNCEMENT.match(line)
@@ -76,17 +80,12 @@ def parse_announcement(line):
     when = calendar.timegm((year, month, day, hour, minute, second)) + int(fraction) / (
         10 ** len(fraction)
     )
-    return when, int(match.group(8)), match.group(9).decode()
+    return Block(when, int(match.group(8)), match.group(9).decode())
 
 
 def announcements(lines):
     """The block announcements among `lines`, oldest first."""
-    found = []
-    for line in lines:
-        parsed = parse_announcement(line)
-        if parsed is not None:
-            found.append(parsed)
-    return found
+    return [block for line in lines if (block := parse_announcement(line)) is not None]
 
 
 # ---- per-block stage timings, from the node's trace tables ----
@@ -131,6 +130,23 @@ STAGES = (
 )
 
 
+# The trace events that start and end each stage, by how the block arrived. A block
+# from the legacy network has no header or hand-off stages: its trace starts when its
+# download finishes, and that row says how long the download took. `writer_queued` is
+# when the block joined the state writer's queue, worked back from the tip row.
+STAGE_BOUNDARIES = {
+    PATH_ZAKURA: (
+        ("header_fetch", "header_request_sent", "header_response_received"),
+        ("header_check", "header_response_received", "header_target_admitted"),
+        ("body_request", "header_target_admitted", "block_get_blocks_sent"),
+        ("body_download", "block_get_blocks_sent", "block_body_received"),
+        ("submit", "block_body_received", "commit_start"),
+        ("verify", "commit_start", "writer_queued"),
+    ),
+    PATH_LEGACY: (("verify", "block_request_finish", "writer_queued"),),
+}
+
+
 def block_path(events):
     """Which network the block's download was recorded on."""
     if "commit_start" in events:
@@ -143,9 +159,7 @@ def block_path(events):
 def stage_durations(events, queue_us, commit_us, typical_status):
     """Milliseconds per stage for one block, `None` where a boundary was not recorded.
 
-    `events` maps an event name to the node-clock time it first happened. A block from
-    the legacy network has no header or hand-off stages: its trace starts when its
-    download finishes, and that row says how long the download took.
+    `events` maps an event name to the node-clock time it first happened.
     """
 
     def between(start, end):
@@ -153,21 +167,16 @@ def stage_durations(events, queue_us, commit_us, typical_status):
             return None
         return round((end - start) / 1000, 3)
 
-    at = events.get
-    tip = at("tip_published")
-    queued = tip - queue_us - commit_us if tip is not None else None
-    stages = dict.fromkeys(stage for stage, _, _ in STAGES)
+    tip = events.get("tip_published")
+    at = dict(events)
+    if tip is not None:
+        at["writer_queued"] = tip - queue_us - commit_us
     path = block_path(events)
-    if path == PATH_ZAKURA:
-        stages["header_fetch"] = between(at("header_request_sent"), at("header_response_received"))
-        stages["header_check"] = between(at("header_response_received"), at("header_target_admitted"))
-        stages["body_request"] = between(at("header_target_admitted"), at("block_get_blocks_sent"))
-        stages["body_download"] = between(at("block_get_blocks_sent"), at("block_body_received"))
-        stages["submit"] = between(at("block_body_received"), at("commit_start"))
-        stages["verify"] = between(at("commit_start"), queued)
-    elif path == PATH_LEGACY:
+    stages = dict.fromkeys(stage for stage, _, _ in STAGES)
+    for stage, start, end in STAGE_BOUNDARIES.get(path, ()):
+        stages[stage] = between(at.get(start), at.get(end))
+    if path == PATH_LEGACY:
         stages["body_download"] = events.get("download_ms")
-        stages["verify"] = between(at("block_request_finish"), queued)
     if tip is not None:
         stages["writer_wait"] = round(queue_us / 1000, 3)
         stages["writer_commit"] = round(commit_us / 1000, 3)
@@ -176,7 +185,12 @@ def stage_durations(events, queue_us, commit_us, typical_status):
 
 
 class BlockStages:
-    """Joins trace rows into one record per block that became the node's tip."""
+    """Joins trace rows into one record per block that became the node's tip.
+
+    Events are kept per node run, under `(process_trace_id, hash)` and
+    `(process_trace_id, height)`: a restarted node counts time from zero again, so rows
+    from different runs are never compared.
+    """
 
     def __init__(self):
         self._by_hash = {}
@@ -204,14 +218,11 @@ class BlockStages:
             # The request names the tip it is fetching toward at the end of its owner.
             found = HASH_IN_TEXT.findall(str(row.get("request_owner", "")))
             block_hash = found[-1] if found else None
+        process = row.get("process_trace_id")
         for key, table in ((block_hash, self._by_hash), (height, self._by_height)):
             if key is None:
                 continue
-            seen = table.setdefault(key, {"process": row.get("process_trace_id")})
-            if seen["process"] != row.get("process_trace_id"):
-                # The node restarted: its clock began again, so earlier rows cannot be compared.
-                seen.clear()
-                seen["process"] = row.get("process_trace_id")
+            seen = table.setdefault((process, key), {})
             if event == "block_status_sent":
                 times = seen.setdefault("status_times", [])
                 if len(times) < MAX_STATUS_TIMES:
@@ -230,7 +241,7 @@ class BlockStages:
                     "height": height,
                     "hash": block_hash,
                     "tip": when,
-                    "process": row.get("process_trace_id"),
+                    "process": process,
                     "queue_us": row.get("queue_us") or 0,
                     "commit_us": row.get("commit_us") or 0,
                     "reorg": row.get("kind") == "reorg",
@@ -245,10 +256,10 @@ class BlockStages:
             if same_run and self._latest - block["tip"] < SETTLE_MICROSECONDS:
                 still_open.append(block)
                 continue
-            events = {}
-            for seen in (self._by_height.get(block["height"], {}), self._by_hash.get(block["hash"], {})):
-                if seen.get("process") == block["process"]:
-                    events.update(seen)
+            events = {
+                **self._by_height.get((block["process"], block["height"]), {}),
+                **self._by_hash.get((block["process"], block["hash"]), {}),
+            }
             # The status messages of this block's fan-out, soonest first.
             told = sorted(
                 when
@@ -274,10 +285,10 @@ class BlockStages:
         self._open = still_open
         if done:
             floor = max(block["height"] for block in done) - PENDING_DEPTH
-            self._by_height = {h: seen for h, seen in self._by_height.items() if h > floor}
-            keep = {block["hash"] for block in self._open}
-            newest = dict(list(self._by_hash.items())[-4 * PENDING_DEPTH :])
-            self._by_hash = {h: seen for h, seen in self._by_hash.items() if h in keep or h in newest}
+            self._by_height = {key: seen for key, seen in self._by_height.items() if key[1] > floor}
+            keep = {(block["process"], block["hash"]) for block in self._open}
+            newest = set(list(self._by_hash)[-4 * PENDING_DEPTH :])
+            self._by_hash = {key: seen for key, seen in self._by_hash.items() if key in keep or key in newest}
         return done
 
 

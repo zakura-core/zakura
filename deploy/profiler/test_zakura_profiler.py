@@ -58,6 +58,11 @@ def samples():
     return list(stacks.parse_perf_script(PERF_SCRIPT.splitlines()))
 
 
+def nested(node):
+    """A tree as plain nested values, for comparing two trees."""
+    return (node.self_us, node.block_us, {name: nested(child) for name, child in node.children.items()})
+
+
 def window_tree(block_times=()):
     return profiler_module.build_window(
         samples(), stacks.SymbolNames(fake_demangle), stacks.Categorizer(), 100, list(block_times)
@@ -151,27 +156,28 @@ class TreeTests(unittest.TestCase):
         stacks.add_stack(second, ["a", "b"], 5)
         stacks.add_stack(second, ["a", "c"], 7, 7)
         stacks.merge_into(first, second)
-        self.assertEqual(first[2]["a"][2]["b"][:2], [15, 4])
+        b = first.children["a"].children["b"]
+        self.assertEqual((b.self_us, b.block_us), (15, 4))
         self.assertEqual(stacks.total_us(first), 22)
         self.assertEqual(stacks.total_us(first, block_only=True), 11)
 
     def test_a_stored_tree_reads_back_identical(self):
         tree, _ = window_tree([1794528036.3])
         restored = stacks.decode_tree(json.loads(json.dumps(stacks.encode_tree(tree))))
-        self.assertEqual(restored, tree)
+        self.assertEqual(nested(restored), nested(tree))
 
     def test_a_view_merges_one_subsystem_across_threads_and_callers(self):
         tree, _ = window_tree()
         view = stacks.view_tree(tree, "verification", stacks.Categorizer())
         # Verification ran on a rayon thread and, cut short, on a tokio worker.
-        self.assertEqual(list(view[2]), ["zakura_consensus::block::verify"])
+        self.assertEqual(list(view.children), ["zakura_consensus::block::verify"])
         self.assertEqual(stacks.total_us(view), 20_000)
-        self.assertEqual(list(view[2]["zakura_consensus::block::verify"][2]), ["pasta_curves::fields::mul"])
+        self.assertEqual(list(view.children["zakura_consensus::block::verify"].children), ["pasta_curves::fields::mul"])
 
     def test_the_whole_process_view_keeps_thread_groups(self):
         tree, _ = window_tree()
         self.assertIs(stacks.view_tree(tree, "all", stacks.Categorizer()), tree)
-        self.assertTrue(all(name.startswith("thread: ") for name in tree[2]))
+        self.assertTrue(all(name.startswith("thread: ") for name in tree.children))
 
     def test_focusing_on_a_function_keeps_only_what_ran_under_it(self):
         tree, _ = window_tree()
@@ -210,8 +216,8 @@ class WindowTests(unittest.TestCase):
 
     def test_a_truncated_stack_hangs_under_a_marker_in_its_thread_group(self):
         tree, _ = window_tree()
-        tokio = tree[2]["thread: " + stacks.thread_group("tokio-rt-worker")]
-        self.assertIn("[stack truncated]", tokio[2])
+        tokio = tree.children["thread: " + stacks.thread_group("tokio-rt-worker")]
+        self.assertIn("[stack truncated]", tokio.children)
 
     def test_block_window_covers_just_before_to_just_after_the_announcement(self):
         block = 1000.0
@@ -256,7 +262,7 @@ class StoreTests(unittest.TestCase):
         for offset, name in ((0, "a"), (60, "b"), (120, "c")):
             self.store.add_window(summary(self.hour + offset), tree_of(name, 1000))
         merged = self.store.merged_tree(self.hour + 60, self.hour + 180)
-        self.assertEqual(sorted(merged[2]["thread: tokio"][2]), ["b", "c"])
+        self.assertEqual(sorted(merged.children["thread: tokio"].children), ["b", "c"])
 
     def test_hourly_files_replace_the_windows_they_were_merged_from(self):
         for offset in (0, 1800, 3600):
@@ -443,6 +449,18 @@ class BlockStageTests(unittest.TestCase):
         self.assertEqual(record["path"], "unknown")
         self.assertIsNone(record["ms"]["verify"])
         self.assertEqual(record["ms"]["writer_commit"], 4.0)
+
+    def test_a_block_seen_again_after_a_restart_keeps_its_earlier_timings(self):
+        later_run = "101-1794529000000000000"
+        stages = blocks.BlockStages()
+        stages.feed(tip_row(1_010_000))
+        # The restarted node publishes the same block as its tip again.
+        stages.feed(tip_row(50_000, process=later_run, queue_us=0, commit_us=0))
+        stages.feed(trace_row("block_status_sent", 9_000_000, later_run, height=999))
+        self.assertEqual(
+            [(record["process"], record["ms"]["writer_commit"]) for record in stages.finished()],
+            [(NODE_RUN, 4.0), (later_run, 0.0)],
+        )
 
     def test_a_block_request_that_returned_nothing_is_not_a_download(self):
         (record,) = self.finished_after(

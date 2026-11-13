@@ -6,16 +6,17 @@ symbol names, adds samples to a tree whose nodes are functions and whose values 
 microseconds, merges trees from several time windows, and cuts a tree down to one view
 (for example block verification) for the flame graph.
 
-A tree node is the list `[self_us, self_block_us, children]`:
+A tree is made of `Node`s, each with:
 
-- `self_us` is CPU time sampled in exactly this function at this position in the stack,
-- `self_block_us` is the part of it sampled while a block was being processed,
-- `children` maps a callee's name to its node.
+- `self_us`, CPU time sampled in exactly this function at this position in the stack,
+- `block_us`, the part of it sampled while a block was being processed,
+- `children`, which maps a callee's name to its node.
 
 The children of the root are thread groups, so the same function called from two kinds
 of thread stays separate until a view merges it.
 """
 
+import collections
 import re
 import subprocess
 
@@ -322,22 +323,49 @@ class SymbolNames:
         return name
 
 
+class Node:
+    """One function at one position in a call stack, and the functions it called."""
+
+    __slots__ = ("self_us", "block_us", "children")
+
+    def __init__(self, self_us=0, block_us=0):
+        self.self_us = self_us
+        self.block_us = block_us
+        self.children = {}
+
+    def child(self, name):
+        """The callee called `name`, added empty if it is not there yet."""
+        node = self.children.get(name)
+        if node is None:
+            node = self.children[name] = Node()
+        return node
+
+    def own_us(self, block_only=False):
+        """Self time: all of it, or only the part sampled while a block was processed."""
+        return self.block_us if block_only else self.self_us
+
+
 def new_tree():
     """An empty tree root."""
-    return [0, 0, {}]
+    return Node()
+
+
+def walk(root):
+    """Yield `(parent, name, node)` for every node below `root`, each parent before its children."""
+    stack = [(root, name, child) for name, child in root.children.items()]
+    while stack:
+        parent, name, node = stack.pop()
+        yield parent, name, node
+        stack.extend((node, child_name, child) for child_name, child in node.children.items())
 
 
 def add_stack(root, path, cpu_us, block_us=0):
     """Add CPU time sampled at the end of `path`, which runs from the outermost caller."""
     node = root
     for name in path:
-        children = node[2]
-        child = children.get(name)
-        if child is None:
-            child = children[name] = [0, 0, {}]
-        node = child
-    node[0] += cpu_us
-    node[1] += block_us
+        node = node.child(name)
+    node.self_us += cpu_us
+    node.block_us += block_us
 
 
 def merge_into(target, source):
@@ -345,61 +373,64 @@ def merge_into(target, source):
     stack = [(target, source)]
     while stack:
         into, node = stack.pop()
-        into[0] += node[0]
-        into[1] += node[1]
-        into_children = into[2]
-        for name, child in node[2].items():
-            match = into_children.get(name)
-            if match is None:
-                match = into_children[name] = [0, 0, {}]
-            stack.append((match, child))
+        into.self_us += node.self_us
+        into.block_us += node.block_us
+        stack.extend((into.child(name), child) for name, child in node.children.items())
 
 
 def total_us(node, block_only=False):
-    """CPU time in `node` and everything it called."""
-    index = 1 if block_only else 0
-    total = 0
-    stack = [node]
-    while stack:
-        current = stack.pop()
-        total += current[index]
-        stack.extend(current[2].values())
-    return total
+    """CPU time in `node` and everything below it."""
+    return node.own_us(block_only) + sum(child.own_us(block_only) for _, _, child in walk(node))
+
+
+class FlatTree:
+    """A tree written as a table of distinct names plus one list per node field.
+
+    Nodes are listed parents first. `n` is each node's index into `names` and `p` its
+    parent's position, `-1` for children of the root; the remaining lists hold the
+    values named when the table is made. Storing each function name once keeps both the
+    files on disk and the page's responses small.
+    """
+
+    def __init__(self, *value_keys):
+        self.names = []
+        self._name_ids = {}
+        self.columns = {"n": [], "p": [], **{key: [] for key in value_keys}}
+
+    def add(self, parent, name, **values):
+        """Append one node under the node at position `parent`; returns its position."""
+        name_id = self._name_ids.get(name)
+        if name_id is None:
+            name_id = self._name_ids[name] = len(self.names)
+            self.names.append(name)
+        self.columns["n"].append(name_id)
+        self.columns["p"].append(parent)
+        for key, value in values.items():
+            self.columns[key].append(value)
+        return len(self.columns["n"]) - 1
+
+    def document(self):
+        return {"names": self.names, **self.columns}
 
 
 def encode_tree(root):
-    """A JSON-ready form of a stored tree: a name table and parallel node arrays.
-
-    Nodes are listed parents first. `p` is each node's parent index, `-1` for children
-    of the root.
-    """
-    names, name_ids = [], {}
-    n, p, s, b = [], [], [], []
-    stack = [(-1, name, child) for name, child in root[2].items()]
-    while stack:
-        parent, name, node = stack.pop()
-        name_id = name_ids.get(name)
-        if name_id is None:
-            name_id = name_ids[name] = len(names)
-            names.append(name)
-        index = len(n)
-        n.append(name_id)
-        p.append(parent)
-        s.append(node[0])
-        b.append(node[1])
-        stack.extend((index, child_name, child) for child_name, child in node[2].items())
-    return {"names": names, "n": n, "p": p, "s": s, "b": b}
+    """A JSON-ready form of a stored tree: a `FlatTree` with self time `s` and block time `b`."""
+    flat = FlatTree("s", "b")
+    position = {id(root): -1}
+    for parent, name, node in walk(root):
+        position[id(node)] = flat.add(position[id(parent)], name, s=node.self_us, b=node.block_us)
+    return flat.document()
 
 
 def decode_tree(doc):
     """The tree stored by `encode_tree`."""
-    root = new_tree()
+    root = Node()
     names = doc["names"]
     nodes = []
     for name_id, parent, self_us, block_us in zip(doc["n"], doc["p"], doc["s"], doc["b"]):
-        node = [self_us, block_us, {}]
+        node = Node(self_us, block_us)
         owner = root if parent < 0 else nodes[parent]
-        owner[2][names[name_id]] = node
+        owner.children[names[name_id]] = node
         nodes.append(node)
     return root
 
@@ -418,20 +449,17 @@ def focus_tree(root, matches):
     tasks, thread pools) shows up as one tower per entry point. Thread groups are
     dropped.
     """
-    focused = new_tree()
+    focused = Node()
     verdicts = {}
-    stack = list(root[2].values())
+    stack = list(root.children.values())
     while stack:
         node = stack.pop()
-        for name, child in node[2].items():
+        for name, child in node.children.items():
             verdict = verdicts.get(name)
             if verdict is None:
                 verdict = verdicts[name] = bool(matches(name))
             if verdict:
-                match = focused[2].get(name)
-                if match is None:
-                    match = focused[2][name] = [0, 0, {}]
-                merge_into(match, child)
+                merge_into(focused.child(name), child)
             else:
                 stack.append(child)
     return focused
@@ -457,75 +485,43 @@ def flame_document(root, block_only=False, min_share=0.0002, top=40):
     keeps its full width. `top` lists the functions with the most self time, summed
     over every place they appear.
     """
-    index = 1 if block_only else 0
+    # Each node's time including its callees; children are summed before their parent.
     inclusive = {}
-
-    def measure(node):
-        # Iterative post-order: a deep stack must not hit Python's recursion limit.
-        order, pending = [], [node]
-        while pending:
-            current = pending.pop()
-            order.append(current)
-            pending.extend(current[2].values())
-        for current in reversed(order):
-            inclusive[id(current)] = current[index] + sum(
-                inclusive[id(child)] for child in current[2].values()
-            )
-
-    measure(root)
+    for node in reversed([root, *(node for _, _, node in walk(root))]):
+        inclusive[id(node)] = node.own_us(block_only) + sum(
+            inclusive[id(child)] for child in node.children.values()
+        )
     total = inclusive[id(root)]
     threshold = max(1, total * min_share)
 
-    names, name_ids = [], {}
-    n, p, v, s = [], [], [], []
-    self_by_name = {}
-
-    def name_id_of(name):
-        name_id = name_ids.get(name)
-        if name_id is None:
-            name_id = name_ids[name] = len(names)
-            names.append(name)
-        return name_id
-
-    def emit(parent, name, value, self_us):
-        n.append(name_id_of(name))
-        p.append(parent)
-        v.append(value)
-        s.append(self_us)
-        return len(n) - 1
-
+    flat = FlatTree("v", "s")
+    self_by_name = collections.Counter()
     stack = [(-1, root)]
     while stack:
-        parent_index, parent = stack.pop()
+        parent_position, parent = stack.pop()
         small = 0
         children = sorted(
-            parent[2].items(), key=lambda item: inclusive[id(item[1])], reverse=True
+            parent.children.items(), key=lambda item: inclusive[id(item[1])], reverse=True
         )
         for name, child in children:
             value = inclusive[id(child)]
             if value <= 0:
                 continue
-            self_by_name[name] = self_by_name.get(name, 0) + child[index]
+            self_by_name[name] += child.own_us(block_only)
             if value < threshold:
                 small += value
                 # Self time below the fold still counts toward the function totals.
-                pending = list(child[2].items())
-                while pending:
-                    inner_name, inner = pending.pop()
-                    self_by_name[inner_name] = self_by_name.get(inner_name, 0) + inner[index]
-                    pending.extend(inner[2].items())
+                for _, inner_name, inner in walk(child):
+                    self_by_name[inner_name] += inner.own_us(block_only)
                 continue
-            stack.append((emit(parent_index, name, value, child[index]), child))
+            position = flat.add(parent_position, name, v=value, s=child.own_us(block_only))
+            stack.append((position, child))
         if small:
-            emit(parent_index, SMALL_FRAMES, small, small)
+            flat.add(parent_position, SMALL_FRAMES, v=small, s=small)
 
     ranked = sorted(self_by_name.items(), key=lambda item: item[1], reverse=True)
     return {
         "total_us": total,
-        "names": names,
-        "n": n,
-        "p": p,
-        "v": v,
-        "s": s,
+        **flat.document(),
         "top": [[name, self_us] for name, self_us in ranked[:top] if self_us > 0],
     }

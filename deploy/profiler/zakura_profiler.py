@@ -19,6 +19,7 @@ import bisect
 import collections
 import gzip
 import json
+import operator
 import os
 import shutil
 import signal
@@ -146,6 +147,63 @@ def read_json_gz(path):
         return json.load(handle)
 
 
+def json_line(row):
+    return json.dumps(row, separators=(",", ":")) + "\n"
+
+
+class JsonlLog:
+    """A file of one JSON row per line: appended to, and rewritten whole to drop old rows."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def read(self):
+        rows = []
+        try:
+            with open(self.path) as handle:
+                for line in handle:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        continue  # a line cut short by a crash
+        except FileNotFoundError:
+            pass
+        return rows
+
+    def append(self, rows):
+        with open(self.path, "a") as handle:
+            handle.writelines(json_line(row) for row in rows)
+
+    def rewrite(self, rows):
+        """Replace the file's rows so a reader never sees a partial file."""
+        temporary = self.path.with_name(self.path.name + ".tmp")
+        with open(temporary, "w") as handle:
+            handle.writelines(json_line(row) for row in rows)
+        os.replace(temporary, self.path)
+
+
+class BoundedCache:
+    """Remembers the `size` most recently stored values; the oldest goes first."""
+
+    def __init__(self, size):
+        self.size = size
+        self._values = collections.OrderedDict()
+
+    def get(self, key):
+        return self._values.get(key)
+
+    def put(self, key, value):
+        """Store `value` under `key` and return it."""
+        self._values[key] = value
+        while len(self._values) > self.size:
+            self._values.popitem(last=False)
+        return value
+
+
+_window_start = operator.itemgetter("start")
+_block_time = operator.attrgetter("time")
+
+
 class Store:
     """The profile on disk: one file per window, one merged file per hour, an index.
 
@@ -157,51 +215,27 @@ class Store:
         self.root = Path(root)
         self.minutes = self.root / "min"
         self.hours = self.root / "hour"
-        self.index_path = self.root / "index.jsonl"
-        self.blocks_path = self.root / "blocks.jsonl"
-        self.stages_path = self.root / "block_stages.jsonl"
         for directory in (self.minutes, self.hours):
             directory.mkdir(parents=True, exist_ok=True)
+        self.index_log = JsonlLog(self.root / "index.jsonl")
+        self.blocks_log = JsonlLog(self.root / "blocks.jsonl")
+        self.stages_log = JsonlLog(self.root / "block_stages.jsonl")
         self._lock = threading.Lock()
-        self.windows = []
-        self.blocks = []
-        self.block_stages = []
-        self._load()
-
-    def _load(self):
-        horizon = time.time() - HOUR_RETENTION_SECONDS
-        self.windows = [w for w in self._read_lines(self.index_path) if w["end"] >= horizon]
-        self.windows.sort(key=lambda w: w["start"])
-        self.blocks = sorted(
-            tuple(b) for b in self._read_lines(self.blocks_path) if b[0] >= horizon
-        )
-        self.block_stages = self._read_lines(self.stages_path)[-MAX_STAGE_RECORDS:]
+        # Window summaries sorted by start, and `blocks.Block`s sorted by time.
+        self.windows = sorted(self.index_log.read(), key=_window_start)
+        self.blocks = sorted(blocks.Block(*row) for row in self.blocks_log.read())
+        self.block_stages = self.stages_log.read()[-MAX_STAGE_RECORDS:]
+        self._drop_older_than(time.time() - HOUR_RETENTION_SECONDS)
         # Rewrite the files without the rows that aged out.
-        self._rewrite(self.index_path, self.windows)
-        self._rewrite(self.blocks_path, self.blocks)
-        self._rewrite(self.stages_path, self.block_stages)
+        self.index_log.rewrite(self.windows)
+        self.blocks_log.rewrite(self.blocks)
+        self.stages_log.rewrite(self.block_stages)
 
-    @staticmethod
-    def _read_lines(path):
-        rows = []
-        try:
-            with open(path) as handle:
-                for line in handle:
-                    try:
-                        rows.append(json.loads(line))
-                    except ValueError:
-                        continue  # a line cut short by a crash
-        except FileNotFoundError:
-            pass
-        return rows
-
-    @staticmethod
-    def _rewrite(path, rows):
-        temporary = path.with_name(path.name + ".tmp")
-        with open(temporary, "w") as handle:
-            for row in rows:
-                handle.write(json.dumps(row, separators=(",", ":")) + "\n")
-        os.replace(temporary, path)
+    def _drop_older_than(self, horizon):
+        """Forget window summaries and block announcements from before `horizon`."""
+        with self._lock:
+            self.windows = [w for w in self.windows if w["end"] >= horizon]
+            self.blocks = [b for b in self.blocks if b.time >= horizon]
 
     def add_window(self, summary, tree):
         """Store one finished window."""
@@ -209,30 +243,25 @@ class Store:
             self.minutes / f"{int(summary['start'])}.json.gz",
             {"summary": summary, "tree": stacks.encode_tree(tree)},
         )
-        with open(self.index_path, "a") as handle:
-            handle.write(json.dumps(summary, separators=(",", ":")) + "\n")
+        self.index_log.append([summary])
         with self._lock:
             self.windows.append(summary)
 
     def add_blocks(self, announcements):
-        """Remember block announcements `(time, height, hash)` not seen before."""
+        """Remember block announcements (`blocks.Block`s) not seen before."""
         with self._lock:
-            known = {b[2] for b in self.blocks[-500:]}
-            new = [tuple(b) for b in announcements if b[2] not in known]
+            known = {b.hash for b in self.blocks[-500:]}
+            new = [blocks.Block(*b) for b in announcements if b[2] not in known]
             self.blocks.extend(new)
             self.blocks.sort()
         if new:
-            with open(self.blocks_path, "a") as handle:
-                for block in new:
-                    handle.write(json.dumps(block, separators=(",", ":")) + "\n")
+            self.blocks_log.append(new)
 
     def add_block_stages(self, records):
         """Remember the per-stage timings of blocks that just finished."""
         if not records:
             return
-        with open(self.stages_path, "a") as handle:
-            for record in records:
-                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self.stages_log.append(records)
         with self._lock:
             self.block_stages = (self.block_stages + records)[-MAX_STAGE_RECORDS:]
 
@@ -240,19 +269,22 @@ class Store:
         """The newest stage records, oldest first, each with its announcement time."""
         with self._lock:
             records = self.block_stages[-limit:]
-            announced = {block[2]: block[0] for block in self.blocks[-(limit + 500) :]}
+            announced = {block.hash: block.time for block in self.blocks[-(limit + 500) :]}
         return [{**record, "t": announced.get(record["hash"])} for record in records]
 
     def block_times(self, start, end):
+        """Announcement times in `[start, end]`, oldest first."""
         with self._lock:
-            times = [b[0] for b in self.blocks]
-        return times[bisect.bisect_left(times, start) : bisect.bisect_right(times, end)]
+            first = bisect.bisect_left(self.blocks, start, key=_block_time)
+            last = bisect.bisect_right(self.blocks, end, key=_block_time)
+            return [b.time for b in self.blocks[first:last]]
 
     def windows_between(self, start, end):
         """Summaries of the windows that started in `[start, end)`, oldest first."""
         with self._lock:
-            starts = [w["start"] for w in self.windows]
-            return self.windows[bisect.bisect_left(starts, start) : bisect.bisect_left(starts, end)]
+            first = bisect.bisect_left(self.windows, start, key=_window_start)
+            last = bisect.bisect_left(self.windows, end, key=_window_start)
+            return self.windows[first:last]
 
     def latest_end(self):
         with self._lock:
@@ -329,10 +361,7 @@ class Store:
                 break
             path.unlink(missing_ok=True)
             total -= size
-        with self._lock:
-            horizon = now - HOUR_RETENTION_SECONDS
-            self.windows = [w for w in self.windows if w["end"] >= horizon]
-            self.blocks = [b for b in self.blocks if b[0] >= horizon]
+        self._drop_older_than(now - HOUR_RETENTION_SECONDS)
 
     def size_bytes(self):
         return sum(
@@ -594,8 +623,8 @@ class Queries:
         self.store = store
         self.profiler = profiler
         self._compute = threading.Lock()
-        self._trees = collections.OrderedDict()
-        self._flames = collections.OrderedDict()
+        self._trees = BoundedCache(3)
+        self._flames = BoundedCache(48)
 
     def resolve_range(self, params):
         """`(start, end)` for a request's `range` or `from`/`to` parameters."""
@@ -617,12 +646,9 @@ class Queries:
         if not self._compute.acquire(timeout=COMPUTE_WAIT_SECONDS):
             raise TimeoutError("profile is busy")
         try:
-            tree_key = key[:2]
-            tree = self._trees.get(tree_key)
+            tree = self._trees.get(key[:2])
             if tree is None:
-                tree = self._trees[tree_key] = self.store.merged_tree(start, end)
-                while len(self._trees) > 3:
-                    self._trees.popitem(last=False)
+                tree = self._trees.put(key[:2], self.store.merged_tree(start, end))
             block_only = lens == "block"
             whole_us = stacks.total_us(tree, block_only)
             if focus:
@@ -645,11 +671,7 @@ class Queries:
                     "categories": [self.profiler.categorizer.frame(n) for n in document["names"]],
                 }
             )
-            body = json.dumps(document, separators=(",", ":")).encode()
-            self._flames[key] = body
-            while len(self._flames) > 48:
-                self._flames.popitem(last=False)
-            return body
+            return self._flames.put(key, json.dumps(document, separators=(",", ":")).encode())
         finally:
             self._compute.release()
 

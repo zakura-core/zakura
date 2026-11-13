@@ -16,7 +16,7 @@ use crate::{
 /// A list of peers that Zakura never scores or bans, and keeps connected where it can.
 ///
 /// Each entry is an IP address, such as `192.0.2.1`, an IP address and port, such as
-/// `192.0.2.1:8233` or `[2001:db8::1]:8233`, a DNS name and port, such as
+/// `192.0.2.1:8233` or `[2001:db8::1]:8233`, a DNS name, such as `peer.example.com` or
 /// `peer.example.com:8233`, or a CIDR range, such as `2001:db8::/32`.
 /// An IPv4 entry also matches the IPv4-mapped IPv6 form of the same address, and the
 /// reverse.
@@ -60,8 +60,8 @@ enum Entry {
         /// The name, in lower case.
         name: Arc<str>,
 
-        /// The port to dial.
-        port: u16,
+        /// The port to dial, if the entry gives one.
+        port: Option<u16>,
     },
 }
 
@@ -191,17 +191,17 @@ impl UnconditionalPeers {
     }
 
     /// Returns the DNS names Zakura dials to stay connected to its unconditional peers,
-    /// each with its port.
+    /// each with the port to dial: `default_port` unless the entry gives its own port.
     ///
     /// Names are in lower case, in config order, with duplicates removed.
-    pub fn dial_hosts(&self) -> Vec<(Arc<str>, u16)> {
+    pub fn dial_hosts(&self, default_port: u16) -> Vec<(Arc<str>, u16)> {
         let mut dial_hosts = Vec::new();
 
         for entry in self.entries.iter() {
             let Entry::Host { name, port } = entry else {
                 continue;
             };
-            let host = (name.clone(), *port);
+            let host = (name.clone(), port.unwrap_or(default_port));
 
             if !dial_hosts.contains(&host) {
                 dial_hosts.push(host);
@@ -256,7 +256,7 @@ impl FromIterator<IpNet> for UnconditionalPeers {
     }
 }
 
-/// Parses an IP address or a DNS name with a non-zero port, an IP address, or a CIDR
+/// Parses an IP address or a DNS name, each with an optional non-zero port, or a CIDR
 /// range.
 fn parse_entry(entry: &str) -> Option<Entry> {
     if let Ok(addr) = entry.parse::<SocketAddr>() {
@@ -279,8 +279,13 @@ fn parse_entry(entry: &str) -> Option<Entry> {
         });
     }
 
-    let (name, port) = entry.rsplit_once(':')?;
-    let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+    let (name, port) = match entry.rsplit_once(':') {
+        Some((name, port)) => {
+            let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+            (name, Some(port))
+        }
+        None => (entry, None),
+    };
 
     is_dns_name(name).then(|| Entry::Host {
         name: name.to_ascii_lowercase().into(),
@@ -335,7 +340,11 @@ fn format_entry(entry: &Entry) -> String {
         Entry::Net {
             net, port: None, ..
         } => net.to_string(),
-        Entry::Host { name, port } => format!("{name}:{port}"),
+        Entry::Host {
+            name,
+            port: Some(port),
+        } => format!("{name}:{port}"),
+        Entry::Host { name, port: None } => name.to_string(),
     }
 }
 
@@ -359,9 +368,9 @@ impl<'de> Deserialize<'de> for UnconditionalPeers {
                 parse_entry(entry).ok_or_else(|| {
                     de::Error::custom(format!(
                         "invalid network.unconditional_peers entry {entry:?}: expected an IP \
-                         address, an IP address or DNS name with a port, or a canonical CIDR \
+                         address or DNS name, with or without a port, or a canonical CIDR \
                          range without host bits, such as 192.0.2.1, 192.0.2.1:8233, \
-                         peer.example.com:8233 or 2001:db8::/32"
+                         peer.example.com, peer.example.com:8233 or 2001:db8::/32"
                     ))
                 })
             })

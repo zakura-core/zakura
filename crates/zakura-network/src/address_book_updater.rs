@@ -116,7 +116,9 @@ impl AddressBookUpdater {
                 // Two entries with different ports name the same address.
                 let unconditional_peers: std::collections::BTreeSet<_> =
                     config.unconditional_peers.iter().collect();
-                let unconditional_peer_names = config.unconditional_peers.dial_hosts();
+                let unconditional_peer_names = config
+                    .unconditional_peers
+                    .dial_hosts(config.network.default_port());
                 info!(
                     ?unconditional_peers,
                     ?unconditional_peer_names,

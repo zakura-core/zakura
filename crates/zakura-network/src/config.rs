@@ -369,9 +369,9 @@ pub struct Config {
     /// Peers that Zakura never scores or bans, and keeps connected where it can.
     ///
     /// Each entry is an IP address, such as `"192.0.2.1"`, an IP address and port, such
-    /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, a DNS name and port, such as
-    /// `"peer.example.com:8233"`, or a CIDR range, such as `"2001:db8::/32"`. CIDR ranges
-    /// with host bits set are rejected, and a DNS name needs a port.
+    /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, a DNS name, such as
+    /// `"peer.example.com"` or `"peer.example.com:8233"`, or a CIDR range, such as
+    /// `"2001:db8::/32"`. CIDR ranges with host bits set are rejected.
     /// Use this setting for peers you operate, such as your own nodes, miners, or
     /// sidecars.
     ///
@@ -382,7 +382,7 @@ pub struct Config {
     ///
     /// Zakura also dials every entry that names one address or one DNS name, and dials
     /// it again whenever no connection to that peer is open, in either direction. An IP
-    /// address without a port is dialed on the network's default port. A CIDR range is
+    /// address or DNS name without a port is dialed on the network's default port. A CIDR range is
     /// only dialed when it covers a single address, such as `"192.0.2.1/32"`. A dial to
     /// a peer that accepts no connections fails quietly, and each failure doubles the
     /// delay before the next dial, up to ten minutes. Zakura keeps at most
@@ -394,7 +394,7 @@ pub struct Config {
     /// whose name moves to a new address. The exemption covers the addresses the name
     /// resolved to in the last lookup that worked, and Zakura lifts any ban on them. It
     /// does not look a name up while that peer is connected. A name with several
-    /// addresses is dialed at one of them per attempt, in turn. When a lookup fails,
+    /// addresses is dialed at the first one in the answer. When a lookup fails,
     /// Zakura dials the addresses of the last lookup that worked. A name that resolves only
     /// to addresses Zakura cannot dial, such as this node's own, has no addresses until it
     /// resolves to one it can.

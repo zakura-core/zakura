@@ -62,12 +62,6 @@ struct RedialState {
     /// dialable addresses that its name resolved to at the last lookup that worked.
     addrs: Vec<PeerSocketAddr>,
 
-    /// The addresses that can be dialed, in the order of their turns. The address
-    /// that was dialed goes to the back, and an address that a lookup adds waits
-    /// behind the others. So no sequence of lookup answers can keep an address that
-    /// stays in them from being dialed.
-    dial_queue: Vec<PeerSocketAddr>,
-
     /// The earliest time of the next attempt.
     next_attempt: Instant,
 
@@ -98,8 +92,8 @@ impl RedialState {
     /// A fixed address needs none when a dial to it would add nothing, see
     /// [`is_connected`]. A name needs none only when one of its addresses has a
     /// connection, see [`has_connection`]. An address whose IP is merely full does not
-    /// count for a name: its other addresses can still be dialed, and its next lookup
-    /// can find an address that is not full.
+    /// count for a name: a later address can still be dialed, and its next lookup can
+    /// find an address that is not full.
     fn is_connected(
         &self,
         connections: &[(PeerSocketAddr, bool)],
@@ -149,7 +143,7 @@ pub(super) fn unconditional_peer_dial_targets(
         .map(DialTarget::Addr);
     let hosts = config
         .unconditional_peers
-        .dial_hosts()
+        .dial_hosts(config.network.default_port())
         .into_iter()
         .map(|(name, port)| DialTarget::Host(name, port));
 
@@ -419,8 +413,8 @@ fn log_failed_attempt(peer: &RedialState, error: &BoxError, expose_peer_addresse
 /// [`BannedIps::exempt_and_lift`]. They replace the addresses of
 /// the last lookup. When a lookup fails, Zakura dials the addresses of the last one that
 /// worked. A lookup that works but gives no address Zakura can dial leaves the name with
-/// none, so its old addresses stop being exempt. Successive dials go through a name's
-/// addresses in turn, and skip an address whose IP is full.
+/// none, so its old addresses stop being exempt. Each attempt dials the first address of
+/// the answer whose IP is not full.
 ///
 /// An attempt that does not lead to a lasting connection doubles the peer's redial
 /// delay, from [`constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY`] up to
@@ -503,7 +497,6 @@ where
                 DialTarget::Host(..) => Vec::new(),
             },
             target,
-            dial_queue: Vec::new(),
             next_attempt: start,
             attempts: 0,
             is_attempting: false,
@@ -701,25 +694,16 @@ where
                         continue;
                     }
 
-                    // The peer set would drop a connection to a full IP, so an address
-                    // on one loses its turn. A dial in flight counts, see
+                    // The peer set would drop a connection to a full IP, so skip an
+                    // address on one. A dial in flight counts, see
                     // `connections_with_dials_in_flight`.
-                    let candidates: Vec<PeerSocketAddr> = peer
+                    let addr = peer
                         .addrs
                         .iter()
                         .copied()
-                        .filter(|addr| !is_ip_full(*addr, &connections, max_connections_per_ip))
-                        .collect();
+                        .find(|addr| !is_ip_full(*addr, &connections, max_connections_per_ip));
 
-                    // Keep the turns of the addresses that stay, see `dial_queue`.
-                    peer.dial_queue.retain(|addr| candidates.contains(addr));
-                    for addr in candidates {
-                        if !peer.dial_queue.contains(&addr) {
-                            peer.dial_queue.push(addr);
-                        }
-                    }
-
-                    let Some(addr) = peer.dial_queue.first().copied() else {
+                    let Some(addr) = addr else {
                         peer.is_attempting = false;
                         let error = "no address of the name can be dialed: the last \
                                      answer that worked had none, or each is on an IP \
@@ -728,7 +712,6 @@ where
                         log_failed_attempt(peer, &error, expose_peer_addresses);
                         continue;
                     };
-                    peer.dial_queue.rotate_left(1);
                     peer.dialing = Some(addr);
                     events.push(start_dial(index, addr));
 

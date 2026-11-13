@@ -1895,8 +1895,8 @@ fn unconditional_peers_parse_ports_and_roundtrip() {
     assert!(!config.unconditional_peers.contains(ip("192.0.2.2")));
 }
 
-/// An entry can be a DNS name with a port. Names load in lower case, are dialed, and
-/// match no address until they are resolved.
+/// An entry can be a DNS name, with or without a port. Names load in lower case, are
+/// dialed, and match no address until they are resolved.
 #[test]
 fn unconditional_peers_parse_dns_names_and_roundtrip() {
     let config: Config = toml::from_str(
@@ -1923,7 +1923,7 @@ fn unconditional_peers_parse_dns_names_and_roundtrip() {
 
     let peers = config.unconditional_peers;
     assert_eq!(
-        peers.dial_hosts(),
+        peers.dial_hosts(8233),
         vec![
             ("peer.example.com".into(), 8233),
             ("zakura-peer-1".into(), 18233),
@@ -1964,7 +1964,7 @@ fn unconditional_peers_accept_an_absolute_dns_name() {
     let config: Config = toml::from_str("unconditional_peers = ['Pool-Peer.Example.:8233']")
         .expect("an absolute DNS name with a port parses");
     assert_eq!(
-        config.unconditional_peers.dial_hosts(),
+        config.unconditional_peers.dial_hosts(18233),
         vec![("pool-peer.example.".into(), 8233)],
     );
 
@@ -2126,8 +2126,7 @@ fn unconditional_peer_dials_raise_the_total_connection_limit() {
 fn unconditional_peers_reject_invalid_entries() {
     for entry in [
         "not an ip",
-        // A DNS name needs a port.
-        "zakura.example.com",
+        "zakura.example.com:",
         "zakura.example.com:0",
         "zakura.example.com:65536",
         // These are not DNS names.
@@ -2140,6 +2139,7 @@ fn unconditional_peers_reject_invalid_entries() {
         "zakura_peer.example.com:8233",
         "zakura peer.example.com:8233",
         // A mistyped IPv4 address is not a DNS name either.
+        "192.0.2.300",
         "192.0.2.300:8233",
         "192.0.2.300.:8233",
         "zakura.example.123:8233",
@@ -2587,4 +2587,29 @@ fn invalid_advert_fanout_config_is_rejected() {
             .to_string();
         assert!(error.contains(field), "{config:?} gave {error}");
     }
+}
+
+/// A DNS name without a port is dialed on the default port, and serializes without one.
+#[test]
+fn unconditional_peers_dial_a_dns_name_without_a_port_on_the_default_port() {
+    let config: Config =
+        toml::from_str("unconditional_peers = ['Peer.Example.com', 'peer.example.com:8234']")
+            .expect("a DNS name without a port parses");
+    assert_eq!(
+        config.unconditional_peers.dial_hosts(18233),
+        vec![
+            ("peer.example.com".into(), 18233),
+            ("peer.example.com".into(), 8234),
+        ],
+    );
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    assert!(
+        serialized
+            .contains(r#"unconditional_peers = ["peer.example.com", "peer.example.com:8234"]"#),
+        "a name without a port serializes without one:\n{serialized}"
+    );
+
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip.unconditional_peers, config.unconditional_peers);
 }

@@ -1204,10 +1204,10 @@ async fn unconditional_peer_name_answer_with_no_dialable_address_replaces_the_ol
     assert!(dialer.unconditional_peers.contains(ip_addr("192.0.2.2")));
 }
 
-/// Successive dials go through a name's addresses in turn, so one dead address does not
-/// hide the others. Every address is exempt.
+/// Every attempt dials the first address of a name's answer. Every address in the
+/// answer is exempt.
 #[tokio::test(start_paused = true)]
-async fn unconditional_peer_name_addresses_are_dialed_in_turn() {
+async fn unconditional_peer_name_is_dialed_at_its_first_address() {
     let _init_guard = zakura_test::init();
 
     let config: Config = toml::from_str("unconditional_peers = ['peer.example.com:8233']").unwrap();
@@ -1230,9 +1230,9 @@ async fn unconditional_peer_name_addresses_are_dialed_in_turn() {
         peer_addr("[2001:db8::1]:8233"),
     ];
     let dial_addrs = dialer.dial_addrs();
-    assert!(dial_addrs.len() >= 2 * expected.len());
+    assert!(dial_addrs.len() >= 2);
     for (dial, addr) in dial_addrs.iter().enumerate() {
-        assert_eq!(*addr, expected[dial % expected.len()], "dial {dial}");
+        assert_eq!(*addr, expected[0], "dial {dial}");
     }
 
     for addr in expected {
@@ -1342,8 +1342,8 @@ async fn unconditional_peer_name_address_is_not_banned_while_lookups_fail() {
 }
 
 /// A lookup can return the same addresses in a new order every time, as round-robin
-/// DNS does. Zakura still dials each address before it dials one again, so a dead
-/// address never hides a live one.
+/// DNS does. Zakura dials the first address of each answer, so it reaches a live
+/// address once an answer starts with one.
 #[tokio::test(start_paused = true)]
 async fn unconditional_peer_name_reaches_a_live_address_when_the_answer_order_rotates() {
     let _init_guard = zakura_test::init();
@@ -1365,40 +1365,12 @@ async fn unconditional_peer_name_reaches_a_live_address_when_the_answer_order_ro
     assert_eq!(
         dialer.dial_addrs(),
         vec![peer_addr("192.0.2.1:8233"), peer_addr("192.0.2.2:8233")],
-        "the second dial goes to the address that the first dial left out",
+        "the second dial goes to the first address of the second answer",
     );
 }
 
-/// An address that stays in a name's answers keeps its turn while other addresses come
-/// and go. A new address waits behind it, so answers that keep swapping one dead
-/// address for another cannot hold a live address back.
-#[tokio::test(start_paused = true)]
-async fn unconditional_peer_name_reaches_a_live_address_when_other_addresses_change() {
-    let _init_guard = zakura_test::init();
-
-    let config: Config = toml::from_str("unconditional_peers = ['peer.example.com:8233']").unwrap();
-    let dialer = spawn_unconditional_peer_dialer(
-        config,
-        PeerRegistry::default(),
-        UnconditionalPeerDial::ConnectAndStayOpen,
-    );
-    dialer.set_resolved_cycle(
-        "peer.example.com",
-        &[&["192.0.2.1", "192.0.2.3"], &["192.0.2.2", "192.0.2.3"]],
-    );
-    dialer.set_dead_ips(&["192.0.2.1", "192.0.2.2"]);
-
-    tokio::time::sleep(Duration::from_secs(10 * 60)).await;
-
-    assert_eq!(
-        dialer.dial_addrs(),
-        vec![peer_addr("192.0.2.1:8233"), peer_addr("192.0.2.3:8233")],
-        "the second dial goes to the address that was in both answers",
-    );
-}
-
-/// When a name's answer changes, Zakura dials each address of the new answer once
-/// before it dials one again, and only the addresses of the latest answer stay exempt.
+/// When a name's answer changes, Zakura dials the first address of the new answer, and
+/// only the addresses of the latest answer stay exempt.
 #[tokio::test(start_paused = true)]
 async fn unconditional_peer_name_dials_follow_a_changed_answer() {
     let _init_guard = zakura_test::init();
@@ -1418,17 +1390,12 @@ async fn unconditional_peer_name_dials_follow_a_changed_answer() {
 
     tokio::time::sleep(Duration::from_secs(10 * 60)).await;
 
-    let expected = [
-        peer_addr("192.0.2.2:8233"),
-        peer_addr("192.0.2.3:8233"),
-        peer_addr("192.0.2.4:8233"),
-    ];
     let dial_addrs = dialer.dial_addrs();
-    assert!(dial_addrs.len() > 2 * expected.len());
+    assert!(dial_addrs.len() > 2);
     for (dial, addr) in dial_addrs.iter().skip(1).enumerate() {
         assert_eq!(
             *addr,
-            expected[dial % expected.len()],
+            peer_addr("192.0.2.2:8233"),
             "dial {dial} of the new answer"
         );
     }
@@ -1447,7 +1414,7 @@ async fn unconditional_peer_name_dials_follow_a_changed_answer() {
 }
 
 /// An address whose IP is full does not count as a connection to a name. Zakura keeps
-/// looking the name up, and dials its other addresses.
+/// looking the name up, and dials its first address on an IP that is not full.
 #[tokio::test(start_paused = true)]
 async fn unconditional_peer_name_dials_past_an_address_on_a_full_ip() {
     let _init_guard = zakura_test::init();
@@ -1511,10 +1478,7 @@ async fn unconditional_peer_name_addresses_are_limited_and_exclude_this_node() {
         &[&unconditional_peer_test_listen_addr().ip().to_string()],
     );
 
-    // Long enough to dial each taken address once, even at the maximum delay.
-    let taken_addrs = u32::try_from(constants::MAX_UNCONDITIONAL_PEER_RESOLVED_ADDRS)
-        .expect("the address limit is small");
-    tokio::time::sleep(constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY * taken_addrs).await;
+    tokio::time::sleep(constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY * 2).await;
 
     let last_taken = format!(
         "192.0.2.{}",
@@ -1528,7 +1492,7 @@ async fn unconditional_peer_name_addresses_are_limited_and_exclude_this_node() {
     assert!(!dialer.unconditional_peers.contains(ip_addr(&first_dropped)));
 
     let dial_addrs = dialer.dial_addrs();
-    assert!(dial_addrs.contains(&peer_addr(&format!("{last_taken}:8233"))));
+    assert!(dial_addrs.contains(&peer_addr("192.0.2.1:8233")));
     assert!(!dial_addrs.contains(&peer_addr(&format!("{first_dropped}:8233"))));
 
     assert!(

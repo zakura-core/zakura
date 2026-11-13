@@ -1610,9 +1610,8 @@ where
                 .downcast_ref::<peer::HandshakeError>()
                 .is_some_and(peer::HandshakeError::is_neutral_disconnect);
 
-            // Silence verbose info logs in production, but keep logs if the number of connections is low.
-            // Also silence them completely in tests.
-            if outbound_connections <= MAX_CONNECTIONS_FOR_INFO_LOG && !cfg!(test) {
+            // Silence verbose info logs, but keep logs if the number of connections is low.
+            if outbound_connections <= MAX_CONNECTIONS_FOR_INFO_LOG {
                 info!(?error, peer = %addr_label, "failed to make outbound connection to peer");
             } else {
                 debug!(?error, peer = %addr_label, "failed to make outbound connection to peer");

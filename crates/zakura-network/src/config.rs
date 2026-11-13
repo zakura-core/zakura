@@ -697,11 +697,7 @@ impl Config {
             Ok(Ok(ip_addrs)) => {
                 let ip_addrs: Vec<PeerSocketAddr> = ip_addrs.map(canonical_peer_addr).collect();
 
-                // This log is needed for user debugging, but it's annoying during tests.
-                #[cfg(not(test))]
                 info!(seed = ?host, remote_ip_count = ?ip_addrs.len(), "resolved seed peer IP addresses");
-                #[cfg(test)]
-                debug!(seed = ?host, remote_ip_count = ?ip_addrs.len(), "resolved seed peer IP addresses");
 
                 for ip in &ip_addrs {
                     // Count each initial peer, recording the seed config and resolved IP address.
@@ -776,15 +772,7 @@ impl Config {
             })
             .collect();
 
-        // This log is needed for user debugging, but it's annoying during tests.
-        #[cfg(not(test))]
         info!(
-            cached_ip_count = ?peer_list.len(),
-            ?peer_cache_file,
-            "loaded cached peer IP addresses"
-        );
-        #[cfg(test)]
-        debug!(
             cached_ip_count = ?peer_list.len(),
             ?peer_cache_file,
             "loaded cached peer IP addresses"
@@ -816,6 +804,7 @@ impl Config {
     ///
     /// Atomic writes avoid corrupting the cache if Zakura panics or crashes, or if multiple Zakura
     /// instances try to read and write the same cache file.
+    #[cfg(test)]
     pub async fn update_peer_cache(&self, peer_list: IndexSet<PeerSocketAddr>) -> io::Result<()> {
         let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(&self.network) else {
             return Ok(());

@@ -930,43 +930,6 @@ impl AddressBook {
         updated
     }
 
-    /// Removes the entry with `addr`, returning it if it exists
-    ///
-    /// # Note
-    ///
-    /// All address removals should go through `take`, so that the address
-    /// book metrics are accurate.
-    #[allow(dead_code)]
-    fn take(&mut self, removed_addr: PeerSocketAddr) -> Option<MetaAddr> {
-        let _guard = self.span.enter();
-
-        let chrono_now = Utc::now();
-
-        trace!(
-            ?removed_addr,
-            total_peers = self.peers.len(),
-            recent_peers = self.recently_live_peers(chrono_now).len(),
-        );
-
-        if let Some(entry) = self.peers.remove(&removed_addr) {
-            self.address_metrics_dirty = true;
-
-            // Check if this surplus peer's addr matches that in `most_recent_by_ip`
-            // for this the surplus peer's ip to remove it there as well.
-            if self.should_remove_most_recent_by_ip(entry.addr) {
-                if let Some(most_recent_by_ip) = self.most_recent_by_ip.as_mut() {
-                    most_recent_by_ip.remove(&entry.addr.ip());
-                }
-            }
-
-            std::mem::drop(_guard);
-            self.publish_metrics();
-            Some(entry)
-        } else {
-            None
-        }
-    }
-
     /// Return an iterator over all peers.
     ///
     /// Returns peers in reconnection attempt order, including recently connected peers.

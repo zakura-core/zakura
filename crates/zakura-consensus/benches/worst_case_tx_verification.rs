@@ -14,7 +14,7 @@
 //! baked into the case table:
 //!
 //! ```sh
-//! ZAKURA_BENCH_RAYON_THREADS=1 cargo bench -p zakura-consensus --bench worst_case_tx_verification
+//! ZAKURA_BENCH_RAYON_THREADS=1 cargo bench -p zakura-consensus --bench worst_case_tx_verification --features internal-bench
 //! ```
 //!
 //! This matters here specifically: all Zakura proof verification runs on the global rayon

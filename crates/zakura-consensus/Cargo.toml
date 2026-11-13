@@ -119,6 +119,7 @@ harness = false
 [[bench]]
 name = "worst_case_tx_verification"
 harness = false
+required-features = ["internal-bench"]
 
 [[bench]]
 name = "state_read_routing"

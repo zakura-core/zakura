@@ -456,6 +456,7 @@ impl ValueBalance<NonNegative> {
     /// the chain value pools.
     ///
     /// [ZIP 234]: https://zips.z.cash/zip-0234
+    #[cfg(test)]
     pub fn money_reserve(&self) -> Amount<NonNegative> {
         let max_money =
             Amount::<NonNegative>::try_from(MAX_MONEY).expect("MAX_MONEY is a valid amount");

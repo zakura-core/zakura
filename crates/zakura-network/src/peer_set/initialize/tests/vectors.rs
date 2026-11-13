@@ -2422,10 +2422,9 @@ async fn listener_lets_unconditional_peers_use_free_public_slots() {
         return;
     };
 
-    let mut open_connections = Vec::new();
-    while let Some(connection) = listener.offer(LISTENER_UNCONDITIONAL_IP).await {
-        open_connections.push(connection);
-    }
+    let open_connections = listener
+        .offer_until_refused(LISTENER_UNCONDITIONAL_IP)
+        .await;
     assert_eq!(
         open_connections.len(),
         listener.inbound_limit + 1,
@@ -2449,10 +2448,7 @@ async fn listener_keeps_an_unconditional_peer_slot_after_its_connection_closes()
         return;
     };
 
-    let mut public_connections = Vec::new();
-    while let Some(connection) = listener.offer(LISTENER_PUBLIC_IP).await {
-        public_connections.push(connection);
-    }
+    let public_connections = listener.offer_until_refused(LISTENER_PUBLIC_IP).await;
     assert_eq!(public_connections.len(), listener.inbound_limit);
 
     let own_slot_connection = listener
@@ -3978,6 +3974,23 @@ impl UnconditionalPeerListener {
         })
         .await
         .expect("the listener accepts or closes every connection")
+    }
+
+    /// Offers connections from `source_ip` until the listener closes one, and returns the
+    /// connections it accepted, see [`offer`](Self::offer).
+    ///
+    /// Gives up after more connections than the listener can hold from one address, so a
+    /// listener that accepts every connection fails the test instead of looping forever.
+    async fn offer_until_refused(&mut self, source_ip: IpAddr) -> Vec<AcceptedInboundConnection> {
+        let mut accepted = Vec::new();
+        for _ in 0..self.inbound_limit * 2 + 8 {
+            match self.offer(source_ip).await {
+                Some(connection) => accepted.push(connection),
+                None => return accepted,
+            }
+        }
+
+        panic!("the listener accepted every connection from {source_ip}");
     }
 
     /// Stops the listener, and checks that it was still running without an error.

@@ -32,14 +32,8 @@ name: Semver checks
 on:
   pull_request:
     branches: [main, "feat/**", "split/**", "adam/**", "release/**"]
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - .github/workflows/semver-checks.yml
-      - .github/workflows/scripts/affected_semver_packages.py
-      - .github/workflows/scripts/patch_registry_for_semver.sh
-      - .github/workflows/scripts/test_affected_semver_packages.py
+    # Required checks must report even when the PR only changes documentation.
+    # Package selection skips the heavy jobs when no library is affected.
   push:
     branches: [main]
     paths:

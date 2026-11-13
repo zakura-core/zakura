@@ -1136,9 +1136,9 @@ impl Outstanding {
     fn members<'a>(&self, row: &'static str, peers: impl Iterator<Item = &'a ZakuraPeerId>) {
         let set: BTreeSet<String> = peers.map(super::tap::peer).collect();
         self.evidence.change(|store| {
-            let history = store.members.entry(row).or_default();
-            if history.last() != Some(&set) {
-                history.push(set);
+            let kept = store.members.entry(row).or_default();
+            if kept.last() != Some(&set) {
+                kept.push(set);
             }
         });
     }

@@ -361,6 +361,9 @@ name = "header_sync_wire"
 smoke-secs = 60
 timeout-secs = 1800
 
+# `handshake/wire` runs the node's control handshake behind its real
+# transport on simulated QUIC. Its 32-byte prefix picks one of fifteen
+# scenario families, and the rest of the input picks the schedule.
 [[target]]
 package = "sim"
 name = "handshake_wire"
@@ -368,6 +371,8 @@ smoke-secs = 60
 args = ["-max_len=4096", "-len_control=0"]
 timeout-secs = 1800
 
+# `handshake/counts` drives the production admission machine. Each
+# three-byte operation picks an action, an owner slot and an address.
 [[target]]
 package = "sim"
 name = "handshake_counts"

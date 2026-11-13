@@ -159,6 +159,14 @@ class JoinTests(unittest.TestCase):
         self.assertEqual(self.join(**{"us-0": report(unheard)})["blocks"][0]["nodes"]["us-0"]["from"], "unknown")
         self.assertEqual(self.join(**{"us-0": report(heard)})["blocks"][0]["nodes"]["us-0"]["from"], "outside")
 
+    def test_a_hop_starts_at_the_sender_s_first_word_of_the_block(self):
+        # us-0 announced the header to us-east-0 at 10 ms, before it had the block.
+        us_0 = self.reports["us-0"]["blocks"][0]
+        peers = {"name:us-east-0": {**us_0["peers"]["name:us-east-0"], "announced": START + 0.010}}
+        (block,) = self.join(**{"us-0": report({**us_0, "peers": peers})})["blocks"]
+        hop = next(hop for hop in block["hops"] if hop["from"] == "us-0")
+        self.assertEqual((hop["told"], hop["heard"]), (10.0, 58.0))
+
     def test_a_malformed_record_costs_only_that_block_on_that_node(self):
         good = self.reports["us-0"]["blocks"][0]
         malformed = [

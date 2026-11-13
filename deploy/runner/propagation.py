@@ -32,9 +32,12 @@ INTERVALS = (
     ("commit", "queued", "tip"),
     ("tell_peers", "tip", "told"),
 )
-# The steps of one hop, the first three on the sender's clock and the last on the
-# receiver's.
-HOP_STEPS = ("told", "asked", "sent")
+# The steps of one hop after the first word of the block, on the sender's clock; the
+# receiver's "heard" is added on its own clock.
+HOP_STEPS = ("asked", "sent")
+# What a sender may have said first about a block: a Zakura node announces the header
+# ("announced") before it has the block and says it has the block ("told") after.
+FIRST_WORD_STEPS = ("announced", "told")
 NAMED_PEER = "name:"
 # Where a node first heard of a block when it was not one of ours: a peer outside the
 # fleet, or nowhere the node recorded (no announcement of the block was written).
@@ -232,9 +235,12 @@ def joined_block(block_hash, records):
     hops = []
     for sender, record in records.items():
         for receiver, steps in record["peers"].items():
-            if "told" not in steps:
+            said = [steps[step] for step in FIRST_WORD_STEPS if step in steps]
+            if not said:
                 continue
-            hop = {"from": sender, "to": receiver}
+            # "told" is the sender's first word of the block to the receiver, so the hop
+            # compares like with like: that word and the receiver hearing it.
+            hop = {"from": sender, "to": receiver, "told": offset(min(said))}
             hop.update({step: offset(steps[step]) for step in HOP_STEPS if step in steps})
             heard = records.get(receiver, {}).get("peers", {}).get(sender, {}).get("heard")
             if heard is not None:

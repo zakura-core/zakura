@@ -913,6 +913,23 @@ class TraceFollowingTests(unittest.TestCase):
         )
         self.assertEqual(record["unnamed"], {"heard": 1, "told": 1})
 
+    def test_a_header_announcement_before_the_tip_is_kept_apart_from_telling(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        started = 1794528928.0
+        self.append(
+            "header_sync",
+            # The node announces the block's header to peer:bbbb before it has the block.
+            trace_row("header_status_sent", 400_000, peer="peer:bbbb", selected_tip_hash=BLOCK_HASH),
+        )
+        self.append("chain_tip", tip_row(1_000_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        self.append("block_sync", trace_row("block_status_sent", 1_002_000, peer="peer:bbbb", height=10))
+        self.append("chain_tip", tip_row(9_500_000, height=12, block_hash="12" * 32))
+        record = follower.poll()[0]
+
+        self.assertEqual(record["peers"]["peer:bbbb"], {"announced": started + 0.4, "told": started + 1.002})
+        # The node's own first telling after its tip is still the block status.
+        self.assertEqual(record["wall"]["told"], started + 1.002)
+
     def test_a_zakura_peer_is_kept_under_the_label_the_node_writes(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
         started = 1794528928.0

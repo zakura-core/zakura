@@ -158,6 +158,7 @@ MOVED_SUFFIX = ".1"
 TRACE_TABLES = {
     "header_sync": (
         "header_request_sent", "header_response_received", "header_target_admitted", "header_status_received",
+        "header_status_sent",
     ),
     "block_sync": ("block_get_blocks_sent", "block_body_received", "block_body_submitted", "block_status_sent"),
     "legacy_peer_request": ("block_request_finish", "find_blocks_finish"),
@@ -167,12 +168,16 @@ TRACE_TABLES = {
     "chain_tip": ("tip_published",),
 }
 # Rows that say a peer and this node exchanged word of a block, and which step each is:
-# the peer told us ("heard"), we told the peer ("told"), the peer asked us for the block
-# ("asked"), or we finished sending it ("sent").
+# the peer told us ("heard"), we announced the block's header to the peer before having
+# the block ("announced"), we told the peer we had the block ("told"), the peer asked us
+# for it ("asked"), or we finished sending it ("sent").
 PEER_STEPS = {
     "block_inv_received": "heard",
     "header_status_received": "heard",
     "block_inv_sent": "told",
+    # A Zakura node announces a new header tip before it has the block, so the first
+    # thing a peer hears of a block is often this header status, not the block status.
+    "header_status_sent": "announced",
     "block_status_sent": "told",
     "block_getdata_received": "asked",
     "block_sent": "sent",
@@ -367,8 +372,9 @@ def cluster_times(events, block):
       had its bytes, queued it for the writer, published it as its tip and first told a
       peer. A point that was not recorded is missing.
     - `heard_from`: the peer it was first heard from, `None` for an unnamed legacy peer.
-    - `peers`: for each peer that can be told apart, when it told us, we told it, it
-      asked us and we finished sending.
+    - `peers`: for each peer that can be told apart, when it told us, we announced the
+      block's header to it, we told it we had the block, it asked us and we finished
+      sending.
     - `unnamed`: how many announcements came from and went to the other legacy peers.
 
     Empty when the run's start time cannot be read from its trace id.
@@ -480,8 +486,8 @@ class BlockStages:
             # The request names the tip it is fetching toward at the end of its owner.
             found = HASH_IN_TEXT.findall(str(row.get("request_owner", "")))
             block_hash = found[-1] if found else None
-        if event == "header_status_received":
-            # A Zakura peer telling us its tip: the row names the tip, not a block of ours.
+        if event in ("header_status_received", "header_status_sent"):
+            # A Zakura header status names the sender's tip, not a block of ours.
             block_hash, height = row.get("selected_tip_hash"), None
         for key, table in ((block_hash, self._by_hash), (height, self._by_height)):
             if key is None:

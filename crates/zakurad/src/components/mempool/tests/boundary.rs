@@ -1206,18 +1206,22 @@ async fn a_mined_id_frees_its_fetch_slot(mode: Mode) {
         .commit(zakura_test::vectors::BLOCK_MAINNET_2_BYTES.as_slice())
         .await;
 
-    // The mined id's fetch is gone, so the peer has room for one more.
-    let next = unknown_id(9);
+    // The mined id's fetch is gone, so the peer has room for one more. Its
+    // slot frees a moment after the block, so each try offers a fresh id: a
+    // try that came too early leaves its id queued by this node instead.
     let mut taken = false;
-    for _ in 0..(ANSWER_WAIT.as_millis() / 50) {
+    for attempt in 0..(ANSWER_WAIT.as_millis() / 50) {
+        let next = unknown_id(9 + usize::try_from(attempt).expect("few attempts"));
         let request = Request::QueueFromPeer {
             transactions: vec![Gossip::from(next)],
             source: legacy_peer(1),
         };
         harness.ask(request).await;
-        if harness.queue_one(next).await.unbox_mempool_error() == MempoolError::AlreadyQueued {
-            taken = true;
-            break;
+        if let Err(error) = harness.queue_one(next).await {
+            if error.unbox_mempool_error() == MempoolError::AlreadyQueued {
+                taken = true;
+                break;
+            }
         }
         time::sleep(Duration::from_millis(50)).await;
     }

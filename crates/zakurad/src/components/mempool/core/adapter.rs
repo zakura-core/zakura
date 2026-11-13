@@ -329,7 +329,23 @@ async fn queue(
     // share of waiters.
     let (answer, receiver) = oneshot::channel();
     tokio::spawn(async move {
-        let result = bring_in(&shared, reservation, item, from).await;
+        // Today's download task has one deadline, `RATE_LIMIT_DELAY`, for the
+        // fetch and the verification together, and its peer's slot is free
+        // once it ends. So does this. A body the core already holds stays
+        // under the core's own deadlines and node-wide slot after it.
+        let result = match tokio::time::timeout(
+            RATE_LIMIT_DELAY,
+            bring_in(&shared, reservation, item, from),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                metrics::counter!("mempool.failed.verify.tasks.total", "reason" => "timeout")
+                    .increment(1);
+                Err("timeout waiting for verification result".into())
+            }
+        };
         drop(slot);
         let _ = answer.send(result);
     });
@@ -450,7 +466,7 @@ async fn bring_in(
                 .clone();
             let cancel = reservation.cancellation();
             let fetched = tokio::select! {
-                fetched = fetch_within(read_state, shared.outbound.clone(), tx_id, source) => fetched,
+                fetched = fetch_unless_mined(read_state, shared.outbound.clone(), tx_id, source) => fetched,
                 () = cancel.cancelled() => {
                     // A block mined it while it was fetched. Dropping the
                     // reservation frees its slot, as today's pool cancels
@@ -586,16 +602,14 @@ fn second_stage(tx_id: UnminedTxId, verdict: Verdict) -> Result<(), BoxError> {
     }
 }
 
-/// Fetches `tx_id`, unless the best chain already holds it, within today's
-/// whole-task deadline, [`RATE_LIMIT_DELAY`].
+/// Fetches `tx_id`, unless the best chain already holds it.
 ///
 /// Today's downloader checks the chain before it asks the network, so an id
 /// that is already mined is answered `InState` without a download. The
-/// service's own timeout starts only once the network is ready, and the
-/// caller's reservation holds a core slot the whole time, so the whole fetch
-/// has the deadline today's download task has, and a fetch that misses it
-/// fails, which frees its slot.
-async fn fetch_within(
+/// service's own timeout starts only once the network is ready, so the whole
+/// task's deadline in [`queue`] is what bounds a fetch from a network that
+/// never gets ready.
+async fn fetch_unless_mined(
     read_state: ReadState,
     outbound: Timeout<Outbound>,
     tx_id: UnminedTxId,
@@ -607,15 +621,8 @@ async fn fetch_within(
         transaction_in_best_chain(read_state, tx_id).boxed();
     let download: futures::future::BoxFuture<'static, _> =
         fetch_transaction(outbound, tx_id, source).boxed();
-    let fetch: futures::future::BoxFuture<'static, _> = async move {
-        lookup.await?;
-        download.await
-    }
-    .boxed();
-    match tokio::time::timeout(RATE_LIMIT_DELAY, fetch).await {
-        Ok(fetched) => fetched.map_err(BoxError::from),
-        Err(elapsed) => Err(BoxError::from(elapsed)),
-    }
+    lookup.await?;
+    download.await.map_err(BoxError::from)
 }
 
 /// Today's pool's error for the core's rejection `error`. Callers of the
@@ -757,7 +764,7 @@ mod tests {
             TRANSACTION_DOWNLOAD_TIMEOUT,
         );
         let started = tokio::time::Instant::now();
-        let fetched = fetch_within(chain_holding(Some(mined)), outbound, mined, None).await;
+        let fetched = fetch_unless_mined(chain_holding(Some(mined)), outbound, mined, None).await;
         let error = fetched.expect_err("a mined id is not fetched");
         assert!(matches!(
             error.downcast_ref::<TransactionDownloadVerifyError>(),
@@ -766,28 +773,129 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::ZERO, "no wait for the network");
     }
 
-    /// A fetch from a network that never becomes ready fails at its
-    /// deadline, so the reservation it holds is freed.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_fetch_from_an_unready_network_fails_at_its_deadline() {
+    /// The adapter on `handle`, with a network that is never ready, an
+    /// empty chain and no exempt peers.
+    fn adapter_on(handle: PoolHandle) -> CoreMempool {
         let outbound = Timeout::new(
             BoxCloneSyncService::new(NeverReady),
             TRANSACTION_DOWNLOAD_TIMEOUT,
         );
-        let started = tokio::time::Instant::now();
-        let fetched = fetch_within(
-            chain_holding(None),
+        CoreMempool::new(
+            handle,
             outbound,
-            UnminedTxId::Legacy(zakura_chain::transaction::Hash([7; 32])),
-            None,
+            BoxCloneSyncService::new(NeverReady),
+            chain_holding(None),
+            false,
+            mpsc::channel(1).0,
+            Arc::new(Exempt::default()),
         )
-        .await;
-        assert!(fetched.is_err(), "the fetch fails");
+    }
+
+    /// A legacy peer.
+    fn peer() -> QueueSource {
+        QueueSource::LegacySocket(std::net::SocketAddr::from(([192, 0, 2, 1], 8233)))
+    }
+
+    /// A fetch from a network that never becomes ready ends at today's
+    /// whole-task deadline: its reservation is dropped, which frees the
+    /// core's slot, and its peer's slot is free again.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_fetch_from_an_unready_network_ends_at_the_task_deadline() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
+
+        let (handle, mut inbox) = pool_port();
+        let core = adapter_on(handle);
+        let id = UnminedTxId::Legacy(zakura_chain::transaction::Hash([7; 32]));
+        let started = tokio::time::Instant::now();
+        let queued = tokio::spawn(queue(core.shared.clone(), Gossip::Id(id), Some(peer())));
+        let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
+            panic!("the fetch reserves first");
+        };
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            id,
+            false,
+            true,
+            Default::default(),
+        )));
+        let receiver = queued
+            .await
+            .expect("the task does not panic")
+            .expect("the id passes the first stage");
+
+        let error = receiver
+            .await
+            .expect("the fetch is answered")
+            .expect_err("a fetch that never happens fails");
+        assert_eq!(error.to_string(), "timeout waiting for verification result");
         assert_eq!(
             started.elapsed(),
             RATE_LIMIT_DELAY,
             "today's whole-task deadline"
         );
+        assert!(matches!(
+            inbox.next().await,
+            Some(PoolCommand::Released(ReservationId(1)))
+        ));
+        assert!(core.shared.per_peer.lock().expect("no panics").is_empty());
+    }
+
+    /// A body whose verdict takes too long ends at the same deadline, which
+    /// covers the fetch and the verification together, as today's download
+    /// task does. Its peer's slot is free again.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_verdict_that_takes_too_long_ends_at_the_task_deadline() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
+
+        let (handle, mut inbox) = pool_port();
+        let core = adapter_on(handle);
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let started = tokio::time::Instant::now();
+        let queued = tokio::spawn(queue(
+            core.shared.clone(),
+            Gossip::Tx(body.clone()),
+            Some(peer()),
+        ));
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the push reserves first");
+        };
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            tx_id,
+            false,
+            true,
+            Default::default(),
+        )));
+        let receiver = queued
+            .await
+            .expect("the task does not panic")
+            .expect("the push passes the first stage");
+        // The core takes the body and never answers.
+        let Some(PoolCommand::Submit {
+            reservation,
+            reply: _verdict,
+            ..
+        }) = inbox.next().await
+        else {
+            panic!("the body is submitted");
+        };
+        let _accepted = reservation.accept();
+
+        let error = receiver
+            .await
+            .expect("the push is answered")
+            .expect_err("a verdict that never comes fails");
+        assert_eq!(error.to_string(), "timeout waiting for verification result");
+        assert_eq!(
+            started.elapsed(),
+            RATE_LIMIT_DELAY,
+            "today's whole-task deadline"
+        );
+        assert!(core.shared.per_peer.lock().expect("no panics").is_empty());
     }
 
     /// A peer that starts cooling down while its pushed body waits for its

@@ -72,30 +72,6 @@ stage = "generator"
 reason = """Seeds 11, 23, 47 and 89 end at the drain bound with a block-sync task unfinished, a harness end the loop doesn't count as a kill. Seed 179's 20 runs hold: none overdrafts the budget from a near-floor request."""
 
 [[triage]]
-patch = "qa/native-mutations/discovery-table/wants-every-service/wants-every-service.patch"
-property = "discovery/s4v2/services/sender-within-owed"
-lane = "discovery/wire"
-class = "survived"
-stage = "generator"
-reason = """No drawn peer sends `GetServices`, so `services/sender-within-owed` never applies: discovery/wire's drawn peers never ask. #2364 draws a peer that asks for header sync's service alone."""
-
-[[triage]]
-patch = "qa/native-mutations/discovery-table/wants-unnamed-services/wants-unnamed-services.patch"
-property = "discovery/s4v2/services/sender-within-owed"
-lane = "discovery/wire"
-class = "survived"
-stage = "generator"
-reason = """No drawn peer sends `GetServices`, so `services/sender-within-owed` never applies: discovery/wire's drawn peers never ask. #2364 draws a peer that asks for header sync's service alone."""
-
-[[triage]]
-patch = "qa/native-mutations/shared-wire-path/cadence-exhaustion-throttles/cadence-exhaustion-throttles.patch"
-property = "discovery/s4v2/hello/cadence-never-closes"
-lane = "discovery/wire"
-class = "survived"
-stage = "generator"
-reason = """No drawn peer sends `Hello` faster than its cadence, so `hello/cadence-never-closes` never applies. #2364 draws a `Hello` burst."""
-
-[[triage]]
 patch = "qa/native-mutations/shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
 property = "discovery/s4v2/undeclared-type-closes"
 lane = "witness"
@@ -202,14 +178,6 @@ stage = "property"
 reason = """A wider commit window lets the node request above the window, and `lookahead-overshoot-bound` names that first, before the retained bytes pass their bound."""
 
 [[triage]]
-patch = "qa/planted/block-sync/stale-completion-inert/release-by-height.patch"
-property = "block-sync/stale-completion-inert"
-lane = "block-sync/storage"
-class = "survived"
-stage = "schedule"
-reason = """Seeds 23, 47, 89 and 179 kill it on `stale-beside-current`. Seed 11 draws that family once, and its Plan doesn't deliver the stale completion beside the current one."""
-
-[[triage]]
 patch = "qa/planted/block-sync/teardown-returns-baseline/kept-session-sender.patch"
 property = "block-sync/teardown-returns-baseline"
 lane = "block-sync/storage"
@@ -234,62 +202,6 @@ stage = "schedule"
 reason = """Each seed draws `late-response` about 170 times, and no drawn Plan delivers the held `Peers` after the node's initial wait times out and before its session ends, so `late-response-admitted` never applies."""
 
 [[triage]]
-patch = "qa/planted/discovery/s4v2/conformant-never-closes/close-on-expired-hello.patch"
-property = "discovery/s4v2/conformant-never-closes"
-lane = "discovery/wire"
-class = "survived"
-stage = "generator"
-reason = """No drawn peer sends an expired `Hello`, a frame only local policy refuses, so closing on one changes no drawn run. #2364 draws the expired-`Hello` control."""
-
-[[triage]]
-patch = "qa/planted/discovery/s4v2/get-peers/cadence-never-closes/close-on-empty-get-peers-bucket.patch"
-property = "discovery/s4v2/get-peers/cadence-never-closes"
-lane = "discovery/wire"
-class = "survived"
-stage = "generator"
-reason = """No drawn peer empties the `get-peers` cadence bucket, so `get-peers/cadence-never-closes` never applies. #2364 draws a `GetPeers` run."""
-
-[[triage]]
-patch = "qa/planted/discovery/s4v2/get-services/cadence-never-closes/close-on-empty-get-services-bucket.patch"
-property = "discovery/s4v2/get-services/cadence-never-closes"
-lane = "discovery/wire"
-class = "survived"
-stage = "generator"
-reason = """No drawn peer empties the `get-services` cadence bucket, so `get-services/cadence-never-closes` never applies. #2364 draws a `GetServices` run."""
-
-[[triage]]
-patch = "qa/planted/discovery/s4v2/hello/cadence-never-closes/close-on-empty-hello-bucket.patch"
-property = "discovery/s4v2/hello/cadence-never-closes"
-lane = "discovery/wire"
-class = "survived"
-stage = "generator"
-reason = """No drawn peer empties the `hello` cadence bucket, so `hello/cadence-never-closes` never applies. #2364 draws a `Hello` burst."""
-
-[[triage]]
-patch = "qa/planted/discovery/s4v2/peers/sender-ends-once/answer-peers-twice.patch"
-property = "discovery/s4v2/peers/sender-ends-once"
-lane = "discovery/wire"
-class = "survived"
-stage = "generator"
-reason = """No drawn peer sends `GetPeers`, so `peers/sender-ends-once` never applies. #2364 draws a peer that asks for one peer."""
-
-[[triage]]
-patch = "qa/planted/discovery/s4v2/services/sender-ends-once/answer-services-twice.patch"
-property = "discovery/s4v2/services/sender-ends-once"
-lane = "discovery/wire"
-class = "survived"
-stage = "generator"
-reason = """No drawn peer sends `GetServices`, so `services/sender-ends-once` never applies. #2364 draws a peer that asks for header sync's service."""
-
-[[triage]]
-patch = "qa/planted/discovery/s4v2/services/sender-within-owed/ignore-wanted-services.patch"
-property = "discovery/s4v2/services/sender-within-owed"
-lane = "discovery/wire"
-class = "survived"
-stage = "generator"
-reason = """No drawn peer sends `GetServices`, so `services/sender-within-owed` never applies: discovery/wire's drawn peers never ask. #2364 draws a peer that asks for header sync's service alone."""
-
-[[triage]]
 patch = "qa/native-mutations/shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
 property = "block-sync/s6v3/undeclared-type-closes"
 lane = "witness"
@@ -297,3 +209,260 @@ class = "killed-by-other-rule"
 other = "sim/no-task-panic"
 stage = "property"
 reason = "The mutant lets an undeclared type reach admission, whose row `expect` panics the relay task before any close. `sim/no-task-panic` is the rule that sees it: a reader panic is the production effect, so no close ID can apply."
+
+[[triage]]
+patch = "qa/native-mutations/block-sync-table/accept-any-ending/accept-any-ending.patch"
+property = "block-sync/s6v3/blocks-done/bad-content-closes"
+lane = "block-sync/storage"
+class = "killed-by-other-rule"
+other = "block-sync/s6v3/get-blocks/sender-within-limit"
+stage = "property"
+reason = """Seed 23 draws `range-unavailable-bad-content` before any `blocks-done-bad-content`. The mutant takes that malformed ending as the range's end and opens the next request, while the rules still count the range as open, so `get-blocks/sender-within-limit` fails first."""
+
+[[triage]]
+patch = "qa/native-mutations/block-sync-table/accept-any-ending/accept-any-ending.patch"
+property = "block-sync/s6v3/blocks-done/bad-content-closes"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """Seeds 11 and 89 kill it on `blocks-done-bad-content`. The 20 runs of seeds 47 and 179 draw neither that family nor `range-unavailable-bad-content`, the only families that send a malformed ending."""
+
+[[triage]]
+patch = "qa/native-mutations/bounds/budget-ignores-charges/budget-ignores-charges.patch"
+property = "block-sync/reserved-byte-bound"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """Seeds 47 and 179 kill it on `paused-handoffs`. The 20 runs of seeds 11, 23 and 89 never draw that family, the only one that holds charged bodies while the sequencer is paused."""
+
+[[triage]]
+patch = "qa/native-mutations/bounds/lookahead-gate-off/lookahead-gate-off.patch"
+property = "block-sync/lookahead-overshoot-bound"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """Seeds 89 and 179 kill it on `above-window`. Seed 11's 20 runs never draw that family, the only one whose peers offer bodies above the commit window."""
+
+[[triage]]
+patch = "qa/native-mutations/bounds/lookahead-gate-off/lookahead-gate-off.patch"
+property = "block-sync/retained-byte-bound"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """Seeds 23 and 47 kill it on `stuck-floor`. Seed 11's 20 runs never draw that family, the only one that holds the commit floor while bodies above it arrive."""
+
+[[triage]]
+patch = "qa/native-mutations/detached-submission-bounded/mismatched-completion-inert/mismatched-completion-inert.patch"
+property = "block-sync/detached-submission-bounded"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """Seeds 47, 89 and 179 kill it on `capacity-release` or `stalled-reset`. The 20 runs of seeds 11 and 23 draw neither family, the only ones that detach submissions while the window is full."""
+
+[[triage]]
+patch = "qa/native-mutations/detached-submission-bounded/reset-rolls-back-submissions/reset-rolls-back-submissions.patch"
+property = "block-sync/detached-submission-bounded"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """Seeds 47, 89 and 179 kill it on `capacity-release` or `stalled-reset`. The 20 runs of seeds 11 and 23 draw neither family, the only ones that detach submissions while the window is full."""
+
+[[triage]]
+patch = "qa/planted/block-sync/detached-submission-bounded/forget-on-reset.patch"
+property = "block-sync/detached-submission-bounded"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """Seeds 47, 89 and 179 kill it on `capacity-release` or `stalled-reset`. The 20 runs of seeds 11 and 23 draw neither family, the only ones that detach submissions while the window is full."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/cadence-exhaustion-throttles/cadence-exhaustion-throttles.patch"
+property = "block-sync/s6v3/status/cadence-never-closes"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """Seeds 11 and 23 kill it on `status-cadence-burst`. The 20 runs of seeds 47, 89 and 179 never draw that family, the only one that sends `Status` faster than its cadence."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/cadence-exhaustion-throttles/cadence-exhaustion-throttles.patch"
+property = "discovery/s4v2/hello/cadence-never-closes"
+lane = "discovery/wire"
+class = "killed-by-other-rule"
+other = "discovery/s4v2/get-peers/cadence-never-closes"
+stage = "property"
+reason = """The mutant changes the shared reader, so it breaks every message's cadence. Seeds 23, 47 and 89 draw `get-peers-request-run` before any `hello-burst`, so `get-peers/cadence-never-closes` fails first. Seed 179 draws `hello-burst` and kills it."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/cadence-exhaustion-throttles/cadence-exhaustion-throttles.patch"
+property = "discovery/s4v2/hello/cadence-never-closes"
+lane = "discovery/wire"
+class = "killed-by-other-rule"
+other = "discovery/s4v2/get-services/cadence-never-closes"
+stage = "property"
+reason = """The mutant changes the shared reader, so it breaks every message's cadence. Seed 11 draws `get-services-request-run` before any `hello-burst`, so `get-services/cadence-never-closes` fails first. Seed 179 draws `hello-burst` and kills it."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/protocol-reject-keeps-connection/protocol-reject-keeps-connection.patch"
+property = "block-sync/s6v3/status/bad-content-closes"
+lane = "block-sync/storage"
+class = "killed-by-other-rule"
+other = "block-sync/s6v3/block/bad-content-closes"
+stage = "property"
+reason = """The mutant keeps the connection after any protocol reject, so it breaks every message's close rule. Seed 47 draws `block-bad-content` before any `status-bad-content`, so `block/bad-content-closes` fails first. Seed 179 draws `status-bad-content` and kills it."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/protocol-reject-keeps-connection/protocol-reject-keeps-connection.patch"
+property = "block-sync/s6v3/status/bad-content-closes"
+lane = "block-sync/storage"
+class = "killed-by-other-rule"
+other = "block-sync/s6v3/blocks-done/bad-content-closes"
+stage = "property"
+reason = """The mutant keeps the connection after any protocol reject, so it breaks every message's close rule. Seeds 11 and 89 draw `blocks-done-bad-content` before any `status-bad-content`, so `blocks-done/bad-content-closes` fails first. Seed 179 draws `status-bad-content` and kills it."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/protocol-reject-keeps-connection/protocol-reject-keeps-connection.patch"
+property = "block-sync/s6v3/status/bad-content-closes"
+lane = "block-sync/storage"
+class = "killed-by-other-rule"
+other = "block-sync/s6v3/get-blocks/bad-content-closes"
+stage = "property"
+reason = """The mutant keeps the connection after any protocol reject, so it breaks every message's close rule. Seed 23 draws `get-blocks-bad-content` before any `status-bad-content`, so `get-blocks/bad-content-closes` fails first. Seed 179 draws `status-bad-content` and kills it."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/protocol-reject-keeps-connection/protocol-reject-keeps-connection.patch"
+property = "discovery/s4v2/hello/bad-content-closes"
+lane = "discovery/wire"
+class = "killed-by-other-rule"
+other = "discovery/s4v2/get-services/bad-content-closes"
+stage = "property"
+reason = """The mutant keeps the connection after any protocol reject, so it breaks every message's close rule. Seed 179 draws `get-services-bad-content` before any `hello-bad-content`, so `get-services/bad-content-closes` fails first. No seed draws `hello-bad-content` before another family whose rule fails."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/protocol-reject-keeps-connection/protocol-reject-keeps-connection.patch"
+property = "discovery/s4v2/hello/bad-content-closes"
+lane = "discovery/wire"
+class = "killed-by-other-rule"
+other = "discovery/s4v2/peers/bad-content-closes"
+stage = "property"
+reason = """The mutant keeps the connection after any protocol reject, so it breaks every message's close rule. Seed 47 draws `peers-bad-content` before any `hello-bad-content`, so `peers/bad-content-closes` fails first. No seed draws `hello-bad-content` before another family whose rule fails."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/protocol-reject-keeps-connection/protocol-reject-keeps-connection.patch"
+property = "discovery/s4v2/hello/bad-content-closes"
+lane = "discovery/wire"
+class = "killed-by-other-rule"
+other = "discovery/s4v2/peers/over-owed-closes"
+stage = "property"
+reason = """The mutant keeps the connection after any protocol reject, including an unsolicited `Peers`. Seed 11 draws `expired-hello`, whose late `Peers` the node owes nothing for, so `peers/over-owed-closes` fails before any `hello-bad-content`."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/protocol-reject-keeps-connection/protocol-reject-keeps-connection.patch"
+property = "discovery/s4v2/hello/bad-content-closes"
+lane = "discovery/wire"
+class = "killed-by-other-rule"
+other = "discovery/s4v2/services/bad-content-closes"
+stage = "property"
+reason = """The mutant keeps the connection after any protocol reject, so it breaks every message's close rule. Seeds 23 and 89 draw `services-bad-content` before any `hello-bad-content`, so `services/bad-content-closes` fails first. No seed draws `hello-bad-content` before another family whose rule fails."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/reserved-flags-ignored/reserved-flags-ignored.patch"
+property = "block-sync/s6v3/status/reserved-flags-closes"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """Seeds 11 and 179 kill it on `status-flag-only`, the only family whose `Status` breaks the flag rule alone. Seeds 23, 47 and 89 never draw it. Seed 89 draws `status-reserved-flags`, whose raw frame also breaks a content rule, so the node closes the connection without the flag check."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/reserved-flags-ignored/reserved-flags-ignored.patch"
+property = "discovery/s4v2/hello/reserved-flags-closes"
+lane = "discovery/wire"
+class = "killed-by-other-rule"
+other = "discovery/s4v2/get-services/reserved-flags-closes"
+stage = "property"
+reason = """The mutant makes every reader ignore flag bits, so it breaks every message's flag rule. Seeds 11 and 47 draw `get-services-reserved-flags` before any `hello-reserved-flags`, so `get-services/reserved-flags-closes` fails first. Seeds 23 and 179 draw `hello-reserved-flags` and kill it."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/reserved-flags-ignored/reserved-flags-ignored.patch"
+property = "discovery/s4v2/hello/reserved-flags-closes"
+lane = "discovery/wire"
+class = "killed-by-other-rule"
+other = "discovery/s4v2/services/reserved-flags-closes"
+stage = "property"
+reason = """The mutant makes every reader ignore flag bits, so it breaks every message's flag rule. Seed 89 draws `services-reserved-flags` before any `hello-reserved-flags`, so `services/reserved-flags-closes` fails first. Seeds 23 and 179 draw `hello-reserved-flags` and kill it."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
+property = "block-sync/s6v3/undeclared-type-closes"
+lane = "block-sync/storage"
+class = "killed-by-other-rule"
+other = "sim/no-task-panic"
+stage = "property"
+reason = """As in the witness lane: seeds 47 and 89 draw `undeclared-type`, and the undeclared type reaches admission, whose row `expect` panics the relay task before any close. `sim/no-task-panic` is the rule that sees it."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
+property = "block-sync/s6v3/undeclared-type-closes"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """The 20 runs of seeds 11, 23 and 179 never draw `undeclared-type`, the only family that sends an undeclared message type. Seeds 47 and 89 draw it, and `sim/no-task-panic` fails there."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
+property = "discovery/s4v2/undeclared-type-closes"
+lane = "discovery/wire"
+class = "killed-by-other-rule"
+other = "sim/no-task-panic"
+stage = "property"
+reason = """As in the witness lane: every seed draws `undeclared-type`, and the undeclared type reaches admission's table lookup, whose `expect` panics before discovery's codec can refuse the frame. `sim/no-task-panic` is the rule that sees it."""
+
+[[triage]]
+patch = "qa/planted/block-sync/budget-ledgers-agree/handoff-keeps-charge.patch"
+property = "block-sync/budget-ledgers-agree"
+lane = "block-sync/storage"
+class = "killed-by-other-rule"
+other = "block-sync/reserved-byte-bound"
+stage = "property"
+reason = """Seed 179's first run draws `paused-handoffs`, where routines hand bodies over while the sequencer is paused. Each kept charge leaves the budget's reserved bytes up, so `reserved-byte-bound` fails before the next quiescence boundary compares the ledgers. The other seeds kill it."""
+
+[[triage]]
+patch = "qa/planted/block-sync/lookahead-overshoot-bound/omit-outstanding-estimates.patch"
+property = "block-sync/lookahead-overshoot-bound"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """Seeds 89 and 179 kill it on `above-window`. The 20 runs of seeds 11, 23 and 47 never draw that family, the only one whose peers offer bodies above the commit window."""
+
+[[triage]]
+patch = "qa/planted/block-sync/reserved-byte-bound/above-floor-charge.patch"
+property = "block-sync/reserved-byte-bound"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """Seeds 47 and 179 kill it on `paused-handoffs`. The 20 runs of seeds 11, 23 and 89 never draw that family, the only one that holds charged bodies while the sequencer is paused."""
+
+[[triage]]
+patch = "qa/planted/block-sync/retained-byte-bound/wide-commit-window.patch"
+property = "block-sync/retained-byte-bound"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = """Seeds 23 and 47 kill it on `stuck-floor`. Seed 11's 20 runs never draw that family, the only one that holds the commit floor while bodies above it arrive."""
+
+[[triage]]
+patch = "qa/planted/discovery/s4v2/peers/sender-ends-once/answer-peers-twice.patch"
+property = "discovery/s4v2/peers/sender-ends-once"
+lane = "discovery/wire"
+class = "killed-by-other-rule"
+other = "discovery/s4v2/conformant-never-closes"
+stage = "property"
+reason = """Each answer spends a `GetPeers` slot, so answering twice spends two. Seed 89 draws `get-peers-over-margin` first, whose peer asks up to its margin, so the node closes a conformant peer and `conformant-never-closes` fails before a second `Peers` reaches the rule."""
+
+[[triage]]
+patch = "qa/planted/discovery/s4v2/services/sender-ends-once/answer-services-twice.patch"
+property = "discovery/s4v2/services/sender-ends-once"
+lane = "discovery/wire"
+class = "killed-by-other-rule"
+other = "discovery/s4v2/conformant-never-closes"
+stage = "property"
+reason = """Each answer spends a `GetServices` slot, so answering twice spends two. Seeds 11, 23 and 89 draw `get-services-over-margin` first, whose peer asks up to its margin, so the node closes a conformant peer and `conformant-never-closes` fails before a second `Services` reaches the rule."""

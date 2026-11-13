@@ -277,7 +277,9 @@ impl Drop for PeerRegistryGuard {
     }
 }
 
-fn sanitize_subversion(user_agent: &str) -> String {
+/// Returns `user_agent` with every character a peer could use to forge log or trace
+/// text removed.
+pub(crate) fn sanitize_subversion(user_agent: &str) -> String {
     user_agent
         .chars()
         .filter(|character| {

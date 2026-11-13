@@ -462,7 +462,7 @@ pub(super) fn selects(prefix: &str, path: &str) -> bool {
 
 /// Every retained planted case whose property starts with one of
 /// `prefixes`, with its own committed witness. Fails on a case that names
-/// a nested `set`, which the loop's classes don't judge.
+/// a nested `set` or a `draft_set`, which the loop's classes don't judge.
 pub(super) fn planted_cases(
     repo_root: &Path,
     prefixes: &[String],
@@ -484,7 +484,10 @@ pub(super) fn planted_cases(
         matched.extend(prefixes.iter().filter(|prefix| selects(prefix, &path)));
         let case_file = patch.with_extension("toml");
         let CaseFile {
-            also_violates, set, ..
+            also_violates,
+            set,
+            draft_set,
+            ..
         } = toml::from_str(&fs::read_to_string(&case_file)?)
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
         // The loop's classes judge one property beside `also_violates`, so
@@ -492,6 +495,15 @@ pub(super) fn planted_cases(
         if !set.is_empty() {
             return Err(format!(
                 "{}: the loop doesn't judge a nested case's `set`; `cargo xtask planted` does",
+                case_file.display()
+            )
+            .into());
+        }
+        // Nor does it run the `Draft` run a `draft_set` case's catch needs.
+        if !draft_set.is_empty() {
+            return Err(format!(
+                "{}: the loop doesn't run a case's `draft_set` Draft run; `cargo xtask planted` \
+                 does",
                 case_file.display()
             )
             .into());

@@ -22,10 +22,10 @@ use super::{
         Outcome, PoolModel, Step, WaiterId, COOLDOWN, REJECTION_MEMORY, REVALIDATE_RETRY, T_PARK,
         T_VERIFY,
     },
-    pool_port, ChainTip, Change, ChangeLog, ChangeSeq, ChangesSince, Charge, CooldownKey,
-    Generation, GenerationCell, GenerationRead, Intent, LocalFault, NoRoom, PoolCommand,
-    PoolSnapshot, RejectionScope, RemovalReason, ReservationId, Source, Supplier, Unreserved,
-    Verdict, Violation, CHANGE_LOG_CAPACITY, COMMAND_QUEUE, MAX_COOLDOWNS, MAX_PENDING,
+    pool_port, ChainReason, ChainTip, Change, ChangeLog, ChangeSeq, ChangesSince, Charge,
+    CooldownKey, Generation, GenerationCell, GenerationRead, Intent, LocalFault, NoRoom,
+    PoolCommand, PoolSnapshot, RejectionScope, RemovalReason, ReservationId, Source, Supplier,
+    Unreserved, Verdict, Violation, CHANGE_LOG_CAPACITY, COMMAND_QUEUE, MAX_COOLDOWNS, MAX_PENDING,
     MAX_PENDING_PER_SOURCE, MAX_REJECTIONS, MAX_REVALIDATING, MAX_WAITERS,
 };
 use crate::mempool::QueueSource;
@@ -467,19 +467,25 @@ fn joined_submissions_share_one_verification_and_each_supplier_is_charged() {
     let step = model.outcome(
         job,
         Outcome::Fail {
-            scope: RejectionScope::EffectsChain,
+            scope: RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
             charge: Charge::Cooldown,
         },
         stable(0),
         stable(0),
         secs(1),
     );
-    let charged = rejected(RejectionScope::EffectsChain, Charge::Cooldown);
+    let charged = rejected(
+        RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
+        Charge::Cooldown,
+    );
     assert_eq!(step.verdict(first), Some(charged));
     assert_eq!(step.verdict(second), Some(charged));
     assert_eq!(
         step.verdict(rpc),
-        Some(rejected(RejectionScope::EffectsChain, Charge::None))
+        Some(rejected(
+            RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
+            Charge::None
+        ))
     );
     assert_eq!(step.changes, vec![Change::Refused(id(1))]);
 
@@ -495,7 +501,9 @@ fn joined_submissions_share_one_verification_and_each_supplier_is_charged() {
     );
     assert_eq!(
         model.reserve(id(1), peer(3), Intent::Fetch, secs(1)),
-        Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain))
+        Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain(
+            ChainReason::DuplicateSpend
+        )))
     );
 }
 
@@ -533,7 +541,7 @@ fn an_outcome_that_saw_a_chain_change_gives_no_verdict_and_runs_again() {
     let step = model.outcome(
         job,
         Outcome::Fail {
-            scope: RejectionScope::EffectsChain,
+            scope: RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
             charge: Charge::Ban,
         },
         stable(0),
@@ -716,7 +724,7 @@ fn a_child_of_a_hidden_parent_that_fails_is_rejected_for_an_unresolved_parent() 
     let step = model.outcome(
         parent_job,
         Outcome::Fail {
-            scope: RejectionScope::EffectsChain,
+            scope: RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
             charge: Charge::Ban,
         },
         stable(1),
@@ -841,7 +849,7 @@ fn a_tip_change_forgets_tip_scoped_rejections_only() {
     for (n, scope) in [
         (1, RejectionScope::ExactTip),
         (2, RejectionScope::EffectsTip),
-        (3, RejectionScope::EffectsChain),
+        (3, RejectionScope::EffectsChain(ChainReason::DuplicateSpend)),
     ] {
         let (_, job) = bring_in(&mut model, tx(n), legacy(n));
         model.outcome(
@@ -869,7 +877,9 @@ fn a_tip_change_forgets_tip_scoped_rejections_only() {
         .is_ok());
     assert_eq!(
         model.reserve(id(3), peer(50), Intent::Fetch, secs(1)),
-        Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain))
+        Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain(
+            ChainReason::DuplicateSpend
+        )))
     );
 }
 
@@ -1575,7 +1585,7 @@ fn a_reorg_forgets_chain_scoped_rejections_too() {
     model.outcome(
         job,
         Outcome::Fail {
-            scope: RejectionScope::EffectsChain,
+            scope: RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
             charge: Charge::None,
         },
         stable(0),
@@ -1594,7 +1604,7 @@ fn a_reorg_forgets_chain_scoped_rejections_too() {
     model.outcome(
         job,
         Outcome::Fail {
-            scope: RejectionScope::EffectsChain,
+            scope: RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
             charge: Charge::None,
         },
         stable(1),
@@ -1634,11 +1644,19 @@ fn a_block_caches_what_it_mined_what_conflicted_and_what_expired() {
     let block = vec![tx(7).spending(coin, 0), tx(3)];
     model.transition(transition(1, 101, vec![block]), secs(1));
 
-    // None of them is fetched again, and each answers at the first stage.
-    for n in [1, 2, 3, 7] {
+    // None of them is fetched again, and each answers at the first stage
+    // with the reason today's lists keep.
+    for (n, reason) in [
+        (1, ChainReason::DuplicateSpend),
+        (2, ChainReason::Expired),
+        (3, ChainReason::Mined),
+        (7, ChainReason::Mined),
+    ] {
         assert_eq!(
             model.reserve(id(n), peer(50), Intent::Fetch, secs(1)),
-            Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain)),
+            Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain(
+                reason
+            ))),
             "transaction {n}"
         );
     }
@@ -1656,7 +1674,7 @@ fn a_chain_scoped_rejection_is_forgotten_after_its_memory_time() {
     model.outcome(
         job,
         Outcome::Fail {
-            scope: RejectionScope::EffectsChain,
+            scope: RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
             charge: Charge::None,
         },
         stable(0),
@@ -1890,4 +1908,161 @@ fn a_revealed_entry_says_when_the_transaction_was_hidden() {
     let announces = |opened_at: ChangeSeq| opened_at >= hidden_at;
     assert!(announces(ChangeSeq(2)));
     assert!(!announces(ChangeSeq(1)));
+}
+
+// Cases from the second review.
+
+#[test]
+fn a_hidden_child_whose_parent_arrives_while_it_is_checked_is_checked_again() {
+    let mut model = new_model();
+    // The child is in the pool. Its parent was mined, so it is not.
+    admit(&mut model, child_of(2, 1), 2, 0);
+    // A reorg undoes the block that mined the parent.
+    let step = model.transition(reorg(1, 99), secs(1));
+    let child_job = the_job(&step);
+
+    // The child's verifier looks first and misses the parent. The parent is
+    // submitted again and admitted before the core handles that outcome.
+    let (_, parent_job) = bring_in(&mut model, tx(1), legacy(1));
+    model.outcome(parent_job, Outcome::Pass, stable(1), stable(1), secs(2));
+    let step = model.outcome(child_job, missing(1), stable(1), stable(1), secs(2));
+
+    // The child is valid again. It is not thrown out for an old answer.
+    assert!(step.changes.is_empty());
+    assert_eq!(model.hidden(), vec![id(2)]);
+    let step = model.outcome(
+        the_job(&step),
+        Outcome::PassUsing(vec![output(1, 0)]),
+        stable(1),
+        stable(1),
+        secs(3),
+    );
+    assert_eq!(step.changes, vec![revealed(2, 2)]);
+}
+
+#[test]
+fn a_cooldown_and_a_remembered_rejection_end_on_time_without_a_tick() {
+    let mut model = new_model();
+    model.violation(v2(1), secs(0));
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    model.outcome(
+        job,
+        Outcome::Fail {
+            scope: RejectionScope::EffectsChain(ChainReason::Expired),
+            charge: Charge::None,
+        },
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+
+    // No tick in between. Each lookup uses the time of its own call.
+    assert_eq!(
+        model.reserve(
+            id(2),
+            Source::Peer(v2(1)),
+            Intent::Fetch,
+            COOLDOWN - secs(1)
+        ),
+        Err(ModelUnreserved::CoolingDown)
+    );
+    assert!(model
+        .reserve(id(2), Source::Peer(v2(1)), Intent::Fetch, COOLDOWN)
+        .is_ok());
+    assert!(model
+        .reserve(id(1), peer(2), Intent::Fetch, REJECTION_MEMORY - secs(1))
+        .is_err());
+    assert!(model
+        .reserve(id(1), peer(2), Intent::Fetch, REJECTION_MEMORY)
+        .is_ok());
+}
+
+#[test]
+fn each_chain_rejection_reason_keeps_its_own_list_and_the_configured_memory() {
+    let memory = secs(120);
+    let mut model = new_model().with_rejection_memory(memory);
+    let coin = hash(900);
+    admit(&mut model, tx(1).spending(coin, 0), 1, 0);
+    // One duplicate spend, then more mined transactions than one list holds.
+    let block = vec![tx(7).spending(coin, 0)];
+    model.transition(transition(1, 101, vec![block]), secs(0));
+    let many = u16::try_from(MAX_REJECTIONS + 1).expect("the limit fits the test's ids");
+    let mined: Vec<ModelTx> = (1_000..1_000 + many).map(tx).collect();
+    model.transition(transition(2, 102, vec![mined]), secs(0));
+
+    // The mined list dropped its oldest entry. The duplicate spend is in
+    // another list and is still remembered.
+    assert_eq!(
+        model.reserve(id(1), peer(2), Intent::Fetch, secs(0)),
+        Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain(
+            ChainReason::DuplicateSpend
+        )))
+    );
+    assert!(model
+        .reserve(id(7), peer(2), Intent::Fetch, secs(0))
+        .is_ok());
+    model.assert_invariants();
+
+    // The memory time is the configured one, not the default.
+    assert!(model.reserve(id(1), peer(3), Intent::Fetch, memory).is_ok());
+}
+
+#[test]
+fn a_reader_that_resynchronized_while_a_transaction_was_hidden_announces_its_reveal() {
+    let mut model = new_model();
+    let mut log = ChangeLog::default();
+    // The session opens on an empty pool.
+    let opened_at = log.last();
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    log.append(
+        model
+            .outcome(job, Outcome::Pass, stable(0), stable(0), secs(0))
+            .changes,
+    );
+    let step = model.transition(reorg(1, 100), secs(1));
+    let job = the_job(&step);
+    log.append(step.changes);
+
+    // The session falls off the log before it reads the addition, and
+    // resynchronizes from a snapshot taken now, while the transaction is
+    // hidden. That snapshot does not hold it.
+    assert!(model.visible().is_empty());
+    let resynced_at = log.last();
+
+    log.append(
+        model
+            .outcome(job, Outcome::Pass, stable(1), stable(1), secs(2))
+            .changes,
+    );
+    let ChangesSince::Entries(entries) = log.since(resynced_at) else {
+        panic!("the reader is on the log again");
+    };
+    let Change::Revealed { hidden_at, .. } = entries[0].change else {
+        panic!("the transaction is visible again");
+    };
+    // Its opening cursor would say "already announced". Its baseline moved
+    // when it resynchronized, and says it has not.
+    assert!(!opened_at.announces_reveal(hidden_at));
+    assert!(resynced_at.announces_reveal(hidden_at));
+}
+
+#[tokio::test]
+async fn a_dropped_reservation_wakes_an_idle_core() {
+    let (handle, mut inbox) = pool_port();
+    let reservation = inbox.grant(ReservationId(7), id(1), false, true);
+    // The core has nothing to do and waits.
+    let core = tokio::spawn(async move { inbox.next().await });
+    tokio::task::yield_now().await;
+
+    // No command follows. The drop alone has to wake it.
+    drop(reservation);
+    let event = tokio::time::timeout(secs(5), core)
+        .await
+        .expect("the core wakes")
+        .expect("the core does not panic");
+    assert!(matches!(
+        event,
+        Some(PoolCommand::Released(ReservationId(7)))
+    ));
+    drop(handle);
 }

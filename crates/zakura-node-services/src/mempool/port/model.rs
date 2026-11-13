@@ -34,9 +34,10 @@ use zakura_chain::{
 };
 
 use super::{
-    Change, ChangeSeq, Charge, CooldownKey, Generation, GenerationRead, Intent, LocalFault, NoRoom,
-    RejectionScope, RemovalReason, ReservationId, Source, Supplier, MAX_COOLDOWNS, MAX_PENDING,
-    MAX_PENDING_PER_SOURCE, MAX_REJECTIONS, MAX_REVALIDATING, MAX_WAITERS,
+    ChainReason, Change, ChangeSeq, Charge, CooldownKey, Generation, GenerationRead, Intent,
+    LocalFault, NoRoom, RejectionScope, RemovalReason, ReservationId, Source, Supplier,
+    MAX_COOLDOWNS, MAX_PENDING, MAX_PENDING_PER_SOURCE, MAX_REJECTIONS, MAX_REVALIDATING,
+    MAX_WAITERS,
 };
 use crate::mempool::QueueSource;
 
@@ -54,8 +55,8 @@ pub const T_PARK: Duration = Duration::from_secs(60);
 /// Today's base cooldown.
 pub const COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
-/// How long a chain-scoped rejection is remembered. Today's default
-/// `eviction_memory_time`.
+/// How long a chain-scoped rejection is remembered unless the model is told
+/// otherwise. Today's default `eviction_memory_time`.
 pub const REJECTION_MEMORY: Duration = Duration::from_secs(60 * 60);
 
 /// The most pooled ancestors a new transaction can have. Today's
@@ -366,6 +367,13 @@ struct JoinTicket {
     brings: bool,
 }
 
+/// One chain-scoped rejection list: when each entry was made, oldest first.
+#[derive(Debug, Default)]
+struct ChainList {
+    at: HashMap<transaction::Hash, ModelTime>,
+    order: VecDeque<transaction::Hash>,
+}
+
 /// The documented rules of the pool core.
 #[derive(Debug)]
 pub struct PoolModel {
@@ -386,8 +394,9 @@ pub struct PoolModel {
     jobs: HashMap<JobId, (JobTarget, u64)>,
     rejected_exact: HashSet<UnminedTxId>,
     rejected_effects_tip: HashSet<transaction::Hash>,
-    rejected_chain: HashMap<transaction::Hash, ModelTime>,
-    rejected_chain_order: VecDeque<transaction::Hash>,
+    /// One list for each reason, as today.
+    rejected_chain: HashMap<ChainReason, ChainList>,
+    rejection_memory: Duration,
     cooldowns: HashMap<CooldownKey, ModelTime>,
     /// Changes returned in earlier steps. Each step is one batch of the log,
     /// so this is the log position of the last one.
@@ -414,11 +423,17 @@ impl PoolModel {
             rejected_exact: HashSet::new(),
             rejected_effects_tip: HashSet::new(),
             rejected_chain: HashMap::new(),
-            rejected_chain_order: VecDeque::new(),
+            rejection_memory: REJECTION_MEMORY,
             cooldowns: HashMap::new(),
             logged: 0,
             step: Step::default(),
         }
+    }
+
+    /// The same model with the configured `eviction_memory_time`.
+    pub fn with_rejection_memory(mut self, memory: Duration) -> Self {
+        self.rejection_memory = memory;
+        self
     }
 
     // Inputs.
@@ -649,7 +664,7 @@ impl PoolModel {
                         self.pooled_at(key).hidden = Some(Hidden::Queued);
                     }
                 } else {
-                    self.revalidation_outcome(key, hash, outcome);
+                    self.revalidation_outcome(key, hash, outcome, started_at);
                 }
             }
         }
@@ -682,7 +697,10 @@ impl PoolModel {
                     // Its dependents stay. Their parent is on the chain now.
                     self.remove_one(key, RemovalReason::Mined);
                 }
-                self.cache(block_tx.id, RejectionScope::EffectsChain);
+                self.cache(
+                    block_tx.id,
+                    RejectionScope::EffectsChain(ChainReason::Mined),
+                );
                 let conflicting: Vec<UnminedTxId> = self
                     .pool
                     .values()
@@ -691,7 +709,10 @@ impl PoolModel {
                     .collect();
                 for conflict in conflicting {
                     self.remove_with_dependents(conflict.mined_id(), RemovalReason::Conflicted);
-                    self.cache(conflict, RejectionScope::EffectsChain);
+                    self.cache(
+                        conflict,
+                        RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
+                    );
                 }
                 mined.push(hash);
             }
@@ -704,7 +725,7 @@ impl PoolModel {
             .collect();
         for tx_id in expired {
             self.remove_with_dependents(tx_id.mined_id(), RemovalReason::Expired);
-            self.cache(tx_id, RejectionScope::EffectsChain);
+            self.cache(tx_id, RejectionScope::EffectsChain(ChainReason::Expired));
         }
         if verify_again {
             self.hide_all();
@@ -782,18 +803,6 @@ impl PoolModel {
                 }
                 _ => {}
             }
-        }
-        self.cooldowns.retain(|_, until| *until > now);
-        while let Some(oldest) = self.rejected_chain_order.front().copied() {
-            let forgotten = self
-                .rejected_chain
-                .get(&oldest)
-                .is_none_or(|at| at.saturating_add(REJECTION_MEMORY) <= now);
-            if !forgotten {
-                break;
-            }
-            self.rejected_chain_order.pop_front();
-            self.rejected_chain.remove(&oldest);
         }
         self.start_revalidations();
         self.take_step()
@@ -935,7 +944,10 @@ impl PoolModel {
         assert!(
             self.rejected_exact.len() <= MAX_REJECTIONS
                 && self.rejected_effects_tip.len() <= MAX_REJECTIONS
-                && self.rejected_chain.len() <= MAX_REJECTIONS,
+                && self
+                    .rejected_chain
+                    .values()
+                    .all(|list| list.at.len() <= MAX_REJECTIONS),
             "the rejection lists' limits"
         );
         assert!(self.cooldowns.len() <= MAX_COOLDOWNS, "the cooldown limit");
@@ -1074,7 +1086,11 @@ impl PoolModel {
                 self.decide(key, ModelVerdict::Admitted);
                 self.wake(hash);
             }
-            Outcome::AlreadyMined => self.reject(key, RejectionScope::EffectsChain, Charge::None),
+            Outcome::AlreadyMined => self.reject(
+                key,
+                RejectionScope::EffectsChain(ChainReason::Mined),
+                Charge::None,
+            ),
             Outcome::Fail { scope, charge } => self.reject(key, scope, charge),
             Outcome::MissingInputs(missing) => {
                 // One of the missing outputs became available after this job
@@ -1086,14 +1102,9 @@ impl PoolModel {
                 // A parent that was visible all along, or that has no such
                 // output, is not a reason to run again: the answer would be
                 // the same.
-                let arrived = missing.iter().any(|outpoint| {
-                    self.pooled.get(&outpoint.hash).is_some_and(|parent| {
-                        let parent = &self.pool[parent];
-                        parent.hidden.is_none()
-                            && outpoint.index < parent.tx.outputs
-                            && parent.visible_at > started_at
-                    })
-                });
+                let arrived = missing
+                    .iter()
+                    .any(|outpoint| self.arrived_since(outpoint, started_at));
                 if arrived {
                     self.start_admission(key);
                     return;
@@ -1110,7 +1121,13 @@ impl PoolModel {
         }
     }
 
-    fn revalidation_outcome(&mut self, key: u64, hash: transaction::Hash, outcome: Outcome) {
+    fn revalidation_outcome(
+        &mut self,
+        key: u64,
+        hash: transaction::Hash,
+        outcome: Outcome,
+        started_at: u64,
+    ) {
         match outcome {
             Outcome::Pass | Outcome::PassUsing(_) => {
                 let pool_inputs = match outcome {
@@ -1139,8 +1156,17 @@ impl PoolModel {
                 // Its job has reported, so there is nothing to cancel.
                 self.pooled_at(key).hidden = Some(Hidden::Queued);
                 self.remove_one(key, RemovalReason::Mined);
-                self.cache(tx_id, RejectionScope::EffectsChain);
+                self.cache(tx_id, RejectionScope::EffectsChain(ChainReason::Mined));
                 self.wake(hash);
+            }
+            // As for a new transaction: a parent that became visible after
+            // this job looked is a reason to look again, not a failure.
+            Outcome::MissingInputs(missing)
+                if missing
+                    .iter()
+                    .any(|outpoint| self.arrived_since(outpoint, started_at)) =>
+            {
+                self.pooled_at(key).hidden = Some(Hidden::Queued);
             }
             // A pooled transaction whose parent left the pool fails with its
             // parent.
@@ -1403,6 +1429,24 @@ impl PoolModel {
         if elapsed.is_zero() {
             return;
         }
+        // A cooldown or a remembered rejection ends at its time, whichever
+        // input comes next.
+        let now = self.now;
+        self.cooldowns.retain(|_, until| *until > now);
+        let memory = self.rejection_memory;
+        for list in self.rejected_chain.values_mut() {
+            while let Some(oldest) = list.order.front().copied() {
+                let forgotten = list
+                    .at
+                    .get(&oldest)
+                    .is_none_or(|at| at.saturating_add(memory) <= now);
+                if !forgotten {
+                    break;
+                }
+                list.order.pop_front();
+                list.at.remove(&oldest);
+            }
+        }
         let arriving: HashSet<transaction::Hash> = self
             .admissions
             .values()
@@ -1432,11 +1476,10 @@ impl PoolModel {
     fn clear_all_rejections(&mut self) {
         self.clear_tip_rejections();
         self.rejected_chain.clear();
-        self.rejected_chain_order.clear();
     }
 
     /// Remembers a rejection in the list its scope names. A tip-scoped list
-    /// that grows past its limit is cleared. The chain-scoped list drops its
+    /// that grows past its limit is cleared. A chain-scoped list drops its
     /// oldest entry.
     fn cache(&mut self, tx_id: UnminedTxId, scope: RejectionScope) {
         match scope {
@@ -1452,14 +1495,16 @@ impl PoolModel {
                     self.rejected_effects_tip.clear();
                 }
             }
-            RejectionScope::EffectsChain => {
+            RejectionScope::EffectsChain(reason) => {
                 let hash = tx_id.mined_id();
-                if self.rejected_chain.insert(hash, self.now).is_none() {
-                    self.rejected_chain_order.push_back(hash);
+                let now = self.now;
+                let list = self.rejected_chain.entry(reason).or_default();
+                if list.at.insert(hash, now).is_none() {
+                    list.order.push_back(hash);
                 }
-                if self.rejected_chain.len() > MAX_REJECTIONS {
-                    if let Some(oldest) = self.rejected_chain_order.pop_front() {
-                        self.rejected_chain.remove(&oldest);
+                if list.at.len() > MAX_REJECTIONS {
+                    if let Some(oldest) = list.order.pop_front() {
+                        list.at.remove(&oldest);
                     }
                 }
             }
@@ -1470,14 +1515,23 @@ impl PoolModel {
     fn cached_rejection(&self, tx_id: UnminedTxId) -> Option<RejectionScope> {
         let hash = tx_id.mined_id();
         if self.rejected_exact.contains(&tx_id) {
-            Some(RejectionScope::ExactTip)
-        } else if self.rejected_effects_tip.contains(&hash) {
-            Some(RejectionScope::EffectsTip)
-        } else if self.rejected_chain.contains_key(&hash) {
-            Some(RejectionScope::EffectsChain)
-        } else {
-            None
+            return Some(RejectionScope::ExactTip);
         }
+        if self.rejected_effects_tip.contains(&hash) {
+            return Some(RejectionScope::EffectsTip);
+        }
+        [
+            ChainReason::Expired,
+            ChainReason::DuplicateSpend,
+            ChainReason::Mined,
+        ]
+        .into_iter()
+        .find(|reason| {
+            self.rejected_chain
+                .get(reason)
+                .is_some_and(|list| list.at.contains_key(&hash))
+        })
+        .map(RejectionScope::EffectsChain)
     }
 
     /// Starts a peer's cooldown. A new peer past the limit replaces the one
@@ -1496,6 +1550,17 @@ impl PoolModel {
         }
         self.cooldowns
             .insert(key, self.now.saturating_add(COOLDOWN));
+    }
+
+    /// Whether `outpoint` became available after the event count
+    /// `started_at`: its transaction is visible now, creates that output,
+    /// and became visible after that count.
+    fn arrived_since(&self, outpoint: &OutPoint, started_at: u64) -> bool {
+        self.offers(outpoint)
+            && self
+                .pooled
+                .get(&outpoint.hash)
+                .is_some_and(|key| self.pool[key].visible_at > started_at)
     }
 
     /// Whether the visible pool offers `outpoint`: its transaction is

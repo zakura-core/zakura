@@ -9,16 +9,16 @@ use zakura_chain::{
 };
 use zakura_node_services::mempool::{
     port::{
-        model::{ModelTx, ModelUnreserved, Outcome, PoolModel, Step, T_VERIFY},
-        Charge, Generation, GenerationRead, Intent, LocalFault, RejectionScope, Source,
-        MAX_PENDING, MAX_PENDING_PER_SOURCE,
+        model::{ModelTx, ModelUnreserved, ModelVerdict, Outcome, PoolModel, Step, T_VERIFY},
+        ChainReason, Charge, Generation, GenerationRead, Intent, LocalFault, RejectionScope,
+        Source, Supplier, MAX_PENDING, MAX_PENDING_PER_SOURCE,
     },
     QueueSource,
 };
 
 use super::reactor_model::{
-    ReactorModel, RelayEffect, MAX_ATTEMPTS, MAX_REQUESTS_PER_PEER, PENDING_PER_PEER,
-    REQUEST_TIMEOUT, RETRY_FIRST, RETRY_MAX,
+    ReactorModel, RelayEffect, SessionId, MAX_ATTEMPTS, MAX_REFETCHES, MAX_REQUESTS_PER_PEER,
+    PENDING_PER_PEER, REQUEST_TIMEOUT, RETRY_FIRST, RETRY_MAX,
 };
 
 const MAX_TX: u32 = 250_000;
@@ -45,21 +45,19 @@ fn stable() -> GenerationRead {
     GenerationRead::Stable(Generation(0))
 }
 
-fn ask(peer: u8, n: u16) -> RelayEffect {
-    RelayEffect::Ask {
-        peer: v2(peer),
-        id: id(n),
-    }
+fn ask(session: SessionId, n: u16) -> RelayEffect {
+    RelayEffect::Ask { session, id: id(n) }
 }
 
 /// A pool and a reactor with `peers` live sessions, none of them dialed.
-fn setup(peers: u8) -> (PoolModel, ReactorModel) {
+/// Session `n` of the returned list belongs to peer `v2(n + 1)`.
+fn setup(peers: u8) -> (PoolModel, ReactorModel, Vec<SessionId>) {
     let pool = PoolModel::new(Height(100), Generation(0));
     let mut reactor = ReactorModel::new(MAX_TX);
-    for peer in 1..=peers {
-        reactor.connect(v2(peer), false, MAX_REQUESTS_PER_PEER);
-    }
-    (pool, reactor)
+    let sessions = (1..=peers)
+        .map(|peer| reactor.connect(v2(peer), false, MAX_REQUESTS_PER_PEER))
+        .collect();
+    (pool, reactor, sessions)
 }
 
 /// Feeds the outcome of the one job the pool started, and routes what the
@@ -102,46 +100,48 @@ fn fill_core(pool: &mut PoolModel) -> Vec<zakura_node_services::mempool::port::R
 
 #[test]
 fn an_announced_id_is_reserved_then_asked_for_then_submitted() {
-    let (mut pool, mut reactor) = setup(1);
-    let effects = reactor.announce(&v2(1), id(1), 300, secs(0), &mut pool);
-    assert_eq!(effects, vec![ask(1, 1)]);
+    let (mut pool, mut reactor, s) = setup(1);
+    let effects = reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    assert_eq!(effects, vec![ask(s[0], 1)]);
     // The slot is taken before the request goes out.
     assert_eq!(pool.counted_against(&Source::Peer(v2(1))), 1);
     assert_eq!(pool.bodies_held(), 0);
 
-    reactor.tx(&v2(1), tx(1), secs(1), &mut pool);
+    reactor.tx(s[0], tx(1), secs(1), &mut pool);
     assert_eq!(pool.bodies_held(), 1);
-    assert_eq!(reactor.outstanding(&v2(1)), 0);
+    assert_eq!(reactor.outstanding(s[0]), 0);
+    assert_eq!(reactor.verifying(s[0]), 1);
 
     finish(&mut pool, &mut reactor, Outcome::Pass, secs(2));
     assert!(!reactor.wants(id(1)));
+    assert_eq!(reactor.verifying(s[0]), 0);
     assert_eq!(pool.visible(), vec![id(1)]);
     reactor.assert_invariants();
 }
 
 #[test]
 fn nothing_is_requested_while_the_core_is_full() {
-    let (mut pool, mut reactor) = setup(1);
+    let (mut pool, mut reactor, s) = setup(1);
     let held = fill_core(&mut pool);
 
     // No slot, so no request: a body is never downloaded to be turned away.
     assert!(reactor
-        .announce(&v2(1), id(1), 300, secs(0), &mut pool)
+        .announce(s[0], id(1), 300, secs(0), &mut pool)
         .is_empty());
     assert!(reactor.wants(id(1)));
-    assert_eq!(reactor.outstanding(&v2(1)), 0);
+    assert_eq!(reactor.outstanding(s[0]), 0);
 
     // The node tries again after a delay, not on every tick.
     pool.release(held[0], secs(0));
     assert!(reactor.tick(RETRY_FIRST - secs(1), &mut pool).is_empty());
-    assert_eq!(reactor.tick(RETRY_FIRST, &mut pool), vec![ask(1, 1)]);
+    assert_eq!(reactor.tick(RETRY_FIRST, &mut pool), vec![ask(s[0], 1)]);
 }
 
 #[test]
 fn the_retry_delay_doubles_up_to_its_limit() {
-    let (mut pool, mut reactor) = setup(1);
+    let (mut pool, mut reactor, s) = setup(1);
     fill_core(&mut pool);
-    reactor.announce(&v2(1), id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
 
     let mut now = secs(0);
     let mut delay = RETRY_FIRST;
@@ -153,22 +153,22 @@ fn the_retry_delay_doubles_up_to_its_limit() {
         delay = (delay * 2).min(RETRY_MAX);
     }
     assert_eq!(delay, RETRY_MAX);
-    assert_eq!(reactor.outstanding(&v2(1)), 0);
+    assert_eq!(reactor.outstanding(s[0]), 0);
 }
 
 #[test]
 fn a_timeout_asks_the_next_announcer_and_keeps_the_first_request_outstanding() {
-    let (mut pool, mut reactor) = setup(2);
-    reactor.announce(&v2(1), id(1), 300, secs(0), &mut pool);
-    reactor.announce(&v2(2), id(1), 300, secs(0), &mut pool);
+    let (mut pool, mut reactor, s) = setup(2);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[1], id(1), 300, secs(0), &mut pool);
 
     assert!(reactor
         .tick(REQUEST_TIMEOUT - secs(1), &mut pool)
         .is_empty());
-    assert_eq!(reactor.tick(REQUEST_TIMEOUT, &mut pool), vec![ask(2, 1)]);
+    assert_eq!(reactor.tick(REQUEST_TIMEOUT, &mut pool), vec![ask(s[1], 1)]);
     // The first peer may still answer, so its request slot stays taken.
-    assert_eq!(reactor.outstanding(&v2(1)), 1);
-    assert_eq!(reactor.outstanding(&v2(2)), 1);
+    assert_eq!(reactor.outstanding(s[0]), 1);
+    assert_eq!(reactor.outstanding(s[1]), 1);
     // One slot at the core, still counted against the first peer asked.
     assert_eq!(pool.slots_in_use(), 1);
     assert_eq!(pool.counted_against(&Source::Peer(v2(1))), 1);
@@ -178,19 +178,19 @@ fn a_timeout_asks_the_next_announcer_and_keeps_the_first_request_outstanding() {
 
 #[test]
 fn the_next_announcer_can_answer_while_it_holds_its_own_five_at_the_core() {
-    let (mut pool, mut reactor) = setup(2);
+    let (mut pool, mut reactor, s) = setup(2);
     // Bob's five slots at the core are taken by his adapter traffic.
     for n in 0..5 {
         pool.reserve(id(100 + n), Source::Peer(v2(2)), Intent::Deliver, secs(0))
             .expect("five fit");
     }
-    reactor.announce(&v2(1), id(1), 300, secs(0), &mut pool);
-    reactor.announce(&v2(2), id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[1], id(1), 300, secs(0), &mut pool);
 
     // Alice times out. Bob is asked, though nothing more can be counted
     // against him: the reservation stays Alice's.
-    assert_eq!(reactor.tick(REQUEST_TIMEOUT, &mut pool), vec![ask(2, 1)]);
-    reactor.tx(&v2(2), tx(1), REQUEST_TIMEOUT + secs(1), &mut pool);
+    assert_eq!(reactor.tick(REQUEST_TIMEOUT, &mut pool), vec![ask(s[1], 1)]);
+    reactor.tx(s[1], tx(1), REQUEST_TIMEOUT + secs(1), &mut pool);
     assert_eq!(pool.counted_against(&Source::Peer(v2(2))), 5);
     pool.assert_invariants();
 
@@ -204,72 +204,77 @@ fn the_next_announcer_can_answer_while_it_holds_its_own_five_at_the_core() {
         },
         REQUEST_TIMEOUT + secs(2),
     );
-    assert_eq!(effects, vec![RelayEffect::Close(v2(2))]);
+    assert_eq!(effects, vec![RelayEffect::Close(s[1])]);
 }
 
 #[test]
 fn the_first_body_wins_and_a_later_one_is_dropped_without_penalty() {
-    let (mut pool, mut reactor) = setup(2);
-    reactor.announce(&v2(1), id(1), 300, secs(0), &mut pool);
-    reactor.announce(&v2(2), id(1), 300, secs(0), &mut pool);
+    let (mut pool, mut reactor, s) = setup(2);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[1], id(1), 300, secs(0), &mut pool);
     reactor.tick(REQUEST_TIMEOUT, &mut pool);
 
     // The first peer answers late, before the second.
     let late = REQUEST_TIMEOUT + secs(1);
-    assert!(reactor.tx(&v2(1), tx(1), late, &mut pool).is_empty());
+    assert!(reactor.tx(s[0], tx(1), late, &mut pool).is_empty());
     assert_eq!(pool.bodies_held(), 1);
-    assert_eq!(reactor.outstanding(&v2(1)), 0);
+    assert_eq!(reactor.outstanding(s[0]), 0);
 
     // The second answer is a valid answer to a request this node sent.
-    let effects = reactor.tx(&v2(2), tx(1), late + secs(1), &mut pool);
+    let effects = reactor.tx(s[1], tx(1), late + secs(1), &mut pool);
     assert!(effects.is_empty(), "no violation: {effects:?}");
-    assert_eq!(reactor.outstanding(&v2(2)), 0);
+    assert_eq!(reactor.outstanding(s[1]), 0);
     assert!(!pool.cooling(&v2(2)));
     assert_eq!(pool.bodies_held(), 1);
+    // Only the body that went to the core counts against its supplier.
+    assert_eq!(reactor.verifying(s[0]), 1);
+    assert_eq!(reactor.verifying(s[1]), 0);
 }
 
 #[test]
 fn a_body_that_arrives_after_the_verdict_is_dropped_without_penalty() {
-    let (mut pool, mut reactor) = setup(2);
-    reactor.announce(&v2(1), id(1), 300, secs(0), &mut pool);
-    reactor.announce(&v2(2), id(1), 300, secs(0), &mut pool);
+    let (mut pool, mut reactor, s) = setup(2);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[1], id(1), 300, secs(0), &mut pool);
     reactor.tick(REQUEST_TIMEOUT, &mut pool);
-    reactor.tx(&v2(2), tx(1), REQUEST_TIMEOUT, &mut pool);
+    reactor.tx(s[1], tx(1), REQUEST_TIMEOUT, &mut pool);
     finish(&mut pool, &mut reactor, Outcome::Pass, REQUEST_TIMEOUT);
 
-    let effects = reactor.tx(&v2(1), tx(1), REQUEST_TIMEOUT + secs(5), &mut pool);
+    let effects = reactor.tx(s[0], tx(1), REQUEST_TIMEOUT + secs(5), &mut pool);
     assert!(effects.is_empty());
     assert_eq!(pool.bodies_held(), 0);
-    assert_eq!(reactor.outstanding(&v2(1)), 0);
+    assert_eq!(reactor.outstanding(s[0]), 0);
 }
 
 #[test]
 fn a_silent_peer_holds_only_its_own_five_requests() {
-    let (mut pool, mut reactor) = setup(2);
+    let (mut pool, mut reactor, s) = setup(2);
     for n in 0..7 {
-        reactor.announce(&v2(1), id(n), 300, secs(0), &mut pool);
+        reactor.announce(s[0], id(n), 300, secs(0), &mut pool);
     }
     // Five requests are out. The other two ids wait for a slot.
-    assert_eq!(reactor.outstanding(&v2(1)), MAX_REQUESTS_PER_PEER);
+    assert_eq!(reactor.outstanding(s[0]), MAX_REQUESTS_PER_PEER);
 
-    // The peer never answers. Nothing more is asked of it, ever.
+    // The peer never answers. Nothing more is asked of it, ever, and the
+    // core slots of the five it was asked for are free again.
     let effects = reactor.tick(REQUEST_TIMEOUT, &mut pool);
     assert!(effects.is_empty(), "nobody else announced these");
-    assert_eq!(reactor.outstanding(&v2(1)), MAX_REQUESTS_PER_PEER);
+    assert_eq!(reactor.outstanding(s[0]), MAX_REQUESTS_PER_PEER);
+    assert_eq!(pool.slots_in_use(), 0);
 
-    // An honest peer announces the two it never got to. They are fetched
-    // from that peer.
-    let effects = reactor.announce(&v2(2), id(5), 300, REQUEST_TIMEOUT, &mut pool);
-    assert_eq!(effects, vec![ask(2, 5)]);
+    // An honest peer announces one it never got to. It is fetched from that
+    // peer.
+    let effects = reactor.announce(s[1], id(5), 300, REQUEST_TIMEOUT, &mut pool);
+    assert_eq!(effects, vec![ask(s[1], 5)]);
     reactor.assert_invariants();
     pool.assert_invariants();
 }
 
 #[test]
 fn an_unrequested_body_is_a_violation_and_starts_a_cooldown() {
-    let (mut pool, mut reactor) = setup(1);
-    let effects = reactor.tx(&v2(1), tx(1), secs(0), &mut pool);
-    assert_eq!(effects, vec![RelayEffect::Close(v2(1))]);
+    let (mut pool, mut reactor, s) = setup(1);
+    let effects = reactor.tx(s[0], tx(1), secs(0), &mut pool);
+    assert_eq!(effects, vec![RelayEffect::Close(s[0])]);
     // The core heard about it, though no body was submitted.
     assert!(pool.cooling(&v2(1)));
     assert_eq!(
@@ -280,31 +285,30 @@ fn an_unrequested_body_is_a_violation_and_starts_a_cooldown() {
 
 #[test]
 fn a_not_found_moves_the_id_on_and_is_never_penalised() {
-    let (mut pool, mut reactor) = setup(2);
-    reactor.announce(&v2(1), id(1), 300, secs(0), &mut pool);
-    reactor.announce(&v2(2), id(1), 300, secs(0), &mut pool);
+    let (mut pool, mut reactor, s) = setup(2);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[1], id(1), 300, secs(0), &mut pool);
 
-    let effects = reactor.not_found(&v2(1), id(1), secs(1), &mut pool);
-    assert_eq!(effects, vec![ask(2, 1)]);
-    assert_eq!(reactor.outstanding(&v2(1)), 0);
+    let effects = reactor.not_found(s[0], id(1), secs(1), &mut pool);
+    assert_eq!(effects, vec![ask(s[1], 1)]);
+    assert_eq!(reactor.outstanding(s[0]), 0);
     assert!(!pool.cooling(&v2(1)));
 
     // One that answers no request is a violation.
-    let effects = reactor.not_found(&v2(1), id(9), secs(2), &mut pool);
-    assert_eq!(effects, vec![RelayEffect::Close(v2(1))]);
+    let effects = reactor.not_found(s[0], id(9), secs(2), &mut pool);
+    assert_eq!(effects, vec![RelayEffect::Close(s[0])]);
 }
 
 #[test]
-fn after_the_last_announcer_the_node_gives_up_and_frees_the_core_slot() {
-    let (mut pool, mut reactor) = setup(4);
-    for peer in 1..=4 {
-        reactor.announce(&v2(peer), id(1), 300, secs(0), &mut pool);
+fn after_the_last_attempt_the_node_gives_up_and_frees_the_core_slot() {
+    let (mut pool, mut reactor, s) = setup(4);
+    for session in &s {
+        reactor.announce(*session, id(1), 300, secs(0), &mut pool);
     }
     let mut now = secs(0);
     for attempt in 1..MAX_ATTEMPTS {
         now += REQUEST_TIMEOUT;
-        let peer = u8::try_from(attempt + 1).expect("small");
-        assert_eq!(reactor.tick(now, &mut pool), vec![ask(peer, 1)]);
+        assert_eq!(reactor.tick(now, &mut pool), vec![ask(s[attempt], 1)]);
     }
     assert_eq!(pool.slots_in_use(), 1);
 
@@ -317,16 +321,16 @@ fn after_the_last_announcer_the_node_gives_up_and_frees_the_core_slot() {
 
 #[test]
 fn a_verdict_ends_the_fetch_for_every_announcer() {
-    let (mut pool, mut reactor) = setup(3);
-    for peer in 1..=3 {
-        reactor.announce(&v2(peer), id(1), 300, secs(0), &mut pool);
+    let (mut pool, mut reactor, s) = setup(3);
+    for session in &s {
+        reactor.announce(*session, id(1), 300, secs(0), &mut pool);
     }
-    reactor.tx(&v2(1), tx(1), secs(1), &mut pool);
+    reactor.tx(s[0], tx(1), secs(1), &mut pool);
     let (_, effects) = finish(
         &mut pool,
         &mut reactor,
         Outcome::Fail {
-            scope: RejectionScope::EffectsChain,
+            scope: RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
             charge: Charge::None,
         },
         secs(2),
@@ -336,17 +340,17 @@ fn a_verdict_ends_the_fetch_for_every_announcer() {
 
     // A peer that announces it again is not asked: the core remembers.
     assert!(reactor
-        .announce(&v2(2), id(1), 300, secs(3), &mut pool)
+        .announce(s[1], id(1), 300, secs(3), &mut pool)
         .is_empty());
     assert!(!reactor.wants(id(1)));
 }
 
 #[test]
 fn a_local_fault_fetches_the_id_again_after_a_delay() {
-    let (mut pool, mut reactor) = setup(2);
-    reactor.announce(&v2(1), id(1), 300, secs(0), &mut pool);
-    reactor.announce(&v2(2), id(1), 300, secs(0), &mut pool);
-    reactor.tx(&v2(1), tx(1), secs(1), &mut pool);
+    let (mut pool, mut reactor, s) = setup(2);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[1], id(1), 300, secs(0), &mut pool);
+    reactor.tx(s[0], tx(1), secs(1), &mut pool);
 
     let (_, effects) = finish(
         &mut pool,
@@ -367,9 +371,9 @@ fn a_local_fault_fetches_the_id_again_after_a_delay() {
 
 #[test]
 fn a_verification_that_times_out_is_a_local_fault_for_the_reactor_too() {
-    let (mut pool, mut reactor) = setup(1);
-    reactor.announce(&v2(1), id(1), 300, secs(0), &mut pool);
-    reactor.tx(&v2(1), tx(1), secs(0), &mut pool);
+    let (mut pool, mut reactor, s) = setup(1);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.tx(s[0], tx(1), secs(0), &mut pool);
     reactor.take_started();
 
     let step = pool.tick(T_VERIFY);
@@ -380,14 +384,14 @@ fn a_verification_that_times_out_is_a_local_fault_for_the_reactor_too() {
 
 #[test]
 fn a_session_that_ends_moves_its_ids_on_and_keeps_the_core_slot() {
-    let (mut pool, mut reactor) = setup(2);
-    reactor.announce(&v2(1), id(1), 300, secs(0), &mut pool);
-    reactor.announce(&v2(2), id(1), 300, secs(0), &mut pool);
-    reactor.announce(&v2(1), id(2), 300, secs(0), &mut pool);
+    let (mut pool, mut reactor, s) = setup(2);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[1], id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[0], id(2), 300, secs(0), &mut pool);
 
-    let effects = reactor.end(&v2(1), secs(1), &mut pool);
+    let effects = reactor.end(s[0], secs(1), &mut pool);
     // Id 1 has another announcer. Id 2 has nobody left.
-    assert_eq!(effects, vec![ask(2, 1)]);
+    assert_eq!(effects, vec![ask(s[1], 1)]);
     assert!(!reactor.wants(id(2)));
     // Id 1's slot is the one taken when the first peer was asked.
     assert_eq!(pool.slots_in_use(), 1);
@@ -399,35 +403,35 @@ fn a_session_that_ends_moves_its_ids_on_and_keeps_the_core_slot() {
 fn a_peer_this_node_dialed_is_asked_first() {
     let mut pool = PoolModel::new(Height(100), Generation(0));
     let mut reactor = ReactorModel::new(MAX_TX);
-    reactor.connect(v2(1), false, MAX_REQUESTS_PER_PEER);
-    reactor.connect(v2(2), true, MAX_REQUESTS_PER_PEER);
+    let accepted = reactor.connect(v2(1), false, MAX_REQUESTS_PER_PEER);
+    let dialed = reactor.connect(v2(2), true, MAX_REQUESTS_PER_PEER);
     // The core is full while both announce, so the choice is made later
     // with both announcers known.
     let held = fill_core(&mut pool);
-    reactor.announce(&v2(1), id(1), 300, secs(0), &mut pool);
-    reactor.announce(&v2(2), id(1), 300, secs(0), &mut pool);
+    reactor.announce(accepted, id(1), 300, secs(0), &mut pool);
+    reactor.announce(dialed, id(1), 300, secs(0), &mut pool);
 
     pool.release(held[0], secs(0));
-    assert_eq!(reactor.tick(RETRY_FIRST, &mut pool), vec![ask(2, 1)]);
+    assert_eq!(reactor.tick(RETRY_FIRST, &mut pool), vec![ask(dialed, 1)]);
 }
 
 #[test]
 fn a_peer_is_never_asked_for_more_than_its_hello_allows() {
     let mut pool = PoolModel::new(Height(100), Generation(0));
     let mut reactor = ReactorModel::new(MAX_TX);
-    reactor.connect(v2(1), false, 2);
+    let session = reactor.connect(v2(1), false, 2);
     for n in 0..4 {
-        reactor.announce(&v2(1), id(n), 300, secs(0), &mut pool);
+        reactor.announce(session, id(n), 300, secs(0), &mut pool);
     }
-    assert_eq!(reactor.outstanding(&v2(1)), 2);
+    assert_eq!(reactor.outstanding(session), 2);
     reactor.assert_invariants();
 }
 
 #[test]
 fn an_id_too_large_for_this_node_is_skipped() {
-    let (mut pool, mut reactor) = setup(1);
+    let (mut pool, mut reactor, s) = setup(1);
     assert!(reactor
-        .announce(&v2(1), id(1), MAX_TX + 1, secs(0), &mut pool)
+        .announce(s[0], id(1), MAX_TX + 1, secs(0), &mut pool)
         .is_empty());
     assert!(!reactor.wants(id(1)));
     assert_eq!(pool.slots_in_use(), 0);
@@ -435,21 +439,21 @@ fn an_id_too_large_for_this_node_is_skipped() {
 
 #[test]
 fn a_full_pending_set_drops_and_counts() {
-    let (mut pool, mut reactor) = setup(1);
+    let (mut pool, mut reactor, s) = setup(1);
     let total = u16::try_from(PENDING_PER_PEER).expect("fits the test's ids");
     for n in 0..total {
-        reactor.announce(&v2(1), id(n), 300, secs(0), &mut pool);
+        reactor.announce(s[0], id(n), 300, secs(0), &mut pool);
     }
     assert_eq!(reactor.overflowed, 0);
-    reactor.announce(&v2(1), id(total), 300, secs(0), &mut pool);
+    reactor.announce(s[0], id(total), 300, secs(0), &mut pool);
     assert_eq!(reactor.overflowed, 1);
     assert!(!reactor.wants(id(total)));
     reactor.assert_invariants();
 }
 
 #[test]
-fn an_id_the_pool_has_or_that_another_source_is_bringing_in_is_not_fetched() {
-    let (mut pool, mut reactor) = setup(1);
+fn an_id_another_source_is_bringing_in_is_not_fetched_twice() {
+    let (mut pool, mut reactor, s) = setup(1);
     // A legacy peer is already bringing id 1 in.
     let legacy = Source::Peer(QueueSource::LegacySocket(([10, 0, 0, 9], 8233).into()));
     let reserved = pool
@@ -457,16 +461,182 @@ fn an_id_the_pool_has_or_that_another_source_is_bringing_in_is_not_fetched() {
         .expect("room");
 
     assert!(reactor
-        .announce(&v2(1), id(1), 300, secs(0), &mut pool)
+        .announce(s[0], id(1), 300, secs(0), &mut pool)
         .is_empty());
     assert!(reactor.wants(id(1)), "it may still be needed");
 
     // The legacy fetch fails. The relay fetches it on its next try.
     pool.release(reserved.id, secs(0));
-    assert_eq!(reactor.tick(RETRY_FIRST, &mut pool), vec![ask(1, 1)]);
+    assert_eq!(reactor.tick(RETRY_FIRST, &mut pool), vec![ask(s[0], 1)]);
     // While the relay is fetching it, nobody else fetches it either.
     assert_eq!(
         pool.reserve(id(1), Source::Node, Intent::Fetch, RETRY_FIRST),
         Err(ModelUnreserved::Pending)
     );
+}
+
+// Cases from the second review.
+
+#[test]
+fn an_old_session_that_ends_does_not_remove_its_replacement() {
+    let (mut pool, mut reactor, s) = setup(1);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    // The same peer opens a new session before the old one's end arrives.
+    let replacement = reactor.connect(v2(1), false, MAX_REQUESTS_PER_PEER);
+
+    reactor.end(s[0], secs(1), &mut pool);
+    assert!(!reactor.is_live(s[0]));
+    assert!(reactor.is_live(replacement));
+    // The old session's request went with it. The new one starts clean.
+    assert_eq!(reactor.outstanding(replacement), 0);
+    assert!(!reactor.wants(id(1)));
+
+    // An answer on the new session to the old session's request answers
+    // nothing this session was asked.
+    let effects = reactor.tx(replacement, tx(1), secs(2), &mut pool);
+    assert_eq!(effects, vec![RelayEffect::Close(replacement)]);
+}
+
+#[test]
+fn an_id_announced_again_is_not_asked_twice_on_one_session() {
+    let (mut pool, mut reactor, s) = setup(1);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    // The only announcer times out. The node gives up on the id, and the
+    // request stays outstanding.
+    reactor.tick(REQUEST_TIMEOUT, &mut pool);
+    assert!(!reactor.wants(id(1)));
+    assert_eq!(reactor.outstanding(s[0]), 1);
+
+    // The peer announces it again. A second request for the same id would
+    // break the wire rule and make the two answers indistinguishable.
+    let effects = reactor.announce(s[0], id(1), 300, REQUEST_TIMEOUT, &mut pool);
+    assert!(effects.is_empty());
+    assert!(reactor.wants(id(1)));
+    reactor.assert_invariants();
+
+    // The answer to the first request is still good, and is delivered.
+    let effects = reactor.tx(s[0], tx(1), REQUEST_TIMEOUT + secs(1), &mut pool);
+    assert!(effects.is_empty());
+    assert_eq!(pool.bodies_held(), 1);
+}
+
+#[test]
+fn a_refetch_after_a_local_fault_skips_a_session_that_still_owes_an_answer() {
+    let (mut pool, mut reactor, s) = setup(2);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[1], id(1), 300, secs(0), &mut pool);
+    // Alice times out. Bob supplies the body, and it hits a local fault.
+    reactor.tick(REQUEST_TIMEOUT, &mut pool);
+    reactor.tx(s[1], tx(1), REQUEST_TIMEOUT, &mut pool);
+    finish(
+        &mut pool,
+        &mut reactor,
+        Outcome::LocalFault(LocalFault::StateUnavailable),
+        REQUEST_TIMEOUT,
+    );
+
+    // Both are eligible again in the new fetch, but Alice still has the
+    // first request outstanding. Bob is asked.
+    let effects = reactor.tick(REQUEST_TIMEOUT + RETRY_FIRST, &mut pool);
+    assert_eq!(effects, vec![ask(s[1], 1)]);
+    assert_eq!(reactor.outstanding(s[0]), 1);
+    reactor.assert_invariants();
+}
+
+#[test]
+fn local_faults_do_not_fetch_one_id_for_ever() {
+    let (mut pool, mut reactor, s) = setup(1);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    let mut now = secs(0);
+    for _ in 0..=MAX_REFETCHES {
+        assert!(reactor.wants(id(1)));
+        reactor.tx(s[0], tx(1), now, &mut pool);
+        finish(
+            &mut pool,
+            &mut reactor,
+            Outcome::LocalFault(LocalFault::StateUnavailable),
+            now,
+        );
+        reactor.assert_invariants();
+        now += RETRY_MAX;
+        reactor.tick(now, &mut pool);
+    }
+    assert!(!reactor.wants(id(1)));
+    assert_eq!(pool.slots_in_use(), 0);
+}
+
+#[test]
+fn a_peer_has_at_most_five_ids_requested_or_awaiting_a_verdict() {
+    let (mut pool, mut reactor, s) = setup(6);
+    let bob = s[5];
+    // Five peers each announce one id first, and Bob announces all five.
+    for n in 0..5 {
+        reactor.announce(s[usize::from(n)], id(n), 300, secs(0), &mut pool);
+        reactor.announce(bob, id(n), 300, secs(0), &mut pool);
+    }
+    // They all time out, so Bob is asked for the five. Their core slots
+    // stay counted against the first peers asked, not against Bob.
+    let effects = reactor.tick(REQUEST_TIMEOUT, &mut pool);
+    assert_eq!(effects.len(), 5);
+    assert_eq!(pool.counted_against(&Source::Peer(v2(6))), 0);
+
+    // Bob answers all five. None of his requests is outstanding now.
+    for n in 0..5 {
+        reactor.tx(bob, tx(n), REQUEST_TIMEOUT, &mut pool);
+    }
+    assert_eq!(reactor.outstanding(bob), 0);
+    assert_eq!(reactor.verifying(bob), 5);
+
+    // The core would count a sixth against Bob. The reactor does not ask,
+    // because five of his bodies are still awaiting a verdict.
+    let effects = reactor.announce(bob, id(9), 300, REQUEST_TIMEOUT, &mut pool);
+    assert!(effects.is_empty());
+    reactor.assert_invariants();
+}
+
+#[test]
+fn a_supplier_that_is_cooling_down_does_not_strand_the_id() {
+    let (mut pool, mut reactor, s) = setup(2);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[1], id(1), 300, secs(0), &mut pool);
+    // Alice does not have it. Bob is asked, then enters a cooldown.
+    reactor.not_found(s[0], id(1), secs(1), &mut pool);
+    pool.violation(v2(2), secs(1));
+
+    // Bob's body is not verified. Nobody is left to ask, so the node gives
+    // up on the id instead of keeping it with nothing to wait for.
+    let effects = reactor.tx(s[1], tx(1), secs(2), &mut pool);
+    assert!(effects.is_empty());
+    assert!(!reactor.wants(id(1)));
+    assert_eq!(reactor.verifying(s[1]), 0);
+    assert_eq!(pool.slots_in_use(), 0);
+    reactor.assert_invariants();
+}
+
+#[test]
+fn giving_up_passes_on_the_verdict_it_causes_for_another_caller() {
+    let (mut pool, mut reactor, s) = setup(1);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.take_pool_steps();
+
+    // Two legacy callers hold the same transaction. The first is asked for
+    // the body and is cancelled. The second waits for its verdict.
+    let legacy = |n: u8| QueueSource::LegacySocket(([10, 0, 0, n], 8233).into());
+    let bringer = pool
+        .reserve(id(1), Source::Peer(legacy(1)), Intent::Deliver, secs(0))
+        .expect("joins the relay's reservation");
+    let waiting = pool
+        .reserve(id(1), Source::Peer(legacy(2)), Intent::Deliver, secs(0))
+        .expect("joins");
+    let (waiter, _) = pool.wait(waiting.id, id(1), Supplier::Peer(legacy(2)), secs(0));
+    pool.release(bringer.id, secs(0));
+
+    // The relay's only announcer times out, and the relay gives up. Nobody
+    // can bring the body now. The waiting caller's answer is not lost.
+    reactor.tick(REQUEST_TIMEOUT, &mut pool);
+    let verdict = reactor
+        .take_pool_steps()
+        .iter()
+        .find_map(|step| step.verdict(waiter));
+    assert_eq!(verdict, Some(ModelVerdict::LocalFault(LocalFault::NoBody)));
 }

@@ -68,9 +68,8 @@ pub const MAX_REVALIDATING: usize = 400;
 /// ring of 16,384 removals.
 pub const CHANGE_LOG_CAPACITY: usize = 24_384;
 
-/// Entries in each of the two tip-scoped rejection lists. A list that grows
-/// past this is cleared, as today. The chain-scoped list holds as many and
-/// drops its oldest entry.
+/// Entries in each rejection list. A tip-scoped list that grows past this is
+/// cleared, as today. Each chain-scoped list drops its oldest entry.
 pub const MAX_REJECTIONS: usize = 40_000;
 
 /// Peers with a cooldown. A new one past this replaces the one that ends
@@ -265,11 +264,25 @@ pub enum RejectionScope {
     ExactTip,
     /// Any transaction with these effects, until the tip changes.
     EffectsTip,
-    /// Any transaction with these effects, on this chain.
-    EffectsChain,
+    /// Any transaction with these effects, while this chain keeps growing.
+    /// Each reason has its own list, as today.
+    EffectsChain(ChainReason),
     /// Not remembered: a parent that never arrived, or a transaction a block
     /// already mined.
     Uncached,
+}
+
+/// Why a rejection holds for as long as the chain keeps growing. Today's
+/// three chain-scoped lists.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum ChainReason {
+    /// The tip reached the transaction's expiry height.
+    Expired,
+    /// The best chain spent one of its inputs or revealed one of its
+    /// nullifiers.
+    DuplicateSpend,
+    /// The best chain mined it.
+    Mined,
 }
 
 /// What a rejection costs the supplier.
@@ -518,6 +531,24 @@ pub enum ChainEvent {
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ChangeSeq(pub u64);
 
+impl ChangeSeq {
+    /// Whether a reader announces a [`Change::Revealed`] whose transaction
+    /// was hidden at `hidden_at`. `self` is the reader's baseline: the
+    /// [`PoolSnapshot::last_change`] of the snapshot it last announced in
+    /// full, at its opening or at its latest resynchronization.
+    ///
+    /// A baseline at or after `hidden_at` is a snapshot taken while the
+    /// transaction was hidden, so the reader has not announced it and does
+    /// now. An earlier baseline means the reader announced it from that
+    /// snapshot or from the log, and skips this.
+    ///
+    /// A reader that resynchronizes announces the whole snapshot again and
+    /// moves its baseline, because it cannot know which additions it lost.
+    pub fn announces_reveal(self, hidden_at: ChangeSeq) -> bool {
+        self >= hidden_at
+    }
+}
+
 /// Why a transaction left the pool.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RemovalReason {
@@ -553,9 +584,7 @@ pub enum Change {
     Hidden(UnminedTxId),
     /// A hidden transaction passed and is visible again.
     ///
-    /// A reader that opened at or after `hidden_at` took its opening
-    /// snapshot while the transaction was hidden, so it has never announced
-    /// it and does now. Every other reader already has, and skips this.
+    /// Whether a reader announces it is [`ChangeSeq::announces_reveal`].
     Revealed {
         /// The transaction.
         id: UnminedTxId,
@@ -770,6 +799,9 @@ pub enum PoolCommand {
         /// admitted, or the reason the core will not wait.
         reply: oneshot::Sender<Result<transparent::Output, AwaitOutputError>>,
     },
+    /// A reservation was dropped before the core accepted it. No caller
+    /// sends this. [`PoolInbox::next`] yields it.
+    Released(ReservationId),
     /// [`PoolHandle::rejected_ids`].
     RejectedIds {
         /// The ids to check.
@@ -972,7 +1004,22 @@ impl PoolHandle {
 }
 
 impl PoolInbox {
-    /// The next command, or `None` once every handle is gone.
+    /// The next thing a caller did, or `None` once every handle is gone.
+    ///
+    /// A dropped reservation arrives as [`PoolCommand::Released`] and wakes
+    /// this as any command does, so an idle core still frees the slot and
+    /// answers anyone waiting on it. Releases come first, so a freed slot is
+    /// seen by the next reservation.
+    pub async fn next(&mut self) -> Option<PoolCommand> {
+        zakura_rt::select! {
+            biased;
+            Some(released) = self.releases.recv() => Some(PoolCommand::Released(released)),
+            command = self.commands.recv() => command,
+        }
+    }
+
+    /// The next command, or `None` once every handle is gone. This does not
+    /// wake for a dropped reservation. The core's task uses [`Self::next`].
     pub async fn command(&mut self) -> Option<PoolCommand> {
         self.commands.recv().await
     }

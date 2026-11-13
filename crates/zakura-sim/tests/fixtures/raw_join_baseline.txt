@@ -453,13 +453,11 @@ src/table.rs	check_never_closes	*stream==id.stream
 src/table.rs	check_never_closes	f.stream==id.stream
 src/table.rs	check_never_closes	id.template==Template::CadenceNeverCloses
 src/table.rs	check_never_closes	id.template==Template::ConformantNeverCloses
-src/table.rs	closed	c==connection
 src/table.rs	content_consequence	key.subject==session(*connection)
 src/table.rs	fault_close	key.subject==session(*connection)
 src/table.rs	is_page_of	(enforced_on.kind,enforced_on.version)==(stream.kind,stream.version)
 src/table.rs	is_page_of	(rule_stream,row)==(stream,subscription)
 src/table.rs	is_page_of	enforced.name==subscription
-src/table.rs	judged	c==connection
 src/table.rs	judged_nonconformant	frame.label!=Label::Conformant
 src/table.rs	receiver_reached	*c==connection
 src/table.rs	receiver_reached	Some(*exchange)==frame.exchange
@@ -470,7 +468,6 @@ src/table.rs	receiver_reached	frame.rule_stream==id.stream
 src/table.rs	receiver_reached	frame.stream==id.stream
 src/table.rs	receiver_reached	granted.row==subscription
 src/table.rs	receiver_reached	granted.stream==id.stream
-src/table.rs	sent	(*c,*s,*quic,*q)==(connection,stream,quic_stream,seq)
 src/table.rs	stream_of	stream.kind==id.kind
 src/table.rs	stream_of	stream.version==id.version
 src/table.rs	unclaimed_fault	consequence(frame.label)==Consequence::NoPunishment
@@ -897,7 +894,6 @@ tests/header_wire_net.rs	of	Some(*connection)==crossing.connection
 tests/header_wire_net.rs	of	peer=="peer-0"
 tests/header_wire_net.rs	peer_read	(*c,*q,*seq)==(connection,frame.quic_stream,frame.seq)
 tests/header_wire_net.rs	peer_written	(*c,*quic_stream,*seq)==(connection,frame.quic_stream,frame.seq)
-tests/header_wire_prepare_fault.rs	a_disconnect_mid_prepare_is_still_penalized	shape.misbehavior.contains(&(Some(session),None)
 tests/header_wire_prepare_fault.rs	assert_penalized	*origin==Some(session)
 tests/header_wire_prepare_fault.rs	assert_stale_fault_inert	*c==call
 tests/header_wire_prepare_fault.rs	assert_stale_fault_inert	*ended==op

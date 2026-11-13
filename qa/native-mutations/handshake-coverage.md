@@ -57,7 +57,7 @@ The cadence admission bypass now applies; the `da37` campaign could not apply it
 The wire generator found one production bug.
 The `da37` wire baselines failed `handshake/hello/refusal-releases-slot` at seed 11, run 178.
 quinn-proto kept a refused connection's closing state for three probe timeouts, which a slow peer controls.
-#2340 caps the drain at `SHUTDOWN_DRAIN`.
+This PR caps the drain at `SHUTDOWN_DRAIN`.
 The `dde6` wire baselines pass, so `dde6` is the first campaign with generated wire evidence.
 
 ## Scope and coverage limits

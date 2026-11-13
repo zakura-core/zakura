@@ -200,9 +200,10 @@ pub const END_BOUNDARY_FAULT_STORE_TEST: TestRef = sim_test(
 );
 
 /// Gate 5's bound-table limit fixtures (hdr-9d.1): work slots, locator
-/// reads and node execution slots each reach their limit and no further
-/// while one more party waits, and the slot fixture's per-round
-/// reservations, staged capacity and request deadlines reach 16 with them.
+/// reads, and node and peer execution slots each reach their limit and no
+/// further while one more party waits, the departed strikes and cooldowns
+/// reach theirs, and the slot fixture's per-round reservations, staged
+/// capacity and request deadlines reach 16 with them.
 pub const BOUND_LIMIT_TEST: TestRef = sim_test(
     "tests/header_outstanding.rs",
     "the_limit_fixtures_reach_and_hold_their_bounds",
@@ -211,7 +212,9 @@ pub const BOUND_LIMIT_TEST: TestRef = sim_test(
 /// Gate 5's bound-table release and reuse: in each limit fixture's log, and
 /// for the reservation maps in the slot fixture's reservation facts, the
 /// waiting party gets its first unit only after a release, with fewer than
-/// the limit open.
+/// the limit open. The departed strikes and cooldowns take more drops in
+/// one cooldown than they hold, the last of which replaces one of the
+/// earliest entries, then fall as entries end and rise again.
 pub const BOUND_REUSE_TEST: TestRef = sim_test(
     "tests/header_outstanding.rs",
     "the_limit_fixtures_release_and_reuse_their_bounds",
@@ -280,9 +283,6 @@ pub mod bound_unshown {
     /// Detached `RetainedHeaders`.
     pub const DETACHED: &str = "detached RetainedHeaders count inside the chunk budget, which \
         chunk-budget-bound judges, and no fixture holds one past its round";
-    /// Departed strikes.
-    pub const STRIKES: &str = "no committed storage fixture leaves a departed strike, so the \
-        map's limit and its maintenance expiry are never exercised";
     /// Pending closes.
     pub const PENDING_CLOSES: &str = "no committed storage fixture fills a session's queue so a \
         Close is refused and waits to retry, so the map stays empty";
@@ -300,11 +300,10 @@ pub mod bound_unshown {
     pub const SUBSCRIPTION_SLOTS: &str = "no fixture opens a second subscription while the \
         first's terminal write finishes, so the 2-slot margin is never used";
     /// The sent-cursor ring.
-    pub const SENT_RING: &str = "no fixture sends a subscription anywhere near 4,096 pages, so \
-        its sent-cursor ring never nears its limit";
-    /// Peer execution slots.
-    pub const PEER_EXECUTION: &str = "the capacity-waits fixture holds a peer's 2 execution \
-        slots, but no fixture shows a third page job for that peer denied, released and reused";
+    pub const SENT_RING: &str = "the sent-cursor ring is structurally unreachable: every page \
+        spends at least one header of credit, and a subscription holds at most 4,000 headers \
+        of credit past its acknowledged cursor, so reserve_page's credit check refuses before \
+        the 4,096-entry ring fills";
     /// Node serving output.
     pub const NODE_OUTPUT: &str = "the node's output grants are listed, not checked: their \
         limit follows the configured session count through the toolkit's sizing";
@@ -317,10 +316,6 @@ pub mod bound_unshown {
     /// Retained-path leases.
     pub const LEASES: &str = "the 8 node execution slots bound concurrent serving leases first, \
         so no fixture reaches storage's 16 retained-path leases";
-    /// Readmission cooldowns.
-    pub const COOLDOWNS: &str = "readmission cooldowns are capped at the admitted peer limit \
-        (#2131), but no committed storage fixture installs one, so the cap and the \
-        maintenance expiry are never exercised";
     /// Pruned peers.
     pub const PRUNED_PEERS: &str = "pruned peers are capped at the admitted peer limit \
         (#2209), but no committed storage fixture prunes a peer's history, so the cap is never \
@@ -576,6 +571,30 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
         BOUND_REUSE_TEST,
     ),
     bound_test(
+        "gate-5/bound-table/peer-execution-slots/at-limit",
+        BOUND_LIMIT_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/peer-execution-slots/release-reuse",
+        BOUND_REUSE_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/departed-strikes/at-limit",
+        BOUND_LIMIT_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/departed-strikes/release-reuse",
+        BOUND_REUSE_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/readmission-cooldowns/at-limit",
+        BOUND_LIMIT_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/readmission-cooldowns/release-reuse",
+        BOUND_REUSE_TEST,
+    ),
+    bound_test(
         "gate-5/bound-table/publisher-capacity-waits/cleanup",
         BOUND_WAITS_TEST,
     ),
@@ -646,10 +665,6 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
         bound_unshown::DETACHED,
     ),
     bound_unshown(
-        "gate-5/bound-table/departed-strikes",
-        bound_unshown::STRIKES,
-    ),
-    bound_unshown(
         "gate-5/bound-table/pending-closes",
         bound_unshown::PENDING_CLOSES,
     ),
@@ -670,10 +685,6 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
         "gate-5/bound-table/sent-cursor-ring",
         bound_unshown::SENT_RING,
     ),
-    bound_unshown(
-        "gate-5/bound-table/peer-execution-slots",
-        bound_unshown::PEER_EXECUTION,
-    ),
     bound_unshown("gate-5/bound-table/node-output", bound_unshown::NODE_OUTPUT),
     bound_unshown("gate-5/bound-table/peer-output", bound_unshown::PEER_OUTPUT),
     bound_unshown(
@@ -683,10 +694,6 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     bound_unshown(
         "gate-5/bound-table/retained-path-leases",
         bound_unshown::LEASES,
-    ),
-    bound_unshown(
-        "gate-5/bound-table/readmission-cooldowns",
-        bound_unshown::COOLDOWNS,
     ),
     bound_unshown(
         "gate-5/bound-table/pruned-peers",

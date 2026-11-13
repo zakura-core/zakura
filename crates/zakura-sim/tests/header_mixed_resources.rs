@@ -166,6 +166,9 @@ fn mixed_resources() -> StorageScenario {
             step(NODE, ControlAction::StopStorage, None),
         ],
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 

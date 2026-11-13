@@ -65,6 +65,9 @@ pub fn syncing(
         },
         controls,
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -269,6 +272,9 @@ pub fn release_after_apply() -> StorageScenario {
             Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
         )],
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -292,6 +298,9 @@ pub fn reply_hold() -> StorageScenario {
         },
         controls: Vec::new(),
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -381,6 +390,9 @@ pub fn peer_lease_denied() -> StorageScenario {
             ),
         ],
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -404,6 +416,9 @@ pub fn fault(kind: OpKind, fault: Allow, after: u64) -> StorageScenario {
         },
         controls: Vec::new(),
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -427,6 +442,9 @@ fn forks(len_1: u32, len_2: u32, weights: Weights) -> StorageScenario {
         weights,
         policy: Policy::converging(),
         controls: Vec::new(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 

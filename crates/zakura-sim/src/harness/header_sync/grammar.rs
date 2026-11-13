@@ -354,6 +354,9 @@ fn decode_as(
             branch_1: weight(0),
             branch_2: weight(1),
         },
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     };
     let decode_trigger = |trigger: &[u8], site| decode_trigger(trigger, mirrors, site, generator);
     // Holds first, so a release knows how many there are.
@@ -478,6 +481,23 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
         return Err(Unencodable(format!(
             "the grammar has no disruption, but it declares {:?}",
             scenario.policy.disruptions
+        )));
+    }
+    if !scenario.node_settings.is_default() {
+        return Err(Unencodable(format!(
+            "the grammar has no node settings, but it sets {:?}",
+            scenario.node_settings
+        )));
+    }
+    if !scenario.page_delays.is_empty() {
+        return Err(Unencodable(format!(
+            "the grammar has no page delay, but it declares {:?}",
+            scenario.page_delays
+        )));
+    }
+    if let Some(budget) = scenario.budget {
+        return Err(Unencodable(format!(
+            "the grammar has no step budget, but it sets {budget}"
         )));
     }
     let mirrors = scenario.mirrors.len();

@@ -3347,6 +3347,30 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
         obligation::BOUND_REUSE_TEST,
     ),
     bound_passes(
+        "gate-5/bound-table/peer-execution-slots/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/peer-execution-slots/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/departed-strikes/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/departed-strikes/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/readmission-cooldowns/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/readmission-cooldowns/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
         "gate-5/bound-table/publisher-capacity-waits/cleanup",
         obligation::BOUND_WAITS_TEST,
     ),
@@ -3421,10 +3445,6 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
         obligation::bound_unshown::DETACHED,
     ),
     bound_open(
-        "gate-5/bound-table/departed-strikes",
-        obligation::bound_unshown::STRIKES,
-    ),
-    bound_open(
         "gate-5/bound-table/pending-closes",
         obligation::bound_unshown::PENDING_CLOSES,
     ),
@@ -3449,10 +3469,6 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
         obligation::bound_unshown::SENT_RING,
     ),
     bound_open(
-        "gate-5/bound-table/peer-execution-slots",
-        obligation::bound_unshown::PEER_EXECUTION,
-    ),
-    bound_open(
         "gate-5/bound-table/node-output",
         obligation::bound_unshown::NODE_OUTPUT,
     ),
@@ -3467,10 +3483,6 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     bound_open(
         "gate-5/bound-table/retained-path-leases",
         obligation::bound_unshown::LEASES,
-    ),
-    bound_open(
-        "gate-5/bound-table/readmission-cooldowns",
-        obligation::bound_unshown::COOLDOWNS,
     ),
     bound_open(
         "gate-5/bound-table/pruned-peers",

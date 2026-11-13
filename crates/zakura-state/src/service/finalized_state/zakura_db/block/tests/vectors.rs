@@ -30,7 +30,9 @@ use crate::{
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     request::{FinalizedBlock, Treestate},
     service::finalized_state::{
-        disk_db::DiskWriteBatch, ZakuraDb, PRUNING_METADATA, STATE_COLUMN_FAMILIES_IN_CODE,
+        disk_db::{DiskWriteBatch, WriteDisk},
+        disk_format::block::TransactionLocation,
+        ZakuraDb, PRUNING_METADATA, STATE_COLUMN_FAMILIES_IN_CODE,
     },
     CheckpointVerifiedBlock, Config, SemanticallyVerifiedBlock,
 };
@@ -633,42 +635,7 @@ fn test_block_db_round_trip_with(
 
         // Now, use the database
         let original_block = Arc::new(original_block);
-        let checkpoint_verified = if original_block.coinbase_height().is_some() {
-            CheckpointVerifiedBlock::from(original_block.clone())
-        } else {
-            // Fake a zero height
-            let hash = original_block.hash();
-            let transaction_hashes: Arc<[_]> = original_block
-                .transactions
-                .iter()
-                .map(|tx| tx.hash())
-                .collect();
-            let new_outputs =
-                new_ordered_outputs_with_height(&original_block, Height(0), &transaction_hashes);
-
-            CheckpointVerifiedBlock(SemanticallyVerifiedBlock {
-                block: original_block.clone().into(),
-                hash,
-                height: Height(0),
-                new_outputs: Arc::new(new_outputs),
-                transaction_hashes,
-                deferred_pool_balance_change: None,
-                origin: crate::BlockOrigin::Network,
-                auth_data_root: None,
-                receipt_order: None,
-            })
-        };
-
-        let dummy_treestate = Treestate::default();
-        let finalized =
-            FinalizedBlock::from_checkpoint_verified(checkpoint_verified, dummy_treestate);
-
-        // Skip validation by writing the block directly to the database
-        let mut batch = DiskWriteBatch::new();
-        batch
-            .prepare_block_header_and_transaction_data_batch(&state, &finalized, true, None)
-            .expect("test block header and transaction batch is valid");
-        state.db.write(batch).expect("block is valid for writing");
+        let finalized = write_block_without_validation(&state, &original_block);
 
         // Now read it back from the state
         let stored_block = state
@@ -737,6 +704,87 @@ fn test_block_db_round_trip_with(
             );
         }
     }
+}
+
+/// Write `original_block`'s header and transactions straight to the database, at height 0
+/// when it has no coinbase height, and return the block as it was written.
+fn write_block_without_validation(state: &ZakuraDb, original_block: &Arc<Block>) -> FinalizedBlock {
+    let checkpoint_verified = if original_block.coinbase_height().is_some() {
+        CheckpointVerifiedBlock::from(original_block.clone())
+    } else {
+        // Fake a zero height
+        let hash = original_block.hash();
+        let transaction_hashes: Arc<[_]> = original_block
+            .transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect();
+        let new_outputs =
+            new_ordered_outputs_with_height(&original_block, Height(0), &transaction_hashes);
+
+        CheckpointVerifiedBlock(SemanticallyVerifiedBlock {
+            block: original_block.clone().into(),
+            hash,
+            height: Height(0),
+            new_outputs: Arc::new(new_outputs),
+            transaction_hashes,
+            deferred_pool_balance_change: None,
+            origin: crate::BlockOrigin::Network,
+            auth_data_root: None,
+            receipt_order: None,
+        })
+    };
+
+    let dummy_treestate = Treestate::default();
+    let finalized = FinalizedBlock::from_checkpoint_verified(checkpoint_verified, dummy_treestate);
+
+    // Skip validation by writing the block directly to the database
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_block_header_and_transaction_data_batch(state, &finalized, true, None)
+        .expect("test block header and transaction batch is valid");
+    state.db.write(batch).expect("block is valid for writing");
+
+    finalized
+}
+
+/// A block is served only while its first transaction is stored. Without that row the raw
+/// read reports the body as missing, even though the block's later transactions remain.
+#[test]
+fn raw_block_is_missing_without_its_first_transaction() {
+    let _init_guard = zakura_test::init();
+
+    let state = ZakuraDb::new(
+        &Config::ephemeral(),
+        STATE_DATABASE_KIND,
+        &state_database_format_version_in_code(),
+        &Mainnet,
+        // The raw database accesses in this test create invalid database formats.
+        true,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        false,
+    )
+    .expect("opening an ephemeral database should succeed");
+    let block = Arc::new(large_multi_transaction_block());
+    assert!(
+        block.transactions.len() > 1,
+        "the test needs transactions after the first one"
+    );
+    let height = write_block_without_validation(&state, &block).height;
+    assert!(state.raw_block_result(height.into()).unwrap().is_some());
+
+    let tx_by_loc = state.db.cf_handle("tx_by_loc").unwrap();
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_delete(&tx_by_loc, TransactionLocation::min_for_height(height));
+    state.db.write(batch).expect("deleting a row is valid");
+
+    assert!(!state.contains_body_at_height(height));
+    assert!(
+        state.raw_block_result(height.into()).unwrap().is_none(),
+        "a block without its first transaction is not serveable"
+    );
 }
 
 /// Missing pruning metadata means this is an archive database from before pruning was added.

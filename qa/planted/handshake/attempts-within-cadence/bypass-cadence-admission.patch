@@ -1,6 +1,6 @@
 --- a/crates/zakura-network/src/zakura/handler.rs
 +++ b/crates/zakura-network/src/zakura/handler.rs
-@@ -5023,39 +5023,8 @@
+@@ -5033,42 +5033,8 @@
                  "zakura.p2p.conn.rejected.pending_handshake",
              );
          }
@@ -17,6 +17,8 @@
 -        if cadence != super::HandshakeCadenceAdmission::Admit {
 -            counts.release_transport();
 -        }
+-        #[cfg(any(test, zakura_sim))]
+-        let hosts = counts.cadence_hosts();
          drop(counts);
 -        #[cfg(any(test, zakura_sim))]
 -        self.observe_handshake_cadence(
@@ -27,6 +29,7 @@
 -                super::HandshakeCadenceAdmission::Capacity => "capacity",
 -            },
 -            fresh && cadence == super::HandshakeCadenceAdmission::Admit,
+-            hosts,
 -        );
 -        match cadence {
 -            super::HandshakeCadenceAdmission::Admit => Admit::Accept,

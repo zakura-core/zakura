@@ -747,7 +747,7 @@ fn a_child_of_a_hidden_parent_that_fails_is_rejected_for_an_unresolved_parent() 
     let step = model.tick(T_PARK);
     assert_eq!(
         step.verdict(child),
-        Some(rejected(RejectionScope::Uncached, Charge::None))
+        Some(rejected(RejectionScope::ExactTip, Charge::None))
     );
     assert_eq!(step.changes, vec![Change::Refused(id(2))]);
 }
@@ -770,7 +770,7 @@ fn the_wait_for_a_parent_is_flat_and_does_not_stop_while_the_parent_is_verified(
     assert_eq!(model.tick(T_PARK - secs(1)).verdict(child), None);
     assert_eq!(
         model.tick(T_PARK).verdict(child),
-        Some(rejected(RejectionScope::Uncached, Charge::None))
+        Some(rejected(RejectionScope::ExactTip, Charge::None))
     );
 }
 
@@ -1519,7 +1519,7 @@ fn a_child_that_spends_an_output_its_visible_parent_lacks_is_not_verified_in_a_l
     let step = model.tick(secs(1) + T_PARK);
     assert_eq!(
         step.verdict(waiter),
-        Some(rejected(RejectionScope::Uncached, Charge::None))
+        Some(rejected(RejectionScope::ExactTip, Charge::None))
     );
     assert_eq!(model.slots_in_use(), 0);
 }
@@ -1540,7 +1540,7 @@ fn waking_and_parking_again_does_not_restart_the_wait() {
     assert_eq!(model.tick(secs(59)).verdict(waiter), None);
     assert_eq!(
         model.tick(secs(60)).verdict(waiter),
-        Some(rejected(RejectionScope::Uncached, Charge::None))
+        Some(rejected(RejectionScope::ExactTip, Charge::None))
     );
 }
 
@@ -2741,7 +2741,7 @@ fn parked_children_cannot_hold_the_slots_their_hidden_parent_needs() {
     for (waiter, _) in &children {
         assert_eq!(
             step.verdict(*waiter),
-            Some(rejected(RejectionScope::Uncached, Charge::None))
+            Some(rejected(RejectionScope::ExactTip, Charge::None))
         );
     }
     assert_eq!(step.started().len(), 1, "the parent is checked now");
@@ -2940,6 +2940,12 @@ fn a_random_run_with_small_limits_always_drains() {
         for (reservation, ..) in granted.drain(..) {
             run.record(model.release(reservation, now));
         }
+        // What is visible when the drain starts. On a run where every
+        // verification passes and the chain stays put, none of it has a
+        // reason to leave. A hidden transaction can: one parked on a parent
+        // that never comes is removed when its wait ends.
+        let held_at_drain: Vec<UnminedTxId> = model.visible();
+        let nothing_should_leave = seed % 3 == 2 && seed % 4 != 3;
         for round in 0..400 {
             // On one run in four the chain keeps changing for a while, with
             // a missed event each round. Everything is checked again each
@@ -3000,6 +3006,16 @@ fn a_random_run_with_small_limits_always_drains() {
             "seed {seed}: a reservation is remembered"
         );
         assert!(run.jobs.is_empty(), "seed {seed}: a job never finished");
+        // Settling is not allowed to mean throwing things away.
+        if nothing_should_leave {
+            let visible = model.visible();
+            for held in &held_at_drain {
+                assert!(
+                    visible.contains(held),
+                    "seed {seed}: a valid transaction was lost while the pool settled"
+                );
+            }
+        }
         // Nothing is stuck: no slot is held, nothing is hidden, and every
         // submission was answered exactly once, with the pool still on.
         assert_eq!(model.slots_in_use(), 0, "seed {seed}: a slot is stuck");
@@ -3113,7 +3129,7 @@ fn a_parent_that_is_verified_again_and_again_cannot_hold_its_child_for_ever() {
     // back.
     assert_eq!(
         answered,
-        Some((T_PARK, rejected(RejectionScope::Uncached, Charge::None)))
+        Some((T_PARK, rejected(RejectionScope::ExactTip, Charge::None)))
     );
     model.assert_invariants();
 }
@@ -3216,7 +3232,7 @@ fn checking_a_transaction_again_and_again_does_not_extend_its_wait_for_a_parent(
     // The first check after its sixty seconds is its answer.
     assert_eq!(
         answered,
-        Some((secs(79), rejected(RejectionScope::Uncached, Charge::None)))
+        Some((secs(79), rejected(RejectionScope::ExactTip, Charge::None)))
     );
     assert_eq!(model.slots_in_use(), 0);
 }
@@ -3259,4 +3275,75 @@ fn a_chain_rejection_recorded_twice_keeps_its_first_place_and_time() {
     // one behind it in the order is still remembered.
     assert_eq!(model.rejected_ids(&both, secs(100)), second);
     model.assert_invariants();
+}
+
+#[test]
+fn a_missed_block_that_mined_an_expired_parent_keeps_its_child() {
+    let mut model = new_model();
+    let mut parent = tx(1);
+    parent.expiry = Some(Height(102));
+    admit(&mut model, parent, 1, 0);
+    let mut child = child_of(2, 1);
+    child.expiry = Some(Height(200));
+    let (waiter, job) = bring_in(&mut model, child, legacy(2));
+    let step = model.outcome(
+        job,
+        Outcome::PassUsing(vec![output(1, 0)]),
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+    assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
+
+    // The core missed block 101, which mined the parent, and the tip is
+    // now past the parent's expiry height. The parent goes as expired. Its
+    // output is on the chain, so the child is still valid, and is checked.
+    let step = model.resync(Height(103), Generation(4), secs(1));
+    assert_eq!(
+        step.changes,
+        vec![
+            Change::Removed {
+                id: id(1),
+                reason: RemovalReason::Expired
+            },
+            Change::Hidden(id(2)),
+        ]
+    );
+    let step = model.outcome(the_job(&step), Outcome::Pass, stable(4), stable(4), secs(2));
+    assert!(matches!(step.changes[0], Change::Revealed { .. }));
+    assert_eq!(model.visible(), vec![id(2)]);
+}
+
+#[test]
+fn a_parent_that_never_arrives_is_remembered_until_the_tip_changes() {
+    let mut model = new_model();
+    let (_, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    model.outcome(job, missing(1), stable(0), stable(0), secs(0));
+    model.tick(T_PARK);
+
+    // As today: the same bytes are not fetched and verified again at this
+    // tip, and the adapter's rejection query sees it.
+    assert_eq!(
+        model.reserve(id(2), peer(2), Intent::Fetch, T_PARK),
+        Err(ModelUnreserved::Rejected(RejectionScope::ExactTip))
+    );
+    let asked: HashSet<_> = [id(2)].into_iter().collect();
+    assert_eq!(model.rejected_ids(&asked, T_PARK), asked);
+    model.transition(transition(1, 101, vec![vec![]]), T_PARK);
+    assert!(model.reserve(id(2), peer(2), Intent::Fetch, T_PARK).is_ok());
+}
+
+#[test]
+fn waiting_for_one_output_and_leaving_many_times_keeps_nothing() {
+    let mut model = new_model();
+    for _ in 0..1_000 {
+        let OutputAnswer::Waiting(waiter) = model.await_output(output(1, 0), secs(0)) else {
+            panic!("nothing creates the output");
+        };
+        model.cancel_output_wait(waiter);
+    }
+    // One outpoint, far below the limit on distinct outpoints. Nothing is
+    // kept for a caller that left.
+    assert_eq!(model.output_waiters(), 0);
+    assert_eq!(model.output_waits(), 0);
 }

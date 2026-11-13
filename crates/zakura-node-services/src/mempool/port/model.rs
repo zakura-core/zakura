@@ -916,7 +916,10 @@ impl PoolModel {
                 RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
             );
         }
-        self.remove_expired();
+        // Every block of this transition was seen, and what they mined is
+        // gone already. So an expired transaction here was not mined, and
+        // what depends on it goes with it.
+        self.remove_expired(true);
         if verify_again {
             self.hide_all();
             // A block that left the chain may have spent an output a parked
@@ -942,8 +945,11 @@ impl PoolModel {
         self.applied = generation;
         self.tip = tip;
         self.clear_all_rejections();
-        // Expiry needs no verifier, only the new tip.
-        self.remove_expired();
+        // Expiry needs no verifier, only the new tip. Only the expired
+        // transaction goes. A block the core missed may have mined it
+        // first, and then what spends its outputs is still valid, so its
+        // dependents are checked again like everything else.
+        self.remove_expired(false);
         self.hide_all();
         self.rerun_parked();
         self.chain_applied();
@@ -973,7 +979,9 @@ impl PoolModel {
             self.fail_locally(key, LocalFault::VerifyTimeout);
         }
         for key in unparked {
-            self.reject(key, RejectionScope::Uncached, Charge::None);
+            // Today a parent that never arrived is a missing-input failure,
+            // remembered for these exact bytes until the tip changes.
+            self.reject(key, RejectionScope::ExactTip, Charge::None);
         }
         let keys: Vec<u64> = self.pool.keys().copied().collect();
         for key in keys {
@@ -1047,6 +1055,12 @@ impl PoolModel {
     /// Distinct outpoints callers are waiting for.
     pub fn output_waits(&self) -> usize {
         self.output_waiters.len()
+    }
+
+    /// Callers waiting for an output, over every outpoint. A caller that
+    /// stopped waiting is not one of them: nothing is kept for it.
+    pub fn output_waiters(&self) -> usize {
+        self.output_waiters.values().map(Vec::len).sum()
     }
 
     /// [`super::PoolHandle::report_violation`].
@@ -1460,7 +1474,7 @@ impl PoolModel {
                 let now = self.now;
                 let since = *self.admission_at(key).missing_since.get_or_insert(now);
                 if since.saturating_add(T_PARK) <= now {
-                    self.reject(key, RejectionScope::Uncached, Charge::None);
+                    self.reject(key, RejectionScope::ExactTip, Charge::None);
                     return;
                 }
                 let mut on: Vec<transaction::Hash> = Vec::new();
@@ -1731,8 +1745,9 @@ impl PoolModel {
     }
 
     /// Removes every pooled transaction whose expiry height the tip has
-    /// reached, with what depends on it, and remembers each as expired.
-    fn remove_expired(&mut self) {
+    /// reached, and remembers each as expired. With `with_dependents`, what
+    /// depends on it goes too.
+    fn remove_expired(&mut self, with_dependents: bool) {
         let expired: Vec<UnminedTxId> = self
             .pool
             .values()
@@ -1740,7 +1755,11 @@ impl PoolModel {
             .map(|pooled| pooled.tx.id)
             .collect();
         for tx_id in expired {
-            self.remove_with_dependents(tx_id.mined_id(), RemovalReason::Expired);
+            if with_dependents {
+                self.remove_with_dependents(tx_id.mined_id(), RemovalReason::Expired);
+            } else if let Some(key) = self.pooled.get(&tx_id.mined_id()).copied() {
+                self.remove_one(key, RemovalReason::Expired);
+            }
             self.cache(tx_id, RejectionScope::EffectsChain(ChainReason::Expired));
         }
     }

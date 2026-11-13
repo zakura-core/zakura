@@ -16,6 +16,12 @@
 //!    whose bytes these are. It answers exactly one [`Verdict`].
 //! 3. Dropping a [`Reservation`] that was never submitted frees its slot.
 //!
+//! A slot is held until the caller that reserved it submits its body or drops
+//! the reservation, and at least until the verdict. So if another caller's
+//! body decides the id while the first caller's fetch is still out, that
+//! fetch still holds its slot. A source never has more fetches out than
+//! slots.
+//!
 //! A slot is counted against the source that reserved it until the verdict,
 //! whoever supplies the body. So a caller that asks a second peer for the same
 //! id keeps its reservation and names that second peer as the supplier. No
@@ -39,6 +45,7 @@ use zakura_rt::{
         atomic::{AtomicU64, Ordering},
         mpsc, oneshot, watch, Mutex, PoisonError,
     },
+    time::Instant,
 };
 
 use super::{QueueSource, TransactionDependencies};
@@ -544,6 +551,10 @@ impl ChangeSeq {
     ///
     /// A reader that resynchronizes announces the whole snapshot again and
     /// moves its baseline, because it cannot know which additions it lost.
+    ///
+    /// This is not the whole rule. A reader can read an addition only after
+    /// the transaction was hidden, and it then announces nothing. It defers
+    /// that addition and announces it on the reveal, whatever its baseline.
     pub fn announces_reveal(self, hidden_at: ChangeSeq) -> bool {
         self >= hidden_at
     }
@@ -584,7 +595,8 @@ pub enum Change {
     Hidden(UnminedTxId),
     /// A hidden transaction passed and is visible again.
     ///
-    /// Whether a reader announces it is [`ChangeSeq::announces_reveal`].
+    /// A reader announces it unless it has already announced the
+    /// transaction. [`model::ModelReader`] is that rule in full.
     Revealed {
         /// The transaction.
         id: UnminedTxId,
@@ -828,11 +840,15 @@ struct Shared {
     log: Mutex<ChangeLog>,
 }
 
+/// The peers in a cooldown, and when each one ends.
+pub type Cooldowns = Arc<HashMap<CooldownKey, Instant>>;
+
 /// The callers' side of the port. Cheap to clone.
 #[derive(Clone, Debug)]
 pub struct PoolHandle {
     commands: mpsc::Sender<PoolCommand>,
     snapshot: watch::Receiver<Option<Arc<PoolSnapshot>>>,
+    cooldowns: watch::Receiver<Cooldowns>,
     shared: Arc<Shared>,
 }
 
@@ -843,6 +859,7 @@ pub struct PoolInbox {
     releases: mpsc::UnboundedReceiver<ReservationId>,
     release_handle: mpsc::UnboundedSender<ReservationId>,
     snapshot: watch::Sender<Option<Arc<PoolSnapshot>>>,
+    cooldowns: watch::Sender<Cooldowns>,
     shared: Arc<Shared>,
 }
 
@@ -853,11 +870,13 @@ pub fn pool_port() -> (PoolHandle, PoolInbox) {
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE);
     let (release_tx, release_rx) = mpsc::unbounded_channel();
     let (snapshot_tx, snapshot_rx) = watch::channel(None);
+    let (cooldowns_tx, cooldowns_rx) = watch::channel(Cooldowns::default());
     let shared = Arc::new(Shared::default());
     (
         PoolHandle {
             commands: commands_tx,
             snapshot: snapshot_rx,
+            cooldowns: cooldowns_rx,
             shared: shared.clone(),
         },
         PoolInbox {
@@ -865,6 +884,7 @@ pub fn pool_port() -> (PoolHandle, PoolInbox) {
             releases: release_rx,
             release_handle: release_tx,
             snapshot: snapshot_tx,
+            cooldowns: cooldowns_tx,
             shared,
         },
     )
@@ -971,6 +991,18 @@ impl PoolHandle {
         answer.await.unwrap_or_default()
     }
 
+    /// Whether the core refuses `peer`'s transactions at `now`.
+    ///
+    /// A caller checks this before it asks a peer for a body under a
+    /// reservation that another source holds. The core checked only that
+    /// source, and would refuse the body once it arrived.
+    pub fn is_cooling(&self, peer: &QueueSource, now: Instant) -> bool {
+        self.cooldowns
+            .borrow()
+            .get(&CooldownKey::from(peer))
+            .is_some_and(|until| *until > now)
+    }
+
     /// The latest snapshot, or `None` until the core has attached and
     /// published one.
     pub fn snapshot(&self) -> Option<Arc<PoolSnapshot>> {
@@ -1040,6 +1072,11 @@ impl PoolInbox {
         wants_body: bool,
     ) -> Reservation {
         Reservation::granted(id, tx_id, joined, wants_body, self.release_handle.clone())
+    }
+
+    /// Publish the peers in a cooldown, whenever one starts.
+    pub fn publish_cooldowns(&self, cooldowns: HashMap<CooldownKey, Instant>) {
+        self.cooldowns.send_replace(Arc::new(cooldowns));
     }
 
     /// Publish one batch: append `changes` to the log, then publish the

@@ -13,6 +13,11 @@
 //! storage code's rule, so the model assumes the pool stays below it. A
 //! cooldown lasts [`COOLDOWN`] each time and does not escalate.
 //!
+//! A slot outlives its admission while the caller that reserved it is still
+//! fetching. If another caller's body decides the id first, the reserving
+//! caller's slot stays taken until it submits its body or drops the
+//! reservation. Otherwise a source could have more fetches out than slots.
+//!
 //! Two rules are for the core's task, not the machine. A worker waits for a
 //! stable generation before its first lookup. And the core publishes a
 //! batch's snapshot before it starts that batch's jobs, so a verification
@@ -34,8 +39,8 @@ use zakura_chain::{
 };
 
 use super::{
-    ChainReason, Change, ChangeSeq, Charge, CooldownKey, Generation, GenerationRead, Intent,
-    LocalFault, NoRoom, RejectionScope, RemovalReason, ReservationId, Source, Supplier,
+    ChainReason, Change, ChangeEntry, ChangeSeq, Charge, CooldownKey, Generation, GenerationRead,
+    Intent, LocalFault, NoRoom, RejectionScope, RemovalReason, ReservationId, Source, Supplier,
     MAX_COOLDOWNS, MAX_PENDING, MAX_PENDING_PER_SOURCE, MAX_REJECTIONS, MAX_REVALIDATING,
     MAX_WAITERS,
 };
@@ -288,6 +293,82 @@ pub struct ModelTransition {
     pub rules_change: bool,
 }
 
+/// How a reader of the change log decides what to announce. A `tx-relay`
+/// session is one.
+///
+/// It announces an addition only when the snapshot it reads with holds the
+/// transaction. An addition it could not announce, because the transaction
+/// was hidden by then, is deferred and announced when it is revealed. So
+/// what it skips on a reveal is exactly what it has announced.
+#[derive(Clone, Debug)]
+pub struct ModelReader {
+    /// The newest entry it has read.
+    cursor: ChangeSeq,
+    /// The position of the snapshot it last announced in full.
+    baseline: ChangeSeq,
+    /// Additions it has read and not announced.
+    deferred: HashSet<UnminedTxId>,
+}
+
+impl ModelReader {
+    /// Opens on a snapshot and announces all of it.
+    pub fn open(visible: &[UnminedTxId], last_change: ChangeSeq) -> (Self, Vec<UnminedTxId>) {
+        let reader = Self {
+            cursor: last_change,
+            baseline: last_change,
+            deferred: HashSet::new(),
+        };
+        (reader, visible.to_vec())
+    }
+
+    /// The reader fell off the log. It cannot know which additions it lost,
+    /// so it announces the whole snapshot again and starts from it.
+    pub fn resync(&mut self, visible: &[UnminedTxId], last_change: ChangeSeq) -> Vec<UnminedTxId> {
+        self.cursor = last_change;
+        self.baseline = last_change;
+        self.deferred.clear();
+        visible.to_vec()
+    }
+
+    /// The newest entry it has read, which is its cursor for the next view.
+    pub fn cursor(&self) -> ChangeSeq {
+        self.cursor
+    }
+
+    /// Reads one view: the entries after its cursor, and the visible pool of
+    /// the snapshot they lead to. Returns what it announces.
+    pub fn read(&mut self, entries: &[ChangeEntry], visible: &[UnminedTxId]) -> Vec<UnminedTxId> {
+        let mut announced = Vec::new();
+        for entry in entries {
+            match entry.change {
+                Change::Added(id) => {
+                    if visible.contains(&id) {
+                        announced.push(id);
+                    } else {
+                        self.deferred.insert(id);
+                    }
+                }
+                Change::Revealed { id, hidden_at } => {
+                    let unannounced =
+                        self.deferred.contains(&id) || self.baseline.announces_reveal(hidden_at);
+                    if unannounced && visible.contains(&id) {
+                        self.deferred.remove(&id);
+                        announced.push(id);
+                    } else if unannounced {
+                        self.deferred.insert(id);
+                    }
+                }
+                Change::Removed { id, .. } | Change::Refused(id) => {
+                    self.deferred.remove(&id);
+                }
+                Change::Hidden(_) => {}
+            }
+            self.cursor = entry.seq;
+        }
+        announced
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Waiter {
     id: WaiterId,
@@ -336,6 +417,12 @@ enum Hidden {
     AwaitingChain,
     Retry {
         at: ModelTime,
+    },
+    /// Parents are missing. `waited` counts as a parked admission's wait
+    /// does.
+    Parked {
+        on: Vec<transaction::Hash>,
+        waited: Duration,
     },
 }
 
@@ -386,6 +473,11 @@ pub struct PoolModel {
     admissions: BTreeMap<u64, Admission>,
     admission_of: HashMap<UnminedTxId, u64>,
     owners: HashMap<ReservationId, u64>,
+    /// Reservations whose id was decided through someone else's body while
+    /// their own fetch was still out. Each keeps its slot until its caller
+    /// submits or drops it, so a source cannot have more fetches out than
+    /// slots.
+    leases: HashMap<ReservationId, Source>,
     tickets: BTreeMap<ReservationId, JoinTicket>,
     /// The pool, oldest first.
     pool: BTreeMap<u64, Pooled>,
@@ -416,6 +508,7 @@ impl PoolModel {
             admissions: BTreeMap::new(),
             admission_of: HashMap::new(),
             owners: HashMap::new(),
+            leases: HashMap::new(),
             tickets: BTreeMap::new(),
             pool: BTreeMap::new(),
             pooled: HashMap::new(),
@@ -511,6 +604,7 @@ impl PoolModel {
         if let Some(key) = key {
             self.settle_bodyless(key);
         }
+        self.leases.remove(&reservation);
         self.start_revalidations();
         self.take_step()
     }
@@ -563,8 +657,11 @@ impl PoolModel {
                 .is_some_and(|admission| admission.tx_id == tx_id)
         });
         let Some(key) = key else {
+            // The fetch that held this slot is over.
+            self.leases.remove(&reservation);
             let verdict = self.stale_verdict(tx_id);
             self.step.effects.push(Effect::Verdict { waiter, verdict });
+            self.start_revalidations();
             return (waiter, self.take_step());
         };
         // The source was checked when it reserved. The supplier can be
@@ -689,33 +786,39 @@ impl PoolModel {
         } else {
             self.clear_tip_rejections();
         }
-        let mut mined = Vec::new();
-        for block in &transition.connected {
-            for block_tx in &block.transactions {
-                let hash = block_tx.id.mined_id();
-                if let Some(key) = self.pooled.get(&hash).copied() {
-                    // Its dependents stay. Their parent is on the chain now.
-                    self.remove_one(key, RemovalReason::Mined);
-                }
-                self.cache(
-                    block_tx.id,
-                    RejectionScope::EffectsChain(ChainReason::Mined),
-                );
-                let conflicting: Vec<UnminedTxId> = self
-                    .pool
-                    .values()
-                    .filter(|pooled| pooled.tx.conflicts_with(block_tx))
-                    .map(|pooled| pooled.tx.id)
-                    .collect();
-                for conflict in conflicting {
-                    self.remove_with_dependents(conflict.mined_id(), RemovalReason::Conflicted);
-                    self.cache(
-                        conflict,
-                        RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
-                    );
-                }
-                mined.push(hash);
+        // What the whole batch mined, and what in the pool it conflicts
+        // with, are worked out before anything is removed. A pooled
+        // transaction that conflicts with a later block transaction is then
+        // found even if an earlier one already took its parent away.
+        let block_txs: Vec<&ModelTx> = transition
+            .connected
+            .iter()
+            .flat_map(|block| &block.transactions)
+            .collect();
+        let mined: Vec<transaction::Hash> = block_txs.iter().map(|tx| tx.id.mined_id()).collect();
+        let conflicting: Vec<UnminedTxId> = self
+            .pool
+            .values()
+            .filter(|pooled| !mined.contains(&pooled.tx.id.mined_id()))
+            .filter(|pooled| block_txs.iter().any(|tx| pooled.tx.conflicts_with(tx)))
+            .map(|pooled| pooled.tx.id)
+            .collect();
+        for block_tx in &block_txs {
+            if let Some(key) = self.pooled.get(&block_tx.id.mined_id()).copied() {
+                // Its dependents stay. Their parent is on the chain now.
+                self.remove_one(key, RemovalReason::Mined);
             }
+            self.cache(
+                block_tx.id,
+                RejectionScope::EffectsChain(ChainReason::Mined),
+            );
+        }
+        for conflict in conflicting {
+            self.remove_with_dependents(conflict.mined_id(), RemovalReason::Conflicted);
+            self.cache(
+                conflict,
+                RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
+            );
         }
         let expired: Vec<UnminedTxId> = self
             .pool
@@ -729,6 +832,10 @@ impl PoolModel {
         }
         if verify_again {
             self.hide_all();
+            // A block that left the chain may have spent an output a parked
+            // transaction is waiting for. Nothing names which, so each one
+            // looks again.
+            self.rerun_parked();
         }
         for hash in mined {
             self.wake(hash);
@@ -749,15 +856,7 @@ impl PoolModel {
         self.tip = tip;
         self.clear_all_rejections();
         self.hide_all();
-        let parked: Vec<u64> = self
-            .admissions
-            .iter()
-            .filter(|(_, admission)| matches!(admission.stage, Stage::Parked { .. }))
-            .map(|(key, _)| *key)
-            .collect();
-        for key in parked {
-            self.start_admission(key);
-        }
+        self.rerun_parked();
         self.chain_applied();
         self.take_step()
     }
@@ -776,7 +875,7 @@ impl PoolModel {
         }
         for key in timed_out {
             self.cancel_admission_job(key);
-            self.decide(key, ModelVerdict::LocalFault(LocalFault::VerifyTimeout));
+            self.fail_locally(key, LocalFault::VerifyTimeout);
         }
         for key in unparked {
             let tx_id = self.admission_at(key).tx_id;
@@ -791,7 +890,11 @@ impl PoolModel {
         }
         let keys: Vec<u64> = self.pool.keys().copied().collect();
         for key in keys {
-            let hidden = self.pooled_at(key).hidden.clone();
+            // An earlier removal in this loop can have taken this one with
+            // it, as a dependent.
+            let Some(hidden) = self.pool.get(&key).map(|pooled| pooled.hidden.clone()) else {
+                continue;
+            };
             match hidden {
                 Some(Hidden::Running { job, deadline }) if deadline <= now => {
                     self.jobs.remove(&job);
@@ -800,6 +903,11 @@ impl PoolModel {
                 }
                 Some(Hidden::Retry { at }) if at <= now => {
                     self.pooled_at(key).hidden = Some(Hidden::Queued);
+                }
+                // Its parent never came back.
+                Some(Hidden::Parked { waited, .. }) if waited >= T_PARK => {
+                    let hash = self.pooled_at(key).tx.id.mined_id();
+                    self.remove_with_dependents(hash, RemovalReason::Invalidated);
                 }
                 _ => {}
             }
@@ -846,14 +954,20 @@ impl PoolModel {
 
     /// Undecided transactions, plus running revalidations.
     pub fn slots_in_use(&self) -> usize {
-        self.admissions.len().saturating_add(self.revalidating())
+        self.admissions
+            .len()
+            .saturating_add(self.leases.len())
+            .saturating_add(self.revalidating())
     }
 
-    /// Undecided transactions counted against `source`.
+    /// Slots counted against `source`: its undecided transactions, and its
+    /// fetches that are still out for ids decided through someone else.
     pub fn counted_against(&self, source: &Source) -> usize {
         self.admissions
             .values()
-            .filter(|admission| admission.source == *source)
+            .map(|admission| &admission.source)
+            .chain(self.leases.values())
+            .filter(|counted| *counted == source)
             .count()
     }
 
@@ -917,6 +1031,9 @@ impl PoolModel {
             "pool/admissions-within-limits: the node's limit"
         );
         let mut sources: HashMap<&Source, usize> = HashMap::new();
+        for source in self.leases.values() {
+            *sources.entry(source).or_default() += 1;
+        }
         for admission in self.admissions.values() {
             *sources.entry(&admission.source).or_default() += 1;
             assert!(
@@ -951,6 +1068,13 @@ impl PoolModel {
             "the rejection lists' limits"
         );
         assert!(self.cooldowns.len() <= MAX_COOLDOWNS, "the cooldown limit");
+        for pooled in self.pool.values().filter(|pooled| pooled.hidden.is_none()) {
+            let seed: HashSet<transaction::Hash> = [pooled.tx.id.mined_id()].into();
+            assert!(
+                self.dependency_group(&seed).len() <= MAX_PACKAGE,
+                "pool/consistent: no visible dependency group past its limit"
+            );
+        }
         for ticket in self.tickets.values() {
             assert!(
                 self.admissions.contains_key(&ticket.admission),
@@ -1117,7 +1241,7 @@ impl PoolModel {
                 }
                 self.admission_at(key).stage = Stage::Parked { on };
             }
-            Outcome::LocalFault(fault) => self.decide(key, ModelVerdict::LocalFault(fault)),
+            Outcome::LocalFault(fault) => self.fail_locally(key, fault),
         }
     }
 
@@ -1140,13 +1264,28 @@ impl PoolModel {
                     self.pooled_at(key).hidden = Some(Hidden::Queued);
                     return;
                 }
+                // Today's insertion limits, as for a new transaction. A
+                // parent that was mined, then put back by a reorg, can have
+                // gained more pooled children than one group holds.
+                let parents: HashSet<transaction::Hash> =
+                    pool_inputs.iter().map(|input| input.hash).collect();
+                let ancestors = self.ancestors(parents);
+                if ancestors.len() > MAX_ANCESTORS
+                    || self.dependency_group(&ancestors).len() >= MAX_PACKAGE
+                {
+                    self.pooled_at(key).hidden = Some(Hidden::Queued);
+                    self.remove_with_dependents(hash, RemovalReason::Invalidated);
+                    return;
+                }
                 let visible_at = self.fresh();
                 let pooled = self.pooled_at(key);
                 pooled.hidden = None;
                 pooled.backoff = REVALIDATE_RETRY;
                 pooled.visible_at = visible_at;
-                let (id, hidden_at) = (pooled.tx.id, pooled.hidden_at);
+                let (id, hidden_at, count) = (pooled.tx.id, pooled.hidden_at, pooled.tx.outputs);
                 self.step.changes.push(Change::Revealed { id, hidden_at });
+                // Its outputs are available again, to waiters as well.
+                self.step.effects.push(Effect::Outputs { tx: hash, count });
                 self.wake(hash);
             }
             // A block the core never saw mined it. Its dependents stay and
@@ -1168,9 +1307,22 @@ impl PoolModel {
             {
                 self.pooled_at(key).hidden = Some(Hidden::Queued);
             }
-            // A pooled transaction whose parent left the pool fails with its
-            // parent.
-            Outcome::Fail { .. } | Outcome::MissingInputs(_) => {
+            // Its parent is in neither the chain nor the visible pool. After
+            // a reorg that can be a mined parent that is on its way back, so
+            // it waits as a new transaction would, still hidden.
+            Outcome::MissingInputs(missing) => {
+                let mut on: Vec<transaction::Hash> = Vec::new();
+                for outpoint in missing {
+                    if !on.contains(&outpoint.hash) {
+                        on.push(outpoint.hash);
+                    }
+                }
+                self.pooled_at(key).hidden = Some(Hidden::Parked {
+                    on,
+                    waited: Duration::ZERO,
+                });
+            }
+            Outcome::Fail { .. } => {
                 // Its job has reported, so there is nothing to cancel.
                 self.pooled_at(key).hidden = Some(Hidden::Queued);
                 self.remove_with_dependents(hash, RemovalReason::Invalidated);
@@ -1197,6 +1349,12 @@ impl PoolModel {
             .expect("the caller names a live admission");
         self.admission_of.remove(&admission.tx_id);
         self.owners.remove(&admission.owner);
+        if admission.owner_waiting {
+            // The reserving caller's fetch is still out. Its body will
+            // arrive decoded, so its slot is not free yet.
+            self.leases
+                .insert(admission.owner, admission.source.clone());
+        }
         // A reservation that joined this admission dies with it.
         self.tickets.retain(|_, ticket| ticket.admission != key);
         for waiter in admission.waiters {
@@ -1277,6 +1435,33 @@ impl PoolModel {
         for key in woken {
             self.start_admission(key);
         }
+        for pooled in self.pool.values_mut() {
+            if matches!(&pooled.hidden, Some(Hidden::Parked { on, .. }) if on.contains(&parent)) {
+                pooled.hidden = Some(Hidden::Queued);
+            }
+        }
+    }
+
+    /// Runs every parked admission again.
+    fn rerun_parked(&mut self) {
+        let parked: Vec<u64> = self
+            .admissions
+            .iter()
+            .filter(|(_, admission)| matches!(admission.stage, Stage::Parked { .. }))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in parked {
+            self.start_admission(key);
+        }
+    }
+
+    /// Ends an admission for a failure on this node. Today's change stream
+    /// reports a verification that failed or timed out, so this is logged
+    /// too. Nothing is cached and nobody is charged.
+    fn fail_locally(&mut self, key: u64, fault: LocalFault) {
+        let tx_id = self.admission_at(key).tx_id;
+        self.step.changes.push(Change::Refused(tx_id));
+        self.decide(key, ModelVerdict::LocalFault(fault));
     }
 
     /// Hides every visible pooled transaction, to be verified again.
@@ -1466,6 +1651,13 @@ impl PoolModel {
                 }
             }
         }
+        for pooled in self.pool.values_mut() {
+            if let Some(Hidden::Parked { on, waited }) = &mut pooled.hidden {
+                if !on.iter().any(|parent| arriving.contains(parent)) {
+                    *waited = waited.saturating_add(elapsed);
+                }
+            }
+        }
     }
 
     fn clear_tip_rejections(&mut self) {
@@ -1572,7 +1764,15 @@ impl PoolModel {
         })
     }
 
-    /// The pooled parents of a pooled transaction.
+    /// Whether `hash` is pooled and visible. The dependency limits are
+    /// about the visible pool, as today's are about the verified set.
+    fn is_visible(&self, hash: &transaction::Hash) -> bool {
+        self.pooled
+            .get(hash)
+            .is_some_and(|key| self.pool[key].hidden.is_none())
+    }
+
+    /// The visible parents of a pooled transaction.
     fn pooled_parents(&self, hash: &transaction::Hash) -> Vec<transaction::Hash> {
         self.pooled
             .get(hash)
@@ -1580,7 +1780,7 @@ impl PoolModel {
                 self.pool[key]
                     .tx
                     .parents()
-                    .filter(|parent| self.pooled.contains_key(parent))
+                    .filter(|parent| self.is_visible(parent))
                     .collect()
             })
             .unwrap_or_default()
@@ -1591,7 +1791,7 @@ impl PoolModel {
         let mut ancestors = HashSet::new();
         let mut next: Vec<transaction::Hash> = parents.into_iter().collect();
         while let Some(hash) = next.pop() {
-            if self.pooled.contains_key(&hash) && ancestors.insert(hash) {
+            if self.is_visible(&hash) && ancestors.insert(hash) {
                 next.extend(self.pooled_parents(&hash));
             }
         }
@@ -1604,13 +1804,14 @@ impl PoolModel {
         let mut group = HashSet::new();
         let mut next: Vec<transaction::Hash> = seeds.iter().copied().collect();
         while let Some(hash) = next.pop() {
-            if !self.pooled.contains_key(&hash) || !group.insert(hash) {
+            if !self.is_visible(&hash) || !group.insert(hash) {
                 continue;
             }
             next.extend(self.pooled_parents(&hash));
             next.extend(
                 self.pool
                     .values()
+                    .filter(|pooled| pooled.hidden.is_none())
                     .filter(|pooled| pooled.tx.parents().any(|parent| parent == hash))
                     .map(|pooled| pooled.tx.id.mined_id()),
             );

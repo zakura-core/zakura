@@ -18,9 +18,9 @@ use zakura_chain::{
 
 use super::{
     model::{
-        Effect, JobId, ModelBlock, ModelTransition, ModelTx, ModelUnreserved, ModelVerdict,
-        Outcome, PoolModel, Step, WaiterId, COOLDOWN, REJECTION_MEMORY, REVALIDATE_RETRY, T_PARK,
-        T_VERIFY,
+        Effect, JobId, ModelBlock, ModelReader, ModelTransition, ModelTx, ModelUnreserved,
+        ModelVerdict, Outcome, PoolModel, Step, WaiterId, COOLDOWN, REJECTION_MEMORY,
+        REVALIDATE_RETRY, T_PARK, T_VERIFY,
     },
     pool_port, ChainReason, ChainTip, Change, ChangeLog, ChangeSeq, ChangesSince, Charge,
     CooldownKey, Generation, GenerationCell, GenerationRead, Intent, LocalFault, NoRoom,
@@ -395,7 +395,8 @@ fn a_body_that_arrives_after_the_verdict_is_answered_and_not_charged() {
 
     let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(2));
     assert_eq!(step.verdict(pusher), Some(ModelVerdict::Admitted));
-    assert_eq!(model.slots_in_use(), 0);
+    // The relay's fetch is still out, so its slot is still taken.
+    assert_eq!(model.slots_in_use(), 1);
 
     // The relay's own answer arrives late. It gets a verdict and no charge.
     let (late, step) = model.submit(relay.id, tx(1), Supplier::Peer(v2(1)), secs(3));
@@ -404,6 +405,7 @@ fn a_body_that_arrives_after_the_verdict_is_answered_and_not_charged() {
         Some(rejected(RejectionScope::Uncached, Charge::None))
     );
     assert!(step.started().is_empty());
+    assert_eq!(model.slots_in_use(), 0);
 }
 
 #[test]
@@ -794,9 +796,15 @@ fn a_block_removes_a_pooled_transaction_that_conflicts_with_one_never_pooled() {
     // same output as transaction 1. Its id alone would not show that.
     let block = vec![tx(7).spending(coin, 0), tx(3)];
     let step = model.transition(transition(1, 101, vec![block]), secs(1));
+    // What the block mined leaves first, then what it conflicts with, as
+    // today.
     assert_eq!(
         step.changes,
         vec![
+            Change::Removed {
+                id: id(3),
+                reason: RemovalReason::Mined
+            },
             Change::Removed {
                 id: id(1),
                 reason: RemovalReason::Conflicted
@@ -804,10 +812,6 @@ fn a_block_removes_a_pooled_transaction_that_conflicts_with_one_never_pooled() {
             Change::Removed {
                 id: id(2),
                 reason: RemovalReason::Invalidated
-            },
-            Change::Removed {
-                id: id(3),
-                reason: RemovalReason::Mined
             },
         ]
     );
@@ -2065,4 +2069,307 @@ async fn a_dropped_reservation_wakes_an_idle_core() {
         Some(PoolCommand::Released(ReservationId(7)))
     ));
     drop(handle);
+}
+
+// Cases from Sol's second review.
+
+#[test]
+fn a_fetch_that_is_still_out_keeps_its_slot_after_someone_else_decides_the_id() {
+    let mut model = new_model();
+    let alice = peer(1);
+    // Alice's five fetches are out.
+    let fetching: Vec<_> = (0..5)
+        .map(|n| {
+            model
+                .reserve(id(n), alice.clone(), Intent::Fetch, secs(0))
+                .expect("five fit")
+        })
+        .collect();
+    // Bob delivers all five, and they are verified before Alice's fetches
+    // come back.
+    for n in 0..5 {
+        let joined = model
+            .reserve(id(n), peer(2), Intent::Deliver, secs(0))
+            .expect("joins");
+        let (_, step) = model.submit(joined.id, tx(n), Supplier::Peer(legacy(2)), secs(0));
+        model.outcome(the_job(&step), Outcome::Pass, stable(0), stable(0), secs(0));
+    }
+    assert_eq!(model.visible().len(), 5);
+
+    // Five decoded bodies are still on their way from Alice's peers. She
+    // cannot start a sixth fetch.
+    assert_eq!(model.counted_against(&alice), 5);
+    assert_eq!(
+        model.reserve(id(9), alice.clone(), Intent::Fetch, secs(1)),
+        Err(ModelUnreserved::NoRoom(NoRoom::Source))
+    );
+
+    // One fetch comes back, and one fails. Each frees its slot.
+    let (late, step) = model.submit(fetching[0].id, tx(0), Supplier::Peer(legacy(1)), secs(2));
+    assert_eq!(
+        step.verdict(late),
+        Some(rejected(RejectionScope::Uncached, Charge::None))
+    );
+    model.release(fetching[1].id, secs(2));
+    assert_eq!(model.counted_against(&alice), 3);
+    assert!(model.reserve(id(9), alice, Intent::Fetch, secs(2)).is_ok());
+    model.assert_invariants();
+}
+
+#[test]
+fn a_rollback_runs_every_parked_transaction_again() {
+    let mut model = new_model();
+    // The tip spent the output the child needs, so the verifier does not
+    // find it and the child parks.
+    let (_, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    model.outcome(job, missing(1), stable(0), stable(0), secs(0));
+    assert!(model.is_parked(id(2)));
+
+    // A reorg disconnects the spender. No connected block names the parent,
+    // so nothing else would wake the child.
+    let step = model.transition(reorg(1, 99), secs(1));
+    assert_eq!(step.started().len(), 1);
+    assert!(!model.is_parked(id(2)));
+}
+
+#[test]
+fn a_hidden_transaction_waits_for_a_parent_that_is_on_its_way_back() {
+    let mut model = new_model();
+    // The child is pooled. Its parent was mined.
+    admit(&mut model, child_of(2, 1), 2, 0);
+    let step = model.transition(reorg(1, 99), secs(0));
+    // The reorg undid the parent's block. The child's check does not find
+    // the parent anywhere yet.
+    let step = model.outcome(the_job(&step), missing(1), stable(1), stable(1), secs(1));
+    assert!(step.changes.is_empty(), "it is not thrown out");
+    assert_eq!(model.hidden(), vec![id(2)]);
+
+    // The parent is delivered a second later.
+    let (_, parent_job) = bring_in(&mut model, tx(1), legacy(1));
+    let step = model.outcome(parent_job, Outcome::Pass, stable(1), stable(1), secs(2));
+    let child_job = step.started()[0];
+    let step = model.outcome(
+        child_job,
+        Outcome::PassUsing(vec![output(1, 0)]),
+        stable(1),
+        stable(1),
+        secs(3),
+    );
+    assert_eq!(step.changes, vec![revealed(2, 2)]);
+    assert_eq!(model.visible(), vec![id(2), id(1)]);
+}
+
+#[test]
+fn a_hidden_transaction_whose_parent_never_returns_is_removed_after_its_wait() {
+    let mut model = new_model();
+    admit(&mut model, child_of(2, 1), 2, 0);
+    let step = model.transition(reorg(1, 99), secs(0));
+    model.outcome(the_job(&step), missing(1), stable(1), stable(1), secs(0));
+
+    assert!(model.tick(T_PARK - secs(1)).changes.is_empty());
+    assert_eq!(
+        model.tick(T_PARK).changes,
+        vec![Change::Removed {
+            id: id(2),
+            reason: RemovalReason::Invalidated
+        }]
+    );
+}
+
+#[test]
+fn a_reveal_cannot_grow_a_dependency_group_past_its_limit() {
+    let mut model = new_model();
+    // Three pooled children of one mined parent. Each stands alone.
+    for (n, index) in [(2, 0), (3, 1), (4, 2)] {
+        admit(&mut model, tx(n).spending(hash(1), index), n, 0);
+    }
+    // A reorg undoes the parent's block, and the parent is admitted again.
+    let step = model.transition(reorg(1, 99), secs(0));
+    let jobs = step.started();
+    let mut parent = tx(1);
+    parent.outputs = 3;
+    let (_, parent_job) = bring_in(&mut model, parent, legacy(1));
+    model.outcome(parent_job, Outcome::Pass, stable(1), stable(1), secs(1));
+
+    // Each child passes against the parent in the pool. The third would
+    // make a group of four.
+    for (job, index) in jobs.iter().zip(0..) {
+        model.outcome(
+            *job,
+            Outcome::PassUsing(vec![output(1, index)]),
+            stable(1),
+            stable(1),
+            secs(2),
+        );
+        model.assert_invariants();
+    }
+    assert_eq!(model.visible(), vec![id(2), id(3), id(1)]);
+    assert!(model.hidden().is_empty());
+}
+
+#[test]
+fn a_revealed_transaction_offers_its_outputs_to_waiters_again() {
+    let mut model = new_model();
+    admit(&mut model, tx(1), 1, 0);
+    let step = model.transition(reorg(1, 100), secs(0));
+    let step = model.outcome(the_job(&step), Outcome::Pass, stable(1), stable(1), secs(1));
+    assert!(step.effects.contains(&Effect::Outputs {
+        tx: hash(1),
+        count: 1
+    }));
+}
+
+#[test]
+fn a_local_fault_is_in_the_change_log_but_not_in_any_cache() {
+    let mut model = new_model();
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let step = model.outcome(
+        job,
+        Outcome::LocalFault(LocalFault::VerifyPanicked),
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+    // Today's change stream reports a verification that failed.
+    assert_eq!(step.changes, vec![Change::Refused(id(1))]);
+    assert!(model
+        .reserve(id(1), peer(2), Intent::Fetch, secs(0))
+        .is_ok());
+
+    let (_, _) = bring_in(&mut model, tx(2), legacy(3));
+    assert_eq!(model.tick(T_VERIFY).changes, vec![Change::Refused(id(2))]);
+}
+
+#[test]
+fn a_conflict_with_a_later_block_transaction_is_cached_though_its_parent_went_first() {
+    let mut model = new_model();
+    let (coin_u, coin_v) = (hash(900), hash(901));
+    admit(&mut model, tx(1).spending(coin_u, 0), 1, 0);
+    let child = child_of(2, 1).spending(coin_v, 0);
+    let (waiter, job) = bring_in(&mut model, child, legacy(2));
+    let step = model.outcome(
+        job,
+        Outcome::PassUsing(vec![output(1, 0)]),
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+    assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
+
+    // The block's first transaction conflicts with the parent, which takes
+    // the child with it. Its second conflicts with the child directly.
+    let block = vec![tx(7).spending(coin_u, 0), tx(8).spending(coin_v, 0)];
+    model.transition(transition(1, 101, vec![block]), secs(1));
+    assert!(model.visible().is_empty());
+    for n in [1, 2] {
+        assert_eq!(
+            model.reserve(id(n), peer(9), Intent::Fetch, secs(1)),
+            Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain(
+                ChainReason::DuplicateSpend
+            ))),
+            "transaction {n}"
+        );
+    }
+}
+
+/// Appends a step's batch to the log and returns the entries a reader at
+/// `cursor` then sees.
+fn logged(log: &mut ChangeLog, step: Step, cursor: ChangeSeq) -> Vec<super::ChangeEntry> {
+    log.append(step.changes);
+    match log.since(cursor) {
+        ChangesSince::Entries(entries) => entries,
+        ChangesSince::Resync => panic!("the test's reader stays on the log"),
+    }
+}
+
+#[test]
+fn a_reader_that_reads_an_addition_after_it_was_hidden_announces_it_on_the_reveal() {
+    let mut model = new_model();
+    let mut log = ChangeLog::default();
+    // The session opens on an empty pool, and announces nothing.
+    let (mut reader, announced) = ModelReader::open(&model.visible(), log.last());
+    assert!(announced.is_empty());
+
+    // A transaction is added and then hidden before the session reads.
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    log.append(
+        model
+            .outcome(job, Outcome::Pass, stable(0), stable(0), secs(0))
+            .changes,
+    );
+    let step = model.transition(reorg(1, 100), secs(1));
+    let job = the_job(&step);
+    let entries = logged(&mut log, step, reader.cursor());
+    assert_eq!(entries.len(), 2);
+    // The snapshot does not hold it, so there is nothing to announce yet.
+    assert!(reader.read(&entries, &model.visible()).is_empty());
+
+    // It opened before the hide, and it still announces the reveal, because
+    // it never announced the addition.
+    let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), secs(2));
+    let entries = logged(&mut log, step, reader.cursor());
+    assert_eq!(reader.read(&entries, &model.visible()), vec![id(1)]);
+}
+
+#[test]
+fn a_reader_that_announced_a_transaction_skips_its_reveal() {
+    let mut model = new_model();
+    let mut log = ChangeLog::default();
+    let (mut reader, _) = ModelReader::open(&model.visible(), log.last());
+
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(0));
+    let entries = logged(&mut log, step, reader.cursor());
+    assert_eq!(reader.read(&entries, &model.visible()), vec![id(1)]);
+
+    let step = model.transition(reorg(1, 100), secs(1));
+    let job = the_job(&step);
+    let entries = logged(&mut log, step, reader.cursor());
+    assert!(reader.read(&entries, &model.visible()).is_empty());
+    let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), secs(2));
+    let entries = logged(&mut log, step, reader.cursor());
+    assert!(reader.read(&entries, &model.visible()).is_empty());
+}
+
+#[test]
+fn a_reader_that_opens_or_resynchronizes_while_a_transaction_is_hidden_announces_its_reveal() {
+    let mut model = new_model();
+    let mut log = ChangeLog::default();
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    log.append(
+        model
+            .outcome(job, Outcome::Pass, stable(0), stable(0), secs(0))
+            .changes,
+    );
+    // This reader announced it from its opening snapshot.
+    let (mut early, announced) = ModelReader::open(&model.visible(), log.last());
+    assert_eq!(announced, vec![id(1)]);
+
+    let step = model.transition(reorg(1, 100), secs(1));
+    let job = the_job(&step);
+    log.append(step.changes);
+    // One reader opens now, and the early one falls off the log and
+    // resynchronizes now. Neither snapshot holds the transaction.
+    let (mut late, announced) = ModelReader::open(&model.visible(), log.last());
+    assert!(announced.is_empty());
+    assert!(early.resync(&model.visible(), log.last()).is_empty());
+
+    let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), secs(2));
+    let entries = logged(&mut log, step, late.cursor());
+    assert_eq!(late.read(&entries, &model.visible()), vec![id(1)]);
+    assert_eq!(early.read(&entries, &model.visible()), vec![id(1)]);
+}
+
+#[tokio::test]
+async fn a_caller_can_see_which_peers_are_cooling_down() {
+    use zakura_rt::time::Instant;
+    let (handle, inbox) = pool_port();
+    let now = Instant::now();
+    assert!(!handle.is_cooling(&v2(1), now));
+
+    let until = now + secs(600);
+    inbox.publish_cooldowns([(CooldownKey::from(&v2(1)), until)].into_iter().collect());
+    assert!(handle.is_cooling(&v2(1), now));
+    assert!(!handle.is_cooling(&v2(2), now));
+    assert!(!handle.is_cooling(&v2(1), until));
 }

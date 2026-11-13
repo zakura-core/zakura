@@ -306,9 +306,9 @@ fn after_the_last_attempt_the_node_gives_up_and_frees_the_core_slot() {
         reactor.announce(*session, id(1), 300, secs(0), &mut pool);
     }
     let mut now = secs(0);
-    for attempt in 1..MAX_ATTEMPTS {
+    for next in s.iter().take(MAX_ATTEMPTS).skip(1) {
         now += REQUEST_TIMEOUT;
-        assert_eq!(reactor.tick(now, &mut pool), vec![ask(s[attempt], 1)]);
+        assert_eq!(reactor.tick(now, &mut pool), vec![ask(*next, 1)]);
     }
     assert_eq!(pool.slots_in_use(), 1);
 
@@ -639,4 +639,43 @@ fn giving_up_passes_on_the_verdict_it_causes_for_another_caller() {
         .iter()
         .find_map(|step| step.verdict(waiter));
     assert_eq!(verdict, Some(ModelVerdict::LocalFault(LocalFault::NoBody)));
+}
+
+// Cases from Sol's second review.
+
+#[test]
+fn a_handoff_skips_an_announcer_that_is_cooling_down() {
+    let (mut pool, mut reactor, s) = setup(3);
+    for session in &s {
+        reactor.announce(*session, id(1), 300, secs(0), &mut pool);
+    }
+    // Bob enters a cooldown for something else while Alice is being asked.
+    pool.violation(v2(2), secs(1));
+
+    // Alice times out. The slot is hers, so the core is not asked again,
+    // and it would refuse Bob's body. Bob is not asked. Carol is.
+    let effects = reactor.tick(REQUEST_TIMEOUT, &mut pool);
+    assert_eq!(effects, vec![ask(s[2], 1)]);
+    assert_eq!(reactor.outstanding(s[1]), 0);
+}
+
+#[test]
+fn a_local_fault_after_the_last_session_ended_does_not_leave_the_id_wanted() {
+    let (mut pool, mut reactor, s) = setup(1);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.tx(s[0], tx(1), secs(0), &mut pool);
+    // The session ends while its body is verified. The body stays.
+    reactor.end(s[0], secs(1), &mut pool);
+    assert!(reactor.wants(id(1)));
+
+    finish(
+        &mut pool,
+        &mut reactor,
+        Outcome::LocalFault(LocalFault::StateUnavailable),
+        secs(2),
+    );
+    // Nobody is left to ask, now or after the retry delay.
+    reactor.tick(secs(2) + RETRY_MAX, &mut pool);
+    assert!(!reactor.wants(id(1)));
+    assert_eq!(pool.slots_in_use(), 0);
 }

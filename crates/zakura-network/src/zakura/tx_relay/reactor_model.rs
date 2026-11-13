@@ -341,9 +341,9 @@ impl ReactorModel {
             };
             match wanted.fetch {
                 Fetch::Asking { deadline, .. } if deadline <= now => self.move_on(key, now, pool),
-                Fetch::Backoff { until } if until <= now => {
-                    self.wanted_at(key).fetch = Fetch::Idle;
-                }
+                // Asked directly, not left for the next pump: with nobody
+                // left to ask, this is where the id is given up.
+                Fetch::Backoff { until } if until <= now => self.move_on(key, now, pool),
                 _ => {}
             }
         }
@@ -607,6 +607,13 @@ impl ReactorModel {
         let mut refused = false;
         for session in candidates {
             let peer = self.sessions[&session].peer.clone();
+            // The core would refuse this peer's body. That holds for a
+            // handoff too, where the slot is already taken under another
+            // peer and the core is not asked again.
+            if pool.cooling(&peer) {
+                refused = true;
+                continue;
+            }
             if self.wanted[&key].reservation.is_none() {
                 match pool.reserve(id, Source::Peer(peer), Intent::Fetch, now) {
                     Ok(reservation) => self.wanted_at(key).reservation = Some(reservation.id),

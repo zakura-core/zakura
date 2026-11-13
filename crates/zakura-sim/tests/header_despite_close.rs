@@ -15,14 +15,24 @@ mod support;
 use std::path::Path;
 
 use support::one_key_off::assert_one_key_off;
-use zakura_sim::harness::header_acceptance::{
-    companions::{
-        fault_close, judge, path_break, rejected_page, run_draft, sent_page, staged_page,
-        DraftEvidence, Refusal, SentPage, StagedPage, CONTENT_FAULT, FAULT_CLOSE, PATH_BREAK,
-        STAGED,
+use zakura_sim::{
+    check::FrameRef,
+    harness::{
+        self,
+        header_acceptance::{
+            companions::{
+                fault_close, judge, path_break, rejected_page, run_draft, sent_page, staged_page,
+                DraftEvidence, Refusal, SentPage, StagedPage, CONTENT_FAULT, FAULT_CLOSE,
+                PATH_BREAK, STAGED,
+            },
+            refs::{PageRef, Ref},
+        },
+        header_sync::{HeaderWire, WireScenario},
+        Subsystem,
     },
-    refs::PageRef,
+    Observation,
 };
+use zakura_storage::header::fixture::HeaderFixture;
 
 /// The committed bad-content input, the case's input.
 fn input() -> Vec<u8> {
@@ -124,6 +134,128 @@ fn the_staging_companion_needs_the_rejected_page_staged() {
     assert_one_key_off(&page.page(&sent), |staged_ref| {
         staged_page(&[staged(staged_ref)], &page, &sent).is_ok()
     });
+}
+
+/// The chain peer `peer` (its harness name) serves in the input's
+/// scenario, built from the scenario rather than from the run: each
+/// header's hash in hex, and the hash in hex the same header gets with its
+/// previous-block hash's first byte flipped, as the linkage fault sends it.
+fn served_chain(peer: &str) -> Vec<(String, String)> {
+    let entry = harness::find(HeaderWire::NAME).expect("the wire harness is registered");
+    let scenario: WireScenario =
+        serde_json::from_value(entry.scenario(&input())).expect("the input draws a scenario");
+    let index: usize = peer
+        .strip_prefix("peer-")
+        .and_then(|index| index.parse().ok())
+        .unwrap_or_else(|| panic!("{peer} is a scenario peer's name"));
+    let length = scenario.peers[index]
+        .honest
+        .as_ref()
+        .expect("the faulting peer serves an honest chain")
+        .chain;
+    let hex = |hash: zakura_chain::block::Hash| -> String {
+        hash.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    };
+    let fixture = HeaderFixture::regtest();
+    fixture
+        .extend(fixture.anchor(), length, 0)
+        .iter()
+        .map(|header| {
+            let mut unlinked = **header;
+            unlinked.previous_block_hash.0[0] ^= 1;
+            (hex(header.hash()), hex(unlinked.hash()))
+        })
+        .collect()
+}
+
+/// The hashes of the one page in `pages` sent as `frame`, joined on its
+/// whole ref, or `None` if none was. Two pages at one frame fail the test.
+fn sent_at(pages: &[(FrameRef, Vec<String>)], frame: &FrameRef) -> Option<Vec<String>> {
+    match FrameRef::joined(frame, pages, |(sent, _)| Some(sent.clone()))[..] {
+        [] => None,
+        [(_, hashes)] => Some(hashes.clone()),
+        ref many => panic!("{frame:?}: {} pages", many.len()),
+    }
+}
+
+/// [`sent_at`] finds a stored page at its whole frame, and not with any
+/// one key of that frame moved (Rule 25's template).
+#[test]
+fn a_stored_page_joins_its_whole_frame() {
+    let evidence = evidence();
+    let page = rejected_page(&evidence.observations).expect("one page was rejected");
+    let pages = vec![(page.frame.clone(), vec!["ab".to_owned()])];
+    assert!(sent_at(&pages, &page.frame).is_some());
+    let keys =
+        assert_one_key_off::<FrameRef>(&page.frame, |frame| sent_at(&pages, frame).is_some());
+    assert_eq!(keys, 6);
+}
+
+/// The producer of `SentPages`: what it keeps for the rejected frame is
+/// the page the peer sent there, as the scenario's chain and the linkage
+/// fault give it: its first header unlinked, then the chain's next
+/// headers. Every page it keeps sits at a headers frame the peer logged,
+/// and is that page or a run of the chain's headers.
+#[test]
+fn the_sent_pages_store_holds_what_the_peer_sent() {
+    let evidence = evidence();
+    let page = rejected_page(&evidence.observations).expect("one page was rejected");
+    let chain = served_chain(&page.peer);
+    let pages = evidence.sent.pages();
+    let stored = sent_at(&pages, &page.frame).expect("the store holds the rejected frame's page");
+    let start = chain
+        .iter()
+        .position(|(_, unlinked)| *unlinked == stored[0])
+        .unwrap_or_else(|| {
+            panic!("the page's first header is a chain header unlinked: {stored:?}")
+        });
+    let expected: Vec<String> = std::iter::once(chain[start].1.clone())
+        .chain(
+            chain[start + 1..]
+                .iter()
+                .take(stored.len() - 1)
+                .map(|(hash, _)| hash.clone()),
+        )
+        .collect();
+    assert_eq!(stored, expected, "{page:?}");
+
+    let hashes: Vec<String> = chain.iter().map(|(hash, _)| hash.clone()).collect();
+    let mut logged = 0;
+    for obs in &evidence.observations {
+        let Observation::PeerFrame {
+            connection,
+            stream,
+            quic_stream: Some(quic_stream),
+            seq,
+            row: Some(row),
+            ..
+        } = obs
+        else {
+            continue;
+        };
+        let frame = FrameRef {
+            connection: *connection,
+            kind: stream.kind,
+            version: stream.version,
+            quic_stream: *quic_stream,
+            inbound: true,
+            seq: *seq,
+        };
+        let Some(kept) = sent_at(&pages, &frame) else {
+            continue;
+        };
+        assert_eq!(row, "headers", "{frame:?}: {kept:?}");
+        logged += 1;
+        assert!(
+            kept == expected || hashes.windows(kept.len()).any(|run| run == &kept[..]),
+            "{frame:?}: {kept:?}"
+        );
+    }
+    assert_eq!(
+        logged,
+        evidence.sent.len(),
+        "every kept page is a logged frame's"
+    );
 }
 
 /// Unpatched, `commit-only-authorized` holds, so no retained violation is

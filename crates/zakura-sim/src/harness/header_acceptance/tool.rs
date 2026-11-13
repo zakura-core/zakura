@@ -139,7 +139,7 @@ use super::{
         ObligationState, Report, ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
     history::{Declaration, DeclaredHistory, Ran, PLAN_FILE, RAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
-    refs::{Ref, TriggerRef},
+    refs::{DeclarationRef, PlantedRef, Ref, TriggerRef},
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
     rows::HEADER_HARNESSES,
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
@@ -814,7 +814,8 @@ fn history_task(
 /// Where in `tasks` execution `run` is recorded: its task's index and the
 /// recorded run's directory within it, `run` for a history and the role's
 /// name for a planted case's run. `None` if no task records it, as for a
-/// native mutation's run, whose witness test isn't a recorded run.
+/// native mutation's run, whose witness test isn't a recorded run. A
+/// planted case's run is joined to its task on its whole [`PlantedRef`].
 pub fn recorded_at(tasks: &[Task], run: &RunId) -> Option<(usize, &'static str)> {
     tasks.iter().enumerate().find_map(|(index, task)| {
         let dir = match (task, run) {
@@ -824,27 +825,43 @@ pub fn recorded_at(tasks: &[Task], run: &RunId) -> Option<(usize, &'static str)>
                 "run"
             }
             (
-                Task::Case {
+                Task::Case { draft, .. },
+                RunId::Case {
                     property,
                     name,
-                    draft,
-                    ..
-                },
-                RunId::Case {
-                    property: p,
-                    name: n,
                     run: role,
                 },
-            ) if property == p && name == n => match role {
-                CaseRun::Baseline => "baseline",
-                CaseRun::Patched => "patched",
-                CaseRun::Draft if draft.is_some() => "draft",
-                _ => return None,
-            },
+            ) if PlantedRef::joins(
+                &PlantedRef {
+                    property: property.clone(),
+                    name: name.clone(),
+                },
+                task,
+                planted_case,
+            ) =>
+            {
+                match role {
+                    CaseRun::Baseline => "baseline",
+                    CaseRun::Patched => "patched",
+                    CaseRun::Draft if draft.is_some() => "draft",
+                    _ => return None,
+                }
+            }
             _ => return None,
         };
         Some((index, dir))
     })
+}
+
+/// The planted case `task` records, if it's a planted case's task.
+fn planted_case(task: &Task) -> Option<PlantedRef> {
+    match task {
+        Task::Case { property, name, .. } => Some(PlantedRef {
+            property: property.clone(),
+            name: name.clone(),
+        }),
+        _ => None,
+    }
 }
 
 /// The history a `Holds` or `StaysNotApplicable` identity names.
@@ -2639,38 +2656,53 @@ fn case_input_refusal(repo: &Path, harness: &str, input: &CaseInput, dir: &Path)
 
 /// The one declaration of `all`, a task's bound declarations
 /// ([`TaskAt::declared`]), of `harness`'s history `case` by `test`
-/// ([`super::history`]), or why there isn't exactly one. A declaration by
-/// another test, or of the case on another harness, isn't it.
+/// ([`super::history`]), joined on its whole [`DeclarationRef`], or why
+/// there isn't exactly one. A declaration by another test, or of the case
+/// on another harness, isn't it, so one case name declared on two
+/// harnesses is two histories.
 fn declaration<'a>(
     all: &'a [Declaration],
     harness: &str,
     test: &str,
     case: &str,
 ) -> Result<&'a Declaration, String> {
-    let named: Vec<&Declaration> = all
-        .iter()
-        .filter(|declaration| declaration.history().case == case)
-        .collect();
-    match named.as_slice() {
-        [found]
-            if found.history().harness == harness && libtest_names(&found.history().test, test) =>
-        {
-            Ok(found)
-        }
-        [found] => {
-            let history = found.history();
+    let want = DeclarationRef {
+        test: test.to_owned(),
+        harness: harness.to_owned(),
+        case: case.to_owned(),
+    };
+    let found = DeclarationRef::joined(&want, all, |declaration| {
+        let history = declaration.history();
+        // libtest names the declaring thread by the test's path in its
+        // crate, which names the task's test if it ends in it.
+        let test = match libtest_names(&history.test, test) {
+            true => test.to_owned(),
+            false => history.test.clone(),
+        };
+        Some(DeclarationRef {
+            test,
+            harness: history.harness.clone(),
+            case: history.case.clone(),
+        })
+    });
+    match found.as_slice() {
+        [found] => Ok(found),
+        [] => {
+            let declared: Vec<String> = all
+                .iter()
+                .map(|declaration| {
+                    let history = declaration.history();
+                    format!("{}'s {} on {}", history.test, history.case, history.harness)
+                })
+                .collect();
             Err(format!(
-                "its witness test declared {case} as {}'s on {}, not {test}'s on {harness}",
-                history.test, history.harness
+                "its witness test declared no history {case} of {test}'s on {harness}, \
+                 among {declared:?}"
             ))
         }
-        [] => Err(format!(
-            "its witness test declared no history named {case} among {} declarations",
-            all.len()
-        )),
         _ => Err(format!(
-            "its witness test declared {case} {} times",
-            named.len()
+            "its witness test declared {case} on {harness} {} times",
+            found.len()
         )),
     }
 }
@@ -4979,6 +5011,77 @@ mod tests {
             )
         });
         assert_eq!(keys, 4);
+    }
+
+    /// A task's history is the declaration joined on its whole
+    /// [`DeclarationRef`] (Rule 25's template): a witness test declaring
+    /// one case on two harnesses declared two histories, and each is found
+    /// on its own harness, while the ref with its test, its harness or its
+    /// case moved finds none.
+    #[test]
+    fn a_declaration_joins_its_whole_identity() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let root = tempfile::tempdir().expect("a temp dir can be created");
+        let scenario = serde_json::json!({ "peers": 2 });
+        let wire = "header-sync/wire";
+        for harness in [NODE, wire] {
+            super::super::history::declare_into(
+                root.path(),
+                &at_for(),
+                harness,
+                "only",
+                &scenario,
+                &crate::PlanInput::Bytes(vec![1]),
+            )
+            .expect("the declaration writes");
+        }
+        let all = AT.declared(root.path(), "").expect("they read back");
+        let test = "a_declaration_joins_its_whole_identity";
+        for (at, harness) in [NODE, wire].into_iter().enumerate() {
+            let found = declaration(&all, harness, test, "only").expect("one declaration");
+            assert_eq!(found.dir(), all[at].dir());
+        }
+        let own = DeclarationRef {
+            test: test.to_owned(),
+            harness: wire.to_owned(),
+            case: "only".to_owned(),
+        };
+        let keys = assert_one_key_off::<DeclarationRef>(&own, |want| {
+            declaration(&all, &want.harness, &want.test, &want.case).is_ok()
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// A planted case's run is recorded at its own task, joined on its
+    /// whole [`PlantedRef`] (Rule 25's template): the committed plan has
+    /// several `reserved-flags-skipped` cases under different properties,
+    /// each run is found at its own task, and the ref with its property or
+    /// its name moved is found at none.
+    #[test]
+    fn a_case_run_is_recorded_at_its_whole_case() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plan = plan(&Manifest::committed(), &repo).expect("the committed manifest plans");
+        let named: Vec<(usize, PlantedRef)> = plan
+            .tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(at, task)| Some((at, planted_case(task)?)))
+            .filter(|(_, case)| case.name == "reserved-flags-skipped")
+            .collect();
+        assert!(named.len() > 1, "{named:?}");
+        let run = |case: &PlantedRef| RunId::Case {
+            property: case.property.clone(),
+            name: case.name.clone(),
+            run: CaseRun::Patched,
+        };
+        for (at, case) in &named {
+            assert_eq!(recorded_at(&plan.tasks, &run(case)), Some((*at, "patched")));
+            let keys = assert_one_key_off::<PlantedRef>(case, |want| {
+                recorded_at(&plan.tasks, &run(want)).is_some()
+            });
+            assert_eq!(keys, 2);
+        }
     }
 
     /// A planted case's patched witness is the one the planted runner

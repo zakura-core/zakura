@@ -7001,7 +7001,7 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
     (
         "FrameRef",
         "src/harness/header_acceptance/companions.rs",
-        "rejected_page",
+        "rejected_frame",
         "src/harness/header_acceptance/companions.rs",
         "the_rejected_page_joins_its_judged_frame",
     ),
@@ -7389,6 +7389,55 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "grew",
         "src/harness/header_acceptance/actions.rs",
         "a_grow_joins_its_whole_step",
+    ),
+    (
+        "DeclarationRef",
+        "src/harness/header_acceptance/tool.rs",
+        "declaration",
+        "src/harness/header_acceptance/tool.rs",
+        "a_declaration_joins_its_whole_identity",
+    ),
+    (
+        "PlantedRef",
+        "src/harness/header_acceptance/tool.rs",
+        "recorded_at",
+        "src/harness/header_acceptance/tool.rs",
+        "a_case_run_is_recorded_at_its_whole_case",
+    ),
+    (
+        "PlantedRef",
+        "src/harness/header_acceptance.rs",
+        "proving_catch",
+        "src/harness/header_acceptance.rs",
+        "a_proving_catch_joins_its_whole_case",
+    ),
+    (
+        "FrameRef",
+        "src/harness/header_acceptance/companions.rs",
+        "sent_page",
+        "src/harness/header_acceptance/companions.rs",
+        "the_sent_page_comes_from_the_frames_evidence",
+    ),
+    (
+        "LinkRef",
+        "src/harness/header_acceptance/actions.rs",
+        "closes_current",
+        "src/harness/header_acceptance/actions.rs",
+        "a_close_fact_names_its_peer_s_current_link",
+    ),
+    (
+        "WitnessRef",
+        "src/harness/header_acceptance/not_applicable.rs",
+        "history_groups",
+        "src/harness/header_acceptance/not_applicable.rs",
+        "a_history_s_group_joins_its_whole_witness",
+    ),
+    (
+        "FrameRef",
+        "tests/header_despite_close.rs",
+        "sent_at",
+        "tests/header_despite_close.rs",
+        "a_stored_page_joins_its_whole_frame",
     ),
 ];
 
@@ -7858,10 +7907,10 @@ fn every_ref_has_a_one_key_off_control() {
     let templated: Vec<_> = REF_CONTROLS
         .iter()
         .map(|entry| match entry {
-            ("FrameRef", file, "rejected_page", ..) => (
+            ("FrameRef", file, "rejected_frame", ..) => (
                 "FrameRef",
                 *file,
-                "rejected_page",
+                "rejected_frame",
                 companions,
                 "a_template_control",
             ),
@@ -7884,7 +7933,7 @@ fn every_ref_has_a_one_key_off_control() {
         control_gaps(&planted, &refs, &templated),
         [format!(
             "{companions} a_template_control has no typed FrameRef control reaching \
-             {companions} rejected_page"
+             {companions} rejected_frame"
         )]
     );
 

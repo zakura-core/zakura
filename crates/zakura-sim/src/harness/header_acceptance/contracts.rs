@@ -663,7 +663,7 @@ const C12_PROVING: &[TestRef] = &[
 const C14_PROVING: &[TestRef] = &[
     sim_test(
         "tests/header_despite_close.rs",
-        "the_staging_companion_needs_the_rejected_page_staged",
+        "the_sent_pages_store_holds_what_the_peer_sent",
     ),
     sim_test(
         "tests/header_node_ends.rs",

@@ -280,10 +280,17 @@ impl SentPages {
         self.0.write(|pages| pages.0.insert(frame, hashes));
     }
 
-    /// The header hashes, in hex, of the page the peer sent as `frame`,
-    /// joined on its whole ref, if it sent one there.
-    pub fn page(&self, frame: &FrameRef) -> Option<Vec<String>> {
-        self.0.read(|pages| pages.0.get(frame).cloned())
+    /// Every page the peers sent, as its frame and its header hashes, in
+    /// hex, in frame order. A reader joins the one it wants on its frame's
+    /// whole ref.
+    pub fn pages(&self) -> Vec<(FrameRef, Vec<String>)> {
+        self.0.read(|pages| {
+            pages
+                .0
+                .iter()
+                .map(|(frame, hashes)| (frame.clone(), hashes.clone()))
+                .collect()
+        })
     }
 
     /// How many pages it holds.
@@ -1219,7 +1226,7 @@ mod tests {
         crate::stores::assert_freeze_drops_writes(
             super::SentPages::new,
             |pages| pages.record(frame.clone(), vec!["ab".to_owned()]),
-            |pages| pages.page(&frame),
+            |pages| pages.pages(),
         );
     }
 

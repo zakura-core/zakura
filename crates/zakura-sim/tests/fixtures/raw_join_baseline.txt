@@ -232,7 +232,6 @@ src/harness/header_acceptance/inventory.rs	each_inventory_change_is_an_inventory
 src/harness/header_acceptance/required.rs	allows	test==*t
 src/harness/header_acceptance/required.rs	required_keys	(property.clone(),name.clone())
 src/harness/header_acceptance/required.rs	required_keys	contract.id==id
-src/harness/header_acceptance/rows.rs	attach_history_passes	h==history
 src/harness/header_acceptance/rows.rs	attach_history_passes	property==target
 src/harness/header_acceptance/rows.rs	machine_row	property==REACTOR
 src/harness/header_acceptance/rows.rs	tier_exclusion_in	*p==property

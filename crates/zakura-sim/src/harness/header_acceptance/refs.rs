@@ -485,6 +485,58 @@ impl TestIdRef {
     }
 }
 
+/// One acceptance history, as its run names it: its harness, its witness
+/// test's package, file and name, and its case within that test. A case
+/// name is per test, and one test can run a case on two harnesses.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryRunRef {
+    /// The harness.
+    pub harness: String,
+    /// The witness test's package.
+    pub package: String,
+    /// The witness test's file, relative to its package.
+    pub file: String,
+    /// The witness test's name.
+    pub test: String,
+    /// The case within that test.
+    pub case: String,
+}
+impl Ref for HistoryRunRef {}
+
+impl HistoryRunRef {
+    /// The whole identity of `history`.
+    pub fn of(history: super::HistoryRef) -> Self {
+        HistoryRunRef {
+            harness: history.harness.to_owned(),
+            package: history.witness.package.to_owned(),
+            file: history.witness.file.to_owned(),
+            test: history.witness.test.to_owned(),
+            case: history.case.to_owned(),
+        }
+    }
+
+    /// The history `run` is, if it's a history's run rather than a planted
+    /// case's.
+    pub fn of_run(run: &super::RunId) -> Option<Self> {
+        match run {
+            super::RunId::History {
+                harness,
+                package,
+                file,
+                test,
+                case,
+            } => Some(HistoryRunRef {
+                harness: harness.clone(),
+                package: package.clone(),
+                file: file.clone(),
+                test: test.clone(),
+                case: case.clone(),
+            }),
+            super::RunId::Case { .. } => None,
+        }
+    }
+}
+
 /// One property, by its ID, as a catch key names the property whose
 /// planted cases it takes: a case's property directory is its property's
 /// ID.

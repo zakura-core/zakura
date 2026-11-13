@@ -78,7 +78,11 @@ fn extract_sapling_items_from_blocks() -> Vec<SaplingItem> {
                 continue;
             };
 
-            let Some(bundle) = sighasher.sapling_bundle() else {
+            let Some(bundle) = tx
+                .shielded_bundles(nu)
+                .ok()
+                .and_then(|bundles| bundles.sapling)
+            else {
                 continue;
             };
 

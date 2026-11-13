@@ -29,7 +29,8 @@ use zakura_chain::{
     primitives::Groth16Proof,
     serialization::DateTime32,
     transaction::{
-        self, HashType, SigHash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx,
+        self, HashType, ShieldedBundles, SigHash, Transaction, UnminedTx, UnminedTxId,
+        VerifiedUnminedTx,
     },
     transparent,
 };
@@ -39,7 +40,11 @@ use zakura_node_services::mempool;
 use zakura_script::{CachedFfiTransaction, Sigops};
 use zakura_state as zs;
 
-use crate::{error::TransactionError, primitives, script, BoxError};
+use crate::{
+    error::TransactionError,
+    primitives::{self, ShieldedPool},
+    script, BoxError,
+};
 
 pub mod check;
 #[cfg(test)]
@@ -1048,7 +1053,8 @@ where
 
         Self::verify_v4_transaction_network_upgrade(&tx, network, request.height(), nu)?;
 
-        let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
+        let sapling_bundle =
+            Self::unverified_shielded_bundles(&tx, nu, &cached_ffi_transaction, tx_id)?.sapling;
         if joinsplit_data.is_none() && sapling_bundle.is_none() {
             // Only shielded data signs the transaction-wide sighash, so a transparent-only
             // transaction never needs it; its inputs compute their own sighashes.
@@ -1170,8 +1176,16 @@ where
 
         Self::verify_v5_transaction_network_upgrade(&transaction, nu)?;
 
-        let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
-        let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
+        let ShieldedBundles {
+            sapling: sapling_bundle,
+            orchard: orchard_bundle,
+            ironwood: _,
+        } = Self::unverified_shielded_bundles(
+            &transaction,
+            nu,
+            &cached_ffi_transaction,
+            UnminedTxId::Witnessed(wtx_id),
+        )?;
         if sapling_bundle.is_none() && orchard_bundle.is_none() {
             // See `verify_v4_transaction`: a transparent-only transaction never needs the
             // transaction-wide sighash.
@@ -1259,9 +1273,16 @@ where
 
         Self::verify_v6_transaction_network_upgrade(&transaction, nu)?;
 
-        let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
-        let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
-        let ironwood_bundle = cached_ffi_transaction.sighasher().ironwood_bundle();
+        let ShieldedBundles {
+            sapling: sapling_bundle,
+            orchard: orchard_bundle,
+            ironwood: ironwood_bundle,
+        } = Self::unverified_shielded_bundles(
+            &transaction,
+            nu,
+            &cached_ffi_transaction,
+            UnminedTxId::Witnessed(wtx_id),
+        )?;
         if sapling_bundle.is_none() && orchard_bundle.is_none() && ironwood_bundle.is_none() {
             // See `verify_v4_transaction`: a transparent-only transaction never needs the
             // transaction-wide sighash.
@@ -1313,6 +1334,70 @@ where
         }
 
         Ok(())
+    }
+
+    /// Returns the shielded bundles of `transaction` whose proofs and signatures still have to
+    /// be verified.
+    ///
+    /// The verifiers take bundles in `librustzcash`'s form, and getting them means reading the
+    /// whole transaction a second time. When every shielded bundle `transaction` carries has
+    /// already verified under `tx_id` and its sighash, which is the usual case for a block
+    /// transaction this node admitted to its mempool, there is nothing left to verify: the read
+    /// is skipped and no bundle is returned. Otherwise all of them are read and returned.
+    ///
+    /// # Consensus
+    ///
+    /// A transaction that `librustzcash` cannot read is invalid, so the read is also a check, and
+    /// it is skipped only when it cannot fail. A bundle is recorded as verified only after its
+    /// transaction passed the read, and the record names the transaction ID, which commits to
+    /// every byte that is read, and the sighash, which commits to the consensus branch ID the
+    /// read is given. So a transaction with a recorded bundle reads the same way again. A
+    /// transaction with no shielded bundle has no such record, and is always read.
+    ///
+    /// # Correctness
+    ///
+    /// Skipping the read when only some of the bundles are recorded would leave the rest
+    /// unverified, so every pool the transaction has must be recorded. The pools are taken from
+    /// Zakura's own transaction, which never has fewer than `librustzcash` would find: it reads
+    /// what Zakura serializes, and a pool the transaction lacks is serialized as empty.
+    fn unverified_shielded_bundles(
+        transaction: &Transaction,
+        network_upgrade: NetworkUpgrade,
+        cached_ffi_transaction: &CachedFfiTransaction<TransactionHandle>,
+        tx_id: UnminedTxId,
+    ) -> Result<ShieldedBundles, TransactionError> {
+        let pools = [
+            (
+                transaction.has_sapling_shielded_data(),
+                ShieldedPool::Sapling,
+            ),
+            (
+                transaction.has_orchard_shielded_data(),
+                ShieldedPool::Orchard,
+            ),
+            (
+                transaction.has_ironwood_shielded_data(),
+                ShieldedPool::Ironwood,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(is_present, pool)| is_present.then_some(pool));
+
+        // Only shielded data signs the transaction-wide sighash, so it is not computed for a
+        // transaction without any.
+        if pools.clone().next().is_some() {
+            let sighash = cached_ffi_transaction
+                .sighasher()
+                .sighash(HashType::ALL, None);
+
+            if primitives::shielded_bundles_are_verified(network_upgrade, tx_id, &sighash, pools) {
+                return Ok(ShieldedBundles::default());
+            }
+        }
+
+        transaction.shielded_bundles(network_upgrade).map_err(|_| {
+            TransactionError::UnsupportedByNetworkUpgrade(transaction.version(), network_upgrade)
+        })
     }
 
     /// Verifies if a transaction's transparent inputs are valid using the provided

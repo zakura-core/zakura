@@ -2014,14 +2014,14 @@ fn v6_sighasher_preserves_distinct_orchard_and_ironwood_bundle_slots() {
         ironwood_shielded_data: Some(ironwood_data),
     };
 
-    let sighasher = tx
-        .sighasher(NetworkUpgrade::Nu6_3, Arc::new(Vec::new()))
+    let bundles = tx
+        .shielded_bundles(NetworkUpgrade::Nu6_3)
         .expect("the mixed-pool V6 transaction converts to librustzcash");
-    let orchard_bundle = sighasher
-        .orchard_bundle()
+    let orchard_bundle = bundles
+        .orchard
         .expect("the V6 transaction keeps its Orchard bundle");
-    let ironwood_bundle = sighasher
-        .ironwood_bundle()
+    let ironwood_bundle = bundles
+        .ironwood
         .expect("the V6 transaction keeps its Ironwood bundle");
 
     let parsed_orchard_nullifier = (*orchard_bundle
@@ -2321,6 +2321,8 @@ fn v6_noncanonical_orchard_proof_is_rejected_during_deserialization() {
         let tx = make_tx(noncanonical);
         tx.to_librustzcash(NetworkUpgrade::Nu6_3)
             .expect_err("librustzcash enforces V6 Orchard proof sizes");
+        tx.shielded_bundles(NetworkUpgrade::Nu6_3)
+            .expect_err("the bundles are read by librustzcash, so its rejection is reported");
         let bytes = tx.zcash_serialize_to_vec().expect("serialize");
         let error = Transaction::zcash_deserialize(&bytes[..])
             .expect_err("V6 Orchard proof size must be canonical");

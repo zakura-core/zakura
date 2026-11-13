@@ -330,6 +330,11 @@ pub enum Verdict {
     Rejected(Rejection),
     /// A limit was reached. Only a submission without a slot can get this.
     NoRoom(NoRoom),
+    /// The supplier is in a cooldown, so its body was not verified. Nothing
+    /// is cached and nobody else is charged. A supplier can enter a cooldown
+    /// after its body was asked for, or be named under another source's
+    /// reservation.
+    CoolingDown,
     /// A failure on this node.
     LocalFault(LocalFault),
 }
@@ -472,10 +477,12 @@ pub struct ChainTransition {
     pub after: ChainTip,
     /// The stable generation this transition ends on.
     pub generation: Generation,
-    /// Whether a connected block activates a network upgrade. The pool was
-    /// verified under the old rules, so the core verifies all of it again,
-    /// as it does after a reorg.
-    pub activates_upgrade: bool,
+    /// Whether the rules change at this tip: the next block activates a
+    /// network upgrade or the temporary Orchard-disabling soft fork, which
+    /// is where today's tip handling resets the pool. The pool was verified
+    /// under the old rules, so the core verifies all of it again, as it does
+    /// after a reorg.
+    pub rules_change: bool,
 }
 
 impl ChainTransition {
@@ -544,9 +551,17 @@ pub enum Change {
     /// The transaction is still in the pool but hidden from snapshots while
     /// it is verified again after a reorg.
     Hidden(UnminedTxId),
-    /// A hidden transaction passed and is visible again. Announcers skip
-    /// this, because peers already heard of it.
-    Revealed(UnminedTxId),
+    /// A hidden transaction passed and is visible again.
+    ///
+    /// A reader that opened at or after `hidden_at` took its opening
+    /// snapshot while the transaction was hidden, so it has never announced
+    /// it and does now. Every other reader already has, and skips this.
+    Revealed {
+        /// The transaction.
+        id: UnminedTxId,
+        /// The position of the [`Change::Hidden`] entry this one ends.
+        hidden_at: ChangeSeq,
+    },
     /// A submitted transaction was rejected and never entered the pool.
     /// Today's change stream reports this as `Invalidated`.
     Refused(UnminedTxId),
@@ -985,6 +1000,10 @@ impl PoolInbox {
     ///
     /// Both happen under the log's lock, so [`PoolHandle::view`] never pairs
     /// a snapshot with entries newer than it.
+    ///
+    /// The core publishes a batch before it starts the jobs that batch
+    /// calls for. A verification that looks an unmined output up therefore
+    /// reads a pool at least as new as the one that started it.
     pub fn publish(
         &self,
         changes: impl IntoIterator<Item = Change>,

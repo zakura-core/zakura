@@ -13,6 +13,11 @@
 //! storage code's rule, so the model assumes the pool stays below it. A
 //! cooldown lasts [`COOLDOWN`] each time and does not escalate.
 //!
+//! Two rules are for the core's task, not the machine. A worker waits for a
+//! stable generation before its first lookup. And the core publishes a
+//! batch's snapshot before it starts that batch's jobs, so a verification
+//! reads a pool at least as new as the one that started it.
+//!
 //! The model is synchronous, so it has no bodies in transit. The port keeps
 //! those bounded: a body travels only under a reservation that holds a slot,
 //! or under the one joined reservation the core asked to bring it.
@@ -29,7 +34,7 @@ use zakura_chain::{
 };
 
 use super::{
-    Change, Charge, CooldownKey, Generation, GenerationRead, Intent, LocalFault, NoRoom,
+    Change, ChangeSeq, Charge, CooldownKey, Generation, GenerationRead, Intent, LocalFault, NoRoom,
     RejectionScope, RemovalReason, ReservationId, Source, Supplier, MAX_COOLDOWNS, MAX_PENDING,
     MAX_PENDING_PER_SOURCE, MAX_REJECTIONS, MAX_REVALIDATING, MAX_WAITERS,
 };
@@ -52,6 +57,14 @@ pub const COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// How long a chain-scoped rejection is remembered. Today's default
 /// `eviction_memory_time`.
 pub const REJECTION_MEMORY: Duration = Duration::from_secs(60 * 60);
+
+/// The most pooled ancestors a new transaction can have. Today's
+/// `MAX_MEMPOOL_ANCESTORS`.
+pub const MAX_ANCESTORS: usize = 2;
+
+/// The most transactions in one connected group of pooled dependencies.
+/// Today's `MAX_MEMPOOL_PACKAGE_TRANSACTIONS`.
+pub const MAX_PACKAGE: usize = 3;
 
 /// The first wait before a revalidation that hit a local fault is tried
 /// again. It doubles up to [`REVALIDATE_RETRY_MAX`]. Provisional.
@@ -112,8 +125,12 @@ impl ModelTx {
 /// What a verification found.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Outcome {
-    /// The transaction is valid at the tip it was verified against.
+    /// The transaction is valid at the tip it was verified against, and
+    /// every input it spends is on the chain.
     Pass,
+    /// The transaction is valid, and these inputs came from the pool the
+    /// verifier saw, not from the chain.
+    PassUsing(Vec<OutPoint>),
     /// A block on the best chain already mined the transaction.
     AlreadyMined,
     /// The transaction is invalid.
@@ -152,6 +169,8 @@ pub enum ModelVerdict {
     },
     /// A limit was reached.
     NoRoom(NoRoom),
+    /// The supplier is in a cooldown, so its body was not verified.
+    CoolingDown,
     /// A failure on this node.
     LocalFault(LocalFault),
 }
@@ -264,8 +283,8 @@ pub struct ModelTransition {
     pub tip: Height,
     /// The stable generation the transition ends on.
     pub generation: Generation,
-    /// Whether a connected block activates a network upgrade.
-    pub activates_upgrade: bool,
+    /// Whether the rules change at this tip.
+    pub rules_change: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -327,6 +346,8 @@ struct Pooled {
     backoff: Duration,
     /// The model's event count when it last became visible.
     visible_at: u64,
+    /// The log position of its latest `Hidden` entry.
+    hidden_at: ChangeSeq,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -368,6 +389,9 @@ pub struct PoolModel {
     rejected_chain: HashMap<transaction::Hash, ModelTime>,
     rejected_chain_order: VecDeque<transaction::Hash>,
     cooldowns: HashMap<CooldownKey, ModelTime>,
+    /// Changes returned in earlier steps. Each step is one batch of the log,
+    /// so this is the log position of the last one.
+    logged: u64,
     step: Step,
 }
 
@@ -392,6 +416,7 @@ impl PoolModel {
             rejected_chain: HashMap::new(),
             rejected_chain_order: VecDeque::new(),
             cooldowns: HashMap::new(),
+            logged: 0,
             step: Step::default(),
         }
     }
@@ -527,6 +552,20 @@ impl PoolModel {
             self.step.effects.push(Effect::Verdict { waiter, verdict });
             return (waiter, self.take_step());
         };
+        // The source was checked when it reserved. The supplier can be
+        // another peer, or have entered a cooldown since.
+        if matches!(&supplier, Supplier::Peer(peer) if self.cooling(peer)) {
+            if self.admission_at(key).owner == reservation {
+                self.admission_at(key).owner_waiting = false;
+            }
+            self.step.effects.push(Effect::Verdict {
+                waiter,
+                verdict: ModelVerdict::CoolingDown,
+            });
+            self.settle_bodyless(key);
+            self.start_revalidations();
+            return (waiter, self.take_step());
+        }
         let start = {
             let admission = self.admission_at(key);
             if admission.owner == reservation {
@@ -572,12 +611,22 @@ impl PoolModel {
             return self.take_step();
         };
         let fresh = before.brackets(after, self.applied);
-        // A stale outcome waits for the chain event when that event has not
-        // been applied yet. Otherwise the job can run again at once.
-        let chain_is_ahead = [before, after].iter().any(|read| match read {
-            GenerationRead::Changing => true,
-            GenerationRead::Stable(generation) => *generation > self.applied,
-        });
+        // A stale outcome waits for the chain event only when that event is
+        // certainly still to come: a reading is past what the core has
+        // applied, or a change was in flight on top of exactly what it has
+        // applied. In every other case the job runs again at once, so no
+        // work waits for an event that has already been applied.
+        //
+        // A worker waits for a stable reading before its first lookup, so a
+        // "changing" first reading does not happen in practice. It is
+        // handled as unknown.
+        use GenerationRead::{Changing, Stable};
+        let chain_is_ahead = match (before, after) {
+            (Stable(read), _) if read > self.applied => true,
+            (_, Stable(read)) if read > self.applied => true,
+            (Stable(read), Changing) => read == self.applied,
+            _ => false,
+        };
         match target {
             JobTarget::Admission(tx_id) => {
                 let key = self.admission_of[&tx_id];
@@ -619,7 +668,7 @@ impl PoolModel {
         // After a reorg or an activation the pool is verified again, and a
         // rejection made on the old chain or under the old rules says
         // nothing. Today's reset drops every list too.
-        let verify_again = transition.disconnected > 0 || transition.activates_upgrade;
+        let verify_again = transition.disconnected > 0 || transition.rules_change;
         if verify_again {
             self.clear_all_rejections();
         } else {
@@ -970,7 +1019,12 @@ impl PoolModel {
         let tx = admission.body.expect("a verified admission holds its body");
         let hash = tx.id.mined_id();
         match outcome {
-            Outcome::Pass => {
+            Outcome::Pass | Outcome::PassUsing(_) => {
+                let pool_inputs = match outcome {
+                    Outcome::PassUsing(inputs) => inputs,
+                    _ => Vec::new(),
+                };
+                // Today's insertion checks, in today's order.
                 if self
                     .pool
                     .values()
@@ -978,6 +1032,25 @@ impl PoolModel {
                 {
                     // The pool took a conflicting transaction while this one
                     // was verified.
+                    self.reject(key, RejectionScope::EffectsTip, Charge::None);
+                    return;
+                }
+                // The verifier used a pool output that the pool no longer
+                // offers. The generation readings cannot show this: the
+                // state was stable, and the pool the verifier read was older
+                // than the core's. Today this is a rejection. Here the job
+                // runs again, because the parent may have been mined, and
+                // the child is then valid against the chain.
+                if !pool_inputs.iter().all(|input| self.offers(input)) {
+                    self.start_admission(key);
+                    return;
+                }
+                let parents: HashSet<transaction::Hash> =
+                    pool_inputs.iter().map(|input| input.hash).collect();
+                let ancestors = self.ancestors(parents);
+                if ancestors.len() > MAX_ANCESTORS
+                    || self.dependency_group(&ancestors).len() >= MAX_PACKAGE
+                {
                     self.reject(key, RejectionScope::EffectsTip, Charge::None);
                     return;
                 }
@@ -994,6 +1067,7 @@ impl PoolModel {
                         hidden: None,
                         backoff: REVALIDATE_RETRY,
                         visible_at: pool_key,
+                        hidden_at: ChangeSeq(0),
                     },
                 );
                 self.pooled.insert(hash, pool_key);
@@ -1038,14 +1112,24 @@ impl PoolModel {
 
     fn revalidation_outcome(&mut self, key: u64, hash: transaction::Hash, outcome: Outcome) {
         match outcome {
-            Outcome::Pass => {
+            Outcome::Pass | Outcome::PassUsing(_) => {
+                let pool_inputs = match outcome {
+                    Outcome::PassUsing(inputs) => inputs,
+                    _ => Vec::new(),
+                };
+                if !pool_inputs.iter().all(|input| self.offers(input)) {
+                    // As for a new transaction: verified against a pool that
+                    // has since lost that output. It runs again.
+                    self.pooled_at(key).hidden = Some(Hidden::Queued);
+                    return;
+                }
                 let visible_at = self.fresh();
                 let pooled = self.pooled_at(key);
                 pooled.hidden = None;
                 pooled.backoff = REVALIDATE_RETRY;
                 pooled.visible_at = visible_at;
-                let tx_id = pooled.tx.id;
-                self.step.changes.push(Change::Revealed(tx_id));
+                let (id, hidden_at) = (pooled.tx.id, pooled.hidden_at);
+                self.step.changes.push(Change::Revealed { id, hidden_at });
                 self.wake(hash);
             }
             // A block the core never saw mined it. Its dependents stay and
@@ -1174,7 +1258,11 @@ impl PoolModel {
         for pooled in self.pool.values_mut() {
             match pooled.hidden {
                 None => {
+                    let pending =
+                        u64::try_from(self.step.changes.len()).expect("a batch fits in u64");
                     pooled.hidden = Some(Hidden::Queued);
+                    pooled.hidden_at =
+                        ChangeSeq(self.logged.saturating_add(pending).saturating_add(1));
                     self.step.changes.push(Change::Hidden(pooled.tx.id));
                 }
                 // A running job read the old chain, so its outcome will be
@@ -1410,6 +1498,61 @@ impl PoolModel {
             .insert(key, self.now.saturating_add(COOLDOWN));
     }
 
+    /// Whether the visible pool offers `outpoint`: its transaction is
+    /// visible and creates that output.
+    fn offers(&self, outpoint: &OutPoint) -> bool {
+        self.pooled.get(&outpoint.hash).is_some_and(|key| {
+            let pooled = &self.pool[key];
+            pooled.hidden.is_none() && outpoint.index < pooled.tx.outputs
+        })
+    }
+
+    /// The pooled parents of a pooled transaction.
+    fn pooled_parents(&self, hash: &transaction::Hash) -> Vec<transaction::Hash> {
+        self.pooled
+            .get(hash)
+            .map(|key| {
+                self.pool[key]
+                    .tx
+                    .parents()
+                    .filter(|parent| self.pooled.contains_key(parent))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `parents` and every pooled transaction they depend on.
+    fn ancestors(&self, parents: HashSet<transaction::Hash>) -> HashSet<transaction::Hash> {
+        let mut ancestors = HashSet::new();
+        let mut next: Vec<transaction::Hash> = parents.into_iter().collect();
+        while let Some(hash) = next.pop() {
+            if self.pooled.contains_key(&hash) && ancestors.insert(hash) {
+                next.extend(self.pooled_parents(&hash));
+            }
+        }
+        ancestors
+    }
+
+    /// Every pooled transaction connected to `seeds` through parents,
+    /// children or both.
+    fn dependency_group(&self, seeds: &HashSet<transaction::Hash>) -> HashSet<transaction::Hash> {
+        let mut group = HashSet::new();
+        let mut next: Vec<transaction::Hash> = seeds.iter().copied().collect();
+        while let Some(hash) = next.pop() {
+            if !self.pooled.contains_key(&hash) || !group.insert(hash) {
+                continue;
+            }
+            next.extend(self.pooled_parents(&hash));
+            next.extend(
+                self.pool
+                    .values()
+                    .filter(|pooled| pooled.tx.parents().any(|parent| parent == hash))
+                    .map(|pooled| pooled.tx.id.mined_id()),
+            );
+        }
+        group
+    }
+
     fn revalidating(&self) -> usize {
         self.pool
             .values()
@@ -1435,6 +1578,9 @@ impl PoolModel {
     }
 
     fn take_step(&mut self) -> Step {
-        std::mem::take(&mut self.step)
+        let step = std::mem::take(&mut self.step);
+        let changes = u64::try_from(step.changes.len()).expect("a batch fits in u64");
+        self.logged = self.logged.saturating_add(changes);
+        step
     }
 }

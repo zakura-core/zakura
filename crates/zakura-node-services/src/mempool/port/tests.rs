@@ -75,6 +75,15 @@ fn rejected(scope: RejectionScope, charge: Charge) -> ModelVerdict {
     ModelVerdict::Rejected { scope, charge }
 }
 
+/// The entry for transaction `n` becoming visible again, after it was
+/// hidden by the log entry at position `hidden_at`.
+fn revealed(n: u16, hidden_at: u64) -> Change {
+    Change::Revealed {
+        id: id(n),
+        hidden_at: ChangeSeq(hidden_at),
+    }
+}
+
 fn the_job(step: &Step) -> JobId {
     let started = step.started();
     assert_eq!(started.len(), 1, "exactly one job starts: {step:?}");
@@ -113,7 +122,7 @@ fn transition(generation: u64, tip: u32, blocks: Vec<Vec<ModelTx>>) -> ModelTran
             .collect(),
         tip: Height(tip),
         generation: Generation(generation),
-        activates_upgrade: false,
+        rules_change: false,
     }
 }
 
@@ -123,7 +132,7 @@ fn reorg(generation: u64, tip: u32) -> ModelTransition {
         connected: vec![ModelBlock::default()],
         tip: Height(tip),
         generation: Generation(generation),
-        activates_upgrade: false,
+        rules_change: false,
     }
 }
 
@@ -566,7 +575,7 @@ fn a_chain_that_goes_away_and_comes_back_is_still_a_change() {
 #[test]
 fn a_read_taken_while_state_is_changing_is_never_used() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
     let step = model.outcome(
         job,
         Outcome::Pass,
@@ -574,7 +583,12 @@ fn a_read_taken_while_state_is_changing_is_never_used() {
         GenerationRead::Changing,
         secs(1),
     );
-    assert_eq!(step, Step::default());
+    // No verdict and nothing admitted. The core cannot tell whether that
+    // change is one it has applied, so it does not wait for an event. The
+    // job runs again.
+    assert_eq!(step.verdict(waiter), None);
+    assert!(step.changes.is_empty());
+    assert_eq!(step.started().len(), 1);
 }
 
 #[test]
@@ -681,7 +695,7 @@ fn a_child_parked_on_a_hidden_parent_runs_again_when_the_parent_passes() {
     // The parent was admitted long ago. Passing again is what wakes the
     // child.
     let step = model.outcome(parent_job, Outcome::Pass, stable(1), stable(1), secs(3));
-    assert_eq!(step.changes, vec![Change::Revealed(id(1))]);
+    assert_eq!(step.changes, vec![revealed(1, 2)]);
     let job = the_job(&step);
     let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), secs(4));
     assert_eq!(step.verdict(child), Some(ModelVerdict::Admitted));
@@ -882,9 +896,9 @@ fn a_reorg_keeps_the_pool_and_verifies_it_again_parents_first() {
     );
 
     let step = model.outcome(the_job(&step), Outcome::Pass, stable(1), stable(1), secs(2));
-    assert_eq!(step.changes, vec![Change::Revealed(id(1))]);
+    assert_eq!(step.changes, vec![revealed(1, 3)]);
     let step = model.outcome(the_job(&step), Outcome::Pass, stable(1), stable(1), secs(3));
-    assert_eq!(step.changes, vec![Change::Revealed(id(2))]);
+    assert_eq!(step.changes, vec![revealed(2, 4)]);
     // pool/survives-reorg: both are still valid, and both are back.
     assert_eq!(model.visible(), vec![id(1), id(2)]);
 }
@@ -919,7 +933,7 @@ fn a_revalidation_that_hits_a_local_fault_keeps_the_transaction_and_tries_again(
         stable(1),
         secs(10),
     );
-    assert_eq!(step.changes, vec![Change::Revealed(id(1))]);
+    assert_eq!(step.changes, vec![revealed(1, 2)]);
 }
 
 #[test]
@@ -1549,7 +1563,7 @@ fn a_missed_block_that_mined_a_parent_keeps_its_child() {
     // The child is not removed with it. It is checked against the chain.
     let child_job = the_job(&step);
     let step = model.outcome(child_job, Outcome::Pass, stable(5), stable(5), secs(3));
-    assert_eq!(step.changes, vec![Change::Revealed(id(2))]);
+    assert_eq!(step.changes, vec![revealed(2, 4)]);
     assert_eq!(model.visible(), vec![id(2)]);
 }
 
@@ -1600,7 +1614,7 @@ fn an_upgrade_activation_verifies_the_pool_again() {
 
     // No block left the chain, but the rules changed.
     let mut activation = transition(1, 101, vec![vec![]]);
-    activation.activates_upgrade = true;
+    activation.rules_change = true;
     let step = model.transition(activation, secs(1));
     assert_eq!(step.changes, vec![Change::Hidden(id(1))]);
     assert!(model.visible().is_empty());
@@ -1694,4 +1708,186 @@ fn the_rejection_lists_and_the_cooldowns_stay_bounded() {
         [10, 1, 0, 0],
         8233
     )))));
+}
+
+// Cases from Sol's review of the contract's first version.
+
+fn output(parent: u16, index: u32) -> OutPoint {
+    OutPoint {
+        hash: hash(parent),
+        index,
+    }
+}
+
+#[test]
+fn a_child_verified_against_a_parent_the_pool_has_since_lost_is_not_admitted() {
+    let mut model = new_model();
+    let coin = hash(900);
+    admit(&mut model, tx(1).spending(coin, 0), 1, 0);
+    let (child, job) = bring_in(&mut model, child_of(2, 1), legacy(2));
+
+    // A block mines a transaction that conflicts with the parent. State is
+    // at generation 1 and stable. The verifier reads that state, but the
+    // pool it reads is the core's older one, which still offers the parent.
+    let block = vec![tx(7).spending(coin, 0)];
+    model.transition(transition(1, 101, vec![block]), secs(1));
+    assert!(model.visible().is_empty());
+
+    // Both readings are generation 1, which the core has applied. The
+    // readings alone would let this through.
+    let step = model.outcome(
+        job,
+        Outcome::PassUsing(vec![output(1, 0)]),
+        stable(1),
+        stable(1),
+        secs(2),
+    );
+    assert_eq!(step.verdict(child), None);
+    assert!(model.visible().is_empty());
+    assert_eq!(step.started().len(), 1, "it is verified again");
+    model.assert_invariants();
+}
+
+#[test]
+fn a_changing_read_that_the_core_has_already_applied_does_not_strand_the_job() {
+    let mut model = new_model();
+    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    model.transition(transition(1, 101, vec![vec![]]), secs(1));
+
+    // The worker read while generation 1 was becoming visible. By the time
+    // its outcome arrives, the core has applied generation 1, and no other
+    // chain event is coming.
+    let step = model.outcome(
+        job,
+        Outcome::Pass,
+        GenerationRead::Changing,
+        stable(1),
+        secs(2),
+    );
+    let job = the_job(&step);
+    let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), secs(3));
+    assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
+}
+
+#[test]
+fn a_change_in_flight_on_top_of_the_applied_generation_is_waited_for() {
+    let mut model = new_model();
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let step = model.outcome(
+        job,
+        Outcome::Pass,
+        stable(0),
+        GenerationRead::Changing,
+        secs(1),
+    );
+    // Running again now would only read the same change in flight.
+    assert_eq!(step, Step::default());
+    let step = model.transition(transition(1, 101, vec![vec![]]), secs(2));
+    assert_eq!(step.started().len(), 1);
+}
+
+#[test]
+fn a_fourth_transaction_in_a_chain_of_dependencies_is_rejected() {
+    let mut model = new_model();
+    admit(&mut model, tx(1), 1, 0);
+    for n in 2..=3 {
+        let (waiter, job) = bring_in(&mut model, child_of(n, n - 1), legacy(n));
+        let step = model.outcome(
+            job,
+            Outcome::PassUsing(vec![output(n - 1, 0)]),
+            stable(0),
+            stable(0),
+            secs(0),
+        );
+        assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
+    }
+
+    // Each of the four passes the verifier. The pool takes three.
+    let (waiter, job) = bring_in(&mut model, child_of(4, 3), legacy(4));
+    let step = model.outcome(
+        job,
+        Outcome::PassUsing(vec![output(3, 0)]),
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+    assert_eq!(
+        step.verdict(waiter),
+        Some(rejected(RejectionScope::EffectsTip, Charge::None))
+    );
+    assert_eq!(model.visible(), vec![id(1), id(2), id(3)]);
+}
+
+#[test]
+fn a_fourth_transaction_beside_its_siblings_is_rejected_too() {
+    let mut model = new_model();
+    let mut parent = tx(1);
+    parent.outputs = 3;
+    admit(&mut model, parent, 1, 0);
+    for (n, index) in [(2, 0), (3, 1)] {
+        let (waiter, job) = bring_in(&mut model, tx(n).spending(hash(1), index), legacy(n));
+        let step = model.outcome(
+            job,
+            Outcome::PassUsing(vec![output(1, index)]),
+            stable(0),
+            stable(0),
+            secs(0),
+        );
+        assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
+    }
+
+    // One ancestor only, but the group it would join already has three.
+    let (waiter, job) = bring_in(&mut model, tx(4).spending(hash(1), 2), legacy(4));
+    let step = model.outcome(
+        job,
+        Outcome::PassUsing(vec![output(1, 2)]),
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+    assert_eq!(
+        step.verdict(waiter),
+        Some(rejected(RejectionScope::EffectsTip, Charge::None))
+    );
+}
+
+#[test]
+fn a_cooled_supplier_cannot_bring_a_body_in_under_another_source() {
+    let mut model = new_model();
+    // The crawler reserved the id. Nothing is counted against a peer.
+    let crawled = model
+        .reserve(id(1), Source::Node, Intent::Fetch, secs(0))
+        .expect("room");
+    // The peer the body comes from enters a cooldown while it is fetched.
+    model.violation(legacy(5), secs(1));
+
+    let (waiter, step) = model.submit(crawled.id, tx(1), Supplier::Peer(legacy(5)), secs(2));
+    assert_eq!(step.verdict(waiter), Some(ModelVerdict::CoolingDown));
+    assert!(step.started().is_empty(), "its body is not verified");
+    // Nothing is cached, and the slot is free.
+    assert_eq!(model.slots_in_use(), 0);
+    assert!(model
+        .reserve(id(1), peer(6), Intent::Fetch, secs(2))
+        .is_ok());
+}
+
+#[test]
+fn a_revealed_entry_says_when_the_transaction_was_hidden() {
+    let mut model = new_model();
+    admit(&mut model, tx(1), 1, 0);
+    let step = model.transition(reorg(1, 100), secs(1));
+    // Entry 1 added it. Entry 2 hides it.
+    assert_eq!(step.changes, vec![Change::Hidden(id(1))]);
+
+    // A session that opens now has cursor 2 and a snapshot without the
+    // transaction. One that opened before the reorg has cursor 1 and has
+    // announced it.
+    let step = model.outcome(the_job(&step), Outcome::Pass, stable(1), stable(1), secs(2));
+    let Change::Revealed { hidden_at, .. } = step.changes[0] else {
+        panic!("the transaction is visible again");
+    };
+    assert_eq!(hidden_at, ChangeSeq(2));
+    let announces = |opened_at: ChangeSeq| opened_at >= hidden_at;
+    assert!(announces(ChangeSeq(2)));
+    assert!(!announces(ChangeSeq(1)));
 }

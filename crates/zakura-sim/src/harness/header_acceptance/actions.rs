@@ -546,28 +546,20 @@ impl Sessions {
         LinkRef::joined(link, ended, |(at, _)| Some(at.clone())).len()
     }
 
-    /// Whether the node shows `shows` on `link` the `nth` time, from 0, a
-    /// script acted that way there: a link it admitted for a redial, and
-    /// more ends for the reason a close or finish leaves than acts before
-    /// this one.
-    fn show(&self, link: &LinkRef, shows: LinkShows, nth: usize) -> bool {
-        match shows {
-            LinkShows::Opened => {
-                let opened: Vec<LinkRef> = self
-                    .links
-                    .iter()
-                    .flat_map(|(peer, links)| {
-                        links.iter().map(|&connection| LinkRef {
-                            peer: peer.clone(),
-                            connection,
-                        })
-                    })
-                    .collect();
-                !LinkRef::joined(link, &opened, |at| Some(at.clone())).is_empty()
-            }
-            LinkShows::Ended => self.ends(link, PEER_CLOSED) > nth,
-            LinkShows::Finished => self.ends(link, STREAM_FINISHED) > nth,
-        }
+    /// Whether the node admitted a session on `link`, joined by its whole
+    /// ref, its peer and connection: what shows a redial's link.
+    fn opened(&self, link: &LinkRef) -> bool {
+        let opened: Vec<LinkRef> = self
+            .links
+            .iter()
+            .flat_map(|(peer, links)| {
+                links.iter().map(|&connection| LinkRef {
+                    peer: peer.clone(),
+                    connection,
+                })
+            })
+            .collect();
+        !LinkRef::joined(link, &opened, |at| Some(at.clone())).is_empty()
     }
 }
 
@@ -739,11 +731,18 @@ pub fn judge(
                 }
             }
             Effect::ActRan => witnessed,
+            // The node shows a link act the `nth` time, from 0, a script
+            // acted that way there: a link it admitted for a redial, and
+            // more ends for the reason a close or finish leaves than acts
+            // before this one. Each branch is its own join site, with its
+            // own control.
             Effect::Link { peer, link, shows } => {
                 let nth = acted.entry((peer.clone(), *link, *shows)).or_default();
-                let shown = sessions
-                    .link(peer, *link)
-                    .is_some_and(|at| sessions.show(&at, *shows, *nth));
+                let shown = sessions.link(peer, *link).is_some_and(|at| match shows {
+                    LinkShows::Opened => sessions.opened(&at),
+                    LinkShows::Ended => sessions.ends(&at, PEER_CLOSED) > *nth,
+                    LinkShows::Finished => sessions.ends(&at, STREAM_FINISHED) > *nth,
+                });
                 *nth += 1;
                 shown
             }
@@ -1083,6 +1082,26 @@ mod tests {
         }
     }
 
+    /// A wire redial joins the node's admissions on its whole link (Rule
+    /// 25's template): the close-and-redial run's second `peer-0` link is
+    /// one the node opened, and the same link with only its peer or only its
+    /// connection moved is none. Its first link is opened too, and the two
+    /// differ, so the redial isn't shown by the first.
+    #[test]
+    fn a_redial_joins_its_whole_link() {
+        let (trace, report, declared) = close_redial();
+        let sessions = Sessions::of(&report);
+        let first = sessions.link("peer-0", 0).expect("peer-0 linked");
+        let redialed = sessions.link("peer-0", 1).expect("the redial linked");
+        assert_ne!(first, redialed);
+        assert!(sessions.opened(&first));
+        assert_one_key_off::<LinkRef>(&redialed, |link| sessions.opened(link));
+        assert_eq!(
+            judge(&declared, &trace, &report, &End::Completed, false),
+            Actions::Complete
+        );
+    }
+
     /// A session's end takes the link its admission names, joined by the
     /// whole session ref (Rule 25's template): in the close-relink-close
     /// history's store, which admits `mirror-0` again on each relink beside
@@ -1124,8 +1143,8 @@ mod tests {
         let link = sessions
             .link("peer-0", 0)
             .expect("the node admitted peer-0");
-        assert_one_key_off::<LinkRef>(&link, |link| sessions.show(link, LinkShows::Ended, 0));
-        assert!(!sessions.show(&link, LinkShows::Ended, 1));
+        assert_one_key_off::<LinkRef>(&link, |link| sessions.ends(link, PEER_CLOSED) > 0);
+        assert_eq!(sessions.ends(&link, PEER_CLOSED), 1);
         let judged = |report: &FullReport| judge(&declared, &trace, report, &End::Completed, false);
         assert_eq!(judged(&report), Actions::Complete);
         let ended = "SessionEnded { peer: \"peer-0\", session_id: 16294208416658607535, reason: \"accept_failed\" }";

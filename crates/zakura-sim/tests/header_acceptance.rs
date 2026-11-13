@@ -7017,13 +7017,6 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
     (
         "LinkRef",
         "src/harness/header_acceptance/actions.rs",
-        "show",
-        "src/harness/header_acceptance/actions.rs",
-        "a_link_act_joins_its_whole_link",
-    ),
-    (
-        "LinkRef",
-        "src/harness/header_acceptance/actions.rs",
         "names_its_link",
         "src/harness/header_acceptance/actions.rs",
         "a_relink_fact_names_its_whole_link",
@@ -7167,6 +7160,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "is_harness_driven",
         "src/harness/header_acceptance/actions.rs",
         "a_harness_driven_pick_joins_its_whole_identity",
+    ),
+    (
+        "LinkRef",
+        "src/harness/header_acceptance/actions.rs",
+        "opened",
+        "src/harness/header_acceptance/actions.rs",
+        "a_redial_joins_its_whole_link",
     ),
 ];
 
@@ -7681,6 +7681,25 @@ fn every_ref_has_a_one_key_off_control() {
         scans.insert(tool.to_owned(), join_scan(&text, tool));
         assert_eq!(control_gaps(&scans, &refs, REF_CONTROLS), [gap]);
     }
+    // The redial's control calling only the `Ended` branch's join, as the
+    // one registered for the old whole `show` did (round 9's gap): each
+    // branch is its own function, so it no longer reaches `opened`.
+    let actions = "src/harness/header_acceptance/actions.rs";
+    let opened = "assert_one_key_off::<LinkRef>(&redialed, |link| sessions.opened(link));";
+    assert_eq!(sources[actions].matches(opened).count(), 1);
+    let ended_only = sources[actions].replace(
+        opened,
+        "assert_one_key_off::<LinkRef>(&redialed, |link| sessions.ends(link, PEER_CLOSED) > 0);",
+    );
+    let mut redial = scans.clone();
+    redial.insert(actions.to_owned(), join_scan(&ended_only, actions));
+    assert_eq!(
+        control_gaps(&redial, &refs, REF_CONTROLS),
+        [format!(
+            "{actions} a_redial_joins_its_whole_link has no typed LinkRef control reaching \
+             {actions} opened"
+        )]
+    );
     let unjoined = format!("{refs}\npub struct NewRef;\nimpl Ref for NewRef {{}}\n");
     assert_eq!(
         control_gaps(&scans, &unjoined, REF_CONTROLS),

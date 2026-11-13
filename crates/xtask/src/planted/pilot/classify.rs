@@ -541,8 +541,8 @@ fn left_failures(campaign: &CampaignFacts) -> Option<String> {
 /// numerator and denominator.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct Summary {
-    /// Results counted: cases for sensitivity, case-seed pairs for
-    /// discovery.
+    /// Results counted: cases for sensitivity, and for discovery one per
+    /// case, seed and arm.
     pub(super) results: usize,
     /// Results by class. Every class appears, with zero if none.
     pub(super) classes: BTreeMap<Class, usize>,

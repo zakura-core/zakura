@@ -267,7 +267,12 @@ struct Report<T> {
     /// doesn't count.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<Excluded>,
+    /// Every result's counts. A discovery report with several arms pools
+    /// them here, so its rates compare only in `by_arm`.
     summary: Summary,
+    /// A discovery report's counts in each arm alone.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    by_arm: BTreeMap<Arm, Summary>,
 }
 
 /// A selected case that discovery left out, and the review's reason.
@@ -343,20 +348,32 @@ pub(crate) fn run(
     // Each child runs in its own process group, which a terminal's signal
     // doesn't reach. The handler lets the running child's group be killed.
     install_interrupt_handler();
-    let summary = match experiment.as_str() {
+    let (summary, by_arm) = match experiment.as_str() {
         "sensitivity" | "discovery" => pilot(repo_root, &experiment, flags, &work)?,
         "feedback" => feedback_comparison(repo_root, flags, &work)?,
         _ => return Err(UsageError(EXPERIMENTS).into()),
     };
-    println!(
-        "{experiment}: {} of {} counted results are intended violations, over {} results; report in {}",
-        summary.intended,
-        summary.denominator,
-        summary.results,
-        out.join(format!("{experiment}.json")).display()
-    );
+    let report = out.join(format!("{experiment}.json"));
+    let print = |label: String, summary: &Summary| {
+        println!(
+            "{label}: {} of {} counted results are intended violations, over {} results; report in {}",
+            summary.intended,
+            summary.denominator,
+            summary.results,
+            report.display()
+        );
+    };
+    if by_arm.is_empty() {
+        print(experiment.clone(), &summary);
+    }
+    for (arm, summary) in &by_arm {
+        print(format!("{experiment}, feedback {arm}"), summary);
+    }
     Ok(())
 }
+
+/// A written report's counts: all results, and those of each arm.
+type Counts = (Summary, BTreeMap<Arm, Summary>);
 
 /// Runs the pilot's `sensitivity` or `discovery` `experiment` over the
 /// catalogue's cases, building under `work`, and writes its report.
@@ -365,7 +382,7 @@ fn pilot(
     experiment: &str,
     flags: Flags,
     work: &Path,
-) -> Result<Summary, BoxError> {
+) -> Result<Counts, BoxError> {
     let Flags {
         out,
         only,
@@ -416,7 +433,7 @@ fn pilot(
 
 /// Runs the feedback comparison over the case list's cases on the runner's
 /// own `HEAD`, building under `work`, and writes its report.
-fn feedback_comparison(repo_root: &Path, flags: Flags, work: &Path) -> Result<Summary, BoxError> {
+fn feedback_comparison(repo_root: &Path, flags: Flags, work: &Path) -> Result<Counts, BoxError> {
     let Flags {
         out,
         only,
@@ -683,34 +700,49 @@ fn sensitivity_report(
         cases,
         excluded: Vec::new(),
         summary,
+        by_arm: BTreeMap::new(),
     })
 }
 
-/// The discovery report over `cases`, counting each case's seeds, and
-/// listing the `excluded` cases outside the counts. Fails on zero results.
+/// The discovery report over `cases`, counting each case's seeds in all
+/// and in each arm, and listing the `excluded` cases outside the counts.
+/// Fails on zero results.
 fn discovery_report(
     meta: Meta,
     cases: Vec<DiscoveryCase>,
     excluded: Vec<Excluded>,
 ) -> Result<Report<DiscoveryCase>, String> {
-    let summary = classify::summarize(cases.iter().flat_map(|case| {
-        case.seeds
-            .iter()
-            .map(|seed| (case.fault_class.as_str(), seed.result.class))
-    }))?;
+    let rows = |arm: Option<Arm>| {
+        cases.iter().flat_map(move |case| {
+            case.seeds
+                .iter()
+                .filter(move |seed| arm.is_none_or(|arm| seed.arm == arm))
+                .map(|seed| (case.fault_class.as_str(), seed.result.class))
+        })
+    };
+    let summary = classify::summarize(rows(None))?;
+    let arms: BTreeSet<Arm> = cases
+        .iter()
+        .flat_map(|case| case.seeds.iter().map(|seed| seed.arm))
+        .collect();
+    let by_arm = arms
+        .into_iter()
+        .map(|arm| Ok((arm, classify::summarize(rows(Some(arm)))?)))
+        .collect::<Result<_, String>>()?;
     Ok(Report {
         meta,
         cases,
         excluded,
         summary,
+        by_arm,
     })
 }
 
-/// Writes `report` to `<out>/<experiment>.json`, and returns its summary.
-fn write_report<T: Serialize>(out: &Path, report: Report<T>) -> Result<Summary, BoxError> {
+/// Writes `report` to `<out>/<experiment>.json`, and returns its counts.
+fn write_report<T: Serialize>(out: &Path, report: Report<T>) -> Result<Counts, BoxError> {
     let path = out.join(format!("{}.json", report.meta.experiment));
     fs::write(&path, serde_json::to_string_pretty(&report)? + "\n")?;
-    Ok(report.summary)
+    Ok((report.summary, report.by_arm))
 }
 
 /// Runs each case's sensitivity experiment, writing its artifacts under

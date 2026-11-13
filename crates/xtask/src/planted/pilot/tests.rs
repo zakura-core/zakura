@@ -954,11 +954,14 @@ fn reports_count_classes_and_rates() {
     assert_eq!(json["experiment"], "sensitivity");
     assert_eq!(json["cases"][0]["result"]["class"], "intended-violation");
     assert_eq!(json["summary"]["classes"]["not-applicable"], 1);
+    // Sensitivity has no arms.
+    assert!(report.by_arm.is_empty());
+    assert!(json.get("by_arm").is_none());
 
-    // Discovery counts each seed of each case.
+    // Discovery counts each seed of each case, in all and in each arm.
     let seed = |seed: u32, class: Class| SeedResult {
         seed,
-        arm: Arm::On,
+        arm: if seed == 23 { Arm::Off } else { Arm::On },
         result: classified(class),
         baseline: None,
         mutant: None,
@@ -994,6 +997,13 @@ fn reports_count_classes_and_rates() {
     );
     assert_eq!(report.summary.by_fault_class["stale"].results, 3);
     assert_eq!(report.excluded, vec![excluded]);
+    let arm = |arm: Arm| {
+        let summary = &report.by_arm[&arm];
+        (summary.results, summary.denominator, summary.intended)
+    };
+    assert_eq!((arm(Arm::On), arm(Arm::Off)), ((2, 1, 1), (1, 1, 0)));
+    let json = serde_json::to_value(&report).expect("the report serializes");
+    assert_eq!(json["by_arm"]["off"]["classes"]["not-applicable"], 1);
 }
 
 /// Discovery leaves out exactly the cases the catalogue excludes, the two

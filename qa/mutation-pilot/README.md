@@ -208,7 +208,10 @@ Each seed's arms run one after the other, and differ only in their store,
 name and feedback mode. The collector runs in both arms; the arm sets only
 whether libFuzzer reads its features. The fuzzer logs its mode at startup,
 and the run's manifest records it. A run whose fuzzer logged another mode,
-or none, is a harness failure.
+or none, doesn't pair, as a build with another identity doesn't. On a
+mutant that's a harness failure. On an original it's a baseline failure,
+since the result table counts a failed paired check of the unchanged build
+as one.
 
 Detection is discovery's: a saved input that violates the case's property,
 which a fresh `zakura-sim confirm --property` confirms and an Exact replay
@@ -216,8 +219,9 @@ reproduces. As in `cargo xtask planted`, a campaign and its confirmation
 may violate the case's `also_violates` beside its property. One of them
 alone is another violation. A campaign stops at its first finding.
 
-`feedback.json` has `discovery.json`'s rows, by case, seed and arm, and an
-`arms` comparison per case. For each arm, it gives:
+`feedback.json` has `discovery.json`'s rows, by case, seed and arm. Its
+`summary` pools both arms, and `by_arm` counts each arm's results alone.
+Each case has an `arms` comparison. For each arm, it gives:
 
 - `detected`: seeds whose mutant campaign found the intended property;
 - `censored`: seeds whose valid mutant campaign ended without a

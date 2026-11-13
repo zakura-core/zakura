@@ -72,7 +72,8 @@ empties any table in that directory that grows past `--trace-table-cap-mb`
 Trace reading and capping run in their own worker every five seconds, including
 when `perf` cannot start or produces no samples. The status endpoint reports the
 configured trace directory, cap, and whether that worker has completed a recent
-poll.
+poll that left every table under the cap. A table it could not empty makes it
+not ready and is reported as the profiler's error.
 
 ## Installing
 

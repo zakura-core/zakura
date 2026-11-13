@@ -560,7 +560,13 @@ class Profiler:
         while not self._stop.is_set():
             try:
                 self.store.add_block_stages(self.traces.poll())
-                self._trace_checked_at = time.monotonic()
+                untrimmed = self.traces.trim_failure
+                if untrimmed is None:
+                    self._trace_checked_at = time.monotonic()
+                else:
+                    # The poll read the files but left one over the cap: not ready.
+                    self._trace_checked_at = None
+                    self.fail(f"trimming trace files failed ({type(untrimmed).__name__})", str(untrimmed))
             except Exception as error:  # noqa: BLE001 - keep retention alive after a bad row or failed write
                 self._trace_checked_at = None
                 self.fail(f"following trace files failed ({type(error).__name__})", str(error))

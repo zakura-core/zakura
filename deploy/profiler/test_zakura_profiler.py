@@ -458,6 +458,32 @@ class TraceRetentionTests(unittest.TestCase):
         self.assertEqual(self.table.stat().st_size, 0)
         self.assertFalse(self.profiler.status()["trace_retention"]["ready"])
 
+    def test_a_table_that_cannot_be_emptied_is_reported_and_not_ready(self):
+        failed = threading.Event()
+        real_fail = self.profiler.fail
+
+        def report_failure(*arguments):
+            real_fail(*arguments)
+            failed.set()
+
+        size = self.table.stat().st_size
+        with (
+            patch.object(blocks.os, "truncate", side_effect=PermissionError("the table is read-only")),
+            patch.object(self.profiler, "fail", side_effect=report_failure),
+        ):
+            follower = threading.Thread(target=self.profiler.trace_loop)
+            follower.start()
+            try:
+                self.assertTrue(failed.wait(2), "a table left over the cap must be reported")
+            finally:
+                self.profiler.stop()
+                follower.join(timeout=2)
+        self.assertFalse(follower.is_alive())
+        self.assertEqual(self.table.stat().st_size, size)
+        status = self.profiler.status()
+        self.assertFalse(status["trace_retention"]["ready"])
+        self.assertEqual(status["error"], "trimming trace files failed (PermissionError)")
+
     def test_an_unconfigured_trace_reader_exits_without_claiming_readiness(self):
         self.profiler.traces = None
         self.profiler.trace_loop()
@@ -683,6 +709,31 @@ class TraceFollowingTests(unittest.TestCase):
     def test_a_missing_trace_directory_yields_nothing(self):
         follower = blocks.TraceFollower(str(self.directory / "absent"), table_cap_bytes=2000)
         self.assertEqual(follower.poll(), [])
+        self.assertIsNone(follower.trim_failure)
+
+    def test_a_table_that_cannot_be_emptied_is_a_failure_until_it_is_emptied(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
+        rows = [trace_row("peer_seen", index, peer="p" * 40) for index in range(40)]
+        self.append("discovery", *rows)
+        self.append("block_sync", *rows)
+        stuck = str(self.directory / "discovery.jsonl")
+        real_truncate = os.truncate
+
+        def refuse_one_table(path, length):
+            if path == stuck:
+                raise PermissionError("the table is read-only")
+            real_truncate(path, length)
+
+        with patch.object(blocks.os, "truncate", side_effect=refuse_one_table):
+            follower.poll()
+        self.assertIsInstance(follower.trim_failure, PermissionError)
+        self.assertGreater(os.path.getsize(stuck), 2000)
+        # The table that could be emptied was, despite the one that could not.
+        self.assertEqual((self.directory / "block_sync.jsonl").stat().st_size, 0)
+
+        follower.poll()
+        self.assertIsNone(follower.trim_failure)
+        self.assertEqual(os.path.getsize(stuck), 0)
 
 
 class ApiTests(unittest.TestCase):

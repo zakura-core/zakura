@@ -138,12 +138,13 @@ fn the_witnesses_hold_under_generated_plans() {
 /// its first session's page read and its second session's lease acquire,
 /// so those two page jobs hold the peer's 2 execution slots, and the third
 /// session's job waits for one. In the departed-limit fixture the node
-/// admits 8 peers and drops a peer at its first request timeout, and every
-/// mirror's first page on a link arrives past that timeout. So the 8
-/// admitted mirrors' drops fill the departed strikes and cooldowns to 8,
-/// and the 9th mirror, linked once a slot frees, is dropped while they're
-/// held, so the earliest entry goes. Each row reaches its limit and no
-/// further.
+/// admits 4 inbound peers, drops a peer at its first request timeout and
+/// holds its entries for 120 s, and every mirror's first page on a link
+/// arrives past that timeout. So two waves of 4 mirrors, each linked as the
+/// one before is dropped, fill the departed strikes and cooldowns to their
+/// limit, the admitted peer limit's floor of 8, and the 9th mirror is
+/// dropped while they're held, so the earliest entry goes. Each row
+/// reaches its limit and no further.
 /// In the slot fixture the 16 rounds' reservations, staged capacity entries
 /// and request deadlines, one per round, reach 16 with them. Each run then
 /// releases and reuses its row, which
@@ -184,7 +185,7 @@ fn the_limit_fixtures_reach_and_hold_their_bounds() {
             "header-outstanding-departed-limit",
             "departed strikes",
             8,
-            8,
+            4,
             &["cooldowns"][..],
         ),
     ] {
@@ -508,7 +509,7 @@ fn released_and_reused(sizes: &[usize], limit: usize) -> bool {
 /// cooldowns evict instead of making a party wait: more peers are dropped
 /// within one cooldown than the rows hold, so an entry was evicted, and
 /// each row then falls below its limit as entries end and rises again
-/// when a returning peer is dropped once more.
+/// when returning peers are dropped once more.
 #[test]
 fn the_limit_fixtures_release_and_reuse_their_bounds() {
     for row in limit_rows() {
@@ -546,8 +547,17 @@ fn the_limit_fixtures_release_and_reuse_their_bounds() {
     )
     .unwrap_or_else(|error| panic!("{stem}: {error}"));
     assert_eq!(report.end.violation, None, "{stem}: {:?}", report.end);
+    let config = scenario.node_settings.config();
+    let per_direction = config
+        .peer_limits
+        .max_inbound_peers
+        .saturating_add(config.peer_limits.max_outbound_peers);
+    // The rows' limit is the admitted peer limit, here its floor. Keeping the
+    // per-direction sum below it makes a reactor that capped the rows by
+    // that sum stop short of the limit and fail the read below.
+    assert!(per_direction < limit, "{stem}: {per_direction} < {limit}");
     let timeouts = timeouts(report.log.entries());
-    let hold = scenario.node_settings.config().unproductive_peer_cooldown;
+    let hold = config.unproductive_peer_cooldown;
     let first = timeouts.first().map(|(at, _)| *at).unwrap_or_default();
     let held: BTreeSet<&String> = timeouts
         .iter()

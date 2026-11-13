@@ -75,24 +75,67 @@
   },
   "controls": [
     {
-      "peer": "mirror-8",
+      "peer": "mirror-4",
       "action": "relink",
       "when": {
         "retired": "mirror-0"
       }
     },
     {
+      "peer": "mirror-5",
+      "action": "relink",
+      "when": {
+        "retired": "mirror-1"
+      }
+    },
+    {
+      "peer": "mirror-6",
+      "action": "relink",
+      "when": {
+        "retired": "mirror-2"
+      }
+    },
+    {
+      "peer": "mirror-7",
+      "action": "relink",
+      "when": {
+        "retired": "mirror-3"
+      }
+    },
+    {
+      "peer": "mirror-8",
+      "action": "relink",
+      "when": {
+        "retired": "mirror-4"
+      }
+    },
+    {
       "peer": "mirror-0",
       "action": "relink",
       "when": {
-        "virtual-time": 95000
+        "virtual-time": 180000
+      }
+    },
+    {
+      "peer": "mirror-1",
+      "action": "relink",
+      "when": {
+        "virtual-time": 180000
+      }
+    },
+    {
+      "peer": "mirror-2",
+      "action": "relink",
+      "when": {
+        "virtual-time": 180000
       }
     }
   ],
   "node_settings": {
-    "max_inbound_peers": 8,
+    "max_inbound_peers": 4,
     "max_outbound_peers": 0,
-    "max_unproductive_header_requests": 1
+    "max_unproductive_header_requests": 1,
+    "unproductive_peer_cooldown_ms": 120000
   },
   "page_delays": [
     {
@@ -132,5 +175,5 @@
       "by_ms": 40000
     }
   ],
-  "budget": 40000
+  "budget": 80000
 }

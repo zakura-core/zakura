@@ -316,6 +316,9 @@ pub struct NodeSettings {
     /// `max_unproductive_header_requests`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_unproductive_header_requests: Option<u32>,
+    /// `unproductive_peer_cooldown`, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unproductive_peer_cooldown_ms: Option<u64>,
 }
 
 impl NodeSettings {
@@ -335,6 +338,9 @@ impl NodeSettings {
         }
         if let Some(max) = self.max_unproductive_header_requests {
             config.max_unproductive_header_requests = max;
+        }
+        if let Some(ms) = self.unproductive_peer_cooldown_ms {
+            config.unproductive_peer_cooldown = std::time::Duration::from_millis(ms);
         }
         config
     }

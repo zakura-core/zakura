@@ -636,7 +636,7 @@ impl VerifiedSet {
     /// as the last item.
     ///
     /// Also removes the outputs of any removed transactions from the internal caches.
-    pub(super) fn remove(&mut self, key_to_remove: &transaction::Hash) -> Vec<VerifiedUnminedTx> {
+    pub fn remove(&mut self, key_to_remove: &transaction::Hash) -> Vec<VerifiedUnminedTx> {
         let affected = self.dependency_group([*key_to_remove]);
         self.remove_ordering_candidates(&affected);
         let removed_transactions: Vec<_> = self
@@ -698,7 +698,7 @@ impl VerifiedSet {
     ///
     /// Two transactions have a spend conflict if they spend the same UTXO or if they reveal the
     /// same nullifier.
-    fn has_spend_conflicts(&self, unmined_tx: &UnminedTx) -> bool {
+    pub fn has_spend_conflicts(&self, unmined_tx: &UnminedTx) -> bool {
         let tx = unmined_tx.transaction();
 
         Self::has_conflicts(&self.spent_outpoints, tx.spent_outpoints())

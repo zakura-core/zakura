@@ -747,6 +747,40 @@ impl<E: Clone + std::fmt::Debug> Storage<E> {
         self.verified.remove_all(tx_ids).len()
     }
 
+    /// Removes the transaction with mined id `tx_id` and nothing else. What
+    /// depends on it stays, no longer counted as its dependent.
+    ///
+    /// Caches no rejection. Returns the transaction, if it was stored.
+    pub fn remove_one(&mut self, tx_id: &transaction::Hash) -> Option<VerifiedUnminedTx> {
+        if !self.verified.contains(tx_id) {
+            return None;
+        }
+        self.verified
+            .clear_mined_dependencies(&[*tx_id].into_iter().collect());
+        self.verified.remove(tx_id).pop()
+    }
+
+    /// Removes and returns every stored transaction. Rejections stay.
+    pub fn take_all(&mut self) -> Vec<VerifiedUnminedTx> {
+        let transactions = self.verified.transactions().values().cloned().collect();
+        self.verified.clear();
+        transactions
+    }
+
+    /// Clears every rejection list, the chain-scoped ones too.
+    pub fn clear_rejections(&mut self, now: Instant) {
+        self.tip_rejected_exact.clear();
+        self.tip_rejected_same_effects.clear();
+        self.chain_rejected_same_effects.clear();
+        self.update_rejected_metrics(now);
+    }
+
+    /// Whether `tx` spends an output or reveals a nullifier that a stored
+    /// transaction does.
+    pub fn has_spend_conflicts(&self, tx: &UnminedTx) -> bool {
+        self.verified.has_spend_conflicts(tx)
+    }
+
     /// Clears a list of mined transaction ids from the verified set's tracked transaction dependencies.
     pub fn clear_mined_dependencies(&mut self, mined_ids: &HashSet<transaction::Hash>) {
         self.verified.clear_mined_dependencies(mined_ids);
@@ -1041,7 +1075,8 @@ impl<E: Clone + std::fmt::Debug> Storage<E> {
     ///
     /// This matches transactions based on each rejection list's matching rule.
     ///
-    /// Returns an arbitrary error if the transaction is in multiple lists.
+    /// A transaction in several lists gets the first of: exact tip, effects
+    /// tip, expired, duplicate spend, mined.
     pub fn rejection_error(&self, txid: &UnminedTxId, now: Instant) -> Option<MempoolError<E>> {
         if let Some(error) = self.tip_rejected_exact.get(txid) {
             return Some(error.clone().into());
@@ -1051,9 +1086,19 @@ impl<E: Clone + std::fmt::Debug> Storage<E> {
             return Some(error.clone().into());
         }
 
-        for (error, set) in self.chain_rejected_same_effects.iter() {
-            if set.contains_key(&txid.mined_id(), now) {
-                return Some(error.clone().into());
+        // A fixed order, so a transaction in several lists always gets the
+        // same answer.
+        for error in [
+            SameEffectsChainRejectionError::Expired,
+            SameEffectsChainRejectionError::DuplicateSpend,
+            SameEffectsChainRejectionError::Mined,
+        ] {
+            if self
+                .chain_rejected_same_effects
+                .get(&error)
+                .is_some_and(|set| set.contains_key(&txid.mined_id(), now))
+            {
+                return Some(error.into());
             }
         }
 

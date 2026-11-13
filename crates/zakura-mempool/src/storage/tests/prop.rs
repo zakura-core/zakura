@@ -1283,14 +1283,17 @@ proptest! {
         prop_assert_eq!(e.len(crate::Instant::now()), 0);
     }
 
-    /// Check if EvictionList panics if entries are added multiple times.
+    /// An entry added again keeps its first time and its place.
     #[test]
-    #[should_panic]
     fn eviction_list_refresh(
         txid in any::<UnminedTxId>()
     ) {
         let mut e = EvictionList::new(2, EVICTION_MEMORY_TIME);
-        e.insert(txid.mined_id(), crate::Instant::now());
-        e.insert(txid.mined_id(), crate::Instant::now());
+        let first = crate::Instant::now();
+        e.insert(txid.mined_id(), first);
+        e.insert(txid.mined_id(), first + EVICTION_MEMORY_TIME);
+        prop_assert_eq!(e.len(first), 1);
+        // It is forgotten when its first entry expires.
+        prop_assert!(!e.contains_key(&txid.mined_id(), first + EVICTION_MEMORY_TIME + Duration::from_millis(1)));
     }
 }

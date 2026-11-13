@@ -9,8 +9,8 @@ use thiserror::Error;
 use proptest_derive::Arbitrary;
 
 use crate::storage::{
-    ExactTipRejectionError, NonStandardTransactionError, SameEffectsChainRejectionError,
-    SameEffectsTipRejectionError,
+    ExactTipRejectionError, NonStandardTransactionError, RejectionError,
+    SameEffectsChainRejectionError, SameEffectsTipRejectionError,
 };
 
 /// Mempool errors. `E` is the verification error a cached rejection holds.
@@ -80,4 +80,16 @@ pub enum MempoolError<E> {
     /// The transaction is non-standard.
     #[error("transaction is non-standard")]
     NonStandardTransaction(#[from] NonStandardTransactionError),
+}
+
+/// A rejection as the error today's callers see.
+impl<E> From<RejectionError<E>> for MempoolError<E> {
+    fn from(error: RejectionError<E>) -> Self {
+        match error {
+            RejectionError::ExactTip(error) => Self::StorageExactTip(error),
+            RejectionError::SameEffectsTip(error) => Self::StorageEffectsTip(error),
+            RejectionError::SameEffectsChain(error) => Self::StorageEffectsChain(error),
+            RejectionError::NonStandardTransaction(error) => Self::NonStandardTransaction(error),
+        }
+    }
 }

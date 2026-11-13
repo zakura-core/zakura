@@ -46,6 +46,7 @@ eyre = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 zakura-chain = { path = "../zakura-chain", version = "15.0.0", features = ["proptest-impl"] }
+zakura-node-services = { path = "../zakura-node-services", version = "5.2.3", features = ["test-support"] }
 zakura-test = { path = "../zakura-test", version = "4.0.0" }
 
 [lints]

@@ -72,33 +72,9 @@ use crate::mempool::QueueSource;
 /// Time since the model started.
 pub type ModelTime = Duration;
 
-/// How long one verification can take. Provisional.
-pub const T_VERIFY: Duration = Duration::from_secs(60);
-
-/// How long a transaction waits for a missing parent, counted from the
-/// first time one of its inputs is found missing. Today's wait for a pool
-/// parent.
-///
-/// The wait is flat. It does not stop while a parent is being verified, and
-/// waking the transaction or checking it again does not restart it. So a
-/// transaction with a missing input is answered within this long plus one
-/// verification, whatever its parents, the chain or its peers do.
-pub const T_PARK: Duration = Duration::from_secs(60);
-
-/// The longest an undecided transaction holds its slot after its body
-/// arrives: the wait for a parent plus one verification.
-///
-/// Every other deadline is about one stage, and a transaction can move
-/// between stages for as long as something keeps moving it: a chain that
-/// changes during every check, or inputs that arrive one at a time. This one
-/// is about the slot. When it ends the submission is answered with a local
-/// fault, nothing is cached and nobody is charged, because the core never
-/// got a trustworthy answer.
-///
-/// It bounds the admission. A slot kept as a lease, for a fetch that is
-/// still out after another caller's body decided the id, lasts until that
-/// fetch's caller submits or drops, and is that caller's to bound.
-pub const MAX_UNDECIDED: Duration = Duration::from_secs(120);
+pub use super::{
+    MAX_OUTPUT_WAITS, MAX_UNDECIDED, REVALIDATE_RETRY, REVALIDATE_RETRY_MAX, T_PARK, T_VERIFY,
+};
 
 /// How long the core refuses a peer after a cooldown charge or a violation.
 /// Today's base cooldown.
@@ -108,10 +84,6 @@ pub const COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// otherwise. Today's default `eviction_memory_time`.
 pub const REJECTION_MEMORY: Duration = Duration::from_secs(60 * 60);
 
-/// The most distinct outpoints callers can wait for at once. Today's
-/// `MAX_PENDING_OUTPUTS`.
-pub const MAX_OUTPUT_WAITS: usize = 65_536;
-
 /// The most pooled ancestors a new transaction can have. Today's
 /// `MAX_MEMPOOL_ANCESTORS`.
 pub const MAX_ANCESTORS: usize = 2;
@@ -119,13 +91,6 @@ pub const MAX_ANCESTORS: usize = 2;
 /// The most transactions in one connected group of pooled dependencies.
 /// Today's `MAX_MEMPOOL_PACKAGE_TRANSACTIONS`.
 pub const MAX_PACKAGE: usize = 3;
-
-/// The first wait before a revalidation that hit a local fault is tried
-/// again. It doubles up to [`REVALIDATE_RETRY_MAX`]. Provisional.
-pub const REVALIDATE_RETRY: Duration = Duration::from_secs(1);
-
-/// The longest wait between revalidation tries. Provisional.
-pub const REVALIDATE_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// What the model needs to know about a transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1570,6 +1535,20 @@ impl PoolModel {
                     Outcome::PassUsing(inputs) => inputs,
                     _ => Vec::new(),
                 };
+                // Today's insertion checks the rejection lists first. A
+                // rejection made while this one was verified, such as a block
+                // that mined it, still holds. It is not cached again.
+                if let Some(scope) = self.cached_rejection(tx.id, self.now) {
+                    self.step.changes.push(Change::Refused(tx.id));
+                    self.decide(
+                        key,
+                        ModelVerdict::Rejected {
+                            scope,
+                            charge: Charge::None,
+                        },
+                    );
+                    return;
+                }
                 // The tip has reached its expiry height. The verifier should
                 // have said so. The pool does not rely on that: nothing
                 // expired gets in.

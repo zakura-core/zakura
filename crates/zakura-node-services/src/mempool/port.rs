@@ -36,7 +36,7 @@
 //!
 //! [`model`] restates these rules as an independent model.
 
-use std::{collections::VecDeque, fmt, net::IpAddr, sync::Arc};
+use std::{collections::VecDeque, fmt, net::IpAddr, sync::Arc, time::Duration};
 
 use zakura_chain::{
     block,
@@ -93,6 +93,45 @@ pub const MAX_REJECTIONS: usize = 40_000;
 /// Peers with a cooldown. A new one past this replaces the one that ends
 /// first, as today.
 pub const MAX_COOLDOWNS: usize = 20_000;
+
+/// How long one verification can take. Provisional.
+pub const T_VERIFY: Duration = Duration::from_secs(60);
+
+/// How long a transaction waits for a missing parent, counted from the
+/// first time one of its inputs is found missing. Today's wait for a pool
+/// parent.
+///
+/// The wait is flat. It does not stop while a parent is being verified, and
+/// waking the transaction or checking it again does not restart it. So a
+/// transaction with a missing input is answered within this long plus one
+/// verification, whatever its parents, the chain or its peers do.
+pub const T_PARK: Duration = Duration::from_secs(60);
+
+/// The longest an undecided transaction holds its slot after its body
+/// arrives: the wait for a parent plus one verification.
+///
+/// Every other deadline is about one stage, and a transaction can move
+/// between stages for as long as something keeps moving it: a chain that
+/// changes during every check, or inputs that arrive one at a time. This one
+/// is about the slot. When it ends the submission is answered with a local
+/// fault, nothing is cached and nobody is charged, because the core never
+/// got a trustworthy answer.
+///
+/// It bounds the admission. A slot kept as a lease, for a fetch that is
+/// still out after another caller's body decided the id, lasts until that
+/// fetch's caller submits or drops, and is that caller's to bound.
+pub const MAX_UNDECIDED: Duration = Duration::from_secs(120);
+
+/// The most distinct outpoints callers can wait for at once. Today's
+/// `MAX_PENDING_OUTPUTS`.
+pub const MAX_OUTPUT_WAITS: usize = 65_536;
+
+/// The first wait before a revalidation that hit a local fault is tried
+/// again. It doubles up to [`REVALIDATE_RETRY_MAX`]. Provisional.
+pub const REVALIDATE_RETRY: Duration = Duration::from_secs(1);
+
+/// The longest wait between revalidation tries. Provisional.
+pub const REVALIDATE_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Commands that can wait for the core. A full queue makes
 /// [`PoolHandle::reserve`] and [`PoolHandle::submit`] wait.
@@ -854,8 +893,10 @@ pub enum PoolCommand {
     /// core does not keep closed replies without bound. It drops the closed
     /// ones for an outpoint whenever it registers another waiter for that
     /// outpoint, and all of them before it refuses a new outpoint for the
-    /// limit, as today. So callers that left cannot fill the limit, and one
-    /// outpoint waited for and abandoned many times holds one entry.
+    /// limit. Today's pool drops them only on its prune cadence, so it can
+    /// refuse while every entry is abandoned. Here callers that left cannot
+    /// fill the limit, and one outpoint waited for and abandoned many times
+    /// holds one entry.
     AwaitOutput {
         /// The outpoint.
         outpoint: transparent::OutPoint,

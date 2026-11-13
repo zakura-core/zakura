@@ -61,7 +61,10 @@
 //!
 //! A mutant's search runs once per harness and seed, and the loop
 //! classifies each of the mutant's cases from it. A search, or each
-//! campaign child, runs under the witness lane's memory cap. Its deadline
+//! campaign child but the build, runs under the witness lane's memory cap.
+//! A lane that the cap killed, or that failed on a harness and seed whose
+//! baseline needed the host's memory, reruns alone with the host's memory
+//! once every mutant ran ([`Lanes::reruns_alone`]). Its deadline
 //! is its baseline's time times the witness lane's factor, and at least the
 //! witness lane's minimum. A campaign's `start` also gets at least its
 //! budget and the pilot's grace.
@@ -354,6 +357,11 @@ pub(in crate::planted) struct GeneratorReport {
     /// The lane's recorded triage ([`super::triage`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) triage: Option<Triage>,
+    /// True if the first search ended at a failure that a run alone may
+    /// not repeat ([`Lanes::reruns_alone`]), and this result is the rerun
+    /// alone with the host's memory.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(in crate::planted) rerun_alone: bool,
     /// The search's evidence, relative to `--out`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) log: Option<PathBuf>,
@@ -426,6 +434,7 @@ impl GeneratorReport {
             shrunk: None,
             unpatched: Vec::new(),
             triage: None,
+            rerun_alone: false,
             log: None,
         }
     }
@@ -640,6 +649,9 @@ pub(super) struct GenBaseline {
     /// `baseline-fails` one, or `None` for a clean search.
     pub(super) failure: Option<Classified>,
     pub(super) millis: u64,
+    /// True if a run failure ended the first search under the memory cap,
+    /// and the search reran alone with the host's memory.
+    pub(super) alone: bool,
 }
 
 /// What a search on the unpatched build showed.
@@ -656,6 +668,7 @@ pub(super) enum Unpatched {
 }
 
 /// What every generator lane shares once the baselines ran.
+#[derive(Clone)]
 pub(super) struct Lanes {
     pub(super) flags: GenerateFlags,
     /// Each case's harness, or why it gets no lane, by case index.
@@ -686,6 +699,23 @@ impl Lanes {
                 GeneratorReport::unsearched(harness, *seed, self.flags.mode, result.clone())
             })
             .collect()
+    }
+
+    /// Whether `lane`, a search on a mutant under the memory cap, reruns
+    /// alone with the host's memory: a lane the cap killed does, as a
+    /// witness the cap killed does. So does any harness failure of a lane
+    /// whose harness and seed needed the host's memory on the unpatched
+    /// build ([`GenBaseline::alone`]). The cap can end a `libfuzzer`
+    /// campaign as a timeout or a saved out-of-memory input, not only as
+    /// an OOM. A broken build, which the cap doesn't bound, never reruns.
+    pub(super) fn reruns_alone(&self, lane: &GeneratorReport) -> bool {
+        lane.result.class == Class::HarnessFailure
+            && lane.result.reason != Some(Reason::Build)
+            && (lane.result.reason == Some(Reason::Oom)
+                || self
+                    .baselines
+                    .get(&(lane.harness.clone(), lane.seed))
+                    .is_some_and(|baseline| baseline.alone))
     }
 }
 
@@ -1626,6 +1656,7 @@ impl Runner {
                 GenBaseline {
                     failure,
                     millis: search.millis,
+                    alone: rerun_alone,
                 },
             );
         }

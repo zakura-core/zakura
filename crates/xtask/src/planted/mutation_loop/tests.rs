@@ -26,9 +26,9 @@ use super::{
         GeneratorBaselineFailure, GeneratorReport, Kill, KillTrace, Lanes, OnUnpatched,
         PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck,
     },
-    parse_flags, planted_cases, selects, summarize, test_executables, triage, BaselineReport,
-    BuildIdentity, CaseReport, GenerateFlags, ListedCase, LoopCase, Mutant, Report, Runner, Slot,
-    WitnessSpec,
+    merge_alone, parse_flags, planted_cases, selects, summarize, test_executables, triage,
+    BaselineReport, BuildIdentity, CaseReport, GenerateFlags, ListedCase, LoopCase, Mutant, Report,
+    Runner, Slot, WitnessSpec,
 };
 use crate::planted::lane::{campaign_facts, Campaign, CampaignFacts};
 
@@ -1550,6 +1550,7 @@ fn fake_kill(
             GenBaseline {
                 failure: None,
                 millis: 10,
+                alone: false,
             },
         )]),
         exclude: out.path().join("exclude.txt"),
@@ -1795,6 +1796,7 @@ fn only_a_confirmed_unpatched_violation_is_a_property_finding() {
                         "the unpatched search violates x",
                     )),
                     millis: 10,
+                    alone: false,
                 },
             ),
             (
@@ -1806,6 +1808,7 @@ fn only_a_confirmed_unpatched_violation_is_a_property_finding() {
                         "the search passed its deadline",
                     )),
                     millis: 10,
+                    alone: false,
                 },
             ),
         ]),
@@ -2774,4 +2777,139 @@ fn the_unpatched_build_reruns_a_kills_input() {
     );
     assert!(calls[1].starts_with("replay "), "{}", calls[1]);
     assert!(calls[1].contains("--allow-build-mismatch"), "{}", calls[1]);
+}
+
+/// A generator lane that the memory cap killed reruns alone, as does a
+/// harness failure on a harness and seed whose baseline needed the host's
+/// memory. A broken build, a kill and a baseline failure don't.
+#[test]
+fn a_generator_lane_the_cap_killed_reruns_alone() {
+    let out = tempfile::tempdir().expect("a temporary directory");
+    let harness = "block-sync/storage";
+    let baseline = |alone| GenBaseline {
+        failure: None,
+        millis: 10,
+        alone,
+    };
+    let lanes = Lanes {
+        flags: GenerateFlags {
+            runs: 1,
+            seeds: vec![7, 8],
+            ..GenerateFlags::default()
+        },
+        plans: vec![Ok(harness.to_owned())],
+        baselines: BTreeMap::from([
+            ((harness.to_owned(), 7), baseline(false)),
+            ((harness.to_owned(), 8), baseline(true)),
+        ]),
+        exclude: out.path().join("exclude.txt"),
+        corpus: out.path().join("corpus"),
+        targets: BTreeMap::new(),
+        unpatched_sim: out.path().join("zakura-sim"),
+    };
+    let lane = |seed, class, reason| {
+        GeneratorReport::unsearched(
+            harness,
+            seed,
+            GenerateMode::Inproc,
+            classify::Classified::new(class, reason, "why"),
+        )
+    };
+    for (seed, class, reason, reruns) in [
+        (7, Class::HarnessFailure, Some(Reason::Oom), true),
+        (7, Class::HarnessFailure, Some(Reason::Timeout), false),
+        (8, Class::HarnessFailure, Some(Reason::Timeout), true),
+        (8, Class::HarnessFailure, Some(Reason::NoEndRecord), true),
+        (8, Class::HarnessFailure, Some(Reason::Build), false),
+        (8, Class::KilledByNamedRule, None, false),
+        (8, Class::BaselineFails, None, false),
+    ] {
+        assert_eq!(
+            lanes.reruns_alone(&lane(seed, class, reason)),
+            reruns,
+            "seed {seed}: {class:?} {reason:?}"
+        );
+    }
+}
+
+/// A case's run alone replaces only what reran: the witness lane if the
+/// cap killed the first witness, and each generator lane that reruns
+/// alone, matched by seed. Every other lane keeps its first result.
+#[test]
+fn a_run_alone_replaces_only_the_lanes_that_reran() {
+    let lane = |seed, class, reason| {
+        GeneratorReport::unsearched(
+            "block-sync/storage",
+            seed,
+            GenerateMode::Inproc,
+            classify::Classified::new(class, reason, "why"),
+        )
+    };
+    let case = |result: classify::Classified, generator: Vec<GeneratorReport>| CaseReport {
+        patch: "bounds/raise/raise.patch".to_owned(),
+        patch_sha256: "00".repeat(32),
+        property: NAMED.to_owned(),
+        entry: None,
+        table: None,
+        witness: WitnessSpec::Test {
+            test: "t".to_owned(),
+            test_target: "block_table".to_owned(),
+        },
+        also_violates: Vec::new(),
+        result,
+        trigger: None,
+        baseline: BaselineReport {
+            passed: true,
+            detail: None,
+            millis: 10,
+            rerun_alone: false,
+        },
+        millis: Some(10),
+        peak_rss_kib: None,
+        log: None,
+        rerun_alone: false,
+        generator,
+        no_generator: None,
+        triage: None,
+    };
+    let oom = || classify::Classified::new(Class::HarnessFailure, Some(Reason::Oom), "cap");
+    let held = || classify::Classified::new(Class::Survived, Some(Reason::Held), "held");
+    let killed = || classify::Classified::new(Class::KilledByNamedRule, None, "killed");
+    let reruns = |lane: &GeneratorReport| lane.result.reason == Some(Reason::Oom);
+
+    // The witness held, so it keeps its first result. Seed 7's lane the
+    // cap killed takes the rerun's kill. Seed 8's held lane keeps its own,
+    // though the rerun has another.
+    let first = case(
+        held(),
+        vec![
+            lane(7, Class::HarnessFailure, Some(Reason::Oom)),
+            lane(8, Class::Survived, Some(Reason::Held)),
+        ],
+    );
+    let rerun = case(
+        killed(),
+        vec![
+            lane(7, Class::KilledByNamedRule, None),
+            lane(8, Class::HarnessFailure, Some(Reason::Panic)),
+        ],
+    );
+    let merged = merge_alone(first, rerun, reruns);
+    assert_eq!(merged.result, held());
+    assert!(!merged.rerun_alone);
+    assert_eq!(merged.generator[0].result.class, Class::KilledByNamedRule);
+    assert!(merged.generator[0].rerun_alone);
+    assert_eq!(merged.generator[1].result.class, Class::Survived);
+    assert!(!merged.generator[1].rerun_alone);
+
+    // The cap killed the witness, so it takes the rerun's result. The
+    // generator lane survived, so the rerun, which searched nothing, leaves
+    // it.
+    let first = case(oom(), vec![lane(7, Class::Survived, Some(Reason::Held))]);
+    let rerun = case(killed(), Vec::new());
+    let merged = merge_alone(first, rerun, reruns);
+    assert_eq!(merged.result, killed());
+    assert!(merged.rerun_alone);
+    assert_eq!(merged.generator.len(), 1);
+    assert_eq!(merged.generator[0].result.class, Class::Survived);
 }

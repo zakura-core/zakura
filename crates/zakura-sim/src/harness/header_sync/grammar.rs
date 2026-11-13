@@ -354,6 +354,9 @@ fn decode_as(
             branch_1: weight(0),
             branch_2: weight(1),
         },
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     };
     let decode_trigger = |trigger: &[u8], site| decode_trigger(trigger, mirrors, site, generator);
     // Holds first, so a release knows how many there are.

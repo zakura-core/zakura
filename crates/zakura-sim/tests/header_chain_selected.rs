@@ -65,6 +65,9 @@ fn fork_fixture(mirrors: Vec<MirrorSpec>, weights: Weights) -> StorageScenario {
         weights,
         policy: fork_policy(),
         controls: Vec::new(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -145,6 +148,9 @@ pub fn heavier_offered_to_longer() -> StorageScenario {
         weights: heavier_short(),
         policy: Policy::converging(),
         controls: Vec::new(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -178,6 +184,9 @@ pub fn invalidated_then_reconsidered() -> StorageScenario {
                 Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
             ),
         ],
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -196,6 +205,9 @@ pub fn harness_commit() -> StorageScenario {
         policy: Policy::converging(),
         controls: vec![node_step(ControlAction::Commit { len: 2 }, None)],
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 

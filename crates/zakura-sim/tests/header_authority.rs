@@ -62,6 +62,9 @@ pub fn forks_sharing_a_header() -> StorageScenario {
             when: Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
         }],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -78,6 +81,9 @@ pub fn multi_page_sync() -> StorageScenario {
         policy: Policy::converging(),
         controls: Vec::new(),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -102,6 +108,9 @@ pub fn relinked_mid_round() -> StorageScenario {
             when: Some(Trigger::Submitted(Select::nth(OpKind::Prepare, 1))),
         }],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -120,6 +129,9 @@ pub fn harness_commit() -> StorageScenario {
             when: None,
         }],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 

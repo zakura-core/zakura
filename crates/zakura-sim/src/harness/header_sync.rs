@@ -287,6 +287,68 @@ pub struct StorageScenario {
     /// Link actions the `Plan` may take, in order.
     #[serde(default)]
     pub controls: Vec<ControlStep>,
+    /// Operator settings the node under test runs with in place of
+    /// production's defaults.
+    #[serde(default, skip_serializing_if = "NodeSettings::is_default")]
+    pub node_settings: NodeSettings,
+    /// The mirrors whose first page on each of their links the harness
+    /// holds back ([`DelayedPage`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub page_delays: Vec<PageDelay>,
+    /// The run's step budget in place of [`storage_config`]'s, for a
+    /// history the default budget can't reach. `None`, and absent from the
+    /// JSON, leaves the budget to [`Harness::config`](crate::Harness::config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u64>,
+}
+
+/// Header-sync settings an operator can change, for the node under test.
+/// Each unset field keeps production's default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeSettings {
+    /// `peer_limits.max_inbound_peers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inbound_peers: Option<usize>,
+    /// `peer_limits.max_outbound_peers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_outbound_peers: Option<usize>,
+    /// `max_unproductive_header_requests`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unproductive_header_requests: Option<u32>,
+}
+
+impl NodeSettings {
+    /// Whether every setting keeps production's default.
+    pub fn is_default(&self) -> bool {
+        *self == NodeSettings::default()
+    }
+
+    /// Production's default config with these settings applied.
+    pub fn config(&self) -> ZakuraHeaderSyncConfig {
+        let mut config = ZakuraHeaderSyncConfig::default();
+        if let Some(max) = self.max_inbound_peers {
+            config.peer_limits.max_inbound_peers = max;
+        }
+        if let Some(max) = self.max_outbound_peers {
+            config.peer_limits.max_outbound_peers = max;
+        }
+        if let Some(max) = self.max_unproductive_header_requests {
+            config.max_unproductive_header_requests = max;
+        }
+        config
+    }
+}
+
+/// A mirror whose first page on each of its links waits `by_ms` of virtual
+/// time before the node under test gets it ([`DelayedPage`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageDelay {
+    /// The mirror's name.
+    pub mirror: String,
+    /// How long its first page waits, in milliseconds.
+    pub by_ms: u64,
 }
 
 impl Default for StorageScenario {
@@ -302,6 +364,9 @@ impl Default for StorageScenario {
             policy: Policy::converging(),
             controls: Vec::new(),
             weights: Weights::default(),
+            node_settings: NodeSettings::default(),
+            page_delays: Vec::new(),
+            budget: None,
         }
     }
 }
@@ -562,6 +627,9 @@ impl StorageScenario {
                 ),
             ],
             weights: Weights::default(),
+            node_settings: Default::default(),
+            page_delays: Vec::new(),
+            budget: None,
         }
     }
 }
@@ -758,9 +826,10 @@ pub struct Ports {
     pub outstanding: OutstandingEvidence,
     /// The run's recovery, which a `Recover` step starts.
     pub recovery: RecoveryEvidence,
-    /// The mirror whose first page on each link the harness holds back.
-    /// `None` unless whoever prepared the ports set one.
-    pub delayed_page: Option<DelayedPage>,
+    /// The mirrors whose first page on each link the harness holds back,
+    /// as the scenario's `page_delays` names them unless whoever prepared
+    /// the ports set others.
+    pub delayed_pages: Vec<DelayedPage>,
     /// When the node's fork-choice check first applied, which its tap finds
     /// during the run.
     pub fork_choice: ForkChoiceEvidence,
@@ -805,7 +874,7 @@ impl Ports {
             authority: AuthorityEvidence::new(&stores),
             outstanding: OutstandingEvidence::new(&stores),
             recovery,
-            delayed_page: None,
+            delayed_pages: Vec::new(),
             fork_choice: ForkChoiceEvidence::new(&stores),
             publication: PublicationEvidence::new(&stores),
             finishes: false,
@@ -1153,15 +1222,17 @@ impl Subsystem for Storage {
     type Scenario = StorageScenario;
     type Prepared = Ports;
 
-    /// [`storage_config`], with [`RECOVERY_BUDGET`] for a scenario with a
-    /// `Recover` step.
+    /// [`storage_config`], with the scenario's own budget if it names one,
+    /// or else [`RECOVERY_BUDGET`] for a scenario with a `Recover` step.
     fn config(scenario: &StorageScenario) -> RunConfig {
-        match recovery_source(scenario) {
-            Some(_) => RunConfig {
-                budget: RECOVERY_BUDGET,
-                ..storage_config()
+        let config = storage_config();
+        RunConfig {
+            budget: match (scenario.budget, recovery_source(scenario)) {
+                (Some(budget), _) => budget,
+                (None, Some(_)) => RECOVERY_BUDGET,
+                (None, None) => config.budget,
             },
-            None => storage_config(),
+            ..config
         }
     }
 
@@ -1277,6 +1348,14 @@ impl Subsystem for Storage {
         };
         let ports = Ports {
             finishes: recovery_source(scenario).is_some(),
+            delayed_pages: scenario
+                .page_delays
+                .iter()
+                .map(|delay| DelayedPage {
+                    mirror: delay.mirror.clone(),
+                    by: std::time::Duration::from_millis(delay.by_ms),
+                })
+                .collect(),
             ..Ports::new(fixture, node, preloaded_at, mirrors, stores, recovery)
         };
         // A flood or churn scenario's adoption is the watch-flood
@@ -1338,10 +1417,11 @@ impl Subsystem for Storage {
             branches.clone(),
             [],
         );
+        let node_config = scenario.node_settings.config();
         tap.watch_outstanding(
             ports.outstanding.clone(),
-            storage_peer_limit(),
-            storage_departed_limit(),
+            storage_peer_limit(&node_config),
+            storage_departed_limit(&node_config),
         );
         tap.watch_fork_choice(
             ports.fork_choice.clone(),
@@ -1361,7 +1441,7 @@ impl Subsystem for Storage {
         }
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
-        let mut nodes = vec![HeaderNode::spawn(
+        let mut nodes = vec![HeaderNode::spawn_configured(
             sim,
             "node",
             1,
@@ -1370,6 +1450,7 @@ impl Subsystem for Storage {
             scenario.node.tip(&ports.fixture),
             dispatch.clone(),
             Some(observer),
+            node_config,
         )];
         for (index, ((spec, port), seed)) in scenario
             .mirrors
@@ -1416,7 +1497,7 @@ impl Subsystem for Storage {
                 .with_tap(shutdown)
                 .with_sessions(ports.sessions.clone())
                 .with_grown(ports.grown.clone())
-                .with_delayed_page(ports.delayed_page.clone()),
+                .with_delayed_pages(ports.delayed_pages.clone()),
         );
         let mut mirror_links = Vec::new();
         for (index, spec) in (1..).zip(&scenario.mirrors) {
@@ -2634,10 +2715,10 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
     ]
 }
 
-/// The peers the storage harness's node admits at once, from the config
-/// and connection limit [`HeaderNode::spawn`] gives it.
-fn storage_peer_limit() -> usize {
-    let limits = ZakuraHeaderSyncConfig::default().peer_limits;
+/// The peers the storage harness's node admits at once, from its `config`
+/// and the connection limit [`HeaderNode::spawn_configured`] gives it.
+fn storage_peer_limit(config: &ZakuraHeaderSyncConfig) -> usize {
+    let limits = &config.peer_limits;
     admitted_peer_limit(
         limits.max_inbound_peers,
         limits.max_outbound_peers,
@@ -2647,10 +2728,9 @@ fn storage_peer_limit() -> usize {
 
 /// The departed VCT repair suppliers whose history the storage harness's
 /// node keeps, `max_inbound_peers + max_outbound_peers`, as the reactor's
-/// `prune_vct_supplier_history` passes them from the config
-/// [`HeaderNode::spawn`] gives it.
-fn storage_departed_limit() -> usize {
-    let limits = ZakuraHeaderSyncConfig::default().peer_limits;
+/// `prune_vct_supplier_history` passes them from its `config`.
+fn storage_departed_limit(config: &ZakuraHeaderSyncConfig) -> usize {
+    let limits = &config.peer_limits;
     limits
         .max_inbound_peers
         .saturating_add(limits.max_outbound_peers)
@@ -3001,6 +3081,9 @@ mod tests {
             },
             controls: Vec::new(),
             weights: Weights::default(),
+            node_settings: Default::default(),
+            page_delays: Vec::new(),
+            budget: None,
         }
     }
 

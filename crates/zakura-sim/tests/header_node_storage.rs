@@ -105,6 +105,9 @@ fn worked_example(policy: Policy) -> StorageScenario {
         policy,
         controls: Vec::new(),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -686,6 +689,9 @@ fn node_at_a3(
         },
         controls: Vec::new(),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -1248,6 +1254,9 @@ fn a_deferring_clock_keeps_the_fork_fixture_unsettled() {
                 disruptions: Vec::new(),
             },
             controls: Vec::new(),
+            node_settings: Default::default(),
+            page_delays: Vec::new(),
+            budget: None,
         },
         probe: Probe::Idle,
         utc_origin: Some(genesis - 3 * 60 * 60),

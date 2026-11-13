@@ -245,6 +245,9 @@ pub struct OutstandingEvidence(Registered<Store>);
 struct Store {
     /// Each row's peak, by name.
     peaks: BTreeMap<&'static str, usize>,
+    /// Each row's sizes in report order, by name, with a repeated size
+    /// kept once.
+    sizes: BTreeMap<&'static str, Vec<usize>>,
     /// The first step whose drain judged a `Sizes`.
     applicable: Option<u64>,
     /// Whether a `Sizes` was judged since the last drain.
@@ -271,6 +274,7 @@ impl Snapshot for Store {
     fn snapshot(&self) -> serde_json::Value {
         let Store {
             peaks,
+            sizes,
             applicable,
             pending,
             running,
@@ -285,6 +289,7 @@ impl Snapshot for Store {
         );
         serde_json::json!({
             "fields": debug_snapshot(&(peaks, applicable, pending, shut_down, at_rest, reported)),
+            "sizes": debug_snapshot(sizes),
             "running": running,
         })
     }
@@ -311,6 +316,13 @@ impl OutstandingEvidence {
     /// Each row's largest size so far, by name.
     pub fn peaks(&self) -> BTreeMap<&'static str, usize> {
         self.with(|store| store.peaks.clone())
+    }
+
+    /// `row`'s sizes in the order the tap saw them, each run of one size
+    /// kept once, so a fall shows a release and a later rise a reuse.
+    /// Empty for a row the tap never saw.
+    pub fn sizes(&self, row: &str) -> Vec<usize> {
+        self.with(|store| store.sizes.get(row).cloned().unwrap_or_default())
     }
 
     /// Whether a drain up to and including `step`'s judged a `Sizes`.
@@ -1082,6 +1094,10 @@ impl Outstanding {
         self.evidence.change(|store| {
             let peak = store.peaks.entry(row).or_default();
             *peak = (*peak).max(size);
+            let sizes = store.sizes.entry(row).or_default();
+            if sizes.last() != Some(&size) {
+                sizes.push(size);
+            }
         });
     }
 

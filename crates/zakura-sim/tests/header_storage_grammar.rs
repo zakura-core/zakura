@@ -274,6 +274,9 @@ fn hand_built_scenarios_round_trip() {
                 Some(Trigger::Handled(Select::nth(OpKind::Prepare, 2))),
             )],
             weights: Default::default(),
+            node_settings: Default::default(),
+            page_delays: Vec::new(),
+            budget: None,
         },
     ];
     for scenario in &scenarios {

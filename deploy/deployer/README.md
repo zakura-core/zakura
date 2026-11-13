@@ -264,8 +264,22 @@ is separate future work.
 The workflow refreshes a fleet status dashboard on `us-east-0`:
 
 - service: `zakura-mainnet-dashboard.service`
-- URL: `http://159.65.183.89:8090/`
+- URL: `https://status.mainnet.zakura.valargroup.dev/` (Caddy; the server listens on
+  `127.0.0.1:8090` only)
 - install dir: `/opt/zakura-mainnet-dashboard`
+
+The fleet pages (`/`, `/node/*`, `/profile/*`) and their data (`/data*`) need a
+shared password: visitors sign in at a login page and get a one-week cookie
+(`/logout` clears it). The public APIs (`/ironwood-status.json`, `/v1/*`) and
+`/healthz` stay open, and processes on the host reading `127.0.0.1:8090`
+directly (the fleet watchdog) need no login. The password is the repository
+secret `ZAKURA_STATUS_DASHBOARD_PASSWORD`; each deploy writes only its hash to
+`/etc/zakura-mainnet-dashboard/dashboard.env` (root, mode 600). Login cookies
+are signed with a key the server makes at startup and never stores, so every
+dashboard restart (each deploy) signs everyone out. To change the password,
+update the secret and redeploy. Without the secret the deploy fails rather than
+serving the pages openly. Logins are accepted only through the HTTPS hostnames;
+the server listens on loopback.
 
 It also installs the public broadcast-only JSON-RPC gateway on the same host
 (see `deploy/gateway/`):

@@ -15,6 +15,7 @@ use crate::BoxError;
 
 mod gossip;
 mod mempool_change;
+pub mod port;
 mod service_trait;
 mod transaction_dependencies;
 

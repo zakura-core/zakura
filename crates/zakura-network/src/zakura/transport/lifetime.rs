@@ -537,6 +537,7 @@ impl ConnectionResources {
         #[cfg(zakura_sim)]
         let owner = {
             let mut owner = owner;
+            // `OwnerPhase` discriminants are 0..OWNER_PHASES, so the cast indexes in bounds.
             self.stream_owners[OwnerPhase::Setup as usize].fetch_add(1, Ordering::Relaxed);
             owner.stream_owners = Some(self.stream_owners.clone());
             owner
@@ -953,6 +954,7 @@ impl OwnerGuard {
         #[cfg(zakura_sim)]
         if let Some(owners) = &self.stream_owners {
             owners[previous].fetch_sub(1, Ordering::Relaxed);
+            // `OwnerPhase` discriminants are 0..OWNER_PHASES, so the cast indexes in bounds.
             owners[phase as usize].fetch_add(1, Ordering::Relaxed);
         }
     }

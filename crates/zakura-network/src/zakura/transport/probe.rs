@@ -262,6 +262,7 @@ impl ConnectionProbe {
             "a connection probe reads only inside a boundary read"
         );
         let owners = self.stream_owners.upgrade();
+        // `OwnerPhase` discriminants are 0..OWNER_PHASES, so the cast indexes in bounds.
         let count = |phase: OwnerPhase| {
             owners
                 .as_ref()

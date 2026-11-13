@@ -22,7 +22,7 @@ use super::{
 use crate::{
     explore::{
         feedback::{FEEDBACK_LINE, FEEDBACK_VAR},
-        ProcessFailure,
+        Bucket, ProcessFailure,
     },
     harness::HarnessEntry,
     seed,
@@ -747,7 +747,9 @@ fn check_harness(build: &FuzzBuild, harness: &str) -> Result<(), CampaignError> 
 
 /// Runs `build`'s fuzzer once with `-runs=0` and no corpus, and returns the
 /// feedback it logs. Fails if the fuzzer fails, so a manifest never names
-/// a fuzzer that can't start.
+/// a fuzzer that can't start. A fuzzer whose empty input violates an
+/// `Active` property did start: the probe accepts it, and the run's first
+/// input records the violation as a finding.
 fn probe_feedback(
     store: &Store,
     build: &FuzzBuild,
@@ -785,7 +787,8 @@ fn probe_in(
         |_| {},
     )?;
     let log = String::from_utf8_lossy(&log);
-    if let Some(failure) = ProcessFailure::of(exit, log.as_bytes()) {
+    let failure = ProcessFailure::of(exit, log.as_bytes());
+    if let Some(failure) = failure.filter(|_| !saved_active_input(&dir.join("sim"))) {
         let tail: Vec<&str> = log.lines().rev().take(20).collect();
         return Err(CampaignError::Refused(format!(
             "fuzzer {} failed its startup probe with {failure:?}:\n{}",
@@ -794,6 +797,19 @@ fn probe_in(
         )));
     }
     FeedbackRecord::parse(&log).map_err(CampaignError::Refused)
+}
+
+/// Whether the fuzz target saved an input under `artifacts`'
+/// `inputs/active/<property-id>/`, which it does only for an input that
+/// violates an `Active` property.
+fn saved_active_input(artifacts: &Path) -> bool {
+    let active = artifacts.join("inputs").join(Bucket::Active.name());
+    let Ok(properties) = fs::read_dir(active) else {
+        return false;
+    };
+    properties.flatten().any(|property| {
+        fs::read_dir(property.path()).is_ok_and(|mut inputs| inputs.next().is_some())
+    })
 }
 
 #[cfg(test)]
@@ -816,6 +832,24 @@ mod tests {
     }
 
     /// Extra flags can't set what the supervisor sets.
+    /// Only an input under `inputs/active/<property-id>/` counts as a saved
+    /// `Active` violation.
+    #[test]
+    fn saved_active_inputs_are_found() {
+        let artifacts = tempfile::tempdir().unwrap();
+        assert!(!saved_active_input(artifacts.path()));
+        let active = artifacts.path().join("inputs").join("active");
+        let property = active.join("block-sync.payload-inventory-agrees");
+        fs::create_dir_all(&property).unwrap();
+        assert!(!saved_active_input(artifacts.path()));
+        let crash = artifacts.path().join("inputs").join("crash").join("p");
+        fs::create_dir_all(&crash).unwrap();
+        fs::write(crash.join("input"), b"").unwrap();
+        assert!(!saved_active_input(artifacts.path()));
+        fs::write(property.join("input"), b"").unwrap();
+        assert!(saved_active_input(artifacts.path()));
+    }
+
     #[test]
     fn reserved_flags_are_refused() {
         let budget = |args: &[&str]| Budget {

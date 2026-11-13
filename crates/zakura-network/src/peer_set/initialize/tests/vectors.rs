@@ -2510,6 +2510,53 @@ async fn listener_keeps_an_unconditional_peer_slot_after_its_connection_closes()
     listener.stop().await;
 }
 
+/// One IP holds at most `max_connections_per_ip` of the inbound slots that dialed
+/// unconditional peers share, so one listed peer cannot take another's slot. Its slots
+/// are free for it again once its connections close.
+#[tokio::test]
+async fn listener_limits_the_unconditional_slots_that_one_ip_holds() {
+    let _init_guard = zakura_test::init();
+
+    // Each case is the per-IP limit, and the connections that the two listed peers get,
+    // the first one first, from a node with no other inbound slots.
+    for (max_connections_per_ip, expected) in [(1, [1, 1]), (2, [2, 0])] {
+        let Some(mut listener) = UnconditionalPeerListener::spawn_with_ip_limit(
+            "['::1', '127.0.0.1']",
+            &[],
+            0,
+            max_connections_per_ip,
+        )
+        .await
+        else {
+            return;
+        };
+
+        let mut first_peer_connections = listener
+            .offer_until_refused(LISTENER_UNCONDITIONAL_IP)
+            .await;
+        let second_peer_connections = listener.offer_until_refused(LISTENER_PUBLIC_IP).await;
+        assert_eq!(
+            [first_peer_connections.len(), second_peer_connections.len()],
+            expected,
+            "unexpected connections with {max_connections_per_ip} connections per IP",
+        );
+
+        let closed_connections = first_peer_connections.len();
+        first_peer_connections.clear();
+        assert_eq!(
+            listener
+                .offer_until_refused(LISTENER_UNCONDITIONAL_IP)
+                .await
+                .len(),
+            closed_connections,
+            "the first peer takes its slots again with {max_connections_per_ip} \
+             connections per IP",
+        );
+
+        listener.stop().await;
+    }
+}
+
 /// Test configured zcashd-compat reconnects bypass the normal
 /// successful-handshake delay.
 #[tokio::test]
@@ -3920,6 +3967,24 @@ impl UnconditionalPeerListener {
         zcashd_compat_peer_ips: &[&str],
         peerset_initial_target_size: usize,
     ) -> Option<Self> {
+        Self::spawn_with_ip_limit(
+            unconditional_peers,
+            zcashd_compat_peer_ips,
+            peerset_initial_target_size,
+            usize::MAX,
+        )
+        .await
+    }
+
+    /// Like [`spawn`](Self::spawn), for a node that keeps at most `max_connections_per_ip`
+    /// connections to one IP. `spawn` sets no such limit, so that one address can fill
+    /// every slot.
+    async fn spawn_with_ip_limit(
+        unconditional_peers: &str,
+        zcashd_compat_peer_ips: &[&str],
+        peerset_initial_target_size: usize,
+        max_connections_per_ip: usize,
+    ) -> Option<Self> {
         if zakura_test::net::zebra_skip_network_tests() || zakura_test::net::zebra_skip_ipv6_tests()
         {
             return None;
@@ -3932,7 +3997,7 @@ impl UnconditionalPeerListener {
         let config = Config {
             listen_addr,
             peerset_initial_target_size,
-            max_connections_per_ip: usize::MAX,
+            max_connections_per_ip,
             unconditional_peers: toml::from_str::<Config>(&format!(
                 "unconditional_peers = {unconditional_peers}"
             ))

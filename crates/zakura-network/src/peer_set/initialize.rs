@@ -947,11 +947,15 @@ where
             } else if config.unconditional_peers.is_dial_address(addr.ip())
                 && active_unconditional_inbound_connections
                     < config.unconditional_peer_connection_limit()
+                && active_unconditional_connections.connections_from(canonical_ip)
+                    < config.max_connections_per_ip
             {
                 // These slots skip the wait between inbound connections from one IP, so a
-                // dialed peer that lost its connection can reconnect at once. When they are
-                // all taken, the peer competes for a public slot, and waits like any other.
-                active_unconditional_connections.track_connection()
+                // dialed peer that lost its connection can reconnect at once. One IP holds
+                // at most `max_connections_per_ip` of them, so it cannot take the slot of
+                // another listed peer. A peer that gets no slot here competes for a public
+                // slot, and waits like any other.
+                active_unconditional_connections.track_connection_from(canonical_ip)
             } else if active_public_inbound_connections >= public_inbound_connection_limit
                 || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
                 || recent_inbound_connections.is_past_limit_or_add(addr.ip())

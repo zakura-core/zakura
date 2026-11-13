@@ -15,12 +15,12 @@ use tracing::Span;
 use zakura_chain::{parameters::Network, serialization::DateTime32};
 
 use crate::{
-    config::UnconditionalPeers,
     constants::{self, ADDR_RESPONSE_LIMIT_DENOMINATOR, MAX_ADDRS_IN_MESSAGE},
     meta_addr::MetaAddrChange,
     peer_registry::PeerRegistry,
     protocol::external::{canonical_ip, canonical_peer_addr, canonical_socket_addr},
     types::{MetaAddr, PeerServices},
+    unconditional_peer_set::UnconditionalPeerSet,
     AddressBookPeers, PeerAddrState, PeerSocketAddr,
 };
 
@@ -81,13 +81,21 @@ impl BannedIps {
         self.changes.subscribe()
     }
 
-    /// Applies a ban and notifies readers after releasing the list lock.
-    fn insert(&self, ip: IpAddr) {
+    /// Bans `ip` unless `is_exempt` returns true, and notifies readers after releasing
+    /// the list lock. Returns false when `is_exempt` stopped the ban.
+    ///
+    /// `is_exempt` runs while the list is locked, and so does the exemption in
+    /// [`exempt_and_lift`](Self::exempt_and_lift). So a racing ban either sees the
+    /// exemption, or lands before it and is lifted.
+    fn insert_unless(&self, ip: IpAddr, is_exempt: impl FnOnce() -> bool) -> bool {
         let changed = {
             let mut list = self
                 .inner
                 .write()
                 .expect("ban list lock should not be poisoned");
+            if is_exempt() {
+                return false;
+            }
             let changed = !list.ips.contains(&canonical_ip(ip));
             list.insert(ip);
             changed
@@ -95,6 +103,46 @@ impl BannedIps {
         if changed {
             self.changes.send_replace(());
         }
+
+        true
+    }
+
+    /// Runs `exempt`, then lifts the bans on `ips`, while holding the list lock, and
+    /// notifies readers after releasing it.
+    ///
+    /// No ban can land between the exemption and the lifted bans, see
+    /// [`insert_unless`](Self::insert_unless).
+    pub(crate) fn exempt_and_lift(
+        &self,
+        exempt: impl FnOnce(),
+        ips: impl IntoIterator<Item = IpAddr>,
+    ) {
+        let changed = {
+            let mut list = self
+                .inner
+                .write()
+                .expect("ban list lock should not be poisoned");
+            exempt();
+
+            let mut changed = false;
+            for ip in ips {
+                let ip = canonical_ip(ip);
+                if list.ips.remove(&ip) {
+                    list.insertion_order.retain(|banned_ip| *banned_ip != ip);
+                    changed = true;
+                }
+            }
+            changed
+        };
+        if changed {
+            self.changes.send_replace(());
+        }
+    }
+
+    /// Lifts the ban on `ip`, if it has one.
+    #[cfg(test)]
+    pub(crate) fn remove(&self, ip: IpAddr) {
+        self.exempt_and_lift(|| {}, [ip]);
     }
 
     /// Returns whether `ip` is currently banned.
@@ -106,6 +154,12 @@ impl BannedIps {
             .expect("ban list lock should not be poisoned")
             .ips
             .contains(&ip)
+    }
+
+    /// Bans `ip`, whatever is exempt.
+    #[cfg(test)]
+    fn insert(&self, ip: IpAddr) {
+        self.insert_unless(ip, || false);
     }
 
     #[cfg(test)]
@@ -366,12 +420,12 @@ pub struct AddressBook {
     /// A list of banned addresses, with the time they were banned.
     bans_by_ip: BannedIps,
 
-    /// Peer IP addresses and ranges that are never scored or banned.
+    /// The peers that are never scored or banned.
     ///
     /// The address book drops misbehavior changes for these peers, and leaves the IPs
     /// that Zakura dials to stay connected to them out of
     /// [`reconnection_peers`](Self::reconnection_peers).
-    unconditional_peers: UnconditionalPeers,
+    unconditional_peers: UnconditionalPeerSet,
 
     /// The local listener address.
     local_listener: SocketAddr,
@@ -484,7 +538,7 @@ impl AddressBook {
             last_address_log: None,
             most_recent_by_ip: should_limit_outbound_conns_per_ip.then(HashMap::new),
             bans_by_ip: Default::default(),
-            unconditional_peers: UnconditionalPeers::default(),
+            unconditional_peers: UnconditionalPeerSet::default(),
         };
 
         new_book.update_metrics(instant_now, chrono_now);
@@ -507,14 +561,20 @@ impl AddressBook {
         self
     }
 
-    /// Sets the peer IP addresses and ranges that are never scored or banned.
+    /// Sets the peers that are never scored or banned.
     #[must_use]
     pub(crate) fn with_unconditional_peers(
         mut self,
-        unconditional_peers: UnconditionalPeers,
+        unconditional_peers: impl Into<UnconditionalPeerSet>,
     ) -> Self {
-        self.unconditional_peers = unconditional_peers;
+        self.unconditional_peers = unconditional_peers.into();
         self
+    }
+
+    /// Returns the peers that are never scored or banned. The returned set follows the
+    /// addresses that unconditional peer names resolve to.
+    pub fn unconditional_peers(&self) -> UnconditionalPeerSet {
+        self.unconditional_peers.clone()
     }
 
     /// Attach the active peer registry used by local RPC diagnostics.
@@ -826,11 +886,20 @@ impl AddressBook {
             if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
                 // Ban and skip outbound connections with excessively misbehaving peers.
                 let banned_ip = updated.addr.ip();
-                debug_assert!(
-                    !self.unconditional_peers.contains(banned_ip),
-                    "unconditional peers must never be banned"
-                );
-                self.bans_by_ip.insert(banned_ip);
+
+                // A name lookup can exempt this address after the check above.
+                let is_banned = self
+                    .bans_by_ip
+                    .insert_unless(banned_ip, || self.unconditional_peers.contains(banned_ip));
+                if !is_banned {
+                    debug!(
+                        peer = %addr_label,
+                        "ignored a ban for a peer that became unconditional"
+                    );
+                    metrics::counter!("address_book.misbehavior.unconditional_ignored.total")
+                        .increment(1);
+                    return None;
+                }
 
                 // `most_recent_by_ip` is only populated when
                 // `max_connections_per_ip == 1`. The ban path runs for any
@@ -1000,9 +1069,10 @@ impl AddressBook {
     /// Return an iterator over peers that are due for a reconnection attempt,
     /// in reconnection attempt order.
     ///
-    /// Leaves out every address on the IP of a dialed unconditional peer. Zakura keeps
-    /// that peer connected on a slot of its own, and a connection to another node on its
-    /// IP could take the room under `max_connections_per_ip` that the peer needs.
+    /// Leaves out every address on the IP of a dialed unconditional peer, or of an address
+    /// that a listed name resolves to. Zakura keeps that peer connected on a slot of its
+    /// own, and a connection to another node on its IP could take the room under
+    /// `max_connections_per_ip` that the peer needs.
     pub fn reconnection_peers(
         &'_ self,
         instant_now: Instant,
@@ -1018,7 +1088,7 @@ impl AddressBook {
                 // Inbound entries stay in the book for liveness, bans, and per-IP dial
                 // limits, but their ephemeral source ports are not listeners to dial.
                 !peer.is_inbound()
-                    && !self.unconditional_peers.is_dial_address(peer.addr.ip())
+                    && !self.unconditional_peers.is_kept_connected(peer.addr.ip())
                     && peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
                     && self.is_ready_for_connection_attempt_with_ip(&peer.addr.ip(), chrono_now)
             })

@@ -141,6 +141,7 @@ use crate::{
         external::{canonical_ip, InventoryHash},
         internal::{Request, Response},
     },
+    unconditional_peer_set::UnconditionalPeerSet,
     BannedIps, BoxError, Config, PeerError, PeerSocketAddr, PeerSource, SharedPeerError,
 };
 
@@ -209,6 +210,9 @@ where
 
     /// A shared list of banned IP addresses.
     bans: BannedIps,
+
+    /// The unconditional peers, which [`Request::DisconnectPeer`] leaves connected.
+    unconditional_peers: UnconditionalPeerSet,
 
     /// Tracks peers returning empty `FindBlocks`/`FindHeaders` responses.
     /// Mutated only from [`Self::poll_ready`] via [`Self::stall_event_rx`].
@@ -343,6 +347,7 @@ where
     /// - `inv_stream`: receives inventory changes from peers,
     ///   allowing the peer set to direct inventory requests;
     /// - `bans`: a map of banned IP addresses that should be dropped;
+    /// - `unconditional_peers`: peers that disconnect requests leave connected;
     /// - `address_book`: when peer set is busy, it logs address book diagnostics.
     /// - `minimum_peer_version`: endpoint to see the minimum peer protocol version in real time.
     /// - `max_conns_per_ip`: configured maximum number of peers that can be in the
@@ -356,6 +361,7 @@ where
         handle_rx: tokio::sync::oneshot::Receiver<Vec<JoinHandle<Result<(), BoxError>>>>,
         inv_stream: broadcast::Receiver<InventoryChange>,
         bans: BannedIps,
+        unconditional_peers: UnconditionalPeerSet,
         address_metrics: watch::Receiver<AddressMetrics>,
         minimum_peer_version: MinimumPeerVersion<C>,
         max_conns_per_ip: Option<usize>,
@@ -367,6 +373,7 @@ where
             demand_signal,
             // Banned peers
             bans,
+            unconditional_peers,
 
             // Stall tracking
             find_response_stalls: FindResponseStallTracker::new(),
@@ -1749,7 +1756,14 @@ where
     fn call(&mut self, req: Request) -> Self::Future {
         let fut = match req {
             Request::DisconnectPeer(addr) => {
-                self.remove(&addr);
+                if self.unconditional_peers.contains(addr.ip()) {
+                    debug!(
+                        peer = %addr.addr_label(self.expose_peer_addresses),
+                        "kept an unconditional peer that a disconnect request named"
+                    );
+                } else {
+                    self.remove(&addr);
+                }
                 async { Ok(Response::Nil) }.boxed()
             }
             // Only do inventory-aware routing on individual items.

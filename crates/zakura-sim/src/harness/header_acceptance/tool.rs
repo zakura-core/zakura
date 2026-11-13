@@ -278,6 +278,50 @@ impl std::str::FromStr for Containment {
 pub const REPLAY_DIR: &str = "replay";
 /// A fresh replay's own artifact: how its child ended ([`ReplayRun`]).
 pub const REPLAY_FILE: &str = "replay.json";
+/// A tool recording's own artifact: how its `zakura-sim record` child
+/// ended ([`RecordingRun`]).
+pub const RECORDING_FILE: &str = "recorded.json";
+
+/// What a tool recording's [`RECORDING_FILE`] holds, as the runner writes
+/// it from its child.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingRun {
+    /// The ID of the run whose runner made the recording.
+    pub run_id: String,
+    /// The index of its task.
+    pub index: usize,
+    /// The recording's role in the task's directory.
+    pub role: String,
+    /// The SHA-256 of the trace it left, or `None` if it left none.
+    pub trace: Option<String>,
+    /// Whether the child exited 0, which `zakura-sim record` does only if
+    /// it recorded and any witness it judged passed.
+    pub exited_ok: bool,
+    /// Whether it ended at its deadline.
+    pub killed: bool,
+}
+
+/// Why the recording in `dir`, task `at`'s run at `role`, doesn't count,
+/// or `None` if it does: its [`RECORDING_FILE`] must name that task's run
+/// at that role and `dir`'s trace ([`binding::RECORDING`]), and its child
+/// must have exited 0, so a recorder that wrote passing artifacts and then
+/// failed gets no credit for them.
+fn recorder_refusal(dir: &Path, (at, role): (&TaskAt<'_>, &str)) -> Option<String> {
+    let expect = Expect::new().with_read(
+        Field::Trace,
+        file_digest(&dir.join("trace.jsonl")),
+        "the recorded trace can't be read",
+    );
+    let path = dir.join(RECORDING_FILE);
+    match at.read::<RecordingRun>(&binding::RECORDING, &path, role, expect) {
+        Err(why) => Some(format!("its recorder's status isn't this run's: {why}")),
+        Ok(ran) if ran.killed => Some("its recorder hit its deadline".to_owned()),
+        Ok(ran) if !ran.exited_ok => Some("its recorder exited nonzero".to_owned()),
+        Ok(_) => None,
+    }
+}
+
 /// A node case's `Draft` run's companions, judged by the case's own build
 /// ([`CompanionsRun`]).
 pub const COMPANIONS_FILE: &str = "companions.json";
@@ -1531,6 +1575,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 };
                 let checks = CaseChecks {
                     repo,
+                    at,
                     dir: &dir,
                     property,
                     harness,
@@ -1700,6 +1745,8 @@ fn task_expected(task: &Task) -> &ExpectedId {
 struct CaseChecks<'a> {
     /// The repository at S.
     repo: &'a Path,
+    /// The case's task.
+    at: TaskAt<'a>,
     /// The case task's directory.
     dir: &'a Path,
     /// The case's property directory.
@@ -1763,6 +1810,9 @@ impl CaseChecks<'_> {
     fn draft(&self, run: RunId) -> Execution {
         let dir = self.dir.join("draft");
         let mut execution = execution(&dir, run, self.harness, RunBy::Tool);
+        if let Some(why) = recorder_refusal(&dir, (&self.at, "draft")) {
+            fail(&mut execution, why);
+        }
         if let Some(why) = case_input_refusal(self.repo, self.harness, self.input, &dir) {
             fail(&mut execution, why);
         }
@@ -1913,6 +1963,9 @@ fn history_execution(
     let (package, file, name, case) = test;
     let recording = dir.join("run");
     let mut execution = execution(&recording, run, harness, RunBy::Tool);
+    if let Some(why) = recorder_refusal(&recording, (at, "run")) {
+        fail(&mut execution, why);
+    }
     match witness {
         (property, Some(expect)) if !witness_judges(&recording, property, expect, &[]) => {
             execution.trigger = false;
@@ -3579,6 +3632,25 @@ mod tests {
     const MACHINE: &str = "header/reactor-policy";
     const NODE: &str = "header-sync/storage";
 
+    /// Writes the [`RECORDING_FILE`] the runner leaves beside the tool
+    /// recording in `dir`, [`AT`]'s run at `role`, naming its trace, for a
+    /// recorder that exited 0 if `exited_ok`.
+    fn recorder_exited(dir: &Path, role: &str, exited_ok: bool) {
+        let ran = RecordingRun {
+            run_id: AT.run_id.into(),
+            index: AT.index,
+            role: role.into(),
+            trace: file_digest(&dir.join("trace.jsonl")),
+            exited_ok,
+            killed: false,
+        };
+        fs::write(
+            dir.join(RECORDING_FILE),
+            serde_json::to_string(&ran).expect("a recording run serializes"),
+        )
+        .expect("the temp dir is writable");
+    }
+
     /// Records a real trace of the machine harness on its committed input
     /// into `dir`, its meta's build source set to `source`, with a witness
     /// that passed.
@@ -4817,6 +4889,7 @@ mod tests {
             .expect("the case's harness records its committed input");
         let checks = CaseChecks {
             repo: &repo,
+            at: AT,
             dir: case.path(),
             property,
             harness,
@@ -4840,6 +4913,7 @@ mod tests {
             &draft_dir,
         )
         .expect("the case's harness records its committed input");
+        recorder_exited(&draft_dir, "draft", true);
         let draft_run = |expect: &str, beside: &[String]| {
             write_witness(
                 &draft_dir,
@@ -5037,6 +5111,7 @@ mod tests {
         let case = case_dir("s", "patched");
         let draft_dir = case.path().join("draft");
         record_into(&draft_dir, "patched");
+        recorder_exited(&draft_dir, "draft", true);
         let input = CaseInput::Fuzz {
             input: MACHINE_INPUT.into(),
         };
@@ -5046,6 +5121,7 @@ mod tests {
         };
         let checks = CaseChecks {
             repo: &repo,
+            at: AT,
             dir: case.path(),
             property: MACHINE,
             harness: MACHINE,
@@ -5083,6 +5159,106 @@ mod tests {
             "{:?}",
             failed.end
         );
+    }
+
+    /// A tool recording counts only if its recorder exited 0. A history
+    /// run and a `Draft` run whose recorder wrote every artifact, all
+    /// passing, and then exited 1 each fail, and so does one whose status
+    /// names another role, another trace, or is missing.
+    #[test]
+    fn a_recorder_s_nonzero_exit_fails_its_run() {
+        let status = |dir: &Path, role: &str, trace: Option<String>, exited_ok: bool| {
+            let ran = serde_json::json!({
+                "run_id": "r",
+                "index": 0,
+                "role": role,
+                "trace": trace,
+                "exited_ok": exited_ok,
+                "killed": false,
+            });
+            fs::write(dir.join("recorded.json"), ran.to_string())
+                .expect("the temp dir is writable");
+        };
+        let refused = |run: &Execution, why: &str| matches!(&run.end, End::Failed { why: found } if found.contains(why));
+
+        let history = tempfile::tempdir().expect("a temp dir can be created");
+        history_task_dir(
+            history.path(),
+            Some(serde_json::json!({ "property": "p/a", "expect": "holds", "passed": true })),
+        );
+        let run = history.path().join("run");
+        let trace = file_digest(&run.join("trace.jsonl"));
+        let read = || {
+            history_execution(
+                (history.path(), &AT),
+                history_run(),
+                NODE,
+                ("p/a", Some("holds")),
+                ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
+                "s",
+            )
+        };
+        status(&run, "run", trace.clone(), true);
+        let ok = read();
+        assert!(
+            ok.trigger && !matches!(ok.end, End::Failed { .. }),
+            "{:?}",
+            ok.end
+        );
+        status(&run, "run", trace.clone(), false);
+        assert!(refused(&read(), "nonzero"), "{:?}", read().end);
+        status(&run, "draft", trace.clone(), true);
+        assert!(refused(&read(), "recorder"), "{:?}", read().end);
+        status(&run, "run", Some("0".repeat(64)), true);
+        assert!(refused(&read(), "recorder"), "{:?}", read().end);
+        fs::remove_file(run.join("recorded.json")).expect("it exists");
+        assert!(refused(&read(), "recorder"), "{:?}", read().end);
+
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let case = case_dir("s", "patched");
+        let draft_dir = case.path().join("draft");
+        record_into(&draft_dir, "patched");
+        let input = CaseInput::Fuzz {
+            input: MACHINE_INPUT.into(),
+        };
+        let expected = PatchedWitness {
+            expect: "violated".into(),
+            beside: Vec::new(),
+        };
+        write_witness(
+            &draft_dir,
+            serde_json::json!({
+                "property": MACHINE,
+                "expect": "violated",
+                "also_violates": [],
+                "passed": true,
+                "error": null,
+            }),
+        );
+        let checks = CaseChecks {
+            repo: &repo,
+            at: AT,
+            dir: case.path(),
+            property: MACHINE,
+            harness: MACHINE,
+            input: &input,
+            subject_source: "s",
+            draft_witness: Some(&expected),
+            subject: "s",
+            patch: TEST_PATCH,
+        };
+        let draft = || {
+            checks.draft(RunId::Case {
+                property: MACHINE.into(),
+                name: "a".into(),
+                run: CaseRun::Draft,
+            })
+        };
+        let trace = file_digest(&draft_dir.join("trace.jsonl"));
+        status(&draft_dir, "draft", trace.clone(), true);
+        assert_eq!(draft().end, End::Completed);
+        status(&draft_dir, "draft", trace, false);
+        assert!(refused(&draft(), "nonzero"), "{:?}", draft().end);
     }
 
     /// A typed planted case plans beside a fuzz-input one: each gets a task
@@ -6214,6 +6390,7 @@ mod tests {
         if let Some(witness) = witness {
             write_witness(&dir.join("run"), witness);
         }
+        recorder_exited(&dir.join("run"), "run", true);
     }
 
     /// A witness test's declaration counts only for the run, task and role

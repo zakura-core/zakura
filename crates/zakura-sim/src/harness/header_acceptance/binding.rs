@@ -212,6 +212,21 @@ pub const REPLAY: Kind = Kind {
     closed: false,
 };
 
+/// A tool recording's `recorded.json` ([`RecordingRun`](super::tool::RecordingRun)),
+/// which the runner writes for the run, task and role whose recording it
+/// made, with the trace that recording left.
+pub const RECORDING: Kind = Kind {
+    name: "recorded.json",
+    carries: &[
+        (Field::RunId, "/run_id"),
+        (Field::TaskIndex, "/index"),
+        (Field::Role, "/role"),
+        (Field::Trace, "/trace"),
+    ],
+    required: &[Field::RunId, Field::TaskIndex, Field::Role, Field::Trace],
+    closed: false,
+};
+
 /// A recording's or a fresh replay's `full-report.json` (C8).
 pub const FULL_REPORT: Kind = Kind {
     name: "full-report.json",

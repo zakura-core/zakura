@@ -91,6 +91,7 @@ fn raw_blocks(
 ) -> Vec<(Height, Vec<RawBytes>)> {
     heights
         .map(|height| {
+            // Widening a `u32` to `usize` is lossless on supported targets.
             let transactions = blocks[height as usize]
                 .transactions
                 .iter()
@@ -168,6 +169,7 @@ fn committed_bodies_move_to_static_files_in_batches() {
     // A range across the static file tip merges both stores in location order.
     let start = TransactionLocation::min_for_height(Height(MOVED_TIP.0 - 3));
     let end = TransactionLocation::max_for_height(Height(MOVED_TIP.0 + 3));
+    // Widening a `u32` to `usize` is lossless on supported targets.
     let expected: Vec<_> = blocks[MOVED_TIP.0 as usize - 3..=MOVED_TIP.0 as usize + 3]
         .iter()
         .flat_map(|block| block.transactions.iter().map(|tx| tx.hash()))
@@ -194,6 +196,7 @@ fn secondary_range_reads_include_blocks_the_primary_moved_later() {
     let config = config_at(dir.path());
 
     // The secondary lists the static files after the first move only.
+    // Widening a `u32` to `usize` is lossless on supported targets.
     let first_move = STATIC_FILE_MOVE_THRESHOLD as usize + 1;
     let mut primary = FinalizedState::new(&config, &network).expect("state opens");
     commit(&mut primary, &blocks[..first_move]);
@@ -368,6 +371,7 @@ fn the_mover_frees_moved_files_after_the_delay_without_more_commits() {
     state.db.compact_raw_transaction_range(Height(0), Height(1));
     let genesis_bytes = state.db.live_sst_bytes_for_test("tx_by_loc");
     assert!(genesis_bytes > 0);
+    // Widening a `u32` to `usize` is lossless on supported targets.
     let before_move = STATIC_FILE_MOVE_THRESHOLD as usize;
     commit(&mut state, &blocks[1..before_move]);
     state
@@ -404,12 +408,14 @@ fn moves_record_blocks_a_failed_move_left_in_static_files() {
     // A move whose database write failed: its blocks are in static files but
     // still in `tx_by_loc`, and the recorded tip didn't move.
     let appended = MOVED_TIP.0 + 10;
+    // Widening a `u32` to `usize` is lossless on supported targets.
     commit(&mut state, &blocks[..=appended as usize]);
     state
         .db
         .append_static_file_blocks_for_test(&raw_blocks(&blocks, MOVED_TIP.0 + 1..=appended));
     assert_eq!(state.db.static_file_transactions_tip(), Some(MOVED_TIP));
 
+    // Widening a `u32` to `usize` is lossless on supported targets.
     commit(&mut state, &blocks[appended as usize + 1..]);
     assert_eq!(
         state.db.static_file_transactions_tip(),
@@ -568,6 +574,7 @@ fn a_failed_static_file_write_stops_moves_until_reopen() {
     let blocks = test_chain();
     let dir = TempDir::new().expect("temp dir");
     let config = config_at(dir.path());
+    // Widening a `u32` to `usize` is lossless on supported targets.
     let first_move = STATIC_FILE_MOVE_THRESHOLD as usize + 1;
 
     let mut state = FinalizedState::new(&config, &network).expect("state opens");
@@ -636,6 +643,7 @@ fn rollback_deletes_rows_a_file_delete_brought_back() {
     assert!(tx_by_loc_heights(&state.db)
         .iter()
         .all(|height| *height <= target || *height > MOVED_TIP));
+    // Widening a `u32` to `usize` is lossless on supported targets.
     commit(&mut state, &blocks[target.0 as usize + 1..]);
     assert_chain_reads(&state.db, &blocks);
 }
@@ -667,11 +675,13 @@ fn rollback_truncates_static_files() {
     let mut state = FinalizedState::new(&config, &network).expect("state reopens");
     assert_eq!(state.db.static_file_transactions_tip(), Some(target));
     assert_eq!(state.db.finalized_tip_height(), Some(target));
+    // Widening a `u32` to `usize` is lossless on supported targets.
     assert_chain_reads(&state.db, &blocks[..=target.0 as usize]);
     assert!(!state.db.contains_body_at_height(Height(target.0 + 1)));
 
     // The rolled back blocks commit and move again, in a batch that starts
     // after the rollback target.
+    // Widening a `u32` to `usize` is lossless on supported targets.
     commit(&mut state, &blocks[target.0 as usize + 1..]);
     assert_eq!(
         state.db.static_file_transactions_tip(),

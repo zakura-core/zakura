@@ -215,6 +215,7 @@ impl ZakuraDb {
 
         metrics::histogram!("zakura.state.static_files.move.duration_seconds")
             .record(move_start.elapsed().as_secs_f64());
+        // A move holds at most `MAX_STATIC_FILE_MOVE_BLOCKS` blocks, so the count fits in a `u64`.
         metrics::counter!("zakura.state.static_files.moved.blocks").increment(blocks.len() as u64);
 
         Ok(true)

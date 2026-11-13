@@ -593,6 +593,7 @@ impl ZakuraDb {
     /// Call this periodically (e.g., every 30 seconds) from a background task.
     pub(crate) fn export_metrics(&self) {
         self.db.export_metrics();
+        // Static file sizes stay far below `f64`'s exact integer range of 2^53 bytes.
         ::metrics::gauge!("zakura.state.static_files.total_disk_size_bytes")
             .set(self.static_files.committed_bytes() as f64);
     }

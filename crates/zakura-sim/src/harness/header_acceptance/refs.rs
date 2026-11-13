@@ -287,8 +287,10 @@ pub struct TriggerRef {
 }
 impl Ref for TriggerRef {}
 
-/// One fact of a node's `ends` store, by the stamp the store records it
-/// under, which its `causes` name it by.
+/// One fact of a node's stores, by the node stamp the store records it
+/// under: an `ends` fact as its `causes` name it, or an adoption fact as a
+/// check's new stamps name it. The stores share the node's one stamp
+/// counter, so a stamp names one fact.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StampRef {
     /// The stamp.

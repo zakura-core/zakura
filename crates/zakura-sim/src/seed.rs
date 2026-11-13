@@ -27,7 +27,9 @@
 //! target checks and `zakura-sim seeds --out` run each one as an input that
 //! passes. A seed that fails by design, whose witness
 //! [expects a violation](Sidecar::expects_violation), sits in a
-//! subdirectory such as `known-failures/`, which only its own test loads.
+//! subdirectory such as `known-failures/`, which only its own test loads. A
+//! seed that runs too long for a fuzz input sits in `slow-seeds/` the same
+//! way.
 
 use std::{
     fmt, fs, io,

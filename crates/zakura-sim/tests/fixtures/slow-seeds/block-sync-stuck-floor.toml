@@ -2,6 +2,8 @@
 # runs it, the generator version it was built for, and its SHA-256. Its
 # first two bytes, `ff 02`, pick the stuck-floor scenario: one mirror serves
 # 840 bodies but withholds height 3.
+# Its run takes over 20 minutes in a target's AddressSanitizer build, too
+# long for a fuzz input, so it sits in `slow-seeds/`, outside the seed corpus.
 harness = "block-sync/storage"
 generator = 3
 sha256 = "4fa5ce72c2dcba356e9db4a472497944eb6720eac3db88e18f4b37cd57d8916d"

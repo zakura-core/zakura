@@ -452,6 +452,12 @@ loads it: `known-failures/` holds open-bug repros, and `race-schedules/`
 holds the planted races' violating schedules. The seed tests fail on a
 corpus seed that expects a violation and on a known failure that doesn't.
 
+A seed that runs clean but too long for a fuzz input sits in `slow-seeds/`.
+Each of its runs takes 20 minutes or more in a target's AddressSanitizer
+build, far past a campaign's 30-second input timeout, so the seed would
+fail every campaign's first pass over its corpus. Its own tests and its
+planted case still run it.
+
 `cargo xtask sim-seeds` validates every seed against the current generators.
 A required seed that fails, such as one built for an older generator or one
 whose prefix now decodes to another scenario, fails the command with the

@@ -3,6 +3,8 @@
 # SHA-256. Its first two bytes, `ff 08`, pick the capacity-release scenario.
 # Its plan has block sync handle the detached commit's reply before its tip,
 # so the freed room wakes the waiting body.
+# Its run takes over 20 minutes in a target's AddressSanitizer build, too
+# long for a fuzz input, so it sits in `slow-seeds/`, outside the seed corpus.
 harness = "block-sync/storage"
 generator = 3
 sha256 = "d4c200d4dbce4f9c68f34c674d96d7e475926dc38af62d5381fcb8dc575510c5"

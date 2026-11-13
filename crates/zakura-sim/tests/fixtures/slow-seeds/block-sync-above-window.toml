@@ -4,6 +4,8 @@
 # 420 bodies of unknown size but withhold height 3 and every height above
 # 403, so the node requests above-window heights that never arrive. The
 # plan is empty, so every pick is round-robin.
+# Its run takes over 20 minutes in a target's AddressSanitizer build, too
+# long for a fuzz input, so it sits in `slow-seeds/`, outside the seed corpus.
 harness = "block-sync/storage"
 generator = 3
 sha256 = "e66b81be1c76b815b0d2ef0c9b60e702d09219cf7d689b1f1100c6a11d0599cd"

@@ -50,7 +50,8 @@ lane is `baseline-fails`. A property that no generator harness reaches has a
 
 Every lane that survived, or that another rule killed, needs a triage record
 in `triage.toml`: the case's patch and property, the lane (`witness` or the
-generator harness), the class it explains (`survived` or
+generator harness), a generator lane's mode (`inproc` unless the record says
+`libfuzzer`), the class it explains (`survived` or
 `killed-by-other-rule`), the other rule's ID for a kill by another rule
 (`other`, required there and forbidden otherwise), the causal-chain stage
 where the bug stopped (`generator`, `schedule`, `observation`, `property` or

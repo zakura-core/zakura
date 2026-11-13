@@ -7,6 +7,7 @@
 # patch = "<the report's patch>"
 # property = "<the case's property>"
 # lane = "witness"          # or the generator harness, for every seed
+# mode = "libfuzzer"        # a generator lane's mode; inproc if absent
 # class = "survived"        # or killed-by-other-rule
 # other = "<the other ID>"  # for killed-by-other-rule only, and required there
 # stage = "generator"       # generator, schedule, observation, property or unsupported

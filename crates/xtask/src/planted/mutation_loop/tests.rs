@@ -22,13 +22,13 @@ use super::{
     generate::{
         baseline_lane, campaign_class, co_violation_confirmed, co_violations, confirm_child,
         confirmed, judge_unpatched, no_generator as no_generator_of, plan, shrink_wall,
-        unpatched_class, write_exclusions, FollowUp, GenBaseline, GenerateConfig, GenerateMode,
-        GeneratorBaselineFailure, GeneratorReport, Kill, KillTrace, Lanes, OnUnpatched,
-        PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck,
+        unpatched_class, unpatched_id, write_exclusions, FollowUp, GenBaseline, GenerateConfig,
+        GenerateMode, GeneratorBaselineFailure, GeneratorReport, Kill, KillTrace, Lanes,
+        OnUnpatched, PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck, UnpatchedRun,
     },
-    parse_flags, planted_cases, selects, summarize, test_executables, triage, BaselineReport,
-    BuildIdentity, CaseReport, GenerateFlags, ListedCase, LoopCase, Mutant, Report, Runner, Slot,
-    WitnessSpec,
+    merge_alone, parse_flags, planted_cases, selects, summarize, test_executables, triage,
+    BaselineReport, BuildIdentity, CaseReport, GenerateFlags, ListedCase, LoopCase, Mutant, Report,
+    Runner, Slot, WitnessSpec,
 };
 use crate::planted::lane::{campaign_facts, Campaign, CampaignFacts};
 
@@ -1054,6 +1054,48 @@ fn a_case_watches_its_work_list_entrys_paths() {
     ));
 }
 
+/// With generator lanes on, every case watches the inputs the lanes read:
+/// the work list, whose `[[no-generator]]` records apply to a planted case
+/// that names no entry, then the excluded inputs for an `inproc` search or
+/// the fuzz targets for a `libfuzzer` lane. With the lanes off, a planted
+/// case watches none of them.
+#[test]
+fn generator_lanes_watch_their_inputs() {
+    let repo_root = crate::repo_root().expect("xtask lives in the workspace");
+    let cases = planted_cases(&repo_root, &["session/connection-shares-bound".to_owned()])
+        .expect("the committed planted cases parse");
+    let case = cases
+        .first()
+        .expect("connection-shares-bound has planted cases");
+    assert_eq!(case.entry, None);
+    let own = super::watched(&repo_root, case).expect("the case's files read");
+    let watches = |flags: &GenerateFlags, path: &str| {
+        let mut watched = own.clone();
+        watched.extend(super::generate::watched(flags));
+        crate::planted::is_affected(&watched, &[path.into()])
+    };
+    let inproc = GenerateFlags {
+        runs: 10,
+        ..GenerateFlags::default()
+    };
+    let libfuzzer = GenerateFlags {
+        mode: GenerateMode::Libfuzzer,
+        ..inproc.clone()
+    };
+    let work_list = "qa/native-mutations/work-list.toml";
+    let excluded = "qa/planted/discovery/s4v2/hello/sender-cadence/repeat-hello.plan.bin";
+    let target = "qa/fuzz/sim/fuzz_targets/block_sync_storage.rs";
+    for path in [work_list, excluded, target] {
+        assert!(!watches(&GenerateFlags::default(), path), "off: {path}");
+    }
+    assert!(watches(&inproc, work_list));
+    assert!(watches(&inproc, excluded));
+    assert!(!watches(&inproc, target));
+    assert!(watches(&libfuzzer, work_list));
+    assert!(!watches(&libfuzzer, excluded));
+    assert!(watches(&libfuzzer, target));
+}
+
 // The generator lane (mut-4.3 and mut-4.4).
 
 /// A search's report that stopped at `stop`, with `NAMED`'s outcome
@@ -1341,6 +1383,7 @@ fn a_kill_that_fails_unpatched_is_a_property_finding() {
     let killed = classify::Classified::new(Class::KilledByNamedRule, None, "the kill");
     let check = |trace, outcome| UnpatchedCheck {
         trace,
+        property: None,
         outcome,
         detail: "the trace violates it on the unpatched build too".to_owned(),
         log: format!("mutants/x/unpatched-{trace:?}-replay.log").into(),
@@ -1550,6 +1593,8 @@ fn fake_kill(
             GenBaseline {
                 failure: None,
                 millis: 10,
+                runs: Some(1),
+                alone: false,
             },
         )]),
         exclude: out.path().join("exclude.txt"),
@@ -1669,7 +1714,7 @@ fn a_co_violation_kill_needs_its_property_in_the_confirmation() {
     #[cfg(unix)]
     {
         let cases = [generator_case(NAMED, &[OTHER]), generator_case(OTHER, &[])];
-        let holds = full_report(&[], &[OTHER]);
+        let holds = full_report(&[], &[OTHER, NAMED]);
         let lanes = fake_kill(OTHER, &[OTHER, NAMED], &both, Some(&holds), &cases);
         assert_eq!(lanes[0].result.class, Class::KilledByNamedRule, "{lanes:?}");
         assert_eq!(lanes[0].violated.as_deref(), Some(OTHER));
@@ -1680,6 +1725,17 @@ fn a_co_violation_kill_needs_its_property_in_the_confirmation() {
             "{lanes:?}"
         );
         assert_eq!(lanes[1].result.class, Class::KilledByNamedRule, "{lanes:?}");
+
+        // The unpatched build violates OTHER, the allowed co-violation, and
+        // holds NAMED. The NAMED case's kill rests on NAMED, so it stands.
+        // The OTHER case's kill rests on OTHER, so its baseline fails.
+        let pinned = full_report(&[OTHER], &[NAMED]);
+        let lanes = fake_kill(OTHER, &[OTHER, NAMED], &both, Some(&pinned), &cases);
+        assert_eq!(lanes[0].result.class, Class::KilledByNamedRule, "{lanes:?}");
+        assert_eq!(lanes[0].unpatched[0].property.as_deref(), Some(NAMED));
+        assert_eq!(lanes[0].unpatched[0].outcome, OnUnpatched::Holds);
+        assert_eq!(lanes[1].result.class, Class::BaselineFails, "{lanes:?}");
+        assert_eq!(lanes[1].unpatched[0].property.as_deref(), Some(OTHER));
     }
 }
 
@@ -1795,6 +1851,8 @@ fn only_a_confirmed_unpatched_violation_is_a_property_finding() {
                         "the unpatched search violates x",
                     )),
                     millis: 10,
+                    runs: Some(50),
+                    alone: false,
                 },
             ),
             (
@@ -1806,6 +1864,8 @@ fn only_a_confirmed_unpatched_violation_is_a_property_finding() {
                         "the search passed its deadline",
                     )),
                     millis: 10,
+                    runs: Some(50),
+                    alone: false,
                 },
             ),
         ]),
@@ -2566,6 +2626,10 @@ fn a_triage_record_names_its_other_rule_only_for_another_rules_kill() {
         ),
         ("", "missing field `class`"),
         ("class = \"killed-by-named-rule\"\n", "unknown variant"),
+        (
+            "class = \"survived\"\nmode = \"inproc\"\n",
+            "names a `mode`, which only a generator lane takes",
+        ),
     ] {
         fs::write(&file, record(fields)).unwrap();
         let read = triage::read(root.path()).unwrap_err().to_string();
@@ -2742,12 +2806,12 @@ fn the_unpatched_build_reruns_a_kills_input() {
                 "block-sync/storage",
                 which,
                 trace,
-                NAMED,
                 &dir,
                 None,
                 Duration::from_secs(30),
             )
             .unwrap()
+            .judge(NAMED)
     };
 
     let rerun = check(KillTrace::Confirmed, &confirmed);
@@ -2774,4 +2838,300 @@ fn the_unpatched_build_reruns_a_kills_input() {
     );
     assert!(calls[1].starts_with("replay "), "{}", calls[1]);
     assert!(calls[1].contains("--allow-build-mismatch"), "{}", calls[1]);
+}
+
+/// A generator lane that the memory cap killed reruns alone, as does a
+/// harness failure on a harness and seed whose baseline needed the host's
+/// memory. A broken build, a kill and a baseline failure don't.
+#[test]
+fn a_generator_lane_the_cap_killed_reruns_alone() {
+    let out = tempfile::tempdir().expect("a temporary directory");
+    let harness = "block-sync/storage";
+    let baseline = |alone| GenBaseline {
+        failure: None,
+        millis: 10,
+        runs: Some(1),
+        alone,
+    };
+    let lanes = Lanes {
+        flags: GenerateFlags {
+            runs: 1,
+            seeds: vec![7, 8],
+            ..GenerateFlags::default()
+        },
+        plans: vec![Ok(harness.to_owned())],
+        baselines: BTreeMap::from([
+            ((harness.to_owned(), 7), baseline(false)),
+            ((harness.to_owned(), 8), baseline(true)),
+        ]),
+        exclude: out.path().join("exclude.txt"),
+        corpus: out.path().join("corpus"),
+        targets: BTreeMap::new(),
+        unpatched_sim: out.path().join("zakura-sim"),
+    };
+    let lane = |seed, class, reason| {
+        GeneratorReport::unsearched(
+            harness,
+            seed,
+            GenerateMode::Inproc,
+            classify::Classified::new(class, reason, "why"),
+        )
+    };
+    for (seed, class, reason, reruns) in [
+        (7, Class::HarnessFailure, Some(Reason::Oom), true),
+        (7, Class::HarnessFailure, Some(Reason::Timeout), false),
+        (8, Class::HarnessFailure, Some(Reason::Timeout), true),
+        (8, Class::HarnessFailure, Some(Reason::NoEndRecord), true),
+        (8, Class::HarnessFailure, Some(Reason::Build), false),
+        (8, Class::KilledByNamedRule, None, false),
+        (8, Class::BaselineFails, None, false),
+    ] {
+        assert_eq!(
+            lanes.reruns_alone(&lane(seed, class, reason)),
+            reruns,
+            "seed {seed}: {class:?} {reason:?}"
+        );
+    }
+}
+
+/// A case's run alone replaces only what reran: the witness lane if the
+/// cap killed the first witness, and each generator lane that reruns
+/// alone, matched by seed. Every other lane keeps its first result.
+#[test]
+fn a_run_alone_replaces_only_the_lanes_that_reran() {
+    let lane = |seed, class, reason| {
+        GeneratorReport::unsearched(
+            "block-sync/storage",
+            seed,
+            GenerateMode::Inproc,
+            classify::Classified::new(class, reason, "why"),
+        )
+    };
+    let case = |result: classify::Classified, generator: Vec<GeneratorReport>| CaseReport {
+        patch: "bounds/raise/raise.patch".to_owned(),
+        patch_sha256: "00".repeat(32),
+        property: NAMED.to_owned(),
+        entry: None,
+        table: None,
+        witness: WitnessSpec::Test {
+            test: "t".to_owned(),
+            test_target: "block_table".to_owned(),
+        },
+        also_violates: Vec::new(),
+        result,
+        trigger: None,
+        baseline: BaselineReport {
+            passed: true,
+            detail: None,
+            millis: 10,
+            rerun_alone: false,
+        },
+        millis: Some(10),
+        peak_rss_kib: None,
+        log: None,
+        rerun_alone: false,
+        generator,
+        no_generator: None,
+        triage: None,
+    };
+    let oom = || classify::Classified::new(Class::HarnessFailure, Some(Reason::Oom), "cap");
+    let held = || classify::Classified::new(Class::Survived, Some(Reason::Held), "held");
+    let killed = || classify::Classified::new(Class::KilledByNamedRule, None, "killed");
+    let reruns = |lane: &GeneratorReport| lane.result.reason == Some(Reason::Oom);
+
+    // The witness held, so it keeps its first result. Seed 7's lane the
+    // cap killed takes the rerun's kill. Seed 8's held lane keeps its own,
+    // though the rerun has another.
+    let first = case(
+        held(),
+        vec![
+            lane(7, Class::HarnessFailure, Some(Reason::Oom)),
+            lane(8, Class::Survived, Some(Reason::Held)),
+        ],
+    );
+    let rerun = case(
+        killed(),
+        vec![
+            lane(7, Class::KilledByNamedRule, None),
+            lane(8, Class::HarnessFailure, Some(Reason::Panic)),
+        ],
+    );
+    let merged = merge_alone(first, rerun, reruns);
+    assert_eq!(merged.result, held());
+    assert!(!merged.rerun_alone);
+    assert_eq!(merged.generator[0].result.class, Class::KilledByNamedRule);
+    assert!(merged.generator[0].rerun_alone);
+    assert_eq!(merged.generator[1].result.class, Class::Survived);
+    assert!(!merged.generator[1].rerun_alone);
+
+    // The cap killed the witness, so it takes the rerun's result. The
+    // generator lane survived, so the rerun, which searched nothing, leaves
+    // it.
+    let first = case(oom(), vec![lane(7, Class::Survived, Some(Reason::Held))]);
+    let rerun = case(killed(), Vec::new());
+    let merged = merge_alone(first, rerun, reruns);
+    assert_eq!(merged.result, killed());
+    assert!(merged.rerun_alone);
+    assert_eq!(merged.generator.len(), 1);
+    assert_eq!(merged.generator[0].result.class, Class::Survived);
+}
+
+/// A kill by the named rule that stopped on an allowed co-violation is
+/// judged on the unpatched build by the case's property, not by the
+/// co-violation that stopped the search: an unpatched run that violates
+/// only the co-violation leaves the kill. A kill by another rule is judged
+/// by its killing ID.
+#[test]
+fn the_unpatched_check_judges_a_named_kill_by_the_cases_property() {
+    let named = classify::Classified::new(Class::KilledByNamedRule, None, "the kill");
+    let other = classify::Classified {
+        other: Some(OTHER.to_owned()),
+        ..classify::Classified::new(Class::KilledByOtherRule, None, "the kill")
+    };
+    assert_eq!(unpatched_id(&named, NAMED, OTHER), NAMED);
+    assert_eq!(unpatched_id(&other, NAMED, OTHER), OTHER);
+
+    // The unpatched build violates the allowed co-violation, `OTHER`, on
+    // the confirmed trace, and holds the case's property.
+    let report = json!({"properties": [
+        {"property": NAMED, "violations": []},
+        {"property": OTHER, "violations": [{"step": 3}]},
+    ]})
+    .to_string();
+    let run = UnpatchedRun {
+        trace: KillTrace::Confirmed,
+        command: "record",
+        report: Some(report),
+        ended: "exited 0".to_owned(),
+        log: "mutants/x/unpatched-confirmed-record.log".into(),
+    };
+    let check = run.judge(unpatched_id(&named, NAMED, OTHER));
+    assert_eq!(check.property.as_deref(), Some(NAMED));
+    assert_eq!(check.outcome, OnUnpatched::Holds, "{}", check.detail);
+    assert_eq!(unpatched_class(named.clone(), &[check]), named);
+
+    // Judged by the killing ID, the same run would have failed the kill's
+    // baseline.
+    let check = run.judge(OTHER);
+    assert_eq!(check.outcome, OnUnpatched::Violated);
+    let failed = unpatched_class(named, std::slice::from_ref(&check));
+    assert_eq!(failed.class, Class::BaselineFails);
+
+    // A finding names the ID its check judged.
+    let mut lane =
+        GeneratorReport::unsearched("block-sync/storage", 11, GenerateMode::Inproc, failed);
+    lane.violated = Some(NAMED.to_owned());
+    lane.unpatched = vec![check];
+    assert_eq!(
+        lane.finding()
+            .and_then(|finding| finding.property)
+            .as_deref(),
+        Some(OTHER)
+    );
+}
+
+/// A generator lane's record names its mode, `inproc` by default, so an
+/// `inproc` lane's reason never lands on a `libfuzzer` lane of the same
+/// harness, class and other rule, and a `libfuzzer` record lands only on a
+/// `libfuzzer` lane.
+#[test]
+fn a_triage_record_matches_only_its_generator_mode() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join(triage::TRIAGE_FILE);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(
+        &file,
+        format!(
+            r##"
+[[triage]]
+patch = "p.patch"
+property = "{NAMED}"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = "inproc draws honest mirrors only"
+
+[[triage]]
+patch = "p.patch"
+property = "{NAMED}"
+lane = "block-sync/storage"
+mode = "libfuzzer"
+class = "survived"
+stage = "schedule"
+reason = "the campaign never reaches the race"
+"##
+        ),
+    )
+    .unwrap();
+    let records = triage::read(root.path()).unwrap();
+    assert_eq!(records[0].mode, None);
+    assert_eq!(records[1].mode, Some(GenerateMode::Libfuzzer));
+    let survived = || classify::Classified::new(Class::Survived, Some(Reason::Held), "why");
+    let lane = |mode| GeneratorReport::unsearched("block-sync/storage", 11, mode, survived());
+    let case = |generator| CaseReport {
+        patch: "p.patch".to_owned(),
+        patch_sha256: String::new(),
+        property: NAMED.to_owned(),
+        entry: None,
+        table: None,
+        witness: WitnessSpec::Test {
+            test: "t".to_owned(),
+            test_target: "block_table".to_owned(),
+        },
+        also_violates: Vec::new(),
+        result: classify::Classified::new(Class::KilledByNamedRule, None, "why"),
+        trigger: None,
+        baseline: BaselineReport {
+            passed: true,
+            detail: None,
+            millis: 1,
+            rerun_alone: false,
+        },
+        millis: None,
+        peak_rss_kib: None,
+        log: None,
+        rerun_alone: false,
+        generator,
+        no_generator: None,
+        triage: None,
+    };
+    let mut cases = vec![case(vec![
+        lane(GenerateMode::Inproc),
+        lane(GenerateMode::Libfuzzer),
+    ])];
+    assert!(triage::apply(&mut cases, &records).is_empty());
+    let stages: Vec<_> = cases[0]
+        .generator
+        .iter()
+        .map(|lane| lane.triage.as_ref().map(|triage| triage.stage))
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            Some(triage::Stage::Generator),
+            Some(triage::Stage::Schedule)
+        ]
+    );
+
+    // Without a libFuzzer record, the libFuzzer lane stays untriaged.
+    let mut cases = vec![case(vec![lane(GenerateMode::Libfuzzer)])];
+    assert_eq!(triage::apply(&mut cases, &records[..1]), vec![&records[0]]);
+    assert_eq!(cases[0].generator[0].triage, None);
+    assert_eq!(triage::untriaged(&cases), 1);
+}
+
+/// A mutant kill's follow-ups take their time per run from the baseline
+/// search's own runs: a `libfuzzer` campaign that ran 600 s and executed
+/// 30,000 inputs ran each in 20 ms, whatever `--generate-runs` says.
+#[test]
+fn a_kills_follow_ups_count_the_baselines_own_runs() {
+    let baseline = |runs| GenBaseline {
+        failure: None,
+        millis: 600_000,
+        runs,
+        alone: false,
+    };
+    assert_eq!(baseline(Some(30_000)).per_run(), Duration::from_millis(20));
+    assert_eq!(baseline(None).per_run(), Duration::ZERO);
+    assert_eq!(baseline(Some(0)).per_run(), Duration::ZERO);
 }

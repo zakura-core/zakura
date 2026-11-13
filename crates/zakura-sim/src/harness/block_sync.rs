@@ -590,7 +590,7 @@ impl HasView for Storage {
 
 impl Subsystem for Storage {
     const NAME: &'static str = "block-sync/storage";
-    const GENERATOR: u32 = 2;
+    const GENERATOR: u32 = 3;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = BlockScenario;
     type Prepared = Ports;

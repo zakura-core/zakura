@@ -36,7 +36,8 @@
 //! Each witness process runs under `systemd-run --scope -p MemoryMax=<cap>`.
 //! The cap is the host's memory divided by the slots, unless
 //! `--memory-max` sets it. A baseline witness or a case the cap killed
-//! reruns alone, with the host's memory as its cap. A mutant's deadline is
+//! reruns alone, with the host's memory as its cap, as does a generator
+//! lane the cap killed. A mutant's deadline is
 //! five times its baseline's time, and at least 60 s. A timeout is a
 //! harness failure, never a kill or a survivor.
 //!
@@ -49,6 +50,8 @@
 //! `--changed-since <rev>` keeps only the cases a change since `rev` can
 //! affect, by `cargo xtask planted`'s rule: the patch, the case file, the
 //! witness's files, the files the patch changes, and the shared machinery.
+//! With generator lanes on, a change to the work list, or to the inputs
+//! their searches read, affects every case ([`generate::watched`]).
 //!
 //! `--list` prints the cases the other flags select, as JSON, by the fields
 //! that tell a case apart in a report ([`ListedCase`]), and runs nothing.
@@ -470,6 +473,7 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         cases,
         &flags.only,
         flags.changed_since.as_deref(),
+        &flags.generate,
     )?;
     if flags.list {
         let listed: Vec<ListedCase> = cases.iter().flatten().map(ListedCase::from).collect();
@@ -673,13 +677,15 @@ fn relative_label(repo_root: &Path, path: &Path) -> String {
 }
 
 /// The cases `only` names by property, or all of them, then those a change
-/// since `changed_since` affects. `None` if the change affects none. Fails
-/// on zero cases before the change filter.
+/// since `changed_since` affects, with the generator lanes `generate`
+/// turns on. `None` if the change affects none. Fails on zero cases before
+/// the change filter.
 fn select(
     repo_root: &Path,
     cases: Vec<LoopCase>,
     only: &[String],
     changed_since: Option<&str>,
+    generate: &GenerateFlags,
 ) -> Result<Option<Vec<LoopCase>>, BoxError> {
     if let Some(unknown) = only
         .iter()
@@ -700,7 +706,9 @@ fn select(
     let changed = changed_since_rev(repo_root, rev)?;
     let mut affected = Vec::new();
     for case in cases {
-        if is_affected(&watched(repo_root, &case)?, &changed) {
+        let mut watched = watched(repo_root, &case)?;
+        watched.extend(generate::watched(generate));
+        if is_affected(&watched, &changed) {
             affected.push(case);
         }
     }
@@ -858,6 +866,69 @@ struct Ran {
     generated: Option<GenerateFacts>,
 }
 
+/// The generator lanes of `report`'s case that rerun alone
+/// ([`Lanes::reruns_alone`]): `lanes` with only their seeds, or `None` if
+/// none does.
+fn alone_lanes(lanes: &Lanes, report: &CaseReport) -> Option<Lanes> {
+    let seeds: Vec<u64> = report
+        .generator
+        .iter()
+        .filter(|lane| lanes.reruns_alone(lane))
+        .map(|lane| lane.seed)
+        .collect();
+    (!seeds.is_empty()).then(|| {
+        let mut alone = lanes.clone();
+        alone.flags.seeds = seeds;
+        alone
+    })
+}
+
+/// A case's report after its run alone, `rerun`, from its `first` run.
+/// The witness lane takes the rerun's result if the memory cap killed the
+/// first witness. Each generator lane that `reruns` picks takes the
+/// rerun's lane for its seed, if the rerun searched it. Every other lane
+/// keeps its first result.
+fn merge_alone(
+    first: CaseReport,
+    rerun: CaseReport,
+    reruns: impl Fn(&GeneratorReport) -> bool,
+) -> CaseReport {
+    let generator = first
+        .generator
+        .iter()
+        .map(|lane| {
+            reruns(lane)
+                .then(|| {
+                    rerun
+                        .generator
+                        .iter()
+                        .find(|again| (&again.harness, again.seed) == (&lane.harness, lane.seed))
+                })
+                .flatten()
+                .map_or_else(
+                    || lane.clone(),
+                    |again| GeneratorReport {
+                        rerun_alone: true,
+                        ..again.clone()
+                    },
+                )
+        })
+        .collect();
+    let witness = if first.result.reason == Some(Reason::Oom) {
+        CaseReport {
+            rerun_alone: true,
+            no_generator: first.no_generator,
+            ..rerun
+        }
+    } else {
+        first
+    };
+    CaseReport {
+        generator,
+        ..witness
+    }
+}
+
 /// A mutant: one patch and its cases, by index into the case list.
 struct Mutant {
     patch: PathBuf,
@@ -990,32 +1061,37 @@ impl Runner {
         })?;
         let mut results = results.into_inner().expect("every worker joined");
         // A case whose witness the memory cap killed reruns alone with the
-        // host's memory. Its generator lanes keep their first results.
-        let killed: Vec<usize> = results
+        // host's memory, as do its generator lanes that
+        // `Lanes::reruns_alone` picks. Every other lane keeps its first
+        // result.
+        let alone: Vec<(usize, Option<Lanes>)> = results
             .iter()
-            .filter(|(_, report)| report.result.reason == Some(Reason::Oom))
-            .map(|(index, _)| *index)
+            .filter_map(|(index, report)| {
+                let lanes = lanes.as_ref().and_then(|lanes| alone_lanes(lanes, report));
+                (report.result.reason == Some(Reason::Oom) || lanes.is_some())
+                    .then_some((*index, lanes))
+            })
             .collect();
-        for index in killed {
+        for (index, alone_lanes) in alone {
             let mutant = Mutant {
                 patch: cases[index].patch.clone(),
                 cases: vec![index],
                 alone: true,
             };
-            for (index, mut report) in self.mutant(
+            for (index, report) in self.mutant(
                 &slots[0],
                 &mutant,
                 cases,
                 runnables,
                 &baselines,
-                None,
+                alone_lanes.as_ref(),
                 self.alone_cap(),
             )? {
-                let first = &results[&index];
-                report.generator = first.generator.clone();
-                report.no_generator = first.no_generator.clone();
-                report.rerun_alone = true;
-                results.insert(index, report);
+                let first = results.remove(&index).expect("the case ran first");
+                let merged = merge_alone(first, report, |lane| {
+                    lanes.as_ref().is_some_and(|lanes| lanes.reruns_alone(lane))
+                });
+                results.insert(index, merged);
             }
         }
         let cases: Vec<CaseReport> = results.into_values().collect();

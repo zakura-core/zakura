@@ -37,6 +37,18 @@ use crate::zakura::ZakuraConnId;
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
+
+/// A peer's entry before a generation-gated write, as
+/// [`PeerTable::before_write`] reads it.
+#[cfg(any(test, zakura_sim))]
+pub(super) enum BeforeWrite {
+    /// The peer had no entry.
+    Absent,
+    /// The writing generation owned the entry.
+    Owned,
+    /// Another generation owned the entry, with this fingerprint.
+    Other(EntryFingerprint),
+}
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use tests::{
     replay_peer_registry_bytes, replay_retry_authority_bytes, PeerRegistryReplaySummary,
@@ -111,40 +123,58 @@ impl PeerTable {
 
     /// The fingerprint of the peer's entry, if it has one.
     #[cfg(any(test, zakura_sim))]
-    pub(super) fn fingerprint(&self, peer: &ZakuraPeerId) -> Option<EntryFingerprint> {
+    fn fingerprint(&self, peer: &ZakuraPeerId) -> Option<EntryFingerprint> {
         self.peers.get(peer).map(Entry::fingerprint)
     }
 
+    /// What [`PeerTable::report_stale_change`] needs to know of the peer's
+    /// entry before a write from `generation`. Only an entry another
+    /// generation owns can report a change it had, so only that entry is
+    /// fingerprinted.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn before_write(&self, peer: &ZakuraPeerId, generation: u64) -> BeforeWrite {
+        match self.peers.get(peer) {
+            None => BeforeWrite::Absent,
+            Some(entry) if entry.generation == generation => BeforeWrite::Owned,
+            Some(entry) => BeforeWrite::Other(entry.fingerprint()),
+        }
+    }
+
     /// Reports a change that `writer`'s call from `generation` made to the
-    /// peer's entry, if another generation owns the entry. `before` is the
-    /// entry's fingerprint before the call, taken under the same lock.
+    /// peer's entry, if another generation owns the entry. `before` is what
+    /// [`PeerTable::before_write`] read before the call, under the same
+    /// lock. An entry the call created belongs to the generation that owns
+    /// it after the call.
     #[cfg(any(test, zakura_sim))]
     pub(super) fn report_stale_change(
         &self,
         peer: &ZakuraPeerId,
         writer: RegistryWriter,
         generation: u64,
-        before: Option<EntryFingerprint>,
+        before: BeforeWrite,
     ) {
-        let after = self.fingerprint(peer);
-        let Some(entry_generation) = before
-            .as_ref()
-            .or(after.as_ref())
-            .map(|entry| entry.generation)
-        else {
-            return;
-        };
-        if entry_generation != generation && before != after {
-            observe!(
-                self.observer,
-                BlockEvent::StaleRegistryChange {
-                    peer: peer.clone(),
-                    writer,
-                    generation,
-                    entry_generation,
+        let entry_generation = match before {
+            BeforeWrite::Owned => return,
+            BeforeWrite::Absent => match self.peers.get(peer) {
+                Some(entry) if entry.generation != generation => entry.generation,
+                _ => return,
+            },
+            BeforeWrite::Other(before) => {
+                if self.fingerprint(peer).as_ref() == Some(&before) {
+                    return;
                 }
-            );
-        }
+                before.generation
+            }
+        };
+        observe!(
+            self.observer,
+            BlockEvent::StaleRegistryChange {
+                peer: peer.clone(),
+                writer,
+                generation,
+                entry_generation,
+            }
+        );
     }
 
     pub(super) fn get(&self, peer: &ZakuraPeerId) -> Option<&Entry> {

@@ -703,23 +703,42 @@ pub const CONFORMANT_ACTS: [(&str, DiscoveryAct); 2] = [
     ("expired-relay", DiscoveryAct::ExpiredRelay),
 ];
 
+/// What a drawn family runs: a peer's discovery act ([`act_scenario`]), or
+/// an asking request ([`asking_scenario`]).
+#[derive(Clone, Copy)]
+enum Drawn {
+    Act(DiscoveryAct),
+    Asked(Request),
+}
+
+impl Drawn {
+    /// The family's scenario.
+    fn scenario(self) -> WireScenario {
+        match self {
+            Drawn::Act(act) => act_scenario(act),
+            Drawn::Asked(request) => asking_scenario(request),
+        }
+    }
+}
+
 /// The families after the saved Plans: each of [`HOSTILE_ACTS`], then
 /// each of [`ASKED`], then each of [`CONFORMANT_ACTS`], by name, tag and
-/// scenario.
-fn drawn_families() -> impl Iterator<Item = (&'static str, [u8; 2], WireScenario)> {
+/// what it runs. Only [`Drawn::scenario`] builds a scenario, so a draw
+/// builds just the family it picks.
+fn drawn_families() -> impl Iterator<Item = (&'static str, [u8; 2], Drawn)> {
     let acts = HOSTILE_ACTS
         .iter()
-        .map(|(name, act)| (*name, act_scenario(*act)));
+        .map(|(name, act)| (*name, Drawn::Act(*act)));
     let asked = ASKED
         .iter()
-        .map(|request| (request.name(), asking_scenario(*request)));
+        .map(|request| (request.name(), Drawn::Asked(*request)));
     let conformant = CONFORMANT_ACTS
         .iter()
-        .map(|(name, act)| (*name, act_scenario(*act)));
+        .map(|(name, act)| (*name, Drawn::Act(*act)));
     acts.chain(asked)
         .chain(conformant)
         .zip(HOSTILE_TAG_BASE..)
-        .map(|((name, scenario), tag)| (name, [TAG, tag], scenario))
+        .map(|((name, drawn), tag)| (name, [TAG, tag], drawn))
 }
 
 /// The scenario `prefix` tags, if it starts with one of
@@ -727,7 +746,7 @@ fn drawn_families() -> impl Iterator<Item = (&'static str, [u8; 2], WireScenario
 fn drawn_scenario(prefix: &[u8]) -> Option<WireScenario> {
     drawn_families()
         .find(|(_, tag, _)| prefix.get(..2) == Some(&tag[..]))
-        .map(|(_, _, scenario)| scenario)
+        .map(|(_, _, drawn)| drawn.scenario())
 }
 
 /// The honest exchange, with the peer sending `request` once.
@@ -1042,7 +1061,7 @@ impl HasView for DiscoveryWire {
 
 impl Subsystem for DiscoveryWire {
     const NAME: &'static str = "discovery/wire";
-    const GENERATOR: u32 = 1;
+    const GENERATOR: u32 = 2;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = WireScenario;
     type Prepared = NodeHandle;

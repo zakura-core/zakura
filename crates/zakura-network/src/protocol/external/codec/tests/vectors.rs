@@ -901,3 +901,34 @@ fn warmup_ping_encodes_as_padded_ping() {
         )
         .expect_err("a warm-up ping over the message limit does not encode");
 }
+
+/// The message checksum matches the shared double SHA-256 checksum for empty, short and
+/// block-sized bodies, including lengths around SHA-256's 64-byte block boundary.
+#[test]
+fn message_checksum_matches_sha256d_checksum() {
+    let _init_guard = zakura_test::init();
+
+    let body: Vec<u8> = (0..2_100_000u32)
+        .map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[3])
+        .collect();
+
+    // Fixed lengths around the 64-byte block boundary, then lengths spread over the whole range
+    // up to a full block from a fixed pseudo-random sequence.
+    // The shift leaves 21 bits, so each length is below 2^21 and fits in `usize` and `body`.
+    let spread = (1..=64u64).map(|i| (i.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 43) as usize);
+    let fixed = [0, 1, 55, 56, 63, 64, 65, 119, 128, 1_000, 65_537, 2_100_000];
+
+    for len in fixed.into_iter().chain(spread) {
+        assert_eq!(
+            message_checksum(&body[..len]),
+            sha256d::Checksum::from(&body[..len]),
+            "checksums differ for a {len} byte body",
+        );
+    }
+
+    // The test vector from zakura-chain's sha256d checksum tests.
+    assert_eq!(
+        message_checksum(b"hello"),
+        sha256d::Checksum([0x95, 0x95, 0xc9, 0xdf]),
+    );
+}

@@ -170,6 +170,22 @@ impl Builder {
     }
 }
 
+/// Returns the checksum in a message header: the first four bytes of SHA-256 applied twice to
+/// `body`.
+///
+/// This is the same value as [`sha256d::Checksum::from`]. It is calculated with `ring`, whose
+/// SHA-256 uses assembly for the instructions each CPU has. On CPUs without SHA instructions it
+/// hashes about twice as fast as `sha2`. Every message sent or received is hashed on its
+/// connection's task, and blocks are the largest messages, so this hash bounds how fast one
+/// connection can send or receive blocks.
+fn message_checksum(body: &[u8]) -> sha256d::Checksum {
+    let first = ring::digest::digest(&ring::digest::SHA256, body);
+    let second = ring::digest::digest(&ring::digest::SHA256, first.as_ref());
+    let mut checksum = [0; 4];
+    checksum.copy_from_slice(&second.as_ref()[..4]);
+    sha256d::Checksum(checksum)
+}
+
 // ======== Encoding =========
 
 impl Encoder<Message> for Codec {
@@ -229,7 +245,7 @@ impl Encoder<Message> for Codec {
 
             self.write_body(&item, dst)?;
         }
-        let checksum = sha256d::Checksum::from(&dst[start_len + HEADER_LEN..]);
+        let checksum = message_checksum(&dst[start_len + HEADER_LEN..]);
         dst[start_len + 20..][..4].copy_from_slice(&checksum.0);
 
         Ok(())
@@ -488,7 +504,7 @@ impl Decoder for Codec {
                     let body = src.split_to(body_len);
                     self.state = DecodeState::Head;
 
-                    if checksum != sha256d::Checksum::from(&body[..]) {
+                    if checksum != message_checksum(&body[..]) {
                         return Err(Parse(
                             "supplied message checksum does not match computed checksum",
                         ));

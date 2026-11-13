@@ -19,6 +19,12 @@ use zakura_chain::{
     serialization::Duration32,
 };
 
+/// The largest padding a `ping` can carry: the protocol message limit minus the 8-byte nonce.
+/// Peers disconnect on a larger message.
+// The message limit is 2 MiB, so the cast to u32 is lossless.
+pub const MAX_PING_PADDING: u32 =
+    (zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN - 8) as u32;
+
 /// A multiplier used to calculate the inbound connection limit for the peer set,
 ///
 /// When it starts up, Zebra opens [`crate::Config::peerset_initial_target_size`]
@@ -251,6 +257,13 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(59);
 ///
 /// It also enforces a minimum per-peer reconnection interval, and filters failed outbound peers.
 pub const MIN_OUTBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The maximum number of concurrent legacy connection attempts to initial peers at startup.
+///
+/// Each completed attempt immediately admits the next initial peer, so startup is not paced by
+/// [`MIN_OUTBOUND_PEER_CONNECTION_INTERVAL`]. `peerset_initial_target_size` still bounds the total
+/// number of startup attempts.
+pub const INITIAL_PEER_DIAL_CONCURRENCY: usize = 50;
 
 /// The minimum time between _successful_ inbound peer connections, implemented by
 /// `peer_set::initialize::accept_inbound_connections`.

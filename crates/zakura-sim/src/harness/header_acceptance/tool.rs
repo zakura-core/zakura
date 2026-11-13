@@ -1995,7 +1995,11 @@ mod tests {
             target_of(&targets, MACHINE).as_deref(),
             Some("header_reactor_policy")
         );
-        assert_eq!(target_of(&targets, "header-sync/wire"), None);
+        assert_eq!(
+            target_of(&targets, "header-sync/wire").as_deref(),
+            Some("header_sync_wire")
+        );
+        assert_eq!(target_of(&targets, "header-sync/repair"), None);
         assert!(fuzz_targets(Path::new("/no/such/repo")).is_empty());
     }
 

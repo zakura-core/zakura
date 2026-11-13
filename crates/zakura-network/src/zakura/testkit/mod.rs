@@ -4,7 +4,8 @@
 //! and [`discovery`]: its tests drive the production regulation tools
 //! through the first, and its discovery node starts production's discovery
 //! through the second. The rest needs the `zakura-testkit` feature or a
-//! test build.
+//! test build, and builds only outside the simulator: it runs on tokio's
+//! types, which the simulator build replaces.
 
 #[cfg(zakura_sim)]
 pub mod discovery;
@@ -15,7 +16,7 @@ pub mod regulation;
 macro_rules! test_stack {
     ($($item:item)*) => {
         $(
-            #[cfg(any(test, feature = "zakura-testkit"))]
+            #[cfg(all(any(test, feature = "zakura-testkit"), not(zakura_sim)))]
             $item
         )*
     };

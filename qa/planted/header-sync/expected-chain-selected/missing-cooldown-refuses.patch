@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+index 4048262202..c2f8e6adcc 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+@@ -337,7 +337,7 @@ impl ReactorState {
+     pub(super) fn readmission_refused(&self, peer: &ZakuraPeerId, now: Instant) -> bool {
+         self.unproductive_peer_cooldowns
+             .get(peer)
+-            .is_some_and(|until| *until > now)
++            .is_none_or(|until| *until > now)
+     }
+ 
+     /// Refuse `peer`'s readmission for `cooldown` from `now`. A zero cooldown

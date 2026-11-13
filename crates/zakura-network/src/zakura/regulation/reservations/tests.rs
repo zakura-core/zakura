@@ -201,7 +201,7 @@ fn an_abandoned_reservation_still_delivers_and_never_refuses() {
 #[test]
 fn a_fenced_reservation_ends_its_exchange_with_its_ending() {
     use crate::zakura::{regulation::WriterFence, CloseCause};
-    use tokio_util::sync::CancellationToken;
+    use zakura_rt::sync::CancellationToken;
 
     for ended in [false, true] {
         let pool = pool(2);

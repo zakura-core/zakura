@@ -261,7 +261,7 @@ pub struct ExcludedTarget {
 }
 
 /// A harness no target runs yet.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct MissingTarget {
     /// The harness.

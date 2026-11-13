@@ -18,15 +18,14 @@ use zakura_sim::{
     harness::{
         self,
         header_node::{
-            policy::{Allow, Hold, OpKind, Select, Trigger},
             session::{EndCheck, Retirement, SessionEvidence, SessionFact},
             Chain, Policy,
         },
         header_sync::{HeaderWire, WireScenario},
-        record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem,
+        record, run_prepared, wire_plans, HarnessEntry, HarnessError, RecordInput, Subsystem,
     },
     peer::{
-        honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
+        honest::{HonestSpec, SubscribeSpec},
         PeerAction, PeerSpec,
     },
     record::RecordSink,
@@ -79,38 +78,12 @@ fn redial_witness() -> WireScenario {
     }
 }
 
-/// The two-generation witness: the node dials `peer-0`, both subscribe, and
-/// the peer finishes its header stream once both subscriptions end, so the
-/// node reopens it on the same connection. The node's next locator is held,
-/// so its second subscription doesn't race the finish.
+/// The two-generation witness, the saved Plan `reopen`
+/// ([`wire_plans::reopen_scenario`]): the node dials `peer-0`, both
+/// subscribe, and the peer finishes its header stream once both
+/// subscriptions end, so the node reopens it on the same connection.
 fn reopen_witness() -> WireScenario {
-    let subscribe = SubscribeSpec {
-        start: 0,
-        open: CreditSpec {
-            objects: 250,
-            bytes: 65_750,
-        },
-        grants: GrantPolicy::Immediate,
-    };
-    WireScenario {
-        node: Chain::main(50),
-        peers: vec![honest(
-            PeerSpec::listening(),
-            120,
-            Some(subscribe),
-            vec![PeerAction::FinishHeader],
-        )],
-        policy: Policy {
-            holds: vec![Hold {
-                select: Select::nth(OpKind::Locator, 2),
-                until: Trigger::VirtualTime(3_600_000),
-                then: vec![Allow::Engine],
-                deadline_ms: None,
-            }],
-            ..Policy::converging()
-        },
-        ..WireScenario::default()
-    }
+    wire_plans::reopen_scenario()
 }
 
 /// Each admission in `facts`: its session ID, the session it replaced and

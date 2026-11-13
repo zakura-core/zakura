@@ -9,10 +9,7 @@ use std::{
     convert::Infallible,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -26,7 +23,7 @@ use indexmap::IndexSet;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
-    time::{sleep, Instant},
+    time::Instant,
 };
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::task::AbortOnDropHandle;
@@ -344,6 +341,10 @@ where
             .with_peer_registry(peer_registry)
             .with_protected_peer_ips(protected_peer_ips)
             .with_bans(bans.clone())
+            .with_tcp_warmup(peer::TcpWarmup::spawn(
+                config.tcp_warmup.clone(),
+                latest_chain_tip.clone(),
+            ))
             .want_transactions(true);
 
         if let Some(zakura_handshake_connector) = zakura_handshake_connector {
@@ -481,7 +482,6 @@ where
             peerset_tx,
             active_outbound_connections,
             address_book_updater,
-            Arc::new(AtomicBool::new(false)),
         );
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             crawl_fut.in_current_span(),
@@ -612,53 +612,44 @@ where
         "connecting to initial peer set"
     );
 
-    // # Security
-    //
-    // Resists distributed denial of service attacks by making sure that
-    // new peer connections are initiated at least `MIN_OUTBOUND_PEER_CONNECTION_INTERVAL` apart.
-    //
-    // # Correctness
-    //
-    // Each `FuturesUnordered` can hold one `Buffer` or `Batch` reservation for
-    // an indefinite period. We can use `FuturesUnordered` without filling
-    // the underlying network buffers, because we immediately drive this
-    // single `FuturesUnordered` to completion, and handshakes have a short timeout.
-    let mut handshakes: FuturesUnordered<_> = initial_peers
-        .into_iter()
-        .enumerate()
-        .map(|(i, addr)| {
-            let connection_tracker = active_outbound_connections.track_connection();
+    // Admit only a bounded window of attempts. The selected prefix still obeys
+    // the total target, per-IP limit, and cached/seed preference order.
+    // Completed attempts refill the window without delaying unrelated peers.
+    let mut remaining_peers = initial_peers.into_iter();
+    let mut handshakes = FuturesUnordered::new();
+
+    loop {
+        while handshakes.len() < constants::INITIAL_PEER_DIAL_CONCURRENCY {
+            let Some(addr) = remaining_peers.next() else {
+                break;
+            };
             let req = OutboundConnectorRequest {
                 addr,
-                connection_tracker,
+                connection_tracker: active_outbound_connections.track_connection(),
             };
             let outbound_connector = outbound_connector.clone();
 
-            // Spawn a new task to make the outbound connection.
-            tokio::spawn(erased(
+            // Drive handshakes independently of peer-set delivery, but abort
+            // outstanding attempts if startup fails or its caller shuts down.
+            let task = AbortOnDropHandle::new(tokio::spawn(erased(
                 async move {
-                    // Only spawn one outbound connector per
-                    // `MIN_OUTBOUND_PEER_CONNECTION_INTERVAL`,
-                    // by sleeping for the interval multiplied by the peer's index in the list.
-                    sleep(
-                        constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL.saturating_mul(i as u32),
-                    )
-                    .await;
-
-                    // As soon as we create the connector future,
-                    // the handshake starts running as a spawned task.
                     outbound_connector
                         .oneshot(req)
                         .map_err(move |e| (addr, e))
                         .await
                 }
                 .in_current_span(),
-            ))
-            .wait_for_panics()
-        })
-        .collect();
+            )));
+            handshakes.push(async move {
+                task.await
+                    .panic_if_task_has_panicked()
+                    .expect("initial peer handshake tasks are not cancelled individually")
+            });
+        }
 
-    while let Some(handshake_result) = handshakes.next().await {
+        let Some(handshake_result) = handshakes.next().await else {
+            break;
+        };
         match handshake_result {
             Ok(change) => {
                 handshake_success_total += 1;
@@ -1091,6 +1082,51 @@ enum CrawlerAction {
 const OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR: usize = 80;
 const OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR: usize = 100;
 
+/// The crawler's local peer replenishment demand, in connection attempts.
+///
+/// The periodic crawl sets it to the outbound deficit. Each demand action, from
+/// the channel or from this budget, consumes one unit, even if it crawls instead
+/// of dialing. A failed dial gives its unit back only if the dial consumed one and
+/// the dial put its demand back on the channel. Otherwise the budget would grow
+/// without a matching decrement and keep dialing past the target.
+#[derive(Debug, Default)]
+struct ReplenishmentBudget {
+    remaining: usize,
+}
+
+impl ReplenishmentBudget {
+    /// Whether the crawler should start another replenishment action.
+    fn has_demand(&self) -> bool {
+        self.remaining > 0
+    }
+
+    /// Consumes one unit for a demand action. Returns whether a unit was consumed,
+    /// which is whether a failure of this action may be credited back.
+    fn consume(&mut self) -> bool {
+        let consumed = self.has_demand();
+        self.remaining = self.remaining.saturating_sub(1);
+        consumed
+    }
+
+    /// Drops the remaining demand, because the outbound connection limit is reached.
+    fn clear(&mut self) {
+        self.remaining = 0;
+    }
+
+    /// Gives back one unit for a failed dial, when `consumed_and_restored`: the
+    /// dial consumed a unit, and it put its demand back on the channel.
+    fn credit_failed_dial(&mut self, consumed_and_restored: bool) {
+        if consumed_and_restored {
+            self.remaining = self.remaining.saturating_add(1);
+        }
+    }
+
+    /// Replaces the remaining demand with the deficit the periodic crawl computed.
+    fn refresh(&mut self, demand: usize) {
+        self.remaining = demand;
+    }
+}
+
 /// Returns the number of outbound peers needed to reach 80% of the configured
 /// peer set target size, bounded by the outbound connection limit.
 ///
@@ -1155,7 +1191,6 @@ fn outbound_peer_replenishment_demand(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
-        force_failed_dial_demand_restore_full,
     ),
     fields(
         new_peer_interval = ?config.crawl_new_peer_interval,
@@ -1170,9 +1205,6 @@ async fn crawl_and_dial<C, S>(
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     mut active_outbound_connections: ActiveConnectionCounter,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-    // When true, failed dials report a full demand channel so tests can cover
-    // unrestored-demand credit gating without racing the crawler select loop.
-    force_failed_dial_demand_restore_full: Arc<AtomicBool>,
 ) -> Result<(), BoxError>
 where
     C: Service<
@@ -1216,10 +1248,7 @@ where
 
     let mut crawl_timer = IntervalStream::new(crawl_timer).map(|tick| TimerCrawl { tick });
 
-    // Periodic replenishment is best-effort. Every consumed demand action
-    // decrements this counter, even if it crawls instead of dialing. The next
-    // periodic crawl refreshes any remaining deficit.
-    let remaining_replenishment_demand = AtomicUsize::new(0);
+    let mut replenishment = ReplenishmentBudget::default();
 
     // # Concurrency
     //
@@ -1252,9 +1281,7 @@ where
                 }),
             // Existing channel demand gets priority over local replenishment.
             // Each action consumes one unit of replenishment demand below.
-            _ = future::ready(()),
-                if remaining_replenishment_demand.load(Ordering::Relaxed) > 0 =>
-            {
+            _ = future::ready(()), if replenishment.has_demand() => {
                 Ok(DemandHandshakeOrCrawl {
                     restore_replenishment_demand: false,
                 })
@@ -1263,21 +1290,12 @@ where
 
         let crawler_action = match crawler_action {
             Ok(DemandHandshakeOrCrawl { .. }) => {
-                // Only credit later if this action actually consumed a timer
-                // replenishment unit. Channel demand with remaining == 0 must
-                // not invent local budget on failure.
-                let restore_replenishment_demand =
-                    remaining_replenishment_demand.load(Ordering::Relaxed) > 0;
-                let _ = remaining_replenishment_demand.try_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |demand| Some(demand.saturating_sub(1)),
-                );
+                let restore_replenishment_demand = replenishment.consume();
 
                 if active_outbound_connections.update_count()
                     >= config.peerset_outbound_connection_limit()
                 {
-                    remaining_replenishment_demand.store(0, Ordering::Relaxed);
+                    replenishment.clear();
                     Ok(DemandDrop)
                 } else {
                     Ok(DemandHandshakeOrCrawl {
@@ -1306,8 +1324,6 @@ where
                 let address_book_updater = address_book_updater.clone();
                 let demand_tx = demand_tx.clone();
                 let expose_peer_addresses = config.expose_peer_addresses;
-                let force_failed_dial_demand_restore_full =
-                    force_failed_dial_demand_restore_full.clone();
 
                 // Increment the connection count before we spawn the connection.
                 let outbound_connection_tracker = active_outbound_connections.track_connection();
@@ -1343,7 +1359,6 @@ where
                                 address_book_updater,
                                 demand_tx,
                                 expose_peer_addresses,
-                                force_failed_dial_demand_restore_full,
                             )
                             .await?
                             {
@@ -1397,12 +1412,7 @@ where
             Ok(HandshakeFailed {
                 restore_replenishment_demand,
             }) => {
-                // Credit only when this attempt spent timer budget and dial()
-                // successfully restored MorePeers. A full channel must not
-                // credit, or remaining would rise without a matching decrement.
-                if restore_replenishment_demand {
-                    let _ = remaining_replenishment_demand.fetch_add(1, Ordering::Relaxed);
-                }
+                replenishment.credit_failed_dial(restore_replenishment_demand);
             }
             Ok(DemandCrawlFinished) => {
                 // This is set to trace level because when the peerset is
@@ -1418,7 +1428,7 @@ where
                     peerset_target_size,
                     outbound_connection_limit,
                 );
-                remaining_replenishment_demand.store(replenishment_demand, Ordering::Relaxed);
+                replenishment.refresh(replenishment_demand);
 
                 // This is the only place the crawler's view of its own outbound
                 // connections is visible, and a node that stops replenishing looks
@@ -1516,13 +1526,7 @@ enum DialOutcome {
 /// so callers do not credit replenishment budget without a later decrement.
 fn try_restore_demand_after_failed_dial(
     demand_tx: &mut futures::channel::mpsc::Sender<MorePeers>,
-    force_failed_dial_demand_restore_full: &AtomicBool,
 ) -> Result<bool, BoxError> {
-    // Tests can force a full-channel outcome without racing the crawler select.
-    if force_failed_dial_demand_restore_full.load(Ordering::Relaxed) {
-        return Ok(false);
-    }
-
     match demand_tx.try_send(MorePeers) {
         Ok(()) => Ok(true),
         Err(send_error) if send_error.is_disconnected() => Err(send_error.into()),
@@ -1546,7 +1550,6 @@ fn try_restore_demand_after_failed_dial(
     address_book_updater,
     demand_tx,
     expose_peer_addresses,
-    force_failed_dial_demand_restore_full,
 ), fields(peer = %candidate.addr.addr_label(expose_peer_addresses)))]
 async fn dial<C>(
     candidate: MetaAddr,
@@ -1557,7 +1560,6 @@ async fn dial<C>(
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
     mut demand_tx: futures::channel::mpsc::Sender<MorePeers>,
     expose_peer_addresses: bool,
-    force_failed_dial_demand_restore_full: Arc<AtomicBool>,
 ) -> Result<DialOutcome, BoxError>
 where
     C: Service<
@@ -1631,10 +1633,7 @@ where
             // # Security
             //
             // Handshake failures are rate-limited by peer attempt timeouts.
-            let demand_restored = try_restore_demand_after_failed_dial(
-                &mut demand_tx,
-                &force_failed_dial_demand_restore_full,
-            )?;
+            let demand_restored = try_restore_demand_after_failed_dial(&mut demand_tx)?;
 
             Ok(DialOutcome::Failed { demand_restored })
         }

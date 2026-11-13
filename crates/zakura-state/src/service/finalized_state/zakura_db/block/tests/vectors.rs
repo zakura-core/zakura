@@ -794,6 +794,45 @@ fn test_block_db_round_trip_with(
     }
 }
 
+/// A block is served only while its first transaction is stored. Without that row the raw
+/// read reports the body as missing, even though the block's later transactions remain.
+#[test]
+fn raw_block_is_missing_without_its_first_transaction() {
+    let _init_guard = zakura_test::init();
+
+    let state = ZakuraDb::new(
+        &Config::ephemeral(),
+        STATE_DATABASE_KIND,
+        &state_database_format_version_in_code(),
+        &Mainnet,
+        // The raw database accesses in this test create invalid database formats.
+        true,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        false,
+    )
+    .expect("opening an ephemeral database should succeed");
+    let block = Arc::new(large_multi_transaction_block());
+    assert!(
+        block.transactions.len() > 1,
+        "the test needs transactions after the first one"
+    );
+    let height = write_block_without_validation(&state, block).height;
+    assert!(state.raw_block_result(height.into()).unwrap().is_some());
+
+    let tx_by_loc = state.db.cf_handle("tx_by_loc").unwrap();
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_delete(&tx_by_loc, TransactionLocation::min_for_height(height));
+    state.db.write(batch).expect("deleting a row is valid");
+
+    assert!(!state.contains_body_at_height(height));
+    assert!(
+        state.raw_block_result(height.into()).unwrap().is_none(),
+        "a block without its first transaction is not serveable"
+    );
+}
+
 /// Missing pruning metadata means this is an archive database from before pruning was added.
 #[test]
 fn missing_pruning_metadata_cf_is_archive_database() {

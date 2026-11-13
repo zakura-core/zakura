@@ -161,6 +161,12 @@ pub struct DiskDb {
     /// only [`Drop`] requires exclusive access.
     db: Arc<DB>,
 
+    /// The names of the column families this handle opened.
+    ///
+    /// The set is fixed while the database is open, so readers use this list instead of
+    /// reading the column family list from disk again.
+    column_family_names: Arc<[String]>,
+
     /// The temporary workspace RocksDB uses to follow a primary database.
     ///
     /// This must be declared after `db` so the RocksDB handle is dropped before the directory.
@@ -657,14 +663,11 @@ impl DiskDb {
         let mut total_live_size_on_disk = 0;
         let mut total_size_in_mem = 0;
         let db: &Arc<DB> = &self.db;
-        let db_options = DiskDb::options();
-        let column_families = DiskDb::construct_column_families(db_options, db.path(), [], false);
         let mut column_families_log_string = String::from("");
 
         write!(column_families_log_string, "Column families and sizes: ").unwrap();
 
-        for cf_descriptor in column_families {
-            let cf_name = &cf_descriptor.name();
+        for cf_name in self.column_family_names.iter() {
             let cf_handle = db
                 .cf_handle(cf_name)
                 .expect("Column family handle must exist");
@@ -713,8 +716,6 @@ impl DiskDb {
     /// Call this periodically (e.g., every 30 seconds) from a background task.
     pub(crate) fn export_metrics(&self) {
         let db: &Arc<DB> = &self.db;
-        let db_options = DiskDb::options();
-        let column_families = DiskDb::construct_column_families(db_options, db.path(), [], false);
 
         let mut total_disk: u64 = 0;
         let mut total_live: u64 = 0;
@@ -722,9 +723,8 @@ impl DiskDb {
         let mut measured_column_family = false;
         let mut complete_disk_measurement = true;
 
-        for cf_descriptor in column_families {
-            let cf_name = cf_descriptor.name().to_string();
-            if let Some(cf_handle) = db.cf_handle(&cf_name) {
+        for cf_name in self.column_family_names.iter() {
+            if let Some(cf_handle) = db.cf_handle(cf_name) {
                 measured_column_family = true;
                 let disk = match db.property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size")
                 {
@@ -751,7 +751,7 @@ impl DiskDb {
 
                 metrics::gauge!("zakura.state.rocksdb.cf_disk_size_bytes", "cf" => cf_name.clone())
                     .set(disk as f64);
-                metrics::gauge!("zakura.state.rocksdb.cf_memory_size_bytes", "cf" => cf_name)
+                metrics::gauge!("zakura.state.rocksdb.cf_memory_size_bytes", "cf" => cf_name.clone())
                     .set(mem as f64);
             } else {
                 complete_disk_measurement = false;
@@ -810,12 +810,10 @@ impl DiskDb {
     /// Measures the estimated disk usage and reports whether every property was available.
     fn measure_size(&self) -> (u64, bool) {
         let db: &Arc<DB> = &self.db;
-        let db_options = DiskDb::options();
         let mut total_size_on_disk = 0;
         let mut measured_column_family = false;
         let mut complete = true;
-        for cf_descriptor in DiskDb::construct_column_families(db_options, db.path(), [], false) {
-            let cf_name = &cf_descriptor.name();
+        for cf_name in self.column_family_names.iter() {
             let cf_handle = db
                 .cf_handle(cf_name)
                 .expect("column family handle exists because RocksDB opened every descriptor");
@@ -1305,6 +1303,7 @@ impl DiskDb {
                     network: network.clone(),
                     mode,
                     db: Arc::new(db),
+                    column_family_names: column_family_names.into(),
                     _secondary_dir: secondary_dir,
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
                     shutdown_format_check_claimed: Arc::new(AtomicBool::new(false)),

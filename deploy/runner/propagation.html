@@ -277,8 +277,9 @@ function nodeCell(name) { return el("td", {}, nodeLink(name)); }
 
 // What a peer says it runs, as its handshake wrote it: "/Zakura:1.8.7/" reads "Zakura 1.8.7".
 // zcashd names itself "MagicBean" there, so it is shown by the name people know it by.
+// A peer may send an empty name, which is all a node then knows about its software.
 function software(agent) {
-  if (!agent) return "unknown software";
+  if (!agent) return "no name sent";
   const parts = agent.split("/").filter(Boolean)
     .map((part) => part.replace(":", " ").replace("MagicBean", "zcashd"));
   return parts.length ? parts.join(", ") : agent;
@@ -292,7 +293,11 @@ function peerName(download) {
 }
 function peerSoftware(download) {
   if (download.kind === "fleet") return "one of ours";
-  return download.kind === "private" ? "–" : software(download.agent);
+  if (download.kind === "private") return "–";
+  // Only Zakura speaks the Zakura stack. A peer our node dialled there directly, without
+  // the legacy handshake first, never names its software, so its version is not known.
+  if (!download.agent && download.stack === "zakura") return "Zakura, version not recorded";
+  return software(download.agent);
 }
 function outcome(result) {
   if (result === "available") return "delivered";

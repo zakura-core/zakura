@@ -101,6 +101,12 @@ until a node runs a build that writes download rows and has restarted with
 is on the dashboard's private list (below) reads "private peer". Any other is
 an outside peer, shown by IP address.
 
+A peer's software is the name it sent in the legacy handshake. A peer that
+sent an empty name reads "no name sent". A Zakura peer the node dialled
+directly, without a legacy handshake first, sends no name at all and gets no
+upgrade row, so its downloads read "address hidden" and "Zakura, version not
+recorded".
+
 Limits: a legacy download time is in whole milliseconds and includes any wait
 behind other requests on the same connection. A peer that connects to us does
 so from a temporary port, so peers are told apart by IP address alone and two

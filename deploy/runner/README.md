@@ -84,7 +84,10 @@ than 50 ms, as builds before the trace clock fix do, is placed by its log
 instead and marked.
 
 The page also says who served each block. In the selected block's table every
-node has a "Downloaded from" column. "Slowest downloads" lists the 50 slowest
+node has a "Downloaded from" column, and its "First heard from" column names
+the outside peer that announced the block first when the node has written that
+connection's address (in a request it sent the same connection, matched by the
+connection's number). "Slowest downloads" lists the 50 slowest
 single attempts over the blocks shown, with the node that made it, the peer,
 its software, the block and its size; selecting one shows its block. "Peers
 outside the fleet" has one row per outside IP address, slowest first: its

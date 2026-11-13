@@ -198,6 +198,22 @@ class DownloadTests(unittest.TestCase):
         for secret in (PRIVATE_IP, "9.9.9-private", "feedfeed"):
             self.assertNotIn(secret, served)
 
+    def test_the_first_outside_announcer_is_filtered_like_a_download(self):
+        def first_heard_from(addr):
+            peer = {"addr": addr, "agent": "/MagicBean:6.2.0/"}
+            joined = propagation.join(
+                {"us-east-0": report(record(wall={"heard": 0.0, "tip": 0.1}, heard_from_peer=peer))}, NODE_IDS,
+                now=START + 60, fleet_addresses=FLEET_ADDRESSES, is_private=lambda ip: ip == PRIVATE_IP,
+            )  # fmt: skip
+            return joined["blocks"][0]["nodes"]["us-east-0"]["from_peer"], joined
+
+        outside, _ = first_heard_from("203.0.113.5")
+        self.assertEqual(outside, {"kind": "outside", "ip": "203.0.113.5", "agent": "/MagicBean:6.2.0/"})
+        private, joined = first_heard_from(PRIVATE_IP)
+        self.assertEqual(private, {"kind": "private"})
+        self.assertNotIn(PRIVATE_IP, repr(joined))
+        self.assertNotIn("6.2.0", repr(joined))
+
     def test_a_private_address_wins_over_a_fleet_name(self):
         joined = propagation.join(
             {"us-east-0": report(record(wall={"tip": 0.1}, downloads=[download(PRIVATE_IP)]))}, NODE_IDS,

@@ -159,7 +159,7 @@ TRACE_TABLES = {
         "header_request_sent", "header_response_received", "header_target_admitted", "header_status_received",
     ),
     "block_sync": ("block_get_blocks_sent", "block_body_received", "block_body_submitted", "block_status_sent"),
-    "legacy_peer_request": ("block_request_finish",),
+    "legacy_peer_request": ("block_request_finish", "find_blocks_finish"),
     "legacy_gossip": ("block_inv_received", "block_inv_sent", "block_getdata_received", "block_sent"),
     "handshake": ("peer_upgraded",),
     "commit_state": ("commit_start", "commit_finish"),
@@ -182,7 +182,8 @@ NAMED_PEER = "name:"
 MAX_PEERS_PER_BLOCK = 64
 # A block is normally downloaded once; more than this many attempts are not kept.
 MAX_DOWNLOADS_PER_BLOCK = 16
-# Zakura peers whose address and software are remembered, newest kept.
+# Zakura peers, and legacy connections, whose address and software are remembered,
+# newest kept.
 MAX_KNOWN_PEERS = 4096
 # A block's record is closed this long (in the node's clock) after its tip was
 # published, which leaves time for the status messages to its peers to be recorded.
@@ -315,6 +316,14 @@ def note_peer_step(seen, step, peer, when):
         steps[step] = min(when, steps.get(step, when))
 
 
+def remember(known, key, peer):
+    """Keep `peer`'s `{"addr", "agent"}` under `key`, dropping the oldest past the limit."""
+    known.pop(key, None)
+    known[key] = peer
+    while len(known) > MAX_KNOWN_PEERS:
+        del known[next(iter(known))]
+
+
 def merged_peers(*tables):
     """One `{peer: {step: time}}` table from several that may name the same peers."""
     merged = {}
@@ -428,6 +437,8 @@ class BlockStages:
         self._process = None
         # What each Zakura peer's upgrade row said about it: `{label: {"addr", "agent"}}`.
         self._zakura_peers = {}
+        # `{(process, connection_id): {"addr", "agent"}}` of legacy connections.
+        self._connections = {}
 
     def feed(self, row):
         """Take one parsed trace row. Rows may arrive in any order across tables."""
@@ -441,10 +452,15 @@ class BlockStages:
         process = row.get("process_trace_id")
         if event == "peer_upgraded":
             if isinstance(row.get("peer"), str):
-                self._zakura_peers.pop(row["peer"], None)
-                self._zakura_peers[row["peer"]] = {"addr": peer_ip(row.get("addr")), "agent": row.get("user_agent")}
-                while len(self._zakura_peers) > MAX_KNOWN_PEERS:
-                    del self._zakura_peers[next(iter(self._zakura_peers))]
+                peer = {"addr": peer_ip(row.get("addr")), "agent": row.get("user_agent")}
+                remember(self._zakura_peers, row["peer"], peer)
+            return
+        if event in ("block_request_finish", "find_blocks_finish") and type(row.get("connection_id")) is int:
+            # A request row is where a legacy connection's address and software are written;
+            # its announcements carry only the connection's number.
+            peer = {"addr": peer_ip(row.get("peer")), "agent": row.get("user_agent")}
+            remember(self._connections, (process, row["connection_id"]), peer)
+        if event == "find_blocks_finish":
             return
         if event == "block_request_finish" and isinstance(row.get("requested_hash"), str):
             # Every attempt counts as a download, whether or not the peer had the block.
@@ -484,6 +500,10 @@ class BlockStages:
             seen = table.setdefault((process, key), {})
             if event in PEER_STEPS:
                 note_peer_step(seen, PEER_STEPS[event], peer_of(row), when)
+                connection = row.get("connection_id")
+                if event == "block_inv_received" and type(connection) is int and peer_of(row) is None:
+                    if when < seen.get("first_inv_unnamed", (when + 1,))[0]:
+                        seen["first_inv_unnamed"] = (when, connection)
                 if event != "block_status_sent":
                     continue
             if event == "block_status_sent":
@@ -510,6 +530,16 @@ class BlockStages:
                     "reorg": row.get("kind") == "reorg",
                 }
             )
+
+    def _outside_announcer(self, events, process):
+        """`{"heard_from_peer": {"addr", "agent"}}` when an unnamed legacy peer told the node
+        of the block first and the node has written that connection's address; else empty."""
+        first_heard = events.get("first_heard", (None, None))
+        first_inv = events.get("first_inv_unnamed")
+        if first_heard[1] is not None or first_inv is None or first_inv[0] != first_heard[0]:
+            return {}
+        peer = self._connections.get((process, first_inv[1]))
+        return {} if peer is None else {"heard_from_peer": dict(peer)}
 
     def finished(self):
         """The records of blocks whose tip was published long enough ago to be complete."""
@@ -541,6 +571,7 @@ class BlockStages:
                     "tip_us": block["tip"],
                     "reorg": block["reorg"],
                     **cluster_times(events, block),
+                    **self._outside_announcer(events, block["process"]),
                     "downloads": block_downloads(attempts, process_started(block["process"]), self._zakura_peers),
                     "path": block_path(events),
                     "size": events.get("size"),

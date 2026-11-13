@@ -38,7 +38,7 @@ use zakura_mempool::{
     storage::{ExactTipRejectionError, NonStandardTransactionError, RejectionError},
 };
 use zakura_node_services::mempool::{
-    port::{ChainTip, Charge, LocalFault, PoolReader, PoolSnapshot},
+    port::{ChainTip, Charge, LocalFault, PoolReader},
     OutputNotInPool, Request, Response,
 };
 use zakura_state as zs;
@@ -57,7 +57,6 @@ pub(crate) struct ConsensusVerifier {
     /// The read state service is not `Sync`, so each verification clones it
     /// under this lock.
     read_state: Arc<Mutex<ReadState>>,
-    pool: PoolReader,
     max_transaction_bytes: u64,
     network: Network,
     /// Whether the node is current enough to start cooldowns. Today's pool
@@ -66,12 +65,11 @@ pub(crate) struct ConsensusVerifier {
 }
 
 impl ConsensusVerifier {
-    /// A verifier that calls `tx_verifier`, looks transactions up in
-    /// `read_state`, and reads the pool through `pool`.
+    /// A verifier that calls `tx_verifier` and looks transactions up in
+    /// `read_state`.
     pub fn new(
         tx_verifier: Timeout<TxVerifier>,
         read_state: ReadState,
-        pool: PoolReader,
         max_transaction_bytes: u64,
         network: Network,
         current: Arc<AtomicBool>,
@@ -79,21 +77,18 @@ impl ConsensusVerifier {
         Self {
             tx_verifier,
             read_state: Arc::new(Mutex::new(read_state)),
-            pool,
             max_transaction_bytes,
             network,
             current,
         }
     }
 
-    /// Verifies `tx` for the block after `tip`. `start` is the pool the core
-    /// published before it started this job.
+    /// Verifies `tx` for the block after `tip`.
     async fn check(
         self,
         tx: UnminedTx,
         tip: ChainTip,
         revalidation: bool,
-        start: Option<Arc<PoolSnapshot>>,
     ) -> Outcome<TransactionError> {
         if usize::try_from(self.max_transaction_bytes)
             .is_ok_and(|max_transaction_bytes| tx.size() > max_transaction_bytes)
@@ -166,25 +161,18 @@ impl ConsensusVerifier {
         };
 
         match error {
-            // The inputs the start pool did not offer. Spends of chain
-            // outputs are among them, which only parks the transaction on
-            // parents that never arrive. Using the pool from the start of
-            // the job is what lets the machine see a parent that arrived
-            // while it ran.
+            // Every transparent spend, since the verifier's lookup does not
+            // say which one it missed. A parent the job's pool offered may
+            // have left before the lookup, and has to stay in the list so its
+            // return wakes this transaction. Spends of chain outputs only
+            // park it on parents that never arrive. The machine tells a
+            // parent that arrived while the job ran by when it became
+            // visible.
             TransactionError::TransparentInputNotFound => Outcome::MissingInputs {
-                missing: spends
-                    .into_iter()
-                    .filter(|outpoint| {
-                        start
-                            .as_ref()
-                            .is_none_or(|start| start.created_output(outpoint).is_none())
-                    })
-                    .collect(),
+                missing: spends,
                 error: TransactionError::TransparentInputNotFound,
             },
-            TransactionError::StateUnavailable(_) => {
-                Outcome::LocalFault(LocalFault::StateUnavailable)
-            }
+            error if is_local_failure(&error) => Outcome::LocalFault(LocalFault::StateUnavailable),
             error => {
                 let charge = if revalidation {
                     // The machine charges nobody for a transaction that
@@ -223,11 +211,20 @@ impl Verifier<TransactionError> for ConsensusVerifier {
         tip: ChainTip,
         revalidation: bool,
     ) -> Pin<Box<dyn Future<Output = Outcome<TransactionError>> + Send>> {
-        // The core calls this after it published the step that starts the
-        // job, so this is the pool the job started from.
-        let start = self.pool.snapshot();
-        Box::pin(self.clone().check(tx, tip, revalidation, start))
+        Box::pin(self.clone().check(tx, tip, revalidation))
     }
+}
+
+/// Whether `error` is a failure on this node that says nothing about the
+/// transaction: a failed state lookup, or an internal error. The lock-time
+/// check turns a failed median-time lookup into its own error.
+fn is_local_failure(error: &TransactionError) -> bool {
+    matches!(
+        error,
+        TransactionError::StateUnavailable(_)
+            | TransactionError::ValidateMempoolLockTimeError(_)
+            | TransactionError::InternalDowncastError(_)
+    )
 }
 
 /// The transaction verifier's pool handle in core mode. It answers
@@ -266,5 +263,29 @@ impl Service<Request> for VerifierPool {
             _ => Err("the verifier's pool handle only answers output lookups".into()),
         };
         async move { answer }.boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed state lookup is a local fault, so a pooled transaction being
+    /// verified again is tried later instead of removed and rejected.
+    #[test]
+    fn state_failures_are_local_and_invalid_transactions_are_not() {
+        assert!(is_local_failure(&TransactionError::StateUnavailable(
+            "read capacity".into()
+        )));
+        assert!(is_local_failure(
+            &TransactionError::ValidateMempoolLockTimeError("lookup failed".into())
+        ));
+        assert!(is_local_failure(&TransactionError::InternalDowncastError(
+            "unexpected".into()
+        )));
+        assert!(!is_local_failure(&TransactionError::BadBalance));
+        assert!(!is_local_failure(
+            &TransactionError::TransparentInputNotFound
+        ));
     }
 }

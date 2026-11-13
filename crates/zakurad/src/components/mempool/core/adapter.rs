@@ -38,7 +38,9 @@ use crate::BoxError;
 
 use super::{
     super::{
-        downloads::{fetch_transaction, peer_source_from_queue_source},
+        downloads::{
+            fetch_transaction, peer_source_from_queue_source, TRANSACTION_DOWNLOAD_TIMEOUT,
+        },
         pending_outputs::PendingOutputsFull,
         queue_source_log_label, ExactTipRejectionError, MempoolError, Outbound,
     },
@@ -349,9 +351,7 @@ async fn bring_in(
             let source = from.as_ref().and_then(peer_source_from_queue_source);
             // Boxing works around a compiler limitation: without it, the
             // spawned task cannot be proven `Send`.
-            let fetch: futures::future::BoxFuture<'static, _> =
-                fetch_transaction(shared.outbound.clone(), tx_id, source).boxed();
-            match fetch.await {
+            match fetch_within(shared.outbound.clone(), tx_id, source).await {
                 Ok((tx, served_by)) => {
                     // A v2 peer's body is not charged, as today.
                     let supplier = match (&from, served_by) {
@@ -460,5 +460,73 @@ fn second_stage(tx_id: UnminedTxId, verdict: Verdict) -> Result<(), BoxError> {
         Verdict::LocalFault(fault) => {
             Err(format!("the pool core could not decide transaction {tx_id}: {fault:?}").into())
         }
+    }
+}
+
+/// Fetches `tx_id` within [`TRANSACTION_DOWNLOAD_TIMEOUT`], the wait for the
+/// network included.
+///
+/// The service's own timeout starts only once the network is ready, and the
+/// caller's reservation holds a core slot the whole time. So the whole fetch
+/// has a deadline, as today's download task does, and a fetch that misses it
+/// fails, which frees its slot.
+async fn fetch_within(
+    outbound: Timeout<Outbound>,
+    tx_id: UnminedTxId,
+    source: Option<zn::PeerSource>,
+) -> Result<(zakura_chain::transaction::UnminedTx, Option<PeerSocketAddr>), BoxError> {
+    // Boxing works around a compiler limitation: without it, the spawned
+    // task cannot be proven `Send`.
+    let fetch: futures::future::BoxFuture<'static, _> =
+        fetch_transaction(outbound, tx_id, source).boxed();
+    match tokio::time::timeout(TRANSACTION_DOWNLOAD_TIMEOUT, fetch).await {
+        Ok(fetched) => fetched.map_err(BoxError::from),
+        Err(elapsed) => Err(BoxError::from(elapsed)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::{Context, Poll};
+
+    use tower::util::BoxCloneSyncService;
+
+    use super::*;
+
+    /// A peer set that never becomes ready.
+    #[derive(Clone)]
+    struct NeverReady;
+
+    impl Service<zn::Request> for NeverReady {
+        type Response = zn::Response;
+        type Error = zn::BoxError;
+        type Future = futures::future::BoxFuture<'static, Result<zn::Response, zn::BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn call(&mut self, _request: zn::Request) -> Self::Future {
+            unreachable!("a service that is never ready is never called")
+        }
+    }
+
+    /// A fetch from a network that never becomes ready fails at its
+    /// deadline, so the reservation it holds is freed.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_fetch_from_an_unready_network_fails_at_its_deadline() {
+        let outbound = Timeout::new(
+            BoxCloneSyncService::new(NeverReady),
+            TRANSACTION_DOWNLOAD_TIMEOUT,
+        );
+        let started = tokio::time::Instant::now();
+        let fetched = fetch_within(
+            outbound,
+            UnminedTxId::Legacy(zakura_chain::transaction::Hash([7; 32])),
+            None,
+        )
+        .await;
+        assert!(fetched.is_err(), "the fetch fails");
+        assert_eq!(started.elapsed(), TRANSACTION_DOWNLOAD_TIMEOUT);
     }
 }

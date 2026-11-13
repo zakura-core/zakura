@@ -398,18 +398,16 @@ fn a_body_that_arrives_after_the_verdict_is_answered_and_not_charged() {
     // The relay's fetch is still out, so its slot is still taken.
     assert_eq!(model.slots_in_use(), 1);
 
-    // The relay's own answer arrives late. It gets a verdict and no charge.
+    // The relay's own answer arrives late. It gets the admission's verdict,
+    // as if it had come in time.
     let (late, step) = model.submit(relay.id, tx(1), Supplier::Peer(v2(1)), secs(3));
-    assert_eq!(
-        step.verdict(late),
-        Some(rejected(RejectionScope::Uncached, Charge::None))
-    );
+    assert_eq!(step.verdict(late), Some(ModelVerdict::Admitted));
     assert!(step.started().is_empty());
     assert_eq!(model.slots_in_use(), 0);
 }
 
 #[test]
-fn a_stale_reservation_for_an_unknown_id_is_a_local_fault() {
+fn a_joiner_that_comes_back_after_a_local_fault_gets_that_fault() {
     let mut model = new_model();
     let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
     let late = model
@@ -427,12 +425,12 @@ fn a_stale_reservation_for_an_unknown_id_is_a_local_fault() {
         Some(ModelVerdict::LocalFault(LocalFault::StateUnavailable))
     );
 
-    // Nothing is cached after a local fault, so the late body cannot be
-    // answered from a cache. The caller reserves again.
+    // Nothing is cached after a local fault. The late joiner gets the
+    // admission's verdict, and can submit again.
     let (waiter, step) = model.submit(late.id, tx(1), Supplier::Peer(legacy(2)), secs(2));
     assert_eq!(
         step.verdict(waiter),
-        Some(ModelVerdict::LocalFault(LocalFault::StaleReservation))
+        Some(ModelVerdict::LocalFault(LocalFault::StateUnavailable))
     );
     assert!(model
         .reserve(id(1), peer(2), Intent::Deliver, secs(2))
@@ -1488,12 +1486,13 @@ fn a_joined_reservation_does_not_reach_a_later_admission_of_the_same_id() {
 
     // Bob starts a new admission of the same id.
     let (bob, _) = bring_in(&mut model, tx(1), legacy(3));
-    // Alice's old reservation died with the first admission. It neither
-    // joins Bob's nor counts among its waiters.
+    // Alice's old reservation ended with the first admission. It gets that
+    // admission's verdict, and neither joins Bob's nor counts among its
+    // waiters.
     let (late, step) = model.submit(alice.id, tx(1), Supplier::Peer(legacy(2)), secs(2));
     assert_eq!(
         step.verdict(late),
-        Some(ModelVerdict::LocalFault(LocalFault::StaleReservation))
+        Some(ModelVerdict::LocalFault(LocalFault::StateUnavailable))
     );
     assert_eq!(step.verdict(bob), None);
     model.assert_invariants();
@@ -2118,12 +2117,10 @@ fn a_fetch_that_is_still_out_keeps_its_slot_after_someone_else_decides_the_id() 
         Err(ModelUnreserved::NoRoom(NoRoom::Source))
     );
 
-    // One fetch comes back, and one fails. Each frees its slot.
+    // One fetch comes back, and one fails. Each frees its slot. The one
+    // that came back gets the admission's verdict.
     let (late, step) = model.submit(fetching[0].id, tx(0), Supplier::Peer(legacy(1)), secs(2));
-    assert_eq!(
-        step.verdict(late),
-        Some(rejected(RejectionScope::Uncached, Charge::None))
-    );
+    assert_eq!(step.verdict(late), Some(ModelVerdict::Admitted));
     model.release(fetching[1].id, secs(2));
     assert_eq!(model.counted_against(&alice), 3);
     assert!(model.reserve(id(9), alice, Intent::Fetch, secs(2)).is_ok());
@@ -4025,4 +4022,55 @@ fn the_rejection_query_sees_the_deadlines_that_are_due_whether_or_not_a_tick_cam
         Some(rejected(RejectionScope::ExactTip, Charge::None))
     );
     direct.assert_invariants();
+}
+
+// Cases from the M1 review, round 3.
+
+#[test]
+fn a_joiner_whose_admission_was_decided_before_it_came_back_gets_that_verdict() {
+    let mut model = new_model();
+    let (first, job) = bring_in(&mut model, tx(1), legacy(1));
+    // An RPC caller joins while the first verification runs, then is slow
+    // to send its join.
+    let joined = model
+        .reserve(id(1), Source::Node, Intent::Deliver, secs(0))
+        .expect("a delivery joins an undecided id");
+    assert!(!joined.wants_body, "the core already holds the body");
+    let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(1));
+    assert_eq!(step.verdict(first), Some(ModelVerdict::Admitted));
+
+    let (late, step) = model.wait(joined.id, id(1), Supplier::Nobody, secs(2));
+    assert_eq!(step.verdict(late), Some(ModelVerdict::Admitted));
+    assert_eq!(model.caller_held(), 0);
+    model.assert_invariants();
+}
+
+#[test]
+fn a_late_joiner_is_charged_for_a_cooldown_failure_as_an_early_one_is() {
+    let mut model = new_model();
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let joined = model
+        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .expect("a delivery joins an undecided id");
+    model.outcome(
+        job,
+        Outcome::Fail {
+            scope: RejectionScope::ExactTip,
+            charge: Charge::Cooldown,
+        },
+        stable(0),
+        stable(0),
+        secs(1),
+    );
+    assert!(!model.cooling(&legacy(2), secs(1)));
+
+    let (late, step) = model.wait(joined.id, id(1), Supplier::Peer(legacy(2)), secs(2));
+    assert_eq!(
+        step.verdict(late),
+        Some(rejected(RejectionScope::ExactTip, Charge::Cooldown))
+    );
+    assert!(
+        model.cooling(&legacy(2), secs(2)),
+        "its supplier is charged"
+    );
 }

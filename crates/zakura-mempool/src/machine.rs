@@ -330,6 +330,8 @@ struct JoinTicket {
 struct Lease {
     source: Source,
     tx_id: UnminedTxId,
+    /// The verdict its admission got, which its caller gets too.
+    verdict: Verdict,
 }
 
 /// The spends and nullifiers of a set of transactions, to find what conflicts
@@ -397,8 +399,10 @@ pub struct MempoolState<E> {
     leases: HashMap<ReservationId, Lease>,
     tickets: BTreeMap<ReservationId, JoinTicket>,
     /// Joined reservations whose admission ended before their caller came
-    /// back. Each keeps its id, so a wrong body under it is still told apart.
-    ended_joins: HashMap<ReservationId, UnminedTxId>,
+    /// back, with the verdict the admission got, which the caller gets when
+    /// it comes back. Each keeps its id too, so a wrong body under it is
+    /// still told apart.
+    ended_joins: HashMap<ReservationId, (UnminedTxId, Verdict)>,
     /// Every pooled transaction, visible or hidden, oldest first.
     pool: BTreeMap<u64, Pooled<E>>,
     pooled: HashMap<transaction::Hash, u64>,
@@ -1303,10 +1307,22 @@ impl<E: VerifyError> MempoolState<E> {
                 .is_some_and(|admission| admission.tx_id == tx_id)
         });
         let Some(key) = key else {
-            // The fetch that held this slot is over.
-            self.leases.remove(&reservation);
-            self.ended_joins.remove(&reservation);
-            let verdict = self.stale_verdict(tx_id);
+            // The admission this reservation was granted for ended before
+            // its caller came back. The caller gets that admission's verdict,
+            // charged to its own supplier, as if it had come in time.
+            let ended = self
+                .leases
+                .remove(&reservation)
+                .map(|lease| lease.verdict)
+                .or_else(|| {
+                    self.ended_joins
+                        .remove(&reservation)
+                        .map(|(_, verdict)| verdict)
+                });
+            let verdict = match ended {
+                Some(verdict) => self.charged(&verdict, &supplier),
+                None => self.stale_verdict(tx_id),
+            };
             self.step.effects.push(Effect::Verdict { waiter, verdict });
             return (waiter, self.take_step());
         };
@@ -1372,7 +1388,7 @@ impl<E: VerifyError> MempoolState<E> {
     fn reserved_for(&self, reservation: ReservationId) -> Option<UnminedTxId> {
         self.undecided_for(reservation)
             .or_else(|| self.leases.get(&reservation).map(|lease| lease.tx_id))
-            .or_else(|| self.ended_joins.get(&reservation).copied())
+            .or_else(|| self.ended_joins.get(&reservation).map(|(id, _)| *id))
     }
 
     /// Ends a reservation that brought no body: frees its lease, or its place
@@ -1795,6 +1811,7 @@ impl<E: VerifyError> MempoolState<E> {
                 Lease {
                     source: admission.source.clone(),
                     tx_id: admission.tx_id,
+                    verdict: verdict.clone(),
                 },
             );
         }
@@ -1809,26 +1826,33 @@ impl<E: VerifyError> MempoolState<E> {
             .collect();
         for reservation in ended {
             self.tickets.remove(&reservation);
-            self.ended_joins.insert(reservation, tx_id);
+            self.ended_joins
+                .insert(reservation, (tx_id, verdict.clone()));
         }
         for waiter in admission.waiters {
-            let verdict = match (&verdict, &waiter.supplier) {
-                (Verdict::Rejected(rejection), Supplier::Peer(peer)) => {
-                    if rejection.charge == Charge::Cooldown {
-                        self.cool(peer);
-                    }
-                    verdict.clone()
-                }
-                (Verdict::Rejected(rejection), Supplier::Nobody) => Verdict::Rejected(Rejection {
-                    charge: Charge::None,
-                    ..rejection.clone()
-                }),
-                (other, _) => other.clone(),
-            };
+            let verdict = self.charged(&verdict, &waiter.supplier);
             self.step.effects.push(Effect::Verdict {
                 waiter: waiter.id,
                 verdict,
             });
+        }
+    }
+
+    /// `verdict` as `supplier` gets it. A cooldown charge starts a peer
+    /// supplier's cooldown, and nobody else is charged.
+    fn charged(&mut self, verdict: &Verdict, supplier: &Supplier) -> Verdict {
+        match (verdict, supplier) {
+            (Verdict::Rejected(rejection), Supplier::Peer(peer)) => {
+                if rejection.charge == Charge::Cooldown {
+                    self.cool(peer);
+                }
+                verdict.clone()
+            }
+            (Verdict::Rejected(rejection), Supplier::Nobody) => Verdict::Rejected(Rejection {
+                charge: Charge::None,
+                ..rejection.clone()
+            }),
+            (other, _) => other.clone(),
         }
     }
 

@@ -509,6 +509,8 @@ struct JoinTicket {
 struct Lease {
     source: Source,
     tx_id: UnminedTxId,
+    /// The verdict its admission got, which its caller gets too.
+    verdict: ModelVerdict,
 }
 
 /// One chain-scoped rejection list: when each entry was made, oldest first.
@@ -537,14 +539,13 @@ pub struct PoolModel {
     leases: HashMap<ReservationId, Lease>,
     tickets: BTreeMap<ReservationId, JoinTicket>,
     /// Joined reservations whose admission ended before their caller came
-    /// back. Each keeps its id, so a wrong body under it is still told
-    /// apart, as the handle would.
+    /// back, with the verdict the admission got. The caller gets that
+    /// verdict when it comes back, as if it had arrived in time.
     ///
-    /// This is the model's stand-in for the id the caller's reservation
-    /// carries. The core keeps nothing for it: the handle makes that check
-    /// before it sends anything. An entry lasts as long as its caller holds
-    /// the reservation.
-    ended_joins: HashMap<ReservationId, UnminedTxId>,
+    /// Each keeps its id too, so a wrong body under it is still told apart,
+    /// as the handle would. An entry lasts as long as its caller holds the
+    /// reservation.
+    ended_joins: HashMap<ReservationId, (UnminedTxId, ModelVerdict)>,
     /// The pool, oldest first.
     pool: BTreeMap<u64, Pooled>,
     pooled: HashMap<transaction::Hash, u64>,
@@ -774,10 +775,22 @@ impl PoolModel {
                 .is_some_and(|admission| admission.tx_id == tx_id)
         });
         let Some(key) = key else {
-            // The fetch that held this slot is over.
-            self.leases.remove(&reservation);
-            self.ended_joins.remove(&reservation);
-            let verdict = self.stale_verdict(tx_id);
+            // The admission this reservation was granted for ended before
+            // its caller came back. The caller gets that admission's verdict,
+            // charged to its own supplier, as if it had come in time.
+            let ended = self
+                .leases
+                .remove(&reservation)
+                .map(|lease| lease.verdict)
+                .or_else(|| {
+                    self.ended_joins
+                        .remove(&reservation)
+                        .map(|(_, verdict)| verdict)
+                });
+            let verdict = match ended {
+                Some(verdict) => self.charged(verdict, &supplier),
+                None => self.stale_verdict(tx_id),
+            };
             self.step.effects.push(Effect::Verdict { waiter, verdict });
             self.start_revalidations();
             return (waiter, self.take_step());
@@ -1452,7 +1465,7 @@ impl PoolModel {
     fn reserved_for(&self, reservation: ReservationId) -> Option<UnminedTxId> {
         self.undecided_for(reservation)
             .or_else(|| self.leases.get(&reservation).map(|lease| lease.tx_id))
-            .or_else(|| self.ended_joins.get(&reservation).copied())
+            .or_else(|| self.ended_joins.get(&reservation).map(|(id, _)| *id))
     }
 
     /// Ends a reservation that brought no body: frees its lease, or its
@@ -1844,6 +1857,7 @@ impl PoolModel {
                 Lease {
                     source: admission.source.clone(),
                     tx_id: admission.tx_id,
+                    verdict,
                 },
             );
         }
@@ -1858,28 +1872,32 @@ impl PoolModel {
             .collect();
         for reservation in ended {
             self.tickets.remove(&reservation);
-            self.ended_joins.insert(reservation, tx_id);
+            self.ended_joins.insert(reservation, (tx_id, verdict));
         }
         for waiter in admission.waiters {
-            let verdict = match (verdict, &waiter.supplier) {
-                (ModelVerdict::Rejected { scope, charge }, Supplier::Peer(peer)) => {
-                    if charge == Charge::Cooldown {
-                        self.cool(peer);
-                    }
-                    ModelVerdict::Rejected { scope, charge }
-                }
-                (ModelVerdict::Rejected { scope, .. }, Supplier::Nobody) => {
-                    ModelVerdict::Rejected {
-                        scope,
-                        charge: Charge::None,
-                    }
-                }
-                (other, _) => other,
-            };
+            let verdict = self.charged(verdict, &waiter.supplier);
             self.step.effects.push(Effect::Verdict {
                 waiter: waiter.id,
                 verdict,
             });
+        }
+    }
+
+    /// `verdict` as `supplier` gets it. A cooldown charge starts a peer
+    /// supplier's cooldown, and nobody else is charged.
+    fn charged(&mut self, verdict: ModelVerdict, supplier: &Supplier) -> ModelVerdict {
+        match (verdict, supplier) {
+            (ModelVerdict::Rejected { scope, charge }, Supplier::Peer(peer)) => {
+                if charge == Charge::Cooldown {
+                    self.cool(peer);
+                }
+                ModelVerdict::Rejected { scope, charge }
+            }
+            (ModelVerdict::Rejected { scope, .. }, Supplier::Nobody) => ModelVerdict::Rejected {
+                scope,
+                charge: Charge::None,
+            },
+            (other, _) => other,
         }
     }
 

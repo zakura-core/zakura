@@ -1358,7 +1358,6 @@ fn pool_state_matches_model() {
             "verdict CoolingDown",
             "verdict LocalFault(NoBody)",
             "verdict LocalFault(PoolUnsettled)",
-            "verdict LocalFault(StaleReservation)",
             "verdict LocalFault(VerifyTimeout)",
             "verdict LocalFault(WrongTransaction)",
             "verdict LocalFault(Deactivated)",

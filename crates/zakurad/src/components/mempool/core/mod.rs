@@ -196,9 +196,6 @@ pub(crate) fn assemble(
     let verifier = verifier::ConsensusVerifier::new(
         Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
         read_state,
-        // A reader, not a handle: the core owns the verifier, and a handle
-        // it held would keep the core's command channel open.
-        handle.reader(),
         config.max_transaction_bytes,
         network,
         current,
@@ -215,7 +212,7 @@ pub(crate) fn assemble(
 
     let (changes, _) = tokio::sync::broadcast::channel(MEMPOOL_CHANGE_CHANNEL_CAPACITY);
     let subscriber = MempoolTxSubscriber::new(changes.clone());
-    let follower = follower::Follower::new(handle.clone(), outbound.clone(), changes);
+    let follower = follower::Follower::new(handle.reader(), outbound.clone(), changes);
 
     let adapter = adapter::CoreMempool::new(
         handle.clone(),

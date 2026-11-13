@@ -1,7 +1,7 @@
 //! What follows the pool core's published pool: the announcer and the
 //! indexer's change stream.
 //!
-//! Both read the numbered change log through `PoolHandle::view`, which pairs
+//! Both read the numbered change log through `PoolReader::view`, which pairs
 //! a snapshot with exactly the entries that lead to it, so an addition is
 //! never read ahead of the snapshot that holds it.
 //!
@@ -17,18 +17,23 @@
 
 use std::collections::HashSet;
 
+use futures::{future::BoxFuture, FutureExt};
+
 use tokio::{sync::broadcast, time::Instant};
 use tower::{timeout::Timeout, Service, ServiceExt};
 
 use zakura_chain::transaction::UnminedTxId;
 use zakura_network::{self as zn, MAX_TX_INV_IN_SENT_MESSAGE};
 use zakura_node_services::mempool::{
-    port::{Change, ChangeSeq, ChangesSince, PoolHandle, RemovalReason},
+    port::{Change, ChangeSeq, ChangesSince, PoolReader, RemovalReason},
     MempoolChange,
 };
 
 use crate::{
-    components::{mempool::gossip::TRANSACTION_GOSSIP_DELAY, sync::TIPS_RESPONSE_TIMEOUT},
+    components::{
+        mempool::gossip::{BROADCAST_READY_TIMEOUT, TRANSACTION_GOSSIP_DELAY},
+        sync::TIPS_RESPONSE_TIMEOUT,
+    },
     BoxError,
 };
 
@@ -39,7 +44,9 @@ const MAX_ANNOUNCED: usize = MAX_TX_INV_IN_SENT_MESSAGE as usize;
 
 /// The announcer and the change stream.
 pub(crate) struct Follower {
-    handle: PoolHandle,
+    /// A reader, not a handle, so the follower does not keep the core
+    /// running while it waits for the core to stop.
+    pool: PoolReader,
     outbound: Timeout<Outbound>,
     changes: broadcast::Sender<MempoolChange>,
     cursor: ChangeSeq,
@@ -48,15 +55,15 @@ pub(crate) struct Follower {
 }
 
 impl Follower {
-    /// A follower of `handle` that announces through `outbound` and sends
+    /// A follower of `pool` that announces through `outbound` and sends
     /// the change stream on `changes`.
     pub fn new(
-        handle: PoolHandle,
+        pool: PoolReader,
         outbound: Outbound,
         changes: broadcast::Sender<MempoolChange>,
     ) -> Self {
         Self {
-            handle,
+            pool,
             outbound: Timeout::new(outbound, TIPS_RESPONSE_TIMEOUT),
             changes,
             cursor: ChangeSeq::default(),
@@ -65,20 +72,36 @@ impl Follower {
     }
 
     /// Follows the pool until the core stops.
+    ///
+    /// An announcement waits for the network beside the change stream, not
+    /// in its way, so an unready network never holds up the indexer's
+    /// events.
     pub async fn run(mut self) -> Result<(), BoxError> {
         let mut next_announcement = Instant::now();
+        let mut announcing: Option<BoxFuture<'static, Option<HashSet<UnminedTxId>>>> = None;
         loop {
             self.read();
-            let announce = !self.pending.is_empty();
+            let due = announcing.is_none() && !self.pending.is_empty();
             tokio::select! {
-                changed = self.handle.snapshot_changed() => {
+                changed = self.pool.snapshot_changed() => {
                     if !changed {
                         return Ok(());
                     }
                 }
-                () = tokio::time::sleep_until(next_announcement), if announce => {
-                    self.announce().await;
+                () = tokio::time::sleep_until(next_announcement), if due => {
+                    let ids: HashSet<UnminedTxId> =
+                        self.pending.iter().copied().take(MAX_ANNOUNCED).collect();
+                    announcing = Some(announce(self.outbound.clone(), ids).boxed());
+                }
+                announced = async { announcing.as_mut().expect("guarded").await },
+                    if announcing.is_some() =>
+                {
+                    announcing = None;
                     next_announcement = Instant::now() + TRANSACTION_GOSSIP_DELAY;
+                    // Only ids a broadcast started for leave `pending`.
+                    for id in announced.into_iter().flatten() {
+                        self.pending.remove(&id);
+                    }
                 }
             }
         }
@@ -86,7 +109,7 @@ impl Follower {
 
     /// Reads the log from the cursor to the latest snapshot.
     fn read(&mut self) {
-        let Some(view) = self.handle.view(self.cursor) else {
+        let Some(view) = self.pool.view(self.cursor) else {
             return;
         };
         let snapshot = view.snapshot;
@@ -135,26 +158,35 @@ impl Follower {
         });
         self.cursor = snapshot.last_change;
     }
+}
 
-    /// Advertises up to one message of pending ids to the peer set.
-    async fn announce(&mut self) {
-        let ids: HashSet<UnminedTxId> = self.pending.iter().copied().take(MAX_ANNOUNCED).collect();
-        for id in &ids {
-            self.pending.remove(id);
-        }
-        let count = u64::try_from(ids.len()).expect("one advertisement fits in u64");
-        let Ok(network) = self.outbound.ready().await else {
-            metrics::counter!("mempool.gossip.network.unready.total").increment(1);
-            return;
-        };
-        let response = network.call(zn::Request::AdvertiseTransactionIds(ids, None));
-        tokio::spawn(async move {
-            if let Err(error) = response.await {
-                tracing::debug!(%error, "transaction broadcast did not finish");
+/// Advertises `ids` to the peer set, and returns them once the broadcast has
+/// started, or `None` if the network was not ready in time.
+///
+/// The wait for the network is bounded, as today's gossip bounds it. Ids
+/// that were not sent stay pending for a later try.
+async fn announce(
+    outbound: Timeout<Outbound>,
+    ids: HashSet<UnminedTxId>,
+) -> Option<HashSet<UnminedTxId>> {
+    let network =
+        match tokio::time::timeout(BROADCAST_READY_TIMEOUT, outbound.ready_oneshot()).await {
+            Ok(Ok(network)) => network,
+            Ok(Err(_)) | Err(_) => {
+                metrics::counter!("mempool.gossip.network.unready.total").increment(1);
+                return None;
             }
-        });
-        metrics::counter!("mempool.gossiped.transactions.total").increment(count);
-    }
+        };
+    let count = u64::try_from(ids.len()).expect("one advertisement fits in u64");
+    let mut network = network;
+    let response = network.call(zn::Request::AdvertiseTransactionIds(ids.clone(), None));
+    tokio::spawn(async move {
+        if let Err(error) = response.await {
+            tracing::debug!(%error, "transaction broadcast did not finish");
+        }
+    });
+    metrics::counter!("mempool.gossiped.transactions.total").increment(count);
+    Some(ids)
 }
 
 /// One batch of the change log, as today's change stream events.
@@ -201,5 +233,119 @@ impl Batch {
         if !mined.is_empty() {
             let _ = changes.send(MempoolChange::mined(mined));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use tower::util::BoxCloneSyncService;
+    use zakura_chain::{block, parameters::Network};
+    use zakura_node_services::mempool::{
+        port::{pool_port, ChainTip, Generation, PoolSnapshot},
+        MempoolChangeKind, TransactionDependencies,
+    };
+
+    use super::*;
+
+    /// A peer set that is ready only while `open` holds, and records each
+    /// advertisement.
+    #[derive(Clone, Default)]
+    struct Gate {
+        open: Arc<AtomicBool>,
+        advertised: Arc<Mutex<Vec<HashSet<UnminedTxId>>>>,
+    }
+
+    impl Service<zn::Request> for Gate {
+        type Response = zn::Response;
+        type Error = zn::BoxError;
+        type Future = BoxFuture<'static, Result<zn::Response, zn::BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            // A closed gate never wakes its caller. Each try polls again.
+            if self.open.load(Ordering::SeqCst) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn call(&mut self, request: zn::Request) -> Self::Future {
+            if let zn::Request::AdvertiseTransactionIds(ids, _) = request {
+                self.advertised
+                    .lock()
+                    .expect("no test panics holding it")
+                    .push(ids);
+            }
+            async { Ok(zn::Response::Nil) }.boxed()
+        }
+    }
+
+    /// The pool at height 1 holding `txs`.
+    fn snapshot(
+        txs: Vec<zakura_chain::transaction::VerifiedUnminedTx>,
+        last_change: ChangeSeq,
+    ) -> PoolSnapshot {
+        PoolSnapshot::new(
+            ChainTip {
+                hash: block::Hash([1; 32]),
+                height: block::Height(1),
+            },
+            Generation(0),
+            last_change,
+            txs,
+            TransactionDependencies::default(),
+        )
+    }
+
+    /// An unready network neither holds up the change stream nor loses the
+    /// ids it could not announce.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_unready_network_neither_stalls_the_change_stream_nor_loses_ids() {
+        let mut vectors = Network::Mainnet.unmined_transactions_in_blocks(1..=10);
+        let pooled = vectors.next().expect("a vector transaction");
+        let refused = vectors.next().expect("a second vector transaction");
+        let (handle, inbox) = pool_port();
+        let gate = Gate::default();
+        let (changes, mut events) = broadcast::channel(16);
+        let follower = Follower::new(
+            handle.reader(),
+            BoxCloneSyncService::new(gate.clone()),
+            changes,
+        );
+        tokio::spawn(follower.run());
+
+        inbox.publish([Change::Added(pooled.transaction.id())], |last| {
+            snapshot(vec![pooled.clone()], last)
+        });
+        let added = events.recv().await.expect("the stream stays open");
+        assert_eq!(added.kind, MempoolChangeKind::Added);
+
+        // The announcement is now waiting on the closed network. A refusal
+        // still reaches the stream well before that wait ends.
+        tokio::time::sleep(TRANSACTION_GOSSIP_DELAY).await;
+        inbox.publish([Change::Refused(refused.transaction.id())], |last| {
+            snapshot(vec![pooled.clone()], last)
+        });
+        let invalidated = tokio::time::timeout(Duration::from_millis(10), events.recv())
+            .await
+            .expect("the change stream is not held up by the network")
+            .expect("the stream stays open");
+        assert_eq!(invalidated.kind, MempoolChangeKind::Invalidated);
+        assert!(gate.advertised.lock().expect("no panics").is_empty());
+
+        // Once the network is ready, the id that waited is announced.
+        gate.open.store(true, Ordering::SeqCst);
+        tokio::time::sleep(BROADCAST_READY_TIMEOUT + TRANSACTION_GOSSIP_DELAY * 2).await;
+        let advertised = gate.advertised.lock().expect("no panics").clone();
+        assert_eq!(advertised, vec![[pooled.transaction.id()].into()]);
     }
 }

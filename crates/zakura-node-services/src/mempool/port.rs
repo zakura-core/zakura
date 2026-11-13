@@ -26,6 +26,10 @@
 //! bodies, and drops each one before it reaches the core. Holding the slot
 //! instead would let peers that never answer fill the core.
 //!
+//! A caller whose reservation outlives its admission, because another
+//! caller's body decided the id first, gets that admission's verdict when it
+//! submits, charged to its own supplier, as if it had come in time.
+//!
 //! A slot is counted against the source that reserved it until the verdict,
 //! whoever supplies the body. So a caller that asks a second peer for the same
 //! id keeps its reservation and names that second peer as the supplier. No
@@ -945,12 +949,14 @@ pub struct PoolHandle {
     shared: Arc<Shared>,
 }
 
-/// Read-only access to the pool's latest snapshot. Unlike a [`PoolHandle`],
-/// it sends no commands, so holding one does not keep the core running. A
-/// verifier the core owns reads the pool through one.
+/// Read-only access to the pool: the latest snapshot and the change log.
+/// Unlike a [`PoolHandle`], it sends no commands, so holding one does not
+/// keep the core running. A verifier the core owns, and a reader that waits
+/// for the core to stop, use one.
 #[derive(Clone, Debug)]
 pub struct PoolReader {
     snapshot: watch::Receiver<Option<Arc<PoolSnapshot>>>,
+    shared: Arc<Shared>,
 }
 
 impl PoolReader {
@@ -958,6 +964,31 @@ impl PoolReader {
     pub fn snapshot(&self) -> Option<Arc<PoolSnapshot>> {
         self.snapshot.borrow().clone()
     }
+
+    /// Wait for a snapshot newer than the last one this reader saw. Returns
+    /// `false` when the core has stopped.
+    pub async fn snapshot_changed(&mut self) -> bool {
+        self.snapshot.changed().await.is_ok()
+    }
+
+    /// See [`PoolHandle::view`].
+    pub fn view(&self, cursor: ChangeSeq) -> Option<PoolView> {
+        view(&self.shared, &self.snapshot, cursor)
+    }
+}
+
+/// The latest snapshot with the changes after `cursor` that it includes.
+fn view(
+    shared: &Shared,
+    snapshot: &watch::Receiver<Option<Arc<PoolSnapshot>>>,
+    cursor: ChangeSeq,
+) -> Option<PoolView> {
+    let log = shared.log.lock().unwrap_or_else(PoisonError::into_inner);
+    // The core publishes under this lock, so the snapshot read here is the
+    // one the log's newest entry belongs to, or an older one.
+    let snapshot = snapshot.borrow().clone()?;
+    let changes = log.between(cursor, snapshot.last_change);
+    Some(PoolView { snapshot, changes })
 }
 
 /// The core's side of the port.
@@ -1136,6 +1167,7 @@ impl PoolHandle {
     pub fn reader(&self) -> PoolReader {
         PoolReader {
             snapshot: self.snapshot.clone(),
+            shared: self.shared.clone(),
         }
     }
 
@@ -1152,16 +1184,7 @@ impl PoolHandle {
     /// sees an addition ahead of the snapshot that holds the transaction.
     /// Its next cursor is the snapshot's [`PoolSnapshot::last_change`].
     pub fn view(&self, cursor: ChangeSeq) -> Option<PoolView> {
-        let log = self
-            .shared
-            .log
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        // The core publishes under this lock, so the snapshot read here is
-        // the one the log's newest entry belongs to, or an older one.
-        let snapshot = self.snapshot.borrow().clone()?;
-        let changes = log.between(cursor, snapshot.last_change);
-        Some(PoolView { snapshot, changes })
+        view(&self.shared, &self.snapshot, cursor)
     }
 }
 

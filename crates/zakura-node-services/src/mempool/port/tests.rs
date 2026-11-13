@@ -4,7 +4,11 @@
 //! review findings on the M1 and M2 plans, and the test name says which
 //! rule it pins.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    collections::HashSet,
+    net::{Ipv6Addr, SocketAddr},
+    time::Duration,
+};
 
 use zakura_chain::{
     block::Height,
@@ -15,14 +19,17 @@ use zakura_chain::{
 use super::{
     model::{
         Effect, JobId, ModelBlock, ModelTransition, ModelTx, ModelUnreserved, ModelVerdict,
-        Outcome, PoolModel, Step, WaiterId, COOLDOWN, REVALIDATE_RETRY, T_PARK, T_VERIFY,
+        Outcome, PoolModel, Step, WaiterId, COOLDOWN, REJECTION_MEMORY, REVALIDATE_RETRY, T_PARK,
+        T_VERIFY,
     },
-    pool_port, Change, ChangeLog, ChangeSeq, ChangesSince, Charge, Generation, GenerationCell,
-    GenerationRead, Intent, LocalFault, NoRoom, PoolCommand, RejectionScope, RemovalReason,
-    ReservationId, Source, Supplier, Unreserved, CHANGE_LOG_CAPACITY, MAX_PENDING,
-    MAX_PENDING_PER_SOURCE, MAX_REVALIDATING, MAX_WAITERS,
+    pool_port, ChainTip, Change, ChangeLog, ChangeSeq, ChangesSince, Charge, CooldownKey,
+    Generation, GenerationCell, GenerationRead, Intent, LocalFault, NoRoom, PoolCommand,
+    PoolSnapshot, RejectionScope, RemovalReason, ReservationId, Source, Supplier, Unreserved,
+    Verdict, Violation, CHANGE_LOG_CAPACITY, COMMAND_QUEUE, MAX_COOLDOWNS, MAX_PENDING,
+    MAX_PENDING_PER_SOURCE, MAX_REJECTIONS, MAX_REVALIDATING, MAX_WAITERS,
 };
 use crate::mempool::QueueSource;
+use crate::mempool::TransactionDependencies;
 
 fn hash(n: u16) -> transaction::Hash {
     let mut bytes = [0; 32];
@@ -38,8 +45,10 @@ fn tx(n: u16) -> ModelTx {
     ModelTx::new(id(n))
 }
 
+/// A legacy peer with its own IP address, since a cooldown is per address.
 fn legacy(n: u16) -> QueueSource {
-    QueueSource::LegacySocket(SocketAddr::from(([10, 0, 0, 1], n)))
+    let [high, low] = n.to_be_bytes();
+    QueueSource::LegacySocket(SocketAddr::from(([10, 0, high, low], 8233)))
 }
 
 fn v2(n: u8) -> QueueSource {
@@ -104,6 +113,7 @@ fn transition(generation: u64, tip: u32, blocks: Vec<Vec<ModelTx>>) -> ModelTran
             .collect(),
         tip: Height(tip),
         generation: Generation(generation),
+        activates_upgrade: false,
     }
 }
 
@@ -113,6 +123,7 @@ fn reorg(generation: u64, tip: u32) -> ModelTransition {
         connected: vec![ModelBlock::default()],
         tip: Height(tip),
         generation: Generation(generation),
+        activates_upgrade: false,
     }
 }
 
@@ -191,7 +202,7 @@ async fn a_dropped_reservation_reaches_the_core() {
         let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.command().await else {
             panic!("the first command is the reservation");
         };
-        let _ = reply.send(Ok(inbox.grant(ReservationId(7), tx_id, false)));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(7), tx_id, false, true)));
         inbox
     });
 
@@ -1180,4 +1191,507 @@ fn every_submission_gets_exactly_one_verdict_and_the_limits_hold() {
         verdicts.sort();
         assert_eq!(waiters, verdicts, "seed {seed}");
     }
+}
+
+// Cases from review of the contract's first version.
+
+/// A unit transaction that the test only needs for its id.
+fn body(n: u8) -> zakura_chain::transaction::UnminedTx {
+    use zakura_chain::{
+        block::Height as BlockHeight,
+        transaction::{LockTime, Transaction},
+    };
+    let mut expiry = BlockHeight(1_000_000);
+    expiry.0 += u32::from(n);
+    Transaction::V4 {
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+        expiry_height: expiry,
+        joinsplit_data: None,
+        sapling_shielded_data: None,
+    }
+    .into()
+}
+
+#[tokio::test]
+async fn cancelling_a_blocked_submission_frees_its_slot() {
+    let (handle, mut inbox) = pool_port();
+    let transaction = body(1);
+    let tx_id = transaction.id();
+    let reservation = inbox.grant(ReservationId(7), tx_id, false, true);
+
+    // The command queue is full, so the submission waits to be sent.
+    for _ in 0..COMMAND_QUEUE {
+        handle
+            .report_violation(Violation {
+                peer: v2(1),
+                cause: "test",
+            })
+            .await;
+    }
+    let caller = {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            handle
+                .submit(reservation, transaction, Supplier::Nobody)
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    assert_eq!(inbox.released(), None);
+
+    // The caller goes away while it waits. The command never reaches the
+    // core, so the reservation inside it is dropped still armed.
+    caller.abort();
+    assert!(caller
+        .await
+        .expect_err("the caller was aborted")
+        .is_cancelled());
+    assert_eq!(inbox.released(), Some(ReservationId(7)));
+}
+
+#[tokio::test]
+async fn an_accepted_reservation_is_the_cores_and_a_dropped_command_is_not() {
+    let (handle, mut inbox) = pool_port();
+    let transaction = body(1);
+    let reservation = inbox.grant(ReservationId(7), transaction.id(), false, true);
+    let caller = {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            handle
+                .submit(reservation, transaction, Supplier::Nobody)
+                .await
+        })
+    };
+
+    let Some(PoolCommand::Submit {
+        reservation, reply, ..
+    }) = inbox.command().await
+    else {
+        panic!("a reservation that wants the body sends it");
+    };
+    assert_eq!(reservation.accept(), ReservationId(7));
+    let _ = reply.send(Verdict::Admitted);
+    assert!(matches!(
+        caller.await.expect("the caller is not cancelled"),
+        Verdict::Admitted
+    ));
+    // The core owns the outcome now. Nothing is released.
+    assert_eq!(inbox.released(), None);
+}
+
+#[tokio::test]
+async fn a_joined_reservation_that_needs_no_body_sends_none() {
+    let (handle, mut inbox) = pool_port();
+    let transaction = body(1);
+    let reservation = inbox.grant(ReservationId(8), transaction.id(), true, false);
+    let caller = {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            handle
+                .submit(reservation, transaction, Supplier::Peer(v2(1)))
+                .await
+        })
+    };
+
+    let Some(PoolCommand::Join { reply, .. }) = inbox.command().await else {
+        panic!("the body stays with the caller");
+    };
+    let _ = reply.send(Verdict::Admitted);
+    assert!(matches!(
+        caller.await.expect("the caller is not cancelled"),
+        Verdict::Admitted
+    ));
+}
+
+#[tokio::test]
+async fn a_body_for_another_id_is_refused_and_frees_the_slot() {
+    let (handle, mut inbox) = pool_port();
+    let reservation = inbox.grant(ReservationId(9), body(1).id(), false, true);
+    assert!(matches!(
+        handle.submit(reservation, body(2), Supplier::Nobody).await,
+        Verdict::LocalFault(LocalFault::WrongTransaction)
+    ));
+    assert_eq!(inbox.released(), Some(ReservationId(9)));
+}
+
+fn snapshot_at(last_change: ChangeSeq) -> PoolSnapshot {
+    PoolSnapshot::new(
+        ChainTip {
+            hash: zakura_chain::block::Hash([0; 32]),
+            height: Height(100),
+        },
+        Generation(0),
+        last_change,
+        Vec::new(),
+        TransactionDependencies::default(),
+    )
+}
+
+#[tokio::test]
+async fn a_view_pairs_each_snapshot_with_exactly_its_changes() {
+    let (handle, inbox) = pool_port();
+    assert!(handle.view(ChangeSeq(0)).is_none());
+
+    inbox.publish([Change::Added(id(1))], snapshot_at);
+    inbox.publish([Change::Added(id(2)), Change::Refused(id(3))], snapshot_at);
+
+    let view = handle.view(ChangeSeq(1)).expect("published");
+    assert_eq!(view.snapshot.last_change, ChangeSeq(3));
+    let ChangesSince::Entries(entries) = view.changes else {
+        panic!("the reader is on the log");
+    };
+    assert_eq!(
+        entries.iter().map(|entry| entry.change).collect::<Vec<_>>(),
+        vec![Change::Added(id(2)), Change::Refused(id(3))]
+    );
+}
+
+#[test]
+fn a_reader_is_never_handed_changes_newer_than_its_snapshot() {
+    let mut log = ChangeLog::default();
+    log.append([Change::Added(id(1))]);
+    log.append([Change::Added(id(2))]);
+    // A snapshot taken after the first batch.
+    let ChangesSince::Entries(entries) = log.between(ChangeSeq(0), ChangeSeq(1)) else {
+        panic!("the reader is on the log");
+    };
+    assert_eq!(
+        entries.iter().map(|entry| entry.change).collect::<Vec<_>>(),
+        vec![Change::Added(id(1))]
+    );
+}
+
+#[test]
+fn a_legacy_cooldown_key_is_the_canonical_ip() {
+    let plain = QueueSource::LegacySocket(SocketAddr::from(([10, 0, 0, 1], 8233)));
+    let other_port = QueueSource::LegacySocket(SocketAddr::from(([10, 0, 0, 1], 9999)));
+    let mapped = QueueSource::LegacySocket(SocketAddr::from((
+        Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001),
+        8233,
+    )));
+    assert_eq!(CooldownKey::from(&plain), CooldownKey::from(&other_port));
+    assert_eq!(CooldownKey::from(&plain), CooldownKey::from(&mapped));
+    assert_ne!(CooldownKey::from(&v2(1)), CooldownKey::from(&v2(2)));
+}
+
+#[test]
+fn a_cooldown_follows_a_legacy_peer_to_a_new_port() {
+    let mut model = new_model();
+    let first = QueueSource::LegacySocket(SocketAddr::from(([10, 9, 9, 9], 8233)));
+    let reconnected = QueueSource::LegacySocket(SocketAddr::from(([10, 9, 9, 9], 40_000)));
+    model.violation(first, secs(0));
+    assert_eq!(
+        model.reserve(id(1), Source::Peer(reconnected), Intent::Fetch, secs(1)),
+        Err(ModelUnreserved::CoolingDown)
+    );
+}
+
+#[test]
+fn only_one_joined_caller_is_asked_for_the_body() {
+    let mut model = new_model();
+    // tx-relay reserved the id and is fetching it.
+    model
+        .reserve(id(1), Source::Peer(v2(1)), Intent::Fetch, secs(0))
+        .expect("room");
+    let first = model
+        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .expect("joins");
+    let second = model
+        .reserve(id(1), peer(3), Intent::Deliver, secs(0))
+        .expect("joins");
+    // Both hold the body. The core takes it from one of them.
+    assert!(first.wants_body);
+    assert!(!second.wants_body);
+
+    let (second_waiter, step) = model.wait(second.id, id(1), Supplier::Peer(legacy(3)), secs(0));
+    assert!(step.started().is_empty());
+    let (first_waiter, step) = model.submit(first.id, tx(1), Supplier::Peer(legacy(2)), secs(0));
+    let job = the_job(&step);
+
+    // A caller that joins once the core holds the body is not asked either.
+    let third = model
+        .reserve(id(1), peer(4), Intent::Deliver, secs(0))
+        .expect("joins");
+    assert!(!third.wants_body);
+
+    let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(1));
+    assert_eq!(step.verdict(first_waiter), Some(ModelVerdict::Admitted));
+    assert_eq!(step.verdict(second_waiter), Some(ModelVerdict::Admitted));
+    assert_eq!(model.bodies_held(), 0);
+}
+
+#[test]
+fn waiters_get_a_local_fault_when_nobody_brings_the_body() {
+    let mut model = new_model();
+    let owner = model
+        .reserve(id(1), Source::Peer(v2(1)), Intent::Fetch, secs(0))
+        .expect("room");
+    let bringer = model
+        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .expect("joins");
+    let waiting = model
+        .reserve(id(1), peer(3), Intent::Deliver, secs(0))
+        .expect("joins");
+    let (waiter, _) = model.wait(waiting.id, id(1), Supplier::Peer(legacy(3)), secs(0));
+
+    // The fetch fails, and the caller that was asked for the body is
+    // cancelled.
+    assert_eq!(model.release(owner.id, secs(1)), Step::default());
+    let step = model.release(bringer.id, secs(1));
+    assert_eq!(
+        step.verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::NoBody))
+    );
+    assert_eq!(model.slots_in_use(), 0);
+    model.assert_invariants();
+}
+
+#[test]
+fn a_joined_reservation_does_not_reach_a_later_admission_of_the_same_id() {
+    let mut model = new_model();
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let alice = model
+        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .expect("joins");
+    model.outcome(
+        job,
+        Outcome::LocalFault(LocalFault::StateUnavailable),
+        stable(0),
+        stable(0),
+        secs(1),
+    );
+
+    // Bob starts a new admission of the same id.
+    let (bob, _) = bring_in(&mut model, tx(1), legacy(3));
+    // Alice's old reservation died with the first admission. It neither
+    // joins Bob's nor counts among its waiters.
+    let (late, step) = model.submit(alice.id, tx(1), Supplier::Peer(legacy(2)), secs(2));
+    assert_eq!(
+        step.verdict(late),
+        Some(ModelVerdict::LocalFault(LocalFault::StaleReservation))
+    );
+    assert_eq!(step.verdict(bob), None);
+    model.assert_invariants();
+}
+
+#[test]
+fn a_child_that_spends_an_output_its_visible_parent_lacks_is_not_verified_in_a_loop() {
+    let mut model = new_model();
+    admit(&mut model, tx(1), 1, 0);
+    // The parent has one output. The child spends output 5 of it.
+    let child = tx(2).spending(hash(1), 5);
+    let (waiter, job) = bring_in(&mut model, child, legacy(2));
+    let no_such_output = Outcome::MissingInputs(vec![OutPoint {
+        hash: hash(1),
+        index: 5,
+    }]);
+
+    // The parent is visible, but nothing changed since the verifier looked.
+    let step = model.outcome(job, no_such_output, stable(0), stable(0), secs(1));
+    assert_eq!(step, Step::default(), "no immediate second run");
+    assert!(model.is_parked(id(2)));
+
+    // A visible parent does not stop the wait, so the child is answered.
+    let step = model.tick(secs(1) + T_PARK);
+    assert_eq!(
+        step.verdict(waiter),
+        Some(rejected(RejectionScope::Uncached, Charge::None))
+    );
+    assert_eq!(model.slots_in_use(), 0);
+}
+
+#[test]
+fn waking_and_parking_again_does_not_restart_the_wait() {
+    let mut model = new_model();
+    let (waiter, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    model.outcome(job, missing(1), stable(0), stable(0), secs(0));
+
+    // Forty seconds parked. Then a block mines something with the parent's
+    // id, the child runs again, and the output is still missing.
+    let step = model.transition(transition(1, 101, vec![vec![tx(1)]]), secs(40));
+    let job = the_job(&step);
+    model.outcome(job, missing(1), stable(1), stable(1), secs(40));
+    assert!(model.is_parked(id(2)));
+
+    assert_eq!(model.tick(secs(59)).verdict(waiter), None);
+    assert_eq!(
+        model.tick(secs(60)).verdict(waiter),
+        Some(rejected(RejectionScope::Uncached, Charge::None))
+    );
+}
+
+#[test]
+fn a_missed_block_that_mined_a_parent_keeps_its_child() {
+    let mut model = new_model();
+    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, child_of(2, 1), 2, 0);
+
+    let step = model.resync(Height(240), Generation(5), secs(1));
+    let parent_job = the_job(&step);
+
+    // The state finds the parent in the best chain.
+    let step = model.outcome(
+        parent_job,
+        Outcome::AlreadyMined,
+        stable(5),
+        stable(5),
+        secs(2),
+    );
+    assert_eq!(
+        step.changes,
+        vec![Change::Removed {
+            id: id(1),
+            reason: RemovalReason::Mined
+        }]
+    );
+    // The child is not removed with it. It is checked against the chain.
+    let child_job = the_job(&step);
+    let step = model.outcome(child_job, Outcome::Pass, stable(5), stable(5), secs(3));
+    assert_eq!(step.changes, vec![Change::Revealed(id(2))]);
+    assert_eq!(model.visible(), vec![id(2)]);
+}
+
+#[test]
+fn a_reorg_forgets_chain_scoped_rejections_too() {
+    let mut model = new_model();
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    // Rejected as expired at this height.
+    model.outcome(
+        job,
+        Outcome::Fail {
+            scope: RejectionScope::EffectsChain,
+            charge: Charge::None,
+        },
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+
+    // The chain goes back below the expiry height. The old answer says
+    // nothing about the new chain.
+    model.transition(reorg(1, 90), secs(1));
+    assert!(model
+        .reserve(id(1), peer(2), Intent::Fetch, secs(1))
+        .is_ok());
+
+    let (_, job) = bring_in(&mut model, tx(3), legacy(3));
+    model.outcome(
+        job,
+        Outcome::Fail {
+            scope: RejectionScope::EffectsChain,
+            charge: Charge::None,
+        },
+        stable(1),
+        stable(1),
+        secs(1),
+    );
+    model.resync(Height(200), Generation(4), secs(2));
+    assert!(model
+        .reserve(id(3), peer(4), Intent::Fetch, secs(2))
+        .is_ok());
+}
+
+#[test]
+fn an_upgrade_activation_verifies_the_pool_again() {
+    let mut model = new_model();
+    admit(&mut model, tx(1), 1, 0);
+
+    // No block left the chain, but the rules changed.
+    let mut activation = transition(1, 101, vec![vec![]]);
+    activation.activates_upgrade = true;
+    let step = model.transition(activation, secs(1));
+    assert_eq!(step.changes, vec![Change::Hidden(id(1))]);
+    assert!(model.visible().is_empty());
+    assert_eq!(step.started().len(), 1);
+}
+
+#[test]
+fn a_block_caches_what_it_mined_what_conflicted_and_what_expired() {
+    let mut model = new_model();
+    let coin = hash(900);
+    admit(&mut model, tx(1).spending(coin, 0), 1, 0);
+    let mut expiring = tx(2);
+    expiring.expiry = Some(Height(101));
+    admit(&mut model, expiring, 2, 0);
+    admit(&mut model, tx(3), 3, 0);
+
+    let block = vec![tx(7).spending(coin, 0), tx(3)];
+    model.transition(transition(1, 101, vec![block]), secs(1));
+
+    // None of them is fetched again, and each answers at the first stage.
+    for n in [1, 2, 3, 7] {
+        assert_eq!(
+            model.reserve(id(n), peer(50), Intent::Fetch, secs(1)),
+            Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain)),
+            "transaction {n}"
+        );
+    }
+    // The query takes no slot and does not depend on room.
+    let asked: HashSet<_> = [id(1), id(3), id(40)].into_iter().collect();
+    let cached: HashSet<_> = [id(1), id(3)].into_iter().collect();
+    assert_eq!(model.rejected_ids(&asked), cached);
+    assert_eq!(model.slots_in_use(), 0);
+}
+
+#[test]
+fn a_chain_scoped_rejection_is_forgotten_after_its_memory_time() {
+    let mut model = new_model();
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    model.outcome(
+        job,
+        Outcome::Fail {
+            scope: RejectionScope::EffectsChain,
+            charge: Charge::None,
+        },
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+    model.tick(REJECTION_MEMORY - secs(1));
+    assert!(model
+        .reserve(id(1), peer(2), Intent::Fetch, REJECTION_MEMORY - secs(1))
+        .is_err());
+    model.tick(REJECTION_MEMORY);
+    assert!(model
+        .reserve(id(1), peer(2), Intent::Fetch, REJECTION_MEMORY)
+        .is_ok());
+}
+
+#[test]
+fn the_rejection_lists_and_the_cooldowns_stay_bounded() {
+    let mut model = new_model();
+    let over = u16::try_from(MAX_REJECTIONS + 1).expect("the limit fits the test's ids");
+    for n in 0..over {
+        let (_, job) = bring_in(&mut model, tx(n), legacy(n));
+        model.outcome(
+            job,
+            Outcome::Fail {
+                scope: RejectionScope::ExactTip,
+                charge: Charge::None,
+            },
+            stable(0),
+            stable(0),
+            secs(0),
+        );
+    }
+    // A tip-scoped list that passes its limit is cleared, as today.
+    assert!(model
+        .reserve(id(0), peer(1), Intent::Fetch, secs(0))
+        .is_ok());
+    model.assert_invariants();
+
+    let over = u16::try_from(MAX_COOLDOWNS + 1).expect("the limit fits the test's ids");
+    for n in 0..over {
+        let [high, low] = n.to_be_bytes();
+        let address = SocketAddr::from(([10, 1, high, low], 8233));
+        model.violation(QueueSource::LegacySocket(address), secs(u64::from(n)));
+    }
+    model.assert_invariants();
+    // The first cooldown ended soonest, so it made room for the last.
+    assert!(!model.cooling(&QueueSource::LegacySocket(SocketAddr::from((
+        [10, 1, 0, 0],
+        8233
+    )))));
 }

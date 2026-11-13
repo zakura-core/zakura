@@ -26,7 +26,7 @@
 //!
 //! [`model`] restates these rules as an independent model.
 
-use std::{collections::VecDeque, fmt, sync::Arc};
+use std::{collections::VecDeque, fmt, net::IpAddr, sync::Arc};
 
 use zakura_chain::{
     block,
@@ -68,6 +68,15 @@ pub const MAX_REVALIDATING: usize = 400;
 /// ring of 16,384 removals.
 pub const CHANGE_LOG_CAPACITY: usize = 24_384;
 
+/// Entries in each of the two tip-scoped rejection lists. A list that grows
+/// past this is cleared, as today. The chain-scoped list holds as many and
+/// drops its oldest entry.
+pub const MAX_REJECTIONS: usize = 40_000;
+
+/// Peers with a cooldown. A new one past this replaces the one that ends
+/// first, as today.
+pub const MAX_COOLDOWNS: usize = 20_000;
+
 /// Commands that can wait for the core. A full queue makes
 /// [`PoolHandle::reserve`] and [`PoolHandle::submit`] wait.
 pub const COMMAND_QUEUE: usize = 1_024;
@@ -98,6 +107,26 @@ pub enum Supplier {
     Nobody,
 }
 
+/// What a cooldown is keyed by. A legacy peer is its canonical IP address,
+/// as today, so a new port or an IPv4-mapped form of the address does not
+/// escape it.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CooldownKey {
+    /// A legacy peer's canonical IP address.
+    Ip(IpAddr),
+    /// A v2 peer's encoded id.
+    Peer(Vec<u8>),
+}
+
+impl From<&QueueSource> for CooldownKey {
+    fn from(peer: &QueueSource) -> Self {
+        match peer {
+            QueueSource::LegacySocket(address) => Self::Ip(address.ip().to_canonical()),
+            QueueSource::Zakura(id) => Self::Peer(id.clone()),
+        }
+    }
+}
+
 /// Why the caller is reserving.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Intent {
@@ -117,12 +146,15 @@ pub struct ReservationId(pub u64);
 /// A slot in the core for one transaction id, or a place among the waiters
 /// of an id that is already undecided.
 ///
-/// Dropping it before [`PoolHandle::submit`] frees the slot.
+/// Dropping it frees the slot, unless the core has accepted it. That holds
+/// while it waits inside a [`PoolCommand`] too, so a caller that is cancelled
+/// in the middle of [`PoolHandle::submit`] leaks nothing.
 #[must_use = "dropping a reservation frees its slot"]
 pub struct Reservation {
     id: ReservationId,
     tx_id: UnminedTxId,
     joined: bool,
+    wants_body: bool,
     release: Option<mpsc::UnboundedSender<ReservationId>>,
 }
 
@@ -133,12 +165,14 @@ impl Reservation {
         id: ReservationId,
         tx_id: UnminedTxId,
         joined: bool,
+        wants_body: bool,
         release: mpsc::UnboundedSender<ReservationId>,
     ) -> Self {
         Self {
             id,
             tx_id,
             joined,
+            wants_body,
             release: Some(release),
         }
     }
@@ -159,8 +193,17 @@ impl Reservation {
         self.joined
     }
 
-    /// Give up the release-on-drop, because the core now owns the outcome.
-    fn disarm(mut self) -> ReservationId {
+    /// Whether the core needs the body from this caller. False for a joined
+    /// reservation when the core already holds the body or another caller
+    /// is bringing it. [`PoolHandle::submit`] then sends no body.
+    pub fn wants_body(&self) -> bool {
+        self.wants_body
+    }
+
+    /// The core takes over: the outcome is now the core's to deliver, and
+    /// dropping this no longer frees anything. Only the core calls this,
+    /// when it takes the reservation out of a command.
+    pub fn accept(mut self) -> ReservationId {
         self.release = None;
         self.id
     }
@@ -180,6 +223,7 @@ impl fmt::Debug for Reservation {
         f.debug_struct("Reservation")
             .field("id", &self.id)
             .field("joined", &self.joined)
+            .field("wants_body", &self.wants_body)
             .finish_non_exhaustive()
     }
 }
@@ -269,6 +313,8 @@ pub enum LocalFault {
     Deactivated,
     /// The reservation was no longer valid when the body arrived.
     StaleReservation,
+    /// Every caller that could have brought the body gave up.
+    NoBody,
     /// The body is not the transaction the reservation names.
     WrongTransaction,
     /// The core has stopped.
@@ -426,6 +472,10 @@ pub struct ChainTransition {
     pub after: ChainTip,
     /// The stable generation this transition ends on.
     pub generation: Generation,
+    /// Whether a connected block activates a network upgrade. The pool was
+    /// verified under the old rules, so the core verifies all of it again,
+    /// as it does after a reorg.
+    pub activates_upgrade: bool,
 }
 
 impl ChainTransition {
@@ -521,6 +571,11 @@ pub enum ChangesSince {
     Entries(Vec<ChangeEntry>),
     /// The reader fell off the log. It reads the snapshot and continues from
     /// the snapshot's [`PoolSnapshot::last_change`].
+    ///
+    /// The snapshot cannot give back a lost [`Change::Refused`], because a
+    /// refused transaction was never in the pool. A reader that owes its
+    /// subscribers every refusal ends their stream here, as today's change
+    /// stream does when a subscriber lags.
     Resync,
 }
 
@@ -554,6 +609,17 @@ impl ChangeLog {
     /// The position of the newest entry.
     pub fn last(&self) -> ChangeSeq {
         self.last
+    }
+
+    /// Every entry after `cursor`, up to and including `upto`.
+    pub fn between(&self, cursor: ChangeSeq, upto: ChangeSeq) -> ChangesSince {
+        match self.since(cursor) {
+            ChangesSince::Entries(mut entries) => {
+                entries.retain(|entry| entry.seq <= upto);
+                ChangesSince::Entries(entries)
+            }
+            ChangesSince::Resync => ChangesSince::Resync,
+        }
     }
 
     /// Every entry after `cursor`.
@@ -655,13 +721,24 @@ pub enum PoolCommand {
         /// Where the answer goes.
         reply: oneshot::Sender<Result<Reservation, Unreserved>>,
     },
-    /// [`PoolHandle::submit`].
+    /// [`PoolHandle::submit`] with a body.
     Submit {
-        /// The reservation the body arrives under.
-        reservation: ReservationId,
+        /// The reservation the body arrives under. Still armed: if this
+        /// command is dropped before the core takes it, the slot is freed.
+        reservation: Reservation,
         /// The body.
         transaction: UnminedTx,
         /// Whose bytes it is.
+        supplier: Supplier,
+        /// Where the verdict goes.
+        reply: oneshot::Sender<Verdict>,
+    },
+    /// [`PoolHandle::submit`] under a joined reservation that needs no body.
+    /// The caller waits for the verdict of the body the core already has.
+    Join {
+        /// The joined reservation. Still armed.
+        reservation: Reservation,
+        /// Whose bytes the caller's copy was.
         supplier: Supplier,
         /// Where the verdict goes.
         reply: oneshot::Sender<Verdict>,
@@ -678,6 +755,24 @@ pub enum PoolCommand {
         /// admitted, or the reason the core will not wait.
         reply: oneshot::Sender<Result<transparent::Output, AwaitOutputError>>,
     },
+    /// [`PoolHandle::rejected_ids`].
+    RejectedIds {
+        /// The ids to check.
+        ids: HashSet<UnminedTxId>,
+        /// The ids a cached rejection covers.
+        reply: oneshot::Sender<HashSet<UnminedTxId>>,
+    },
+}
+
+/// The pool as one reader sees it: a snapshot, and the changes that lead up
+/// to exactly that snapshot from the reader's cursor.
+#[derive(Clone, Debug)]
+pub struct PoolView {
+    /// The snapshot.
+    pub snapshot: Arc<PoolSnapshot>,
+    /// The entries after the reader's cursor, none newer than the
+    /// snapshot's [`PoolSnapshot::last_change`].
+    pub changes: ChangesSince,
 }
 
 /// What readers share with the core.
@@ -754,6 +849,12 @@ impl PoolHandle {
     ///
     /// The slot stays counted against the reservation's source. `supplier`
     /// is whose bytes these are, which can be another peer.
+    ///
+    /// A joined reservation that does not want the body sends none. The
+    /// body is dropped here, so at most one copy of a transaction waits for
+    /// the core beside the one the core holds.
+    ///
+    /// Cancelling this before the core takes the command frees the slot.
     pub async fn submit(
         &self,
         reservation: Reservation,
@@ -765,11 +866,20 @@ impl PoolHandle {
             return Verdict::LocalFault(LocalFault::WrongTransaction);
         }
         let (reply, verdict) = oneshot::channel();
-        let command = PoolCommand::Submit {
-            reservation: reservation.disarm(),
-            transaction,
-            supplier,
-            reply,
+        let command = if reservation.wants_body() {
+            PoolCommand::Submit {
+                reservation,
+                transaction,
+                supplier,
+                reply,
+            }
+        } else {
+            drop(transaction);
+            PoolCommand::Join {
+                reservation,
+                supplier,
+                reply,
+            }
         };
         if self.commands.send(command).await.is_err() {
             return Verdict::LocalFault(LocalFault::Stopped);
@@ -802,6 +912,18 @@ impl PoolHandle {
         answer.await.unwrap_or(Err(AwaitOutputError::Stopped))
     }
 
+    /// The members of `ids` that a cached rejection covers. Takes no slot
+    /// and answers the same whether or not the core has room. Empty when the
+    /// core has stopped.
+    pub async fn rejected_ids(&self, ids: HashSet<UnminedTxId>) -> HashSet<UnminedTxId> {
+        let (reply, answer) = oneshot::channel();
+        let command = PoolCommand::RejectedIds { ids, reply };
+        if self.commands.send(command).await.is_err() {
+            return HashSet::new();
+        }
+        answer.await.unwrap_or_default()
+    }
+
     /// The latest snapshot, or `None` until the core has attached and
     /// published one.
     pub fn snapshot(&self) -> Option<Arc<PoolSnapshot>> {
@@ -814,13 +936,23 @@ impl PoolHandle {
         self.snapshot.changed().await.is_ok()
     }
 
-    /// Every change after `cursor`.
-    pub fn changes_since(&self, cursor: ChangeSeq) -> ChangesSince {
-        self.shared
+    /// The latest snapshot with the changes after `cursor` that it
+    /// includes, or `None` until the core has published one.
+    ///
+    /// A reader that announces or serves from the log uses this, so it never
+    /// sees an addition ahead of the snapshot that holds the transaction.
+    /// Its next cursor is the snapshot's [`PoolSnapshot::last_change`].
+    pub fn view(&self, cursor: ChangeSeq) -> Option<PoolView> {
+        let log = self
+            .shared
             .log
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .since(cursor)
+            .unwrap_or_else(PoisonError::into_inner);
+        // The core publishes under this lock, so the snapshot read here is
+        // the one the log's newest entry belongs to, or an older one.
+        let snapshot = self.snapshot.borrow().clone()?;
+        let changes = log.between(cursor, snapshot.last_change);
+        Some(PoolView { snapshot, changes })
     }
 }
 
@@ -830,41 +962,40 @@ impl PoolInbox {
         self.commands.recv().await
     }
 
-    /// A reservation a caller dropped without submitting, if one is waiting.
-    /// The core drains these before it answers a command, so a freed slot is
-    /// seen by the next reservation.
+    /// A reservation that was dropped before the core accepted it, if one is
+    /// waiting. The core drains these before it answers a command, so a
+    /// freed slot is seen by the next reservation.
     pub fn released(&mut self) -> Option<ReservationId> {
         self.releases.try_recv().ok()
     }
 
     /// Grant a reservation whose drop the core will hear about.
-    pub fn grant(&self, id: ReservationId, tx_id: UnminedTxId, joined: bool) -> Reservation {
-        Reservation::granted(id, tx_id, joined, self.release_handle.clone())
+    pub fn grant(
+        &self,
+        id: ReservationId,
+        tx_id: UnminedTxId,
+        joined: bool,
+        wants_body: bool,
+    ) -> Reservation {
+        Reservation::granted(id, tx_id, joined, wants_body, self.release_handle.clone())
     }
 
-    /// The position of the newest change, which the next snapshot records as
-    /// its [`PoolSnapshot::last_change`].
-    pub fn last_change(&self) -> ChangeSeq {
-        self.shared
+    /// Publish one batch: append `changes` to the log, then publish the
+    /// snapshot `build` makes for the position of the batch's last entry.
+    ///
+    /// Both happen under the log's lock, so [`PoolHandle::view`] never pairs
+    /// a snapshot with entries newer than it.
+    pub fn publish(
+        &self,
+        changes: impl IntoIterator<Item = Change>,
+        build: impl FnOnce(ChangeSeq) -> PoolSnapshot,
+    ) {
+        let mut log = self
+            .shared
             .log
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .last()
-    }
-
-    /// Append one batch to the change log and return the position of its
-    /// last entry.
-    pub fn log(&self, changes: impl IntoIterator<Item = Change>) -> ChangeSeq {
-        self.shared
-            .log
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .append(changes)
-    }
-
-    /// Publish the snapshot that includes every change logged so far.
-    /// Readers see the log entries before the snapshot that includes them.
-    pub fn publish(&self, snapshot: PoolSnapshot) {
-        self.snapshot.send_replace(Some(Arc::new(snapshot)));
+            .unwrap_or_else(PoisonError::into_inner);
+        let last = log.append(changes);
+        self.snapshot.send_replace(Some(Arc::new(build(last))));
     }
 }

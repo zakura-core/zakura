@@ -394,6 +394,20 @@ pub struct ExchangeRef {
 }
 impl Ref for ExchangeRef {}
 
+/// One history a witness test declared: the test, as its task names it,
+/// and the harness and case its declaration names. Two declarations of
+/// one case on two harnesses are two histories.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclarationRef {
+    /// The test, as its task names it.
+    pub test: String,
+    /// The harness.
+    pub harness: String,
+    /// The case.
+    pub case: String,
+}
+impl Ref for DeclarationRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

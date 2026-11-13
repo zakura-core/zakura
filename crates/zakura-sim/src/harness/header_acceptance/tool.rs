@@ -139,7 +139,7 @@ use super::{
         ObligationState, Report, ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
     history::{Declaration, DeclaredHistory, Ran, PLAN_FILE, RAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
-    refs::{Ref, TriggerRef},
+    refs::{DeclarationRef, Ref, TriggerRef},
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
     rows::HEADER_HARNESSES,
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
@@ -2639,38 +2639,53 @@ fn case_input_refusal(repo: &Path, harness: &str, input: &CaseInput, dir: &Path)
 
 /// The one declaration of `all`, a task's bound declarations
 /// ([`TaskAt::declared`]), of `harness`'s history `case` by `test`
-/// ([`super::history`]), or why there isn't exactly one. A declaration by
-/// another test, or of the case on another harness, isn't it.
+/// ([`super::history`]), joined on its whole [`DeclarationRef`], or why
+/// there isn't exactly one. A declaration by another test, or of the case
+/// on another harness, isn't it, so one case name declared on two
+/// harnesses is two histories.
 fn declaration<'a>(
     all: &'a [Declaration],
     harness: &str,
     test: &str,
     case: &str,
 ) -> Result<&'a Declaration, String> {
-    let named: Vec<&Declaration> = all
-        .iter()
-        .filter(|declaration| declaration.history().case == case)
-        .collect();
-    match named.as_slice() {
-        [found]
-            if found.history().harness == harness && libtest_names(&found.history().test, test) =>
-        {
-            Ok(found)
-        }
-        [found] => {
-            let history = found.history();
+    let want = DeclarationRef {
+        test: test.to_owned(),
+        harness: harness.to_owned(),
+        case: case.to_owned(),
+    };
+    let found = DeclarationRef::joined(&want, all, |declaration| {
+        let history = declaration.history();
+        // libtest names the declaring thread by the test's path in its
+        // crate, which names the task's test if it ends in it.
+        let test = match libtest_names(&history.test, test) {
+            true => test.to_owned(),
+            false => history.test.clone(),
+        };
+        Some(DeclarationRef {
+            test,
+            harness: history.harness.clone(),
+            case: history.case.clone(),
+        })
+    });
+    match found.as_slice() {
+        [found] => Ok(found),
+        [] => {
+            let declared: Vec<String> = all
+                .iter()
+                .map(|declaration| {
+                    let history = declaration.history();
+                    format!("{}'s {} on {}", history.test, history.case, history.harness)
+                })
+                .collect();
             Err(format!(
-                "its witness test declared {case} as {}'s on {}, not {test}'s on {harness}",
-                history.test, history.harness
+                "its witness test declared no history {case} of {test}'s on {harness}, \
+                 among {declared:?}"
             ))
         }
-        [] => Err(format!(
-            "its witness test declared no history named {case} among {} declarations",
-            all.len()
-        )),
         _ => Err(format!(
-            "its witness test declared {case} {} times",
-            named.len()
+            "its witness test declared {case} on {harness} {} times",
+            found.len()
         )),
     }
 }
@@ -4979,6 +4994,45 @@ mod tests {
             )
         });
         assert_eq!(keys, 4);
+    }
+
+    /// A task's history is the declaration joined on its whole
+    /// [`DeclarationRef`] (Rule 25's template): a witness test declaring
+    /// one case on two harnesses declared two histories, and each is found
+    /// on its own harness, while the ref with its test, its harness or its
+    /// case moved finds none.
+    #[test]
+    fn a_declaration_joins_its_whole_identity() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let root = tempfile::tempdir().expect("a temp dir can be created");
+        let scenario = serde_json::json!({ "peers": 2 });
+        let wire = "header-sync/wire";
+        for harness in [NODE, wire] {
+            super::super::history::declare_into(
+                root.path(),
+                &at_for(),
+                harness,
+                "only",
+                &scenario,
+                &crate::PlanInput::Bytes(vec![1]),
+            )
+            .expect("the declaration writes");
+        }
+        let all = AT.declared(root.path(), "").expect("they read back");
+        let test = "a_declaration_joins_its_whole_identity";
+        for (at, harness) in [NODE, wire].into_iter().enumerate() {
+            let found = declaration(&all, harness, test, "only").expect("one declaration");
+            assert_eq!(found.dir(), all[at].dir());
+        }
+        let own = DeclarationRef {
+            test: test.to_owned(),
+            harness: wire.to_owned(),
+            case: "only".to_owned(),
+        };
+        let keys = assert_one_key_off::<DeclarationRef>(&own, |want| {
+            declaration(&all, &want.harness, &want.test, &want.case).is_ok()
+        });
+        assert_eq!(keys, 3);
     }
 
     /// A planted case's patched witness is the one the planted runner

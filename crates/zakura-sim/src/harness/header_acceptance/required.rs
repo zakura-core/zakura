@@ -13,8 +13,9 @@ use super::{
         contract_catch_key, contract_test_key, Contract, ContractId, ContractState, Narrowing,
     },
     reasons::NaEntry,
-    sim_test, Approval, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, RunId, TestRef,
-    Tier, PLAN, TIERS,
+    refs::{PlantedRef, Ref},
+    sim_test, Approval, CaseRef, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, RunId,
+    TestRef, Tier, PLAN, TIERS,
 };
 use crate::property::Status;
 
@@ -88,6 +89,9 @@ pub struct Inventories<'a> {
 pub enum Permit {
     /// Exactly this test's `Passes`.
     Test(TestRef),
+    /// Exactly this planted case's `Caught`, the result its row's
+    /// [`Key::Case`] takes, joined on the case's whole [`PlantedRef`].
+    Caught(CaseRef),
     /// A transitional `Open` until exactly this PR, with exactly this
     /// reason, so another obligation's `Open` for the same PR doesn't
     /// satisfy it.
@@ -127,6 +131,7 @@ impl Permit {
     pub fn allows(self, expected: &Expected) -> bool {
         match (self, expected) {
             (Permit::Test(test), Expected::Passes { test: t }) => test == *t,
+            (Permit::Caught(want), Expected::Caught { case, .. }) => permitted_catch(&want, case),
             (
                 Permit::Until { owner, pr, reason },
                 Expected::Open {
@@ -152,6 +157,12 @@ impl Permit {
             _ => false,
         }
     }
+}
+
+/// Whether `case` is the planted case `want` a [`Permit::Caught`] names,
+/// joined on its whole [`PlantedRef`].
+fn permitted_catch(want: &CaseRef, case: &CaseRef) -> bool {
+    PlantedRef::joins(&want.planted(), case, |case| Some(case.planted()))
 }
 
 /// Gate 1's topology freshness test (hf-7): a link the harness closes,
@@ -372,10 +383,7 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     GateObligation {
         name: "gate-2/despite-close/caught",
         gates: &[Gate::G2],
-        permit: Permit::Test(sim_test(
-            "tests/header_despite_close.rs",
-            "the_path_break_needs_a_retained_violation",
-        )),
+        permit: Permit::Caught(super::companions::DESPITE_CLOSE),
     },
     GateObligation {
         name: "gate-2/despite-close/close-companion",
@@ -1011,4 +1019,58 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
         }
     }
     keys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::header_acceptance::{
+        companions::DESPITE_CLOSE, refs::one_key_off::assert_one_key_off, Found,
+    };
+
+    /// The case `planted` names, with its fields leaked to `'static` as a
+    /// [`CaseRef`] holds them.
+    fn case_of(planted: &PlantedRef) -> CaseRef {
+        CaseRef {
+            property: Box::leak(planted.property.clone().into_boxed_str()),
+            name: Box::leak(planted.name.clone().into_boxed_str()),
+        }
+    }
+
+    /// `case`'s `Caught`.
+    fn caught(case: CaseRef) -> Expected {
+        Expected::Caught {
+            case,
+            harness: "header-sync/wire",
+            set: &[],
+            found: Found::AtStep,
+            companions: &[],
+            not_applicable: &[],
+            patched_not_applicable: None,
+        }
+    }
+
+    /// A [`Permit::Caught`] takes the `Caught` of its case only on the
+    /// case's whole [`PlantedRef`] (Rule 25's template): the despite-close
+    /// permit allows that case's `Caught`, and another case's, with its
+    /// property or its name moved, it allows no more. Nor does it allow
+    /// the case's other results or a test's pass.
+    #[test]
+    fn a_permitted_catch_joins_its_whole_case() {
+        let permit = Permit::Caught(DESPITE_CLOSE);
+        let keys = assert_one_key_off::<PlantedRef>(&DESPITE_CLOSE.planted(), |planted| {
+            permit.allows(&caught(case_of(planted)))
+        });
+        assert_eq!(keys, 2);
+        assert!(!permit.allows(&Expected::MachineCaught {
+            case: DESPITE_CLOSE,
+            harness: "header-sync/wire",
+        }));
+        assert!(!permit.allows(&Expected::Passes {
+            test: sim_test(
+                "tests/header_despite_close.rs",
+                "the_path_break_needs_a_retained_violation",
+            ),
+        }));
+    }
 }

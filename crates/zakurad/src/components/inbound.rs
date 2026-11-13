@@ -279,8 +279,8 @@ pub struct InboundSetupData {
     /// The network whose target spacing scales the gossip lookahead window.
     pub network: Network,
 
-    /// A channel to send misbehavior reports to the [`AddressBook`].
-    pub misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
+    /// Scores peer misbehavior, and bans peers whose score reaches the ban threshold.
+    pub misbehavior: zn::MisbehaviorReporter,
 }
 
 /// Tracks the internal state of the [`Inbound`] service during setup.
@@ -324,8 +324,8 @@ pub enum Setup {
         /// A service that manages cached blockchain state.
         state: State,
 
-        /// A channel to send misbehavior reports to the [`AddressBook`].
-        misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
+        /// Scores peer misbehavior, and bans peers whose score reaches the ban threshold.
+        misbehavior: zn::MisbehaviorReporter,
     },
 
     /// Temporary state used in the inbound service's internal initialization code.
@@ -473,7 +473,7 @@ impl Service<zn::Request> for Inbound {
                         state,
                         latest_chain_tip,
                         network,
-                        misbehavior_sender,
+                        misbehavior,
                     } = setup_data;
 
                     let cached_peer_addr_response = CachedPeerAddrResponse::new(address_book);
@@ -494,7 +494,7 @@ impl Service<zn::Request> for Inbound {
                         block_downloads,
                         mempool,
                         state,
-                        misbehavior_sender,
+                        misbehavior,
                     }
                 }
                 Err(TryRecvError::Empty) => {
@@ -530,7 +530,7 @@ impl Service<zn::Request> for Inbound {
                 mut block_downloads,
                 mempool,
                 state,
-                misbehavior_sender,
+                misbehavior,
             } => {
                 // # Correctness
                 //
@@ -556,10 +556,8 @@ impl Service<zn::Request> for Inbound {
                     // the two decisions are the same decision.
                     if let Some(mismatch) = err.downcast_ref::<GossipedTipChildHeightMismatch>() {
                         if let Some(advertiser_addr) = advertiser_addr {
-                            let _ = misbehavior_sender.try_send((
-                                advertiser_addr,
-                                zn::constants::MAX_PEER_MISBEHAVIOR_SCORE,
-                            ));
+                            misbehavior
+                                .report(advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
                         }
 
                         // A failed parent recovery is left to the syncer. A re-request would
@@ -573,7 +571,8 @@ impl Service<zn::Request> for Inbound {
                     }
 
                     if let Some(update) = block_misbehavior(err, advertiser_addr) {
-                        let _ = misbehavior_sender.try_send(update);
+                        let (addr, score) = update;
+                        misbehavior.report(addr, score);
                     }
                 }
 
@@ -584,7 +583,7 @@ impl Service<zn::Request> for Inbound {
                     block_downloads,
                     mempool,
                     state,
-                    misbehavior_sender,
+                    misbehavior,
                 }
             }
         };
@@ -620,7 +619,7 @@ impl Service<zn::Request> for Inbound {
                 block_downloads,
                 mempool,
                 state,
-                misbehavior_sender: _,
+                misbehavior: _,
             } => (cached_peer_addr_response, block_downloads, mempool, state),
             _ => {
                 debug!("ignoring request from remote peer during setup");

@@ -58,7 +58,8 @@ use crate::{
         P2P_V2_UPGRADE_COMMAND, PRELUDE_MAGIC,
     },
     zakura::{ZakuraHandshakeConnector, ZakuraRejectReason, ZakuraUpgradeOutcome},
-    BannedIps, BoxError, Config, PeerSocketAddr, VersionMessage,
+    BannedIps, BoxError, Config, MisbehaviorReporter, PeerSocketAddr, UnconditionalPeers,
+    VersionMessage,
 };
 
 #[cfg(test)]
@@ -101,6 +102,9 @@ where
 
     /// The live ban list, rechecked by each connection before it writes a block advert.
     bans: BannedIps,
+
+    /// Records misbehavior that a connection detects before its messages reach a service.
+    misbehavior: MisbehaviorReporter,
 
     /// Warms each new connection's send direction, if warm-up is enabled.
     tcp_warmup: Option<TcpWarmup>,
@@ -153,6 +157,7 @@ where
             protected_peer_ips: self.protected_peer_ips.clone(),
             inbound_budget: self.inbound_budget.clone(),
             bans: self.bans.clone(),
+            misbehavior: self.misbehavior.clone(),
             tcp_warmup: self.tcp_warmup.clone(),
             parent_span: self.parent_span.clone(),
         }
@@ -511,7 +516,7 @@ where
     peer_registry: Option<PeerRegistry>,
     protected_peer_ips: Option<Arc<HashSet<IpAddr>>>,
     latest_chain_tip: C,
-    bans: Option<BannedIps>,
+    misbehavior: Option<MisbehaviorReporter>,
     tcp_warmup: Option<TcpWarmup>,
 }
 
@@ -597,7 +602,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector,
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips,
-            bans: self.bans,
+            misbehavior: self.misbehavior,
             tcp_warmup: self.tcp_warmup,
         }
     }
@@ -628,11 +633,13 @@ where
         self
     }
 
-    /// Share the live ban list with connection advert delivery. Optional.
+    /// Report peer misbehavior that connections detect to `misbehavior`, and check block
+    /// adverts against its live ban list when they are written. Optional.
     ///
-    /// If this is unset, block adverts are not checked against bans when they are written.
-    pub fn with_bans(mut self, bans: BannedIps) -> Self {
-        self.bans = Some(bans);
+    /// If this is unset, connections score misbehavior in a ban list of their own, which
+    /// nothing else reads.
+    pub fn with_misbehavior(mut self, misbehavior: MisbehaviorReporter) -> Self {
+        self.misbehavior = Some(misbehavior);
         self
     }
 
@@ -664,6 +671,9 @@ where
             let (tx, _) = broadcast::channel(100);
             tx
         });
+        let misbehavior = self.misbehavior.unwrap_or_else(|| {
+            MisbehaviorReporter::new(BannedIps::default(), UnconditionalPeers::default())
+        });
         let address_book_updater = self.address_book_updater.unwrap_or_else(|| {
             // No `AddressBookUpdater` for timestamp collection was passed, so create a stub
             // channel. Dropping the receiver means sends will fail, but we don't care.
@@ -694,7 +704,8 @@ where
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
             inbound_budget: InboundBudget::new(TCP_INBOUND_RETAINED_BYTES),
-            bans: self.bans.unwrap_or_default(),
+            bans: misbehavior.bans(),
+            misbehavior,
             tcp_warmup: self.tcp_warmup,
             parent_span: Span::current(),
         })
@@ -723,7 +734,7 @@ where
             peer_registry: None,
             protected_peer_ips: None,
             latest_chain_tip: NoChainTip,
-            bans: None,
+            misbehavior: None,
             tcp_warmup: None,
         }
     }
@@ -740,17 +751,14 @@ fn configured_advertised_services(config: &Config, mut services: PeerServices) -
     services
 }
 
-fn inbound_error_address_change(
-    addr: PeerSocketAddr,
-    remote_services: PeerServices,
-    error: &SerializationError,
-) -> MetaAddrChange {
+/// Returns the misbehavior score of an inbound message that failed to deserialize.
+fn inbound_error_misbehavior_score(error: &SerializationError) -> u32 {
     // Strict parsing rejects this fault before semantic verification can assign
     // its existing ban score, so preserve the same peer penalty here.
     if matches!(error, SerializationError::NonCanonicalShieldedProofSize) {
-        MetaAddr::new_misbehavior(addr, constants::MAX_PEER_MISBEHAVIOR_SCORE)
+        constants::MAX_PEER_MISBEHAVIOR_SCORE
     } else {
-        MetaAddr::new_errored(addr, remote_services)
+        0
     }
 }
 
@@ -1592,6 +1600,7 @@ where
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
         let bans = self.bans.clone();
+        let misbehavior = self.misbehavior.clone();
         let tcp_warmup = self.tcp_warmup.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
         let peer_registry = self.peer_registry.clone();
@@ -1804,6 +1813,14 @@ where
                 .then(move |msg| {
                     // Add a metric for inbound messages and errors.
                     // Fire a timestamp or failure event.
+                    // Reporting misbehavior doesn't wait, so it happens before the
+                    // timestamp collector send.
+                    if let (Err(err), Some(book_addr)) =
+                        (&msg, connected_addr.get_address_book_addr())
+                    {
+                        misbehavior.report(book_addr, inbound_error_misbehavior_score(err));
+                    }
+
                     let inbound_ts_collector = inbound_ts_collector.clone();
                     let span =
                         debug_span!(parent: ts_inner_conn_span.clone(), "inbound_ts_collector");
@@ -1836,11 +1853,7 @@ where
                                 // - the number of connections is limited
                                 // - after the first error, the peer is disconnected
                                 if let Some(book_addr) = connected_addr.get_address_book_addr() {
-                                    let change = inbound_error_address_change(
-                                        book_addr,
-                                        remote_services,
-                                        err,
-                                    );
+                                    let change = MetaAddr::new_errored(book_addr, remote_services);
                                     let _ = inbound_ts_collector.send(change).await;
                                 }
                             }

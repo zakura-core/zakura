@@ -263,10 +263,7 @@ fn misbehavior_ban_removes_all_addresses_for_ip() {
     let bans = address_book.bans();
     assert_eq!(address_metrics.borrow_and_update().num_addresses, 3);
 
-    address_book.update(MetaAddrChange::UpdateMisbehavior {
-        addr: banned_addr,
-        score_increment: MAX_PEER_MISBEHAVIOR_SCORE,
-    });
+    report_misbehavior(&mut address_book, banned_addr, MAX_PEER_MISBEHAVIOR_SCORE);
     address_book.peers.assert_consistent();
 
     assert!(
@@ -361,10 +358,7 @@ fn address_metrics_count_peers_by_state() {
         .is_empty());
 
     // A banned peer leaves the address book and its state's count.
-    address_book.update(MetaAddrChange::UpdateMisbehavior {
-        addr: responded_a,
-        score_increment: MAX_PEER_MISBEHAVIOR_SCORE,
-    });
+    report_misbehavior(&mut address_book, responded_a, MAX_PEER_MISBEHAVIOR_SCORE);
     address_book.peers.assert_consistent();
 
     let metrics = address_book.address_metrics(Utc::now());
@@ -600,26 +594,22 @@ fn unconditional_peer_misbehavior_is_ignored() {
         address_book_with_unconditional_peers(&["127.0.0.1/32"], &[unconditional_addr, other_addr]);
     let bans = address_book.bans();
 
-    let updated = address_book.update(MetaAddr::new_misbehavior(
+    report_misbehavior(
+        &mut address_book,
         unconditional_addr,
         MAX_PEER_MISBEHAVIOR_SCORE,
-    ));
+    );
     address_book.peers.assert_consistent();
 
-    assert_eq!(updated, None, "the misbehavior report should be dropped");
     assert!(!bans.contains(unconditional_addr.ip()));
     assert_eq!(
         address_book
-            .get(unconditional_addr)
-            .expect("unconditional peer should stay in the address book")
-            .misbehavior(),
+            .misbehavior_reporter()
+            .score(unconditional_addr.ip()),
         0,
     );
 
-    address_book.update(MetaAddr::new_misbehavior(
-        other_addr,
-        MAX_PEER_MISBEHAVIOR_SCORE,
-    ));
+    report_misbehavior(&mut address_book, other_addr, MAX_PEER_MISBEHAVIOR_SCORE);
 
     assert!(
         bans.contains(other_addr.ip()),
@@ -640,18 +630,18 @@ fn unconditional_peer_misbehavior_does_not_accumulate() {
     let bans = address_book.bans();
 
     for _ in 0..10 {
-        address_book.update(MetaAddr::new_misbehavior(
+        report_misbehavior(
+            &mut address_book,
             unconditional_addr,
             MAX_PEER_MISBEHAVIOR_SCORE / 2,
-        ));
+        );
     }
 
     assert!(!bans.contains(unconditional_addr.ip()));
     assert_eq!(
         address_book
-            .get(unconditional_addr)
-            .expect("unconditional peer should stay in the address book")
-            .misbehavior(),
+            .misbehavior_reporter()
+            .score(unconditional_addr.ip()),
         0,
     );
 }
@@ -668,18 +658,13 @@ fn unconditional_peer_ranges_match_inner_and_mapped_addresses() {
         address_book_with_unconditional_peers(&["127.0.0.0/30"], &[inner_addr, outer_addr]);
     let bans = address_book.bans();
 
-    address_book.update(MetaAddr::new_misbehavior(
-        inner_addr,
-        MAX_PEER_MISBEHAVIOR_SCORE,
-    ));
-    address_book.update(MetaAddr::new_misbehavior(
+    report_misbehavior(&mut address_book, inner_addr, MAX_PEER_MISBEHAVIOR_SCORE);
+    report_misbehavior(
+        &mut address_book,
         mapped_inner_addr,
         MAX_PEER_MISBEHAVIOR_SCORE,
-    ));
-    address_book.update(MetaAddr::new_misbehavior(
-        outer_addr,
-        MAX_PEER_MISBEHAVIOR_SCORE,
-    ));
+    );
+    report_misbehavior(&mut address_book, outer_addr, MAX_PEER_MISBEHAVIOR_SCORE);
 
     assert!(!bans.contains(inner_addr.ip()));
     assert!(!bans.contains(mapped_inner_addr.ip()));
@@ -729,4 +714,73 @@ fn disconnected_inbound_endpoint_is_not_dialed_or_cached() {
         );
         assert_eq!(cached, !is_inbound, "inbound {is_inbound}: cacheable");
     }
+}
+
+/// Reports misbehavior for `addr`, then removes the addresses of any IP that the report
+/// banned and publishes metrics, as the address book's next update would.
+fn report_misbehavior(address_book: &mut AddressBook, addr: crate::PeerSocketAddr, score: u32) {
+    address_book.misbehavior_reporter().report(addr, score);
+    address_book.remove_banned_peers();
+    address_book.publish_metrics();
+}
+
+/// A peer with a misbehavior score below the ban threshold is left out of the addresses
+/// the node gossips.
+#[test]
+fn scored_peers_are_not_gossiped() {
+    let _init_guard = zakura_test::init();
+
+    let addr: crate::PeerSocketAddr = "1.2.3.4:8233".parse().unwrap();
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    address_book.update(
+        MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, DateTime32::now())
+            .new_gossiped_change()
+            .expect("a gossiped address with a valid last seen time is a change"),
+    );
+
+    let is_gossiped = |address_book: &AddressBook| {
+        address_book
+            .sanitized(Utc::now())
+            .iter()
+            .any(|meta_addr| meta_addr.addr == addr)
+    };
+    assert!(is_gossiped(&address_book));
+
+    address_book.misbehavior_reporter().report(addr, 1);
+    assert!(!is_gossiped(&address_book));
+}
+
+/// A report bans an IP without locking the address book, and the address book's next
+/// update removes that IP's addresses.
+#[test]
+fn next_update_removes_addresses_banned_by_a_report() {
+    let _init_guard = zakura_test::init();
+
+    let banned: crate::PeerSocketAddr = "1.2.3.4:8233".parse().unwrap();
+    let other: crate::PeerSocketAddr = "1.2.3.5:8233".parse().unwrap();
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    address_book.update(MetaAddr::new_initial_peer(banned));
+
+    address_book
+        .misbehavior_reporter()
+        .report(banned, MAX_PEER_MISBEHAVIOR_SCORE);
+    assert!(
+        address_book.get(banned).is_some(),
+        "the report itself doesn't lock the address book"
+    );
+
+    address_book.update(MetaAddr::new_initial_peer(other));
+    address_book.peers.assert_consistent();
+    assert!(address_book.get(banned).is_none());
+    assert!(address_book.get(other).is_some());
 }

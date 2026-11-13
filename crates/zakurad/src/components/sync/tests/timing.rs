@@ -150,7 +150,7 @@ fn request_genesis_is_rate_limited() {
         );
 
     // start the sync
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let misbehavior = crate::components::test_misbehavior::reporter();
     let (mut chain_sync, _) = ChainSync::new(
         &ZakuradConfig::default(),
         Height(0),
@@ -158,7 +158,7 @@ fn request_genesis_is_rate_limited() {
         verifier_service,
         state_service,
         latest_chain_tip,
-        misbehavior_tx,
+        misbehavior,
     );
 
     // Run `request_genesis()` long enough to observe multiple retries.

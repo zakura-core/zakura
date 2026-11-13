@@ -159,7 +159,7 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
     );
     let (_chain_tip_sender, latest_chain_tip, _chain_tip_change) =
         zakura_state::ChainTipSender::new(None, &network);
-    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let misbehavior = crate::components::test_misbehavior::reporter();
     let setup = InboundSetupData {
         address_book: Arc::new(std::sync::Mutex::new(AddressBook::new(
             "0.0.0.0:0".parse()?,
@@ -180,7 +180,7 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
         state: Buffer::new(BoxService::new(state), 1),
         latest_chain_tip,
         network,
-        misbehavior_sender,
+        misbehavior,
     };
     assert!(
         setup_tx.send(setup).is_ok(),

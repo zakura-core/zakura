@@ -410,12 +410,12 @@ pub enum Task {
         expected: ExpectedId,
         /// The harness it runs on.
         harness: String,
-        /// The property whose witness the recording runs.
+        /// The property whose witness the recording runs: a `Holds`'s
+        /// target, or for a `StaysNotApplicable` its history's own target
+        /// ([`history_target`]).
         property: String,
-        /// `--expect`'s value for that witness: `holds` for a `Holds`, and
-        /// `not-applicable` for a `StaysNotApplicable`, whose target stays
-        /// `NotApplicable` while its trigger history is reached. `None`
-        /// records with no witness, which shows no trigger.
+        /// `--expect`'s value for that witness, `holds`. `None` records
+        /// with no witness, which shows no trigger.
         expect: Option<String>,
         /// Its witness test's package.
         package: String,
@@ -679,7 +679,8 @@ fn case_files(repo: &Path, case: CaseRef) -> Result<CaseInput, String> {
 }
 
 /// Turns `manifest`'s expected results into tasks: a `Holds` or
-/// `StaysNotApplicable` becomes a history task, a planted case a case task
+/// `StaysNotApplicable` becomes a history task ([`history_target`] says
+/// which witness a `StaysNotApplicable` records), a planted case a case task
 /// with its `Draft` run if it's a node one, and a `Replays` is read from
 /// the task that records its run. A replay of a run no task records is
 /// listed unsupported.
@@ -705,11 +706,10 @@ pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
             Expected::Holds {
                 property, history, ..
             } => tasks.push(history_task(id, property, history, Some("holds"))),
-            // A target that stays NotApplicable records its trigger history
-            // under the `not-applicable` expectation.
-            Expected::StaysNotApplicable {
-                property, history, ..
-            } => tasks.push(history_task(id, property, history, Some("not-applicable"))),
+            Expected::StaysNotApplicable { history, .. } => {
+                let target = history_target(history)?;
+                tasks.push(history_task(id, target, history, Some("holds")));
+            }
             Expected::Caught {
                 case,
                 harness,
@@ -776,6 +776,20 @@ pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
         }
     }
     Ok(RunPlan { tasks, unsupported })
+}
+
+/// The property `history`'s witness test runs it for, the first
+/// [`history_targets`](super::rows::history_targets) names. A
+/// `StaysNotApplicable` records its history under that target's `holds`
+/// witness, so the recording shows the history's own trigger: its
+/// `NotApplicable` target, a row no scenario reaches, has no trigger a run
+/// can show.
+fn history_target(history: super::HistoryRef) -> Result<&'static str, String> {
+    super::rows::history_targets()
+        .into_iter()
+        .find(|(counted, _)| *counted == history)
+        .map(|(_, target)| target)
+        .ok_or_else(|| format!("{history:?} isn't a counted history, so it has no target"))
 }
 
 /// A history's task, recording its witness of `property` with `expect`.
@@ -5609,33 +5623,55 @@ mod tests {
         }
     }
 
-    /// Each history task records its target's witness: a `Holds` under
-    /// `holds`, and a `StaysNotApplicable` under `not-applicable`, so its
-    /// trigger history is recorded beside its target's `NotApplicable`.
-    /// A `not-applicable` witness of the task's own property supplies its
-    /// trigger, and one recorded under `holds` doesn't.
+    /// Each history task records a `holds` witness: a `Holds` its own
+    /// target's, and a `StaysNotApplicable` its history's own target's,
+    /// since its `NotApplicable` target, a row no scenario reaches, has no
+    /// trigger a run can show. So the two `over-owed-closes` rows record the
+    /// `unsolicited-closes` histories' triggers. A `holds` witness of the
+    /// task's property supplies its trigger, and a `not-applicable` one
+    /// doesn't.
     #[test]
     fn a_stays_not_applicable_task_records_its_trigger() {
         let manifest = Manifest::committed();
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let plan = plan(&manifest, &repo).expect("the committed manifest plans");
-        let mut stays = 0;
+        let mut stays = Vec::new();
         for task in &plan.tasks {
             if let Task::History {
-                expected, expect, ..
+                expected,
+                property,
+                expect,
+                case,
+                ..
             } = task
             {
-                let wanted = match expected {
-                    ExpectedId::StaysNotApplicable { .. } => {
-                        stays += 1;
-                        "not-applicable"
+                assert_eq!(expect.as_deref(), Some("holds"), "{expected:?}");
+                match expected {
+                    ExpectedId::StaysNotApplicable {
+                        property: stays_na, ..
+                    } => {
+                        assert_ne!(property, stays_na, "{expected:?}");
+                        stays.push((property.clone(), case.clone()));
                     }
-                    _ => "holds",
-                };
-                assert_eq!(expect.as_deref(), Some(wanted), "{expected:?}");
+                    ExpectedId::Holds {
+                        property: target, ..
+                    } => {
+                        assert_eq!(property, target, "{expected:?}");
+                    }
+                    other => panic!("a history task for {other:?}"),
+                }
             }
         }
-        assert_eq!(stays, 2);
+        let unsolicited = |row: &str| {
+            (
+                format!("header-sync/s5v9/{row}/unsolicited-closes"),
+                format!("{row}/unsolicited-closes"),
+            )
+        };
+        assert_eq!(
+            stays,
+            [unsolicited("headers"), unsolicited("headers-outcome")]
+        );
         let read = |expect: &str| {
             let dir = tempfile::tempdir().expect("a temp dir can be created");
             let witness =
@@ -5645,13 +5681,13 @@ mod tests {
                 (dir.path(), &AT),
                 history_run(),
                 NODE,
-                ("p/a", Some("not-applicable")),
+                ("p/a", Some("holds")),
                 ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
                 "s",
             )
         };
-        assert!(read("not-applicable").trigger);
-        assert!(!read("holds").trigger);
+        assert!(read("holds").trigger);
+        assert!(!read("not-applicable").trigger);
     }
 
     /// An artifacts directory counts only for the run of S it names: one

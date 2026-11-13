@@ -84,6 +84,9 @@ struct Shared {
     /// The largest body the pool takes, which today's downloader checks
     /// before a cooldown.
     max_transaction_bytes: u64,
+    /// Queued items not yet answered at their second stage, for today's
+    /// `mempool.currently.queued.transactions` gauge.
+    in_flight: std::sync::atomic::AtomicUsize,
     /// Undecided transactions from each peer, counted from the reservation to
     /// the verdict.
     per_peer: std::sync::Mutex<HashMap<QueueSource, usize>>,
@@ -125,6 +128,7 @@ impl CoreMempool {
                 cooldowns: PeerCooldowns::default(),
                 may_cool,
                 max_transaction_bytes,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
                 per_peer: std::sync::Mutex::new(HashMap::new()),
                 read_state: std::sync::Mutex::new(read_state),
                 expose_peer_addresses,
@@ -331,7 +335,13 @@ async fn queue(
     // `FullQueue`, so the peer's is checked first here, before a slot is
     // taken.
     let slot = match &from {
-        Some(peer) => Some(PeerSlot::take(&shared, peer).ok_or(MempoolError::FullQueue)?),
+        Some(peer) => match PeerSlot::take(&shared, peer) {
+            Some(slot) => Some(slot),
+            None => {
+                metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
+                return Err(MempoolError::FullQueue.into());
+            }
+        },
         None => None,
     };
     let reservation = match shared.handle.reserve(id, intent).await {
@@ -341,6 +351,8 @@ async fn queue(
     // A joined submission takes no core slot, but it still counts against
     // its peer until its verdict, so one peer cannot hold more than its
     // share of waiters.
+    metrics::counter!("mempool.queued.transactions.total").increment(1);
+    shared.set_in_flight(1);
     let (answer, receiver) = oneshot::channel();
     tokio::spawn(async move {
         // Today's download task has one deadline, `RATE_LIMIT_DELAY`, for the
@@ -349,6 +361,7 @@ async fn queue(
         let deadline = tokio::time::Instant::now() + RATE_LIMIT_DELAY;
         let result = bring_in(&shared, reservation, item, from, deadline).await;
         drop(slot);
+        shared.set_in_flight(-1);
         let _ = answer.send(result);
     });
     Ok(receiver)
@@ -571,6 +584,23 @@ async fn bring_in(
 }
 
 impl Shared {
+    /// Moves the count of queued items in flight by `by`, and sets today's
+    /// gauge for it.
+    fn set_in_flight(&self, by: isize) {
+        use std::sync::atomic::Ordering;
+        let now = if by >= 0 {
+            self.in_flight
+                .fetch_add(by.unsigned_abs(), Ordering::Relaxed)
+                .saturating_add(by.unsigned_abs())
+        } else {
+            self.in_flight
+                .fetch_sub(by.unsigned_abs(), Ordering::Relaxed)
+                .saturating_sub(by.unsigned_abs())
+        };
+        // A count of tasks, far below where `f64` loses precision.
+        metrics::gauge!("mempool.currently.queued.transactions").set(now as f64);
+    }
+
     /// The legacy peer to charge for a body `peer` served: the peer, unless
     /// the pool must never charge it.
     fn supplier(&self, peer: PeerSocketAddr) -> Option<PeerSocketAddr> {

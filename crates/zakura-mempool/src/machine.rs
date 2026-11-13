@@ -989,6 +989,12 @@ impl<E: VerifyError> MempoolState<E> {
             .collect()
     }
 
+    /// How many pooled transactions are hidden while they are verified
+    /// again.
+    pub fn hidden_count(&self) -> usize {
+        self.hidden.len()
+    }
+
     /// The pooled transactions hidden while they are verified again.
     pub fn hidden(&self) -> Vec<UnminedTxId> {
         self.hidden.iter().map(|key| self.pool[key].id).collect()

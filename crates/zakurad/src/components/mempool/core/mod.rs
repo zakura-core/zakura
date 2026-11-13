@@ -25,6 +25,7 @@ use tokio::{
 use tower::{buffer::Buffer, timeout::Timeout, util::BoxService};
 
 use zakura_chain::{block::Height, parameters::Network};
+use zakura_jsonl_trace::JsonlEventEmitter;
 use zakura_mempool::io::PoolCore;
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::{
@@ -43,6 +44,7 @@ use super::{
         MAX_INBOUND_CONCURRENCY, TRANSACTION_DOWNLOAD_TIMEOUT, TRANSACTION_VERIFY_TIMEOUT,
     },
     gossip::MEMPOOL_CHANGE_CHANNEL_CAPACITY,
+    trace::{MempoolTrace, TipProcessing},
     Config, Outbound, ReadState, TxVerifier,
 };
 use crate::BoxError;
@@ -119,6 +121,7 @@ pub(crate) fn start(
     chain_tip_change: ChainTipChange,
     misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
     exempt: Exempt,
+    trace: JsonlEventEmitter,
 ) -> Result<CoreParts, BoxError> {
     let activation = activation::Activation::new(
         config,
@@ -150,6 +153,22 @@ pub(crate) fn start(
         exempt,
         active_rx,
     )?;
+    // The same `mempool.jsonl` row today's pool writes for each tip it
+    // applies.
+    let trace = MempoolTrace(trace);
+    let core = core.on_tip_applied(move |applied| {
+        trace.tip_processed(
+            if applied.reset {
+                TipProcessing::Reset
+            } else {
+                TipProcessing::Grow
+            },
+            (applied.tip.hash, applied.tip.height),
+            applied.visible,
+            applied.hidden,
+            applied.took,
+        );
+    });
     let core_task = spawn_erased(async move {
         core.run().await;
         Ok::<(), BoxError>(())

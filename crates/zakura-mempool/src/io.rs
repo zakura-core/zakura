@@ -148,6 +148,27 @@ pub struct PoolCore<E, V> {
     replies: Vec<Box<dyn FnOnce() + Send>>,
     /// What storage held when its metrics were last emitted.
     emitted: StorageStats,
+    /// Told about each chain event the core applies. See
+    /// [`Self::on_tip_applied`].
+    tips: Option<Box<dyn FnMut(&TipApplied) + Send>>,
+}
+
+/// One chain event the core applied, for the node's trace.
+#[derive(Clone, Debug)]
+pub struct TipApplied {
+    /// The tip after it.
+    pub tip: ChainTip,
+    /// Whether the pool was hidden to be verified again: a reorg, a rules
+    /// change, a jump of more than one block, or a missed event. Otherwise
+    /// the tip grew by one block, and only that block's transactions and
+    /// what they conflict with left the pool.
+    pub reset: bool,
+    /// Visible transactions after it.
+    pub visible: usize,
+    /// Hidden transactions waiting to be verified again after it.
+    pub hidden: usize,
+    /// How long the machine took to apply it.
+    pub took: std::time::Duration,
 }
 
 impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
@@ -215,6 +236,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             steps: Vec::new(),
             replies: Vec::new(),
             emitted: StorageStats::default(),
+            tips: None,
         }
     }
 
@@ -378,21 +400,40 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
         }
     }
 
+    /// Has `tips` told about each chain event the core applies, as the
+    /// node's trace records each tip today's pool applies.
+    pub fn on_tip_applied(mut self, tips: impl FnMut(&TipApplied) + Send + 'static) -> Self {
+        self.tips = Some(Box::new(tips));
+        self
+    }
+
     /// One chain event. The core remembers the tip even while it is off.
     fn chain_event(&mut self, event: ChainEvent) {
         let now = time::Instant::now();
-        let step = match event {
+        let (step, reset) = match event {
             ChainEvent::Transition(transition) => {
                 self.chain_tip = transition.after;
                 self.chain_generation = transition.generation;
-                self.machine.transition(transition, now)
+                let reset = !transition.disconnected.is_empty()
+                    || transition.connected.len() != 1
+                    || transition.rules_change;
+                (self.machine.transition(transition, now), reset)
             }
             ChainEvent::Resync { tip, generation } => {
                 self.chain_tip = tip;
                 self.chain_generation = generation;
-                self.machine.resync(tip, generation, now)
+                (self.machine.resync(tip, generation, now), true)
             }
         };
+        if let Some(tips) = &mut self.tips {
+            tips(&TipApplied {
+                tip: self.chain_tip,
+                reset,
+                visible: self.machine.storage_stats().transactions,
+                hidden: self.machine.hidden_count(),
+                took: time::Instant::now().saturating_duration_since(now),
+            });
+        }
         self.has_tip = true;
         self.finish(step);
         // The pool may have been waiting only for a real tip.

@@ -748,6 +748,7 @@ impl StartCmd {
                             .collect(),
                         unconditional: config.network.unconditional_peers.clone(),
                     },
+                    template_path_trace.clone(),
                 )
                 .map_err(|error| eyre!(error))?;
                 (

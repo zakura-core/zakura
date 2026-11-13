@@ -141,6 +141,7 @@ impl Follower {
                 tracing::debug!(%error, "transaction broadcast did not finish");
             }
         });
+        metrics::counter!("mempool.gossip.pending.transactions.total").increment(count);
         metrics::counter!("mempool.gossiped.transactions.total").increment(count);
     }
 

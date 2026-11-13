@@ -160,6 +160,8 @@ struct Harness {
     active: watch::Sender<bool>,
     verifier: SnapshotVerifier,
     height: u32,
+    /// What the core reported for each chain event it applied.
+    tips: Mutex<std::sync::mpsc::Receiver<super::TipApplied>>,
 }
 
 impl Harness {
@@ -219,6 +221,10 @@ impl Harness {
             active_rx,
             limits,
         );
+        let (tips_tx, tips) = std::sync::mpsc::channel();
+        let core = core.on_tip_applied(move |applied| {
+            let _ = tips_tx.send(applied.clone());
+        });
         let core = tokio::spawn(core.run());
         Self {
             handle,
@@ -227,7 +233,24 @@ impl Harness {
             active,
             verifier,
             height: 100,
+            tips: Mutex::new(tips),
         }
+    }
+
+    /// Waits for the core's report of the next chain event it applies.
+    async fn next_tip(&self) -> super::TipApplied {
+        for _ in 0..1_000 {
+            if let Ok(applied) = self
+                .tips
+                .lock()
+                .expect("no test panics holding it")
+                .try_recv()
+            {
+                return applied;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("the core applies the chain event");
     }
 
     /// Reserves and submits `tx` from this node, and returns the verdict.
@@ -493,6 +516,32 @@ async fn a_block_that_mines_a_pooled_transaction_removes_it() {
     assert!(snapshot.transaction(&parent.id().mined_id()).is_none());
     // Its child spends a chain output now, and stays.
     assert!(snapshot.transaction(&child.id().mined_id()).is_some());
+}
+
+/// Each chain event the core applies is reported for the node's trace: a
+/// one-block growth with what stays visible, and a reorg as a reset with
+/// what waits hidden to be verified again.
+#[tokio::test]
+async fn each_applied_chain_event_is_reported_for_the_trace() {
+    let (parent, child) = parent_and_child();
+    let mut harness = Harness::start(&[parent.clone(), child.clone()]);
+    assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
+    assert!(matches!(harness.submit(&child).await, Verdict::Admitted));
+
+    harness.mine(&[&parent]);
+    let grew = harness.next_tip().await;
+    assert!(!grew.reset, "{grew:?}");
+    assert_eq!(grew.tip.height.0, harness.height);
+    assert_eq!((grew.visible, grew.hidden), (1, 0), "the child stays");
+
+    harness.change(1, 1, &[]);
+    let reorged = harness.next_tip().await;
+    assert!(reorged.reset, "{reorged:?}");
+    assert_eq!(
+        (reorged.visible, reorged.hidden),
+        (0, 1),
+        "the child is checked again"
+    );
 }
 
 #[tokio::test]

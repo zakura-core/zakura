@@ -7220,6 +7220,20 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "tests/header_wire_prepare_fault.rs",
         "a_bad_page_joins_the_close_of_its_own_connection",
     ),
+    (
+        "StorageOpRef",
+        "tests/header_node_reservations.rs",
+        "first_prepare_ran",
+        "tests/header_node_reservations.rs",
+        "a_prepare_joins_its_pick_and_completion_by_its_whole_operation",
+    ),
+    (
+        "StorageOpRef",
+        "tests/header_node_reservations.rs",
+        "runs_prepare",
+        "tests/header_node_reservations.rs",
+        "a_prepare_joins_its_pick_and_completion_by_its_whole_operation",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.

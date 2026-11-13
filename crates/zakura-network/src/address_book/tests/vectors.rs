@@ -18,6 +18,43 @@ use crate::{
     AddressBook,
 };
 
+/// A startup peer whose first dial fails is retried later, but is not gossiped or
+/// cached before it responds. A peer added without a last seen time is never retried
+/// after a failure.
+#[test]
+fn failed_startup_peers_stay_retryable_but_unshared() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let startup = "203.0.113.1:8233".parse().unwrap();
+    let other = "203.0.113.2:8233".parse().unwrap();
+    book.update(MetaAddr::new_startup_peer(startup, DateTime32::now()));
+    book.update(MetaAddr::new_initial_peer(other));
+    for addr in [startup, other] {
+        book.update(MetaAddr::new_errored(addr, None));
+    }
+
+    let now = Utc::now();
+    let startup_entry = book.get(startup).unwrap();
+    assert!(
+        startup_entry.is_probably_reachable(now),
+        "a failed startup peer is retried after the reconnection delay"
+    );
+    assert!(
+        !book.get(other).unwrap().is_probably_reachable(now),
+        "a peer with no last seen time is tried once"
+    );
+    assert!(
+        !startup_entry.is_active_for_gossip(now),
+        "a startup peer is not gossiped before it responds"
+    );
+    assert!(book.cacheable(now).is_empty());
+}
+
 /// Cache ranking uses measured RTT, retaining book order for measured ties.
 #[test]
 fn peer_cache_ranks_by_rtt_with_stable_ties() {

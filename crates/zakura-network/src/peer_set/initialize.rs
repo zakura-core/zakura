@@ -41,6 +41,7 @@ use tracing::Instrument;
 use zakura_chain::{
     chain_tip::ChainTip,
     diagnostic::task::{CheckForPanics, WaitForPanics},
+    serialization::DateTime32,
 };
 use zakura_node_services::task::{erased, spawn_buffer};
 
@@ -743,9 +744,10 @@ async fn limit_initial_peers(
 
     // Config has validated and interleaved cached peers with shuffled seeds.
     // Feed every candidate to discovery, even beyond the startup dial limit.
+    let now = DateTime32::now();
     for peer in all_peers {
         let _ = address_book_updater
-            .send(MetaAddr::new_initial_peer(peer))
+            .send(MetaAddr::new_startup_peer(peer, now))
             .await;
         if initial_peers.len() < config.peerset_initial_target_size {
             let count = selected_per_ip.entry(peer.ip()).or_insert(0);

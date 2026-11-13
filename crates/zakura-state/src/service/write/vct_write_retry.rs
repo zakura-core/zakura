@@ -13,12 +13,6 @@ use crate::service::{
     write::{VctRootRepairState, VctRootRepairStatus},
 };
 
-/// Delay between commit attempts that lack a VCT successor witness.
-///
-/// The root already exists. The shorter delay limits the one-block commit lag while the state
-/// waits for the successor header.
-const VCT_AWAIT_SUCCESSOR_WAIT: Duration = Duration::from_millis(20);
-
 /// Maximum time a checkpoint height may remain in a retryable VCT root stall.
 /// The committer reports longer stalls through an error-level log and the
 /// `state.vct.root.stalled.height` gauge. Successor downloads and fanout deliveries should finish
@@ -90,15 +84,6 @@ pub(super) enum VctWriteRetryCause {
     },
     /// The state has not stored the successor header that authenticates the root.
     MissingSuccessor,
-}
-
-/// Event that can make one parked checkpoint block retryable.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum VctWriteRetryWait {
-    /// Wait for header-chain insertion instead of polling missing roots.
-    HeaderChainInsert,
-    /// Retry after a short bounded delay.
-    Delay(Duration),
 }
 
 impl Default for VctWriteRetryManager {
@@ -183,14 +168,14 @@ impl VctWriteRetryManager {
 
     /// Parks `block` and records a retryable VCT metadata stall at `height`.
     ///
-    /// The manager reports a persistent stall after [`VCT_ROOT_STALL_WARN_AFTER`]. The returned
-    /// wait tells the committer which event can retry the block.
+    /// The manager reports a persistent stall after [`VCT_ROOT_STALL_WARN_AFTER`]. The
+    /// block remains parked until local recovery succeeds or header-chain input changes.
     pub(super) fn on_retryable_error(
         &mut self,
         height: Height,
         retry_cause: VctWriteRetryCause,
         block: QueuedCheckpointVerified,
-    ) -> VctWriteRetryWait {
+    ) {
         metrics::counter!("state.vct.root.retry.count").increment(1);
         if let VctWriteRetryCause::MissingRoot { trigger } = retry_cause {
             self.request_committer_repair(height, trigger);
@@ -229,13 +214,6 @@ impl VctWriteRetryManager {
         }
 
         self.retryable_block = Some(block);
-
-        match retry_cause {
-            VctWriteRetryCause::MissingRoot { .. } => VctWriteRetryWait::HeaderChainInsert,
-            VctWriteRetryCause::MissingSuccessor => {
-                VctWriteRetryWait::Delay(VCT_AWAIT_SUCCESSOR_WAIT)
-            }
-        }
     }
 
     /// Return the remaining time before the active stall needs an operator diagnostic.
@@ -313,9 +291,8 @@ impl VctWriteRetryManager {
 
     /// Publishes the repair that can unblock the writer.
     ///
-    /// The repair channel stores one latest value. A committer repair takes priority because the
-    /// authentication sweep runs only after the checkpoint queue becomes empty. The sweep cannot
-    /// clear its repair while a missing committer root keeps that queue nonempty.
+    /// The repair channel stores one latest value. A committer repair takes priority because it
+    /// blocks body commits. Sweep repair can concern a higher boundary that bodies have not reached.
     fn publish_effective_repair_status(
         &mut self,
         requester_with_new_episode: Option<VctRepairRequester>,

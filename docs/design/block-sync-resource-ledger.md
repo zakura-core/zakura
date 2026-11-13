@@ -21,15 +21,16 @@ it is sized to the throughput target, not below it.
 
 Every term counts one physical allocation once. Defaults are shown. "Peer" means one
 connection; the node admits at most `zakura.max_connections` = 92 of them. The transport holds
-at most 124 live QUIC connections, admitted or not (zakura-quic ADM-12): the most that
-`zakura.peer_memory_budget_bytes` = 8 GiB funds after one 256 MiB datagram queue for the one
-bound socket, with 32 of them headroom for handshakes (CTRL-26). Closed connections release their
+at most 124 live QUIC connections, admitted or not (zakura-quic ADM-12): 92 admitted and 32 of
+headroom for handshakes. `zakura.peer_memory_budget_bytes` = 15 GiB funds them after one 256 MiB
+datagram queue for the one bound socket, charging a handshake its 64 MiB of windows and an
+admitted connection its raised window plus send window, 141,937,353 B (CTRL-26). Closed connections release their
 stream buffers and drain in a separate allowance of 248 (ADM-13). The QUIC rows count all 124
 live connections; the application rows count the 92 admitted peers.
 
 | Term | Per peer | Node | Bound comes from |
 | --- | --- | --- | --- |
-| QUIC receive buffers | 32 MiB connection window (16 MiB per stream) | 3.9 GiB | `DEFAULT_ZAKURA_RECEIVE_WINDOW`, `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` in `handler.rs`, enforced by QUIC flow control |
+| QUIC receive buffers | 108,382,921 B connection window once admitted: 32 MiB handshake window plus every reactor's receive share, 43,287,718 B per stream | 10.3 GiB (92 admitted plus 32 handshakes at 32 MiB) | `DEFAULT_ZAKURA_RECEIVE_WINDOW` in `handler.rs` and the reactor budgets in `ZakuraConfig::reactor_shares`, enforced by QUIC flow control |
 | QUIC send buffers | 32 MiB | 3.9 GiB | `DEFAULT_ZAKURA_SEND_WINDOW`; serving output below sits inside it |
 | Serving bookkeeping | 1 MiB (144 KiB + 2 × 2,816 × 160 B) | 512 MiB | `BOOKKEEPING_BUDGET_BYTES` in `regulated/session.rs`; config validation refuses a config that cannot fund one request per slot |
 | Serving storage results | 12 jobs | 24 jobs × one read (≤ `blocks_per_response` decoded blocks) | `NODE_EXECUTION` / `PEER_EXECUTION`; a lease lives until the blocking read and encode return |
@@ -44,10 +45,10 @@ At defaults, block-sync application memory sums to about 11 GB in the worst case
 serving bookkeeping, 1.25 GB serving output, 1.3 GB of worst-case serving reads (about 170 MB
 for real blocks), 0.13 GiB requester hashes, 1.8 GB of raw frames awaiting their routines and
 5.6 GB of requested bodies (both derived below). The QUIC windows
-add 3.9 + 3.9 GiB, and the datagram queues 256 MiB more per bound socket, however many
-connections it serves. They are shared with every other service on the connection and stay
-unchanged: the 8 GiB peer memory budget covers all three for every live QUIC connection the
-transport holds, and is a transport budget, not a block-sync choice.
+add 10.3 + 3.9 GiB, and the datagram queues 256 MiB more per bound socket, however many
+connections it serves. They are shared with every other service on the connection: the 15 GiB
+peer memory budget covers all three for every live QUIC connection the transport holds, and is a
+transport budget, not a block-sync choice.
 
 ## Serving
 
@@ -70,7 +71,7 @@ Execution slots are 24 per node and 12 per peer. A slot is held until the blocki
 encode actually return, including after the session is cancelled, so connection churn cannot
 multiply running reads. Each job retains the blocks it read. These are decoded blocks from
 the node's own consensus-valid state. One job holds `blocks_per_response` blocks (always 1):
-at most about 53 MB decoded for the worst consensus-valid block, about 7 MB for real Mainnet
+at most about 53 MB decoded using the conservative pre-boxing bound, about 7 MB for sampled Mainnet
 blocks (≤ 3.45× wire). The encoder serializes one block at a time and the handler drops each
 frame right after encoding, so the transient copy is one block.
 
@@ -134,16 +135,18 @@ response beside requests and control.
 
 ### Decoded bodies
 
-A decoded block's heap is not a fixed multiple of its wire size:
+A decoded block's heap is not a fixed multiple of its wire size. Boxing Sprout, Sapling,
+and Orchard bundles reduces the measured payloads on a 64-bit target:
 
-| Body | Wire | Decoded | Ratio |
+| Body | Wire | Decoded before | Decoded now |
 | --- | --- | --- | --- |
-| Real Mainnet blocks | — | — | ≤ 3.45×, about 2× in aggregate |
-| Worst consensus-valid block (smallest valid transactions) | 2 MB | about 53 MB | about 26× |
-| Junk body: 37,037 empty V1 transactions | 372 KB | 74.9 MB | about 200× |
+| 26,646 small transparent V5 transactions | 2 MB | 56.3 MB | 9.4 MB (4.7×) |
+| Junk body: 37,037 empty V1 transactions | 372 KB | 74.9 MB | 9.7 MB (26×) |
 
-`size_of::<Transaction>()` is 2,008 B, so per-transaction overhead dominates small
-transactions. `DESERIALIZED_MEM_FACTOR` = 4 is an average, not a bound.
+`size_of::<Transaction>()` drops from 2,008 B to 248 B. Ironwood remains inline, so
+transparent and Ironwood-only transactions need no additional bundle allocation. The V5
+example still exceeds `DESERIALIZED_MEM_FACTOR` = 4; the factor remains an average, not a
+bound. The pre-boxing Mainnet samples decoded at up to 3.45×, about 2× in aggregate.
 
 Two changes tie decoded memory to the blocks the node asked for:
 
@@ -170,19 +173,21 @@ B + R + L × W × (1 + r) + min(P, L) × J
 - `J` = one transient junk decode per connection before its rejection (≤ about 80 MB)
 
 At `r` ≈ 4 this is about 5.6 GB, of which about 3.2 GB is the decoded window. A deliberately
-built, proof-of-work-paid chain at `r` ≈ 26 raises the window term to about 21 GB; admission
-then charges the measured size and stops requesting ahead. The check costs one txid pass per
+built, proof-of-work-paid chain under the conservative pre-boxing estimate at `r` ≈ 26
+raises the window term to about 21 GB. The boxed V5 example at `r` ≈ 4.7 instead gives about
+3.8 GB; admission still charges the measured size and stops requesting ahead. The check costs one txid pass per
 body, about 11% of decode time on real blocks, on the per-peer routine tasks.
 
 Above the last checkpoint the sequencer also gates new decoded submissions on
 `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` (512 MiB). Past the cap, bodies stay raw until earlier
 submissions finish, so in steady sync the window term there is 512 MiB plus about one block of
-estimate error. The cap is an admission target, not a hard ceiling. Submissions detached by a
-failure or reset stay charged but never block the next submission, since they can be successors
-waiting for that very block. While they hold the cap, the window advances one body at a time,
-so repeated resets can push it past 512 MiB, bounded by the submission count limit. That rules
-out the 21 GB case for steady sync, because below the last checkpoint the window holds fixed
-Mainnet blocks of about 7 MB decoded at most, about 2.8 GB in total.
+estimate error. Submissions detached by a failure or reset stay charged until their exact
+completions, and they block the next submission like attached ones. Only an empty window admits
+a body past the cap, so one oversized block still progresses. Repeated resets therefore can't
+push the window past 512 MiB. While storage never completes the detached submissions,
+submission stops once they fill the cap. That rules out the pre-boxing 21 GB case for steady
+sync, because below the last checkpoint the window holds fixed Mainnet blocks of about 7 MB
+decoded at most, about 2.8 GB in total.
 
 The Merkle check departs from the Block section's SHOULD to reuse downstream validation
 rather than add a duplicate ingress check. The downstream check runs only after the junk body

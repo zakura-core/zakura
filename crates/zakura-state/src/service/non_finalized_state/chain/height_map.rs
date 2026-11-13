@@ -2,6 +2,8 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
+    num::NonZeroU64,
     ops::{Bound, RangeBounds},
     sync::Arc,
 };
@@ -9,11 +11,131 @@ use zakura_chain::block::Height;
 
 const HEIGHTS_PER_CHUNK: u32 = 64;
 
+/// The number of slots in a [`Chunk`]. The cast is lossless: 64 fits in `usize`.
+const CHUNK_SLOTS: usize = HEIGHTS_PER_CHUNK as usize;
+
 /// A private ordered index with copy-on-write 64-height chunks.
 /// Snapshots copy the outer index; writes copy only touched chunks.
 #[derive(Debug)]
 pub(crate) struct HeightMap<V> {
-    chunks: BTreeMap<u32, Arc<BTreeMap<Height, V>>>,
+    chunks: BTreeMap<u32, Arc<Chunk<V>>>,
+}
+
+/// The entries for 64 consecutive heights, in a slot per height.
+///
+/// A fixed array keeps lookups to an index and compiles far less code per value
+/// type than a nested `BTreeMap`.
+#[derive(Clone, PartialEq, Eq)]
+struct Chunk<V> {
+    /// The entry for height `chunk_id * 64 + i`, if any, in slot `i`.
+    slots: [Option<(Height, V)>; CHUNK_SLOTS],
+    /// Bit `i` is set when slot `i` holds an entry.
+    occupied: u64,
+}
+
+impl<V> Default for Chunk<V> {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| None),
+            occupied: 0,
+        }
+    }
+}
+
+impl<V: fmt::Debug> fmt::Debug for Chunk<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+fn chunk_id(height: Height) -> u32 {
+    height.0 / HEIGHTS_PER_CHUNK
+}
+
+fn slot(height: Height) -> usize {
+    // The cast is lossless: the remainder is less than 64.
+    (height.0 % HEIGHTS_PER_CHUNK) as usize
+}
+
+impl<V> Chunk<V> {
+    fn is_empty(&self) -> bool {
+        self.occupied == 0
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        // The cast is lossless: a `u64` has at most 64 set bits.
+        self.occupied.count_ones() as usize
+    }
+
+    fn entry_at(&self, slot: u32) -> Option<(&Height, &V)> {
+        // The cast is lossless: slots are less than 64.
+        let (height, value) = self.slots[slot as usize].as_ref()?;
+        Some((height, value))
+    }
+
+    fn first(&self) -> Option<(&Height, &V)> {
+        self.entry_at(NonZeroU64::new(self.occupied)?.trailing_zeros())
+    }
+
+    fn last(&self) -> Option<(&Height, &V)> {
+        self.entry_at(63 - NonZeroU64::new(self.occupied)?.leading_zeros())
+    }
+
+    fn get(&self, height: &Height) -> Option<&V> {
+        self.slots[slot(*height)].as_ref().map(|(_, value)| value)
+    }
+
+    fn get_mut(&mut self, height: &Height) -> Option<&mut V> {
+        self.slots[slot(*height)].as_mut().map(|(_, value)| value)
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = (&Height, &V)> {
+        self.slots
+            .iter()
+            .filter_map(|entry| entry.as_ref().map(|(height, value)| (height, value)))
+    }
+
+    fn insert(&mut self, height: Height, value: V) -> Option<V> {
+        let slot = slot(height);
+        self.occupied |= 1 << slot;
+        self.slots[slot]
+            .replace((height, value))
+            .map(|(_, value)| value)
+    }
+
+    fn remove(&mut self, height: &Height) -> Option<V> {
+        let slot = slot(*height);
+        let (_, value) = self.slots[slot].take()?;
+        self.occupied &= !(1 << slot);
+        Some(value)
+    }
+
+    /// Removes the entries at or below `height`, which must be in this chunk.
+    fn remove_through(&mut self, height: Height) {
+        let last = slot(height);
+        for entry in &mut self.slots[..=last] {
+            *entry = None;
+        }
+        // Keep only the bits above `last`; shifting by 64 would overflow.
+        self.occupied &= if last == CHUNK_SLOTS - 1 {
+            0
+        } else {
+            u64::MAX << (last + 1)
+        };
+    }
+
+    #[cfg(test)]
+    fn retain(&mut self, keep: &mut impl FnMut(&Height, &mut V) -> bool) {
+        for entry in &mut self.slots {
+            if let Some((height, value)) = entry {
+                if !keep(height, value) {
+                    self.occupied &= !(1 << slot(*height));
+                    *entry = None;
+                }
+            }
+        }
+    }
 }
 
 impl<V> Default for HeightMap<V> {
@@ -41,16 +163,14 @@ impl<V: Eq> Eq for HeightMap<V> {}
 
 impl<V> HeightMap<V> {
     pub(super) fn get(&self, height: &Height) -> Option<&V> {
-        self.chunks
-            .get(&(height.0 / HEIGHTS_PER_CHUNK))?
-            .get(height)
+        self.chunks.get(&chunk_id(*height))?.get(height)
     }
     #[cfg(test)]
     pub(super) fn first_key_value(&self) -> Option<(&Height, &V)> {
-        self.chunks.first_key_value()?.1.first_key_value()
+        self.chunks.first_key_value()?.1.first()
     }
     pub(super) fn last_key_value(&self) -> Option<(&Height, &V)> {
-        self.chunks.last_key_value()?.1.last_key_value()
+        self.chunks.last_key_value()?.1.last()
     }
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
@@ -87,9 +207,7 @@ impl<V> HeightMap<V> {
         }
         let chunk_bound = |bound: &Bound<Height>| match bound {
             Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(height) | Bound::Excluded(height) => {
-                Bound::Included(height.0 / HEIGHTS_PER_CHUNK)
-            }
+            Bound::Included(height) | Bound::Excluded(height) => Bound::Included(chunk_id(*height)),
         };
         self.chunks
             .range((chunk_bound(&start), chunk_bound(&end)))
@@ -100,15 +218,13 @@ impl<V> HeightMap<V> {
 
 impl<V: Clone> HeightMap<V> {
     pub(super) fn insert(&mut self, height: Height, value: V) -> Option<V> {
-        let chunk = self.chunks.entry(height.0 / HEIGHTS_PER_CHUNK).or_default();
+        let chunk = self.chunks.entry(chunk_id(height)).or_default();
         Arc::make_mut(chunk).insert(height, value)
     }
     pub(super) fn remove(&mut self, height: &Height) -> Option<V> {
-        let id = height.0 / HEIGHTS_PER_CHUNK;
+        let id = chunk_id(*height);
         let chunk = self.chunks.get_mut(&id)?;
-        if !chunk.contains_key(height) {
-            return None;
-        }
+        chunk.get(height)?;
         let removed = Arc::make_mut(chunk).remove(height);
         if chunk.is_empty() {
             self.chunks.remove(&id);
@@ -120,12 +236,12 @@ impl<V: Clone> HeightMap<V> {
     }
     /// Removes every entry at or below `height`, copying at most the boundary chunk.
     pub(super) fn remove_through(&mut self, height: Height) {
-        let boundary_chunk_id = height.0 / HEIGHTS_PER_CHUNK;
+        let boundary_chunk_id = chunk_id(height);
         // Keep the boundary chunk and every chunk above it, and drop the chunks below it.
         self.chunks = self.chunks.split_off(&boundary_chunk_id);
         if let Some(chunk) = self.chunks.get_mut(&boundary_chunk_id) {
-            if chunk.range(..=height).next().is_some() {
-                Arc::make_mut(chunk).retain(|key, _| *key > height);
+            if chunk.first().is_some_and(|(key, _)| *key <= height) {
+                Arc::make_mut(chunk).remove_through(height);
             }
             if chunk.is_empty() {
                 self.chunks.remove(&boundary_chunk_id);
@@ -155,11 +271,177 @@ impl<'a, V: Clone> Entry<'a, V> {
         let chunk = self
             .map
             .chunks
-            .get_mut(&(self.height.0 / HEIGHTS_PER_CHUNK))
+            .get_mut(&chunk_id(self.height))
             .expect("the entry exists after lookup or insertion");
         Arc::make_mut(chunk)
             .get_mut(&self.height)
             .expect("the entry exists after lookup or insertion")
+    }
+}
+
+/// Release-mode timings of [`HeightMap`] operations at non-finalized chain sizes.
+#[cfg(feature = "internal-bench")]
+pub mod benchmark {
+    use std::{hint::black_box, sync::Arc, time::Instant};
+
+    use zakura_chain::block::Height;
+
+    use super::HeightMap;
+
+    /// The median time of one benchmarked operation.
+    #[derive(Clone, Debug)]
+    pub struct HeightMapBenchmarkSample {
+        /// The operation and value type measured.
+        pub name: String,
+        /// The median nanoseconds per operation over all samples.
+        pub nanos_per_op: f64,
+    }
+
+    /// Times the operations a non-finalized chain performs on its height indexes,
+    /// for a chain of `heights` blocks, with tree-like (`Arc`) and root-like
+    /// (32-byte) values.
+    pub fn benchmark_height_map(heights: u32, samples: usize) -> Vec<HeightMapBenchmarkSample> {
+        let mut results = run::<Arc<u64>>("arc", heights, samples, |height| {
+            Arc::new(u64::from(height))
+        });
+        results.extend(run::<[u8; 32]>("root", heights, samples, |height| {
+            let mut root = [0; 32];
+            root[..4].copy_from_slice(&height.to_le_bytes());
+            root
+        }));
+        results
+    }
+
+    fn run<V: Clone>(
+        value_type: &str,
+        heights: u32,
+        samples: usize,
+        value: impl Fn(u32) -> V,
+    ) -> Vec<HeightMapBenchmarkSample> {
+        let full: HeightMap<V> = {
+            let mut map = HeightMap::default();
+            for height in 0..heights {
+                map.insert(Height(height), value(height));
+            }
+            map
+        };
+        let with_tip = |tip: u32| {
+            let mut map = HeightMap::default();
+            for height in 0..=tip {
+                map.insert(Height(height), value(height));
+            }
+            map
+        };
+        let tip_at_chunk_start = with_tip(heights / 64 * 64);
+        let tip_at_chunk_end = with_tip(heights / 64 * 64 + 63);
+        let per_op = |ops: u32, mut body: Box<dyn FnMut() + '_>| {
+            let mut timings: Vec<f64> = (0..samples)
+                .map(|_| {
+                    let start = Instant::now();
+                    body();
+                    // Rounding nanosecond counts to f64 is harmless for timings.
+                    start.elapsed().as_nanos() as f64 / f64::from(ops)
+                })
+                .collect();
+            timings.sort_by(f64::total_cmp);
+            timings[timings.len() / 2]
+        };
+        let sample = |op: &str, nanos_per_op| HeightMapBenchmarkSample {
+            name: format!("{op}/{value_type}"),
+            nanos_per_op,
+        };
+
+        vec![
+            // Commit a block onto a snapshot of the chain.
+            sample(
+                "snapshot_and_push",
+                per_op(
+                    heights,
+                    Box::new(|| {
+                        let mut map = HeightMap::default();
+                        for height in 0..heights {
+                            let mut next = map.clone();
+                            next.insert(Height(height), value(height));
+                            map = black_box(next);
+                        }
+                    }),
+                ),
+            ),
+            sample(
+                "get",
+                per_op(
+                    heights,
+                    Box::new(|| {
+                        for height in 0..heights {
+                            black_box(full.get(&Height(height)));
+                        }
+                    }),
+                ),
+            ),
+            sample(
+                "range_all",
+                per_op(
+                    heights,
+                    Box::new(|| {
+                        for entry in full.range(..) {
+                            black_box(entry);
+                        }
+                    }),
+                ),
+            ),
+            // Read the tip, at the first and the last slot of its chunk.
+            sample(
+                "last_key_value_chunk_start",
+                per_op(
+                    heights,
+                    Box::new(|| {
+                        let map = black_box(&tip_at_chunk_start);
+                        for _ in 0..heights {
+                            black_box(map.last_key_value());
+                        }
+                    }),
+                ),
+            ),
+            sample(
+                "last_key_value_chunk_end",
+                per_op(
+                    heights,
+                    Box::new(|| {
+                        let map = black_box(&tip_at_chunk_end);
+                        for _ in 0..heights {
+                            black_box(map.last_key_value());
+                        }
+                    }),
+                ),
+            ),
+            // Finalize the root block of a snapshot, one block at a time.
+            sample(
+                "finalize_root",
+                per_op(
+                    heights,
+                    Box::new(|| {
+                        let mut map = full.clone();
+                        for height in 0..heights {
+                            map.remove_through(Height(height));
+                        }
+                        black_box(map);
+                    }),
+                ),
+            ),
+            // Pop the tip of a snapshot, as a fork or rollback does.
+            sample(
+                "pop_tip",
+                per_op(
+                    heights,
+                    Box::new(|| {
+                        let mut map = full.clone();
+                        for height in (0..heights).rev() {
+                            black_box(map.remove(&Height(height)));
+                        }
+                    }),
+                ),
+            ),
+        ]
     }
 }
 
@@ -179,6 +461,11 @@ mod tests {
         );
         assert_eq!(actual.last_key_value(), expected.last_key_value());
         assert!(actual.chunks.values().all(|chunk| !chunk.is_empty()));
+        for chunk in actual.chunks.values() {
+            for (index, entry) in chunk.slots.iter().enumerate() {
+                assert_eq!(entry.is_some(), chunk.occupied & (1 << index) != 0);
+            }
+        }
         let mut actual_entries = actual.iter();
         let mut expected_entries = expected.iter();
         for index in 0..expected.len() {

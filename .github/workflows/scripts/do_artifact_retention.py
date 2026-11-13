@@ -6,6 +6,24 @@ from datetime import datetime, timedelta, timezone
 
 from do_provision import REGIONS, doctl, handoff_height, height, newest, output
 
+VALIDATION_PREFIX = "zakura-pr-validation-"
+VALIDATION_TTL = timedelta(days=7)
+
+
+def expired_validation_ids(items, now):
+    """Return IDs of branch-bake validation artifacts older than `VALIDATION_TTL`.
+
+    Scheduled jobs never select these. Only PR-node runs given their exact IDs
+    use them, and a validation pass finishes well inside the TTL.
+    """
+    return {
+        str(i["id"])
+        for i in items
+        if i["name"].startswith(VALIDATION_PREFIX)
+        and now - datetime.fromisoformat(i["created_at"].replace("Z", "+00:00"))
+        > VALIDATION_TTL
+    }
+
 
 def retained_ids(images, snapshots, checkpoint):
     keep = set()
@@ -81,14 +99,12 @@ def main():
     args = cli.parse_args()
     if args.checkpoint <= 0:
         raise ValueError("checkpoint must be positive before pruning")
-    images = [
-        i
-        for i in doctl("image", "list-user")
-        if i["name"].startswith("zakura-pr-node-")
-    ]
+    all_images = doctl("image", "list-user")
+    all_snapshots = doctl("snapshot", "list", "--resource", "volume")
+    images = [i for i in all_images if i["name"].startswith("zakura-pr-node-")]
     snapshots = [
         s
-        for s in doctl("snapshot", "list", "--resource", "volume")
+        for s in all_snapshots
         if s["name"].startswith(
             (
                 "zakura-pr-state-mainnet-",
@@ -119,6 +135,16 @@ def main():
             ):
                 continue
             print(f"Prune {kind} {item['id']} ({item['name']})")
+            if args.apply:
+                doctl(kind, "delete", item["id"], "--force")
+    expired = expired_validation_ids(all_images + all_snapshots, now)
+    for kind, items in (("image", all_images), ("snapshot", all_snapshots)):
+        for item in items:
+            if str(item["id"]) not in expired or (
+                kind == "image" and item.get("status") != "available"
+            ):
+                continue
+            print(f"Prune expired validation {kind} {item['id']} ({item['name']})")
             if args.apply:
                 doctl(kind, "delete", item["id"], "--force")
 

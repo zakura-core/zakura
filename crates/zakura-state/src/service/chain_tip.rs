@@ -6,6 +6,7 @@
 //! * [ChainTipChange] to `await` specific changes to the chain tip.
 
 use std::{fmt, sync::Arc};
+use zakura_node_services::block_memory::TransactionHandle;
 
 use chrono::{DateTime, Utc};
 use futures::TryFutureExt;
@@ -16,7 +17,7 @@ use zakura_chain::{
     block,
     chain_tip::ChainTip,
     parameters::{Network, NetworkUpgrade},
-    transaction::{self, Transaction},
+    transaction::{self},
 };
 
 use crate::{
@@ -24,8 +25,12 @@ use crate::{
     CheckpointVerifiedBlock, SemanticallyVerifiedBlock,
 };
 
+use super::block_announcements::BlockAnnouncementSender;
+use crate::{BlockAnnouncements, CommittedBlockAnnouncement};
 use TipAction::*;
 
+#[cfg(any(test, feature = "proptest-impl"))]
+use proptest::prelude::*;
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
@@ -60,7 +65,13 @@ pub struct ChainTipBlock {
     pub time: DateTime<Utc>,
 
     /// The block transactions.
-    pub transactions: Vec<Arc<Transaction>>,
+    #[cfg_attr(
+        any(test, feature = "proptest-impl"),
+        proptest(
+            strategy = "any::<Vec<Arc<transaction::Transaction>>>().prop_map(|transactions| transactions.into_iter().map(Into::into).collect())"
+        )
+    )]
+    pub transactions: Vec<TransactionHandle>,
 
     /// The mined transaction IDs of the transactions in `block`,
     /// in the same order as `block.transactions`.
@@ -118,10 +129,10 @@ impl From<ContextuallyVerifiedBlock> for ChainTipBlock {
         Self {
             hash,
             height,
-            time: block.header.time,
-            transactions: block.transactions.clone(),
+            time: block.header().time,
+            transactions: block.transactions().collect(),
             transaction_hashes,
-            previous_block_hash: block.header.previous_block_hash,
+            previous_block_hash: block.header().previous_block_hash,
         }
     }
 }
@@ -132,20 +143,17 @@ impl From<SemanticallyVerifiedBlock> for ChainTipBlock {
             block,
             hash,
             height,
-            new_outputs: _,
             transaction_hashes,
-            deferred_pool_balance_change: _,
-            auth_data_root: _,
-            receipt_order: _,
+            ..
         } = prepared;
 
         Self {
             hash,
             height,
-            time: block.header.time,
-            transactions: block.transactions.clone(),
+            time: block.header().time,
+            transactions: block.transactions().collect(),
             transaction_hashes,
-            previous_block_hash: block.header.previous_block_hash,
+            previous_block_hash: block.header().previous_block_hash,
         }
     }
 }
@@ -167,9 +175,47 @@ pub struct ChainTipSender {
 
     /// The sender channel for chain tip data.
     sender: watch::Sender<ChainTipData>,
+    announcements: Option<BlockAnnouncementSender>,
 }
 
 impl ChainTipSender {
+    /// Connect the single committed-announcement consumer before starting the writer.
+    pub fn with_block_announcements(mut self) -> (Self, BlockAnnouncements) {
+        let (sender, receiver) = BlockAnnouncementSender::new();
+        let tip = self
+            .sender
+            .borrow()
+            .as_ref()
+            .map(|tip| (tip.hash, tip.height));
+        sender.publish(tip, None);
+        self.announcements = Some(sender);
+        (self, receiver)
+    }
+
+    /// Publish a successful non-finalized commit and its selected tip together.
+    pub fn publish_non_finalized_commit(
+        &mut self,
+        tip: ChainTipBlock,
+        committed: CommittedBlockAnnouncement,
+    ) {
+        self.use_non_finalized_tip = true;
+        self.update_with_commit(Some(tip), Some(committed));
+    }
+
+    /// Publish a successful checkpoint commit after the database write is visible.
+    pub fn publish_finalized_commit(
+        &mut self,
+        tip: ChainTipBlock,
+        committed: CommittedBlockAnnouncement,
+    ) {
+        let selected_tip = if self.use_non_finalized_tip {
+            self.sender.borrow().clone()
+        } else {
+            Some(tip)
+        };
+        self.update_with_commit(selected_tip, Some(committed));
+    }
+
     /// Create new linked instances of [`ChainTipSender`], [`LatestChainTip`], and [`ChainTipChange`],
     /// using an `initial_tip` and a [`Network`].
     #[instrument(skip(initial_tip), fields(new_height, new_hash))]
@@ -185,6 +231,7 @@ impl ChainTipSender {
         let mut sender = ChainTipSender {
             use_non_finalized_tip: false,
             sender,
+            announcements: None,
         };
 
         let current = LatestChainTip::new(receiver);
@@ -201,6 +248,7 @@ impl ChainTipSender {
         Self {
             use_non_finalized_tip: false,
             sender: self.sender.clone(),
+            announcements: self.announcements.clone(),
         }
     }
 
@@ -257,6 +305,14 @@ impl ChainTipSender {
     /// An update is only sent if the current best tip is different from the last best tip
     /// that was sent.
     fn update(&mut self, new_tip: Option<ChainTipBlock>) {
+        self.update_with_commit(new_tip, None);
+    }
+
+    fn update_with_commit(
+        &mut self,
+        new_tip: Option<ChainTipBlock>,
+        committed: Option<CommittedBlockAnnouncement>,
+    ) {
         // Correctness: the `self.sender.borrow()` must not be placed in a `let` binding to prevent
         // a read-lock being created and living beyond the `self.sender.send(..)` call. If that
         // happens, the `send` method will attempt to obtain a write-lock and will dead-lock.
@@ -275,8 +331,12 @@ impl ChainTipSender {
             (None, _active_value_hash) => false,
         };
 
+        let tip = new_tip.as_ref().map(|tip| (tip.hash, tip.height));
         if needs_update {
             let _ = self.sender.send(new_tip);
+        }
+        if let Some(announcements) = &self.announcements {
+            announcements.publish(tip, committed);
         }
     }
 
@@ -358,8 +418,7 @@ impl LatestChainTip {
     /// while holding the receiver lock as briefly as possible.
     ///
     /// This helper method is a shorter way to borrow the value from the [`watch::Receiver`] and
-    /// extract some information from it, while also adding the current chain tip block's fields as
-    /// records to the current span.
+    /// extract some information from it.
     ///
     /// A single read lock is acquired to clone `T`, and then released after the clone.
     /// See the performance note on [`WatchReceiver::with_watch_data`].
@@ -373,68 +432,38 @@ impl LatestChainTip {
     where
         F: FnOnce(&ChainTipBlock) -> U,
     {
-        let span = tracing::Span::current();
-
-        let register_span_fields = |chain_tip_block: Option<&ChainTipBlock>| {
-            span.record(
-                "height",
-                tracing::field::debug(chain_tip_block.map(|block| block.height)),
-            );
-            span.record(
-                "hash",
-                tracing::field::debug(chain_tip_block.map(|block| block.hash)),
-            );
-            span.record(
-                "time",
-                tracing::field::debug(chain_tip_block.map(|block| block.time)),
-            );
-            span.record(
-                "previous_hash",
-                tracing::field::debug(chain_tip_block.map(|block| block.previous_block_hash)),
-            );
-            span.record(
-                "transaction_count",
-                tracing::field::debug(chain_tip_block.map(|block| block.transaction_hashes.len())),
-            );
-        };
-
-        self.receiver.with_watch_data(|chain_tip_block| {
-            // TODO: replace with Option::inspect when it stabilises
-            //       https://github.com/rust-lang/rust/issues/91345
-            register_span_fields(chain_tip_block.as_ref());
-
-            chain_tip_block.as_ref().map(f)
-        })
+        self.receiver
+            .with_watch_data(|chain_tip_block| chain_tip_block.as_ref().map(f))
     }
 }
 
 impl ChainTip for LatestChainTip {
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     fn best_tip_height(&self) -> Option<block::Height> {
         self.with_chain_tip_block(|block| block.height)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     fn best_tip_hash(&self) -> Option<block::Hash> {
         self.with_chain_tip_block(|block| block.hash)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     fn best_tip_height_and_hash(&self) -> Option<(block::Height, block::Hash)> {
         self.with_chain_tip_block(|block| (block.height, block.hash))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     fn best_tip_block_time(&self) -> Option<DateTime<Utc>> {
         self.with_chain_tip_block(|block| block.time)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     fn best_tip_height_and_block_time(&self) -> Option<(block::Height, DateTime<Utc>)> {
         self.with_chain_tip_block(|block| (block.height, block.time))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     fn best_tip_mined_transaction_ids(&self) -> Arc<[transaction::Hash]> {
         self.with_chain_tip_block(|block| block.transaction_hashes.clone())
             .unwrap_or_else(|| Arc::new([]))

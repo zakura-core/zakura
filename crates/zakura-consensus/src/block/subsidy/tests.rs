@@ -23,17 +23,20 @@ fn test_funding_stream_values() -> Result<(), Report> {
     let canopy_activation_height = Canopy.activation_height(network).unwrap();
     let nu6_activation_height = Nu6.activation_height(network).unwrap();
     let nu6_1_activation_height = Nu6_1.activation_height(network).unwrap();
+    let nu7_activation_height = Nu7.activation_height(network).unwrap();
 
     let dev_fund_height_range = network.all_funding_streams()[0].height_range();
     let nu6_fund_height_range = network.all_funding_streams()[1].height_range();
     let nu6_1_fund_height_range = network.all_funding_streams()[2].height_range();
 
     let nu6_fund_end = Height(3_146_400);
-    let nu6_1_fund_end = Height(4_406_400);
+    // The ZIP 218 moved third halving, where the NU6.1 stream now ends.
+    let nu6_1_fund_end = Height(6_132_390);
 
     assert_eq!(canopy_activation_height, Height(1_046_400));
     assert_eq!(nu6_activation_height, Height(2_726_400));
     assert_eq!(nu6_1_activation_height, Height(3_146_400));
+    assert_eq!(nu7_activation_height, Height(3_543_405));
 
     assert_eq!(dev_fund_height_range.start, canopy_activation_height);
     assert_eq!(dev_fund_height_range.end, nu6_activation_height);
@@ -70,6 +73,19 @@ fn test_funding_stream_values() -> Result<(), Report> {
     );
     let expected_nu6_fund = expected_nu6_fund;
 
+    // ZIP 218 divides the block subsidy by the spacing ratio at NU7, and the
+    // funding stream values with it.
+    let mut expected_post_nu7_fund = HashMap::new();
+    expected_post_nu7_fund.insert(
+        FundingStreamReceiver::Deferred,
+        Amount::try_from(6_249_999)?,
+    );
+    expected_post_nu7_fund.insert(
+        FundingStreamReceiver::MajorGrants,
+        Amount::try_from(4_166_666)?,
+    );
+    let expected_post_nu7_fund = expected_post_nu7_fund;
+
     for height in [
         dev_fund_height_range.start.previous().unwrap(),
         dev_fund_height_range.start,
@@ -86,6 +102,9 @@ fn test_funding_stream_values() -> Result<(), Report> {
         nu6_1_fund_height_range.start.previous().unwrap(),
         nu6_1_fund_height_range.start,
         nu6_1_fund_height_range.start.next().unwrap(),
+        nu7_activation_height.previous().unwrap(),
+        nu7_activation_height,
+        nu7_activation_height.next().unwrap(),
         nu6_1_fund_height_range.end.previous().unwrap(),
         nu6_1_fund_height_range.end,
         nu6_1_fund_height_range.end.next().unwrap(),
@@ -97,9 +116,11 @@ fn test_funding_stream_values() -> Result<(), Report> {
             assert!(fsv.is_empty());
         } else if height < nu6_activation_height {
             assert_eq!(fsv, expected_dev_fund);
-        } else if height < nu6_1_fund_end {
+        } else if height < nu7_activation_height {
             // NU6 and NU6.1 funding streams are in the same halving and expected to have the same values
             assert_eq!(fsv, expected_nu6_fund);
+        } else if height < nu6_1_fund_end {
+            assert_eq!(fsv, expected_post_nu7_fund);
         } else {
             assert!(fsv.is_empty());
         }
@@ -132,8 +153,6 @@ fn test_funding_stream_addresses() -> Result<(), Report> {
                 );
 
                 // ZIP 2008 changes only Mainnet's NU7 FPF recipient to P2PKH.
-                // TODO(zip-259): verify the built-in stream contains this recipient
-                // once the final Mainnet activation height is assigned.
                 let zip_2008_mainnet_fpf = network.kind() == NetworkKind::Mainnet
                     && *receiver == FundingStreamReceiver::MajorGrants
                     && address.to_string() == "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG";
@@ -146,6 +165,20 @@ fn test_funding_stream_addresses() -> Result<(), Report> {
             }
         }
     }
+
+    // ZIP 2008: the built-in Mainnet stream pays the P2PKH FPF recipient
+    // after the ZIP 259 NU7 rotation.
+    assert!(Network::Mainnet
+        .all_funding_streams()
+        .iter()
+        .flat_map(|fs| fs.recipients())
+        .any(
+            |(receiver, recipient)| *receiver == FundingStreamReceiver::MajorGrants
+                && recipient
+                    .addresses()
+                    .iter()
+                    .any(|address| address.to_string() == "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG")
+        ));
 
     Ok(())
 }
@@ -181,21 +214,20 @@ const TESTNET_THIRD_HALVING: u32 = 4_476_000;
 /// The Testnet third halving after ZIP 218 with NU7 at [`TESTNET_NU7`].
 const TESTNET_ZIP_218_THIRD_HALVING: u32 = 4_656_000;
 
-/// Test-only projected November 5 Mainnet activation, not a consensus parameter.
-// TODO(zip-259): replace this fixture once the ZIP assigns Mainnet NU7.
-const TEST_ONLY_MAINNET_NU7: u32 = 3_543_000;
+/// The ZIP 259 Mainnet NU7 activation height.
+const MAINNET_NU7: u32 = 3_543_405;
 
 /// A configured Testnet with Mainnet's activation schedule and synthetic P2SH
 /// grants recipients. The separate Mainnet constants test checks the real ZIP
 /// 2008 P2PKH recipient, which configured Testnets cannot accept.
-fn test_only_mainnet_schedule_with_stream() -> (Network, Vec<transparent::Address>) {
+fn mainnet_schedule_with_test_stream() -> (Network, Vec<transparent::Address>) {
     use zakura_chain::parameters::testnet::{
         ConfiguredActivationHeights, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams,
         Parameters,
     };
 
     let mut activations: ConfiguredActivationHeights = Network::Mainnet.activation_list().into();
-    activations.nu7 = Some(TEST_ONLY_MAINNET_NU7);
+    activations.nu7 = Some(MAINNET_NU7);
     let addresses: Vec<_> = (0..36)
         .map(|index| transparent::Address::from_script_hash(NetworkKind::Testnet, [index; 20]))
         .collect();
@@ -203,7 +235,7 @@ fn test_only_mainnet_schedule_with_stream() -> (Network, Vec<transparent::Addres
         .with_activation_heights(activations)
         .expect("activation heights are valid")
         .with_funding_streams(vec![ConfiguredFundingStreams {
-            height_range: Some(Height(3_146_400)..Height(6_133_200)),
+            height_range: Some(Height(3_146_400)..Height(6_132_390)),
             recipients: Some(vec![
                 ConfiguredFundingStreamRecipient {
                     receiver: FundingStreamReceiver::Deferred,
@@ -223,7 +255,7 @@ fn test_only_mainnet_schedule_with_stream() -> (Network, Vec<transparent::Addres
 }
 
 #[test]
-fn test_only_mainnet_coinbase_boundaries_match_fixed_oracle() -> Result<(), Report> {
+fn mainnet_coinbase_boundaries_match_fixed_oracle() -> Result<(), Report> {
     use crate::{
         block::check::{miner_fees_are_valid, subsidy_is_valid},
         checkpoint::deferred_pool_balance_change as checkpoint_deferred,
@@ -231,16 +263,17 @@ fn test_only_mainnet_coinbase_boundaries_match_fixed_oracle() -> Result<(), Repo
     };
 
     let _init_guard = zakura_test::init();
-    const ROTATION: u32 = 3_613_200;
+    const ROTATION: u32 = 3_612_390;
     const OLD_END: u32 = 4_406_400;
-    const MOVED_END: u32 = 6_133_200;
+    const MOVED_END: u32 = 6_132_390;
 
-    let (network, addresses) = test_only_mainnet_schedule_with_stream();
-    assert_eq!(Nu7.activation_height(&Network::Mainnet), None);
+    let (network, addresses) = mainnet_schedule_with_test_stream();
     assert_eq!(
-        Nu7.activation_height(&network),
-        Some(Height(TEST_ONLY_MAINNET_NU7))
+        Nu7.activation_height(&Network::Mainnet),
+        Some(Height(MAINNET_NU7)),
+        "the fixed oracle uses the ZIP 259 Mainnet schedule",
     );
+    assert_eq!(Nu7.activation_height(&network), Some(Height(MAINNET_NU7)));
     let output = |value: i64, script: transparent::Script| transparent::Output {
         value: Amount::try_from(value).expect("oracle amount is valid"),
         lock_script: script,
@@ -250,7 +283,7 @@ fn test_only_mainnet_coinbase_boundaries_match_fixed_oracle() -> Result<(), Repo
     // Height, subsidy, grants, deferred, miner, zero-based recipient slot.
     for (height, subsidy_zats, grants_zats, deferred_zats, miner_zats, slot) in [
         (
-            TEST_ONLY_MAINNET_NU7 - 1,
+            MAINNET_NU7 - 1,
             156_250_000,
             12_500_000,
             18_750_000,
@@ -258,7 +291,7 @@ fn test_only_mainnet_coinbase_boundaries_match_fixed_oracle() -> Result<(), Repo
             Some(11),
         ),
         (
-            TEST_ONLY_MAINNET_NU7,
+            MAINNET_NU7,
             52_083_333,
             4_166_666,
             6_249_999,
@@ -266,7 +299,7 @@ fn test_only_mainnet_coinbase_boundaries_match_fixed_oracle() -> Result<(), Repo
             Some(11),
         ),
         (
-            TEST_ONLY_MAINNET_NU7 + 1,
+            MAINNET_NU7 + 1,
             52_083_333,
             4_166_666,
             6_249_999,
@@ -389,8 +422,8 @@ fn test_only_mainnet_coinbase_boundaries_match_fixed_oracle() -> Result<(), Repo
         crate::error::TransactionError::Subsidy(SubsidyError::FundingStreamNotFound),
     ));
     for (height, grants) in [
-        (TEST_ONLY_MAINNET_NU7 - 1, 12_500_000),
-        (TEST_ONLY_MAINNET_NU7, 4_166_666),
+        (MAINNET_NU7 - 1, 12_500_000),
+        (MAINNET_NU7, 4_166_666),
         (ROTATION, 4_166_666),
         (MOVED_END - 1, 4_166_666),
     ] {
@@ -414,8 +447,8 @@ fn test_only_mainnet_coinbase_boundaries_match_fixed_oracle() -> Result<(), Repo
     // floor(17 * 6 / 10) = 10 goes to NSM, even at the stream's end.
     let fees = Amount::try_from(17)?;
     for (height, fee_share, miner, grants) in [
-        (TEST_ONLY_MAINNET_NU7 - 1, 17, 125_000_000, Some(12_500_000)),
-        (TEST_ONLY_MAINNET_NU7, 7, 41_666_668, Some(4_166_666)),
+        (MAINNET_NU7 - 1, 17, 125_000_000, Some(12_500_000)),
+        (MAINNET_NU7, 7, 41_666_668, Some(4_166_666)),
         (MOVED_END - 1, 7, 41_666_668, Some(4_166_666)),
         (MOVED_END, 7, 26_041_666, None),
     ] {

@@ -23,18 +23,10 @@ use zcash_address::{ToAddress, ZcashAddress};
 
 use super::super::*;
 use super::utils::fake_history_tree;
+use crate::tests::test_rpc::TestRpcImpl;
 
 type Mock<Req, Resp> = MockService<Req, Resp, PanicAssertion, BoxError>;
 type Verifier = Mock<zakura_consensus::Request, Hash>;
-type TestRpc<M, R> = RpcImpl<
-    M,
-    Mock<zakura_state::Request, zakura_state::Response>,
-    R,
-    MockChainTip,
-    MockAddressBookPeers,
-    Verifier,
-    MockSyncStatus,
->;
 
 fn network() -> Network {
     Network::new_regtest(RegtestParameters {
@@ -52,7 +44,7 @@ fn rpc<M: MempoolService, R: ReadStateService>(
     mempool: M,
     read: R,
     tip: MockChainTip,
-) -> (TestRpc<M, R>, Verifier) {
+) -> (TestRpcImpl, Verifier) {
     // Template construction runs on the blocking pool and can exceed the mock
     // default of 300 ms on busy CI runners. Use the enclosing test deadline.
     let verifier: Verifier = MockService::build()
@@ -62,7 +54,7 @@ fn rpc<M: MempoolService, R: ReadStateService>(
     let mut sync_status = MockSyncStatus::default();
     sync_status.set_is_close_to_tip(true);
     let (_, rx) = watch::channel(None);
-    let (rpc, queue) = RpcImpl::new(
+    let (rpc, queue) = TestRpcImpl::new_for_tests(
         network,
         config::mining::Config {
             miner_address: Some(miner_address),
@@ -247,7 +239,7 @@ fn chain_info(height: u32, hash: u8, balance: i64) -> GetBlockTemplateChainInfo 
 fn mining_rpc(
     info: watch::Receiver<GetBlockTemplateChainInfo>,
 ) -> (
-    TestRpc<impl MempoolService, impl ReadStateService>,
+    TestRpcImpl,
     zakura_chain::chain_tip::mock::MockChainTipSender,
     Verifier,
 ) {
@@ -286,7 +278,7 @@ fn mining_rpc(
 fn counting_mining_rpc(
     info: watch::Receiver<GetBlockTemplateChainInfo>,
 ) -> (
-    TestRpc<impl MempoolService, impl ReadStateService>,
+    TestRpcImpl,
     zakura_chain::chain_tip::mock::MockChainTipSender,
     Arc<AtomicUsize>,
     Arc<AtomicBool>,
@@ -995,6 +987,7 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         sender.send_best_tip_height(original.tip_height);
         sender.send_best_tip_hash(original.tip_hash);
         sender.send_estimated_distance_to_network_chain_tip(0);
+        sender.send_best_tip_block_time(chrono::Utc::now());
         let read_count = Arc::new(AtomicUsize::new(0));
         let reads = read_count.clone();
         let slow_read = Arc::new(AtomicBool::new(false));

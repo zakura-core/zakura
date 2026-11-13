@@ -50,8 +50,11 @@ pub fn transparent_spend(
 ) -> Result<HashMap<transparent::OutPoint, transparent::OrderedUtxo>, ValidateContextError> {
     let mut block_spends = HashMap::new();
 
-    for (spend_tx_index_in_block, transaction) in
-        semantically_verified.block.transactions.iter().enumerate()
+    for (spend_tx_index_in_block, transaction) in semantically_verified
+        .block
+        .view()
+        .transactions()
+        .enumerate()
     {
         // Coinbase inputs represent new coins,
         // so there are no UTXOs to mark as spent.
@@ -242,8 +245,11 @@ pub fn remaining_transaction_value(
     semantically_verified: &SemanticallyVerifiedBlock,
     utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
 ) -> Result<(), ValidateContextError> {
-    for (tx_index_in_block, transaction) in
-        semantically_verified.block.transactions.iter().enumerate()
+    for (tx_index_in_block, transaction) in semantically_verified
+        .block
+        .view()
+        .transactions()
+        .enumerate()
     {
         if transaction.is_coinbase() {
             continue;

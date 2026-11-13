@@ -12,7 +12,7 @@ use chrono::{Duration, Utc};
 use tokio::time;
 use tower::{
     buffer::Buffer,
-    util::{BoxCloneService, BoxService},
+    util::{BoxCloneService, BoxCloneSyncService, BoxService},
 };
 
 use zakura_chain::{
@@ -578,7 +578,7 @@ fn setup(
             ..Default::default()
         },
         false,
-        Buffer::new(BoxService::new(peer_set.clone()), 1),
+        BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 1)),
         Buffer::new(BoxService::new(state_guard.clone()), 1),
         BoxCloneService::new(state_service.clone()),
         Buffer::new(BoxService::new(tx_verifier.clone()), 1),
@@ -587,6 +587,7 @@ fn setup(
         chain_tip_change,
         tokio::sync::mpsc::channel(1).0,
         Vec::new(),
+        zn::UnconditionalPeers::default(),
     );
 
     let mut transaction_receiver = mempool_transaction_subscriber.subscribe();

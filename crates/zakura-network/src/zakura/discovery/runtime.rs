@@ -2,8 +2,8 @@
 
 use std::net::SocketAddr;
 
-use tokio::sync::watch;
 use zakura_quic::NodeSecretKey;
+use zakura_rt::sync::watch;
 
 use crate::zakura::{ZakuraHandshakeConfig, ZakuraPeerId};
 
@@ -11,6 +11,7 @@ use super::protocol::{
     DiscoveryWireError, ZakuraDiscoveryConfig, ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig,
     ZakuraServiceId, DEFAULT_DISCOVERY_CONNECTION_HEADROOM,
 };
+use super::sequence_file::AuthoredSequenceFile;
 
 /// Services advertised in this node's discovery self-record.
 pub(crate) fn default_advertised_services() -> Vec<ZakuraServiceId> {
@@ -31,10 +32,13 @@ pub(crate) fn effective_discovery_connection_headroom(bootstrap_peer_count: usiz
 }
 
 /// Builds a discovery runtime handle from the local node identity and the
-/// negotiated network parameters.
+/// negotiated network parameters. With a `sequence_file`, the handle seeds its
+/// first self-record sequence from the stored one and stores each sequence it
+/// authors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_discovery_handle(
     secret_key: NodeSecretKey,
+    sequence_file: Option<AuthoredSequenceFile>,
     direct_addrs: Vec<SocketAddr>,
     advertised_services: Vec<ZakuraServiceId>,
     handshake: &ZakuraHandshakeConfig,
@@ -50,7 +54,7 @@ pub(crate) fn build_discovery_handle(
         zakura_protocol_max: handshake.zakura_protocol_max,
         network_id: handshake.network_id,
         chain_id: handshake.chain_id,
-        last_authored_sequence: None,
+        last_authored_sequence: sequence_file.as_ref().and_then(AuthoredSequenceFile::load),
     };
     let config = ZakuraDiscoveryConfig {
         max_zakura_connections,
@@ -59,5 +63,41 @@ pub(crate) fn build_discovery_handle(
         ),
         ..ZakuraDiscoveryConfig::default()
     };
-    ZakuraDiscoveryHandle::new(local_config, config, connected)
+    let handle = ZakuraDiscoveryHandle::new(local_config, config, connected)?;
+    Ok(match sequence_file {
+        Some(file) => handle.with_sequence_file(file),
+        None => handle,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::parameters::Network;
+
+    use super::*;
+
+    /// Production builds the handle through this function, so the stored
+    /// sequence must seed the first record here, whatever the wall clock says.
+    #[tokio::test]
+    async fn the_stored_sequence_seeds_the_first_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = || AuthoredSequenceFile::new(dir.path().join("sequence"));
+        // Far ahead of the wall clock, as after a backward clock step.
+        let stored = u64::MAX / 2;
+        file().store(stored).unwrap();
+        let (_connected_tx, connected) = watch::channel(Vec::new());
+        let handle = build_discovery_handle(
+            NodeSecretKey::generate(),
+            Some(file()),
+            Vec::new(),
+            default_advertised_services(),
+            &ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            8,
+            0,
+            connected,
+        )
+        .unwrap();
+        assert_eq!(handle.current_self_record().body.sequence, stored + 1);
+        assert_eq!(file().load(), Some(stored + 1));
+    }
 }

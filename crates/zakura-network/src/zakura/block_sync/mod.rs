@@ -4,25 +4,20 @@
 //! peer's stream-6 frames flow through the per-peer routine, the work queue, the
 //! commit pipeline, the registry, and the reactor.
 
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    io,
-    sync::{Arc, Mutex as StdMutex},
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, io, sync::Arc, time::Duration};
 
 use byteorder::WriteBytesExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{
-    sync::{mpsc, watch},
-    task::JoinHandle,
-    time,
-};
-use tokio_util::sync::CancellationToken;
 use zakura_chain::{
     block,
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
+};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    sync::{mpsc, watch, CancellationToken, Mutex as StdMutex},
+    task::JoinHandle,
+    time::{self, Instant},
 };
 
 use super::{
@@ -30,10 +25,26 @@ use super::{
     ZakuraPeerId, ZakuraTrace,
 };
 
+/// Reports the event that `$event` builds to the observer in `$slot`, an
+/// [`ObserverSlot`](block_sync_observe::ObserverSlot), if one is installed.
+/// `$event` is evaluated only then.
+///
+/// Every call site is itself compiled only in test and simulator builds.
+#[cfg(any(test, zakura_sim))]
+macro_rules! observe {
+    ($slot:expr, $event:expr) => {
+        if let Some(observer) = &$slot.0 {
+            observer.observe($event)
+        }
+    };
+}
+
 mod admission;
 mod bbr;
 #[cfg(feature = "internal-bench")]
 mod bench;
+#[cfg(any(test, zakura_sim))]
+pub mod block_sync_observe;
 mod config;
 mod error;
 mod events;
@@ -62,27 +73,42 @@ mod work_queue;
 pub(crate) use admission::DESERIALIZED_MEM_FACTOR;
 #[cfg(feature = "internal-bench")]
 pub use bench::{
-    spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchSequencerHandle, BenchSubmissions,
-    BenchSubmit, SequencerProgress,
+    bench_work_request, spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchReceiptBatch,
+    BenchSequencerHandle, BenchSubmissions, BenchSubmit, BenchWorkCapacity, BenchWorkChurn,
+    SequencerProgress, WorkRequestEnd,
 };
 #[cfg(test)]
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
-pub use config::{BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
+pub use config::{
+    BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES,
+    MAX_BS_RESPONSE_BYTES,
+};
 pub use error::{BlockSyncStartError, BlockSyncWireError};
 pub use events::{
     BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
     BlockSyncEvent, BlockSyncMisbehavior,
 };
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub use peer_routine::routine_accepts_body;
 pub use reactor::spawn_block_sync_reactor;
+pub(crate) use regulated::session::serving_limits as getblocks_serving_limits;
 pub use request::BlockSizeEstimate;
-#[cfg(test)]
-pub(crate) use service::block_sync_streams;
-pub use service::BlockSyncPeerSession;
-pub(crate) use service::BlockSyncService;
+pub(crate) use service::BLOCK_SYNC_SERVICE_STREAMS;
 #[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;
+pub use service::{
+    block_sync_reactor_budget, BlockSyncPeerSession, BlockSyncService, BLOCK_SYNC_REACTOR_BUDGET,
+};
+#[cfg(any(test, zakura_sim))]
+pub use service::{block_sync_serving_limit, block_sync_streams};
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub use source::DetachedReadSession;
 pub use source::{BlockRangeRead, BlockRangeReadLease, BlockRangeReadResult, BlockRangeSource};
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub use state::DetachedHandleEvents;
 pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub use wire::decode_block_payload_for_test;
 pub use wire::{
     BlockSyncMessage, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_MESSAGE_BYTES, MSG_BS_BLOCK,
     MSG_BS_BLOCKS_DONE, MSG_BS_GET_BLOCKS, MSG_BS_RANGE_UNAVAILABLE, MSG_BS_STATUS,
@@ -90,7 +116,25 @@ pub use wire::{
     ZAKURA_STREAM_BLOCK_SYNC,
 };
 
-#[cfg(test)]
+/// The current UTC time as chrono's type. Reads `zakura_rt::time::utc_now`,
+/// so a simulated run sees the scenario clock.
+fn utc_now() -> chrono::DateTime<chrono::Utc> {
+    time::utc_now().into()
+}
+
+/// A header-chain [`Clock`](zakura_header_chain::Clock) that reads [`utc_now`], so
+/// body-retry deadlines and their conversion to `Instant`s share one clock.
+#[derive(Copy, Clone, Debug, Default)]
+struct BlockSyncClock;
+
+impl zakura_header_chain::Clock for BlockSyncClock {
+    /// Returns [`utc_now`].
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        utc_now()
+    }
+}
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
 fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {
     zakura_header_chain::BodyWorkAuthority {
         header: zakura_header_chain::HeaderWorkAuthority {
@@ -100,6 +144,13 @@ fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {
         verified_generation: zakura_header_chain::VerifiedGeneration::new(3),
         body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
     }
+}
+
+#[cfg(test)]
+fn test_decoded_pool() -> zakura_node_services::block_memory::DecodedBlockPool {
+    ZakuraBlockSyncConfig::default()
+        .decoded_block_pool(10_000)
+        .expect("fixture decoded allowance fits")
 }
 
 #[cfg(test)]
@@ -150,3 +201,36 @@ pub(crate) fn test_block_apply_outcome(result: BlockApplyResult) -> BlockApplyOu
         }
     }
 }
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use work_queue::{
+    trace_work_funding_bytes, trace_work_ownership_bytes, FundingReceiptView, FundingRequestPhase,
+    FundingRequestView, WorkFundingHistory, WorkFundingStep, WorkFundingView, WorkOwnershipEntry,
+    WorkOwnershipFailure, WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary,
+    WorkOwnershipStep, WorkOwnershipView,
+};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use reactor::{
+    replay_block_query_bytes, replay_block_reactor_bytes, trace_block_reactor_bytes, ActionRefusal,
+    BlockQueryReplaySummary, BlockReactorHistory, BlockReactorReplaySummary, BlockReactorStep,
+    PendingNeededQuery, QueryReplyOutcome, ReactorMachineView, ReactorSnapshot, ReactorTransition,
+};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use peer_routine::{replay_block_fill_bytes, BlockFillReplaySummary};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use peer_routine::{replay_request_lifecycle_bytes, RequestLifecycleReplaySummary};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use peer_registry::{
+    replay_peer_registry_bytes, replay_retry_authority_bytes, PeerRegistryReplaySummary,
+    RetryAuthorityReplaySummary,
+};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use sequencer_task::{
+    replay_sequencer_evidence_bytes, replay_sequencer_order_bytes, replay_sequencer_reset_bytes,
+    SequencerReplaySummary,
+};

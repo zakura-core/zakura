@@ -4,11 +4,11 @@ use std::{
     future::Future,
     mem,
     pin::Pin,
+    sync::LazyLock,
     task::{Context, Poll},
 };
 
 use futures::{future::BoxFuture, FutureExt};
-use once_cell::sync::Lazy;
 use rand_core::OsRng;
 
 use super::batch_control::{Batch, BatchControl, RequestWeight};
@@ -66,12 +66,12 @@ impl Item {
 /// Note that making a `Service` call requires mutable access to the service, so
 /// you should call `.clone()` on the global handle to create a local, mutable
 /// handle.
-pub static VERIFIER: Lazy<
+pub static VERIFIER: LazyLock<
     Fallback<
         Batch<Verifier, Item>,
         ServiceFn<fn(Item) -> BoxFuture<'static, Result<(), BoxError>>>,
     >,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     Fallback::new(
         Batch::new(
             Verifier::default(),

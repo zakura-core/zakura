@@ -15,6 +15,7 @@ use tracing::Span;
 use zakura_chain::{parameters::Network, serialization::DateTime32};
 
 use crate::{
+    config::UnconditionalPeers,
     constants::{self, ADDR_RESPONSE_LIMIT_DENOMINATOR, MAX_ADDRS_IN_MESSAGE},
     meta_addr::MetaAddrChange,
     peer_registry::PeerRegistry,
@@ -27,9 +28,19 @@ use crate::{
 mod tests;
 
 /// Read-only access to currently banned peer IP addresses.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct BannedIps {
     inner: Arc<RwLock<BanList>>,
+    changes: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for BannedIps {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+            changes: tokio::sync::watch::channel(()).0,
+        }
+    }
 }
 
 /// A bounded FIFO list of banned peer IP addresses.
@@ -65,6 +76,27 @@ impl BanList {
 }
 
 impl BannedIps {
+    /// Watches authorization changes without polling the ban list.
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    /// Applies a ban and notifies readers after releasing the list lock.
+    fn insert(&self, ip: IpAddr) {
+        let changed = {
+            let mut list = self
+                .inner
+                .write()
+                .expect("ban list lock should not be poisoned");
+            let changed = !list.ips.contains(&canonical_ip(ip));
+            list.insert(ip);
+            changed
+        };
+        if changed {
+            self.changes.send_replace(());
+        }
+    }
+
     /// Returns whether `ip` is currently banned.
     pub fn contains(&self, ip: IpAddr) -> bool {
         let ip = canonical_ip(ip);
@@ -79,10 +111,7 @@ impl BannedIps {
     #[cfg(test)]
     pub(crate) fn with_banned_ip(ip: IpAddr) -> Self {
         let bans = Self::default();
-        bans.inner
-            .write()
-            .expect("ban list lock should not be poisoned")
-            .insert(ip);
+        bans.insert(ip);
         bans
     }
 }
@@ -264,6 +293,11 @@ pub struct AddressBook {
     /// A list of banned addresses, with the time they were banned.
     bans_by_ip: BannedIps,
 
+    /// Peer IP addresses and ranges that are never scored or banned.
+    ///
+    /// The address book drops misbehavior changes for these peers.
+    unconditional_peers: UnconditionalPeers,
+
     /// The local listener address.
     local_listener: SocketAddr,
 
@@ -375,6 +409,7 @@ impl AddressBook {
             last_address_log: None,
             most_recent_by_ip: should_limit_outbound_conns_per_ip.then(HashMap::new),
             bans_by_ip: Default::default(),
+            unconditional_peers: UnconditionalPeers::default(),
         };
 
         new_book.update_metrics(instant_now, chrono_now);
@@ -394,6 +429,16 @@ impl AddressBook {
     #[must_use]
     pub(crate) fn with_expose_peer_addresses(mut self, expose_peer_addresses: bool) -> Self {
         self.expose_peer_addresses = expose_peer_addresses;
+        self
+    }
+
+    /// Sets the peer IP addresses and ranges that are never scored or banned.
+    #[must_use]
+    pub(crate) fn with_unconditional_peers(
+        mut self,
+        unconditional_peers: UnconditionalPeers,
+    ) -> Self {
+        self.unconditional_peers = unconditional_peers;
         self
     }
 
@@ -637,6 +682,9 @@ impl AddressBook {
     /// As an exception, this function can ignore all changes for specific
     /// [`PeerSocketAddr`]s. Ignored addresses will never be used to connect to
     /// peers.
+    ///
+    /// It also drops misbehavior changes for configured unconditional peers,
+    /// which are never scored or banned but can still be connected.
     pub fn update(&mut self, change: MetaAddrChange) -> Option<MetaAddr> {
         let updated = self.update_inner(change);
         self.publish_metrics();
@@ -654,6 +702,18 @@ impl AddressBook {
                 ?change,
                 "attempted to add a banned peer addr to address book"
             );
+            return None;
+        }
+
+        if matches!(change, MetaAddrChange::UpdateMisbehavior { .. })
+            && self.unconditional_peers.contains(change.addr().ip())
+        {
+            debug!(
+                peer = %addr_label,
+                score_increment = change.misbehavior_score(),
+                "ignored misbehavior report for an unconditional peer"
+            );
+            metrics::counter!("address_book.misbehavior.unconditional_ignored.total").increment(1);
             return None;
         }
 
@@ -680,15 +740,11 @@ impl AddressBook {
             if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
                 // Ban and skip outbound connections with excessively misbehaving peers.
                 let banned_ip = updated.addr.ip();
-                {
-                    let mut bans_by_ip = self
-                        .bans_by_ip
-                        .inner
-                        .write()
-                        .expect("ban list lock should not be poisoned");
-
-                    bans_by_ip.insert(banned_ip);
-                }
+                debug_assert!(
+                    !self.unconditional_peers.contains(banned_ip),
+                    "unconditional peers must never be banned"
+                );
+                self.bans_by_ip.insert(banned_ip);
 
                 // `most_recent_by_ip` is only populated when
                 // `max_connections_per_ip == 1`. The ban path runs for any
@@ -1146,6 +1202,7 @@ impl Clone for AddressBook {
             last_address_log: None,
             most_recent_by_ip: self.most_recent_by_ip.clone(),
             bans_by_ip: self.bans_by_ip.clone(),
+            unconditional_peers: self.unconditional_peers.clone(),
         }
     }
 }

@@ -871,6 +871,15 @@ jobs:
             /etc/systemd/system/zakura-broadcast-mainnet.service
 
           # Keep status hosts and the broadcast TLS front door in sync.
+          # Caddy's 2026 advisory cluster (CVE-2026-77281, CVE-2026-92284,
+          # CVE-2026-92700, CVE-2026-52845) is fixed only in 2.11.4. Nothing on
+          # this runner pins Caddy (bootstrap-runner.sh never installs it), so
+          # assert the floor before replacing the Caddyfile and reloading.
+          caddy_version="$(caddy version 2>/dev/null | awk '{print $1}' | sed 's/^v//')"
+          if [ "$(printf '%s\n%s\n' 2.11.4 "$caddy_version" | sort -V | head -n1)" != "2.11.4" ]; then
+            echo "Caddy ${caddy_version:-unknown} is older than the required 2.11.4; not reloading" >&2
+            exit 1
+          fi
           sudo install -m 644 deploy/gateway/mainnet/Caddyfile /etc/caddy/Caddyfile
           sudo caddy validate --config /etc/caddy/Caddyfile
           sudo systemctl reload caddy.service

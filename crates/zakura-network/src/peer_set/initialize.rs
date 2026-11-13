@@ -484,6 +484,7 @@ where
             peerset_tx,
             active_outbound_connections,
             address_book_updater,
+            address_book.clone(),
             bans,
             peer_registry,
         );
@@ -1126,10 +1127,10 @@ enum CrawlerAction {
     OutboundConnectionsChanged,
     /// Redial the dropped peers whose next redial is due.
     RedialsDue,
-    /// Clear a finished redial of `addr`, which reconnected if `connected` is set.
+    /// Clear a finished redial of `addr`.
     RedialFinished {
         addr: PeerSocketAddr,
-        connected: bool,
+        outcome: RedialOutcome,
     },
 }
 
@@ -1236,9 +1237,10 @@ fn outbound_peer_replenishment_demand(
 /// across both the initial peers and crawler. The limit is based on `config`.
 ///
 /// When the peer of an outbound connection that was open for
-/// [`constants::MIN_REDIALED_CONNECTION_AGE`] closes it, dials the peer again at the times in [`constants::DROPPED_PEER_REDIAL_DELAYS`],
-/// until a dial succeeds, unless `bans` holds the peer or `peer_registry` shows it connected.
-/// See [`dropped_peer_redials`] for why.
+/// [`constants::MIN_REDIALED_CONNECTION_AGE`] closes it, dials the peer again at about the times
+/// in [`constants::DROPPED_PEER_REDIAL_DELAYS`], until a dial succeeds, see [`redial`] for the
+/// checks it makes with `address_book`, `bans` and `peer_registry`, and [`dropped_peer_redials`]
+/// for why.
 #[allow(clippy::too_many_arguments)]
 #[instrument(
     skip(
@@ -1250,6 +1252,7 @@ fn outbound_peer_replenishment_demand(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
+        address_book,
         bans,
         peer_registry,
     ),
@@ -1266,6 +1269,7 @@ async fn crawl_and_dial<C, S>(
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     mut active_outbound_connections: ActiveConnectionCounter,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    address_book: Arc<std::sync::Mutex<AddressBook>>,
     bans: BannedIps,
     peer_registry: PeerRegistry,
 ) -> Result<(), BoxError>
@@ -1535,63 +1539,62 @@ where
                 // The next iteration schedules redials for the connections that closed.
             }
             Ok(RedialsDue) => {
-                let now = Instant::now();
-                for (index, addr) in dropped_peer_redials.take_due(now).into_iter().enumerate() {
-                    // The peer is back, or must not be dialed.
-                    if bans.contains(addr.ip()) || peer_registry.is_connected_to(addr.ip()) {
-                        dropped_peer_redials.stop(addr);
-                        continue;
-                    }
-
+                // Space out redials that are due together, as `CandidateSet::next` spaces the
+                // crawler's dials.
+                let mut delay = Duration::ZERO;
+                for addr in dropped_peer_redials.take_due(Instant::now()) {
                     let outbound_connections = active_outbound_connections.update_count();
                     if outbound_connections >= config.peerset_outbound_connection_limit() {
                         dropped_peer_redials.failed(addr);
                         continue;
                     }
 
-                    metrics::counter!("peer.outbound.redials.attempted").increment(1);
                     let outbound_connection_tracker =
                         active_outbound_connections.track_connection();
                     let outbound_connector = outbound_connector.clone();
                     let peerset_tx = peerset_tx.clone();
                     let address_book_updater = address_book_updater.clone();
+                    let address_book = address_book.clone();
+                    let bans = bans.clone();
+                    let peer_registry = peer_registry.clone();
                     let expose_peer_addresses = config.expose_peer_addresses;
-                    // Space out redials that are due together, as `CandidateSet::next` does.
-                    let delay = constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL
-                        .saturating_mul(u32::try_from(index).unwrap_or(u32::MAX));
 
                     let redial_handle = tokio::spawn(erased(
                         async move {
                             sleep(delay).await;
 
-                            let connected = redial(
+                            let outcome = redial(
                                 addr,
                                 outbound_connector,
                                 outbound_connection_tracker,
                                 outbound_connections,
                                 peerset_tx,
                                 address_book_updater,
+                                address_book,
+                                bans,
+                                peer_registry,
                                 expose_peer_addresses,
                             )
                             .await?;
 
-                            Ok(RedialFinished { addr, connected })
+                            Ok(RedialFinished { addr, outcome })
                         }
                         .in_current_span(),
                     ))
                     .wait_for_panics();
 
                     handshakes.push(redial_handle);
+                    delay = delay.saturating_add(constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL);
                 }
             }
-            Ok(RedialFinished { addr, connected }) => {
-                if connected {
+            Ok(RedialFinished { addr, outcome }) => match outcome {
+                RedialOutcome::Reconnected => {
                     metrics::counter!("peer.outbound.redials.reconnected").increment(1);
                     dropped_peer_redials.stop(addr);
-                } else {
-                    dropped_peer_redials.failed(addr);
                 }
-            }
+                RedialOutcome::NotNeeded => dropped_peer_redials.stop(addr),
+                RedialOutcome::Failed => dropped_peer_redials.failed(addr),
+            },
 
             // Fatal errors and shutdowns
             Err(error) => {
@@ -1747,10 +1750,23 @@ where
     Ok(DialOutcome::Failed { demand_restored })
 }
 
+/// What a redial of a dropped peer did, see [`redial`].
+enum RedialOutcome {
+    /// The redial reconnected to the peer.
+    Reconnected,
+    /// The peer is banned or connected again, so it needs no more redials.
+    NotNeeded,
+    /// The dial failed, or another dial to the peer was pending.
+    Failed,
+}
+
 /// Dials `addr` again after a long-lived connection to it closed, see [`dropped_peer_redials`].
 ///
-/// First records the attempt in the address book, as [`CandidateSet::next`] does for the
-/// peers it returns. Returns whether the connection succeeded.
+/// Checks the peer right before dialing, after any spacing delay: a peer that `bans` holds or
+/// that `peer_registry` shows connected is not dialed, and neither is one that another dial is
+/// attempting. The redial claims its attempt with [`AddressBook::claim_attempt`], under the
+/// lock that [`CandidateSet::next`] takes, so the crawler never dials the peer twice at once.
+#[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(peer = %addr.addr_label(expose_peer_addresses)))]
 async fn redial<C>(
     addr: PeerSocketAddr,
@@ -1759,8 +1775,11 @@ async fn redial<C>(
     outbound_connections: usize,
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    address_book: Arc<std::sync::Mutex<AddressBook>>,
+    bans: BannedIps,
+    peer_registry: PeerRegistry,
     expose_peer_addresses: bool,
-) -> Result<bool, BoxError>
+) -> Result<RedialOutcome, BoxError>
 where
     C: Service<
             OutboundConnectorRequest,
@@ -1771,11 +1790,25 @@ where
         + 'static,
     C::Future: Send + 'static,
 {
-    // Ignore send errors on Zakura shutdown.
-    let _ = address_book_updater
-        .send(MetaAddr::new_reconnect(addr))
-        .await;
+    if bans.contains(addr.ip()) || peer_registry.is_connected_to(addr.ip()) {
+        return Ok(RedialOutcome::NotNeeded);
+    }
 
+    // Correctness: run address book accesses on a blocking thread, as `CandidateSet::next`
+    // does, to avoid deadlocks (see #1976).
+    let claimed = tokio::task::spawn_blocking(move || {
+        address_book
+            .lock()
+            .expect("unexpected panic in previous thread while accessing the address book")
+            .claim_attempt(addr)
+    })
+    .wait_for_panics()
+    .await;
+    if !claimed {
+        return Ok(RedialOutcome::Failed);
+    }
+
+    metrics::counter!("peer.outbound.redials.attempted").increment(1);
     let connected = connect_outbound(
         addr,
         outbound_connector,
@@ -1786,15 +1819,16 @@ where
         expose_peer_addresses,
     )
     .await?;
-
-    if connected {
-        info!(
-            peer = %addr.addr_label(expose_peer_addresses),
-            "reconnected to an outbound peer whose long-lived connection closed"
-        );
+    if !connected {
+        return Ok(RedialOutcome::Failed);
     }
 
-    Ok(connected)
+    info!(
+        peer = %addr.addr_label(expose_peer_addresses),
+        "reconnected to an outbound peer whose long-lived connection closed"
+    );
+
+    Ok(RedialOutcome::Reconnected)
 }
 
 /// Connects to `addr` using `outbound_connector`, counting the connection with

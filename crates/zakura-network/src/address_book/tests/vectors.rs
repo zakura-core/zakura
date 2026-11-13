@@ -15,7 +15,7 @@ use crate::{
     constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE},
     meta_addr::{MetaAddr, MetaAddrChange},
     protocol::external::types::PeerServices,
-    AddressBook,
+    AddressBook, PeerAddrState,
 };
 
 /// Cache ranking uses measured RTT, retaining book order for measured ties.
@@ -171,6 +171,41 @@ fn address_book_empty() {
         None
     );
     assert_eq!(address_book.len(), 0);
+}
+
+/// Make sure an attempt to an address can be claimed only while none is pending.
+#[test]
+fn an_attempt_is_claimed_only_while_none_is_pending() {
+    let _init_guard = zakura_test::init();
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let addr = "127.0.0.1:8233".parse().unwrap();
+
+    assert!(
+        address_book.claim_attempt(addr),
+        "an unknown address can be claimed"
+    );
+    assert_eq!(
+        address_book
+            .get(addr)
+            .map(|peer| peer.last_connection_state),
+        Some(PeerAddrState::AttemptPending),
+        "a claim records the attempt"
+    );
+    assert!(
+        !address_book.claim_attempt(addr),
+        "a pending attempt cannot be claimed again"
+    );
+
+    address_book.update(MetaAddr::new_errored(addr, None));
+    assert!(
+        address_book.claim_attempt(addr),
+        "an attempt that has failed no longer blocks a claim"
+    );
 }
 
 /// Peer addresses stay redacted unless the address book is explicitly configured to expose them.

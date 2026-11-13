@@ -5,8 +5,15 @@
 //! address book would not dial the peer again for at least
 //! [`MIN_PEER_RECONNECTION_DELAY`](constants::MIN_PEER_RECONNECTION_DELAY), and then only
 //! after every address it has never tried. So the crawler dials the peer's address again at
-//! the times in [`DROPPED_PEER_REDIAL_DELAYS`](constants::DROPPED_PEER_REDIAL_DELAYS), and
+//! about the times in [`DROPPED_PEER_REDIAL_DELAYS`](constants::DROPPED_PEER_REDIAL_DELAYS),
+//! scaled for each peer by up to
+//! [`DROPPED_PEER_REDIAL_JITTER`](constants::DROPPED_PEER_REDIAL_JITTER), and
 //! [`DroppedPeerRedials`] tracks when each redial is due.
+//!
+//! This is best effort. A Zakura listener with the default per-IP limit refuses an IP address
+//! for `MIN_PEER_RECONNECTION_DELAY` after it admits a connection from it, so once a redial
+//! reaches the restarted peer and its handshake fails, the later redials are refused too, and
+//! the address book's own reconnection takes over.
 //!
 //! # Security
 //!
@@ -19,11 +26,13 @@
 //!   a peer causes at most one dial per redial delay for each such connection,
 //! - each address has at most one pending set of redials, and at most the outbound
 //!   connection limit are pending in total, and
-//! - the crawler stops at the first success, skips banned and connected peers, and counts
-//!   each redial against the outbound connection limit.
+//! - the crawler stops at the first success, counts each redial against the outbound
+//!   connection limit, and right before each dial skips a banned or connected peer, and a
+//!   peer that another dial is attempting.
 
 use std::{collections::HashMap, time::Duration};
 
+use rand_10::{rng, RngExt};
 use tokio::time::Instant;
 
 use crate::{constants, peer_set::ClosedConnection, PeerSocketAddr};
@@ -40,8 +49,11 @@ pub struct DroppedPeerRedials {
     /// How long a connection must have been open for its peer to be redialed.
     min_connection_age: Duration,
 
-    /// How long after the close each redial is due, in order.
+    /// How long after the close each redial is due, in order, before jitter.
     delays: Vec<Duration>,
+
+    /// The most that each peer's delays are scaled up or down, at random, as a fraction.
+    jitter: f64,
 
     /// The most peer addresses with pending redials at one time.
     max_pending: usize,
@@ -53,11 +65,21 @@ struct PendingRedial {
     /// When the connection to the peer closed.
     closed_at: Instant,
 
+    /// The random factor that scales this peer's delays.
+    stretch: f64,
+
     /// The index in `delays` of the next redial.
     next: usize,
 
     /// Whether a redial is in progress.
     dialing: bool,
+}
+
+impl PendingRedial {
+    /// Returns when this peer's redial `delay` after the close is due.
+    fn due_at(&self, delay: Duration) -> Instant {
+        self.closed_at + delay.mul_f64(self.stretch)
+    }
 }
 
 impl DroppedPeerRedials {
@@ -66,33 +88,43 @@ impl DroppedPeerRedials {
         Self::with_policy(
             constants::MIN_REDIALED_CONNECTION_AGE,
             constants::DROPPED_PEER_REDIAL_DELAYS.to_vec(),
+            constants::DROPPED_PEER_REDIAL_JITTER,
             max_pending,
         )
     }
 
     /// Returns an empty set of redials with the given policy.
     ///
-    /// `delays` must be in time order.
+    /// `delays` must be in time order, and `jitter` must be at least 0 and less than 1.
     fn with_policy(
         min_connection_age: Duration,
         delays: Vec<Duration>,
+        jitter: f64,
         max_pending: usize,
     ) -> Self {
         Self {
             pending: HashMap::new(),
             min_connection_age,
             delays,
+            jitter,
             max_pending,
         }
     }
 
-    /// Schedules redials of the peer that `closed` was connected to.
+    /// Schedules redials of the peer that `closed` was connected to, with its delays scaled by
+    /// a random factor within `jitter` of 1.
     ///
     /// Returns `true` if redials are now pending. They are not if the connection was too
     /// short, if every redial time has already passed at `now`, if the address already has
     /// pending redials, or if the cap is reached.
     pub fn schedule(&mut self, closed: ClosedConnection, now: Instant) -> bool {
-        let last_redial = self.delays.last().map(|delay| closed.closed_at + *delay);
+        let redial = PendingRedial {
+            closed_at: closed.closed_at,
+            stretch: 1.0 + rng().random_range(-self.jitter..=self.jitter),
+            next: 0,
+            dialing: false,
+        };
+        let last_redial = self.delays.last().map(|delay| redial.due_at(*delay));
 
         if closed.open_for < self.min_connection_age
             || last_redial.is_none_or(|last_redial| last_redial < now)
@@ -102,14 +134,7 @@ impl DroppedPeerRedials {
             return false;
         }
 
-        self.pending.insert(
-            closed.addr,
-            PendingRedial {
-                closed_at: closed.closed_at,
-                next: 0,
-                dialing: false,
-            },
-        );
+        self.pending.insert(closed.addr, redial);
 
         true
     }
@@ -119,7 +144,7 @@ impl DroppedPeerRedials {
         self.pending
             .values()
             .filter(|redial| !redial.dialing)
-            .map(|redial| redial.closed_at + self.delays[redial.next])
+            .map(|redial| redial.due_at(self.delays[redial.next]))
             .min()
     }
 
@@ -130,12 +155,12 @@ impl DroppedPeerRedials {
         let mut due = Vec::new();
 
         for (addr, redial) in &mut self.pending {
-            if redial.dialing || redial.closed_at + self.delays[redial.next] > now {
+            if redial.dialing || redial.due_at(self.delays[redial.next]) > now {
                 continue;
             }
 
             while redial.next + 1 < self.delays.len()
-                && redial.closed_at + self.delays[redial.next + 1] <= now
+                && redial.due_at(self.delays[redial.next + 1]) <= now
             {
                 redial.next += 1;
             }

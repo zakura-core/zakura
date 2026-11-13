@@ -331,7 +331,8 @@ pub const INBOUND_SEAT_HOLD_LIMIT_DIVISOR: usize = 10;
 pub const MIN_REDIALED_CONNECTION_AGE: Duration = MIN_HELD_SEAT_CONNECTION_AGE;
 
 /// After the peer of a long-lived outbound connection closes it, Zakura dials the peer again
-/// this long after the close, at each time in turn until one dial succeeds. Implemented by
+/// about this long after the close, at each time in turn until one dial succeeds. Each peer's
+/// delays are scaled by up to [`DROPPED_PEER_REDIAL_JITTER`]. Implemented by
 /// `peer_set::initialize::crawl_and_dial`.
 ///
 /// A peer that restarts reopens its listener with every inbound seat empty, and on Mainnet
@@ -351,6 +352,15 @@ pub const DROPPED_PEER_REDIAL_DELAYS: [Duration; 4] = [
     Duration::from_secs(60),
     Duration::from_secs(120),
 ];
+
+/// The most that a peer's [`DROPPED_PEER_REDIAL_DELAYS`] are scaled up or down, at random, as a
+/// fraction of each delay.
+///
+/// A peer that restarts closes its connections to every node at once, so without jitter those
+/// nodes would all redial it at the same moments. A redial that waits in the listener's queue
+/// for longer than [`HANDSHAKE_TIMEOUT`] fails, and also costs its node the later redials, see
+/// `peer_set::initialize::dropped_peer_redials`.
+pub const DROPPED_PEER_REDIAL_JITTER: f64 = 0.25;
 
 /// The minimum time between successive calls to
 /// [`CandidateSet::update`][crate::peer_set::CandidateSet::update].
@@ -630,7 +640,13 @@ mod tests {
         let _init_guard = zakura_test::init();
 
         assert!(
-            DROPPED_PEER_REDIAL_DELAYS[0] > CONCURRENT_ADDRESS_CHANGE_PERIOD,
+            (0.0..1.0).contains(&DROPPED_PEER_REDIAL_JITTER),
+            "jitter must keep every redial after the close"
+        );
+        let first_redial = DROPPED_PEER_REDIAL_DELAYS[0];
+        assert!(
+            first_redial.mul_f64(1.0 - DROPPED_PEER_REDIAL_JITTER)
+                > CONCURRENT_ADDRESS_CHANGE_PERIOD,
             "the address book ignores an attempt that is too close to the failure before it"
         );
         assert!(
@@ -640,7 +656,7 @@ mod tests {
             "redials must be in time order"
         );
         assert!(
-            DROPPED_PEER_REDIAL_DELAYS[0] < INBOUND_SEAT_HOLD_DURATION,
+            first_redial.mul_f64(1.0 + DROPPED_PEER_REDIAL_JITTER) < INBOUND_SEAT_HOLD_DURATION,
             "a connection that drops without a restart must be redialed while its seat is held"
         );
         assert_eq!(

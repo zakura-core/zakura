@@ -39,9 +39,10 @@ fn closed(addr: PeerSocketAddr, open_for: Duration, closed_at: Instant) -> Close
     }
 }
 
-/// Returns redials with the test policy and room for `max_pending` addresses.
+/// Returns redials with the test policy, which has no jitter, and room for `max_pending`
+/// addresses.
 fn redials(max_pending: usize) -> DroppedPeerRedials {
-    DroppedPeerRedials::with_policy(MIN_AGE, delays(), max_pending)
+    DroppedPeerRedials::with_policy(MIN_AGE, delays(), 0.0, max_pending)
 }
 
 /// Each redial is due at its delay after the close, and the peer is redialed until every
@@ -171,7 +172,43 @@ fn a_failure_keeps_the_later_redials() {
     assert_eq!(redials.next_due(), Some(now + delays()[1]));
 }
 
-/// The production policy redials long-lived connections at the configured delays.
+/// Each peer's redials are scaled by its own random factor within the jitter, so peers whose
+/// connections closed together are not all redialed at once.
+#[test]
+fn jitter_spreads_the_redials_of_peers_that_closed_together() {
+    let _init_guard = zakura_test::init();
+
+    const PEERS: u8 = 40;
+    const JITTER: f64 = 0.25;
+    let closed_at = Instant::now();
+    let mut redials =
+        DroppedPeerRedials::with_policy(MIN_AGE, delays(), JITTER, usize::from(PEERS));
+    for last_octet in 1..=PEERS {
+        assert!(redials.schedule(closed(addr(last_octet), MIN_AGE, closed_at), closed_at));
+    }
+
+    let first_delay = delays()[0];
+    let earliest = closed_at + first_delay.mul_f64(1.0 - JITTER);
+    let latest = closed_at + first_delay.mul_f64(1.0 + JITTER);
+    assert!(redials.next_due().is_some_and(|due| due >= earliest));
+    assert_eq!(redials.take_due(earliest - TICK), vec![]);
+
+    // Each peer is equally likely to be due before or after its unscaled time, so all 40 on
+    // one side has a chance of about 2 in a trillion.
+    let early = redials.take_due(closed_at + first_delay).len();
+    assert!(
+        early > 0 && early < usize::from(PEERS),
+        "{early} of {PEERS} redials were due by the unscaled time"
+    );
+    assert_eq!(
+        redials.take_due(latest).len(),
+        usize::from(PEERS) - early,
+        "every redial is due by the latest scaled time"
+    );
+}
+
+/// The production policy redials long-lived connections at the configured delays, within
+/// the configured jitter.
 #[test]
 fn the_default_policy_uses_the_configured_constants() {
     let _init_guard = zakura_test::init();
@@ -187,7 +224,15 @@ fn the_default_policy_uses_the_configured_constants() {
     assert!(!redials.schedule(closed(addr(2), long_lived, closed_at), closed_at));
 
     for delay in constants::DROPPED_PEER_REDIAL_DELAYS {
-        assert_eq!(redials.take_due(closed_at + delay), vec![addr(1)]);
+        let due = redials.next_due().expect("a redial is pending");
+        let earliest = closed_at + delay.mul_f64(1.0 - constants::DROPPED_PEER_REDIAL_JITTER);
+        let latest = closed_at + delay.mul_f64(1.0 + constants::DROPPED_PEER_REDIAL_JITTER);
+        assert!(
+            due >= earliest && due <= latest,
+            "the redial {delay:?} after the close is due {:?} after it",
+            due - closed_at
+        );
+        assert_eq!(redials.take_due(due), vec![addr(1)]);
         redials.failed(addr(1));
     }
     assert_eq!(redials.len(), 0);

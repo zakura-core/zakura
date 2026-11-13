@@ -5,9 +5,32 @@ use std::{
     time::{Duration, Instant},
 };
 
+use zakura_network as zn;
+
 use super::{PeerCooldowns, BASE_COOLDOWN, MAX_COOLDOWN, MAX_COOLDOWN_PEERS};
 
 const PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+
+/// An unconditional peer is not cooling down, even when its address has a cooldown
+/// from before it became one. Other peers still cool down.
+#[test]
+fn unconditional_peer_cooldowns_are_ignored() {
+    let start = Instant::now();
+    let other_peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8));
+    let config: zn::Config =
+        toml::from_str("unconditional_peers = ['203.0.113.7']").expect("test config parses");
+    let cooldowns = PeerCooldowns::new(config.unconditional_peers.into());
+
+    for peer in [PEER, other_peer] {
+        assert_eq!(
+            cooldowns.record_invalid_transaction(peer, start),
+            Some(BASE_COOLDOWN)
+        );
+    }
+
+    assert!(!cooldowns.is_cooling_down(PEER, start));
+    assert!(cooldowns.is_cooling_down(other_peer, start));
+}
 
 #[test]
 fn first_invalid_transaction_starts_base_cooldown() {

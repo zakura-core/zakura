@@ -490,7 +490,15 @@ fn start_peer_cooldown(
             .clone()
             .oneshot(zn::Request::DisconnectPeer(peer))
             .boxed();
+        let peer_cooldowns = peer_cooldowns.clone();
         spawn_erased(async move {
+            // A listed DNS name can make the peer unconditional after the caller checked
+            // it, and an unconditional peer is never cooling down. Dropping the request
+            // unsent keeps the peer connected. The peer set covers a name that resolves
+            // after this check, see `zn::Request::DisconnectPeer`.
+            if !peer_cooldowns.is_cooling_down(peer.ip(), Instant::now()) {
+                return;
+            }
             let result = tokio::time::timeout(DISCONNECT_TIMEOUT, disconnect).await;
             if !matches!(result, Ok(Ok(_))) {
                 tracing::debug!("could not disconnect a peer after repeated transaction failures");
@@ -634,8 +642,8 @@ pub struct Mempool {
     /// cools down, or disconnects these peers.
     zcashd_compat_peer_ips: HashSet<IpAddr>,
 
-    /// Configured peers exempt from mempool bans, cooldowns, and disconnects.
-    unconditional_peers: zn::UnconditionalPeers,
+    /// The peers exempt from mempool bans, cooldowns, and disconnects.
+    unconditional_peers: zn::UnconditionalPeerSet,
     /// Signalled after each transaction download and verify task finishes.
     /// Shared with every downloader, and kept across mempool resets.
     verification_finished: Arc<Notify>,
@@ -658,7 +666,7 @@ impl Mempool {
         chain_tip_change: ChainTipChange,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
         zcashd_compat_peer_ips: Vec<IpAddr>,
-        unconditional_peers: zn::UnconditionalPeers,
+        unconditional_peers: zn::UnconditionalPeerSet,
     ) -> (Self, MempoolTxSubscriber) {
         let (transaction_sender, _) =
             tokio::sync::broadcast::channel(gossip::MEMPOOL_CHANGE_CHANNEL_CAPACITY);
@@ -677,7 +685,7 @@ impl Mempool {
             _state_guard: state,
             tx_verifier,
             transaction_sender,
-            peer_cooldowns: peer_cooldown::PeerCooldowns::default(),
+            peer_cooldowns: peer_cooldown::PeerCooldowns::new(unconditional_peers.clone()),
             misbehavior_sender,
             unconditional_peers,
             zcashd_compat_peer_ips: zcashd_compat_peer_ips

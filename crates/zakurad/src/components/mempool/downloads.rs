@@ -1663,63 +1663,85 @@ mod tests {
 
     /// A transaction served by a peer in a cooldown must not be verified, even
     /// when the crawler queued it without a peer source, and even when the
-    /// cooldown started after the download was queued.
+    /// cooldown started after the download was queued. A transaction served by an
+    /// unconditional peer is verified in the same cooldown.
     #[tokio::test]
     async fn transaction_served_by_cooling_down_peer_is_not_verified() {
         let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
         let transaction = empty_v5_transaction(1);
         let txid = transaction.id();
-        let peer_cooldowns = PeerCooldowns::default();
+        let unconditional_config: zn::Config =
+            toml::from_str("unconditional_peers = ['203.0.113.7']").expect("test config parses");
 
-        let served_transaction = transaction.clone();
-        let mut downloads = Downloads::new(
-            BoxCloneService::new(service_fn(move |request| {
-                let transaction = served_transaction.clone();
-                async move {
-                    assert!(
-                        matches!(request, zn::Request::TransactionsById(_)),
-                        "unexpected network request: {request:?}"
-                    );
-                    Ok::<_, BoxError>(zn::Response::Transactions(vec![
-                        zn::InventoryResponse::Available((transaction, Some(peer_addr))),
-                    ]))
-                }
-            })),
-            BoxCloneService::new(service_fn(|_request| async move {
-                panic!("transactions from a cooling down peer must not be verified");
-            })),
-            BoxCloneService::new(service_fn(|request| async move {
-                match request {
-                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
-                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
-                    request => Err(format!("unexpected state request: {request:?}").into()),
-                }
-            })),
-            false,
-            u64::MAX,
-            peer_cooldowns.clone(),
-            Arc::new(Notify::new()),
-        );
+        for is_unconditional in [false, true] {
+            let peer_cooldowns = if is_unconditional {
+                PeerCooldowns::new(unconditional_config.unconditional_peers.clone().into())
+            } else {
+                PeerCooldowns::default()
+            };
+            let verifier_calls = Arc::new(AtomicUsize::new(0));
+            let verifier_calls_for_service = verifier_calls.clone();
 
-        downloads
-            .download_if_needed_and_verify(Gossip::Id(txid), None, None)
-            .expect("download is queued");
+            let served_transaction = transaction.clone();
+            let mut downloads = Downloads::new(
+                BoxCloneService::new(service_fn(move |request| {
+                    let transaction = served_transaction.clone();
+                    async move {
+                        assert!(
+                            matches!(request, zn::Request::TransactionsById(_)),
+                            "unexpected network request: {request:?}"
+                        );
+                        Ok::<_, BoxError>(zn::Response::Transactions(vec![
+                            zn::InventoryResponse::Available((transaction, Some(peer_addr))),
+                        ]))
+                    }
+                })),
+                BoxCloneService::new(service_fn(move |_request| {
+                    let verifier_calls = verifier_calls_for_service.clone();
+                    async move {
+                        verifier_calls.fetch_add(1, Ordering::SeqCst);
+                        Err::<tx::Response, BoxError>("test verifier rejects everything".into())
+                    }
+                })),
+                BoxCloneService::new(service_fn(|request| async move {
+                    match request {
+                        zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                        zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
+                        request => Err(format!("unexpected state request: {request:?}").into()),
+                    }
+                })),
+                false,
+                u64::MAX,
+                peer_cooldowns.clone(),
+                Arc::new(Notify::new()),
+            );
 
-        // The current-thread runtime has not run the download task yet.
-        peer_cooldowns.record_invalid_transaction(peer_addr.ip(), Instant::now());
+            downloads
+                .download_if_needed_and_verify(Gossip::Id(txid), None, None)
+                .expect("download is queued");
 
-        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
-            .await
-            .expect("download should complete")
-            .expect("download stream should yield an item")
-            .expect("download should not time out");
+            // The current-thread runtime has not run the download task yet.
+            peer_cooldowns.record_invalid_transaction(peer_addr.ip(), Instant::now());
 
-        let error = result
-            .expect_err("a transaction from a cooling down peer should not be accepted")
-            .1;
-        assert!(
-            matches!(error, TransactionDownloadVerifyError::PeerCoolingDown),
-            "expected a peer cooldown error, got {error:?}"
-        );
+            let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+                .await
+                .expect("download should complete")
+                .expect("download stream should yield an item")
+                .expect("download should not time out");
+
+            let error = result
+                .expect_err("the cooldown or the test verifier rejects the transaction")
+                .1;
+            assert_eq!(
+                matches!(error, TransactionDownloadVerifyError::PeerCoolingDown),
+                !is_unconditional,
+                "unexpected error for an unconditional peer ({is_unconditional}): {error:?}"
+            );
+            assert_eq!(
+                verifier_calls.load(Ordering::SeqCst),
+                usize::from(is_unconditional),
+                "only an unconditional peer's transaction reaches the verifier"
+            );
+        }
     }
 }

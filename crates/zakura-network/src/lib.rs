@@ -174,6 +174,7 @@ mod peer_cache_updater;
 mod peer_registry;
 mod peer_set;
 mod protocol;
+mod unconditional_peer_set;
 pub mod zakura;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -198,6 +199,7 @@ pub use crate::{
         external::{Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE},
         internal::{AdvertisedBlock, InventoryResponse, PeerSource, Request, Response},
     },
+    unconditional_peer_set::UnconditionalPeerSet,
 };
 
 /// Types used in the definition of [`Request`], [`Response`], and [`VersionMessage`].

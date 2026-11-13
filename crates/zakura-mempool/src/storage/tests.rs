@@ -9,6 +9,7 @@ mod eviction;
 mod known_ids;
 mod mutation_benchmarks;
 mod prop;
+mod standardness;
 mod vectors;
 
 /// The verifier's error, as these tests see it.

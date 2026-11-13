@@ -408,7 +408,7 @@ jobs:
           # compat host does not. Used only for the dashboard's disk probe.
           state_cache_dir = "/mnt/data/zakura-cache"
 
-          # Each node's `monitor.profiler_url` is where the dashboard reaches that node's
+          # Each node's monitor.profiler_url is where the dashboard reaches that node's
           # continuous profiler (deploy/profiler/): us-east-0, the dashboard host, on the
           # profiler's own port, every other node through an SSH tunnel on the port named.
           # deploy.py ignores it.

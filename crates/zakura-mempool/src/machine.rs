@@ -542,9 +542,13 @@ impl<E: VerifyError> MempoolState<E> {
     /// logged, because today's change stream reports a download that failed.
     pub fn fetch_failed(&mut self, reservation: ReservationId, now: Instant) -> Step {
         self.enter(now);
-        // An id that another caller's body already decided has its outcome in
-        // the log. A late failure of this fetch adds nothing to it.
-        if let Some(tx_id) = self.undecided_for(reservation) {
+        // An id that another caller's body already decided has its outcome
+        // in the log. A late failure of this fetch adds nothing to it. Only
+        // the reserving caller's failure ends the admission, so only it is
+        // logged: a joined caller that leaves while the admission goes on
+        // changes nothing a reader sees.
+        let owner = self.owners.contains_key(&reservation);
+        if let Some(tx_id) = self.undecided_for(reservation).filter(|_| owner) {
             self.step.changes.push(Change::Refused(tx_id));
         }
         self.drop_reservation(reservation);

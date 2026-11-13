@@ -3779,3 +3779,22 @@ fn turning_the_pool_off_stops_every_fetch_and_holds_its_slot_until_dropped() {
     assert!(model.reserve(id(9), Intent::Fetch, secs(2)).is_ok());
     model.assert_invariants();
 }
+
+#[test]
+fn a_joined_caller_that_leaves_logs_nothing_while_the_admission_goes_on() {
+    let mut model = new_model();
+    let (first, job) = bring_in(&mut model, tx(1));
+    let joined = model
+        .reserve(id(1), Intent::Deliver, secs(0))
+        .expect("a delivery joins an undecided id");
+
+    // The joined caller gives up, as the adapter does when its peer starts
+    // cooling. The admission goes on, so no refusal reaches the log.
+    let step = model.fetch_failed(joined.id, secs(1));
+    assert!(step.changes.is_empty(), "{step:?}");
+
+    let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(2));
+    assert_eq!(step.verdict(first), Some(ModelVerdict::Admitted));
+    assert_eq!(step.changes, vec![Change::Added(id(1))]);
+    model.assert_invariants();
+}

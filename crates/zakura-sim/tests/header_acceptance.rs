@@ -7177,44 +7177,6 @@ impl Ref for NewRef {{}}
 /// The acceptance tool's source directory, relative to the crate.
 const ACCEPTANCE_SRC: &str = "src/harness/header_acceptance";
 
-/// The reads under [`ACCEPTANCE_SRC`] outside `binding.rs` that read no
-/// run artifact, as `(file, function, why)`. Every other read there must
-/// go through `binding.rs`, the one place an artifact is bound to what its
-/// reader expects (Rule 25).
-const NON_ARTIFACT_READS: &[(&str, &str, &str)] = &[
-    (
-        "tool.rs",
-        "patched_witness",
-        "a planted case's committed `.toml` at S",
-    ),
-    (
-        "tool.rs",
-        "case_input",
-        "a planted case's committed `.toml` at S",
-    ),
-    (
-        "tool.rs",
-        "native_patch",
-        "the committed native mutation's directory at S",
-    ),
-    (
-        "tool.rs",
-        "fuzz_targets",
-        "the committed fuzz-target mapping at S",
-    ),
-    ("tool.rs", "committed_input", "a committed fuzz input at S"),
-    (
-        "tool.rs",
-        "walk",
-        "the committed planted-case tree at S, which `planted_cases_in` walks",
-    ),
-    (
-        "tool.rs",
-        "native_dirs",
-        "the committed native-mutation tree at S",
-    ),
-];
-
 /// Every read in the Rust source `text` outside test code, as the name of
 /// the function it's in, in order: a call of `fs::read`,
 /// `fs::read_to_string`, `fs::read_dir`, `File::open`, `read_bounded`,
@@ -7366,12 +7328,11 @@ fn artifact_reads(text: &str, file: &str) -> Vec<String> {
     reads.found
 }
 
-/// Rule 25's enforcement: under [`ACCEPTANCE_SRC`], every read of a run
-/// artifact goes through `binding.rs`, so no reader binds an artifact
-/// itself or reads one unbound. Each read anywhere else in the directory
-/// is one [`NON_ARTIFACT_READS`] lists, with why it reads no artifact, and
-/// each listed read is still there. A planted bypass, however its read is
-/// spelled, fails the scan.
+/// Rule 25's enforcement: under [`ACCEPTANCE_SRC`], every read goes
+/// through `binding.rs`, a run artifact by its kind and S's committed files
+/// by `binding::committed_text` and its siblings, so no reader binds an
+/// artifact itself or reads one unbound, and there's no exemption to keep
+/// honest. A planted bypass, however its read is spelled, fails the scan.
 #[test]
 fn every_artifact_read_goes_through_binding() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(ACCEPTANCE_SRC);
@@ -7393,17 +7354,10 @@ fn every_artifact_read_goes_through_binding() {
         }
         texts.insert(file, text);
     }
-    let allowed: BTreeSet<(String, String)> = NON_ARTIFACT_READS
-        .iter()
-        .map(|(file, within, _)| ((*file).to_owned(), (*within).to_owned()))
-        .collect();
-    let unbound: Vec<&(String, String)> = found.difference(&allowed).collect();
     assert!(
-        unbound.is_empty(),
-        "reads outside binding.rs that NON_ARTIFACT_READS doesn't list: {unbound:?}"
+        found.is_empty(),
+        "reads outside binding.rs, which must read through it: {found:?}"
     );
-    let stale: Vec<&(String, String)> = allowed.difference(&found).collect();
-    assert!(stale.is_empty(), "listed reads that are gone: {stale:?}");
 
     let tool = &texts["tool.rs"];
     for bypass in [

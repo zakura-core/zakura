@@ -559,11 +559,10 @@ pub struct PatchedWitness {
 /// so they expect `violated` beside nothing: its set is judged on its
 /// `Draft` run ([`super::Found::AtStepSetOnDraft`]).
 fn patched_witness(repo: &Path, case: CaseRef) -> Result<PatchedWitness, String> {
-    let file = repo
-        .join("qa/planted")
+    let file = Path::new("qa/planted")
         .join(case.property)
         .join(format!("{}.toml", case.name));
-    let text = fs::read_to_string(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+    let text = binding::committed_text(repo, &file)?;
     let table: toml::Table =
         toml::from_str(&text).map_err(|error| format!("{}: {error}", file.display()))?;
     let ids = |key: &str| -> Result<Vec<String>, String> {
@@ -618,11 +617,10 @@ impl CaseInput {
 /// table's scenario and Plan, its `plan` bytes or its `script`. A case
 /// names exactly one input, and a typed one exactly one Plan.
 fn case_input(repo: &Path, case: CaseRef) -> Result<CaseInput, String> {
-    let file = repo
-        .join("qa/planted")
+    let file = Path::new("qa/planted")
         .join(case.property)
         .join(format!("{}.toml", case.name));
-    let text = fs::read_to_string(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+    let text = binding::committed_text(repo, &file)?;
     let table: toml::Table =
         toml::from_str(&text).map_err(|error| format!("{}: {error}", file.display()))?;
     let path = |table: &toml::Table, key: &str| {
@@ -869,10 +867,9 @@ fn draft_witness(property: &str, set: &[&str]) -> PatchedWitness {
 /// the repository root.
 fn native_patch(repo: &Path, patch: &str) -> Result<String, String> {
     let dir = format!("qa/native-mutations/header-sync/{patch}");
-    let patches: Vec<String> = fs::read_dir(repo.join(&dir))
-        .map_err(|error| format!("{dir}: {error}"))?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
+    let patches: Vec<String> = binding::committed_entries(repo, &dir)?
+        .into_iter()
+        .filter_map(|(path, _)| path.file_name()?.to_str().map(str::to_owned))
         .filter(|name| name.ends_with(".patch"))
         .collect();
     match patches.as_slice() {
@@ -2245,7 +2242,7 @@ impl CommittedInput {
 /// can't be read.
 fn committed_input(repo: &Path, input: &str) -> Result<CommittedInput, String> {
     use sha2::{Digest, Sha256};
-    let bytes = fs::read(repo.join(input))
+    let bytes = binding::committed_bytes(repo, input)
         .map_err(|_| format!("the committed input {input} can't be read"))?;
     Ok(CommittedInput {
         sha256: Sha256::digest(&bytes)
@@ -2288,7 +2285,7 @@ fn mapped_case_refusal(
 /// which no case's target can be confirmed.
 fn fuzz_targets(repo: &Path) -> Result<BTreeMap<String, String>, String> {
     let path = repo.join("qa/fuzz/sim/Cargo.toml");
-    let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text = binding::committed_text(repo, "qa/fuzz/sim/Cargo.toml")?;
     let manifest = toml::from_str::<toml::Table>(&text)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let targets = manifest
@@ -2830,7 +2827,7 @@ pub fn planted_cases(repo: &Path) -> Vec<(String, String)> {
         .iter()
         .map(|registration| registration.property.as_ref())
         .collect();
-    planted_cases_in(&repo.join("qa/planted"), &|property, name| {
+    planted_cases_in(repo, Path::new("qa/planted"), &|property, name| {
         is_header_case(repo, &ids, property, name)
     })
 }
@@ -2859,18 +2856,22 @@ fn is_header_case(repo: &Path, ids: &BTreeSet<&str>, property: &str, name: &str)
     })
 }
 
-/// Every planted case under `root` that `header` keeps, given its property
-/// and name, as `(property, name)`, sorted. An unreadable directory holds
-/// none.
-fn planted_cases_in(root: &Path, header: &dyn Fn(&str, &str) -> bool) -> Vec<(String, String)> {
+/// Every planted case under `root`, a committed directory of `repo`, that
+/// `header` keeps, given its property and name, as `(property, name)`,
+/// sorted. An unreadable directory holds none.
+fn planted_cases_in(
+    repo: &Path,
+    root: &Path,
+    header: &dyn Fn(&str, &str) -> bool,
+) -> Vec<(String, String)> {
     /// Collects every `.patch` under `dir`.
-    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
-        let Ok(entries) = fs::read_dir(dir) else {
+    fn walk(repo: &Path, root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = binding::committed_entries(repo, dir) else {
             return;
         };
-        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
-            if path.is_dir() {
-                walk(root, &path, out);
+        for (path, is_dir) in entries {
+            if is_dir {
+                walk(repo, root, &path, out);
             } else if path.extension().is_some_and(|ext| ext == "patch") {
                 let property = path
                     .parent()
@@ -2884,7 +2885,7 @@ fn planted_cases_in(root: &Path, header: &dyn Fn(&str, &str) -> bool) -> Vec<(St
         }
     }
     let mut cases = Vec::new();
-    walk(root, root, &mut cases);
+    walk(repo, root, root, &mut cases);
     cases.retain(|(property, name)| header(property, name));
     cases.sort();
     cases
@@ -2893,13 +2894,11 @@ fn planted_cases_in(root: &Path, header: &dyn Fn(&str, &str) -> bool) -> Vec<(St
 /// Every native-mutation directory under `repo`'s
 /// `qa/native-mutations/header-sync/`.
 pub fn native_dirs(repo: &Path) -> Vec<String> {
-    let mut dirs: Vec<String> = fs::read_dir(repo.join("qa/native-mutations/header-sync"))
+    let mut dirs: Vec<String> = binding::committed_entries(repo, "qa/native-mutations/header-sync")
         .into_iter()
         .flatten()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+        .filter(|(_, is_dir)| *is_dir)
+        .filter_map(|(path, _)| path.file_name()?.to_str().map(str::to_owned))
         .collect();
     dirs.sort();
     dirs
@@ -5646,7 +5645,7 @@ mod tests {
             fs::write(root.path().join(dir).join(format!("{name}.patch")), "")
                 .expect("the temp dir is writable");
         }
-        let cases = planted_cases_in(root.path(), &|property, _| {
+        let cases = planted_cases_in(root.path(), Path::new(""), &|property, _| {
             property.starts_with("header-sync/") || property == "session/honest-never-punished"
         });
         let owned = |property: &str, name: &str| (property.to_owned(), name.to_owned());

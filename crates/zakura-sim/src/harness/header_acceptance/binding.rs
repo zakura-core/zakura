@@ -10,6 +10,10 @@
 //! builds an [`Expect`] from what it knows, most often the trace beside the
 //! artifact ([`Expect::of_trace`]), and never compares one of those fields
 //! itself.
+//!
+//! It's also the one place the tool reads S's committed files, its planted
+//! cases, inputs and mappings ([`committed_text`]), which a run doesn't
+//! write.
 
 use std::{collections::BTreeMap, fmt::Write as _, path::Path};
 
@@ -613,6 +617,55 @@ pub fn read_declaration(dir: &Path, expect: &Expect) -> Result<(Value, String), 
     Ok((history, scenario))
 }
 
+/// `rel` under S's checkout `repo`, if it names a committed path at all:
+/// relative, with only plain components, and outside `target`, where
+/// builds and runs write. The runner reads S only from a clean checkout
+/// (xtask's `subject_of`), so a path here is S's committed file, never a
+/// run's artifact.
+fn committed_path(repo: &Path, rel: &Path) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    let plain = rel
+        .components()
+        .all(|part| matches!(part, Component::Normal(_)));
+    let first = rel.components().next();
+    if !plain || first.is_some_and(|part| part.as_os_str() == "target") {
+        return Err(format!("{} isn't a committed path", rel.display()));
+    }
+    Ok(repo.join(rel))
+}
+
+/// The committed text file `rel` of S's checkout `repo`
+/// ([`committed_path`]), or why it can't be read.
+pub fn committed_text(repo: &Path, rel: impl AsRef<Path>) -> Result<String, String> {
+    let path = committed_path(repo, rel.as_ref())?;
+    std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The committed file `rel` of S's checkout `repo`'s bytes
+/// ([`committed_path`]), or why it can't be read.
+pub fn committed_bytes(repo: &Path, rel: impl AsRef<Path>) -> Result<Vec<u8>, String> {
+    let path = committed_path(repo, rel.as_ref())?;
+    std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Each entry of the committed directory `rel` of S's checkout `repo`
+/// ([`committed_path`]), as its path relative to `repo` and whether it's a
+/// directory, sorted, or why it can't be read.
+pub fn committed_entries(
+    repo: &Path,
+    rel: impl AsRef<Path>,
+) -> Result<Vec<(std::path::PathBuf, bool)>, String> {
+    let rel = rel.as_ref();
+    let path = committed_path(repo, rel)?;
+    let mut entries: Vec<(std::path::PathBuf, bool)> = std::fs::read_dir(&path)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| (rel.join(entry.file_name()), entry.path().is_dir()))
+        .collect();
+    entries.sort();
+    Ok(entries)
+}
+
 /// The `meta` line of the trace in `dir`, read without checking the rest
 /// of the trace, so a reader can bind a run whose trace it doesn't judge
 /// whole, or why it can't be read.
@@ -707,6 +760,38 @@ mod tests {
         extra["also"] = json!(1);
         assert!(check(&TASK, &extra, &expect).is_err());
         assert!(check(&TASK, &json!([]), &expect).is_err());
+    }
+
+    /// A committed read stays inside S's checkout and out of its build and
+    /// run output: a plain relative path reads, and one climbing out, one
+    /// that's absolute, and one under `target` are refused unread.
+    #[test]
+    fn a_committed_read_names_only_a_committed_path() {
+        let repo = tempfile::tempdir().expect("a temp dir can be created");
+        std::fs::create_dir_all(repo.path().join("qa/planted")).expect("writable");
+        std::fs::create_dir_all(repo.path().join("target")).expect("writable");
+        std::fs::write(repo.path().join("qa/planted/a.toml"), "x").expect("writable");
+        std::fs::write(repo.path().join("target/run.json"), "{}").expect("writable");
+        assert_eq!(
+            committed_text(repo.path(), "qa/planted/a.toml"),
+            Ok("x".into())
+        );
+        assert_eq!(
+            committed_entries(repo.path(), "qa/planted"),
+            Ok(vec![("qa/planted/a.toml".into(), false)])
+        );
+        let outside = repo.path().join("target/run.json");
+        for refused in [
+            Path::new("qa/../target/run.json"),
+            Path::new("target/run.json"),
+            outside.as_path(),
+        ] {
+            assert!(committed_text(repo.path(), refused).is_err(), "{refused:?}");
+            assert!(
+                committed_bytes(repo.path(), refused).is_err(),
+                "{refused:?}"
+            );
+        }
     }
 
     /// Each line of a replay's log that says it matched claims its trace,

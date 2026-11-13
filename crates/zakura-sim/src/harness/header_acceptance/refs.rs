@@ -338,11 +338,12 @@ pub struct PeerFrameRef {
 }
 impl Ref for PeerFrameRef {}
 
-/// One session as a store that keys its lives by session ID alone names
-/// it, the topology's
+/// One session as evidence that names it by session ID alone names it:
+/// the topology's
 /// [`SessionLife`](crate::harness::header_node::adoption::SessionLife)s,
-/// which hold one session per link in a run, so the ID is the whole
-/// identity they carry.
+/// which hold one session per link in a run, and a reactor
+/// `Misbehavior`'s origin, which the node numbers within its run. So the
+/// ID is the whole identity they carry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionIdRef {
     /// The session.

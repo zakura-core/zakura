@@ -29,7 +29,7 @@ use support::{
 use zakura_sim::{
     domain::header_sync::STALE_COMPLETION_INERT,
     harness::{
-        header_acceptance::refs::{ConnectionRef, Ref},
+        header_acceptance::refs::{ConnectionRef, Ref, SessionIdRef},
         header_node::{
             fault::FaultEnd,
             stale::{StaleWindow, Staleness},
@@ -116,6 +116,35 @@ struct Shape {
     misbehavior: Vec<(Option<u64>, Option<u64>)>,
     /// Where each `FrameJudged` of a `BadContent` page sits in the log.
     judged_bad: Vec<usize>,
+}
+
+/// Whether `shape` holds a `Misbehavior` from session `session`, joined
+/// by its origin's whole [`SessionIdRef`], that the node reported after
+/// the session ended, with no current session.
+fn penalized_late(shape: &Shape, session: u64) -> bool {
+    let sent = SessionIdRef {
+        session_id: session,
+    };
+    shape.misbehavior.iter().any(|(origin, current)| {
+        current.is_none()
+            && SessionIdRef::joins(&sent, origin, |origin| {
+                origin.map(|session_id| SessionIdRef { session_id })
+            })
+    })
+}
+
+/// A late penalty joins the session that sent the page by its whole
+/// origin: a `Misbehavior` from session 3 after it ended is session 3's,
+/// and one from another session isn't.
+#[test]
+fn a_late_penalty_joins_its_origin_session() {
+    assert_one_key_off::<SessionIdRef>(&SessionIdRef { session_id: 3 }, |origin| {
+        let shape = Shape {
+            misbehavior: vec![(Some(origin.session_id), None)],
+            ..Shape::default()
+        };
+        penalized_late(&shape, 3)
+    });
 }
 
 /// Reads `report`'s shape.
@@ -336,7 +365,7 @@ fn a_disconnect_mid_prepare_is_still_penalized() {
         let shape = assert_penalized(&format!("plan {index}"), &report, &view);
         let (_, session, _) = shape.prepare.expect("checked above");
         assert!(
-            shape.misbehavior.contains(&(Some(session), None)),
+            penalized_late(&shape, session),
             "plan {index}: the penalty came after the session ended: {shape:?}"
         );
         assert_stale_fault_inert(index, &report, &view, &shape);
@@ -647,7 +676,7 @@ fn the_late_fault_fixture_penalizes_after_the_session_ended() {
         })
     );
     assert!(
-        shape.misbehavior.contains(&(Some(session), None)),
+        penalized_late(&shape, session),
         "the penalty came after the session ended: {shape:?}"
     );
 }

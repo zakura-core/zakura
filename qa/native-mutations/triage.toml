@@ -292,5 +292,7 @@ reason = """No drawn peer sends `GetServices`, so `services/sender-within-owed` 
 patch = "qa/native-mutations/shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
 property = "block-sync/s6v3/undeclared-type-closes"
 lane = "witness"
+class = "killed-by-other-rule"
+other = "sim/no-task-panic"
 stage = "property"
 reason = "The mutant lets an undeclared type reach admission, whose row `expect` panics the relay task before any close. `sim/no-task-panic` is the rule that sees it: a reader panic is the production effect, so no close ID can apply."

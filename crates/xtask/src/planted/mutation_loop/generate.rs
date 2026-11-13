@@ -727,9 +727,22 @@ pub(super) struct GenBaseline {
     /// `baseline-fails` one, or `None` for a clean search.
     pub(super) failure: Option<Classified>,
     pub(super) millis: u64,
+    /// The runs the search took: the draws of an `inproc` search, or the
+    /// executions a `libfuzzer` campaign counted.
+    pub(super) runs: Option<u64>,
     /// True if a run failure ended the first search under the memory cap,
     /// and the search reran alone with the host's memory.
     pub(super) alone: bool,
+}
+
+impl GenBaseline {
+    /// The search's time per run, which sizes a mutant kill's confirm,
+    /// replay and shrink deadlines. It counts the search's own runs, as the
+    /// baseline's follow-ups do, since a `libfuzzer` campaign's executions
+    /// aren't `--generate-runs`.
+    pub(super) fn per_run(&self) -> Duration {
+        per_run(self.millis, self.runs)
+    }
 }
 
 /// What a search on the unpatched build showed.
@@ -1732,6 +1745,7 @@ impl Runner {
                 GenBaseline {
                     failure,
                     millis: search.millis,
+                    runs: search.runs(),
                     alone: rerun_alone,
                 },
             );
@@ -1795,7 +1809,7 @@ impl Runner {
                     deadline,
                     cap,
                 )?;
-                let run_time = per_run(baseline.millis, Some(lanes.flags.runs_for(harness)));
+                let run_time = baseline.per_run();
                 let mut follow_ups: BTreeMap<String, KillFollowUps> = BTreeMap::new();
                 for (index, case) in &cases {
                     let (mut result, kill) = search.classify(&case.property, &case.also_violates);

@@ -1593,6 +1593,7 @@ fn fake_kill(
             GenBaseline {
                 failure: None,
                 millis: 10,
+                runs: Some(1),
                 alone: false,
             },
         )]),
@@ -1850,6 +1851,7 @@ fn only_a_confirmed_unpatched_violation_is_a_property_finding() {
                         "the unpatched search violates x",
                     )),
                     millis: 10,
+                    runs: Some(50),
                     alone: false,
                 },
             ),
@@ -1862,6 +1864,7 @@ fn only_a_confirmed_unpatched_violation_is_a_property_finding() {
                         "the search passed its deadline",
                     )),
                     millis: 10,
+                    runs: Some(50),
                     alone: false,
                 },
             ),
@@ -2847,6 +2850,7 @@ fn a_generator_lane_the_cap_killed_reruns_alone() {
     let baseline = |alone| GenBaseline {
         failure: None,
         millis: 10,
+        runs: Some(1),
         alone,
     };
     let lanes = Lanes {
@@ -3114,4 +3118,20 @@ reason = "the campaign never reaches the race"
     assert_eq!(triage::apply(&mut cases, &records[..1]), vec![&records[0]]);
     assert_eq!(cases[0].generator[0].triage, None);
     assert_eq!(triage::untriaged(&cases), 1);
+}
+
+/// A mutant kill's follow-ups take their time per run from the baseline
+/// search's own runs: a `libfuzzer` campaign that ran 600 s and executed
+/// 30,000 inputs ran each in 20 ms, whatever `--generate-runs` says.
+#[test]
+fn a_kills_follow_ups_count_the_baselines_own_runs() {
+    let baseline = |runs| GenBaseline {
+        failure: None,
+        millis: 600_000,
+        runs,
+        alone: false,
+    };
+    assert_eq!(baseline(Some(30_000)).per_run(), Duration::from_millis(20));
+    assert_eq!(baseline(None).per_run(), Duration::ZERO);
+    assert_eq!(baseline(Some(0)).per_run(), Duration::ZERO);
 }

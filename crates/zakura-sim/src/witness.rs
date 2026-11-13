@@ -44,8 +44,8 @@ pub enum Expect {
     /// The property stays `NotApplicable`, with any reason, while the run
     /// reaches its trigger history, and the rest of the run is judged as
     /// for [`Expect::Holds`]: no property is violated and none is left
-    /// incomplete. A row no scenario reaches, such as an `over-owed-closes`
-    /// ID, records its history's trigger this way.
+    /// incomplete. The trigger is the property's own, so a row no scenario
+    /// reaches, such as an `over-owed-closes` ID, can't pass this way.
     NotApplicable,
 }
 

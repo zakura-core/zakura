@@ -85,16 +85,16 @@ patch = "qa/native-mutations/stale-completion/mismatch-finishes-current/mismatch
 property = "block-sync/stale-completion-inert"
 lane = "block-sync/storage"
 class = "survived"
-stage = "schedule"
-reason = """Seeds 23, 47, 89 and 179 kill it on `stale-beside-current`. Seed 11 draws that family once, and its Plan doesn't deliver the stale completion beside the current one."""
+stage = "generator"
+reason = """Only `stale-beside-current` delivers a stale completion beside the current one. Block-sync/storage draws from about 40 families, one per run, and no seed's 20 runs draw this one. In #2360's first run, with fewer families, seeds 23, 47, 89 and 179 killed it on that family."""
 
 [[triage]]
 patch = "qa/native-mutations/stale-completion/mismatch-resubmits-current/mismatch-resubmits-current.patch"
 property = "block-sync/stale-completion-inert"
 lane = "block-sync/storage"
 class = "survived"
-stage = "schedule"
-reason = """Seeds 23, 47, 89 and 179 kill it on `stale-beside-current`. Seed 11 draws that family once, and its Plan doesn't deliver the stale completion beside the current one."""
+stage = "generator"
+reason = """Only `stale-beside-current` delivers a stale completion beside the current one. Block-sync/storage draws from about 40 families, one per run, and no seed's 20 runs draw this one. In #2360's first run, with fewer families, seeds 23, 47, 89 and 179 killed it on that family."""
 
 [[triage]]
 patch = "qa/native-mutations/submit-only-requested/competing-receipt-any-hash/competing-receipt-any-hash.patch"
@@ -133,8 +133,8 @@ patch = "qa/native-mutations/wakes/detached-finish-keeps-slot/detached-finish-ke
 property = "block-sync/capacity-release-wakes"
 lane = "block-sync/storage"
 class = "survived"
-stage = "schedule"
-reason = """Seed 179's 20 runs never draw `capacity-release`, so the property never applies. The other seeds draw it and find a violation."""
+stage = "generator"
+reason = """Seed 47 kills it on `capacity-release`, the only family that frees submission room while work waits. The 20 runs of the other seeds never draw that family."""
 
 [[triage]]
 patch = "qa/native-mutations/wakes/detached-release-unreported/detached-release-unreported.patch"
@@ -142,7 +142,7 @@ property = "block-sync/capacity-release-wakes"
 lane = "block-sync/storage"
 class = "survived"
 stage = "schedule"
-reason = """Seeds 11–89 draw `capacity-release` one to three times, but no drawn Plan fills the submission window and then detaches it with a fork, as the witness's input does. Seed 179 never draws the family."""
+reason = """A seed draws `capacity-release` at most a few times in 20 runs, and no drawn Plan fills the submission window and then detaches it with a fork, as the witness's input does."""
 
 [[triage]]
 patch = "qa/native-mutations/wakes/judged-owner-epoch/judged-owner-epoch.patch"
@@ -150,7 +150,7 @@ property = "block-sync/capacity-release-wakes"
 lane = "block-sync/storage"
 class = "survived"
 stage = "schedule"
-reason = """Seeds 11–89 draw `capacity-release` one to three times, but no drawn Plan delivers a stale reply that frees room while work waits, as the witness's input does. Seed 179 never draws the family."""
+reason = """A seed draws `capacity-release` at most a few times in 20 runs, and no drawn Plan delivers a stale reply that frees room while work waits, as the witness's input does."""
 
 [[triage]]
 patch = "qa/planted/block-sync/capacity-release-wakes/stale-completion-no-wake.patch"
@@ -158,7 +158,7 @@ property = "block-sync/capacity-release-wakes"
 lane = "block-sync/storage"
 class = "survived"
 stage = "schedule"
-reason = """Seeds 11–89 draw `capacity-release` one to three times, but no drawn Plan delivers a stale completion that frees room while work waits, as the witness's input does. Seed 179 never draws the family."""
+reason = """A seed draws `capacity-release` at most a few times in 20 runs, and no drawn Plan delivers a stale completion that frees room while work waits, as the witness's input does."""
 
 [[triage]]
 patch = "qa/planted/block-sync/input-decoded-bound/no-room-check.patch"
@@ -199,7 +199,7 @@ property = "discovery/late-response-admitted"
 lane = "discovery/wire"
 class = "survived"
 stage = "schedule"
-reason = """Each seed draws `late-response` about 170 times, and no drawn Plan delivers the held `Peers` after the node's initial wait times out and before its session ends, so `late-response-admitted` never applies."""
+reason = """Every seed draws `late-response` many times, and no drawn Plan delivers the held `Peers` after the node's initial wait times out and before its session ends, so `late-response-admitted` never applies."""
 
 [[triage]]
 patch = "qa/native-mutations/shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"

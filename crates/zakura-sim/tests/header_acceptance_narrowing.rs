@@ -17,6 +17,8 @@
 //! holds for every input of a released harness.
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
@@ -24,12 +26,14 @@ use std::{
 };
 
 use serde_json::Value;
+use support::one_key_off::assert_one_key_off;
 use zakura_sim::{
     harness::{
         self,
         header_acceptance::{
             contracts::{Narrowing, RunBy},
             evaluate::{result_context, End, Execution, ResultFile, ResultRecord},
+            refs::{PlantedRef, Ref},
             rows::HEADER_HARNESSES,
             tool, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, Manifest,
             ObligationState, ResultKind, RunId, Subject, NARROWING, NATIVE_DIR,
@@ -195,6 +199,48 @@ fn runs(expected: &Expected) -> Vec<RunId> {
     }
 }
 
+/// The planted case's task among `plan`'s, joined on the case's whole
+/// [`PlantedRef`]: cases under two properties can share a name.
+fn case_task<'a>(plan: &'a tool::RunPlan, case: &PlantedRef) -> Option<&'a tool::Task> {
+    PlantedRef::joined(case, &plan.tasks, |task| match task {
+        tool::Task::Case { property, name, .. } => Some(PlantedRef {
+            property: property.clone(),
+            name: name.clone(),
+        }),
+        _ => None,
+    })
+    .first()
+    .copied()
+}
+
+/// A released case's input is its own task's, joined on the case's whole
+/// [`PlantedRef`] (Rule 25's template): every `reserved-flags-skipped`
+/// case, a name several properties share, finds its task, and with its
+/// property or its name moved finds none.
+#[test]
+fn a_released_case_s_task_joins_its_whole_case() {
+    let manifest = Manifest::committed();
+    let plan = tool::plan(&manifest, &repo()).expect("the committed manifest plans");
+    let shared: Vec<PlantedRef> = plan
+        .tasks
+        .iter()
+        .filter_map(|task| match task {
+            tool::Task::Case { property, name, .. } if name == "reserved-flags-skipped" => {
+                Some(PlantedRef {
+                    property: property.clone(),
+                    name: name.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(shared.len() > 1, "{shared:?}");
+    for case in &shared {
+        let keys = assert_one_key_off::<PlantedRef>(case, |want| case_task(&plan, want).is_some());
+        assert_eq!(keys, 2);
+    }
+}
+
 /// Every committed input the results `entry` releases run on, each once: a
 /// planted case's run reads the input its task in `plan` names, and a
 /// history's run, or a native mutation's, every committed fixture of its
@@ -210,19 +256,13 @@ fn released_inputs(manifest: &Manifest, plan: &tool::RunPlan, entry: &Narrowing)
         for run in runs(&result.expected) {
             let found = match &run {
                 RunId::Case { property, name, .. } if property != NATIVE_DIR => {
-                    let input = plan
-                        .tasks
-                        .iter()
-                        .find_map(|task| match task {
-                            tool::Task::Case {
-                                property: p,
-                                name: n,
-                                input,
-                                ..
-                            } if (p, n) == (property, name) => Some(input),
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| panic!("{run:?} has a task"));
+                    let case = PlantedRef {
+                        property: property.clone(),
+                        name: name.clone(),
+                    };
+                    let Some(tool::Task::Case { input, .. }) = case_task(plan, &case) else {
+                        panic!("{run:?} has a task");
+                    };
                     vec![Input::case(&harness, input)]
                 }
                 _ => {

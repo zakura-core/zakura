@@ -47,6 +47,18 @@ fn peer_addr(port: u16) -> PeerSocketAddr {
 }
 
 #[test]
+fn serialization_error_metric_labels_ignore_details() {
+    for detail in ["first error detail", "second error detail"] {
+        let error = SerializationError::from(std::io::Error::other(detail));
+        assert_eq!(serialization_error_metric_label(&error), "io");
+        assert_eq!(
+            serialization_error_metric_label(&SerializationError::Parse(detail)),
+            "parse",
+        );
+    }
+}
+
+#[test]
 fn connected_addr_labels_require_explicit_opt_in() {
     let peer = ConnectedAddr::new_outbound_direct(
         "192.0.2.1:8233".parse().expect("valid test peer address"),

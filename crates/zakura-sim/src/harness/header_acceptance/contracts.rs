@@ -1388,11 +1388,12 @@ pub fn contract_table() -> Vec<Contract> {
                  benign, except StoppedByViolation under the expected stop, or a missing \
                  report, and judges a nested case's exact set. A set the patched run breaks is \
                  judged in both runs, each nested finding joined to the case's own break by \
-                 subject: the same peer and the same punished event or frame. A set that \
-                 breaks only after the case's own break is judged on its Draft run as a \
-                 counterfactual of its baseline: every member breaks there and none in the \
-                 baseline, which proves each member depends on the patch, not that it shares \
-                 the case's peer or punished event or frame.",
+                 the same subject: for a finding at a step, the same punishment, its peer and \
+                 punished event or frame, and for one the run's end found, the same \
+                 publication, its state version. A set that breaks only after the case's own \
+                 break is judged on its Draft run as a counterfactual of its baseline: every \
+                 member breaks there and none in the baseline, which proves each member \
+                 depends on the patch, not that it shares the case's subject.",
                 C6_PROVING,
                 "E2, with Rule 25's subject joins",
             )

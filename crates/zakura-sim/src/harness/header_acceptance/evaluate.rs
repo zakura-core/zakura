@@ -1748,9 +1748,9 @@ fn missing_evidence(end: &End, property: &str, detail: &str) -> Result<(), Strin
 /// however late it breaks. An independent bug would break it in the
 /// baseline too, and fail rule 3. That's all this judge proves:
 /// counterfactual dependence on the patch. It doesn't show a member
-/// shares the case's peer or punished event or frame, which only a set
-/// judged in its patched run proves, by the witness judge's subject join
-/// of each nested finding to the case's own break (C6). The planted
+/// shares the case's subject, its punishment or publication, which only a
+/// set judged in its patched run proves, by the witness judge's subject
+/// join of each nested finding to the case's own break (C6). The planted
 /// runner's `classify_draft_set` applies the same rule to its own runs.
 fn caught_draft(
     manifest: &Manifest,

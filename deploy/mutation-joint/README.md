@@ -1,35 +1,51 @@
 # Joint mutation runs
 
 The droplet timer for mutation plan mut-4.6 and run-2 to run-4. Once a day it
-runs `scripts/mutation_joint_run.py routine`, which:
+runs `scripts/mutation_joint_run.py routine`, which, in order:
 
 1. fetches `origin/main` into its own checkout and detaches it there;
-2. writes the frozen suite manifest, `suite-manifest.json`, with
-   `cargo xtask sim-suite --frozen`;
-3. runs the full planted sim suite (`cargo test -p zakura-sim --profile
-   planted`);
-4. runs `cargo xtask planted loop` with generator lanes on the cases a change
-   since the last pin affects, or on every case the first time;
-5. with `--libfuzzer-seconds`, runs the libFuzzer lane on the same cases;
-6. with `--suite-fuzz` or `--fuzz-seconds`, runs `scripts/suite_fuzz_run.py
-   run` (run-3), then `scripts/suite_fuzz_run.py archive` (run-4);
-7. diffs each new report against its cumulative report into
-   `joint-diff.json`, then merges it in. `<state>/cumulative.json` holds
-   every case's latest generator-lane result and every property finding so
-   far, and `<state>/cumulative-libfuzzer.json` holds the libFuzzer lane's.
-   A `--changed-since` report holds only the cases it reran, so diffing it
-   against the last report alone would list every unchanged survivor again.
-   `findings.json` holds every diff of the run;
-8. runs `scripts/suite_fuzz_run.py completeness` (run-4), which writes
-   `completeness.json`.
+2. `suite-manifest`: writes the frozen suite manifest, `suite-manifest.json`,
+   with `cargo xtask sim-suite --frozen`;
+3. `suite`: runs the full planted sim suite (`cargo test -p zakura-sim
+   --profile planted`);
+4. `loop`: runs `cargo xtask planted loop` with generator lanes on the cases
+   a change since the last pin affects, or on every case the first time;
+5. `libfuzzer`: with `--libfuzzer-seconds`, runs the libFuzzer lane on the
+   same cases;
+6. `suite-fuzz` and `archive`: with `--suite-fuzz` or `--fuzz-seconds`, runs
+   `scripts/suite_fuzz_run.py run` (run-3), then `scripts/suite_fuzz_run.py
+   archive` (run-4). See [Suite fuzz](#suite-fuzz);
+7. `cases`: lists the loop's cases at the checkout with `cargo xtask planted
+   loop --list`;
+8. `triage-<lane>`: merges each new report into its cumulative report.
+   `<state>/cumulative.json` holds every case's latest generator-lane result,
+   every property finding so far and each generator search's latest baseline
+   failure, and `<state>/cumulative-libfuzzer.json` holds the libFuzzer
+   lane's. A `--changed-since` report holds only the cases it reran, so
+   diffing it against the last report alone would list every unchanged
+   survivor again. Each cumulative report keeps only the cases that `cases`
+   listed, so a removed case, or one a witness change re-keyed, leaves it,
+   and the diff lists it under `removed_cases`. The step then runs `cargo
+   xtask planted triage` on the cumulative report, which applies the
+   checkout's `qa/native-mutations/triage.toml` afresh. A triage-only commit
+   selects no case, so this step is what records its triage. Last, the
+   routine diffs each new report against the previous cumulative report into
+   `joint-diff.json`, with the cumulative report's untriaged lanes, and
+   writes every lane's diff to `findings.json`;
+9. `completeness`: runs `scripts/suite_fuzz_run.py completeness` (run-4),
+   which writes `completeness.json`.
 
 Each run writes under `<state>/runs/<UTC time>-<commit>/`: one log per step,
 the loop's report under `loop/`, the diff beside it, `findings.json`,
 `completeness.json`, and `routine.json` with each step's exit status.
-`<state>/latest.json` names the last pin. The unit fails when a step fails or
-when either diff lists a new survivor, a newly failing baseline or a new
-property finding. `untriaged` in the diff lists the lanes that still need a
-record in `qa/native-mutations/triage.toml`.
+`<state>/latest.json` names the last pin. The libFuzzer lane keeps its own
+pin in `<state>/latest-libfuzzer.json`, which advances only when its step
+succeeds, so the next run covers a failed run's changes again. Before it has
+one, the lane uses the loop's pin. The unit fails when a step fails or when
+either diff lists a new survivor, a newly failing baseline, a new property
+finding or a new generator baseline failure. `untriaged` in the diff lists
+the cumulative report's lanes that still need a record in
+`qa/native-mutations/triage.toml`.
 
 ## Suite fuzz
 

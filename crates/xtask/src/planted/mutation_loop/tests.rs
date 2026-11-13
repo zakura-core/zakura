@@ -2581,6 +2581,10 @@ fn a_triage_record_names_its_other_rule_only_for_another_rules_kill() {
         ),
         ("", "missing field `class`"),
         ("class = \"killed-by-named-rule\"\n", "unknown variant"),
+        (
+            "class = \"survived\"\nmode = \"inproc\"\n",
+            "names a `mode`, which only a generator lane takes",
+        ),
     ] {
         fs::write(&file, record(fields)).unwrap();
         let read = triage::read(root.path()).unwrap_err().to_string();
@@ -2978,4 +2982,94 @@ fn the_unpatched_check_judges_a_named_kill_by_the_cases_property() {
             .as_deref(),
         Some(OTHER)
     );
+}
+
+/// A generator lane's record names its mode, `inproc` by default, so an
+/// `inproc` lane's reason never lands on a `libfuzzer` lane of the same
+/// harness, class and other rule, and a `libfuzzer` record lands only on a
+/// `libfuzzer` lane.
+#[test]
+fn a_triage_record_matches_only_its_generator_mode() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join(triage::TRIAGE_FILE);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(
+        &file,
+        format!(
+            r##"
+[[triage]]
+patch = "p.patch"
+property = "{NAMED}"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = "inproc draws honest mirrors only"
+
+[[triage]]
+patch = "p.patch"
+property = "{NAMED}"
+lane = "block-sync/storage"
+mode = "libfuzzer"
+class = "survived"
+stage = "schedule"
+reason = "the campaign never reaches the race"
+"##
+        ),
+    )
+    .unwrap();
+    let records = triage::read(root.path()).unwrap();
+    assert_eq!(records[0].mode, None);
+    assert_eq!(records[1].mode, Some(GenerateMode::Libfuzzer));
+    let survived = || classify::Classified::new(Class::Survived, Some(Reason::Held), "why");
+    let lane = |mode| GeneratorReport::unsearched("block-sync/storage", 11, mode, survived());
+    let case = |generator| CaseReport {
+        patch: "p.patch".to_owned(),
+        patch_sha256: String::new(),
+        property: NAMED.to_owned(),
+        entry: None,
+        table: None,
+        witness: WitnessSpec::Test {
+            test: "t".to_owned(),
+            test_target: "block_table".to_owned(),
+        },
+        also_violates: Vec::new(),
+        result: classify::Classified::new(Class::KilledByNamedRule, None, "why"),
+        trigger: None,
+        baseline: BaselineReport {
+            passed: true,
+            detail: None,
+            millis: 1,
+            rerun_alone: false,
+        },
+        millis: None,
+        peak_rss_kib: None,
+        log: None,
+        rerun_alone: false,
+        generator,
+        no_generator: None,
+        triage: None,
+    };
+    let mut cases = vec![case(vec![
+        lane(GenerateMode::Inproc),
+        lane(GenerateMode::Libfuzzer),
+    ])];
+    assert!(triage::apply(&mut cases, &records).is_empty());
+    let stages: Vec<_> = cases[0]
+        .generator
+        .iter()
+        .map(|lane| lane.triage.as_ref().map(|triage| triage.stage))
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            Some(triage::Stage::Generator),
+            Some(triage::Stage::Schedule)
+        ]
+    );
+
+    // Without a libFuzzer record, the libFuzzer lane stays untriaged.
+    let mut cases = vec![case(vec![lane(GenerateMode::Libfuzzer)])];
+    assert_eq!(triage::apply(&mut cases, &records[..1]), vec![&records[0]]);
+    assert_eq!(cases[0].generator[0].triage, None);
+    assert_eq!(triage::untriaged(&cases), 1);
 }

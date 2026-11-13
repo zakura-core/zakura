@@ -6,15 +6,18 @@
 //! - a modeled verifier that reads the pool through the published snapshot,
 //!   as the real one does, and fails, bans, finds a block's transaction or
 //!   misses an input as its transaction's script says. It can be slow.
-//! - three legacy peers and this node submit through `PoolHandle`: bursts
-//!   of fetch reservations, delivered bodies, a failed fetch, an abandoned
-//!   reservation, a wait for an output, and a violation.
+//! - four legacy peers and this node submit through `PoolHandle`: bursts
+//!   of fetch reservations, one offered again while the first ones verify,
+//!   delivered bodies, a body one peer reserved and another supplied, a
+//!   failed fetch, an abandoned reservation, a wait for an output, a
+//!   violation, and a burst that fills the node's limit.
 //! - a chain script grows the chain, mines a pooled transaction, can
 //!   activate a network upgrade, reorganize, and lose its queue so the core
 //!   resynchronizes. Each change marks the generation changing first, with
 //!   a preemption point before it finishes, so a verification can read
 //!   `Changing`.
-//! - an observer follows the change log and checks each snapshot it sees.
+//! - every publication is checked as the core makes it, through the port's
+//!   simulator hook, and an observer follows the change log as a reader.
 //!
 //! The tasks record what they see in [`PoolEvidence`], which the properties
 //! in [`crate::domain::pool`] read.
@@ -41,7 +44,8 @@ use zakura_node_services::{
         port::{
             chain_transitions, pool_port, ChainTip, ChainTransition, ChainTransitionSender, Change,
             ChangeSeq, ChangesSince, Charge, ConnectedBlock, Intent, LocalFault, PoolHandle,
-            PoolReader, Source as PoolSource, Supplier, Verdict, Violation,
+            PoolReader, PoolSnapshot, Reservation, Source as PoolSource, Supplier, Unreserved,
+            Verdict, Violation,
         },
         QueueSource,
     },
@@ -51,7 +55,7 @@ use zakura_scheduler::SchedulerConfig;
 
 use super::Subsystem;
 use crate::{
-    domain::pool::{self as properties, lock, PoolView, SharedEvidence, LIMITS},
+    domain::pool::{self as properties, lock, PoolView, SharedEvidence, LIMITS, LOCAL},
     property::{EndViolation, HasView, Property, Source, Sources},
     ObservationLog, RunConfig, RunEnd, Sim,
 };
@@ -148,9 +152,14 @@ const T12: usize = 12;
 const T13: usize = 13;
 /// Offered by a peer that is cooling down.
 const T14: usize = 14;
+/// Invalid, and submitted by this node, so it charges nobody.
+const T15: usize = 15;
+/// Seven bodies this node reserves at once, once the chain is quiet, so its
+/// reservations alone reach the node's limit.
+const FILL: [usize; 7] = [16, 17, 18, 19, 20, 21, 22];
 
 /// The universe, by index.
-const UNIVERSE: [Planned; 15] = [
+const UNIVERSE: [Planned; 23] = [
     valid(&[Spend::Chain(0)], 2),
     valid(&[Spend::Parent(T0, 0)], 1),
     valid(&[Spend::Parent(T0, 1)], 1),
@@ -181,6 +190,19 @@ const UNIVERSE: [Planned; 15] = [
     valid(&[Spend::Chain(8)], 1),
     valid(&[Spend::Chain(9)], 1),
     valid(&[Spend::Chain(10)], 1),
+    Planned {
+        spends: &[Spend::Chain(11)],
+        outputs: 1,
+        expires_after: None,
+        script: Script::Invalid,
+    },
+    valid(&[Spend::Chain(12)], 1),
+    valid(&[Spend::Chain(13)], 1),
+    valid(&[Spend::Chain(14)], 1),
+    valid(&[Spend::Chain(15)], 1),
+    valid(&[Spend::Chain(16)], 1),
+    valid(&[Spend::Chain(17)], 1),
+    valid(&[Spend::Chain(18)], 1),
 ];
 
 /// A valid transaction that never expires.
@@ -318,17 +340,23 @@ struct SimVerifier {
 
 impl Verifier<SimVerifyError> for SimVerifier {
     /// Reads the pool as the core published it when it started this job,
-    /// then, once polled, waits its delay and reads the modeled chain.
+    /// then, once polled, waits its delay and reads the modeled chain. The
+    /// transaction counts as being verified until the job ends.
     fn verify(
         &self,
         tx: UnminedTx,
         _tip: ChainTip,
-        _revalidation: bool,
+        revalidation: bool,
         _after_reset: bool,
     ) -> Pin<Box<dyn Future<Output = Outcome<SimVerifyError>> + Send>> {
         let snapshot = self.pool.snapshot();
         let verifier = self.clone();
+        let verifying = self
+            .universe
+            .index(tx.id())
+            .map(|index| Verifying::start(&self.evidence, index, revalidation));
         Box::pin(async move {
+            let _verifying = verifying;
             if !verifier.delay.is_zero() {
                 zakura_rt::time::sleep(verifier.delay).await;
             }
@@ -396,14 +424,63 @@ impl Verifier<SimVerifyError> for SimVerifier {
     }
 }
 
+/// One transaction the verifier is checking, counted in
+/// [`PoolEvidence::verifying`] until the job ends or is dropped.
+///
+/// [`PoolEvidence::verifying`]: crate::domain::pool::PoolEvidence::verifying
+struct Verifying {
+    evidence: SharedEvidence,
+    index: usize,
+}
+
+impl Verifying {
+    /// Counts `index` as being verified, for a submission's source or, if
+    /// `revalidation`, toward the node's limit only.
+    fn start(evidence: &SharedEvidence, index: usize, revalidation: bool) -> Self {
+        let mut shared = lock(evidence);
+        let source = if revalidation {
+            None
+        } else {
+            Some(
+                shared
+                    .slot_source
+                    .get(&index)
+                    .cloned()
+                    .unwrap_or_else(|| "an unknown source".to_owned()),
+            )
+        };
+        shared.verifying.insert(index, source);
+        shared.count_slots();
+        Verifying {
+            evidence: Arc::clone(evidence),
+            index,
+        }
+    }
+}
+
+impl Drop for Verifying {
+    /// Stops counting the transaction. A later job for the same transaction
+    /// may lose its count too, which only undercounts.
+    fn drop(&mut self) {
+        lock(&self.evidence).verifying.remove(&self.index);
+    }
+}
+
 /// One thing a submitter does.
 #[derive(Clone, Copy, Debug)]
 enum Op {
     /// Reserves each id to fetch it, holding what is granted, then submits
     /// each granted body.
     Burst(&'static [usize]),
+    /// Reserves each id to fetch it, then submits the granted bodies at
+    /// once while it offers the refused ids again, which the source's
+    /// limit must still refuse while those bodies verify.
+    Overlap(&'static [usize]),
     /// Reserves an id with its body in hand, and submits it.
     Deliver(usize),
+    /// Reserves an id with its body in hand, and submits it as supplied by
+    /// the legacy peer numbered so.
+    Relay(usize, u8),
     /// Reserves an id to fetch it, then reports the fetch failed.
     FetchFails(usize),
     /// Reserves an id, then drops the reservation.
@@ -412,6 +489,8 @@ enum Op {
     Violation,
     /// Waits this many seconds.
     Pause(u64),
+    /// Waits for the chain script to finish, then this many seconds.
+    AfterChain(u64),
 }
 
 /// A submitter: who it is, and what it does.
@@ -433,35 +512,42 @@ impl Submitter {
     }
 }
 
+/// The legacy peers: each one's label and number.
+const PEERS: [(&str, u8); 4] = [("peer-a", 1), ("peer-b", 2), ("peer-c", 3), ("peer-d", 4)];
+
 /// A legacy peer at `10.0.0.<n>`.
 fn legacy(n: u8) -> QueueSource {
     QueueSource::LegacySocket(([10, 0, 0, n], 8233).into())
 }
 
+/// The label of the legacy peer `peer`.
+fn label_of(peer: &QueueSource) -> String {
+    PEERS
+        .iter()
+        .find(|(_, n)| legacy(*n) == *peer)
+        .map_or_else(|| format!("{peer:?}"), |(label, _)| (*label).to_owned())
+}
+
 /// The run's submitters.
 fn submitters() -> Vec<Submitter> {
     vec![
-        // A burst of three, of which the source's limit of two admits two.
+        // Three fetches, of which the source's limit of two grants two. The
+        // third is offered again while those two verify.
         Submitter {
             label: "peer-a",
             peer: Some(legacy(1)),
             script: &[
-                Op::Burst(&[T0, T3, T11]),
+                Op::Overlap(&[T0, T3, T11]),
                 Op::Pause(4),
                 Op::Burst(&[T1, T2]),
             ],
         },
-        // A conflict with peer-a's T3, then an invalid body that cools this
-        // peer down, then an offer the cooldown refuses.
+        // A conflict with peer-a's T3, then an invalid body this peer
+        // reserved and peer-d supplied, which cools peer-d alone.
         Submitter {
             label: "peer-b",
             peer: Some(legacy(2)),
-            script: &[
-                Op::Pause(1),
-                Op::Deliver(T4),
-                Op::Deliver(T6),
-                Op::Deliver(T14),
-            ],
+            script: &[Op::Pause(1), Op::Deliver(T4), Op::Relay(T6, 4)],
         },
         // A body that bans this peer, a child before its parent, and a
         // violation.
@@ -470,10 +556,18 @@ fn submitters() -> Vec<Submitter> {
             peer: Some(legacy(3)),
             script: &[Op::Deliver(T7), Op::Deliver(T9), Op::Violation],
         },
-        // This node: the parent T9 waits for, an expiring body, the body a
-        // block will mine, a failed fetch and an abandoned reservation.
+        // An offer the cooldown peer-b's relay caused refuses.
         Submitter {
-            label: "local",
+            label: "peer-d",
+            peer: Some(legacy(4)),
+            script: &[Op::Pause(6), Op::Deliver(T14)],
+        },
+        // This node: the parent T9 waits for, an expiring body, the body a
+        // block will mine, a failed fetch, an abandoned reservation, an
+        // invalid body that charges nobody, and once the chain is quiet a
+        // burst past the node's limit.
+        Submitter {
+            label: LOCAL,
             peer: None,
             script: &[
                 Op::Pause(2),
@@ -482,6 +576,9 @@ fn submitters() -> Vec<Submitter> {
                 Op::Deliver(T10),
                 Op::FetchFails(T12),
                 Op::Abandon(T13),
+                Op::Deliver(T15),
+                Op::AfterChain(5),
+                Op::Burst(&FILL),
             ],
         },
     ]
@@ -494,47 +591,75 @@ async fn submit_all(
     universe: Arc<Universe>,
     evidence: SharedEvidence,
 ) {
+    let at = Submitting {
+        submitter: &submitter,
+        handle: &handle,
+        universe: &universe,
+        evidence: &evidence,
+    };
     for op in submitter.script {
         match *op {
             Op::Burst(ids) => {
                 let mut granted = Vec::new();
                 for &tx in ids {
-                    if let Ok(reservation) = handle
-                        .reserve(universe.id(tx), submitter.source(), Intent::Fetch)
-                        .await
-                    {
+                    if let Some(reservation) = at.reserve(tx, Intent::Fetch).await {
                         granted.push((tx, reservation));
-                        count_burst(&evidence, submitter.label, submitter.peer.is_some());
                     }
                 }
-                lock(&evidence).bursts.insert(submitter.label.to_owned(), 0);
                 for (tx, reservation) in granted {
-                    submit(&submitter, &handle, &universe, &evidence, tx, reservation).await;
+                    at.submit(tx, reservation, submitter.supplier()).await;
                 }
             }
+            Op::Overlap(ids) => {
+                let mut granted = Vec::new();
+                let mut refused = Vec::new();
+                for &tx in ids {
+                    match at.reserve(tx, Intent::Fetch).await {
+                        Some(reservation) => granted.push((tx, reservation)),
+                        None => refused.push(tx),
+                    }
+                }
+                let submits = futures::future::join_all(
+                    granted
+                        .into_iter()
+                        .map(|(tx, reservation)| at.submit(tx, reservation, submitter.supplier())),
+                );
+                let again = async {
+                    zakura_rt::task::yield_now().await;
+                    for tx in refused {
+                        if let Some(reservation) = at.reserve(tx, Intent::Fetch).await {
+                            at.submit(tx, reservation, submitter.supplier()).await;
+                        }
+                    }
+                };
+                futures::future::join(submits, again).await;
+            }
             Op::Deliver(tx) => {
-                if let Ok(reservation) = handle
-                    .reserve(universe.id(tx), submitter.source(), Intent::Deliver)
-                    .await
-                {
-                    submit(&submitter, &handle, &universe, &evidence, tx, reservation).await;
+                if let Some(reservation) = at.reserve(tx, Intent::Deliver).await {
+                    at.submit(tx, reservation, submitter.supplier()).await;
+                }
+            }
+            Op::Relay(tx, supplier) => {
+                if let Some(reservation) = at.reserve(tx, Intent::Deliver).await {
+                    at.submit(tx, reservation, Supplier::Peer(legacy(supplier)))
+                        .await;
                 }
             }
             Op::FetchFails(tx) => {
-                if let Ok(reservation) = handle
-                    .reserve(universe.id(tx), submitter.source(), Intent::Fetch)
-                    .await
-                {
+                if let Some(reservation) = at.reserve(tx, Intent::Fetch).await {
+                    lock(&evidence).held.remove(&tx);
                     handle.fetch_failed(reservation).await;
                 }
             }
             Op::Abandon(tx) => {
-                let _dropped = handle
-                    .reserve(universe.id(tx), submitter.source(), Intent::Fetch)
-                    .await;
+                if let Some(reservation) = at.reserve(tx, Intent::Fetch).await {
+                    lock(&evidence).held.remove(&tx);
+                    drop(reservation);
+                }
             }
             Op::Violation => {
                 if let Some(peer) = submitter.peer.clone() {
+                    lock(&evidence).may_cool.insert(submitter.label.to_owned());
                     handle
                         .report_violation(Violation {
                             peer,
@@ -544,61 +669,132 @@ async fn submit_all(
                 }
             }
             Op::Pause(secs) => zakura_rt::time::sleep(Duration::from_secs(secs)).await,
+            Op::AfterChain(secs) => {
+                for _ in 0..600 {
+                    if lock(&evidence).chain_done {
+                        break;
+                    }
+                    zakura_rt::time::sleep(Duration::from_secs(1)).await;
+                }
+                zakura_rt::time::sleep(Duration::from_secs(secs)).await;
+            }
         }
     }
 }
 
-/// Counts one more reservation in `label`'s burst, and records a burst past
-/// a limit. Only a peer source has a limit of its own.
-fn count_burst(evidence: &SharedEvidence, label: &str, peer: bool) {
-    let mut evidence = lock(evidence);
-    let burst = {
-        let burst = evidence.bursts.entry(label.to_owned()).or_default();
-        *burst += 1;
-        *burst
-    };
-    let all: u64 = evidence.bursts.values().sum();
-    evidence.peak_burst = evidence.peak_burst.max(burst);
-    if evidence.burst_past_limit.is_none() {
-        if peer && burst > LIMITS.per_source {
-            evidence.burst_past_limit =
-                Some(format!("{label} holds {burst} undecided reservations"));
-        } else if all > LIMITS.pending {
-            evidence.burst_past_limit =
-                Some(format!("the sources hold {all} undecided reservations"));
-        }
-    }
+/// One submitter's view of the run, for reserving and submitting.
+#[derive(Clone, Copy)]
+struct Submitting<'a> {
+    submitter: &'a Submitter,
+    handle: &'a PoolHandle,
+    universe: &'a Universe,
+    evidence: &'a SharedEvidence,
 }
 
-/// Submits `tx` under `reservation` and records the verdict.
-async fn submit(
-    submitter: &Submitter,
-    handle: &PoolHandle,
-    universe: &Universe,
-    evidence: &SharedEvidence,
-    tx: usize,
-    reservation: zakura_node_services::mempool::port::Reservation,
-) {
-    lock(evidence).submits_started += 1;
-    let body = universe.txs[tx].transaction.clone();
-    let verdict = handle.submit(reservation, body, submitter.supplier()).await;
-    let charged = matches!(
-        &verdict,
-        Verdict::Rejected(rejection) if rejection.charge == Charge::Cooldown
-    );
-    // Read before the evidence lock, since the cooldown watch's read is a
-    // preemption point.
-    let cooling = match (&submitter.peer, charged) {
-        (Some(peer), true) => Some(handle.is_cooling(peer, zakura_rt::time::Instant::now())),
-        _ => None,
-    };
-    let mut evidence = lock(evidence);
-    evidence.submits_answered += 1;
-    if matches!(verdict, Verdict::LocalFault(LocalFault::Stopped)) {
-        evidence.stopped.push(tx);
+impl Submitting<'_> {
+    /// Reserves `tx`, counting a grant as held. A cooldown refusal of a peer
+    /// nothing charged is a misattribution.
+    async fn reserve(&self, tx: usize, intent: Intent) -> Option<Reservation> {
+        let label = self.submitter.label;
+        let answer = self
+            .handle
+            .reserve(self.universe.id(tx), self.submitter.source(), intent)
+            .await;
+        let mut evidence = lock(self.evidence);
+        match answer {
+            Ok(reservation) => {
+                evidence.held.insert(tx, label.to_owned());
+                evidence.slot_source.insert(tx, label.to_owned());
+                evidence.count_slots();
+                Some(reservation)
+            }
+            Err(Unreserved::CoolingDown) => {
+                if !evidence.may_cool.contains(label) && evidence.misattributed.is_none() {
+                    evidence.misattributed = Some(format!(
+                        "{label} was refused as cooling down, and nothing charged it"
+                    ));
+                }
+                None
+            }
+            Err(_) => None,
+        }
     }
-    if let Some(cooling) = cooling {
-        evidence.charges.push((submitter.label.to_owned(), cooling));
+
+    /// Submits `tx` under `reservation` as supplied by `supplier`, and
+    /// checks the verdict's charge against `tx`'s script and who is cooling
+    /// down once it arrives.
+    async fn submit(&self, tx: usize, reservation: Reservation, supplier: Supplier) {
+        let supplier_label = match &supplier {
+            Supplier::Peer(peer) => Some(label_of(peer)),
+            Supplier::Nobody => None,
+        };
+        let expected = match (UNIVERSE[tx].script, &supplier_label) {
+            (Script::Valid, _) => None,
+            (_, None) => Some(Charge::None),
+            (Script::Invalid, Some(_)) => Some(Charge::Cooldown),
+            (Script::Banned, Some(_)) => Some(Charge::Ban),
+        };
+        {
+            let mut evidence = lock(self.evidence);
+            evidence.held.remove(&tx);
+            evidence.submits_started += 1;
+            if let (Some(Charge::Cooldown), Some(label)) = (expected, &supplier_label) {
+                evidence.may_cool.insert(label.clone());
+            }
+        }
+        let body = self.universe.txs[tx].transaction.clone();
+        let verdict = self.handle.submit(reservation, body, supplier).await;
+        // Read before the evidence lock, since each cooldown read is a
+        // preemption point.
+        let now = zakura_rt::time::Instant::now();
+        let cooling: Vec<(&str, bool)> = PEERS
+            .iter()
+            .map(|(label, n)| (*label, self.handle.is_cooling(&legacy(*n), now)))
+            .collect();
+        let mut evidence = lock(self.evidence);
+        evidence.verifying.remove(&tx);
+        evidence.submits_answered += 1;
+        if matches!(verdict, Verdict::LocalFault(LocalFault::Stopped)) {
+            // A dropped reply is `pool/verdict-for-every-submission`'s to
+            // report. It says nothing about who was charged.
+            evidence.stopped.push(tx);
+            return;
+        }
+        let mut problem = None;
+        if let Some(expected) = expected {
+            let charge = match &verdict {
+                Verdict::Rejected(rejection) => Some(rejection.charge),
+                _ => None,
+            };
+            if charge != Some(expected) {
+                problem = Some(format!(
+                    "transaction {tx} from {supplier_label:?} got {verdict:?}, and its script charges {expected:?}"
+                ));
+            }
+            if supplier_label.is_none() {
+                evidence.local_failures += 1;
+            }
+        }
+        if let (Some(Charge::Cooldown), Some(label)) = (expected, &supplier_label) {
+            let is_cooling = cooling
+                .iter()
+                .any(|(peer, cooling)| *peer == label.as_str() && *cooling);
+            evidence.charges.push((label.clone(), is_cooling));
+            if label.as_str() != self.submitter.label {
+                evidence.relayed_charges += 1;
+            }
+        }
+        if let Some((peer, _)) = cooling
+            .iter()
+            .find(|(peer, cooling)| *cooling && !evidence.may_cool.contains(*peer))
+        {
+            problem.get_or_insert(format!(
+                "{peer} is cooling down after transaction {tx}'s verdict, and nothing charged it"
+            ));
+        }
+        if evidence.misattributed.is_none() {
+            evidence.misattributed = problem;
+        }
     }
 }
 
@@ -644,9 +840,12 @@ impl Chain {
         }
         self.sender.borrow().begin_change();
         // The new chain becomes readable: the verifier's view of what is
-        // mined changes now, while the generation reads `Changing`.
+        // mined changes now, while the generation reads `Changing`. The
+        // core may cancel any revalidation for this change, so none counts
+        // from here on.
         {
             let mut evidence = lock(evidence);
+            evidence.verifying.retain(|_, source| source.is_some());
             for _ in 0..disconnect {
                 for tx in self.blocks.pop().unwrap_or_default() {
                     evidence.mined.remove(&tx);
@@ -660,6 +859,9 @@ impl Chain {
         for block in connect {
             self.blocks.push(block.clone());
             let at = self.current();
+            let mined: std::collections::BTreeSet<usize> =
+                self.blocks.iter().flatten().copied().collect();
+            lock(evidence).mined_at.insert(at.hash.0, mined);
             connected.push(ConnectedBlock {
                 hash: at.hash,
                 height: at.height,
@@ -692,8 +894,11 @@ impl Chain {
     }
 
     /// Loses the transition queue: the core gets a resync at the tip.
-    async fn resync(&mut self) {
+    async fn resync(&mut self, evidence: &SharedEvidence) {
         self.sender.borrow().begin_change();
+        lock(evidence)
+            .verifying
+            .retain(|_, source| source.is_some());
         zakura_rt::task::yield_now().await;
         let tip = self.current();
         self.sender.borrow_mut().finish_unknown_change(Some(tip));
@@ -766,22 +971,150 @@ async fn run_chain(
     }
     if scenario.resync {
         sleep(5).await;
-        chain.resync().await;
+        chain.resync(&evidence).await;
+    }
+    lock(&evidence).chain_done = true;
+}
+
+/// The pool a change log describes, replayed one entry at a time.
+#[derive(Debug, Default)]
+struct Replay {
+    visible: std::collections::BTreeSet<usize>,
+    hidden: std::collections::BTreeSet<usize>,
+}
+
+impl Replay {
+    /// Applies `change`, or says why the entries before it do not allow it:
+    /// an addition or refusal of a pooled transaction, a hiding of one that
+    /// is not visible, a reveal of one that is not hidden, or a removal of
+    /// one that is not pooled.
+    fn apply(&mut self, universe: &Universe, change: Change) -> Result<(), String> {
+        let id = match change {
+            Change::Added(id) | Change::Hidden(id) | Change::Refused(id) => id,
+            Change::Removed { id, .. } | Change::Revealed { id, .. } => id,
+        };
+        let Some(tx) = universe.index(id) else {
+            return Err(format!(
+                "{change:?} names a transaction outside the universe"
+            ));
+        };
+        let (visible, hidden) = (self.visible.contains(&tx), self.hidden.contains(&tx));
+        let allowed = match change {
+            Change::Added(_) | Change::Refused(_) => !visible && !hidden,
+            Change::Hidden(_) => visible,
+            Change::Revealed { .. } => hidden,
+            Change::Removed { .. } => visible || hidden,
+        };
+        if !allowed {
+            let state = if visible {
+                "visible"
+            } else if hidden {
+                "hidden"
+            } else {
+                "not pooled"
+            };
+            return Err(format!(
+                "{change:?} for transaction {tx}, which was {state}"
+            ));
+        }
+        match change {
+            Change::Added(_) | Change::Revealed { .. } => {
+                self.hidden.remove(&tx);
+                self.visible.insert(tx);
+            }
+            Change::Hidden(_) => {
+                self.visible.remove(&tx);
+                self.hidden.insert(tx);
+            }
+            Change::Removed { .. } => {
+                self.visible.remove(&tx);
+                self.hidden.remove(&tx);
+            }
+            Change::Refused(_) => {}
+        }
+        Ok(())
     }
 }
 
-/// Follows the change log and checks each snapshot it sees: the log leads
-/// to it, and it is a consistent pool.
+/// The visible transactions of `snapshot`, by index.
+fn shown(snapshot: &PoolSnapshot, universe: &Universe) -> std::collections::BTreeSet<usize> {
+    snapshot
+        .transactions
+        .iter()
+        .filter_map(|tx| universe.index(tx.transaction.id()))
+        .collect()
+}
+
+/// Checks one publication as the core makes it: its batches follow the log
+/// so far, lead to exactly its snapshot, and the snapshot is a consistent
+/// pool. Runs inside the core's publish, so it sees every snapshot.
+fn check_publication(
+    universe: &Universe,
+    evidence: &SharedEvidence,
+    replay: &mut Replay,
+    last: &mut ChangeSeq,
+    batches: &[Vec<Change>],
+    snapshot: &PoolSnapshot,
+) {
+    let mut problem = None;
+    let count: usize = batches.iter().map(Vec::len).sum();
+    let count = u64::try_from(count).expect("one publication is short");
+    if snapshot.last_change.0 != last.0 + count {
+        problem = Some(format!(
+            "the snapshot at {} follows {} with {count} changes",
+            snapshot.last_change.0, last.0
+        ));
+    }
+    *last = snapshot.last_change;
+    let (mut removals, mut additions) = (0, 0);
+    for change in batches.iter().flatten() {
+        match change {
+            Change::Removed { .. } => removals += 1,
+            Change::Added(_) => additions += 1,
+            _ => {}
+        }
+        if let Err(error) = replay.apply(universe, *change) {
+            problem.get_or_insert(error);
+        }
+    }
+    let shown = shown(snapshot, universe);
+    if shown != replay.visible {
+        problem.get_or_insert(format!(
+            "the log leads to {:?} and the snapshot at {} holds {shown:?}",
+            replay.visible, snapshot.last_change.0
+        ));
+    }
+    let mut evidence = lock(evidence);
+    let inconsistent = inconsistency(
+        snapshot,
+        universe,
+        evidence.mined_at.get(&snapshot.tip.hash.0),
+    );
+    evidence.logs_checked += 1;
+    evidence.snapshots_checked += 1;
+    evidence.removals_seen += removals;
+    evidence.additions_seen += additions;
+    if evidence.log_mismatch.is_none() {
+        evidence.log_mismatch = problem;
+    }
+    if evidence.inconsistent.is_none() {
+        evidence.inconsistent = inconsistent;
+    }
+    evidence.last_visible = shown;
+    evidence.tip = snapshot.tip.height.0;
+}
+
+/// Follows the change log as a reader does, and checks that each view's
+/// entries follow the ones before them and lead to its snapshot.
 async fn observe(mut handle: PoolHandle, universe: Arc<Universe>, evidence: SharedEvidence) {
     let mut cursor = ChangeSeq(0);
-    let mut visible = std::collections::BTreeSet::new();
+    let mut replay = Replay::default();
     while handle.snapshot_changed().await {
         let Some(view) = handle.view(cursor) else {
             continue;
         };
         let snapshot = view.snapshot;
         let mut problem = None;
-        let mut removals = 0;
         match view.changes {
             ChangesSince::Entries(entries) => {
                 for entry in entries {
@@ -792,22 +1125,8 @@ async fn observe(mut handle: PoolHandle, universe: Arc<Universe>, evidence: Shar
                         ));
                     }
                     cursor = entry.seq;
-                    match entry.change {
-                        Change::Added(id) | Change::Revealed { id, .. } => {
-                            visible.extend(universe.index(id));
-                        }
-                        Change::Removed { id, .. } => {
-                            removals += 1;
-                            if let Some(index) = universe.index(id) {
-                                visible.remove(&index);
-                            }
-                        }
-                        Change::Hidden(id) => {
-                            if let Some(index) = universe.index(id) {
-                                visible.remove(&index);
-                            }
-                        }
-                        Change::Refused(_) => {}
+                    if let Err(error) = replay.apply(&universe, entry.change) {
+                        problem.get_or_insert(error);
                     }
                 }
             }
@@ -816,41 +1135,33 @@ async fn observe(mut handle: PoolHandle, universe: Arc<Universe>, evidence: Shar
             }
         }
         cursor = snapshot.last_change;
-        let shown: std::collections::BTreeSet<usize> = snapshot
-            .transactions
-            .iter()
-            .filter_map(|tx| universe.index(tx.transaction.id()))
-            .collect();
-        if problem.is_none() && shown != visible {
-            problem = Some(format!(
-                "the log leads to {visible:?} and the snapshot at {} holds {shown:?}",
-                snapshot.last_change.0
+        let shown = shown(&snapshot, &universe);
+        if shown != replay.visible {
+            problem.get_or_insert(format!(
+                "a reader's log leads to {:?} and the snapshot at {} holds {shown:?}",
+                replay.visible, snapshot.last_change.0
             ));
         }
-        let inconsistent = inconsistency(&snapshot, &universe);
         let mut evidence = lock(&evidence);
         evidence.logs_checked += 1;
-        evidence.snapshots_checked += 1;
-        evidence.removals_seen += removals;
         if evidence.log_mismatch.is_none() {
             evidence.log_mismatch = problem;
         }
-        if evidence.inconsistent.is_none() {
-            evidence.inconsistent = inconsistent;
-        }
-        evidence.last_visible = shown;
-        evidence.tip = snapshot.tip.height.0;
     }
 }
 
 /// What makes `snapshot` inconsistent, if anything: two transactions that
-/// spend one output, an expired transaction, or a dependency group past
+/// spend one output, an expired transaction, a transaction whose parent is
+/// neither mined on the snapshot's chain (`mined`) nor visible, dependency
+/// edges other than those the bodies imply, or a dependency group past
 /// three.
 fn inconsistency(
-    snapshot: &zakura_node_services::mempool::port::PoolSnapshot,
+    snapshot: &PoolSnapshot,
     universe: &Universe,
+    mined: Option<&std::collections::BTreeSet<usize>>,
 ) -> Option<String> {
-    let mut spent = std::collections::BTreeMap::new();
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut spent = BTreeMap::new();
     for tx in &snapshot.transactions {
         let index = universe.index(tx.transaction.id());
         for outpoint in tx.transaction.transaction().spent_outpoints() {
@@ -869,22 +1180,58 @@ fn inconsistency(
             }
         }
     }
-    // Each group's size, by walking parents and children.
-    let parents = snapshot.dependencies.dependencies();
-    let children = snapshot.dependencies.dependents();
-    let mut seen = std::collections::BTreeSet::new();
+    // The edges the bodies imply: a visible child to each visible parent.
+    // A parent that is neither visible nor mined is missing.
+    let visible = shown(snapshot, universe);
+    let mut expected: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
     for tx in &snapshot.transactions {
-        let start = tx.transaction.id().mined_id();
-        if seen.contains(&start.0) {
+        let Some(child) = universe.index(tx.transaction.id()) else {
+            return Some("a transaction outside the universe".to_owned());
+        };
+        for outpoint in tx.transaction.transaction().spent_outpoints() {
+            let Some(parent) = universe.index_of_hash(outpoint.hash) else {
+                continue;
+            };
+            if visible.contains(&parent) {
+                expected.entry(child).or_default().insert(parent);
+            } else if mined.is_some_and(|mined| !mined.contains(&parent)) {
+                return Some(format!(
+                    "transaction {child} spends transaction {parent}, which is neither mined nor visible"
+                ));
+            }
+        }
+    }
+    let published = edges(universe, snapshot.dependencies.dependencies());
+    if published != expected {
+        return Some(format!(
+            "the snapshot's dependencies are {published:?} and its bodies imply {expected:?}"
+        ));
+    }
+    let mut inverse: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for (child, parents) in &expected {
+        for parent in parents {
+            inverse.entry(*parent).or_default().insert(*child);
+        }
+    }
+    let dependents = edges(universe, snapshot.dependencies.dependents());
+    if dependents != inverse {
+        return Some(format!(
+            "the snapshot's dependents are {dependents:?} and its bodies imply {inverse:?}"
+        ));
+    }
+    // Each group's size, walking the implied edges both ways.
+    let mut seen = BTreeSet::new();
+    for start in &visible {
+        if seen.contains(start) {
             continue;
         }
-        let mut group = std::collections::BTreeSet::new();
-        let mut next = vec![start];
-        while let Some(hash) = next.pop() {
-            if !group.insert(hash.0) {
+        let mut group = BTreeSet::new();
+        let mut next = vec![*start];
+        while let Some(tx) = next.pop() {
+            if !group.insert(tx) {
                 continue;
             }
-            for linked in parents.get(&hash).into_iter().chain(children.get(&hash)) {
+            for linked in expected.get(&tx).into_iter().chain(inverse.get(&tx)) {
                 next.extend(linked.iter().copied());
             }
         }
@@ -897,6 +1244,25 @@ fn inconsistency(
         seen.extend(group);
     }
     None
+}
+
+/// A published dependency map as edges between universe indexes. A hash
+/// outside the universe becomes `usize::MAX`, which no expected edge names.
+fn edges<'a, T: IntoIterator<Item = &'a transaction::Hash>>(
+    universe: &Universe,
+    map: impl IntoIterator<Item = (&'a transaction::Hash, T)>,
+) -> std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>> {
+    let index = |hash: &transaction::Hash| universe.index_of_hash(*hash).unwrap_or(usize::MAX);
+    let mut edges: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>> =
+        std::collections::BTreeMap::new();
+    for (from, to) in map {
+        edges
+            .entry(index(from))
+            .or_default()
+            .extend(to.into_iter().map(index));
+    }
+    edges.retain(|_, to| !to.is_empty());
+    edges
 }
 
 /// The pool core with its submitters, chain script, verifier and observer.
@@ -976,7 +1342,22 @@ impl Subsystem for PoolCoreHarness {
             .expect("the harness is the queue's only consumer");
         let generation = transitions.generation();
         let sender = Rc::new(RefCell::new(sender));
-        let (handle, inbox) = pool_port();
+        lock(&evidence)
+            .mined_at
+            .insert(tip(START, 0).hash.0, Default::default());
+        let (handle, mut inbox) = pool_port();
+        {
+            let universe = Arc::clone(&universe);
+            let evidence = Arc::clone(&evidence);
+            let replay = std::sync::Mutex::new((Replay::default(), ChangeSeq(0)));
+            inbox.observe_publications(Box::new(move |batches, snapshot| {
+                let mut replay = replay
+                    .lock()
+                    .expect("no publication check panics while it holds the replay");
+                let (replay, last) = &mut *replay;
+                check_publication(&universe, &evidence, replay, last, batches, snapshot);
+            }));
+        }
         let (active, active_rx) = watch::channel(true);
         let verifier = SimVerifier {
             pool: handle.reader(),

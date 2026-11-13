@@ -1201,6 +1201,14 @@ impl PoolModel {
             self.cancel_admission_job(key);
             self.decide(key, ModelVerdict::LocalFault(LocalFault::Deactivated));
         }
+        // Today's pool drops its downloads when it turns off. Every fetch
+        // still out is told to stop, and its lease stays counted until its
+        // caller drops the reservation.
+        let mut fetching: Vec<ReservationId> = self.leases.keys().copied().collect();
+        fetching.sort();
+        self.step
+            .effects
+            .extend(fetching.into_iter().map(Effect::CancelFetch));
         self.tickets.clear();
         self.owners.clear();
         let keys: Vec<u64> = self.pool.keys().copied().collect();

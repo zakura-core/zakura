@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-mempool/src/machine.rs b/crates/zakura-mempool/src/machine.rs
+index f15ab160cb..bc6c9c426f 100644
+--- a/crates/zakura-mempool/src/machine.rs
++++ b/crates/zakura-mempool/src/machine.rs
+@@ -1903,7 +1903,11 @@ impl<E: VerifyError> MempoolState<E> {
+                 .insert(reservation, (tx_id, verdict.clone()));
+         }
+         for waiter in admission.waiters {
+-            let verdict = self.charged(&verdict, &waiter.supplier);
++            let supplier = match (&admission.source, &waiter.supplier) {
++                (Source::Peer(peer), Supplier::Peer(_)) => Supplier::Peer(peer.clone()),
++                _ => waiter.supplier.clone(),
++            };
++            let verdict = self.charged(&verdict, &supplier);
+             self.step.effects.push(Effect::Verdict {
+                 waiter: waiter.id,
+                 verdict,

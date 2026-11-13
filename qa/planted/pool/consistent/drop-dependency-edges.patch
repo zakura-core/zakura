@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-mempool/src/machine.rs b/crates/zakura-mempool/src/machine.rs
+index f15ab160cb..ebe4615771 100644
+--- a/crates/zakura-mempool/src/machine.rs
++++ b/crates/zakura-mempool/src/machine.rs
+@@ -954,7 +954,7 @@ impl<E: VerifyError> MempoolState<E> {
+             self.applied,
+             last_change,
+             self.storage.mining_transactions().cloned().collect(),
+-            self.storage.transaction_dependencies().clone(),
++            Default::default(),
+         )
+     }
+ 

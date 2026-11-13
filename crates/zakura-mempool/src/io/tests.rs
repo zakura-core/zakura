@@ -524,6 +524,25 @@ async fn turning_the_pool_off_answers_every_undecided_submission() {
 }
 
 #[tokio::test]
+async fn turning_the_pool_off_cancels_a_fetch_still_out() {
+    let (parent, _) = parent_and_child();
+    let harness = Harness::start(std::slice::from_ref(&parent));
+    let peer = Source::Peer(QueueSource::LegacySocket(([10, 0, 0, 1], 8233).into()));
+    let fetch = harness
+        .handle
+        .reserve(parent.id(), peer, Intent::Fetch)
+        .await
+        .expect("the peer has room");
+    let cancel = fetch.cancellation();
+    assert!(!cancel.is_cancelled());
+
+    harness.active.send_replace(false);
+    tokio::time::timeout(ANSWER, cancel.cancelled())
+        .await
+        .expect("the fetch is told to stop when the pool turns off");
+}
+
+#[tokio::test]
 async fn a_verifier_that_panics_is_a_local_fault() {
     let (parent, _) = parent_and_child();
     let harness = Harness::start(std::slice::from_ref(&parent));

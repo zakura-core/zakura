@@ -1320,7 +1320,13 @@ async fn a_joined_reservation_that_needs_no_body_sends_none() {
 #[tokio::test]
 async fn a_body_for_another_id_is_refused_and_frees_the_slot() {
     let (handle, mut inbox) = pool_port();
-    let reservation = inbox.grant(ReservationId(9), body(1).id(), false, true, Default::default());
+    let reservation = inbox.grant(
+        ReservationId(9),
+        body(1).id(),
+        false,
+        true,
+        Default::default(),
+    );
     assert!(matches!(
         handle.submit(reservation, body(2), Supplier::Nobody).await,
         Verdict::LocalFault(LocalFault::WrongTransaction)
@@ -4084,5 +4090,40 @@ fn a_block_that_mines_an_id_being_fetched_cancels_the_fetch_and_decides_it() {
     assert_eq!(model.slots_in_use(), 1);
     model.release(fetch.id, secs(1));
     assert_eq!(model.slots_in_use(), 0);
+    model.assert_invariants();
+}
+
+#[test]
+fn turning_the_pool_off_stops_every_fetch_and_holds_its_slot_until_dropped() {
+    let mut model = new_model();
+    let fetches: Vec<_> = (1..=5u16)
+        .map(|n| {
+            model
+                .reserve(id(n), peer(1), Intent::Fetch, secs(0))
+                .expect("room")
+        })
+        .collect();
+
+    let step = model.deactivate(secs(1));
+    for fetch in &fetches {
+        assert!(
+            step.effects.contains(&Effect::CancelFetch(fetch.id)),
+            "every fetch still out is told to stop"
+        );
+    }
+
+    // Turned back on, the old fetches still hold the peer's slots until their
+    // callers drop them.
+    model.activate(Height(100), Generation(0), secs(2));
+    assert_eq!(
+        model.reserve(id(9), peer(1), Intent::Fetch, secs(2)),
+        Err(ModelUnreserved::NoRoom(NoRoom::Source))
+    );
+    for fetch in &fetches {
+        model.release(fetch.id, secs(2));
+    }
+    assert!(model
+        .reserve(id(9), peer(1), Intent::Fetch, secs(2))
+        .is_ok());
     model.assert_invariants();
 }

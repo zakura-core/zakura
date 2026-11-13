@@ -1,0 +1,12 @@
+diff --git a/crates/zakura-mempool/src/machine.rs b/crates/zakura-mempool/src/machine.rs
+index f15ab160cb..b30405faf1 100644
+--- a/crates/zakura-mempool/src/machine.rs
++++ b/crates/zakura-mempool/src/machine.rs
+@@ -1606,6 +1606,7 @@ impl<E: VerifyError> MempoolState<E> {
+                     return;
+                 }
+                 self.step.changes.push(Change::Added(tx.transaction.id()));
++                self.step.changes.push(Change::Added(tx.transaction.id()));
+                 let pool_key = self.fresh();
+                 let parents = parents_of(tx.transaction.transaction());
+                 for parent in &parents {

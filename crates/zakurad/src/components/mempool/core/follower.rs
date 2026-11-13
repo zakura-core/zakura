@@ -10,12 +10,12 @@
 //! that is visible again after a reorg is announced again, as today's reset
 //! re-inserts and re-announces it.
 //!
-//! The change stream sends at most one event of each kind for each batch, in
-//! today's order: added, invalidated, mined. A transaction refused at
+//! The change stream sends at most one event of each kind for each of at most
+//! two batches per read, in today's order: added, invalidated, mined. A transaction refused at
 //! verification, or removed for any reason but a block mining it, is
 //! invalidated, as today.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use futures::{future::BoxFuture, FutureExt};
 
@@ -138,17 +138,7 @@ impl Follower {
         let snapshot = view.snapshot;
         match view.changes {
             ChangesSince::Entries(entries) => {
-                // Everything this read found goes out as one event per kind,
-                // as today's pool sends one per kind for each pass, so a burst
-                // cannot overflow the indexer's channel. The batch is cut only
-                // where sending it whole would put one transaction's events
-                // out of order.
-                let mut batch = Batch::default();
-                for entry in entries {
-                    if batch.would_reorder(entry.change) {
-                        batch.send(&self.changes);
-                    }
-                    batch.take(entry.change);
+                for entry in &entries {
                     match entry.change {
                         Change::Added(id) | Change::Revealed { id, .. } => {
                             self.pending.insert(id);
@@ -159,7 +149,9 @@ impl Follower {
                         Change::Refused(_) => {}
                     }
                 }
-                batch.send(&self.changes);
+                let [first, second] = batches(entries.iter().map(|entry| entry.change));
+                first.send(&self.changes);
+                second.send(&self.changes);
             }
             ChangesSince::Resync => {
                 // The log moved past this reader. The snapshot cannot give back
@@ -196,6 +188,74 @@ async fn ready(outbound: Timeout<Outbound>) -> Option<Timeout<Outbound>> {
     }
 }
 
+/// Splits one read of the change log into at most two batches, so the read
+/// sends at most six events however its changes repeat, and the indexer's
+/// channel cannot overflow.
+///
+/// Each batch goes out as one event per kind, as today's pool sends one per
+/// kind for each pass. Its events go out added, then invalidated, then mined,
+/// so a transaction added after it was removed in the same read would be sent
+/// out of order. Such a transaction keeps only its last removal in the first
+/// batch, and what followed its last re-addition in the second. The flaps in
+/// between are dropped, as a pass of today's pool drops them.
+fn batches(changes: impl Iterator<Item = Change>) -> [Batch; 2] {
+    let mut histories: HashMap<UnminedTxId, Vec<Kind>> = HashMap::new();
+    for change in changes {
+        if let Some((id, kind)) = Kind::of(change) {
+            histories.entry(id).or_default().push(kind);
+        }
+    }
+    let mut first = Batch::default();
+    let mut second = Batch::default();
+    for (id, history) in histories {
+        let readded = (1..history.len())
+            .rev()
+            .find(|&at| history[at] == Kind::Added && history[..at].iter().any(Kind::removes));
+        match readded {
+            None => history.iter().for_each(|kind| first.take(id, *kind)),
+            Some(at) => {
+                let removal = *history[..at]
+                    .iter()
+                    .rev()
+                    .find(|kind| kind.removes())
+                    .expect("a re-addition follows a removal");
+                first.take(id, removal);
+                history[at..].iter().for_each(|kind| second.take(id, *kind));
+            }
+        }
+    }
+    [first, second]
+}
+
+/// The change stream event one change of the log becomes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Kind {
+    Added,
+    Invalidated,
+    Mined,
+}
+
+impl Kind {
+    /// The transaction and event of `change`, or `None` for a change the
+    /// stream does not report.
+    fn of(change: Change) -> Option<(UnminedTxId, Kind)> {
+        match change {
+            Change::Added(id) | Change::Revealed { id, .. } => Some((id, Kind::Added)),
+            Change::Removed {
+                id,
+                reason: RemovalReason::Mined,
+            } => Some((id, Kind::Mined)),
+            Change::Removed { id, .. } | Change::Refused(id) => Some((id, Kind::Invalidated)),
+            Change::Hidden(_) => None,
+        }
+    }
+
+    /// Whether this event takes the transaction out of the pool.
+    fn removes(&self) -> bool {
+        *self != Kind::Added
+    }
+}
+
 /// One batch of the change log, as today's change stream events.
 #[derive(Default)]
 struct Batch {
@@ -205,57 +265,26 @@ struct Batch {
 }
 
 impl Batch {
-    /// Whether taking `change` would send its transaction's events out of
-    /// order. The events go out added, then invalidated, then mined, so a
-    /// change is out of order if the batch already holds its transaction in
-    /// a kind sent after the change's.
-    fn would_reorder(&self, change: Change) -> bool {
-        match change {
-            Change::Added(id) | Change::Revealed { id, .. } => {
-                self.invalidated.contains(&id) || self.mined.contains(&id)
-            }
-            Change::Removed {
-                reason: RemovalReason::Mined,
-                ..
-            }
-            | Change::Hidden(_) => false,
-            Change::Removed { id, .. } | Change::Refused(id) => self.mined.contains(&id),
-        }
-    }
-
-    /// Adds one change.
-    fn take(&mut self, change: Change) {
-        match change {
-            Change::Added(id) | Change::Revealed { id, .. } => {
-                self.added.insert(id);
-            }
-            Change::Removed {
-                id,
-                reason: RemovalReason::Mined,
-            } => {
-                self.mined.insert(id);
-            }
-            Change::Removed { id, .. } | Change::Refused(id) => {
-                self.invalidated.insert(id);
-            }
-            Change::Hidden(_) => {}
-        }
+    /// Adds one event for `id`.
+    fn take(&mut self, id: UnminedTxId, kind: Kind) {
+        match kind {
+            Kind::Added => self.added.insert(id),
+            Kind::Invalidated => self.invalidated.insert(id),
+            Kind::Mined => self.mined.insert(id),
+        };
     }
 
     /// Sends this batch's events, in today's order. Nobody listening is
     /// fine.
-    fn send(&mut self, changes: &broadcast::Sender<MempoolChange>) {
-        let added = std::mem::take(&mut self.added);
-        if !added.is_empty() {
-            let _ = changes.send(MempoolChange::added(added));
+    fn send(self, changes: &broadcast::Sender<MempoolChange>) {
+        if !self.added.is_empty() {
+            let _ = changes.send(MempoolChange::added(self.added));
         }
-        let invalidated = std::mem::take(&mut self.invalidated);
-        if !invalidated.is_empty() {
-            let _ = changes.send(MempoolChange::invalidated(invalidated));
+        if !self.invalidated.is_empty() {
+            let _ = changes.send(MempoolChange::invalidated(self.invalidated));
         }
-        let mined = std::mem::take(&mut self.mined);
-        if !mined.is_empty() {
-            let _ = changes.send(MempoolChange::mined(mined));
+        if !self.mined.is_empty() {
+            let _ = changes.send(MempoolChange::mined(self.mined));
         }
     }
 }
@@ -475,5 +504,50 @@ mod tests {
             .position(|kind| *kind == (MempoolChangeKind::Added, true))
             .expect("the admission is sent");
         assert!(refused < admitted, "the refusal comes before the admission");
+    }
+
+    /// One read of many add and removal cycles of the same transaction
+    /// still sends at most six events, and the last ones say how it ended.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn repeated_changes_to_one_transaction_cannot_overflow_the_indexer() {
+        let (handle, inbox) = pool_port();
+        let (changes, mut events) = broadcast::channel(16);
+        let id = UnminedTxId::Legacy(zakura_chain::transaction::Hash([7; 32]));
+        for _ in 0..33 {
+            inbox.publish([Change::Added(id)], |last| snapshot(Vec::new(), last));
+            inbox.publish(
+                [Change::Removed {
+                    id,
+                    reason: RemovalReason::Evicted,
+                }],
+                |last| snapshot(Vec::new(), last),
+            );
+        }
+        tokio::spawn(
+            Follower::new(
+                handle.reader(),
+                BoxCloneSyncService::new(Gate::default()),
+                changes,
+            )
+            .run(),
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut kinds = Vec::new();
+        loop {
+            match events.try_recv() {
+                Ok(event) => kinds.push(event.kind),
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(error) => panic!("the indexer's channel overflowed: {error:?}"),
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec![
+                MempoolChangeKind::Invalidated,
+                MempoolChangeKind::Added,
+                MempoolChangeKind::Invalidated
+            ],
+        );
     }
 }

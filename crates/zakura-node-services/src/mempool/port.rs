@@ -1012,6 +1012,28 @@ pub struct PoolInbox {
     snapshot: watch::Sender<Option<Arc<PoolSnapshot>>>,
     cooldowns: watch::Sender<Cooldowns>,
     shared: Arc<Shared>,
+    /// Under the simulator, sees every publication. See
+    /// [`Self::observe_publications`].
+    #[cfg(zakura_sim)]
+    publications: Option<Publications>,
+}
+
+/// Sees each publication's batches, in order, and its snapshot, while the
+/// log is locked, so it sees every snapshot the core publishes, including
+/// those a reader skips. It must not call back into the port.
+#[cfg(zakura_sim)]
+pub type PublicationObserver = Box<dyn Fn(&[Vec<Change>], &PoolSnapshot) + Send + Sync>;
+
+/// The installed [`PublicationObserver`].
+#[cfg(zakura_sim)]
+struct Publications(PublicationObserver);
+
+#[cfg(zakura_sim)]
+impl std::fmt::Debug for Publications {
+    /// Names the observer, which has nothing else to show.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Publications")
+    }
 }
 
 /// Create the port. The network takes the handle at startup, and the core
@@ -1037,6 +1059,8 @@ pub fn pool_port() -> (PoolHandle, PoolInbox) {
             snapshot: snapshot_tx,
             cooldowns: cooldowns_tx,
             shared,
+            #[cfg(zakura_sim)]
+            publications: None,
         },
     )
 }
@@ -1293,9 +1317,30 @@ impl PoolInbox {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut last = log.last();
+        #[cfg(zakura_sim)]
+        let batches: Vec<Vec<Change>> = batches
+            .into_iter()
+            .map(|batch| batch.into_iter().collect())
+            .collect();
+        #[cfg(zakura_sim)]
+        for changes in &batches {
+            last = log.append(changes.iter().copied());
+        }
+        #[cfg(not(zakura_sim))]
         for changes in batches {
             last = log.append(changes);
         }
-        self.snapshot.send_replace(Some(Arc::new(build(last))));
+        let snapshot = Arc::new(build(last));
+        #[cfg(zakura_sim)]
+        if let Some(Publications(observe)) = &self.publications {
+            observe(&batches, &snapshot);
+        }
+        self.snapshot.send_replace(Some(snapshot));
+    }
+
+    /// Under the simulator, has `observe` see every later publication.
+    #[cfg(zakura_sim)]
+    pub fn observe_publications(&mut self, observe: PublicationObserver) {
+        self.publications = Some(Publications(observe));
     }
 }

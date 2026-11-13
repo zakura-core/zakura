@@ -37,13 +37,24 @@ fn summary(shared: &SharedEvidence) -> Vec<String> {
             evidence.submits_answered, evidence.submits_started
         ),
         format!("charges {:?}", evidence.charges),
-        format!("peak burst {}", evidence.peak_burst),
+        format!(
+            "peak slots {} in all, {} for one peer",
+            evidence.peak_total, evidence.peak_source
+        ),
+        format!(
+            "relayed charges {}, local failures {}",
+            evidence.relayed_charges, evidence.local_failures
+        ),
+        format!("misattributed {:?}", evidence.misattributed),
+        format!("past limit {:?}", evidence.past_limit),
         format!("passed {:?}", evidence.passed),
         format!("removals {}", evidence.removals_seen),
         format!("mined {:?}", evidence.mined),
         format!("before reorg {:?}", evidence.before_reorg),
         format!("last visible {:?}", evidence.last_visible),
         format!("snapshots {}", evidence.snapshots_checked),
+        format!("inconsistent {:?}", evidence.inconsistent),
+        format!("log mismatch {:?}", evidence.log_mismatch),
         format!("end {:?}", evidence.end),
     ]
 }
@@ -64,6 +75,39 @@ fn the_pool_core_seed_holds_every_pool_property() {
             &mut NullSink,
         )
         .unwrap_or_else(|error| panic!("{property}: {error}\n{:#?}", summary(&shared)));
+        // Each witness triggers at its earliest case, so a planted failure
+        // is caught before the run ends. The seed reaches every case.
+        let evidence = lock(&shared);
+        let reached = [
+            (
+                "the node's limit",
+                evidence.peak_total == pool::LIMITS.pending,
+            ),
+            (
+                "a peer's limit",
+                evidence.peak_source == pool::LIMITS.per_source,
+            ),
+            (
+                "a charge relayed to another supplier",
+                evidence.relayed_charges > 0,
+            ),
+            (
+                "a local failure that charges nobody",
+                evidence.local_failures > 0,
+            ),
+            ("a removal in the log", evidence.removals_seen > 0),
+        ];
+        let missed: Vec<&str> = reached
+            .into_iter()
+            .filter(|(_, reached)| !reached)
+            .map(|(case, _)| case)
+            .collect();
+        drop(evidence);
+        assert!(
+            missed.is_empty(),
+            "{property}: the seed never reached {missed:?}\n{:#?}",
+            summary(&shared)
+        );
     }
 }
 

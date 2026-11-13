@@ -1,0 +1,12 @@
+diff --git a/crates/zakura-mempool/src/machine.rs b/crates/zakura-mempool/src/machine.rs
+index f15ab160cb..f8e7ffb744 100644
+--- a/crates/zakura-mempool/src/machine.rs
++++ b/crates/zakura-mempool/src/machine.rs
+@@ -1011,6 +1011,7 @@ impl<E: VerifyError> MempoolState<E> {
+     pub fn counted_against(&self, source: &Source) -> usize {
+         self.admissions
+             .values()
++            .filter(|admission| admission.body.is_none())
+             .map(|admission| &admission.source)
+             .chain(self.leases.values().map(|lease| &lease.source))
+             .filter(|counted| *counted == source)

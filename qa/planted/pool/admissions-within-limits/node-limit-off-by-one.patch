@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-mempool/src/machine.rs b/crates/zakura-mempool/src/machine.rs
+index f15ab160cb..d7bfb18b16 100644
+--- a/crates/zakura-mempool/src/machine.rs
++++ b/crates/zakura-mempool/src/machine.rs
+@@ -523,7 +523,7 @@ impl<E: VerifyError> MempoolState<E> {
+             return self.join(key, source, intent);
+         }
+         // Today's order: the node's limit, then the source's.
+-        if self.slots_in_use() >= self.limits.pending {
++        if self.slots_in_use() > self.limits.pending {
+             return Err(Unreserved::NoRoom(NoRoom::Node));
+         }
+         if matches!(source, Source::Peer(_))

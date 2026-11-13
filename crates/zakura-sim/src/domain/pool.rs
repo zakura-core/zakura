@@ -25,14 +25,19 @@ use crate::{
 
 /// Every submission gets exactly one verdict from the core.
 pub const VERDICT_FOR_EVERY_SUBMISSION: &str = "pool/verdict-for-every-submission";
-/// A rejection that charges a peer supplier starts its cooldown before the
-/// verdict reaches the caller.
+/// A rejection charges exactly its body's peer supplier, never the reserving
+/// source, another peer or a local submission, and a cooldown has started
+/// when the caller gets the verdict.
 pub const SUPPLIER_CHARGED: &str = "pool/supplier-charged";
-/// No source holds more undecided reservations than the core's limits.
+/// No source holds more slots than the core's limits, counting each
+/// reservation until its body is submitted and each body until its
+/// verification ends.
 pub const ADMISSIONS_WITHIN_LIMITS: &str = "pool/admissions-within-limits";
-/// Every published snapshot is a consistent pool.
+/// Every published snapshot is a consistent pool, with the dependency edges
+/// its bodies imply.
 pub const CONSISTENT: &str = "pool/consistent";
-/// The change log leads to exactly each published snapshot.
+/// The change log leads to exactly each published snapshot, and each entry
+/// follows from the ones before it.
 pub const LOG_COMPLETE: &str = "pool/log-complete";
 /// A reorg that leaves pooled transactions valid gives them back.
 pub const SURVIVES_REORG: &str = "pool/survives-reorg";
@@ -65,13 +70,30 @@ pub struct PoolEvidence {
     /// For each rejection that charged a peer supplier a cooldown: the peer,
     /// and whether the port showed it cooling when the verdict arrived.
     pub charges: Vec<(String, bool)>,
-    /// Each peer source's reservations granted since its last submission or
-    /// drop, while no body of its own is in flight.
-    pub bursts: BTreeMap<String, u64>,
-    /// The largest burst any source reached.
-    pub peak_burst: u64,
-    /// The first burst past a limit.
-    pub burst_past_limit: Option<String>,
+    /// Cooldowns that fell on a supplier other than the reserving source.
+    pub relayed_charges: u64,
+    /// Invalid bodies this node submitted, which charge nobody.
+    pub local_failures: u64,
+    /// The peers that may be cooling down: each supplied an invalid body or
+    /// reported a violation.
+    pub may_cool: BTreeSet<String>,
+    /// The first charge that fell on the wrong peer, or a verdict whose
+    /// charge differs from what its body's script says.
+    pub misattributed: Option<String>,
+    /// Reservations granted and not yet submitted, failed or dropped: the
+    /// transaction, and its source's label.
+    pub held: BTreeMap<usize, String>,
+    /// Transactions the verifier is checking: a submission's source label,
+    /// or `None` for a revalidation.
+    pub verifying: BTreeMap<usize, Option<String>>,
+    /// The source label each transaction was last granted to.
+    pub slot_source: BTreeMap<usize, String>,
+    /// The most slots counted at once, in all.
+    pub peak_total: u64,
+    /// The most slots counted at once against one peer source.
+    pub peak_source: u64,
+    /// The first count past a limit.
+    pub past_limit: Option<String>,
     /// The transactions the verifier passed.
     pub passed: BTreeSet<usize>,
     /// Pairs of transactions that spend the same chain output.
@@ -84,6 +106,8 @@ pub struct PoolEvidence {
     pub logs_checked: u64,
     /// Removals the change log carried.
     pub removals_seen: u64,
+    /// Additions the change log carried.
+    pub additions_seen: u64,
     /// The first snapshot the log did not lead to.
     pub log_mismatch: Option<String>,
     /// Reorgs that happened while the pool held visible transactions.
@@ -94,6 +118,10 @@ pub struct PoolEvidence {
     pub last_visible: BTreeSet<usize>,
     /// The transactions the current chain mined.
     pub mined: BTreeSet<usize>,
+    /// The transactions each tip's chain mined, by the tip's hash.
+    pub mined_at: BTreeMap<[u8; 32], BTreeSet<usize>>,
+    /// Whether the chain script has finished.
+    pub chain_done: bool,
     /// Each transaction's expiry height, if it has one.
     pub expiries: BTreeMap<usize, u32>,
     /// The height of the last snapshot's tip.
@@ -101,6 +129,43 @@ pub struct PoolEvidence {
     /// How the run ended, once it has.
     pub end: Option<Outcome>,
 }
+
+impl PoolEvidence {
+    /// Counts the slots certainly in use now, and records the first count
+    /// past a limit.
+    ///
+    /// A reservation counts from the moment its caller holds it until the
+    /// caller submits or drops it, and a submitted body while the verifier
+    /// checks it. Both lie inside the time the core counts the slot, so the
+    /// count never exceeds the core's own. A revalidation counts only
+    /// toward the node's limit.
+    pub fn count_slots(&mut self) {
+        let mut by_source: BTreeMap<String, u64> = BTreeMap::new();
+        for source in self.held.values().chain(self.verifying.values().flatten()) {
+            *by_source.entry(source.clone()).or_default() += 1;
+        }
+        let total = u64::try_from(self.held.len() + self.verifying.len())
+            .expect("the harness's universe is small");
+        self.peak_total = self.peak_total.max(total);
+        let mut past = None;
+        for (source, count) in by_source.into_iter().filter(|(source, _)| source != LOCAL) {
+            self.peak_source = self.peak_source.max(count);
+            if count > LIMITS.per_source {
+                past.get_or_insert(format!("{source} holds {count} slots"));
+            }
+        }
+        if total > LIMITS.pending {
+            past.get_or_insert(format!("the sources hold {total} slots"));
+        }
+        if self.past_limit.is_none() {
+            self.past_limit = past;
+        }
+    }
+}
+
+/// The label of the submitter that is this node. It has no limit of its
+/// own.
+pub const LOCAL: &str = "local";
 
 /// The evidence the harness's tasks share. Each task holds the lock only
 /// between preemption points, so a check never finds it held.
@@ -149,31 +214,33 @@ pub fn properties<S: HasView<View = PoolView>>() -> Vec<Property<S>> {
         },
         Property {
             id: PropertyId::new(SUPPLIER_CHARGED),
-            claim: "a rejection that charges a peer supplier a cooldown has started it when the caller gets the verdict",
+            claim: "a rejection charges exactly its body's peer supplier, never the reserving source, another peer or a local submission, and a cooldown has started when the caller gets the verdict",
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View],
             status: Status::Active,
             check: check_charges::<S>,
             witness: Some(TriggerHistory::View(|view, _| {
-                lock(view).cooldown_failures > 0
+                let evidence = lock(view);
+                evidence.relayed_charges > 0 || evidence.local_failures > 0
             })),
         },
         Property {
             id: PropertyId::new(ADMISSIONS_WITHIN_LIMITS),
-            claim: "no peer source holds more undecided reservations than its limit, nor all of them more than the node's",
+            claim: "no peer source holds more slots than its limit, nor all sources more than the node's, counting reservations until submitted and bodies while verified",
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View],
             status: Status::Active,
             check: check_admissions::<S>,
             witness: Some(TriggerHistory::View(|view, _| {
-                lock(view).peak_burst >= LIMITS.per_source
+                let evidence = lock(view);
+                evidence.peak_total >= LIMITS.pending || evidence.peak_source >= LIMITS.per_source
             })),
         },
         Property {
             id: PropertyId::new(CONSISTENT),
-            claim: "every published snapshot holds no two transactions that spend one output, no expired transaction, and no dependency group past three",
+            claim: "every published snapshot holds no two transactions that spend one output, no expired transaction, no transaction without its unmined parent, exactly the dependency edges its bodies imply, and no dependency group past three",
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View],
@@ -189,16 +256,15 @@ pub fn properties<S: HasView<View = PoolView>>() -> Vec<Property<S>> {
         },
         Property {
             id: PropertyId::new(LOG_COMPLETE),
-            claim: "replaying the change log from the start leads to exactly each published snapshot's transactions",
+            claim: "replaying the change log from the start leads to exactly each published snapshot's transactions, and each entry is allowed by the entries before it",
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View],
             status: Status::Active,
             check: check_log::<S>,
-            // A patched core can drop removals from the log, so the trigger
-            // is the removal the chain caused, a block that mined a pooled
-            // transaction, not one the log carried.
-            witness: Some(TriggerHistory::View(|view, _| !lock(view).mined.is_empty())),
+            // A patched core can drop or repeat entries, so the trigger is
+            // the first addition a publication carried.
+            witness: Some(TriggerHistory::View(|view, _| lock(view).additions_seen > 0)),
         },
         Property {
             id: PropertyId::new(SURVIVES_REORG),
@@ -237,6 +303,12 @@ fn check_verdicts<S: HasView<View = PoolView>>(cx: &mut CheckCtx<'_, S>) -> Verd
 fn check_charges<S: HasView<View = PoolView>>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     let view = cx.view();
     let evidence = lock(&view);
+    if let Some(problem) = &evidence.misattributed {
+        return cx.violated(
+            "each charge on its body's peer supplier alone",
+            problem.clone(),
+        );
+    }
     if let Some((peer, _)) = evidence.charges.iter().find(|(_, cooling)| !cooling) {
         return cx.violated(
             "the charged supplier is cooling down when its verdict arrives",
@@ -254,16 +326,16 @@ fn check_charges<S: HasView<View = PoolView>>(cx: &mut CheckCtx<'_, S>) -> Verdi
 fn check_admissions<S: HasView<View = PoolView>>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     let view = cx.view();
     let evidence = lock(&view);
-    if let Some(burst) = &evidence.burst_past_limit {
+    if let Some(count) = &evidence.past_limit {
         return cx.violated(
             format!(
-                "at most {} undecided reservations per peer source and {} in all",
+                "at most {} slots per peer source and {} in all",
                 LIMITS.per_source, LIMITS.pending
             ),
-            burst.clone(),
+            count.clone(),
         );
     }
-    if evidence.peak_burst > 0 {
+    if evidence.peak_total > 0 {
         Verdict::Holds
     } else {
         Verdict::NotApplicable

@@ -388,13 +388,14 @@ pub struct Config {
     /// most `max_connections_per_ip` connections to one IP, so it does not dial further
     /// entries on that IP.
     ///
-    /// Each dialed address gets two connection slots of its own: an outbound slot, outside
-    /// the outbound connection limit, and an inbound slot, outside the inbound connection
-    /// limit. So a node whose inbound slots are full still accepts a listed peer that
-    /// dials it, and its other peers keep every slot. The inbound slots are shared between
-    /// the dialed peers. A peer that is only in a range of several addresses gets no
-    /// slots of its own. Zakura still applies the per-IP connection limit to these peers,
-    /// and still disconnects them on protocol errors or inbound overload.
+    /// Each dialed address adds one outbound and one inbound connection slot on top of the
+    /// connection limits. Zakura dials each address on an outbound slot of its own, so a
+    /// full outbound peer set never blocks the dial. The inbound slots are a pool that
+    /// only dialed addresses can use, so a node whose other inbound slots are full still
+    /// accepts a listed peer that dials it, unless connections from listed peers already
+    /// fill the pool. A peer that is only in a range of several addresses adds no slots.
+    /// Zakura still applies the per-IP connection limit to these peers, and still
+    /// disconnects them on protocol errors or inbound overload.
     ///
     /// Entries match legacy peer IP addresses, and only the legacy P2P stack dials them.
     /// An IPv4 entry also matches the IPv4-mapped IPv6 form of the same address. The
@@ -487,7 +488,9 @@ impl Config {
             / OUTBOUND_PEER_LIMIT_DIVISOR
     }
 
-    /// The maximum number of inbound connections that Zakura will accept at the same time.
+    /// The maximum number of inbound connections that Zakura will accept at the same time,
+    /// besides the slots of dialed unconditional peers, see
+    /// [`unconditional_peer_connection_limit`](Self::unconditional_peer_connection_limit).
     /// When this limit is reached, Zakura drops new inbound connections,
     /// without handshaking on them.
     ///
@@ -503,9 +506,10 @@ impl Config {
     ///
     /// These connections are counted separately from
     /// [`peerset_outbound_connection_limit`](Self::peerset_outbound_connection_limit), so
-    /// a full outbound peer set never blocks them. The inbound listener keeps as many
-    /// slots for these peers, outside
-    /// [`peerset_inbound_connection_limit`](Self::peerset_inbound_connection_limit).
+    /// a full outbound peer set never blocks them. The inbound listener adds as many
+    /// slots outside
+    /// [`peerset_inbound_connection_limit`](Self::peerset_inbound_connection_limit), as a
+    /// pool that only these peers can use.
     pub fn unconditional_peer_connection_limit(&self) -> usize {
         self.unconditional_peers.dial_limit()
     }

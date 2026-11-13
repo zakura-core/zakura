@@ -615,8 +615,25 @@ impl CaseInput {
 
 /// What a planted case's `.toml` runs: its `input`, or its `[typed]`
 /// table's scenario and Plan, its `plan` bytes or its `script`. A case
-/// names exactly one input, and a typed one exactly one Plan.
+/// names exactly one input, and a typed one exactly one Plan. Each must be a
+/// committed file of `repo` ([`binding::committed_file`]), so the runner
+/// never records, nor the judge reads, a file outside S's checkout.
 fn case_input(repo: &Path, case: CaseRef) -> Result<CaseInput, String> {
+    let input = case_files(repo, case)?;
+    for path in [Some(input.input()), input.plan()].into_iter().flatten() {
+        binding::committed_file(repo, path).map_err(|why| {
+            format!(
+                "planted case {}/{} names {path}, which {why}",
+                case.property, case.name
+            )
+        })?;
+    }
+    Ok(input)
+}
+
+/// What a planted case's `.toml` names as its input ([`case_input`]),
+/// before its paths are checked.
+fn case_files(repo: &Path, case: CaseRef) -> Result<CaseInput, String> {
     let file = Path::new("qa/planted")
         .join(case.property)
         .join(format!("{}.toml", case.name));
@@ -2589,14 +2606,17 @@ fn typed_refusal(
 /// under `repo` on `harness`: its fuzz input by digest, or its typed
 /// scenario and Plan bytes or script (C18).
 fn case_input_refusal(repo: &Path, harness: &str, input: &CaseInput, dir: &Path) -> Option<String> {
-    match input {
-        CaseInput::Fuzz { input } => input_refusal(repo, input, dir),
-        CaseInput::Typed { scenario, plan } => {
-            typed_refusal(harness, &repo.join(scenario), &repo.join(plan), false, dir)
-        }
-        CaseInput::Scripted { scenario, script } => {
-            typed_refusal(harness, &repo.join(scenario), &repo.join(script), true, dir)
-        }
+    let (scenario, plan, script) = match input {
+        CaseInput::Fuzz { input } => return input_refusal(repo, input, dir),
+        CaseInput::Typed { scenario, plan } => (scenario, plan, false),
+        CaseInput::Scripted { scenario, script } => (scenario, script, true),
+    };
+    // Only S's committed files, never one an absolute path names.
+    let files = binding::committed_file(repo, scenario)
+        .and_then(|scenario| Ok((scenario, binding::committed_file(repo, plan)?)));
+    match files {
+        Ok((scenario, plan)) => typed_refusal(harness, &scenario, &plan, script, dir),
+        Err(why) => Some(format!("its case input isn't S's: {why}")),
     }
 }
 
@@ -4244,6 +4264,91 @@ mod tests {
             .as_bytes(),
         );
         assert!(refused(&scripted, script_run.path()).is_some());
+
+        // The same files named by absolute paths, or under `target`, aren't
+        // S's committed ones, whatever they hold.
+        let absolute = |name: &str| {
+            repo.path()
+                .join(name)
+                .to_str()
+                .expect("a UTF-8 path")
+                .to_owned()
+        };
+        put(
+            "script.json",
+            serde_json::to_string_pretty(&script)
+                .expect("it serializes")
+                .as_bytes(),
+        );
+        assert_eq!(refused(&scripted, script_run.path()), None);
+        fs::create_dir_all(repo.path().join("target")).expect("the temp dir is writable");
+        put("target/plan.bin", &plan);
+        for input in [
+            CaseInput::Typed {
+                scenario: absolute("scenario.json"),
+                plan: "plan.bin".into(),
+            },
+            CaseInput::Typed {
+                scenario: "scenario.json".into(),
+                plan: absolute("plan.bin"),
+            },
+            CaseInput::Typed {
+                scenario: "scenario.json".into(),
+                plan: "target/plan.bin".into(),
+            },
+        ] {
+            assert!(refused(&input, bytes_run.path()).is_some(), "{input:?}");
+        }
+        assert!(refused(
+            &CaseInput::Scripted {
+                scenario: absolute("scenario.json"),
+                script: "script.json".into(),
+            },
+            script_run.path()
+        )
+        .is_some());
+    }
+
+    /// A planted case's `.toml` must name committed files of the checkout:
+    /// a typed case naming its scenario or Plan by an absolute path, or
+    /// under `target`, doesn't plan, while the same case naming them
+    /// relative to the checkout does.
+    #[test]
+    fn a_case_input_names_only_committed_files() {
+        let repo = tempfile::tempdir().expect("a temp dir can be created");
+        let write = |path: &str, text: &str| {
+            let path = repo.path().join(path);
+            fs::create_dir_all(path.parent().expect("the path has a parent"))
+                .expect("the temp dir is writable");
+            fs::write(path, text).expect("the temp dir is writable");
+        };
+        write("cases/s.json", "{}");
+        write("cases/p.bin", "");
+        write("target/p.bin", "");
+        let absolute = repo.path().join("cases/s.json");
+        let absolute = absolute.to_str().expect("a UTF-8 path");
+        let case = CaseRef {
+            property: "p",
+            name: "c",
+        };
+        for (scenario, plan, planned) in [
+            ("cases/s.json", "cases/p.bin", true),
+            (absolute, "cases/p.bin", false),
+            ("cases/s.json", "target/p.bin", false),
+            ("cases/../cases/s.json", "cases/p.bin", false),
+            ("cases/missing.json", "cases/p.bin", false),
+        ] {
+            write(
+                "qa/planted/p/c.toml",
+                &format!(
+                    "[typed]\nharness = \"header-sync/storage\"\nscenario = \"{scenario}\"\nplan = \"{plan}\"\n"
+                ),
+            );
+            let input = case_input(repo.path(), case);
+            assert_eq!(input.is_ok(), planned, "{scenario} {plan}: {input:?}");
+        }
+        write("qa/planted/p/c.toml", &format!("input = \"{absolute}\"\n"));
+        assert!(case_input(repo.path(), case).is_err());
     }
 
     /// A case's baseline must be built from the subject's source, and its
@@ -5406,6 +5511,11 @@ mod tests {
         let repo = tempfile::tempdir().expect("a temp dir can be created");
         let dir = repo.path().join("qa/planted/header/reactor-policy");
         fs::create_dir_all(&dir).expect("the temp dir is writable");
+        // Each case names committed files ([`case_input`]).
+        fs::create_dir_all(repo.path().join("fixtures")).expect("the temp dir is writable");
+        for file in ["fixtures/in.bin", "s.json", "p.bin", "p.json"] {
+            fs::write(repo.path().join(file), "").expect("the temp dir is writable");
+        }
         for (name, toml) in [
             ("fuzz", "input = \"fixtures/in.bin\"\n"),
             (

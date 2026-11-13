@@ -703,6 +703,21 @@ pub fn committed_bytes(repo: &Path, rel: impl AsRef<Path>) -> Result<Vec<u8>, St
     std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/// `rel` under S's checkout `repo`, if it names a committed regular file
+/// there ([`committed_path`]), for a reader that hands the path on rather
+/// than reading it here: a typed case's scenario and Plan, which
+/// [`scenario_expect`] judges a trace against and the runner records from.
+/// An absolute path, one with `..`, one under `target`, or a missing file is
+/// refused.
+pub fn committed_file(repo: &Path, rel: impl AsRef<Path>) -> Result<std::path::PathBuf, String> {
+    let rel = rel.as_ref();
+    let path = committed_path(repo, rel)?;
+    if !path.is_file() {
+        return Err(format!("{} isn't a committed file", rel.display()));
+    }
+    Ok(path)
+}
+
 /// Each entry of the committed directory `rel` of S's checkout `repo`
 /// ([`committed_path`]), as its path relative to `repo` and whether it's a
 /// directory, sorted, or why it can't be read.

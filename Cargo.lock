@@ -3037,6 +3037,7 @@ dependencies = [
  "proptest-derive",
  "rand 0.10.2",
  "rayon",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

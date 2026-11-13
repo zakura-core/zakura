@@ -4466,11 +4466,10 @@ class DashboardLogin:
 
     def token_valid(self, token: str | None, now: float) -> bool:
         """Whether a cookie value was signed under this secret and has not expired."""
-        try:
-            expiry_text, signature = (token or "").split(".", 1)
-            expiry = int(expiry_text)
-        except ValueError:
+        expiry_text, _, signature = (token or "").partition(".")
+        if not (expiry_text.isascii() and expiry_text.isdigit()) or not re.fullmatch(r"[0-9a-f]{64}", signature):
             return False
+        expiry = int(expiry_text)
         return hmac.compare_digest(signature, self._signature(expiry)) and expiry > now
 
 
@@ -4712,10 +4711,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def came_through_proxy(self) -> bool:
+        """The request arrived through the TLS reverse proxy, which always adds `X-Forwarded-For`."""
+        try:
+            peer = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        return (peer.is_loopback or peer in TRUSTED_PROXY_IPS) and "X-Forwarded-For" in self.headers
+
     def do_POST(self) -> None:
         if urllib.parse.urlparse(self.path).path != "/login" or DASHBOARD_LOGIN is None:
             return self.send_body(404, b"not found\n", "text/plain; charset=utf-8",
                                   {"X-Content-Type-Options": "nosniff"})
+        # The password must only cross an encrypted connection, so refuse logins
+        # that reached the plain-HTTP port directly instead of through the proxy.
+        if not self.came_through_proxy():
+            return self.send_body(403, b"log in through the HTTPS dashboard address\n",
+                                  "text/plain; charset=utf-8", {"X-Content-Type-Options": "nosniff"})
         if not LOGIN_RATE_LIMITER.allow(self.rate_limit_client()):
             return self.send_login_page(429, "Too many attempts; wait a minute and try again")
         try:
@@ -4737,6 +4749,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect_home(f"{SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax")
         if parsed.path in PASSWORD_GATED_PAGES or parsed.path.startswith(PASSWORD_GATED_PREFIXES):
             if not self.logged_in():
+                if not self.came_through_proxy():
+                    return self.send_json(401, {"error": "use the HTTPS dashboard address"}, NO_STORE)
                 is_page = parsed.path == "/" or (parsed.path.startswith(("/node/", "/profile/"))
                                                  and "/api/" not in parsed.path)
                 if is_page:

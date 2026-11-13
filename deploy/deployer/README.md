@@ -264,7 +264,8 @@ is separate future work.
 The workflow refreshes a fleet status dashboard on `us-east-0`:
 
 - service: `zakura-mainnet-dashboard.service`
-- URL: `http://159.65.183.89:8090/`
+- URL: `https://status.mainnet.zakura.valargroup.dev/` (Caddy; the server listens on
+  `127.0.0.1:8090` only)
 - install dir: `/opt/zakura-mainnet-dashboard`
 
 The fleet pages (`/`, `/node/*`, `/profile/*`) and their data (`/data*`) need a

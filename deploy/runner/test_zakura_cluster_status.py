@@ -1425,6 +1425,21 @@ class DashboardPasswordTests(unittest.TestCase):
         expired = f"{status.SESSION_COOKIE}={status.DASHBOARD_LOGIN.issue_token(time.time() - status.SESSION_SECONDS - 1)}"
         self.assertEqual(self.get("/data", {"Cookie": expired})[0], 401)
 
+    def test_malformed_cookie_signature_is_refused_not_crashed(self):
+        for token in ("123.\u00e9", "abc.def", "9999999999." + "z" * 64, ""):
+            with self.subTest(token=token):
+                self.assertFalse(status.DASHBOARD_LOGIN.token_valid(token, time.time()))
+        self.assertEqual(self.get("/data", {"Cookie": f"{status.SESSION_COOKIE}=1.%C3%A9"})[0], 401)
+
+    def test_login_over_the_plain_http_port_is_refused(self):
+        request = urllib.request.Request(
+            self.base_url + "/login", method="POST",
+            data=urllib.parse.urlencode({"password": self.PASSWORD}).encode())
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.no_redirect.open(request)
+        self.assertEqual(caught.exception.code, 403)
+        self.assertIsNone(caught.exception.headers["Set-Cookie"])
+
     def test_logout_clears_the_cookie(self):
         code, headers, _ = self.get("/logout")
         self.assertEqual(code, 303)

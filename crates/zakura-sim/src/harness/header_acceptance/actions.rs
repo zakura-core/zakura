@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use super::{
     evaluate::{Actions, End},
-    refs::{ControlRef, LinkRef, PickRef, Ref, SessionRef, StampRef},
+    refs::{ControlRef, LinkRef, PeerNameRef, PickRef, Ref, SessionRef, StampRef},
 };
 use crate::{
     harness::{
@@ -503,8 +503,9 @@ fn session_links(report: &FullReport, fact: &str) -> Vec<LinkRef> {
 /// origin names no link, so its end shows nothing.
 #[derive(Debug, Default)]
 struct Sessions {
-    /// Each peer's links, in first-admission order.
-    links: std::collections::BTreeMap<String, Vec<u64>>,
+    /// Every link the node admitted a session on, once each, in
+    /// first-admission order.
+    links: Vec<LinkRef>,
     /// Each admitted session and its link, in the store's order.
     admitted: Vec<(SessionRef, u64)>,
     /// Each ended session's link and reason, in the store's order.
@@ -544,9 +545,14 @@ impl Sessions {
                 else {
                     continue;
                 };
-                let links = sessions.links.entry(peer.clone()).or_default();
-                if !links.contains(&link) {
-                    links.push(link);
+                // A link is new unless an earlier admission was on its
+                // whole ref, its peer and connection.
+                let opened = LinkRef {
+                    peer: peer.clone(),
+                    connection: link,
+                };
+                if LinkRef::joined(&opened, &sessions.links, |at| Some(at.clone())).is_empty() {
+                    sessions.links.push(opened);
                 }
                 sessions.admitted.push((SessionRef { peer, session }, link));
             } else if fact.starts_with("Ended {") {
@@ -572,12 +578,19 @@ impl Sessions {
             .map(|(_, link)| *link)
     }
 
-    /// `peer`'s `link`th link, if the node admitted that many.
+    /// `peer`'s `link`th link, if the node admitted that many: its links
+    /// joined on the peer's whole [`PeerNameRef`], in first-admission
+    /// order.
     fn link(&self, peer: &str, link: usize) -> Option<LinkRef> {
-        Some(LinkRef {
+        let peer = PeerNameRef {
             peer: peer.to_owned(),
-            connection: *self.links.get(peer)?.get(link)?,
-        })
+        };
+        let own = PeerNameRef::joined(&peer, &self.links, |at| {
+            Some(PeerNameRef {
+                peer: at.peer.clone(),
+            })
+        });
+        own.get(link).map(|at| (*at).clone())
     }
 
     /// How many sessions on `link` the node ended for `reason`.
@@ -589,17 +602,7 @@ impl Sessions {
     /// Whether the node admitted a session on `link`, joined by its whole
     /// ref, its peer and connection: what shows a redial's link.
     fn opened(&self, link: &LinkRef) -> bool {
-        let opened: Vec<LinkRef> = self
-            .links
-            .iter()
-            .flat_map(|(peer, links)| {
-                links.iter().map(|&connection| LinkRef {
-                    peer: peer.clone(),
-                    connection,
-                })
-            })
-            .collect();
-        !LinkRef::joined(link, &opened, |at| Some(at.clone())).is_empty()
+        !LinkRef::joined(link, &self.links, |at| Some(at.clone())).is_empty()
     }
 }
 
@@ -1272,6 +1275,61 @@ mod tests {
             judge(&declared, &trace, &report, &End::Completed, false),
             Actions::Complete
         );
+    }
+
+    /// A session's admission opens a new link unless an earlier admission
+    /// was on its whole link (Rule 25's template): after `a` on 7 and `b`
+    /// on 8, a third admission on `a`'s link 7 adds none, and the same
+    /// admission with only its peer or only its connection moved adds one.
+    #[test]
+    fn an_admission_joins_its_earlier_link_whole() {
+        let report = |probe: &LinkRef| {
+            let admitted = |peer: &str, session: u64, connection: u64| {
+                format!(
+                    "SessionAdmitted {{ peer: \"{peer}\", session_id: {session}, origin: \
+                     Some(SessionOrigin {{ connection: {connection} }}) }}"
+                )
+            };
+            let facts = format!(
+                "[{}, {}, {}]",
+                admitted("a", 1, 7),
+                admitted("b", 2, 8),
+                admitted(&probe.peer, 3, probe.connection)
+            );
+            FullReport::new(
+                &[],
+                Some(json!([{"store": "sessions", "snapshot": {"facts": facts}}])),
+            )
+        };
+        let earlier = LinkRef {
+            peer: "a".to_owned(),
+            connection: 7,
+        };
+        let keys = assert_one_key_off::<LinkRef>(&earlier, |probe| {
+            Sessions::of(&report(probe)).links.len() == 2
+        });
+        assert_eq!(keys, 2);
+    }
+
+    /// A peer's links are the node's links on the peer's whole name (Rule
+    /// 25's template): in the close-relink-close history, each peer's
+    /// first link is found by its own name, and by no other.
+    #[test]
+    fn a_peer_s_links_join_its_whole_name() {
+        let (_, report, _) = close_relink_close();
+        let sessions = Sessions::of(&report);
+        let peers: std::collections::BTreeSet<String> =
+            sessions.links.iter().map(|at| at.peer.clone()).collect();
+        assert!(peers.len() > 1, "{sessions:?}");
+        for peer in peers {
+            let first = sessions
+                .link(&peer, 0)
+                .expect("each linked peer has a first link");
+            let keys = assert_one_key_off::<PeerNameRef>(&PeerNameRef { peer }, |want| {
+                sessions.link(&want.peer, 0).as_ref() == Some(&first)
+            });
+            assert_eq!(keys, 1);
+        }
     }
 
     /// A session's end takes the link its admission names, joined by the

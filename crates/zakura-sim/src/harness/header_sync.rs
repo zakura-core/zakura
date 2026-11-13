@@ -1229,7 +1229,8 @@ impl Subsystem for Storage {
     type Prepared = Ports;
 
     /// [`storage_config`], with the scenario's own budget if it names one,
-    /// or else [`RECOVERY_BUDGET`] for a scenario with a `Recover` step.
+    /// or else [`RECOVERY_BUDGET`] for a scenario with a `Recover` step,
+    /// which [`Self::prepare`] refuses to combine with its own budget.
     fn config(scenario: &StorageScenario) -> RunConfig {
         let config = storage_config();
         RunConfig {
@@ -1253,7 +1254,10 @@ impl Subsystem for Storage {
     /// hdr-13's loss path, which only a typed scenario takes: the control
     /// source offers it from the `recovered` pick on, and the grammar can't
     /// encode it. Also if the policy declares a disruption with no `Recover`
-    /// step to disrupt.
+    /// step to disrupt, or a scenario with a `Recover` step sets its own
+    /// budget: recovery's prefix cutoff and finish check stay at their
+    /// fixed steps, so a smaller budget can end the run before `Recover` is
+    /// offered and a larger one still stops at [`RECOVERY_BUDGET`].
     fn prepare(scenario: &StorageScenario) -> Ports {
         let triggers = scenario
             .policy
@@ -1321,6 +1325,12 @@ impl Subsystem for Storage {
             }) {
                 panic!("a recover can't follow {before:?}");
             }
+        }
+        if let (Some(budget), Some(_)) = (scenario.budget, recovery_source(scenario)) {
+            panic!(
+                "a scenario with a recover keeps recovery's own step limits, but it sets a \
+                 budget of {budget}"
+            );
         }
         if recovery_source(scenario).is_none() && !scenario.policy.disruptions.is_empty() {
             panic!(
@@ -3032,6 +3042,23 @@ impl OperationIds {
 mod tests {
     use super::*;
     use crate::observe::{StorageRequest, StorageResult};
+
+    /// A storage scenario with a `Recover` step can't set its own budget,
+    /// since recovery's prefix cutoff and finish check stay fixed.
+    #[test]
+    #[should_panic(expected = "keeps recovery's own step limits")]
+    fn a_recovery_scenario_cant_set_its_own_budget() {
+        let scenario = StorageScenario {
+            controls: vec![ControlStep {
+                peer: "mirror-0".to_owned(),
+                action: ControlAction::Recover,
+                when: None,
+            }],
+            budget: Some(1_000),
+            ..StorageScenario::default()
+        };
+        let _ = Storage::prepare(&scenario);
+    }
 
     /// A wire scenario's own budget replaces the harness's, burst or not,
     /// and an unset one is left out of the JSON, so every committed

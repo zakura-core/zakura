@@ -3316,7 +3316,11 @@ impl ZakuraProtocolHandler {
     /// `Acceptor::handle` calls this synchronously, before the transport
     /// releases the connection's pending count, so no admission decision sees
     /// the IP uncounted.
-    fn claim_inbound(&self, connection: &Connection, transfer: bool) -> Option<InboundClaim> {
+    fn claim_inbound(
+        &self,
+        connection: &Connection,
+        transfer: bool,
+    ) -> Result<InboundClaim, InboundRefusal> {
         #[cfg(zakura_sim)]
         self.observe_handshake_slot(connection);
         transport_observe!(
@@ -3330,8 +3334,12 @@ impl ZakuraProtocolHandler {
                 elapsed: None,
             }
         );
-        let admission = self.claim_connection(true)?;
-        let pending = self.claim_pending_handshake_with_transfer(true, transfer)?;
+        let admission = self
+            .claim_connection(true)
+            .ok_or(InboundRefusal::Admission)?;
+        let pending = self
+            .claim_pending_handshake_with_transfer(true, transfer)
+            .ok_or(InboundRefusal::PendingHandshake)?;
         let control_handshake = self
             .supervisor
             .enter_control_handshake(connection.admitted_ip());
@@ -3344,44 +3352,29 @@ impl ZakuraProtocolHandler {
             control_handshake.observation = observation;
             (admission, control_handshake)
         };
-        Some(InboundClaim {
+        Ok(InboundClaim {
             pending,
             _admission: admission,
             control_handshake,
         })
     }
 
-    async fn serve_inbound(&self, connection: Connection, claim: Option<InboundClaim>) {
+    async fn serve_inbound(
+        &self,
+        connection: Connection,
+        claim: Result<InboundClaim, InboundRefusal>,
+    ) {
         let conn_id = trace_conn_id(&connection);
-        let Some(InboundClaim {
-            pending,
-            _admission,
-            control_handshake,
-        }) = claim
-        else {
-            metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
-            #[cfg(any(test, zakura_sim))]
-            self.handshake_refused(&connection, "admission");
-            let conn = ZakuraConnTrace::without_peer_on(&self.trace, conn_id);
-            conn.trace_connection(
-                "rejected.admission",
-                None,
-                Some("inbound"),
-                Some("admission"),
-            );
-            connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"admission");
-            transport_observe!(
-                self.transport_observer,
-                super::TransportEvent::Handshake {
-                    remote: connection.admitted_addr(),
-                    shared_id: connection.shared_id(),
-                    stage: "released",
-                    validation: None,
-                    error: None,
-                    elapsed: None,
-                }
-            );
-            return;
+        let (pending, _admission, control_handshake) = match claim {
+            Ok(InboundClaim {
+                pending,
+                _admission,
+                control_handshake,
+            }) => (pending, _admission, control_handshake),
+            Err(refusal) => {
+                self.refuse_inbound(&connection, conn_id, refusal);
+                return;
+            }
         };
 
         let remote_node_id = connection.remote_id();
@@ -3400,19 +3393,11 @@ impl ZakuraProtocolHandler {
                 &connection,
                 &remote_peer_id,
                 &conn,
-                Some(pending),
+                pending,
             )
             .await
         {
             Ok(negotiated) => negotiated,
-            Err(ZakuraHandlerError::ResourceLimit("pending handshake")) => {
-                #[cfg(any(test, zakura_sim))]
-                self.handshake_refused(
-                    &connection,
-                    ZakuraHandlerError::ResourceLimit("pending handshake"),
-                );
-                return;
-            }
             Err(error) => {
                 debug!(?error, "Zakura control handshake failed");
                 #[cfg(any(test, zakura_sim))]
@@ -3466,6 +3451,42 @@ impl ZakuraProtocolHandler {
         if let Err(error) = result {
             debug!(?error, "inbound Zakura connection ended with an error");
         }
+    }
+
+    /// Closes an inbound connection whose claim found no room, and counts the
+    /// refusal under the budget that was full.
+    fn refuse_inbound(&self, connection: &Connection, conn_id: u64, refusal: InboundRefusal) {
+        let (label, error) = match refusal {
+            InboundRefusal::Admission => {
+                metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
+                ("admission", ADMISSION_LIMIT)
+            }
+            InboundRefusal::PendingHandshake => {
+                metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
+                ("pending_handshake", PENDING_HANDSHAKE_LIMIT)
+            }
+        };
+        #[cfg(any(test, zakura_sim))]
+        match refusal {
+            InboundRefusal::Admission => self.handshake_refused(connection, label),
+            InboundRefusal::PendingHandshake => {
+                self.handshake_refused(connection, ZakuraHandlerError::ResourceLimit(error))
+            }
+        }
+        let conn = ZakuraConnTrace::without_peer_on(&self.trace, conn_id);
+        conn.trace_connection("rejected.admission", None, Some("inbound"), Some(label));
+        connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), error.as_bytes());
+        transport_observe!(
+            self.transport_observer,
+            super::TransportEvent::Handshake {
+                remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
+                stage: "released",
+                validation: None,
+                error: None,
+                elapsed: None,
+            }
+        );
     }
 
     /// Claims connection permits and their machine charge as one transition.
@@ -3530,24 +3551,8 @@ impl ZakuraProtocolHandler {
         connection: &Connection,
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
-        permits: Option<PendingHandshakeGuard>,
+        _handshake: PendingHandshakeGuard,
     ) -> Result<(NativeHandshakeNegotiated, u64), ZakuraHandlerError> {
-        // The shared permit is taken only once the inbound one is held, so a
-        // refused inbound handshake never holds a slot a dial needs.
-        let Some(_handshake) = permits else {
-            metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
-            conn.trace_connection(
-                "rejected.admission",
-                None,
-                Some("inbound"),
-                Some("pending_handshake"),
-            );
-            connection.close(
-                VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
-                b"pending handshake",
-            );
-            return Err(ZakuraHandlerError::ResourceLimit("pending handshake"));
-        };
         #[cfg(any(test, zakura_sim))]
         let _handshake = {
             let mut guard = _handshake;
@@ -5085,11 +5090,20 @@ impl Acceptor for ZakuraProtocolHandler {
     fn handle(&self, connection: Connection) -> BoxFuture<'static, ()> {
         let handler = self.clone();
         let claim = handler.claim_inbound(&connection, true);
-        if claim.is_none() {
+        if claim.is_err() {
             handler.finish_admission(false);
         }
         Box::pin(async move { handler.serve_inbound(connection, claim).await })
     }
+}
+
+/// The budget an inbound claim found full.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundRefusal {
+    /// The connection cap or its inbound share.
+    Admission,
+    /// The pending-handshake budget or its inbound share.
+    PendingHandshake,
 }
 
 /// An inbound connection's share of the connection cap and its per-IP control
@@ -5929,7 +5943,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
     let (negotiated, capability_epoch) = {
         let _handshake = sim_chain!(endpoint.handler
             .claim_pending_handshake(false)
-            .ok_or(ZakuraHandlerError::ResourceLimit("pending handshake"))
+            .ok_or(ZakuraHandlerError::ResourceLimit(PENDING_HANDSHAKE_LIMIT))
             => inspect_err(|error| endpoint.handler.handshake_refused(&connection, error)))?;
         #[cfg(any(test, zakura_sim))]
         let _handshake = {
@@ -8427,6 +8441,7 @@ pub enum ZakuraHandlerError {
 /// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the admission
 /// semaphore is full, before it sends any packet.
 const ADMISSION_LIMIT: &str = "admission";
+const PENDING_HANDSHAKE_LIMIT: &str = "pending handshake";
 /// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the transport
 /// cannot fit the dial under its connection ceiling, before any packet
 /// (zakura-quic ADM-12).
@@ -14898,8 +14913,11 @@ mod tests {
             .iter()
             .map(|connection| handler.claim_inbound(connection, false))
             .collect();
-        assert!(claims.iter().all(Option::is_some));
-        assert!(handler.claim_inbound(&inbound[3], false).is_none());
+        assert!(claims.iter().all(Result::is_ok));
+        assert!(matches!(
+            handler.claim_inbound(&inbound[3], false),
+            Err(InboundRefusal::Admission)
+        ));
         assert_eq!(handler.admission.available_permits(), 1);
         drop(claims);
         assert_eq!(handler.inbound_admission.available_permits(), 3);
@@ -14917,7 +14935,9 @@ mod tests {
                         &connection,
                         &peer,
                         &conn,
-                        handler.claim_pending_handshake(true),
+                        handler
+                            .claim_pending_handshake(true)
+                            .expect("the inbound handshake share has room"),
                     )
                     .await
                     .map(|_| ())
@@ -14937,18 +14957,19 @@ mod tests {
         assert_eq!(handler.inbound_handshakes.available_permits(), 3);
         assert_eq!(handler.pending_handshakes.available_permits(), 4);
 
-        // With the inbound share full, a responder handshake is refused
-        // without taking a shared slot.
+        // With the inbound share full, an inbound claim is refused for its
+        // pending handshake without keeping a connection or shared slot.
         let full = handler
             .inbound_handshakes
             .clone()
             .try_acquire_many_owned(3)
             .expect("the test holds free permits");
         assert!(matches!(
-            responder(inbound[4].clone()).await,
-            Err(ZakuraHandlerError::ResourceLimit("pending handshake"))
+            handler.claim_inbound(&inbound[4], false),
+            Err(InboundRefusal::PendingHandshake)
         ));
         assert_eq!(handler.pending_handshakes.available_permits(), 4);
+        assert_eq!(handler.admission.available_permits(), 4);
         drop(full);
         Ok(())
     }

@@ -397,8 +397,11 @@ pub struct Config {
     /// Zakura dials the addresses of the last lookup that worked.
     ///
     /// Each dialed entry gets its own connection slot, outside the outbound connection
-    /// limit. Zakura still applies the inbound and per-IP connection limits to these
-    /// peers, and still disconnects them on protocol errors or inbound overload.
+    /// limit. Zakura also keeps one inbound connection slot for each dialed entry, out
+    /// of the inbound connection limit, so the peer can connect while other peers fill
+    /// every public slot. A CIDR range of several addresses keeps no slot. Zakura still
+    /// applies the per-IP connection limit to these peers, and still disconnects them
+    /// on protocol errors or inbound overload.
     ///
     /// Entries match legacy peer IP addresses, and only the legacy P2P stack dials them.
     /// An IPv4 entry also matches the IPv4-mapped IPv6 form of the same address. The
@@ -509,6 +512,10 @@ impl Config {
     /// These connections are counted separately from
     /// [`peerset_outbound_connection_limit`](Self::peerset_outbound_connection_limit), so
     /// a full outbound peer set never blocks them.
+    ///
+    /// The inbound listener keeps as many of the connections in
+    /// [`peerset_inbound_connection_limit`](Self::peerset_inbound_connection_limit) for
+    /// these peers.
     pub fn unconditional_peer_connection_limit(&self) -> usize {
         self.unconditional_peers.dial_limit()
     }

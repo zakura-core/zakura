@@ -844,6 +844,10 @@ const MIN_INBOUND_ACCEPT_BURST_INTERVAL: Duration = Duration::from_millis(100);
 /// Limits the number of active inbound connections based on `config`,
 /// and waits `min_inbound_peer_connection_interval` between connections.
 ///
+/// Keeps one of those connections for each unconditional peer that Zakura keeps
+/// connected, see [`UnconditionalPeerSet::is_kept_connected`]. Other peers cannot use
+/// them, so such a peer can connect while the public connections are all taken.
+///
 /// A bounded accept burst drains connections that are already queued by the
 /// kernel. Without it, the normal one-second handshake pacing can keep a full
 /// listen backlog from ever reaching a configured local sidecar connection.
@@ -880,9 +884,29 @@ where
     let zcashd_compat_reserved_slots = usize::from(
         !zcashd_compat_peer_ips.is_empty() && config.peerset_inbound_connection_limit() > 0,
     );
+    // One slot for each unconditional peer that Zakura keeps connected, so that
+    // peer can connect while ordinary peers fill every public slot. The reserved and
+    // public slots add up to the inbound limit.
+    let unconditional_reserved_slots = config.unconditional_peer_connection_limit().min(
+        config
+            .peerset_inbound_connection_limit()
+            .saturating_sub(zcashd_compat_reserved_slots),
+    );
+    let mut active_unconditional_connections = ActiveConnectionCounter::new_counter_with(
+        unconditional_reserved_slots,
+        "Unconditional Peer Inbound Connections",
+    );
     let public_inbound_connection_limit = config
         .peerset_inbound_connection_limit()
-        .saturating_sub(zcashd_compat_reserved_slots);
+        .saturating_sub(zcashd_compat_reserved_slots)
+        .saturating_sub(unconditional_reserved_slots);
+    if unconditional_reserved_slots > 0 {
+        info!(
+            unconditional_reserved_slots,
+            public_inbound_connection_limit,
+            "keeping inbound connection slots for unconditional peers"
+        );
+    }
 
     let mut handshakes: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send>>> =
         FuturesUnordered::new();
@@ -930,8 +954,11 @@ where
             let active_public_inbound_connections = active_inbound_connections.update_count();
             let active_zcashd_compat_inbound_connections =
                 active_zcashd_compat_connections.update_count();
-            let active_total_inbound_connections =
-                active_public_inbound_connections + active_zcashd_compat_inbound_connections;
+            let active_unconditional_inbound_connections =
+                active_unconditional_connections.update_count();
+            let active_total_inbound_connections = active_public_inbound_connections
+                + active_zcashd_compat_inbound_connections
+                + active_unconditional_inbound_connections;
             let canonical_ip = canonical_socket_addr(addr.remove_socket_addr_privacy()).ip();
             let is_zcashd_compat_peer = zcashd_compat_peer_ips.contains(&canonical_ip);
             let connection_tracker = if is_zcashd_compat_peer {
@@ -949,6 +976,12 @@ where
                 }
 
                 active_zcashd_compat_connections.track_connection()
+            } else if unconditional_peers.is_kept_connected(addr.ip())
+                && active_unconditional_inbound_connections < unconditional_reserved_slots
+            {
+                // The peer takes a reserved slot. When those are all taken, it competes
+                // for a public slot below, like a peer in an unconditional range.
+                active_unconditional_connections.track_connection()
             } else if active_public_inbound_connections >= public_inbound_connection_limit
                 || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
                 // An unconditional peer that lost its connection may reconnect at once.

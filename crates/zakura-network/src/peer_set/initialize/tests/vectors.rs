@@ -15,7 +15,8 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    future::Future,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -27,8 +28,8 @@ use chrono::Utc;
 use futures::{channel::mpsc, future, FutureExt, StreamExt};
 use indexmap::IndexSet;
 use tokio::{
-    io::AsyncWriteExt,
-    net::{TcpSocket, TcpStream},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpSocket, TcpStream},
     task::{JoinError, JoinHandle},
 };
 use tower::{service_fn, Layer, Service, ServiceExt};
@@ -2909,6 +2910,160 @@ async fn listener_unconditional_peer_reconnect_bypasses_recent_ip_limit() {
     }
 }
 
+/// The listener keeps one inbound slot for each unconditional peer that Zakura keeps
+/// connected, whether it is listed by address or is an address that a listed name
+/// resolves to. Other peers cannot take those slots, a peer in a listed range has none,
+/// and the reserved slots never add to the inbound limit.
+#[tokio::test]
+async fn listener_keeps_inbound_slots_for_dialed_unconditional_peers() {
+    let _init_guard = zakura_test::init();
+
+    if zakura_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    // The two kinds of peer need different IP addresses, and every machine has one IPv4
+    // and one IPv6 localhost address.
+    if zakura_test::net::zebra_skip_ipv6_tests() {
+        return;
+    }
+
+    let public_ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+    let unconditional_ip: IpAddr = Ipv6Addr::LOCALHOST.into();
+
+    // The inbound limit is 3 in every case.
+    for (listed, resolved, zcashd_compat_peer_ips, expected_public, expected_unconditional) in [
+        // No reserved slot: the unconditional peer finds the public slots full.
+        ("[]", None, vec![], 3, 0),
+        // One slot for a peer listed by address.
+        ("['::1']", None, vec![], 2, 1),
+        // One slot for the address that a listed name resolves to.
+        ("['peer.example.com:8233']", Some("::1"), vec![], 2, 1),
+        // The slot of another listed address is not for a peer in a listed range.
+        ("['192.0.2.1', '::/127']", None, vec![], 2, 0),
+        // More listed addresses than inbound slots: every slot is reserved, and no more.
+        (
+            "['::1', '192.0.2.1', '192.0.2.2', '192.0.2.3']",
+            None,
+            vec![],
+            0,
+            3,
+        ),
+        // The zcashd-compat slot is reserved first.
+        (
+            "['::1', '192.0.2.1', '192.0.2.2', '192.0.2.3']",
+            None,
+            vec![ip_addr("192.0.2.9")],
+            0,
+            2,
+        ),
+    ] {
+        let (accepted_tx, mut accepted_rx) = mpsc::unbounded();
+        let (tcp_listener, config, unconditional_peers) =
+            open_listener_for_unconditional_peers(listed, resolved).await;
+        let inbound_limit = config.peerset_inbound_connection_limit();
+        let listen_port = config.listen_addr.port();
+        let (peerset_tx, _peerset_rx) = mpsc::channel::<DiscoveredPeer>(inbound_limit * 2);
+
+        let listen_task_handle = tokio::spawn(accept_inbound_connections(
+            config,
+            tcp_listener,
+            MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
+            tower::util::BoxCloneService::new(open_inbound_handshaker(accepted_tx)),
+            peerset_tx,
+            BannedIps::default(),
+            zcashd_compat_peer_ips,
+            unconditional_peers,
+        ));
+
+        // Offer one more connection of each kind than the listener has slots.
+        let mut open_connections = Vec::new();
+        let mut accepted_public = 0;
+        for _ in 0..=inbound_limit {
+            if let Some(connection) =
+                offer_inbound_connection(public_ip, listen_port, &mut accepted_rx).await
+            {
+                accepted_public += 1;
+                open_connections.push(connection);
+            }
+        }
+        let mut accepted_unconditional = 0;
+        for _ in 0..=inbound_limit {
+            if let Some(connection) =
+                offer_inbound_connection(unconditional_ip, listen_port, &mut accepted_rx).await
+            {
+                accepted_unconditional += 1;
+                open_connections.push(connection);
+            }
+        }
+
+        assert_eq!(
+            (accepted_public, accepted_unconditional),
+            (expected_public, expected_unconditional),
+            "unexpected ordinary and unconditional connections with \
+             unconditional_peers = {listed}, resolved: {resolved:?}",
+        );
+
+        listen_task_handle.abort();
+    }
+}
+
+/// An unconditional peer also takes public slots while they are free, so its reserved
+/// slot is not all it can use.
+#[tokio::test]
+async fn listener_lets_unconditional_peers_use_free_public_slots() {
+    let _init_guard = zakura_test::init();
+
+    if zakura_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    if zakura_test::net::zebra_skip_ipv6_tests() {
+        return;
+    }
+
+    let public_ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+    let unconditional_ip: IpAddr = Ipv6Addr::LOCALHOST.into();
+
+    let (accepted_tx, mut accepted_rx) = mpsc::unbounded();
+    let (tcp_listener, config, unconditional_peers) =
+        open_listener_for_unconditional_peers("['::1']", None).await;
+    let inbound_limit = config.peerset_inbound_connection_limit();
+    let listen_port = config.listen_addr.port();
+    let (peerset_tx, _peerset_rx) = mpsc::channel::<DiscoveredPeer>(inbound_limit * 2);
+
+    let listen_task_handle = tokio::spawn(accept_inbound_connections(
+        config,
+        tcp_listener,
+        MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
+        tower::util::BoxCloneService::new(open_inbound_handshaker(accepted_tx)),
+        peerset_tx,
+        BannedIps::default(),
+        Vec::new(),
+        unconditional_peers,
+    ));
+
+    let mut open_connections = Vec::new();
+    for connection in 0..inbound_limit {
+        open_connections.push(
+            offer_inbound_connection(unconditional_ip, listen_port, &mut accepted_rx)
+                .await
+                .unwrap_or_else(|| panic!("connection {connection} has a free slot")),
+        );
+    }
+
+    for source_ip in [unconditional_ip, public_ip] {
+        assert!(
+            offer_inbound_connection(source_ip, listen_port, &mut accepted_rx)
+                .await
+                .is_none(),
+            "every inbound slot is taken, so {source_ip} is turned away",
+        );
+    }
+
+    listen_task_handle.abort();
+}
+
 /// Test configured zcashd-compat reconnects bypass the normal
 /// successful-handshake delay.
 #[tokio::test]
@@ -4282,6 +4437,126 @@ async fn spawn_boxed_crawler_with_peer_limit(
     );
 
     (config, discovered_peers)
+}
+
+/// Connects to the listener on `listen_port` from the loopback address `source_ip`.
+async fn connect_from_loopback(source_ip: IpAddr, listen_port: u16) -> TcpStream {
+    let socket = match source_ip {
+        IpAddr::V4(_) => TcpSocket::new_v4(),
+        IpAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .expect("test should create a TCP socket");
+    socket
+        .bind(SocketAddr::new(source_ip, 0))
+        .expect("test should bind to a loopback source address");
+    socket
+        .connect(SocketAddr::new(source_ip, listen_port))
+        .await
+        .expect("test should connect to the inbound listener")
+}
+
+/// An inbound connection that the listener accepted: the peer's side, the listener's
+/// side, and the tracker that the listener gave the handshake.
+type AcceptedInboundConnection = (TcpStream, TcpStream, ConnectionTracker);
+
+/// Opens a dual-stack listener with 3 inbound slots for a node that lists
+/// `unconditional_peers`, written as a TOML array, and whose listed names resolve to
+/// `resolved`.
+///
+/// IPv4 peers arrive at a dual-stack listener as IPv4-mapped addresses, so tests can
+/// connect from two addresses on any machine: `127.0.0.1` and `::1`. Each address can
+/// open any number of connections.
+async fn open_listener_for_unconditional_peers(
+    unconditional_peers: &str,
+    resolved: Option<&str>,
+) -> (TcpListener, Config, UnconditionalPeerSet) {
+    let mut config = Config {
+        listen_addr: "[::]:0".parse().unwrap(),
+        peerset_initial_target_size: 1,
+        max_connections_per_ip: usize::MAX,
+        unconditional_peers: toml::from_str::<Config>(&format!(
+            "unconditional_peers = {unconditional_peers}"
+        ))
+        .unwrap()
+        .unconditional_peers,
+        ..test_defaults()
+    };
+    assert_eq!(config.peerset_inbound_connection_limit(), 3);
+
+    let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
+    config.listen_addr = listen_addr;
+
+    let (unconditional_peers, resolved_peers) =
+        UnconditionalPeerSet::new(config.unconditional_peers.clone());
+    resolved_peers.publish(resolved.map(ip_addr));
+
+    (tcp_listener, config, unconditional_peers)
+}
+
+/// Returns a handshaker that succeeds, and sends the listener's side of each
+/// connection to `accepted_tx`, so the connection stays open.
+fn open_inbound_handshaker(
+    accepted_tx: mpsc::UnboundedSender<(TcpStream, ConnectionTracker)>,
+) -> impl Service<
+    HandshakeRequest<TcpStream>,
+    Response = peer::Client,
+    Error = BoxError,
+    Future = impl Future<Output = Result<peer::Client, BoxError>> + Send,
+> + Clone
+       + Send
+       + 'static {
+    service_fn(move |req: HandshakeRequest<TcpStream>| {
+        let accepted_tx = accepted_tx.clone();
+        async move {
+            let HandshakeRequest {
+                data_stream: tcp_stream,
+                connected_addr,
+                connection_tracker,
+            } = req;
+
+            let (fake_client, _harness) = ClientTestHarness::build()
+                .with_connected_addr(connected_addr)
+                .finish();
+
+            accepted_tx
+                .unbounded_send((tcp_stream, connection_tracker))
+                .expect("unexpected error sending to unbounded channel");
+
+            Ok(fake_client)
+        }
+    })
+}
+
+/// Connects to the listener from `source_ip`, and waits until the listener either
+/// hands the connection to its handshaker or closes it.
+///
+/// Returns the connection if the listener accepted it. It keeps its slot until it is
+/// dropped.
+async fn offer_inbound_connection(
+    source_ip: IpAddr,
+    listen_port: u16,
+    accepted_rx: &mut mpsc::UnboundedReceiver<(TcpStream, ConnectionTracker)>,
+) -> Option<AcceptedInboundConnection> {
+    let mut peer_stream = connect_from_loopback(source_ip, listen_port).await;
+
+    let outcome = tokio::time::timeout(LISTENER_TEST_DURATION, async {
+        tokio::select! {
+            accepted = accepted_rx.next() => {
+                let (listener_stream, connection_tracker) =
+                    accepted.expect("the handshaker holds the sender");
+                Some((listener_stream, connection_tracker))
+            }
+            // The listener sends nothing on a connection it keeps, so the read only
+            // finishes when the listener closes the connection.
+            _closed = peer_stream.read_u8() => None,
+        }
+    })
+    .await
+    .expect("the listener accepts or closes every connection");
+
+    outcome.map(|(listener_stream, connection_tracker)| {
+        (peer_stream, listener_stream, connection_tracker)
+    })
 }
 
 async fn connect_from(source_ip: Ipv4Addr, listen_addr: SocketAddr) -> TcpStream {

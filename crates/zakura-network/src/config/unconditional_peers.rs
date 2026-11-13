@@ -85,13 +85,31 @@ impl UnconditionalPeers {
     /// The addresses that configured DNS names resolve to are not known here, see
     /// [`UnconditionalPeerSet::contains`](crate::UnconditionalPeerSet::contains).
     pub fn contains(&self, ip: IpAddr) -> bool {
+        self.contains_in(ip, |_entry| true)
+    }
+
+    /// Returns whether `ip` is the address of an entry that names one address, which
+    /// Zakura dials. An address that is only in a configured range is not.
+    ///
+    /// The addresses that configured DNS names resolve to are not known here, see
+    /// [`UnconditionalPeerSet::is_kept_connected`](crate::UnconditionalPeerSet::is_kept_connected).
+    pub fn is_dial_address(&self, ip: IpAddr) -> bool {
+        self.contains_in(ip, Entry::is_dialed)
+    }
+
+    /// Returns whether `ip` is in a configured address or range whose entry
+    /// `is_included` accepts.
+    fn contains_in(&self, ip: IpAddr, is_included: impl Fn(&Entry) -> bool) -> bool {
         let ip = canonical_ip(ip);
         let mapped_ip = match ip {
             IpAddr::V4(ipv4) => Some(IpAddr::V6(ipv4.to_ipv6_mapped())),
             IpAddr::V6(_) => None,
         };
 
-        self.iter()
+        self.entries
+            .iter()
+            .filter(|entry| is_included(entry))
+            .filter_map(Entry::net)
             .any(|net| net.contains(&ip) || mapped_ip.is_some_and(|ip| net.contains(&ip)))
     }
 

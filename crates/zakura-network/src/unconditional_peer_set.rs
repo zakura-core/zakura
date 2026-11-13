@@ -47,6 +47,13 @@ impl UnconditionalPeerSet {
     pub fn contains(&self, ip: IpAddr) -> bool {
         self.configured.contains(ip) || self.resolved.borrow().contains(&canonical_ip(ip))
     }
+
+    /// Returns whether `ip` is the address of a peer that Zakura keeps connected: a
+    /// configured single address, or an address that a configured DNS name currently
+    /// resolves to. An address that is only in a configured range is not.
+    pub fn is_kept_connected(&self, ip: IpAddr) -> bool {
+        self.configured.is_dial_address(ip) || self.resolved.borrow().contains(&canonical_ip(ip))
+    }
 }
 
 impl From<UnconditionalPeers> for UnconditionalPeerSet {
@@ -127,6 +134,32 @@ mod tests {
         assert!(set.contains(ip("::ffff:192.0.2.1")));
         assert!(set.contains(ip("192.0.2.2")));
         assert!(!set.contains(ip("192.0.2.3")));
+    }
+
+    /// Zakura keeps a peer connected when it is listed as one address, or is an address
+    /// that a listed name currently resolves to. A range is not enough.
+    #[test]
+    fn kept_connected_peers_are_single_addresses_and_resolved_names() {
+        let configured: UnconditionalPeers = ["192.0.2.1/32", "198.51.100.0/24"]
+            .into_iter()
+            .map(|net| net.parse().unwrap())
+            .collect();
+        let (set, resolved_peers) = UnconditionalPeerSet::new(configured);
+
+        assert!(set.is_kept_connected(ip("192.0.2.1")));
+        assert!(set.is_kept_connected(ip("::ffff:192.0.2.1")));
+        assert!(set.contains(ip("198.51.100.7")));
+        assert!(!set.is_kept_connected(ip("198.51.100.7")));
+        assert!(!set.is_kept_connected(ip("203.0.113.1")));
+
+        resolved_peers.publish([ip("203.0.113.1")]);
+        assert!(set.is_kept_connected(ip("203.0.113.1")));
+        assert!(set.is_kept_connected(ip("::ffff:203.0.113.1")));
+
+        // A new resolution replaces the last one.
+        resolved_peers.publish([ip("203.0.113.2")]);
+        assert!(!set.is_kept_connected(ip("203.0.113.1")));
+        assert!(set.is_kept_connected(ip("192.0.2.1")));
     }
 
     /// A set made from a config alone holds its addresses and ranges, and nothing else.

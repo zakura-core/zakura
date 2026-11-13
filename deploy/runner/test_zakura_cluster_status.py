@@ -1678,6 +1678,9 @@ class ProfilerRouteTests(unittest.TestCase):
             "/profile/plain",
             "/profile/plain/api/status",
             "/profile/profiled/api/shutdown",
+            # The profiler's block records name peers by address before any is dropped.
+            "/profile/profiled/api/propagation",
+            "/profile/profiled/api/propagation?limit=5",
             "/profile/profiled/anything",
             "/profile/profiled/api/",
         ):
@@ -1800,11 +1803,16 @@ class PropagationRouteTests(unittest.TestCase):
     """The cluster view against stand-in profilers that each report one block."""
 
     BLOCK = "ab" * 32
+    # Documentation addresses: a peer outside the fleet, and one that must stay private.
+    OUTSIDE = "198.51.100.9"
+    PRIVATE = "192.0.2.17"
 
     def setUp(self):
         import propagation
 
         self.asked = []
+        # What each stand-in profiler says its node downloaded the block from.
+        self.downloads = {}
         self.original = (status.PROPAGATION, status.RATE_LIMITER, status.fetch_profiler)
         heard_first, heard_later = node("heard-first"), node("heard-later")
         down, plain = node("down"), node("plain")
@@ -1826,7 +1834,10 @@ class PropagationRouteTests(unittest.TestCase):
         if profiler_url == "down":
             return 502, b"", "text/plain"
         tip = 1_794_000_000.0 + (0.05 if profiler_url == "first" else 0.25)
-        block = {"hash": self.BLOCK, "height": 7, "path": "legacy", "t": tip, "wall": {"tip": tip}, "peers": {}}
+        block = {
+            "hash": self.BLOCK, "height": 7, "path": "legacy", "t": tip, "wall": {"tip": tip}, "peers": {},
+            "downloads": self.downloads.get(profiler_url, []),
+        }
         return 200, json.dumps({"node": profiler_url, "clock": None, "blocks": [block]}).encode(), "application/json"
 
     def fetch(self, path):
@@ -1846,6 +1857,67 @@ class PropagationRouteTests(unittest.TestCase):
         (block,) = joined["blocks"]
         self.assertEqual((block["hash"], block["first_node"], block["spread_ms"]), (self.BLOCK, "heard-first", 200.0))
 
+    @staticmethod
+    def download(addr, ms=420, agent="/Zakura:1.8.7/"):
+        return {"stack": "legacy", "addr": addr, "agent": agent, "ms": ms, "result": "available", "route": "ready"}
+
+    def test_a_download_names_an_outside_peer_and_a_fleet_node(self):
+        self.downloads = {
+            "first": [self.download(self.OUTSIDE)],
+            # `heard-first` is reached at this address, so the peer is one of ours.
+            "later": [self.download("203.0.113.5", ms=30)],
+        }
+        status.PROPAGATION.fleet_addresses = {"203.0.113.5": "heard-first"}
+        joined = json.loads(self.fetch("/propagation/data")[1])
+        (peer,) = joined["outside_peers"]
+        self.assertEqual((peer["ip"], peer["agent"], peer["nodes"]), (self.OUTSIDE, "/Zakura:1.8.7/", ["heard-first"]))
+        slowest, fastest = joined["slowest_downloads"]
+        self.assertEqual((slowest["node"], slowest["kind"], slowest["ip"], slowest["ms"]),
+                         ("heard-first", "outside", self.OUTSIDE, 420))
+        self.assertEqual((fastest["node"], fastest["kind"], fastest["name"]), ("heard-later", "fleet", "heard-first"))
+        self.assertNotIn("203.0.113.5", json.dumps(joined))
+
+    def test_every_node_in_the_list_is_one_of_ours_by_its_address(self):
+        named = [node("with-profiler"), node("without")]
+        named[0].ssh_string, named[1].ssh_string = "root@203.0.113.5", "deploy@[2001:db8::7]:22"
+        named[0].profiler_url = "first"
+        view = status.PropagationView(named, None)
+        self.assertEqual(view.fleet_addresses, {"203.0.113.5": "with-profiler", "2001:db8::7": "without"})
+
+    def test_a_private_peer_s_address_and_software_are_never_served(self):
+        private_agent = "/Zakura:9.9.9-private/"
+        self.downloads = {
+            "first": [
+                self.download(self.PRIVATE, ms=900, agent=private_agent),
+                self.download(f"{self.PRIVATE}:8233", ms=800, agent=private_agent),
+                self.download(f"::ffff:{self.PRIVATE}", ms=700, agent=private_agent),
+                self.download(f"[::ffff:{self.PRIVATE}]:8233", ms=600, agent=private_agent),
+            ],
+            "later": [self.download(self.OUTSIDE)],
+        }
+        protected = frozenset({status.address_key(self.PRIVATE)})
+        with mock.patch.object(status, "private_addresses", return_value=protected):
+            code, body, _ = self.fetch("/propagation/data")
+        self.assertEqual(code, 200)
+        for secret in (self.PRIVATE.encode(), b"9.9.9-private", b"redacted-address"):
+            self.assertNotIn(secret, body)
+        joined = json.loads(body)
+        self.assertEqual([peer["ip"] for peer in joined["outside_peers"]], [self.OUTSIDE])
+        # The node's slow downloads are still shown, without saying who served them.
+        private = [d for d in joined["slowest_downloads"] if d["node"] == "heard-first"]
+        self.assertEqual([(d["kind"], d["ms"]) for d in private],
+                         [("private", 900), ("private", 800), ("private", 700), ("private", 600)])
+        self.assertTrue(all("ip" not in d and "agent" not in d for d in private))
+
+    def test_nothing_is_served_when_the_private_addresses_cannot_be_read(self):
+        self.downloads = {"first": [self.download(self.PRIVATE)]}
+        for failure in (ValueError("private address configuration required"), OSError("unreadable")):
+            with mock.patch.object(status, "private_addresses", side_effect=failure):
+                code, body, _ = self.fetch("/propagation/data")
+            self.assertEqual((code, json.loads(body)), (503, {"error": "privacy configuration unavailable"}))
+            self.assertNotIn(self.PRIVATE.encode(), body)
+        self.assertEqual(self.asked, [])
+
     def test_profilers_are_asked_once_for_requests_close_together(self):
         self.fetch("/propagation/data")
         self.fetch("/propagation/data")
@@ -1860,6 +1932,9 @@ class PropagationRouteTests(unittest.TestCase):
         self.assertIn(b'fetch("/propagation/data"', body)
         # A selected block is named in the page address, so it can be linked to.
         self.assertIn(b'"#block=" + hash', body)
+        # The downloads each node made: the slowest ones, and the outside peers that served them.
+        for part in (b'<table id="slowest">', b'<table id="outside">', b'"private peer"'):
+            self.assertIn(part, body)
         # A node's name on the page leads to that node's own page.
         self.assertIn(b'"/node/" + encodeURIComponent(name)', body)
 

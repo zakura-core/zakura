@@ -657,6 +657,65 @@ class TraceFollowingTests(unittest.TestCase):
             },
         )
 
+    def test_every_legacy_download_attempt_is_kept_with_its_peer(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        started = 1794528928.0
+        self.append(
+            "legacy_peer_request",
+            # The first peer did not have the block; its address is hidden by the node.
+            trace_row("block_request_finish", 700_000, result="notfound_response", requested_hash=BLOCK_HASH,
+                      peer="v4redacted:8233", user_agent="/MagicBean:6.2.0/", elapsed_ms=250, route="maybe"),
+            trace_row("block_request_finish", 1_000_000, result="available", requested_hash=BLOCK_HASH,
+                      returned_hash=BLOCK_HASH, returned_height=10, peer="192.0.2.7:8233",
+                      user_agent="/Zakura:1.8.7/", elapsed_ms=40, route="advertised"),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(1_010_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+
+        self.assertEqual(
+            record["downloads"],
+            [
+                {"stack": "legacy", "addr": None, "agent": "/MagicBean:6.2.0/", "ms": 250,
+                 "result": "notfound_response", "route": "maybe", "at": started + 0.7},
+                {"stack": "legacy", "addr": "192.0.2.7", "agent": "/Zakura:1.8.7/", "ms": 40,
+                 "result": "available", "route": "advertised", "at": started + 1.0},
+            ],
+        )  # fmt: skip
+        # The failed attempt does not move the block's own download time.
+        self.assertEqual(record["ms"]["body_download"], 40)
+
+    def test_a_zakura_download_names_the_peer_its_upgrade_row_described(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append(
+            "handshake",
+            trace_row("peer_upgraded", 100_000, peer="peer:aaaa", addr="[::ffff:192.0.2.9]:8233",
+                      user_agent="/Zakura:1.8.6/", direction="outbound"),
+        )  # fmt: skip
+        self.append(
+            "block_sync",
+            trace_row("block_body_received", 950_000, peer="peer:aaaa", height=10, serialized_bytes=1500,
+                      request_elapsed_ms=62),
+            trace_row("block_body_received", 960_000, peer="peer:bbbb", height=10, serialized_bytes=1500),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(1_000_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+
+        known, unknown = record["downloads"]
+        self.assertEqual(
+            {key: known[key] for key in ("stack", "peer", "addr", "agent", "ms", "bytes", "result")},
+            {"stack": "zakura", "peer": "peer:aaaa", "addr": "192.0.2.9", "agent": "/Zakura:1.8.6/", "ms": 62,
+             "bytes": 1500, "result": "available"},
+        )  # fmt: skip
+        # A peer with no upgrade row on record keeps its label and nothing else.
+        self.assertEqual((unknown["peer"], unknown["addr"], unknown["agent"], unknown["ms"]), ("peer:bbbb", None, None, None))
+
+    def test_a_peer_address_is_read_in_every_form_the_node_writes(self):
+        self.assertEqual(blocks.peer_ip("192.0.2.7:8233"), "192.0.2.7")
+        self.assertEqual(blocks.peer_ip("[2001:db8::7]:8233"), "2001:db8::7")
+        self.assertEqual(blocks.peer_ip("[::ffff:192.0.2.7]:8233"), "192.0.2.7")
+        for hidden in ("v4redacted:8233", "v6redacted:8233", "isolated", "", None):
+            self.assertIsNone(blocks.peer_ip(hidden), hidden)
+
     def test_a_run_whose_start_time_cannot_be_read_has_no_wall_clock_times(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
         self.append(
@@ -820,6 +879,17 @@ class ApiTests(unittest.TestCase):
         # The node log's time for the same block, to check the trace clock against.
         self.assertEqual(block["t"], 100.051)
         self.assertEqual(self.get("/api/propagation?limit=many")[0], 400)
+
+    def test_peer_addresses_are_served_to_the_cluster_view_only(self):
+        download = {"stack": "legacy", "addr": "192.0.2.7", "agent": "/Zakura:1.8.7/", "ms": 40, "result": "available"}
+        self.queries.store.add_block_stages(
+            [{**stage_record(9, "ab" * 32), "wall": {"tip": 100.05}, "downloads": [download]}]
+        )
+        self.queries.store.add_blocks([(100.051, 9, "ab" * 32)])
+        (block,) = json.loads(self.get("/api/propagation?limit=50")[1])["blocks"]
+        self.assertEqual(block["downloads"], [download])
+        # `/api/blocks` is one of the requests the dashboard passes on to the public.
+        self.assertNotIn(b"192.0.2.7", self.get("/api/blocks?limit=50")[1])
 
     def test_the_clock_offset_is_read_from_chrony(self):
         tracking = (

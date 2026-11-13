@@ -45,6 +45,14 @@ status dashboard reads them from every node and joins them into the block
 propagation page (`deploy/runner/README.md`). That request is for the
 dashboard only and is not among those it passes through to the public.
 
+**Who served each block.** Each record also lists the node's attempts to
+download the block, up to 16: the network stack, how long the attempt took,
+how it ended, and the peer's software as its handshake gave it. When the node
+writes peer addresses (`expose_peer_addresses`, below) an attempt also has the
+peer's IP address; otherwise the address is absent. These addresses are every
+peer's, with nothing left out, which is why `/api/propagation` is not passed
+through: the dashboard drops the private ones when it joins the nodes.
+
 ## Staying out of the node's way
 
 - Parsing, storage and serving run at idle scheduling priority and idle I/O
@@ -108,10 +116,19 @@ python3 deploy/profiler/fleet.py tunnels --config nodes.toml
 
 **`ensure-trace-config`** reads the config file named on the node's service
 command line and adds `trace_dir = "/mnt/data/zakura-traces"` under
-`[network.zakura]` when the config sets no `trace_dir`. It changes nothing else,
+`[network.zakura]` when the config sets no `trace_dir`, and
+`expose_peer_addresses = true` under `[network]` when the config does not set
+it. It changes nothing else,
 keeps the first original as `<config>.before-trace-dir`, and does not restart
-the node: the setting takes effect when the node next starts. A config that
-already names a trace directory is left as it is.
+the node: the settings take effect when the node next starts. A config that
+already names a trace directory keeps it, and one that sets
+`expose_peer_addresses = false` keeps that and is reported.
+
+With `expose_peer_addresses` on, the node writes its peers' real addresses,
+where it wrote `v4redacted` before, in two places on its own disk: its log
+file and its trace files. Both are readable by root only. Nothing else on the
+node changes, and no address leaves the node except through the profiler's
+`/api/propagation`, which only the dashboard host can reach.
 
 **`peer-names`** writes a systemd drop-in for the node's own service
 (`<service>.service.d/trace-peer-names.conf`) that sets

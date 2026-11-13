@@ -10,6 +10,7 @@ from its header arriving to its peers being told.
 
 import calendar
 import collections
+import ipaddress
 import json
 import os
 import re
@@ -102,6 +103,7 @@ TRACE_TABLES = {
     "block_sync": ("block_get_blocks_sent", "block_body_received", "block_body_submitted", "block_status_sent"),
     "legacy_peer_request": ("block_request_finish",),
     "legacy_gossip": ("block_inv_received", "block_inv_sent", "block_getdata_received", "block_sent"),
+    "handshake": ("peer_upgraded",),
     "commit_state": ("commit_start", "commit_finish"),
     "chain_tip": ("tip_published",),
 }
@@ -120,6 +122,10 @@ PEER_STEPS = {
 # the node writes for it (`peer:<hash of its node id>`). Other legacy peers are counted.
 NAMED_PEER = "name:"
 MAX_PEERS_PER_BLOCK = 64
+# A block is normally downloaded once; more than this many attempts are not kept.
+MAX_DOWNLOADS_PER_BLOCK = 16
+# Zakura peers whose address and software are remembered, newest kept.
+MAX_KNOWN_PEERS = 4096
 # A block's record is closed this long (in the node's clock) after its tip was
 # published, which leaves time for the status messages to its peers to be recorded.
 SETTLE_MICROSECONDS = 3_000_000
@@ -183,6 +189,52 @@ def peer_of(row):
         return NAMED_PEER + row["peer_name"]
     peer = row.get("peer")
     return peer if isinstance(peer, str) and peer.startswith("peer:") else None
+
+
+def peer_ip(text):
+    """The IP address in a peer column, or `None` when the node hid it.
+
+    A node writes a peer as `ip:port` (`[ip]:port` for IPv6) only when its
+    `expose_peer_addresses` setting is on, and as `v4redacted:port` otherwise. An IPv4
+    address written in IPv6 form comes back as IPv4, so one peer has one spelling.
+    """
+    if not isinstance(text, str):
+        return None
+    host = text.rsplit(":", 1)[0] if text.count(":") == 1 or text.startswith("[") else text
+    try:
+        address = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return None
+    return str(getattr(address, "ipv4_mapped", None) or address)
+
+
+def note_download(seen, download):
+    """Record in `seen`, one block's events, one attempt to download the block."""
+    downloads = seen.setdefault("downloads", [])
+    if len(downloads) < MAX_DOWNLOADS_PER_BLOCK:
+        downloads.append(download)
+
+
+def block_downloads(attempts, started, zakura_peers):
+    """Every attempt to download one block, oldest first, as the cluster view reads them.
+
+    Each says which network it used (`stack`), the peer's IP address (`addr`, `None`
+    when the node hides addresses), the software the peer says it runs (`agent`), how
+    long the attempt took (`ms`), how it ended (`result`, "available" when the block
+    arrived) and when it ended (`at`, unix seconds, when the run's start is known). A
+    Zakura peer also has its trace label (`peer`) and the block's size (`bytes`); a
+    legacy one says whether the peer had announced the block (`route`).
+    """
+    downloads = []
+    for attempt in sorted(attempts, key=lambda attempt: attempt["when"]):
+        download = {key: value for key, value in attempt.items() if key != "when"}
+        if "peer" in download:
+            # A Zakura row names the peer by label; its upgrade row said who that is.
+            download.update(zakura_peers.get(download["peer"], {"addr": None, "agent": None}))
+        if started is not None:
+            download["at"] = round(started + attempt["when"] / 1e6, 6)
+        downloads.append(download)
+    return downloads
 
 
 def note_peer_step(seen, step, peer, when):
@@ -316,6 +368,8 @@ class BlockStages:
         self._open = []
         self._latest = 0
         self._process = None
+        # What each Zakura peer's upgrade row said about it: `{label: {"addr", "agent"}}`.
+        self._zakura_peers = {}
 
     def feed(self, row):
         """Take one parsed trace row. Rows may arrive in any order across tables."""
@@ -326,6 +380,33 @@ class BlockStages:
             # A restarted node counts time from zero again.
             self._process, self._latest = row.get("process_trace_id"), when
         self._latest = max(self._latest, when)
+        process = row.get("process_trace_id")
+        if event == "peer_upgraded":
+            if isinstance(row.get("peer"), str):
+                self._zakura_peers.pop(row["peer"], None)
+                self._zakura_peers[row["peer"]] = {"addr": peer_ip(row.get("addr")), "agent": row.get("user_agent")}
+                while len(self._zakura_peers) > MAX_KNOWN_PEERS:
+                    del self._zakura_peers[next(iter(self._zakura_peers))]
+            return
+        if event == "block_request_finish" and isinstance(row.get("requested_hash"), str):
+            # Every attempt counts as a download, whether or not the peer had the block.
+            note_download(
+                self._by_hash.setdefault((process, row["requested_hash"]), {}),
+                {
+                    "when": when, "stack": PATH_LEGACY, "addr": peer_ip(row.get("peer")),
+                    "agent": row.get("user_agent"), "ms": row.get("elapsed_ms"),
+                    "result": row.get("result"), "route": row.get("route"),
+                },
+            )  # fmt: skip
+        if event == "block_body_received" and type(row.get("height")) is int:
+            note_download(
+                self._by_height.setdefault((process, row["height"]), {}),
+                {
+                    "when": when, "stack": PATH_ZAKURA, "peer": row.get("peer"),
+                    "ms": row.get("request_elapsed_ms"), "bytes": row.get("serialized_bytes"),
+                    "result": "available",
+                },
+            )  # fmt: skip
         if event == "block_request_finish" and row.get("result") != "available":
             return
         height = row.get("tip_height", row.get("height", row.get("returned_height")))
@@ -336,7 +417,6 @@ class BlockStages:
             # The request names the tip it is fetching toward at the end of its owner.
             found = HASH_IN_TEXT.findall(str(row.get("request_owner", "")))
             block_hash = found[-1] if found else None
-        process = row.get("process_trace_id")
         if event == "header_status_received":
             # A Zakura peer telling us its tip: the row names the tip, not a block of ours.
             block_hash, height = row.get("selected_tip_hash"), None
@@ -387,6 +467,8 @@ class BlockStages:
             # Zakura status rows name a height and announcements a hash, so what a block
             # exchanged with one peer can be split across the two.
             events["peers"] = merged_peers(by_height.get("peers", {}), by_hash.get("peers", {}))
+            # A legacy download names the block by hash and a Zakura one by height.
+            attempts = by_height.get("downloads", []) + by_hash.get("downloads", [])
             # The status messages of this block's fan-out, soonest first.
             told = sorted(
                 when
@@ -401,6 +483,7 @@ class BlockStages:
                     "tip_us": block["tip"],
                     "reorg": block["reorg"],
                     **cluster_times(events, block),
+                    "downloads": block_downloads(attempts, process_started(block["process"]), self._zakura_peers),
                     "path": block_path(events),
                     "size": events.get("size"),
                     "status_peers": len(told),

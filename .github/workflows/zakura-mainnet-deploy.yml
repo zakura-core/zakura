@@ -577,9 +577,12 @@ jobs:
 
       - name: Switch on trace files
         # The profiler reads each node's trace files for per-block timings. This adds
-        # `trace_dir` to a node config that has none and changes nothing else; the
-        # restart in the next step makes the node read it. A node this cannot edit is
-        # reported and deployed as it is.
+        # `trace_dir` to a node config that has none, and `expose_peer_addresses = true`
+        # to one that does not set it, so the trace rows of a block download name the
+        # peer that served it. It changes nothing else; the restart in the next step
+        # makes the node read it. A node this cannot edit is reported and deployed as
+        # it is. The addresses stay on the node: the dashboard host reads them through
+        # its tunnel and drops the private ones before the cluster view is served.
         env:
           NODE: ${{ inputs.node }}
         run: |

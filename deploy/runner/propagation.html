@@ -82,12 +82,16 @@ th { font-weight: 600; color: var(--muted); font-size: 11px; letter-spacing: 0.0
 th.num, td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
 th.num { font-family: inherit; }
 td .quiet { color: var(--muted); }
+td.wrap { white-space: normal; min-width: 200px; max-width: 360px; }
 #blocks td button { all: unset; cursor: pointer; color: var(--pink-hi); font-family: var(--mono); }
 #blocks td button:hover { text-decoration: underline; }
 #blocks td button:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
-#blocks tbody tr { cursor: pointer; }
-#blocks tbody tr:hover td { background: var(--raised); }
-#blocks tr[aria-selected="true"] td { background: var(--pink-soft); }
+#blocks tbody tr, #slowest tbody tr { cursor: pointer; }
+#blocks tbody tr:hover td, #slowest tbody tr:hover td { background: var(--raised); }
+#blocks tr[aria-selected="true"] td, #slowest tr[aria-selected="true"] td { background: var(--pink-soft); }
+#slowest td button { all: unset; cursor: pointer; color: var(--pink-hi); font-family: var(--mono); }
+#slowest td button:hover { text-decoration: underline; }
+#slowest td button:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
 .bar { height: 6px; border-radius: 3px; min-width: 2px; background: var(--c-wait_to_ask); }
 .tooltip {
   position: fixed; z-index: 5; pointer-events: none; background: var(--raised); border: 1px solid var(--line-hi);
@@ -140,6 +144,20 @@ td .quiet { color: var(--muted); }
       <div class="legend"><span class="note">Select a block to see its path. The address then leads to that block.</span>
         <button id="follow" type="button" aria-pressed="true">Follow the newest block</button></div></header>
     <div class="scroll"><table id="blocks"></table></div>
+  </section>
+
+  <section class="panel" id="slowest-panel">
+    <header><h2>Slowest downloads</h2>
+      <span class="note">Single attempts to download a block, over the blocks shown. Select one to see its block.</span></header>
+    <div class="scroll"><table id="slowest"></table></div>
+    <p class="note" id="slowest-note"></p>
+  </section>
+
+  <section class="panel" id="outside-panel">
+    <header><h2>Peers outside the fleet</h2>
+      <span class="note">Every outside peer one of our nodes downloaded a block from, slowest first.</span></header>
+    <div class="scroll"><table id="outside"></table></div>
+    <p class="note" id="outside-note"></p>
   </section>
 
   <section class="panel">
@@ -255,6 +273,42 @@ function nodeLink(name) { return el("a", { class: "node-link", href: nodeHref(na
 // A block's source is one of our nodes or somewhere outside the fleet.
 function sourceLink(name, outside) { return name === "outside" ? outside : nodeLink(name); }
 function nodeCell(name) { return el("td", {}, nodeLink(name)); }
+
+// What a peer says it runs, as its handshake wrote it: "/Zakura:1.8.7/" reads "Zakura 1.8.7".
+function software(agent) {
+  if (!agent) return "unknown software";
+  const parts = agent.split("/").filter(Boolean).map((part) => part.replace(":", " "));
+  return parts.length ? parts.join(", ") : agent;
+}
+// Who served a download: one of our nodes, an outside peer by address, a peer whose address
+// the node did not record, or a peer whose address is kept private.
+function peerName(download) {
+  if (download.kind === "fleet") return nodeLink(download.name);
+  if (download.kind === "outside") return el("span", { class: "mono", text: download.ip });
+  return el("span", { class: "quiet", text: download.kind === "private" ? "private peer" : "address hidden" });
+}
+function peerSoftware(download) {
+  if (download.kind === "fleet") return "one of ours";
+  return download.kind === "private" ? "–" : software(download.agent);
+}
+function outcome(result) {
+  if (result === "available") return "delivered";
+  return result === "missing" ? "did not have it" : String(result).replaceAll("_", " ");
+}
+function bytes(value) {
+  if (value === null || value === undefined) return "–";
+  return value >= 1e6 ? (value / 1e6).toFixed(2) + " MB" : value >= 1e3 ? (value / 1e3).toFixed(1) + " kB" : value + " B";
+}
+// Where a node got one block: the attempt that delivered it, and how many others it made.
+function downloadedFrom(view) {
+  const attempts = view.downloads || [];
+  const delivered = attempts.find((download) => download.result === "available") || attempts[0];
+  if (!delivered) return el("td", {}, el("span", { class: "quiet", text: "–" }));
+  const others = attempts.length - 1;
+  const detail = [peerSoftware(delivered), delivered.result === "available" ? ms(delivered.ms) : outcome(delivered.result)];
+  if (others > 0) detail.push(`${others} other attempt${others === 1 ? "" : "s"}`);
+  return el("td", {}, peerName(delivered), el("span", { class: "quiet", text: " · " + detail.join(" · ") }));
+}
 
 function renderTiles(data) {
   const spreads = data.blocks.filter((block) => Object.keys(block.nodes).length > 1).map((block) => block.spread_ms).sort((a, b) => a - b);
@@ -402,10 +456,12 @@ function renderBlock(data) {
   renderWaterfall(block);
   const names = Object.keys(block.nodes).sort((a, b) => block.nodes[a].at.tip - block.nodes[b].at.tip);
   table(document.getElementById("block-nodes"),
-    [["Node"], ["Stack"], ["First heard from"], ...Object.values(POINT_LABELS).map((label) => [label, true]), ["Clock"]],
+    [["Node"], ["Stack"], ["First heard from"], ["Downloaded from"],
+      ...Object.values(POINT_LABELS).map((label) => [label, true]), ["Clock"]],
     names.map((name) => {
       const view = block.nodes[name];
       return el("tr", {}, nodeCell(name), cell(view.path || "–"), el("td", {}, sourceLink(view.from, "outside")),
+        downloadedFrom(view),
         ...Object.keys(POINT_LABELS).map((point) => cell(ms(view.at[point]), true)),
         cell(view.clock === "log" ? "node log (trace clock was off)" : "trace"));
     }));
@@ -447,6 +503,44 @@ function renderSummary(data) {
     : "No announcement between two of our nodes has been recorded by both ends yet.";
 }
 
+function renderDownloads(data) {
+  const slow = data.slowest_downloads || [];
+  table(document.getElementById("slowest"),
+    [["Took", true], ["Node"], ["Downloaded from"], ["Software"], ["Block"], ["Size", true], ["Stack"], ["Outcome"]],
+    slow.map((download) => {
+      const pick = el("button", { type: "button", text: String(download.height ?? shortHash(download.hash)) });
+      pick.setAttribute("aria-label", `Show block ${download.height ?? shortHash(download.hash)}`);
+      const row = el("tr", { "aria-selected": download.hash === state.selected ? "true" : "false" },
+        cell(ms(download.ms), true), nodeCell(download.node), el("td", {}, peerName(download)),
+        cell(peerSoftware(download)), el("td", {}, pick), cell(bytes(download.bytes ?? download.size), true),
+        cell(download.stack || "–"), cell(outcome(download.result)));
+      row.addEventListener("click", (event) => { if (!event.target.closest("a")) selectBlock(download.hash); });
+      return row;
+    }));
+  document.getElementById("slowest-note").textContent = slow.length
+    ? "A time on the legacy stack is in whole milliseconds and includes any wait behind other requests on the same connection."
+    : "No download has been recorded yet. A node records them once it runs a build that writes them.";
+
+  const peers = data.outside_peers || [];
+  const worst = Math.max(1, ...peers.map((peer) => peer.p90_ms || 0));
+  table(document.getElementById("outside"),
+    [["Address"], ["Software"], ["Used by"], ["Downloads", true], ["Failed", true], ["Median", true],
+      ["9 in 10", true], [""], ["Slowest", true], ["Last used"]],
+    peers.map((peer) => {
+      const users = el("td", { class: "wrap" });
+      peer.nodes.forEach((name, index) => users.append(index ? ", " : "", nodeLink(name)));
+      return el("tr", {}, el("td", { class: "mono", text: peer.ip }), cell(software(peer.agent)), users,
+        cell(String(peer.downloads), true), cell(String(peer.failed), true), cell(ms(peer.median_ms), true),
+        cell(ms(peer.p90_ms), true),
+        el("td", { style: "min-width:120px" }, peer.p90_ms === null ? "" :
+          el("div", { class: "bar", style: `width:${(peer.p90_ms / worst) * 100}%;background:var(--c-download)` })),
+        cell(ms(peer.max_ms), true), cell(clockTime(peer.last)));
+    }));
+  document.getElementById("outside-note").textContent = peers.length
+    ? "A peer is known by its IP address alone, so two nodes behind one address are one row. Times count only the downloads that delivered the block."
+    : "No outside peer is listed yet. A node records peer addresses only after it restarts with them switched on; until then its downloads show as \"address hidden\".";
+}
+
 function renderLegend() {
   const arrow = svg("svg", { width: 26, height: 10, viewBox: "0 0 26 10" });
   arrow.append(svg("path", { d: "M1 5 H22 M18 1.5 L23 5 L18 8.5", fill: "none", stroke: "var(--ink-2)", "stroke-width": 1.5 }));
@@ -478,7 +572,7 @@ function render() {
   const unreachable = document.getElementById("unreachable");
   unreachable.hidden = data.unreachable.length === 0;
   unreachable.textContent = "no answer from " + data.unreachable.join(", ");
-  renderTiles(data); renderBlock(data); renderBlocks(data); renderSummary(data);
+  renderTiles(data); renderBlock(data); renderBlocks(data); renderDownloads(data); renderSummary(data);
 }
 
 async function refresh() {

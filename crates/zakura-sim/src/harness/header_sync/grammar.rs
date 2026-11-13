@@ -483,6 +483,23 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
             scenario.policy.disruptions
         )));
     }
+    if !scenario.node_settings.is_default() {
+        return Err(Unencodable(format!(
+            "the grammar has no node settings, but it sets {:?}",
+            scenario.node_settings
+        )));
+    }
+    if !scenario.page_delays.is_empty() {
+        return Err(Unencodable(format!(
+            "the grammar has no page delay, but it declares {:?}",
+            scenario.page_delays
+        )));
+    }
+    if let Some(budget) = scenario.budget {
+        return Err(Unencodable(format!(
+            "the grammar has no step budget, but it sets {budget}"
+        )));
+    }
     let mirrors = scenario.mirrors.len();
     if !(1..=MAX_MIRRORS).contains(&mirrors) {
         return Err(Unencodable(format!(

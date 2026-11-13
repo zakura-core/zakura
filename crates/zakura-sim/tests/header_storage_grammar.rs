@@ -20,7 +20,7 @@ use zakura_sim::{
         },
         header_sync::{
             grammar::{self, GENERATOR, LAYOUT, MAX_ACTIONS, MAX_HEADERS, MAX_MIRRORS},
-            Dialer, MirrorSpec, Storage, StorageScenario, Weights,
+            Dialer, MirrorSpec, NodeSettings, PageDelay, Storage, StorageScenario, Weights,
         },
         scenario::{Rejection, MAX_INPUT_BYTES},
         Subsystem,
@@ -547,6 +547,33 @@ fn the_encoder_refuses_what_the_grammar_cannot_express() {
                 ..StorageScenario::default()
             },
             "a mirror's response limit is 235",
+        ),
+        (
+            StorageScenario {
+                node_settings: NodeSettings {
+                    max_inbound_peers: Some(4),
+                    ..NodeSettings::default()
+                },
+                ..StorageScenario::default()
+            },
+            "it sets NodeSettings",
+        ),
+        (
+            StorageScenario {
+                page_delays: vec![PageDelay {
+                    mirror: "mirror-0".to_owned(),
+                    by_ms: 40_000,
+                }],
+                ..StorageScenario::default()
+            },
+            "the grammar has no page delay",
+        ),
+        (
+            StorageScenario {
+                budget: Some(40_000),
+                ..StorageScenario::default()
+            },
+            "it sets 40000",
         ),
         (
             StorageScenario {

@@ -234,7 +234,7 @@ pub fn rows_digest_of(rows: &[Row]) -> String {
 
 /// [`rows_digest`] at S, which a change to any row's fixed content must
 /// move.
-pub const ROWS_SHA256: &str = "65e9a2055cd6ff1b09070bf545d4a2e4c35b9c93a0b99f9c03524b52820b0903";
+pub const ROWS_SHA256: &str = "af4ab39e5a84ae790f9c40d5612458254eb39cb2420946e923141805c3567d70";
 
 /// The race agreement pairs: one per registered race fixture, so a new
 /// fixture joins S4.4 by itself ([`problems`] checks each has a saved
@@ -502,7 +502,8 @@ pub fn rows(derived: &Derived) -> Vec<Row> {
                 "gate-2/despite-close/close-companion",
                 "gate-2/despite-close/staging-companion",
                 "gate-2/same-step-preservation",
-                "gate-2/end-boundary-preservation",
+                "gate-2/end-boundary-preservation/registry",
+                "gate-2/end-boundary-preservation/fault-store",
             ]
             .map(requirement)
             .into_iter()

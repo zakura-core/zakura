@@ -45,7 +45,7 @@ use crate::{
         AnnouncedBlocks, CancelHeartbeatTask, Client, ClientRequest, Connection,
         ConnectionRequests, ErrorSlot, HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
     },
-    peer_registry::PeerRegistry,
+    peer_registry::{sanitize_subversion, PeerRegistry},
     peer_set::{ConnectionTracker, InventoryChange},
     protocol::{
         external::{canonical_ip, types::*, AddrInVersion, Codec, InventoryHash, Message},
@@ -1200,6 +1200,14 @@ fn record_zakura_upgrade(
     let ZakuraUpgradeOutcome::Upgraded { peer_id, conn_id } = outcome else {
         return;
     };
+
+    // Zakura trace rows name a peer only by its label, so this is where its software
+    // version is tied to that label.
+    connector.trace_upgraded_peer(
+        peer_id,
+        &sanitize_subversion(&connection_info.remote.user_agent),
+        connected_addr.is_inbound(),
+    );
 
     if let (Some(peer_registry), Some(peer)) = (
         peer_registry,

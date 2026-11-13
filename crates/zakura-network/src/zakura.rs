@@ -299,6 +299,21 @@ impl ZakuraHandshakeConnector {
         }
     }
 
+    /// Records in the trace which software a peer runs, once its legacy connection has
+    /// been upgraded to Zakura. Does nothing without a live Zakura endpoint.
+    pub(crate) fn trace_upgraded_peer(
+        &self,
+        peer_id: &ZakuraPeerId,
+        user_agent: &str,
+        inbound: bool,
+    ) {
+        if let Some(endpoint) = self.endpoint.as_ref() {
+            endpoint
+                .trace()
+                .emit_peer_upgraded(peer_id, user_agent, inbound);
+        }
+    }
+
     /// Returns our local Zakura dial hints (iroh node id, and direct addresses
     /// each encoded as a `SocketAddr` string) for the legacy upgrade prelude, or
     /// `None` if this node has no live Zakura endpoint.

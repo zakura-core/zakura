@@ -18,6 +18,7 @@ use tower::{
 use crate::{
     constants::{EWMA_DECAY_TIME_NANOS, EWMA_DEFAULT_RTT},
     peer::{Client, ConnectedAddr, ConnectionInfo},
+    peer_registry::sanitize_subversion,
     protocol::external::{canonical_socket_addr, types::Version},
 };
 
@@ -44,6 +45,9 @@ pub struct LoadTrackedClient {
 
     /// A process-local identifier for correlating privacy-preserving peer traces.
     trace_id: u64,
+
+    /// The sanitized user agent the peer advertised in its handshake, for peer traces.
+    user_agent: Arc<str>,
 }
 
 /// Create a new [`LoadTrackedClient`] wrapping the provided `client` service.
@@ -61,6 +65,7 @@ impl From<Client> for LoadTrackedClient {
         };
 
         let request_slot = client.request_slot.clone();
+        let user_agent = sanitize_subversion(&connection_info.remote.user_agent).into();
 
         let service = PeakEwma::new(
             client,
@@ -76,6 +81,7 @@ impl From<Client> for LoadTrackedClient {
             connection_info,
             // Wrap-around is unreachable for a process-local u64 counter.
             trace_id: NEXT_PEER_TRACE_ID.fetch_add(1, Ordering::Relaxed),
+            user_agent,
         }
     }
 }
@@ -120,6 +126,11 @@ impl LoadTrackedClient {
     /// Retrieve a process-local identifier used to correlate peer trace events.
     pub(crate) fn trace_id(&self) -> u64 {
         self.trace_id
+    }
+
+    /// Retrieve the sanitized user agent the peer advertised in its handshake.
+    pub(crate) fn remote_user_agent(&self) -> Arc<str> {
+        self.user_agent.clone()
     }
 
     /// Returns true if this peer connected directly to us from `ip`.

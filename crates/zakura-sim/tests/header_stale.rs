@@ -31,6 +31,11 @@ use zakura_sim::{
 /// next round is active.
 const STALE_PREPARE_INPUT: &[u8] = include_bytes!("fixtures/header-storage-stale-prepare.bin");
 
+/// The stale-prepare seed less its unrun last control step, which the stale
+/// planted cases run (`tests/header_storage_seeds.rs`).
+const STALE_PREPARE_STEPS_INPUT: &[u8] =
+    include_bytes!("fixtures/header-storage-stale-prepare-steps.bin");
+
 /// The committed close-and-relink seed (`tests/header_storage_seeds.rs`),
 /// whose every control step runs.
 const CLOSE_RELINK_INPUT: &[u8] = include_bytes!("fixtures/header-storage-close-relink.bin");
@@ -253,4 +258,62 @@ fn a_typed_witness_records_and_replays_in_a_fresh_process() {
         replayed.status.success() && stdout.contains("every pick, draw and observation matched"),
         "{replayed:?}"
     );
+}
+
+/// The stale planted cases' input, `header-storage-stale-prepare-steps.bin`,
+/// is the committed stale-prepare seed's scenario less its last control
+/// step, under the seed's Plan bytes. That step, a close on a dropped read,
+/// never runs, so the two runs pick, observe and report the same, and the
+/// new seed's run picks every control step it declares. This fails if the
+/// two seeds drift apart, or if a declared step stops running.
+#[test]
+fn the_planted_stale_seed_is_the_seed_less_its_unrun_step() {
+    let entry = harness::find(Storage::NAME).expect("the storage harness is registered");
+    let (prefix, plan) = STALE_PREPARE_INPUT.split_at(Storage::SCENARIO_BYTES);
+    let (steps_prefix, steps_plan) = STALE_PREPARE_STEPS_INPUT.split_at(Storage::SCENARIO_BYTES);
+    assert_eq!(steps_plan, plan);
+    let seed: StorageScenario =
+        serde_json::from_value(entry.scenario(prefix)).expect("the seed's scenario reads");
+    let steps: StorageScenario = serde_json::from_value(entry.scenario(steps_prefix))
+        .expect("the new seed's scenario reads");
+    let mut less = seed.clone();
+    less.controls.pop();
+    assert_eq!(
+        serde_json::to_value(&steps).unwrap(),
+        serde_json::to_value(&less).unwrap()
+    );
+    let run = |scenario: &StorageScenario| {
+        run_prepared::<Storage>(
+            scenario,
+            Storage::prepare(scenario),
+            Plan::from_fuzz(plan),
+            &mut MemorySink::default(),
+            None,
+        )
+        .expect("the run ends")
+    };
+    let (seeded, stepped) = (run(&seed), run(&steps));
+    assert_eq!(format!("{:?}", seeded.end), format!("{:?}", stepped.end));
+    assert_eq!(
+        format!("{:?}", seeded.properties),
+        format!("{:?}", stepped.properties)
+    );
+    assert_eq!(
+        format!("{:?}", seeded.log.entries()),
+        format!("{:?}", stepped.log.entries())
+    );
+    let picks = |report: &RunReport| -> Vec<(u64, String)> {
+        report
+            .picks
+            .iter()
+            .map(|pick| (pick.step, pick.identity.clone()))
+            .collect()
+    };
+    assert_eq!(picks(&seeded), picks(&stepped));
+    let controls = stepped
+        .picks
+        .iter()
+        .filter(|pick| pick.identity.starts_with("peer:"))
+        .count();
+    assert_eq!(controls, steps.controls.len());
 }

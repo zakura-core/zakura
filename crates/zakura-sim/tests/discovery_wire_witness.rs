@@ -26,7 +26,7 @@ use zakura_sim::{
     harness::{
         discovery_service::{
             act_scenario, asking_scenario, wire_properties, DiscoveryWire, NodeHandle, SavedPlan,
-            WireScenario, ASKED, FAMILY, HOSTILE_ACTS, SCRIPTED,
+            WireScenario, ASKED, CONFORMANT_ACTS, FAMILY, HOSTILE_ACTS, SCRIPTED,
         },
         run_prepared, HarnessError, Subsystem,
     },
@@ -324,10 +324,12 @@ fn every_discovery_property_applies_in_its_witness() {
     assert_eq!(fault_closes(&report), Vec::<String>::new());
 }
 
-/// `discovery/wire` draws each act witness, and each asking witness of
-/// [`OWED`], from its family's tag, so the generator reaches stream 4's
-/// refusal and `sender-within-owed` IDs (mutation plan, mut-6). Each
-/// family's name is its own.
+/// `discovery/wire` draws each act witness, each asking witness of
+/// [`OWED`], and each conformant control, from its family's tag, so the
+/// generator reaches stream 4's refusal, `sender-within-owed` and
+/// `conformant-never-closes` IDs (mutation plan, mut-6). Each family's name
+/// is its own. The drawn `expired-hello` is the scenario of
+/// `conformant-never-closes`' planted case.
 #[test]
 fn each_hostile_family_draws_its_witness() {
     let families = DiscoveryWire::families();
@@ -349,9 +351,20 @@ fn each_hostile_family_draws_its_witness() {
             "{request:?}"
         );
     }
+    for (name, act) in CONFORMANT_ACTS {
+        assert_eq!(act.label(), Label::Conformant, "{name}");
+        assert_eq!(drawn(name), act_scenario(act), "{name}");
+    }
+    let planted: WireScenario = serde_json::from_str(EXPIRED_HELLO_SCENARIO).unwrap();
+    assert_eq!(drawn("expired-hello"), planted);
     let names: BTreeSet<&str> = families.iter().map(|family| family.name).collect();
     assert_eq!(names.len(), families.len(), "{families:?}");
 }
+
+/// The committed scenario of `conformant-never-closes`' planted case.
+const EXPIRED_HELLO_SCENARIO: &str = include_str!(
+    "../../../qa/planted/discovery/s4v2/conformant-never-closes/close-on-expired-hello.scenario.json"
+);
 
 /// The node's answers carry only what their requests asked for:
 /// `sender-within-owed` applies and holds on a `Peers` that answers a

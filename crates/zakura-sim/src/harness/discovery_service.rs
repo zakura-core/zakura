@@ -694,8 +694,17 @@ pub const HOSTILE_ACTS: [(&str, DiscoveryAct); 29] = [
 /// [`HOSTILE_ACTS`]'.
 pub const ASKED: [Request; 2] = [Request::GetOnePeer, Request::GetHeaderSyncService];
 
+/// The conformant frames that local policy, not the specification, refuses,
+/// each with its family's name. A node that closes on one breaks
+/// `conformant-never-closes`. Their tags follow [`ASKED`]'.
+pub const CONFORMANT_ACTS: [(&str, DiscoveryAct); 2] = [
+    ("expired-hello", DiscoveryAct::ExpiredHello),
+    ("expired-relay", DiscoveryAct::ExpiredRelay),
+];
+
 /// The families after the saved Plans: each of [`HOSTILE_ACTS`], then
-/// each of [`ASKED`], by name, tag and scenario.
+/// each of [`ASKED`], then each of [`CONFORMANT_ACTS`], by name, tag and
+/// scenario.
 fn drawn_families() -> impl Iterator<Item = (&'static str, [u8; 2], WireScenario)> {
     let acts = HOSTILE_ACTS
         .iter()
@@ -703,7 +712,11 @@ fn drawn_families() -> impl Iterator<Item = (&'static str, [u8; 2], WireScenario
     let asked = ASKED
         .iter()
         .map(|request| (request.name(), asking_scenario(*request)));
+    let conformant = CONFORMANT_ACTS
+        .iter()
+        .map(|(name, act)| (*name, act_scenario(*act)));
     acts.chain(asked)
+        .chain(conformant)
         .zip(HOSTILE_TAG_BASE..)
         .map(|((name, scenario), tag)| (name, [TAG, tag], scenario))
 }

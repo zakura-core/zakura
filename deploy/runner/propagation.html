@@ -241,7 +241,10 @@ function slowest(block) {
   const longest = spans(block.nodes[name]).sort((a, b) => (b.end - b.start) - (a.end - a.start))[0];
   return { name, tip: block.nodes[name].at.tip, longest };
 }
-function source(view) { return view.from === "outside" ? "a peer outside the fleet" : view.from; }
+function source(view) {
+  if (view.from === "outside") return "a peer outside the fleet";
+  return view.from === "unknown" ? "a source the node did not record" : view.from;
+}
 
 // The block the page address names, as `#block=<hash>`, if any.
 function linkedBlock() {
@@ -271,8 +274,11 @@ function cell(text, numeric) { return el("td", { text, class: numeric ? "num" : 
 // Every node has a page of its own on the status dashboard; a node's name links to it.
 function nodeHref(name) { return "/node/" + encodeURIComponent(name); }
 function nodeLink(name) { return el("a", { class: "node-link", href: nodeHref(name), text: name }); }
-// A block's source is one of our nodes or somewhere outside the fleet.
-function sourceLink(name, outside) { return name === "outside" ? outside : nodeLink(name); }
+// A block's source is one of our nodes, somewhere outside the fleet, or not recorded.
+function sourceLink(name, outside) {
+  if (name === "outside") return outside;
+  return name === "unknown" ? el("span", { class: "quiet", text: "not recorded" }) : nodeLink(name);
+}
 function nodeCell(name) { return el("td", {}, nodeLink(name)); }
 
 // What a peer says it runs, as its handshake wrote it: "/Zakura:1.8.7/" reads "Zakura 1.8.7".
@@ -325,14 +331,21 @@ function downloadedFrom(view) {
   return el("td", {}, peerName(delivered), el("span", { class: "quiet", text: " · " + detail.join(" · ") }));
 }
 
+// A profiler that answers can still lack a block, so "every node" holds only for a
+// block that every node in the fleet recorded.
+function recordedBy(block) { return Object.keys(block.nodes).length; }
+function everyNode(block, data) { return recordedBy(block) === data.nodes.length; }
+
 function renderTiles(data) {
-  const spreads = data.blocks.filter((block) => Object.keys(block.nodes).length > 1).map((block) => block.spread_ms).sort((a, b) => a - b);
+  const complete = data.blocks.filter((block) => everyNode(block, data) && recordedBy(block) > 1);
+  const spreads = complete.map((block) => block.spread_ms).sort((a, b) => a - b);
   const reporting = data.nodes.length - data.unreachable.length;
   const firsts = Object.entries(data.summary.nodes).sort((a, b) => b[1].first - a[1].first)[0];
   const tiles = [
     [String(data.blocks.length), "blocks shown"],
     [`${reporting} of ${data.nodes.length}`, "nodes reporting"],
-    [spreads.length ? ms(spreads[Math.floor(spreads.length / 2)]) : "–", "median time until every node had the tip"],
+    [spreads.length ? ms(spreads[Math.floor(spreads.length / 2)]) : "–",
+      `median time until every node had the tip, over the ${complete.length} blocks every node recorded`],
     [spreads.length ? ms(spreads[Math.min(spreads.length - 1, Math.floor(spreads.length * 0.9))]) : "–", "the same, 9 blocks in 10"],
     [firsts ? firsts[0] : "–", firsts ? `heard first most often (${firsts[1].first} blocks)` : "heard first most often"],
   ];
@@ -358,7 +371,7 @@ function renderBlocks(data) {
     return row;
   });
   table(document.getElementById("blocks"), [["Height"], ["Hash"], ["First heard"], ["First node ← its source"],
-    ["Every node at tip after", true], ["Last node · its longest step"], ["Nodes", true]], rows);
+    ["Last node at tip after", true], ["Last node · its longest step"], ["Nodes recorded", true]], rows);
 }
 
 function niceStep(span, target) {
@@ -467,7 +480,10 @@ function renderBlock(data) {
   note.replaceChildren(el("span", { class: "mono", text: block.hash }),
     ` · first heard at ${clockTime(block.origin)} by `, nodeLink(block.first_node), ", from ",
     sourceLink(block.first_from, "a peer outside the fleet"),
-    ` · every node had it as tip after ${ms(block.spread_ms)}, `, nodeLink(slow.name), " last");
+    everyNode(block, data)
+      ? ` · every node had it as tip after ${ms(block.spread_ms)}, `
+      : ` · ${recordedBy(block)} of ${data.nodes.length} nodes recorded this block; the last of them had it as tip after ${ms(block.spread_ms)}, `,
+    nodeLink(slow.name), " last");
   renderWaterfall(block);
   const names = Object.keys(block.nodes).sort((a, b) => block.nodes[a].at.tip - block.nodes[b].at.tip);
   table(document.getElementById("block-nodes"),
@@ -552,7 +568,7 @@ function renderDownloads(data) {
         cell(ms(peer.max_ms), true), cell(clockTime(peer.last)));
     }));
   document.getElementById("outside-note").textContent = peers.length
-    ? "A peer is known by its IP address alone, so two nodes behind one address are one row. Times count only the downloads that delivered the block."
+    ? "A peer is known by its IP address alone, so two nodes behind one address are one row. Times count only the downloads that delivered the block. \"Failed\" counts only legacy attempts: a download over Zakura is recorded when its block arrives, so a Zakura peer never shows a failure here."
     : "No outside peer is listed yet. A node records peer addresses only after it restarts with them switched on; until then its downloads show as \"address hidden\".";
 }
 

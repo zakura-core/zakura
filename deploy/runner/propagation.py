@@ -35,7 +35,9 @@ INTERVALS = (
 # receiver's.
 HOP_STEPS = ("told", "asked", "sent")
 NAMED_PEER = "name:"
-OUTSIDE = "outside"
+# Where a node first heard of a block when it was not one of ours: a peer outside the
+# fleet, or nowhere the node recorded (no announcement of the block was written).
+OUTSIDE, UNKNOWN = "outside", "unknown"
 # A node log and trace clock that disagree about a block's tip time by more than this
 # are not one clock: the node's times are then moved onto its log's.
 CLOCK_TRUST_SECONDS = 0.05
@@ -156,6 +158,15 @@ def seconds(value):
     return value
 
 
+def block_source(record, wall, fleet):
+    """Which of our nodes a node first heard of a block from, `OUTSIDE` for any other
+    peer, or `UNKNOWN` when the node recorded no announcement of the block."""
+    name = fleet.get(record.get("heard_from"))
+    if name is not None:
+        return name
+    return OUTSIDE if "heard" in wall else UNKNOWN
+
+
 def node_record(record, node, fleet, fleet_addresses, is_private):
     """One block record of a node's report with peers resolved to node names, or `None`
     when it lacks a tip time.
@@ -183,7 +194,7 @@ def node_record(record, node, fleet, fleet_addresses, is_private):
         "reorg": bool(record.get("reorg")),
         "size": record.get("size") if isinstance(record.get("size"), int) else None,
         "clock": clock,
-        "from": fleet.get(record.get("heard_from"), OUTSIDE),
+        "from": block_source(record, wall, fleet),
         "from_peer": outside_announcer(record, fleet, fleet_addresses, is_private),
         "wall": {point: seconds(wall[point]) + shift for point in POINTS if point in wall},
         "peers": peers,
@@ -256,6 +267,8 @@ def joined_block(block_hash, records):
         "origin": round(origin, 6),
         "first_node": first,
         "first_from": records[first]["from"],
+        # When the last node that recorded the block had it as tip; a node can lack a
+        # block even when its profiler answers, so this is not always every node.
         "spread_ms": max(tips),
         "nodes": nodes,
         "hops": sorted(hops, key=lambda hop: (hop["told"], hop["from"], hop["to"])),

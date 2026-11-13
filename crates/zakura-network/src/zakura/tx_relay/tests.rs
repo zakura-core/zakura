@@ -63,6 +63,17 @@ fn setup(peers: u8) -> (PoolModel, ReactorModel, Vec<SessionId>) {
     (pool, reactor, sessions)
 }
 
+/// The jobs the pool started for the reactor's own calls since the last
+/// time. Only for tests where the reactor is the pool's one caller, because
+/// it drops everything else those steps hold.
+fn started(reactor: &mut ReactorModel) -> Vec<zakura_node_services::mempool::port::model::JobId> {
+    reactor
+        .take_pool_steps()
+        .iter()
+        .flat_map(Step::started)
+        .collect()
+}
+
 /// Feeds the outcome of the one job the pool started, and routes what the
 /// pool then did back to the reactor.
 fn finish(
@@ -71,7 +82,7 @@ fn finish(
     outcome: Outcome,
     now: Duration,
 ) -> (Step, Vec<RelayEffect>) {
-    let started = reactor.take_started();
+    let started = started(reactor);
     assert_eq!(started.len(), 1, "exactly one job is running");
     let step = pool.outcome(started[0], outcome, stable(), stable(), now);
     // The verdict's own effects, with no later input to flush them.
@@ -377,7 +388,7 @@ fn a_verification_that_times_out_is_a_local_fault_for_the_reactor_too() {
     let (mut pool, mut reactor, s) = setup(1);
     reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
     reactor.tx(s[0], tx(1), secs(0), &mut pool);
-    reactor.take_started();
+    started(&mut reactor);
 
     let step = pool.tick(T_VERIFY);
     reactor.pool_step(&step, T_VERIFY, &mut pool);
@@ -809,7 +820,7 @@ fn a_verdict_frees_a_request_slot_and_the_next_id_is_asked_at_once() {
     for n in 0..5 {
         reactor.tx(s[0], tx(n), secs(0), &mut pool);
     }
-    let started = reactor.take_started();
+    let started = started(&mut reactor);
     assert_eq!(reactor.in_use(&v2(1)), 5);
 
     // The verdict itself asks for the sixth. No tick is needed.
@@ -912,6 +923,8 @@ struct Ledger {
     legacy_waiters: Vec<zakura_node_services::mempool::port::model::WaiterId>,
     /// Every verdict any step carried.
     verdicts: Vec<zakura_node_services::mempool::port::model::WaiterId>,
+    /// Jobs the pool cancelled. Their outcomes still arrive, late.
+    cancelled: Vec<zakura_node_services::mempool::port::model::JobId>,
 }
 
 impl Ledger {
@@ -920,7 +933,10 @@ impl Ledger {
         for effect in &step.effects {
             match effect {
                 Effect::Start { job, .. } => self.jobs.push(*job),
-                Effect::Cancel(job) => self.jobs.retain(|running| running != job),
+                Effect::Cancel(job) => {
+                    self.jobs.retain(|running| running != job);
+                    self.cancelled.push(*job);
+                }
                 Effect::Verdict { waiter, .. } => self.verdicts.push(*waiter),
                 _ => {}
             }
@@ -982,7 +998,19 @@ fn a_random_run_always_drains_once_the_sessions_end() {
             now += Duration::from_millis(rng.next(4_000));
             let n = u16::try_from(rng.next(16)).expect("small");
             let peer = u8::try_from(rng.next(3) + 1).expect("small");
-            let effects = match rng.next(15) {
+            let effects = match rng.next(16) {
+                // The outcome of a job the pool cancelled arrives late, in
+                // the middle of everything else. It changes nothing by
+                // itself, but the call can find a deadline due.
+                15 if !ledger.cancelled.is_empty() => {
+                    let job = ledger
+                        .cancelled
+                        .swap_remove(rng.pick(ledger.cancelled.len()));
+                    let read = GenerationRead::Stable(Generation(generation));
+                    let step = pool.outcome(job, Outcome::Pass, read, read, now);
+                    ledger.absorb(&step);
+                    reactor.pool_step(&step, now, &mut pool)
+                }
                 // A legacy caller reserves the same id, to fetch or deliver.
                 12 => {
                     let source = Source::Peer(legacy_peer(peer));

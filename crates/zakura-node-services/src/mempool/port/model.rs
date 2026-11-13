@@ -1033,6 +1033,14 @@ impl PoolModel {
     /// passed is decided whichever of the timer and another input the core
     /// happens to handle first.
     fn enter(&mut self, now: ModelTime) {
+        // An input's effects belong to that input. If the caller has not
+        // taken the last one's, they would be handed over as part of this
+        // one, and nothing could tell that they came late.
+        assert!(
+            self.step.is_empty(),
+            "the previous input's effects were not collected before the next input: {:?}",
+            self.step
+        );
         self.advance(now);
         // The model's own clock from here on. It never goes back, so a
         // caller that passes an older time cannot make a deadline that has
@@ -1218,8 +1226,9 @@ impl PoolModel {
     ///
     /// Every input has effects, and these five have an answer of their own
     /// as well. The caller takes this straight after each of them, so no
-    /// verdict or job start waits for some later input.
-    /// [`Self::assert_invariants`] fails if one was left.
+    /// verdict or job start waits for some later input. The next input
+    /// panics if it was not taken, and so does
+    /// [`Self::assert_invariants`].
     pub fn effects(&mut self) -> Step {
         self.take_step()
     }

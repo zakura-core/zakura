@@ -48,8 +48,8 @@ use zakura_chain::transaction::UnminedTxId;
 use zakura_node_services::mempool::{
     port::{
         model::{
-            Effect, JobId, ModelTime, ModelTx, ModelUnreserved, ModelVerdict, PoolModel, Step,
-            WaiterId,
+            Effect, ModelReservation, ModelTime, ModelTx, ModelUnreserved, ModelVerdict, PoolModel,
+            Step, WaiterId,
         },
         Charge, Intent, NoRoom, ReservationId, Source, Supplier,
     },
@@ -165,6 +165,9 @@ pub(crate) struct ReactorModel {
     effects: Vec<RelayEffect>,
     /// Every step the pool returned to a call this reactor made.
     pool_steps: Vec<Step>,
+    /// Steps taken from the pool after a call that returns only an answer,
+    /// waiting to be routed before this input ends.
+    collected: Vec<Step>,
     /// Announced ids dropped at a full pending set.
     pub(crate) overflowed: u64,
 }
@@ -181,6 +184,7 @@ impl ReactorModel {
             wanted_of: HashMap::new(),
             effects: Vec::new(),
             pool_steps: Vec::new(),
+            collected: Vec::new(),
             overflowed: 0,
         }
     }
@@ -285,13 +289,15 @@ impl ReactorModel {
                     // The slot was used by a body that hit a local fault, or
                     // the id was announced again after the node gave up.
                     // This body is in hand, so it is delivered.
-                    None => match pool.reserve(id, Source::Peer(peer), Intent::Deliver, now) {
-                        Ok(joined) if joined.wants_body => {
-                            Some(pool.submit(joined.id, tx, supplier, now))
+                    None => {
+                        match self.reserve(id, Source::Peer(peer), Intent::Deliver, now, pool) {
+                            Ok(joined) if joined.wants_body => {
+                                Some(pool.submit(joined.id, tx, supplier, now))
+                            }
+                            Ok(joined) => Some(pool.wait(joined.id, id, supplier, now)),
+                            Err(_) => None,
                         }
-                        Ok(joined) => Some(pool.wait(joined.id, id, supplier, now)),
-                        Err(_) => None,
-                    },
+                    }
                 };
                 if let Some((waiter, step)) = arrival {
                     let supplier = self.sessions[&session].peer.clone();
@@ -393,14 +399,6 @@ impl ReactorModel {
     /// last call. They can hold verdicts for other callers.
     pub(crate) fn take_pool_steps(&mut self) -> Vec<Step> {
         std::mem::take(&mut self.pool_steps)
-    }
-
-    /// The jobs the pool started for this reactor since the last call.
-    pub(crate) fn take_started(&mut self) -> Vec<JobId> {
-        self.take_pool_steps()
-            .iter()
-            .flat_map(Step::started)
-            .collect()
     }
 
     /// How many ids the node wants.
@@ -521,6 +519,7 @@ impl ReactorModel {
             }
             None => {
                 pool.violation(asked.peer.clone(), now);
+                self.collect(pool);
                 self.effects.push(RelayEffect::Close(session));
                 false
             }
@@ -660,7 +659,7 @@ impl ReactorModel {
                 continue;
             }
             if self.wanted[&key].reservation.is_none() {
-                match pool.reserve(id, Source::Peer(peer), Intent::Fetch, now) {
+                match self.reserve(id, Source::Peer(peer), Intent::Fetch, now, pool) {
                     Ok(reservation) => self.wanted_at(key).reservation = Some(reservation.id),
                     // The slot cannot be counted against this peer. Another
                     // announcer may have room.
@@ -791,24 +790,47 @@ impl ReactorModel {
             .expect("the caller names a wanted id")
     }
 
-    /// The one way out of an input. Some calls into the pool return an
-    /// answer and no step, and what the pool's deadlines caused during them
-    /// is collected here, so no verdict or job start waits for a later
-    /// input. Then every idle id that has someone to ask is asked.
+    /// Reserves at the core and takes what the call caused out of the pool
+    /// at once, so the pool's next input starts clean. A reservation can
+    /// find a deadline due, and then its step holds a verdict or a job
+    /// start that is nothing to do with the id being reserved.
+    fn reserve(
+        &mut self,
+        id: UnminedTxId,
+        source: Source,
+        intent: Intent,
+        now: ModelTime,
+        pool: &mut PoolModel,
+    ) -> Result<ModelReservation, ModelUnreserved> {
+        let answer = pool.reserve(id, source, intent, now);
+        self.collect(pool);
+        answer
+    }
+
+    /// Takes the effects of a pool call that returned only an answer.
+    fn collect(&mut self, pool: &mut PoolModel) {
+        let step = pool.effects();
+        if !step.is_empty() {
+            self.collected.push(step);
+        }
+    }
+
+    /// The one way out of an input. What the pool's deadlines caused during
+    /// this input's calls is routed here, in the order it was collected,
+    /// and every idle id that has someone to ask is asked. Routing and
+    /// asking can each cause more of the other, so this runs until both are
+    /// done.
     fn finish(&mut self, now: ModelTime, pool: &mut PoolModel) -> Vec<RelayEffect> {
         loop {
-            let step = pool.effects();
-            if !step.is_empty() {
+            if !self.collected.is_empty() {
+                let step = self.collected.remove(0);
                 self.route(step, now, pool);
                 continue;
             }
             self.pump(now, pool);
-            // The pump can reserve, which can find a deadline due.
-            let step = pool.effects();
-            if step.is_empty() {
+            if self.collected.is_empty() {
                 break;
             }
-            self.route(step, now, pool);
         }
         self.take_effects()
     }

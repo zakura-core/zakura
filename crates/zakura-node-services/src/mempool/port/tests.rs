@@ -3887,18 +3887,38 @@ fn a_late_outcome_that_brings_a_retry_due_starts_it() {
 fn an_older_time_from_a_caller_does_not_turn_the_models_clock_back() {
     let mut model = new_model();
     let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
-    // Another input moves time far past this job's deadline.
+    // Another input moves time far past this job's deadline, and is the
+    // one that finds it due. Its effects are taken before anything else.
     let late = MAX_UNDECIDED + secs(1);
     assert!(model.reserve(id(2), peer(2), Intent::Fetch, late).is_ok());
-
-    // The job's outcome is delivered by a caller whose time is stale. The
-    // deadlines are judged on the model's clock, and the pass is too late.
-    let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(1));
     assert_eq!(
-        step.verdict(waiter),
+        model.effects().verdict(waiter),
         Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
     );
+
+    // The job's outcome is delivered by a caller whose time is stale. The
+    // model's clock does not go back for it, and the pass changes nothing.
+    let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(1));
+    assert!(step.is_empty());
     assert!(model.visible().is_empty());
+
+    // A second submission is judged on the model's clock too. Its deadline
+    // runs from now, not from the stale time its caller passes.
+    let (waiter, job) = bring_in(&mut model, tx(3), legacy(3));
+    let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(2));
+    assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
+}
+
+#[test]
+#[should_panic(expected = "the previous input's effects were not collected")]
+fn the_next_input_refuses_to_run_over_uncollected_effects() {
+    let mut model = new_model();
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    // The reservation finds the job's deadline due. Its caller does not
+    // take what that caused.
+    let _ = model.reserve(id(2), peer(2), Intent::Fetch, T_VERIFY + secs(1));
+    // The next input would hand that verdict over as if it were its own.
+    model.outcome(job, Outcome::Pass, stable(0), stable(0), T_VERIFY + secs(2));
 }
 
 // Cases from the eleventh review.

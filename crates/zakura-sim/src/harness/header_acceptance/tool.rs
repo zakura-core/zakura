@@ -4819,7 +4819,11 @@ mod tests {
             target_of(&targets, MACHINE).as_deref(),
             Some("header_reactor_policy")
         );
-        assert_eq!(target_of(&targets, "header-sync/wire"), None);
+        assert_eq!(
+            target_of(&targets, "header-sync/wire").as_deref(),
+            Some("header_sync_wire")
+        );
+        assert_eq!(target_of(&targets, "header-sync/repair"), None);
         // A mapping that's missing, isn't TOML, has no targets table or
         // maps a target to no harness name is an error, not an empty map.
         assert!(fuzz_targets(Path::new("/no/such/repo")).is_err());
@@ -4867,7 +4871,7 @@ mod tests {
         assert!(refusal(&committed, storage).is_some());
         let unreadable = fuzz_targets(Path::new("/no/such/repo"));
         assert!(refusal(&unreadable, storage).is_some());
-        assert_eq!(refusal(&committed, "header-sync/wire"), None);
+        assert_eq!(refusal(&committed, "header-sync/repair"), None);
 
         // A typed or scripted storage case has no fuzz input, so the
         // runner confirms it through no target, and that's accepted under

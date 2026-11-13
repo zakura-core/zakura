@@ -232,8 +232,14 @@ const fn bound_test(name: &'static str, test: TestRef) -> GateObligation {
     }
 }
 
+/// Adam's approval of the [`bound_unshown`] rows' standing exclusions,
+/// with their fixtures owed by a follow-up PR.
+pub const BOUND_UNSHOWN_RULING: Approval = Approval::Adam {
+    record: "Adam, 2026-11-12, gate-5 bound-table rows with no fixture evidence, fixtures in a follow-up",
+};
+
 /// A bound-table row's obligation `name` with no fixture evidence, met
-/// only by a standing exclusion for `reason` once Adam approves it.
+/// by its standing exclusion for `reason` under [`BOUND_UNSHOWN_RULING`].
 const fn bound_unshown(name: &'static str, reason: &'static str) -> GateObligation {
     GateObligation {
         name,
@@ -241,14 +247,14 @@ const fn bound_unshown(name: &'static str, reason: &'static str) -> GateObligati
         permit: Permit::Standing {
             owner: BOUND_OWNER,
             reason,
-            approval: Approval::Pending,
+            approval: BOUND_UNSHOWN_RULING,
         },
     }
 }
 
 /// The bound-table rows with no fixture evidence, each with the reason its
 /// exclusion would carry. `pub` so the manifest's rows write the same
-/// standing `Open`s. Each awaits Adam's approval.
+/// standing `Open`s, under [`BOUND_UNSHOWN_RULING`].
 pub mod bound_unshown {
     /// The ordinary per-identity reservation.
     pub const RESERVATION: &str = "no fixture reaches the 250-header per-identity \

@@ -4496,8 +4496,8 @@ setInterval(renderFreshness, 1000);
 # -- the shared dashboard password --------------------------------------------
 # One password gates the fleet pages and their data. Only its salted PBKDF2
 # hash reaches this process, through the environment. A login sets a cookie
-# holding an expiry and an HMAC of it under a random key made at startup and
-# never stored, so every restart signs everyone out.
+# holding an expiry and an HMAC of it under a key derived from that hash, so a
+# login lasts across dashboard restarts and a new password signs everyone out.
 SESSION_COOKIE = "zakura_status_session"
 SESSION_SECONDS = 7 * 86400
 PASSWORD_HASH_ALGORITHM = "pbkdf2_sha256"
@@ -4563,14 +4563,18 @@ class DashboardLogin:
 def dashboard_login_from_env(environ) -> DashboardLogin | None:
     """The login gate configured by `ZAKURA_DASHBOARD_PASSWORD_HASH`, or None when no password is set.
 
-    The cookie-signing key is fresh for this process and kept only in memory.
+    The cookie-signing key is derived from the hash, so cookies stay valid when
+    the dashboard restarts (deploys restart it often) and stop being valid when
+    the password changes.
     """
     password_hash = environ.get("ZAKURA_DASHBOARD_PASSWORD_HASH", "").strip()
     if not password_hash:
         return None
     if not password_hash.startswith(PASSWORD_HASH_ALGORITHM + "$"):
         raise ValueError("ZAKURA_DASHBOARD_PASSWORD_HASH is not a pbkdf2_sha256 hash")
-    return DashboardLogin(password_hash, secrets.token_hex(32))
+    session_secret = hmac.new(password_hash.encode(), b"zakura dashboard session cookie",
+                              hashlib.sha256).hexdigest()
+    return DashboardLogin(password_hash, session_secret)
 
 
 LOGIN_PAGE = """<!doctype html>

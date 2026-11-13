@@ -74,6 +74,11 @@ PROFILER_STATUS_TIMEOUT_SECONDS = 2
 PROFILER_REQUEST_TIMEOUT_SECONDS = 8
 PROFILER_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 PROFILER_MAX_PARAM_LENGTH = 400
+# The cluster view (`/propagation`) asks every profiler for this many recent blocks, and
+# one round of answers serves every request for this long.
+PROPAGATION_BLOCKS = 200
+PROPAGATION_CACHE_SECONDS = 10
+PROPAGATION_PAGE = Path(__file__).resolve().with_name("propagation.html")
 # The profiler requests the profile page may make, and the parameters each accepts.
 PROFILER_API = {
     "status": (),
@@ -339,6 +344,52 @@ def profiler_summary(profiler_url: str) -> dict:
         if type(value) in (int, float) and math.isfinite(value):
             summary[key] = value
     return summary
+
+
+class PropagationView:
+    """Each block's path through the fleet, joined from the profilers' own records.
+
+    Every node with a profiler is asked for its recent blocks, and `join`
+    (`propagation.join`, in the module beside this script) puts them on one time axis.
+    Requests that arrive while a round is under way wait for it instead of starting
+    another.
+    """
+
+    def __init__(self, nodes: list[Node], join):
+        self.nodes = [node for node in nodes if node.profiler_url]
+        self.join = join
+        self._lock = threading.Lock()
+        self._joined: dict | None = None
+        self._fetched_at = 0.0
+
+    def fetch_report(self, node: Node) -> dict | None:
+        """One node's recent blocks from its profiler, or `None` when it did not answer."""
+        status, body, _ = fetch_profiler(
+            node.profiler_url,
+            f"/api/propagation?limit={PROPAGATION_BLOCKS}",
+            PROFILER_REQUEST_TIMEOUT_SECONDS,
+        )
+        try:
+            report = json.loads(body) if status == 200 else None
+        except ValueError:
+            report = None
+        return report if isinstance(report, dict) else None
+
+    def data(self) -> dict:
+        """The joined view, at most `PROPAGATION_CACHE_SECONDS` old."""
+        with self._lock:
+            if self._joined is None or time.monotonic() - self._fetched_at >= PROPAGATION_CACHE_SECONDS:
+                reports: dict[str, dict | None] = {}
+                if self.nodes:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(self.nodes))) as pool:
+                        reports = dict(zip(
+                            (node.name for node in self.nodes), pool.map(self.fetch_report, self.nodes)
+                        ))
+                self._joined = self.join(
+                    reports, {node.name: node.node_id for node in self.nodes}, limit=PROPAGATION_BLOCKS
+                )
+                self._fetched_at = time.monotonic()
+            return self._joined
 
 
 def ssh_host(ssh_string: str) -> str:
@@ -3236,7 +3287,10 @@ footer {
         <p class="eyebrow">Fleet health</p>
         <h2>Nodes reporting</h2>
       </div>
-      <span class="badge" id="client-mix">...</span>
+      <span>
+        <a class="badge" id="propagation-link" href="/propagation" hidden>Block propagation</a>
+        <span class="badge" id="client-mix">...</span>
+      </span>
     </div>
     <div class="big-value" id="healthy-count">...</div>
     <p class="big-sub" id="healthy-sub">waiting for the first poll</p>
@@ -3660,6 +3714,7 @@ function renderFleet(data) {
   el('client-mix').textContent = (Object.keys(clients).sort()
     .map((client) => clients[client] + ' ' + client).join(' · ') || 'no clients')
     + (profiled ? ' · CPU profile on ' + profiled + ' of ' + rows.length : '');
+  el('propagation-link').hidden = !profiled;
 
   const heights = rows.map((row) => row.height).filter((height) => height != null);
   el('fleet-max-height').textContent = heights.length ? num(Math.max(...heights)) : '—';
@@ -4517,6 +4572,7 @@ LOGIN_PAGE = """<!doctype html>
 
 
 COLLECTOR: ClusterCollector | None = None
+PROPAGATION: PropagationView | None = None
 ACTIVATION_FEED = None
 TRUSTED_PROXY_IPS = set()
 RATE_LIMITER = RateLimiter()
@@ -4533,7 +4589,7 @@ NO_STORE = {
 # The fleet pages and their data need the dashboard password when one is set.
 # The public APIs (`/ironwood-status.json`, `/v1/*`) and `/healthz` stay open.
 PASSWORD_GATED_PAGES = {"/", "/data"}
-PASSWORD_GATED_PREFIXES = ("/data/node/", "/node/", "/profile/")
+PASSWORD_GATED_PREFIXES = ("/data/node/", "/node/", "/profile/", "/propagation")
 
 
 class BoundedHTTPServer(ThreadingHTTPServer):
@@ -4743,6 +4799,27 @@ class Handler(BaseHTTPRequestHandler):
         token = DASHBOARD_LOGIN.issue_token(time.time())
         self.redirect_home(f"{SESSION_COOKIE}={token}; Max-Age={SESSION_SECONDS}; Path=/; HttpOnly; Secure; SameSite=Lax")
 
+    def serve_propagation(self, parsed: urllib.parse.ParseResult) -> None:
+        """The cluster view: `/propagation` is the page, `/propagation/data` what it shows."""
+        if PROPAGATION is None or parsed.path not in ("/propagation", "/propagation/data"):
+            return self.send_body(
+                404, b"not found\n", "text/plain; charset=utf-8", {"X-Content-Type-Options": "nosniff"}
+            )
+        if not RATE_LIMITER.allow(self.rate_limit_client()):
+            return self.send_json(
+                429, {"error": "Request rate limit exceeded"},
+                {**NO_STORE, "Retry-After": str(int(PUBLIC_RATE_WINDOW))},
+            )
+        if parsed.path == "/propagation/data":
+            return self.send_json(200, PROPAGATION.data(), NO_STORE)
+        try:
+            page = PROPAGATION_PAGE.read_bytes()
+        except OSError:
+            return self.send_body(
+                503, b"The cluster view page is not installed.\n", "text/plain; charset=utf-8", NO_STORE
+            )
+        return self.send_body(200, page, "text/html; charset=utf-8", NO_STORE)
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/logout":
@@ -4751,8 +4828,9 @@ class Handler(BaseHTTPRequestHandler):
             if not self.logged_in():
                 if not self.came_through_proxy():
                     return self.send_json(401, {"error": "use the HTTPS dashboard address"}, NO_STORE)
-                is_page = parsed.path == "/" or (parsed.path.startswith(("/node/", "/profile/"))
-                                                 and "/api/" not in parsed.path)
+                is_page = parsed.path in ("/", "/propagation") or (
+                    parsed.path.startswith(("/node/", "/profile/")) and "/api/" not in parsed.path
+                )
                 if is_page:
                     return self.send_login_page(200)
                 return self.send_json(401, {"error": "login required"}, NO_STORE)
@@ -4761,6 +4839,8 @@ class Handler(BaseHTTPRequestHandler):
     def serve_get(self, parsed: urllib.parse.ParseResult) -> None:
         if parsed.path.startswith("/profile/"):
             return self.serve_profile(parsed)
+        if parsed.path.startswith("/propagation"):
+            return self.serve_propagation(parsed)
         if parsed.path == "/data":
             assert COLLECTOR is not None
             body = json.dumps(COLLECTOR.snapshot()).encode()
@@ -4875,7 +4955,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global COLLECTOR, ACTIVATION_FEED, TRUSTED_PROXY_IPS, DASHBOARD_LOGIN
+    global COLLECTOR, PROPAGATION, ACTIVATION_FEED, TRUSTED_PROXY_IPS, DASHBOARD_LOGIN
 
     parser = argparse.ArgumentParser(description="Serve a Zakura fleet status dashboard.")
     if sys.argv[1:] == ["--print-password-hash"]:
@@ -4958,6 +5038,11 @@ def main() -> None:
         nu7=nu7,
     )
     threading.Thread(target=COLLECTOR.loop, daemon=True).start()
+    if any(node.profiler_url for node in nodes):
+        # Only a fleet with profilers has a cluster view, so only its dashboard host
+        # needs the module that builds it.
+        from propagation import join
+        PROPAGATION = PropagationView(nodes, join)
     if args.nu7_activation_config:
         from nu7_activation import ActivationFeed
         ACTIVATION_FEED = ActivationFeed(args.nu7_activation_config, nu7)

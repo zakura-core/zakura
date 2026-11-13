@@ -6,7 +6,7 @@ its entry says where the dashboard reaches its profiler:
 
     monitor = { profiler_url = "http://127.0.0.1:8098" }
 
-Three steps, each safe to repeat:
+Four steps, each safe to repeat:
 
     fleet.py ensure-trace-config --config nodes.toml [--node NAME]
         Install the profiler and verify trace retention before adding `trace_dir`
@@ -14,6 +14,13 @@ Three steps, each safe to repeat:
         file changes apart from peer names in the same section. Peer names come from
         the fleet inventory; the old environment override is removed only after the
         config is verified. The node is not restarted. Existing trace settings are preserved.
+
+    fleet.py peer-names --config nodes.toml [--node NAME]
+        Tell the node the names of the other nodes in the list, by address, so its
+        trace files name them when a block is announced or served over the legacy
+        network; the cluster view (deploy/runner/propagation.py) joins nodes on
+        those names. The node is not restarted: the names take effect the next time
+        it starts.
 
     fleet.py install --config nodes.toml [--node NAME]
         Copy the profiler to the node, point it at that node's log and trace files,
@@ -57,6 +64,9 @@ PROFILER_PORT = 8097
 TRACE_DIR = "/mnt/data/zakura-traces"
 TRACE_MARKER = ".zakura-profiler-managed"
 TRACE_TABLE_CAP_MB = 200
+# The node reads the names of its fleet peers from this variable, as `name=ip,name=ip`.
+PEER_NAMES_VARIABLE = "ZAKURA_TRACE_PEER_NAMES"
+PEER_NAMES_DROP_IN = "trace-peer-names.conf"
 ZAKURA_SECTION = re.compile(r"^\s*\[network\.zakura\]\s*(#.*)?$")
 # `systemctl show -p ExecStart` prints the command line as `argv[]=... ;`.
 CONFIG_ARGUMENT = re.compile(r"argv\[\]=[^;]*?\s(?:-c|--config)[ =](\S+)")
@@ -333,6 +343,23 @@ mkdir -- "$1"
 READ_TRACE_MARKER_SCRIPT = f'if [ -f "$1/{TRACE_MARKER}" ]; then printf managed; fi'
 
 
+# Installs stdin as a drop-in of the node's service; prints whether it differed.
+WRITE_DROP_IN_SCRIPT = """
+set -euo pipefail
+directory="/etc/systemd/system/$1.d"
+install -d -m 755 "$directory"
+cat > "$directory/$2.new"
+if cmp -s "$directory/$2.new" "$directory/$2"; then
+    rm "$directory/$2.new"
+    echo unchanged
+else
+    mv "$directory/$2.new" "$directory/$2"
+    systemctl daemon-reload
+    echo written
+fi
+"""
+
+
 # ---- running things on a node ----
 
 
@@ -388,6 +415,31 @@ def ensure_trace_config(node, nodes):
     if edited == text:
         return f"already writes trace files to {trace_dir_of(text)} with configured peer names"
     return f"updated trace settings in {path}; they take effect when the node next starts"
+
+
+def peer_address(node):
+    """The address other nodes see `node` connect from: the host it is reached at over SSH."""
+    host = node.ssh_string.rpartition("@")[2]
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError as error:
+        raise FleetError(f"{node.name} is reached at {host!r}, which is not an IP address") from error
+
+
+def peer_names_drop_in(node, nodes):
+    """The service drop-in that names every node in `nodes` but `node` itself."""
+    names = ",".join(f"{peer.name}={peer_address(peer)}" for peer in nodes if peer.name != node.name)
+    return f"# Written by deploy/profiler/fleet.py.\n[Service]\nEnvironment={PEER_NAMES_VARIABLE}={names}\n"
+
+
+def set_peer_names(node, nodes):
+    """Give the node its fleet peers' names; returns a line saying what was done."""
+    unit = node.service_name if "." in node.service_name else node.service_name + ".service"
+    drop_in = peer_names_drop_in(node, nodes)
+    result = remote(node, WRITE_DROP_IN_SCRIPT, unit, PEER_NAMES_DROP_IN, stdin=drop_in.encode()).strip()
+    if result == "unchanged":
+        return f"already names its {len(nodes) - 1} fleet peers"
+    return f"names its {len(nodes) - 1} fleet peers once the node next starts"
 
 
 def install_profiler(node):
@@ -448,7 +500,7 @@ def for_each_node(nodes, step):
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     steps = parser.add_subparsers(dest="step", required=True)
-    for name in ("ensure-trace-config", "install"):
+    for name in ("ensure-trace-config", "peer-names", "install"):
         step = steps.add_parser(name)
         step.add_argument("--config", required=True, help="the deployer's node list")
         step.add_argument("--node", default="", help="only this node; all profiled nodes when empty")
@@ -467,18 +519,30 @@ def main(argv=None):
     if args.step == "tunnels":
         install_tunnels(nodes)
         return 0
+<<<<<<< HEAD
     fleet_nodes = nodes
+=======
+    fleet = nodes
+>>>>>>> 459eaa410 (feat(deploy): show each block's path through the fleet on the status dashboard)
     if args.node:
         nodes = [node for node in nodes if node.name == args.node]
         if not nodes:
             print(f"{args.node} has no profiler in {args.config}; nothing to do")
             return 0
+<<<<<<< HEAD
 
     def step(node):
         if args.step == "ensure-trace-config":
             return ensure_trace_config(node, fleet_nodes)
         return install_profiler(node)
 
+=======
+    step = {
+        "ensure-trace-config": ensure_trace_config,
+        "peer-names": lambda node: set_peer_names(node, fleet),
+        "install": install_profiler,
+    }[args.step]
+>>>>>>> 459eaa410 (feat(deploy): show each block's path through the fleet on the status dashboard)
     return 1 if for_each_node(nodes, step) else 0
 
 

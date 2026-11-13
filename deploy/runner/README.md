@@ -58,6 +58,36 @@ the page does not serve it unless the dashboard runs with `--expose-logs`. These
 dashboards are public and unauthenticated, so log text stays off by default even
 though peer addresses are already redacted on the node.
 
+### Block Propagation
+
+On a fleet whose nodes run the continuous profiler (`deploy/profiler/`), the
+dashboard also serves `/propagation`: for each recent block, when each node
+first heard of it and from which of our nodes or from outside, how long it
+then waited to ask, downloaded, verified, committed and told its peers, and
+every announcement between two of our nodes. Below that are medians per node
+and per pair of nodes over the blocks shown. The fleet page links to it.
+
+`/propagation/data` is the same as JSON. The dashboard asks each node's
+profiler for its recent blocks (`/api/propagation`) at most once every 10
+seconds, and `propagation.py` joins them by block hash on one time axis that
+starts when the first node heard of the block. A node that did not answer is
+listed as unreachable and the rest are still joined.
+
+Times come from each node's own clock. The page shows each node's clock error
+as its time service reports it and marks a time between two nodes that is smaller than
+their combined error. A node whose trace clock disagrees with its log by more
+than 50 ms, as builds before the trace clock fix do, is placed by its log
+instead and marked.
+
+Legacy announcements between our nodes are only visible when the nodes run a
+build that writes `legacy_gossip.jsonl` and know each other's names
+(`fleet.py peer-names`). Without those, a legacy node still appears with its
+own stage times, and its source shows as outside the fleet.
+
+`propagation.py` and `propagation.html` are installed beside
+`zakura-cluster-status.py`; the dashboard loads them only when a node in its
+list has a `profiler_url`.
+
 ### Tip Agreement and Orphan Pairs
 
 Each poll groups the fleet by `(height, tip hash)`. A single group means the

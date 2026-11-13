@@ -7525,6 +7525,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/actions.rs",
         "a_peer_s_links_join_its_whole_name",
     ),
+    (
+        "ActNameRef",
+        "src/harness/header_acceptance/actions.rs",
+        "one_peer_declares",
+        "src/harness/header_acceptance/actions.rs",
+        "an_act_joins_its_declarers_by_its_whole_name",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.

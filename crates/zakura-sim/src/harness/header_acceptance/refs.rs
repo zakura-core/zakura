@@ -449,6 +449,16 @@ impl WitnessRef {
     }
 }
 
+/// One adversary act, by its name, such as `bad-content`: the whole
+/// identity the witness's act evidence (`ActsScripted` and `ActRan`) gives
+/// it, which names no peer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActNameRef {
+    /// The act's name.
+    pub act: String,
+}
+impl Ref for ActNameRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

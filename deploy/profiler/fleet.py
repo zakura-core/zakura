@@ -28,6 +28,7 @@ Stdlib only (Python 3.11+ for tomllib).
 
 import argparse
 import copy
+import hashlib
 import io
 import os
 import re
@@ -254,15 +255,25 @@ echo "the profiler did not confirm trace retention on 127.0.0.1:{PROFILER_PORT}"
 exit 4
 """
 
-# Replaces the config in place, keeping its owner and mode, and keeps the first
-# original beside it.
+# Replaces the config ($1) in place with the text on its input, keeping the owner and
+# mode, and keeps the first original beside it. The config is replaced only when the
+# text that arrived has the SHA-256 in $2: a connection that ends early delivers an
+# empty or short text, which must never become the node's config.
 WRITE_CONFIG_SCRIPT = """
 set -euo pipefail
 config="$1"
-cp -p "$config" "$config.tmp-trace-dir"
-cat > "$config.tmp-trace-dir"
+expected="$2"
+new="$config.tmp-trace-dir"
+trap 'rm -f "$new"' EXIT
+cp -p "$config" "$new"
+cat > "$new"
+received="$(sha256sum < "$new" | cut -d ' ' -f 1)"
+if [ "$received" != "$expected" ]; then
+    echo "the new config did not arrive whole; $config is unchanged" >&2
+    exit 5
+fi
 [ -e "$config.before-trace-dir" ] || cp -p "$config" "$config.before-trace-dir"
-mv "$config.tmp-trace-dir" "$config"
+mv "$new" "$config"
 """
 
 # Claim only a new directory; never grant rotation permission over existing files.
@@ -309,6 +320,14 @@ def read_node_config(node):
     return path, remote(node, 'cat "$1"', path)
 
 
+def write_node_config(node, path, text):
+    """Replace the node's config at `path` with `text`, which the node checks arrived whole."""
+    data = text.encode()
+    remote(node, WRITE_CONFIG_SCRIPT, path, hashlib.sha256(data).hexdigest(), stdin=data)
+    if remote(node, 'cat "$1"', path) != text:
+        raise FleetError(f"{path} does not hold what was written")
+
+
 def ensure_trace_config(node):
     """Start verified retention before enabling new trace writes; never restart the node."""
     path, text = read_node_config(node)
@@ -318,9 +337,7 @@ def ensure_trace_config(node):
         return f"already writes trace files to {trace_dir_of(text)}"
     remote(node, CLAIM_TRACE_SCRIPT, TRACE_DIR)
     start_profiler(node, TRACE_DIR, manage_traces=True)
-    remote(node, WRITE_CONFIG_SCRIPT, path, stdin=edited.encode())
-    if remote(node, 'cat "$1"', path) != edited:
-        raise FleetError(f"{path} does not hold what was written")
+    write_node_config(node, path, edited)
     return f"added trace_dir to {path}; it takes effect when the node next starts"
 
 

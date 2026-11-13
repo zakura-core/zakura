@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Tests for the fleet installer: the node list, the config edit and the files it writes."""
 
+import hashlib
 import io
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -215,6 +217,55 @@ class InstalledFilesTests(unittest.TestCase):
         self.assertIn(f"-L 127.0.0.1:${{LOCAL_PORT}}:127.0.0.1:{fleet.PROFILER_PORT} ${{SSH_TARGET}}", unit)
 
 
+@unittest.skipUnless(shutil.which("sha256sum"), "the write script needs sha256sum, as the nodes have")
+class ConfigWriteTests(unittest.TestCase):
+    """The script that replaces a node's config, run as the node runs it."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        self.config = self.directory / "zakura.toml"
+        self.config.write_text(DUAL_CONFIG)
+        self.config.chmod(0o640)
+        self.original = self.directory / "zakura.toml.before-trace-dir"
+        self.edited = fleet.with_trace_dir(DUAL_CONFIG).encode()
+
+    def write(self, arrived, expected=None):
+        """Run the script with `arrived` on its input, expecting the checksum of `expected`."""
+        checksum = hashlib.sha256(self.edited if expected is None else expected).hexdigest()
+        return subprocess.run(
+            ["bash", "-c", fleet.WRITE_CONFIG_SCRIPT, "fleet", str(self.config), checksum],
+            input=arrived, capture_output=True, timeout=5,
+        )
+
+    def assert_config_untouched(self, done):
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn(b"did not arrive whole", done.stderr)
+        self.assertEqual(self.config.read_text(), DUAL_CONFIG)
+        self.assertEqual(sorted(path.name for path in self.directory.iterdir()), ["zakura.toml"])
+
+    def test_the_config_is_replaced_and_the_first_original_is_kept(self):
+        self.assertEqual(self.write(self.edited).returncode, 0)
+        self.assertEqual(self.config.read_bytes(), self.edited)
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.original.read_text(), DUAL_CONFIG)
+
+        again = self.edited + b"# a later edit\n"
+        self.assertEqual(self.write(again, expected=again).returncode, 0)
+        self.assertEqual(self.config.read_bytes(), again)
+        self.assertEqual(self.original.read_text(), DUAL_CONFIG)
+        self.assertEqual(
+            sorted(path.name for path in self.directory.iterdir()), ["zakura.toml", "zakura.toml.before-trace-dir"]
+        )
+
+    def test_a_connection_that_ends_before_the_config_arrives_changes_nothing(self):
+        self.assert_config_untouched(self.write(b""))
+
+    def test_a_config_that_arrives_cut_short_changes_nothing(self):
+        self.assert_config_untouched(self.write(self.edited[: len(self.edited) // 2]))
+
+
 class StepTests(unittest.TestCase):
     """The steps against a stand-in for the node, so no SSH is needed."""
 
@@ -236,7 +287,7 @@ class StepTests(unittest.TestCase):
         if script.startswith("cat "):
             return self.config
         if script == fleet.WRITE_CONFIG_SCRIPT:
-            self.assertEqual(arguments, ("/etc/zakura/zakura.toml",))
+            self.assertEqual(arguments, ("/etc/zakura/zakura.toml", hashlib.sha256(stdin).hexdigest()))
             self.config = stdin.decode()
             return ""
         if script == fleet.CLAIM_TRACE_SCRIPT:

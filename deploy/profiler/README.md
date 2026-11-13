@@ -107,6 +107,8 @@ running with the expected directory and cap. Only then does it add
 keeps the first original as `<config>.before-trace-dir`, and does not restart
 the node: the setting takes effect when the node next starts. A config that
 already names a trace directory is left as it is.
+The node replaces its config only after checking that the new text arrived
+whole, so a connection that drops mid-write leaves the config as it was.
 An installation or readiness failure leaves a node without tracing unchanged.
 
 When adding the setting, the installer creates a new trace directory containing

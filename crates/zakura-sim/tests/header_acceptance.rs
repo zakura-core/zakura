@@ -7740,6 +7740,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "tests/header_acceptance_narrowing.rs",
         "a_released_case_s_task_joins_its_whole_case",
     ),
+    (
+        "PropertyRef",
+        "src/harness/header_acceptance/tool.rs",
+        "draft_list",
+        "src/harness/header_acceptance/tool.rs",
+        "a_draft_s_row_joins_its_whole_property",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.
@@ -9004,12 +9011,6 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "src/harness/header_acceptance/tool.rs",
-        "draft_list",
-        "row.property==property",
-        "a property ID finding its row in the static rows, not run evidence",
-    ),
-    (
-        "src/harness/header_acceptance/tool.rs",
         "draft_witness",
         "**id!=property",
         "property IDs, the case's set without its own ID, not run evidence",
@@ -9997,6 +9998,12 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "native_pin_errors",
         "property==p",
         "a static check of the native classification against its pins, whole names of the committed tables",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "a_draft_s_row_joins_its_whole_property",
+        "row.property==\"header-sync/honest-progress\"",
+        "picks the test's fixture row by a literal property, a test building its input",
     ),
 ];
 

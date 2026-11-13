@@ -154,19 +154,39 @@ impl Permit {
     }
 }
 
-/// Why `gate-1/topology-freshness` is open until hf-7.
-pub const GATE_1_TOPOLOGY_FRESHNESS: &str =
-    "a topology change with no reactor event shows in the next view";
+/// Gate 1's topology freshness test (hf-7): a link the harness closes,
+/// with no reactor event between, shows in the next view.
+pub const TOPOLOGY_FRESHNESS_TEST: TestRef = sim_test(
+    "tests/header_node_session_ends.rs",
+    "a_link_the_harness_closes_shows_in_the_next_view",
+);
 
-/// Why `gate-1/store-inventory` is open until hf-6.
-pub const GATE_1_STORE_INVENTORY: &str =
-    "every store a header check reads is registered, behind a checkpoint and \
-                     has a producer test";
+/// Gate 1's store inventory, its first half (hf-6): every field holding
+/// shared state in the header harness's sources is a registered store or
+/// an allowed live resource.
+pub const STORE_INVENTORY_REGISTERED_TEST: TestRef = sim_test(
+    "tests/evidence_inventory.rs",
+    "every_shared_field_is_a_registered_store_or_allowed",
+);
 
-/// Why `gate-2/end-boundary-preservation` is open until hdr-14.8.
-pub const GATE_2_END_BOUNDARY_PRESERVATION: &str =
-    "every distinct end finding at one boundary survives, which C12 and C13 \
-                     deliver";
+/// Gate 1's store inventory, its second half (hf-6, hf-7): every
+/// registered store names its checkpoint and a producer test that exists.
+pub const STORE_INVENTORY_PRODUCER_TEST: TestRef = sim_test(
+    "tests/evidence_inventory.rs",
+    "every_registered_store_names_its_checkpoint_and_producer",
+);
+
+/// Gate 2's end-boundary preservation in the registry (C12): every
+/// distinct end finding at one boundary is kept.
+pub const END_BOUNDARY_REGISTRY_TEST: TestRef =
+    sim_test("tests/registry.rs", "every_end_finding_is_kept");
+
+/// Gate 2's end-boundary preservation in the fault store (C13): a settled
+/// end reports every open fault, not just the first.
+pub const END_BOUNDARY_FAULT_STORE_TEST: TestRef = sim_test(
+    "src/harness/header_node/fault.rs",
+    "harness::header_node::fault::tests::the_end_reports_every_open_fault",
+);
 
 /// Why `gate-5/bound-table` is open until hdr-9d.1.
 pub const GATE_5_BOUND_TABLE: &str =
@@ -188,20 +208,17 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     GateObligation {
         name: "gate-1/topology-freshness",
         gates: &[Gate::G1],
-        permit: Permit::Until {
-            owner: "Adam's harness",
-            pr: "hf-7",
-            reason: GATE_1_TOPOLOGY_FRESHNESS,
-        },
+        permit: Permit::Test(TOPOLOGY_FRESHNESS_TEST),
     },
     GateObligation {
-        name: "gate-1/store-inventory",
+        name: "gate-1/store-inventory/registered",
         gates: &[Gate::G1],
-        permit: Permit::Until {
-            owner: "Adam's harness",
-            pr: "hf-6",
-            reason: GATE_1_STORE_INVENTORY,
-        },
+        permit: Permit::Test(STORE_INVENTORY_REGISTERED_TEST),
+    },
+    GateObligation {
+        name: "gate-1/store-inventory/checkpoint-and-producer",
+        gates: &[Gate::G1],
+        permit: Permit::Test(STORE_INVENTORY_PRODUCER_TEST),
     },
     GateObligation {
         name: "gate-1/replay-store-control",
@@ -307,13 +324,14 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
         )),
     },
     GateObligation {
-        name: "gate-2/end-boundary-preservation",
+        name: "gate-2/end-boundary-preservation/registry",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Evan (E9) and Adam's harness (hf-1 to hf-3)",
-            pr: "hdr-14.8",
-            reason: GATE_2_END_BOUNDARY_PRESERVATION,
-        },
+        permit: Permit::Test(END_BOUNDARY_REGISTRY_TEST),
+    },
+    GateObligation {
+        name: "gate-2/end-boundary-preservation/fault-store",
+        gates: &[Gate::G2],
+        permit: Permit::Test(END_BOUNDARY_FAULT_STORE_TEST),
     },
     GateObligation {
         name: "gate-3/crossing/unretained-open-then-outcome",

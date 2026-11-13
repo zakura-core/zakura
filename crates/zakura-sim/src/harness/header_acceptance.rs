@@ -568,7 +568,8 @@ pub enum Key {
         /// [`history_targets`](rows::history_targets) names it.
         target: String,
     },
-    /// A node history's expected `NotApplicable` list (C1).
+    /// A node history's expected `NotApplicable` list (C1), which that
+    /// history's own whole-report pass judges.
     NaList {
         /// The history.
         run: RunId,
@@ -722,9 +723,12 @@ impl Key {
     /// key the catch of exactly that case, a duplicate native mutation's key
     /// the catch of the case its classification names, a replay key the
     /// replay of exactly that execution, a test key the `Passes` of exactly
-    /// that test, and a requirement key what its
-    /// [`GATE_OBLIGATIONS`](required::GATE_OBLIGATIONS) entry permits. Any
-    /// other key also takes an `Open`, which blocks until approved. A
+    /// that test, a requirement key what its
+    /// [`GATE_OBLIGATIONS`](required::GATE_OBLIGATIONS) entry permits, a
+    /// `NotApplicable` reason's key the pass of the test that shows it
+    /// ([`rows::REASON_TESTS`]), and a node history's list key that
+    /// history's whole-report pass. Any other key also takes an `Open`,
+    /// which blocks until approved. A
     /// narrowing test key is matched against `narrowing`, the manifest's
     /// entries.
     pub fn covers(&self, expected: &Expected, narrowing: &[contracts::Narrowing]) -> bool {
@@ -822,9 +826,19 @@ impl Key {
                 };
                 same_open(expected, &canonical)
             }
-            (Key::NaList { .. }, Expected::Open { .. }) => same_open(expected, &rows::NA_LIST),
-            (Key::NaReason { .. }, Expected::Open { .. }) => {
-                same_open(expected, &rows::REASON_TEST)
+            // A node history's list is judged by that history's own
+            // whole-report pass, which compares every report with it.
+            (
+                Key::NaList { run },
+                Expected::Holds { history, .. } | Expected::StaysNotApplicable { history, .. },
+            ) => RunId::from(*history) == *run,
+            // A reason's key takes the pass of exactly the test that shows
+            // it, or, for a reason with none, the Open that blocks.
+            (Key::NaReason { reason }, Expected::Passes { test }) => {
+                rows::reason_test(*reason) == Some(*test)
+            }
+            (Key::NaReason { reason }, Expected::Open { .. }) => {
+                rows::reason_test(*reason).is_none() && same_open(expected, &rows::REASON_UNSHOWN)
             }
             (Key::Tier { property, tier }, Expected::Open { .. }) => TIERS
                 .into_iter()

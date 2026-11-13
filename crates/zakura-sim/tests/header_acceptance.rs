@@ -2981,37 +2981,20 @@ fn every_narrowing_entry_has_a_test_or_its_pr() {
     }
 }
 
-/// What a transitional row may wait for: the later hdr-14 PRs, Adam's
-/// harness fixes, the hdr-9 to hdr-12 PRs that move native mutations, and
-/// E1, whose reason-bearing `NotApplicable` the expected-NA lists and the
-/// reason tests need.
-/// A transitional row and the result that replaces it would cover one key
-/// twice, which `every_required_key_is_covered_once_with_its_gates` refuses.
-/// A PR that merges leaves this list, so any `Open` still naming it fails
-/// `open_errors`, including a gate requirement's, whose replacement is a
-/// `Permit::Test` that PR switches to.
-const OPEN_PRS: &[&str] = &[
-    "hdr-14.4",
-    "hdr-14.5",
-    "hdr-14.7b",
-    "hdr-14.8",
-    "hf-1",
-    "hf-2",
-    "hf-3",
-    "hf-4",
-    "hf-6",
-    "hf-7",
-    "hf-8",
-    "hf-9",
-    "hdr-9a.2",
-    "hdr-9c.1a",
-    "hdr-9c.1b",
-    "hdr-9c.2a",
-    "hdr-9d.1",
-    "hdr-10b",
-    "hdr-12b",
-    "E1",
-];
+/// What a transitional row may wait for. A PR that merges leaves this
+/// list, so any `Open` still naming it fails `open_errors`, including a
+/// gate requirement's, whose replacement is a `Permit::Test` that PR
+/// switches to. A transitional row and the result that replaces it would
+/// cover one key twice, which `every_required_key_is_covered_once_with_its_gates`
+/// refuses.
+///
+/// hdr-14.8's frozen-head run is still to come, and the node cleanup keys
+/// wait for its per-run cleanup record. hdr-14.4 and hdr-9d.1 merged
+/// without the evidence their rows wait for: the sim-wide IDs' and the
+/// penalty's header-harness histories and catches, and the bound table's
+/// per-row fixtures. They stay here, named, until those are built or Adam
+/// approves standing exclusions for them.
+const OPEN_PRS: &[&str] = &["hdr-14.4", "hdr-14.8", "hdr-9d.1"];
 
 #[test]
 fn every_transitional_row_names_an_open_pr() {
@@ -8895,6 +8878,173 @@ fn each_node_harness_s_missing_sources_are_its_own_test_s() {
             "{key:?} is covered by {expected:?}, not {test:?}"
         );
     }
+}
+
+/// A node history's genuine whole-report record under `manifest`: every ID
+/// its harness registers reports as the history's own `Holds` expects,
+/// `NotApplicable` with its listed reason or `Held`, and the run completed
+/// with its trigger.
+fn genuine_history_record(manifest: &Manifest, history: HistoryRef) -> ResultRecord {
+    let at = covering(
+        manifest,
+        &Key::NaList {
+            run: history.into(),
+        },
+    );
+    let Expected::Holds { not_applicable, .. } = manifest.expected[at].expected else {
+        panic!("{history:?}'s list is judged by its Holds");
+    };
+    let reports: Vec<(&str, Report)> = manifest
+        .matrix
+        .iter()
+        .filter(|(harness, _, _)| *harness == history.harness)
+        .map(|&(_, id, _)| {
+            let report = not_applicable
+                .iter()
+                .find(|na| na.property == id)
+                .map_or_else(held, |listed| na(listed.reason));
+            (id, report)
+        })
+        .collect();
+    ResultRecord {
+        expected: manifest.expected[at].expected.id().unwrap(),
+        commit: S.into(),
+        actual: Actual::Run(execution(history.into(), history.harness, &reports)),
+    }
+}
+
+/// The obligations hf-6, hf-7, E1, E9 and hf-1 to hf-3 delivered verify on
+/// their own evidence and block without it. Contracts are cleared, so only
+/// each key's own result decides: a gate requirement and a `NotApplicable`
+/// reason on its test's pass, and a node history's `NotApplicable` list on
+/// that history's whole-report pass, which judges every report against the
+/// list its row carries. A list one report off, or a row whose list is
+/// dropped, blocks it.
+#[test]
+fn delivered_obligations_verify_on_their_evidence() {
+    use header_acceptance::required as obligation;
+    let mut manifest = Manifest::committed();
+    manifest.contracts.clear();
+    manifest.required_contracts.clear();
+    let required = required(&manifest);
+    let mut tests: Vec<(Key, TestRef)> = [
+        (
+            "gate-1/topology-freshness",
+            obligation::TOPOLOGY_FRESHNESS_TEST,
+        ),
+        (
+            "gate-1/store-inventory/registered",
+            obligation::STORE_INVENTORY_REGISTERED_TEST,
+        ),
+        (
+            "gate-1/store-inventory/checkpoint-and-producer",
+            obligation::STORE_INVENTORY_PRODUCER_TEST,
+        ),
+        (
+            "gate-2/end-boundary-preservation/registry",
+            obligation::END_BOUNDARY_REGISTRY_TEST,
+        ),
+        (
+            "gate-2/end-boundary-preservation/fault-store",
+            obligation::END_BOUNDARY_FAULT_STORE_TEST,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, test)| (Key::Requirement { name: name.into() }, test))
+    .collect();
+    for entry in NA_REASONS {
+        let test = rows::reason_test(entry.reason)
+            .unwrap_or_else(|| panic!("{:?} has a test that shows it", entry.reason));
+        tests.push((
+            Key::NaReason {
+                reason: entry.reason,
+            },
+            test,
+        ));
+    }
+    // A storage and a wire history, each with a non-empty list.
+    let histories: Vec<HistoryRef> = ["header-sync/storage", "header-sync/wire"]
+        .into_iter()
+        .map(|harness| {
+            rows::counted_histories()
+                .into_iter()
+                .find(|history| {
+                    history.harness == harness
+                        && !header_acceptance::not_applicable::history_expected(*history).is_empty()
+                })
+                .unwrap_or_else(|| panic!("a counted {harness} history lists a report"))
+        })
+        .collect();
+    let lists: Vec<Key> = histories
+        .iter()
+        .map(|&history| Key::NaList {
+            run: history.into(),
+        })
+        .collect();
+    let genuine = ResultFile {
+        subject: S.into(),
+        subject_source: SOURCE.into(),
+        // Two reasons share a test, whose one result serves both keys.
+        results: tests
+            .iter()
+            .map(|&(_, test)| test)
+            .collect::<BTreeSet<TestRef>>()
+            .into_iter()
+            .map(test_record)
+            .chain(
+                histories
+                    .iter()
+                    .map(|&history| genuine_history_record(&manifest, history)),
+            )
+            .collect(),
+    };
+    let states = |manifest: &Manifest, results: &ResultFile| {
+        header_acceptance::evaluate(manifest, &required, results, SUBJECT).keys
+    };
+    let verified = states(&manifest, &genuine);
+    for key in tests.iter().map(|(key, _)| key).chain(&lists) {
+        assert_eq!(verified[key], ObligationState::Verified, "{key:?}");
+    }
+    // Without their results, every one blocks.
+    let none = ResultFile {
+        results: Vec::new(),
+        ..genuine.clone()
+    };
+    let missing = states(&manifest, &none);
+    for key in tests.iter().map(|(key, _)| key).chain(&lists) {
+        assert!(blocked(&missing[key]), "{key:?}: {:?}", missing[key]);
+    }
+    // A failed test blocks its key.
+    let mut failed = genuine.clone();
+    let (key, test) = &tests[0];
+    record_mut(&mut failed, &Expected::Passes { test: *test }.id().unwrap()).actual =
+        test_actual(*test, TestOutcome::Failed);
+    assert!(blocked(&states(&manifest, &failed)[key]));
+    // A listed report that held instead, or a row that drops its list,
+    // blocks the history's list key.
+    let history = histories[1];
+    let mut off = genuine.clone();
+    let id = genuine_history_record(&manifest, history).expected;
+    let Actual::Run(run) = &mut record_mut(&mut off, &id).actual else {
+        unreachable!()
+    };
+    let listed = header_acceptance::not_applicable::history_expected(history)[0].property;
+    run.reports.insert(listed.into(), held());
+    assert!(blocked(&states(&manifest, &off)[&lists[1]]));
+    let mut dropped = manifest.clone();
+    for result in &mut dropped.expected {
+        if let Expected::Holds {
+            history: h,
+            not_applicable,
+            ..
+        } = &mut result.expected
+        {
+            if *h == history {
+                *not_applicable = &[];
+            }
+        }
+    }
+    assert!(blocked(&states(&dropped, &genuine)[&lists[1]]));
 }
 
 /// Every node-harness history a `Holds` or `StaysNotApplicable` judges

@@ -914,9 +914,13 @@ fn holds(property: &'static str, gates: &[Gate], history: HistoryRef) -> Vec<Exp
 }
 
 /// Each counted execution's replay and each counted history's cleanup
-/// comparison, once per execution however many rows count it. A machine
-/// history's cleanup key is an approved standing `Open`, and a node
-/// history's waits for hf-6's stores.
+/// comparison, once per execution however many rows count it, and each
+/// node history's expected `NotApplicable` list. A machine history's
+/// cleanup key is an approved standing `Open`, and a node history's waits
+/// for the per-run comparison ([`NODE_CLEANUP`]). A node history's list
+/// key takes the history's own whole-report pass from `expected`, which
+/// judges every report against the list its row carries
+/// ([`super::not_applicable::history_expected`]).
 pub fn counted_results(expected: &[ExpectedResult]) -> Vec<ExpectedResult> {
     let mut replayed = std::collections::BTreeSet::new();
     let mut cleaned = std::collections::BTreeSet::new();
@@ -959,7 +963,18 @@ pub fn counted_results(expected: &[ExpectedResult]) -> Vec<ExpectedResult> {
         results.push(result(vec![Key::Cleanup { run }], G1, cleanup));
     }
     for run in listed {
-        results.push(result(vec![Key::NaList { run }], &[Gate::G6], NA_LIST));
+        let pass = expected
+            .iter()
+            .find_map(|result| match result.expected {
+                Expected::Holds { history, .. } | Expected::StaysNotApplicable { history, .. }
+                    if RunId::from(history) == run =>
+                {
+                    Some(result.expected.clone())
+                }
+                _ => None,
+            })
+            .expect("every counted history has its whole-report pass, by attach_history_passes");
+        results.push(result(vec![Key::NaList { run }], &[Gate::G6], pass));
     }
     results
 }
@@ -1005,22 +1020,17 @@ pub const MACHINE_CLEANUP: Expected = Expected::Open {
     until: None,
 };
 
-/// A node execution's cleanup key, until hf-6's stores can be snapshotted.
+/// A node execution's cleanup key. hf-6 delivered the comparison itself,
+/// `cleanup::run_compared`, which C17's tests run on the witnesses, but no
+/// recorded run carries its result yet: the recorder doesn't compare a
+/// run's stores and log after cleanup with their freeze, so the acceptance
+/// tool has nothing per execution to read.
 pub const NODE_CLEANUP: Expected = Expected::Open {
-    reason: "the cleanup comparison snapshots the stores hf-6 registers",
+    reason: "each recorded node run's stores and log, compared after cleanup with their freeze \
+             (cleanup::run_compared), which the recorder doesn't write yet",
     owner: "Adam's harness",
     approval: Approval::Pending,
-    until: Some("hf-6"),
-};
-
-/// A node history's expected `NotApplicable` list, until C1's reasons let
-/// each one be written with the reason its report must carry.
-pub const NA_LIST: Expected = Expected::Open {
-    reason: "the history's expected NotApplicable reports, each with the reason C1 makes a \
-             report carry",
-    owner: "Adam's side",
-    approval: Approval::Pending,
-    until: Some("E1"),
+    until: Some("hdr-14.8"),
 };
 
 /// Whether `harness` is a machine, by
@@ -3046,21 +3056,22 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     GateRequirement {
         name: "gate-1/topology-freshness",
         gates: G1,
-        expected: Expected::Open {
-            reason: obligation::GATE_1_TOPOLOGY_FRESHNESS,
-            owner: "Adam's harness",
-            approval: Approval::Pending,
-            until: Some("hf-7"),
+        expected: Expected::Passes {
+            test: obligation::TOPOLOGY_FRESHNESS_TEST,
         },
     },
     GateRequirement {
-        name: "gate-1/store-inventory",
+        name: "gate-1/store-inventory/registered",
         gates: G1,
-        expected: Expected::Open {
-            reason: obligation::GATE_1_STORE_INVENTORY,
-            owner: "Adam's harness",
-            approval: Approval::Pending,
-            until: Some("hf-6"),
+        expected: Expected::Passes {
+            test: obligation::STORE_INVENTORY_REGISTERED_TEST,
+        },
+    },
+    GateRequirement {
+        name: "gate-1/store-inventory/checkpoint-and-producer",
+        gates: G1,
+        expected: Expected::Passes {
+            test: obligation::STORE_INVENTORY_PRODUCER_TEST,
         },
     },
     GateRequirement {
@@ -3182,18 +3193,20 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
             ),
         },
     },
-    // C12 (E9) and C13 (hf-1 to hf-3) have landed, but both contracts are
-    // still Blocked in the contracts table, so this stays open until their
-    // states move with their proving tests. The frozen-head run then
-    // records it.
+    // Every distinct end finding at one boundary survives: in the registry
+    // (C12, E9) and in the fault store (C13, hf-1 to hf-3).
     GateRequirement {
-        name: "gate-2/end-boundary-preservation",
+        name: "gate-2/end-boundary-preservation/registry",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_END_BOUNDARY_PRESERVATION,
-            owner: "Evan (E9) and Adam's harness (hf-1 to hf-3)",
-            approval: Approval::Pending,
-            until: Some("hdr-14.8"),
+        expected: Expected::Passes {
+            test: obligation::END_BOUNDARY_REGISTRY_TEST,
+        },
+    },
+    GateRequirement {
+        name: "gate-2/end-boundary-preservation/fault-store",
+        gates: G2,
+        expected: Expected::Passes {
+            test: obligation::END_BOUNDARY_FAULT_STORE_TEST,
         },
     },
     GateRequirement {
@@ -3699,6 +3712,7 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "every_ref_has_a_one_key_off_control",
     "identity_joins_go_through_refs",
     "each_node_harness_s_missing_sources_are_its_own_test_s",
+    "delivered_obligations_verify_on_their_evidence",
     "every_node_history_lists_its_not_applicable_reports",
 ];
 
@@ -3815,7 +3829,8 @@ pub fn missing_source_results(keys: &[(String, String)]) -> Vec<ExpectedResult> 
 }
 
 /// The `NotApplicable` reasons' expected results, one per reason a header
-/// ID can carry ([`super::reasons::NA_REASONS`]).
+/// ID can carry ([`super::reasons::NA_REASONS`]): the pass of the test
+/// [`REASON_TESTS`] names for it, or [`REASON_UNSHOWN`] for one it doesn't.
 pub fn reason_results() -> Vec<ExpectedResult> {
     super::reasons::NA_REASONS
         .iter()
@@ -3825,19 +3840,116 @@ pub fn reason_results() -> Vec<ExpectedResult> {
                     reason: entry.reason,
                 }],
                 &[Gate::G6],
-                REASON_TEST,
+                reason_test(entry.reason).map_or(REASON_UNSHOWN, |test| Expected::Passes { test }),
             )
         })
         .collect()
 }
 
-/// A `NotApplicable` reason's test, until E1's tests show each at its
-/// trigger.
-pub const REASON_TEST: Expected = Expected::Open {
-    reason: "a test that shows this reason at its trigger",
+/// The test [`REASON_TESTS`] names for `reason`, if any.
+pub fn reason_test(reason: crate::NaReason) -> Option<TestRef> {
+    REASON_TESTS
+        .iter()
+        .find(|(r, _)| *r == reason)
+        .map(|&(_, test)| test)
+}
+
+/// The test that shows each `NotApplicable` reason a header ID can carry at
+/// its trigger, from E1's drain and registry tests: the run or the
+/// registry reaches the reason's condition, and the test requires the
+/// property's report to carry exactly that reason.
+pub static REASON_TESTS: &[(crate::NaReason, TestRef)] = {
+    use crate::{property::Pending, NaReason::*};
+    const DRAIN: &str = "tests/drain.rs";
+    const REGISTRY: &str = "tests/registry.rs";
+    &[
+        (
+            NeverApplied,
+            sim_test(DRAIN, "rule_5_every_not_applicable_carries_its_reason"),
+        ),
+        (
+            Undeclared,
+            sim_test(REGISTRY, "undeclared_assumption_not_applicable"),
+        ),
+        (
+            Excluded,
+            sim_test(REGISTRY, "excluded_source_not_applicable"),
+        ),
+        (
+            AssumptionsNeverHeld,
+            sim_test(REGISTRY, "assumptions_never_held_not_applicable"),
+        ),
+        (
+            AssumptionLost,
+            sim_test(
+                DRAIN,
+                "rule_4_a_lost_assumption_withdraws_what_the_dry_end_would_conclude",
+            ),
+        ),
+        (
+            StoppedByViolation,
+            sim_test(
+                "tests/header_recovery_livelock.rs",
+                "a_spin_after_recovered_violates_no_livelock",
+            ),
+        ),
+        (
+            HarnessFailed,
+            sim_test(
+                DRAIN,
+                "rule_6_a_failure_found_only_at_the_end_fails_the_run",
+            ),
+        ),
+        (
+            NodeStopped,
+            sim_test(DRAIN, "a_dry_end_reads_a_watch_mark_as_node_stopped"),
+        ),
+        (
+            Unsettled {
+                site: Pending::FaultOpen,
+            },
+            sim_test(DRAIN, "a_dry_end_leaves_a_fault_mark_unsettled"),
+        ),
+        (
+            Unsettled {
+                site: Pending::TeardownOpen,
+            },
+            sim_test(DRAIN, "a_dry_end_leaves_a_header_teardown_mark_unsettled"),
+        ),
+        (
+            Unsettled {
+                site: Pending::WatchOpen,
+            },
+            sim_test(DRAIN, "a_dry_end_reads_a_watch_mark_as_node_stopped"),
+        ),
+        (
+            Unsettled {
+                site: Pending::UnreadTrigger,
+            },
+            sim_test(DRAIN, "a_dry_end_leaves_an_unread_trigger_unsettled"),
+        ),
+        (
+            Unsettled {
+                site: Pending::UnjudgedDeparture,
+            },
+            sim_test(DRAIN, "a_dry_end_leaves_an_unjudged_departure_unsettled"),
+        ),
+        (
+            Unsettled {
+                site: Pending::TipUnpublished,
+            },
+            sim_test(DRAIN, "a_dry_end_leaves_an_unpublished_tip_unsettled"),
+        ),
+    ]
+};
+
+/// A `NotApplicable` reason no test in [`REASON_TESTS`] shows at its
+/// trigger. It blocks, so a reason added without its test can't pass.
+pub const REASON_UNSHOWN: Expected = Expected::Open {
+    reason: "no test shows this reason at its trigger",
     owner: "Adam's side",
     approval: Approval::Pending,
-    until: Some("E1"),
+    until: None,
 };
 
 /// Each non-`Real` tier exclusion Adam has approved, by its own

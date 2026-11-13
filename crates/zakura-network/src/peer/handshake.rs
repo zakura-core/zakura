@@ -101,7 +101,7 @@ where
     /// Funds decoded TCP payloads across this node's connections.
     inbound_budget: InboundBudget,
 
-    /// Lets this node's connections hash a block they all send only once.
+    /// Lets this node's connections reuse checksums of blocks they send.
     block_checksums: BlockChecksums,
 
     /// The live ban list, rechecked by each connection before it writes a block advert.

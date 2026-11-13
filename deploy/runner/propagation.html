@@ -81,6 +81,9 @@ th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line
 th { font-weight: 600; color: var(--muted); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; position: sticky; top: 0; background: var(--surface); }
 th.num, td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
 th.num { font-family: inherit; }
+th button.sort { all: inherit; display: inline; padding: 0; border: 0; background: none; cursor: pointer; }
+th button.sort:hover, th button.sort.active { color: var(--ink); }
+th button.sort:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
 td .quiet { color: var(--muted); }
 td.wrap { white-space: normal; min-width: 200px; max-width: 360px; }
 #blocks td button { all: unset; cursor: pointer; color: var(--pink-hi); font-family: var(--mono); }
@@ -192,7 +195,11 @@ const INTERVALS = [
 const POINT_LABELS = {
   heard: "Heard", asked: "Asked", body: "Had the block", queued: "Verified", tip: "Tip", told: "Told peers",
 };
-const state = { data: null, selected: null, followNewest: true, allHops: false, outsideBy: "peer" };
+const state = {
+  data: null, selected: null, followNewest: true, allHops: false, outsideBy: "peer",
+  // The outside peers panel's order, per view: the column it sorts by and its direction.
+  outsideSort: { peer: { key: "p90_ms", descending: true }, software: { key: "peers", descending: true } },
+};
 
 // Every name on this page comes from node reports, so text is only ever set as text.
 function el(tag, attributes = {}, ...children) {
@@ -267,8 +274,23 @@ function followNewest(follow) {
   render();
 }
 
-function table(target, columns, rows) {
-  const head = el("tr", {}, ...columns.map(([label, numeric]) => el("th", { text: label, class: numeric ? "num" : null })));
+// `columns` are `[label, numeric, sortKey]`. With `sort` (`{ key, descending, onSort }`), a
+// column that has a sort key gets a heading button that sorts by it.
+function table(target, columns, rows, sort) {
+  const head = el("tr", {}, ...columns.map(([label, numeric, key]) => {
+    const th = el("th", { class: numeric ? "num" : null });
+    if (!sort || !key) {
+      th.textContent = label;
+      return th;
+    }
+    const active = sort.key === key;
+    th.setAttribute("aria-sort", active ? (sort.descending ? "descending" : "ascending") : "none");
+    const button = el("button", { type: "button", class: "sort" + (active ? " active" : ""),
+      text: label + (active ? (sort.descending ? " ↓" : " ↑") : "") });
+    button.addEventListener("click", () => sort.onSort(key));
+    th.append(button);
+    return th;
+  }));
   target.replaceChildren(el("thead", {}, head), el("tbody", {}, ...rows));
 }
 function cell(text, numeric) { return el("td", { text, class: numeric ? "num" : null }); }
@@ -557,20 +579,36 @@ function renderDownloads(data) {
 }
 
 // The outside peers' downloads, one row per peer or one per software version.
+// Sorts `rows` by `key`; a row without a value goes last whichever the direction.
+function sortedRows(rows, { key, descending }) {
+  const blank = (value) => value === null || value === undefined || value === "";
+  return [...rows].sort((a, b) => {
+    if (blank(a[key]) || blank(b[key])) return blank(a[key]) - blank(b[key]);
+    const order = typeof a[key] === "number" ? a[key] - b[key] : String(a[key]).localeCompare(String(b[key]));
+    return descending ? -order : order;
+  });
+}
+
 function renderOutside(data) {
-  const bySoftware = state.outsideBy === "software";
+  const view = state.outsideBy;
+  const bySoftware = view === "software";
   document.getElementById("outside-by-peer").setAttribute("aria-pressed", String(!bySoftware));
   document.getElementById("outside-by-software").setAttribute("aria-pressed", String(bySoftware));
-  document.getElementById("outside-intro").textContent = bySoftware
-    ? "One row per software version that outside peers named when connecting, most peers first."
-    : "One row per peer that is not ours and that one of our nodes downloaded a block from, slowest first. The software is the peer's own, as it named it when connecting.";
-  const rows = (bySoftware ? data.outside_software : data.outside_peers) || [];
+  const first = bySoftware
+    ? [["Software", false, "agent"], ["Peers", true, "peers"]]
+    : [["Peer address", false, "ip"], ["Peer runs", false, "agent"]];
+  const columns = [...first, [bySoftware ? "Our nodes that downloaded from them" : "Our nodes that downloaded from it"],
+    ["Downloads", true, "downloads"], ["Legacy failures", true, "failed"], ["Median", true, "median_ms"],
+    ["9 in 10", true, "p90_ms"], [""], ["Slowest", true, "max_ms"], ["Last used", false, "last"]];
+  const sort = state.outsideSort[view];
+  const sortLabel = columns.find((column) => column[2] === sort.key)[0].toLowerCase();
+  document.getElementById("outside-intro").textContent = (bySoftware
+    ? "One row per software version that outside peers named when connecting."
+    : "One row per peer that is not ours and that one of our nodes downloaded a block from. The software is the peer's own, as it named it when connecting.")
+    + ` Ordered by ${sortLabel}, ${sort.descending ? "highest" : "lowest"} first; select a column heading to sort by it.`;
+  const rows = sortedRows((bySoftware ? data.outside_software : data.outside_peers) || [], sort);
   const worst = Math.max(1, ...rows.map((row) => row.p90_ms || 0));
-  const first = bySoftware ? [["Software"], ["Peers", true]] : [["Peer address"], ["Peer runs"]];
-  table(document.getElementById("outside"),
-    [...first, [bySoftware ? "Our nodes that downloaded from them" : "Our nodes that downloaded from it"],
-      ["Downloads", true], ["Legacy failures", true], ["Median", true], ["9 in 10", true], [""], ["Slowest", true],
-      ["Last used"]],
+  table(document.getElementById("outside"), columns,
     rows.map((row) => {
       const users = el("td", { class: "wrap" });
       row.nodes.forEach((name, index) => users.append(index ? ", " : "", nodeLink(name)));
@@ -583,7 +621,15 @@ function renderOutside(data) {
         el("td", { style: "min-width:120px" }, row.p90_ms === null ? "" :
           el("div", { class: "bar", style: `width:${(row.p90_ms / worst) * 100}%;background:var(--c-download)` })),
         cell(ms(row.max_ms), true), cell(clockTime(row.last)));
-    }));
+    }),
+    { ...sort, onSort: (key) => {
+      // The same column again reverses it; a new one starts with the most telling end:
+      // highest first for numbers and times, A to Z for names and addresses.
+      state.outsideSort[view] = key === sort.key
+        ? { key, descending: !sort.descending }
+        : { key, descending: !["ip", "agent"].includes(key) };
+      renderOutside(data);
+    } });
   document.getElementById("outside-note").textContent = rows.length
     ? (bySoftware
       ? "A version is the exact name a peer sent, so each release is its own row. Times count every download from those peers that delivered the block. "

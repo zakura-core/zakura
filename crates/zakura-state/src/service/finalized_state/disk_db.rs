@@ -1140,6 +1140,29 @@ impl DiskDb {
             })
     }
 
+    /// Turns off RocksDB's compaction of old files in `column_families`, then lets
+    /// their automatic compactions start.
+    ///
+    /// [`DiskDb::options`] explains why, and opens every column family with automatic
+    /// compactions off. Each column family gets both settings in one step, so RocksDB
+    /// never picks a compaction for it while the file-age limit still applies.
+    fn stop_file_age_compactions(
+        db: &DB,
+        column_families: &[String],
+    ) -> Result<(), rocksdb::Error> {
+        for name in column_families {
+            let column_family = db
+                .cf_handle(name)
+                .expect("the database was just opened with this column family");
+            db.set_options_cf(
+                column_family,
+                &[("ttl", "0"), ("disable_auto_compactions", "false")],
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Opens or creates the database at a path based on the kind, major version and network,
     /// with the supplied column families, preserving any existing column families,
     /// and returns a shared low-level database wrapper.
@@ -1190,12 +1213,17 @@ impl DiskDb {
 
         let db_options = DiskDb::options();
 
-        let column_families = DiskDb::construct_column_families(
+        let column_families: Vec<ColumnFamilyDescriptor> = DiskDb::construct_column_families(
             db_options.clone(),
             &path,
             column_families_in_code,
             read_only,
-        );
+        )
+        .collect();
+        let column_family_names: Vec<String> = column_families
+            .iter()
+            .map(|column_family| column_family.name().to_owned())
+            .collect();
 
         let secondary_dir = read_only.then(|| {
             Arc::new(
@@ -1221,7 +1249,10 @@ impl DiskDb {
                 column_families,
             )
         } else {
-            DB::open_cf_descriptors(&db_options, &path, column_families)
+            DB::open_cf_descriptors(&db_options, &path, column_families).and_then(|db| {
+                DiskDb::stop_file_age_compactions(&db, &column_family_names)?;
+                Ok(db)
+            })
         };
 
         match db_result {
@@ -1654,6 +1685,25 @@ impl DiskDb {
         opts.increase_parallelism(background_jobs);
         opts.set_max_background_jobs(background_jobs);
         opts.set_max_subcompactions(4);
+
+        // Never compact a file only because it is old.
+        //
+        // By default RocksDB compacts any file above the last level into the next
+        // level once its oldest data is 30 days old, to get deletions out of the
+        // upper levels within a bounded time. Zakura's large column families
+        // mostly gain keys and rarely lose them, and many are keyed by hashes, so
+        // a month of new entries overlaps the whole last level. Each of these
+        // compactions then rewrote most of a column family to merge that month in:
+        // on mainnet nodes 4 to 6 GiB and several minutes of CPU after a restart,
+        // dropping under 0.2% of the records read. Compaction by level size still
+        // merges the upper levels down as they fill.
+        //
+        // The RocksDB binding can change that age limit only on an open database,
+        // so `stop_file_age_compactions` clears it straight after a writable open.
+        // Automatic compactions start switched off here and that same step switches
+        // them on, so RocksDB cannot begin an age compaction in between. A read-only
+        // instance never compacts, so it keeps them off.
+        opts.set_disable_auto_compactions(true);
 
         // Bound WAL growth so heavy sync cannot accumulate tens of GiB of logs
         // that must be replayed before Zebra can restart.

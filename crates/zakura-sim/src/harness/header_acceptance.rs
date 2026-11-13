@@ -59,6 +59,7 @@ pub use rows::{
 };
 
 use crate::property::{Source, Status};
+use refs::{PlantedRef, Ref};
 
 /// One of sim-6.2's six gates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -168,6 +169,16 @@ pub struct CaseRef {
     pub property: &'static str,
     /// The case's name, without an extension.
     pub name: &'static str,
+}
+
+impl CaseRef {
+    /// Its whole identity, as joins name it.
+    pub fn planted(&self) -> PlantedRef {
+        PlantedRef {
+            property: self.property.to_owned(),
+            name: self.name.to_owned(),
+        }
+    }
 }
 
 /// Which of a planted case's runs an execution is.
@@ -716,6 +727,16 @@ impl Expected {
     }
 }
 
+/// Whether `case` is the one a contract's proving catch names by
+/// `property` and `name`, joined on its whole [`PlantedRef`].
+fn proving_catch(property: &str, name: &str, case: &CaseRef) -> bool {
+    let want = PlantedRef {
+        property: property.to_owned(),
+        name: name.to_owned(),
+    };
+    PlantedRef::joins(&want, case, |case| Some(case.planted()))
+}
+
 impl Key {
     /// Whether `expected` is a result that can satisfy this key: the same
     /// kind of obligation, naming the same item in every identity field.
@@ -762,7 +783,7 @@ impl Key {
             (
                 Key::ContractCatch { property, name, .. },
                 Expected::Caught { case, .. } | Expected::HarnessCaught { case, .. },
-            ) => case.property == property && case.name == name,
+            ) => proving_catch(property, name, case),
             (Key::Replay { run }, Expected::Replays { run: replayed }) => run == replayed,
             (
                 Key::History { run, target },
@@ -1144,4 +1165,41 @@ pub fn needs_of(harnesses: &[&str]) -> Result<Vec<(String, String)>, String> {
         });
     }
     Ok(needs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+
+    /// A contract's proving catch takes the catch of its case only on the
+    /// case's whole [`PlantedRef`] (Rule 25's template): the key naming
+    /// `reserved-flags-skipped` under its property covers that case's
+    /// `Caught`, and the key with its property or its name moved covers
+    /// it no more.
+    #[test]
+    fn a_proving_catch_joins_its_whole_case() {
+        let case = CaseRef {
+            property: "header-sync/s5v9/status/reserved-flags-closes",
+            name: "reserved-flags-skipped",
+        };
+        let caught = Expected::Caught {
+            case,
+            harness: "header-sync/wire",
+            set: &[],
+            found: Found::AtStep,
+            companions: &[],
+            not_applicable: &[],
+            patched_not_applicable: None,
+        };
+        let keys = assert_one_key_off::<PlantedRef>(&case.planted(), |want| {
+            let key = Key::ContractCatch {
+                contract: "C2".to_owned(),
+                property: want.property.clone(),
+                name: want.name.clone(),
+            };
+            key.covers(&caught, &[])
+        });
+        assert_eq!(keys, 2);
+    }
 }

@@ -7404,6 +7404,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/tool.rs",
         "a_case_run_is_recorded_at_its_whole_case",
     ),
+    (
+        "PlantedRef",
+        "src/harness/header_acceptance.rs",
+        "proving_catch",
+        "src/harness/header_acceptance.rs",
+        "a_proving_catch_joins_its_whole_case",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.

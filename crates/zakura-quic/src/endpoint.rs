@@ -979,7 +979,9 @@ async fn kernel_drop_poller(slot: Weak<SocketSlot>, interval: Duration) {
 pub(crate) struct PendingTable(
     Arc<Mutex<PendingCounts>>,
     #[cfg(zakura_sim)] Arc<counter::AtomicUsize>,
-    #[cfg(zakura_sim)] Arc<std::sync::Mutex<Vec<HandshakeEvent>>>,
+    /// Recorded events, or `None` until a probe asks to drain them.
+    #[cfg(zakura_sim)]
+    Arc<std::sync::Mutex<Option<Vec<HandshakeEvent>>>>,
 );
 
 /// Production admission and TLS decisions retained for simulator observation.
@@ -1050,6 +1052,21 @@ pub struct AdmissionSample {
 
 #[cfg(zakura_sim)]
 impl AdmissionProbe {
+    /// Starts recording handshake events for [`Self::take_events`].
+    ///
+    /// The endpoint records nothing before this call, so an endpoint whose
+    /// events no one drains keeps no history.
+    pub fn record_events(&self) {
+        if let Some(shared) = self.0.upgrade() {
+            shared
+                .pending
+                .2
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert_with(Vec::new);
+        }
+    }
+
     /// Drains events without adding simulator scheduling points.
     pub fn take_events(&self) -> Vec<HandshakeEvent> {
         assert!(
@@ -1064,7 +1081,7 @@ impl AdmissionProbe {
             .2
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        std::mem::take(&mut *events)
+        events.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     /// Reports each Initial that reaches cryptographic handshake processing.
@@ -1115,10 +1132,14 @@ impl AdmissionProbe {
 impl PendingTable {
     #[cfg(zakura_sim)]
     pub(crate) fn record(&self, event: HandshakeEvent) {
-        self.2
+        if let Some(events) = self
+            .2
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(event);
+            .as_mut()
+        {
+            events.push(event);
+        }
     }
 
     pub(crate) fn total(&self) -> usize {

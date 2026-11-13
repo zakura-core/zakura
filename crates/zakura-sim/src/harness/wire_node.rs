@@ -634,6 +634,7 @@ impl TransportObserver for TapObserver {
     }
     fn quic_admission(&self, probe: zakura_quic::AdmissionProbe) {
         if self.0.handshake_sampling.load(Ordering::Relaxed) {
+            probe.record_events();
             let state = Arc::downgrade(&self.0);
             probe.observe_attempts(move |remote| {
                 if let Some(state) = state.upgrade() {

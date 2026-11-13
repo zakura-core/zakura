@@ -929,20 +929,10 @@ where
                 active_public_inbound_connections + active_zcashd_compat_inbound_connections;
             let canonical_ip = canonical_socket_addr(addr.remove_socket_addr_privacy()).ip();
             let is_zcashd_compat_peer = zcashd_compat_peer_ips.contains(&canonical_ip);
-            let connection_tracker = if is_zcashd_compat_peer {
-                if active_zcashd_compat_inbound_connections >= zcashd_compat_reserved_slots
-                    || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
-                {
-                    // Too many zcashd-compat or total open inbound connections already.
-                    // Close the connection.
-                    std::mem::drop(tcp_stream);
-                    // Allow invalid connections to be cleared quickly,
-                    // but still put a limit on our CPU and network usage from failed connections.
-                    tokio::time::sleep(constants::MIN_INBOUND_PEER_FAILED_CONNECTION_INTERVAL)
-                        .await;
-                    continue;
-                }
-
+            let connection_tracker = if is_zcashd_compat_peer
+                && active_zcashd_compat_inbound_connections < zcashd_compat_reserved_slots
+                && active_total_inbound_connections < config.peerset_inbound_connection_limit()
+            {
                 active_zcashd_compat_connections.track_connection()
             } else if config.unconditional_peers.is_dial_address(addr.ip())
                 && active_unconditional_inbound_connections
@@ -956,11 +946,13 @@ where
                 // another listed peer. A peer that gets no slot here competes for a public
                 // slot, and waits like any other.
                 active_unconditional_connections.track_connection_from(canonical_ip)
-            } else if active_public_inbound_connections >= public_inbound_connection_limit
+            } else if is_zcashd_compat_peer
+                || active_public_inbound_connections >= public_inbound_connection_limit
                 || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
                 || recent_inbound_connections.is_past_limit_or_add(addr.ip())
             {
-                // Too many open inbound connections or pending handshakes already.
+                // A zcashd-compat peer never takes a public slot. Otherwise there are too
+                // many open inbound connections or pending handshakes already.
                 // Close the connection.
                 std::mem::drop(tcp_stream);
                 // Allow invalid connections to be cleared quickly,

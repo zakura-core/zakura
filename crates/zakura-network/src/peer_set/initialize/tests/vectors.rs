@@ -2405,7 +2405,7 @@ async fn listener_gives_dialed_unconditional_peers_inbound_slots_of_their_own() 
     // Each case is a node's unconditional peers, its zcashd-compat peers, its peer set
     // target size, and the connections it accepts from the ordinary peer, which connects
     // first, and from the unconditional peer. The inbound limit is 3 times the target.
-    let cases: [(&str, &[&str], usize, [usize; 2]); 6] = [
+    let cases: [(&str, &[&str], usize, [usize; 2]); 8] = [
         // Not listed: the unconditional peer finds the public slots full.
         ("[]", &[], 1, [3, 0]),
         // One slot for a listed address, on top of the inbound limit.
@@ -2416,8 +2416,13 @@ async fn listener_gives_dialed_unconditional_peers_inbound_slots_of_their_own() 
         ("['192.0.2.1', '::/127']", &[], 1, [3, 0]),
         // The slots are one pool for the listed addresses.
         ("['::1', '192.0.2.1']", &[], 1, [3, 2]),
-        // A listed zcashd-compat peer only takes the zcashd-compat slot.
-        ("['::1']", &["::1"], 1, [2, 1]),
+        // A listed zcashd-compat peer takes the zcashd-compat slot, then its own slot.
+        ("['::1']", &["::1"], 1, [2, 2]),
+        // A listed zcashd-compat peer that finds the zcashd-compat slot taken by another
+        // zcashd-compat peer takes its own slot.
+        ("['::1']", &["::1", "127.0.0.1"], 1, [1, 1]),
+        // A listed zcashd-compat peer still connects to a node with no inbound slots.
+        ("['::1']", &["::1"], 0, [0, 1]),
     ];
 
     for (listed, zcashd_compat, target_size, expected) in cases {

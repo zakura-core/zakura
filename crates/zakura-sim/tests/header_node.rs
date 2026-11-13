@@ -949,3 +949,23 @@ fn a_growth_overlapping_the_mirrors_sync_grows_its_new_tip() {
         );
     }
 }
+
+/// Every node-sync plan backs `storage-operation-ids`' `Holds` through its
+/// witness, as the acceptance tool records the history: the run reaches the
+/// property's trigger history, a header-storage submission and completion.
+/// This fails if the property has no trigger-history check, which a
+/// `holds` witness refuses.
+#[test]
+fn node_sync_plans_witness_operation_ids() {
+    for (index, input) in inputs(32, 256).into_iter().enumerate() {
+        let result = zakura_sim::witness::witness::<Storage>(
+            zakura_sim::witness::WitnessScenario {
+                scenario: StorageScenario::default(),
+                input,
+            },
+            OPERATION_IDS,
+            zakura_sim::witness::Expect::Holds,
+        );
+        assert_eq!(result, Ok(()), "plan {index}");
+    }
+}

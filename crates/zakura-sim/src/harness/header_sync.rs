@@ -2599,7 +2599,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
             needs: &[Source::Storage],
             status: Status::Active,
             check: check_operation_ids::<S>,
-            witness: None,
+            witness: Some(TriggerHistory::Log(operation_submitted_and_completed)),
         },
         Property {
             id: PropertyId::new(DIRECT_DISPATCH),
@@ -2709,6 +2709,30 @@ pub(crate) fn check_service_operation_ids<S: HasView>(
         cx.record_violation(expected, actual);
     }
     cx.violated(expected, actual)
+}
+
+/// [`OPERATION_IDS`]'s trigger: the node's header storage logged a
+/// submission and a completion, so the rule judged an ID's rise and an
+/// operation's completion.
+fn operation_submitted_and_completed(log: &ObservationLog) -> bool {
+    let facts = || {
+        log.entries()
+            .iter()
+            .filter_map(|entry| operation_fact(HEADER_SERVICE, &entry.obs))
+    };
+    let submitted = facts().any(|fact| {
+        matches!(
+            fact,
+            StorageFact::Submitted { .. } | StorageFact::BlockSubmitted { .. }
+        )
+    });
+    submitted
+        && facts().any(|fact| {
+            matches!(
+                fact,
+                StorageFact::Completed { .. } | StorageFact::BlockCompleted { .. }
+            )
+        })
 }
 
 /// Checks [`DIRECT_DISPATCH`]: violated once the dispatch guard's flag is
@@ -3894,6 +3918,40 @@ mod tests {
         let mut log = ObservationLog::default();
         log_publisher(&mut log);
         assert!(!storage_call_dispatched(&dispatch_view(false), &log));
+    }
+
+    /// [`OPERATION_IDS`]'s trigger needs a header-storage submission and a
+    /// completion. A log with only one of them, or with both on another
+    /// service, doesn't reach it.
+    #[test]
+    fn operation_ids_trigger_needs_a_submission_and_a_completion() {
+        let logged = |facts: &[StorageFact]| {
+            let mut log = ObservationLog::default();
+            for fact in facts {
+                log_storage(&mut log, fact.clone());
+            }
+            log
+        };
+        assert!(operation_submitted_and_completed(&logged(&[
+            submitted(1),
+            completed(1)
+        ])));
+        assert!(!operation_submitted_and_completed(&logged(&[
+            submitted(1),
+            submitted(2)
+        ])));
+        assert!(!operation_submitted_and_completed(&logged(&[completed(1)])));
+        let mut elsewhere = ObservationLog::default();
+        for fact in [submitted(1), completed(1)] {
+            elsewhere.push(Observation::Storage {
+                service: "other".to_owned(),
+                instance: 0,
+                seq: 0,
+                txn: 0,
+                fact,
+            });
+        }
+        assert!(!operation_submitted_and_completed(&elsewhere));
     }
 
     /// [`DIRECT_DISPATCH`]'s trigger needs the reactor's own dispatch: a

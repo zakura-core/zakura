@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use super::{
     evaluate::{Actions, End},
-    refs::{ControlRef, LinkRef, Ref, SessionRef},
+    refs::{ControlRef, LinkRef, Ref, SessionRef, StampRef},
 };
 use crate::{
     harness::{
@@ -322,17 +322,13 @@ fn leading_number<T: std::str::FromStr>(text: &str) -> Option<T> {
     text[..end].parse().ok()
 }
 
-/// Every `Environment` fact the full report's `ends` store holds, in stamp
-/// order, with its stamp, connection and cause, read from its `Debug`
-/// snapshot: `facts: [(<stamp>, Environment { peer: "<peer>", connection:
-/// Some(<id>) | None, action: <action> }), ...], causes: [(<stamp>,
-/// <position>), ...]`. Empty if the store isn't there.
-fn environment_facts(report: &FullReport) -> Vec<Fact> {
-    let Some(text) = snapshot(report, "ends").and_then(Value::as_str) else {
-        return Vec::new();
-    };
+/// The `ends` store's `Debug` snapshot `text` split into its facts and its
+/// causes, each cause as the stamp of the fact it names and the position in
+/// the control script of the step whose execution recorded that fact:
+/// `facts: [...], causes: [(<stamp>, <position>), ...]`.
+fn ends_causes(text: &str) -> (&str, Vec<(StampRef, usize)>) {
     let (facts, causes) = text.split_once("causes: [").unwrap_or((text, ""));
-    let causes: Vec<(u64, usize)> = causes
+    let causes = causes
         .split(']')
         .next()
         .unwrap_or("")
@@ -340,9 +336,34 @@ fn environment_facts(report: &FullReport) -> Vec<Fact> {
         .skip(1)
         .filter_map(|pair| {
             let (stamp, position) = pair.split_once(',')?;
-            Some((leading_number(stamp)?, leading_number(position)?))
+            let stamp = StampRef {
+                stamp: leading_number(stamp)?,
+            };
+            Some((stamp, leading_number(position)?))
         })
         .collect();
+    (facts, causes)
+}
+
+/// The control-script position `causes` names for the fact `fact` stamps,
+/// joined by its whole [`StampRef`], so a fact never takes the cause of
+/// another fact's stamp.
+fn cause_of(causes: &[(StampRef, usize)], fact: &StampRef) -> Option<usize> {
+    StampRef::joined(fact, causes, |(at, _)| Some(at.clone()))
+        .first()
+        .map(|(_, position)| *position)
+}
+
+/// Every `Environment` fact the full report's `ends` store holds, in stamp
+/// order, with its stamp, connection and cause, read from its `Debug`
+/// snapshot: `facts: [(<stamp>, Environment { peer: "<peer>", connection:
+/// Some(<id>) | None, action: <action> }), ...], causes: [...]`
+/// ([`ends_causes`]). Empty if the store isn't there.
+fn environment_facts(report: &FullReport) -> Vec<Fact> {
+    let Some(text) = snapshot(report, "ends").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let (facts, causes) = ends_causes(text);
     let mut found = Vec::new();
     let mut chunks = facts.split("Environment { peer: \"");
     let mut before = chunks.next().unwrap_or("");
@@ -369,10 +390,7 @@ fn environment_facts(report: &FullReport) -> Vec<Fact> {
             peer: peer.to_owned(),
             connection,
             action: action.to_owned(),
-            control: causes
-                .iter()
-                .find(|(at, _)| *at == stamp)
-                .map(|&(_, position)| position),
+            control: cause_of(&causes, &StampRef { stamp }),
         });
     }
     found
@@ -816,6 +834,31 @@ mod tests {
             joined += 1;
         }
         assert_eq!(joined, 3);
+    }
+
+    /// Each fact takes its cause by its whole stamp (Rule 25's template):
+    /// in the close-relink-close history every caused fact's stamp finds
+    /// its own step's position, and the same stamp moved finds none.
+    #[test]
+    fn a_fact_joins_its_cause_by_its_whole_stamp() {
+        let (_, report, _) = close_relink_close();
+        let text = snapshot(&report, "ends")
+            .and_then(Value::as_str)
+            .expect("a node run keeps its ends store");
+        let (_, causes) = ends_causes(text);
+        let facts = environment_facts(&report);
+        let mut caused = 0;
+        for fact in &facts {
+            let Some(position) = fact.control else {
+                continue;
+            };
+            let stamp = StampRef { stamp: fact.stamp };
+            assert_one_key_off::<StampRef>(&stamp, |stamp| {
+                cause_of(&causes, stamp) == Some(position)
+            });
+            caused += 1;
+        }
+        assert_eq!(caused, 3, "{facts:?}");
     }
 
     /// A control fact names its link only by its whole [`LinkRef`]: in the

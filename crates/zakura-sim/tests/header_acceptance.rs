@@ -7147,6 +7147,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "tests/header_mixed_resources.rs",
         "the_mixed_joins_fail_one_identity_off",
     ),
+    (
+        "StampRef",
+        "src/harness/header_acceptance/actions.rs",
+        "cause_of",
+        "src/harness/header_acceptance/actions.rs",
+        "a_fact_joins_its_cause_by_its_whole_stamp",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.
@@ -7898,8 +7905,8 @@ const RULE_25_WITNESSES: &[&str] = &[
 /// The words a name of an identity holds, as one of its `_`-separated
 /// parts: a peer, connection, session, subscription, stream, frame or
 /// page, an operation, call or sequence number, a storage instance, a
-/// peer's incarnation, a link, a version, an ID, or a serialized
-/// attribution.
+/// peer's incarnation, a link, a version, an ID, a serialized attribution,
+/// or a store's stamp for a fact.
 const IDENTITY_WORDS: &[&str] = &[
     "peer",
     "conn",
@@ -7918,6 +7925,7 @@ const IDENTITY_WORDS: &[&str] = &[
     "version",
     "id",
     "attribution",
+    "stamp",
 ];
 
 /// The comparisons [`raw_joins`] finds that aren't identity joins, as
@@ -8354,6 +8362,10 @@ fn identity_joins_go_through_refs() {
             Some("attribution"),
         ),
         ("fn p(links: &[u64], conn: u64) -> bool { links.contains(&conn) }", Some("conn")),
+        (
+            "fn p(causes: &[(u64, usize)], stamp: u64) -> bool { causes.iter().any(|(at, _)| *at == stamp) }",
+            Some("stamp"),
+        ),
         (
             "fn p(peer: &PeerNameRef) { assert_one_key_off::<PeerNameRef>(peer, |p| p.peer == peer.peer); }",
             None,

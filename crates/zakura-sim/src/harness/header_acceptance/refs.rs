@@ -287,6 +287,15 @@ pub struct TriggerRef {
 }
 impl Ref for TriggerRef {}
 
+/// One fact of a node's `ends` store, by the stamp the store records it
+/// under, which its `causes` name it by.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StampRef {
+    /// The stamp.
+    pub stamp: u64,
+}
+impl Ref for StampRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

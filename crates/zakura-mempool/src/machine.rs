@@ -143,6 +143,10 @@ pub enum Effect {
     },
     /// Cancel a verification. Its outcome is ignored.
     Cancel(JobId),
+    /// Tell the caller fetching under this reservation that the body is no
+    /// longer needed, because a block mined the transaction. See
+    /// `Reservation::cancellation`.
+    CancelFetch(ReservationId),
     /// Answer a submission.
     Verdict {
         /// The submission.
@@ -715,6 +719,28 @@ impl<E: VerifyError> MempoolState<E> {
                 now,
             );
         }
+        // Today's pool cancels the download and verification of anything a
+        // block mined. The undecided ones end here, and a fetch still out is
+        // told to stop, so its slot is freed once its caller drops it.
+        let ended: Vec<u64> = self
+            .admissions
+            .iter()
+            .filter(|(_, admission)| mined_set.contains(&admission.tx_id.mined_id()))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in ended {
+            let admission = self.admission_at(key);
+            if admission.owner_waiting {
+                let owner = admission.owner;
+                self.step.effects.push(Effect::CancelFetch(owner));
+            }
+            self.cancel_admission_job(key);
+            self.reject(
+                key,
+                SameEffectsChainRejectionError::Mined.into(),
+                Charge::None,
+            );
+        }
         for conflict in conflicting {
             self.remove_with_dependents(conflict.mined_id(), RemovalReason::Conflicted);
             self.storage.reject(
@@ -1020,6 +1046,21 @@ impl<E: VerifyError> MempoolState<E> {
             .get(&tx_id)
             .and_then(|key| self.admissions.get(key))
             .is_some_and(|admission| matches!(admission.stage, Stage::Parked { .. }))
+    }
+
+    /// Whether the chain was reset since the body of `job`'s transaction
+    /// arrived, as of now. The core asks this when it starts the job, since
+    /// a reset can land after the job's start effect was made and before the
+    /// core carries it out. False for a revalidation or a job that is gone.
+    pub fn job_after_reset(&self, job: JobId) -> bool {
+        match self.jobs.get(&job) {
+            Some((JobTarget::Admission(tx_id), _)) => self
+                .admission_of
+                .get(tx_id)
+                .and_then(|key| self.admissions.get(key))
+                .is_some_and(|admission| admission.after_reset),
+            _ => false,
+        }
     }
 
     /// Whether any undecided transaction is parked on a missing parent.

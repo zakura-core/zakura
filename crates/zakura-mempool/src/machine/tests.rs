@@ -316,6 +316,7 @@ enum Seen {
         revalidation: bool,
     },
     Cancel(u64),
+    CancelFetch(u64),
     Verdict {
         waiter: u64,
         verdict: ModelVerdict,
@@ -343,6 +344,7 @@ fn seen_real(step: &Step) -> Vec<Seen> {
                 revalidation: *revalidation,
             },
             Effect::Cancel(job) => Seen::Cancel(job.0),
+            Effect::CancelFetch(reservation) => Seen::CancelFetch(reservation.0),
             Effect::Verdict { waiter, verdict } => Seen::Verdict {
                 waiter: waiter.0,
                 verdict: model_verdict(verdict),
@@ -373,6 +375,7 @@ fn seen_model(step: &ModelStep) -> Vec<Seen> {
                 revalidation: *revalidation,
             }),
             ModelEffect::Cancel(job) => Some(Seen::Cancel(job.0)),
+            ModelEffect::CancelFetch(reservation) => Some(Seen::CancelFetch(reservation.0)),
             ModelEffect::Verdict { waiter, verdict } => Some(Seen::Verdict {
                 waiter: waiter.0,
                 verdict: *verdict,
@@ -418,6 +421,7 @@ impl Coverage {
                     "start"
                 }),
                 Seen::Cancel(_) => self.saw("cancel"),
+                Seen::CancelFetch(_) => self.saw("cancel fetch"),
                 Seen::Verdict { verdict, .. } => self.saw(format!("verdict {verdict:?}")),
                 Seen::OutputReady { .. } => self.saw("output ready"),
                 Seen::OutputWaitEnded(_) => self.saw("output wait ended"),
@@ -463,6 +467,9 @@ struct Run {
     draining: bool,
     /// The transactions of the universe the current chain mined.
     mined: HashSet<transaction::Hash>,
+    /// Reservations whose fetch the core cancelled. Their callers drop them
+    /// next.
+    to_drop: Vec<ReservationId>,
     coverage: Coverage,
 }
 
@@ -515,6 +522,7 @@ impl Run {
             steps: 0,
             draining: false,
             mined: HashSet::default(),
+            to_drop: Vec::new(),
             coverage: Coverage::default(),
         }
     }
@@ -600,6 +608,15 @@ impl Run {
                 }
                 Seen::OutputReady { waiter, .. } | Seen::OutputWaitEnded(waiter) => {
                     self.output_waiters.retain(|w| *w != waiter)
+                }
+                // The caller stops its fetch and drops the reservation, as
+                // the adapter does, on a later input.
+                Seen::CancelFetch(reservation) => {
+                    if let Some(index) = self.held.iter().position(|held| held.id.0 == reservation)
+                    {
+                        let held = self.held.swap_remove(index);
+                        self.to_drop.push(held.id);
+                    }
                 }
                 Seen::Verdict { .. } => {}
             }
@@ -726,6 +743,14 @@ impl Run {
     /// One random input to both sides.
     fn input(&mut self) {
         self.steps += 1;
+        if let Some(reservation) = self.to_drop.pop() {
+            let at = self.at();
+            let (real, model) = (
+                self.machine.release(reservation, at),
+                self.model.release(reservation, self.now),
+            );
+            return self.compare("drop a cancelled fetch", real, model);
+        }
         match pick(&mut self.rng, 20) {
             0..=4 => self.reserve(),
             5..=8 => self.submit(),
@@ -1244,6 +1269,15 @@ impl Run {
             self.compare("drain resync", real, model);
         }
         self.draining = true;
+        let cancelled: Vec<ReservationId> = std::mem::take(&mut self.to_drop);
+        for reservation in cancelled {
+            let at = self.at();
+            let (real, model) = (
+                self.machine.release(reservation, at),
+                self.model.release(reservation, self.now),
+            );
+            self.compare("drain a cancelled fetch", real, model);
+        }
         while let Some(held) = self.held.pop() {
             let at = self.at();
             let (real, model) = (
@@ -1348,6 +1382,7 @@ fn pool_state_matches_model() {
             "joined",
             "start revalidation",
             "cancel",
+            "cancel fetch",
             "output ready",
             "output wait ended",
             "removed Mined",
@@ -1884,6 +1919,7 @@ fn a_job_run_again_after_a_reset_is_marked() {
     let Some(Effect::Start { job, .. }) = first.effects.first().cloned() else {
         panic!("a body starts a job");
     };
+    assert!(!machine.job_after_reset(job));
 
     // A reorg lands while the job runs, so its outcome is stale and it runs
     // again, marked.
@@ -1906,6 +1942,11 @@ fn a_job_run_again_after_a_reset_is_marked() {
         base,
     );
     assert!(marked(&step).is_empty());
+    // A core that has not started the job yet reads the reset now.
+    assert!(
+        machine.job_after_reset(job),
+        "the job's admission was reset"
+    );
     let stale = GenerationRead::Stable(Generation(0));
     let step = machine.outcome(
         job,

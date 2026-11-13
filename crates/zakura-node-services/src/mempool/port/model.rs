@@ -238,6 +238,11 @@ pub enum Effect {
     },
     /// Cancel a verification. Its outcome is ignored.
     Cancel(JobId),
+    /// Tell the caller fetching under this reservation that the body is no
+    /// longer needed, because a block mined the transaction. The caller
+    /// stops and drops the reservation, as today's pool cancels the
+    /// download.
+    CancelFetch(ReservationId),
     /// Answer a submission.
     Verdict {
         /// The submission.
@@ -957,6 +962,28 @@ impl PoolModel {
             self.cache(
                 block_tx.id,
                 RejectionScope::EffectsChain(ChainReason::Mined),
+            );
+        }
+        // Today's pool cancels the download and verification of anything a
+        // block mined. The undecided ones end here, and a fetch still out is
+        // told to stop, so its slot is freed once its caller drops it.
+        let ended: Vec<u64> = self
+            .admissions
+            .iter()
+            .filter(|(_, admission)| mined.contains(&admission.tx_id.mined_id()))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in ended {
+            let admission = self.admission_at(key);
+            if admission.owner_waiting {
+                let owner = admission.owner;
+                self.step.effects.push(Effect::CancelFetch(owner));
+            }
+            self.cancel_admission_job(key);
+            self.reject(
+                key,
+                RejectionScope::EffectsChain(ChainReason::Mined),
+                Charge::None,
             );
         }
         for conflict in conflicting {

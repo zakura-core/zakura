@@ -39,11 +39,11 @@ use zakura_chain::{
 };
 use zakura_node_services::mempool::port::{
     AwaitOutputError, ChainEvent, ChainEvents, ChainStart, ChainTip, Generation, GenerationCell,
-    GenerationRead, LocalFault, PoolCommand, PoolInbox, Verdict,
+    GenerationRead, LocalFault, PoolCommand, PoolInbox, ReservationId, Verdict,
 };
 use zakura_rt::{
     collections::HashMap,
-    sync::{mpsc, oneshot, watch},
+    sync::{mpsc, oneshot, watch, CancellationToken},
     task::{self, AbortOnDropHandle},
     time,
 };
@@ -130,6 +130,9 @@ pub struct PoolCore<E, V> {
     reports: mpsc::UnboundedReceiver<Report<E>>,
     /// The running verifications. Dropping a handle cancels its task.
     jobs: HashMap<JobId, AbortOnDropHandle<()>>,
+    /// The cancellation of each reservation the core granted for a fetch,
+    /// until its caller submits, fails or drops it. One per slot at most.
+    fetches: HashMap<ReservationId, CancellationToken>,
     /// Callers waiting for a verdict.
     verdicts: HashMap<WaiterId, oneshot::Sender<Verdict>>,
     /// Callers waiting for an output.
@@ -200,6 +203,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             reports_tx,
             reports,
             jobs: HashMap::default(),
+            fetches: HashMap::default(),
             verdicts: HashMap::default(),
             outputs: HashMap::default(),
             published: None,
@@ -278,8 +282,12 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                     .machine
                     .reserve(tx_id, source, intent, now)
                     .map(|grant| {
+                        let cancel = CancellationToken::new();
+                        if !grant.joined {
+                            self.fetches.insert(grant.id, cancel.clone());
+                        }
                         self.inbox
-                            .grant(grant.id, tx_id, grant.joined, grant.wants_body)
+                            .grant(grant.id, tx_id, grant.joined, grant.wants_body, cancel)
                     });
                 // A caller that left drops the reservation with the reply,
                 // which frees the slot.
@@ -302,6 +310,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                     return;
                 }
                 let id = reservation.accept();
+                self.fetches.remove(&id);
                 let (waiter, step) = self.machine.submit(id, transaction, supplier, now);
                 self.verdicts.insert(waiter, reply);
                 self.finish(step);
@@ -322,10 +331,13 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 self.finish(step);
             }
             PoolCommand::FetchFailed(reservation) => {
-                let step = self.machine.fetch_failed(reservation.accept(), now);
+                let id = reservation.accept();
+                self.fetches.remove(&id);
+                let step = self.machine.fetch_failed(id, now);
                 self.finish(step);
             }
             PoolCommand::Released(id) => {
+                self.fetches.remove(&id);
                 let step = self.machine.release(id, now);
                 self.finish(step);
             }
@@ -464,6 +476,11 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 Effect::Cancel(job) => {
                     self.jobs.remove(&job);
                 }
+                Effect::CancelFetch(reservation) => {
+                    if let Some(cancel) = self.fetches.remove(&reservation) {
+                        cancel.cancel();
+                    }
+                }
                 Effect::Verdict { waiter, verdict } => {
                     if let Some(reply) = self.verdicts.remove(&waiter) {
                         let _ = reply.send(verdict);
@@ -507,6 +524,9 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
 
     /// Starts a verification task for `job`.
     fn start(&mut self, job: JobId, tx: UnminedTx, revalidation: bool, after_reset: bool) {
+        // The flag in the effect is as of the step that made it. A reset the
+        // core took later in the same flush counts too.
+        let after_reset = after_reset || self.machine.job_after_reset(job);
         // The job verifies for the machine's tip, which belongs to the
         // generation the machine has applied. A worker that first reads any
         // other generation would report a result for one tip as fresh at

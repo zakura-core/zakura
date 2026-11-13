@@ -1131,6 +1131,60 @@ async fn one_peer_holds_at_most_five_fetches(mode: Mode) {
     }
 }
 
+/// A block that mines an id a peer's fetch is waiting on frees that fetch's
+/// slot, as today's pool cancels the download, so the peer's next offer is
+/// taken.
+async fn a_mined_id_frees_its_fetch_slot(mode: Mode) {
+    let mut harness = pool(Config::default(), Peers::Silent, mode).await;
+    harness.activate().await;
+    // Block 1 starts an upgrade, which resets today's pool.
+    harness
+        .commit(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice())
+        .await;
+    let mined = Network::Mainnet
+        .unmined_transactions_in_blocks(2..=2)
+        .next()
+        .expect("block 2 has a transaction")
+        .transaction
+        .id();
+    let mut offered = vec![mined];
+    offered.extend((1..MAX_INBOUND_CONCURRENCY_PER_PEER).map(unknown_id));
+    let request = Request::QueueFromPeer {
+        transactions: offered.iter().copied().map(Gossip::from).collect(),
+        source: legacy_peer(1),
+    };
+    harness.ask(request).await;
+    assert_eq!(
+        harness.queue_one(mined).await.unbox_mempool_error(),
+        MempoolError::AlreadyQueued,
+        "the peer's five fetches are out"
+    );
+
+    harness
+        .commit(zakura_test::vectors::BLOCK_MAINNET_2_BYTES.as_slice())
+        .await;
+
+    // The mined id's fetch is gone, so the peer has room for one more.
+    let next = unknown_id(9);
+    let mut taken = false;
+    for _ in 0..(ANSWER_WAIT.as_millis() / 50) {
+        let request = Request::QueueFromPeer {
+            transactions: vec![Gossip::from(next)],
+            source: legacy_peer(1),
+        };
+        harness.ask(request).await;
+        if harness.queue_one(next).await.unbox_mempool_error() == MempoolError::AlreadyQueued {
+            taken = true;
+            break;
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        taken,
+        "the peer's next offer is fetched once the mined id's slot is free"
+    );
+}
+
 /// Today's pool only. Its waits register when the request is called, so the
 /// test can hold 65,536 of them without polling. The core's register when
 /// the call is first polled, and the core drops abandoned waits before it
@@ -1286,6 +1340,7 @@ async fn the_verifiers_pool_handle_answers_at_once() {
 }
 
 both_pools!(
+    a_mined_id_frees_its_fetch_slot,
     change_stream_reports_admissions_and_refusals,
     inactive_pool_answers_each_request_as_today,
     empty_active_pool_answers_each_query_as_today,

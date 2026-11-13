@@ -99,6 +99,9 @@ impl Follower {
                     readying = None;
                     next_announcement = Instant::now() + TRANSACTION_GOSSIP_DELAY;
                     if let Some(network) = network {
+                        // A removal can have been published while the
+                        // network got ready, so read it before choosing ids.
+                        self.read();
                         self.announce(network);
                     }
                 }
@@ -135,14 +138,15 @@ impl Follower {
         let snapshot = view.snapshot;
         match view.changes {
             ChangesSince::Entries(entries) => {
+                // Everything this read found goes out as one event per kind,
+                // as today's pool sends one per kind for each pass, so a burst
+                // cannot overflow the indexer's channel. The batch is cut only
+                // where sending it whole would put one transaction's events
+                // out of order.
                 let mut batch = Batch::default();
                 for entry in entries {
-                    if Some(entry.batch) != batch.number {
+                    if batch.would_reorder(entry.change) {
                         batch.send(&self.changes);
-                        batch = Batch {
-                            number: Some(entry.batch),
-                            ..Batch::default()
-                        };
                     }
                     batch.take(entry.change);
                     match entry.change {
@@ -195,13 +199,30 @@ async fn ready(outbound: Timeout<Outbound>) -> Option<Timeout<Outbound>> {
 /// One batch of the change log, as today's change stream events.
 #[derive(Default)]
 struct Batch {
-    number: Option<u64>,
     added: HashSet<UnminedTxId>,
     invalidated: HashSet<UnminedTxId>,
     mined: HashSet<UnminedTxId>,
 }
 
 impl Batch {
+    /// Whether taking `change` would send its transaction's events out of
+    /// order. The events go out added, then invalidated, then mined, so a
+    /// change is out of order if the batch already holds its transaction in
+    /// a kind sent after the change's.
+    fn would_reorder(&self, change: Change) -> bool {
+        match change {
+            Change::Added(id) | Change::Revealed { id, .. } => {
+                self.invalidated.contains(&id) || self.mined.contains(&id)
+            }
+            Change::Removed {
+                reason: RemovalReason::Mined,
+                ..
+            }
+            | Change::Hidden(_) => false,
+            Change::Removed { id, .. } | Change::Refused(id) => self.mined.contains(&id),
+        }
+    }
+
     /// Adds one change.
     fn take(&mut self, change: Change) {
         match change {
@@ -392,5 +413,67 @@ mod tests {
             gate.advertised.lock().expect("no panics").is_empty(),
             "nothing still pooled was left to advertise"
         );
+    }
+
+    /// A burst of inputs, read at once, reaches the indexer as one event per
+    /// kind, so it cannot overflow the channel and end the stream. One
+    /// transaction refused and then admitted in the same read keeps its
+    /// order.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_burst_reaches_the_indexer_as_one_event_per_kind_in_order() {
+        let txs: Vec<_> = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=10)
+            .take(2)
+            .collect();
+        let (handle, inbox) = pool_port();
+        let (changes, mut events) = broadcast::channel(16);
+        // 70 inputs, each its own batch, published before the follower
+        // reads any of them: 35 admissions that each evict another
+        // transaction, as in Terra's example.
+        let id = |n: u8| UnminedTxId::Legacy(zakura_chain::transaction::Hash([n; 32]));
+        for n in 0..35 {
+            inbox.publish([Change::Added(id(n))], |last| snapshot(Vec::new(), last));
+            inbox.publish(
+                [Change::Removed {
+                    id: id(100 + n),
+                    reason: RemovalReason::Evicted,
+                }],
+                |last| snapshot(Vec::new(), last),
+            );
+        }
+        // Then the same transaction is refused and later admitted.
+        inbox.publish([Change::Refused(txs[1].transaction.id())], |last| {
+            snapshot(Vec::new(), last)
+        });
+        inbox.publish([Change::Added(txs[1].transaction.id())], |last| {
+            snapshot(vec![txs[1].clone()], last)
+        });
+        tokio::spawn(
+            Follower::new(
+                handle.reader(),
+                BoxCloneSyncService::new(Gate::default()),
+                changes,
+            )
+            .run(),
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut kinds = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            kinds.push((event.kind, event.tx_ids.contains(&txs[1].transaction.id())));
+        }
+        assert!(
+            kinds.len() <= 6,
+            "a few events, not one per input: {kinds:?}"
+        );
+        let refused = kinds
+            .iter()
+            .position(|kind| *kind == (MempoolChangeKind::Invalidated, true))
+            .expect("the refusal is sent");
+        let admitted = kinds
+            .iter()
+            .position(|kind| *kind == (MempoolChangeKind::Added, true))
+            .expect("the admission is sent");
+        assert!(refused < admitted, "the refusal comes before the admission");
     }
 }

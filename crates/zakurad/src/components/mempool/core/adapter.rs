@@ -39,7 +39,10 @@ use crate::BoxError;
 use super::{
     super::{
         crawler::RATE_LIMIT_DELAY,
-        downloads::{fetch_transaction, peer_source_from_queue_source, transaction_in_best_chain},
+        downloads::{
+            fetch_transaction, peer_source_from_queue_source, transaction_in_best_chain,
+            TransactionDownloadVerifyError,
+        },
         pending_outputs::PendingOutputsFull,
         queue_source_log_label, ExactTipRejectionError, MempoolError, Outbound, ReadState,
     },
@@ -360,7 +363,23 @@ async fn bring_in(
                 .lock()
                 .expect("no code panics while holding the read state lock")
                 .clone();
-            match fetch_within(read_state, shared.outbound.clone(), tx_id, source).await {
+            let cancel = reservation.cancellation();
+            let fetched = tokio::select! {
+                fetched = fetch_within(read_state, shared.outbound.clone(), tx_id, source) => fetched,
+                () = cancel.cancelled() => {
+                    // A block mined it while it was fetched. Dropping the
+                    // reservation frees its slot, as today's pool cancels
+                    // the download.
+                    drop(reservation);
+                    metrics::counter!("mempool.cancelled.verify.tasks.total").increment(1);
+                    return Err(format!(
+                        "failed to validate tx: {tx_id}, error: {}",
+                        TransactionDownloadVerifyError::Cancelled
+                    )
+                    .into());
+                }
+            };
+            match fetched {
                 Ok((tx, served_by)) => {
                     // A v2 peer's body is not charged, as today.
                     let supplier = match (&from, served_by) {

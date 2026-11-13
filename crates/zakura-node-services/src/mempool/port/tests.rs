@@ -211,7 +211,13 @@ async fn a_dropped_reservation_reaches_the_core() {
         let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.command().await else {
             panic!("the first command is the reservation");
         };
-        let _ = reply.send(Ok(inbox.grant(ReservationId(7), tx_id, false, true)));
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(7),
+            tx_id,
+            false,
+            true,
+            Default::default(),
+        )));
         inbox
     });
 
@@ -1100,7 +1106,10 @@ fn every_submission_gets_exactly_one_verdict_and_the_limits_hold() {
                     Effect::Start { job, .. } => jobs.push(job),
                     Effect::Cancel(job) => jobs.retain(|running| *running != job),
                     Effect::Verdict { waiter, .. } => verdicts.push(waiter),
-                    Effect::Outputs { .. }
+                    // The run drops every reservation it holds before it
+                    // drains, which is what a cancelled fetch's caller does.
+                    Effect::CancelFetch(_)
+                    | Effect::Outputs { .. }
                     | Effect::OutputReady { .. }
                     | Effect::OutputWaitEnded(_) => {}
                 }
@@ -1210,7 +1219,7 @@ async fn cancelling_a_blocked_submission_frees_its_slot() {
     let (handle, mut inbox) = pool_port();
     let transaction = body(1);
     let tx_id = transaction.id();
-    let reservation = inbox.grant(ReservationId(7), tx_id, false, true);
+    let reservation = inbox.grant(ReservationId(7), tx_id, false, true, Default::default());
 
     // The command queue is full, so the submission waits to be sent.
     for _ in 0..COMMAND_QUEUE {
@@ -1246,7 +1255,13 @@ async fn cancelling_a_blocked_submission_frees_its_slot() {
 async fn an_accepted_reservation_is_the_cores_and_a_dropped_command_is_not() {
     let (handle, mut inbox) = pool_port();
     let transaction = body(1);
-    let reservation = inbox.grant(ReservationId(7), transaction.id(), false, true);
+    let reservation = inbox.grant(
+        ReservationId(7),
+        transaction.id(),
+        false,
+        true,
+        Default::default(),
+    );
     let caller = {
         let handle = handle.clone();
         tokio::spawn(async move {
@@ -1276,7 +1291,13 @@ async fn an_accepted_reservation_is_the_cores_and_a_dropped_command_is_not() {
 async fn a_joined_reservation_that_needs_no_body_sends_none() {
     let (handle, mut inbox) = pool_port();
     let transaction = body(1);
-    let reservation = inbox.grant(ReservationId(8), transaction.id(), true, false);
+    let reservation = inbox.grant(
+        ReservationId(8),
+        transaction.id(),
+        true,
+        false,
+        Default::default(),
+    );
     let caller = {
         let handle = handle.clone();
         tokio::spawn(async move {
@@ -1299,7 +1320,7 @@ async fn a_joined_reservation_that_needs_no_body_sends_none() {
 #[tokio::test]
 async fn a_body_for_another_id_is_refused_and_frees_the_slot() {
     let (handle, mut inbox) = pool_port();
-    let reservation = inbox.grant(ReservationId(9), body(1).id(), false, true);
+    let reservation = inbox.grant(ReservationId(9), body(1).id(), false, true, Default::default());
     assert!(matches!(
         handle.submit(reservation, body(2), Supplier::Nobody).await,
         Verdict::LocalFault(LocalFault::WrongTransaction)
@@ -2032,7 +2053,7 @@ fn a_reader_that_resynchronized_while_a_transaction_was_hidden_announces_its_rev
 #[tokio::test]
 async fn a_dropped_reservation_wakes_an_idle_core() {
     let (handle, mut inbox) = pool_port();
-    let reservation = inbox.grant(ReservationId(7), id(1), false, true);
+    let reservation = inbox.grant(ReservationId(7), id(1), false, true, Default::default());
     // The core has nothing to do and waits.
     let core = tokio::spawn(async move { inbox.next().await });
     tokio::task::yield_now().await;
@@ -2762,7 +2783,9 @@ impl Run {
                         .expect("an ended output wait was still out");
                     self.output_waits.swap_remove(index);
                 }
-                Effect::Outputs { .. } => {}
+                // This run's callers drop their reservations before it
+                // drains, which is what a cancelled fetch's caller does.
+                Effect::CancelFetch(_) | Effect::Outputs { .. } => {}
             }
         }
     }
@@ -4032,4 +4055,34 @@ fn a_late_joiner_is_charged_for_a_cooldown_failure_as_an_early_one_is() {
         model.cooling(&legacy(2), secs(2)),
         "its supplier is charged"
     );
+}
+
+#[test]
+fn a_block_that_mines_an_id_being_fetched_cancels_the_fetch_and_decides_it() {
+    let mut model = new_model();
+    let fetch = model
+        .reserve(id(1), peer(1), Intent::Fetch, secs(0))
+        .expect("room");
+    let joined = model
+        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .expect("joins");
+    let (waiter, _) = model.wait(joined.id, id(1), Supplier::Peer(legacy(2)), secs(0));
+
+    let step = model.transition(transition(1, 101, vec![vec![tx(1)]]), secs(1));
+    assert!(
+        step.effects.contains(&Effect::CancelFetch(fetch.id)),
+        "the fetch is told to stop"
+    );
+    assert_eq!(
+        step.verdict(waiter),
+        Some(rejected(
+            RejectionScope::EffectsChain(ChainReason::Mined),
+            Charge::None
+        ))
+    );
+    // The slot stays counted until the fetch's caller drops it.
+    assert_eq!(model.slots_in_use(), 1);
+    model.release(fetch.id, secs(1));
+    assert_eq!(model.slots_in_use(), 0);
+    model.assert_invariants();
 }

@@ -51,7 +51,7 @@ use zakura_rt::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, oneshot, watch, Mutex, PoisonError,
+        mpsc, oneshot, watch, CancellationToken, Mutex, PoisonError,
     },
     time::Instant,
 };
@@ -222,6 +222,8 @@ pub struct Reservation {
     joined: bool,
     wants_body: bool,
     release: Option<mpsc::UnboundedSender<ReservationId>>,
+    /// Cancelled when the core no longer needs this reservation's body.
+    cancel: CancellationToken,
 }
 
 impl Reservation {
@@ -233,6 +235,7 @@ impl Reservation {
         joined: bool,
         wants_body: bool,
         release: mpsc::UnboundedSender<ReservationId>,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             id,
@@ -240,7 +243,16 @@ impl Reservation {
             joined,
             wants_body,
             release: Some(release),
+            cancel,
         }
+    }
+
+    /// Cancelled when the core no longer needs the body this reservation
+    /// was taken for, such as when a block mines the transaction while it is
+    /// fetched. A caller that is fetching stops and drops the reservation,
+    /// which frees its slot, as today's pool cancels the download.
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 
     /// The core's name for this reservation.
@@ -1225,15 +1237,24 @@ impl PoolInbox {
         self.releases.try_recv().ok()
     }
 
-    /// Grant a reservation whose drop the core will hear about.
+    /// Grant a reservation whose drop the core will hear about, and which
+    /// the core cancels through `cancel`.
     pub fn grant(
         &self,
         id: ReservationId,
         tx_id: UnminedTxId,
         joined: bool,
         wants_body: bool,
+        cancel: CancellationToken,
     ) -> Reservation {
-        Reservation::granted(id, tx_id, joined, wants_body, self.release_handle.clone())
+        Reservation::granted(
+            id,
+            tx_id,
+            joined,
+            wants_body,
+            self.release_handle.clone(),
+            cancel,
+        )
     }
 
     /// Publish the peers in a cooldown, whenever one starts.

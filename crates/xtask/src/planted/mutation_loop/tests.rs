@@ -2324,10 +2324,10 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
     assert!(plain.get("property_findings").is_none());
 }
 
-/// A triage record lands on each lane it names that needs triage: the
-/// witness lane, or every seed of a generator harness. A record that names
-/// no such lane is stale, and every lane that needs triage without one
-/// counts as untriaged.
+/// A triage record lands on each lane it names that needs triage, while the
+/// lane's class and other rule are the record's: the witness lane, or each
+/// seed of a generator harness. A record that matches no lane is stale, and
+/// every lane that needs triage without one counts as untriaged.
 #[test]
 fn triage_records_land_on_the_lanes_they_name() {
     let root = tempfile::tempdir().unwrap();
@@ -2345,6 +2345,7 @@ fn triage_records_land_on_the_lanes_they_name() {
 patch = "p.patch"
 property = "{NAMED}"
 lane = "witness"
+class = "survived"
 stage = "observation"
 reason = "the harness never records the dropped frame"
 issue = "#2266"
@@ -2353,13 +2354,24 @@ issue = "#2266"
 patch = "p.patch"
 property = "{NAMED}"
 lane = "block-sync/storage"
+class = "survived"
 stage = "generator"
 reason = "honest mirrors only"
+
+[[triage]]
+patch = "p.patch"
+property = "{NAMED}"
+lane = "block-sync/storage"
+class = "killed-by-other-rule"
+other = "{OTHER}"
+stage = "property"
+reason = "{OTHER} names the overdraft first"
 
 [[triage]]
 patch = "gone.patch"
 property = "{NAMED}"
 lane = "witness"
+class = "survived"
 stage = "property"
 reason = "stale"
 "##
@@ -2367,17 +2379,16 @@ reason = "stale"
     )
     .unwrap();
     let records = triage::read(root.path()).unwrap();
-    assert_eq!(records.len(), 3);
+    assert_eq!(records.len(), 4);
 
-    let lane = |harness: &str, seed, class| {
-        GeneratorReport::unsearched(
-            harness,
-            seed,
-            GenerateMode::Inproc,
-            classify::Classified::new(class, None, "why"),
-        )
+    let result = |class, other: Option<&str>| classify::Classified {
+        other: other.map(str::to_owned),
+        ..classify::Classified::new(class, None, "why")
     };
-    let witness = |class| CaseReport {
+    let lane = |harness: &str, seed, class, other| {
+        GeneratorReport::unsearched(harness, seed, GenerateMode::Inproc, result(class, other))
+    };
+    let witness = |class, other| CaseReport {
         patch: "p.patch".to_owned(),
         patch_sha256: String::new(),
         property: NAMED.to_owned(),
@@ -2388,7 +2399,7 @@ reason = "stale"
             test_target: "block_table".to_owned(),
         },
         also_violates: Vec::new(),
-        result: classify::Classified::new(class, None, "why"),
+        result: result(class, other),
         trigger: None,
         baseline: BaselineReport {
             passed: true,
@@ -2401,16 +2412,27 @@ reason = "stale"
         log: None,
         rerun_alone: false,
         generator: vec![
-            lane("block-sync/storage", 11, Class::Survived),
-            lane("block-sync/storage", 23, Class::KilledByOtherRule),
-            lane("block-sync/storage", 47, Class::KilledByNamedRule),
-            lane("block-sync/wire", 11, Class::Survived),
+            lane("block-sync/storage", 11, Class::Survived, None),
+            lane(
+                "block-sync/storage",
+                23,
+                Class::KilledByOtherRule,
+                Some(OTHER),
+            ),
+            lane("block-sync/storage", 47, Class::KilledByNamedRule, None),
+            lane(
+                "block-sync/storage",
+                89,
+                Class::KilledByOtherRule,
+                Some("x/y"),
+            ),
+            lane("block-sync/wire", 11, Class::Survived, None),
         ],
         no_generator: None,
         triage: None,
     };
-    let mut cases = vec![witness(Class::Survived)];
-    assert_eq!(triage::untriaged(&cases), 4);
+    let mut cases = vec![witness(Class::Survived, None)];
+    assert_eq!(triage::untriaged(&cases), 5);
     let stale = triage::apply(&mut cases, &records);
     assert!(
         stale.is_empty(),
@@ -2434,21 +2456,88 @@ reason = "stale"
         stages,
         [
             Some(triage::Stage::Generator),
-            Some(triage::Stage::Generator),
+            Some(triage::Stage::Property),
+            None,
             None,
             None
-        ]
+        ],
+        "seed 89's kill names another rule than the record's"
     );
-    assert_eq!(triage::untriaged(&cases), 1, "block-sync/wire seed 11");
+    assert_eq!(
+        triage::untriaged(&cases),
+        2,
+        "block-sync/storage seed 89 and block-sync/wire seed 11"
+    );
+
+    // A lane whose class changed stays untriaged, and its record is stale.
+    let mut changed = vec![witness(Class::KilledByOtherRule, Some(OTHER))];
+    changed[0].generator.clear();
+    assert_eq!(
+        triage::apply(&mut changed, &records),
+        vec![&records[0], &records[1], &records[2]]
+    );
+    assert_eq!(changed[0].triage, None);
+    assert_eq!(triage::untriaged(&changed), 1);
 
     // A kill by the named rule needs no triage, so its records are stale.
-    let mut killed = vec![witness(Class::KilledByNamedRule)];
+    let mut killed = vec![witness(Class::KilledByNamedRule, None)];
     killed[0].generator.clear();
     assert_eq!(
         triage::apply(&mut killed, &records),
-        vec![&records[0], &records[1]]
+        vec![&records[0], &records[1], &records[2]]
     );
     assert_eq!(killed[0].triage, None);
+}
+
+/// A record names its other rule exactly when it explains a kill by another
+/// rule; anything else is a read error.
+#[test]
+fn a_triage_record_names_its_other_rule_only_for_another_rules_kill() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join(triage::TRIAGE_FILE);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let record = |fields: &str| {
+        format!(
+            "[[triage]]\npatch = \"p.patch\"\nproperty = \"{NAMED}\"\nlane = \"witness\"\n\
+             stage = \"property\"\nreason = \"why\"\n{fields}"
+        )
+    };
+    for (fields, error) in [
+        (
+            "class = \"killed-by-other-rule\"\n",
+            "is `killed-by-other-rule` and names no `other` rule",
+        ),
+        (
+            &*format!("class = \"survived\"\nother = \"{OTHER}\"\n"),
+            "is `survived` and names an `other` rule",
+        ),
+        ("", "missing field `class`"),
+        ("class = \"killed-by-named-rule\"\n", "unknown variant"),
+    ] {
+        fs::write(&file, record(fields)).unwrap();
+        let read = triage::read(root.path()).unwrap_err().to_string();
+        assert!(read.contains(error), "{fields:?}: {read}");
+        assert!(read.contains(triage::TRIAGE_FILE), "{read}");
+    }
+    fs::write(
+        &file,
+        record(&format!(
+            "class = \"killed-by-other-rule\"\nother = \"{OTHER}\"\n"
+        )),
+    )
+    .unwrap();
+    assert_eq!(
+        triage::read(root.path()).unwrap()[0].other.as_deref(),
+        Some(OTHER)
+    );
+}
+
+/// The committed triage records read, each naming its class.
+#[test]
+fn the_committed_triage_records_read() {
+    let repo_root = crate::repo_root().expect("xtask lives in the workspace");
+    let records = triage::read(&repo_root).expect("the committed triage records read");
+    assert!(!records.is_empty());
 }
 
 /// A mutant's trace leaves its picks on the unpatched build, so a trace with

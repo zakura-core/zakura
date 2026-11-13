@@ -466,10 +466,7 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
     let mut outcome = outcome?;
     let records = triage::read(repo_root)?;
     for stale in triage::apply(&mut outcome.cases, &records) {
-        println!(
-            "stale triage: {} {} {}: no such lane needs triage",
-            stale.patch, stale.property, stale.lane
-        );
+        println!("stale triage: {}: it matches no lane", stale.describe());
     }
     let report = Report {
         schema: SCHEMA,

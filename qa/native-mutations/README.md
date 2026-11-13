@@ -50,11 +50,15 @@ lane is `baseline-fails`. A property that no generator harness reaches has a
 
 Every lane that survived, or that another rule killed, needs a triage record
 in `triage.toml`: the case's patch and property, the lane (`witness` or the
-generator harness), the causal-chain stage where the bug stopped
-(`generator`, `schedule`, `observation`, `property` or `unsupported`), the
-reason, and an optional tracking issue. The loop copies each record onto the
-lanes it names, lists as stale each record whose case ran and that names no
-such lane, and prints how many lanes still need one.
+generator harness), the class it explains (`survived` or
+`killed-by-other-rule`), the other rule's ID for a kill by another rule
+(`other`, required there and forbidden otherwise), the causal-chain stage
+where the bug stopped (`generator`, `schedule`, `observation`, `property` or
+`unsupported`), the reason, and an optional tracking issue. A generator
+harness's record covers each seed whose class and other rule are the
+record's. A seed whose result differs stays untriaged. The loop copies each
+record onto the lanes it matches, lists as stale each record whose case ran
+and that matches no lane, and prints how many lanes still need one.
 
 `python3 scripts/mutation_joint_run.py run --previous <report.json> --out
 <dir>` runs the loop with generator lanes on the cases changed since the

@@ -20,7 +20,7 @@ use std::{
 use support::inputs;
 use tempfile::TempDir;
 use zakura_network::zakura::{
-    ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
+    MSG_BS_GET_BLOCKS, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_sim::{
     domain::{
@@ -28,14 +28,14 @@ use zakura_sim::{
         session::{REPLACEMENT_PRESERVES_AUTHORIZATION, STALLED_SERVICE_ISOLATED},
     },
     harness::{
-        run_prepared,
+        run_prepared, run_steered,
         sync::SyncPorts,
         sync_wire::{combined, SavedWire, SyncWire, COMBINED_TAG, CURATED, STALL_GROWTH, STALL_MS},
         HarnessError, Subsystem,
     },
     observe::{BlockSyncFact, StorageFact, StorageRequest, TransportFact},
-    seed, MemorySink, Observation, ObservationLog, Outcome, Plan, PlanInput, PropertyOutcome,
-    RunReport,
+    seed, Category, Identity, MemorySink, NullSink, Observation, ObservationLog, Outcome, Plan,
+    PlanInput, PropertyOutcome, RunReport, Steer,
 };
 
 /// Runs `saved` under `input`, and returns the report with its records and
@@ -581,13 +581,98 @@ fn curated_combined_actions_sync_both_tips() {
 }
 
 /// The committed input, `known-failures/sync-wire-reset-mid-write.bin`,
-/// that reaches zakura#2378. Its prefix picks fuzz-13's combined actions
-/// `FB 14`: the fork while storage holds a submission, with every read
-/// stalled. Its Plan picks each block request's writer last among the ready
-/// actions while its frame write is under way, as a slow thread would. The
-/// fork's tip reset then retires request 1/30 while its frame is partly
+/// that reaches zakura#2378. Its prefix, [`RESET_MID_WRITE_PREFIX`], picks
+/// fuzz-13's combined actions `FB 14`: the fork while storage holds a
+/// submission, with every read stalled. Its Plan replays a run that
+/// [`WriterLast`] steered, so each block request's writer runs last among the
+/// ready actions while its frame write is under way, as a slow thread would.
+/// The fork's tip reset then retires a request while its frame is partly
 /// written. It sits outside the seed corpus because it fails by design.
+/// `regenerate_reset_mid_write` rebuilds it.
 const RESET_MID_WRITE: &str = "reset-mid-write";
+
+/// [`RESET_MID_WRITE`]'s scenario prefix.
+const RESET_MID_WRITE_PREFIX: [u8; 2] = [COMBINED_TAG, 0b0001_0100];
+
+/// A steer that picks each block request's writer last among the ready
+/// actions while its frame write is under way, as a slow thread would.
+/// Otherwise it lets the Plan pick.
+///
+/// A writer is the task whose step logged the request's
+/// [`TransportFact::FrameWriteStarted`], and its write is under way until
+/// the matching [`TransportFact::FrameWritten`]. Among the other ready
+/// actions, the steer takes the first that sorts after its previous pick,
+/// wrapping to the start.
+#[derive(Default)]
+struct WriterLast {
+    /// How many log entries the steer has read.
+    read: usize,
+    /// Each block request frame write that started at the step being read
+    /// and has no writer yet: its connection, QUIC stream and frame seq.
+    started: Vec<(Option<u64>, u64, u64)>,
+    /// Each block request frame write under way, and its writer's name.
+    writing: BTreeMap<(Option<u64>, u64, u64), String>,
+    /// The steer's previous pick.
+    last: Option<Identity>,
+}
+
+impl WriterLast {
+    /// Reads the log entries after the ones already read.
+    fn catch_up(&mut self, log: &ObservationLog) {
+        for entry in &log.entries()[self.read..] {
+            if let Some(task) = entry.obs.ran_task() {
+                for frame in self.started.drain(..) {
+                    self.writing.insert(frame, task.to_owned());
+                }
+            }
+            let Observation::Transport {
+                connection, event, ..
+            } = &entry.obs
+            else {
+                continue;
+            };
+            match event {
+                TransportFact::FrameWriteStarted {
+                    quic_stream,
+                    seq,
+                    message_type,
+                } if *message_type == u16::from(MSG_BS_GET_BLOCKS) => {
+                    self.started.push((*connection, *quic_stream, *seq));
+                }
+                TransportFact::FrameWritten {
+                    quic_stream, seq, ..
+                } => {
+                    self.writing.remove(&(*connection, *quic_stream, *seq));
+                }
+                _ => {}
+            }
+        }
+        self.read = log.entries().len();
+    }
+}
+
+impl Steer for WriterLast {
+    fn pick(&mut self, options: &[Identity], log: &ObservationLog) -> Option<usize> {
+        self.catch_up(log);
+        let writing = |option: &Identity| {
+            option.category == Category::Task && self.writing.values().any(|w| *w == option.key)
+        };
+        if !options.iter().any(writing) {
+            return None;
+        }
+        let rest: Vec<usize> = (0..options.len())
+            .filter(|&index| !writing(&options[index]))
+            .collect();
+        let after_last = |&&index: &&usize| {
+            self.last.as_ref().is_none_or(|last| {
+                (options[index].category, &options[index].key) > (last.category, &last.key)
+            })
+        };
+        let index = *rest.iter().find(after_last).or(rest.first())?;
+        self.last = Some(options[index].clone());
+        Some(index)
+    }
+}
 
 /// The steps at which a reset retired a block request whose frame write
 /// had started and not finished.
@@ -650,7 +735,7 @@ fn a_mid_write_reset_closes_an_honest_connection_until_zakura_2378_is_fixed() {
     let (prefix, plan) = seed.input.split_at(SyncWire::SCENARIO_BYTES);
     assert_eq!(
         SyncWire::draw(prefix),
-        combined(&[COMBINED_TAG, 0b0001_0100]),
+        combined(&RESET_MID_WRITE_PREFIX),
         "the fork while storage holds a submission, with every read stalled"
     );
     let (report, _, _) =
@@ -860,7 +945,53 @@ fn regenerate_saved_scenarios() {
         );
         fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
     }
-    // The input is a search's result, so only its sidecar is rewritten.
+    // `regenerate_reset_mid_write` builds the input, so only its sidecar is
+    // rewritten here.
+    write_reset_mid_write_sidecar();
+}
+
+/// Rebuilds [`RESET_MID_WRITE`]'s input and sidecar: runs
+/// [`RESET_MID_WRITE_PREFIX`]'s scenario under [`WriterLast`], and saves the
+/// prefix and the Plan bytes that replay the steered run with no steer. Fails
+/// unless the steered run resets a block request mid-write and the bytes
+/// replay its picks. Run it with `RUSTFLAGS="--cfg zakura_sim" cargo test
+/// --manifest-path crates/zakura-sim/Cargo.toml --test sync_wire --
+/// --ignored regenerate_reset_mid_write`.
+#[test]
+#[ignore = "rewrites the committed zakura#2378 input"]
+fn regenerate_reset_mid_write() {
+    let scenario = SyncWire::draw(&RESET_MID_WRITE_PREFIX);
+    let ports = SyncWire::prepare(&scenario);
+    let steer = Box::new(WriterLast::default());
+    let (steered, plan) =
+        match run_steered::<SyncWire>(&scenario, ports, Plan::from_fuzz(&[]), &mut NullSink, steer)
+        {
+            Ok(steered) => steered,
+            Err(HarnessError::Run { failure, report }) => panic!("{failure}: {:?}", report.end),
+            Err(error) => panic!("{error}"),
+        };
+    assert!(
+        !mid_write_resets(&steered.log).is_empty(),
+        "the steered run reset no block request mid-write: {:?}",
+        steered.end
+    );
+    let (replayed, _, _) = run_scenario_judged_by_caller(&scenario, Plan::from_fuzz(&plan));
+    assert!(
+        replayed.picks == steered.picks,
+        "the recorded bytes don't replay the steered run: {:?} {:?}",
+        steered.end,
+        replayed.end
+    );
+    fs::write(
+        reset_mid_write().with_extension("bin"),
+        [&RESET_MID_WRITE_PREFIX[..], &plan].concat(),
+    )
+    .expect("the fixture directory exists");
+    write_reset_mid_write_sidecar();
+}
+
+/// Writes [`RESET_MID_WRITE`]'s sidecar for its committed input.
+fn write_reset_mid_write_sidecar() {
     let base = reset_mid_write();
     let input = fs::read(base.with_extension("bin")).expect("the input is committed");
     let scenario = serde_json::to_value(SyncWire::draw(&input[..SyncWire::SCENARIO_BYTES]))

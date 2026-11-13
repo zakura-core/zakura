@@ -507,6 +507,9 @@ pub(crate) struct Decider {
     /// The recovery policy's state, once [`recover`](Self::recover) is
     /// called.
     recovery: Option<Recovery>,
+    /// The bytes that replay the run's choices, once
+    /// [`record_bytes`](Self::record_bytes) is called.
+    recorded: Option<Vec<u8>>,
 }
 
 /// The recovery policy: least recently picked first.
@@ -598,6 +601,29 @@ impl Decider {
             resolved: Vec::new(),
             pending_defaults: 0,
             recovery: None,
+            recorded: None,
+        }
+    }
+
+    /// Records each later choice the input or its default makes, and each
+    /// steered pick, as the bytes a bytes input reads for it. Forced
+    /// choices and choices after recovery starts take no bytes. The bytes
+    /// ([`recorded_bytes`](Self::recorded_bytes)) replay the run's choices
+    /// with no steer, whatever made them.
+    pub(crate) fn record_bytes(&mut self) {
+        self.recorded.get_or_insert_with(Vec::new);
+    }
+
+    /// The bytes [`record_bytes`](Self::record_bytes) recorded, if it was
+    /// called.
+    pub(crate) fn recorded_bytes(&self) -> Option<&[u8]> {
+        self.recorded.as_deref()
+    }
+
+    /// Appends `value` as `width(range)` little-endian bytes, if recording.
+    fn record(&mut self, by: By, value: u64, range: u128) {
+        if let (Some(recorded), By::Bytes | By::Default) = (&mut self.recorded, by) {
+            recorded.extend_from_slice(&value.to_le_bytes()[..width(range)]);
         }
     }
 
@@ -704,13 +730,44 @@ impl Decider {
                 },
             }
         };
+        self.settle(options, decision);
+        Ok(decision)
+    }
+
+    /// Picks `options[index]`, which a steer chose in place of the input.
+    /// The pick counts as a bytes choice. It reads no input. The same
+    /// preconditions as [`pick`](Self::pick) apply, and recovery must not
+    /// have started.
+    pub(crate) fn pick_steered(&mut self, options: &[Identity], index: usize) -> Decision {
+        assert!(index < options.len(), "a steer picks an enabled action");
+        debug_assert!(
+            !self.recovering(),
+            "the recovery policy picks once it starts"
+        );
+        let decision = Decision {
+            index,
+            by: if options.len() == 1 {
+                By::Forced
+            } else {
+                By::Bytes
+            },
+            offset: None,
+        };
+        self.settle(options, decision);
+        decision
+    }
+
+    /// Notes `decision`, a pick among `options`, for the resolved script,
+    /// the round-robin cursor, the recovery policy and the recorded bytes.
+    fn settle(&mut self, options: &[Identity], decision: Decision) {
         let picked = &options[decision.index];
         self.resolve(decision.by, || PlanChoice::Pick(picked.to_string()));
         self.cursor = Some((picked.category, picked.key.clone()));
         if let Some(recovery) = &mut self.recovery {
             recovery.picked(options, decision.index);
         }
-        Ok(decision)
+        // Both fit: an index is below the option count, a usize.
+        self.record(decision.by, decision.index as u64, options.len() as u128);
     }
 
     /// A skip script's pick: the next candidate's recorded pick if it's
@@ -846,6 +903,11 @@ impl Decider {
             Input::Bytes { .. } | Input::Script(_) => self.input_draw(bound, ordinal)?,
         };
         self.resolve(answer.by, || PlanChoice::Draw(HexU64(answer.value)));
+        let range = match bound {
+            0 => 1 << 64,
+            bound => u128::from(bound),
+        };
+        self.record(answer.by, answer.value, range);
         Ok(answer)
     }
 
@@ -1543,6 +1605,35 @@ mod tests {
             let expected = answers(&mut from_bytes, &asks);
             let mut scripted = Decider::new(PlanInput::Script(from_bytes.resolved()));
             prop_assert_eq!(answers(&mut scripted, &asks), expected);
+        }
+
+        #[test]
+        fn recorded_bytes_replay_steered_choices(
+            input in proptest::collection::vec(any::<u8>(), 0..64),
+            asks in proptest::collection::vec((ask(), any::<Option<usize>>()), 0..48),
+        ) {
+            // A steer picks some options in place of the input. The bytes
+            // the decider records then replay every answer with no steer.
+            let mut steered = bytes(&input);
+            steered.record_bytes();
+            let expected: Vec<u64> = asks
+                .iter()
+                .enumerate()
+                .map(|(i, ask)| match ask {
+                    // usize always fits in u64 on supported targets.
+                    (Ask::Pick(n), Some(steer)) => {
+                        steered.pick_steered(&tasks(*n), steer % n).index as u64
+                    }
+                    (Ask::Pick(n), None) => steered.pick(&tasks(*n)).unwrap().index as u64,
+                    // The test's ordinal only needs to differ between draws.
+                    (Ask::Draw(bound), _) => {
+                        steered.draw("t:rng#1", *bound, i as u32 + 1).unwrap().value
+                    }
+                })
+                .collect();
+            let recorded = steered.recorded_bytes().expect("recording started").to_vec();
+            let asks: Vec<Ask> = asks.into_iter().map(|(ask, _)| ask).collect();
+            prop_assert_eq!(answers(&mut bytes(&recorded), &asks), expected);
         }
 
         #[test]

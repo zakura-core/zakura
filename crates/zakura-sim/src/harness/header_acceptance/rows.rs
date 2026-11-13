@@ -3502,7 +3502,8 @@ const fn bound_passes(name: &'static str, test: TestRef) -> GateRequirement {
 }
 
 /// A bound-table row's requirement `name` with no fixture evidence: the
-/// standing exclusion for `reason`, which blocks until Adam approves it.
+/// standing exclusion for `reason`, under the approval its obligation
+/// carries (see [`obligation::BOUND_UNSHOWN_RULING`]).
 const fn bound_open(name: &'static str, reason: &'static str) -> GateRequirement {
     GateRequirement {
         name,
@@ -3510,7 +3511,7 @@ const fn bound_open(name: &'static str, reason: &'static str) -> GateRequirement
         expected: Expected::Open {
             reason,
             owner: obligation::BOUND_OWNER,
-            approval: Approval::Pending,
+            approval: obligation::BOUND_UNSHOWN_RULING,
             until: None,
         },
     }

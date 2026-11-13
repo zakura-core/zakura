@@ -396,6 +396,10 @@ pub struct ZakuraConfig {
     /// number of the announcements each peer sends. Its rows never hold a peer's address; the
     /// `ZAKURA_TRACE_PEER_NAMES` environment variable names the peers an operator wants to
     /// tell apart.
+    /// The writer rotates this table into `legacy_gossip.prev.jsonl`; each file is capped
+    /// at 512 MiB. Read the previous file followed by the current file for retained history.
+    /// A retention failure disables this table until restart; external retention may trim
+    /// files sooner. Each trace directory must have only one node process writing to it.
     pub trace_dir: Option<PathBuf>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,

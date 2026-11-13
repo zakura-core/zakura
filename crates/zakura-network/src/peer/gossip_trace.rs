@@ -6,11 +6,16 @@
 //! sending it. Together with the same rows on another node they give the time a block took
 //! from one node to the next.
 //!
-//! What a peer sends cannot make this table grow without bound. The peer's request for a
+//! Per-connection limits bound the rate of recorded events. The peer's request for a
 //! block, and the block being sent or found missing, are written only for a block this node
 //! announced to that peer, once for each announcement. A peer downloading old blocks from us,
 //! or asking for blocks we never announced to it, writes nothing. The peer's own announcements
 //! are written up to a fixed number a minute for each connection.
+//! Reconnecting starts a fresh allowance, so the writer also bounds storage independently:
+//! `legacy_gossip.jsonl` and `legacy_gossip.prev.jsonl` each hold at most 512 MiB. Read the
+//! previous file before the current file for the retained history. Rotation discards older
+//! rows; a retention failure disables this table until restart. External retention may
+//! discard rows sooner. Only one node process may write to a trace directory.
 //!
 //! Rows never hold a peer's address. A connection has a process-local number, and a peer whose
 //! IP address the operator listed in the `ZAKURA_TRACE_PEER_NAMES` environment variable also

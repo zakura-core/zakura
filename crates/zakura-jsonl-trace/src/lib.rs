@@ -1,5 +1,8 @@
 //! Shared non-blocking JSONL tracing support for Zebra components.
 
+#[cfg(test)]
+mod retention_tests;
+
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -562,32 +565,131 @@ impl std::fmt::Debug for JsonlTracer {
 }
 
 struct TableWriter {
-    file: tokio::fs::File,
+    // Only absent while rotating; any rotation failure disables and drops this writer.
+    file: Option<tokio::fs::File>,
     encode_buf: Vec<u8>,
+    retention: Option<TraceRetention>,
+}
+
+/// The gossip table's two files share a fixed 1 GiB storage budget.
+const LEGACY_GOSSIP_FILE_LIMIT: u64 = 512 * 1024 * 1024;
+
+struct TraceRetention {
+    current: PathBuf,
+    previous: PathBuf,
+    file_limit: u64,
+    /// Includes buffered rows and their newline separators.
+    bytes: u64,
 }
 
 impl TableWriter {
-    fn new(file: tokio::fs::File, buffer_flush_bytes: usize) -> Self {
-        Self {
-            file,
+    async fn open(
+        path: PathBuf,
+        buffer_flush_bytes: usize,
+        retention: Option<(PathBuf, u64)>,
+    ) -> std::io::Result<Self> {
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        let retention = if let Some((previous, file_limit)) = retention {
+            // Reconcile both files before accepting rows, including files from older builds.
+            match tokio::fs::metadata(&previous).await {
+                Ok(metadata) => {
+                    if !metadata.is_file() {
+                        return Err(std::io::Error::other("previous trace is not a file"));
+                    }
+                    if metadata.len() > file_limit {
+                        tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&previous)
+                            .await?
+                            .set_len(0)
+                            .await?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let bytes = file.metadata().await?.len();
+            let bytes = if bytes > file_limit {
+                file.set_len(0).await?;
+                0
+            } else {
+                bytes
+            };
+            Some(TraceRetention {
+                current: path,
+                previous,
+                file_limit,
+                bytes,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            file: Some(file),
             encode_buf: Vec::with_capacity(buffer_flush_bytes),
-        }
+            retention,
+        })
     }
 
-    fn append_line(&mut self, line: &[u8]) {
+    async fn append_line(&mut self, line: &[u8]) -> std::io::Result<()> {
+        let row_bytes = u64::try_from(line.len())
+            .ok()
+            .and_then(|bytes| bytes.checked_add(1));
+        if let Some(retention) = &self.retention {
+            let Some(row_bytes) = row_bytes.filter(|bytes| *bytes <= retention.file_limit) else {
+                // A single oversized row must not bypass the file cap.
+                return Ok(());
+            };
+            if row_bytes > retention.file_limit - retention.bytes {
+                self.rotate().await?;
+            }
+            self.retention
+                .as_mut()
+                .expect("rotation preserves the retention policy")
+                .bytes += row_bytes;
+        }
         self.encode_buf.extend_from_slice(line);
         self.encode_buf.push(b'\n');
+        Ok(())
+    }
+
+    async fn rotate(&mut self) -> std::io::Result<()> {
+        self.flush_buffer(false).await?;
+        drop(self.file.take());
+        let retention = self
+            .retention
+            .as_mut()
+            .expect("only a table with retention rotates");
+        // Rename replaces the previous file without creating a third retained copy.
+        tokio::fs::rename(&retention.current, &retention.previous).await?;
+        self.file = Some(
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&retention.current)
+                .await?,
+        );
+        retention.bytes = 0;
+        Ok(())
     }
 
     async fn flush_buffer(&mut self, sync_file: bool) -> std::io::Result<()> {
+        let file = self
+            .file
+            .as_mut()
+            .expect("an active table has an open file outside rotation");
         if !self.encode_buf.is_empty() {
-            self.file.write_all(&self.encode_buf).await?;
+            file.write_all(&self.encode_buf).await?;
             self.encode_buf.clear();
-            self.file.flush().await?;
+            file.flush().await?;
         }
 
         if sync_file {
-            self.file.sync_data().await?;
+            file.sync_data().await?;
         }
 
         Ok(())
@@ -601,10 +703,19 @@ struct TraceWriter {
     disabled_tables: HashSet<&'static str>,
     trace_dir_created: bool,
     last_file_flush: Instant,
+    legacy_gossip_file_limit: u64,
 }
 
 impl TraceWriter {
     fn new(trace_dir: PathBuf, config: JsonlTraceConfig) -> Self {
+        Self::with_legacy_gossip_limit(trace_dir, config, LEGACY_GOSSIP_FILE_LIMIT)
+    }
+
+    fn with_legacy_gossip_limit(
+        trace_dir: PathBuf,
+        config: JsonlTraceConfig,
+        legacy_gossip_file_limit: u64,
+    ) -> Self {
         Self {
             trace_dir,
             config,
@@ -612,6 +723,7 @@ impl TraceWriter {
             disabled_tables: HashSet::new(),
             trace_dir_created: false,
             last_file_flush: Instant::now(),
+            legacy_gossip_file_limit,
         }
     }
 
@@ -627,8 +739,16 @@ impl TraceWriter {
 
             let append_result = match self.table_writer_mut(event.table, event.file_name).await {
                 Some(table_writer) => {
-                    table_writer.append_line(&event.line);
-                    Ok(())
+                    if let Err(error) = table_writer.append_line(&event.line).await {
+                        tracing::warn!(
+                            ?error,
+                            table = event.table,
+                            "disabling trace table after append or rotation failure"
+                        );
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
                 }
                 None => Err(()),
             };
@@ -702,29 +822,34 @@ impl TraceWriter {
                 self.trace_dir_created = true;
             }
 
-            let file = match tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(self.trace_dir.join(file_name))
-                .await
+            let retention =
+                (table == "legacy_gossip" && file_name == "legacy_gossip.jsonl").then(|| {
+                    (
+                        self.trace_dir.join("legacy_gossip.prev.jsonl"),
+                        self.legacy_gossip_file_limit,
+                    )
+                });
+            let table_writer = match TableWriter::open(
+                self.trace_dir.join(file_name),
+                self.config.buffer_flush_bytes,
+                retention,
+            )
+            .await
             {
-                Ok(file) => file,
+                Ok(table_writer) => table_writer,
                 Err(error) => {
                     tracing::warn!(
                         ?error,
                         table,
                         trace_dir = ?self.trace_dir,
-                        "failed to open trace table, disabling trace table"
+                        "failed to open or limit trace table, disabling trace table"
                     );
                     self.disabled_tables.insert(table);
                     return None;
                 }
             };
 
-            self.tables.insert(
-                table,
-                TableWriter::new(file, self.config.buffer_flush_bytes),
-            );
+            self.tables.insert(table, table_writer);
         }
 
         self.tables.get_mut(table)

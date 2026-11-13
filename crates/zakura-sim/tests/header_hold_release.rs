@@ -295,7 +295,11 @@ fn fixture_file(name: &str, extension: &str) -> PathBuf {
 }
 
 /// Each committed fixture is its named fixture, as JSON, with the fixed
-/// Plan bytes, and holds and applies under them.
+/// Plan bytes, and holds and applies under them. Each also holds and
+/// applies `sim/no-livelock`: every liveness fixture declares
+/// `BoundedAdversary`, so the node waits out its held call without
+/// spinning at one instant, and the held-locator run is that ID's counted
+/// header history.
 #[test]
 fn the_committed_fixtures_match_their_names() {
     for (name, fixture) in committed_fixtures() {
@@ -327,6 +331,14 @@ fn the_committed_fixtures_match_their_names() {
                 PropertyOutcome::Held { applicable } if *applicable > 0
             ),
             "{name}"
+        );
+        assert!(
+            matches!(
+                outcome(&report, NO_LIVELOCK),
+                PropertyOutcome::Held { applicable } if *applicable > 0
+            ),
+            "{name}: {:?}",
+            outcome(&report, NO_LIVELOCK)
         );
     }
 }

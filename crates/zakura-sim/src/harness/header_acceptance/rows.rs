@@ -1399,22 +1399,16 @@ const OPERATION_IDS_UNREACHED: &str =
 const SIM_WIDE_CATCH: &str = "the sim-wide IDs' bypasses run on test-only harnesses, so a \
                               header-harness catch or an approved Open is still owed";
 
-/// Why `sim/no-livelock`'s counted history is still owed.
-const LIVELOCK_PASSING: &str = "its witness runs the test-only test/probe harness, which the \
-                                executable can't replay, so a header-harness history or an \
-                                approved Open is owed";
-
 /// The transitional `Open` each transitional passing or catch key owes,
 /// whole: its reason, owner and the PR it waits for, written from the
-/// plan's PR table. The sim-wide IDs' catches and `sim/no-livelock`'s
-/// passing history are hdr-14.4's. [`Key::covers`] takes a transitional `Open` on such a key only if it's
+/// plan's PR table. The sim-wide IDs' catches are hdr-14.4's.
+/// [`Key::covers`] takes a transitional `Open` on such a key only if it's
 /// exactly this one.
 pub fn owed_open(key: &Key) -> Option<Expected> {
     let (reason, until) = match key {
         Key::Catch { property } if SIM_WIDE.contains(&property.as_str()) => {
             (SIM_WIDE_CATCH, "hdr-14.4")
         }
-        Key::Passing { property } if property == SIM_WIDE[1] => (LIVELOCK_PASSING, "hdr-14.4"),
         _ => return None,
     };
     Some(transitional(reason, "Adam's side", until))
@@ -2900,10 +2894,11 @@ fn hand_written_rows() -> Vec<Row> {
     panic.push(owed(Key::catch(SIM_WIDE[0]), NONE));
     rows.push(sim_row(SIM_WIDE[0], node_harnesses, panic));
 
-    let livelock = vec![
-        owed(Key::passing(SIM_WIDE[1]), NONE),
-        owed(Key::catch(SIM_WIDE[1]), NONE),
-    ];
+    // Its COVERAGE witness runs the test-only test/probe harness
+    // (`TEST_ONLY_WITNESSES`), so its counted history is a liveness
+    // fixture, which declares `BoundedAdversary` from its start.
+    let mut livelock = holds(SIM_WIDE[1], NONE, HOLD_WITNESSES);
+    livelock.push(owed(Key::catch(SIM_WIDE[1]), NONE));
     rows.push(sim_row(SIM_WIDE[1], node_harnesses, livelock));
 
     rows

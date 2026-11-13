@@ -3290,8 +3290,9 @@ const MID_PREPARE: TestRef = sim_test(
 /// Each history a row judges for an ID other than the one it's run for, as
 /// `(history, ID)`: `both-ways`, run for `conformant-never-closes`,
 /// also judges each sender rule; each `over-owed-closes` stays
-/// `NotApplicable` in its row's `unsolicited` history; and the storage
-/// witness's first plan judges `harness/direct-dispatch`.
+/// `NotApplicable` in its row's `unsolicited` history; the storage
+/// witness's first plan judges `harness/direct-dispatch`; and the first
+/// hold-release fixture judges `sim/no-livelock`.
 const SHARED_HISTORIES: &[(HistoryRef, &str)] = &[
     (
         HistoryRef {
@@ -3377,6 +3378,19 @@ const SHARED_HISTORIES: &[(HistoryRef, &str)] = &[
             case: "plan 0 of inputs(32, 256)",
         },
         "harness/direct-dispatch",
+    ),
+    // `sim/no-livelock`'s COVERAGE witness runs test/probe, so its row
+    // judges the first hold-release fixture, run for hold-release-wakes.
+    (
+        HistoryRef {
+            harness: "header-sync/liveness",
+            witness: sim_test(
+                "tests/header_hold_release.rs",
+                "the_committed_fixtures_match_their_names",
+            ),
+            case: "header-hold-held-locator",
+        },
+        "sim/no-livelock",
     ),
 ];
 

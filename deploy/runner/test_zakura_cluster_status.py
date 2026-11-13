@@ -2147,6 +2147,9 @@ class PropagationRouteTests(unittest.TestCase):
         self.assertIn("kvRow(peerSoftwareName(entry[0]), num(entry[1]))", status.PAGE)
         # A node's name on the page leads to that node's own page.
         self.assertIn(b'"/node/" + encodeURIComponent(name)', body)
+        self.assertIn(b'"Legacy failures"', body)
+        self.assertIn(b'every profiled node had the tip', body)
+        self.assertNotIn(b'every node had the tip', body)
 
     def test_other_paths_and_a_dashboard_without_profilers_have_no_cluster_view(self):
         self.assertEqual(self.fetch("/propagation/other")[0], 404)

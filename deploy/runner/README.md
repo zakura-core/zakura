@@ -75,7 +75,10 @@ for as long as the nodes still report it.
 profiler for its recent blocks (`/api/propagation`) at most once every 10
 seconds, and `propagation.py` joins them by block hash on one time axis that
 starts when the first node heard of the block. A node that did not answer is
-listed as unreachable and the rest are still joined.
+listed as unreachable and the rest are still joined. Coverage counts include only
+configured profiled nodes. A block can be absent even when its profiler answers;
+only blocks recorded by every profiled node contribute to the complete-coverage
+timing summary.
 
 Times come from each node's own clock. The page shows each node's clock error
 as its time service reports it and marks a time between two nodes that is smaller than
@@ -93,8 +96,8 @@ its software, the block and its size; selecting one shows its block. "Peers
 outside the fleet" has one row per outside IP address, slowest first: its
 software (`/Zakura:1.8.7/` reads "Zakura 1.8.7", and zcashd's `/MagicBean:6.2.0/`
 reads "zcashd 6.2.0"), which of our nodes
-downloaded from it, how many attempts there were and how many failed, and the
-median, 9-in-10 and slowest time of the ones that delivered a block.
+downloaded from it, how many attempts were recorded and how many legacy attempts
+failed, and the median, 9-in-10 and slowest time of the ones that delivered a block.
 
 A peer is one of four kinds. One of our nodes, recognised by its Zakura label
 or by the address the node list reaches it at, is shown by name. A peer whose
@@ -114,6 +117,13 @@ Limits: a legacy download time is in whole milliseconds and includes any wait
 behind other requests on the same connection. A peer that connects to us does
 so from a temporary port, so peers are told apart by IP address alone and two
 nodes behind one address are one row.
+
+The failure column is explicitly **Legacy failures**. Zakura downloads are recorded
+when a body arrives, so zero does not establish that a Zakura peer had no failed
+requests. Its existing range-unavailable event describes an entire request, which
+can include bodies already delivered; expanding it into per-block failures would
+overcount. Timeouts and range endings need request-level correlation before they
+can contribute comparable failure counts.
 
 **Private addresses.** The addresses in
 `/etc/zakura-mainnet-dashboard/private/addresses.json` are never shown. The
@@ -136,8 +146,8 @@ build that writes `legacy_gossip.jsonl` and know each other's names
 (`fleet.py peer-names`). Without those, a legacy node still appears with its
 own stage times, and its source shows as outside the fleet.
 
-`propagation.py`, `propagation.html`, and the shared `peer_addresses.py` are installed beside
-`zakura-cluster-status.py`; the dashboard loads them only when a node in its
+`propagation.py`, `propagation.html`, and the shared `peer_addresses.py` are
+installed beside `zakura-cluster-status.py`; the dashboard loads them only when a node in its
 list has a `profiler_url`.
 
 ### Tip Agreement and Orphan Pairs

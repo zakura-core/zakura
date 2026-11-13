@@ -331,21 +331,21 @@ function downloadedFrom(view) {
   return el("td", {}, peerName(delivered), el("span", { class: "quiet", text: " · " + detail.join(" · ") }));
 }
 
-// A profiler that answers can still lack a block, so "every node" holds only for a
-// block that every node in the fleet recorded.
+// A profiler that answers can still lack a block, so "every profiled node" holds only for a
+// block that every configured profiled node recorded.
 function recordedBy(block) { return Object.keys(block.nodes).length; }
-function everyNode(block, data) { return recordedBy(block) === data.nodes.length; }
+function everyProfiledNode(block, data) { return recordedBy(block) === data.nodes.length; }
 
 function renderTiles(data) {
-  const complete = data.blocks.filter((block) => everyNode(block, data) && recordedBy(block) > 1);
+  const complete = data.blocks.filter((block) => everyProfiledNode(block, data) && recordedBy(block) > 1);
   const spreads = complete.map((block) => block.spread_ms).sort((a, b) => a - b);
   const reporting = data.nodes.length - data.unreachable.length;
   const firsts = Object.entries(data.summary.nodes).sort((a, b) => b[1].first - a[1].first)[0];
   const tiles = [
     [String(data.blocks.length), "blocks shown"],
-    [`${reporting} of ${data.nodes.length}`, "nodes reporting"],
+    [`${reporting} of ${data.nodes.length}`, "profiled nodes reporting"],
     [spreads.length ? ms(spreads[Math.floor(spreads.length / 2)]) : "–",
-      `median time until every node had the tip, over the ${complete.length} blocks every node recorded`],
+      `median time until every profiled node had the tip, over the ${complete.length} blocks every profiled node recorded`],
     [spreads.length ? ms(spreads[Math.min(spreads.length - 1, Math.floor(spreads.length * 0.9))]) : "–", "the same, 9 blocks in 10"],
     [firsts ? firsts[0] : "–", firsts ? `heard first most often (${firsts[1].first} blocks)` : "heard first most often"],
   ];
@@ -480,9 +480,9 @@ function renderBlock(data) {
   note.replaceChildren(el("span", { class: "mono", text: block.hash }),
     ` · first heard at ${clockTime(block.origin)} by `, nodeLink(block.first_node), ", from ",
     sourceLink(block.first_from, "a peer outside the fleet"),
-    everyNode(block, data)
-      ? ` · every node had it as tip after ${ms(block.spread_ms)}, `
-      : ` · ${recordedBy(block)} of ${data.nodes.length} nodes recorded this block; the last of them had it as tip after ${ms(block.spread_ms)}, `,
+    everyProfiledNode(block, data)
+      ? ` · every profiled node had it as tip after ${ms(block.spread_ms)}, `
+      : ` · ${recordedBy(block)} of ${data.nodes.length} profiled nodes recorded this block; the last of them had it as tip after ${ms(block.spread_ms)}, `,
     nodeLink(slow.name), " last");
   renderWaterfall(block);
   const names = Object.keys(block.nodes).sort((a, b) => block.nodes[a].at.tip - block.nodes[b].at.tip);
@@ -555,7 +555,7 @@ function renderDownloads(data) {
   const peers = data.outside_peers || [];
   const worst = Math.max(1, ...peers.map((peer) => peer.p90_ms || 0));
   table(document.getElementById("outside"),
-    [["Peer address"], ["Peer runs"], ["Our nodes that downloaded from it"], ["Downloads", true], ["Failed", true], ["Median", true],
+    [["Peer address"], ["Peer runs"], ["Our nodes that downloaded from it"], ["Downloads", true], ["Legacy failures", true], ["Median", true],
       ["9 in 10", true], [""], ["Slowest", true], ["Last used"]],
     peers.map((peer) => {
       const users = el("td", { class: "wrap" });
@@ -568,7 +568,7 @@ function renderDownloads(data) {
         cell(ms(peer.max_ms), true), cell(clockTime(peer.last)));
     }));
   document.getElementById("outside-note").textContent = peers.length
-    ? "A peer is known by its IP address alone, so two nodes behind one address are one row. Times count only the downloads that delivered the block. \"Failed\" counts only legacy attempts: a download over Zakura is recorded when its block arrives, so a Zakura peer never shows a failure here."
+    ? "A peer is known by its IP address alone, so two nodes behind one address are one row. Times count only the downloads that delivered the block. \"Legacy failures\" counts only legacy attempts: a download over Zakura is recorded when its block arrives, so a Zakura peer never shows a failure here."
     : "No outside peer is listed yet. A node records peer addresses only after it restarts with them switched on; until then its downloads show as \"address hidden\".";
 }
 

@@ -1,0 +1,4 @@
+# Bans the supplier of a valid body the pool refuses for a spend conflict.
+input = "crates/zakura-sim/tests/fixtures/pool-core.bin"
+# The harness drives the pool core and the storage under it.
+checks = ["crates/zakura-mempool/src"]

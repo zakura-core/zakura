@@ -70,6 +70,8 @@ pub struct PoolEvidence {
     /// For each rejection that charged a peer supplier a cooldown: the peer,
     /// and whether the port showed it cooling when the verdict arrived.
     pub charges: Vec<(String, bool)>,
+    /// Verdicts whose charge was checked against their body's script.
+    pub charges_checked: u64,
     /// Cooldowns that fell on a supplier other than the reserving source.
     pub relayed_charges: u64,
     /// Invalid bodies this node submitted, which charge nobody.
@@ -108,6 +110,10 @@ pub struct PoolEvidence {
     pub removals_seen: u64,
     /// Additions the change log carried.
     pub additions_seen: u64,
+    /// Submissions answered `Admitted`.
+    pub admitted: u64,
+    /// The transactions a publication logged as added.
+    pub logged_additions: BTreeSet<usize>,
     /// The first snapshot the log did not lead to.
     pub log_mismatch: Option<String>,
     /// Reorgs that happened while the pool held visible transactions.
@@ -136,9 +142,18 @@ impl PoolEvidence {
     ///
     /// A reservation counts from the moment its caller holds it until the
     /// caller submits or drops it, and a submitted body while the verifier
-    /// checks it. Both lie inside the time the core counts the slot, so the
-    /// count never exceeds the core's own. A revalidation counts only
-    /// toward the node's limit.
+    /// checks it. A revalidation counts only toward the node's limit. Both
+    /// lie inside the time the core counts the slot, with one exception: a
+    /// job the core cancels keeps counting until its task is dropped, which
+    /// is later. The harness's scripts cancel only revalidations, at chain
+    /// changes, and the chain script stops counting those when it begins a
+    /// change. So on these scripts the count never exceeds the core's own.
+    ///
+    /// The count leaves out a parked body, and a body between its
+    /// submission and its verification. Whether the machine counts those
+    /// slots is `pool_state_matches_model`'s to check, step by step against
+    /// the model's answers. This property is about the task that drives the
+    /// machine: reservations it hands out and bodies it verifies.
     pub fn count_slots(&mut self) {
         let mut by_source: BTreeMap<String, u64> = BTreeMap::new();
         for source in self.held.values().chain(self.verifying.values().flatten()) {
@@ -221,8 +236,7 @@ pub fn properties<S: HasView<View = PoolView>>() -> Vec<Property<S>> {
             status: Status::Active,
             check: check_charges::<S>,
             witness: Some(TriggerHistory::View(|view, _| {
-                let evidence = lock(view);
-                evidence.relayed_charges > 0 || evidence.local_failures > 0
+                lock(view).charges_checked > 0
             })),
         },
         Property {
@@ -240,7 +254,7 @@ pub fn properties<S: HasView<View = PoolView>>() -> Vec<Property<S>> {
         },
         Property {
             id: PropertyId::new(CONSISTENT),
-            claim: "every published snapshot holds no two transactions that spend one output, no expired transaction, no transaction without its unmined parent, exactly the dependency edges its bodies imply, and no dependency group past three",
+            claim: "every published snapshot holds no two transactions that spend one transparent output, no expired transaction, no transaction its chain mined, no transaction without its unmined parent, exactly the dependency edges its bodies imply, and no dependency group past three",
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View],
@@ -256,15 +270,18 @@ pub fn properties<S: HasView<View = PoolView>>() -> Vec<Property<S>> {
         },
         Property {
             id: PropertyId::new(LOG_COMPLETE),
-            claim: "replaying the change log from the start leads to exactly each published snapshot's transactions, and each entry is allowed by the entries before it",
+            claim: "replaying the change log from the start leads to exactly each published snapshot's transactions, each entry is allowed by the entries before it, and an admission is logged before its verdict",
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View],
             status: Status::Active,
             check: check_log::<S>,
             // A patched core can drop or repeat entries, so the trigger is
-            // the first addition a publication carried.
-            witness: Some(TriggerHistory::View(|view, _| lock(view).additions_seen > 0)),
+            // the first addition a publication carried or a caller learned of.
+            witness: Some(TriggerHistory::View(|view, _| {
+                let evidence = lock(view);
+                evidence.additions_seen > 0 || evidence.admitted > 0
+            })),
         },
         Property {
             id: PropertyId::new(SURVIVES_REORG),

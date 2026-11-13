@@ -213,7 +213,12 @@ pub(crate) fn assemble(
 
     let (changes, _) = tokio::sync::broadcast::channel(MEMPOOL_CHANGE_CHANNEL_CAPACITY);
     let subscriber = MempoolTxSubscriber::new(changes.clone());
-    let follower = follower::Follower::new(handle.reader(), outbound.clone(), changes);
+    let follower = follower::Follower::new(
+        handle.reader(),
+        outbound.clone(),
+        changes,
+        MEMPOOL_CHANGE_CHANNEL_CAPACITY,
+    );
 
     let adapter = adapter::CoreMempool::new(
         handle.clone(),

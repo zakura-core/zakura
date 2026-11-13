@@ -10,12 +10,13 @@
 //! that is visible again after a reorg is announced again, as today's reset
 //! re-inserts and re-announces it.
 //!
-//! The change stream sends at most one event of each kind for each of at most
-//! two batches per read, in today's order: added, invalidated, mined. A transaction refused at
-//! verification, or removed for any reason but a block mining it, is
-//! invalidated, as today.
+//! The change stream sends the log's batches in order, at most one event of
+//! each kind for each, in today's order: added, invalidated, mined. Batches
+//! are merged only where that keeps every transaction's events in order. A
+//! transaction refused at verification, or removed for any reason but a
+//! block mining it, is invalidated, as today.
 
-use std::collections::{HashMap, HashSet};
+use std::{collections::HashSet, time::Duration};
 
 use futures::{future::BoxFuture, FutureExt};
 
@@ -42,6 +43,14 @@ use super::super::Outbound;
 /// The most ids one advertisement carries.
 const MAX_ANNOUNCED: usize = MAX_TX_INV_IN_SENT_MESSAGE as usize;
 
+/// The longest one read waits, in all, for the indexer to drain the change
+/// channel. A subscriber that is still behind after it lags, and its stream
+/// ends, as a slow subscriber's does today.
+const MAX_DRAIN_WAIT: Duration = Duration::from_secs(1);
+
+/// How often a read checks whether the indexer drained the channel.
+const DRAIN_POLL: Duration = Duration::from_millis(1);
+
 /// The announcer and the change stream.
 pub(crate) struct Follower {
     /// A reader, not a handle, so the follower does not keep the core
@@ -49,6 +58,9 @@ pub(crate) struct Follower {
     pool: PoolReader,
     outbound: Timeout<Outbound>,
     changes: broadcast::Sender<MempoolChange>,
+    /// A read sends an event only while fewer than this many are queued,
+    /// for at most [`MAX_DRAIN_WAIT`]: half the channel's capacity.
+    drain_below: usize,
     cursor: ChangeSeq,
     /// Visible transactions not yet announced.
     pending: HashSet<UnminedTxId>,
@@ -56,16 +68,18 @@ pub(crate) struct Follower {
 
 impl Follower {
     /// A follower of `pool` that announces through `outbound` and sends
-    /// the change stream on `changes`.
+    /// the change stream on `changes`, a channel of `capacity` events.
     pub fn new(
         pool: PoolReader,
         outbound: Outbound,
         changes: broadcast::Sender<MempoolChange>,
+        capacity: usize,
     ) -> Self {
         Self {
             pool,
             outbound: Timeout::new(outbound, TIPS_RESPONSE_TIMEOUT),
             changes,
+            drain_below: (capacity / 2).max(1),
             cursor: ChangeSeq::default(),
             pending: HashSet::new(),
         }
@@ -82,7 +96,7 @@ impl Follower {
         // none removed during the wait is advertised.
         let mut readying: Option<BoxFuture<'static, Option<Timeout<Outbound>>>> = None;
         loop {
-            self.read();
+            self.read().await;
             let due = readying.is_none() && !self.pending.is_empty();
             tokio::select! {
                 changed = self.pool.snapshot_changed() => {
@@ -101,7 +115,7 @@ impl Follower {
                     if let Some(network) = network {
                         // A removal can have been published while the
                         // network got ready, so read it before choosing ids.
-                        self.read();
+                        self.read().await;
                         self.announce(network);
                     }
                 }
@@ -130,8 +144,9 @@ impl Follower {
         metrics::counter!("mempool.gossiped.transactions.total").increment(count);
     }
 
-    /// Reads the log from the cursor to the latest snapshot.
-    fn read(&mut self) {
+    /// Reads the log from the cursor to the latest snapshot, and sends its
+    /// events.
+    async fn read(&mut self) {
         let Some(view) = self.pool.view(self.cursor) else {
             return;
         };
@@ -149,9 +164,15 @@ impl Follower {
                         Change::Refused(_) => {}
                     }
                 }
-                let [first, second] = batches(entries.iter().map(|entry| entry.change));
-                first.send(&self.changes);
-                second.send(&self.changes);
+                let wait_until = tokio::time::Instant::now() + MAX_DRAIN_WAIT;
+                let mut batch = Batch::default();
+                for entry in entries {
+                    if batch.would_reorder(entry.change) {
+                        self.send(std::mem::take(&mut batch), wait_until).await;
+                    }
+                    batch.take(entry.change);
+                }
+                self.send(batch, wait_until).await;
             }
             ChangesSince::Resync => {
                 // The log moved past this reader. The snapshot cannot give back
@@ -176,6 +197,22 @@ impl Follower {
     }
 }
 
+impl Follower {
+    /// Sends `batch`'s events. Before each, waits until fewer than
+    /// `drain_below` are queued or `wait_until` passes, so a subscriber that
+    /// keeps up is never overrun by one read, however long. Nobody listening
+    /// is fine.
+    async fn send(&self, batch: Batch, wait_until: tokio::time::Instant) {
+        for event in batch.events() {
+            while self.changes.len() >= self.drain_below && tokio::time::Instant::now() < wait_until
+            {
+                tokio::time::sleep(DRAIN_POLL).await;
+            }
+            let _ = self.changes.send(event);
+        }
+    }
+}
+
 /// The peer set once it is ready, or `None` if it was not ready within
 /// [`BROADCAST_READY_TIMEOUT`], as today's gossip bounds the wait.
 async fn ready(outbound: Timeout<Outbound>) -> Option<Timeout<Outbound>> {
@@ -188,74 +225,6 @@ async fn ready(outbound: Timeout<Outbound>) -> Option<Timeout<Outbound>> {
     }
 }
 
-/// Splits one read of the change log into at most two batches, so the read
-/// sends at most six events however its changes repeat, and the indexer's
-/// channel cannot overflow.
-///
-/// Each batch goes out as one event per kind, as today's pool sends one per
-/// kind for each pass. Its events go out added, then invalidated, then mined,
-/// so a transaction added after it was removed in the same read would be sent
-/// out of order. Such a transaction keeps only its last removal in the first
-/// batch, and what followed its last re-addition in the second. The flaps in
-/// between are dropped, as a pass of today's pool drops them.
-fn batches(changes: impl Iterator<Item = Change>) -> [Batch; 2] {
-    let mut histories: HashMap<UnminedTxId, Vec<Kind>> = HashMap::new();
-    for change in changes {
-        if let Some((id, kind)) = Kind::of(change) {
-            histories.entry(id).or_default().push(kind);
-        }
-    }
-    let mut first = Batch::default();
-    let mut second = Batch::default();
-    for (id, history) in histories {
-        let readded = (1..history.len())
-            .rev()
-            .find(|&at| history[at] == Kind::Added && history[..at].iter().any(Kind::removes));
-        match readded {
-            None => history.iter().for_each(|kind| first.take(id, *kind)),
-            Some(at) => {
-                let removal = *history[..at]
-                    .iter()
-                    .rev()
-                    .find(|kind| kind.removes())
-                    .expect("a re-addition follows a removal");
-                first.take(id, removal);
-                history[at..].iter().for_each(|kind| second.take(id, *kind));
-            }
-        }
-    }
-    [first, second]
-}
-
-/// The change stream event one change of the log becomes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Kind {
-    Added,
-    Invalidated,
-    Mined,
-}
-
-impl Kind {
-    /// The transaction and event of `change`, or `None` for a change the
-    /// stream does not report.
-    fn of(change: Change) -> Option<(UnminedTxId, Kind)> {
-        match change {
-            Change::Added(id) | Change::Revealed { id, .. } => Some((id, Kind::Added)),
-            Change::Removed {
-                id,
-                reason: RemovalReason::Mined,
-            } => Some((id, Kind::Mined)),
-            Change::Removed { id, .. } | Change::Refused(id) => Some((id, Kind::Invalidated)),
-            Change::Hidden(_) => None,
-        }
-    }
-
-    /// Whether this event takes the transaction out of the pool.
-    fn removes(&self) -> bool {
-        *self != Kind::Added
-    }
-}
-
 /// One batch of the change log, as today's change stream events.
 #[derive(Default)]
 struct Batch {
@@ -265,27 +234,57 @@ struct Batch {
 }
 
 impl Batch {
-    /// Adds one event for `id`.
-    fn take(&mut self, id: UnminedTxId, kind: Kind) {
-        match kind {
-            Kind::Added => self.added.insert(id),
-            Kind::Invalidated => self.invalidated.insert(id),
-            Kind::Mined => self.mined.insert(id),
-        };
+    /// Whether taking `change` would send its transaction's events out of
+    /// order. The events go out added, then invalidated, then mined, so a
+    /// change is out of order if the batch already holds its transaction in
+    /// a kind sent after the change's, or in the same kind, which one event
+    /// would merge.
+    fn would_reorder(&self, change: Change) -> bool {
+        match change {
+            Change::Added(id) | Change::Revealed { id, .. } => {
+                self.added.contains(&id)
+                    || self.invalidated.contains(&id)
+                    || self.mined.contains(&id)
+            }
+            Change::Removed {
+                id,
+                reason: RemovalReason::Mined,
+            } => self.mined.contains(&id),
+            Change::Hidden(_) => false,
+            Change::Removed { id, .. } | Change::Refused(id) => {
+                self.invalidated.contains(&id) || self.mined.contains(&id)
+            }
+        }
     }
 
-    /// Sends this batch's events, in today's order. Nobody listening is
-    /// fine.
-    fn send(self, changes: &broadcast::Sender<MempoolChange>) {
-        if !self.added.is_empty() {
-            let _ = changes.send(MempoolChange::added(self.added));
+    /// Adds one change.
+    fn take(&mut self, change: Change) {
+        match change {
+            Change::Added(id) | Change::Revealed { id, .. } => {
+                self.added.insert(id);
+            }
+            Change::Removed {
+                id,
+                reason: RemovalReason::Mined,
+            } => {
+                self.mined.insert(id);
+            }
+            Change::Removed { id, .. } | Change::Refused(id) => {
+                self.invalidated.insert(id);
+            }
+            Change::Hidden(_) => {}
         }
-        if !self.invalidated.is_empty() {
-            let _ = changes.send(MempoolChange::invalidated(self.invalidated));
-        }
-        if !self.mined.is_empty() {
-            let _ = changes.send(MempoolChange::mined(self.mined));
-        }
+    }
+
+    /// Its events, in today's order.
+    fn events(self) -> impl Iterator<Item = MempoolChange> {
+        [
+            (!self.added.is_empty()).then(|| MempoolChange::added(self.added)),
+            (!self.invalidated.is_empty()).then(|| MempoolChange::invalidated(self.invalidated)),
+            (!self.mined.is_empty()).then(|| MempoolChange::mined(self.mined)),
+        ]
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -373,6 +372,7 @@ mod tests {
             handle.reader(),
             BoxCloneSyncService::new(gate.clone()),
             changes,
+            16,
         );
         tokio::spawn(follower.run());
 
@@ -418,6 +418,7 @@ mod tests {
                 handle.reader(),
                 BoxCloneSyncService::new(gate.clone()),
                 changes,
+                16,
             )
             .run(),
         );
@@ -482,6 +483,7 @@ mod tests {
                 handle.reader(),
                 BoxCloneSyncService::new(Gate::default()),
                 changes,
+                16,
             )
             .run(),
         );
@@ -507,9 +509,10 @@ mod tests {
     }
 
     /// One read of many add and removal cycles of the same transaction
-    /// still sends at most six events, and the last ones say how it ended.
+    /// reaches an indexer that keeps reading as every event, in order, even
+    /// though the read holds more events than the channel.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn repeated_changes_to_one_transaction_cannot_overflow_the_indexer() {
+    async fn repeated_changes_to_one_transaction_reach_the_indexer_in_order() {
         let (handle, inbox) = pool_port();
         let (changes, mut events) = broadcast::channel(16);
         let id = UnminedTxId::Legacy(zakura_chain::transaction::Hash([7; 32]));
@@ -528,26 +531,58 @@ mod tests {
                 handle.reader(),
                 BoxCloneSyncService::new(Gate::default()),
                 changes,
+                16,
             )
             .run(),
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
 
         let mut kinds = Vec::new();
-        loop {
-            match events.try_recv() {
-                Ok(event) => kinds.push(event.kind),
-                Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(error) => panic!("the indexer's channel overflowed: {error:?}"),
+        while kinds.len() < 66 {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+                Ok(Ok(event)) => kinds.push(event.kind),
+                Ok(Err(error)) => panic!("the indexer's channel overflowed: {error:?}"),
+                Err(_) => panic!("only {} events arrived", kinds.len()),
             }
         }
-        assert_eq!(
-            kinds,
-            vec![
-                MempoolChangeKind::Invalidated,
-                MempoolChangeKind::Added,
-                MempoolChangeKind::Invalidated
-            ],
+        let expected: Vec<_> = (0..33)
+            .flat_map(|_| [MempoolChangeKind::Added, MempoolChangeKind::Invalidated])
+            .collect();
+        assert_eq!(kinds, expected);
+    }
+
+    /// An indexer that stops reading lags once the read has waited its
+    /// bound, so the follower is not held up for good.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_indexer_that_stops_reading_lags_instead_of_holding_the_follower() {
+        let (handle, inbox) = pool_port();
+        let (changes, mut events) = broadcast::channel(16);
+        let id = UnminedTxId::Legacy(zakura_chain::transaction::Hash([7; 32]));
+        for _ in 0..33 {
+            inbox.publish([Change::Added(id)], |last| snapshot(Vec::new(), last));
+            inbox.publish(
+                [Change::Removed {
+                    id,
+                    reason: RemovalReason::Evicted,
+                }],
+                |last| snapshot(Vec::new(), last),
+            );
+        }
+        tokio::spawn(
+            Follower::new(
+                handle.reader(),
+                BoxCloneSyncService::new(Gate::default()),
+                changes,
+                16,
+            )
+            .run(),
+        );
+        tokio::time::sleep(MAX_DRAIN_WAIT * 2).await;
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Lagged(_))
+            ),
+            "the stalled indexer is told it lagged"
         );
     }
 }

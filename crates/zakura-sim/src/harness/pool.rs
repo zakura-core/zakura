@@ -729,8 +729,9 @@ impl Submitting<'_> {
             Supplier::Nobody => None,
         };
         let expected = match (UNIVERSE[tx].script, &supplier_label) {
-            (Script::Valid, _) => None,
-            (_, None) => Some(Charge::None),
+            // A valid body is rejected only by the pool's own rules, such as
+            // a conflict, and that charges nobody.
+            (Script::Valid, _) | (_, None) => Some(Charge::None),
             (Script::Invalid, Some(_)) => Some(Charge::Cooldown),
             (Script::Banned, Some(_)) => Some(Charge::Ban),
         };
@@ -766,12 +767,16 @@ impl Submitting<'_> {
                 Verdict::Rejected(rejection) => Some(rejection.charge),
                 _ => None,
             };
-            if charge != Some(expected) {
+            let applies = UNIVERSE[tx].script != Script::Valid || charge.is_some();
+            if applies {
+                evidence.charges_checked += 1;
+            }
+            if applies && charge != Some(expected) {
                 problem = Some(format!(
                     "transaction {tx} from {supplier_label:?} got {verdict:?}, and its script charges {expected:?}"
                 ));
             }
-            if supplier_label.is_none() {
+            if supplier_label.is_none() && UNIVERSE[tx].script != Script::Valid {
                 evidence.local_failures += 1;
             }
         }
@@ -783,6 +788,19 @@ impl Submitting<'_> {
             if label.as_str() != self.submitter.label {
                 evidence.relayed_charges += 1;
             }
+        }
+        // The core publishes a step's changes before it answers, so an
+        // admission is already in the log.
+        if matches!(verdict, Verdict::Admitted) {
+            evidence.admitted += 1;
+        }
+        if matches!(verdict, Verdict::Admitted)
+            && !evidence.logged_additions.contains(&tx)
+            && evidence.log_mismatch.is_none()
+        {
+            evidence.log_mismatch = Some(format!(
+                "transaction {tx} was admitted, and no publication before its verdict logged it"
+            ));
         }
         if let Some((peer, _)) = cooling
             .iter()
@@ -1067,10 +1085,14 @@ fn check_publication(
     }
     *last = snapshot.last_change;
     let (mut removals, mut additions) = (0, 0);
+    let mut added = Vec::new();
     for change in batches.iter().flatten() {
         match change {
             Change::Removed { .. } => removals += 1,
-            Change::Added(_) => additions += 1,
+            Change::Added(id) => {
+                additions += 1;
+                added.extend(universe.index(*id));
+            }
             _ => {}
         }
         if let Err(error) = replay.apply(universe, *change) {
@@ -1094,6 +1116,7 @@ fn check_publication(
     evidence.snapshots_checked += 1;
     evidence.removals_seen += removals;
     evidence.additions_seen += additions;
+    evidence.logged_additions.extend(added);
     if evidence.log_mismatch.is_none() {
         evidence.log_mismatch = problem;
     }
@@ -1151,7 +1174,8 @@ async fn observe(mut handle: PoolHandle, universe: Arc<Universe>, evidence: Shar
 }
 
 /// What makes `snapshot` inconsistent, if anything: two transactions that
-/// spend one output, an expired transaction, a transaction whose parent is
+/// spend one transparent output, an expired transaction, a transaction the
+/// snapshot's chain (`mined`) mined, a transaction whose parent is
 /// neither mined on the snapshot's chain (`mined`) nor visible, dependency
 /// edges other than those the bodies imply, or a dependency group past
 /// three.
@@ -1188,6 +1212,11 @@ fn inconsistency(
         let Some(child) = universe.index(tx.transaction.id()) else {
             return Some("a transaction outside the universe".to_owned());
         };
+        if mined.is_some_and(|mined| mined.contains(&child)) {
+            return Some(format!(
+                "transaction {child} is visible, and the snapshot's chain mined it"
+            ));
+        }
         for outpoint in tx.transaction.transaction().spent_outpoints() {
             let Some(parent) = universe.index_of_hash(outpoint.hash) else {
                 continue;

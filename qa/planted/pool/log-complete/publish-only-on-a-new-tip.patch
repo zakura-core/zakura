@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-mempool/src/io.rs b/crates/zakura-mempool/src/io.rs
+index 1607ad1b78..7ff5f98560 100644
+--- a/crates/zakura-mempool/src/io.rs
++++ b/crates/zakura-mempool/src/io.rs
+@@ -513,7 +513,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
+             generation: self.machine.generation(),
+             active: self.machine.is_active(),
+         };
+-        if batches.iter().all(Vec::is_empty) && self.published == Some(now) {
++        if self.published == Some(now) {
+             return;
+         }
+         self.published = Some(now);

@@ -1465,13 +1465,19 @@ impl Pair {
     /// Reserves `tx` for this node on both sides. Returns the reservation if
     /// both granted it, after checking both answered the same.
     fn reserve(&mut self, tx: &Tx) -> Option<ReservationId> {
+        self.reserve_from(tx, Source::Node)
+    }
+
+    /// Reserves `tx` with its body in hand for `source` on both sides. See
+    /// [`Self::reserve`].
+    fn reserve_from(&mut self, tx: &Tx, source: Source) -> Option<ReservationId> {
         let at = self.base + self.now;
         let real = self
             .machine
-            .reserve(tx.id(), Source::Node, Intent::Deliver, at);
+            .reserve(tx.id(), source.clone(), Intent::Deliver, at);
         let model = self
             .model
-            .reserve(tx.id(), Source::Node, Intent::Deliver, self.now);
+            .reserve(tx.id(), source, Intent::Deliver, self.now);
         let granted = match (&real, &model) {
             (Ok(grant), Ok(expected)) => {
                 assert_eq!(grant.id, expected.id);
@@ -1490,16 +1496,22 @@ impl Pair {
 
     /// Submits `tx` under `reservation`, and returns the job that started.
     fn submit(&mut self, reservation: ReservationId, tx: &Tx) -> u64 {
+        self.submit_from(reservation, tx, Supplier::Nobody)
+    }
+
+    /// Submits `tx` under `reservation` as supplied by `supplier`, and
+    /// returns the job that started.
+    fn submit_from(&mut self, reservation: ReservationId, tx: &Tx, supplier: Supplier) -> u64 {
         let at = self.base + self.now;
         let (_, real) = self.machine.submit(
             reservation,
             tx.real.transaction.clone(),
-            Supplier::Nobody,
+            supplier.clone(),
             at,
         );
-        let (_, model) =
-            self.model
-                .submit(reservation, tx.model.clone(), Supplier::Nobody, self.now);
+        let (_, model) = self
+            .model
+            .submit(reservation, tx.model.clone(), supplier, self.now);
         let started = self.same(real, model);
         assert_eq!(started.len(), 1, "a body starts one job");
         started[0]
@@ -1960,4 +1972,126 @@ fn a_job_run_again_after_a_reset_is_marked() {
 
     assert_eq!(marked(&start(&mut machine, &after_reset)), vec![false]);
     machine.assert_invariants();
+}
+
+/// Terra's case from M1 review round 7: a body the pool refuses for its own
+/// policy, not for its verification, charges its peer supplier nothing. The
+/// random runs reach this only rarely.
+#[test]
+fn a_policy_refusal_of_a_peer_body_charges_nobody() {
+    let mut runner = TestRunner::deterministic();
+    let pooled = build(&mut runner, &[], 1, None);
+    let other = twin(&pooled);
+    let mut pair = Pair::new(Duration::from_secs(3600));
+    let peer = legacy(1);
+
+    let first = pair.reserve(&pooled).expect("room for the first");
+    let second = pair
+        .reserve_from(&other, Source::Peer(peer.clone()))
+        .expect("an exact id of its own");
+    let first_job = pair.submit(first, &pooled);
+    let second_job = pair.submit_from(second, &other, Supplier::Peer(peer.clone()));
+    pair.pass(first_job, &pooled);
+
+    // The twin passes its verification, and the pool refuses it because the
+    // same effects are already pooled. `same` checks the verdict against the
+    // model's, which charges nobody.
+    pair.pass(second_job, &other);
+    assert!(
+        !pair.machine.is_cooling(&peer, pair.base + pair.now),
+        "the peer that supplied the twin is not charged"
+    );
+}
+
+/// Terra's case from M1 review round 7: an admission that evicts another
+/// transaction logs the addition and the eviction, so the log still leads to
+/// the pool. The model leaves eviction to storage, so the random runs never
+/// evict.
+#[test]
+fn an_admission_that_evicts_logs_both_changes() {
+    use zakura_node_services::mempool::port::{Change, RemovalReason};
+
+    let mut runner = TestRunner::deterministic();
+    let mut txs: Vec<Tx> = (0..3).map(|_| build(&mut runner, &[], 1, None)).collect();
+    let limit = txs[0].real.cost() + txs[1].real.cost();
+    // Storage evicts only for a body that pays enough more than its victim.
+    txs[2].real = VerifiedUnminedTx::new(
+        txs[2].real.transaction.clone(),
+        Amount::try_from(100_000_000).expect("a valid test fee"),
+        0,
+        0,
+        Arc::new(Vec::new()),
+    )
+    .expect("a high fee passes the ZIP-317 checks");
+    let base = Instant::now();
+    let mut machine = Machine::new(
+        &Config {
+            tx_cost_limit: limit,
+            ..Config::default()
+        },
+        tip(START, 0),
+        Generation(0),
+        base,
+    );
+    let read = GenerationRead::Stable(Generation(0));
+    let mut logged = std::collections::HashSet::new();
+    let mut evictions = 0;
+    for tx in &txs {
+        let grant = machine
+            .reserve(tx.id(), Source::Node, Intent::Deliver, base)
+            .expect("room for a reservation");
+        assert!(machine.effects().is_empty());
+        let (waiter, step) = machine.submit(
+            grant.id,
+            tx.real.transaction.clone(),
+            Supplier::Nobody,
+            base,
+        );
+        let Some(Effect::Start { job, .. }) = step.effects.first().cloned() else {
+            panic!("a body starts a job: {step:?}");
+        };
+        let step = machine.outcome(
+            job,
+            Outcome::Pass {
+                tx: tx.real.clone(),
+                pool_inputs: Vec::new(),
+            },
+            read,
+            read,
+            base,
+            chrono::Utc::now(),
+        );
+        machine.assert_invariants();
+        let verdict = step.verdict(waiter).cloned().expect("the pass decides it");
+        for change in &step.changes {
+            match change {
+                Change::Added(id) => assert!(logged.insert(*id), "added once"),
+                Change::Removed {
+                    id,
+                    reason: RemovalReason::Evicted,
+                } => {
+                    evictions += 1;
+                    assert!(logged.remove(id), "an eviction removes a logged addition");
+                }
+                Change::Refused(id) => assert_eq!(*id, tx.id(), "only the new one is refused"),
+                other => panic!("an admission logs only these changes: {other:?}"),
+            }
+        }
+        if matches!(verdict, Verdict::Admitted) {
+            assert!(
+                logged.contains(&tx.id()),
+                "an admitted transaction is logged"
+            );
+        }
+    }
+    assert!(evictions > 0, "the third admission evicts");
+    let visible: std::collections::HashSet<UnminedTxId> = machine.visible().into_iter().collect();
+    assert_eq!(logged, visible, "the log leads to the pool");
+    let snapshot: std::collections::HashSet<UnminedTxId> = machine
+        .snapshot(ChangeSeq(0))
+        .transactions
+        .iter()
+        .map(|tx| tx.transaction.id())
+        .collect();
+    assert_eq!(snapshot, visible, "the snapshot holds the pool");
 }

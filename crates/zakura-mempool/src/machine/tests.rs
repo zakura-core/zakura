@@ -45,8 +45,9 @@ use zakura_node_services::{
                 ModelVerdict, Outcome as ModelOutcome, OutputAnswer as ModelOutputAnswer,
                 PoolModel, Step as ModelStep,
             },
-            ChainTip, ChainTransition, Charge, ConnectedBlock, Generation, GenerationRead, Intent,
-            LocalFault, RejectionScope, ReservationId, Source, Supplier, Unreserved, Verdict,
+            ChainReason, ChainTip, ChainTransition, ChangeSeq, Charge, ConnectedBlock, Generation,
+            GenerationRead, Intent, LocalFault, RejectionScope, ReservationId, Source, Supplier,
+            Unreserved, Verdict,
         },
         QueueSource,
     },
@@ -56,7 +57,10 @@ use zakura_rt::collections::HashSet;
 use super::{Effect, Grant, Limits, MempoolState, Outcome, OutputAnswer, Step};
 use crate::{
     config::Config,
-    storage::{ExactTipRejectionError, RejectionError},
+    storage::{
+        ExactTipRejectionError, RejectionError, SameEffectsChainRejectionError,
+        SameEffectsTipRejectionError,
+    },
     Instant,
 };
 
@@ -70,6 +74,10 @@ type Machine = MempoolState<TestVerifyError>;
 
 /// The tip a run starts at.
 const START: u32 = 100;
+
+/// How long a run remembers a chain-scoped rejection: short, so runs reach
+/// the end of it.
+const REJECTION_MEMORY: Duration = Duration::from_secs(150);
 
 /// How far one run's clock moves before it drains. Less than one cooldown, so
 /// no peer earns a second, longer one, which the model leaves out.
@@ -191,9 +199,53 @@ fn universe(rng: &mut TestRng, runner: &mut TestRunner, size: usize) -> Vec<Tx> 
         let expiry = chance(rng, 4)
             .then(|| Height(START + 1 + u32::try_from(pick(rng, 6)).expect("a small height")));
         let outputs = 1 + u32::try_from(pick(rng, 2)).expect("a small count");
-        txs.push(build(runner, &spends, outputs, expiry));
+        let mut tx = build(runner, &spends, outputs, expiry);
+        // Each transaction reveals its own nullifier, which the model names
+        // by its index.
+        tx.model.nullifiers = vec![u64::try_from(txs.len()).expect("a small index")];
+        txs.push(tx);
+    }
+    // Some transactions get a second authorization: the same effects and
+    // nullifier, other authorizing data.
+    for index in 0..txs.len() {
+        if chance(rng, 4) {
+            let twin = twin(&txs[index]);
+            txs.push(twin);
+        }
     }
     txs
+}
+
+/// `tx` with other authorizing data: the same mined id and effects, and
+/// another exact id.
+fn twin(tx: &Tx) -> Tx {
+    let mut transaction = (**tx.real.transaction.transaction()).clone();
+    if let Transaction::V6 {
+        ironwood_shielded_data: Some(data),
+        ..
+    } = &mut transaction
+    {
+        data.binding_sig = [1u8; 64].into();
+    }
+    let real = VerifiedUnminedTx::new(
+        Arc::new(transaction).into(),
+        Amount::try_from(1_000_000).expect("a valid test fee"),
+        0,
+        0,
+        Arc::new(Vec::new()),
+    )
+    .expect("the test fee passes the ZIP-317 checks");
+    let model = ModelTx {
+        id: real.transaction.id(),
+        ..tx.model.clone()
+    };
+    assert_eq!(
+        model.id.mined_id(),
+        tx.id().mined_id(),
+        "a twin has the same effects"
+    );
+    assert_ne!(model.id, tx.id(), "a twin has other authorizing data");
+    Tx { real, model }
 }
 
 /// A number below `n`.
@@ -397,6 +449,11 @@ struct Run {
     held: Vec<Held>,
     /// Jobs started and not yet answered or cancelled, with their target.
     jobs: Vec<(u64, UnminedTxId)>,
+    /// The visible pool when each job started, which is what its verifier
+    /// read.
+    views: std::collections::HashMap<u64, HashSet<transaction::Hash>>,
+    /// Jobs cancelled before they answered. Their late outcomes are ignored.
+    cancelled: Vec<(u64, UnminedTxId)>,
     /// Output waiters that may still be answered.
     output_waiters: Vec<u64>,
     peers: Vec<QueueSource>,
@@ -426,6 +483,7 @@ impl Run {
         let machine = Machine::new(
             &Config {
                 tx_cost_limit: u64::MAX / 2,
+                eviction_memory_time: REJECTION_MEMORY,
                 ..Config::default()
             },
             tip(START, 0),
@@ -433,11 +491,9 @@ impl Run {
             base,
         )
         .with_limits(limits);
-        let model = PoolModel::new(Height(START), Generation(0)).with_limits(
-            limits.pending,
-            limits.per_source,
-            limits.revalidating,
-        );
+        let model = PoolModel::new(Height(START), Generation(0))
+            .with_limits(limits.pending, limits.per_source, limits.revalidating)
+            .with_rejection_memory(REJECTION_MEMORY);
         Self {
             rng,
             txs,
@@ -451,6 +507,8 @@ impl Run {
             active: true,
             held: Vec::new(),
             jobs: Vec::new(),
+            views: std::collections::HashMap::new(),
+            cancelled: Vec::new(),
             output_waiters: Vec::new(),
             peers: (1..=6).map(legacy).collect(),
             steps: 0,
@@ -498,10 +556,47 @@ impl Run {
         if self.machine.is_parked_any() {
             self.coverage.saw("parked");
         }
+        for effect in &real.effects {
+            if let Effect::OutputReady {
+                outpoint, output, ..
+            } = effect
+            {
+                let creator = self
+                    .txs
+                    .iter()
+                    .find(|tx| tx.id().mined_id() == outpoint.hash)
+                    .expect("an output comes from a transaction of the universe");
+                assert_eq!(
+                    Some(output),
+                    creator
+                        .real
+                        .transaction
+                        .transaction()
+                        .outputs()
+                        .get(usize::try_from(outpoint.index).expect("a small index")),
+                    "step {}: the output a waiter gets",
+                    self.steps
+                );
+            }
+        }
+        let visible_now: HashSet<transaction::Hash> = self
+            .model
+            .visible()
+            .iter()
+            .map(UnminedTxId::mined_id)
+            .collect();
         for effect in seen {
             match effect {
-                Seen::Start { job, tx, .. } => self.jobs.push((job, tx)),
-                Seen::Cancel(job) => self.jobs.retain(|(started, _)| *started != job),
+                Seen::Start { job, tx, .. } => {
+                    self.jobs.push((job, tx));
+                    self.views.insert(job, visible_now.clone());
+                }
+                Seen::Cancel(job) => {
+                    if let Some(index) = self.jobs.iter().position(|(started, _)| *started == job) {
+                        let cancelled = self.jobs.swap_remove(index);
+                        self.cancelled.push(cancelled);
+                    }
+                }
                 Seen::OutputReady { waiter, .. } | Seen::OutputWaitEnded(waiter) => {
                     self.output_waiters.retain(|w| *w != waiter)
                 }
@@ -530,6 +625,50 @@ impl Run {
             self.model.hidden(),
             "step {step} ({what}): hidden pool"
         );
+        // The snapshot holds the visible pool, and each transaction depends
+        // on exactly its visible parents.
+        let snapshot = self.machine.snapshot(ChangeSeq(0));
+        let mut in_snapshot: Vec<UnminedTxId> = snapshot
+            .transactions
+            .iter()
+            .map(|tx| tx.transaction.id())
+            .collect();
+        in_snapshot.sort_by_key(key);
+        assert_eq!(
+            in_snapshot.iter().map(key).collect::<Vec<_>>(),
+            expected.iter().map(key).collect::<Vec<_>>(),
+            "step {step} ({what}): snapshot"
+        );
+        let visible_hashes: HashSet<transaction::Hash> =
+            expected.iter().map(UnminedTxId::mined_id).collect();
+        for id in &expected {
+            let tx = self
+                .txs
+                .iter()
+                .find(|tx| tx.id() == *id)
+                .expect("a pooled transaction is from the universe");
+            let mut parents: Vec<[u8; 32]> = tx
+                .model
+                .spends
+                .iter()
+                .map(|spend| spend.hash)
+                .filter(|parent| visible_hashes.contains(parent))
+                .map(|parent| parent.0)
+                .collect();
+            parents.sort_unstable();
+            parents.dedup();
+            let mut dependencies: Vec<[u8; 32]> = snapshot
+                .dependencies
+                .dependencies()
+                .get(&id.mined_id())
+                .map(|deps| deps.iter().map(|dep| dep.0).collect())
+                .unwrap_or_default();
+            dependencies.sort_unstable();
+            assert_eq!(
+                dependencies, parents,
+                "step {step} ({what}): the dependencies of a visible transaction"
+            );
+        }
         assert_eq!(
             self.machine.slots_in_use(),
             self.model.slots_in_use(),
@@ -744,22 +883,35 @@ impl Run {
     }
 
     fn outcome(&mut self) {
-        if self.jobs.is_empty() {
+        // Sometimes a cancelled job answers late. Both sides ignore it.
+        let late = !self.cancelled.is_empty() && !self.draining && chance(&mut self.rng, 10);
+        if self.jobs.is_empty() && !late {
             return self.tick();
         }
-        let (job, tx_id) = self.jobs.swap_remove(pick(&mut self.rng, self.jobs.len()));
+        let (job, tx_id) = if late {
+            self.cancelled
+                .swap_remove(pick(&mut self.rng, self.cancelled.len()))
+        } else {
+            self.jobs.swap_remove(pick(&mut self.rng, self.jobs.len()))
+        };
+        let view = self.views.remove(&job);
         let tx = self
             .txs
             .iter()
             .find(|tx| tx.id() == tx_id)
             .expect("a job names a transaction of the universe")
             .clone();
-        let visible: HashSet<transaction::Hash> = self
-            .model
-            .visible()
-            .iter()
-            .map(UnminedTxId::mined_id)
-            .collect();
+        // Usually the pool now, sometimes the pool the job started with,
+        // which may have changed since.
+        let visible: HashSet<transaction::Hash> = match view {
+            Some(view) if chance(&mut self.rng, 3) => view,
+            _ => self
+                .model
+                .visible()
+                .iter()
+                .map(UnminedTxId::mined_id)
+                .collect(),
+        };
         // Transactions of the universe that the chain has not mined. A spend
         // of one is found only in the visible pool.
         let pooled: HashSet<transaction::Hash> = self
@@ -809,17 +961,31 @@ impl Run {
             6 => {
                 let charge = [Charge::None, Charge::None, Charge::Cooldown, Charge::Ban]
                     [pick(&mut self.rng, 4)];
-                (
-                    Outcome::Fail {
-                        error: RejectionError::ExactTip(
-                            ExactTipRejectionError::FailedVerification(TestVerifyError),
+                let (error, scope) = match pick(&mut self.rng, 6) {
+                    0 => (
+                        RejectionError::SameEffectsTip(SameEffectsTipRejectionError::SpendConflict),
+                        RejectionScope::EffectsTip,
+                    ),
+                    1 => (
+                        RejectionError::SameEffectsChain(SameEffectsChainRejectionError::Expired),
+                        RejectionScope::EffectsChain(ChainReason::Expired),
+                    ),
+                    2 => (
+                        RejectionError::SameEffectsChain(
+                            SameEffectsChainRejectionError::DuplicateSpend,
                         ),
-                        charge,
-                    },
-                    ModelOutcome::Fail {
-                        scope: RejectionScope::ExactTip,
-                        charge,
-                    },
+                        RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
+                    ),
+                    _ => (
+                        RejectionError::ExactTip(ExactTipRejectionError::FailedVerification(
+                            TestVerifyError,
+                        )),
+                        RejectionScope::ExactTip,
+                    ),
+                };
+                (
+                    Outcome::Fail { error, charge },
+                    ModelOutcome::Fail { scope, charge },
                 )
             }
             7 => (
@@ -878,7 +1044,10 @@ impl Run {
             // forgets every block it mined. The new blocks may mine them again.
             self.mined.clear();
         }
-        let blocks = if disconnected > 0 {
+        let blocks = if disconnected > 0 && chance(&mut self.rng, 4) {
+            // The tip goes back and nothing connects.
+            0
+        } else if disconnected > 0 {
             disconnected + pick(&mut self.rng, 2)
         } else {
             1 + pick(&mut self.rng, 2)
@@ -1206,4 +1375,346 @@ fn pool_state_matches_model() {
             );
         }
     }
+}
+
+/// The machine and the model side by side, driven by hand, with every step
+/// compared.
+struct Pair {
+    machine: Machine,
+    model: PoolModel,
+    base: Instant,
+    now: Duration,
+    applied: u64,
+    tip: u32,
+}
+
+impl Pair {
+    /// Both sides at the start tip, with `memory` for chain-scoped
+    /// rejections.
+    fn new(memory: Duration) -> Self {
+        let base = Instant::now();
+        Self {
+            machine: Machine::new(
+                &Config {
+                    tx_cost_limit: u64::MAX / 2,
+                    eviction_memory_time: memory,
+                    ..Config::default()
+                },
+                tip(START, 0),
+                Generation(0),
+                base,
+            ),
+            model: PoolModel::new(Height(START), Generation(0)).with_rejection_memory(memory),
+            base,
+            now: Duration::ZERO,
+            applied: 0,
+            tip: START,
+        }
+    }
+
+    /// Compares one input's steps, and returns the jobs it started.
+    fn same(&self, real: Step, model: ModelStep) -> Vec<u64> {
+        assert_eq!(seen_real(&real), seen_model(&model), "effects");
+        assert_eq!(real.changes, model.changes, "changes");
+        self.machine.assert_invariants();
+        self.model.assert_invariants();
+        seen_real(&real)
+            .into_iter()
+            .filter_map(|seen| match seen {
+                Seen::Start { job, .. } => Some(job),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Reserves `tx` for this node on both sides. Returns the reservation if
+    /// both granted it, after checking both answered the same.
+    fn reserve(&mut self, tx: &Tx) -> Option<ReservationId> {
+        let at = self.base + self.now;
+        let real = self
+            .machine
+            .reserve(tx.id(), Source::Node, Intent::Deliver, at);
+        let model = self
+            .model
+            .reserve(tx.id(), Source::Node, Intent::Deliver, self.now);
+        let granted = match (&real, &model) {
+            (Ok(grant), Ok(expected)) => {
+                assert_eq!(grant.id, expected.id);
+                Some(grant.id)
+            }
+            (Err(refused), Err(expected)) => {
+                assert_eq!(model_unreserved(refused), *expected);
+                None
+            }
+            _ => panic!("reserve answered {real:?} and the model {model:?}"),
+        };
+        let (real, model) = (self.machine.effects(), self.model.effects());
+        self.same(real, model);
+        granted
+    }
+
+    /// Submits `tx` under `reservation`, and returns the job that started.
+    fn submit(&mut self, reservation: ReservationId, tx: &Tx) -> u64 {
+        let at = self.base + self.now;
+        let (_, real) = self.machine.submit(
+            reservation,
+            tx.real.transaction.clone(),
+            Supplier::Nobody,
+            at,
+        );
+        let (_, model) =
+            self.model
+                .submit(reservation, tx.model.clone(), Supplier::Nobody, self.now);
+        let started = self.same(real, model);
+        assert_eq!(started.len(), 1, "a body starts one job");
+        started[0]
+    }
+
+    /// Reports `job`'s fresh outcome on both sides, and returns the jobs the
+    /// step started.
+    fn outcome(
+        &mut self,
+        job: u64,
+        real: Outcome<TestVerifyError>,
+        model: ModelOutcome,
+    ) -> Vec<u64> {
+        let read = GenerationRead::Stable(Generation(self.applied));
+        let at = self.base + self.now;
+        let real =
+            self.machine
+                .outcome(super::JobId(job), real, read, read, at, chrono::Utc::now());
+        let model = self.model.outcome(
+            zakura_node_services::mempool::port::model::JobId(job),
+            model,
+            read,
+            read,
+            self.now,
+        );
+        self.same(real, model)
+    }
+
+    /// A pass for `tx`, with no pool inputs.
+    fn pass(&mut self, job: u64, tx: &Tx) -> Vec<u64> {
+        self.outcome(
+            job,
+            Outcome::Pass {
+                tx: tx.real.clone(),
+                pool_inputs: Vec::new(),
+            },
+            ModelOutcome::Pass,
+        )
+    }
+
+    /// Connects one block that mines `mined`, after disconnecting
+    /// `disconnect` blocks. Returns the jobs the step started.
+    fn transition(&mut self, disconnect: u32, mined: &[&Tx]) -> Vec<u64> {
+        self.applied += 1;
+        let generation = Generation(self.applied);
+        let before = tip(self.tip, 0);
+        self.tip = self.tip - disconnect + 1;
+        let after = tip(self.tip, u8::from(disconnect > 0));
+        let real = ChainTransition {
+            before: Some(before),
+            disconnected: (0..disconnect)
+                .map(|back| tip(before.height.0 - back, 0))
+                .collect(),
+            connected: vec![ConnectedBlock {
+                hash: after.hash,
+                height: after.height,
+                transactions: mined
+                    .iter()
+                    .map(|tx| TransactionHandle::Shared(tx.real.transaction.transaction().clone()))
+                    .collect(),
+                transaction_hashes: mined.iter().map(|tx| tx.id().mined_id()).collect(),
+            }],
+            after,
+            generation,
+            rules_change: false,
+        };
+        let model = ModelTransition {
+            disconnected: usize::try_from(disconnect).expect("a small reorg"),
+            connected: vec![ModelBlock {
+                transactions: mined.iter().map(|tx| tx.model.clone()).collect(),
+            }],
+            tip: Height(self.tip),
+            generation,
+            rules_change: false,
+        };
+        let at = self.base + self.now;
+        let (real, model) = (
+            self.machine.transition(real, at),
+            self.model.transition(model, self.now),
+        );
+        self.same(real, model)
+    }
+}
+
+/// Terra's case from M1 review round 1: while a pooled transaction is hidden,
+/// another authorization of the same effects is refused for its effects. The
+/// pooled one's revalidation then passes, and the model reveals it. Storage
+/// must not refuse the reveal for the other authorization's rejection.
+#[test]
+fn a_passing_revalidation_ignores_a_rejection_of_another_authorization() {
+    let mut runner = TestRunner::deterministic();
+    let pooled = build(&mut runner, &[], 1, None);
+    let other = twin(&pooled);
+    let mut pair = Pair::new(Duration::from_secs(3600));
+
+    let first = pair.reserve(&pooled).expect("room for the first");
+    let second = pair.reserve(&other).expect("an exact id of its own");
+    let first_job = pair.submit(first, &pooled);
+    let second_job = pair.submit(second, &other);
+    pair.pass(first_job, &pooled);
+
+    // A reorg hides the pooled one and starts its revalidation.
+    let revalidation = pair.transition(1, &[]);
+    assert_eq!(
+        revalidation.len(),
+        1,
+        "the hidden transaction is checked again"
+    );
+
+    // The other authorization's job reports on the new chain and is refused
+    // for its effects, which caches a rejection of its mined id.
+    pair.outcome(
+        second_job,
+        Outcome::Fail {
+            error: RejectionError::SameEffectsTip(SameEffectsTipRejectionError::SpendConflict),
+            charge: Charge::None,
+        },
+        ModelOutcome::Fail {
+            scope: RejectionScope::EffectsTip,
+            charge: Charge::None,
+        },
+    );
+
+    pair.pass(revalidation[0], &pooled);
+    assert_eq!(pair.machine.visible(), vec![pooled.id()], "it is revealed");
+}
+
+/// Both sides still remember a chain-scoped rejection at exactly its memory,
+/// as today's list does, and forget it a moment later.
+#[test]
+fn a_rejection_holds_at_exactly_its_memory_and_ends_after() {
+    let memory = Duration::from_secs(100);
+    let mut runner = TestRunner::deterministic();
+    let mined = build(&mut runner, &[], 1, None);
+    let mut pair = Pair::new(memory);
+
+    pair.transition(0, &[&mined]);
+    pair.now = memory;
+    assert_eq!(pair.reserve(&mined), None, "still remembered at its memory");
+    pair.now = memory + Duration::from_millis(1);
+    assert!(pair.reserve(&mined).is_some(), "forgotten after it");
+}
+
+/// Sol's case from M1 review round 1: hidden transactions keep counting
+/// against the cost limit, so a reorg followed by new admissions cannot hold
+/// more than the limit.
+#[test]
+fn hidden_transactions_count_against_the_cost_limit() {
+    let mut runner = TestRunner::deterministic();
+    let txs: Vec<Tx> = (0..3).map(|_| build(&mut runner, &[], 1, None)).collect();
+    let limit = txs[0].real.cost() + txs[1].real.cost();
+    let base = Instant::now();
+    let mut machine = Machine::new(
+        &Config {
+            tx_cost_limit: limit,
+            ..Config::default()
+        },
+        tip(START, 0),
+        Generation(0),
+        base,
+    );
+    let read = GenerationRead::Stable(Generation(0));
+    let admit = |machine: &mut Machine, tx: &Tx, read: GenerationRead| -> Verdict {
+        let grant = machine
+            .reserve(tx.id(), Source::Node, Intent::Deliver, base)
+            .expect("room for a reservation");
+        assert!(machine.effects().is_empty());
+        let (waiter, step) = machine.submit(
+            grant.id,
+            tx.real.transaction.clone(),
+            Supplier::Nobody,
+            base,
+        );
+        let Some(Effect::Start { job, .. }) = step.effects.first().cloned() else {
+            panic!("a body starts a job: {step:?}");
+        };
+        let step = machine.outcome(
+            job,
+            Outcome::Pass {
+                tx: tx.real.clone(),
+                pool_inputs: Vec::new(),
+            },
+            read,
+            read,
+            base,
+            chrono::Utc::now(),
+        );
+        machine.assert_invariants();
+        step.verdict(waiter).cloned().expect("the pass decides it")
+    };
+    assert!(matches!(
+        admit(&mut machine, &txs[0], read),
+        Verdict::Admitted
+    ));
+    assert!(matches!(
+        admit(&mut machine, &txs[1], read),
+        Verdict::Admitted
+    ));
+
+    // A reorg hides both. Their bodies are still held.
+    let before = tip(START, 0);
+    let after = tip(START, 1);
+    let step = machine.transition(
+        ChainTransition {
+            before: Some(before),
+            disconnected: vec![before],
+            connected: vec![ConnectedBlock {
+                hash: after.hash,
+                height: after.height,
+                transactions: Vec::new(),
+                transaction_hashes: Arc::new([]),
+            }],
+            after,
+            generation: Generation(1),
+            rules_change: false,
+        },
+        base,
+    );
+    assert_eq!(machine.hidden().len(), 2);
+    machine.assert_invariants();
+    let revalidations: Vec<super::JobId> = step
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Start { job, .. } => Some(*job),
+            _ => None,
+        })
+        .collect();
+
+    // A new transaction finds no room: the hidden ones can't be evicted.
+    let read = GenerationRead::Stable(Generation(1));
+    assert!(
+        matches!(admit(&mut machine, &txs[2], read), Verdict::Rejected(_)),
+        "the pool is full of hidden transactions"
+    );
+
+    // Both pass again and are revealed.
+    for (job, tx) in revalidations.into_iter().zip(&txs) {
+        machine.outcome(
+            job,
+            Outcome::Pass {
+                tx: tx.real.clone(),
+                pool_inputs: Vec::new(),
+            },
+            read,
+            read,
+            base,
+            chrono::Utc::now(),
+        );
+        machine.assert_invariants();
+    }
+    assert_eq!(machine.visible().len(), 2);
 }

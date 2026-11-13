@@ -1158,6 +1158,15 @@ impl PoolInbox {
         }
     }
 
+    /// What [`Self::next`] would yield now, without waiting: a dropped
+    /// reservation first, then a queued command.
+    pub fn try_next(&mut self) -> Option<PoolCommand> {
+        if let Ok(released) = self.releases.try_recv() {
+            return Some(PoolCommand::Released(released));
+        }
+        self.commands.try_recv().ok()
+    }
+
     /// The next command, or `None` once every handle is gone. This does not
     /// wake for a dropped reservation. The core's task uses [`Self::next`].
     pub async fn command(&mut self) -> Option<PoolCommand> {
@@ -1201,12 +1210,26 @@ impl PoolInbox {
         changes: impl IntoIterator<Item = Change>,
         build: impl FnOnce(ChangeSeq) -> PoolSnapshot,
     ) {
+        self.publish_batches([changes], build);
+    }
+
+    /// Publish several batches, in order, and one snapshot for the position
+    /// of the last batch's last entry. Readers see the batches as separate
+    /// batches, and no snapshot between them. See [`Self::publish`].
+    pub fn publish_batches<C: IntoIterator<Item = Change>>(
+        &self,
+        batches: impl IntoIterator<Item = C>,
+        build: impl FnOnce(ChangeSeq) -> PoolSnapshot,
+    ) {
         let mut log = self
             .shared
             .log
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let last = log.append(changes);
+        let mut last = log.last();
+        for changes in batches {
+            last = log.append(changes);
+        }
         self.snapshot.send_replace(Some(Arc::new(build(last))));
     }
 }

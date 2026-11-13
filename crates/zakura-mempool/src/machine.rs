@@ -409,6 +409,13 @@ pub struct MempoolState<E> {
     queued: BTreeSet<u64>,
     /// Running revalidations.
     running: usize,
+    /// The cost of the hidden transactions' bodies. They count against the
+    /// pool's cost limit with what storage holds, so hiding the pool and
+    /// refilling it cannot grow memory past the limit.
+    hidden_cost: u64,
+    /// The pooled transactions that spend each transaction's outputs,
+    /// visible or hidden, so a removal finds its dependents without a scan.
+    children: HashMap<transaction::Hash, Vec<transaction::Hash>>,
     /// Each job, with the event count when it started.
     jobs: HashMap<JobId, (JobTarget, u64)>,
     cooldowns: CooldownTable<CooldownKey>,
@@ -444,6 +451,8 @@ impl<E: VerifyError> MempoolState<E> {
             hidden: BTreeSet::new(),
             queued: BTreeSet::new(),
             running: 0,
+            hidden_cost: 0,
+            children: HashMap::default(),
             jobs: HashMap::default(),
             cooldowns: CooldownTable::default(),
             cooldowns_changed: false,
@@ -820,6 +829,7 @@ impl<E: VerifyError> MempoolState<E> {
             self.remove_one(key, RemovalReason::Deactivated);
         }
         self.storage.clear(self.now);
+        debug_assert_eq!(self.hidden_cost, 0, "every hidden transaction was removed");
         // Nobody is left waiting on a pool that is off.
         let mut waiting: Vec<WaiterId> = self
             .output_waiters
@@ -1074,6 +1084,37 @@ impl<E: VerifyError> MempoolState<E> {
             .filter(|pooled| matches!(pooled.hidden, Some(Hidden::Running { .. })))
             .count();
         assert_eq!(running, self.running, "the running count matches the pool");
+        let hidden_cost: u64 = self
+            .pool
+            .values()
+            .filter_map(|pooled| pooled.body.as_ref())
+            .map(VerifiedUnminedTx::cost)
+            .sum();
+        assert_eq!(
+            hidden_cost, self.hidden_cost,
+            "the hidden cost matches the pool"
+        );
+        assert!(
+            self.storage.total_cost().saturating_add(self.hidden_cost) <= self.storage.cost_limit(),
+            "the visible and hidden pool together stay within the cost limit"
+        );
+        for (key, pooled) in &self.pool {
+            let hash = pooled.id.mined_id();
+            let children: Vec<transaction::Hash> = self
+                .pool
+                .values()
+                .filter(|child| child.parents.contains(&hash))
+                .map(|child| child.id.mined_id())
+                .collect();
+            let mut indexed = self.children.get(&hash).cloned().unwrap_or_default();
+            let mut expected = children;
+            indexed.sort_by_key(|hash| hash.0);
+            expected.sort_by_key(|hash| hash.0);
+            assert_eq!(
+                indexed, expected,
+                "the children index matches the pool at {key}"
+            );
+        }
         for pooled in self.pool.values() {
             assert_eq!(
                 pooled.body.is_some(),
@@ -1478,11 +1519,15 @@ impl<E: VerifyError> MempoolState<E> {
                 }
                 self.step.changes.push(Change::Added(tx.transaction.id()));
                 let pool_key = self.fresh();
+                let parents = parents_of(tx.transaction.transaction());
+                for parent in &parents {
+                    self.children.entry(*parent).or_default().push(hash);
+                }
                 self.pool.insert(
                     pool_key,
                     Pooled {
                         id: tx.transaction.id(),
-                        parents: parents_of(tx.transaction.transaction()),
+                        parents,
                         expiry: tx.transaction.transaction().expiry_height(),
                         hidden: None,
                         body: None,
@@ -1600,11 +1645,20 @@ impl<E: VerifyError> MempoolState<E> {
                 // Today's insertion limits, as for a new transaction. A parent
                 // that was mined, then put back by a reorg, can have gained
                 // more pooled children than one group holds.
-                let (result, evicted) = self.storage.insert_with_evicted_ids(
+                // It leaves the hidden cost whether or not storage takes it.
+                let cost = self
+                    .pooled_at(key)
+                    .body
+                    .as_ref()
+                    .map_or(0, VerifiedUnminedTx::cost);
+                self.add_hidden_cost(cost, false);
+                // A rejection cached for another authorization of these
+                // effects while this one was pooled says nothing about it, so
+                // the lists are not checked, as the model's reveal does not.
+                let (result, evicted) = self.storage.reinsert_with_evicted_ids(
                     tx.clone(),
                     pool_inputs,
                     Some(self.tip.height),
-                    &mut |_, _| {},
                     now,
                     time,
                 );
@@ -1618,6 +1672,7 @@ impl<E: VerifyError> MempoolState<E> {
                 let visible_at = self.fresh();
                 self.set_hidden(key, None);
                 let pooled = self.pooled_at(key);
+                // Storage holds it now, and counts its cost.
                 pooled.body = None;
                 pooled.backoff = REVALIDATE_RETRY;
                 pooled.visible_at = visible_at;
@@ -1940,12 +1995,13 @@ impl<E: VerifyError> MempoolState<E> {
                         ChangeSeq(self.logged.saturating_add(pending).saturating_add(1));
                     let pooled = self.pooled_at(key);
                     let id = pooled.id;
-                    pooled.body = Some(
-                        bodies
-                            .remove(&id.mined_id())
-                            .expect("storage holds every visible pooled transaction"),
-                    );
+                    let body = bodies
+                        .remove(&id.mined_id())
+                        .expect("storage holds every visible pooled transaction");
+                    let cost = body.cost();
+                    pooled.body = Some(body);
                     pooled.hidden_at = hidden_at;
+                    self.add_hidden_cost(cost, true);
                     self.set_hidden(key, Some(Hidden::Queued));
                     self.step.changes.push(Change::Hidden(id));
                 }
@@ -1985,13 +2041,29 @@ impl<E: VerifyError> MempoolState<E> {
     /// Starts queued revalidations, parents first, while the revalidation
     /// share and the node's limit allow.
     fn start_revalidations(&mut self) {
-        let queued: Vec<u64> = self.queued.iter().copied().collect();
-        for key in queued {
+        // Walk the queue lazily, so a full share costs nothing and a start
+        // costs only the keys it passes.
+        let mut after = None;
+        loop {
             if self.running >= self.limits.revalidating
                 || self.slots_in_use() >= self.limits.pending
             {
                 break;
             }
+            let next = match after {
+                None => self.queued.iter().next(),
+                Some(previous) => self
+                    .queued
+                    .range((
+                        std::ops::Bound::Excluded(previous),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next(),
+            };
+            let Some(&key) = next else {
+                break;
+            };
+            after = Some(key);
             let pooled = &self.pool[&key];
             let parent_hidden = pooled.parents.iter().any(|parent| {
                 self.pooled
@@ -2056,6 +2128,28 @@ impl<E: VerifyError> MempoolState<E> {
         pooled.hidden = hidden;
     }
 
+    /// Adds or takes away `cost` from the hidden cost, and tells storage.
+    fn add_hidden_cost(&mut self, cost: u64, add: bool) {
+        self.hidden_cost = if add {
+            self.hidden_cost.saturating_add(cost)
+        } else {
+            self.hidden_cost.saturating_sub(cost)
+        };
+        self.storage.set_outside_cost(self.hidden_cost);
+    }
+
+    /// Takes `hash` off its parents' lists of children.
+    fn forget_parents(&mut self, hash: transaction::Hash, parents: &[transaction::Hash]) {
+        for parent in parents {
+            if let Some(children) = self.children.get_mut(parent) {
+                children.retain(|child| *child != hash);
+                if children.is_empty() {
+                    self.children.remove(parent);
+                }
+            }
+        }
+    }
+
     /// Removes one pooled transaction and logs it. What depends on it stays.
     fn remove_one(&mut self, key: u64, reason: RemovalReason) {
         if !self.pool.contains_key(&key) {
@@ -2074,8 +2168,11 @@ impl<E: VerifyError> MempoolState<E> {
             .expect("the transaction was pooled a moment ago");
         let hash = pooled.id.mined_id();
         self.pooled.remove(&hash);
+        self.forget_parents(hash, &pooled.parents);
         if visible {
             self.storage.remove_one(&hash);
+        } else if let Some(body) = &pooled.body {
+            self.add_hidden_cost(body.cost(), false);
         }
         if let Some(job) = running {
             self.jobs.remove(&job);
@@ -2094,12 +2191,7 @@ impl<E: VerifyError> MempoolState<E> {
             return;
         };
         self.remove_one(key, reason);
-        let dependents: Vec<transaction::Hash> = self
-            .pool
-            .values()
-            .filter(|pooled| pooled.parents.contains(&hash))
-            .map(|pooled| pooled.id.mined_id())
-            .collect();
+        let dependents = self.children.get(&hash).cloned().unwrap_or_default();
         for dependent in dependents {
             self.remove_with_dependents(dependent, RemovalReason::Invalidated);
         }
@@ -2118,7 +2210,9 @@ impl<E: VerifyError> MempoolState<E> {
                 .pool
                 .remove(&key)
                 .expect("an evicted transaction was pooled and visible");
-            self.pooled.remove(&pooled.id.mined_id());
+            let hash = pooled.id.mined_id();
+            self.pooled.remove(&hash);
+            self.forget_parents(hash, &pooled.parents);
             self.step.changes.push(Change::Removed {
                 id: pooled.id,
                 reason: RemovalReason::Evicted,

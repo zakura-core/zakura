@@ -2,15 +2,17 @@
 //!
 //! The task takes one input at a time: a caller's command, a chain event, a
 //! verification's outcome, a change to whether the pool is on, or a deadline.
-//! It hands the input to [`MempoolState`] and then carries out the step, in
-//! this order:
+//! It hands the input to [`MempoolState`], then takes every other input that
+//! is already waiting, up to [`MAX_INPUTS_PER_PUBLISH`], the same way. Then it
+//! carries out their steps, in this order:
 //!
-//! 1. It publishes the step's change batch and a snapshot of the pool after
-//!    it, so a verification that starts in this step reads a pool at least
-//!    as new as the one that started it.
+//! 1. It publishes each step's change batch, as a batch of its own, and one
+//!    snapshot of the pool after the last, so a verification that starts in
+//!    any of these steps reads a pool at least as new as the one that
+//!    started it.
 //! 2. It publishes the cooldowns, if one started.
-//! 3. It does each effect in order: starts and cancels verifications, sends
-//!    verdicts, and answers output waiters.
+//! 3. It does each step's effects in order: starts and cancels
+//!    verifications, sends verdicts, and answers output waiters.
 //!
 //! A verification runs in a task of its own, outside the core's task. It
 //! reads the generation before its first state lookup and after its last,
@@ -48,6 +50,12 @@ use crate::{
 
 #[cfg(test)]
 mod tests;
+
+/// The most inputs the core takes before it publishes. Every input that is
+/// already waiting, up to this many, shares one snapshot, so a burst of
+/// outcomes while a large pool is restored does not copy the pool once per
+/// outcome.
+const MAX_INPUTS_PER_PUBLISH: usize = 64;
 
 /// The most times a verification yields while it waits for the state writer
 /// to finish a change before its first lookup. A change is short. A worker
@@ -113,6 +121,8 @@ pub struct PoolCore<E, V> {
     /// Callers waiting for an output.
     outputs: HashMap<WaiterId, oneshot::Sender<Result<transparent::Output, AwaitOutputError>>>,
     published: Option<Published>,
+    /// Steps taken and not yet carried out.
+    steps: Vec<Step>,
 }
 
 impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
@@ -175,6 +185,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             verdicts: HashMap::default(),
             outputs: HashMap::default(),
             published: None,
+            steps: Vec::new(),
         }
     }
 
@@ -187,7 +198,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             let step = self.machine.deactivate(time::Instant::now());
             self.finish(step);
         }
-        self.publish(Vec::new());
+        self.flush();
         loop {
             let deadline = self.machine.next_deadline();
             let sleep = async move {
@@ -218,6 +229,19 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                     self.finish(step);
                 }
             }
+            // Take what else is already waiting, then carry it all out.
+            for _ in 1..MAX_INPUTS_PER_PUBLISH {
+                if let Some(event) = self.chain.try_next() {
+                    self.chain_event(event);
+                } else if let Ok(report) = self.reports.try_recv() {
+                    self.report(report);
+                } else if let Some(command) = self.inbox.try_next() {
+                    self.command(command);
+                } else {
+                    break;
+                }
+            }
+            self.flush();
         }
     }
 
@@ -367,14 +391,24 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
         }
     }
 
-    /// Carries out one step. See the module docs for the order.
+    /// Keeps a step to carry out at the next [`Self::flush`].
     fn finish(&mut self, step: Step) {
-        let Step { effects, changes } = step;
-        self.publish(changes);
+        self.steps.push(step);
+    }
+
+    /// Carries out every step taken since the last flush. See the module
+    /// docs for the order.
+    fn flush(&mut self) {
+        let steps = std::mem::take(&mut self.steps);
+        let (batches, effects): (Vec<_>, Vec<_>) = steps
+            .into_iter()
+            .map(|step| (step.changes, step.effects))
+            .unzip();
+        self.publish(batches);
         if let Some(cooldowns) = self.machine.cooldowns_if_changed() {
             self.inbox.publish_cooldowns(cooldowns);
         }
-        for effect in effects {
+        for effect in effects.into_iter().flatten() {
             match effect {
                 Effect::Start {
                     job,
@@ -403,23 +437,26 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
         }
     }
 
-    /// Publishes a batch, and a snapshot for it, when the batch changed
-    /// anything or the snapshot's tip, generation or state would differ. A
-    /// snapshot copies the visible pool, so an input that changed nothing a
-    /// reader sees publishes nothing.
-    fn publish(&mut self, changes: Vec<zakura_node_services::mempool::port::Change>) {
+    /// Publishes the batches, and one snapshot after them, when a batch
+    /// changed anything or the snapshot's tip, generation or state would
+    /// differ. A snapshot copies the visible pool, so steps that changed
+    /// nothing a reader sees publish nothing.
+    ///
+    /// Batches with no changes are published too when anything is, so the
+    /// log's batch numbers stay one per input.
+    fn publish(&mut self, batches: Vec<Vec<zakura_node_services::mempool::port::Change>>) {
         let now = Published {
             tip: self.machine.tip(),
             generation: self.machine.generation(),
             active: self.machine.is_active(),
         };
-        if changes.is_empty() && self.published == Some(now) {
+        if batches.iter().all(Vec::is_empty) && self.published == Some(now) {
             return;
         }
         self.published = Some(now);
         let machine = &self.machine;
         self.inbox
-            .publish(changes, |last_change| machine.snapshot(last_change));
+            .publish_batches(batches, |last_change| machine.snapshot(last_change));
     }
 
     /// Starts a verification task for `job`.

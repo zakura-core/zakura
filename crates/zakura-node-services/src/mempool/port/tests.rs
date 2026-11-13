@@ -1680,14 +1680,15 @@ fn a_chain_scoped_rejection_is_forgotten_after_its_memory_time() {
         stable(0),
         secs(0),
     );
-    model.tick(REJECTION_MEMORY - secs(1));
-    assert!(model
-        .reserve(id(1), peer(2), Intent::Fetch, REJECTION_MEMORY - secs(1))
-        .is_err());
+    // Today's list still holds an entry at exactly its memory time, and
+    // forgets it after.
     model.tick(REJECTION_MEMORY);
     assert!(model
         .reserve(id(1), peer(2), Intent::Fetch, REJECTION_MEMORY)
-        .is_ok());
+        .is_err());
+    let after = REJECTION_MEMORY + Duration::from_millis(1);
+    model.tick(after);
+    assert!(model.reserve(id(1), peer(2), Intent::Fetch, after).is_ok());
 }
 
 #[test]
@@ -1975,10 +1976,15 @@ fn a_cooldown_and_a_remembered_rejection_end_on_time_without_a_tick() {
         .reserve(id(2), Source::Peer(v2(1)), Intent::Fetch, COOLDOWN)
         .is_ok());
     assert!(model
-        .reserve(id(1), peer(2), Intent::Fetch, REJECTION_MEMORY - secs(1))
+        .reserve(id(1), peer(2), Intent::Fetch, REJECTION_MEMORY)
         .is_err());
     assert!(model
-        .reserve(id(1), peer(2), Intent::Fetch, REJECTION_MEMORY)
+        .reserve(
+            id(1),
+            peer(2),
+            Intent::Fetch,
+            REJECTION_MEMORY + Duration::from_millis(1)
+        )
         .is_ok());
 }
 
@@ -2009,7 +2015,14 @@ fn each_chain_rejection_reason_keeps_its_own_list_and_the_configured_memory() {
     model.assert_invariants();
 
     // The memory time is the configured one, not the default.
-    assert!(model.reserve(id(1), peer(3), Intent::Fetch, memory).is_ok());
+    assert!(model
+        .reserve(
+            id(1),
+            peer(3),
+            Intent::Fetch,
+            memory + Duration::from_millis(1)
+        )
+        .is_ok());
 }
 
 #[test]
@@ -2544,11 +2557,10 @@ fn the_rejection_query_uses_the_time_it_is_asked_at() {
     );
     // No input moves the model's clock between these.
     let asked: HashSet<_> = [id(1)].into_iter().collect();
-    assert_eq!(
-        model.rejected_ids(&asked, REJECTION_MEMORY - secs(1)),
-        asked
-    );
-    assert!(model.rejected_ids(&asked, REJECTION_MEMORY).is_empty());
+    assert_eq!(model.rejected_ids(&asked, REJECTION_MEMORY), asked);
+    assert!(model
+        .rejected_ids(&asked, REJECTION_MEMORY + Duration::from_millis(1))
+        .is_empty());
     assert!(!model.cooling(&v2(1), secs(0)));
 }
 
@@ -3334,10 +3346,13 @@ fn a_chain_rejection_recorded_twice_keeps_its_first_place_and_time() {
 
     let both: HashSet<_> = [id(1), id(2)].into_iter().collect();
     let second: HashSet<_> = [id(2)].into_iter().collect();
-    assert_eq!(model.rejected_ids(&both, secs(99)), both);
-    // The first entry ends a hundred seconds after it was first made. The
-    // one behind it in the order is still remembered.
-    assert_eq!(model.rejected_ids(&both, secs(100)), second);
+    assert_eq!(model.rejected_ids(&both, secs(100)), both);
+    // The first entry ends just after a hundred seconds from when it was
+    // first made. The one behind it in the order is still remembered.
+    assert_eq!(
+        model.rejected_ids(&both, secs(100) + Duration::from_millis(1)),
+        second
+    );
     model.assert_invariants();
 }
 

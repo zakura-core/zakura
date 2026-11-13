@@ -16,21 +16,21 @@ use std::{
 use futures::poll;
 use proptest::test_runner::TestRunner;
 use zakura_chain::{
-    transaction::{UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent::OutPoint,
 };
 use zakura_node_services::{
     block_memory::TransactionHandle,
     mempool::port::{
-        chain_transitions, pool_port, AwaitOutputError, ChainTip, ChainTransition,
-        ChainTransitionSender, ConnectedBlock, Intent, LocalFault, NoRoom, PoolHandle, Source,
-        Supplier, Unreserved, Verdict,
+        chain_transitions, pool_port, AwaitOutputError, ChainReason, ChainTip, ChainTransition,
+        ChainTransitionSender, ConnectedBlock, Intent, LocalFault, NoRoom, PoolHandle,
+        RejectionScope, Source, Supplier, Unreserved, Verdict,
     },
     mempool::QueueSource,
 };
 use zakura_rt::{
     collections::{HashMap, HashSet},
-    sync::watch,
+    sync::{watch, Notify},
 };
 
 use super::{PoolCore, Verifier};
@@ -53,6 +53,13 @@ struct SnapshotVerifier {
     txs: Arc<HashMap<UnminedTxId, VerifiedUnminedTx>>,
     hold: Arc<Mutex<HashSet<UnminedTxId>>>,
     panic_on: Arc<Mutex<HashSet<UnminedTxId>>>,
+    /// Test transactions the chain has mined. A spend of one is found on the
+    /// chain.
+    mined: Arc<Mutex<HashSet<transaction::Hash>>>,
+    /// A verification of one of these waits for its gate to open, once.
+    gates: Arc<Mutex<HashMap<UnminedTxId, Arc<Notify>>>>,
+    /// How many times each transaction was verified.
+    calls: Arc<Mutex<HashMap<UnminedTxId, usize>>>,
 }
 
 impl Verifier<TestVerifyError> for SnapshotVerifier {
@@ -63,6 +70,22 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
         _revalidation: bool,
     ) -> Pin<Box<dyn Future<Output = Outcome<TestVerifyError>> + Send>> {
         let id = tx.id();
+        *self
+            .calls
+            .lock()
+            .expect("no test panics holding it")
+            .entry(id)
+            .or_default() += 1;
+        let gate = self
+            .gates
+            .lock()
+            .expect("no test panics holding it")
+            .remove(&id);
+        let mined = self
+            .mined
+            .lock()
+            .expect("no test panics holding it")
+            .clone();
         let hold = self
             .hold
             .lock()
@@ -82,7 +105,7 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
         let (from_pool, missing): (Vec<OutPoint>, Vec<OutPoint>) = tx
             .transaction()
             .spent_outpoints()
-            .filter(|outpoint| known.contains(&outpoint.hash))
+            .filter(|outpoint| known.contains(&outpoint.hash) && !mined.contains(&outpoint.hash))
             .partition(|outpoint| snapshot.created_output(outpoint).is_some());
         let outcome = if missing.is_empty() {
             Outcome::Pass {
@@ -96,6 +119,9 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
             }
         };
         Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
             if hold {
                 std::future::pending::<()>().await;
             }
@@ -129,6 +155,9 @@ impl Harness {
             txs: Arc::new(txs.iter().map(|tx| (tx.id(), tx.real.clone())).collect()),
             hold: Arc::default(),
             panic_on: Arc::default(),
+            mined: Arc::default(),
+            gates: Arc::default(),
+            calls: Arc::default(),
         };
         let core = PoolCore::new(
             &Config {
@@ -168,16 +197,38 @@ impl Harness {
         .expect("the core answers in time")
     }
 
-    /// Mines `txs` in one new block.
+    /// Mines `txs` in one new block on fork 0.
     fn mine(&mut self, txs: &[&Tx]) {
-        self.height += 1;
-        let after = tip(self.height, 0);
-        let before = tip(self.height - 1, 0);
+        self.change(0, 0, txs);
+    }
+
+    /// Disconnects `disconnect` blocks and connects one new block on `fork`
+    /// that mines `txs`. The chain is marked as changing before anything else
+    /// happens, as the state writer does.
+    fn change(&mut self, disconnect: u32, fork: u8, txs: &[&Tx]) {
         self.chain.begin_change();
+        {
+            let mut mined = self
+                .verifier
+                .mined
+                .lock()
+                .expect("no test panics holding it");
+            if disconnect > 0 {
+                // The tests do not track what each block mined.
+                mined.clear();
+            }
+            mined.extend(txs.iter().map(|tx| tx.id().mined_id()));
+        }
+        let before = self.chain.tip().expect("the test chain has a tip");
+        let height = self.height - disconnect + 1;
+        self.height = height;
+        let after = tip(height, fork);
         self.chain.finish_change(after, |_, generation| {
             Some(ChainTransition {
                 before: Some(before),
-                disconnected: Vec::new(),
+                disconnected: (0..disconnect)
+                    .map(|back| tip(before.height.0 - back, 0xff))
+                    .collect(),
                 connected: vec![ConnectedBlock {
                     hash: after.hash,
                     height: after.height,
@@ -194,6 +245,52 @@ impl Harness {
                 rules_change: false,
             })
         });
+    }
+
+    /// Holds the next verification of `tx` until the returned gate opens.
+    fn gate(&self, tx: &Tx) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        self.verifier
+            .gates
+            .lock()
+            .expect("no test panics holding it")
+            .insert(tx.id(), gate.clone());
+        gate
+    }
+
+    /// How many times `tx` has been verified.
+    fn calls(&self, tx: &Tx) -> usize {
+        self.verifier
+            .calls
+            .lock()
+            .expect("no test panics holding it")
+            .get(&tx.id())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Waits until `tx` has been verified `count` times.
+    async fn calls_reach(&self, tx: &Tx, count: usize) {
+        tokio::time::timeout(ANSWER, async {
+            while self.calls(tx) < count {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the verification starts in time");
+    }
+
+    /// Submits `tx` from this node in a task of its own, and returns the
+    /// task's handle.
+    async fn submit_in_background(&self, tx: &Tx) -> tokio::task::JoinHandle<Verdict> {
+        let reservation = self
+            .handle
+            .reserve(tx.id(), Source::Node, Intent::Deliver)
+            .await
+            .expect("the core grants a reservation");
+        let handle = self.handle.clone();
+        let body = tx.real.transaction.clone();
+        tokio::spawn(async move { handle.submit(reservation, body, Supplier::Nobody).await })
     }
 
     /// Waits until the published snapshot satisfies `done`.
@@ -443,4 +540,131 @@ async fn a_dropped_reservation_frees_its_slot() {
         .reserve(txs[5].id(), peer, Intent::Fetch)
         .await
         .expect("the dropped reservation's slot is free again");
+}
+
+/// Waits for a spawned submission's verdict.
+async fn verdict_of(task: tokio::task::JoinHandle<Verdict>) -> Verdict {
+    tokio::time::timeout(ANSWER, task)
+        .await
+        .expect("the submission is answered in time")
+        .expect("the submission's task does not panic")
+}
+
+#[tokio::test]
+async fn a_block_with_a_conflicting_transaction_removes_the_pooled_one() {
+    let mut runner = TestRunner::deterministic();
+    let chain_output = OutPoint {
+        hash: transaction::Hash([0xc1; 32]),
+        index: 0,
+    };
+    let pooled = build(&mut runner, &[chain_output], 1, None);
+    let rival = build(&mut runner, &[chain_output], 1, None);
+    let mut harness = Harness::start(&[pooled.clone(), rival.clone()]);
+    assert!(matches!(harness.submit(&pooled).await, Verdict::Admitted));
+
+    // The rival was never in the pool, and spends what the pooled one does.
+    harness.mine(&[&rival]);
+    let height = harness.height;
+    harness
+        .snapshot_until(|snapshot| snapshot.tip.height.0 == height)
+        .await;
+    assert!(harness
+        .handle
+        .snapshot()
+        .expect("published")
+        .transaction(&pooled.id().mined_id())
+        .is_none());
+    assert!(matches!(
+        harness
+            .handle
+            .reserve(pooled.id(), Source::Node, Intent::Deliver)
+            .await,
+        Err(Unreserved::Rejected(rejection))
+            if rejection.scope == RejectionScope::EffectsChain(ChainReason::DuplicateSpend)
+    ));
+}
+
+#[tokio::test]
+async fn a_verification_that_spans_a_block_runs_again() {
+    let (parent, _) = parent_and_child();
+    let mut harness = Harness::start(std::slice::from_ref(&parent));
+    let gate = harness.gate(&parent);
+
+    let verdict = harness.submit_in_background(&parent).await;
+    harness.calls_reach(&parent, 1).await;
+    // The block lands while the first verification is still looking.
+    harness.mine(&[]);
+    gate.notify_one();
+
+    assert!(matches!(verdict_of(verdict).await, Verdict::Admitted));
+    assert_eq!(
+        harness.calls(&parent),
+        2,
+        "the first outcome straddled a change, so the core checked again"
+    );
+}
+
+#[tokio::test]
+async fn a_chain_that_reorgs_and_comes_back_during_a_verification_runs_it_again() {
+    let (parent, _) = parent_and_child();
+    let mut harness = Harness::start(std::slice::from_ref(&parent));
+    let gate = harness.gate(&parent);
+
+    let verdict = harness.submit_in_background(&parent).await;
+    harness.calls_reach(&parent, 1).await;
+    // A to B and back to A. The tip ends where it started, but the
+    // generation does not, so the outcome is not trusted.
+    harness.change(1, 1, &[]);
+    harness.change(1, 0, &[]);
+    gate.notify_one();
+
+    assert!(matches!(verdict_of(verdict).await, Verdict::Admitted));
+    assert!(harness.calls(&parent) >= 2);
+}
+
+#[tokio::test]
+async fn a_child_submitted_before_its_parent_is_mined_is_decided_after_the_block() {
+    let (parent, child) = parent_and_child();
+    let mut harness = Harness::start(&[parent.clone(), child.clone()]);
+
+    let verdict = harness.submit_in_background(&child).await;
+    harness.calls_reach(&child, 1).await;
+    harness.round_trip().await;
+
+    // The parent is never pooled. A block mines it, and the child spends
+    // its output from the chain.
+    harness.mine(&[&parent]);
+    assert!(matches!(verdict_of(verdict).await, Verdict::Admitted));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_revalidation_that_panics_is_tried_again_later() {
+    let (parent, _) = parent_and_child();
+    let mut harness = Harness::start(std::slice::from_ref(&parent));
+    assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
+    harness
+        .verifier
+        .panic_on
+        .lock()
+        .expect("no test panics holding it")
+        .insert(parent.id());
+
+    // A reorg hides the pool, and its revalidation panics.
+    harness.change(1, 1, &[]);
+    harness.calls_reach(&parent, 2).await;
+    harness
+        .snapshot_until(|snapshot| snapshot.transaction(&parent.id().mined_id()).is_none())
+        .await;
+
+    harness
+        .verifier
+        .panic_on
+        .lock()
+        .expect("no test panics holding it")
+        .clear();
+    // The retry comes after its backoff, and then it passes.
+    harness
+        .snapshot_until(|snapshot| snapshot.transaction(&parent.id().mined_id()).is_some())
+        .await;
+    assert!(harness.calls(&parent) >= 3);
 }

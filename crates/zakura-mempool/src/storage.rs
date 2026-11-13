@@ -281,6 +281,11 @@ pub struct Storage<E> {
 
     /// Maximum allowed size of OP_RETURN scripts, in bytes.
     max_datacarrier_bytes: u32,
+
+    /// Cost the pool holds outside this storage, which counts against
+    /// `tx_cost_limit` too. The pool core keeps transactions hidden while it
+    /// verifies them again, and their bodies still take memory.
+    outside_cost: u64,
 }
 
 impl<E> Drop for Storage<E> {
@@ -322,6 +327,7 @@ impl<E: Clone + std::fmt::Debug> Storage<E> {
                 .max_datacarrier_bytes
                 .unwrap_or(config::DEFAULT_MAX_DATACARRIER_BYTES),
             verified: Default::default(),
+            outside_cost: 0,
             tip_rejected_exact: Default::default(),
             tip_rejected_same_effects: Default::default(),
             chain_rejected_same_effects: Default::default(),
@@ -576,6 +582,59 @@ impl<E: Clone + std::fmt::Debug> Storage<E> {
         now: Instant,
         time: DateTime<Utc>,
     ) -> (Result<UnminedTxId, MempoolError<E>>, HashSet<UnminedTxId>) {
+        self.insert_checked(
+            tx,
+            spent_mempool_outpoints,
+            height,
+            outputs,
+            now,
+            time,
+            true,
+        )
+    }
+
+    /// [`Self::insert_with_evicted_ids`] for a transaction that was pooled
+    /// already and has passed again. The rejection lists are not checked:
+    /// another authorization of the same effects may have been refused while
+    /// this one was pooled, and that says nothing about this one.
+    pub fn reinsert_with_evicted_ids(
+        &mut self,
+        tx: VerifiedUnminedTx,
+        spent_mempool_outpoints: Vec<transparent::OutPoint>,
+        height: Option<Height>,
+        now: Instant,
+        time: DateTime<Utc>,
+    ) -> (Result<UnminedTxId, MempoolError<E>>, HashSet<UnminedTxId>) {
+        self.insert_checked(
+            tx,
+            spent_mempool_outpoints,
+            height,
+            &mut |_, _| {},
+            now,
+            time,
+            false,
+        )
+    }
+
+    /// Sets the cost the pool holds outside this storage, which counts
+    /// against the cost limit.
+    pub fn set_outside_cost(&mut self, cost: u64) {
+        self.outside_cost = cost;
+    }
+
+    /// Inserts `tx`, checking the rejection lists first if
+    /// `check_rejections`. See [`Self::insert_with_evicted_ids`].
+    #[allow(clippy::unwrap_in_result, clippy::too_many_arguments)]
+    fn insert_checked(
+        &mut self,
+        tx: VerifiedUnminedTx,
+        spent_mempool_outpoints: Vec<transparent::OutPoint>,
+        height: Option<Height>,
+        outputs: &mut dyn FnMut(&transparent::OutPoint, &transparent::Output),
+        now: Instant,
+        time: DateTime<Utc>,
+        check_rejections: bool,
+    ) -> (Result<UnminedTxId, MempoolError<E>>, HashSet<UnminedTxId>) {
         // # Security
         //
         // This method must call `reject`, rather than modifying the rejection lists directly.
@@ -583,7 +642,10 @@ impl<E: Clone + std::fmt::Debug> Storage<E> {
         let tx_id = unmined_tx_id.mined_id();
 
         // First, check if we have a cached rejection for this transaction.
-        if let Some(error) = self.rejection_error(&unmined_tx_id, now) {
+        if let Some(error) = check_rejections
+            .then(|| self.rejection_error(&unmined_tx_id, now))
+            .flatten()
+        {
             tracing::trace!(
                 ?tx_id,
                 ?error,
@@ -663,14 +725,15 @@ impl<E: Clone + std::fmt::Debug> Storage<E> {
         ancestors: &HashSet<transaction::Hash>,
         now: Instant,
     ) -> Result<HashSet<UnminedTxId>, ExactTipRejectionError<E>> {
-        if self.verified.total_cost().saturating_add(tx.cost()) <= self.tx_cost_limit {
+        // What the pool holds outside storage can't be evicted, so it leaves
+        // that much less room for what storage holds.
+        let limit = self.tx_cost_limit.saturating_sub(self.outside_cost);
+        if self.verified.total_cost().saturating_add(tx.cost()) <= limit {
             metrics::gauge!("zcash.mempool.eviction_cost.floor").set(0.0);
             return Ok(HashSet::new());
         }
 
-        let victims = self
-            .verified
-            .select_eviction_victims(tx, ancestors, self.tx_cost_limit);
+        let victims = self.verified.select_eviction_victims(tx, ancestors, limit);
 
         if let Some(cheapest) = victims.cheapest {
             // In zatoshis per `MEMPOOL_TRANSACTION_COST_THRESHOLD` of cost, the increment is
@@ -958,9 +1021,13 @@ impl<E: Clone + std::fmt::Debug> Storage<E> {
     }
 
     /// Returns the cost of the transactions in the mempool, according to ZIP-401.
-    #[cfg(any(test, feature = "mempool-bench"))]
     pub fn total_cost(&self) -> u64 {
         self.verified.total_cost()
+    }
+
+    /// The most cost the pool may hold, inside storage and outside it.
+    pub fn cost_limit(&self) -> u64 {
+        self.tx_cost_limit
     }
 
     /// Returns the total serialized size of the verified transactions in the set.

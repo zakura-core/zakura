@@ -81,7 +81,8 @@ pub use super::{
 pub const COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
 /// How long a chain-scoped rejection is remembered unless the model is told
-/// otherwise. Today's default `eviction_memory_time`.
+/// otherwise. Today's default `eviction_memory_time`. A rejection made at `T`
+/// holds through `T` plus this, and is forgotten after it, as today's list.
 pub const REJECTION_MEMORY: Duration = Duration::from_secs(60 * 60);
 
 /// The most pooled ancestors a new transaction can have. Today's
@@ -2175,7 +2176,7 @@ impl PoolModel {
                 let forgotten = list
                     .at
                     .get(&oldest)
-                    .is_none_or(|at| at.saturating_add(memory) <= now);
+                    .is_none_or(|at| at.saturating_add(memory) < now);
                 if !forgotten {
                     break;
                 }
@@ -2251,7 +2252,9 @@ impl PoolModel {
             self.rejected_chain
                 .get(reason)
                 .and_then(|list| list.at.get(&hash))
-                .is_some_and(|at| at.saturating_add(self.rejection_memory) > now)
+                // Today's list forgets an entry once it is older than the
+                // memory, so at exactly the memory it still holds.
+                .is_some_and(|at| at.saturating_add(self.rejection_memory) >= now)
         })
         .map(RejectionScope::EffectsChain)
     }

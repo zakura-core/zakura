@@ -47,8 +47,10 @@ dashboard only and is not among those it passes through to the public.
 
 **Who served each block.** Each record also lists the node's attempts to
 download the block, up to 16: the network stack, how long the attempt took,
-how it ended, and the peer's software as its handshake gave it. When the node
-writes peer addresses (`expose_peer_addresses`, below) an attempt also has the
+how it ended, and the peer's software as its handshake gave it. Legacy attempts
+include failures; Zakura attempts currently include only received bodies. A
+whole-range unavailable event is not evidence that every body in it failed.
+When the node writes peer addresses (`expose_peer_addresses`, below) an attempt also has the
 peer's IP address; otherwise the address is absent. These addresses are every
 peer's, with nothing left out, which is why `/api/propagation` is not passed
 through: the dashboard drops the private ones when it joins the nodes.

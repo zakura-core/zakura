@@ -348,6 +348,49 @@ pub struct SessionIdRef {
 }
 impl Ref for SessionIdRef {}
 
+/// One frame a peer sent the node, as the work the node admitted from it
+/// names it: `WorkAdmitted`'s connection, its frame row's stream kind and
+/// version, and the frame's sequence. A [`PeerFrameRef`] without the QUIC
+/// stream, which `WorkAdmitted` doesn't carry, so a harness with two QUIC
+/// streams of one kind on a connection can't tell their frames apart here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFrameRef {
+    /// The connection.
+    pub connection: u64,
+    /// The stream's kind.
+    pub kind: u16,
+    /// The stream's version.
+    pub version: u16,
+    /// The frame's position among the peer's frames on the stream.
+    pub seq: u64,
+}
+impl Ref for SourceFrameRef {}
+
+impl From<&PeerFrameRef> for SourceFrameRef {
+    /// The source `frame` is to the work it admits: every key of its ref
+    /// but its QUIC stream.
+    fn from(frame: &PeerFrameRef) -> Self {
+        SourceFrameRef {
+            connection: frame.connection,
+            kind: frame.kind,
+            version: frame.version,
+            seq: frame.seq,
+        }
+    }
+}
+
+/// One exchange or subscription of one connection: the connection and the
+/// key a peer's `PeerFrame` and the node's effects (`WorkAdmitted`,
+/// `Serving`, `NodeOutput`) name it by, which is per connection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeRef {
+    /// The connection.
+    pub connection: u64,
+    /// The exchange's key.
+    pub exchange: u64,
+}
+impl Ref for ExchangeRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

@@ -20,11 +20,12 @@ mod tests;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum ConnectionStatus {
     Opened,
-    /// Carries a report if the tracker has a peer address and the connection had opened.
+    /// Carries a report if the tracker has a peer address, the connection had opened, and its
+    /// peer closed it.
     Closed(Option<ClosedConnection>),
 }
 
-/// An open connection that has closed.
+/// An open connection that its peer closed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ClosedConnection {
     /// The peer's address: the dialed address for an outbound connection, and the remote
@@ -115,8 +116,9 @@ impl ActiveConnectionCounter {
 
     /// Like [`Self::track_connection`], for a connection with the peer at `addr`.
     ///
-    /// If the connection opens, the tracker also sends a [`ClosedConnection`] when it is
-    /// dropped. The caller must collect them with [`Self::take_closed_connections`].
+    /// If the connection opens and its peer closes it, see [`ConnectionTracker::mark_closed_by_peer`],
+    /// the tracker also sends a [`ClosedConnection`] when it is dropped. The caller must collect
+    /// them with [`Self::take_closed_connections`].
     pub fn track_connection_from(&mut self, addr: PeerSocketAddr) -> ConnectionTracker {
         ConnectionTracker::new(self, Some(addr))
     }
@@ -215,6 +217,9 @@ pub struct ConnectionTracker {
 
     /// When the connection was marked open, if it has been.
     opened_at: Option<Instant>,
+
+    /// Whether the peer ended the connection.
+    closed_by_peer: bool,
 }
 
 impl fmt::Debug for ConnectionTracker {
@@ -244,6 +249,15 @@ impl ConnectionTracker {
         self.report_addr = Some(addr);
     }
 
+    /// Records that the peer ended this connection, so the tracker reports it when it is
+    /// dropped.
+    ///
+    /// A connection that this node closes, for example to shed load, or to drop a stalled or
+    /// banned peer, is not reported.
+    pub fn mark_closed_by_peer(&mut self) {
+        self.closed_by_peer = true;
+    }
+
     /// Create and return a new active connection tracker, and add 1 to `counter`.
     /// All connection trackers share a label with their connection counter.
     ///
@@ -266,6 +280,7 @@ impl ConnectionTracker {
             label: counter.label.clone(),
             report_addr,
             opened_at: None,
+            closed_by_peer: false,
         }
     }
 }
@@ -288,12 +303,13 @@ impl Drop for ConnectionTracker {
         // the count for pending connection attempts and the count for open connections in
         // the active connection tracker.
         //
-        // Read the report first: only a connection that opened before this drop has one.
-        // It travels in the close notification, so the counter never sees one without
-        // the other.
+        // Read the report first: only a connection that opened before this drop, and that its
+        // peer closed, has one. It travels in the close notification, so the counter never sees
+        // one without the other.
         let closed_connection = self
             .report_addr
             .zip(self.opened_at)
+            .filter(|_| self.closed_by_peer)
             .map(|(addr, opened_at)| {
                 let closed_at = Instant::now();
 

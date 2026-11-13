@@ -1,6 +1,6 @@
 //! Peer-related errors.
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, io, sync::Arc};
 
 use thiserror::Error;
 
@@ -72,6 +72,25 @@ impl SharedPeerError {
     /// Returns `None` for errors that aren't a `notfound`-style failure.
     pub fn not_found_class(&self) -> Option<NotFoundClass> {
         (self.1 != NotFoundClass::Other).then_some(self.1)
+    }
+
+    /// Returns whether the remote peer ended the connection by closing or resetting it, as it
+    /// does when it restarts.
+    ///
+    /// Returns `false` for the errors that this node acts on, such as overloads, timeouts,
+    /// stalls, bans, and protocol violations.
+    pub(crate) fn is_peer_disconnect(&self) -> bool {
+        match self.0.as_ref() {
+            PeerError::ConnectionClosed => true,
+            PeerError::Serialization(SerializationError::Io(error)) => matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
+            ),
+            _ => false,
+        }
     }
 }
 
@@ -348,9 +367,11 @@ impl From<tokio::time::error::Elapsed> for HandshakeError {
 
 #[cfg(test)]
 mod tests {
+    use std::{io, sync::Arc};
+
     use super::{NotFoundClass, PeerError, SharedPeerError};
     use crate::protocol::external::InventoryHash;
-    use zakura_chain::block;
+    use zakura_chain::{block, serialization::SerializationError};
 
     fn block_inv() -> Vec<InventoryHash> {
         vec![InventoryHash::Block(block::Hash([0; 32]))]
@@ -375,5 +396,42 @@ mod tests {
             SharedPeerError::from(PeerError::NoReadyPeers).not_found_class(),
             None,
         );
+    }
+
+    /// Only a close or reset by the peer counts as the peer ending the connection. The errors
+    /// that this node acts on do not.
+    #[test]
+    fn only_a_close_or_reset_by_the_peer_is_a_peer_disconnect() {
+        let io_error = |kind| {
+            SharedPeerError::from(PeerError::Serialization(SerializationError::Io(Arc::new(
+                io::Error::from(kind),
+            ))))
+        };
+
+        assert!(SharedPeerError::from(PeerError::ConnectionClosed).is_peer_disconnect());
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(io_error(kind).is_peer_disconnect(), "{kind:?}");
+        }
+
+        assert!(!io_error(io::ErrorKind::TimedOut).is_peer_disconnect());
+        assert!(!io_error(io::ErrorKind::InvalidData).is_peer_disconnect());
+        for error in [
+            PeerError::ClientDropped,
+            PeerError::ConnectionDropped,
+            PeerError::Overloaded,
+            PeerError::InboundTimeout,
+            PeerError::ConnectionReceiveTimeout,
+            PeerError::ConnectionSendTimeout,
+            PeerError::HeartbeatTaskExited("test".to_string()),
+            PeerError::DuplicateHandshake,
+        ] {
+            let kind = error.kind();
+            assert!(!SharedPeerError::from(error).is_peer_disconnect(), "{kind}");
+        }
     }
 }

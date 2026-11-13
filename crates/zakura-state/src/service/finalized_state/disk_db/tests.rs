@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 #![allow(dead_code)]
 
-use std::{cell::Cell, io, ops::Deref, sync::atomic::Ordering};
+use std::{cell::Cell, fs, io, ops::Deref, sync::atomic::Ordering};
 
 use semver::Version;
 use zakura_chain::parameters::Network;
@@ -43,6 +43,49 @@ fn format_bytes_preserves_decimal_unit_boundaries() {
     assert_eq!(format_bytes(999_950), "1000 KB");
     assert_eq!(format_bytes(1_000_000), "1 MB");
     assert_eq!(format_bytes(u64::MAX), "18.4 EB");
+}
+
+/// RocksDB records the options a database was opened with in an `OPTIONS-*` file
+/// beside the data, with one `[CFOptions "name"]` section per column family.
+#[test]
+fn zakura_column_families_are_not_compacted_by_file_age() {
+    let _init_guard = zakura_test::init();
+    let db = DiskDb::new(
+        &Config::ephemeral(),
+        "file-age-test",
+        &Version::new(1, 0, 0),
+        &Network::Mainnet,
+        ["first".to_owned(), "second".to_owned()],
+        false,
+    )
+    .expect("the ephemeral database configuration is valid");
+
+    let options_file = fs::read_dir(db.path())
+        .expect("the database directory exists while the database is open")
+        .map(|entry| entry.expect("the database directory is readable").path())
+        .filter(|file| {
+            file.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("OPTIONS-"))
+        })
+        .max()
+        .expect("opening a database writes an options file");
+    let recorded = fs::read_to_string(options_file).expect("the options file is readable text");
+
+    let mut column_family = None;
+    let mut age_limits = Vec::new();
+    for line in recorded.lines().map(str::trim) {
+        if let Some(section) = line.strip_prefix("[CFOptions \"") {
+            column_family = section.strip_suffix("\"]");
+        } else if let (Some(name), Some(seconds)) = (column_family, line.strip_prefix("ttl=")) {
+            age_limits.push((name, seconds));
+        }
+    }
+    // RocksDB's own `default` column family is left out: Zakura stores nothing in it,
+    // and a new database opens it with RocksDB's defaults.
+    age_limits.retain(|(name, _)| *name != "default");
+
+    assert_eq!(age_limits, [("first", "0"), ("second", "0")]);
 }
 
 #[test]

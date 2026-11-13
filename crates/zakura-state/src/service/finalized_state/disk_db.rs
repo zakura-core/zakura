@@ -1655,6 +1655,19 @@ impl DiskDb {
         opts.set_max_background_jobs(background_jobs);
         opts.set_max_subcompactions(4);
 
+        // Never compact a file only because it is old.
+        //
+        // By default RocksDB compacts any file above the last level into the next
+        // level once its oldest data is 30 days old, to get deletions out of the
+        // upper levels within a bounded time. Zakura's large column families
+        // mostly gain keys and rarely lose them, and many are keyed by hashes, so
+        // a month of new entries overlaps the whole last level. Each of these
+        // compactions then rewrote most of a column family to merge that month in:
+        // on mainnet nodes 4 to 6 GiB and several minutes of CPU after a restart,
+        // dropping under 0.2% of the records read. Compaction by level size still
+        // merges the upper levels down as they fill.
+        opts.set_ttl(0);
+
         // Bound WAL growth so heavy sync cannot accumulate tens of GiB of logs
         // that must be replayed before Zebra can restart.
         opts.set_max_total_wal_size(Self::MAX_TOTAL_WAL_SIZE_BYTES);

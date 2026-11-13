@@ -83,6 +83,10 @@ pub struct DeclaredHistory {
     /// Its case, as the manifest's [`HistoryRef::case`](super::HistoryRef::case)
     /// names it.
     pub case: String,
+    /// The SHA-256 of the [`SCENARIO_FILE`] it wrote.
+    pub scenario_sha256: String,
+    /// The SHA-256 of the [`PLAN_FILE`] or [`SCRIPT_FILE`] it wrote.
+    pub plan_sha256: String,
 }
 
 /// What [`RAN_FILE`] holds: how many steps a run took and the digest of
@@ -273,20 +277,30 @@ pub fn declare_into(
         fs::write(dir.join(name), bytes).map_err(|error| format!("{name}: {error}"))
     };
     let json = |value: serde_json::Result<String>| value.map_err(|error| error.to_string());
-    match plan {
-        PlanInput::Bytes(bytes) => put(PLAN_FILE, bytes)?,
+    let digest = |bytes: &[u8]| {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex(hasher)
+    };
+    let plan_sha256 = match plan {
+        PlanInput::Bytes(bytes) => {
+            put(PLAN_FILE, bytes)?;
+            digest(bytes)
+        }
         PlanInput::Script(script) => {
-            put(SCRIPT_FILE, json(serde_json::to_string(script))?.as_bytes())?
+            let text = json(serde_json::to_string(script))?;
+            put(SCRIPT_FILE, text.as_bytes())?;
+            digest(text.as_bytes())
         }
         PlanInput::Trace(_) | PlanInput::Skip(_) => {
             return Err("only Plan bytes or a script name a committed input".to_owned())
         }
-    }
-    put(
-        SCENARIO_FILE,
-        json(serde_json::to_string(scenario))?.as_bytes(),
-    )?;
+    };
+    let scenario = json(serde_json::to_string(scenario))?;
+    put(SCENARIO_FILE, scenario.as_bytes())?;
     let identity = DeclaredHistory {
+        scenario_sha256: digest(scenario.as_bytes()),
+        plan_sha256,
         run_id: declared_for.run_id.clone(),
         index: declared_for.index,
         role: declared_for.role.clone(),

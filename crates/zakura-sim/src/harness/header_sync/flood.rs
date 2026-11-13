@@ -145,6 +145,15 @@ impl FloodScenario {
 /// `header-sync/storage` on a [`FloodScenario`].
 pub struct Flood(Storage, FloodScenario);
 
+/// The storage harness's properties, then the two watch properties, which
+/// apply only where a commit publishes during a flood.
+fn flood_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
+    let mut properties = storage_properties();
+    properties.push(watch_observed_under_flood());
+    properties.push(watch_observed_under_lifecycle_flood());
+    properties
+}
+
 impl HasView for Flood {
     type View = StorageView;
 
@@ -221,13 +230,9 @@ impl Subsystem for Flood {
         Flood(Storage::build(sim, &scenario.storage(), ports), *scenario)
     }
 
-    /// The storage harness's properties, then the two watch properties,
-    /// which apply only where a commit publishes during a flood.
+    /// [`flood_properties`].
     fn properties() -> Vec<Property<Self>> {
-        let mut properties = storage_properties();
-        properties.push(watch_observed_under_flood());
-        properties.push(watch_observed_under_lifecycle_flood());
-        properties
+        flood_properties()
     }
 
     /// The storage harness's sources.
@@ -242,6 +247,157 @@ impl Subsystem for Flood {
             FloodScenario::Lifecycle
         } else {
             FloodScenario::Wire
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_network::zakura::observe::EventQueue;
+
+    use super::{flood_properties, Flood, FloodScenario};
+    use crate::{
+        check::FindingSubject,
+        domain::header_sync::{WATCH_OBSERVED_UNDER_FLOOD, WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD},
+        harness::{
+            entry,
+            header_node::harness_commit,
+            header_sync::{Ports, StorageView},
+            scripted::{findings, recorded},
+            Subsystem,
+        },
+        property::{EndViolation, HasView, Property, Sources},
+        ObservationLog, RunConfig, RunEnd, Sim,
+    };
+
+    /// The flood harness, committing twice more as its run ends, after the
+    /// reactor's last turn, so its loop reads neither state: a loop wedged
+    /// with two publications unread. Everything else, its end findings
+    /// above all, is [`Flood`]'s own.
+    struct TwoUnread(Flood);
+
+    impl HasView for TwoUnread {
+        type View = StorageView;
+
+        /// The flood harness's view.
+        fn view(&self) -> StorageView {
+            self.0.view()
+        }
+
+        /// Commits two states through the harness's commit, then hands the
+        /// end to the flood harness.
+        fn ended(&self, end: &RunEnd) {
+            let storage = &self.0 .0;
+            let fixture = self.0 .1.storage().weights.fixture();
+            for _ in 0..2 {
+                harness_commit(&storage.port, &fixture, &storage.adoption, 1)
+                    .expect("the node's chain extends by a fixture header");
+            }
+            self.0.ended(end);
+        }
+
+        /// [`Flood::end_violations`].
+        fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
+            self.0.end_violations(log)
+        }
+
+        /// The flood harness's stop.
+        fn stopping(&self) -> bool {
+            self.0.stopping()
+        }
+
+        /// The flood harness's stamped facts.
+        fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+            self.0.stamps_after(after)
+        }
+
+        /// The flood harness's store snapshot.
+        fn snapshot(&self) -> Option<serde_json::Value> {
+            self.0.snapshot()
+        }
+    }
+
+    impl Subsystem for TwoUnread {
+        const NAME: &'static str = "test/flood-two-unread-at-a-settled-end";
+        const GENERATOR: u32 = Flood::GENERATOR;
+        const SCENARIO_BYTES: usize = Flood::SCENARIO_BYTES;
+        type Scenario = FloodScenario;
+        type Prepared = Ports;
+
+        /// [`Flood::config`].
+        fn config(scenario: &FloodScenario) -> RunConfig {
+            Flood::config(scenario)
+        }
+
+        /// [`Flood::prepare`].
+        fn prepare(scenario: &FloodScenario) -> Ports {
+            Flood::prepare(scenario)
+        }
+
+        /// The flood harness on the fixture.
+        fn build(sim: &mut Sim, scenario: &FloodScenario, ports: Ports) -> Self {
+            TwoUnread(Flood::build(sim, scenario, ports))
+        }
+
+        /// [`flood_properties`], as the flood harness checks them.
+        fn properties() -> Vec<Property<Self>> {
+            flood_properties()
+        }
+
+        /// [`Flood::sources`].
+        fn sources() -> Sources {
+            Flood::sources()
+        }
+
+        /// [`Flood::draw`].
+        fn draw(prefix: &[u8]) -> FloodScenario {
+            Flood::draw(prefix)
+        }
+    }
+
+    /// C21 through the flood harness's own end path: on each fixture, two
+    /// states published and both unread when the run settles are two end
+    /// findings of each watch rule, each naming its own publication, in the
+    /// full report recorded beside the trace and its fresh replay. A
+    /// [`Flood::end_violations`] that kept only the first would fail it,
+    /// which the adoption sidecar test can't show, as it judges the rules
+    /// through its own end path.
+    #[test]
+    fn the_flood_end_path_reports_every_unread_publication() {
+        for scenario in [FloodScenario::Wire, FloodScenario::Lifecycle] {
+            let scenario_json = serde_json::to_value(scenario).expect("a fixture serializes");
+            let full = recorded(&entry::<TwoUnread>(), &scenario_json, &[]);
+            for (property, queue) in [
+                (WATCH_OBSERVED_UNDER_FLOOD, EventQueue::Wire),
+                (WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD, EventQueue::Lifecycle),
+            ] {
+                let found = findings(&full, property);
+                let unread: Vec<String> = found
+                    .violations
+                    .iter()
+                    .filter(|violation| violation.actual.contains("published and unread"))
+                    .map(|violation| match &violation.subject {
+                        Some(FindingSubject::Publication { state_version }) => {
+                            state_version.clone()
+                        }
+                        other => panic!("{property}: an end finding names {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(unread.len(), 2, "{scenario:?} {property}: {found:?}");
+                assert_ne!(unread[0], unread[1], "{scenario:?} {property}");
+                assert!(
+                    found
+                        .violations
+                        .iter()
+                        .all(|violation| violation.actual.contains(&format!("{queue:?} events"))),
+                    "{scenario:?} {property}: {found:?}"
+                );
+                assert!(
+                    matches!(found.outcome, crate::PropertyOutcome::Violated { .. }),
+                    "{scenario:?} {property}: {:?}",
+                    found.outcome
+                );
+            }
         }
     }
 }

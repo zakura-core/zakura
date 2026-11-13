@@ -10,6 +10,10 @@
 //! builds an [`Expect`] from what it knows, most often the trace beside the
 //! artifact ([`Expect::of_trace`]), and never compares one of those fields
 //! itself.
+//!
+//! It's also the one place the tool reads S's committed files, its planted
+//! cases, inputs and mappings ([`committed_text`]), which a run doesn't
+//! write.
 
 use std::{collections::BTreeMap, fmt::Write as _, path::Path};
 
@@ -69,6 +73,10 @@ pub enum Field {
     Role,
     /// The SHA-256 of the executable a run ran.
     Executable,
+    /// The SHA-256 of the scenario file a declaration wrote.
+    ScenarioFile,
+    /// The SHA-256 of the Plan file a declaration wrote.
+    PlanFile,
 }
 
 impl Field {
@@ -97,6 +105,8 @@ impl Field {
             Field::Plan => "ran the Plan",
             Field::Role => "names the role",
             Field::Executable => "ran the executable",
+            Field::ScenarioFile => "wrote the scenario",
+            Field::PlanFile => "wrote the Plan",
         }
     }
 
@@ -212,6 +222,21 @@ pub const REPLAY: Kind = Kind {
     closed: false,
 };
 
+/// A tool recording's `recorded.json` ([`RecordingRun`](super::tool::RecordingRun)),
+/// which the runner writes for the run, task and role whose recording it
+/// made, with the trace that recording left.
+pub const RECORDING: Kind = Kind {
+    name: "recorded.json",
+    carries: &[
+        (Field::RunId, "/run_id"),
+        (Field::TaskIndex, "/index"),
+        (Field::Role, "/role"),
+        (Field::Trace, "/trace"),
+    ],
+    required: &[Field::RunId, Field::TaskIndex, Field::Role, Field::Trace],
+    closed: false,
+};
+
 /// A recording's or a fresh replay's `full-report.json` (C8).
 pub const FULL_REPORT: Kind = Kind {
     name: "full-report.json",
@@ -233,15 +258,24 @@ pub const REPLAY_LOG: Kind = Kind {
 /// ([`DeclaredHistory`](super::history::DeclaredHistory)), which the
 /// declaring test stamps with the run, task and role the runner ran it for
 /// ([`HISTORIES_FOR_VAR`](super::history::HISTORIES_FOR_VAR)), as the
-/// runner's own artifacts name them ([`TEST`]).
+/// runner's own artifacts name them ([`TEST`]), and with the SHA-256 of
+/// the scenario and Plan files it wrote beside it ([`read_declaration`]).
 pub const DECLARATION: Kind = Kind {
     name: "history.json",
     carries: &[
         (Field::RunId, "/run_id"),
         (Field::TaskIndex, "/index"),
         (Field::Role, "/role"),
+        (Field::ScenarioFile, "/scenario_sha256"),
+        (Field::PlanFile, "/plan_sha256"),
     ],
-    required: &[Field::RunId, Field::TaskIndex, Field::Role],
+    required: &[
+        Field::RunId,
+        Field::TaskIndex,
+        Field::Role,
+        Field::ScenarioFile,
+        Field::PlanFile,
+    ],
     closed: false,
 };
 
@@ -586,16 +620,87 @@ pub fn read(kind: &Kind, path: &Path, expect: &Expect) -> Result<Value, String> 
 }
 
 /// The declaration in `dir`: its [`DECLARATION`] file, if it's bound to
-/// what `expect` names ([`check`]), and the JSON text of the scenario the
-/// same test wrote beside it, in the directory only that test created
-/// ([`declare_into`](super::history::declare_into)), or why not.
+/// what `expect` names and to the scenario and Plan files beside it, by
+/// their SHA-256 ([`check`]), and the JSON text of that scenario, or why
+/// not. So a scenario or Plan another attempt left beside a declaration
+/// isn't recorded as it, nor reconciled with its trace. The Plan file is
+/// the one of [`PLAN_FILE`](super::history::PLAN_FILE) and
+/// [`SCRIPT_FILE`](super::history::SCRIPT_FILE) there is.
 pub fn read_declaration(dir: &Path, expect: &Expect) -> Result<(Value, String), String> {
-    use super::history::{HISTORY_FILE, SCENARIO_FILE};
-    let history = read(&DECLARATION, &dir.join(HISTORY_FILE), expect)?;
+    use super::history::{HISTORY_FILE, PLAN_FILE, SCENARIO_FILE, SCRIPT_FILE};
     let path = dir.join(SCENARIO_FILE);
     let scenario =
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let plan = match (dir.join(PLAN_FILE), dir.join(SCRIPT_FILE)) {
+        (bytes, script) if bytes.exists() != script.exists() => match bytes.exists() {
+            true => bytes,
+            false => script,
+        },
+        _ => return Err("its declaration names neither or both Plan forms".to_owned()),
+    };
+    let expect = expect
+        .clone()
+        .with_read(
+            Field::ScenarioFile,
+            sha256_file(&path),
+            "its scenario can't be read",
+        )
+        .with_read(
+            Field::PlanFile,
+            sha256_file(&plan),
+            "its Plan can't be read",
+        );
+    let history = read(&DECLARATION, &dir.join(HISTORY_FILE), &expect)?;
     Ok((history, scenario))
+}
+
+/// `rel` under S's checkout `repo`, if it names a committed path at all:
+/// relative, with only plain components, and outside `target`, where
+/// builds and runs write. The runner reads S only from a clean checkout
+/// (xtask's `subject_of`), so a path here is S's committed file, never a
+/// run's artifact.
+fn committed_path(repo: &Path, rel: &Path) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    let plain = rel
+        .components()
+        .all(|part| matches!(part, Component::Normal(_)));
+    let first = rel.components().next();
+    if !plain || first.is_some_and(|part| part.as_os_str() == "target") {
+        return Err(format!("{} isn't a committed path", rel.display()));
+    }
+    Ok(repo.join(rel))
+}
+
+/// The committed text file `rel` of S's checkout `repo`
+/// ([`committed_path`]), or why it can't be read.
+pub fn committed_text(repo: &Path, rel: impl AsRef<Path>) -> Result<String, String> {
+    let path = committed_path(repo, rel.as_ref())?;
+    std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The committed file `rel` of S's checkout `repo`'s bytes
+/// ([`committed_path`]), or why it can't be read.
+pub fn committed_bytes(repo: &Path, rel: impl AsRef<Path>) -> Result<Vec<u8>, String> {
+    let path = committed_path(repo, rel.as_ref())?;
+    std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Each entry of the committed directory `rel` of S's checkout `repo`
+/// ([`committed_path`]), as its path relative to `repo` and whether it's a
+/// directory, sorted, or why it can't be read.
+pub fn committed_entries(
+    repo: &Path,
+    rel: impl AsRef<Path>,
+) -> Result<Vec<(std::path::PathBuf, bool)>, String> {
+    let rel = rel.as_ref();
+    let path = committed_path(repo, rel)?;
+    let mut entries: Vec<(std::path::PathBuf, bool)> = std::fs::read_dir(&path)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| (rel.join(entry.file_name()), entry.path().is_dir()))
+        .collect();
+    entries.sort();
+    Ok(entries)
 }
 
 /// The `meta` line of the trace in `dir`, read without checking the rest
@@ -692,6 +797,38 @@ mod tests {
         extra["also"] = json!(1);
         assert!(check(&TASK, &extra, &expect).is_err());
         assert!(check(&TASK, &json!([]), &expect).is_err());
+    }
+
+    /// A committed read stays inside S's checkout and out of its build and
+    /// run output: a plain relative path reads, and one climbing out, one
+    /// that's absolute, and one under `target` are refused unread.
+    #[test]
+    fn a_committed_read_names_only_a_committed_path() {
+        let repo = tempfile::tempdir().expect("a temp dir can be created");
+        std::fs::create_dir_all(repo.path().join("qa/planted")).expect("writable");
+        std::fs::create_dir_all(repo.path().join("target")).expect("writable");
+        std::fs::write(repo.path().join("qa/planted/a.toml"), "x").expect("writable");
+        std::fs::write(repo.path().join("target/run.json"), "{}").expect("writable");
+        assert_eq!(
+            committed_text(repo.path(), "qa/planted/a.toml"),
+            Ok("x".into())
+        );
+        assert_eq!(
+            committed_entries(repo.path(), "qa/planted"),
+            Ok(vec![("qa/planted/a.toml".into(), false)])
+        );
+        let outside = repo.path().join("target/run.json");
+        for refused in [
+            Path::new("qa/../target/run.json"),
+            Path::new("target/run.json"),
+            outside.as_path(),
+        ] {
+            assert!(committed_text(repo.path(), refused).is_err(), "{refused:?}");
+            assert!(
+                committed_bytes(repo.path(), refused).is_err(),
+                "{refused:?}"
+            );
+        }
     }
 
     /// Each line of a replay's log that says it matched claims its trace,

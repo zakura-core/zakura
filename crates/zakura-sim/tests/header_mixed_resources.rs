@@ -27,7 +27,10 @@ use support::{
 use zakura_network::zakura::observe::ReactorEvent;
 use zakura_sim::harness::header_acceptance::{
     history::run_declared,
-    refs::{joined, CallOpRef, DispatchRef, ReleaseRef, StaleCallRef, WorkRef},
+    refs::{
+        CallOpRef, DispatchRef, PeerNameRef, Ref, ReleaseRef, StaleCallRef, StorageOpRef,
+        StorageRef, WorkRef,
+    },
 };
 use zakura_sim::{
     check::{after_step, PropertyOutcome},
@@ -258,19 +261,28 @@ impl Selected {
     }
 
     /// The first storage operation `is` matches, as its submission gives
-    /// it: its ID, the reactor call that submitted it and its owner.
+    /// it: the operation, the reactor call that submitted it and its owner.
     fn first_submitted(
         &self,
         is: impl Fn(&StorageRequest) -> Option<&WorkOwner>,
-    ) -> Option<(u64, Option<u64>, WorkOwner)> {
+    ) -> Option<(StorageOpRef, Option<u64>, WorkOwner)> {
         self.obs.iter().find_map(|obs| match obs {
             Observation::Storage {
+                service,
+                instance,
                 fact:
                     StorageFact::Submitted {
                         id, request, call, ..
                     },
                 ..
-            } => is(request).map(|owner| (*id, *call, owner.clone())),
+            } => is(request).map(|owner| {
+                let storage = StorageRef {
+                    service: service.clone(),
+                    instance: *instance,
+                };
+                let op = StorageOpRef { storage, op: *id };
+                (op, *call, owner.clone())
+            }),
             _ => None,
         })
     }
@@ -278,6 +290,17 @@ impl Selected {
     /// The index of the first observation `is` matches.
     fn position(&self, is: impl Fn(&Observation) -> bool) -> Option<usize> {
         self.obs.iter().position(is)
+    }
+
+    /// The first apply's operation, or why there's none.
+    fn first_apply(&self) -> Result<StorageOpRef, String> {
+        let (op, ..) = self
+            .first_submitted(|request| match request {
+                StorageRequest::ApplyHeaderTarget { owner, .. } => Some(owner),
+                _ => None,
+            })
+            .ok_or("no apply was submitted")?;
+        Ok(op)
     }
 
     /// The first prepare's operation, the reactor call that submitted it
@@ -289,8 +312,8 @@ impl Selected {
                 _ => None,
             })
             .ok_or("no prepare was submitted")?;
-        let call = call.ok_or(format!("prepare {op} names no reactor call"))?;
-        Ok((op, call, owner))
+        let call = call.ok_or(format!("prepare {op:?} names no reactor call"))?;
+        Ok((op.op, call, owner))
     }
 
     /// Whether a reactor call dispatched `want`.
@@ -309,19 +332,22 @@ impl Selected {
             }),
             _ => None,
         };
-        !joined(&self.obs, of, want).is_empty()
+        !DispatchRef::joined(want, &self.obs, of).is_empty()
     }
 
     /// The position of the first observation of a call ending paired with
     /// its operation, `want`.
     fn ended(&self, want: &CallOpRef) -> Option<usize> {
-        self.obs.iter().position(|obs| match obs {
+        let of = |obs: &Observation| match obs {
             Observation::Reactor {
                 event: ReactorFact::CallEnded { call, op, .. },
                 ..
-            } => op.map(|op| CallOpRef { call: *call, op }).as_ref() == Some(want),
-            _ => false,
-        })
+            } => op.map(|op| CallOpRef { call: *call, op }),
+            _ => None,
+        };
+        self.obs
+            .iter()
+            .position(|obs| CallOpRef::joins(want, obs, of))
     }
 
     /// Whether `want`'s stale window ended at a step's drain.
@@ -332,7 +358,7 @@ impl Selected {
                 apply: window.apply,
             })
         };
-        joined(&self.stale, of, want)
+        StaleCallRef::joined(want, &self.stale, of)
             .iter()
             .any(|window| window.step.is_some())
     }
@@ -350,7 +376,7 @@ impl Selected {
             }),
             _ => None,
         };
-        !joined(&self.obs[..ended], of, want).is_empty()
+        !WorkRef::joined(want, &self.obs[..ended], of).is_empty()
     }
 
     /// The round a reservation backs for `want`, by its peer and
@@ -364,7 +390,7 @@ impl Selected {
             }),
             _ => None,
         };
-        joined(&self.accounting, of, want)
+        WorkRef::joined(want, &self.accounting, of)
             .into_iter()
             .find_map(|event| match event {
                 ReactorEvent::ReservationBound { request, .. } => Some(ReleaseRef {
@@ -386,7 +412,7 @@ impl Selected {
             }),
             _ => None,
         };
-        !joined(&self.accounting, of, want).is_empty()
+        !ReleaseRef::joined(want, &self.accounting, of).is_empty()
     }
 
     /// Checks the scenario's held first prepare is the one that ended stale
@@ -433,45 +459,76 @@ impl Selected {
     }
 
     /// Checks the scenario's selected apply, the first, kept its reply
-    /// across the reset: storage committed it, the node then invalidated
-    /// its tip, and only then delivered the apply's reply.
+    /// across the reset ([`Selected::reply_crosses_reset`]).
     fn apply_reply_crosses_reset(&self) -> Result<(), String> {
-        let (op, ..) = self
-            .first_submitted(|request| match request {
-                StorageRequest::ApplyHeaderTarget { owner, .. } => Some(owner),
-                _ => None,
-            })
-            .ok_or("no apply was submitted")?;
+        self.reply_crosses_reset(&self.first_apply()?).map(|_| ())
+    }
+
+    /// Checks `op` kept its reply across the reset: its storage committed
+    /// it, that same storage instance's node then invalidated its tip, and
+    /// only then delivered its reply, each joined on its whole ref, the
+    /// operation's [`StorageOpRef`] and the reset's [`StorageRef`]. Returns
+    /// the three facts' positions.
+    fn reply_crosses_reset(&self, op: &StorageOpRef) -> Result<(usize, usize, usize), String> {
+        let storage = |service: &String, instance: &u64| StorageRef {
+            service: service.clone(),
+            instance: *instance,
+        };
+        let committed = |obs: &Observation| match obs {
+            Observation::Storage {
+                service,
+                instance,
+                fact: StorageFact::Committed { id, .. },
+                ..
+            } => Some(StorageOpRef {
+                storage: storage(service, instance),
+                op: *id,
+            }),
+            _ => None,
+        };
+        let invalidated = |obs: &Observation| match obs {
+            Observation::Storage {
+                service,
+                instance,
+                fact: StorageFact::Reset { kind, .. },
+                ..
+            } if kind == "invalidate" => Some(storage(service, instance)),
+            _ => None,
+        };
+        let delivered = |obs: &Observation| match obs {
+            Observation::Storage {
+                service,
+                instance,
+                fact:
+                    StorageFact::Completed {
+                        id,
+                        delivered: true,
+                        ..
+                    },
+                ..
+            } => Some(StorageOpRef {
+                storage: storage(service, instance),
+                op: *id,
+            }),
+            _ => None,
+        };
         let committed = self
-            .position(|obs| {
-                matches!(obs, Observation::Storage {
-                    fact: StorageFact::Committed { id, .. },
-                    ..
-                } if *id == op)
-            })
-            .ok_or(format!("apply {op} never committed"))?;
+            .position(|obs| StorageOpRef::joins(op, obs, committed))
+            .ok_or(format!("{op:?} never committed"))?;
         let reset = self.obs[committed..]
             .iter()
-            .position(|obs| {
-                matches!(obs, Observation::Storage {
-                    fact: StorageFact::Reset { kind, .. },
-                    ..
-                } if kind == "invalidate")
-            })
-            .ok_or(format!("no invalidation followed apply {op}'s commit"))?
+            .position(|obs| StorageRef::joins(&op.storage, obs, invalidated))
+            .ok_or(format!(
+                "no invalidation of {:?} followed {op:?}'s commit",
+                op.storage
+            ))?
             + committed;
-        let delivered = |obs: &Observation| {
-            matches!(obs, Observation::Storage {
-                fact: StorageFact::Completed { id, delivered: true, .. },
-                ..
-            } if *id == op)
-        };
-        match self.position(delivered) {
-            Some(at) if at > reset => Ok(()),
+        match self.position(|obs| StorageOpRef::joins(op, obs, delivered)) {
+            Some(at) if at > reset => Ok((committed, reset, at)),
             Some(at) => Err(format!(
-                "apply {op}'s reply was delivered at {at}, before the reset at {reset}"
+                "{op:?}'s reply was delivered at {at}, before the reset at {reset}"
             )),
-            None => Err(format!("apply {op}'s reply was never delivered")),
+            None => Err(format!("{op:?}'s reply was never delivered")),
         }
     }
 }
@@ -535,29 +592,12 @@ fn witnessed(label: &str, run: &Run) {
     );
     let facts = run.sessions.facts();
     for peer in [SOURCE, SERVED] {
-        let links: Vec<(u64, u64)> = facts
-            .iter()
-            .filter_map(|fact| match fact {
-                SessionFact::LinkOpened {
-                    peer: at,
-                    connection,
-                    session_id,
-                    ..
-                } if at == peer => Some((*connection, *session_id)),
-                _ => None,
-            })
-            .collect();
-        let admitted: Vec<u64> = facts
-            .iter()
-            .filter_map(|fact| match fact {
-                SessionFact::SessionAdmitted {
-                    peer: at,
-                    session_id,
-                    ..
-                } if at == peer => Some(*session_id),
-                _ => None,
-            })
-            .collect();
+        let (links, admitted) = links_of(
+            &facts,
+            &PeerNameRef {
+                peer: peer.to_owned(),
+            },
+        );
         let [(old_connection, old_session), (new_connection, new_session)] = links[..] else {
             panic!("{label}: {peer} links twice: {links:?}");
         };
@@ -565,6 +605,32 @@ fn witnessed(label: &str, run: &Run) {
         assert_ne!(old_session, new_session, "{label}: {peer}");
         assert_eq!(admitted, [old_session, new_session], "{label}: {peer}");
     }
+}
+
+/// `peer`'s links in `facts`, as `(connection, session)`, and the sessions
+/// the node admitted from it, each fact joined on the peer's whole
+/// [`PeerNameRef`].
+fn links_of(facts: &[SessionFact], peer: &PeerNameRef) -> (Vec<(u64, u64)>, Vec<u64>) {
+    let named = |fact: &SessionFact| match fact {
+        SessionFact::LinkOpened { peer, .. } | SessionFact::SessionAdmitted { peer, .. } => {
+            Some(PeerNameRef { peer: peer.clone() })
+        }
+        _ => None,
+    };
+    let mut links = Vec::new();
+    let mut admitted = Vec::new();
+    for fact in PeerNameRef::joined(peer, facts, named) {
+        match fact {
+            SessionFact::LinkOpened {
+                connection,
+                session_id,
+                ..
+            } => links.push((*connection, *session_id)),
+            SessionFact::SessionAdmitted { session_id, .. } => admitted.push(*session_id),
+            _ => {}
+        }
+    }
+    (links, admitted)
 }
 
 /// The Plan bytes the committed fixture runs under: a fixed draw.
@@ -624,8 +690,11 @@ fn the_mixed_scenario_holds_under_generated_plans() {
 /// one key of its ref moves on its own (Rule 25's template): the call's
 /// dispatch of the prepare's owner, every field of it, the call paired
 /// with the operation, the prepare's stale window, the round retired and
-/// reserved for the owner in full, and the round's release. The apply
-/// reply's crossing fails for a reply delivered before the reset.
+/// reserved for the owner in full, and the round's release. So do the
+/// apply's commit and reply joined on its storage operation, every key of
+/// it including its storage instance, and the reset joined on that same
+/// storage instance ([`Selected::reply_crosses_reset`]). The apply reply's
+/// crossing fails for a reply delivered before the reset.
 #[test]
 fn the_mixed_joins_fail_one_identity_off() {
     let committed: StorageScenario = serde_json::from_str(
@@ -633,10 +702,22 @@ fn the_mixed_joins_fail_one_identity_off() {
     )
     .expect("the fixture is a storage scenario");
     let plan = fs::read(fixture_file("plan")).expect("the Plan is committed");
-    let selected = Selected::of(&run(&committed, Plan::from_fuzz(&plan)));
+    let ran = run(&committed, Plan::from_fuzz(&plan));
+    let selected = Selected::of(&ran);
     selected
         .held_prepare_joined()
         .expect("the committed run joins");
+    // Each mirror's links and admissions join on its whole name: the
+    // other mirror's name, one key off, finds its other links.
+    let facts = ran.sessions.facts();
+    for peer in [SOURCE, SERVED] {
+        let own = PeerNameRef {
+            peer: peer.to_owned(),
+        };
+        let found = links_of(&facts, &own);
+        assert_eq!(found.0.len(), 2, "{peer}");
+        assert_one_key_off::<PeerNameRef>(&own, |moved| links_of(&facts, moved) == found);
+    }
     selected
         .apply_reply_crosses_reset()
         .expect("the committed reply crosses");
@@ -660,34 +741,53 @@ fn the_mixed_joins_fail_one_identity_off() {
     };
     assert_one_key_off::<WorkRef>(&round, |round| selected.retired_before(round, ended));
     let release = selected.reserved(&round).expect("a reservation backs it");
-    assert_one_key_off(&round, |round| selected.reserved(round).is_some());
+    assert_one_key_off::<WorkRef>(&round, |round| selected.reserved(round).is_some());
     assert_one_key_off::<ReleaseRef>(&release, |release| selected.released(release));
 
-    let (apply, ..) = selected
-        .first_submitted(|request| match request {
-            StorageRequest::ApplyHeaderTarget { owner, .. } => Some(owner),
-            _ => None,
-        })
-        .expect("an apply was submitted");
-    let reset = selected
-        .position(|obs| {
-            matches!(obs, Observation::Storage {
-                fact: StorageFact::Reset { kind, .. },
-                ..
-            } if kind == "invalidate")
-        })
-        .expect("the node invalidated");
+    // The apply's commit, the reset and its reply, each fact with one key
+    // of its ref moved on its own: the operation's storage service,
+    // instance or ID, and the reset's service or instance.
+    let apply = selected.first_apply().expect("an apply was submitted");
+    let (committed, reset, reply) = selected
+        .reply_crosses_reset(&apply)
+        .expect("the committed reply crosses");
+    let moved = |at: usize, to: &StorageOpRef| {
+        let mut moved = selected.clone();
+        let Observation::Storage {
+            service,
+            instance,
+            fact,
+            ..
+        } = &mut moved.obs[at]
+        else {
+            panic!("the fact at {at} is a storage fact");
+        };
+        *service = to.storage.service.clone();
+        *instance = to.storage.instance;
+        if let StorageFact::Committed { id, .. } | StorageFact::Completed { id, .. } = fact {
+            *id = to.op;
+        }
+        moved
+    };
+    for at in [committed, reply] {
+        let keys = assert_one_key_off::<StorageOpRef>(&apply, |op| {
+            moved(at, op).reply_crosses_reset(&apply).is_ok()
+        });
+        assert_eq!(keys, 3);
+    }
+    let keys = assert_one_key_off::<StorageRef>(&apply.storage, |storage| {
+        let to = StorageOpRef {
+            storage: storage.clone(),
+            op: apply.op,
+        };
+        moved(reset, &to).reply_crosses_reset(&apply).is_ok()
+    });
+    assert_eq!(keys, 2);
+
+    // The reply delivered before the reset.
     let mut early = selected.clone();
-    let reply = early
-        .position(|obs| {
-            matches!(obs, Observation::Storage {
-                fact: StorageFact::Completed { id, delivered: true, .. },
-                ..
-            } if *id == apply)
-        })
-        .expect("the reply was delivered");
-    let moved = early.obs.remove(reply);
-    early.obs.insert(reset, moved);
+    let delivered = early.obs.remove(reply);
+    early.obs.insert(reset, delivered);
     assert!(early.apply_reply_crosses_reset().is_err());
     assert!(early.held_prepare_joined().is_ok());
 }

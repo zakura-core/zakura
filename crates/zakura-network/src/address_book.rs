@@ -591,25 +591,29 @@ impl AddressBook {
         peers
     }
 
-    /// Get active outbound listener addresses in measured RTT order, followed by
-    /// shuffled addresses without a measurement, excluding our local listener.
+    /// Get outbound listener addresses that responded to this node within
+    /// [`MAX_PEER_ACTIVE_FOR_GOSSIP`](constants::MAX_PEER_ACTIVE_FOR_GOSSIP), in
+    /// measured RTT order, followed by shuffled addresses without a measurement,
+    /// excluding our local listener.
     pub fn cacheable(&self, now: chrono::DateTime<Utc>) -> Vec<MetaAddr> {
         let _guard = self.span.enter();
 
         let peers = self.peers.clone();
 
-        // Get peers in preferred order, then keep the recently active ones
+        // Get peers in preferred order, then keep the ones that recently responded
         let mut eligible: Vec<_> = peers
             .ordered_values()
             // # Security
             //
-            // Remove peers that:
-            //   - last responded more than three hours ago, or
-            //   - haven't responded yet but were reported last seen more than three hours ago
-            //
-            // This prevents Zebra from caching nodes that are likely unreachable,
-            // which improves startup time and reliability.
-            .filter(|addr| addr.is_active_for_gossip(now))
+            // Keep only peers that responded to this node within the gossip window.
+            // A gossiped last seen time does not show that an address is a reachable
+            // listener, and startup dials cached peers first, so caching unproven
+            // addresses spends startup attempts on peers that are likely unreachable.
+            .filter(|addr| {
+                addr.last_response().is_some_and(|last_response| {
+                    last_response.saturating_elapsed(now) <= constants::MAX_PEER_ACTIVE_FOR_GOSSIP
+                })
+            })
             // An inbound peer's entry holds its ephemeral source port, not a listener.
             .filter(|addr| !addr.is_inbound())
             // Address-only persistence must not forget a known rejection.

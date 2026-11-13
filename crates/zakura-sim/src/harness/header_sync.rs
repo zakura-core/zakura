@@ -2739,22 +2739,27 @@ fn storage_call_dispatched(view: &StorageView, log: &ObservationLog) -> bool {
     if view.direct_dispatch_broken {
         return true;
     }
-    let dispatched: BTreeSet<u64> = log
+    use super::header_acceptance::refs::{CallRef, Ref};
+    let dispatched: Vec<CallRef> = log
         .entries()
         .iter()
         .filter_map(|entry| match &entry.obs {
             Observation::Reactor {
                 event: ReactorFact::Dispatched { call, .. },
                 ..
-            } => Some(*call),
+            } => Some(CallRef { call: *call }),
             _ => None,
         })
         .collect();
     log.entries().iter().any(|entry| {
-        matches!(
-            operation_fact(HEADER_SERVICE, &entry.obs),
-            Some(StorageFact::Submitted { call: Some(call), .. }) if dispatched.contains(call)
-        )
+        let Some(StorageFact::Submitted {
+            call: Some(call), ..
+        }) = operation_fact(HEADER_SERVICE, &entry.obs)
+        else {
+            return false;
+        };
+        let call = CallRef { call: *call };
+        !CallRef::joined(&call, &dispatched, |at| Some(at.clone())).is_empty()
     })
 }
 
@@ -3928,6 +3933,24 @@ mod tests {
         let mut flagged = ObservationLog::default();
         log_publisher(&mut flagged);
         assert!(storage_call_dispatched(&dispatch_view(true), &flagged));
+
+        // The submission joins the dispatch by its whole call (Rule 25's
+        // template): the call moved finds no dispatch.
+        use crate::harness::header_acceptance::refs::{one_key_off::assert_one_key_off, CallRef};
+        assert_one_key_off::<CallRef>(&CallRef { call: 1 }, |call| {
+            let mut log = ObservationLog::default();
+            log_storage(
+                &mut log,
+                StorageFact::Submitted {
+                    id: 3,
+                    request: StorageRequest::ContinuationLocator,
+                    digest: String::new(),
+                    call: Some(call.call),
+                },
+            );
+            log_dispatched(&mut log, 1);
+            storage_call_dispatched(&dispatch_view(false), &log)
+        });
     }
 
     /// A harness with no view, for checks that read only the log.

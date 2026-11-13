@@ -28,7 +28,7 @@
 
 use std::{collections::BTreeMap, sync::OnceLock};
 
-use super::{rows::harness_matrix, CaseRef, ExpectedNa};
+use super::{rows::harness_matrix, CaseRef, ExpectedNa, HistoryRef, RunId};
 use crate::NaReason;
 
 /// `header-sync/wire`.
@@ -1527,3 +1527,1449 @@ pub fn patched_expected(case: CaseRef) -> Option<&'static [ExpectedNa]> {
         .get(&(case.property, case.name))
         .and_then(|(_, patched)| patched.as_deref())
 }
+
+/// The IDs every recorded `header-sync/flood` history holds.
+const FLOOD_HOLDS: &[&str] = &[
+    "harness/direct-dispatch",
+    "header-sync/chunk-budget-bound",
+    "header-sync/commit-only-authorized",
+    "header-sync/expected-chain-selected",
+    "header-sync/outstanding-work-bounded",
+    "header-sync/reset-invalidates-work",
+    "header-sync/stale-chain-effect-inert",
+    "header-sync/state-publication-consistent",
+    "header-sync/storage-operation-ids",
+    "header-sync/watch-observed-under-flood",
+    "header-sync/watch-observed-under-lifecycle-flood",
+    "sim/no-task-panic",
+];
+
+/// The IDs every recorded `header-sync/liveness` history holds.
+const LIVENESS_HOLDS: &[&str] = &[
+    "harness/direct-dispatch",
+    "header-sync/chunk-budget-bound",
+    "header-sync/commit-only-authorized",
+    "header-sync/expected-chain-selected",
+    "header-sync/outstanding-work-bounded",
+    "header-sync/reset-invalidates-work",
+    "header-sync/state-publication-consistent",
+    "header-sync/storage-operation-ids",
+    "header-sync/teardown-returns-baseline",
+    "sim/no-livelock",
+    "sim/no-task-panic",
+];
+
+/// The IDs every recorded `header-sync/release-wake` history holds.
+const RELEASE_WAKE_HOLDS: &[&str] = &[
+    "harness/direct-dispatch",
+    "header-sync/capacity-release-wakes",
+    "header-sync/chunk-budget-bound",
+    "header-sync/commit-only-authorized",
+    "header-sync/expected-chain-selected",
+    "header-sync/outstanding-work-bounded",
+    "header-sync/reset-invalidates-work",
+    "header-sync/stale-chain-effect-inert",
+    "header-sync/stale-completion-inert",
+    "header-sync/state-publication-consistent",
+    "header-sync/storage-operation-ids",
+    "header-sync/teardown-returns-baseline",
+    "sim/no-task-panic",
+];
+
+/// The IDs every recorded `header-sync/repair` history holds.
+const REPAIR_HOLDS: &[&str] = &[
+    "harness/direct-dispatch",
+    "header-sync/chunk-budget-bound",
+    "header-sync/commit-only-authorized",
+    "header-sync/expected-chain-selected",
+    "header-sync/outstanding-work-bounded",
+    "header-sync/peer-retirement-progress",
+    "header-sync/reset-invalidates-work",
+    "header-sync/stale-completion-inert",
+    "header-sync/state-publication-consistent",
+    "header-sync/storage-operation-ids",
+    "header-sync/teardown-returns-baseline",
+    "sim/no-task-panic",
+];
+
+/// The IDs every recorded `header-sync/smoke` history holds.
+const SMOKE_HOLDS: &[&str] = &["sim/no-task-panic"];
+
+/// The IDs every recorded `header-sync/storage` history holds.
+const STORAGE_HOLDS: &[&str] = &[
+    "harness/direct-dispatch",
+    "header-sync/chunk-budget-bound",
+    "header-sync/commit-only-authorized",
+    "header-sync/expected-chain-selected",
+    "header-sync/outstanding-work-bounded",
+    "header-sync/state-publication-consistent",
+    "sim/no-task-panic",
+];
+
+/// The IDs every recorded `header-sync/wire` history holds.
+const WIRE_HOLDS: &[&str] = &[
+    "harness/direct-dispatch",
+    "header-sync/chunk-budget-bound",
+    "header-sync/commit-only-authorized",
+    "header-sync/s5v9/conformant-never-closes",
+    "header-sync/s5v9/status/sender-cadence",
+    "session/honest-never-punished",
+    "sim/no-task-panic",
+];
+
+/// One group of counted histories, as the acceptance tool's recordings of
+/// them at the closing PR's head report them (round 9): the IDs of its
+/// harness that hold, its target among them, and those whose assumptions
+/// its scenario doesn't declare. Every other ID [`harness_matrix`]
+/// registers on its harness never applied there.
+struct HistoryNa {
+    /// The harness its histories run on.
+    harness: &'static str,
+    /// Their witness test's file.
+    file: &'static str,
+    /// Their witness test.
+    test: &'static str,
+    /// Its cases, each the start of a case name, so `held-locator ` names
+    /// every plan of that witness and `""` every case of the test. A
+    /// history must match exactly one group.
+    cases: &'static [&'static str],
+    /// The IDs that hold, as the union of these lists.
+    applies: &'static [&'static [&'static str]],
+    /// The IDs that are `NotApplicable` as `undeclared`.
+    undeclared: &'static [&'static str],
+}
+
+/// The groups of [`HISTORIES`] `history` matches: its harness, witness
+/// test and a case prefix.
+fn history_groups(history: HistoryRef) -> impl Iterator<Item = &'static HistoryNa> {
+    HISTORIES.iter().filter(move |group| {
+        group.harness == history.harness
+            && group.file == history.witness.file
+            && group.test == history.witness.test
+            && group
+                .cases
+                .iter()
+                .any(|prefix| history.case.starts_with(prefix))
+    })
+}
+
+/// How many groups of [`HISTORIES`] `history` matches, for the static
+/// check that each counted node history matches exactly one.
+pub fn history_groups_matched(history: HistoryRef) -> usize {
+    history_groups(history).count()
+}
+
+/// Each group of [`HISTORIES`] none of `histories` matches, by its test
+/// and cases, for the static check that no group outlives its histories.
+pub fn history_groups_unmatched(histories: &[HistoryRef]) -> Vec<String> {
+    HISTORIES
+        .iter()
+        .filter(|group| {
+            !histories
+                .iter()
+                .any(|&history| history_groups(history).any(|g| std::ptr::eq(g, *group)))
+        })
+        .map(|group| format!("{}::{} {:?}", group.file, group.test, group.cases))
+        .collect()
+}
+
+/// The `NotApplicable` reports a counted history's whole-report pass
+/// expects, from the one group of [`HISTORIES`] it matches: each ID of its
+/// harness that doesn't hold, as `undeclared` where its scenario doesn't
+/// declare the ID's assumptions and `never-applied` otherwise. A history no
+/// group matches, such as a machine's, which reports only its own ID,
+/// expects none, so a node history added without its reports can't
+/// verify.
+pub fn history_expected(history: HistoryRef) -> &'static [ExpectedNa] {
+    // Built once per history for a fixed set, so the leak is bounded.
+    static LISTS: OnceLock<std::sync::Mutex<BTreeMap<RunId, &'static [ExpectedNa]>>> =
+        OnceLock::new();
+    let key = RunId::from(history);
+    let lists = LISTS.get_or_init(Default::default);
+    let mut lists = lists
+        .lock()
+        .expect("no test panics while holding the history lists");
+    lists.entry(key).or_insert_with(|| {
+        let Some(group) = history_groups(history).next() else {
+            return &[];
+        };
+        // Neither reason carries a site, so each name is borrowed.
+        let name = |reason: NaReason| -> &'static str {
+            match reason.name() {
+                std::borrow::Cow::Borrowed(name) => name,
+                std::borrow::Cow::Owned(name) => Box::leak(name.into_boxed_str()),
+            }
+        };
+        let (never, undeclared) = (name(NaReason::NeverApplied), name(NaReason::Undeclared));
+        let list: Vec<ExpectedNa> = harness_matrix()
+            .into_iter()
+            .filter(|(harness, id, _)| {
+                *harness == group.harness && !group.applies.iter().any(|ids| ids.contains(id))
+            })
+            .map(|(_, id, _)| ExpectedNa {
+                property: id,
+                reason: if group.undeclared.contains(&id) {
+                    undeclared
+                } else {
+                    never
+                },
+            })
+            .collect();
+        Box::leak(list.into_boxed_slice())
+    })
+}
+
+/// Each node-harness history a row judges, grouped by what its run
+/// reports: from the acceptance tool's recording of each at the closing
+/// PR's head (round 9), and for the 32 storage-operation-ids plans and the
+/// smoke run, which the tool can't record yet, from their witness tests'
+/// own runs of the same declared histories.
+static HISTORIES: &[HistoryNa] = &[
+    HistoryNa {
+        harness: "header-sync/flood",
+        file: "tests/header_flood_watch.rs",
+        test: "the_committed_flood_inputs_hold_their_watch_rules",
+        cases: &["committed lifecycle flood input"],
+        applies: &[FLOOD_HOLDS],
+        undeclared: &["sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/flood",
+        file: "tests/header_flood_watch.rs",
+        test: "the_committed_flood_inputs_hold_their_watch_rules",
+        cases: &["committed wire flood input"],
+        applies: &[FLOOD_HOLDS, &["header-sync/teardown-returns-baseline"]],
+        undeclared: &["sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/liveness",
+        file: "tests/header_hold_release.rs",
+        test: "the_committed_fixtures_match_their_names",
+        cases: &["header-hold-held-apply"],
+        applies: &[
+            LIVENESS_HOLDS,
+            &[
+                "header-sync/hold-release-wakes",
+                "header-sync/stale-chain-effect-inert",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/liveness",
+        file: "tests/header_hold_release.rs",
+        test: "the_committed_fixtures_match_their_names",
+        cases: &["header-hold-held-locator", "header-hold-serving-read"],
+        applies: &[LIVENESS_HOLDS, &["header-sync/hold-release-wakes"]],
+        undeclared: &["header-sync/bounded-adversary-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/liveness",
+        file: "tests/header_hold_release.rs",
+        test: "the_committed_fixtures_match_their_names",
+        cases: &["header-hold-held-prepare"],
+        applies: &[
+            LIVENESS_HOLDS,
+            &[
+                "header-sync/hold-release-wakes",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/liveness",
+        file: "tests/header_peer_retirement.rs",
+        test: "the_committed_fixtures_match_their_names",
+        cases: &[
+            "header-retire-applying-relink",
+            "header-retire-late-page",
+            "header-retire-preparing-close",
+            "header-retire-preparing-relink",
+            "header-retire-receiving-close",
+            "header-retire-receiving-relink",
+            "header-retire-timeout",
+        ],
+        applies: &[
+            LIVENESS_HOLDS,
+            &[
+                "header-sync/hold-release-wakes",
+                "header-sync/peer-retirement-progress",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/liveness",
+        file: "tests/header_peer_retirement.rs",
+        test: "the_committed_fixtures_match_their_names",
+        cases: &["header-retire-awaiting-close"],
+        applies: &[
+            LIVENESS_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/liveness",
+        file: "tests/header_recovery_progress.rs",
+        test: "the_committed_fixtures_match_their_names",
+        cases: &["header-recovery-closes"],
+        applies: &[
+            LIVENESS_HOLDS,
+            &[
+                "header-sync/bounded-adversary-progress",
+                "header-sync/peer-retirement-progress",
+                "header-sync/stale-chain-effect-inert",
+            ],
+        ],
+        undeclared: &[],
+    },
+    HistoryNa {
+        harness: "header-sync/liveness",
+        file: "tests/header_recovery_progress.rs",
+        test: "the_committed_fixtures_match_their_names",
+        cases: &["header-recovery-departure"],
+        applies: &[
+            LIVENESS_HOLDS,
+            &[
+                "header-sync/bounded-adversary-progress",
+                "header-sync/hold-release-wakes",
+                "header-sync/peer-retirement-progress",
+                "header-sync/stale-chain-effect-inert",
+            ],
+        ],
+        undeclared: &[],
+    },
+    HistoryNa {
+        harness: "header-sync/liveness",
+        file: "tests/header_recovery_progress.rs",
+        test: "the_committed_fixtures_match_their_names",
+        cases: &["header-recovery-faults"],
+        applies: &[
+            LIVENESS_HOLDS,
+            &[
+                "header-sync/bounded-adversary-progress",
+                "header-sync/hold-release-wakes",
+                "header-sync/stale-chain-effect-inert",
+            ],
+        ],
+        undeclared: &[],
+    },
+    HistoryNa {
+        harness: "header-sync/liveness",
+        file: "tests/header_recovery_progress.rs",
+        test: "the_committed_fixtures_match_their_names",
+        cases: &["header-recovery-successor"],
+        applies: &[
+            LIVENESS_HOLDS,
+            &[
+                "header-sync/bounded-adversary-progress",
+                "header-sync/stale-chain-effect-inert",
+            ],
+        ],
+        undeclared: &[],
+    },
+    HistoryNa {
+        harness: "header-sync/release-wake",
+        file: "tests/header_release_wake.rs",
+        test: "the_release_wake_input_holds_capacity_release_wakes",
+        cases: &[""],
+        applies: &[RELEASE_WAKE_HOLDS],
+        undeclared: &["sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/repair",
+        file: "tests/header_repair.rs",
+        test: "the_committed_repair_inputs_hold_outstanding_work_bounded",
+        cases: &[
+            "committed header-repair-applied input",
+            "committed header-repair-apply-departs input",
+            "committed header-repair-prepare-departs input",
+        ],
+        applies: &[REPAIR_HOLDS, &["header-sync/stale-chain-effect-inert"]],
+        undeclared: &["sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/repair",
+        file: "tests/header_repair.rs",
+        test: "the_committed_repair_inputs_hold_outstanding_work_bounded",
+        cases: &["committed header-repair-supplier-pruned input"],
+        applies: &[REPAIR_HOLDS],
+        undeclared: &["sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/smoke",
+        file: "tests/harness.rs",
+        test: "a_clean_run_holds_no_task_panic",
+        cases: &[""],
+        applies: &[SMOKE_HOLDS],
+        undeclared: &["sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_authority.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &["forks-sharing-a-header ", "multi-page-sync "],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_authority.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &["harness-commit "],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/storage-operation-ids",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_authority.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &["relinked-mid-round "],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_chain_selected.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &[
+            "equal-work ",
+            "heavier-offered-to-longer ",
+            "invalidated-then-reconsidered ",
+            "stronger-first ",
+            "stronger-last ",
+            "three-forks ",
+        ],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_chain_selected.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &["harness-commit "],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/storage-operation-ids",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_mixed_resources.rs",
+        test: "the_mixed_fixture_holds_every_resource_rule",
+        cases: &[""],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_node.rs",
+        test: "node_syncs_from_a_mirror_on_controlled_storage",
+        cases: &[""],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_node_capacity.rs",
+        test: "the_close_relink_input_holds_chunk_budget_bound",
+        cases: &[""],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_outstanding.rs",
+        test: "the_committed_witnesses_hold_outstanding_work_bounded",
+        cases: &[
+            "header-authority-forks-sharing-a-header",
+            "header-reset-held-apply",
+            "header-reset-held-reply",
+        ],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_outstanding.rs",
+        test: "the_committed_witnesses_hold_outstanding_work_bounded",
+        cases: &[
+            "header-authority-relinked-mid-round",
+            "header-outstanding-churn",
+        ],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_outstanding.rs",
+        test: "the_committed_witnesses_hold_outstanding_work_bounded",
+        cases: &["header-outstanding-capacity-waits"],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_outstanding.rs",
+        test: "the_committed_witnesses_hold_outstanding_work_bounded",
+        cases: &["header-outstanding-serving-churn"],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_outstanding.rs",
+        test: "the_committed_witnesses_hold_outstanding_work_bounded",
+        cases: &["header-outstanding-serving-replaced"],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_outstanding.rs",
+        test: "the_committed_witnesses_hold_outstanding_work_bounded",
+        cases: &["header-reset-quiet-reset", "header-reset-quiet-reset-deep"],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_publication.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &[
+            "grow ",
+            "served-across-a-reset plan 4 of inputs(8, 256)",
+            "served-from-a-lower-locator ",
+            "sync ",
+        ],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_publication.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &["harness-commit "],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/storage-operation-ids",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_publication.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &[
+            "invalidate-only ",
+            "served-across-a-reset plan 0 of inputs(8, 256)",
+            "served-across-a-reset plan 1 of inputs(8, 256)",
+            "served-across-a-reset plan 2 of inputs(8, 256)",
+            "served-across-a-reset plan 3 of inputs(8, 256)",
+            "served-across-a-reset plan 5 of inputs(8, 256)",
+            "served-across-a-reset plan 6 of inputs(8, 256)",
+            "served-across-a-reset plan 7 of inputs(8, 256)",
+            "served-after-growth ",
+        ],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_publication.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &["quiet-reset ", "reset-inside-status-floor "],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_publication.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &["served ", "served-in-pages "],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_publication.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &["served-one-header "],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/storage-operation-ids",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_publication.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &["startup-only "],
+        applies: &[STORAGE_HOLDS],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_reset_invalidates.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &[
+            "completion-before-adoption ",
+            "held-apply ",
+            "held-locator ",
+            "held-prepare ",
+            "held-reply ",
+            "tip-reuse ",
+            "two-forks ",
+        ],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_reset_invalidates.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &["quiet-reset ", "quiet-reset-deep "],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_reset_invalidates.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &["session-replaced-read "],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_stale.rs",
+        test: "the_stale_prepare_input_holds_stale_completion_inert",
+        cases: &[""],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_stale_chain.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &[
+            "fork-stale-apply ",
+            "pre-reset-commit ",
+            "refused-across-reset ",
+        ],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_stale_chain.rs",
+        test: "every_witness_holds_and_applies",
+        cases: &["reset-inside-status-floor "],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/storage",
+        file: "tests/header_teardown.rs",
+        test: "the_close_relink_input_holds_teardown_returns_baseline",
+        cases: &[""],
+        applies: &[
+            STORAGE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_progress.rs",
+        test: "the_progress_fixture_holds_honest_progress",
+        cases: &[""],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/honest-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "each_invalid_label_witness_has_a_conformant_control",
+        cases: &[
+            "headers-outcome/min-payload",
+            "headers/max-payload",
+            "headers/min-payload",
+        ],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "each_invalid_label_witness_has_a_conformant_control",
+        cases: &["status/min-payload"],
+        applies: &[WIRE_HOLDS, &["sim/no-livelock"]],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "each_invalid_label_witness_has_a_conformant_control",
+        cases: &[
+            "subscribe-headers/min-payload",
+            "subscribe-headers/second-open",
+        ],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers/sender-answers-open",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "every_generated_property_applies_in_its_witness",
+        cases: &[""],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers-outcome/sender-ends-once",
+                "header-sync/s5v9/headers/sender-answers-open",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "headers_faults_apply_in_their_witnesses",
+        cases: &["headers/bad-content-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers/bad-content-closes",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "headers_faults_apply_in_their_witnesses",
+        cases: &["headers/long-payload-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers/long-payload-closes",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "headers_faults_apply_in_their_witnesses",
+        cases: &["headers/reserved-flags-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers/reserved-flags-closes",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "headers_faults_apply_in_their_witnesses",
+        cases: &["headers/short-payload-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers/short-payload-closes",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "headers_faults_apply_in_their_witnesses",
+        cases: &["headers/unsolicited-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/s5v9/headers/unsolicited-closes",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "headers_outcome_faults_apply_in_their_witnesses",
+        cases: &["headers-outcome/bad-content-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers-outcome/bad-content-closes",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "headers_outcome_faults_apply_in_their_witnesses",
+        cases: &["headers-outcome/long-payload-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers-outcome/long-payload-closes",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "headers_outcome_faults_apply_in_their_witnesses",
+        cases: &["headers-outcome/reserved-flags-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers-outcome/reserved-flags-closes",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "headers_outcome_faults_apply_in_their_witnesses",
+        cases: &["headers-outcome/short-payload-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers-outcome/short-payload-closes",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "headers_outcome_faults_apply_in_their_witnesses",
+        cases: &["headers-outcome/unsolicited-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/s5v9/headers-outcome/unsolicited-closes",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "honest_peer_never_punished",
+        cases: &["both ways"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers-outcome/sender-ends-once",
+                "header-sync/s5v9/headers/sender-answers-open",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "honest_peer_never_punished",
+        cases: &["bystander"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/s5v9/status/short-payload-closes",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "honest_peer_never_punished",
+        cases: &["lossy "],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "honest_peer_never_punished",
+        cases: &["redial"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/stale-chain-effect-inert",
+                "header-sync/stale-completion-inert",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "status_faults_apply_in_their_witnesses",
+        cases: &["status/bad-content-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/s5v9/status/bad-content-closes",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "status_faults_apply_in_their_witnesses",
+        cases: &["status/cadence-never-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/s5v9/status/cadence-never-closes",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "status_faults_apply_in_their_witnesses",
+        cases: &["status/long-payload-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/s5v9/status/long-payload-closes",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "status_faults_apply_in_their_witnesses",
+        cases: &["status/reserved-flags-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/s5v9/status/reserved-flags-closes",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "status_faults_apply_in_their_witnesses",
+        cases: &["status/short-payload-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/s5v9/status/short-payload-closes",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "status_faults_apply_in_their_witnesses",
+        cases: &["undeclared-type-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &["header-sync/s5v9/undeclared-type-closes", "sim/no-livelock"],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        cases: &["subscribe-headers/after-close-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers/sender-answers-open",
+                "header-sync/s5v9/subscribe-headers/after-close-closes",
+                "header-sync/storage-operation-ids",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        cases: &["subscribe-headers/bad-content-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/s5v9/subscribe-headers/bad-content-closes",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        cases: &["subscribe-headers/bad-cursor-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers/sender-answers-open",
+                "header-sync/s5v9/subscribe-headers/bad-cursor-closes",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        cases: &["subscribe-headers/long-payload-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/s5v9/subscribe-headers/long-payload-closes",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        cases: &["subscribe-headers/over-credit-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/subscribe-headers/over-credit-closes",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        cases: &["subscribe-headers/over-live-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/peer-retirement-progress",
+                "header-sync/reset-invalidates-work",
+                "header-sync/s5v9/headers/sender-answers-open",
+                "header-sync/s5v9/subscribe-headers/over-live-closes",
+                "header-sync/s5v9/subscribe-headers/sender-within-credit",
+                "header-sync/s5v9/subscribe-headers/sender-within-live",
+                "header-sync/storage-operation-ids",
+                "header-sync/teardown-returns-baseline",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        cases: &["subscribe-headers/reserved-flags-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/s5v9/subscribe-headers/reserved-flags-closes",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_witness.rs",
+        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        cases: &["subscribe-headers/short-payload-closes"],
+        applies: &[
+            WIRE_HOLDS,
+            &[
+                "header-sync/s5v9/subscribe-headers/short-payload-closes",
+                "sim/no-livelock",
+            ],
+        ],
+        undeclared: &["header-sync/honest-progress"],
+    },
+];

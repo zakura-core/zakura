@@ -286,16 +286,23 @@ fn held_applied(report: &RunReport, id: &str) {
 }
 
 /// The one update that crossed the node's ending in `observations`,
-/// labelled `label`, which must be the frame `act` wrote.
+/// labelled `label`, which must be the frame `act` wrote ([`act_wrote`]).
 fn crossed_act(observations: &[Observation], act: Act, label: Label) -> FrameRef {
     let Crossed { update, .. } =
         crossed(observations, label).unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(
-        act_frame(observations, act).as_ref(),
-        Some(&update),
-        "{act:?}"
-    );
+    act_wrote(observations, act, &update).unwrap_or_else(|error| panic!("{error}"));
     update
+}
+
+/// Requires that `update` is the frame `act` wrote in `observations`
+/// ([`act_frame`]), joined on its whole [`FrameRef`].
+fn act_wrote(observations: &[Observation], act: Act, update: &FrameRef) -> Result<(), String> {
+    let written = act_frame(observations, act).ok_or_else(|| format!("{act:?} wrote no frame"))?;
+    if FrameRef::joins(update, &written, |written| Some(written.clone())) {
+        Ok(())
+    } else {
+        Err(format!("{act:?} wrote {written:?}, not {update:?}"))
+    }
 }
 
 /// Checks `act`'s conformant crossing history: the run ends with no harness
@@ -439,6 +446,23 @@ fn an_act_s_frame_joins_its_quic_stream() {
         act_frame(&moved, act) == Some(written.clone())
     });
     assert_eq!(keys, 2);
+}
+
+/// The crossed update is the act's own frame on its whole [`FrameRef`]:
+/// the outcome crossing's update joins the frame its act wrote, and the
+/// same update with any one key moved, its QUIC stream's and direction's
+/// included, is another frame (Rule 25's template).
+#[test]
+fn a_crossed_update_joins_the_act_s_frame() {
+    let report = saved_outcome_crossing();
+    let observations = observations(&report);
+    let act = Act::OutcomeCrossing;
+    let Crossed { update, .. } =
+        crossed(&observations, Label::Conformant).expect("the act's update crossed");
+    let keys = assert_one_key_off::<FrameRef>(&update, |update| {
+        act_wrote(&observations, act, update).is_ok()
+    });
+    assert_eq!(keys, 6);
 }
 
 /// A `Grant` above the window crosses the node's ending, labelled

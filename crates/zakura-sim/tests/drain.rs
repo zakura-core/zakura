@@ -1219,6 +1219,14 @@ fn a_dry_end_leaves_an_unread_trigger_unsettled() {
     assert_eq!(outcome, unsettled(Pending::UnreadTrigger));
 }
 
+/// D4: an adopted tip's unpublished mark at a dry end is unsettled.
+#[test]
+fn a_dry_end_leaves_an_unpublished_tip_unsettled() {
+    let (outcome, end) = marked_at_a_dry_end(Pending::TipUnpublished, false);
+    assert_eq!(end.harness, None);
+    assert_eq!(outcome, unsettled(Pending::TipUnpublished));
+}
+
 /// Generators started before the drain are retired at its start: a
 /// registered sender stops without closing its link, and one registered
 /// after is cancelled at once.

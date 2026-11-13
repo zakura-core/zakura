@@ -287,6 +287,67 @@ pub struct TriggerRef {
 }
 impl Ref for TriggerRef {}
 
+/// One fact of a node's `ends` store, by the stamp the store records it
+/// under, which its `causes` name it by.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StampRef {
+    /// The stamp.
+    pub stamp: u64,
+}
+impl Ref for StampRef {}
+
+/// One `peer:` pick of a trace, or the declared action it takes: the
+/// peer it acts on and the action, as `peer:<peer>:<action>` spells them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickRef {
+    /// The peer, by harness name, or `node`.
+    pub peer: String,
+    /// The action's name.
+    pub action: String,
+}
+impl Ref for PickRef {}
+
+/// One reactor call, by the number its reactor gives it: the whole of what
+/// a storage submission names of the call that submitted it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRef {
+    /// The reactor call.
+    pub call: u64,
+}
+impl Ref for CallRef {}
+
+/// One frame a peer sent the node, as its `PeerFrame` and the node's
+/// `FrameJudged` of it name it: its connection, its stream's kind and
+/// version, its QUIC stream, if its harness has one, and its sequence. A
+/// [`FrameRef`] without the direction, which both name inbound, and whose
+/// QUIC stream may be absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerFrameRef {
+    /// The connection.
+    pub connection: u64,
+    /// The stream's kind.
+    pub kind: u16,
+    /// The stream's version.
+    pub version: u16,
+    /// The QUIC stream, or `None` for a harness with none.
+    pub quic_stream: Option<u64>,
+    /// The frame's position among the peer's frames on the stream.
+    pub seq: u64,
+}
+impl Ref for PeerFrameRef {}
+
+/// One session as a store that keys its lives by session ID alone names
+/// it, the topology's
+/// [`SessionLife`](crate::harness::header_node::adoption::SessionLife)s,
+/// which hold one session per link in a run, so the ID is the whole
+/// identity they carry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionIdRef {
+    /// The session.
+    pub session_id: u64,
+}
+impl Ref for SessionIdRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

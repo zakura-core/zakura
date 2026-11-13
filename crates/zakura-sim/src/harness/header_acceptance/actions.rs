@@ -16,13 +16,13 @@
 //! A policy hold is a constraint on storage completions, not an act, so it
 //! isn't an action here. Its scripted `Release` step is. Neither is a step
 //! a harness source offers by its own condition rather than a script
-//! ([`HARNESS_DRIVEN`]), whose own properties judge it.
+//! ([`harness_driven`]), whose own properties judge it.
 
 use serde_json::Value;
 
 use super::{
     evaluate::{Actions, End},
-    refs::{ControlRef, LinkRef, Ref, SessionRef},
+    refs::{ControlRef, LinkRef, PickRef, Ref, SessionRef, StampRef},
 };
 use crate::{
     harness::{
@@ -37,23 +37,41 @@ use crate::{
     trace::Trace,
 };
 
-/// The `peer:` actions a harness source offers when its own condition
+/// The actions a harness source offers as `node` when its own condition
 /// comes due, not from a scenario's script: liveness and recovery's
-/// `node:finish`, release-wake's `node:settle`, and recovery's `recovered`,
-/// `recovery-relink` and `recovery-unreached`. A pick of one isn't an
-/// undeclared action.
-pub const HARNESS_DRIVEN: [&str; 5] = [
-    "finish",
-    "settle",
-    "recovered",
-    "recovery-relink",
-    "recovery-unreached",
-];
+/// `finish`, release-wake's `settle`, and recovery's `recovered` and
+/// `recovery-unreached`.
+const NODE_DRIVEN: [&str; 4] = ["finish", "settle", "recovered", "recovery-unreached"];
 
-/// Whether `pick` is a [`HARNESS_DRIVEN`] action.
-fn harness_driven(pick: &str) -> bool {
-    pick.rsplit_once(':')
-        .is_some_and(|(_, action)| HARNESS_DRIVEN.contains(&action))
+/// The action recovery offers as its source peer, the peer a `Recover`
+/// step names, while that peer has no live session.
+const RECOVERY_RELINK: &str = "recovery-relink";
+
+/// Every `peer:` pick a harness source offers by its own condition in a run
+/// that declares `declared`, not from a scenario's script, whole: each of
+/// [`NODE_DRIVEN`] as `node`, and [`RECOVERY_RELINK`] as each `Recover`
+/// step's peer. A pick of one isn't an undeclared action. Another peer's
+/// pick of one of those actions is, since no source offers it.
+fn harness_driven(declared: &[Declared]) -> Vec<PickRef> {
+    let node = NODE_DRIVEN.iter().map(|action| PickRef {
+        peer: "node".to_owned(),
+        action: (*action).to_owned(),
+    });
+    let recover = ControlAction::Recover.name();
+    let sources = declared
+        .iter()
+        .filter(|action| action.control.is_some() && action.pick.action == recover)
+        .map(|action| PickRef {
+            peer: action.pick.peer.clone(),
+            action: RECOVERY_RELINK.to_owned(),
+        });
+    node.chain(sources).collect()
+}
+
+/// Whether `pick` is one of `driven` ([`harness_driven`]), joined by its
+/// whole [`PickRef`], so an action's name alone never makes a pick driven.
+fn is_harness_driven(driven: &[PickRef], pick: &PickRef) -> bool {
+    !PickRef::joined(pick, driven, |at| Some(at.clone())).is_empty()
 }
 
 /// What shows that a picked action took effect.
@@ -136,11 +154,21 @@ const PEER_CLOSED: &str = "accept_failed";
 /// peer finished its header stream.
 const STREAM_FINISHED: &str = "stream_closed";
 
+/// The `peer:<peer>:<action>` pick `pick` names, or `None` for one that
+/// isn't a `peer:` pick of that shape. A peer's name holds no `:`.
+fn pick_ref(pick: &str) -> Option<PickRef> {
+    let (peer, action) = pick.strip_prefix("peer:")?.split_once(':')?;
+    Some(PickRef {
+        peer: peer.to_owned(),
+        action: action.to_owned(),
+    })
+}
+
 /// One action a history's bound scenario declares.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Declared {
-    /// The pick that takes it: `peer:<peer>:<action>`.
-    pub pick: String,
+    /// The pick that takes it.
+    pub pick: PickRef,
     /// Which script it belongs to, whose actions are picked in order: the
     /// control script, or one peer's.
     pub script: String,
@@ -211,7 +239,10 @@ fn controls(scenario: &StorageScenario) -> Vec<Declared> {
                 | ControlAction::RepairStatus { .. } => Effect::AtPick,
             };
             Declared {
-                pick: format!("peer:{}:{}", step.peer, step.action.name()),
+                pick: PickRef {
+                    peer: step.peer.clone(),
+                    action: step.action.name().to_owned(),
+                },
                 script: "control".to_owned(),
                 control: Some(position),
                 effect,
@@ -248,7 +279,10 @@ fn peers(scenario: &WireScenario) -> Vec<Declared> {
                 | PeerAction::Discover { .. } => Effect::Unshown,
             };
             declared.push(Declared {
-                pick: format!("peer:{name}:{}", action.name()),
+                pick: PickRef {
+                    peer: name.clone(),
+                    action: action.name().to_owned(),
+                },
                 script: name.clone(),
                 control: None,
                 effect,
@@ -322,17 +356,13 @@ fn leading_number<T: std::str::FromStr>(text: &str) -> Option<T> {
     text[..end].parse().ok()
 }
 
-/// Every `Environment` fact the full report's `ends` store holds, in stamp
-/// order, with its stamp, connection and cause, read from its `Debug`
-/// snapshot: `facts: [(<stamp>, Environment { peer: "<peer>", connection:
-/// Some(<id>) | None, action: <action> }), ...], causes: [(<stamp>,
-/// <position>), ...]`. Empty if the store isn't there.
-fn environment_facts(report: &FullReport) -> Vec<Fact> {
-    let Some(text) = snapshot(report, "ends").and_then(Value::as_str) else {
-        return Vec::new();
-    };
+/// The `ends` store's `Debug` snapshot `text` split into its facts and its
+/// causes, each cause as the stamp of the fact it names and the position in
+/// the control script of the step whose execution recorded that fact:
+/// `facts: [...], causes: [(<stamp>, <position>), ...]`.
+fn ends_causes(text: &str) -> (&str, Vec<(StampRef, usize)>) {
     let (facts, causes) = text.split_once("causes: [").unwrap_or((text, ""));
-    let causes: Vec<(u64, usize)> = causes
+    let causes = causes
         .split(']')
         .next()
         .unwrap_or("")
@@ -340,9 +370,34 @@ fn environment_facts(report: &FullReport) -> Vec<Fact> {
         .skip(1)
         .filter_map(|pair| {
             let (stamp, position) = pair.split_once(',')?;
-            Some((leading_number(stamp)?, leading_number(position)?))
+            let stamp = StampRef {
+                stamp: leading_number(stamp)?,
+            };
+            Some((stamp, leading_number(position)?))
         })
         .collect();
+    (facts, causes)
+}
+
+/// The control-script position `causes` names for the fact `fact` stamps,
+/// joined by its whole [`StampRef`], so a fact never takes the cause of
+/// another fact's stamp.
+fn cause_of(causes: &[(StampRef, usize)], fact: &StampRef) -> Option<usize> {
+    StampRef::joined(fact, causes, |(at, _)| Some(at.clone()))
+        .first()
+        .map(|(_, position)| *position)
+}
+
+/// Every `Environment` fact the full report's `ends` store holds, in stamp
+/// order, with its stamp, connection and cause, read from its `Debug`
+/// snapshot: `facts: [(<stamp>, Environment { peer: "<peer>", connection:
+/// Some(<id>) | None, action: <action> }), ...], causes: [...]`
+/// ([`ends_causes`]). Empty if the store isn't there.
+fn environment_facts(report: &FullReport) -> Vec<Fact> {
+    let Some(text) = snapshot(report, "ends").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let (facts, causes) = ends_causes(text);
     let mut found = Vec::new();
     let mut chunks = facts.split("Environment { peer: \"");
     let mut before = chunks.next().unwrap_or("");
@@ -369,10 +424,7 @@ fn environment_facts(report: &FullReport) -> Vec<Fact> {
             peer: peer.to_owned(),
             connection,
             action: action.to_owned(),
-            control: causes
-                .iter()
-                .find(|(at, _)| *at == stamp)
-                .map(|&(_, position)| position),
+            control: cause_of(&causes, &StampRef { stamp }),
         });
     }
     found
@@ -494,28 +546,20 @@ impl Sessions {
         LinkRef::joined(link, ended, |(at, _)| Some(at.clone())).len()
     }
 
-    /// Whether the node shows `shows` on `link` the `nth` time, from 0, a
-    /// script acted that way there: a link it admitted for a redial, and
-    /// more ends for the reason a close or finish leaves than acts before
-    /// this one.
-    fn show(&self, link: &LinkRef, shows: LinkShows, nth: usize) -> bool {
-        match shows {
-            LinkShows::Opened => {
-                let opened: Vec<LinkRef> = self
-                    .links
-                    .iter()
-                    .flat_map(|(peer, links)| {
-                        links.iter().map(|&connection| LinkRef {
-                            peer: peer.clone(),
-                            connection,
-                        })
-                    })
-                    .collect();
-                !LinkRef::joined(link, &opened, |at| Some(at.clone())).is_empty()
-            }
-            LinkShows::Ended => self.ends(link, PEER_CLOSED) > nth,
-            LinkShows::Finished => self.ends(link, STREAM_FINISHED) > nth,
-        }
+    /// Whether the node admitted a session on `link`, joined by its whole
+    /// ref, its peer and connection: what shows a redial's link.
+    fn opened(&self, link: &LinkRef) -> bool {
+        let opened: Vec<LinkRef> = self
+            .links
+            .iter()
+            .flat_map(|(peer, links)| {
+                links.iter().map(|&connection| LinkRef {
+                    peer: peer.clone(),
+                    connection,
+                })
+            })
+            .collect();
+        !LinkRef::joined(link, &opened, |at| Some(at.clone())).is_empty()
     }
 }
 
@@ -569,6 +613,20 @@ fn own_effect<'a>(facts: &'a [Fact], named: &[bool], cause: &ControlRef) -> Opti
         .copied()
 }
 
+/// The first of `declared` not yet `picked` that `pick` takes, joined by
+/// its whole [`PickRef`], so a pick never takes another peer's action or
+/// another action of its peer.
+fn next_declared(declared: &[Declared], picked: &[bool], pick: &PickRef) -> Option<usize> {
+    let undone: Vec<(usize, &Declared)> = declared
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| !picked[*at])
+        .collect();
+    PickRef::joined(pick, &undone, |(_, action)| Some(action.pick.clone()))
+        .first()
+        .map(|(at, _)| *at)
+}
+
 /// Whether `run`, a node history's recording that ended `end`, carried
 /// out `declared`: [`Actions::Complete`] for a completed run whose every
 /// declared action was picked, each script's in order, and shown by its
@@ -585,23 +643,29 @@ pub fn judge(
     end: &End,
     witnessed: bool,
 ) -> Actions {
-    let picks: Vec<&str> = trace
+    let driven = harness_driven(declared);
+    let mut picks = Vec::new();
+    for step in trace
         .steps
         .iter()
-        .map(|step| step.pick.as_str())
-        .filter(|pick| pick.starts_with("peer:") && !harness_driven(pick))
-        .collect();
+        .filter(|step| step.pick.starts_with("peer:"))
+    {
+        // A `peer:` pick of no peer and action is undeclared.
+        let Some(pick) = pick_ref(&step.pick) else {
+            return Actions::Incomplete;
+        };
+        if !is_harness_driven(&driven, &pick) {
+            picks.push(pick);
+        }
+    }
     // Each script's actions are picked in order, so each pick takes the
     // next undone declared action of its script with that identity.
     let mut picked = vec![false; declared.len()];
     for pick in &picks {
-        let next = declared
-            .iter()
-            .enumerate()
-            .find(|(at, action)| !picked[*at] && action.pick == *pick);
-        let Some((at, action)) = next else {
+        let Some(at) = next_declared(declared, &picked, pick) else {
             return Actions::Incomplete;
         };
+        let action = &declared[at];
         let earlier_undone = declared[..at]
             .iter()
             .enumerate()
@@ -667,11 +731,18 @@ pub fn judge(
                 }
             }
             Effect::ActRan => witnessed,
+            // The node shows a link act the `nth` time, from 0, a script
+            // acted that way there: a link it admitted for a redial, and
+            // more ends for the reason a close or finish leaves than acts
+            // before this one. Each branch is its own join site, with its
+            // own control.
             Effect::Link { peer, link, shows } => {
                 let nth = acted.entry((peer.clone(), *link, *shows)).or_default();
-                let shown = sessions
-                    .link(peer, *link)
-                    .is_some_and(|at| sessions.show(&at, *shows, *nth));
+                let shown = sessions.link(peer, *link).is_some_and(|at| match shows {
+                    LinkShows::Opened => sessions.opened(&at),
+                    LinkShows::Ended => sessions.ends(&at, PEER_CLOSED) > *nth,
+                    LinkShows::Finished => sessions.ends(&at, STREAM_FINISHED) > *nth,
+                });
                 *nth += 1;
                 shown
             }
@@ -818,6 +889,96 @@ mod tests {
         assert_eq!(joined, 3);
     }
 
+    /// Each pick takes its declared action by its whole [`PickRef`] (Rule
+    /// 25's template): in the close-relink-close history every declared
+    /// action's pick finds the first undone one of its peer and action, and
+    /// the same pick with only its peer, `mirror-1`, which declares
+    /// nothing, or only its action moved finds none.
+    #[test]
+    fn a_pick_joins_its_declared_action_whole() {
+        let (_, _, declared) = close_relink_close();
+        let mut picked = vec![false; declared.len()];
+        for (at, action) in declared.iter().enumerate() {
+            assert_one_key_off::<PickRef>(&action.pick, |pick| {
+                next_declared(&declared, &picked, pick) == Some(at)
+            });
+            picked[at] = true;
+        }
+        assert_eq!(declared.len(), 3);
+        assert_eq!(
+            pick_ref("peer:mirror-0:recovery-relink"),
+            Some(PickRef {
+                peer: "mirror-0".into(),
+                action: "recovery-relink".into(),
+            })
+        );
+        assert_eq!(pick_ref("peer:node"), None);
+    }
+
+    /// A harness-driven pick is ignored only by its whole [`PickRef`]
+    /// (Rule 25's template): `node`'s `finish` and a `Recover` step's
+    /// source's `recovery-relink` are driven, and the same pick with only
+    /// its peer or only its action moved isn't. In the close-relink-close
+    /// history, a `node:finish` pick leaves the run complete, but
+    /// `mirror-0`'s `finish`, which no source offers, is undeclared.
+    #[test]
+    fn a_harness_driven_pick_joins_its_whole_identity() {
+        let (trace, report, declared) = close_relink_close();
+        let recover = Declared {
+            pick: PickRef {
+                peer: "mirror-1".into(),
+                action: "recover".into(),
+            },
+            script: "control".into(),
+            control: Some(3),
+            effect: Effect::AtPick,
+        };
+        let driven = harness_driven(&[recover]);
+        for (peer, action) in [("node", "finish"), ("mirror-1", "recovery-relink")] {
+            let pick = PickRef {
+                peer: peer.into(),
+                action: action.into(),
+            };
+            assert_one_key_off::<PickRef>(&pick, |pick| is_harness_driven(&driven, pick));
+        }
+
+        let with = |pick: &str| {
+            let mut trace = trace.clone();
+            let mut extra = trace.steps.last().expect("the run took steps").clone();
+            extra.pick = pick.to_owned();
+            trace.steps.push(extra);
+            judge(&declared, &trace, &report, &End::Completed, false)
+        };
+        assert_eq!(with("peer:node:finish"), Actions::Complete);
+        assert_eq!(with("peer:mirror-0:finish"), Actions::Incomplete);
+        assert_eq!(with("peer:mirror-0:recovery-relink"), Actions::Incomplete);
+    }
+
+    /// Each fact takes its cause by its whole stamp (Rule 25's template):
+    /// in the close-relink-close history every caused fact's stamp finds
+    /// its own step's position, and the same stamp moved finds none.
+    #[test]
+    fn a_fact_joins_its_cause_by_its_whole_stamp() {
+        let (_, report, _) = close_relink_close();
+        let text = snapshot(&report, "ends")
+            .and_then(Value::as_str)
+            .expect("a node run keeps its ends store");
+        let (_, causes) = ends_causes(text);
+        let facts = environment_facts(&report);
+        let mut caused = 0;
+        for fact in &facts {
+            let Some(position) = fact.control else {
+                continue;
+            };
+            let stamp = StampRef { stamp: fact.stamp };
+            assert_one_key_off::<StampRef>(&stamp, |stamp| {
+                cause_of(&causes, stamp) == Some(position)
+            });
+            caused += 1;
+        }
+        assert_eq!(caused, 3, "{facts:?}");
+    }
+
     /// A control fact names its link only by its whole [`LinkRef`]: in the
     /// close-relink-close history each relink names a link the store
     /// opened, and the same fact with only its peer or connection moved
@@ -921,6 +1082,26 @@ mod tests {
         }
     }
 
+    /// A wire redial joins the node's admissions on its whole link (Rule
+    /// 25's template): the close-and-redial run's second `peer-0` link is
+    /// one the node opened, and the same link with only its peer or only its
+    /// connection moved is none. Its first link is opened too, and the two
+    /// differ, so the redial isn't shown by the first.
+    #[test]
+    fn a_redial_joins_its_whole_link() {
+        let (trace, report, declared) = close_redial();
+        let sessions = Sessions::of(&report);
+        let first = sessions.link("peer-0", 0).expect("peer-0 linked");
+        let redialed = sessions.link("peer-0", 1).expect("the redial linked");
+        assert_ne!(first, redialed);
+        assert!(sessions.opened(&first));
+        assert_one_key_off::<LinkRef>(&redialed, |link| sessions.opened(link));
+        assert_eq!(
+            judge(&declared, &trace, &report, &End::Completed, false),
+            Actions::Complete
+        );
+    }
+
     /// A session's end takes the link its admission names, joined by the
     /// whole session ref (Rule 25's template): in the close-relink-close
     /// history's store, which admits `mirror-0` again on each relink beside
@@ -962,8 +1143,8 @@ mod tests {
         let link = sessions
             .link("peer-0", 0)
             .expect("the node admitted peer-0");
-        assert_one_key_off::<LinkRef>(&link, |link| sessions.show(link, LinkShows::Ended, 0));
-        assert!(!sessions.show(&link, LinkShows::Ended, 1));
+        assert_one_key_off::<LinkRef>(&link, |link| sessions.ends(link, PEER_CLOSED) > 0);
+        assert_eq!(sessions.ends(&link, PEER_CLOSED), 1);
         let judged = |report: &FullReport| judge(&declared, &trace, report, &End::Completed, false);
         assert_eq!(judged(&report), Actions::Complete);
         let ended = "SessionEnded { peer: \"peer-0\", session_id: 16294208416658607535, reason: \"accept_failed\" }";

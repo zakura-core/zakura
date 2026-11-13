@@ -28,8 +28,8 @@ use zakura_network::zakura::observe::ReactorEvent;
 use zakura_sim::harness::header_acceptance::{
     history::run_declared,
     refs::{
-        CallOpRef, DispatchRef, PeerNameRef, Ref, ReleaseRef, StaleCallRef, StorageOpRef,
-        StorageRef, WorkRef,
+        CallOpRef, DispatchRef, PeerNameRef, Ref, ReleaseRef, SessionRef, StaleCallRef,
+        StorageOpRef, StorageRef, WorkRef,
     },
 };
 use zakura_sim::{
@@ -592,7 +592,7 @@ fn witnessed(label: &str, run: &Run) {
     );
     let facts = run.sessions.facts();
     for peer in [SOURCE, SERVED] {
-        let (links, admitted) = links_of(
+        let (links, admissions) = links_of(
             &facts,
             &PeerNameRef {
                 peer: peer.to_owned(),
@@ -603,14 +603,39 @@ fn witnessed(label: &str, run: &Run) {
         };
         assert_ne!(old_connection, new_connection, "{label}: {peer}");
         assert_ne!(old_session, new_session, "{label}: {peer}");
-        assert_eq!(admitted, [old_session, new_session], "{label}: {peer}");
+        assert_eq!(admissions, 2, "{label}: {peer}");
+        for session in [old_session, new_session] {
+            let opened = SessionRef {
+                peer: peer.to_owned(),
+                session,
+            };
+            assert!(
+                admitted(&facts, &opened),
+                "{label}: {opened:?} was admitted"
+            );
+        }
     }
 }
 
-/// `peer`'s links in `facts`, as `(connection, session)`, and the sessions
-/// the node admitted from it, each fact joined on the peer's whole
-/// [`PeerNameRef`].
-fn links_of(facts: &[SessionFact], peer: &PeerNameRef) -> (Vec<(u64, u64)>, Vec<u64>) {
+/// Whether the node admitted `session` in `facts`, joined on its whole
+/// [`SessionRef`]: the peer's harness name and the session.
+fn admitted(facts: &[SessionFact], session: &SessionRef) -> bool {
+    let admission = |fact: &SessionFact| match fact {
+        SessionFact::SessionAdmitted {
+            peer, session_id, ..
+        } => Some(SessionRef {
+            peer: peer.clone(),
+            session: *session_id,
+        }),
+        _ => None,
+    };
+    !SessionRef::joined(session, facts, admission).is_empty()
+}
+
+/// `peer`'s links in `facts`, as `(connection, session)`, and how many
+/// sessions the node admitted from it, each fact joined on the peer's
+/// whole [`PeerNameRef`].
+fn links_of(facts: &[SessionFact], peer: &PeerNameRef) -> (Vec<(u64, u64)>, usize) {
     let named = |fact: &SessionFact| match fact {
         SessionFact::LinkOpened { peer, .. } | SessionFact::SessionAdmitted { peer, .. } => {
             Some(PeerNameRef { peer: peer.clone() })
@@ -618,7 +643,7 @@ fn links_of(facts: &[SessionFact], peer: &PeerNameRef) -> (Vec<(u64, u64)>, Vec<
         _ => None,
     };
     let mut links = Vec::new();
-    let mut admitted = Vec::new();
+    let mut admissions = 0;
     for fact in PeerNameRef::joined(peer, facts, named) {
         match fact {
             SessionFact::LinkOpened {
@@ -626,11 +651,11 @@ fn links_of(facts: &[SessionFact], peer: &PeerNameRef) -> (Vec<(u64, u64)>, Vec<
                 session_id,
                 ..
             } => links.push((*connection, *session_id)),
-            SessionFact::SessionAdmitted { session_id, .. } => admitted.push(*session_id),
+            SessionFact::SessionAdmitted { .. } => admissions += 1,
             _ => {}
         }
     }
-    (links, admitted)
+    (links, admissions)
 }
 
 /// The Plan bytes the committed fixture runs under: a fixed draw.
@@ -717,6 +742,15 @@ fn the_mixed_joins_fail_one_identity_off() {
         let found = links_of(&facts, &own);
         assert_eq!(found.0.len(), 2, "{peer}");
         assert_one_key_off::<PeerNameRef>(&own, |moved| links_of(&facts, moved) == found);
+        // Each link's session joins its admission on its whole ref: the
+        // peer's name or the session moved on its own finds none.
+        for (_, session) in &found.0 {
+            let opened = SessionRef {
+                peer: peer.to_owned(),
+                session: *session,
+            };
+            assert_one_key_off::<SessionRef>(&opened, |opened| admitted(&facts, opened));
+        }
     }
     selected
         .apply_reply_crosses_reset()

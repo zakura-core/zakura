@@ -1884,6 +1884,8 @@ fn a_cooled_supplier_cannot_bring_a_body_in_under_another_source() {
     let (waiter, step) = model.submit(crawled.id, tx(1), Supplier::Peer(legacy(5)), secs(2));
     assert_eq!(step.verdict(waiter), Some(ModelVerdict::CoolingDown));
     assert!(step.started().is_empty(), "its body is not verified");
+    // The change stream hears of it, as today's does.
+    assert_eq!(step.changes, vec![Change::Refused(id(1))]);
     // Nothing is cached, and the slot is free.
     assert_eq!(model.slots_in_use(), 0);
     assert!(model
@@ -3219,6 +3221,10 @@ fn checking_a_transaction_again_and_again_does_not_extend_its_wait_for_a_parent(
             Generation(u64::from(generation)),
             now,
         );
+        if let Some(verdict) = step.verdict(child) {
+            answered = Some((now, verdict));
+            break;
+        }
         let job = step.started()[0];
         now += secs(19);
         let read = stable(u64::from(generation));
@@ -3229,10 +3235,11 @@ fn checking_a_transaction_again_and_again_does_not_extend_its_wait_for_a_parent(
         }
         now += secs(1);
     }
-    // The first check after its sixty seconds is its answer.
+    // Its sixty seconds end while it is parked between checks. The next
+    // input, of any kind, finds the wait over and answers it.
     assert_eq!(
         answered,
-        Some((secs(79), rejected(RejectionScope::ExactTip, Charge::None)))
+        Some((T_PARK, rejected(RejectionScope::ExactTip, Charge::None)))
     );
     assert_eq!(model.slots_in_use(), 0);
 }
@@ -3424,11 +3431,12 @@ fn inputs_that_arrive_one_at_a_time_earn_one_check_after_the_wait_and_no_more() 
         secs(0),
     );
 
-    // After the wait has ended a block wakes the child, and while it is
-    // checked the second parent arrives. That earns one more check.
-    let step = model.transition(transition(1, 101, vec![vec![tx(50)]]), secs(59));
+    // Just before the wait ends a missed event runs the child again. The
+    // check is still running when the wait ends, and while it runs the
+    // second parent arrives. That earns one more check.
+    let step = model.transition(transition(1, 101, vec![vec![tx(50)]]), secs(58));
     assert!(step.started().is_empty());
-    let step = model.resync(Height(102), Generation(2), secs(61));
+    let step = model.resync(Height(102), Generation(2), secs(59));
     let job = step.started()[0];
     admit(&mut model, tx(2), 2, 2);
     let step = model.outcome(
@@ -3451,11 +3459,17 @@ fn inputs_that_arrive_one_at_a_time_earn_one_check_after_the_wait_and_no_more() 
         stable(2),
         secs(63),
     );
+    // No further check is given. This answer is also out of date, because
+    // an input arrived while it was being worked out, so it is not turned
+    // into a remembered rejection. The core has nothing it can trust.
     assert_eq!(
         step.verdict(waiter),
-        Some(rejected(RejectionScope::ExactTip, Charge::None))
+        Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
     );
     assert!(step.started().is_empty());
+    assert!(model
+        .reserve(id(9), peer(8), Intent::Fetch, secs(63))
+        .is_ok());
 }
 
 #[test]
@@ -3536,4 +3550,188 @@ fn a_slot_is_held_at_most_its_limit_however_the_transaction_is_moved_about() {
         Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
     );
     assert_eq!(model.slots_in_use(), 0);
+}
+
+// Cases from the ninth review.
+
+#[test]
+fn the_last_check_is_not_a_cached_rejection_when_the_last_parent_arrived_during_it() {
+    let mut model = new_model();
+    let child = tx(9).spending(hash(1), 0).spending(hash(2), 0);
+    let (waiter, job) = bring_in(&mut model, child, legacy(9));
+    model.outcome(
+        job,
+        Outcome::MissingInputs(vec![output(1, 0), output(2, 0)]),
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+    // A check is running when the wait ends, and the first parent arrives
+    // during it. That earns the one extra check.
+    let step = model.resync(Height(101), Generation(1), secs(59));
+    let job = step.started()[0];
+    admit(&mut model, tx(1), 1, 1);
+    let step = model.outcome(
+        job,
+        Outcome::MissingInputs(vec![output(1, 0), output(2, 0)]),
+        stable(1),
+        stable(1),
+        secs(62),
+    );
+    let job = the_job(&step);
+
+    // The extra check looks for the second parent just before it arrives.
+    admit(&mut model, tx(2), 2, 1);
+    let step = model.outcome(
+        job,
+        Outcome::MissingInputs(vec![output(2, 0)]),
+        stable(1),
+        stable(1),
+        secs(63),
+    );
+    // Both parents are in the pool now. The child may be valid, so it is
+    // not remembered as rejected, and can be submitted again.
+    assert_eq!(
+        step.verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
+    );
+    assert!(model
+        .reserve(id(9), peer(8), Intent::Fetch, secs(63))
+        .is_ok());
+}
+
+#[test]
+fn a_conflict_with_a_hidden_transaction_is_not_a_rejection() {
+    let mut model = new_model();
+    let coin = hash(900);
+    admit(&mut model, tx(1).spending(coin, 0), 1, 0);
+    // The rules change. The pooled transaction is hidden until it has been
+    // checked under the new ones.
+    let mut change = transition(1, 101, vec![vec![]]);
+    change.rules_change = true;
+    let step = model.transition(change, secs(1));
+    let old_job = the_job(&step);
+
+    // A new transaction spends the same output and passes under the new
+    // rules, before the old one's check has answered.
+    let (waiter, job) = bring_in(&mut model, tx(2).spending(coin, 0), legacy(2));
+    let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), secs(2));
+    // Which of the two is valid is not known yet. This is not a rejection,
+    // and nothing is remembered against the new one.
+    assert_eq!(
+        step.verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::PoolUnsettled))
+    );
+
+    // The old one fails under the new rules and leaves. The new one can
+    // come in.
+    model.outcome(
+        old_job,
+        Outcome::Fail {
+            scope: RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
+            charge: Charge::None,
+        },
+        stable(1),
+        stable(1),
+        secs(3),
+    );
+    let (waiter, job) = bring_in(&mut model, tx(2).spending(coin, 0), legacy(2));
+    let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), secs(4));
+    assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
+    model.assert_invariants();
+}
+
+#[test]
+fn a_deadline_that_has_passed_is_applied_before_the_input_that_shows_it() {
+    // A pass that arrives after the slot's limit is too late, whether or
+    // not a tick came first.
+    let mut model = new_model();
+    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    model.outcome(
+        job,
+        Outcome::Pass,
+        stable(0),
+        GenerationRead::Changing,
+        secs(1),
+    );
+    let step = model.transition(transition(1, 101, vec![vec![]]), MAX_UNDECIDED - secs(1));
+    let job = the_job(&step);
+    let step = model.outcome(
+        job,
+        Outcome::Pass,
+        stable(1),
+        stable(1),
+        MAX_UNDECIDED + secs(1),
+    );
+    assert_eq!(
+        step.verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
+    );
+    assert!(model.visible().is_empty());
+
+    // The same for one verification's own limit.
+    let (waiter, job) = bring_in(&mut model, tx(2), legacy(2));
+    let late = MAX_UNDECIDED + secs(1) + T_VERIFY;
+    let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), late);
+    assert_eq!(
+        step.verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
+    );
+
+    // And a chain event that arrives after a parked wait has ended finds
+    // the wait already decided.
+    let (waiter, job) = bring_in(&mut model, child_of(4, 3), legacy(3));
+    model.outcome(job, missing(3), stable(1), stable(1), late);
+    let step = model.transition(transition(2, 102, vec![vec![tx(3)]]), late + T_PARK);
+    assert_eq!(
+        step.verdict(waiter),
+        Some(rejected(RejectionScope::ExactTip, Charge::None))
+    );
+}
+
+#[test]
+fn after_a_reorg_a_passing_verifier_brings_the_whole_pool_back() {
+    let mut model = new_model();
+    let mut run = Run::default();
+    // Two independent transactions, and a parent with its child.
+    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(2), 2, 0);
+    admit(&mut model, tx(3), 3, 0);
+    let (waiter, job) = bring_in(&mut model, child_of(4, 3), legacy(4));
+    let step = model.outcome(
+        job,
+        Outcome::PassUsing(vec![output(3, 0)]),
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+    assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
+    let before = model.visible();
+    assert_eq!(before.len(), 4);
+
+    run.record(model.transition(reorg(1, 100), secs(1)));
+    assert!(model.visible().is_empty());
+    // Every check passes. The child's names the parent it found in the
+    // pool.
+    let mut now = secs(1);
+    for _ in 0..20 {
+        if run.jobs.is_empty() && model.hidden().is_empty() {
+            break;
+        }
+        for job in std::mem::take(&mut run.jobs) {
+            let outcome = if model.hidden() == vec![id(4)] {
+                Outcome::PassUsing(vec![output(3, 0)])
+            } else {
+                Outcome::Pass
+            };
+            run.record(model.outcome(job, outcome, stable(1), stable(1), now));
+        }
+        now += secs(1);
+        run.record(model.tick(now));
+    }
+    // pool/survives-reorg: everything that is still valid is back, and
+    // nothing was thrown away to get there.
+    assert_eq!(model.visible(), before);
+    assert!(model.hidden().is_empty());
+    model.assert_invariants();
 }

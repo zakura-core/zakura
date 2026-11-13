@@ -345,6 +345,9 @@ pub enum LocalFault {
     StaleReservation,
     /// Every caller that could have brought the body gave up.
     NoBody,
+    /// The transaction conflicts with a pooled one that is hidden while it
+    /// is verified again. Which of the two is valid is not known yet.
+    PoolUnsettled,
     /// The body is not the transaction the reservation names.
     WrongTransaction,
     /// The core has stopped.

@@ -708,14 +708,16 @@ impl ReactorModel {
         // The next ask reserves again.
         if let Some(reservation) = self.wanted_at(key).reservation.take() {
             let step = pool.release(reservation, now);
-            self.pool_steps.push(step);
+            self.route(step, now, pool);
         }
         // If the core refused every announcer that had room, try again
         // after a delay. Otherwise the id waits for a request slot, which an
         // answer or a session end frees, and either of those runs this
         // again.
         if refused {
-            Self::back_off(self.wanted_at(key), now);
+            if let Some(wanted) = self.wanted.get_mut(&key) {
+                Self::back_off(wanted, now);
+            }
         }
     }
 
@@ -755,7 +757,10 @@ impl ReactorModel {
             } else {
                 pool.fetch_failed(reservation, now)
             };
-            self.pool_steps.push(step);
+            // Any call into the pool can return a verdict for an earlier
+            // submission, because the pool applies the deadlines that are
+            // due before it handles the call.
+            self.route(step, now, pool);
         }
         self.forget(key);
     }

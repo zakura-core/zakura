@@ -94,6 +94,10 @@ pub const T_PARK: Duration = Duration::from_secs(60);
 /// is about the slot. When it ends the submission is answered with a local
 /// fault, nothing is cached and nobody is charged, because the core never
 /// got a trustworthy answer.
+///
+/// It bounds the admission. A slot kept as a lease, for a fetch that is
+/// still out after another caller's body decided the id, lasts until that
+/// fetch's caller submits or drops, and is that caller's to bound.
 pub const MAX_UNDECIDED: Duration = Duration::from_secs(120);
 
 /// How long the core refuses a peer after a cooldown charge or a violation.
@@ -511,8 +515,6 @@ struct Pooled {
     /// When one of its inputs was first found missing since it was last
     /// visible. Its wait for a parent runs from here.
     missing_since: Option<ModelTime>,
-    /// Whether the one check allowed after that wait ended has been used.
-    last_check_used: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -706,7 +708,7 @@ impl PoolModel {
 
     /// A reservation dropped before the core accepted it.
     pub fn release(&mut self, reservation: ReservationId, now: ModelTime) -> Step {
-        self.advance(now);
+        self.enter(now);
         self.drop_reservation(reservation);
         self.start_revalidations();
         self.take_step()
@@ -716,7 +718,7 @@ impl PoolModel {
     /// a body. Unlike a plain drop, this is logged, because today's change
     /// stream reports a download that failed.
     pub fn fetch_failed(&mut self, reservation: ReservationId, now: ModelTime) -> Step {
-        self.advance(now);
+        self.enter(now);
         // An id that another caller's body already decided has its outcome
         // in the log. A late failure of this fetch adds nothing to it.
         if let Some(tx_id) = self.undecided_for(reservation) {
@@ -761,7 +763,7 @@ impl PoolModel {
         supplier: Supplier,
         now: ModelTime,
     ) -> (WaiterId, Step) {
-        self.advance(now);
+        self.enter(now);
         let waiter = WaiterId(self.fresh());
         // The handle checks the body against the reservation before it
         // sends anything. A wrong body drops the reservation.
@@ -803,6 +805,9 @@ impl PoolModel {
             if self.admission_at(key).owner == reservation {
                 self.admission_at(key).owner_waiting = false;
             }
+            // Today's change stream reports a download refused because its
+            // peer was cooling down. Nothing is cached for it.
+            self.step.changes.push(Change::Refused(tx_id));
             self.step.effects.push(Effect::Verdict {
                 waiter,
                 verdict: ModelVerdict::CoolingDown,
@@ -811,6 +816,8 @@ impl PoolModel {
             self.start_revalidations();
             return (waiter, self.take_step());
         }
+        // The model's own clock, which never goes back, not the caller's.
+        let clock = self.now;
         let start = {
             let admission = self.admission_at(key);
             if admission.owner == reservation {
@@ -825,7 +832,7 @@ impl PoolModel {
             match body {
                 Some(tx) if admission.body.is_none() => {
                     admission.body = Some(tx);
-                    admission.body_at = Some(now);
+                    admission.body_at = Some(clock);
                     true
                 }
                 // The core already holds these bytes, or the caller was not
@@ -851,7 +858,7 @@ impl PoolModel {
         after: GenerationRead,
         now: ModelTime,
     ) -> Step {
-        self.advance(now);
+        self.enter(now);
         let Some((target, started_at)) = self.jobs.remove(&job) else {
             // Cancelled, or timed out.
             return self.take_step();
@@ -905,7 +912,7 @@ impl PoolModel {
 
     /// The next chain transition.
     pub fn transition(&mut self, transition: ModelTransition, now: ModelTime) -> Step {
-        self.advance(now);
+        self.enter(now);
         if !self.active {
             return self.take_step();
         }
@@ -976,7 +983,7 @@ impl PoolModel {
     /// blocks changed, so every pooled and parked transaction is checked
     /// again at this tip.
     pub fn resync(&mut self, tip: Height, generation: Generation, now: ModelTime) -> Step {
-        self.advance(now);
+        self.enter(now);
         if !self.active {
             return self.take_step();
         }
@@ -996,6 +1003,16 @@ impl PoolModel {
 
     /// Time passed. Applies every deadline at or before `now`.
     pub fn tick(&mut self, now: ModelTime) -> Step {
+        self.enter(now);
+        self.start_revalidations();
+        self.take_step()
+    }
+
+    /// Moves time to `now` and applies every deadline that is due, before
+    /// the input that brought the time is handled. A deadline that has
+    /// passed is decided whichever of the timer and another input the core
+    /// happens to handle first.
+    fn enter(&mut self, now: ModelTime) {
         self.advance(now);
         let mut timed_out = Vec::new();
         let mut unparked = Vec::new();
@@ -1062,8 +1079,6 @@ impl PoolModel {
                 _ => {}
             }
         }
-        self.start_revalidations();
-        self.take_step()
     }
 
     /// [`super::PoolHandle::await_output`]. The lookup and the registration
@@ -1120,7 +1135,7 @@ impl PoolModel {
     /// The node fell far behind the tip. Every undecided submission gets a
     /// verdict, and the pool empties.
     pub fn deactivate(&mut self, now: ModelTime) -> Step {
-        self.advance(now);
+        self.enter(now);
         let keys: Vec<u64> = self.admissions.keys().copied().collect();
         for key in keys {
             self.cancel_admission_job(key);
@@ -1446,14 +1461,25 @@ impl PoolModel {
                     );
                     return;
                 }
-                if self
-                    .pool
-                    .values()
-                    .any(|pooled| pooled.tx.conflicts_with(&tx))
-                {
+                let conflicts = |hidden: bool| {
+                    self.pool
+                        .values()
+                        .filter(|pooled| pooled.hidden.is_some() == hidden)
+                        .any(|pooled| pooled.tx.conflicts_with(&tx))
+                };
+                let (with_visible, with_hidden) = (conflicts(false), conflicts(true));
+                if with_visible {
                     // The pool took a conflicting transaction while this one
                     // was verified.
                     self.reject(key, RejectionScope::EffectsTip, Charge::None);
+                    return;
+                }
+                if with_hidden {
+                    // It conflicts with a transaction that is hidden because
+                    // nobody knows yet whether it is still valid. If that
+                    // one fails, this one was fine. So this is not a
+                    // rejection and nothing is remembered against it.
+                    self.fail_locally(key, LocalFault::PoolUnsettled);
                     return;
                 }
                 // The verifier used a pool output that the pool no longer
@@ -1487,7 +1513,6 @@ impl PoolModel {
                         visible_at: pool_key,
                         hidden_at: ChangeSeq(0),
                         missing_since: None,
-                        last_check_used: false,
                     },
                 );
                 self.pooled.insert(hash, pool_key);
@@ -1529,6 +1554,13 @@ impl PoolModel {
                 }
                 if (arrived && !wait_over) || last_check {
                     self.start_admission(key);
+                    return;
+                }
+                if wait_over && arrived {
+                    // An input arrived during this check too, so its answer
+                    // is already out of date, and there is no check left to
+                    // give. The core has no answer it can trust.
+                    self.fail_locally(key, LocalFault::VerifyTimeout);
                     return;
                 }
                 if wait_over {
@@ -1604,7 +1636,6 @@ impl PoolModel {
                 pooled.backoff = REVALIDATE_RETRY;
                 pooled.visible_at = visible_at;
                 pooled.missing_since = None;
-                pooled.last_check_used = false;
                 let (id, hidden_at, count) = (pooled.tx.id, pooled.hidden_at, pooled.tx.outputs);
                 self.step.changes.push(Change::Revealed { id, hidden_at });
                 // Its outputs are available again, to waiters as well.
@@ -1630,14 +1661,12 @@ impl PoolModel {
                     .iter()
                     .any(|outpoint| self.arrived_since(outpoint, started_at));
                 let now = self.now;
-                let pooled = self.pooled_at(key);
-                let since = *pooled.missing_since.get_or_insert(now);
+                let since = *self.pooled_at(key).missing_since.get_or_insert(now);
                 let wait_over = since.saturating_add(T_PARK) <= now;
-                let last_check = wait_over && arrived && !pooled.last_check_used;
-                if last_check {
-                    pooled.last_check_used = true;
-                }
-                if (arrived && !wait_over) || last_check {
+                // An input arrived during this check, so its answer is out
+                // of date. A hidden transaction holds no slot, so it is
+                // simply checked again, however late.
+                if arrived {
                     self.pooled_at(key).hidden = Some(Hidden::Queued);
                     return;
                 }

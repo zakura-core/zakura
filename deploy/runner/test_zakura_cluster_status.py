@@ -2050,6 +2050,17 @@ class PropagationRouteTests(unittest.TestCase):
         view = status.PropagationView(named, None)
         self.assertEqual(view.fleet_addresses, {"203.0.113.5": "with-profiler", "2001:db8::7": "without"})
 
+    def test_a_peer_made_private_is_not_served_from_the_cached_view(self):
+        private_agent = "/Zakura:9.9.9-private/"
+        self.downloads = {"first": [self.download(self.PRIVATE, agent=private_agent)]}
+        with mock.patch.object(status, "private_addresses", return_value=frozenset()):
+            self.assertIn(private_agent.encode(), self.fetch("/propagation/data")[1])
+        protected = frozenset({status.address_key(self.PRIVATE)})
+        with mock.patch.object(status, "private_addresses", return_value=protected):
+            body = self.fetch("/propagation/data")[1]
+        self.assertNotIn(private_agent.encode(), body)
+        self.assertEqual(json.loads(body)["outside_peers"], [])
+
     def test_a_private_peer_s_address_and_software_are_never_served(self):
         private_agent = "/Zakura:9.9.9-private/"
         self.downloads = {

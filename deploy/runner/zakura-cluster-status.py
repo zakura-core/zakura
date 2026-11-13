@@ -368,6 +368,9 @@ class PropagationView:
         self._lock = threading.Lock()
         self._joined: dict | None = None
         self._fetched_at = 0.0
+        # The private list the cached view was built with: a peer is classified once,
+        # so a view built before an address became private must not be served after.
+        self._joined_for: frozenset | None = None
 
     def fetch_report(self, node: Node) -> dict | None:
         """One node's recent blocks from its profiler, or `None` when it did not answer."""
@@ -383,7 +386,8 @@ class PropagationView:
         return report if isinstance(report, dict) else None
 
     def data(self) -> dict:
-        """The joined view, at most `PROPAGATION_CACHE_SECONDS` old.
+        """The joined view, at most `PROPAGATION_CACHE_SECONDS` old and built with the
+        current private address list.
 
         Raises `ValueError` or `OSError` when the list of private addresses cannot be
         read: without it, a private peer cannot be told from any other.
@@ -394,7 +398,11 @@ class PropagationView:
             return address_key(ip) in protected
 
         with self._lock:
-            if self._joined is None or time.monotonic() - self._fetched_at >= PROPAGATION_CACHE_SECONDS:
+            if (
+                self._joined is None
+                or self._joined_for != protected
+                or time.monotonic() - self._fetched_at >= PROPAGATION_CACHE_SECONDS
+            ):
                 reports: dict[str, dict | None] = {}
                 if self.nodes:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(self.nodes))) as pool:
@@ -408,7 +416,7 @@ class PropagationView:
                     fleet_addresses=self.fleet_addresses,
                     is_private=is_private,
                 )
-                self._fetched_at = time.monotonic()
+                self._fetched_at, self._joined_for = time.monotonic(), protected
             return self._joined
 
 

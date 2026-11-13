@@ -508,22 +508,32 @@ fn first_release_at(row: &RowUnits, entries: &[Entry]) -> Option<Duration> {
 }
 
 /// Whether `acquisitions`, a run's serving acquisitions with their virtual
-/// times, show a push holding a peer's output while the other pushes held
-/// all `limit` of its execution slots, before `released`. With no page job
-/// done before then, no push has given its slots back, so that push waits
-/// at the peer's execution reserve.
+/// times, show one push more than `limit` take both its peer and node
+/// output while the others held all `limit` of the peer's execution slots,
+/// before `released`. A push takes output before execution, so the others
+/// already hold theirs and the output that grows in that window is the
+/// extra push's. Its next step after the node output grant is the peer's
+/// execution reserve, and with no page job done before `released`, no
+/// push has given its slots back, so it waits there.
 fn waited_at_full_execution(
     acquisitions: &[(Option<Duration>, ServeInUse)],
     released: Duration,
     limit: usize,
 ) -> bool {
-    acquisitions.iter().any(|(at, in_use)| {
+    let mut window = acquisitions.iter().filter_map(|(at, in_use)| {
         let ServeInUse {
             peer_execution: executing,
             peer_responses: responding,
             ..
         } = in_use;
-        at.is_some_and(|at| at < released) && *executing == limit && *responding > limit
+        (at.is_some_and(|at| at < released) && *executing == limit && *responding == limit + 1)
+            .then_some(in_use)
+    });
+    let Some(first) = window.next() else {
+        return false;
+    };
+    window.next_back().is_some_and(|last| {
+        last.peer_output > first.peer_output && last.node_output > first.node_output
     })
 }
 
@@ -648,8 +658,8 @@ fn the_limit_fixtures_release_and_reuse_their_bounds() {
             let acquisitions = outstanding.acquisitions();
             assert!(
                 waited_at_full_execution(&acquisitions, released, row.limit),
-                "{stem}: a push held output with every execution slot taken before \
-                 {released:?}: {acquisitions:?}"
+                "{stem}: an extra push took its output with every execution slot taken \
+                 before {released:?}: {acquisitions:?}"
             );
         }
     }
@@ -709,26 +719,44 @@ fn the_held_row_read_needs_a_release_and_a_later_rise() {
     assert!(!sizes_fall_and_rise(&[0, 8, 1, 0], 8));
 }
 
-/// The acquisition read fails with no push holding output past the full
-/// execution slots, with one only once the slots aren't full, or with one
-/// only at or after the release.
+/// The acquisition read fails with no extra push past the full execution
+/// slots, with one held at its output grants, with one only once the
+/// slots aren't full, or with one only at or after the release.
 #[test]
-fn the_execution_wait_read_needs_output_held_past_full_slots_before_the_release() {
+fn the_execution_wait_read_needs_the_extra_push_past_its_output_before_the_release() {
     let at = |ms: u64| Some(Duration::from_millis(ms));
-    let in_use = |peer_execution, peer_responses| ServeInUse {
+    let in_use = |peer_execution, peer_responses, peer_output, node_output| ServeInUse {
         peer_execution,
         peer_responses,
+        peer_output,
+        node_output,
         ..ServeInUse::default()
     };
     let released = Duration::from_millis(1_000);
     let read = |acquisitions: &[(Option<Duration>, ServeInUse)]| {
         waited_at_full_execution(acquisitions, released, 2)
     };
-    assert!(read(&[(at(0), in_use(2, 2)), (at(0), in_use(2, 3))]));
-    assert!(!read(&[(at(0), in_use(2, 2))]));
-    assert!(!read(&[(at(0), in_use(1, 3))]));
-    assert!(!read(&[(at(1_000), in_use(2, 3))]));
-    assert!(!read(&[(None, in_use(2, 3))]));
+    let responded = (at(0), in_use(2, 3, 20, 20));
+    let peer_output = (at(0), in_use(2, 3, 30, 20));
+    let node_output = (at(0), in_use(2, 3, 30, 30));
+    assert!(read(&[
+        (at(0), in_use(2, 2, 20, 20)),
+        responded,
+        peer_output,
+        node_output
+    ]));
+    assert!(!read(&[(at(0), in_use(2, 2, 20, 20))]));
+    assert!(!read(&[responded]));
+    assert!(!read(&[responded, peer_output]));
+    assert!(!read(&[
+        (at(0), in_use(1, 3, 20, 20)),
+        (at(0), in_use(1, 3, 30, 30))
+    ]));
+    assert!(!read(&[responded, (at(1_000), in_use(2, 3, 30, 30))]));
+    assert!(!read(&[
+        (None, in_use(2, 3, 20, 20)),
+        (None, in_use(2, 3, 30, 30))
+    ]));
 }
 
 /// A full row that never takes the newcomer in, grows past its limit to

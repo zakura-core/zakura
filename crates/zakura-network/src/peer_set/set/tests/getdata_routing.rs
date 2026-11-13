@@ -23,7 +23,9 @@ use zakura_chain::{
 };
 
 use crate::{
-    peer::{ConnectedClient, LoadTrackedClient, MinimumPeerVersion},
+    peer::{
+        ClientTestHarness, ConnectedAddr, ConnectedClient, LoadTrackedClient, MinimumPeerVersion,
+    },
     peer_set::{inventory_registry::InventoryStatus, InventoryChange, PeerSet},
     protocol::external::{types::PeerServices, InventoryHash, Message},
     BoxError, PeerSocketAddr, Request, Response,
@@ -149,6 +151,12 @@ fn reach_network_tip(tip: &MockChainTipSender) {
     tip.send_estimated_distance_to_network_chain_tip(Some(0));
 }
 
+/// Tells the peer set that this node has a chain tip, but is far behind the network tip.
+fn fall_behind_network_tip(tip: &MockChainTipSender) {
+    tip.send_best_tip_height(block::Height(1));
+    tip.send_estimated_distance_to_network_chain_tip(Some(1000));
+}
+
 /// An archive and a pruned peer connected through the real request/response machinery.
 ///
 /// The node is still syncing, as its chain tip has no distance estimate.
@@ -199,20 +207,37 @@ impl StoragePeers {
     }
 
     fn block_request() -> Request {
-        Request::BlocksByHash(iter::once(BLOCK_HASH).collect())
+        Self::block_request_for(BLOCK_HASH)
+    }
+
+    fn block_request_for(hash: block::Hash) -> Request {
+        Request::BlocksByHash(iter::once(hash).collect())
+    }
+
+    /// Returns true if the peer set does not become ready to route a request.
+    async fn waits_for_a_peer(&mut self) -> bool {
+        tokio::time::timeout(Duration::from_secs(1), self.set.ready())
+            .await
+            .is_err()
     }
 }
+
+/// How often a test repeats a choice between two equally loaded peers, so that a random choice
+/// cannot pass by chance.
+const REPEATS: usize = 16;
 
 #[tokio::test(start_paused = true)]
 async fn pruned_routing_prefers_archive_without_an_advertiser() {
     let _init_guard = zakura_test::init();
-    let mut peers = StoragePeers::new().await;
-    let _response = peers.set.call(StoragePeers::block_request());
-    assert_eq!(
-        StoragePeers::next_message(&mut peers.archive).await,
-        Message::GetData(vec![BLOCK_HASH.into()])
-    );
-    assert_eq!(peers.pruned.written_now().await, None);
+    for _ in 0..REPEATS {
+        let mut peers = StoragePeers::new().await;
+        let _response = peers.set.call(StoragePeers::block_request());
+        assert_eq!(
+            StoragePeers::next_message(&mut peers.archive).await,
+            Message::GetData(vec![BLOCK_HASH.into()])
+        );
+        assert_eq!(peers.pruned.written_now().await, None);
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -235,7 +260,8 @@ async fn pruned_routing_falls_back_without_an_archive() {
 #[tokio::test(start_paused = true)]
 async fn pruned_routing_batch_prefers_archive_and_falls_back() {
     let _init_guard = zakura_test::init();
-    for archive_present in [true, false] {
+    let with_archive = iter::repeat_n(true, REPEATS);
+    for archive_present in with_archive.chain([false]) {
         let mut peers = StoragePeers::new().await;
         if !archive_present {
             peers
@@ -612,11 +638,17 @@ async fn pruned_routing_skips_pruned_peers_while_syncing() {
     const SELECTIONS: usize = 200;
 
     let peers = ArchiveAmongPruned::new().await;
-
     assert_eq!(
         peers.archive_selections(SELECTIONS),
         SELECTIONS,
-        "a pruned peer was selected while an archive peer was ready",
+        "a pruned peer was selected before this node had a chain tip",
+    );
+
+    fall_behind_network_tip(&peers.tip);
+    assert_eq!(
+        peers.archive_selections(SELECTIONS),
+        SELECTIONS,
+        "a pruned peer was selected while this node was far behind the network tip",
     );
 }
 
@@ -640,48 +672,136 @@ async fn pruned_routing_treats_pruned_peers_alike_near_the_tip() {
     );
 }
 
-/// While syncing, a busy archive peer that has not left blocks unanswered keeps priority over
-/// an idle pruned peer, which might no longer hold the requested block.
+/// While syncing, block requests wait for an archive peer that has no room for another request,
+/// although an idle pruned peer is ready: the pruned peer would answer `notfound`.
 #[tokio::test(start_paused = true)]
-async fn pruned_routing_keeps_busy_archive_over_idle_pruned_while_syncing() {
+async fn pruned_routing_waits_for_busy_archive_while_syncing() {
     let _init_guard = zakura_test::init();
+    let [first, second, third] = [0x01, 0x02, 0x03].map(|byte| block::Hash([byte; 32]));
 
-    let BusyAndIdleAdvertisers {
-        mut peer_set,
-        _guard,
-        busy: mut archive,
-        idle: mut pruned,
-        tx,
-        tx_response,
-    } = busy_and_idle_peers(
-        PeerServices::NODE_NETWORK,
-        PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED,
-        None,
-    )
-    .await;
+    let mut peers = StoragePeers::new().await;
 
-    let _block_response = peer_set
+    // A connection holds one request it has written and one it has not taken yet.
+    let first_response = peers.set.call(StoragePeers::block_request_for(first));
+    assert_eq!(
+        StoragePeers::next_message(&mut peers.archive).await,
+        Message::GetData(vec![first.into()])
+    );
+    let _second_response = peers
+        .set
         .ready()
         .await
-        .expect("peer set is ready")
-        .call(StoragePeers::block_request());
+        .expect("the archive peer has room for one more request")
+        .call(StoragePeers::block_request_for(second));
 
+    assert!(
+        peers.waits_for_a_peer().await,
+        "requests wait while the only archive peer is full",
+    );
     assert_eq!(
-        pruned.written_now().await,
+        peers.pruned.written_now().await,
         None,
-        "the idle pruned peer is not asked for the block",
+        "the idle pruned peer is not asked for a block",
     );
 
-    archive
+    // The archive answers its first request, which makes room for the third.
+    peers
+        .archive
         .peer_inbound
-        .send(Ok(Message::Tx(tx)))
+        .send(Ok(Message::NotFound(vec![first.into()])))
         .await
         .expect("connection is open");
-    assert!(matches!(tx_response.await, Ok(Response::Transactions(_))));
+    assert!(first_response.await.is_err());
     assert_eq!(
-        archive.written_now().await,
-        Some(Message::GetData(vec![BLOCK_HASH.into()])),
-        "the archive peer gets the block request once its earlier response arrives",
+        StoragePeers::next_message(&mut peers.archive).await,
+        Message::GetData(vec![second.into()])
+    );
+    let _third_response = peers
+        .set
+        .ready()
+        .await
+        .expect("the archive peer has room again")
+        .call(StoragePeers::block_request_for(third));
+
+    assert_eq!(peers.pruned.written_now().await, None);
+}
+
+/// Near the network tip a full archive peer does not hold requests back: the idle pruned peer
+/// keeps the recent blocks, so it takes the next block request.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_uses_idle_pruned_peer_near_the_tip() {
+    let _init_guard = zakura_test::init();
+    let [first, second, third] = [0x01, 0x02, 0x03].map(|byte| block::Hash([byte; 32]));
+
+    let mut peers = StoragePeers::new().await;
+
+    // While this node is syncing, both requests go to the archive peer and fill it.
+    let _first_response = peers.set.call(StoragePeers::block_request_for(first));
+    assert_eq!(
+        StoragePeers::next_message(&mut peers.archive).await,
+        Message::GetData(vec![first.into()])
+    );
+    let _second_response = peers
+        .set
+        .ready()
+        .await
+        .expect("the archive peer has room for one more request")
+        .call(StoragePeers::block_request_for(second));
+
+    reach_network_tip(&peers.tip);
+
+    assert!(
+        !peers.waits_for_a_peer().await,
+        "near the tip, requests do not wait for the archive peer",
+    );
+    let _third_response = peers.set.call(StoragePeers::block_request_for(third));
+    assert_eq!(
+        StoragePeers::next_message(&mut peers.pruned).await,
+        Message::GetData(vec![third.into()])
+    );
+}
+
+/// A zcashd sidecar that has no block this node lacks is not an archive block source, although
+/// it does not advertise the pruned hint: zcashd would leave the request unanswered.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_does_not_treat_the_sidecar_as_an_archive() {
+    let _init_guard = zakura_test::init();
+    const SELECTIONS: usize = 200;
+
+    let sidecar_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let sidecar_addr: PeerSocketAddr = std::net::SocketAddr::new(sidecar_ip, 1).into();
+    let archive_addr: PeerSocketAddr = "10.0.0.1:2".parse().expect("valid address");
+
+    let (sidecar, _sidecar_harness) = ClientTestHarness::build()
+        .with_version(crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION)
+        .with_connected_addr(ConnectedAddr::new_inbound_direct(sidecar_addr))
+        .finish();
+    let (archive, _archive_harness) = ClientTestHarness::build()
+        .with_version(crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION)
+        .with_connected_addr(ConnectedAddr::new_outbound_direct(archive_addr))
+        .finish();
+
+    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let (mut set, _guard) = PeerSetBuilder::new()
+        .with_block_gossip_peer_ips(vec![sidecar_ip])
+        .with_discover(discover(vec![
+            (sidecar_addr, sidecar.into()),
+            (archive_addr, archive.into()),
+        ]))
+        .with_minimum_peer_version(minimum)
+        .max_conns_per_ip(2)
+        .build();
+    set.ready().await.expect("both peers are ready");
+    let candidates: HashSet<_> = set.ready_services.keys().copied().collect();
+    assert_eq!(candidates.len(), 2);
+
+    let archive_selections = (0..SELECTIONS)
+        .filter(|_| set.select_block_body_peer(&candidates) == Some(archive_addr))
+        .count();
+
+    assert_eq!(
+        archive_selections, SELECTIONS,
+        "the sidecar was selected for a block while an archive peer was ready",
     );
 }
 
@@ -846,23 +966,8 @@ struct BusyAndIdleAdvertisers {
 /// its peak-EWMA load is higher than the busy peer's load, even though the busy peer has one request
 /// outstanding. Load alone therefore selects the busy peer.
 async fn busy_and_idle_advertisers(inventory: InventoryHash) -> BusyAndIdleAdvertisers {
-    busy_and_idle_peers(
-        PeerServices::NODE_NETWORK,
-        PeerServices::NODE_NETWORK,
-        Some(inventory),
-    )
-    .await
-}
-
-/// Connects a busy and an idle peer with the given services, as
-/// [`busy_and_idle_advertisers`] does, with both peers advertising `inventory` if it is given.
-async fn busy_and_idle_peers(
-    busy_services: PeerServices,
-    idle_services: PeerServices,
-    inventory: Option<InventoryHash>,
-) -> BusyAndIdleAdvertisers {
-    let mut busy = TestPeer::spawn_with_services(1, busy_services, None);
-    let mut idle = TestPeer::spawn_with_services(2, idle_services, None);
+    let mut busy = TestPeer::spawn(1);
+    let mut idle = TestPeer::spawn(2);
     let tx = test_transaction();
 
     // Let the default RTT estimates decay, then give the idle peer a slow round trip.
@@ -889,28 +994,25 @@ async fn busy_and_idle_peers(
         .max_conns_per_ip(2)
         .build();
 
-    peer_set.ready().await.expect("peer set is ready");
-    if let Some(inventory) = inventory {
-        // The test inventory channel holds one change, so register each advert before the next.
-        for addr in [busy.addr, idle.addr] {
-            guard
-                .inventory_sender()
-                .as_mut()
-                .expect("guard has an inventory sender")
-                .send(InventoryStatus::new_available(inventory, addr))
-                .expect("peer set receives inventory");
-            peer_set.ready().await.expect("peer set is ready");
-        }
-
-        assert_eq!(
-            peer_set
-                .inventory_registry
-                .advertising_peers(inventory)
-                .copied()
-                .collect::<HashSet<_>>(),
-            HashSet::from([busy.addr, idle.addr]),
-        );
+    // The test inventory channel holds one change, so register each advert before the next.
+    for addr in [busy.addr, idle.addr] {
+        guard
+            .inventory_sender()
+            .as_mut()
+            .expect("guard has an inventory sender")
+            .send(InventoryStatus::new_available(inventory, addr))
+            .expect("peer set receives inventory");
+        peer_set.ready().await.expect("peer set is ready");
     }
+
+    assert_eq!(
+        peer_set
+            .inventory_registry
+            .advertising_peers(inventory)
+            .copied()
+            .collect::<HashSet<_>>(),
+        HashSet::from([busy.addr, idle.addr]),
+    );
     assert_eq!(
         peer_set
             .ready_services

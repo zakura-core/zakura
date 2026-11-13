@@ -956,19 +956,11 @@ where
         is_find_request: bool,
         is_block_body_request: bool,
     ) -> Option<D::Key> {
-        let tip_height = self
-            .minimum_peer_version
-            .chain_tip()
-            .best_tip_height()
-            .unwrap_or(block::Height(0));
-
         let candidates = self
             .ready_services
             .iter()
             .filter(|(_, service)| {
-                !(is_find_request
-                    && self.is_zcashd_compat_peer(service)
-                    && service.remote_start_height() <= tip_height)
+                !(is_find_request && self.is_sidecar_without_new_blocks(service))
             })
             .map(|(key, _)| *key)
             .collect();
@@ -987,10 +979,59 @@ where
             .is_at_or_near_network_tip(&self.network)
     }
 
+    /// Returns true if `service` is a zcashd sidecar whose handshake advertised no more blocks
+    /// than this node has. A sidecar follows only this node, so it then has no block this node
+    /// lacks, and zcashd leaves a request for such a block unanswered.
+    fn is_sidecar_without_new_blocks(&self, service: &D::Service) -> bool {
+        let tip_height = self
+            .minimum_peer_version
+            .chain_tip()
+            .best_tip_height()
+            .unwrap_or(block::Height(0));
+
+        self.is_zcashd_compat_peer(service) && service.remote_start_height() <= tip_height
+    }
+
+    /// Returns true if `service` may hold old blocks that pruned peers have deleted: it does not
+    /// advertise the pruned hint, and it is not a sidecar without new blocks.
+    ///
+    /// The hint is self-reported: a peer that omits it is asked like any archive peer.
+    fn may_hold_old_blocks(&self, service: &D::Service) -> bool {
+        service.claims_full_block_history() && !self.is_sidecar_without_new_blocks(service)
+    }
+
+    /// Returns true if this node is still syncing and every peer it would download old blocks
+    /// from is busy: the peers that may hold old blocks and have not left a block request
+    /// unanswered.
+    ///
+    /// Requests then wait for one of them, as they do when every peer is busy. Otherwise the
+    /// ready pruned peers would take the block requests those peers have no room for, and answer
+    /// `notfound`.
+    fn awaits_archive_block_source(&self) -> bool {
+        if self.is_near_network_tip() {
+            return false;
+        }
+
+        let is_source = |service: &D::Service| {
+            self.may_hold_old_blocks(service) && !service.has_unanswered_block_request()
+        };
+
+        if self.ready_services.values().any(is_source) {
+            return false;
+        }
+
+        Pin::new(&self.unready_services)
+            .iter_pin_ref()
+            .filter_map(|unready| unready.get_ref().service.as_ref())
+            .any(is_source)
+    }
+
     /// Performs P2C on `candidates` for a request for block bodies.
     ///
-    /// While syncing, requests can be for blocks a pruned peer has deleted. Prefer peers without
-    /// the pruned hint, unless all candidates advertise it. The hint is self-reported.
+    /// While syncing, requests can be for blocks a pruned peer has deleted. Prefer peers that may
+    /// hold old blocks, see [`Self::may_hold_old_blocks`], unless no candidate is one: this node
+    /// is connected to none, or the ones it is connected to do not have this block.
+    /// [`Self::awaits_archive_block_source`] makes requests wait while they are only busy.
     ///
     /// First leave out peers that have left a block request unanswered, unless that would remove
     /// every candidate. Otherwise a silent archive peer can capture every retry even when a
@@ -1024,7 +1065,7 @@ where
             .filter(|key| {
                 self.ready_services
                     .get(key)
-                    .is_some_and(LoadTrackedClient::claims_full_block_history)
+                    .is_some_and(|service| self.may_hold_old_blocks(service))
             })
             .copied()
             .collect();
@@ -1577,19 +1618,22 @@ where
     ///
     /// Refreshes the inventory registry here rather than in maintenance, because only request
     /// routing reads it, and asks the crawler for more peers when none is ready.
+    ///
+    /// A syncing node also waits while the peers it downloads old blocks from are all busy,
+    /// although pruned peers may be ready: see [`Self::awaits_archive_block_source`].
     pub(super) fn poll_routing_readiness(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), BoxError>> {
         let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
 
-        if self.ready_services.is_empty() {
+        if self.ready_services.is_empty() || self.awaits_archive_block_source() {
             // # Correctness
             //
             // If the channel is full, drop the demand signal rather than waiting. If we waited
             // here, the crawler could deadlock sending a request to fetch more peers, because it
             // also empties the channel.
-            trace!("no ready services, sending demand signal");
+            trace!("no ready services for requests, sending demand signal");
             let _ = self.demand_signal.try_send(MorePeers);
 
             // # Correctness
@@ -1597,6 +1641,7 @@ where
             // The current task must be scheduled for wakeup every time we return `Poll::Pending`.
             //
             // As long as there are unready or new peers, this task will run, because:
+            // - a busy peer that this node waits to download old blocks from is an unready peer.
             // - `poll_discover` schedules this task for wakeup when new peers arrive.
             // - if there are unready peers, `poll_unready` or `poll_ready_peers` schedule this
             //   task for wakeup when peer services become ready.

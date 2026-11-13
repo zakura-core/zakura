@@ -14,7 +14,7 @@
 mod support;
 
 use support::{
-    inputs,
+    byte_inputs, inputs,
     script::{run_under, Node, OBSERVED},
 };
 use zakura_network::zakura::{block_sync_streams, BlockSyncMessage, MSG_BS_BLOCK};
@@ -250,9 +250,11 @@ fn honest_runs_hold_every_generated_id_they_reach() {
     }
 }
 
-/// The committed reset-mid-flight input: a 2-byte scenario prefix, then
-/// Plan bytes.
-const RESET_MID_FLIGHT_INPUT: &[u8] = include_bytes!("fixtures/block-sync-reset-mid-flight.bin");
+/// The committed Plan bytes under which [`old_chain_scenario`]'s run has a
+/// routine judge an old-chain body after a fork request reserved its height
+/// ([`old_chain_shortfall`]). `regenerate_old_chain_plan` picks them.
+const OLD_CHAIN_PLAN: &[u8] =
+    include_bytes!("fixtures/block-sync-old-chain-after-fork-request.plan");
 
 /// The committed input whose reset-mid-flight run reads an old-epoch body
 /// for a height past the fork while the routine's old request is still
@@ -341,28 +343,75 @@ fn old_body_judged_after_a_fork_request(
     })
 }
 
-/// A reset while old-chain bodies are on the wire credits none of them to
-/// the fork's work. The reset-mid-flight scenario resets once the mirrors
-/// have completed 14 range reads instead of at the third submission, so
-/// bodies of heights past the fork that the old epoch asked for cross after
-/// the node's new epoch reserves those heights. Under the reset-mid-flight
-/// input's plan, one such body reaches its routine after the routine
-/// dropped its request, so first-completion-wins must refuse its hash.
-#[test]
-fn old_chain_bodies_after_a_reset_hold_receiver_work_authorized() {
+/// The reset-mid-flight scenario, resetting once the mirrors have completed
+/// 14 range reads instead of at the third submission, so bodies of heights
+/// past the fork that the old epoch asked for cross after the node's new
+/// epoch reserves those heights.
+fn old_chain_scenario() -> BlockScenario {
     let mut scenario = BlockScenario::reset_mid_flight();
     scenario.control[0].when = Some(Trigger::Completed(Select::nth(BlockKind::MirrorRead, 14)));
-    let (report, ports) = run(&scenario, Plan::from_fuzz(&RESET_MID_FLIGHT_INPUT[2..]));
-    assert_eq!(report.end.violation, None, "{:?}", report.end);
-    assert!(
-        held(&report, &id("block/receiver-work-authorized")),
-        "{:?}",
-        report.properties
+    scenario
+}
+
+/// Checks that `plan` fills [`OLD_CHAIN_PLAN`]'s role, or returns why it
+/// falls short. [`old_chain_scenario`]'s run under it must end without a
+/// violation, hold `receiver-work-authorized`, and have a routine judge an
+/// old-chain body after a fork request reserved its height.
+fn old_chain_shortfall(plan: &[u8]) -> Result<(), String> {
+    let scenario = old_chain_scenario();
+    let (report, ports) = run(&scenario, Plan::from_fuzz(plan));
+    if report.end.violation.is_some() {
+        return Err(format!("a violation: {:?}", report.end));
+    }
+    if !held(&report, &id("block/receiver-work-authorized")) {
+        return Err(format!(
+            "receiver-work-authorized didn't hold: {:?}",
+            report.properties
+        ));
+    }
+    if !old_body_judged_after_a_fork_request(&report, &ports, &scenario) {
+        return Err(
+            "no routine judged an old-chain body after a fork request reserved its height"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// A reset while old-chain bodies are on the wire credits none of them to
+/// the fork's work. Under [`OLD_CHAIN_PLAN`], one such body reaches its
+/// routine after the routine dropped its request, so first-completion-wins
+/// must refuse its hash.
+#[test]
+fn old_chain_bodies_after_a_reset_hold_receiver_work_authorized() {
+    if let Err(shortfall) = old_chain_shortfall(OLD_CHAIN_PLAN) {
+        panic!("{shortfall}");
+    }
+}
+
+/// Rewrites [`OLD_CHAIN_PLAN`] with the first of 64 fuzz inputs that fills
+/// its role ([`old_chain_shortfall`]). Rerun it when a block-sync change
+/// moves the plan off the crossing.
+#[test]
+#[ignore = "rewrites the committed plan"]
+#[allow(clippy::print_stdout)]
+fn regenerate_old_chain_plan() {
+    let plans = byte_inputs(64, 16_384);
+    let (index, plan) = plans
+        .iter()
+        .enumerate()
+        .find(|(index, plan)| {
+            let result = old_chain_shortfall(plan);
+            println!("old-chain plan: candidate {index}: {result:?}");
+            result.is_ok()
+        })
+        .expect("one of 64 candidates fills the plan's role");
+    let path = format!(
+        "{}/tests/fixtures/block-sync-old-chain-after-fork-request.plan",
+        env!("CARGO_MANIFEST_DIR")
     );
-    assert!(
-        old_body_judged_after_a_fork_request(&report, &ports, &scenario),
-        "no routine judged an old-chain body after a fork request reserved its height"
-    );
+    std::fs::write(path, plan).expect("the fixture directory exists");
+    println!("old-chain plan: wrote candidate {index}");
 }
 
 /// The stale-request-body input holds `receiver-work-authorized` after an

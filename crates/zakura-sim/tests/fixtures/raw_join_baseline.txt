@@ -1,4 +1,4 @@
-# Rule 25's raw-join baseline: every raw identity comparison the PR base (c879f071a0) had that the head still has, as file, function and comparison, tab-separated. Written by `regenerate_raw_join_baseline` in tests/header_acceptance.rs. Don't add lines by hand.
+# Rule 25's raw-join baseline: every raw identity comparison the PR base (c879f071a0) had that the head still has, as file, function and comparison, tab-separated, once per occurrence. Written by `regenerate_raw_join_baseline` in tests/header_acceptance.rs. Don't add lines by hand.
 src/campaign/build.rs	differences	self.harness==other.harness
 src/campaign/build.rs	differences	self.package==other.package
 src/campaign/build.rs	locked_version	package.get("name").and_then(toml::Value::as_str)==Some(name)
@@ -83,10 +83,17 @@ src/downstream.rs	closed	c==connection
 src/downstream.rs	credit_conserved	(c,r,e)==(connection,request,exchange)
 src/downstream.rs	credit_conserved	(c,subscription,e)==(connection,request,exchange)
 src/downstream.rs	owners_retired	(*connection,*exchange)
+src/downstream.rs	owners_retired	(*connection,*exchange)
+src/downstream.rs	requests	(*c,r,*e)==(connection,row,exchange)
 src/downstream.rs	requests	(*c,r,*e)==(connection,row,exchange)
 src/downstream.rs	requests	*c==connection
+src/downstream.rs	requests	*c==connection
+src/downstream.rs	requests	*c==connection
+src/downstream.rs	requests	*stream==row.stream
 src/downstream.rs	requests	*stream==row.stream
 src/downstream.rs	source_frame	(*c,*stream,*s)==(connection,row.stream,seq)
+src/downstream.rs	source_frame	(*c,*stream,*s)==(connection,row.stream,seq)
+src/downstream.rs	within_response_quantity	(c,r,e)==(connection,request,exchange)
 src/downstream.rs	within_response_quantity	(c,r,e)==(connection,request,exchange)
 src/downstream.rs	within_response_quantity	c==connection
 src/downstream.rs	within_response_quantity	frame!=row
@@ -111,11 +118,15 @@ src/explore/state/collector.rs	session	self.torn_down.contains(&old.connection
 src/explore/state/collector.rs	session	session==old.session_id
 src/explore/state/collector.rs	storage	(instance,*query_id)
 src/explore/state/collector.rs	track	(instance,lease.peer.clone())
+src/explore/state/collector.rs	track	(instance,lease.peer.clone())
 src/explore/state/crossing.rs	an_ending_read_logged_after_the_judgment_completes_the_crossing	join.observe(&node_frame),crossed()
 src/explore/state/crossing.rs	complete_ending	(connection,quic_stream,subscription)
 src/explore/state/crossing.rs	complete_update	(connection,quic_stream,subscription)
 src/explore/state/crossing.rs	cross	ended==up.subscription
 src/explore/state/crossing.rs	observe	(connection,quic_stream,subscription)
+src/explore/state/crossing.rs	observe	(connection,quic_stream,subscription)
+src/explore/state/crossing.rs	observe	self.header_streams.contains(&(connection,quic_stream)
+src/explore/state/crossing.rs	observe	self.header_streams.contains(&(connection,quic_stream)
 src/explore/state/crossing.rs	observe	self.header_streams.contains(&(connection,quic_stream)
 src/explore/state/mod.rs		*f==StateFeature::HeaderCapacity{event:CapacityEvent::Denied,class:CapacityClass::Peer}
 src/explore/stats.rs	read	version!=STATS_VERSION
@@ -132,11 +143,14 @@ src/harness/block_node/identity.rs	an_owner_frame_judged_later_beats_a_matching_
 src/harness/block_node/identity.rs	delivery	(frame.connection,frame.delivered.seq)
 src/harness/block_node/identity.rs	delivery	(frame.connection==owner)==on_owner
 src/harness/block_node/identity.rs	delivery	frame.connection==owner
+src/harness/block_node/identity.rs	delivery	frame.connection==owner
 src/harness/block_node/identity.rs	delivery	frame.hash.as_ref()==Some(hash)
 src/harness/block_node/identity.rs	fact	self.judged.contains(peer
 src/harness/block_node/identity.rs	judged	(connection,seq)
+src/harness/block_node/identity.rs	judged	(connection,seq)
 src/harness/block_node/identity.rs	judged_connection	*at==connection
 src/harness/block_node/identity.rs	judged_connection	self.judged.contains(peer
+src/harness/block_node/identity.rs	record	(connection,request)
 src/harness/block_node/identity.rs	record	(connection,request)
 src/harness/block_node/identity.rs	record	(connection,seq)
 src/harness/block_node/identity.rs	record	self.settled.get(&(connection,request))!=Some(&false)
@@ -210,10 +224,12 @@ src/harness/header_acceptance/evaluate.rs	contract_standing	contract.id==id
 src/harness/header_acceptance/evaluate.rs	evaluate	contract.id==id
 src/harness/header_acceptance/evaluate.rs	evaluate	expected_ids.contains(*id
 src/harness/header_acceptance/evaluate.rs	evaluate	id!=ContractId::C5
+src/harness/header_acceptance/evaluate.rs	evaluate	id!=ContractId::C5
 src/harness/header_acceptance/evaluate.rs	evaluate	manifest.required_contracts.contains(&contract.id
 src/harness/header_acceptance/evaluate.rs	evaluate	result.expected.id().as_ref()==Some(&record.expected)
 src/harness/header_acceptance/evaluate.rs	inventory	*on==harness
 src/harness/header_acceptance/evaluate.rs	judge	*replayed!=run
+src/harness/header_acceptance/evaluate.rs	judge	manifest.machines.contains(&harness
 src/harness/header_acceptance/evaluate.rs	judge	manifest.machines.contains(&harness
 src/harness/header_acceptance/evaluate.rs	judge	meta.harness!=harness
 src/harness/header_acceptance/evaluate.rs	judge	property==case.property
@@ -263,8 +279,10 @@ src/harness/header_acceptance/tool.rs	record	run.containment!=Containment::Subre
 src/harness/header_acceptance/tool.rs	target_of	runs.as_str()==harness
 src/harness/header_acceptance/tool.rs	the_planted_inventory_reads_nested_properties	property=="session/honest-never-punished"
 src/harness/header_node.rs	enabled	op.id==id
+src/harness/header_node.rs	enabled	op.id==id
 src/harness/header_node.rs	execute	op.id==id
 src/harness/header_node.rs	execute	step.peer!=*node
+src/harness/header_node.rs	execute	step.peer==*node
 src/harness/header_node.rs	execute	step.peer==*node
 src/harness/header_node.rs	grow	node.name==peer
 src/harness/header_node.rs	index	node.name==peer
@@ -311,6 +329,8 @@ src/harness/header_node/hold_wake/tests.rs	a_delivered_held_reply_opens_and_its_
 src/harness/header_node/hold_wake/tests.rs	a_served_held_read_opens_and_its_sessions_page_answers	evidence.facts(),[(1,HoldWakeFact::Served{op:1,peer:"mirroraa".to_owned(),session_id:7,at:SimInstant::default()}),(2,HoldWakeFact::Queued{op:1,session_id:7})]
 src/harness/header_node/hold_wake/tests.rs	a_served_held_read_opens_and_its_sessions_page_answers	evidence.served_peer(1).as_deref(),Some("mirroraa")
 src/harness/header_node/outstanding.rs	judge	(peer.clone(),*incarnation)
+src/harness/header_node/outstanding.rs	judge	(peer.clone(),*incarnation)
+src/harness/header_node/outstanding.rs	judge	(slot.peer.clone(),slot.incarnation)
 src/harness/header_node/outstanding.rs	judge	(slot.peer.clone(),slot.incarnation)
 src/harness/header_node/outstanding.rs	judge	*asked==slot.peer
 src/harness/header_node/outstanding.rs	judge	asked==peer
@@ -321,11 +341,17 @@ src/harness/header_node/outstanding.rs	lingering_at_rest	store.reported.contains
 src/harness/header_node/outstanding.rs	lingering_cancelled	store.reported.contains(&(peer.clone(),*session_id)
 src/harness/header_node/outstanding.rs	note_running	(peer.clone(),*session_id)
 src/harness/header_node/outstanding.rs	observe	(peer.clone(),*incarnation)
+src/harness/header_node/outstanding.rs	observe	(peer.clone(),*incarnation)
+src/harness/header_node/outstanding.rs	observe	(peer.clone(),*incarnation)
 src/harness/header_node/outstanding.rs	observe	(peer.clone(),*session_id)
+src/harness/header_node/outstanding.rs	observe	(peer.clone(),*session_id)
+src/harness/header_node/outstanding.rs	observe	(peer.clone(),*session_id)
+src/harness/header_node/outstanding.rs	observe	(peer.clone(),*session_id,*subscription)
 src/harness/header_node/outstanding.rs	observe	(peer.clone(),*session_id,*subscription)
 src/harness/header_node/outstanding.rs	observe	(request.peer.clone(),request.incarnation)
 src/harness/header_node/outstanding.rs	observe	removed.contains(peer
 src/harness/header_node/outstanding.rs	observe	self.admitted.get(peer)==Some(session_id)
+src/harness/header_node/outstanding.rs	storage	(lease.peer.clone(),lease.session_id,lease.lease_id)
 src/harness/header_node/outstanding.rs	storage	(lease.peer.clone(),lease.session_id,lease.lease_id)
 src/harness/header_node/pair.rs	end	self.removed.contains(&id
 src/harness/header_node/pair.rs	end	self.submitter.get(&id)!=Some(&call)
@@ -351,6 +377,7 @@ src/harness/header_node/publication/tests.rs	status_debts_open_at_admission_and_
 src/harness/header_node/recovery.rs	closes	*link==Some(closed)
 src/harness/header_node/recovery.rs	closes	member.peer==peer
 src/harness/header_node/recovery.rs	cooldown_end	peer==hex
+src/harness/header_node/recovery.rs	cooldown_end	peer==hex
 src/harness/header_node/recovery.rs	holds	peer==record.source.peer
 src/harness/header_node/recovery.rs	link_of	*carried==session_id
 src/harness/header_node/recovery.rs	live_sessions	*link!=Some(*connection)
@@ -360,12 +387,15 @@ src/harness/header_node/recovery.rs	live_sessions	member.session_id!=*session_id
 src/harness/header_node/recovery.rs	live_sessions	session==session_id
 src/harness/header_node/recovery.rs	session_lasts	*replaced==Some(session.session_id)
 src/harness/header_node/recovery.rs	session_lasts	*session_id==session.session_id
+src/harness/header_node/recovery.rs	session_lasts	*session_id==session.session_id
 src/harness/header_node/recovery.rs	session_lasts	Some(*closed)==connection
 src/harness/header_node/recovery.rs	source_session	member.peer==source
 src/harness/header_node/retirement.rs	arm	session!=ready.owner
 src/harness/header_node/retirement.rs	depart	*of==session
 src/harness/header_node/retirement.rs	depart	slot.incarnation==excuse.incarnation
 src/harness/header_node/retirement.rs	depart	slot.peer==*peer
+src/harness/header_node/retirement.rs	depart	slot.peer==*peer
+src/harness/header_node/retirement.rs	depart	slot.session_id==session_id
 src/harness/header_node/retirement.rs	depart	slot.session_id==session_id
 src/harness/header_node/retirement.rs	fixture	roles.taker==*peer
 src/harness/header_node/retirement.rs	fixture	slot.peer==taker.0
@@ -373,6 +403,7 @@ src/harness/header_node/retirement.rs	hand_off	slot.peer==ready.owner.0
 src/harness/header_node/retirement.rs	hand_off	slot.session_id==ready.owner.1
 src/harness/header_node/retirement.rs	kept_apply	excuse.call==call
 src/harness/header_node/retirement.rs	observe	excuse.call==*call
+src/harness/header_node/retirement.rs	observe	self.departed.contains(&session
 src/harness/header_node/retirement.rs	observe	self.departed.contains(&session
 src/harness/header_node/retirement.rs	ready_on	peer==roles.owner
 src/harness/header_node/retirement.rs	ready_on	peer==roles.taker
@@ -433,6 +464,7 @@ src/harness/header_node/wake.rs	released	self.live.get(&wait.peer)==Some(&wait.s
 src/harness/header_node/wake.rs	released	self.started.contains(&wait.peer
 src/harness/header_sync.rs	check	id!=expected
 src/harness/header_sync.rs	check	id==0
+src/harness/header_sync.rs	check	id==0
 src/harness/header_sync.rs	config	peer.script.contains(&PeerAction::Act{act}
 src/harness/header_sync.rs	every_operation_id_finding_at_a_step_is_reported	property.outcome,crate::PropertyOutcome::Violated{witness:vec![2]}
 src/harness/header_sync.rs	every_operation_id_finding_at_a_step_is_reported	property.violations,[found("operation1completesonce","operation1completedagain"),found("acompletionofasubmittedoperation,atmost2","operation3completedbeforeitssubmission")]
@@ -449,6 +481,7 @@ src/harness/header_sync/liveness.rs	due	*answered==op
 src/harness/header_sync/liveness.rs	observe	peer==OWNER
 src/harness/header_sync/liveness.rs	paid	*paid==session_id
 src/harness/header_sync/liveness.rs	timeout	step.peer==TAKER
+src/harness/machine.rs	run_checked	end.outcome==Outcome::Harness
 src/harness/machine.rs	run_checked	end.outcome==Outcome::Harness
 src/harness/machine.rs	witness	property!=machine.name
 src/harness/mod.rs	registry	id==property.id.as_str()
@@ -472,6 +505,7 @@ src/model/cadence.rs	bucket	(connection,layout,row.message_type)
 src/model/cadence.rs	tokens	(connection,layout,message_type)
 src/model/exchange.rs	end_session	*at!=session
 src/model/exchange.rs	owed	(session,key)
+src/model/exchange.rs	response_frame	(session,key)
 src/model/exchange.rs	response_frame	(session,key)
 src/model/exchange.rs	sent	(session,key)
 src/model/subscription.rs	new	row.message_type==subscription_type
@@ -524,6 +558,8 @@ src/peer/discovery/content.rs	label	record.body.node_id!=self.peer
 src/peer/discovery/content.rs	label	services.node_id!=self.peer
 src/peer/discovery/sender.rs	asked	(connection,quic_stream)
 src/peer/discovery/sender.rs	node	(connection,quic_stream)
+src/peer/discovery/sender.rs	node	(connection,quic_stream)
+src/peer/discovery/sender.rs	node	(connection,quic_stream)
 src/peer/discovery/sender.rs	received	(connection,quic_stream)
 src/peer/discovery/sender.rs	received	message_type!=frame.message_type
 src/peer/discovery/sender.rs	received	self.cadence.charge(connection,self.stream.version,row,at)==Charge::Exhausted
@@ -536,6 +572,8 @@ src/peer/evidence.rs	lost	self.refused_streams.contains(&(*connection,record.qui
 src/peer/evidence.rs	lost	self.torn_down.contains(connection
 src/peer/evidence.rs	over_margin_log	seq==2
 src/peer/evidence.rs	place	(connection,record.quic_stream)
+src/peer/evidence.rs	place	Some(stream)==self.discovery
+src/peer/evidence.rs	place	Some(stream)==self.discovery
 src/peer/evidence.rs	place	Some(stream)==self.discovery
 src/peer/evidence.rs	prepared	(*on,*quic)==(connection,stream)
 src/peer/evidence.rs	prepared	hash(page.header)==target
@@ -553,6 +591,7 @@ src/peer/mod.rs	observe	log.run()!=self.id.run
 src/peer/mod.rs	page	(pages,page.subscription_id)
 src/peer/mod.rs	send_crafted	self.cadence.charge(SESSION,stream.version,row,now)==Charge::Exhausted
 src/peer/mod.rs	serve	self.spec.dialer==Dialer::Peer
+src/peer/mod.rs	serve	self.spec.dialer==Dialer::Peer
 src/peer/mod.rs	serve_stream	prelude.stream_kind==ZAKURA_STREAM_HEADER_SYNC
 src/peer/mod.rs	serve_stream	prelude.stream_kind==stream.kind
 src/peer/mod.rs	serve_stream	prelude.stream_version!=ZAKURA_HEADER_SYNC_STREAM_VERSION
@@ -560,10 +599,12 @@ src/peer/mod.rs	serve_stream	prelude.stream_version!=stream.version
 src/peer/stage.rs	the_header_picks_the_stage	header_stage(rules,&header(1,0,status)).0,Stage::Frame
 src/peer/stage.rs	the_ledger_decides_response_headers	empty.decidable_at_header(page,263),Some(Label::Unsolicited)
 src/peer/stage.rs	the_ledger_decides_response_headers	view.decidable_at_header(page,263),Some(Label::OverCredit)
+src/peer/stage.rs	the_ledger_decides_response_headers	view.decidable_at_header(page,263),Some(Label::OverCredit)
 src/peer/stage.rs	the_ledger_decides_response_headers	view.decidable_at_header(page,601),Some(Label::OverCredit)
 src/plan.rs	next_recorded_pick	o.to_string()==pick
 src/plan.rs	recovery_picks_the_oldest_enabled_and_ignores_the_input	d.pick(&options).unwrap().index,0
 src/plan.rs	recovery_picks_the_oldest_enabled_and_ignores_the_input	d.pick(&tasks(1)).unwrap().by,By::Forced
+src/plan.rs	round_robin_follows_keys_as_the_set_changes	d.pick(&all).unwrap().index,0
 src/plan.rs	round_robin_follows_keys_as_the_set_changes	d.pick(&all).unwrap().index,0
 src/plan.rs	round_robin_follows_keys_as_the_set_changes	d.pick(&all[1..]).unwrap().index,0
 src/plan.rs	round_robin_follows_keys_as_the_set_changes	d.pick(&without_t002).unwrap().index,2
@@ -607,6 +648,15 @@ src/sender.rs	frame	*rule_stream!=row.stream
 src/sender.rs	trigger	*rule_stream==id.stream
 src/sender.rs	trigger	*s==stream
 src/sender.rs	trigger	Some(*q)==*quic_stream
+src/sender.rs	trigger	Some(*q)==*quic_stream
+src/sender.rs	trigger	Some(*q)==*quic_stream
+src/sender.rs	trigger	c==connection
+src/sender.rs	trigger	c==connection
+src/sender.rs	trigger	c==connection
+src/sender.rs	trigger	c==connection
+src/sender.rs	trigger	c==connection
+src/sender.rs	trigger	c==connection
+src/sender.rs	trigger	c==connection
 src/sender.rs	trigger	c==connection
 src/sender.rs	trigger	owed.stream==stream
 src/sender.rs	trigger	q==quic_stream
@@ -614,6 +664,7 @@ src/sender.rs	trigger	s==seq
 src/sender.rs	trigger	subscription==key
 src/sim.rs	held_borrow_is_harness_not_panic	report.end.harness,Some(HarnessFailure::PlanBorrowedDuringDraw)
 src/sim.rs	held_borrow_is_harness_not_panic	report.end.outcome,Outcome::Harness
+src/sim.rs	run	end.outcome!=Outcome::Harness
 src/sim.rs	run	end.outcome!=Outcome::Harness
 src/storage/block.rs	observe	log.run()!=self.id.run
 src/storage/block.rs	parent_pending	op.id==id
@@ -628,6 +679,7 @@ src/suite.rs	covered_by	checks.contains(&property.id
 src/suite.rs	harnesses	row.harness.as_deref()==Some(entry.name)
 src/suite.rs	harnesses	row.harness==entry.name
 src/suite.rs	harnesses	row.id==missing_id
+src/suite.rs	harnesses	row.property==property.id
 src/suite.rs	harnesses	row.property==property.id
 src/suite.rs	module_paths_follow_the_file_layout	module_path(file,dir),module
 src/suite.rs	pending	entry.name==missing.harness
@@ -663,7 +715,11 @@ src/table.rs	receiver_reached	Some(*exchange)==frame.exchange
 src/table.rs	receiver_reached	frame.label==Label::Conformant
 src/table.rs	receiver_reached	frame.label==label
 src/table.rs	receiver_reached	frame.row==id.row
+src/table.rs	receiver_reached	frame.row==id.row
+src/table.rs	receiver_reached	frame.row==id.row
 src/table.rs	receiver_reached	frame.rule_stream==id.stream
+src/table.rs	receiver_reached	frame.rule_stream==id.stream
+src/table.rs	receiver_reached	frame.stream==id.stream
 src/table.rs	receiver_reached	frame.stream==id.stream
 src/table.rs	receiver_reached	granted.row==subscription
 src/table.rs	receiver_reached	granted.stream==id.stream
@@ -723,6 +779,8 @@ tests/block_resource_properties.rs	asks_for_the_withheld_floor_before_the_reset	
 tests/block_resource_properties.rs	property	property.property==id
 tests/block_resource_properties.rs	session_slots_follow_their_readings	owners.peaks().session_slots,3
 tests/block_resource_properties.rs	session_slots_follow_their_readings	owners.session_slots(),0
+tests/block_resource_properties.rs	session_slots_follow_their_readings	owners.session_slots(),0
+tests/block_resource_properties.rs	session_slots_follow_their_readings	owners.session_slots(),0
 tests/block_resource_properties.rs	session_slots_follow_their_readings	owners.session_slots(),2
 tests/block_resource_properties.rs	session_slots_follow_their_readings	owners.session_slots(),3
 tests/block_resource_properties.rs	teardown_returns_session_slots	owners.session_slots(),0
@@ -735,6 +793,7 @@ tests/block_resource_properties.rs	the_floor_churn_holds_the_reserved_bound	pick
 tests/block_semantic_properties.rs	an_unrequested_submission_violates_submit_only_requested	violation.property,SUBMIT_ONLY_REQUESTED
 tests/block_semantic_properties.rs	outcome	property.property==id
 tests/block_storage.rs	block_storage_entries_must_reach_the_log_unchanged	report.end.outcome,Outcome::Harness
+tests/block_storage.rs	block_storage_histories_repeat_a_a_and_a_b_a	history(plans[0].clone()),a
 tests/block_storage.rs	block_storage_histories_repeat_a_a_and_a_b_a	history(plans[0].clone()),a
 tests/block_table.rs	bypass	id.row!=Some("block")
 tests/block_table.rs	ids_no_scenario_reaches_stay_not_applicable	*outcome(&report,&id(suffix)),PropertyOutcome::not_applicable(NaReason::NeverApplied)
@@ -752,6 +811,7 @@ tests/campaign.rs	evidence_lists_incomplete_processes	file,"stats-8.json"
 tests/campaign.rs	evidence_matches_each_file_to_the_process_that_wrote_it	file,&format!("stats-0{crashed}.json")
 tests/campaign.rs	evidence_sums_each_workers_processes	evidence.harness,SIM
 tests/campaign.rs	evidence_sums_each_workers_processes	evidence.run,run
+tests/campaign.rs	evidence_without_stats_files_leaves_every_property_unapplied	evidence.unapplied,harness_ids
 tests/campaign.rs	evidence_without_stats_files_leaves_every_property_unapplied	evidence.unapplied,harness_ids
 tests/campaign.rs	incompatible_runs_start_a_new_segment	(feedback.backend.as_str(),feedback.version.as_str(),feedback.mode.as_str()),("stub","7","on")
 tests/campaign.rs	incompatible_runs_start_a_new_segment	fresh_manifest.previous_segment.as_ref(),Some(&run)
@@ -778,6 +838,7 @@ tests/discovery_wire_lifecycle.rs	steer_late_response	*e==pick
 tests/discovery_wire_lifecycle.rs	steer_late_response	*kind==ZAKURA_STREAM_DISCOVERY
 tests/discovery_wire_node.rs	a_redial_the_peer_never_handled	*id==initial
 tests/discovery_wire_node.rs	a_redial_the_peer_never_handled	*link==to_peer
+tests/discovery_wire_node.rs	a_redial_the_peer_never_handled	*link==to_peer
 tests/discovery_wire_node.rs	a_redial_the_peer_never_handled	lost==id
 tests/discovery_wire_node.rs	discovery_tasks_run_on_the_scheduler	*kind==ZAKURA_STREAM_DISCOVERY
 tests/discovery_wire_node.rs	discovery_tasks_run_on_the_scheduler	peer=="peer-0"
@@ -791,6 +852,8 @@ tests/discovery_wire_planted_guards.rs	each_planted_guard_case_runs_its_scenario
 tests/discovery_wire_planted_guards.rs	each_planted_guard_case_runs_its_scenario	typed["scenario"].as_str(),Some(scenario_file.as_str())
 tests/discovery_wire_table.rs	the_harness_registers_the_generated_discovery_ids	SCRIPTED.contains(&property.id.as_str()
 tests/discovery_wire_table.rs	the_harness_registers_the_generated_discovery_ids	owed.contains(&property.id.to_string()
+tests/discovery_wire_table.rs	the_harness_registers_the_generated_discovery_ids	property.id.to_string()==late
+tests/discovery_wire_table.rs	the_harness_registers_the_generated_discovery_ids	property.id.to_string()==late
 tests/discovery_wire_table.rs	the_harness_registers_the_generated_discovery_ids	property.id.to_string()==late
 tests/discovery_wire_table.rs	the_harness_registers_the_generated_discovery_ids	property.needs,needs
 tests/discovery_wire_table.rs	the_harness_registers_the_generated_discovery_ids	property.status,status
@@ -818,6 +881,7 @@ tests/downstream_properties.rs	owners_outliving_their_requests_fail	violation.pr
 tests/downstream_properties.rs	serving_an_answered_request_fails	violation.property,SERVING
 tests/downstream_properties.rs	serving_is_bounded_by_conformant_requests	over_margin.end.violation.map(|v|v.property).as_deref(),Some(SERVING)
 tests/downstream_properties.rs	serving_is_bounded_by_conformant_requests	twice.end.violation.map(|v|v.property).as_deref(),Some(SERVING)
+tests/downstream_properties.rs	serving_needs_outputs_too	id==SERVING
 tests/downstream_properties.rs	serving_needs_outputs_too	id==SERVING
 tests/downstream_properties.rs	stale_owner_work_after_close_fails	violation.property,WORK
 tests/downstream_properties.rs	work_beyond_what_was_delivered_fails	other_exchange.end.violation.map(|v|v.property).as_deref(),Some(WORK)
@@ -906,6 +970,7 @@ tests/explore_state.rs	the_layout_is_pinned_to_its_version	FEEDBACK_VERSION,4
 tests/explore_state.rs	weaker_applied_below_tip	applies.get(id)==Some(&5)
 tests/full_report.rs	a_machine_trace_keeps_its_full_report	*property=="discovery/record-book"
 tests/full_report.rs	record_keeps_the_full_report_and_replay_matches_it	found.property==RACE
+tests/full_report.rs	record_keeps_the_full_report_and_replay_matches_it	found.property==RACE
 tests/full_report.rs	record_refuses_an_existing_full_report	std::fs::read_to_string(dir.path().join(FULL_REPORT_FILE)).unwrap(),"kept\n"
 tests/full_report.rs	the_full_report_keeps_end_found	found.property==RACE
 tests/harness.rs	a_draft_livelock_records_and_runs_on	r.property==NO_LIVELOCK
@@ -940,6 +1005,7 @@ tests/header_acceptance.rs	every_referenced_test_exists	*test==from
 tests/header_acceptance.rs	every_referenced_test_exists	contract.id==ContractId::C10
 tests/header_acceptance.rs	every_referenced_test_exists	contract.id==ContractId::C3
 tests/header_acceptance.rs	every_referenced_test_exists	contract.id==id
+tests/header_acceptance.rs	every_referenced_test_exists	contract.id==id
 tests/header_acceptance.rs	every_referenced_test_exists	proving(&swapped,id),*pinned
 tests/header_acceptance.rs	every_referenced_test_exists	test.file==contracts::REPLAY_EXACT
 tests/header_acceptance.rs	every_referenced_test_exists	test.package=="zakura-sim"
@@ -962,6 +1028,7 @@ tests/header_acceptance.rs	native_errors	cases.contains(&(property.to_owned(),ca
 tests/header_acceptance.rs	native_errors	cases.contains(&(property.to_owned(),mutation.patch.to_owned())
 tests/header_acceptance.rs	native_pin_errors	history==pinned
 tests/header_acceptance.rs	native_pin_errors	property==p
+tests/header_acceptance.rs	native_pin_errors	property==p
 tests/header_acceptance.rs	quiet_entry	ctx.harness.as_deref()==Some(QUIET)
 tests/header_acceptance.rs	record_mut	&record.expected==id
 tests/header_acceptance.rs	row_history_errors	*id==property
@@ -973,6 +1040,7 @@ tests/header_acceptance.rs	set_allowed	nest.over.contains(&case.property
 tests/header_acceptance.rs	set_allowed	set.contains(&case.property
 tests/header_acceptance.rs	test_exists	full.join("::")==test.test
 tests/header_acceptance.rs	the_contracts_table_has_one_row_per_required_contract	contract.id!=ContractId::C18
+tests/header_acceptance.rs	the_evaluator_accepts_real_storage_and_release_wake_histories	*h==harness
 tests/header_acceptance.rs	the_evaluator_accepts_real_storage_and_release_wake_histories	*h==harness
 tests/header_acceptance.rs	the_evaluator_accepts_real_storage_and_release_wake_histories	h.harness==harness
 tests/header_acceptance.rs	the_evaluator_accepts_real_storage_and_release_wake_histories	h.witness.test==test
@@ -995,6 +1063,8 @@ tests/header_acceptance.rs	the_rows_are_consistent_with_coverage	h.harness=="hea
 tests/header_acceptance.rs	the_rows_are_consistent_with_coverage	ids.contains(row.property
 tests/header_acceptance.rs	the_rows_are_consistent_with_coverage	row.property==id
 tests/header_acceptance.rs	the_rows_are_consistent_with_coverage	witness_association_errors(&excepted,rows::TEST_ONLY_WITNESSES),Vec::<String>::new()
+tests/header_acceptance.rs	the_rows_are_consistent_with_coverage	witness_association_errors(&excepted,rows::TEST_ONLY_WITNESSES),Vec::<String>::new()
+tests/header_acceptance.rs	the_rows_are_consistent_with_coverage	witness_association_errors(&excepted,rows::TEST_ONLY_WITNESSES).len(),1
 tests/header_acceptance.rs	the_rows_are_consistent_with_coverage	witness_association_errors(&excepted,rows::TEST_ONLY_WITNESSES).len(),1
 tests/header_acceptance.rs	the_rows_are_consistent_with_coverage	witness_association_errors(&moved,rows::TEST_ONLY_WITNESSES).len(),1
 tests/header_acceptance.rs	the_rows_are_consistent_with_coverage	witness_association_errors(&repackaged,rows::TEST_ONLY_WITNESSES).len(),1
@@ -1024,6 +1094,7 @@ tests/header_controlled.rs	a_property_is_harness_failed_after_an_evidence_failur
 tests/header_controlled.rs	a_skipped_observation_ends_the_run_there	report.end.outcome,Outcome::Harness
 tests/header_controlled.rs	a_tasks_storage_facts_precede_its_outcome	report.end.outcome,Outcome::Harness
 tests/header_controlled.rs	abandoning_unread_replies_in_a_run_keeps_the_storage_driver_working	acquires.contains(id
+tests/header_controlled.rs	abandoning_unread_replies_in_a_run_keeps_the_storage_driver_working	acquires.contains(id
 tests/header_controlled.rs	abandoning_unread_replies_in_a_run_keeps_the_storage_driver_working	report.end.outcome,Outcome::Harness
 tests/header_controlled.rs	delivery_checks	submitted.contains(id
 tests/header_controlled.rs	each_storage_instance_is_checked_on_its_own	report.end.outcome,Outcome::Harness
@@ -1033,6 +1104,7 @@ tests/header_controlled.rs	storage_dropped_after_the_last_step_fails_the_run	saw
 tests/header_controlled.rs	storage_dropped_during_the_run_fails_it	report.end.outcome,Outcome::Harness
 tests/header_controlled.rs	storage_entries_must_reach_the_log_unchanged	report.end.outcome,Outcome::Harness
 tests/header_controlled.rs	storage_from_a_dropped_run_fails_a_later_one	report.end.outcome,Outcome::Harness
+tests/header_controlled.rs	storage_histories_repeat_a_a_and_a_b_a	history(plans[0].clone()),a
 tests/header_controlled.rs	storage_histories_repeat_a_a_and_a_b_a	history(plans[0].clone()),a
 tests/header_controlled.rs	storage_the_run_never_observes_fails_at_setup	report.end.outcome,Outcome::Harness
 tests/header_controlled.rs	the_port_is_checked_live_at_every_evidence_check	report.end.outcome,Outcome::Harness
@@ -1054,6 +1126,7 @@ tests/header_hold_release.rs	build	*handled==call
 tests/header_hold_release.rs	every_fixture_holds_and_takes_its_path	(c,o),(call,op)
 tests/header_hold_release.rs	every_fixture_holds_and_takes_its_path	handled==call
 tests/header_hold_release.rs	every_fixture_holds_and_takes_its_path	id==op
+tests/header_hold_release.rs	every_fixture_holds_and_takes_its_path	id==op
 tests/header_hold_release.rs	outcome	reported.property==property
 tests/header_hold_release.rs	the_serving_fixture_holds_and_takes_its_path	(queued,session),(op,session_id)
 tests/header_hold_release.rs	the_serving_fixture_holds_and_takes_its_path	id==op
@@ -1061,6 +1134,8 @@ tests/header_hold_release.rs	the_serving_fixture_holds_and_takes_its_path	peer,"
 tests/header_hostile_prefix.rs	a_delayed_close_after_recovered_keeps_its_time	outcome(&run.report,BOUNDED_ADVERSARY_PROGRESS),&PropertyOutcome::Held{applicable:1}
 tests/header_hostile_prefix.rs	a_delayed_close_after_recovered_keeps_its_time	pick.identity=="advance-time:500000000"
 tests/header_hostile_prefix.rs	a_source_cooling_down_on_the_node_isnt_unreached	outcome(&run.report,BOUNDED_ADVERSARY_PROGRESS),&PropertyOutcome::not_applicable(NaReason::NeverApplied)
+tests/header_hostile_prefix.rs	an_unfair_plan_starves_the_recovery_the_fair_policy_completes	(&end.violation,&end.harness),(&None,&None)
+tests/header_hostile_prefix.rs	an_unfair_plan_starves_the_recovery_the_fair_policy_completes	(&end.violation,&end.harness),(&None,&None)
 tests/header_hostile_prefix.rs	an_unfair_plan_starves_the_recovery_the_fair_policy_completes	(&end.violation,&end.harness),(&None,&None)
 tests/header_hostile_prefix.rs	closing_a_departed_peer_after_recovered_loses_nothing	member.peer!="mirror-1"
 tests/header_hostile_prefix.rs	closing_a_departed_peer_after_recovered_loses_nothing	outcome(&run.report,BOUNDED_ADVERSARY_PROGRESS),&PropertyOutcome::Held{applicable:1}
@@ -1146,6 +1221,7 @@ tests/header_node_late.rs	stale_completion_held	property.property==STALE_COMPLET
 tests/header_node_late.rs	stale_publisher_release_never_frees_a_replacement_lease	lease.lease_id==l1
 tests/header_node_late.rs	stale_publisher_release_never_frees_a_replacement_lease	lease.lease_id==l2
 tests/header_node_late.rs	stale_publisher_release_never_frees_a_replacement_lease	op.kind==OpKind::Acquire
+tests/header_node_late.rs	stale_publisher_release_never_frees_a_replacement_lease	op.kind==OpKind::Acquire
 tests/header_node_late.rs	stale_publisher_release_never_frees_a_replacement_lease	op.session==Some(1)
 tests/header_node_late.rs	stale_publisher_release_never_frees_a_replacement_lease	op.session==Some(2)
 tests/header_node_late.rs	timed_out_at	*dropped==id
@@ -1181,6 +1257,7 @@ tests/header_pairing.rs	a_hold_waits_for_the_reactor_to_handle_a_call	*call==pre
 tests/header_pairing.rs	a_hold_waits_for_the_reactor_to_handle_a_call	pick.phase==zakura_sim::check::Phase::Live
 tests/header_pairing.rs	assert_dropped_call_paired	*dispatched==call
 tests/header_pairing.rs	assert_dropped_call_paired	*id==op
+tests/header_pairing.rs	assert_dropped_call_paired	*id==op
 tests/header_pairing.rs	assert_dropped_call_paired	*submitter==Some(call)
 tests/header_pairing.rs	fact_at	*logged==seq
 tests/header_pairing.rs	panicked	*call,dispatched.0
@@ -1188,6 +1265,7 @@ tests/header_pairing.rs	panicked	applies.contains(op
 tests/header_pairing.rs	panicked	ended==call
 tests/header_pairing.rs	panicked	events[ended].1,&ReactorFact::CallEnded{call:*call,end:"port-panicked".to_owned(),op:None}
 tests/header_pairing.rs	panicked	id==apply
+tests/header_pairing.rs	timed_out_receipt_pairs_with_either_drop	*dropped==id
 tests/header_pairing.rs	timed_out_receipt_pairs_with_either_drop	*dropped==id
 tests/header_peer_retirement.rs	every_departure_fixture_holds	peer=="mirror-0"
 tests/header_peer_retirement.rs	every_departure_fixture_holds	session!=departed
@@ -1209,9 +1287,11 @@ tests/header_recovery.rs	picked	seen.pick==identity
 tests/header_recovery.rs	recovered_at	(&end.violation,&end.harness),(&None,&None)
 tests/header_recovery.rs	recovered_at	record.source.peer,SOURCE
 tests/header_recovery.rs	recovered_at	seen.pick=="peer:node:finish"
+tests/header_recovery.rs	recovered_at	seen.pick=="peer:node:finish"
 tests/header_recovery.rs	recovered_at	seen.pick=="peer:node:recovered"
 tests/header_recovery.rs	recovered_at	seen.pick==format!("peer:{SOURCE}:recovery-relink")
 tests/header_recovery.rs	recovered_waits_for_other_links_to_settle	*c==connection
+tests/header_recovery.rs	recovered_waits_for_other_links_to_settle	*session_id==session
 tests/header_recovery.rs	recovered_waits_for_other_links_to_settle	*session_id==session
 tests/header_recovery.rs	recovered_waits_for_other_links_to_settle	m.session_id==session
 tests/header_recovery.rs	recovered_waits_for_other_links_to_settle	peer=="mirror-1"
@@ -1221,6 +1301,7 @@ tests/header_recovery_livelock.rs	a_spin_after_recovered_violates_no_livelock	vi
 tests/header_recovery_prefix.rs	a_scenario_without_a_recover_is_unbounded	pick.identity=="peer:node:reset"
 tests/header_recovery_prefix.rs	check_record	faulted.contains(&id
 tests/header_recovery_prefix.rs	check_record	pick.identity!="peer:node:finish"
+tests/header_recovery_prefix.rs	check_record	uncaught.contains(id
 tests/header_recovery_prefix.rs	check_record	uncaught.contains(id
 tests/header_recovery_prefix.rs	run	(&end.violation,&end.harness),(&None,&None)
 tests/header_recovery_prefix.rs	run	pick.identity==format!("peer:{SOURCE}:recover")
@@ -1257,6 +1338,8 @@ tests/header_repair.rs	the_committed_inputs_are_their_plans_and_run_clean	run.le
 tests/header_repair_authority.rs	a_successful_repair_holds_commit_and_reset_properties	*id==apply
 tests/header_repair_authority.rs	a_successful_repair_holds_commit_and_reset_properties	reported.property==property
 tests/header_reply_hold.rs	a_held_reply_outlasts_another_completion	*c==call
+tests/header_reply_hold.rs	a_held_reply_outlasts_another_completion	*c==call
+tests/header_reply_hold.rs	a_held_reply_outlasts_another_completion	*id==apply
 tests/header_reply_hold.rs	a_held_reply_outlasts_another_completion	*id==apply
 tests/header_reply_hold.rs	a_held_reply_outlasts_another_completion	*id==read
 tests/header_reply_hold.rs	a_held_reply_outlasts_another_completion	*op==Some(apply)
@@ -1292,9 +1375,13 @@ tests/header_storage_witness_seeds.rs	in_run	*id==first
 tests/header_storage_witness_seeds.rs	in_run	op.0!=*id
 tests/header_storage_witness_seeds.rs	in_run	op.0!=first
 tests/header_storage_witness_seeds.rs	in_run	op.0==*id
+tests/header_storage_witness_seeds.rs	in_run	op.0==*id
+tests/header_storage_witness_seeds.rs	in_run	op.0==*id
+tests/header_storage_witness_seeds.rs	in_run	op.0==*id
 tests/header_storage_witness_seeds.rs	in_run	op.1==OpKind::Acquire
 tests/header_storage_witness_seeds.rs	in_run	op.1==OpKind::Apply
 tests/header_storage_witness_seeds.rs	in_run	op.1==OpKind::Prepare
+tests/header_storage_witness_seeds.rs	in_run	op.1==OpKind::Read
 tests/header_storage_witness_seeds.rs	in_run	op.1==OpKind::Read
 tests/header_storage_witness_seeds.rs	in_run	op.1==kind
 tests/header_storage_witness_seeds.rs	in_run	reported.property==BOUNDED_ADVERSARY_PROGRESS
@@ -1346,7 +1433,10 @@ tests/header_wire_cooldown.rs	redialed	*on==connection
 tests/header_wire_cooldown.rs	redialed	peer=="peer-0"
 tests/header_wire_honest.rs	a_closed_subscription_offers_no_grant	pick.identity=="peer:peer-0:grant"
 tests/header_wire_honest.rs	a_reopen_after_both_subscriptions_end_gets_a_new_identity	(c,quic_stream)==(connection,first)
+tests/header_wire_honest.rs	a_reopen_after_both_subscriptions_end_gets_a_new_identity	(c,quic_stream)==(connection,first)
 tests/header_wire_honest.rs	a_reopen_after_both_subscriptions_end_gets_a_new_identity	(reopened.0,reopened.2,reopened.3),(connection,ZAKURA_STREAM_HEADER_SYNC,ZAKURA_HEADER_SYNC_STREAM_VERSION)
+tests/header_wire_honest.rs	a_reopen_after_both_subscriptions_end_gets_a_new_identity	*quic_stream==first
+tests/header_wire_honest.rs	a_reopen_after_both_subscriptions_end_gets_a_new_identity	*quic_stream==first
 tests/header_wire_honest.rs	a_reopen_after_both_subscriptions_end_gets_a_new_identity	*quic_stream==first
 tests/header_wire_honest.rs	a_reopen_after_both_subscriptions_end_gets_a_new_identity	*quic_stream==reopened.1
 tests/header_wire_honest.rs	a_reopen_after_both_subscriptions_end_gets_a_new_identity	pick.identity=="peer:peer-0:finish-header"
@@ -1366,11 +1456,13 @@ tests/header_wire_honest.rs	peer_offers	usize::try_from(*seq).ok(),Some(offered.
 tests/header_wire_honest.rs	production_limits_are_in_force	session,(expected,inbound,outbound)
 tests/header_wire_honest.rs	production_limits_are_in_force	startup.max_frame_bytes,LOCAL_MAX_MESSAGE_BYTES
 tests/header_wire_lifecycle.rs	call_of	*c==call
+tests/header_wire_lifecycle.rs	call_of	*c==call
 tests/header_wire_lifecycle.rs	call_of	*o==op
 tests/header_wire_lifecycle.rs	completion	*done==id
 tests/header_wire_lifecycle.rs	disconnect_while_pages_are_in_flight	(fq,fs)==(*q,*seq)
 tests/header_wire_lifecycle.rs	disconnect_while_pages_are_in_flight	(quic_stream,s)==(q,seq)
 tests/header_wire_lifecycle.rs	disconnect_while_pages_are_in_flight	d.id==id
+tests/header_wire_lifecycle.rs	disconnect_while_pages_are_in_flight	pick==disconnect
 tests/header_wire_lifecycle.rs	disconnect_while_pages_are_in_flight	pick==disconnect
 tests/header_wire_lifecycle.rs	disconnect_while_pages_are_in_flight	want==Steer::Pick(pick.clone())
 tests/header_wire_lifecycle.rs	header_sessions	kind==ZAKURA_STREAM_HEADER_SYNC
@@ -1391,6 +1483,7 @@ tests/header_wire_lifecycle.rs	replacement_while_storage_is_pending	op.session==
 tests/header_wire_lifecycle.rs	replacement_while_storage_is_pending	remote_of(new_conn),Some(peer_addr(0,1).to_string())
 tests/header_wire_lifecycle.rs	replacement_while_storage_is_pending	remote_of(old_conn),Some(peer_addr(0,0).to_string())
 tests/header_wire_lifecycle.rs	replacement_while_storage_is_pending	request.session_id==new
+tests/header_wire_lifecycle.rs	replacement_while_storage_is_pending	request.session_id==new
 tests/header_wire_lifecycle.rs	saved_plans_replay_their_end_records	property.property==id
 tests/header_wire_lifecycle.rs	sent_on	d.id==*id
 tests/header_wire_lifecycle.rs	sent_on	l!=link
@@ -1403,6 +1496,7 @@ tests/header_wire_net.rs	a_handshake_timeout_is_neutral	peer,"peer-0"
 tests/header_wire_net.rs	a_lost_initial_is_retransmitted	(lost[0].link.as_str(),lost[0].id),(to_node.as_str(),0)
 tests/header_wire_net.rs	a_lost_initial_is_retransmitted	d.id==retransmitted.id
 tests/header_wire_net.rs	a_lost_initial_is_retransmitted	d.link==from_node
+tests/header_wire_net.rs	a_lost_initial_is_retransmitted	d.link==to_node
 tests/header_wire_net.rs	a_lost_initial_is_retransmitted	d.link==to_node
 tests/header_wire_net.rs	a_lost_initial_is_retransmitted	initial.id,0
 tests/header_wire_net.rs	a_lost_initial_is_retransmitted	peer=="peer-0"
@@ -1419,6 +1513,7 @@ tests/header_wire_net.rs	of	peer=="peer-0"
 tests/header_wire_net.rs	peer_read	(*c,*q,*seq)==(connection,frame.quic_stream,frame.seq)
 tests/header_wire_net.rs	peer_written	(*c,*quic_stream,*seq)==(connection,frame.quic_stream,frame.seq)
 tests/header_wire_prepare_fault.rs	assert_penalized	*origin==Some(session)
+tests/header_wire_prepare_fault.rs	assert_stale_fault_inert	*c==call
 tests/header_wire_prepare_fault.rs	assert_stale_fault_inert	*c==call
 tests/header_wire_prepare_fault.rs	assert_stale_fault_inert	*ended==op
 tests/header_wire_prepare_fault.rs	assert_stale_fault_inert	property.property==STALE_COMPLETION_INERT
@@ -1474,6 +1569,8 @@ tests/header_wire_witness.rs	each_invalid_label_witness_has_a_conformant_control
 tests/header_wire_witness.rs	each_invalid_label_witness_has_a_conformant_control	*c==connection
 tests/header_wire_witness.rs	every_punishment_of_an_honest_peer_at_a_step_is_reported	property.property==HONEST_NEVER_PUNISHED
 tests/header_wire_witness.rs	honest_peer_never_punished	honest.contains(connection
+tests/header_wire_witness.rs	honest_peer_never_punished	honest.contains(connection
+tests/header_wire_witness.rs	honest_peer_never_punished	honest.contains(connection
 tests/header_wire_witness.rs	outcome	property.property==id
 tests/header_wire_witness.rs	peer_connections	peers.contains(&peer
 tests/header_wire_witness.rs	scripted_punishments_of_an_honest_peer_violate_honest_never_punished	*outcome(&report,&id("conformant-never-closes")),PropertyOutcome::not_applicable(NaReason::NeverApplied)
@@ -1496,6 +1593,7 @@ tests/model_labels.rs	labels_fixture_frames_pages	model.page_frame(0,7,1,1,3).fi
 tests/model_labels.rs	labels_fixture_frames_pages	model.page_frame(0,7,1,1,5).first(),Label::Unsolicited
 tests/model_labels.rs	labels_fixture_frames_pages	model.page_frame(0,7,1,21,1).first(),Label::OverCredit
 tests/model_labels.rs	labels_fixture_frames_requests	model.request_frame(0).first(),Label::OverMargin
+tests/model_labels.rs	labels_fixture_frames_requests	model.request_frame(0).first(),Label::OverMargin
 tests/model_labels.rs	labels_fixture_frames_requests	model.request_frame(1).first(),Label::OverMargin
 tests/model_labels.rs	labels_fixture_frames_responses	model.response_frame(0,1,&done).first(),Label::Unsolicited
 tests/model_labels.rs	labels_fixture_frames_responses	model.response_frame(0,1,&part(1)).first(),Label::OverOwed
@@ -1510,6 +1608,7 @@ tests/model_labels.rs	labels_fixture_frames_updates	model.grant_frame(0,0,2,100,
 tests/model_labels.rs	labels_fixture_frames_updates	model.grant_frame(0,0,3,1,empty).first(),Label::BadCursor
 tests/model_labels.rs	labels_fixture_frames_updates	model.grant_frame(0,0,3,77,ONE).first(),Label::BadCursor
 tests/model_labels.rs	labels_fixture_frames_updates	model.grant_frame(0,0,5,1,ONE).first(),Label::BadCursor
+tests/model_labels.rs	labels_fixture_frames_updates	model.grant_frame(0,1,2,101,ONE).first(),Label::AfterClose
 tests/model_labels.rs	labels_fixture_frames_updates	model.grant_frame(0,1,2,101,ONE).first(),Label::AfterClose
 tests/model_labels.rs	labels_fixture_frames_updates	model.grant_frame(0,2,2,2,full).first(),Label::BadCursor
 tests/model_labels.rs	labels_fixture_frames_updates	model.grant_frame(0,2,3,2,ONE).first(),Label::BadCursor
@@ -1571,6 +1670,7 @@ tests/registry.rs	missing_source_fails_the_harness	report.end.harness,Some(Harne
 tests/registry.rs	missing_source_fails_the_harness	report.end.outcome,Outcome::Harness
 tests/registry.rs	obligations_discharge_expire_and_stay_open	open.picks.last().map(|pick|pick.phase),Some(zakura_sim::check::Phase::Drain)
 tests/registry.rs	obligations_discharge_expire_and_stay_open	violation.property,SERVED.as_str()
+tests/registry.rs	obligations_discharge_expire_and_stay_open	violation.property,SERVED.as_str()
 tests/registry.rs	ops_bound_on_poll_rejected	Registry::new(vec![property]).err(),Some(RegistryError::OpsPoll{id:SERVED})
 tests/registry.rs	ops_bound_with_object_rejected	Registry::new(vec![property]).err(),Some(RegistryError::OpsObject{id:SERVED})
 tests/registry.rs	outcome	p.property==id.as_str()
@@ -1589,6 +1689,7 @@ tests/replay_exact.rs	reactor_machine_records_and_replays_query_identities	query
 tests/run_end.rs	a_closure_merge_keeps_every_step_finding_in_order	p.property=="test/stop"
 tests/run_end.rs	a_closure_merge_keeps_every_step_finding_in_order	report.end.outcome,Outcome::Harness
 tests/run_end.rs	a_closure_step_violation_survives_a_late_harness_failure	report.end.outcome,Outcome::Harness
+tests/run_end.rs	a_drain_cut_off_while_a_task_spins_is_drain_bound	report.end.outcome,Outcome::Harness
 tests/run_end.rs	a_drain_cut_off_while_a_task_spins_is_drain_bound	report.end.outcome,Outcome::Harness
 tests/run_end.rs	drain_admits_no_external	pick.options,1
 tests/run_end.rs	harness_text_in_records_has_no_debug_output	end.harness.as_deref(),Some("therunaskedforapick,butthescripthasdraw0x2a")
@@ -1620,6 +1721,7 @@ tests/shrink.rs	padded_stale_owner_shrinks_to_its_witness	std::fs::read(out.path
 tests/shrink.rs	padded_stale_owner_shrinks_to_its_witness	std::fs::read(out.path().join(ORIGINAL_DIR).join(TRACE_FILE)).unwrap(),std::fs::read(dir.path().join(TRACE_FILE)).unwrap()
 tests/shrink.rs	refuses_nondeterministic	std::fs::read(dir.path().join(TRACE_FILE)).unwrap(),recorded
 tests/shrink.rs	shrink_survives_runs_that_leak_tasks	report.property,LEAKED_BORROW.as_str()
+tests/shrink.rs	skipped_pick_runs_the_default	(steps[0].pick.as_str(),steps[0].by),(completion.as_str(),By::Default)
 tests/shrink.rs	skipped_pick_runs_the_default	(steps[0].pick.as_str(),steps[0].by),(completion.as_str(),By::Default)
 tests/shrink.rs	skipped_pick_runs_the_default	(steps[1].pick.as_str(),steps[1].by),("peer:p1:ping1",By::Bytes)
 tests/suite.rs	a_harness_without_a_target_fails	row.harness=="header-sync/repair"
@@ -1675,6 +1777,7 @@ tests/table_properties.rs	generated_ids_are_unique_and_parse_back	parsed.to_stri
 tests/table_properties.rs	misbehavior_readers_need_storage	p.id.as_str()==id
 tests/table_properties.rs	misbehavior_readers_need_storage	properties.iter().find(|p|p.id.as_str()==id).unwrap_or_else(||panic!("{id}isgenerated")).needs.contains(&Source::Storage
 tests/table_properties.rs	outcome	r.property==id
+tests/table_properties.rs	punishing_a_conformant_peer_is_a_violation	violation.property,"feed/s64v1/conformant-never-closes"
 tests/table_properties.rs	punishing_a_conformant_peer_is_a_violation	violation.property,"feed/s64v1/conformant-never-closes"
 tests/table_properties.rs	violations	p.property==id
 tests/targets.rs	bypasses_follow_their_committed_input	discovery[0].property,"discovery/wait-complete-wakes"

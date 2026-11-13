@@ -8507,1105 +8507,1439 @@ const IDENTITY_WORDS: &[&str] = &[
 ];
 
 /// The comparisons [`raw_joins`] finds that aren't identity joins, as
-/// `(file, function, names, why)`: the comparison's identity names, sorted
-/// and space-separated, and why it compares no identity.
+/// `(file, function, comparison, why)`: the comparison's source text,
+/// [`normalized`], as [`RawJoin::text`] holds it, and why it compares no
+/// identity. An entry excuses one occurrence of exactly that comparison,
+/// so another comparison of the same identities in the function isn't
+/// excused, and a function with two identical ones lists it twice.
 const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
     (
         "src/domain/header_sync.rs",
-        "commit_only_authorized_reports_the_overgrant_update_and_no_page",
-        "attribution",
-        "asserts the claims store's whole serialized attribution against the finding's own, and its subject's kind; the finding's join is the witness judge's `FindingSubject`",
-    ),
-    (
-        "src/harness/header_acceptance/actions.rs",
-        "a_link_act_joins_its_whole_link",
-        "PEER_CLOSED link",
-        "counts the link's ends for one reason, after the control of `ends`' join",
-    ),
-    (
-        "src/harness/header_acceptance/actions.rs",
-        "a_pick_joins_its_declared_action_whole",
-        "peer pick_ref",
-        "checks the pick parser's output for a fixed pick string, not a join",
-    ),
-    (
-        "src/harness/header_acceptance/actions.rs",
-        "harness_driven",
-        "pick",
-        "finds the `Recover` steps by their action's name, a kind; the driven picks it builds join by `PickRef`",
-    ),
-    (
-        "src/harness/header_acceptance/companions.rs",
-        "attributed_page",
-        "attribution",
-        "filters a record's rule and subject kind; the page it names joins by `PageRef`",
-    ),
-    (
-        "src/harness/header_acceptance/companions.rs",
-        "the_fault_close_joins_the_rejected_frames_connection",
-        "connection frame page peer quic_stream seq session subscription version",
-        "checks the rejected page read from the fixture is the one the test built; `fault_close`'s joins have their own controls",
-    ),
-    (
-        "src/harness/header_acceptance/companions.rs",
-        "the_fault_close_joins_the_rejected_frames_connection",
-        "page",
-        "asserts the fault close judge's result, `Ok`, for the fixture's page; the join is inside the judge, under its control",
-    ),
-    (
-        "src/harness/header_acceptance/companions.rs",
-        "the_path_break_names_the_sent_page",
-        "page",
-        "asserts the path break judge's result, `Ok`, for the fixture's page; the join is inside the judge, under its control",
-    ),
-    (
-        "src/harness/header_acceptance/companions.rs",
-        "the_sent_page_comes_from_the_frames_evidence",
-        "page sent_page",
-        "asserts the sent page the judge finds for the fixture; the join is inside the judge, under its control",
-    ),
-    (
-        "src/harness/header_acceptance/companions.rs",
-        "the_staged_page_joins_the_rejected_frame",
-        "page staged_page",
-        "asserts the staged page judge's result, `Ok`, for the fixture's page; the join is inside the judge, under its control",
-    ),
-    (
-        "src/harness/header_acceptance/companions.rs",
-        "the_trace_judge_judges_the_recorded_draft_run",
-        "id",
-        "checks the trace judge returns the digest of the trace it read (round 9's C2-6), not a join of records",
-    ),
-    (
-        "src/harness/header_acceptance/evaluate.rs",
-        "caught_draft",
-        "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "src/harness/header_acceptance/history.rs",
-        "declarations_read_back_in_order",
-        "history run_id",
-        "checks a declaration reads back the run, task and role the test wrote, not a join",
-    ),
-    (
-        "src/harness/header_acceptance/not_applicable.rs",
-        "lists",
-        "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "src/harness/header_acceptance/not_applicable.rs",
-        "history_expected",
-        "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "src/harness/header_acceptance/rows.rs",
-        "hand_written_rows",
-        "id",
-        "a property ID choosing its row's watched set",
-    ),
-    (
-        "src/harness/header_acceptance/tool.rs",
-        "a_a_and_a_b_a",
-        "id",
-        "trace digests, compared to show two recordings are one run, not joined",
-    ),
-    (
-        "src/harness/header_acceptance/tool.rs",
-        "a_run_s_actions_follow_its_harness",
-        "pick",
-        "removes the recording's last relink pick, the test's planted change, not a judgment",
-    ),
-    (
-        "src/harness/header_acceptance/tool.rs",
-        "a_typed_case_is_planned_beside_a_fuzz_case",
-        "id",
-        "expected-result IDs, the manifest's keys, not run evidence",
-    ),
-    (
-        "tests/evidence_inventory.rs",
-        "c14_is_proved_by_every_registered_store_s_producer",
-        "id",
-        "contract IDs, the manifest's names for contracts",
-    ),
-    (
-        "tests/header_acceptance.rs",
-        "visit_expr_method_call",
-        "call",
-        "compares a parsed method call's name, Rust syntax, not run evidence",
-    ),
-    (
-        "tests/header_acceptance_narrowing.rs",
-        "not_tool_recorded",
-        "id",
-        "expected-result IDs, the manifest's keys, not run evidence",
-    ),
-    (
-        "tests/header_acceptance_narrowing.rs",
-        "peer_kinds",
-        "PEER_KINDS",
-        "filters observation kinds by the peer kinds' names, a kind check with no join",
-    ),
-    (
-        "tests/header_catch_not_applicable.rs",
-        "each_declared_list_matches_its_baseline",
-        "case id property",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "tests/header_catch_not_applicable.rs",
-        "every_node_catch_declares_its_not_applicable",
-        "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "tests/header_catch_not_applicable.rs",
-        "no_list_accepts_an_incomplete_reason",
-        "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "tests/header_catch_not_applicable.rs",
-        "the_patched_list_judges_the_draft_run",
-        "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "tests/header_catch_not_applicable.rs",
-        "violating",
-        "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "tests/header_mixed_resources.rs",
-        "witnessed",
-        "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "tests/header_wire_crossing.rs",
-        "held_applied",
-        "id property",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "tests/header_wire_witness.rs",
-        "joins_the_frames",
-        "PEER_TO_NODE link",
-        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
-    ),
-    (
-        "tests/header_wire_witness.rs",
-        "joins_the_frames",
-        "first_frame seq",
-        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
-    ),
-    (
-        "tests/header_wire_witness.rs",
-        "joins_the_frames",
-        "id",
-        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
-    ),
-    (
-        "tests/header_wire_witness.rs",
-        "two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary",
-        "ID",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),    (
-        "src/check.rs",
-        "a_punishment_names_the_frame_judged_on_its_own_connection",
-        "connection frame_on quic_stream seq version",
-        "checks the punishment's subject is the frame the test planted, an output check; `punishment`'s join is its `ConnectionRef`, whose control follows",
-    ),
-    (
-        "src/harness/header_node/adoption.rs",
-        "every_unread_publication_at_a_settled_end_reaches_the_sidecar",
-        "version",
-        "checks each finding's detail names the state the test published, an output's text, after the subjects are checked whole",
-    ),
-    (
-        "src/harness/header_node/publication/tests.rs",
-        "an_adoption_stamps_its_debts_in_session_order",
-        "session",
-        "checks the debts' order against the test's own sorted session list, an order, not a join",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "a_ledger_handoff_claim_names_both_calls",
-        "Attribution",
-        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "a_ledger_hold_claim_names_its_call_and_round",
-        "Attribution attribution call",
-        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "a_ledger_hold_claim_names_its_call_and_round",
-        "attribution",
-        "checks a hold's serialized attribution has no page, a field's absence, not a join",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "a_ledger_page_claim_names_its_page",
-        "Attribution page",
-        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "an_open_credit_break_names_its_update_and_no_page",
-        "Attribution attribution",
-        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "an_open_credit_break_names_its_update_and_no_page",
-        "attribution",
-        "checks an update's serialized attribution has no page, a field's absence, not a join",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "attributed",
-        "attribution",
-        "checks a break has an attribution exactly when its claim kind is an authority claim, a kind check",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "each_finding_joins_on_its_full_identity",
-        "Call call op",
-        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "each_finding_joins_on_its_full_identity",
-        "page",
-        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "each_ledger_rule_the_property_reports_has_its_authority_rule",
-        "Attribution call ledger_attribution",
-        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "findings_one_key_apart_stay_distinct",
-        "attribution",
-        "checks a finding's subject is the test's own planted copy with its frame moved, an output check",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "findings_one_key_apart_stay_distinct",
-        "frame",
-        "checks a path finding names the frame the test planted, an output check",
-    ),
-    (
-        "src/harness/header_node/authority/tests.rs",
-        "findings_one_key_apart_stay_distinct",
-        "page",
-        "checks a finding renders as a finding the test builds from the same page, an output check of the rendering",
-    ),
-    (
-        "src/table.rs",
-        "effects_follow_trigger",
-        "id stream",
-        "keeps the effects on the template's own stream kind and row, a property's row, not another event's identity",
-    ),
-    (
-        "src/table.rs",
-        "punishments_follow_conformant",
-        "frame",
-        "checks a judged frame's label, a kind",
-    ),
-    (
-        "src/table.rs",
-        "punishments_follow_conformant",
-        "frame id stream",
-        "checks a judged frame is on the template's stream kind, a property's row, not another event's identity",
-    ),
-    (
-        "tests/header_despite_close.rs",
-        "the_fault_close_holds_on_the_unpatched_rejection",
-        "page session",
-        "pins the fixture's one refusal to the rejected page's session and fault; the companion's join is `fault_close`'s `SessionRef`, whose control follows",
-    ),
-    (
-        "tests/header_mixed_resources.rs",
-        "witnessed",
-        "new_connection old_connection",
-        "checks a peer's two links are on two connections, the opposite of a join; each link joins its admission by `SessionRef`",
-    ),
-    (
-        "tests/header_mixed_resources.rs",
-        "witnessed",
-        "new_session old_session",
-        "checks a peer's two links are two sessions, the opposite of a join; each link joins its admission by `SessionRef`",
-    ),
-    (
-        "tests/header_node_session_ends.rs",
-        "a_link_the_harness_closes_shows_in_the_next_view",
-        "pick",
-        "checks the view's first pick's category and key prefix, kinds",
-    ),
-    (
-        "tests/header_node_session_ends.rs",
-        "a_link_the_harness_closes_shows_in_the_next_view",
-        "session_id",
-        "counts the view's sessions against the test's own link count",
-    ),
-    (
-        "tests/header_release_wake.rs",
-        "a_bypassed_wake_s_patched_draft_run_settles",
-        "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "tests/header_release_wake.rs",
-        "a_bypassed_wake_s_patched_draft_run_settles",
-        "pick",
-        "finds the fixture's one fixed release pick by its literal, to count it and read its step",
-    ),
-    (
-        "tests/header_wire_crossing.rs",
-        "conformant_controls",
-        "connection",
-        "checks the checker accepts a fault on another connection, a result; `unpunished` joins by `ConnectionRef`",
-    ),
-    (
-        "tests/header_wire_prepare_fault.rs",
-        "a_bad_page_joins_the_close_of_its_own_connection",
-        "page",
-        "checks the closes `bad_page_closes` finds for the planted page, a result, before the control of its `ConnectionRef` join",
-    ),
-    (
-        "tests/table_properties.rs",
-        "every_cadence_punishment_at_a_boundary_is_reported",
-        "id",
-        "checks the report's violations of one property ID against the ones the test expects, an output check",
-    ),
-    (
-        "tests/table_properties.rs",
-        "every_unjustified_punishment_is_a_violation",
-        "id",
-        "checks the report's violations of one property ID against the ones the test expects, an output check",
-    ),
-    (
-        "src/domain/header_sync.rs",
         "commit_only_authorized_reports_each_page_it_names",
-        "property",
+        "violation.property==COMMIT_ONLY_AUTHORIZED",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
     ),
     (
         "src/domain/header_sync.rs",
         "commit_only_authorized_reports_the_overgrant_update_and_no_page",
-        "property",
+        "attribution,[serde_json::to_value(record.attribution.as_ref().expect(\"anauthoritybreak\")).expect(\"anattributionserializes\")]",
+        "asserts the claims store's whole serialized attribution against the finding's own, and its subject's kind; the finding's join is the witness judge's `FindingSubject`",
+    ),
+    (
+        "src/domain/header_sync.rs",
+        "commit_only_authorized_reports_the_overgrant_update_and_no_page",
+        "attribution[0].to_string().contains(\"\\\"page\\\"\"",
+        "asserts the claims store's whole serialized attribution against the finding's own, and its subject's kind; the finding's join is the witness judge's `FindingSubject`",
+    ),
+    (
+        "src/domain/header_sync.rs",
+        "commit_only_authorized_reports_the_overgrant_update_and_no_page",
+        "attribution[0][\"subject\"][\"subject\"],\"update\"",
+        "asserts the claims store's whole serialized attribution against the finding's own, and its subject's kind; the finding's join is the witness judge's `FindingSubject`",
+    ),
+    (
+        "src/domain/header_sync.rs",
+        "commit_only_authorized_reports_the_overgrant_update_and_no_page",
+        "violation.property,COMMIT_ONLY_AUTHORIZED",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
     ),
     (
         "src/domain/header_sync.rs",
         "each_claim_case_keeps_its_findings_and_subjects_in_the_sidecar",
-        "property",
+        "found.property==COMMIT_ONLY_AUTHORIZED",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
     ),
     (
         "src/domain/header_sync.rs",
         "each_claim_check_keeps_two_findings_at_a_boundary_in_the_sidecar",
-        "case property",
+        "other.property!=case.property()",
         "checks no other property breaks beside the test case's own ID, a property ID, not a join",
     ),
     (
         "src/domain/header_sync.rs",
         "observe",
-        "case",
+        "*case==TwoFindings::Budget",
         "picks the test's own scenario variant, an enum kind, not an identity",
     ),
     (
         "src/harness/header_acceptance/actions.rs",
+        "a_link_act_joins_its_whole_link",
+        "sessions.ends(&link,PEER_CLOSED),1",
+        "counts the link's ends for one reason, after the control of `ends`' join",
+    ),
+    (
+        "src/harness/header_acceptance/actions.rs",
+        "a_pick_joins_its_declared_action_whole",
+        "pick_ref(\"peer:mirror-0:recovery-relink\"),Some(PickRef{peer:\"mirror-0\".into(),action:\"recovery-relink\".into()})",
+        "checks the pick parser's output for a fixed pick string, not a join",
+    ),
+    (
+        "src/harness/header_acceptance/actions.rs",
+        "harness_driven",
+        "action.pick.action==recover",
+        "finds the `Recover` steps by their action's name, a kind; the driven picks it builds join by `PickRef`",
+    ),
+    (
+        "src/harness/header_acceptance/actions.rs",
         "judge",
-        "link peer",
+        "(peer.clone(),*link,*shows)",
         "tallies a script's earlier acts of one kind on one peer's declared link, a count of the declaration itself; the session evidence joins by `LinkRef`",
     ),
     (
         "src/harness/header_acceptance/companions.rs",
+        "attributed_page",
+        "attribution[\"rule\"]!=serde_json::to_value(rule).ok()?",
+        "filters a record's rule and subject kind; the page it names joins by `PageRef`",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
         "path_break",
-        "property",
+        "report.property==COMMIT",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "the_fault_close_joins_the_rejected_frames_connection",
+        "fault_close(&closed,&linkage,&page),Ok(())",
+        "asserts the fault close judge's result, `Ok`, for the fixture's page; the join is inside the judge, under its control",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "the_fault_close_joins_the_rejected_frames_connection",
+        "page,RejectedPage{frame:FrameRef{connection:1,kind:5,version:9,quic_stream:4,inbound:true,seq:3},session:11,subscription:7,peer:\"peer-0\".into()}",
+        "checks the rejected page read from the fixture is the one the test built; `fault_close`'s joins have their own controls",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "the_path_break_names_the_sent_page",
+        "path_break(&properties,&store,&page,&sent()),Ok(())",
+        "asserts the path break judge's result, `Ok`, for the fixture's page; the join is inside the judge, under its control",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "the_sent_page_comes_from_the_frames_evidence",
+        "sent_page(&page,&peers,&pages),Ok(sent())",
+        "asserts the sent page the judge finds for the fixture; the join is inside the judge, under its control",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "the_staged_page_joins_the_rejected_frame",
+        "staged_page(std::slice::from_ref(&own),&page,&sent()),Ok(())",
+        "asserts the staged page judge's result, `Ok`, for the fixture's page; the join is inside the judge, under its control",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "the_trace_judge_judges_the_recorded_draft_run",
+        "judged.trace,id",
+        "checks the trace judge returns the digest of the trace it read (round 9's C2-6), not a join of records",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "caught_draft",
+        "set.contains(id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
         "src/harness/header_acceptance/evaluate.rs",
         "caught_patched",
-        "case property",
+        "*property==case.property",
         "checks the patched run broke the case's own property ID, one whole key, an output check of the run's end",
     ),
     (
         "src/harness/header_acceptance/evaluate.rs",
         "result_context",
-        "harness",
+        "manifest.machines.contains(&harness",
         "classifies a harness name by the manifest's machine list, a static name, not run evidence",
     ),
     (
         "src/harness/header_acceptance/history.rs",
         "declarations_read_back_in_order",
-        "PLAN_FILE",
+        "(first.history().run_id.as_str(),first.history().index,first.history().role.as_str()),(\"r\",3,\"patched\")",
+        "checks a declaration reads back the run, task and role the test wrote, not a join",
+    ),
+    (
+        "src/harness/header_acceptance/history.rs",
+        "declarations_read_back_in_order",
+        "fs::read(first.dir().join(PLAN_FILE)).unwrap(),[1,2]",
         "checks the Plan file reads back the bytes the test wrote, not a join",
     ),
     (
         "src/harness/header_acceptance/not_applicable.rs",
         "a_history_s_group_joins_its_whole_witness",
-        "history history_groups_matched",
+        "history_groups_matched(history)!=1",
         "skips a history that doesn't match one group, a count, before the group join's control",
     ),
     (
         "src/harness/header_acceptance/not_applicable.rs",
         "history_expected",
-        "harness",
+        "*harness==group.harness",
         "a harness's name selecting its registered IDs from the static matrix, not run evidence",
     ),
     (
         "src/harness/header_acceptance/not_applicable.rs",
-        "lists",
-        "harness",
-        "a harness's name selecting its registered IDs from the static matrix, not run evidence",
+        "history_expected",
+        "group.undeclared.contains(&id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
         "src/harness/header_acceptance/not_applicable.rs",
-        "lists",
-        "id property",
+        "history_expected",
+        "ids.contains(id",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
         "src/harness/header_acceptance/not_applicable.rs",
         "lists",
-        "property",
+        "*harness==group.harness",
+        "a harness's name selecting its registered IDs from the static matrix, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/not_applicable.rs",
+        "lists",
+        "*harness==on",
+        "a harness's name selecting its registered IDs from the static matrix, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/not_applicable.rs",
+        "lists",
+        "*id!=property",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/not_applicable.rs",
+        "lists",
+        "change.applies.contains(&na.property",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/not_applicable.rs",
+        "lists",
+        "entry.applies.contains(id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/not_applicable.rs",
+        "lists",
+        "group.never.contains(id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/not_applicable.rs",
+        "lists",
+        "group.undeclared.contains(id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/not_applicable.rs",
+        "lists",
+        "na.property==id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/not_applicable.rs",
+        "lists",
+        "undeclared_ids.contains(&id",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
         "src/harness/header_acceptance/required.rs",
         "one_case_keys",
-        "harness",
+        "harness==\"header/reactor\"",
         "the test's machine classifier, naming one harness, not a join",
+    ),
+    (
+        "src/harness/header_acceptance/rows.rs",
+        "hand_written_rows",
+        "id==WATCH_WIRE",
+        "a property ID choosing its row's watched set",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "a_a_and_a_b_a",
+        "other.0.id==first.0.id",
+        "trace digests, compared to show two recordings are one run, not joined",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "a_a_and_a_b_a",
+        "trace.id==first.0.id",
+        "trace digests, compared to show two recordings are one run, not joined",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "a_case_run_is_recorded_at_its_whole_case",
-        "case",
+        "case.name==\"reserved-flags-skipped\"",
         "picks the test's fixture cases by a literal name, not a join",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "a_case_run_is_recorded_at_its_whole_case",
-        "case run",
+        "recorded_at(&plan.tasks,&run(case)),Some((*at,\"patched\"))",
         "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "a_case_s_harness_is_read_from_committed_files_only",
-        "harness",
+        "harness.is_ok(),read",
         "asserts a read's result against the test's other read, an output check",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "a_case_s_harness_is_read_from_committed_files_only",
-        "planted_harness_caught",
+        "super::super::planted_harness_caught(repo.path(),\"p\",name),Ok(true)",
         "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "a_counted_test_declares_exactly_its_inventory",
-        "test",
+        "inventory_errors(&inventory,&declare(&all),test),Vec::<String>::new()",
         "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "a_history_run_is_recorded_at_its_whole_history",
-        "run",
+        "recorded_at(&plan.tasks,&run),Some((at,\"run\"))",
         "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "a_nested_case_s_patched_witness_judges_its_exact_set",
-        "property",
+        "p==property",
         "picks the test's fixture case from the committed plan, a test building its input",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "a_replay_is_read_from_its_own_artifacts",
-        "harness",
+        "meta.harness,MACHINE",
         "asserts the replay's harness is the fixture's, an output check",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "a_replay_links_its_run_s_trace",
-        "run",
+        "replay_links(&run(\"a-b\",CaseRun::Draft),&tasks,&all).artifacts[0],\"1/draft/trace.jsonl\"",
         "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
+        "a_run_s_actions_follow_its_harness",
+        "step.pick!=last",
+        "removes the recording's last relink pick, the test's planted change, not a judgment",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
         "a_stays_not_applicable_task_records_its_trigger",
-        "property",
+        "property,stays_na",
+        "asserts the task's property IDs against the fixture's, an output check",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "a_stays_not_applicable_task_records_its_trigger",
+        "property,target",
         "asserts the task's property IDs against the fixture's, an output check",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "a_test_artifact_is_read_by_name",
-        "test_actual",
+        "outcomes(test_actual(dir.path(),&AT)),[TestOutcome::Failed,TestOutcome::Failed]",
         "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
+        "a_test_artifact_is_read_by_name",
+        "outcomes(test_actual(dir.path(),&AT)),[TestOutcome::Failed,TestOutcome::Skipped]",
+        "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "a_test_artifact_is_read_by_name",
+        "outcomes(test_actual(dir.path(),&AT)),[TestOutcome::Passed,TestOutcome::Skipped]",
+        "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "a_typed_case_is_planned_beside_a_fuzz_case",
+        "Some(unsupported)==id.as_ref()",
+        "expected-result IDs, the manifest's keys, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
         "an_earlier_attempt_s_declaration_is_refused",
-        "run",
+        "run==CaseRun::Patched",
+        "picks the patched role, a kind, to plant the test's change",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "an_earlier_attempt_s_declaration_is_refused",
+        "run==CaseRun::Patched",
         "picks the patched role, a kind, to plant the test's change",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "an_earlier_attempt_s_unit_runs_are_refused",
-        "run",
+        "run==\"patched\"",
+        "picks the patched role, a kind, to plant the test's change",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "an_earlier_attempt_s_unit_runs_are_refused",
+        "run==\"patched\"",
+        "picks the patched role, a kind, to plant the test's change",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "an_earlier_attempt_s_unit_runs_are_refused",
+        "run==\"patched\"",
         "picks the patched role, a kind, to plant the test's change",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "an_execution_s_reports_come_from_its_full_report",
-        "run",
+        "run.end,End::Completed",
+        "asserts the execution's end and override, an output check",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "an_execution_s_reports_come_from_its_full_report",
+        "run.meta.draft_override,Vec::<String>::new()",
+        "asserts the execution's end and override, an output check",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "an_execution_s_reports_come_from_its_full_report",
+        "run.meta.draft_override,[\"header/reactor-policy\"]",
         "asserts the execution's end and override, an output check",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "an_integrity_recorder_s_nonzero_exit_fails_its_run",
-        "history_run",
+        "own.meta.input,Some(history_run())",
         "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "an_integrity_recorder_s_nonzero_exit_fails_its_run",
-        "run",
+        "run.1==CaseRun::Patched",
+        "picks the patched role, a kind, to plant the test's change",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "an_integrity_recorder_s_nonzero_exit_fails_its_run",
+        "run==CaseRun::Patched",
         "picks the patched role, a kind, to plant the test's change",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "an_integrity_run_is_read_from_its_artifact",
-        "run",
+        "reread(dir.path(),run).meta.input.as_ref(),Some(&input)",
+        "picks the patched role, a kind, and asserts the input the run read, an output check",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "an_integrity_run_is_read_from_its_artifact",
+        "run==CaseRun::Patched",
         "picks the patched role, a kind, and asserts the input the run read, an output check",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "draft_list",
-        "property",
+        "row.property==property",
         "a property ID finding its row in the static rows, not run evidence",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "draft_witness",
-        "id property",
+        "**id!=property",
         "property IDs, the case's set without its own ID, not run evidence",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "libtest_names",
-        "test",
+        "thread==test",
         "normalizes libtest's thread name to the task's test name, the projection `DeclarationRef`'s and the inventory's joins compare whole",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "links",
-        "run",
+        "run!=\"draft\"",
         "picks the draft role, a kind",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "patched_build_refusal",
-        "test",
+        "test.binary_source.as_deref()==measured",
+        "compares a test artifact's source digests with the build's, a binding check, not an identity join",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "patched_build_refusal",
+        "test.checkout_source.as_deref()==measured",
         "compares a test artifact's source digests with the build's, a binding check, not an identity join",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "the_draft_list_names_each_draft_and_its_owner",
-        "property",
+        "drafts.iter().map(|draft|(draft.property.as_str(),draft.owner.as_str())).collect::<Vec<_>>(),[(\"header-sync/honest-progress\",\"Evan\")]",
+        "asserts the draft list against the fixture's property, an output check",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "the_draft_list_names_each_draft_and_its_owner",
+        "row.property==\"header-sync/honest-progress\"",
         "asserts the draft list against the fixture's property, an output check",
     ),
     (
         "src/harness/header_acceptance/tool.rs",
         "unit_refusal",
-        "run",
+        "run==\"patched\"",
         "picks the patched role, a kind",
+    ),
+    (
+        "src/harness/header_node/adoption.rs",
+        "every_unread_publication_at_a_settled_end_reaches_the_sidecar",
+        "violation.actual.contains(&format!(\"state{:?}publishedandunread\",StateVersion::new(version))",
+        "checks each finding's detail names the state the test published, an output's text, after the subjects are checked whole",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "a_ledger_handoff_claim_names_both_calls",
+        "attributed(&ledger_claims(&events),ClaimRule::BadHandoff),Attribution{rule:AuthorityRule::Submission,subject:AuthoritySubject::Handoff{prepare:1,apply:2,round:1}}",
+        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "a_ledger_hold_claim_names_its_call_and_round",
+        "attribution,Attribution{rule:AuthorityRule::OwnerBinding,subject:AuthoritySubject::Hold{call:3,round:1}}",
+        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "a_ledger_hold_claim_names_its_call_and_round",
+        "serde_json::to_string(&attribution).expect(\"anattributionserializes\").contains(\"\\\"page\\\"\"",
+        "checks a hold's serialized attribution has no page, a field's absence, not a join",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "a_ledger_page_claim_names_its_page",
+        "attributed(&ledger_claims(&foreign),ClaimRule::ForeignPage),Attribution{rule:AuthorityRule::Provenance,subject:AuthoritySubject::page(&(mirror(),9,1),&[chain[0].hash],Some(4))}",
+        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "a_ledger_page_claim_names_its_page",
+        "attributed(&ledger_claims(&over),ClaimRule::OverReservation),Attribution{rule:AuthorityRule::Credit,subject:AuthoritySubject::page(&(mirror(),7,1),&hashes,Some(5))}",
+        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "an_open_credit_break_names_its_update_and_no_page",
+        "found.iter().map(|found|&found.attribution).collect::<Vec<_>>(),[&Attribution{rule:AuthorityRule::Credit,subject:subject.clone()}]",
+        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "an_open_credit_break_names_its_update_and_no_page",
+        "serde_json::to_string(&record.attribution).expect(\"anattributionserializes\").contains(\"\\\"page\\\"\"",
+        "checks an update's serialized attribution has no page, a field's absence, not a join",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "attributed",
+        "attribution.is_some(),AUTHORITY_CLAIMS.contains(&Claim::of(*found))",
+        "checks a break has an attribution exactly when its claim kind is an authority claim, a kind check",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "each_finding_joins_on_its_full_identity",
+        "*found==blamed(AuthorityRule::Submission,AuthoritySubject::Call{call:1,op:12})",
+        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "each_finding_joins_on_its_full_identity",
+        "*found==blamed(AuthorityRule::Submission,AuthoritySubject::Call{call:2,op:11})",
+        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "each_finding_joins_on_its_full_identity",
+        "attributions(&found),[blamed(AuthorityRule::Path,AuthoritySubject::page(&base,&[chain[2].hash],None))]",
+        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "each_finding_joins_on_its_full_identity",
+        "attributions(&found),[blamed(AuthorityRule::Path,AuthoritySubject::page(other,&headers,Some(3)))]",
+        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "each_ledger_rule_the_property_reports_has_its_authority_rule",
+        "ledger_attribution(&claim(rule)),Some(Attribution{rule:authority,subject:AuthoritySubject::Hold{call:1,round:2}})",
+        "checks the checker's findings for a planted history against the attribution the test expects, an output check; the checker's own joins are C22's",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "findings_one_key_apart_stay_distinct",
+        "*frame,Some(4)",
+        "checks a path finding names the frame the test planted, an output check",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "findings_one_key_apart_stay_distinct",
+        "finding(&page).to_string(),AuthorityFinding::new(AuthorityRule::Credit,page.clone(),\"thesamedetail\").to_string()",
+        "checks a finding renders as a finding the test builds from the same page, an output check of the rendering",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "findings_one_key_apart_stay_distinct",
+        "six[0].attribution.subject,refrated",
+        "checks a finding's subject is the test's own planted copy with its frame moved, an output check",
     ),
     (
         "src/harness/header_node/authority/tests.rs",
         "honest",
-        "peer session_id subscription",
+        "(peer.clone(),*session_id,*subscription)",
         "keeps the fixture's running credit totals per whole subscription, a test building its own input",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "honest",
+        "(peer.clone(),*session_id,*subscription)",
+        "keeps the fixture's running credit totals per whole subscription, a test building its own input",
+    ),
+    (
+        "src/harness/header_node/authority/tests.rs",
+        "honest",
+        "(peer.clone(),*session_id,*subscription)",
+        "keeps the fixture's running credit totals per whole subscription, a test building its own input",
+    ),
+    (
+        "src/harness/header_node/publication/tests.rs",
+        "an_adoption_stamps_its_debts_in_session_order",
+        "owed.iter().map(|(_,session)|*session).collect::<Vec<_>>(),ordered",
+        "checks the debts' order against the test's own sorted session list, an order, not a join",
     ),
     (
         "src/harness/header_sync.rs",
         "fault_sidecar",
-        "property",
+        "found.property==HEADER_FAULT_PENALIZED",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
     ),
     (
         "src/harness/scripted.rs",
         "findings",
-        "property",
+        "found.property==property",
         "selects one property's findings by its ID, one whole key, not a join of run evidence",
     ),
     (
         "src/stores.rs",
         "attach",
-        "run",
+        "attached,run",
         "guards that a node's stores serve the one run that attached them, a whole run ID, not a join",
+    ),
+    (
+        "src/table.rs",
+        "effects_follow_trigger",
+        "at.stream==id.stream",
+        "keeps the effects on the template's own stream kind and row, a property's row, not another event's identity",
+    ),
+    (
+        "src/table.rs",
+        "punishments_follow_conformant",
+        "frame.label==Label::Conformant",
+        "checks a judged frame's label, a kind",
+    ),
+    (
+        "src/table.rs",
+        "punishments_follow_conformant",
+        "frame.stream==id.stream",
+        "checks a judged frame is on the template's stream kind, a property's row, not another event's identity",
     ),
     (
         "src/witness.rs",
         "a_member_at_the_break_s_step_joins_by_its_punishment",
-        "property",
+        "judged(None),Err(WitnessError::Unjoined{property:\"test/co\".to_owned(),step:Some(3)})",
         "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
     ),
     (
         "tests/evidence_inventory.rs",
         "c14_is_proved_by_every_registered_store_s_producer",
-        "file test",
+        "contract.id==ContractId::C14",
+        "contract IDs, the manifest's names for contracts",
+    ),
+    (
+        "tests/evidence_inventory.rs",
+        "c14_is_proved_by_every_registered_store_s_producer",
+        "test.file!=\"tests/evidence_inventory.rs\"",
         "filters producer tests outside this file by a literal path, not a join",
     ),
     (
         "tests/evidence_inventory.rs",
         "c14_is_proved_by_every_registered_store_s_producer",
-        "package test",
+        "test.package==\"zakura-sim\"",
         "checks a producer test's package is a literal, not a join",
     ),
     (
         "tests/evidence_inventory.rs",
         "every_shared_field_is_a_registered_store_or_allowed",
-        "file",
+        "(*file,*owner,*name)==key",
+        "the source scan's own (file, owner, field) keys of a store field, not run evidence",
+    ),
+    (
+        "tests/evidence_inventory.rs",
+        "every_shared_field_is_a_registered_store_or_allowed",
+        "(store.file,store.owner,store.field)==key",
+        "the source scan's own (file, owner, field) keys of a store field, not run evidence",
+    ),
+    (
+        "tests/evidence_inventory.rs",
+        "every_shared_field_is_a_registered_store_or_allowed",
+        "found_allowed.contains(&(*file,*owner,*field)",
+        "the source scan's own (file, owner, field) keys of a store field, not run evidence",
+    ),
+    (
+        "tests/evidence_inventory.rs",
+        "every_shared_field_is_a_registered_store_or_allowed",
+        "found_registered.contains(&(store.file,store.owner,store.field)",
         "the source scan's own (file, owner, field) keys of a store field, not run evidence",
     ),
     (
         "tests/evidence_inventory.rs",
         "the_scan_finds_atomics",
-        "file",
+        "(*file,*owner,*name)==(\"new.rs\",\"New\",&field.field)",
         "asserts the source scan found the planted field, an output check",
     ),
     (
         "tests/evidence_inventory.rs",
         "the_scan_reads_enum_variant_fields",
-        "file",
+        "(*file,*owner,*name)==(\"new.rs\",field.owner.as_str(),&field.field)",
         "asserts the source scan found the planted field, an output check",
     ),
     (
         "tests/full_report.rs",
         "a_machine_witness_recording_keeps_its_full_report",
-        "property",
+        "*property==book",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
     ),
     (
         "tests/full_report.rs",
         "a_planted_witness_recording_keeps_its_full_report",
-        "property",
+        "found.property==RACE",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
     ),
     (
         "tests/header_acceptance.rs",
         "artifact_read_scope",
-        "file",
+        "*file!=format!(\"{ACCEPTANCE_SRC}/binding.rs\")",
         "source file paths the scan reads, not acceptance evidence",
     ),
     (
         "tests/header_acceptance.rs",
         "catch_errors",
-        "case",
+        "c==*case",
         "a static check that each contract's proving catch has a row's `Caught`, whole `CaseRef`s of the committed tables",
     ),
     (
         "tests/header_acceptance.rs",
         "control_gaps",
-        "test",
+        "control==test",
         "the control scan's own test names, not acceptance evidence",
     ),
     (
         "tests/header_acceptance.rs",
         "crate_sources",
-        "file",
+        "file!=\"src/harness/header_acceptance/refs.rs\"",
+        "source file paths the scan reads, not acceptance evidence",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "crate_sources",
+        "file!=\"tests/support/one_key_off.rs\"",
         "source file paths the scan reads, not acceptance evidence",
     ),
     (
         "tests/header_acceptance.rs",
         "delivered_obligations_verify_on_their_evidence",
-        "harness history",
-        "picks the test's fixture history by a literal harness, a test building its input",
-    ),
-    (
-        "tests/header_acceptance.rs",
-        "delivered_obligations_verify_on_their_evidence",
-        "history",
+        "*h==history",
         "edits the test's own copy of the fixture history's row, whole `HistoryRef`s, a test building its input",
     ),
     (
         "tests/header_acceptance.rs",
-        "each_node_harness_s_missing_sources_are_its_own_test_s",
-        "file test",
-        "checks a missing-source test's file is a literal, a static check",
+        "delivered_obligations_verify_on_their_evidence",
+        "history.harness==harness",
+        "picks the test's fixture history by a literal harness, a test building its input",
     ),
     (
         "tests/header_acceptance.rs",
         "each_node_harness_s_missing_sources_are_its_own_test_s",
-        "test",
+        "*t==test",
         "a static check that a key's covering pass is the harness's own test, whole `TestRef`s of the committed tables",
     ),
     (
         "tests/header_acceptance.rs",
-        "every_artifact_read_goes_through_binding",
-        "file",
-        "source file paths the scan reads, not acceptance evidence",
+        "each_node_harness_s_missing_sources_are_its_own_test_s",
+        "test.file,\"tests/header_acceptance_sources.rs\"",
+        "checks a missing-source test's file is a literal, a static check",
     ),
     (
         "tests/header_acceptance.rs",
         "every_artifact_read_goes_through_binding",
-        "in_test",
+        "artifact_reads(&in_test,\"tool.rs\").contains(&\"planted\".to_owned()",
         "asserts the read scan's result for a planted source, an output check",
     ),
     (
         "tests/header_acceptance.rs",
+        "every_artifact_read_goes_through_binding",
+        "at==file",
+        "source file paths the scan reads, not acceptance evidence",
+    ),
+    (
+        "tests/header_acceptance.rs",
         "every_history_names_its_case",
-        "history_targets",
+        "targets.len(),rows::history_targets().len()",
         "compares two counts, not a join",
     ),
     (
         "tests/header_acceptance.rs",
         "every_native_mutation_is_classified",
-        "case",
+        "c.name==case",
         "a static check of the native classification against its pins, whole names of the committed tables",
     ),
     (
         "tests/header_acceptance.rs",
         "every_native_mutation_is_classified",
-        "case property",
+        "c.property==property",
         "a static check of the native classification against its pins, whole names of the committed tables",
     ),
     (
         "tests/header_acceptance.rs",
         "every_native_mutation_is_classified",
-        "property",
+        "case.name==covering.1",
+        "a static check of the native classification against its pins, whole names of the committed tables",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "every_native_mutation_is_classified",
+        "case.name==own9.1",
+        "a static check of the native classification against its pins, whole names of the committed tables",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "every_native_mutation_is_classified",
+        "case.property==covering.0",
+        "a static check of the native classification against its pins, whole names of the committed tables",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "every_native_mutation_is_classified",
+        "case.property==own9.0",
         "a static check of the native classification against its pins, whole names of the committed tables",
     ),
     (
         "tests/header_acceptance.rs",
         "every_node_history_lists_its_not_applicable_reports",
-        "history",
+        "header_acceptance::not_applicable::history_groups_unmatched(&judged),Vec::<String>::new()",
+        "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "every_node_history_lists_its_not_applicable_reports",
+        "histories.contains(&RunId::from(history)",
         "a static check that each counted history has its list key, whole `RunId`s of the committed tables",
     ),
     (
         "tests/header_acceptance.rs",
         "every_node_history_lists_its_not_applicable_reports",
-        "history history_expected",
-        "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
-    ),
-    (
-        "tests/header_acceptance.rs",
-        "every_node_history_lists_its_not_applicable_reports",
-        "history history_groups_matched",
+        "history_groups_matched(history),1",
         "checks each counted history matches one group, a count",
     ),
     (
         "tests/header_acceptance.rs",
         "every_node_history_lists_its_not_applicable_reports",
-        "history_groups_unmatched",
+        "not_applicable,history_expected(history)",
         "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
     ),
     (
         "tests/header_acceptance.rs",
         "every_referenced_test_exists",
-        "test test_exists",
+        "test_exists(TestRef{test:\"planted::tests::a_hung_patched_run_is_killed_and_never_caught\",..xtask}),Ok(())",
         "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
     ),
     (
         "tests/header_acceptance.rs",
         "genuine_history_record",
-        "harness history",
+        "*harness==history.harness",
         "a harness's name selecting its registered IDs from the static matrix, to build the test's record",
     ),
     (
         "tests/header_acceptance.rs",
         "genuine_history_record",
-        "id property",
+        "na.property==id",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
         "tests/header_acceptance.rs",
         "native_pin_errors",
-        "case",
+        "case==c",
         "a static check of the native classification against its pins, whole names of the committed tables",
     ),
     (
         "tests/header_acceptance.rs",
         "native_pin_errors",
-        "test",
+        "witness.test.test==test",
         "a static check of the native classification against its pins, whole names of the committed tables",
     ),
     (
         "tests/header_acceptance.rs",
-        "raw_join_gaps",
-        "file",
-        "the raw-join scan's own (file, function) keys, not acceptance evidence",
-    ),
-    (
-        "tests/header_acceptance.rs",
         "raw_join_scope",
-        "file",
+        "file!=\"src/harness/header_acceptance/refs.rs\"",
         "source file paths the scan reads, not acceptance evidence",
     ),
     (
         "tests/header_acceptance.rs",
         "the_evaluator_applies_contracts_and_narrowing",
-        "case",
+        "c==case",
         "picks the test's fixture `Caught` from the committed manifest by its whole `CaseRef`, a test building its input",
     ),
     (
         "tests/header_acceptance.rs",
         "the_evaluator_refuses_each_single_defect",
-        "CASE case",
+        "case==CASE",
         "picks the test's fixture `Caught` from the committed manifest by its whole `CaseRef`, a test building its input",
     ),
     (
         "tests/header_acceptance.rs",
         "the_gate_requirements_match_their_obligations",
-        "case_key",
+        "result.keys.contains(&case_key",
         "a static check of which results the committed manifest covers a key with, whole keys",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "visit_expr_method_call",
+        "call.method==\"contains\"",
+        "compares a parsed method call's name, Rust syntax, not run evidence",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "visit_expr_method_call",
+        "call.method==\"joined\"",
+        "compares a parsed method call's name, Rust syntax, not run evidence",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "visit_expr_method_call",
+        "call.method==\"joins\"",
+        "compares a parsed method call's name, Rust syntax, not run evidence",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "visit_expr_method_call",
+        "call.method==method",
+        "compares a parsed method call's name, Rust syntax, not run evidence",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "visit_expr_method_call",
+        "call.method==name",
+        "compares a parsed method call's name, Rust syntax, not run evidence",
     ),
     (
         "tests/header_acceptance_narrowing.rs",
         "fixtures",
-        "harness",
+        "table.get(\"harness\").and_then(toml::Value::as_str)==Some(harness)",
         "reads a fixture's harness against the one asked for, a test building its input",
     ),
     (
         "tests/header_acceptance_narrowing.rs",
         "harnesses",
-        "harness",
+        "HEADER_HARNESSES.contains(&harness.as_str()",
         "classifies a harness name as a header harness, a static name",
     ),
     (
         "tests/header_acceptance_narrowing.rs",
         "n1_peerless_and_machine_results_read_no_peer_evidence",
-        "harness",
+        "&input.harness==harness",
         "picks the test's input by harness name, a test building its input",
     ),
     (
         "tests/header_acceptance_narrowing.rs",
         "n1_peerless_and_machine_results_read_no_peer_evidence",
-        "wire_harness",
+        "path==wire_harness",
         "checks a source path the test built, not a join",
     ),
     (
         "tests/header_acceptance_narrowing.rs",
         "n2_released_results_carry_no_draft_override",
-        "run",
+        "run.end,End::Killed",
+        "asserts the run's end and override, an output check",
+    ),
+    (
+        "tests/header_acceptance_narrowing.rs",
+        "n2_released_results_carry_no_draft_override",
+        "run.meta.draft_override,draft",
         "asserts the run's end and override, an output check",
     ),
     (
         "tests/header_acceptance_narrowing.rs",
         "n3_only_release_wake_runs_a_wake_fixture",
-        "harness",
+        "&input.harness==harness",
         "picks the test's input by harness name, a test building its input",
     ),
     (
         "tests/header_acceptance_narrowing.rs",
         "n4_machine_results_run_no_sim_drain_or_stores",
-        "harness",
+        "&input.harness==harness",
         "picks the test's input by harness name, a test building its input",
     ),
     (
         "tests/header_acceptance_narrowing.rs",
         "not_tool_recorded",
-        "property",
+        "Some(expected)==id.as_ref()",
+        "expected-result IDs, the manifest's keys, not run evidence",
+    ),
+    (
+        "tests/header_acceptance_narrowing.rs",
+        "not_tool_recorded",
+        "Some(unsupported)==id.as_ref()",
+        "expected-result IDs, the manifest's keys, not run evidence",
+    ),
+    (
+        "tests/header_acceptance_narrowing.rs",
+        "not_tool_recorded",
+        "property==NATIVE_DIR",
         "skips native mutations by their directory, a kind",
     ),
     (
         "tests/header_acceptance_narrowing.rs",
+        "peer_kinds",
+        "PEER_KINDS.contains(&kind.as_str()",
+        "filters observation kinds by the peer kinds' names, a kind check with no join",
+    ),
+    (
+        "tests/header_acceptance_narrowing.rs",
         "released_inputs",
-        "harness",
+        "(input.harness.clone(),input.name.clone())",
         "lists the committed inputs by harness and name, and classifies a harness name, a static check",
     ),
     (
         "tests/header_acceptance_narrowing.rs",
         "released_inputs",
-        "property",
+        "(p,n)==(property,name)",
+        "skips native mutations by their directory, a kind, and picks the test's case, a test building its input",
+    ),
+    (
+        "tests/header_acceptance_narrowing.rs",
+        "released_inputs",
+        "HEADER_HARNESSES.contains(&harness.as_str()",
+        "lists the committed inputs by harness and name, and classifies a harness name, a static check",
+    ),
+    (
+        "tests/header_acceptance_narrowing.rs",
+        "released_inputs",
+        "property!=NATIVE_DIR",
         "skips native mutations by their directory, a kind, and picks the test's case, a test building its input",
     ),
     (
         "tests/header_acceptance_tool.rs",
         "a_draft_run_s_acts_are_shown_by_its_witness",
-        "property",
+        "p==property",
         "picks the test's fixture case from the committed plan, a test building its input",
     ),
     (
         "tests/header_acceptance_tool.rs",
         "a_late_fault_draft_run_s_disconnect_is_shown",
-        "property",
+        "p==property",
         "picks the test's fixture case from the committed plan, a test building its input",
     ),
     (
         "tests/header_acceptance_tool.rs",
         "each_history_is_the_same_alone_and_after_another",
-        "run",
+        "run==1",
+        "picks two of the test's own runs by number, not a join",
+    ),
+    (
+        "tests/header_acceptance_tool.rs",
+        "each_history_is_the_same_alone_and_after_another",
+        "run==3",
         "picks two of the test's own runs by number, not a join",
     ),
     (
         "tests/header_acceptance_tool.rs",
         "fixtures_of",
-        "harness",
+        "table.get(\"harness\").and_then(toml::Value::as_str)==Some(harness)",
         "reads a fixture's harness against the one asked for, a test building its input",
     ),
     (
         "tests/header_acceptance_tool.rs",
         "two_planted_cases_run_through_the_tool",
-        "property",
-        "picks the test's fixture case from the committed plan, a test building its input",
-    ),
-    (
-        "tests/header_acceptance_tool.rs",
-        "two_planted_cases_run_through_the_tool",
-        "run",
+        "*run,replayed.1",
         "asserts the tool's executions against the runs the test made, an output check",
     ),
     (
         "tests/header_acceptance_tool.rs",
         "two_planted_cases_run_through_the_tool",
-        "run_by",
+        "baseline.meta.run_by,RunBy::Planted",
         "asserts who ran each execution, a kind",
+    ),
+    (
+        "tests/header_acceptance_tool.rs",
+        "two_planted_cases_run_through_the_tool",
+        "c.run==draft.run",
+        "asserts the tool's executions against the runs the test made, an output check",
+    ),
+    (
+        "tests/header_acceptance_tool.rs",
+        "two_planted_cases_run_through_the_tool",
+        "draft.meta.run_by,RunBy::Tool",
+        "asserts who ran each execution, a kind",
+    ),
+    (
+        "tests/header_acceptance_tool.rs",
+        "two_planted_cases_run_through_the_tool",
+        "execution.trace,digest(&dir.join(run).join(\"trace.jsonl\"))",
+        "asserts the tool's executions against the runs the test made, an output check",
+    ),
+    (
+        "tests/header_acceptance_tool.rs",
+        "two_planted_cases_run_through_the_tool",
+        "p==property",
+        "picks the test's fixture case from the committed plan, a test building its input",
+    ),
+    (
+        "tests/header_acceptance_tool.rs",
+        "two_planted_cases_run_through_the_tool",
+        "p==property",
+        "picks the test's fixture case from the committed plan, a test building its input",
     ),
     (
         "tests/header_catch_not_applicable.rs",
         "caught",
-        "case",
+        "c==case",
         "picks the test's fixture `Caught` from the committed manifest by its whole `CaseRef`, a test building its input",
     ),
     (
         "tests/header_catch_not_applicable.rs",
         "each_declared_list_matches_its_baseline",
-        "harness",
+        "(harness,shape)",
         "groups the test's own baseline shapes by harness, a test building its input",
     ),
     (
         "tests/header_catch_not_applicable.rs",
-        "every_node_catch_declares_its_not_applicable",
-        "case property",
+        "each_declared_list_matches_its_baseline",
+        "id!=case.property",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
         "tests/header_catch_not_applicable.rs",
         "every_node_catch_declares_its_not_applicable",
-        "harness",
+        "na.property!=case.property",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "every_node_catch_declares_its_not_applicable",
+        "on==harness",
         "a harness's name selecting its registered IDs from the static matrix, a static check",
     ),
     (
         "tests/header_catch_not_applicable.rs",
         "every_node_catch_declares_its_not_applicable",
-        "property",
+        "registered==id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "every_node_catch_declares_its_not_applicable",
+        "set.contains(&na.property",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
         "tests/header_catch_not_applicable.rs",
         "judged",
-        "case",
-        "checks the judged case is the despite-close case, a whole `CaseRef` constant",
-    ),
-    (
-        "tests/header_catch_not_applicable.rs",
-        "judged",
-        "harness",
+        "*harness==WIRE",
         "checks the fixture runs on the wire harness, a constant",
     ),
     (
         "tests/header_catch_not_applicable.rs",
+        "judged",
+        "case==companions::DESPITE_CLOSE",
+        "checks the judged case is the despite-close case, a whole `CaseRef` constant",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
         "no_list_accepts_an_incomplete_reason",
-        "id property",
+        "na.property==*id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "no_list_accepts_an_incomplete_reason",
+        "na.property==id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "no_list_accepts_an_incomplete_reason",
+        "set.contains(&id.as_str()",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "no_list_accepts_an_incomplete_reason",
+        "set.contains(id",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
         "tests/header_catch_not_applicable.rs",
         "the_patched_list_judges_the_draft_run",
-        "id property",
+        "na.property==id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "the_patched_list_judges_the_draft_run",
+        "set.contains(&id.as_str()",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "violating",
+        "set.contains(&id.as_str()",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
         "tests/header_despite_close.rs",
+        "the_fault_close_holds_on_the_unpatched_rejection",
+        "(refusal.session,refusal.reason.as_str()),(page.session,CONTENT_FAULT)",
+        "pins the fixture's one refusal to the rejected page's session and fault; the companion's join is `fault_close`'s `SessionRef`, whose control follows",
+    ),
+    (
+        "tests/header_despite_close.rs",
         "the_sent_pages_store_holds_what_the_peer_sent",
-        "run",
+        "run==&kept[..]",
         "compares a header run, a run of hashes, with the test's own, not an identity",
     ),
     (
         "tests/header_mixed_resources.rs",
         "run_into",
-        "harness",
+        "(&report.end.violation,&report.end.harness),(&None,&None)",
         "asserts the run ended with no violation or harness failure, absences",
     ),
     (
         "tests/header_mixed_resources.rs",
         "witnessed",
-        "id property",
+        "*na==id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_mixed_resources.rs",
+        "witnessed",
+        "old_connection,new_connection",
+        "checks a peer's two links are on two connections, the opposite of a join; each link joins its admission by `SessionRef`",
+    ),
+    (
+        "tests/header_mixed_resources.rs",
+        "witnessed",
+        "old_session,new_session",
+        "checks a peer's two links are two sessions, the opposite of a join; each link joins its admission by `SessionRef`",
+    ),
+    (
+        "tests/header_mixed_resources.rs",
+        "witnessed",
+        "p.property==id",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
     ),
     (
         "tests/header_mixed_resources.rs",
         "witnessed",
-        "run",
+        "run.picks,PICKS",
         "asserts the run's picks against the test's own, an output check",
     ),
     (
         "tests/header_node_capacity.rs",
         "a_drain_reads_past_an_unread_boundary_at_the_cut",
-        "property",
+        "property.property==CHUNK_BUDGET_BOUND",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
     ),
     (
         "tests/header_node_prereqs.rs",
         "a_stop_picked_at_the_cut_settles_in_the_drain",
-        "property",
+        "property.property==TEARDOWN_RETURNS_BASELINE",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
     ),
     (
         "tests/header_node_reservations.rs",
         "the_overlapping_forks_fixture_prepares_both_while_both_are_staged",
-        "property",
+        "property.property==COMMIT_ONLY_AUTHORIZED",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
+    ),
+    (
+        "tests/header_node_session_ends.rs",
+        "a_link_the_harness_closes_shows_in_the_next_view",
+        "first.pick.category,Category::Task",
+        "checks the view's first pick's category and key prefix, kinds",
+    ),
+    (
+        "tests/header_node_session_ends.rs",
+        "a_link_the_harness_closes_shows_in_the_next_view",
+        "first.pick.key.split('.').next(),Some(\"control\")",
+        "checks the view's first pick's category and key prefix, kinds",
+    ),
+    (
+        "tests/header_node_session_ends.rs",
+        "a_link_the_harness_closes_shows_in_the_next_view",
+        "first.sessions,usize::try_from(session_id+1).expect(\"twosessions\")",
+        "counts the view's sessions against the test's own link count",
     ),
     (
         "tests/header_recovery_progress.rs",
         "run_into",
-        "harness",
+        "(&end.violation,&end.harness),(&None,&None)",
         "asserts the run ended with no violation or harness failure, absences",
     ),
     (
         "tests/header_recovery_progress.rs",
         "run_into",
-        "property",
+        "property.property!=BOUNDED_ADVERSARY_PROGRESS",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
+    ),
+    (
+        "tests/header_release_wake.rs",
+        "a_bypassed_wake_s_patched_draft_run_settles",
+        "id,CAPACITY_RELEASE_WAKES",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_release_wake.rs",
+        "a_bypassed_wake_s_patched_draft_run_settles",
+        "line[\"pick\"]==\"peer:node:settle\"",
+        "finds the fixture's one fixed release pick by its literal, to count it and read its step",
+    ),
+    (
+        "tests/header_wire_crossing.rs",
+        "conformant_controls",
+        "unpunished(&with(fault(update.connection+1)),update),Ok(())",
+        "checks the checker accepts a fault on another connection, a result; `unpunished` joins by `ConnectionRef`",
+    ),
+    (
+        "tests/header_wire_crossing.rs",
+        "held_applied",
+        "property.property==id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_wire_prepare_fault.rs",
+        "a_bad_page_joins_the_close_of_its_own_connection",
+        "closes(&page),[(1,vec![\"service_protocol_reject\".to_owned()])]",
+        "checks the closes `bad_page_closes` finds for the planted page, a result, before the control of its `ConnectionRef` join",
     ),
     (
         "tests/header_wire_prepare_fault.rs",
         "the_late_fault_fixture_penalizes_after_the_session_ended",
-        "property",
+        "property.property==HEADER_FAULT_PENALIZED",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
     ),
     (
         "tests/header_wire_witness.rs",
         "a_punishment_before_any_judgement_reaches_the_honest_trigger",
-        "history",
+        "judged(history,Expect::Violated),Ok(())",
         "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
     ),
     (
         "tests/header_wire_witness.rs",
+        "joins_the_frames",
+        "*sent==id",
+        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "joins_the_frames",
+        "Some(seq)==first_frame",
+        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "joins_the_frames",
+        "link==PEER_TO_NODE",
+        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "joins_the_frames",
+        "link==PEER_TO_NODE",
+        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
+    ),
+    (
+        "tests/header_wire_witness.rs",
         "planted_scenarios_match_their_builders",
-        "file",
+        "read(&file),scenario_json(&scenario)",
         "compares a committed scenario file's text with its builder's, not a join",
     ),
     (
         "tests/header_wire_witness.rs",
         "two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary",
-        "ID property",
+        "property[\"property\"]==ID",
         "a property ID, one whole key, checked against a constant or the case's own ID, not a join of run evidence",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary",
+        "violated,[ID]",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/table_properties.rs",
+        "every_cadence_punishment_at_a_boundary_is_reported",
+        "violations(&report,id),[punished(violation(id,(2,&[2]),\"connection1'sjudgedframesareallconformant,sonopunishment\",\"aclosewithcauserequest_protocol_reject\"),1,5),punished(violation(id,(2,&[2]),\"connection2'sjudgedframesareallconformant,sonopunishment\",\"aMisbehavior\"),2,6)]",
+        "checks the report's violations of one property ID against the ones the test expects, an output check",
+    ),
+    (
+        "tests/table_properties.rs",
+        "every_unjustified_punishment_is_a_violation",
+        "violations(&report,id),[punished(violation(id,(1,&[1]),\"connection1'sjudgedframesareallconformant,sonopunishment\",close),1,5),punished(violation(id,(1,&[1]),\"connection2'sjudgedframesareallconformant,sonopunishment\",close),2,6)]",
+        "checks the report's violations of one property ID against the ones the test expects, an output check",
+    ),
+    (
+        "src/check.rs",
+        "a_punishment_names_the_frame_judged_on_its_own_connection",
+        "frame_on(&punished),Some(FrameRef{connection:1,kind:64,version:1,quic_stream:4,inbound:true,seq:2})",
+        "checks the punishment's subject is the frame the test planted, an output check; `punishment`'s join is its `ConnectionRef`, whose control follows",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "caught_patched",
+        "run.actions==Actions::Incomplete",
+        "checks the run's actions against a kind, not a join",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "judge",
+        "manifest.machines.contains(&harness",
+        "classifies a harness name by the manifest's machine list, a static name, not run evidence",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "native_errors",
+        "c.name==case",
+        "a static check of the native classification against its pins, whole names of the committed tables",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "native_errors",
+        "c.property==property",
+        "a static check of the native classification against its pins, whole names of the committed tables",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "native_errors",
+        "cases.contains(&(property.to_owned(),case.to_owned())",
+        "a static check of the native classification against its pins, whole names of the committed tables",
+    ),
+    (
+        "tests/header_acceptance.rs",
+        "native_pin_errors",
+        "property==p",
+        "a static check of the native classification against its pins, whole names of the committed tables",
     ),
 ];
 
@@ -9617,9 +9951,24 @@ const RAW_JOIN_BASE: &str = "c879f071a0";
 /// The committed raw-join baseline, relative to the crate: each hit
 /// [`raw_joins`] finds in [`raw_join_scope`] at [`RAW_JOIN_BASE`] that's
 /// still at the head, one per line as `file<TAB>function<TAB>comparison`,
-/// which [`regenerate_raw_join_baseline`] writes. Taking only base hits, it
-/// never grows to hold a new one, and as head code changes it only shrinks.
+/// which [`regenerate_raw_join_baseline`] writes. A comparison the base
+/// held twice in one function is listed twice, so a new copy of a base
+/// comparison isn't a base hit. Taking only base hits, it never grows to
+/// hold a new one, and as head code changes it only shrinks.
 const RAW_JOIN_BASELINE: &str = "tests/fixtures/raw_join_baseline.txt";
+
+/// Where a raw join is, as the ratchet counts it: its file, its function
+/// and its comparison text ([`RawJoin::text`]).
+type Site = (String, String, String);
+
+/// How many times each site occurs in `sites`.
+fn tally(sites: impl IntoIterator<Item = Site>) -> BTreeMap<Site, usize> {
+    let mut counts = BTreeMap::new();
+    for site in sites {
+        *counts.entry(site).or_default() += 1;
+    }
+    counts
+}
 
 /// One raw identity comparison [`raw_joins`] finds.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -9724,7 +10073,10 @@ fn span_text(
 /// such as `a == b`; a pattern that matches an identity's literal value;
 /// an ordering comparison (`<`, `>=`); and a string join by prefix
 /// (`starts_with`, `strip_prefix`).
-fn raw_joins(text: &str, file: &str) -> BTreeSet<RawJoin> {
+///
+/// Each occurrence is one hit, so two identical comparisons in one
+/// function are two.
+fn raw_joins(text: &str, file: &str) -> Vec<RawJoin> {
     use syn::{spanned::Spanned, visit::Visit};
     /// Whether `name` holds an identity word as one of its parts.
     fn identity(name: &str) -> bool {
@@ -9809,7 +10161,7 @@ fn raw_joins(text: &str, file: &str) -> BTreeSet<RawJoin> {
     struct Raw<'a> {
         lines: Vec<&'a str>,
         within: Vec<String>,
-        found: BTreeSet<RawJoin>,
+        found: Vec<RawJoin>,
     }
     impl Raw<'_> {
         /// Notes a comparison of `sides`, from the first's start to the
@@ -9825,7 +10177,7 @@ fn raw_joins(text: &str, file: &str) -> BTreeSet<RawJoin> {
             };
             if !names.is_empty() {
                 let names: Vec<String> = names.into_iter().collect();
-                self.found.insert(RawJoin {
+                self.found.push(RawJoin {
                     function: self.within.last().cloned().unwrap_or_default(),
                     names: names.join(" "),
                     text: span_text(&self.lines, first.span().start(), last.span().end()),
@@ -9911,17 +10263,19 @@ fn raw_joins(text: &str, file: &str) -> BTreeSet<RawJoin> {
     let mut raw = Raw {
         lines: text.lines().collect(),
         within: Vec::new(),
-        found: BTreeSet::new(),
+        found: Vec::new(),
     };
     raw.visit_file(&parsed);
+    raw.found.sort();
     raw.found
 }
 
-/// The committed [`RAW_JOIN_BASELINE`], as `(file, function, text)`.
-fn raw_join_baseline() -> BTreeSet<(String, String, String)> {
+/// The committed [`RAW_JOIN_BASELINE`], as how many times it lists each
+/// site.
+fn raw_join_baseline() -> BTreeMap<Site, usize> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(RAW_JOIN_BASELINE);
-    std::fs::read_to_string(&path)
-        .expect("the raw-join baseline is committed")
+    let text = std::fs::read_to_string(&path).expect("the raw-join baseline is committed");
+    let sites = text
         .lines()
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| {
@@ -9933,54 +10287,56 @@ fn raw_join_baseline() -> BTreeSet<(String, String, String)> {
                     .to_owned()
             };
             (part(), part(), part())
-        })
-        .collect()
+        });
+    tally(sites)
 }
 
 /// Why `found`, each file's [`raw_joins`], breaks Rule 25's ratchet, one
-/// line each: a hit the `baseline`, as `(file, function, text)`, doesn't
-/// list and `allowed`, as `(file, function, names)`, doesn't excuse; a
-/// baseline line no hit matches any more, which must go; and an `allowed`
-/// entry that excuses no hit the baseline doesn't already list.
+/// line each, counting each site's occurrences: an occurrence of a site
+/// beyond what the `baseline` lists and `allowed` excuses, each as how many
+/// times it holds the site; a baseline site with more occurrences listed
+/// than found, which must go; and an `allowed` entry beyond the
+/// occurrences the baseline doesn't already hold.
 fn raw_join_gaps(
-    found: &BTreeSet<(String, RawJoin)>,
-    baseline: &BTreeSet<(String, String, String)>,
-    allowed: &BTreeSet<(String, String, String)>,
+    found: &[(String, RawJoin)],
+    baseline: &BTreeMap<Site, usize>,
+    allowed: &BTreeMap<Site, usize>,
 ) -> Vec<String> {
     let mut gaps = Vec::new();
-    let based = |file: &str, hit: &RawJoin| {
-        baseline.contains(&(file.to_owned(), hit.function.clone(), hit.text.clone()))
-    };
-    let new: Vec<&(String, RawJoin)> = found
+    let site =
+        |file: &str, hit: &RawJoin| (file.to_owned(), hit.function.clone(), hit.text.clone());
+    let counts = tally(found.iter().map(|(file, hit)| site(file, hit)));
+    let names: BTreeMap<Site, &str> = found
         .iter()
-        .filter(|(file, hit)| !based(file, hit))
+        .map(|(file, hit)| (site(file, hit), hit.names.as_str()))
         .collect();
-    for (file, hit) in &new {
-        if !allowed.contains(&(file.clone(), hit.function.clone(), hit.names.clone())) {
+    for (at, &count) in &counts {
+        let based = baseline.get(at).copied().unwrap_or(0);
+        let new = count.saturating_sub(based);
+        let excused = allowed.get(at).copied().unwrap_or(0);
+        let (file, function, text) = at;
+        for _ in excused..new {
+            gaps.push(format!("{file} {function} joins {} raw: {text}", names[at]));
+        }
+        if excused > new {
             gaps.push(format!(
-                "{file} {} joins {} raw: {}",
-                hit.function, hit.names, hit.text
+                "NOT_RAW_JOINS lists {file} {function} {text} {excused} times, which excuses \
+                 only {new} new"
             ));
         }
     }
-    for (file, function, text) in baseline {
-        let still = found
-            .iter()
-            .any(|(at, hit)| at == file && hit.function == *function && hit.text == *text);
-        if !still {
+    for (at @ (file, function, text), &listed) in baseline {
+        if listed > counts.get(at).copied().unwrap_or(0) {
             gaps.push(format!(
                 "the baseline lists {file} {function} {text}, which is gone: run \
                  `regenerate_raw_join_baseline`"
             ));
         }
     }
-    for (file, function, names) in allowed {
-        let excuses = new
-            .iter()
-            .any(|(at, hit)| at == file && hit.function == *function && hit.names == *names);
-        if !excuses {
+    for at @ (file, function, text) in allowed.keys() {
+        if !counts.contains_key(at) {
             gaps.push(format!(
-                "NOT_RAW_JOINS lists {file} {function} {names}, which excuses nothing new"
+                "NOT_RAW_JOINS lists {file} {function} {text}, which excuses nothing new"
             ));
         }
     }
@@ -9988,13 +10344,13 @@ fn raw_join_gaps(
 }
 
 /// Every hit [`raw_joins`] finds in [`raw_join_scope`] at the head.
-fn head_raw_joins() -> BTreeSet<(String, RawJoin)> {
+fn head_raw_joins() -> Vec<(String, RawJoin)> {
     let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut found = BTreeSet::new();
+    let mut found = Vec::new();
     for file in raw_join_scope(head_files()) {
         let text = std::fs::read_to_string(krate.join(&file)).expect("a source file reads");
         for hit in raw_joins(&text, &file) {
-            found.insert((file.clone(), hit));
+            found.push((file.clone(), hit));
         }
     }
     found
@@ -10015,46 +10371,71 @@ fn head_raw_joins() -> BTreeSet<(String, RawJoin)> {
 fn identity_joins_go_through_refs() {
     let found = head_raw_joins();
     let baseline = raw_join_baseline();
-    let allowed: BTreeSet<(String, String, String)> = NOT_RAW_JOINS
-        .iter()
-        .map(|(file, within, names, why)| {
-            assert!(!why.is_empty(), "{file} {within} has no reason");
-            (
-                (*file).to_owned(),
-                (*within).to_owned(),
-                (*names).to_owned(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        allowed.len(),
-        NOT_RAW_JOINS.len(),
-        "an entry is listed twice"
-    );
+    let allowed = tally(NOT_RAW_JOINS.iter().map(|(file, within, text, why)| {
+        assert!(!why.is_empty(), "{file} {within} has no reason");
+        ((*file).to_owned(), (*within).to_owned(), (*text).to_owned())
+    }));
     let gaps = raw_join_gaps(&found, &baseline, &allowed);
     assert!(gaps.is_empty(), "Rule 25's raw-join ratchet: {gaps:#?}");
 
-    // The ratchet's own controls, on one planted hit.
-    let hit = |names: &str, text: &str| RawJoin {
-        function: "p".into(),
-        names: names.into(),
-        text: text.into(),
+    // The ratchet's own controls, on planted hits.
+    let hit = |names: &str, text: &str| {
+        (
+            "tests/t.rs".to_owned(),
+            RawJoin {
+                function: "p".into(),
+                names: names.into(),
+                text: text.into(),
+            },
+        )
     };
-    let planted: BTreeSet<(String, RawJoin)> =
-        [("tests/t.rs".to_owned(), hit("peer", "name==peer"))].into();
-    let key = |a: &str, b: &str, c: &str| (a.to_owned(), b.to_owned(), c.to_owned());
-    let none = BTreeSet::new();
+    let planted = [hit("peer", "name==peer")];
+    let sites = |texts: &[&str]| {
+        tally(
+            texts
+                .iter()
+                .map(|text| ("tests/t.rs".to_owned(), "p".to_owned(), (*text).to_owned())),
+        )
+    };
+    let none = BTreeMap::new();
     assert_eq!(raw_join_gaps(&planted, &none, &none).len(), 1);
-    let based = [key("tests/t.rs", "p", "name==peer")].into();
+    let based = sites(&["name==peer"]);
     assert_eq!(raw_join_gaps(&planted, &based, &none), Vec::<String>::new());
-    let excused = [key("tests/t.rs", "p", "peer")].into();
+    let excused = sites(&["name==peer"]);
     assert_eq!(
         raw_join_gaps(&planted, &none, &excused),
         Vec::<String>::new()
     );
-    let gone = [key("tests/t.rs", "p", "name==other_peer")].into();
+    let gone = sites(&["name==other_peer"]);
     assert_eq!(raw_join_gaps(&planted, &gone, &excused).len(), 1);
     assert_eq!(raw_join_gaps(&planted, &based, &excused).len(), 1);
+    // An exemption names its comparison, not its identities: a second
+    // comparison of the same peer in the function isn't excused (round
+    // 10's T1).
+    let two = [hit("peer", "name==peer"), hit("peer", "other==peer")];
+    assert_eq!(
+        raw_join_gaps(&two, &none, &excused),
+        ["tests/t.rs p joins peer raw: other==peer"]
+    );
+    // A new copy of a base comparison in its function is new (round 10's
+    // T2), and the baseline listing it twice holds both.
+    let copied = [hit("peer", "name==peer"), hit("peer", "name==peer")];
+    assert_eq!(
+        raw_join_gaps(&copied, &based, &none),
+        ["tests/t.rs p joins peer raw: name==peer"]
+    );
+    assert_eq!(
+        raw_join_gaps(&copied, &sites(&["name==peer", "name==peer"]), &none),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        raw_joins(
+            "fn p(peer: &str, name: &str) -> bool { name == peer || name == peer }",
+            "t.rs"
+        )
+        .len(),
+        2
+    );
 
     for (planted, names) in [
         ("fn p(a: &str, b: &str) -> bool { a == b }", None),
@@ -10166,21 +10547,24 @@ fn regenerate_raw_join_baseline() {
         "src",
         "tests",
     ]);
-    let head = head_raw_joins();
-    let mut lines = BTreeSet::new();
+    let site =
+        |file: &str, hit: &RawJoin| (file.to_owned(), hit.function.clone(), hit.text.clone());
+    let head = tally(head_raw_joins().iter().map(|(file, hit)| site(file, hit)));
+    let mut base = Vec::new();
     for file in raw_join_scope(listed.lines().map(str::to_owned)) {
         let text = git(&["show", &format!("{RAW_JOIN_BASE}:./{file}")]);
-        for hit in raw_joins(&text, &file) {
-            let at = (file.clone(), hit.clone());
-            if head.contains(&at) {
-                lines.insert(format!("{file}\t{}\t{}", hit.function, hit.text));
-            }
-        }
+        base.extend(raw_joins(&text, &file).iter().map(|hit| site(&file, hit)));
+    }
+    let mut lines = Vec::new();
+    for (at, count) in tally(base) {
+        let kept = count.min(head.get(&at).copied().unwrap_or(0));
+        let (file, function, text) = at;
+        lines.extend((0..kept).map(|_| format!("{file}\t{function}\t{text}")));
     }
     let mut out = format!(
         "# Rule 25's raw-join baseline: every raw identity comparison the PR base \
          ({RAW_JOIN_BASE}) had that the head still has, as file, function and \
-         comparison, tab-separated. Written by `regenerate_raw_join_baseline` in \
+         comparison, tab-separated, once per occurrence. Written by `regenerate_raw_join_baseline` in \
          tests/header_acceptance.rs. Don't add lines by hand.\n"
     );
     for line in lines {

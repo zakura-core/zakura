@@ -47,18 +47,33 @@ fn fixtures() -> PathBuf {
     root().join("crates/zakura-sim/tests/fixtures")
 }
 
-/// The targets whose seeds don't apply every property of their harness.
-/// Their seeds run honest and single-fault scenarios, and the coverage
-/// manifest names the test where each other property applies, such as a
-/// frame-conformance property on a faulted frame. Each still needs a seed
-/// that applies one of its harness's own properties, as readiness does, and
-/// `zakura-sim targets` lists the rest as applied in no seed.
-const PARTIAL_SEEDS: [&str; 3] = ["block_sync_storage", "discovery_wire", "header_sync_wire"];
+/// Each target's own properties that no seed applies. These targets' seeds
+/// run honest and single-fault scenarios, and the coverage manifest names
+/// the test where each listed property applies, such as a frame-conformance
+/// property on a faulted frame. A target missing from the list has seeds
+/// that apply every own property. A listed property that a seed now applies
+/// fails the test until it leaves the list, so the list only shrinks.
+const UNAPPLIED: &[(&str, &[&str])] = &[
+    ("block_sync_storage", &[]),
+    ("discovery_wire", &[]),
+    ("header_sync_wire", &[]),
+];
+
+/// The target's own properties that [`UNAPPLIED`] lists, sorted.
+fn unapplied_allowed(target: &str) -> Vec<String> {
+    let mut allowed: Vec<String> = UNAPPLIED
+        .iter()
+        .find(|(name, _)| *name == target)
+        .map(|(_, properties)| properties.iter().map(|id| (*id).to_owned()).collect())
+        .unwrap_or_default();
+    allowed.sort();
+    allowed
+}
 
 /// Each declared target resolves to its registered harness, its harness has
 /// admitted seeds and no rejected one, and the seeds apply each of the
 /// harness's own properties and those of every harness the target covers,
-/// except for a target in [`PARTIAL_SEEDS`]. A target without seeds, or
+/// except the properties [`UNAPPLIED`] lists. A target without seeds, or
 /// whose seeds reach only the properties every harness checks, fails here
 /// before the nightly job runs it.
 #[test]
@@ -67,6 +82,7 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
     let manifest = manifest();
     let declared = declared_targets(&suite);
     assert!(!declared.is_empty(), "{SUITE_FILE} declares sim targets");
+    let mut mismatched = Vec::new();
     for target in &declared {
         let entry = resolve(&manifest, &target.name).unwrap();
         let loaded = seed::load(&[fixtures()], Some(entry.name)).unwrap();
@@ -108,13 +124,12 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
                 }
             })
             .collect();
-        let (applied, unapplied) = own_applicability(entry, &seeds);
+        let (applied, mut unapplied) = own_applicability(entry, &seeds);
         assert!(!applied.is_empty(), "{}", target.name);
-        assert!(
-            unapplied.is_empty() || PARTIAL_SEEDS.contains(&target.name.as_str()),
-            "{}: no seed applies {unapplied:?}",
-            target.name
-        );
+        unapplied.sort();
+        if unapplied != unapplied_allowed(&target.name) {
+            mismatched.push(format!("(\"{}\", &{unapplied:?}),", target.name));
+        }
         let row = suite
             .target
             .iter()
@@ -134,6 +149,11 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
             );
         }
     }
+    assert!(
+        mismatched.is_empty(),
+        "the seeds' unapplied own properties differ from UNAPPLIED; these entries match the seeds:\n{}",
+        mismatched.join("\n")
+    );
 }
 
 /// A target the fuzz package doesn't map, or maps to an unregistered

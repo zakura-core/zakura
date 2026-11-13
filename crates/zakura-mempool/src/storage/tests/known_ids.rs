@@ -8,7 +8,10 @@ use zakura_chain::{
     transparent::OutPoint,
 };
 
-use super::super::{config::Config, fixtures::TxFactory, SameEffectsChainRejectionError, Storage};
+use super::{
+    super::{config::Config, fixtures::TxFactory, SameEffectsChainRejectionError},
+    Storage,
+};
 
 fn with_expiry(mut tx: VerifiedUnminedTx, height: Height) -> VerifiedUnminedTx {
     let mut transaction = tx.transaction.transaction().as_ref().clone();
@@ -29,12 +32,39 @@ fn expiry_removes_overlapping_roots_and_reports_each_transaction_once() {
     let survivor_id = survivor.transaction.id();
     let survivor_cost = survivor.cost();
     let output = OutPoint::from_usize(parent_id.mined_id(), 0);
-    storage.insert(parent, Vec::new(), None).unwrap();
-    storage.insert(child, vec![output], None).unwrap();
-    storage.insert(survivor, Vec::new(), None).unwrap();
+    storage
+        .insert(
+            parent,
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::Instant::now(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    storage
+        .insert(
+            child,
+            vec![output],
+            None,
+            &mut |_, _| {},
+            crate::Instant::now(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    storage
+        .insert(
+            survivor,
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::Instant::now(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
 
     assert_eq!(
-        storage.remove_expired_transactions(Height(1)),
+        storage.remove_expired_transactions(Height(1), crate::Instant::now()),
         HashSet::from([parent_id, child_id])
     );
     assert_eq!(
@@ -45,7 +75,7 @@ fn expiry_removes_overlapping_roots_and_reports_each_transaction_once() {
     assert!(storage.created_output(&output).is_none());
     for id in [parent_id, child_id] {
         assert_eq!(
-            storage.rejection_error(&id),
+            storage.rejection_error(&id, crate::Instant::now()),
             Some(SameEffectsChainRejectionError::Expired.into())
         );
     }
@@ -62,17 +92,30 @@ fn mined_parent_keeps_unmined_child_and_ignores_unknown_mined_ids() {
     let child_id = child.transaction.id();
     let missing = factory.tx(10_000).transaction.id().mined_id();
     let block_transactions = vec![parent.transaction.transaction().clone()];
-    storage.insert(parent, Vec::new(), None).unwrap();
+    storage
+        .insert(
+            parent,
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::Instant::now(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
     storage
         .insert(
             child,
             vec![OutPoint::from_usize(parent_id.mined_id(), 0)],
             None,
+            &mut |_, _| {},
+            crate::Instant::now(),
+            chrono::Utc::now(),
         )
         .unwrap();
     let mined = HashSet::from([parent_id.mined_id(), missing]);
     storage.clear_mined_dependencies(&mined);
-    let removed = storage.reject_and_remove_same_effects(&mined, block_transactions);
+    let removed =
+        storage.reject_and_remove_same_effects(&mined, block_transactions, crate::Instant::now());
     assert_eq!(removed.mined, HashSet::from([parent_id]));
     assert!(removed.invalidated.is_empty());
     assert_eq!(
@@ -92,25 +135,42 @@ fn block_conflict_removes_descendants_and_caches_the_conflicting_root() {
     let child_id = child.transaction.id();
     let conflict = with_expiry(parent.clone(), Height(2));
     let mined = HashSet::from([conflict.transaction.id().mined_id()]);
-    storage.insert(parent, Vec::new(), None).unwrap();
+    storage
+        .insert(
+            parent,
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::Instant::now(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
     storage
         .insert(
             child,
             vec![OutPoint::from_usize(parent_id.mined_id(), 0)],
             None,
+            &mut |_, _| {},
+            crate::Instant::now(),
+            chrono::Utc::now(),
         )
         .unwrap();
     storage.clear_mined_dependencies(&mined);
-    let removed = storage
-        .reject_and_remove_same_effects(&mined, vec![conflict.transaction.transaction().clone()]);
+    let removed = storage.reject_and_remove_same_effects(
+        &mined,
+        vec![conflict.transaction.transaction().clone()],
+        crate::Instant::now(),
+    );
     assert!(removed.mined.is_empty());
     assert_eq!(removed.invalidated, HashSet::from([parent_id, child_id]));
     assert_eq!(storage.total_cost(), 0);
     assert_eq!(
-        storage.rejection_error(&parent_id),
+        storage.rejection_error(&parent_id, crate::Instant::now()),
         Some(SameEffectsChainRejectionError::DuplicateSpend.into())
     );
-    assert!(storage.rejection_error(&child_id).is_none());
+    assert!(storage
+        .rejection_error(&child_id, crate::Instant::now())
+        .is_none());
     storage.verified.assert_dependency_groups_are_bounded();
 }
 
@@ -134,7 +194,16 @@ fn benchmark_mempool_known_id_cleanup() {
                 if is_victim {
                     victims.push(tx.clone());
                 }
-                storage.insert(tx, Vec::new(), None).unwrap();
+                storage
+                    .insert(
+                        tx,
+                        Vec::new(),
+                        None,
+                        &mut |_, _| {},
+                        crate::Instant::now(),
+                        chrono::Utc::now(),
+                    )
+                    .unwrap();
             }
             for mode in ["mined", "conflict", "expiry"] {
                 let block_transactions: Vec<Arc<Transaction>> = victims
@@ -159,7 +228,10 @@ fn benchmark_mempool_known_id_cleanup() {
                     let start = Instant::now();
                     let removed = if mode == "expiry" {
                         storage
-                            .remove_expired_transactions(black_box(Height(1)))
+                            .remove_expired_transactions(
+                                black_box(Height(1)),
+                                crate::Instant::now(),
+                            )
                             .len()
                     } else {
                         storage.clear_mined_dependencies(black_box(&mined));
@@ -167,6 +239,7 @@ fn benchmark_mempool_known_id_cleanup() {
                             .reject_and_remove_same_effects(
                                 black_box(&mined),
                                 black_box(block_transactions.clone()),
+                                crate::Instant::now(),
                             )
                             .total_len()
                     };
@@ -174,7 +247,16 @@ fn benchmark_mempool_known_id_cleanup() {
                     assert_eq!(u64::try_from(black_box(removed)).unwrap(), removed_count);
                     storage.chain_rejected_same_effects.clear();
                     for tx in &victims {
-                        storage.insert(tx.clone(), Vec::new(), None).unwrap();
+                        storage
+                            .insert(
+                                tx.clone(),
+                                Vec::new(),
+                                None,
+                                &mut |_, _| {},
+                                crate::Instant::now(),
+                                chrono::Utc::now(),
+                            )
+                            .unwrap();
                     }
                     assert_eq!(u64::try_from(storage.transaction_count()).unwrap(), count);
                 }

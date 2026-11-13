@@ -12,8 +12,9 @@ use zakura_chain::{
     transparent::OutPoint,
 };
 
-use super::super::{
-    config::Config, fixtures::TxFactory, verified_set::MAX_MEMPOOL_ANCESTORS, Storage,
+use super::{
+    super::{config::Config, fixtures::TxFactory, verified_set::MAX_MEMPOOL_ANCESTORS},
+    Storage,
 };
 
 const SAMPLES: usize = 21;
@@ -31,7 +32,16 @@ impl Fixture {
         });
         for index in 0..count - ancestors - 1 {
             let fee = [10_000, 20_000, 50_000][index % 3];
-            storage.insert(factory.tx(fee), Vec::new(), None).unwrap();
+            storage
+                .insert(
+                    factory.tx(fee),
+                    Vec::new(),
+                    None,
+                    &mut |_, _| {},
+                    crate::Instant::now(),
+                    chrono::Utc::now(),
+                )
+                .unwrap();
         }
         let mut package: Vec<(VerifiedUnminedTx, Vec<OutPoint>)> = Vec::new();
         for _ in 0..=ancestors {
@@ -41,7 +51,16 @@ impl Fixture {
                 .into_iter()
                 .collect::<Vec<_>>();
             let tx = factory.tx_with(20_000, 1, 0);
-            storage.insert(tx.clone(), spent.clone(), None).unwrap();
+            storage
+                .insert(
+                    tx.clone(),
+                    spent.clone(),
+                    None,
+                    &mut |_, _| {},
+                    crate::Instant::now(),
+                    chrono::Utc::now(),
+                )
+                .unwrap();
             package.push((tx, spent));
         }
         assert_eq!(storage.transaction_count(), count);
@@ -60,7 +79,14 @@ impl Fixture {
         let tx = tx.clone();
         let spent = spent.clone();
         let start = Instant::now();
-        let result = black_box(self.storage.insert(black_box(tx), black_box(spent), None));
+        let result = black_box(self.storage.insert(
+            black_box(tx),
+            black_box(spent),
+            None,
+            &mut |_, _| {},
+            crate::Instant::now(),
+            chrono::Utc::now(),
+        ));
         let elapsed = start.elapsed();
         assert!(result.is_ok());
         self.remove_leaf();
@@ -77,7 +103,14 @@ impl Fixture {
         assert_eq!(removed.len(), self.package.len());
         for (tx, spent) in &self.package {
             self.storage
-                .insert(tx.clone(), spent.clone(), None)
+                .insert(
+                    tx.clone(),
+                    spent.clone(),
+                    None,
+                    &mut |_, _| {},
+                    crate::Instant::now(),
+                    chrono::Utc::now(),
+                )
                 .unwrap();
         }
         elapsed
@@ -102,7 +135,14 @@ impl Fixture {
         );
         for (tx, spent) in &self.package {
             self.storage
-                .insert(tx.clone(), spent.clone(), None)
+                .insert(
+                    tx.clone(),
+                    spent.clone(),
+                    None,
+                    &mut |_, _| {},
+                    crate::Instant::now(),
+                    chrono::Utc::now(),
+                )
                 .unwrap();
         }
         elapsed
@@ -153,7 +193,14 @@ fn benchmark_mempool_mining_index_mutations() {
                     let (tx, spent) = fixture.package.last().unwrap();
                     fixture
                         .storage
-                        .insert(tx.clone(), spent.clone(), None)
+                        .insert(
+                            tx.clone(),
+                            spent.clone(),
+                            None,
+                            &mut |_, _| {},
+                            crate::Instant::now(),
+                            chrono::Utc::now(),
+                        )
                         .unwrap();
                 }
                 assert_eq!(fixture.storage.transaction_count(), count);
@@ -226,11 +273,27 @@ fn benchmark_mempool_full_block_deletion() {
         });
         for _ in 0..background_count {
             storage
-                .insert(factory.tx(10_000), Vec::new(), None)
+                .insert(
+                    factory.tx(10_000),
+                    Vec::new(),
+                    None,
+                    &mut |_, _| {},
+                    crate::Instant::now(),
+                    chrono::Utc::now(),
+                )
                 .unwrap();
         }
         for tx in &members {
-            storage.insert(tx.clone(), Vec::new(), None).unwrap();
+            storage
+                .insert(
+                    tx.clone(),
+                    Vec::new(),
+                    None,
+                    &mut |_, _| {},
+                    crate::Instant::now(),
+                    chrono::Utc::now(),
+                )
+                .unwrap();
         }
         let mined = block
             .transactions
@@ -241,16 +304,27 @@ fn benchmark_mempool_full_block_deletion() {
             let transactions = block.transactions.clone();
             let start = Instant::now();
             storage.clear_mined_dependencies(black_box(&mined));
-            let removed = black_box(
-                storage.reject_and_remove_same_effects(black_box(&mined), black_box(transactions)),
-            );
+            let removed = black_box(storage.reject_and_remove_same_effects(
+                black_box(&mined),
+                black_box(transactions),
+                crate::Instant::now(),
+            ));
             let elapsed = start.elapsed();
             assert_eq!(removed.mined.len(), members.len());
             assert!(removed.invalidated.is_empty());
             assert_eq!(storage.transaction_count(), background_count);
             storage.chain_rejected_same_effects.clear();
             for tx in &members {
-                storage.insert(tx.clone(), Vec::new(), None).unwrap();
+                storage
+                    .insert(
+                        tx.clone(),
+                        Vec::new(),
+                        None,
+                        &mut |_, _| {},
+                        crate::Instant::now(),
+                        chrono::Utc::now(),
+                    )
+                    .unwrap();
             }
             assert_eq!(storage.transaction_count(), count);
             elapsed

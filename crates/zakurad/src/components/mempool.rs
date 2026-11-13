@@ -59,13 +59,14 @@ use zakura_state::{ChainTipChange, TipAction};
 use crate::components::sync::SyncStatus;
 use trace::{MempoolTrace, TipProcessing};
 
-pub mod config;
+pub use zakura_mempool::config;
 mod crawler;
 pub mod downloads;
 mod error;
 pub mod gossip;
 mod peer_cooldown;
 mod pending_outputs;
+use pending_outputs::PendingOutputs;
 mod queue_checker;
 mod storage;
 mod trace;
@@ -97,6 +98,52 @@ use downloads::{
     Downloads as TxDownloads, TransactionDownloadVerifyError, TRANSACTION_DOWNLOAD_TIMEOUT,
     TRANSACTION_VERIFY_TIMEOUT,
 };
+
+/// The time storage reads. Today's pool has always read the std clock, so this
+/// does too, also under tokio's paused clock in tests.
+pub(crate) fn storage_now() -> zakura_mempool::Instant {
+    zakura_mempool::Instant::from_std(Instant::now())
+}
+
+/// Add a transaction that failed download and verification to the rejected list
+/// if needed, depending on the reason for the failure.
+fn reject_if_needed(storage: &mut Storage, tx_id: UnminedTxId, e: TransactionDownloadVerifyError) {
+    match e {
+        // Rejecting a transaction already in state would speed up further
+        // download attempts without checking the state. However it would
+        // make the reject list grow forever.
+        //
+        // TODO: revisit after reviewing the rejected list cleanup criteria?
+        // TODO: if we decide to reject it, then we need to pass the block hash
+        // to State::Confirmed. This would require the zs::Response::Transaction
+        // to include the hash, which would need to be implemented.
+        TransactionDownloadVerifyError::InState |
+        // An unknown error in the state service, better do nothing
+        TransactionDownloadVerifyError::StateError(_) |
+        // If download failed, do nothing; the crawler will end up trying to
+        // download it again.
+        TransactionDownloadVerifyError::DownloadFailed(_) |
+        // If it was cancelled then a block was mined, or there was a network
+        // upgrade, etc. No reason to reject it.
+        TransactionDownloadVerifyError::Cancelled |
+        // The transaction was not verified. Another peer can still relay it.
+        TransactionDownloadVerifyError::PeerCoolingDown => {}
+
+        TransactionDownloadVerifyError::PolicyRejected(error) => storage.reject(
+            tx_id,
+            ExactTipRejectionError::FailedStandard(error).into(),
+            storage_now(),
+        ),
+
+        // Consensus verification failed. Reject transaction to avoid
+        // having to download and verify it again just for it to fail again.
+        TransactionDownloadVerifyError::Invalid { error, .. }  => storage.reject(
+            tx_id,
+            ExactTipRejectionError::FailedVerification(error).into(),
+            storage_now(),
+        ),
+    }
+}
 
 fn legacy_peer_log_label(addr: PeerSocketAddr, expose_peer_addresses: bool) -> String {
     if expose_peer_addresses {
@@ -522,6 +569,12 @@ enum ActiveState {
         /// inject transactions into `storage`, as transactions must be verified beforehand.
         storage: Storage,
 
+        /// The callers waiting for an output a mempool transaction will create.
+        ///
+        /// It lives beside `storage`, which reports each output it inserts, and
+        /// is dropped with it, which ends every wait.
+        pending_outputs: PendingOutputs,
+
         /// The transaction download and verify stream.
         tx_downloads: Pin<Box<InboundTxDownloads>>,
 
@@ -785,6 +838,7 @@ impl Mempool {
         ));
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),
+            pending_outputs: PendingOutputs::default(),
             tx_downloads,
             pending_gossip_tx_ids: HashSet::new(),
             last_seen_tip_hash,
@@ -952,6 +1006,7 @@ impl Service<Request> for Mempool {
 
         if let ActiveState::Enabled {
             storage,
+            pending_outputs,
             tx_downloads,
             pending_gossip_tx_ids,
             last_seen_tip_hash,
@@ -986,6 +1041,11 @@ impl Service<Request> for Mempool {
                                 tx,
                                 spent_mempool_outpoints,
                                 best_tip_height,
+                                &mut |outpoint, output| {
+                                    pending_outputs.respond(outpoint, output.clone())
+                                },
+                                storage_now(),
+                                chrono::Utc::now(),
                             );
 
                             tracing::trace!(
@@ -1095,7 +1155,7 @@ impl Service<Request> for Mempool {
                         }
 
                         invalidated_ids.insert(tx_id);
-                        storage.reject_if_needed(tx_id, error);
+                        reject_if_needed(storage, tx_id, error);
                     }
                     Err((tx_id, _elapsed)) => {
                         tracing::info!(
@@ -1123,12 +1183,13 @@ impl Service<Request> for Mempool {
                 tx_downloads.cancel(&mined_ids);
                 storage.clear_mined_dependencies(&mined_ids);
 
-                let storage::RemovedTransactionIds { mined, invalidated } =
-                    storage.reject_and_remove_same_effects(&mined_ids, block.transactions);
+                let storage::RemovedTransactionIds { mined, invalidated } = storage
+                    .reject_and_remove_same_effects(&mined_ids, block.transactions, storage_now());
+                pending_outputs.prune();
 
                 // Clear any transaction rejections if they might have become valid after
                 // the new block was added to the tip.
-                storage.clear_tip_rejections();
+                storage.clear_tip_rejections(storage_now());
 
                 mined_mempool_ids.extend(mined);
                 invalidated_ids.extend(invalidated);
@@ -1136,7 +1197,8 @@ impl Service<Request> for Mempool {
                 // Expiry changes only when the chain grows. New transactions
                 // are verified for the next height, and verification is retried
                 // if the tip height changes before insertion.
-                let expired_transactions = storage.remove_expired_transactions(block.height);
+                let expired_transactions =
+                    storage.remove_expired_transactions(block.height, storage_now());
                 send_to_peers_ids.retain(|id| !expired_transactions.contains(id));
 
                 if !expired_transactions.is_empty() {
@@ -1216,6 +1278,7 @@ impl Service<Request> for Mempool {
         match &mut self.active_state {
             ActiveState::Enabled {
                 storage,
+                pending_outputs,
                 tx_downloads,
                 pending_gossip_tx_ids,
                 last_seen_tip_hash,
@@ -1297,10 +1360,10 @@ impl Service<Request> for Mempool {
 
                     // A created output answers immediately, without a waiter slot.
                     let response_fut = if let Some(output) = storage.created_output(&outpoint) {
-                        storage.pending_outputs.respond(&outpoint, output.clone());
+                        pending_outputs.respond(&outpoint, output.clone());
                         async move { Ok(Response::UnspentOutput(output)) }.boxed()
                     } else {
-                        storage.pending_outputs.queue(outpoint).boxed()
+                        pending_outputs.queue(outpoint).boxed()
                     };
 
                     trace!("answered mempool request");
@@ -1328,7 +1391,9 @@ impl Service<Request> for Mempool {
                 Request::RejectedTransactionIds(ref ids) => {
                     trace!(?req, "got mempool request");
 
-                    let res = storage.rejected_transactions(ids.clone()).collect();
+                    let res = storage
+                        .rejected_transactions(ids.clone(), storage_now())
+                        .collect();
 
                     trace!(?req, ?res, "answered mempool request");
 
@@ -1348,7 +1413,7 @@ impl Service<Request> for Mempool {
                                     MempoolError,
                                 > {
                                     let (rsp_tx, rsp_rx) = oneshot::channel();
-                                    match storage.should_download_or_verify(gossiped_tx.id()) {
+                                    match storage.should_download_or_verify(gossiped_tx.id(), storage_now()) {
                                         Ok(()) => {}
                                         Err(
                                             error @ MempoolError::StorageExactTip(
@@ -1410,7 +1475,10 @@ impl Service<Request> for Mempool {
                             .increment(u64::try_from(transactions.len()).unwrap_or(u64::MAX));
                     } else {
                         for gossiped_tx in transactions {
-                            if storage.should_download_or_verify(gossiped_tx.id()).is_err() {
+                            if storage
+                                .should_download_or_verify(gossiped_tx.id(), storage_now())
+                                .is_err()
+                            {
                                 continue;
                             }
                             let _ = tx_downloads.download_if_needed_and_verify(

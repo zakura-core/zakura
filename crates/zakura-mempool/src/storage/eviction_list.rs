@@ -1,11 +1,11 @@
 //! [`EvictionList`] represents the transaction eviction list with
 //! efficient operations.
-use std::{
-    collections::{HashMap, VecDeque},
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, time::Duration};
 
 use zakura_chain::transaction;
+use zakura_rt::collections::HashMap;
+
+use crate::Instant;
 
 /// An eviction list that allows Zebra to efficiently add entries, get entries,
 /// and remove older entries in the order they were inserted.
@@ -43,19 +43,18 @@ impl EvictionList {
     ///
     /// If the TXID is already in the list.
     ///
-    pub fn insert(&mut self, key: transaction::Hash) {
+    pub fn insert(&mut self, key: transaction::Hash, now: Instant) {
         // From https://zips.z.cash/zip-0401#specification:
         // > Nodes SHOULD remove transactions from RecentlyEvicted that were evicted more than
         // > mempoolevictionmemoryminutes minutes ago. This MAY be done periodically,
         // > and/or just before RecentlyEvicted is accessed when receiving a transaction.
-        self.prune_old();
+        self.prune_old(now);
         // > Add the txid and the current time to RecentlyEvicted, dropping the oldest entry
         // > in RecentlyEvicted if necessary to keep it to at most eviction_memory_entries entries.
-        if self.len() >= self.max_size {
+        if self.len(now) >= self.max_size {
             self.pop_front();
         }
-        let value = Instant::now();
-        let old_value = self.unique_entries.insert(key, value);
+        let old_value = self.unique_entries.insert(key, now);
         // It should be impossible for an already-evicted transaction to be evicted
         // again since transactions are not added to the mempool if they are evicted,
         // and the mempool doesn't allow inserting two transactions with the same
@@ -68,11 +67,11 @@ impl EvictionList {
     }
 
     /// Checks if the given TXID is in the list.
-    pub fn contains_key(&self, txid: &transaction::Hash) -> bool {
+    pub fn contains_key(&self, txid: &transaction::Hash, now: Instant) -> bool {
         if let Some(evicted_at) = self.unique_entries.get(txid) {
             // Since the list is pruned only in mutable functions, make sure
             // we take expired items into account.
-            if !self.has_expired(evicted_at) {
+            if !self.has_expired(evicted_at, now) {
                 return true;
             }
         }
@@ -86,8 +85,8 @@ impl EvictionList {
     // at the cost of `O(len + expired)` performance each time the method is called.
     //
     // Currently the performance is `O(expired)` for the first call, then `O(1)` until the next expiry.
-    pub fn len(&mut self) -> usize {
-        self.prune_old();
+    pub fn len(&mut self, now: Instant) -> usize {
+        self.prune_old(now);
         self.unique_entries.len()
     }
 
@@ -95,13 +94,13 @@ impl EvictionList {
     ///
     // This method is public because ZIP-401 states about pruning:
     // > This MAY be done periodically,
-    pub fn prune_old(&mut self) {
+    pub fn prune_old(&mut self, now: Instant) {
         while let Some(txid) = self.front() {
             let evicted_at = self
                 .unique_entries
                 .get(txid)
                 .unwrap_or_else(|| panic!("all entries should exist in both ordered_entries and unique_entries, missing {txid:?} in unique_entries"));
-            if self.has_expired(evicted_at) {
+            if self.has_expired(evicted_at, now) {
                 self.pop_front();
             } else {
                 break;
@@ -131,8 +130,7 @@ impl EvictionList {
 
     /// Returns if `evicted_at` is considered expired considering the current
     /// time and the configured eviction time.
-    fn has_expired(&self, evicted_at: &Instant) -> bool {
-        let now = Instant::now();
-        (now - *evicted_at) > self.eviction_memory_time
+    fn has_expired(&self, evicted_at: &Instant, now: Instant) -> bool {
+        now.saturating_duration_since(*evicted_at) > self.eviction_memory_time
     }
 }

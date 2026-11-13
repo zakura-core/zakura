@@ -1,11 +1,9 @@
 //! The set of verified transactions in the mempool.
 
-use std::{
-    borrow::Cow,
-    cmp::Reverse,
-    collections::{BTreeSet, HashMap, HashSet},
-    hash::Hash,
-};
+use std::{borrow::Cow, cmp::Reverse, collections::BTreeSet, hash::Hash};
+
+use chrono::{DateTime, Utc};
+use zakura_rt::collections::{HashMap, HashSet};
 
 use zakura_chain::{
     block::Height,
@@ -15,24 +13,22 @@ use zakura_chain::{
 };
 use zakura_node_services::mempool::TransactionDependencies;
 
-use crate::components::mempool::pending_outputs::PendingOutputs;
-
-use super::{super::SameEffectsTipRejectionError, eviction_cost::EvictionCost};
+use super::{eviction_cost::EvictionCost, SameEffectsTipRejectionError};
 
 /// The most transactions in a connected group of unconfirmed dependencies.
 ///
 /// Counting parents, children, and siblings bounds both package width and depth.
 /// Three transactions have at most three dependency edges, so package scores can
 /// be recomputed directly without cached ancestor totals.
-pub(super) const MAX_MEMPOOL_PACKAGE_TRANSACTIONS: usize = 3;
+pub const MAX_MEMPOOL_PACKAGE_TRANSACTIONS: usize = 3;
 
 /// The most ancestors of a transaction in a bounded dependency group.
-pub(super) const MAX_MEMPOOL_ANCESTORS: usize = MAX_MEMPOOL_PACKAGE_TRANSACTIONS - 1;
+pub const MAX_MEMPOOL_ANCESTORS: usize = MAX_MEMPOOL_PACKAGE_TRANSACTIONS - 1;
 
 /// An eviction score, followed by the newest-first insertion time and hash.
 type EvictionCandidate = (
     EvictionCost,
-    Reverse<Option<chrono::DateTime<chrono::Utc>>>,
+    Reverse<Option<DateTime<Utc>>>,
     transaction::Hash,
 );
 
@@ -40,12 +36,12 @@ type EvictionCandidate = (
 /// insertion time and transaction hash.
 type MiningCandidate = (
     Reverse<EvictionCost>,
-    Option<chrono::DateTime<chrono::Utc>>,
+    Option<DateTime<Utc>>,
     transaction::Hash,
 );
 
 #[cfg(feature = "mempool-bench")]
-pub(super) mod benchmarks;
+pub mod benchmarks;
 
 #[cfg(test)]
 mod mining_tests;
@@ -252,12 +248,16 @@ impl VerifiedSet {
     ///
     /// Two transactions have a spend conflict if they spend the same UTXO or if they reveal the
     /// same nullifier.
+    ///
+    /// `outputs` is called with each transparent output the transaction creates. `time` is
+    /// stamped on the transaction as its insertion time.
     pub fn insert(
         &mut self,
         mut transaction: VerifiedUnminedTx,
         spent_mempool_outpoints: Vec<transparent::OutPoint>,
-        pending_outputs: &mut PendingOutputs,
+        outputs: &mut dyn FnMut(&transparent::OutPoint, &transparent::Output),
         height: Option<Height>,
+        time: DateTime<Utc>,
     ) -> Result<(), SameEffectsTipRejectionError> {
         let ancestors = self.check_insert(&transaction.transaction, &spent_mempool_outpoints)?;
         let affected = self.dependency_group(ancestors);
@@ -267,12 +267,12 @@ impl VerifiedSet {
         self.transaction_dependencies
             .add(tx_id, spent_mempool_outpoints);
 
-        // Inserts the transaction's outputs into the internal caches and responds to pending output requests.
+        // Inserts the transaction's outputs into the internal caches and reports them to the caller.
         let tx = &transaction.transaction.transaction();
         for (index, output) in tx.outputs().iter().cloned().enumerate() {
             let outpoint = transparent::OutPoint::from_usize(tx_id, index);
-            self.created_outputs.insert(outpoint, output.clone());
-            pending_outputs.respond(&outpoint, output)
+            outputs(&outpoint, &output);
+            self.created_outputs.insert(outpoint, output);
         }
         self.spent_outpoints.extend(tx.spent_outpoints());
         self.sprout_nullifiers.extend(tx.sprout_nullifiers());
@@ -282,7 +282,7 @@ impl VerifiedSet {
 
         self.transactions_serialized_size += transaction.transaction.size();
         self.total_cost += transaction.cost();
-        transaction.time = Some(chrono::Utc::now());
+        transaction.time = Some(time);
         transaction.height = height;
         self.metrics.add_transaction(&transaction);
         self.transactions.insert(tx_id, transaction);
@@ -947,7 +947,6 @@ mod tests {
 
         let mut factory = TxFactory::new();
         let mut verified = VerifiedSet::default();
-        let mut pending = PendingOutputs::default();
         for _ in 0..1_000 {
             let parent = factory.tx_with(10_000, 1, 0);
             let child = factory.tx_with(20_000, 1, 0);
@@ -956,13 +955,31 @@ mod tests {
                 transparent::OutPoint::from_usize(tx.transaction.id().mined_id(), 0)
             };
             verified
-                .insert(parent.clone(), vec![], &mut pending, None)
+                .insert(
+                    parent.clone(),
+                    vec![],
+                    &mut |_, _| {},
+                    None,
+                    chrono::Utc::now(),
+                )
                 .unwrap();
             verified
-                .insert(child.clone(), vec![output(&parent)], &mut pending, None)
+                .insert(
+                    child.clone(),
+                    vec![output(&parent)],
+                    &mut |_, _| {},
+                    None,
+                    chrono::Utc::now(),
+                )
                 .unwrap();
             verified
-                .insert(grandchild, vec![output(&child)], &mut pending, None)
+                .insert(
+                    grandchild,
+                    vec![output(&child)],
+                    &mut |_, _| {},
+                    None,
+                    chrono::Utc::now(),
+                )
                 .unwrap();
         }
         let limit = verified.total_cost();

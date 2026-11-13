@@ -732,7 +732,10 @@ async fn reject_pushed_transaction(
         .respond(Err(error));
 
     timeout(Duration::from_secs(3), async {
-        while !mempool.storage().contains_rejected(&tx_id) {
+        while !mempool
+            .storage()
+            .contains_rejected(&tx_id, crate::components::mempool::storage_now())
+        {
             mempool.dummy_call().await;
             time::sleep(Duration::from_millis(10)).await;
         }
@@ -1167,7 +1170,10 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
         ]));
 
     timeout(Duration::from_secs(3), async {
-        while !mempool.storage().contains_rejected(&oversized_id) {
+        while !mempool
+            .storage()
+            .contains_rejected(&oversized_id, crate::components::mempool::storage_now())
+        {
             mempool.dummy_call().await;
             time::sleep(Duration::from_millis(10)).await;
         }
@@ -1176,7 +1182,7 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
     .expect("oversized transaction should reach the rejection cache");
 
     assert!(matches!(
-        mempool.storage().rejection_error(&oversized_id),
+        mempool.storage().rejection_error(&oversized_id, crate::components::mempool::storage_now()),
         Some(MempoolError::StorageExactTip(
             ExactTipRejectionError::FailedStandard(
                 storage::NonStandardTransactionError::TransactionTooLarge {
@@ -1229,7 +1235,10 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
         )));
 
     timeout(Duration::from_secs(3), async {
-        while !mempool.storage().contains_rejected(&at_limit_id) {
+        while !mempool
+            .storage()
+            .contains_rejected(&at_limit_id, crate::components::mempool::storage_now())
+        {
             mempool.dummy_call().await;
             time::sleep(Duration::from_millis(10)).await;
         }
@@ -1349,7 +1358,9 @@ async fn crawled_transaction_from_cooling_down_peer_is_not_verified() -> Result<
             tx_verifier.expect_no_requests().await;
         }
         assert_eq!(
-            mempool.storage().contains_rejected(&transaction_id),
+            mempool
+                .storage()
+                .contains_rejected(&transaction_id, crate::components::mempool::storage_now()),
             is_verified,
             "only a verified transaction reaches the rejection cache"
         );
@@ -1409,7 +1420,9 @@ async fn cached_size_policy_rejection_is_a_transaction_result() -> Result<(), Re
         mempool.dummy_call().await;
         time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(mempool.storage().contains_rejected(&transaction_id));
+    assert!(mempool
+        .storage()
+        .contains_rejected(&transaction_id, crate::components::mempool::storage_now()));
 
     let response = mempool
         .ready()
@@ -1475,9 +1488,14 @@ async fn mempool_service_basic_single() -> Result<(), Report> {
 
     // Insert the genesis block coinbase transaction into the mempool storage.
     let mut inserted_ids = HashSet::new();
-    service
-        .storage()
-        .insert(genesis_transaction.clone(), Vec::new(), None)?;
+    service.storage().insert(
+        genesis_transaction.clone(),
+        Vec::new(),
+        None,
+        &mut |_, _| {},
+        crate::components::mempool::storage_now(),
+        chrono::Utc::now(),
+    )?;
     inserted_ids.insert(genesis_transaction.transaction.id());
 
     // Test `Request::TransactionIds`
@@ -1547,7 +1565,14 @@ async fn mempool_service_basic_single() -> Result<(), Report> {
         inserted_ids.insert(tx.transaction.id());
         // Error must be ignored because a insert can trigger an eviction and
         // an error is returned if the transaction being inserted in chosen.
-        let _ = service.storage().insert(tx.clone(), Vec::new(), None);
+        let _ = service.storage().insert(
+            tx.clone(),
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        );
     }
 
     // Test `Request::RejectedTransactionIds`
@@ -1665,7 +1690,14 @@ async fn mempool_queue() -> Result<(), Report> {
     for tx in transactions.iter() {
         // Error must be ignored because the full mempool either evicts a transaction or
         // rejects the transaction being inserted.
-        let _ = service.storage().insert(tx.clone(), Vec::new(), None);
+        let _ = service.storage().insert(
+            tx.clone(),
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        );
     }
 
     // Test `Request::Queue` for a new transaction
@@ -1754,9 +1786,14 @@ async fn mempool_service_stays_enabled_when_legacy_sync_status_falls_behind() ->
     assert!(service.is_enabled());
 
     // Insert the genesis block coinbase transaction into the mempool storage.
-    service
-        .storage()
-        .insert(genesis_transaction.clone(), Vec::new(), None)?;
+    service.storage().insert(
+        genesis_transaction.clone(),
+        Vec::new(),
+        None,
+        &mut |_, _| {},
+        crate::components::mempool::storage_now(),
+        chrono::Utc::now(),
+    )?;
 
     // Test if the mempool answers correctly (i.e. is enabled)
     let response = service
@@ -1960,18 +1997,38 @@ async fn mempool_expiry_follows_block_growth() -> Result<(), Report> {
     let no_expiry = expiry_fixture_transaction(4, Height(0), None);
     let expired = HashSet::from([parent.transaction.id(), child.transaction.id()]);
     let survivors = HashSet::from([later.transaction.id(), no_expiry.transaction.id()]);
-    mempool
-        .storage()
-        .insert(parent, Vec::new(), Some(Height(1)))?;
-    mempool
-        .storage()
-        .insert(child, vec![outpoint], Some(Height(1)))?;
-    mempool
-        .storage()
-        .insert(later, Vec::new(), Some(Height(1)))?;
-    mempool
-        .storage()
-        .insert(no_expiry, Vec::new(), Some(Height(1)))?;
+    mempool.storage().insert(
+        parent,
+        Vec::new(),
+        Some(Height(1)),
+        &mut |_, _| {},
+        crate::components::mempool::storage_now(),
+        chrono::Utc::now(),
+    )?;
+    mempool.storage().insert(
+        child,
+        vec![outpoint],
+        Some(Height(1)),
+        &mut |_, _| {},
+        crate::components::mempool::storage_now(),
+        chrono::Utc::now(),
+    )?;
+    mempool.storage().insert(
+        later,
+        Vec::new(),
+        Some(Height(1)),
+        &mut |_, _| {},
+        crate::components::mempool::storage_now(),
+        chrono::Utc::now(),
+    )?;
+    mempool.storage().insert(
+        no_expiry,
+        Vec::new(),
+        Some(Height(1)),
+        &mut |_, _| {},
+        crate::components::mempool::storage_now(),
+        chrono::Utc::now(),
+    )?;
     let ActiveState::Enabled {
         pending_gossip_tx_ids,
         ..
@@ -2041,6 +2098,9 @@ async fn benchmark_mempool_idle_poll() -> Result<(), Report> {
                 expiry_fixture_transaction(index, Height(100), None),
                 Vec::new(),
                 Some(Height(0)),
+                &mut |_, _| {},
+                crate::components::mempool::storage_now(),
+                chrono::Utc::now(),
             )?;
         }
         let waker = futures::task::noop_waker();
@@ -3332,7 +3392,14 @@ async fn mempool_reject_non_standard() -> Result<(), Report> {
     // Expect insertion to fail for non-standard transaction.
     let insert_err = service
         .storage()
-        .insert(last_transaction.clone(), Vec::new(), None)
+        .insert(
+            last_transaction.clone(),
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        )
         .expect_err("expected insert to fail for non-standard tx");
 
     assert_eq!(
@@ -3377,9 +3444,14 @@ async fn mempool_accept_standard_op_return() -> Result<(), Report> {
 
     service.enable(&mut recent_syncs).await;
 
-    service
-        .storage()
-        .insert(last_transaction.clone(), Vec::new(), None)?;
+    service.storage().insert(
+        last_transaction.clone(),
+        Vec::new(),
+        None,
+        &mut |_, _| {},
+        crate::components::mempool::storage_now(),
+        chrono::Utc::now(),
+    )?;
 
     Ok(())
 }
@@ -3426,7 +3498,14 @@ async fn mempool_reject_op_return_too_large() -> Result<(), Report> {
 
     let insert_err = service
         .storage()
-        .insert(last_transaction.clone(), Vec::new(), None)
+        .insert(
+            last_transaction.clone(),
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        )
         .expect_err("expected insert to fail for non-standard tx");
 
     assert_eq!(
@@ -3481,7 +3560,14 @@ async fn mempool_reject_multi_op_return() -> Result<(), Report> {
 
     let insert_err = service
         .storage()
-        .insert(last_transaction.clone(), Vec::new(), None)
+        .insert(
+            last_transaction.clone(),
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        )
         .expect_err("expected insert to fail for non-standard tx");
 
     assert_eq!(
@@ -3528,7 +3614,14 @@ async fn mempool_reject_non_standard_scriptpubkey() -> Result<(), Report> {
 
     let insert_err = service
         .storage()
-        .insert(last_transaction.clone(), Vec::new(), None)
+        .insert(
+            last_transaction.clone(),
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        )
         .expect_err("expected insert to fail for non-standard tx");
 
     assert_eq!(
@@ -3577,7 +3670,14 @@ async fn mempool_reject_bare_multisig() -> Result<(), Report> {
 
     let insert_err = service
         .storage()
-        .insert(last_transaction.clone(), Vec::new(), None)
+        .insert(
+            last_transaction.clone(),
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        )
         .expect_err("expected insert to fail for non-standard tx");
 
     assert_eq!(
@@ -3624,7 +3724,14 @@ async fn mempool_reject_large_multisig() -> Result<(), Report> {
 
     let insert_err = service
         .storage()
-        .insert(last_transaction.clone(), Vec::new(), None)
+        .insert(
+            last_transaction.clone(),
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        )
         .expect_err("expected insert to fail for non-standard tx");
 
     assert_eq!(
@@ -3667,7 +3774,14 @@ async fn mempool_reject_large_scriptsig() -> Result<(), Report> {
 
     let insert_err = service
         .storage()
-        .insert(last_transaction.clone(), Vec::new(), None)
+        .insert(
+            last_transaction.clone(),
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        )
         .expect_err("expected insert to fail for non-standard tx");
 
     assert_eq!(
@@ -3710,7 +3824,14 @@ async fn mempool_reject_non_push_only_scriptsig() -> Result<(), Report> {
 
     let insert_err = service
         .storage()
-        .insert(last_transaction.clone(), Vec::new(), None)
+        .insert(
+            last_transaction.clone(),
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        )
         .expect_err("expected insert to fail for non-standard tx");
 
     assert_eq!(
@@ -3754,7 +3875,14 @@ async fn mempool_reject_too_many_sigops() -> Result<(), Report> {
 
     let insert_err = service
         .storage()
-        .insert(last_transaction.clone(), Vec::new(), None)
+        .insert(
+            last_transaction.clone(),
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        )
         .expect_err("expected insert to fail for too many sigops");
 
     assert_eq!(
@@ -3804,7 +3932,14 @@ async fn mempool_reject_non_standard_inputs() -> Result<(), Report> {
 
     let insert_err = service
         .storage()
-        .insert(last_transaction.clone(), Vec::new(), None)
+        .insert(
+            last_transaction.clone(),
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        )
         .expect_err("expected insert to fail for non-standard inputs");
 
     assert_eq!(

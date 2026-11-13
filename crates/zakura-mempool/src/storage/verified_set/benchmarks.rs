@@ -3,17 +3,17 @@
 //! Uses actual storage and dependency indexes with synthetic verified fixtures.
 //! Downloading, cryptographic verification, and gossip are outside these timings.
 
-use std::{
-    collections::BinaryHeap,
-    hint::black_box,
-    time::{Duration, Instant},
-};
+use std::{collections::BinaryHeap, hint::black_box, time::Duration};
 
 use zakura_chain::{transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD, transparent::OutPoint};
+use zakura_rt::time::{utc_now, Instant};
 
-use super::super::{fixtures::TxFactory, Storage};
+use super::super::fixtures::TxFactory;
 use super::*;
-use crate::components::mempool::config;
+use crate::config;
+
+/// Storage for the benchmarks. They never cache a verification error.
+type Storage = super::super::Storage<std::convert::Infallible>;
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -72,7 +72,14 @@ impl Fixture {
                 let tx = factory.tx_with(fee, 2, 0);
                 fixture
                     .storage
-                    .insert(tx.clone(), spent.clone(), None)
+                    .insert(
+                        tx.clone(),
+                        spent.clone(),
+                        None,
+                        &mut |_, _| {},
+                        Instant::now(),
+                        utc_now().into(),
+                    )
                     .unwrap();
                 fixture.spent.insert(tx.transaction.id().mined_id(), spent);
                 group.push(tx);
@@ -114,12 +121,15 @@ impl Fixture {
                 )
             })
             .collect();
-        self.storage.clear_tip_rejections();
+        self.storage.clear_tip_rejections(Instant::now());
         let start = Instant::now();
         let (result, evicted) = black_box(self.storage.insert_with_evicted_ids(
             black_box(incoming.clone()),
             spent.to_vec(),
             None,
+            &mut |_, _| {},
+            Instant::now(),
+            utc_now().into(),
         ));
         let elapsed = start.elapsed();
         assert_eq!(result.is_ok(), expected_success);
@@ -146,7 +156,7 @@ impl Fixture {
             let time = tx.time;
             self.storage
                 .verified
-                .insert(tx, spent, &mut self.storage.pending_outputs, None)
+                .insert(tx, spent, &mut |_, _| {}, None, utc_now().into())
                 .unwrap();
             let affected = self.storage.verified.dependency_group([id]);
             self.storage.verified.remove_ordering_candidates(&affected);
@@ -259,7 +269,14 @@ pub fn mempool_eviction_benchmarks(mut run: impl FnMut(&str, &mut dyn FnMut() ->
         ] {
             fixture
                 .storage
-                .insert(tx.clone(), spent.clone(), None)
+                .insert(
+                    tx.clone(),
+                    spent.clone(),
+                    None,
+                    &mut |_, _| {},
+                    Instant::now(),
+                    utc_now().into(),
+                )
                 .unwrap();
             fixture.spent.insert(tx.transaction.id().mined_id(), spent);
         }

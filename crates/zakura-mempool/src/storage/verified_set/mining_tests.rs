@@ -1,7 +1,7 @@
 //! Mining-order scores, tie-breaking, and mutation coverage.
 
 use super::*;
-use crate::components::mempool::storage::fixtures::TxFactory;
+use crate::storage::fixtures::TxFactory;
 
 fn insert(
     verified: &mut VerifiedSet,
@@ -10,7 +10,7 @@ fn insert(
 ) -> transaction::Hash {
     let id = tx.transaction.id().mined_id();
     verified
-        .insert(tx, spent, &mut PendingOutputs::default(), None)
+        .insert(tx, spent, &mut |_, _| {}, None, chrono::Utc::now())
         .unwrap();
     id
 }
@@ -138,7 +138,7 @@ fn failed_insert_does_not_change_mining_order() {
     insert(&mut verified, tx.clone(), Vec::new());
     let before = verified.mining_order.clone();
     assert_eq!(
-        verified.insert(tx, Vec::new(), &mut PendingOutputs::default(), None),
+        verified.insert(tx, Vec::new(), &mut |_, _| {}, None, chrono::Utc::now()),
         Err(SameEffectsTipRejectionError::SpendConflict)
     );
     assert_eq!(verified.mining_order, before);

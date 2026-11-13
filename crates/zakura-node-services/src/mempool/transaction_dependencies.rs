@@ -1,6 +1,6 @@
 //! Representation of mempool transactions' dependencies on other transactions in the mempool.
 
-use std::collections::{HashMap, HashSet};
+use zakura_rt::collections::{HashMap, HashSet};
 
 use zakura_chain::{transaction, transparent};
 

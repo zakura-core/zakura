@@ -20,14 +20,13 @@ use zakura_chain::{
     transparent, LedgerState,
 };
 
-use crate::components::mempool::tests::{
-    standard_verified_unmined_tx_strategy, standardize_transaction,
-};
-use crate::components::mempool::{
+use crate::arbitrary::{standard_verified_unmined_tx_strategy, standardize_transaction};
+use crate::{
     config::Config,
     storage::{
-        eviction_list::EvictionList, ExactTipRejectionError, MempoolError, RejectionError,
-        SameEffectsTipRejectionError, Storage, MAX_EVICTION_MEMORY_ENTRIES,
+        eviction_list::EvictionList,
+        tests::{ExactTipRejectionError, MempoolError, RejectionError, Storage},
+        SameEffectsTipRejectionError, MAX_EVICTION_MEMORY_ENTRIES,
     },
     SameEffectsChainRejectionError,
 };
@@ -84,16 +83,24 @@ fn reject_lists_enforce_production_capacity() {
 
     for index in 0..=production_capacity {
         let id = cheap_rejection_id(index);
-        tip_rejected.reject(id, SameEffectsTipRejectionError::SpendConflict.into());
-        chain_rejected.reject(id, SameEffectsChainRejectionError::Expired.into());
+        tip_rejected.reject(
+            id,
+            SameEffectsTipRejectionError::SpendConflict.into(),
+            crate::Instant::now(),
+        );
+        chain_rejected.reject(
+            id,
+            SameEffectsChainRejectionError::Expired.into(),
+            crate::Instant::now(),
+        );
 
         if index == production_capacity - 1 {
             assert_eq!(
-                tip_rejected.rejected_transaction_count(),
+                tip_rejected.rejected_transaction_count(crate::Instant::now()),
                 MAX_EVICTION_MEMORY_ENTRIES
             );
             assert_eq!(
-                chain_rejected.rejected_transaction_count(),
+                chain_rejected.rejected_transaction_count(crate::Instant::now()),
                 MAX_EVICTION_MEMORY_ENTRIES
             );
         }
@@ -101,13 +108,16 @@ fn reject_lists_enforce_production_capacity() {
 
     let oldest = cheap_rejection_id(0);
     let newest = cheap_rejection_id(production_capacity);
-    assert_eq!(tip_rejected.rejected_transaction_count(), 0);
     assert_eq!(
-        chain_rejected.rejected_transaction_count(),
+        tip_rejected.rejected_transaction_count(crate::Instant::now()),
+        0
+    );
+    assert_eq!(
+        chain_rejected.rejected_transaction_count(crate::Instant::now()),
         MAX_EVICTION_MEMORY_ENTRIES
     );
-    assert!(!chain_rejected.contains_rejected(&oldest));
-    assert!(chain_rejected.contains_rejected(&newest));
+    assert!(!chain_rejected.contains_rejected(&oldest, crate::Instant::now()));
+    assert!(chain_rejected.contains_rejected(&newest, crate::Instant::now()));
 }
 
 proptest! {
@@ -142,7 +152,7 @@ proptest! {
         for (transaction_to_accept, transaction_to_reject) in input_permutations {
             let id_to_accept = transaction_to_accept.transaction.id();
 
-            prop_assert_eq!(storage.insert(transaction_to_accept, Vec::new(), None), Ok(id_to_accept));
+            prop_assert_eq!(storage.insert(transaction_to_accept, Vec::new(), None, &mut |_, _| {}, crate::Instant::now(), chrono::Utc::now()), Ok(id_to_accept));
 
             let test_capacity: u32 = TEST_REJECTION_LIST_CAPACITY
                 .try_into()
@@ -151,12 +161,12 @@ proptest! {
                 .map(|index| rejection_id_with_index(rejection_template, index));
 
             for rejection in unique_ids {
-                storage.reject(rejection, SameEffectsTipRejectionError::SpendConflict.into());
+                storage.reject(rejection, SameEffectsTipRejectionError::SpendConflict.into(), crate::Instant::now());
             }
 
             // Make sure there were no duplicates
             prop_assert_eq!(
-                storage.rejected_transaction_count(),
+                storage.rejected_transaction_count(crate::Instant::now()),
                 TEST_REJECTION_LIST_CAPACITY
             );
 
@@ -164,15 +174,15 @@ proptest! {
             // - transaction_to_accept, or
             // - a rejection from rejections
             prop_assert_eq!(
-                storage.insert(transaction_to_reject, Vec::new(), None),
+                storage.insert(transaction_to_reject, Vec::new(), None, &mut |_, _| {}, crate::Instant::now(), chrono::Utc::now()),
                 Err(MempoolError::StorageEffectsTip(SameEffectsTipRejectionError::SpendConflict))
             );
 
             // Since we inserted more than the configured capacity,
             // the storage should have cleared the reject list
-            prop_assert_eq!(storage.rejected_transaction_count(), 0);
+            prop_assert_eq!(storage.rejected_transaction_count(crate::Instant::now()), 0);
 
-            storage.clear();
+            storage.clear(crate::Instant::now());
         }
     }
 
@@ -202,12 +212,12 @@ proptest! {
             (0..test_capacity).map(|index| rejection_id_with_index(rejection_template, index));
 
         for rejection in unique_ids {
-            storage.reject(rejection, ExactTipRejectionError::Evicted.into());
+            storage.reject(rejection, ExactTipRejectionError::Evicted.into(), crate::Instant::now());
         }
 
         // Make sure there were no duplicates
         prop_assert_eq!(
-            storage.rejected_transaction_count(),
+            storage.rejected_transaction_count(crate::Instant::now()),
             TEST_REJECTION_LIST_CAPACITY
         );
 
@@ -217,13 +227,13 @@ proptest! {
             if i < transactions.len() - 1 {
                 // The initial transactions should be successful
                 prop_assert_eq!(
-                    storage.insert(transaction.clone(), Vec::new(), None),
+                    storage.insert(transaction.clone(), Vec::new(), None, &mut |_, _| {}, crate::Instant::now(), chrono::Utc::now()),
                     Ok(tx_id)
                 );
             } else {
                 // The final transaction either evicts cheaper transactions, or is rejected
                 // because it pays too little to evict them.
-                let result = storage.insert(transaction.clone(), Vec::new(), None);
+                let result = storage.insert(transaction.clone(), Vec::new(), None, &mut |_, _| {}, crate::Instant::now(), chrono::Utc::now());
 
                 if result.is_ok() {
                     prop_assert_eq!(
@@ -244,7 +254,7 @@ proptest! {
 
         // The eviction or the rejection pushed the tip rejection list over its capacity, so
         // the storage cleared it.
-        prop_assert!(storage.rejected_transaction_count() < TEST_REJECTION_LIST_CAPACITY);
+        prop_assert!(storage.rejected_transaction_count(crate::Instant::now()) < TEST_REJECTION_LIST_CAPACITY);
     }
 
     /// Test that the reject list length limits are applied when directly rejecting transactions.
@@ -269,12 +279,12 @@ proptest! {
             .map(|index| rejection_id_with_index(rejection_template, index));
 
         for (index, rejection) in unique_ids.enumerate() {
-            storage.reject(rejection, rejection_error.clone());
+            storage.reject(rejection, rejection_error.clone(), crate::Instant::now());
 
             if index == TEST_REJECTION_LIST_CAPACITY - 1 {
                 // Make sure there were no duplicates
                 prop_assert_eq!(
-                    storage.rejected_transaction_count(),
+                    storage.rejected_transaction_count(crate::Instant::now()),
                     TEST_REJECTION_LIST_CAPACITY
                 );
             } else if index == TEST_REJECTION_LIST_CAPACITY {
@@ -287,11 +297,11 @@ proptest! {
                     RejectionError::ExactTip(_) |
                     RejectionError::NonStandardTransaction(_) |
                     RejectionError::SameEffectsTip(_) => {
-                        prop_assert_eq!(storage.rejected_transaction_count(), 0);
+                        prop_assert_eq!(storage.rejected_transaction_count(crate::Instant::now()), 0);
                     },
                     RejectionError::SameEffectsChain(_) => {
                         prop_assert_eq!(
-                            storage.rejected_transaction_count(),
+                            storage.rejected_transaction_count(crate::Instant::now()),
                             TEST_REJECTION_LIST_CAPACITY
                         );
                     },
@@ -323,11 +333,11 @@ proptest! {
             rejection_template
         }).collect();
 
-        storage.reject(unique_ids[0], SameEffectsChainRejectionError::Expired.into());
+        storage.reject(unique_ids[0], SameEffectsChainRejectionError::Expired.into(), crate::Instant::now());
         thread::sleep(Duration::from_millis(11));
-        storage.reject(unique_ids[1], SameEffectsChainRejectionError::Expired.into());
+        storage.reject(unique_ids[1], SameEffectsChainRejectionError::Expired.into(), crate::Instant::now());
 
-        prop_assert_eq!(storage.rejected_transaction_count(), 1);
+        prop_assert_eq!(storage.rejected_transaction_count(crate::Instant::now()), 1);
     }
 }
 
@@ -355,16 +365,16 @@ proptest! {
             let id_to_accept = transaction_to_accept.transaction.id();
             let id_to_reject = transaction_to_reject.transaction.id();
 
-            prop_assert_eq!(storage.insert(transaction_to_accept, Vec::new(), None), Ok(id_to_accept));
+            prop_assert_eq!(storage.insert(transaction_to_accept, Vec::new(), None, &mut |_, _| {}, crate::Instant::now(), chrono::Utc::now()), Ok(id_to_accept));
 
             prop_assert_eq!(
-                storage.insert(transaction_to_reject, Vec::new(), None),
+                storage.insert(transaction_to_reject, Vec::new(), None, &mut |_, _| {}, crate::Instant::now(), chrono::Utc::now()),
                 Err(MempoolError::StorageEffectsTip(SameEffectsTipRejectionError::SpendConflict))
             );
 
-            prop_assert!(storage.contains_rejected(&id_to_reject));
+            prop_assert!(storage.contains_rejected(&id_to_reject, crate::Instant::now()));
 
-            storage.clear();
+            storage.clear(crate::Instant::now());
         }
     }
 
@@ -406,23 +416,23 @@ proptest! {
             let id_to_reject = transaction_to_reject.transaction.id();
 
             prop_assert_eq!(
-                storage.insert(first_transaction_to_accept, Vec::new(), None),
+                storage.insert(first_transaction_to_accept, Vec::new(), None, &mut |_, _| {}, crate::Instant::now(), chrono::Utc::now()),
                 Ok(first_id_to_accept)
             );
 
             prop_assert_eq!(
-                storage.insert(transaction_to_reject, Vec::new(), None),
+                storage.insert(transaction_to_reject, Vec::new(), None, &mut |_, _| {}, crate::Instant::now(), chrono::Utc::now()),
                 Err(MempoolError::StorageEffectsTip(SameEffectsTipRejectionError::SpendConflict))
             );
 
-            prop_assert!(storage.contains_rejected(&id_to_reject));
+            prop_assert!(storage.contains_rejected(&id_to_reject, crate::Instant::now()));
 
             prop_assert_eq!(
-                storage.insert(second_transaction_to_accept, Vec::new(), None),
+                storage.insert(second_transaction_to_accept, Vec::new(), None, &mut |_, _| {}, crate::Instant::now(), chrono::Utc::now()),
                 Ok(second_id_to_accept)
             );
 
-            storage.clear();
+            storage.clear(crate::Instant::now());
         }
     }
 
@@ -445,7 +455,7 @@ proptest! {
             .filter_map(|transaction| {
                 let id = transaction.transaction.id();
 
-                storage.insert(transaction.clone(), Vec::new(), None).ok().map(|_| id)
+                storage.insert(transaction.clone(), Vec::new(), None, &mut |_, _| {}, crate::Instant::now(), chrono::Utc::now()).ok().map(|_| id)
             })
             .collect();
 
@@ -458,10 +468,10 @@ proptest! {
         match &input {
             RemoveExact { wtx_ids_to_remove, .. } => storage.remove_exact(wtx_ids_to_remove),
             RejectAndRemoveSameEffects { mined_ids_to_remove, .. } => {
-                let num_removals = storage.reject_and_remove_same_effects(mined_ids_to_remove, Vec::<std::sync::Arc<zakura_chain::transaction::Transaction>>::new()).total_len();
+                let num_removals = storage.reject_and_remove_same_effects(mined_ids_to_remove, Vec::<std::sync::Arc<zakura_chain::transaction::Transaction>>::new(), crate::Instant::now()).total_len();
                 for &removed_transaction_id in mined_ids_to_remove.iter() {
                     prop_assert_eq!(
-                        storage.rejection_error(&UnminedTxId::Legacy(removed_transaction_id)),
+                        storage.rejection_error(&UnminedTxId::Legacy(removed_transaction_id), crate::Instant::now()),
                         Some(SameEffectsChainRejectionError::Mined.into())
                     );
                 }
@@ -1173,13 +1183,13 @@ proptest! {
 
         let mut e = EvictionList::new(2, EVICTION_MEMORY_TIME);
         for txid in txids.iter() {
-            e.insert(txid.mined_id());
+            e.insert(txid.mined_id(), crate::Instant::now());
         }
-        prop_assert!(!e.contains_key(&txids[0].mined_id()));
-        prop_assert!(!e.contains_key(&txids[1].mined_id()));
-        prop_assert!(e.contains_key(&txids[2].mined_id()));
-        prop_assert!(e.contains_key(&txids[3].mined_id()));
-        prop_assert_eq!(e.len(), 2);
+        prop_assert!(!e.contains_key(&txids[0].mined_id(), crate::Instant::now()));
+        prop_assert!(!e.contains_key(&txids[1].mined_id(), crate::Instant::now()));
+        prop_assert!(e.contains_key(&txids[2].mined_id(), crate::Instant::now()));
+        prop_assert!(e.contains_key(&txids[3].mined_id(), crate::Instant::now()));
+        prop_assert_eq!(e.len(crate::Instant::now()), 2);
     }
 
     /// Check if EvictionList removes old entries.
@@ -1199,18 +1209,18 @@ proptest! {
         }).collect();
 
         let mut e = EvictionList::new(2, Duration::from_millis(10));
-        e.insert(txids[0].mined_id());
+        e.insert(txids[0].mined_id(), crate::Instant::now());
         thread::sleep(Duration::from_millis(11));
 
         // First txid has expired, but list wasn't pruned yet.
         // Make sure len() and contains_key() take that into account.
-        prop_assert!(!e.contains_key(&txids[0].mined_id()));
-        prop_assert_eq!(e.len(), 0);
+        prop_assert!(!e.contains_key(&txids[0].mined_id(), crate::Instant::now()));
+        prop_assert_eq!(e.len(crate::Instant::now()), 0);
 
-        e.insert(txids[1].mined_id());
-        prop_assert!(!e.contains_key(&txids[0].mined_id()));
-        prop_assert!(e.contains_key(&txids[1].mined_id()));
-        prop_assert_eq!(e.len(), 1);
+        e.insert(txids[1].mined_id(), crate::Instant::now());
+        prop_assert!(!e.contains_key(&txids[0].mined_id(), crate::Instant::now()));
+        prop_assert!(e.contains_key(&txids[1].mined_id(), crate::Instant::now()));
+        prop_assert_eq!(e.len(crate::Instant::now()), 1);
     }
 
     /// Check if EvictionList removes old entries and computes length correctly
@@ -1241,13 +1251,13 @@ proptest! {
 
         let mut e = EvictionList::new(20, Duration::from_millis(EVICTION_TIME));
         for txid in txids.iter().take(10) {
-            e.insert(txid.mined_id());
+            e.insert(txid.mined_id(), crate::Instant::now());
         }
         thread::sleep(Duration::from_millis(BEFORE_EVICTION_TIME));
         // Add the next 10 before the eviction time to avoid a prune from
         // happening.
         for txid in txids.iter().skip(10) {
-            e.insert(txid.mined_id());
+            e.insert(txid.mined_id(), crate::Instant::now());
         }
         thread::sleep(Duration::from_millis(EVICTION_TIME - BEFORE_EVICTION_TIME + 1));
 
@@ -1257,20 +1267,20 @@ proptest! {
         // Note: if one of these fails, you may need to adjust EVICTION_TIME and/or
         // BEFORE_EVICTION_TIME, see above.
         for txid in txids.iter().take(10) {
-            prop_assert!(!e.contains_key(&txid.mined_id()));
+            prop_assert!(!e.contains_key(&txid.mined_id(), crate::Instant::now()));
         }
         for txid in txids.iter().skip(10) {
-            prop_assert!(e.contains_key(&txid.mined_id()));
+            prop_assert!(e.contains_key(&txid.mined_id(), crate::Instant::now()));
         }
-        prop_assert_eq!(e.len(), 10);
+        prop_assert_eq!(e.len(crate::Instant::now()), 10);
 
         // Make sure all of them are expired
         thread::sleep(Duration::from_millis(EVICTION_TIME + 1));
 
         for txid in txids.iter() {
-            prop_assert!(!e.contains_key(&txid.mined_id()));
+            prop_assert!(!e.contains_key(&txid.mined_id(), crate::Instant::now()));
         }
-        prop_assert_eq!(e.len(), 0);
+        prop_assert_eq!(e.len(crate::Instant::now()), 0);
     }
 
     /// Check if EvictionList panics if entries are added multiple times.
@@ -1280,7 +1290,7 @@ proptest! {
         txid in any::<UnminedTxId>()
     ) {
         let mut e = EvictionList::new(2, EVICTION_MEMORY_TIME);
-        e.insert(txid.mined_id());
-        e.insert(txid.mined_id());
+        e.insert(txid.mined_id(), crate::Instant::now());
+        e.insert(txid.mined_id(), crate::Instant::now());
     }
 }

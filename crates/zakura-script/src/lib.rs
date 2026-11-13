@@ -4,6 +4,8 @@
 #![doc(html_root_url = "https://docs.rs/zakura_script")]
 #![forbid(unsafe_code)]
 
+pub mod standard;
+
 #[cfg(test)]
 mod encoding_tests;
 #[cfg(test)]

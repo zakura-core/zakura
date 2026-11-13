@@ -139,6 +139,7 @@ max_level_debug = ["tracing/max_level_debug"]
 proptest-impl = [
     "proptest",
     "proptest-derive",
+    "zakura-mempool/proptest-impl",
     "zakura-consensus/proptest-impl",
     "zakura-state/proptest-impl",
     "zakura-network/proptest-impl",
@@ -146,7 +147,7 @@ proptest-impl = [
 ]
 
 # Criterion benchmarks for verified mempool storage, without network or crypto.
-mempool-bench = ["proptest-impl"]
+mempool-bench = ["proptest-impl", "zakura-mempool/mempool-bench"]
 
 # Build the zakura-checkpoints utility for checkpoint generation tests
 zakura-checkpoints = [
@@ -159,6 +160,7 @@ zakura-consensus = { path = "../zakura-consensus", version = "17.0.2" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.1" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "17.0.0" }
+zakura-mempool = { path = "../zakura-mempool", version = "0.1.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.2.3" }
 zakura-rpc = { path = "../zakura-rpc", version = "18.0.1", default-features = false }
 zakura-state = { path = "../zakura-state", version = "17.0.0" }
@@ -248,6 +250,7 @@ zakura-test = { path = "../zakura-test", version = "4.0.0" }
 # zakura-storage is never published, so packaging drops it.
 zakura-storage = { path = "../zakura-storage", features = ["driver-fidelity"] }
 zakura-node-services = { path = "../zakura-node-services", version = "5.2.3", features = ["rpc-client", "test-support"] }
+zakura-mempool = { path = "../zakura-mempool", version = "0.1.0", features = ["proptest-impl"] }
 
 # Used by the checkpoint generation tests via the zakura-checkpoints feature
 # (the binaries in this crate won't be built unless their features are enabled).

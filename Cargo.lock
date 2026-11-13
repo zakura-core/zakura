@@ -2710,6 +2710,7 @@ dependencies = [
  "zakura-consensus",
  "zakura-header-chain",
  "zakura-jsonl-trace",
+ "zakura-mempool",
  "zakura-network",
  "zakura-node-services",
  "zakura-orchard",
@@ -3009,9 +3010,20 @@ dependencies = [
 name = "zakura-mempool"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "eyre",
+ "metrics",
+ "proptest",
+ "proptest-derive",
+ "serde",
+ "thiserror",
+ "tracing",
  "zakura-chain",
  "zakura-node-services",
  "zakura-rt",
+ "zakura-script",
+ "zakura-test",
+ "zakura-zcash-script",
 ]
 
 [[package]]

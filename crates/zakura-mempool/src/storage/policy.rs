@@ -1,18 +1,17 @@
 //! Mempool transaction standardness policy constants and helpers.
 //!
 //! These mirror zcashd's mempool policy for rejecting non-standard transactions
-//! (`IsStandardTx()` and `AreInputsStandard()`). The transparent-input checks now live in
-//! `zakura-consensus`, where the transaction verifier applies them before script verification;
-//! they are re-exported here and used by the storage-time policy in the parent module.
+//! (`IsStandardTx()` and `AreInputsStandard()`). The transparent-input checks live in
+//! `zakura-script`. The transaction verifier applies them before script verification, and
+//! the storage-time policy in the parent module applies them again.
 
 #[cfg(any(test, feature = "mempool-bench"))]
 use zakura_chain::transparent;
 
 // The transparent-input standardness checks (`AreInputsStandard()` and the spent-output
-// classifier) live in `zakura-consensus`, where the transaction verifier also applies them to
-// mempool transactions *before* script verification (`check::mempool_standard_input_scripts`).
-// They are re-exported here for the storage-time policy checks, so the two paths can't drift apart.
-pub(super) use zakura_consensus::transaction::check::{
+// classifier) are shared with the transaction verifier, which applies them to mempool
+// transactions *before* script verification, so the two paths can't drift apart.
+pub(super) use zakura_script::standard::{
     are_inputs_standard, standard_script_kind, MAX_STANDARD_SCRIPTSIG_SIZE,
 };
 

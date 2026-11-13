@@ -95,7 +95,7 @@ proptest! {
             // Insert a dummy transaction.
             mempool
                 .storage()
-                .insert(transaction.0, Vec::new(), None)
+                .insert(transaction.0, Vec::new(), None, &mut |_, _| {}, crate::components::mempool::storage_now(), chrono::Utc::now())
                 .expect("Inserting a transaction should succeed");
 
             // The first call to `poll_ready` shouldn't clear the storage yet.
@@ -174,7 +174,7 @@ proptest! {
                 // Insert the dummy transaction into the mempool.
                 mempool
                     .storage()
-                    .insert(transaction.0.clone(), Vec::new(), None)
+                    .insert(transaction.0.clone(), Vec::new(), None, &mut |_, _| {}, crate::components::mempool::storage_now(), chrono::Utc::now())
                     .expect("Inserting a transaction should succeed");
 
                 // Set the new chain tip.
@@ -232,7 +232,7 @@ proptest! {
             // Insert a dummy transaction.
             mempool
                 .storage()
-                .insert(transaction, Vec::new(), None)
+                .insert(transaction, Vec::new(), None, &mut |_, _| {}, crate::components::mempool::storage_now(), chrono::Utc::now())
                 .expect("Inserting a transaction should succeed");
 
             // The first call to `poll_ready` shouldn't clear the storage yet.
@@ -511,7 +511,14 @@ async fn disabling_mempool_notifies_subscribers() {
     let tx_id = transaction.transaction.id();
     mempool
         .storage()
-        .insert(transaction, Vec::new(), None)
+        .insert(
+            transaction,
+            Vec::new(),
+            None,
+            &mut |_, _| {},
+            crate::components::mempool::storage_now(),
+            chrono::Utc::now(),
+        )
         .expect("test transaction is accepted");
     let mut subscriber = mempool.transaction_sender.subscribe();
     tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(

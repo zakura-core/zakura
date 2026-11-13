@@ -2995,7 +2995,8 @@ dependencies = [
 [[package]]
 name = "zakura-librocksdb-sys"
 version = "0.17.7+10.4.2"
-source = "git+https://github.com/p0mvn/rust-rocksdb-wrapper?rev=f41450671c90825def7dc3b733c91519e631d57f#f41450671c90825def7dc3b733c91519e631d57f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5cd1d4800d313a2141553906abc9292fc9b5a93c60c3b5740bee81e5885da15"
 dependencies = [
  "bzip2-sys",
  "cc",
@@ -3252,7 +3253,8 @@ dependencies = [
 [[package]]
 name = "zakura-rocksdb"
 version = "0.24.4"
-source = "git+https://github.com/p0mvn/rust-rocksdb-wrapper?rev=f41450671c90825def7dc3b733c91519e631d57f#f41450671c90825def7dc3b733c91519e631d57f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "662d3cb40b2838d016cc24389b14a4cbb250110796a3756cbb71a4edbd10daf5"
 dependencies = [
  "libc",
  "zakura-librocksdb-sys",

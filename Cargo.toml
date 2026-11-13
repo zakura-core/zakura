@@ -131,10 +131,7 @@ rustls-pki-types = "1.12"
 #
 # The fork commits its RocksDB C API bindings, so building needs neither
 # bindgen nor libclang.
-#
-# Pinned to the head of zakura-core/rust-rocksdb-wrapper#12, which adds
-# `Options::set_ttl`. Return to a crates.io version once the fork releases it.
-rocksdb = { git = "https://github.com/p0mvn/rust-rocksdb-wrapper", rev = "f41450671c90825def7dc3b733c91519e631d57f", package = "zakura-rocksdb", default-features = false }
+rocksdb = { version = "=0.24.4", package = "zakura-rocksdb", default-features = false }
 secp256k1 = "0.33"
 semver = "1.0.26"
 serde = "1.0.219"

@@ -1042,7 +1042,7 @@ impl HasView for DiscoveryWire {
 
 impl Subsystem for DiscoveryWire {
     const NAME: &'static str = "discovery/wire";
-    const GENERATOR: u32 = 1;
+    const GENERATOR: u32 = 2;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = WireScenario;
     type Prepared = NodeHandle;

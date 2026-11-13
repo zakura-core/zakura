@@ -609,7 +609,7 @@ fn quarantine_keeps_each_sidecar() {
         .into_iter()
         .map(|prefix| {
             sidecar.replacen(
-                "generator = 2",
+                "generator = 3",
                 &format!("generator = 0\nrequired = false\nkind = \"plan\"\nprefix = \"{prefix}\""),
                 1,
             )

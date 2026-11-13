@@ -10,7 +10,7 @@
 # sequencer refuses an old-epoch body after it applied a newer epoch. Rerun
 # it when a block-sync change moves the input off that crossing.
 harness = "block-sync/storage"
-generator = 2
+generator = 3
 sha256 = "db878ab38107f578cd10dfc9ded692e63676cfa3032707cae19e6dbd0a089933"
 scenario_sha256 = "ef7a2693943a5f576cfab7e8029e9ceef242b4bd6c02d7d5b726c360bf127914"
 source = "crates/zakura-sim/tests/block_semantic_properties.rs"

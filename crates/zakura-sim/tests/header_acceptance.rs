@@ -7628,6 +7628,55 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/not_applicable.rs",
         "a_case_s_lists_join_its_whole_case",
     ),
+    (
+        "HistoryRunRef",
+        "src/harness/header_acceptance/tool.rs",
+        "recorded_at",
+        "src/harness/header_acceptance/tool.rs",
+        "a_history_run_is_recorded_at_its_whole_history",
+    ),
+    (
+        "HistoryRunRef",
+        "src/harness/header_acceptance/tool.rs",
+        "history_target",
+        "src/harness/header_acceptance/tool.rs",
+        "a_history_s_target_joins_its_whole_history",
+    ),
+    (
+        "TestIdRef",
+        "src/harness/header_acceptance/tool.rs",
+        "integrity_execution",
+        "src/harness/header_acceptance/tool.rs",
+        "an_integrity_run_s_test_joins_its_whole_test",
+    ),
+    (
+        "TestIdRef",
+        "src/harness/header_acceptance/tool.rs",
+        "history_execution",
+        "src/harness/header_acceptance/tool.rs",
+        "a_history_s_witness_test_joins_its_whole_test",
+    ),
+    (
+        "TestIdRef",
+        "src/harness/header_acceptance/tool.rs",
+        "unit_refusal",
+        "src/harness/header_acceptance/tool.rs",
+        "a_unit_run_s_test_joins_its_whole_test",
+    ),
+    (
+        "TestIdRef",
+        "src/harness/header_acceptance/tool.rs",
+        "inventory_cases",
+        "src/harness/header_acceptance/tool.rs",
+        "a_counted_test_s_inventory_joins_its_whole_test",
+    ),
+    (
+        "DeclarationRef",
+        "src/harness/header_acceptance/tool.rs",
+        "declared_in",
+        "src/harness/header_acceptance/tool.rs",
+        "a_declared_history_joins_its_whole_declaration",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.
@@ -8968,6 +9017,12 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/tool.rs",
         "a_counted_test_declares_exactly_its_inventory",
         "test",
+        "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "a_history_run_is_recorded_at_its_whole_history",
+        "run",
         "asserts what the code under test returned for the test's own input, an output check; the join is inside it, under its control",
     ),
     (

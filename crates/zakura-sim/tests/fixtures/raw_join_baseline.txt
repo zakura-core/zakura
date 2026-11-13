@@ -256,8 +256,6 @@ src/harness/header_acceptance/tool.rs	fail	run.end!=End::Killed
 src/harness/header_acceptance/tool.rs	integrity_execution	patched==(test.checkout_source.as_deref()==Some(subject_source))
 src/harness/header_acceptance/tool.rs	integrity_execution	test.binary_source!=test.checkout_source
 src/harness/header_acceptance/tool.rs	integrity_execution	test.checkout_source.as_deref()==Some(subject_source)
-src/harness/header_acceptance/tool.rs	integrity_execution	test.file!=*file
-src/harness/header_acceptance/tool.rs	integrity_execution	test.package!=*package
 src/harness/header_acceptance/tool.rs	is_header_case	HEADER_HARNESSES.contains(&harness.as_str()
 src/harness/header_acceptance/tool.rs	is_header_case	entry.name==harness
 src/harness/header_acceptance/tool.rs	is_header_case	ids.contains(property

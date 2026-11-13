@@ -437,11 +437,13 @@ def completeness(manifest, steps, suite_fuzz, loop_report):
             not_run.append({"id": row["id"], "reason": "the routine's suite fuzz is off"})
     ran_ids = {entry["id"] for entry in ran}
     for row in manifest.get("tests", []):
-        if row["id"].startswith("test/zakura-sim/") and "suite" in steps:
+        if not row["id"].startswith("test/zakura-sim/"):
+            not_run.append({"id": row["id"], "reason": "the routine's suite step runs only zakura-sim's tests"})
+        elif "suite" in steps:
             ran.append({"id": row["id"], "by": "suite", "exit": steps["suite"]})
             ran_ids.add(row["id"])
         else:
-            not_run.append({"id": row["id"], "reason": "the routine's suite step runs only zakura-sim's tests"})
+            not_run.append({"id": row["id"], "reason": "the routine ran no suite step"})
     for row in manifest.get("witnesses", []):
         if row["expect"] == "unimplemented":
             unimplemented.append({"id": row["id"], "kind": "witness", "detail": row.get("pending")})

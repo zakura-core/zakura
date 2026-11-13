@@ -1825,7 +1825,7 @@ where
                             Err(err) => {
                                 metrics::counter!(
                                     "zakura.net.in.errors",
-                                    "error" => err.to_string(),
+                                    "error" => serialization_error_metric_label(err),
                                 )
                                 .increment(1);
 
@@ -1988,6 +1988,24 @@ where
                 },
             )
             .boxed()
+    }
+}
+
+/// Returns a bounded serialization error label without error details.
+fn serialization_error_metric_label(error: &SerializationError) -> &'static str {
+    match error {
+        SerializationError::Io(_) => "io",
+        SerializationError::Parse(_) => "parse",
+        SerializationError::NonCanonicalShieldedProofSize => "non_canonical_shielded_proof_size",
+        SerializationError::Utf8Error(_) => "utf8_error",
+        SerializationError::TryFromSliceError(_) => "try_from_slice_error",
+        SerializationError::TryFromIntError(_) => "try_from_int_error",
+        SerializationError::FromHexError(_) => "from_hex_error",
+        SerializationError::Amount { .. } => "amount",
+        SerializationError::BadTransactionBalance => "bad_transaction_balance",
+        SerializationError::Script(_) => "script",
+        SerializationError::Opcode(_) => "opcode",
+        SerializationError::Num(_) => "num",
     }
 }
 

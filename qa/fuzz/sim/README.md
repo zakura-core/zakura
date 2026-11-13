@@ -22,7 +22,7 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
 ```
 
 `sim-fuzz.yml` runs each mapped target for two minutes nightly, or on a
-manual dispatch. That run is a smoke: it shows each target still builds and
+manual dispatch, and `block_sync_storage` on its seeds alone. That run is a smoke: it shows each target still builds and
 runs, and isn't meant to find bugs. [Long runs](#long-runs) covers the long
 campaigns. It caches `corpus/<target>/` under the target's name and a digest of
 its harness's `cargo xtask sim-versions` output, adds the harness's committed seeds, and replays that corpus in a
@@ -53,6 +53,22 @@ whose target has no harness or no campaign.
   actions: the mirrors' fork at one stage of the block pipeline, a
   connection replacement, and a read stall), or the honest scenario. Its
   committed seeds are `crates/zakura-sim/tests/fixtures/sync-wire-*.bin`.
+- `block_sync_storage` runs `block-sync/storage`, a block-sync node on
+  controlled block storage with mirror peers. Its two-byte prefix picks a
+  saved scenario or the default one. A generated run takes about 96 s and
+  needs about 7 GB, so its suite row sets `-rss_limit_mb=8192` and a
+  one-second smoke and scheduled campaign. libFuzzer runs the whole corpus
+  before it checks `-max_total_time`, so those runs replay the seeds and
+  generate nothing. Long runs search it. Its committed seeds are
+  `crates/zakura-sim/tests/fixtures/block-sync-*.bin`.
+- `discovery_wire` runs `discovery/wire`, the discovery node behind its
+  real transport on simulated QUIC. Its two-byte prefix picks a saved
+  Plan's scenario or the default one. Its committed seeds are
+  `crates/zakura-sim/tests/fixtures/discovery-wire-*.bin`.
+- `header_sync_wire` runs `header-sync/wire`, the header-sync node behind
+  its real transport on simulated QUIC. Its two-byte prefix picks a saved
+  Plan's scenario or the default one. Its committed seeds are
+  `crates/zakura-sim/tests/fixtures/header-wire-*.bin`.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 - `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only
@@ -561,7 +577,8 @@ only from a target with a collector.
 ## Long runs
 
 The nightly CI jobs smoke the simulator's long checks. `sim-fuzz.yml` fuzzes
-each target for two minutes. The `zakura_sim planted` job in `tests-unit.yml`
+each target for two minutes, and runs `block_sync_storage` on its seeds
+alone. The `zakura_sim planted` job in `tests-unit.yml`
 splits `qa/planted/` into fourteen shards. Each night its two parts run the
 two shards the UTC weekday picks, with `cargo xtask planted --shard
 <index>/14`, so each case runs once a week. A

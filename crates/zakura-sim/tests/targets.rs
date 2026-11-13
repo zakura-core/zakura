@@ -47,11 +47,20 @@ fn fixtures() -> PathBuf {
     root().join("crates/zakura-sim/tests/fixtures")
 }
 
+/// The targets whose seeds don't apply every property of their harness.
+/// Their seeds run honest and single-fault scenarios, and the coverage
+/// manifest names the test where each other property applies, such as a
+/// frame-conformance property on a faulted frame. Each still needs a seed
+/// that applies one of its harness's own properties, as readiness does, and
+/// `zakura-sim targets` lists the rest as applied in no seed.
+const PARTIAL_SEEDS: [&str; 3] = ["block_sync_storage", "discovery_wire", "header_sync_wire"];
+
 /// Each declared target resolves to its registered harness, its harness has
 /// admitted seeds and no rejected one, and the seeds apply each of the
-/// harness's own properties and those of every harness the target covers.
-/// A target without seeds, or whose seeds reach only the properties every
-/// harness checks, fails here before the nightly job runs it.
+/// harness's own properties and those of every harness the target covers,
+/// except for a target in [`PARTIAL_SEEDS`]. A target without seeds, or
+/// whose seeds reach only the properties every harness checks, fails here
+/// before the nightly job runs it.
 #[test]
 fn every_declared_target_runs_seeds_that_apply_its_properties() {
     let suite = suite();
@@ -102,7 +111,7 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
         let (applied, unapplied) = own_applicability(entry, &seeds);
         assert!(!applied.is_empty(), "{}", target.name);
         assert!(
-            unapplied.is_empty(),
+            unapplied.is_empty() || PARTIAL_SEEDS.contains(&target.name.as_str()),
             "{}: no seed applies {unapplied:?}",
             target.name
         );

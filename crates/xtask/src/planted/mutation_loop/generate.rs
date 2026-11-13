@@ -1306,10 +1306,15 @@ impl Runner {
                     feedback: "on".to_owned(),
                     sanitizer: "none".to_owned(),
                 };
+                // The cap bounds the campaign's runs, not the cargo fuzz
+                // build: a build the cap killed would read as a broken
+                // build and fail the lane's baseline.
+                let build = || Command::new(sim);
                 let make = || scoped(cap, sim);
                 let deadline = deadline.max(lane::start_deadline(&bounds));
                 Searched::Campaign(
                     lane::campaign_lane(
+                        &build,
                         &make,
                         dir,
                         &slot.target.join("fuzz"),

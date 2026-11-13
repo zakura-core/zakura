@@ -1012,6 +1012,7 @@ fn campaign_lane(
     };
     Ok(lane::campaign_lane(
         &|| Command::new(sim),
+        &|| Command::new(sim),
         dir,
         fuzz_target,
         &spec,

@@ -1679,3 +1679,80 @@ fn a_campaign_that_a_signal_killed_is_not_read() {
         assert_eq!(baseline.class, Class::HarnessFailure, "{name}");
     }
 }
+
+/// `lane::campaign_lane` runs `campaign build` with its `build` command and
+/// `campaign start` and `campaign evidence` with its `sim` command, so a
+/// memory cap on the runs never reaches the cargo build.
+#[cfg(unix)]
+#[test]
+fn a_campaign_builds_with_its_own_command() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // `campaign_lane` runs its children against the pilot's interrupt flag.
+    let _flag = crate::sim_minimize::tests::INTERRUPT_FLAG_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let catalogue = committed_catalogue();
+    let case = &catalogue.cases[0];
+    let log = dir.path().join("children.log");
+    // Stand-ins for `zakura-sim` that log which command ran which child.
+    // `build` makes one build; `sim` refuses a build and leaves a run's
+    // records for `start` and an evidence file for `evidence`.
+    let script = |name: &str, body: &str| {
+        let path = dir.path().join(name);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"{name} $1 $2\" >> '{}'\n\
+                 store=$4\n\
+                 {body}\n",
+                log.display()
+            ),
+        )
+        .expect("the script is written");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("the script is executable");
+        wait_until_executable(&path);
+        path
+    };
+    let build = script("build", "mkdir -p \"$store/builds/b\"");
+    let sim = script(
+        "sim",
+        "case \"$1 $2\" in\n\
+         'campaign build') exit 1 ;;\n\
+         'campaign start') mkdir -p \"$store/manifests\" \"$store/snapshots/s\"\n\
+           echo '{\"initial_snapshot\":\"s\"}' > \"$store/manifests/r.json\"\n\
+           echo '{\"inputs\":[]}' > \"$store/snapshots/s/snapshot.json\" ;;\n\
+         'campaign evidence') echo '{}' > \"$8\" ;;\n\
+         esac",
+    );
+    // `wait_until_executable` ran each script once.
+    fs::remove_file(&log).expect("the scripts logged their trial runs");
+    let spec = lane::LaneSpec {
+        target: &case.target,
+        harness: &case.harness,
+        name: "split",
+        seed: 11,
+        corpus: dir.path(),
+    };
+    let bounds = &catalogue.discovery.campaign;
+    let campaign = lane::campaign_lane(
+        &|| Command::new(&build),
+        &|| Command::new(&sim),
+        &dir.path().join("lane"),
+        &dir.path().join("fuzz-target"),
+        &spec,
+        bounds,
+        lane::start_deadline(bounds),
+    )
+    .expect("the lane runs")
+    .expect("the lane reads its records");
+    assert_eq!(campaign.initial_inputs, 0);
+    assert_eq!(
+        fs::read_to_string(&log).expect("the children logged"),
+        "build campaign build\nsim campaign start\nsim campaign evidence\n"
+    );
+}

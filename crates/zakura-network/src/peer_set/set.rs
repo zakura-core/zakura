@@ -94,7 +94,6 @@
 //! [ZIP-201]: https://zips.z.cash/zip-0201
 
 use std::{
-    cmp::Ordering,
     collections::{HashMap, HashSet},
     convert,
     fmt::Debug,
@@ -949,7 +948,14 @@ where
     /// unanswered (and any `getheaders` during its initial block download), so the request would
     /// hold the sidecar's only connection until it times out, and the block `inv`s the sidecar
     /// follows would queue behind it.
-    fn select_ready_p2c_peer(&self, is_find_request: bool, prefer_archive: bool) -> Option<D::Key> {
+    ///
+    /// For a request for block bodies (`is_block_body_request`), chooses among the remaining peers
+    /// with [`Self::select_block_body_peer`].
+    fn select_ready_p2c_peer(
+        &self,
+        is_find_request: bool,
+        is_block_body_request: bool,
+    ) -> Option<D::Key> {
         let tip_height = self
             .minimum_peer_version
             .chain_tip()
@@ -966,45 +972,55 @@ where
             })
             .map(|(key, _)| *key)
             .collect();
-        if prefer_archive {
-            self.select_archive_or_pruned_peer(&candidates)
+        if is_block_body_request {
+            self.select_block_body_peer(&candidates)
         } else {
             self.select_p2c_peer_from_list(&candidates)
         }
     }
 
-    /// Performs P2C on `candidates` for a block request, ranking the two sampled peers.
+    /// Returns true if this node's best chain tip is at or near the estimated network tip, and
+    /// false while it is still syncing or has no tip yet.
+    fn is_near_network_tip(&self) -> bool {
+        self.minimum_peer_version
+            .chain_tip()
+            .is_at_or_near_network_tip(&self.network)
+    }
+
+    /// Performs P2C on `candidates` for a request for block bodies.
     ///
-    /// A peer that can write the request now and answered its last block request wins first, so a
-    /// block request does not queue behind another response or a withholding peer. Among those, a
-    /// peer that claims full block history wins over one that may have pruned it. Otherwise the
-    /// less-loaded peer wins.
+    /// While this node is still syncing, it asks for old blocks, which a pruned peer has deleted
+    /// and answers with `notfound`. So peers that advertise the pruned hint are left out, unless
+    /// every candidate advertises it. The hint is self-reported: a peer that omits it is asked like
+    /// any archive peer.
     ///
-    /// This is a bias, not a filter: a single favoured peer among `n` candidates is sampled for
-    /// about `2/n` of requests, so a peer cannot take every block request by claiming full history.
-    /// The claim is unverified, and older peers and zcashd make it whether or not they prune.
-    fn select_archive_or_pruned_peer(&self, candidates: &HashSet<D::Key>) -> Option<D::Key> {
-        self.select_p2c_peer_ranked(candidates, |service| {
-            (
-                service.is_preferred_block_source(),
-                service.claims_full_block_history(),
-            )
-        })
+    /// Near the network tip this node asks for recent blocks, which pruned peers keep, so all
+    /// candidates are treated alike.
+    fn select_block_body_peer(&self, candidates: &HashSet<D::Key>) -> Option<D::Key> {
+        if self.is_near_network_tip() {
+            return self.select_p2c_peer_from_list(candidates);
+        }
+
+        let archive_candidates: HashSet<D::Key> = candidates
+            .iter()
+            .filter(|key| {
+                self.ready_services
+                    .get(key)
+                    .is_some_and(LoadTrackedClient::claims_full_block_history)
+            })
+            .copied()
+            .collect();
+
+        if archive_candidates.is_empty() {
+            self.select_p2c_peer_from_list(candidates)
+        } else {
+            self.select_p2c_peer_from_list(&archive_candidates)
+        }
     }
 
     /// Performs P2C on `ready_service_list` to randomly select a less-loaded ready service.
-    fn select_p2c_peer_from_list(&self, ready_service_list: &HashSet<D::Key>) -> Option<D::Key> {
-        self.select_p2c_peer_ranked(ready_service_list, |_| ())
-    }
-
-    /// Performs P2C on `ready_service_list`: samples two ready services and returns the one with
-    /// the higher `rank`, or the less loaded one when their ranks are equal.
     #[allow(clippy::unwrap_in_result)]
-    fn select_p2c_peer_ranked<R: Ord + Debug>(
-        &self,
-        ready_service_list: &HashSet<D::Key>,
-        rank: impl Fn(&D::Service) -> R,
-    ) -> Option<D::Key> {
+    fn select_p2c_peer_from_list(&self, ready_service_list: &HashSet<D::Key>) -> Option<D::Key> {
         match ready_service_list.len() {
             0 => None,
             1 => Some(
@@ -1035,23 +1051,13 @@ where
                 let a_load = self.query_load(&a).expect("supplied services are ready");
                 let b_load = self.query_load(&b).expect("supplied services are ready");
 
-                let a_rank = self.ready_services.get(&a).map(&rank);
-                let b_rank = self.ready_services.get(&b).map(&rank);
-
-                let selected = match a_rank.cmp(&b_rank) {
-                    Ordering::Greater => a,
-                    Ordering::Less => b,
-                    Ordering::Equal if a_load <= b_load => a,
-                    Ordering::Equal => b,
-                };
+                let selected = if a_load <= b_load { a } else { b };
 
                 trace!(
                     a.key = %a.addr_label(self.expose_peer_addresses),
                     a.load = ?a_load,
                     b.key = %b.addr_label(self.expose_peer_addresses),
                     b.load = ?b_load,
-                    ?a_rank,
-                    ?b_rank,
                     selected = %selected.addr_label(self.expose_peer_addresses),
                     ?len,
                     "selected service by p2c"
@@ -1158,13 +1164,11 @@ where
             Request::FindBlocks { .. } | Request::FindHeaders { .. }
         );
 
-        let prefer_archive = matches!(
+        let is_block_body_request = matches!(
             &req,
-            Request::FindBlocks { .. }
-                | Request::BlocksByHash(_)
-                | Request::BlocksByHashFrom { .. }
+            Request::BlocksByHash(_) | Request::BlocksByHashFrom { .. }
         );
-        if let Some(p2c_key) = self.select_ready_p2c_peer(is_find_request, prefer_archive) {
+        if let Some(p2c_key) = self.select_ready_p2c_peer(is_find_request, is_block_body_request) {
             tracing::trace!(
                 peer = %p2c_key.addr_label(self.expose_peer_addresses),
                 "routing based on p2c"
@@ -1185,12 +1189,8 @@ where
                 _ => None,
             };
 
-            let track_stalls = is_find_request
-                && !self.is_zcashd_compat_peer(&svc)
-                && !self
-                    .minimum_peer_version
-                    .chain_tip()
-                    .is_at_or_near_network_tip(&self.network);
+            let track_stalls =
+                is_find_request && !self.is_zcashd_compat_peer(&svc) && !self.is_near_network_tip();
 
             let fut = svc.call(req);
             self.push_unready(p2c_key, svc);
@@ -1339,7 +1339,7 @@ where
 
         // Security: choose a random, less-loaded peer that might have the inventory.
         let peer = if matches!(hash, InventoryHash::Block(_)) {
-            self.select_archive_or_pruned_peer(&maybe_peer_list)
+            self.select_block_body_peer(&maybe_peer_list)
         } else {
             self.select_p2c_peer_from_list(&maybe_peer_list)
         };

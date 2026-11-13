@@ -16,7 +16,7 @@ use tower::{discover::Change, Service, ServiceExt};
 
 use zakura_chain::{
     block::{self, Block},
-    chain_tip::mock::MockChainTip,
+    chain_tip::mock::{MockChainTip, MockChainTipSender},
     parameters::Network,
     serialization::ZcashDeserializeInto,
     transaction::{self, UnminedTx, UnminedTxId},
@@ -141,7 +141,17 @@ fn discover(peers: Vec<(PeerSocketAddr, LoadTrackedClient)>) -> TestDiscover {
 /// The peer discovery stream used by these tests.
 type TestDiscover = BoxStream<'static, Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>>;
 
+/// Tells the peer set that this node has reached the network tip.
+///
+/// A mock chain tip starts with no distance estimate, which the peer set reads as still syncing.
+fn reach_network_tip(tip: &MockChainTipSender) {
+    tip.send_best_tip_height(block::Height(1));
+    tip.send_estimated_distance_to_network_chain_tip(Some(0));
+}
+
 /// An archive and a pruned peer connected through the real request/response machinery.
+///
+/// The node is still syncing, as its chain tip has no distance estimate.
 struct StoragePeers {
     set: PeerSet<TestDiscover, MockChainTip>,
     _guard: PeerSetGuard,
@@ -313,38 +323,47 @@ async fn pruned_routing_notfound_excludes_archive_but_keeps_connection() {
     assert_eq!(peers.archive.written_now().await, None);
 }
 
+/// `getblocks` returns block hashes, which pruned peers keep, so it has no storage preference: a
+/// syncing node sends it to pruned peers too.
 #[tokio::test(start_paused = true)]
-async fn pruned_routing_findblocks_prefers_archive_and_falls_back() {
+async fn pruned_routing_findblocks_reaches_pruned_peers_while_syncing() {
     let _init_guard = zakura_test::init();
+    const REQUESTS: usize = 32;
+
     let mut peers = StoragePeers::new().await;
     let request = Request::FindBlocks {
         known_blocks: vec![BLOCK_HASH],
         stop: None,
     };
-    let archive_response = peers.set.call(request.clone());
-    assert!(matches!(
-        StoragePeers::next_message(&mut peers.archive).await,
-        Message::GetBlocks { .. }
-    ));
-    peers
-        .archive
-        .peer_inbound
-        .send(Ok(Message::Inv(vec![BLOCK_HASH.into()])))
-        .await
-        .unwrap();
-    archive_response.await.unwrap();
-    peers.set.ready().await.unwrap();
-    peers
-        .set
-        .call(Request::DisconnectPeer(peers.archive.addr))
-        .await
-        .unwrap();
-    peers.set.ready().await.unwrap();
-    let _pruned_response = peers.set.call(request);
-    assert!(matches!(
-        StoragePeers::next_message(&mut peers.pruned).await,
-        Message::GetBlocks { .. }
-    ));
+    // An `inv` with several blocks answers `getblocks` without advertising any of them.
+    let found = vec![BLOCK_HASH.into(), block::Hash([0x88; 32]).into()];
+
+    // Both peers have the same load, so each request picks one of them at random.
+    let mut pruned_requests = 0;
+    for _ in 0..REQUESTS {
+        let response = peers.set.ready().await.unwrap().call(request.clone());
+        let selected = if peers.pruned.written_now().await.is_some() {
+            pruned_requests += 1;
+            &mut peers.pruned
+        } else {
+            assert!(matches!(
+                StoragePeers::next_message(&mut peers.archive).await,
+                Message::GetBlocks { .. }
+            ));
+            &mut peers.archive
+        };
+        selected
+            .peer_inbound
+            .send(Ok(Message::Inv(found.clone())))
+            .await
+            .unwrap();
+        response.await.unwrap();
+    }
+
+    assert!(
+        pruned_requests > 0,
+        "the pruned peer received none of {REQUESTS} getblocks requests"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -386,56 +405,104 @@ async fn pruned_routing_pruned_notfound_retries_archive_without_disconnect() {
     assert_eq!(peers.pruned.written_now().await, None);
 }
 
-/// One peer without the pruned hint cannot take every fallback block request: archive preference
-/// only breaks ties between the two peers that power-of-two-choices samples.
-#[tokio::test(start_paused = true)]
-async fn pruned_routing_single_archive_does_not_capture_every_request() {
-    let _init_guard = zakura_test::init();
-    const PRUNED_PEERS: u16 = 9;
-    const SELECTIONS: usize = 400;
+/// One archive peer among several pruned peers, all ready and equally loaded.
+struct ArchiveAmongPruned {
+    set: PeerSet<TestDiscover, MockChainTip>,
+    _guard: PeerSetGuard,
+    tip: MockChainTipSender,
+    archive: PeerSocketAddr,
+    candidates: HashSet<PeerSocketAddr>,
+    /// The peers' ends of the connections, which keep them open.
+    _peers: Vec<TestPeer>,
+}
 
-    let mut archive = TestPeer::spawn_with_services(1, PeerServices::NODE_NETWORK, None);
-    let mut pruned: Vec<TestPeer> = (0..PRUNED_PEERS)
-        .map(|i| {
+impl ArchiveAmongPruned {
+    const PRUNED_PEERS: u16 = 9;
+
+    async fn new() -> Self {
+        let mut peers = vec![TestPeer::spawn_with_services(
+            1,
+            PeerServices::NODE_NETWORK,
+            None,
+        )];
+        peers.extend((0..Self::PRUNED_PEERS).map(|i| {
             TestPeer::spawn_with_services(
                 2 + i,
                 PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED,
                 None,
             )
-        })
-        .collect();
-    let mut discovered = vec![archive.discovered()];
-    discovered.extend(pruned.iter_mut().map(TestPeer::discovered));
-    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
-    let (mut set, _guard) = PeerSetBuilder::new()
-        .with_discover(discover(discovered))
-        .with_minimum_peer_version(minimum)
-        .max_conns_per_ip(usize::from(PRUNED_PEERS) + 1)
-        .build();
-    set.ready().await.expect("all peers are ready");
-    let candidates: HashSet<_> = set.ready_services.keys().copied().collect();
-    assert_eq!(candidates.len(), usize::from(PRUNED_PEERS) + 1);
+        }));
+        let archive = peers[0].addr;
+        let (minimum, tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let (mut set, guard) = PeerSetBuilder::new()
+            .with_discover(discover(
+                peers.iter_mut().map(TestPeer::discovered).collect(),
+            ))
+            .with_minimum_peer_version(minimum)
+            .max_conns_per_ip(peers.len())
+            .build();
+        set.ready().await.expect("all peers are ready");
+        let candidates: HashSet<_> = set.ready_services.keys().copied().collect();
+        assert_eq!(candidates.len(), peers.len());
 
-    let archive_selections = (0..SELECTIONS)
-        .filter(|_| set.select_archive_or_pruned_peer(&candidates) == Some(archive.addr))
-        .count();
+        Self {
+            set,
+            _guard: guard,
+            tip,
+            archive,
+            candidates,
+            _peers: peers,
+        }
+    }
 
-    // P2C samples the archive in 2 of every 10 draws, so expect about 80 of 400 selections.
-    // Both bounds are many standard deviations away from that expectation.
-    assert!(
-        archive_selections > 0,
-        "the archive wins whenever it is sampled"
-    );
-    assert!(
-        archive_selections < SELECTIONS / 2,
-        "the archive took {archive_selections} of {SELECTIONS} selections"
+    /// Returns how many of `selections` block body selections pick the archive peer.
+    fn archive_selections(&self, selections: usize) -> usize {
+        (0..selections)
+            .filter(|_| self.set.select_block_body_peer(&self.candidates) == Some(self.archive))
+            .count()
+    }
+}
+
+/// A syncing node asks for blocks that pruned peers have deleted, so while a peer without the
+/// pruned hint is ready, no block request goes to a pruned peer.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_skips_pruned_peers_while_syncing() {
+    let _init_guard = zakura_test::init();
+    const SELECTIONS: usize = 200;
+
+    let peers = ArchiveAmongPruned::new().await;
+
+    assert_eq!(
+        peers.archive_selections(SELECTIONS),
+        SELECTIONS,
+        "a pruned peer was selected while an archive peer was ready",
     );
 }
 
-/// A busy archive peer does not take a block request from an idle pruned peer: readiness ranks
-/// above the full-history claim, and load alone would pick the busy archive.
+/// Near the network tip pruned peers hold every block this node asks for, so they share block
+/// requests with the archive peer like any other peer.
 #[tokio::test(start_paused = true)]
-async fn pruned_routing_prefers_idle_pruned_over_busy_archive() {
+async fn pruned_routing_treats_pruned_peers_alike_near_the_tip() {
+    let _init_guard = zakura_test::init();
+    const SELECTIONS: usize = 4000;
+
+    let peers = ArchiveAmongPruned::new().await;
+    reach_network_tip(&peers.tip);
+
+    // The archive is one of 10 equally loaded peers, so expect about 400 of 4000 selections.
+    // If it also won whenever it was one of the two sampled peers, it would take about 800.
+    // The bound is many standard deviations away from both.
+    let archive_selections = peers.archive_selections(SELECTIONS);
+    assert!(
+        archive_selections < SELECTIONS * 3 / 20,
+        "the archive took {archive_selections} of {SELECTIONS} selections near the tip"
+    );
+}
+
+/// While syncing, an archive peer that is busy with another response still gets the block request,
+/// although an idle pruned peer could take it at once: the pruned peer would answer `notfound`.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_keeps_busy_archive_over_idle_pruned_while_syncing() {
     let _init_guard = zakura_test::init();
 
     let BusyAndIdleAdvertisers {
@@ -443,7 +510,8 @@ async fn pruned_routing_prefers_idle_pruned_over_busy_archive() {
         _guard,
         busy: mut archive,
         idle: mut pruned,
-        ..
+        tx,
+        tx_response,
     } = busy_and_idle_peers(
         PeerServices::NODE_NETWORK,
         PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED,
@@ -459,14 +527,25 @@ async fn pruned_routing_prefers_idle_pruned_over_busy_archive() {
 
     assert_eq!(
         pruned.written_now().await,
-        Some(Message::GetData(vec![BLOCK_HASH.into()])),
-        "the block request leaves through the idle pruned peer without waiting",
+        None,
+        "the idle pruned peer is not asked for the block",
     );
-    assert_eq!(archive.written_now().await, None);
+
+    archive
+        .peer_inbound
+        .send(Ok(Message::Tx(tx)))
+        .await
+        .expect("connection is open");
+    assert!(matches!(tx_response.await, Ok(Response::Transactions(_))));
+    assert_eq!(
+        archive.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "the archive peer gets the block request once its earlier response arrives",
+    );
 }
 
 /// A peer that advertises no services, such as an older Zakura pruned node, lacks the pruned hint,
-/// so it is treated as an archive candidate and outranks a peer with the hint.
+/// so a syncing node treats it as an archive candidate and asks it instead of a peer with the hint.
 #[tokio::test(start_paused = true)]
 async fn pruned_routing_treats_peers_without_services_as_archive() {
     let _init_guard = zakura_test::init();
@@ -492,10 +571,10 @@ async fn pruned_routing_treats_peers_without_services_as_archive() {
     assert_eq!(candidates.len(), 2);
 
     let no_services_selections = (0..SELECTIONS)
-        .filter(|_| set.select_archive_or_pruned_peer(&candidates) == Some(no_services.addr))
+        .filter(|_| set.select_block_body_peer(&candidates) == Some(no_services.addr))
         .count();
 
-    // With two candidates both are sampled every time, so the higher rank always wins.
+    // While syncing, the peer with the pruned hint is left out of the candidates.
     assert_eq!(
         no_services_selections, SELECTIONS,
         "the peer without services must win every selection against a pruned peer",

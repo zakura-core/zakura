@@ -248,6 +248,9 @@ struct Store {
     /// Each row's sizes in report order, by name, with a repeated size
     /// kept once.
     sizes: BTreeMap<&'static str, Vec<usize>>,
+    /// The departed strikes' and cooldowns' peers in report order, by row,
+    /// with a repeated set kept once.
+    members: BTreeMap<&'static str, Vec<BTreeSet<String>>>,
     /// The first step whose drain judged a `Sizes`.
     applicable: Option<u64>,
     /// Whether a `Sizes` was judged since the last drain.
@@ -275,6 +278,7 @@ impl Snapshot for Store {
         let Store {
             peaks,
             sizes,
+            members,
             applicable,
             pending,
             running,
@@ -290,6 +294,7 @@ impl Snapshot for Store {
         serde_json::json!({
             "fields": debug_snapshot(&(peaks, applicable, pending, shut_down, at_rest, reported)),
             "sizes": debug_snapshot(sizes),
+            "members": debug_snapshot(members),
             "running": running,
         })
     }
@@ -323,6 +328,14 @@ impl OutstandingEvidence {
     /// Empty for a row the tap never saw.
     pub fn sizes(&self, row: &str) -> Vec<usize> {
         self.with(|store| store.sizes.get(row).cloned().unwrap_or_default())
+    }
+
+    /// `row`'s peers in the order the tap saw them, each run of one set
+    /// kept once, for the departed strikes and cooldowns, so a full row's
+    /// change shows which entry made way for which. Peers are named as the
+    /// log names them. Empty for any other row.
+    pub fn members(&self, row: &str) -> Vec<BTreeSet<String>> {
+        self.with(|store| store.members.get(row).cloned().unwrap_or_default())
     }
 
     /// Whether a drain up to and including `step`'s judged a `Sizes`.
@@ -1101,6 +1114,17 @@ impl Outstanding {
         });
     }
 
+    /// Records `peers` as `row`'s members, unless they're the last set kept.
+    fn members<'a>(&self, row: &'static str, peers: impl Iterator<Item = &'a ZakuraPeerId>) {
+        let set: BTreeSet<String> = peers.map(super::tap::peer).collect();
+        self.evidence.change(|store| {
+            let history = store.members.entry(row).or_default();
+            if history.last() != Some(&set) {
+                history.push(set);
+            }
+        });
+    }
+
     /// Breaks if a repair context read for `owner`, dispatched at
     /// `dispatched`, ends now, past the request timeout, which a `Sizes`
     /// report between its dispatch and its end might not have seen.
@@ -1275,6 +1299,11 @@ impl Outstanding {
                 found.push(format!("holds {size} {row}, past its {bound}"));
             }
         }
+        self.members(
+            "departed strikes",
+            departed_strikes.iter().map(|(peer, _, _)| peer),
+        );
+        self.members("cooldowns", cooldowns.iter().map(|(peer, _)| peer));
         self.peak("storage calls", storage_calls.len());
         self.peak("port futures", *port_futures);
         self.peak("completed targets", completed_targets.len());

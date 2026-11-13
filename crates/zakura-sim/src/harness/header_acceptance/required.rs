@@ -202,7 +202,8 @@ pub const BOUND_LIMIT_TEST: TestRef = sim_test(
 /// for the reservation maps in the slot fixture's reservation facts, the
 /// waiting party gets its first unit only after a release, with fewer than
 /// the limit open. The departed strikes and cooldowns take more drops in
-/// one cooldown than they hold, then fall as entries end and rise again.
+/// one cooldown than they hold, the last of which replaces one of the
+/// earliest entries, then fall as entries end and rise again.
 pub const BOUND_REUSE_TEST: TestRef = sim_test(
     "tests/header_outstanding.rs",
     "the_limit_fixtures_release_and_reuse_their_bounds",

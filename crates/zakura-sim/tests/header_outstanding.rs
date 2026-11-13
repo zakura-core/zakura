@@ -489,6 +489,30 @@ fn timeouts(entries: &[Entry]) -> Vec<(Duration, String)> {
     found
 }
 
+/// Whether `history`, a row's member sets in order, takes `newcomer` in
+/// while full by evicting one of `earliest`: the first set that holds it
+/// and the set before both have `limit` members, and the one member they
+/// don't share is one of `earliest`.
+fn evicted_for(
+    history: &[BTreeSet<String>],
+    newcomer: &str,
+    earliest: &BTreeSet<&String>,
+    limit: usize,
+) -> bool {
+    let Some(at) = history.iter().position(|set| set.contains(newcomer)) else {
+        return false;
+    };
+    let Some(before) = at.checked_sub(1).map(|index| &history[index]) else {
+        return false;
+    };
+    let after = &history[at];
+    let evicted: Vec<&String> = before.difference(after).collect();
+    before.len() == limit
+        && after.len() == limit
+        && evicted.len() == 1
+        && evicted.iter().all(|gone| earliest.contains(gone))
+}
+
 /// Whether `sizes`, a row's sizes in order, reach `limit`, then fall below
 /// it, a release, and later rise from below it, a reuse.
 fn sizes_fall_and_rise(sizes: &[usize], limit: usize) -> bool {
@@ -613,7 +637,22 @@ fn the_limit_fixtures_release_and_reuse_their_bounds() {
         .collect();
     assert_eq!(held.len(), parties, "{stem}: {timeouts:?}");
     assert!(timeouts.len() > parties, "{stem}: {timeouts:?}");
+    let earliest: BTreeSet<&String> = timeouts
+        .iter()
+        .filter(|(at, _)| *at == first)
+        .map(|(_, peer)| peer)
+        .collect();
+    let (_, newcomer) = timeouts
+        .iter()
+        .rev()
+        .find(|(at, _)| *at < first + hold)
+        .expect("the held timeouts are nonempty, as their count shows");
     for row in rows {
+        let members = evidence.members(row);
+        assert!(
+            evicted_for(&members, newcomer, &earliest, limit),
+            "{stem}: {row} took {newcomer} in by evicting one of {earliest:?}: {members:?}"
+        );
         let sizes = evidence.sizes(row);
         assert!(
             sizes_fall_and_rise(&sizes, limit),
@@ -630,6 +669,26 @@ fn the_held_row_read_needs_a_release_and_a_later_rise() {
     assert!(!sizes_fall_and_rise(&[0, 7, 6, 7], 8));
     assert!(!sizes_fall_and_rise(&[0, 8, 8], 8));
     assert!(!sizes_fall_and_rise(&[0, 8, 1, 0], 8));
+}
+
+/// A full row that never takes the newcomer in, grows past its limit to
+/// take it, takes it in before it's full, or evicts an entry that wasn't
+/// among the earliest fails the eviction read.
+#[test]
+fn the_eviction_read_needs_the_newcomer_to_replace_an_earliest_entry() {
+    let sets = |sets: &[&[&str]]| -> Vec<BTreeSet<String>> {
+        sets.iter()
+            .map(|set| set.iter().map(|member| (*member).to_owned()).collect())
+            .collect()
+    };
+    let a = "a".to_owned();
+    let earliest = BTreeSet::from([&a]);
+    let read = |history: &[&[&str]]| evicted_for(&sets(history), "c", &earliest, 2);
+    assert!(read(&[&["a"], &["a", "b"], &["b", "c"]]));
+    assert!(!read(&[&["a"], &["a", "b"], &["b"]]));
+    assert!(!read(&[&["a"], &["a", "b"], &["a", "b", "c"]]));
+    assert!(!read(&[&["a"], &["c"]]));
+    assert!(!read(&[&["a"], &["a", "b"], &["a", "c"]]));
 }
 
 /// A row read with no release, or whose waiting party got its unit before

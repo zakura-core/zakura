@@ -1025,6 +1025,32 @@ class TraceFollowingTests(unittest.TestCase):
         # A peer with no upgrade row on record keeps its label and nothing else.
         self.assertEqual((unknown["peer"], unknown["addr"], unknown["agent"], unknown["ms"]), ("peer:bbbb", None, None, None))
 
+    def test_a_zakura_peer_is_named_only_from_its_own_node_run(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        restarted = "200-1794529928000000000"
+        # The first run recorded who peer:aaaa was; the restarted run has no upgrade row for it.
+        self.append(
+            "handshake",
+            trace_row("peer_upgraded", 100_000, peer="peer:aaaa", addr="192.0.2.9:8233",
+                      user_agent="/Zakura:1.8.6/", direction="outbound"),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(200_000, height=9, block_hash="cd" * 32))
+        follower.poll()
+        self.append(
+            "block_sync",
+            trace_row("block_body_received", 950_000, restarted, peer="peer:aaaa", height=10,
+                      serialized_bytes=1500, request_elapsed_ms=62),
+        )  # fmt: skip
+        self.append(
+            "chain_tip",
+            tip_row(1_000_000, process=restarted),
+            tip_row(9_000_000, height=11, block_hash="ef" * 32, process=restarted),
+        )
+        (record,) = [record for record in follower.poll() if record["height"] == 10]
+
+        (download,) = record["downloads"]
+        self.assertEqual((download["peer"], download["addr"], download["agent"]), ("peer:aaaa", None, None))
+
     def test_a_peer_address_is_read_in_every_form_the_node_writes(self):
         self.assertEqual(blocks.peer_ip("192.0.2.7:8233"), "192.0.2.7")
         self.assertEqual(blocks.peer_ip("[2001:db8::7]:8233"), "2001:db8::7")

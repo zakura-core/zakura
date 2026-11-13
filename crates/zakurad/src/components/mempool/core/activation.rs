@@ -35,6 +35,13 @@ impl Currentness {
         self.sync_status.is_close_to_tip() && self.is_estimated_close_to_network_tip()
     }
 
+    /// Whether a cooldown earned against a tip at `height` may start now:
+    /// the node is current, and its best tip is still at that height, as
+    /// today's pool requires of a failure before it starts a cooldown.
+    pub fn may_cool(&self, height: Height) -> bool {
+        self.is_current() && self.latest_chain_tip.best_tip_height() == Some(height)
+    }
+
     /// Today's `is_estimated_close_to_network_tip`, read from the latest
     /// tip, which is what the chain tip change reads too.
     fn is_estimated_close_to_network_tip(&self) -> bool {

@@ -32,7 +32,7 @@ use futures::FutureExt;
 use tokio::sync::{mpsc, oneshot};
 use tower::{timeout::Timeout, Service};
 
-use zakura_chain::transaction::UnminedTxId;
+use zakura_chain::{block::Height, transaction::UnminedTxId};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
     port::{
@@ -76,9 +76,11 @@ struct Shared {
     peers: Outbound,
     /// The legacy peers in a transaction cooldown, keyed by IP address.
     cooldowns: PeerCooldowns,
-    /// Whether the node is current now. Today's pool starts a cooldown only
-    /// then, and asks when it handles the failure.
-    current: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Whether a cooldown earned against a tip at this height may start now.
+    /// Today's pool starts one only while the node is current and its best
+    /// tip is still the one the failure was verified at, and asks when it
+    /// handles the failure.
+    may_cool: Arc<dyn Fn(Height) -> bool + Send + Sync>,
     /// Undecided transactions from each peer, counted from the reservation to
     /// the verdict.
     per_peer: std::sync::Mutex<HashMap<QueueSource, usize>>,
@@ -99,13 +101,13 @@ pub(crate) struct CoreMempool {
 impl CoreMempool {
     /// A service on `handle` that fetches through `outbound` and bans through
     /// `misbehavior_sender`. It never charges a peer in `exempt`, and starts
-    /// a cooldown only while `current` says the node is current.
+    /// a cooldown only when `may_cool` allows it for the verdict's tip.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         handle: PoolHandle,
         outbound: Timeout<Outbound>,
         peers: Outbound,
-        current: Arc<dyn Fn() -> bool + Send + Sync>,
+        may_cool: Arc<dyn Fn(Height) -> bool + Send + Sync>,
         read_state: ReadState,
         expose_peer_addresses: bool,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
@@ -117,7 +119,7 @@ impl CoreMempool {
                 outbound,
                 peers,
                 cooldowns: PeerCooldowns::default(),
-                current,
+                may_cool,
                 per_peer: std::sync::Mutex::new(HashMap::new()),
                 read_state: std::sync::Mutex::new(read_state),
                 expose_peer_addresses,
@@ -522,10 +524,13 @@ async fn bring_in(
         .into());
     }
     // A v2 peer's body is not charged, as today, and nor is an exempt peer's.
+    // A joined caller whose copy the core did not need is not charged
+    // either: the verdict is about another caller's body.
     let supplier = match &from {
         Some(QueueSource::Zakura(_)) => None,
         _ => sender.and_then(|addr| shared.supplier(addr)),
-    };
+    }
+    .filter(|_| !reservation.joined() || reservation.wants_body());
     let Ok(verdict) =
         tokio::time::timeout_at(deadline, shared.handle.submit(reservation, tx)).await
     else {
@@ -533,7 +538,7 @@ async fn bring_in(
     };
     if let (Verdict::Rejected(rejection), Some(peer)) = (&verdict, supplier) {
         match rejection.charge {
-            Charge::Cooldown if (shared.current)() => start_peer_cooldown(
+            Charge::Cooldown if (shared.may_cool)(rejection.tip) => start_peer_cooldown(
                 &shared.cooldowns,
                 &shared.peers,
                 peer,
@@ -793,11 +798,15 @@ mod tests {
     /// The adapter on `handle`, with a network that is never ready, an
     /// empty chain, no exempt peers, and a node that is current.
     fn adapter_on(handle: PoolHandle) -> CoreMempool {
-        adapter_when(handle, true)
+        adapter_when(handle, |_| true)
     }
 
-    /// [`adapter_on`], with a node whose currentness is `current`.
-    fn adapter_when(handle: PoolHandle, current: bool) -> CoreMempool {
+    /// [`adapter_on`], where `may_cool` says whether a cooldown earned at a
+    /// height may start.
+    fn adapter_when(
+        handle: PoolHandle,
+        may_cool: impl Fn(Height) -> bool + Send + Sync + 'static,
+    ) -> CoreMempool {
         let outbound = Timeout::new(
             BoxCloneSyncService::new(NeverReady),
             TRANSACTION_DOWNLOAD_TIMEOUT,
@@ -806,7 +815,7 @@ mod tests {
             handle,
             outbound,
             BoxCloneSyncService::new(NeverReady),
-            Arc::new(move || current),
+            Arc::new(may_cool),
             chain_holding(None),
             false,
             mpsc::channel(1).0,
@@ -939,7 +948,7 @@ mod tests {
             handle,
             outbound,
             BoxCloneSyncService::new(NeverReady),
-            Arc::new(|| true),
+            Arc::new(|_| true),
             chain_holding(None),
             false,
             mpsc::channel(1).0,
@@ -988,62 +997,89 @@ mod tests {
         assert!(error.to_string().contains("cooldown"), "{error}");
     }
 
-    /// A cooldown charge cools the peer that pushed the body only while the
-    /// node is current, asked when the verdict arrives, as today's pool asks
-    /// when it handles the failure.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_cooldown_charge_cools_its_peer_only_while_the_node_is_current() {
+    /// What one push from [`peer`] costs that peer, when the core answers
+    /// its reservation with `joined` and `wants_body` and its submission
+    /// with a cooldown charge earned at `tip`, and `may_cool` says whether a
+    /// cooldown earned at a height may start. Returns whether the peer is
+    /// cooling down afterward.
+    async fn cooled_by_one_push(
+        joined: bool,
+        wants_body: bool,
+        tip: Height,
+        may_cool: impl Fn(Height) -> bool + Send + Sync + 'static,
+    ) -> bool {
         use zakura_node_services::mempool::port::{
             pool_port, PoolCommand, Rejection, RejectionScope, ReservationId,
         };
 
-        for current in [true, false] {
-            let (handle, mut inbox) = pool_port();
-            let core = adapter_when(handle, current);
-            let body = Network::Mainnet
-                .unmined_transactions_in_blocks(1..=1)
-                .next()
-                .expect("a vector transaction")
-                .transaction;
-            let queued = tokio::spawn(queue(core.shared.clone(), Gossip::Tx(body), Some(peer())));
-            let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
-                panic!("the push reserves first");
-            };
-            let _ = reply.send(Ok(inbox.grant(
-                ReservationId(1),
-                tx_id,
-                false,
-                true,
-                Default::default(),
-            )));
-            let receiver = queued
-                .await
-                .expect("the task does not panic")
-                .expect("the push passes the first stage");
-            let Some(PoolCommand::Submit {
+        let (handle, mut inbox) = pool_port();
+        let core = adapter_when(handle, may_cool);
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let queued = tokio::spawn(queue(core.shared.clone(), Gossip::Tx(body), Some(peer())));
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the push reserves first");
+        };
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            tx_id,
+            joined,
+            wants_body,
+            Default::default(),
+        )));
+        let receiver = queued
+            .await
+            .expect("the task does not panic")
+            .expect("the push passes the first stage");
+        let (reservation, reply) = match inbox.next().await {
+            Some(PoolCommand::Submit {
                 reservation, reply, ..
-            }) = inbox.next().await
-            else {
-                panic!("the body is submitted");
-            };
-            let _accepted = reservation.accept();
-            let _ = reply.send(Verdict::Rejected(Rejection {
-                scope: RejectionScope::ExactTip,
-                charge: Charge::Cooldown,
-                detail: Arc::new(std::io::Error::other("invalid")),
-            }));
-            let _ = receiver.await.expect("the push is answered");
+            })
+            | Some(PoolCommand::Join { reservation, reply }) => (reservation, reply),
+            other => panic!("the push is submitted or joined: {other:?}"),
+        };
+        let _accepted = reservation.accept();
+        let _ = reply.send(Verdict::Rejected(Rejection {
+            scope: RejectionScope::ExactTip,
+            charge: Charge::Cooldown,
+            tip,
+            detail: Arc::new(std::io::Error::other("invalid")),
+        }));
+        let _ = receiver.await.expect("the push is answered");
+        let QueueSource::LegacySocket(addr) = peer() else {
+            unreachable!("the test peer is a legacy peer");
+        };
+        core.shared
+            .cooldowns
+            .is_cooling_down(addr.ip(), Instant::now())
+    }
 
-            let QueueSource::LegacySocket(addr) = peer() else {
-                unreachable!("the test peer is a legacy peer");
-            };
-            assert_eq!(
-                core.shared
-                    .cooldowns
-                    .is_cooling_down(addr.ip(), Instant::now()),
-                current,
-                "cooling down only while current"
-            );
-        }
+    /// A cooldown charge cools the peer that pushed the body only while the
+    /// node is current and its best tip is still the one the failure was
+    /// verified at, asked when the verdict arrives, as today's pool asks when
+    /// it handles the failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cooldown_charge_cools_its_peer_only_at_the_tip_it_was_earned_at() {
+        let still_at_100 = |height| height == Height(100);
+        assert!(cooled_by_one_push(false, true, Height(100), still_at_100).await);
+        assert!(
+            !cooled_by_one_push(false, true, Height(99), still_at_100).await,
+            "the tip moved on after the failure was verified"
+        );
+        assert!(
+            !cooled_by_one_push(false, true, Height(100), |_| false).await,
+            "the node is not current"
+        );
+    }
+
+    /// A joined push whose copy the core did not need is not charged for the
+    /// verdict on another caller's body. One the core asked for its body is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_joined_push_is_charged_only_for_its_own_body() {
+        assert!(!cooled_by_one_push(true, false, Height(100), |_| true).await);
+        assert!(cooled_by_one_push(true, true, Height(100), |_| true).await);
     }
 }

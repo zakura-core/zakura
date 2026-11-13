@@ -24,7 +24,7 @@ use tokio::{
 };
 use tower::{buffer::Buffer, timeout::Timeout, util::BoxService};
 
-use zakura_chain::parameters::Network;
+use zakura_chain::{block::Height, parameters::Network};
 use zakura_mempool::io::PoolCore;
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::{
@@ -144,7 +144,7 @@ pub(crate) fn start(
         chain_tip_change.network().clone(),
         {
             let currentness = activation.currentness();
-            Arc::new(move || currentness.is_current())
+            Arc::new(move |height| currentness.may_cool(height))
         },
         misbehavior_sender,
         exempt,
@@ -185,8 +185,9 @@ pub(crate) struct Assembled {
 }
 
 /// Builds the pool core and its connections. The core is on while `active`
-/// holds `true`, and the adapter starts cooldowns only while `current`
-/// answers `true`. [`start`] decides both as today's pool does.
+/// holds `true`, and the adapter starts a cooldown only when `may_cool`
+/// allows it for the verdict's tip. [`start`] decides both as today's pool
+/// does.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble(
     config: &Config,
@@ -196,7 +197,7 @@ pub(crate) fn assemble(
     chain_transitions: &ChainTransitions,
     tx_verifier: TxVerifier,
     network: Network,
-    current: Arc<dyn Fn() -> bool + Send + Sync>,
+    may_cool: Arc<dyn Fn(Height) -> bool + Send + Sync>,
     misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
     exempt: Exempt,
     active: watch::Receiver<bool>,
@@ -234,7 +235,7 @@ pub(crate) fn assemble(
         handle.clone(),
         Timeout::new(outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
         outbound,
-        current,
+        may_cool,
         adapter_read_state,
         expose_peer_addresses,
         misbehavior_sender,

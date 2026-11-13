@@ -323,6 +323,11 @@ pub struct Rejection {
     pub scope: RejectionScope,
     /// What the body earned its supplier. See [`Charge`].
     pub charge: Charge,
+    /// The height of the tip the core held when it decided. A charge was
+    /// earned against this tip, so a caller that applies a cooldown can skip
+    /// it once the best tip has moved on, as today's pool skips a cooldown
+    /// for a failure verified at another height.
+    pub tip: block::Height,
     /// Today's error value, for RPC and logs.
     pub detail: RejectionDetail,
 }

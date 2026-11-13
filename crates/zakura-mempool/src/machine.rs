@@ -493,6 +493,7 @@ impl<E: VerifyError> MempoolState<E> {
         }
         if let Some(error) = self.cached_rejection(tx_id) {
             return Err(Unreserved::Rejected(rejection(
+                self.tip,
                 scope_of(&error),
                 Charge::None,
                 error,
@@ -1543,6 +1544,7 @@ impl<E: VerifyError> MempoolState<E> {
                     Verdict::Rejected(Rejection {
                         scope: RejectionScope::Uncached,
                         charge: Charge::None,
+                        tip: self.tip.height,
                         detail,
                     }),
                 );
@@ -1750,7 +1752,7 @@ impl<E: VerifyError> MempoolState<E> {
         self.step.changes.push(Change::Refused(tx_id));
         self.decide(
             key,
-            Verdict::Rejected(rejection(scope_of(&error), charge, error)),
+            Verdict::Rejected(rejection(self.tip, scope_of(&error), charge, error)),
         );
     }
 
@@ -1761,7 +1763,7 @@ impl<E: VerifyError> MempoolState<E> {
         self.step.changes.push(Change::Refused(tx_id));
         self.decide(
             key,
-            Verdict::Rejected(rejection(scope_of(&error), Charge::None, error)),
+            Verdict::Rejected(rejection(self.tip, scope_of(&error), Charge::None, error)),
         );
     }
 
@@ -1811,13 +1813,14 @@ impl<E: VerifyError> MempoolState<E> {
     fn stale_verdict(&self, tx_id: UnminedTxId) -> Verdict {
         if self.pooled.contains_key(&tx_id.mined_id()) {
             return Verdict::Rejected(rejection(
+                self.tip,
                 RejectionScope::Uncached,
                 Charge::None,
                 MempoolError::<E>::InMempool,
             ));
         }
         if let Some(error) = self.cached_rejection(tx_id) {
-            return Verdict::Rejected(rejection(scope_of(&error), Charge::None, error));
+            return Verdict::Rejected(rejection(self.tip, scope_of(&error), Charge::None, error));
         }
         Verdict::LocalFault(LocalFault::StaleReservation)
     }
@@ -2307,6 +2310,7 @@ impl<E: VerifyError> MempoolState<E> {
 
 /// A rejection as callers see it.
 fn rejection<E: VerifyError>(
+    tip: ChainTip,
     scope: RejectionScope,
     charge: Charge,
     error: MempoolError<E>,
@@ -2314,6 +2318,7 @@ fn rejection<E: VerifyError>(
     Rejection {
         scope,
         charge,
+        tip: tip.height,
         detail: Arc::new(error),
     }
 }

@@ -226,7 +226,7 @@ async fn pool(config: Config, peers: Peers, mode: Mode) -> Harness {
                 &transitions,
                 tx_verifier,
                 network.clone(),
-                Arc::new(|| true),
+                Arc::new(|_| true),
                 tokio::sync::mpsc::channel(1).0,
                 Exempt::default(),
                 active_rx,

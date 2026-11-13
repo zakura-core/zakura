@@ -31,8 +31,19 @@ trace tables (`trace_dir` under `[network.zakura]` in its config), the profiler
 also reads how long each block spent in each stage: download, verification,
 the wait for the state writer, the commit, and telling Zakura peers about the
 new tip. This includes waiting. Blocks that arrive over the legacy Zcash
-network have no header stages, and there is no trace point between the new tip
-and the hand-off to legacy gossip.
+network have no header stages.
+
+**A block's path between nodes.** For each block the profiler also keeps the
+wall-clock time at which the node first heard of it, asked for it, had its
+bytes, finished verifying it, made it the tip and told its peers, and what it
+exchanged with each peer it can tell apart: a Zakura peer by the label the
+trace rows carry for its node id, a legacy peer by the name the node was given
+for its address (`peer-names` below). It serves these records at
+`/api/propagation`, with the node's clock offset as chrony or
+systemd-timesyncd reports it. The
+status dashboard reads them from every node and joins them into the block
+propagation page (`deploy/runner/README.md`). That request is for the
+dashboard only and is not among those it passes through to the public.
 
 ## Staying out of the node's way
 
@@ -99,12 +110,14 @@ monitor    = { profiler_url = "http://127.0.0.1:8100" }
 ```
 
 The mainnet deploy workflow prepares each node before deploying its binary and
-installs the tunnels afterwards. The commands are safe to repeat; the two node
+installs the tunnels afterwards. The commands are safe to repeat; the three node
 commands accept `--node NAME` to act on one node.
 
 ```bash
 # Before the node restarts: install retention, then enable trace writes.
 python3 deploy/profiler/fleet.py ensure-trace-config --config nodes.toml
+# Before the node restarts: tell it the names of the other nodes.
+python3 deploy/profiler/fleet.py peer-names --config nodes.toml
 # To refresh the profiler alone, without changing the node's config:
 python3 deploy/profiler/fleet.py install --config nodes.toml
 # On the dashboard host: one SSH tunnel per node on another host.
@@ -137,6 +150,14 @@ touch /mnt/data/zakura-traces/.zakura-profiler-managed
 
 Without it the profiler on `us-east-0` reads that directory with a cap of 0 and
 its trace files grow without limit.
+
+**`peer-names`** writes a systemd drop-in for the node's own service
+(`<service>.service.d/trace-peer-names.conf`) that sets
+`ZAKURA_TRACE_PEER_NAMES` to `name=ip` for every other node in the list, with
+the address each is reached at over SSH. The node then writes that name, and
+never the address, in the trace rows for a legacy peer connecting from it. It
+does not restart the node: the names take effect when the node next starts. A
+node build that does not know the variable ignores it.
 
 **`install`** needs `perf` on the node (the `linux-tools` package) and installs
 `binutils` when `c++filt` is missing. It writes the node's own name, log file

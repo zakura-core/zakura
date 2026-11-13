@@ -875,6 +875,85 @@ class TraceFollowingTests(unittest.TestCase):
         )  # fmt: skip
         self.assertIn(60, self.heights(follower.poll()))
 
+    def test_a_legacy_block_records_who_it_was_heard_from_and_served_to(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        started = 1794528928.0  # the start time in NODE_RUN
+        self.append(
+            "legacy_gossip",
+            trace_row("block_inv_received", 900_000, hash=BLOCK_HASH, connection_id=3),
+            trace_row("block_inv_received", 950_000, hash=BLOCK_HASH, connection_id=4, peer_name="us-0"),
+            trace_row("block_inv_sent", 1_011_000, hash=BLOCK_HASH, connection_id=5),
+            trace_row("block_inv_sent", 1_012_000, hash=BLOCK_HASH, connection_id=6, peer_name="asia-0"),
+            trace_row("block_getdata_received", 1_030_000, hash=BLOCK_HASH, connection_id=6, peer_name="asia-0"),
+            trace_row("block_sent", 1_070_000, hash=BLOCK_HASH, connection_id=6, peer_name="asia-0"),
+        )
+        self.append(
+            "legacy_peer_request",
+            trace_row("block_request_finish", 1_000_000, result="available", returned_hash=BLOCK_HASH,
+                      returned_height=10, elapsed_ms=40),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(1_010_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+
+        self.assertEqual(
+            record["wall"],
+            {
+                "heard": started + 0.9, "asked": started + 0.96, "body": started + 1.0,
+                "queued": started + 1.0055, "tip": started + 1.01, "told": started + 1.011,
+            },
+        )  # fmt: skip
+        # First heard from a peer that cannot be told apart.
+        self.assertIsNone(record["heard_from"])
+        self.assertEqual(
+            record["peers"],
+            {
+                "name:us-0": {"heard": started + 0.95},
+                "name:asia-0": {"told": started + 1.012, "asked": started + 1.03, "sent": started + 1.07},
+            },
+        )
+        self.assertEqual(record["unnamed"], {"heard": 1, "told": 1})
+
+    def test_a_zakura_peer_is_kept_under_the_label_the_node_writes(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        started = 1794528928.0
+        self.append(
+            "header_sync",
+            trace_row("header_status_received", 800_000, peer="peer:aaaa", selected_tip_hash=BLOCK_HASH),
+            trace_row("header_status_received", 850_000, peer="peer:bbbb", selected_tip_hash=BLOCK_HASH),
+        )
+        self.append("chain_tip", tip_row(1_000_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        self.append(
+            "block_sync",
+            trace_row("block_status_sent", 1_002_000, peer="peer:bbbb", height=10),
+            trace_row("block_status_sent", 1_003_000, peer="peer:cccc", height=10),
+        )
+        self.append("chain_tip", tip_row(9_500_000, height=12, block_hash="12" * 32))
+        record = follower.poll()[0]
+
+        self.assertEqual(record["heard_from"], "peer:aaaa")
+        self.assertEqual(record["wall"]["heard"], started + 0.8)
+        self.assertEqual(record["wall"]["told"], started + 1.002)
+        self.assertEqual(
+            record["peers"],
+            {
+                "peer:aaaa": {"heard": started + 0.8},
+                "peer:bbbb": {"heard": started + 0.85, "told": started + 1.002},
+                "peer:cccc": {"told": started + 1.003},
+            },
+        )
+
+    def test_a_run_whose_start_time_cannot_be_read_has_no_wall_clock_times(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append(
+            "chain_tip",
+            tip_row(1_000_000, process="no-start-time"),
+            tip_row(9_000_000, height=11, block_hash="ef" * 32, process="no-start-time"),
+        )
+        (record,) = follower.poll()
+        self.assertNotIn("wall", record)
+        self.assertIsNone(blocks.process_started("no-start-time"))
+        self.assertEqual(blocks.process_started(NODE_RUN), 1794528928.0)
+
     def test_a_cap_of_zero_never_empties_a_table(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=0)
         self.append("discovery", *[trace_row("peer_seen", index, peer="p" * 40) for index in range(40)])
@@ -1035,6 +1114,51 @@ class ApiTests(unittest.TestCase):
         ):
             self.assertEqual(self.get(path)[0], 400, path)
         self.assertEqual(self.get("/api/nothing")[0], 404)
+
+    def test_propagation_serves_only_blocks_with_wall_clock_times(self):
+        wall = {"heard": 100.0, "tip": 100.05}
+        self.queries.store.add_block_stages(
+            [{**stage_record(9, "ab" * 32), "wall": wall, "heard_from": "peer:aaaa", "peers": {}, "unnamed": {}}]
+        )
+        self.queries.store.add_blocks([(100.051, 9, "ab" * 32)])
+        code, body = self.get("/api/propagation?limit=50")
+        self.assertEqual(code, 200)
+        report = json.loads(body)
+        self.assertEqual(report["node"], "test-node")
+        self.assertIn("clock", report)
+        # The three records stored without wall-clock times are left out.
+        (block,) = report["blocks"]
+        self.assertEqual((block["height"], block["wall"], block["heard_from"]), (9, wall, "peer:aaaa"))
+        # The node log's time for the same block, to check the trace clock against.
+        self.assertEqual(block["t"], 100.051)
+        self.assertEqual(self.get("/api/propagation?limit=many")[0], 400)
+
+    def test_the_clock_offset_is_read_from_chrony(self):
+        tracking = (
+            "Reference ID    : A9FEA97B (169.254.169.123)\n"
+            "System time     : 0.000040404 seconds slow of NTP time\n"
+            "Last offset     : -0.000011222 seconds\n"
+            "RMS offset      : 0.000243539 seconds\n"
+        )
+        self.assertEqual(profiler_module.parse_clock_offset(tracking), {"offset_ms": -0.04, "rms_ms": 0.244})
+        self.assertEqual(
+            profiler_module.parse_clock_offset(tracking.replace("slow", "fast"))["offset_ms"], 0.04
+        )
+        self.assertIsNone(profiler_module.parse_clock_offset("506 Cannot talk to daemon\n"))
+
+    def test_the_clock_offset_is_read_from_timesyncd_where_there_is_no_chrony(self):
+        status = (
+            "       Server: 2001:db8::40 (ntp.example)\n"
+            "Root distance: 4.417ms (max: 5s)\n"
+            "       Offset: -18us\n"
+            "        Delay: 69.555ms\n"
+            "       Jitter: 496us\n"
+        )
+        self.assertEqual(profiler_module.parse_timesync_offset(status), {"offset_ms": 0.018, "rms_ms": 0.496})
+        self.assertEqual(
+            profiler_module.parse_timesync_offset(status.replace("-18us", "+1.5ms"))["offset_ms"], -1.5
+        )
+        self.assertIsNone(profiler_module.parse_timesync_offset("Failed to query server: unit not found\n"))
 
     def test_page_and_health_are_served(self):
         code, body = self.get("/")

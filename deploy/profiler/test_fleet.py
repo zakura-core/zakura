@@ -206,6 +206,15 @@ class InstalledFilesTests(unittest.TestCase):
         )
         self.assertEqual(archive.extractfile("node.conf").read(), b"[Service]\n")
 
+    def test_a_node_is_told_every_other_node_s_name_and_address(self):
+        drop_in = fleet.peer_names_drop_in(self.remote, [self.local, self.remote])
+        self.assertEqual(drop_in.splitlines()[1:], ["[Service]", "Environment=ZAKURA_TRACE_PEER_NAMES=us-east-0=192.0.2.1"])
+
+    def test_a_node_reached_by_host_name_cannot_be_named(self):
+        named = load(NODE_LIST.replace("root@192.0.2.2", "root@archive.example"))[1]
+        with self.assertRaises(fleet.FleetError):
+            fleet.peer_address(named)
+
     def test_the_tunnel_settings_name_the_dashboard_port_and_the_node(self):
         self.assertEqual(
             fleet.tunnel_env(self.remote), "LOCAL_PORT=8098\nSSH_TARGET=root@192.0.2.2\nSSH_PORT=22\n"
@@ -276,6 +285,7 @@ class StepTests(unittest.TestCase):
         self.managed = False
         self.install_error = None
         self.steps = []
+        self.drop_in = b""
         self.real_remote = fleet.remote
         fleet.remote = self.fake_remote
         self.addCleanup(lambda: setattr(fleet, "remote", self.real_remote))
@@ -296,6 +306,11 @@ class StepTests(unittest.TestCase):
             return ""
         if script == fleet.READ_TRACE_MARKER_SCRIPT:
             return "managed" if self.managed else ""
+        if script == fleet.WRITE_DROP_IN_SCRIPT:
+            self.assertEqual(arguments, ("zakurad.service", "trace-peer-names.conf"))
+            changed = stdin != self.drop_in
+            self.drop_in = stdin
+            return "written\n" if changed else "unchanged\n"
         if script == fleet.INSTALL_SCRIPT:
             self.assertEqual(arguments, (fleet.TRACE_DIR, "200" if self.managed else "0"))
             if self.install_error:
@@ -344,6 +359,12 @@ class StepTests(unittest.TestCase):
         sent = self.archives[-1]
         drop_in = tarfile.open(fileobj=io.BytesIO(sent)).extractfile("node.conf").read().decode()
         self.assertIn("--trace-dir /mnt/data/zakura-traces --trace-table-cap-mb 0", drop_in)
+
+    def test_peer_names_are_written_once_as_a_drop_in_of_the_node_service(self):
+        nodes = load(NODE_LIST)
+        self.assertEqual(fleet.set_peer_names(self.node, nodes), "names its 1 fleet peers once the node next starts")
+        self.assertIn(b"ZAKURA_TRACE_PEER_NAMES=us-east-0=192.0.2.1\n", self.drop_in)
+        self.assertEqual(fleet.set_peer_names(self.node, nodes), "already names its 1 fleet peers")
 
     def test_one_failing_node_does_not_stop_the_others(self):
         def step(node):

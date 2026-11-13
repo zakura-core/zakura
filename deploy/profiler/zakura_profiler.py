@@ -21,6 +21,7 @@ import gzip
 import json
 import operator
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -66,6 +67,16 @@ MAX_STAGE_RECORDS = 10_000
 DEFAULT_TRACE_TABLE_CAP_MB = 200
 # What the page gets of each block's stage record.
 BLOCK_FIELDS = ("height", "hash", "t", "path", "size", "status_peers", "status_slowest_ms", "reorg", "ms")
+# What the cluster view needs of a block to join it with the same block on other nodes.
+PROPAGATION_FIELDS = ("height", "hash", "t", "path", "reorg", "ms", "wall", "heard_from", "peers", "unnamed")
+# How far this host's clock is from true time, as `chronyc tracking` prints it.
+CLOCK_OFFSET = re.compile(r"System time\s*:\s*([0-9.]+) seconds (slow|fast)")
+CLOCK_RMS = re.compile(r"RMS offset\s*:\s*([0-9.]+) seconds")
+# `timedatectl timesync-status` prints each as one number and a unit.
+TIMESYNC_OFFSET = re.compile(r"^\s*Offset:\s*([+-]?[0-9.]+)(us|ms|s)\s*$", re.MULTILINE)
+TIMESYNC_JITTER = re.compile(r"^\s*Jitter:\s*([0-9.]+)(us|ms|s)\s*$", re.MULTILINE)
+TIMESYNC_UNIT_MS = {"us": 0.001, "ms": 1.0, "s": 1000.0}
+CLOCK_CHECK_SECONDS = 60
 COMPUTE_WAIT_SECONDS = 20
 # Flame graphs that are not cached may use this much CPU time between them in any
 # minute. Past it the API answers "busy", so requests for many different ranges cannot
@@ -386,6 +397,65 @@ class Store:
             for directory in (self.minutes, self.hours)
             for path in directory.glob("*.json.gz")
         )
+
+
+def parse_clock_offset(tracking):
+    """`{"offset_ms", "rms_ms"}` from the output of `chronyc tracking`, else `None`.
+
+    `offset_ms` is how far the system clock is from true time right now, positive when
+    it is ahead; `rms_ms` is its typical distance over the recent past.
+    """
+    offset, rms = CLOCK_OFFSET.search(tracking), CLOCK_RMS.search(tracking)
+    if offset is None or rms is None:
+        return None
+    sign = 1 if offset.group(2) == "fast" else -1
+    return {
+        "offset_ms": round(sign * float(offset.group(1)) * 1000, 3),
+        "rms_ms": round(float(rms.group(1)) * 1000, 3),
+    }
+
+
+def parse_timesync_offset(status):
+    """The same from the output of `timedatectl timesync-status`, else `None`.
+
+    systemd-timesyncd reports the last measured offset, positive when the clock is
+    behind, and the jitter between measurements, which stands in for `rms_ms`.
+    """
+    offset, jitter = TIMESYNC_OFFSET.search(status), TIMESYNC_JITTER.search(status)
+    if offset is None or jitter is None:
+        return None
+    return {
+        "offset_ms": round(-float(offset.group(1)) * TIMESYNC_UNIT_MS[offset.group(2)], 3),
+        "rms_ms": round(float(jitter.group(1)) * TIMESYNC_UNIT_MS[jitter.group(2)], 3),
+    }
+
+
+# The time services a node may run, with how to read each one's answer.
+CLOCK_SOURCES = (
+    (("chronyc", "tracking"), parse_clock_offset),
+    (("timedatectl", "timesync-status"), parse_timesync_offset),
+)
+_clock = {"checked": 0.0, "offset": None}
+
+
+def clock_offset():
+    """This host's clock offset, asked of its time service at most once a minute.
+
+    `None` when the host runs neither chrony nor systemd-timesyncd.
+    """
+    now = time.monotonic()
+    if now - _clock["checked"] >= CLOCK_CHECK_SECONDS or not _clock["checked"]:
+        _clock["checked"] = now
+        _clock["offset"] = None
+        for command, parse in CLOCK_SOURCES:
+            try:
+                done = subprocess.run(command, capture_output=True, text=True, timeout=2, check=False)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            _clock["offset"] = parse(done.stdout)
+            if _clock["offset"] is not None:
+                break
+    return _clock["offset"]
 
 
 def use_normal_scheduling():
@@ -807,6 +877,23 @@ class Queries:
             "blocks": [{key: record[key] for key in BLOCK_FIELDS} for record in records],
         }
 
+    def propagation(self, limit):
+        """Recent blocks with the wall-clock times the cluster view joins across nodes.
+
+        `t` is when the node log announced the block, on the system clock: a second
+        reading of the tip time, which shows whether the trace clock can be trusted.
+        """
+        records = self.store.recent_block_stages(limit)
+        return {
+            "node": self.profiler.args.node_name,
+            "clock": clock_offset(),
+            "blocks": [
+                {key: record[key] for key in PROPAGATION_FIELDS if key in record}
+                for record in records
+                if record.get("wall")
+            ],
+        }
+
     def meta(self):
         """What the page needs before its first query: views, colours, ranges."""
         labels = {c["id"]: c["label"] for c in stacks.CATEGORIES}
@@ -863,6 +950,9 @@ def make_handler(queries, profiler, page_path):
                 if parsed.path == "/api/blocks":
                     limit = max(1, min(int(params.get("limit", "200")), 1000))
                     return self.reply_json(200, queries.block_stages(limit))
+                if parsed.path == "/api/propagation":
+                    limit = max(1, min(int(params.get("limit", "200")), 1000))
+                    return self.reply_json(200, queries.propagation(limit))
             except (KeyError, ValueError):
                 return self.reply_json(400, {"error": "bad request"})
             except TimeoutError:

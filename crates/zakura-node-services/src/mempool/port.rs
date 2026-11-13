@@ -159,6 +159,12 @@ pub struct ReservationId(pub u64);
 /// Dropping it frees the slot, unless the core has accepted it. That holds
 /// while it waits inside a [`PoolCommand`] too, so a caller that is cancelled
 /// in the middle of [`PoolHandle::submit`] leaks nothing.
+///
+/// A caller holds one for the length of one fetch or one delivery and then
+/// submits or drops it. A drop puts one id on the port's release queue,
+/// which the core empties before each command. The queue is as long as the
+/// reservations callers dropped since then, so a caller that hoards
+/// reservations and drops them together is the caller's bug to bound.
 #[must_use = "dropping a reservation frees its slot"]
 pub struct Reservation {
     id: ReservationId,
@@ -833,8 +839,11 @@ pub enum PoolCommand {
     /// admission cannot fall between the lookup and the registration.
     ///
     /// A caller that stops waiting drops its end, which closes `reply`. The
-    /// core drops closed waiters before it refuses a new outpoint for the
-    /// limit, as today, so callers that left cannot fill it.
+    /// core does not keep closed replies without bound. It drops the closed
+    /// ones for an outpoint whenever it registers another waiter for that
+    /// outpoint, and all of them before it refuses a new outpoint for the
+    /// limit, as today. So callers that left cannot fill the limit, and one
+    /// outpoint waited for and abandoned many times holds one entry.
     AwaitOutput {
         /// The outpoint.
         outpoint: transparent::OutPoint,

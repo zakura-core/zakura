@@ -19,8 +19,8 @@ use zakura_chain::{
 use super::{
     model::{
         Effect, JobId, ModelBlock, ModelReader, ModelTransition, ModelTx, ModelUnreserved,
-        ModelVerdict, Outcome, OutputAnswer, PoolModel, Step, WaiterId, COOLDOWN, MAX_PARKED,
-        REJECTION_MEMORY, REVALIDATE_RETRY, T_PARK, T_VERIFY,
+        ModelVerdict, Outcome, OutputAnswer, PoolModel, Step, WaiterId, COOLDOWN, REJECTION_MEMORY,
+        REVALIDATE_RETRY, T_PARK, T_VERIFY,
     },
     pool_port, ChainReason, ChainTip, Change, ChangeLog, ChangeSeq, ChangesSince, Charge,
     CooldownKey, Generation, GenerationCell, GenerationRead, Intent, LocalFault, NoRoom,
@@ -720,8 +720,6 @@ fn a_child_of_a_hidden_parent_that_fails_is_rejected_for_an_unresolved_parent() 
     let (child, job) = bring_in(&mut model, child_of(2, 1), legacy(2));
     model.outcome(job, missing(1), stable(1), stable(1), secs(0));
 
-    // While the parent is being verified again, the child's clock is
-    // stopped.
     assert_eq!(model.tick(secs(50)), Step::default());
     let step = model.outcome(
         parent_job,
@@ -743,9 +741,10 @@ fn a_child_of_a_hidden_parent_that_fails_is_rejected_for_an_unresolved_parent() 
     );
     assert!(step.effects.is_empty());
 
-    // Now nobody is bringing the parent in, so the clock runs.
-    assert_eq!(model.tick(secs(50) + T_PARK - secs(1)), Step::default());
-    let step = model.tick(secs(50) + T_PARK);
+    // The child's wait began when its input was first missing, and ends a
+    // flat sixty seconds later.
+    assert_eq!(model.tick(T_PARK - secs(1)), Step::default());
+    let step = model.tick(T_PARK);
     assert_eq!(
         step.verdict(child),
         Some(rejected(RejectionScope::Uncached, Charge::None))
@@ -754,30 +753,23 @@ fn a_child_of_a_hidden_parent_that_fails_is_rejected_for_an_unresolved_parent() 
 }
 
 #[test]
-fn the_park_clock_stops_while_the_parent_is_being_verified() {
+fn the_wait_for_a_parent_is_flat_and_does_not_stop_while_the_parent_is_verified() {
     let mut model = new_model();
     let (child, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
     model.outcome(job, missing(1), stable(0), stable(0), secs(0));
 
-    // Thirty seconds with nobody bringing the parent in.
+    // The parent's body arrives at forty seconds and its verification is
+    // slow.
     let reservation = model
         .reserve(id(1), peer(2), Intent::Fetch, secs(30))
         .expect("room");
-    // A reservation is not a body. The clock still runs until the body is
-    // here.
     model.submit(reservation.id, tx(1), Supplier::Peer(legacy(2)), secs(40));
 
-    // The parent's verification never finishes.
-    let step = model.tick(secs(40) + T_VERIFY);
-    assert_eq!(step.verdict(child), None);
-    assert!(model.is_parked(id(2)));
-
-    // Forty seconds had passed before the body arrived. Twenty more remain.
-    let step = model.tick(secs(40) + T_VERIFY + secs(19));
-    assert_eq!(step.verdict(child), None);
-    let step = model.tick(secs(40) + T_VERIFY + secs(20));
+    // The child's sixty seconds are not paused for that. This is today's
+    // wait, and it is what keeps the child's lifetime bounded.
+    assert_eq!(model.tick(T_PARK - secs(1)).verdict(child), None);
     assert_eq!(
-        step.verdict(child),
+        model.tick(T_PARK).verdict(child),
         Some(rejected(RejectionScope::Uncached, Charge::None))
     );
 }
@@ -2507,8 +2499,7 @@ fn a_hidden_transaction_that_is_woken_and_parks_again_keeps_its_wait() {
 
     // Forty seconds later the first parent arrives and wakes it. The second
     // is still missing.
-    // Nobody was bringing either parent in until now, so the forty seconds
-    // count.
+    // The first parent arrives at forty seconds.
     let reservation = model
         .reserve(id(1), peer(1), Intent::Fetch, secs(40))
         .expect("room");
@@ -2950,7 +2941,16 @@ fn a_random_run_with_small_limits_always_drains() {
             run.record(model.release(reservation, now));
         }
         for round in 0..400 {
-            if model.slots_in_use() == 0 && model.hidden().is_empty() && run.jobs.is_empty() {
+            // On one run in four the chain keeps changing for a while, with
+            // a missed event each round. Everything is checked again each
+            // time, and must still be answered in the end.
+            let chain_still_moving = seed % 4 == 3 && round < 30;
+            if chain_still_moving {
+                generation += 1;
+                tip += 1;
+                run.record(model.resync(Height(tip), Generation(generation), now));
+            } else if model.slots_in_use() == 0 && model.hidden().is_empty() && run.jobs.is_empty()
+            {
                 break;
             }
             for job in std::mem::take(&mut run.jobs) {
@@ -2999,6 +2999,7 @@ fn a_random_run_with_small_limits_always_drains() {
             0,
             "seed {seed}: a reservation is remembered"
         );
+        assert!(run.jobs.is_empty(), "seed {seed}: a job never finished");
         // Nothing is stuck: no slot is held, nothing is hidden, and every
         // submission was answered exactly once, with the pool still on.
         assert_eq!(model.slots_in_use(), 0, "seed {seed}: a slot is stuck");
@@ -3088,8 +3089,7 @@ fn a_parent_that_is_verified_again_and_again_cannot_hold_its_child_for_ever() {
     model.outcome(job, missing(1), stable(0), stable(0), secs(0));
 
     // The parent is submitted, its verification never finishes, it times
-    // out, and it is submitted again at once. Each attempt stops the
-    // child's own wait.
+    // out, and it is submitted again at once.
     let mut now = secs(0);
     let mut answered = None;
     for attempt in 0..4 {
@@ -3109,10 +3109,11 @@ fn a_parent_that_is_verified_again_and_again_cannot_hold_its_child_for_ever() {
             break;
         }
     }
-    // The child still gets its answer, and its slot comes back.
+    // The child is answered when its own wait ends, and its slot comes
+    // back.
     assert_eq!(
         answered,
-        Some((MAX_PARKED, rejected(RejectionScope::Uncached, Charge::None)))
+        Some((T_PARK, rejected(RejectionScope::Uncached, Charge::None)))
     );
     model.assert_invariants();
 }
@@ -3180,5 +3181,82 @@ fn nothing_expired_gets_in_even_if_a_verification_passes_it() {
         ))
     );
     assert!(model.visible().is_empty());
+    model.assert_invariants();
+}
+
+// Cases from the seventh review.
+
+#[test]
+fn checking_a_transaction_again_and_again_does_not_extend_its_wait_for_a_parent() {
+    let mut model = new_model();
+    let (child, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    model.outcome(job, missing(1), stable(0), stable(0), secs(0));
+
+    // The chain keeps changing. Every twenty seconds a missed event runs
+    // the child again, and its check finds the parent missing just before
+    // the next one. It is being verified almost all the time.
+    let mut now = secs(0);
+    let mut answered = None;
+    for generation in 1..10u32 {
+        let step = model.resync(
+            Height(100 + generation),
+            Generation(u64::from(generation)),
+            now,
+        );
+        let job = step.started()[0];
+        now += secs(19);
+        let read = stable(u64::from(generation));
+        let step = model.outcome(job, missing(1), read, read, now);
+        if let Some(verdict) = step.verdict(child) {
+            answered = Some((now, verdict));
+            break;
+        }
+        now += secs(1);
+    }
+    // The first check after its sixty seconds is its answer.
+    assert_eq!(
+        answered,
+        Some((secs(79), rejected(RejectionScope::Uncached, Charge::None)))
+    );
+    assert_eq!(model.slots_in_use(), 0);
+}
+
+#[test]
+fn a_hidden_transaction_checked_again_and_again_does_not_outlive_its_wait() {
+    let mut model = new_model();
+    admit(&mut model, child_of(2, 1), 2, 0);
+    let mut now = secs(0);
+    let mut removed_at = None;
+    for generation in 1..10u32 {
+        let step = model.resync(Height(100), Generation(u64::from(generation)), now);
+        let job = step.started()[0];
+        now += secs(19);
+        let read = stable(u64::from(generation));
+        let step = model.outcome(job, missing(1), read, read, now);
+        if !step.changes.is_empty() {
+            removed_at = Some(now);
+            break;
+        }
+        now += secs(1);
+    }
+    assert_eq!(removed_at, Some(secs(79)));
+    assert!(model.hidden().is_empty());
+}
+
+#[test]
+fn a_chain_rejection_recorded_twice_keeps_its_first_place_and_time() {
+    let mut model = new_model().with_rejection_memory(secs(100));
+    // Transaction 1 is mined at time zero, then transaction 2 at fifty.
+    model.transition(transition(1, 101, vec![vec![tx(1)]]), secs(0));
+    model.transition(transition(2, 102, vec![vec![tx(2)]]), secs(50));
+    // A block names transaction 1 again later. Its entry is not refreshed.
+    model.transition(transition(3, 103, vec![vec![tx(1)]]), secs(90));
+
+    let both: HashSet<_> = [id(1), id(2)].into_iter().collect();
+    let second: HashSet<_> = [id(2)].into_iter().collect();
+    assert_eq!(model.rejected_ids(&both, secs(99)), both);
+    // The first entry ends a hundred seconds after it was first made. The
+    // one behind it in the order is still remembered.
+    assert_eq!(model.rejected_ids(&both, secs(100)), second);
     model.assert_invariants();
 }

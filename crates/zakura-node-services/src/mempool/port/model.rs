@@ -58,16 +58,15 @@ pub type ModelTime = Duration;
 /// How long one verification can take. Provisional.
 pub const T_VERIFY: Duration = Duration::from_secs(60);
 
-/// How long a transaction waits for a parent nobody is bringing in. Today's
-/// wait for a pool parent.
+/// How long a transaction waits for a missing parent, counted from the
+/// first time one of its inputs is found missing. Today's wait for a pool
+/// parent.
+///
+/// The wait is flat. It does not stop while a parent is being verified, and
+/// waking the transaction or checking it again does not restart it. So a
+/// transaction with a missing input is answered within this long plus one
+/// verification, whatever its parents, the chain or its peers do.
 pub const T_PARK: Duration = Duration::from_secs(60);
-
-/// The longest a transaction stays parked, whatever its parents are doing:
-/// its own wait, plus one full verification of a parent. The wait in
-/// [`T_PARK`] stops while a parent is being verified, and without this a
-/// parent that is verified again and again could hold its children, and
-/// their slots, for ever.
-pub const MAX_PARKED: Duration = Duration::from_secs(120);
 
 /// How long the core refuses a peer after a cooldown charge or a violation.
 /// Today's base cooldown.
@@ -443,12 +442,9 @@ struct Admission {
     body: Option<ModelTx>,
     waiters: Vec<Waiter>,
     stage: Stage,
-    /// The time spent parked with nobody bringing a parent in, over every
-    /// time it was parked. It never resets, so waking and parking again
-    /// cannot keep a transaction past [`T_PARK`].
-    parked_for: Duration,
-    /// All the time spent parked, bounded by [`MAX_PARKED`].
-    parked_total: Duration,
+    /// When one of its inputs was first found missing. Its wait for a
+    /// parent runs from here and is never restarted.
+    missing_since: Option<ModelTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -479,13 +475,9 @@ struct Pooled {
     visible_at: u64,
     /// The log position of its latest `Hidden` entry.
     hidden_at: ChangeSeq,
-    /// The time spent hidden and parked with nobody bringing a parent in,
-    /// since it was last visible. Waking and parking again does not reset
-    /// it.
-    parked_for: Duration,
-    /// All the time spent hidden and parked since it was last visible,
-    /// bounded by [`MAX_PARKED`].
-    parked_total: Duration,
+    /// When one of its inputs was first found missing since it was last
+    /// visible. Its wait for a parent runs from here.
+    missing_since: Option<ModelTime>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -663,8 +655,7 @@ impl PoolModel {
                 body: None,
                 waiters: Vec::new(),
                 stage: Stage::Reserved,
-                parked_for: Duration::ZERO,
-                parked_total: Duration::ZERO,
+                missing_since: None,
             },
         );
         self.admission_of.insert(tx_id, key);
@@ -968,7 +959,9 @@ impl PoolModel {
             match &admission.stage {
                 Stage::Verifying { deadline, .. } if *deadline <= now => timed_out.push(*key),
                 Stage::Parked { .. }
-                    if admission.parked_for >= T_PARK || admission.parked_total >= MAX_PARKED =>
+                    if admission
+                        .missing_since
+                        .is_some_and(|since| since.saturating_add(T_PARK) <= now) =>
                 {
                     unparked.push(*key)
                 }
@@ -980,15 +973,7 @@ impl PoolModel {
             self.fail_locally(key, LocalFault::VerifyTimeout);
         }
         for key in unparked {
-            let tx_id = self.admission_at(key).tx_id;
-            self.step.changes.push(Change::Refused(tx_id));
-            self.decide(
-                key,
-                ModelVerdict::Rejected {
-                    scope: RejectionScope::Uncached,
-                    charge: Charge::None,
-                },
-            );
+            self.reject(key, RejectionScope::Uncached, Charge::None);
         }
         let keys: Vec<u64> = self.pool.keys().copied().collect();
         for key in keys {
@@ -997,7 +982,9 @@ impl PoolModel {
             let Some((hidden, parked_out)) = self.pool.get(&key).map(|pooled| {
                 (
                     pooled.hidden.clone(),
-                    pooled.parked_for >= T_PARK || pooled.parked_total >= MAX_PARKED,
+                    pooled
+                        .missing_since
+                        .is_some_and(|since| since.saturating_add(T_PARK) <= now),
                 )
             }) else {
                 continue;
@@ -1437,8 +1424,7 @@ impl PoolModel {
                         backoff: REVALIDATE_RETRY,
                         visible_at: pool_key,
                         hidden_at: ChangeSeq(0),
-                        parked_for: Duration::ZERO,
-                        parked_total: Duration::ZERO,
+                        missing_since: None,
                     },
                 );
                 self.pooled.insert(hash, pool_key);
@@ -1466,6 +1452,15 @@ impl PoolModel {
                     .any(|outpoint| self.arrived_since(outpoint, started_at));
                 if arrived {
                     self.start_admission(key);
+                    return;
+                }
+                // Its wait runs from the first time an input was missing.
+                // A check that still finds one missing after the wait ended
+                // is the answer, however the check came to run again.
+                let now = self.now;
+                let since = *self.admission_at(key).missing_since.get_or_insert(now);
+                if since.saturating_add(T_PARK) <= now {
+                    self.reject(key, RejectionScope::Uncached, Charge::None);
                     return;
                 }
                 let mut on: Vec<transaction::Hash> = Vec::new();
@@ -1533,8 +1528,7 @@ impl PoolModel {
                 pooled.hidden = None;
                 pooled.backoff = REVALIDATE_RETRY;
                 pooled.visible_at = visible_at;
-                pooled.parked_for = Duration::ZERO;
-                pooled.parked_total = Duration::ZERO;
+                pooled.missing_since = None;
                 let (id, hidden_at, count) = (pooled.tx.id, pooled.hidden_at, pooled.tx.outputs);
                 self.step.changes.push(Change::Revealed { id, hidden_at });
                 // Its outputs are available again, to waiters as well.
@@ -1564,6 +1558,14 @@ impl PoolModel {
             // a reorg that can be a mined parent that is on its way back, so
             // it waits as a new transaction would, still hidden.
             Outcome::MissingInputs(missing) => {
+                let now = self.now;
+                let since = *self.pooled_at(key).missing_since.get_or_insert(now);
+                if since.saturating_add(T_PARK) <= now {
+                    // Its job has reported, so there is nothing to cancel.
+                    self.pooled_at(key).hidden = Some(Hidden::Queued);
+                    self.remove_with_dependents(hash, RemovalReason::Invalidated);
+                    return;
+                }
                 let mut on: Vec<transaction::Hash> = Vec::new();
                 for outpoint in missing {
                     if !on.contains(&outpoint.hash) {
@@ -1906,18 +1908,13 @@ impl PoolModel {
         }
     }
 
-    /// Moves time to `now`. A parked transaction's wait counts only the time
-    /// none of its parents was being verified, as a new transaction or as a
-    /// hidden one. Nothing else stops the wait.
+    /// Moves time to `now`. A cooldown or a remembered rejection ends at its
+    /// time, whichever input comes next.
     fn advance(&mut self, now: ModelTime) {
-        let elapsed = now.saturating_sub(self.now);
-        self.now = self.now.max(now);
-        if elapsed.is_zero() {
+        if now <= self.now {
             return;
         }
-        // A cooldown or a remembered rejection ends at its time, whichever
-        // input comes next.
-        let now = self.now;
+        self.now = now;
         self.cooldowns.retain(|_, until| *until > now);
         let memory = self.rejection_memory;
         for list in self.rejected_chain.values_mut() {
@@ -1931,40 +1928,6 @@ impl PoolModel {
                 }
                 list.order.pop_front();
                 list.at.remove(&oldest);
-            }
-        }
-        // A parent is on its way only while a verification of it is running.
-        // A parent that is itself parked, or hidden and waiting for a slot,
-        // may never come. Stopping the clock for those could leave a full
-        // core where the parked transactions hold the very slots their
-        // parent needs.
-        let arriving: HashSet<transaction::Hash> = self
-            .admissions
-            .values()
-            .filter(|admission| matches!(admission.stage, Stage::Verifying { .. }))
-            .filter_map(|admission| admission.body.as_ref())
-            .map(|tx| tx.id.mined_id())
-            .chain(
-                self.pool
-                    .values()
-                    .filter(|pooled| matches!(pooled.hidden, Some(Hidden::Running { .. })))
-                    .map(|pooled| pooled.tx.id.mined_id()),
-            )
-            .collect();
-        for admission in self.admissions.values_mut() {
-            if let Stage::Parked { on } = &admission.stage {
-                admission.parked_total = admission.parked_total.saturating_add(elapsed);
-                if !on.iter().any(|parent| arriving.contains(parent)) {
-                    admission.parked_for = admission.parked_for.saturating_add(elapsed);
-                }
-            }
-        }
-        for pooled in self.pool.values_mut() {
-            if let Some(Hidden::Parked { on }) = &pooled.hidden {
-                pooled.parked_total = pooled.parked_total.saturating_add(elapsed);
-                if !on.iter().any(|parent| arriving.contains(parent)) {
-                    pooled.parked_for = pooled.parked_for.saturating_add(elapsed);
-                }
             }
         }
     }
@@ -2000,7 +1963,11 @@ impl PoolModel {
                 let hash = tx_id.mined_id();
                 let now = self.now;
                 let list = self.rejected_chain.entry(reason).or_default();
-                if list.at.insert(hash, now).is_none() {
+                // An id already in the list keeps its first entry, so its
+                // time and its place in the order stay in step. Today's list
+                // is never given an id twice.
+                if let std::collections::hash_map::Entry::Vacant(entry) = list.at.entry(hash) {
+                    entry.insert(now);
                     list.order.push_back(hash);
                 }
                 if list.at.len() > MAX_REJECTIONS {

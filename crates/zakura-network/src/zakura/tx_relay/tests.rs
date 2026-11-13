@@ -1137,13 +1137,17 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                 let read = GenerationRead::Stable(Generation(generation));
                 let step = pool.outcome(job, outcome, read, read, now);
                 ledger.absorb(&step);
-                reactor.pool_step(&step, now, &mut pool);
+                // Every request the drain causes is a request on the wire,
+                // and is tracked like one.
+                let effects = reactor.pool_step(&step, now, &mut pool);
+                apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
             }
             now += RETRY_MAX + T_VERIFY;
             let step = pool.tick(now);
             ledger.absorb(&step);
-            reactor.pool_step(&step, now, &mut pool);
-            reactor.tick(now, &mut pool);
+            let mut effects = reactor.pool_step(&step, now, &mut pool);
+            effects.extend(reactor.tick(now, &mut pool));
+            apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
             reactor.assert_invariants();
         }
 
@@ -1161,15 +1165,33 @@ fn a_random_run_always_drains_once_the_sessions_end() {
             // The silent peers answer at last: none of them has anything.
             // Every id they were holding up is asked for or given up, until
             // nothing is wanted.
-            for _ in 0..200 {
-                let Some((session, n)) = asked.pop() else {
+            // An id can also be waiting out a retry delay, or a peer's
+            // cooldown, so time has to pass between answers.
+            for _ in 0..400 {
+                if asked.is_empty() && reactor.wanted_count() == 0 {
                     break;
-                };
-                let effects = reactor.not_found(session, id(n), now, &mut pool);
+                }
+                while let Some((session, n)) = asked.pop() {
+                    let effects = reactor.not_found(session, id(n), now, &mut pool);
+                    apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
+                }
+                now += RETRY_MAX;
+                let step = pool.tick(now);
+                ledger.absorb(&step);
+                let mut effects = reactor.pool_step(&step, now, &mut pool);
+                effects.extend(reactor.tick(now, &mut pool));
                 apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
             }
             assert!(asked.is_empty(), "seed {seed}: requests never settle");
             assert_eq!(pool.slots_in_use(), 0, "seed {seed}: a core slot is stuck");
+            // With every request answered and the peers still connected,
+            // nothing may be left wanted. Ending the sessions first would
+            // clear a stuck id and hide it.
+            assert_eq!(
+                reactor.wanted_count(),
+                0,
+                "seed {seed}: an id is stuck while its announcer is connected"
+            );
             for session in live.drain(..) {
                 reactor.end(session, now, &mut pool);
             }

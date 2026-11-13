@@ -8,5 +8,9 @@
 # The input is the stale-prepare seed less its last control step, a close
 # on a dropped read that never runs: the same run, with every step it
 # declares carried out.
+# Past the stop, the charged round outgrows its bound, so
+# `header-sync/outstanding-work-bounded` breaks too, but only later, and the
+# case's set is judged on its Draft run (`draft_set`).
+draft_set = ["header-sync/outstanding-work-bounded"]
 input = "crates/zakura-sim/tests/fixtures/header-storage-stale-prepare-steps.bin"
 checks = ["crates/zakura-network/src/zakura/header_sync"]

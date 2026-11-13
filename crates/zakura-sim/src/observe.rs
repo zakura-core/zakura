@@ -1908,6 +1908,9 @@ pub(crate) fn peer_entries<'o>(
                     | Observation::PeerWritten { .. }
                     | Observation::PeerReceived { .. }
                     | Observation::PeerClosed { .. }
+                    | Observation::PeerHandshake { .. }
+                    | Observation::PeerStreamReset { .. }
+                    | Observation::PeerConnectionClosed { .. }
                     | Observation::NodeFrame { .. }
                     | Observation::FrameJudged { .. }
                     | Observation::ConnectionClosed { .. }

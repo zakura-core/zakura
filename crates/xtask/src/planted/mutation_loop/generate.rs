@@ -47,10 +47,13 @@
 //!   each confirmed kill's input with `record`, since a mutant's trace holds
 //!   picks the unpatched build leaves. It replays the shrunk trace, which
 //!   has no input, with `--allow-build-mismatch`, if the shrink finished.
-//!   The loop reads each run's report ([`judge_unpatched`]). If the
-//!   unpatched build violates the killing ID on the confirmed trace too, the
-//!   kill shows a defect of the pinned revision, not of the mutant: the lane
-//!   is `baseline-fails` ([`unpatched_class`]). A violation on either trace
+//!   The loop reads each run's report ([`judge_unpatched`]) for the judged
+//!   ID ([`unpatched_id`]): the case's property for a kill by the named
+//!   rule, even one that stopped on an allowed co-violation, and the
+//!   killing ID for a kill by another rule. If the unpatched build violates
+//!   the judged ID on the confirmed trace too, the kill shows a defect of
+//!   the pinned revision, not of the mutant: the lane is `baseline-fails`
+//!   ([`unpatched_class`]). A violation on either trace
 //!   is a property finding ([`GeneratorReport::finding`]). The shrink kept
 //!   only the ID, not the mutant's effect, so a violation on the shrunk
 //!   trace alone leaves the kill. A run that passes its deadline, that the
@@ -371,11 +374,11 @@ pub(in crate::planted) struct GeneratorReport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(in crate::planted) enum OnUnpatched {
-    /// The run ended, and the killing ID isn't violated.
+    /// The run ended, and the judged ID isn't violated.
     Holds,
-    /// The run violates the killing ID: a property finding.
+    /// The run violates the judged ID: a property finding.
     Violated,
-    /// The run wrote no report that judges the killing ID, such as when it
+    /// The run wrote no report that judges the ID, such as when it
     /// passed its deadline or a replay left the trace's picks.
     Undecided,
 }
@@ -405,6 +408,11 @@ impl KillTrace {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::planted) struct UnpatchedCheck {
     pub(in crate::planted) trace: KillTrace,
+    /// The ID the check judged: the case's property for a kill by the
+    /// named rule, else the killing ID. Reports from before it recorded
+    /// the ID judged the killing ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::planted) property: Option<String>,
     pub(in crate::planted) outcome: OnUnpatched,
     /// What showed it, in words.
     pub(in crate::planted) detail: String,
@@ -440,7 +448,7 @@ impl GeneratorReport {
     }
 
     /// The property finding this lane shows, if the unpatched build
-    /// violates the killing ID on one of the kill's traces too: the shrunk
+    /// violates the judged ID on one of the kill's traces too: the shrunk
     /// trace's replay if it violates, as the smaller reproduction, else the
     /// confirmed trace's.
     pub(in crate::planted) fn finding(&self) -> Option<PropertyFinding> {
@@ -454,7 +462,7 @@ impl GeneratorReport {
             harness: self.harness.clone(),
             seed: self.seed,
             mode: self.mode,
-            property: self.violated.clone(),
+            property: check.property.clone().or_else(|| self.violated.clone()),
             detail: check.detail.clone(),
             runs: self.runs,
             millis: self.millis.unwrap_or_default(),
@@ -464,6 +472,54 @@ impl GeneratorReport {
             shrunk: self.shrunk.clone(),
             log: check.log.clone(),
         })
+    }
+}
+
+/// A kill's trace run on the unpatched build, before any ID is judged:
+/// each case of the kill judges its own ID from it ([`UnpatchedRun::judge`]).
+#[derive(Clone, Debug)]
+pub(super) struct UnpatchedRun {
+    pub(super) trace: KillTrace,
+    /// `record` for a rerun of the trace's input, `replay` for a replay.
+    pub(super) command: &'static str,
+    /// The report the run wrote, if any.
+    pub(super) report: Option<String>,
+    /// How the run ended, in words.
+    pub(super) ended: String,
+    /// The run's log, relative to `--out`.
+    pub(super) log: PathBuf,
+}
+
+impl UnpatchedRun {
+    /// How the run judged `id` ([`judge_unpatched`]).
+    pub(super) fn judge(&self, id: &str) -> UnpatchedCheck {
+        let (outcome, detail) = judge_unpatched(
+            id,
+            self.trace,
+            self.command,
+            self.report.as_deref(),
+            &self.ended,
+        );
+        UnpatchedCheck {
+            trace: self.trace,
+            property: Some(id.to_owned()),
+            outcome,
+            detail,
+            log: self.log.clone(),
+        }
+    }
+}
+
+/// The ID whose violation on the unpatched build makes a kill `result` a
+/// baseline failure: the case's `property` for a kill by the named rule,
+/// and the killing ID, `kill`, otherwise. A named kill can stop on a
+/// co-violation the case allows, and the mutant's defect is then
+/// `property`'s, not `kill`'s.
+pub(super) fn unpatched_id<'a>(result: &Classified, property: &'a str, kill: &'a str) -> &'a str {
+    if result.class == Class::KilledByNamedRule {
+        property
+    } else {
+        kill
     }
 }
 
@@ -550,9 +606,9 @@ pub(super) fn co_violation_confirmed(
     )
 }
 
-/// A kill's class once the unpatched build ran its traces. A kill keeps
-/// `result` only if the killing ID holds when the unpatched build reruns the
-/// confirmed trace's input. If the unpatched build violates the ID there
+/// A kill's class once the unpatched build ran its traces, each check
+/// judging [`unpatched_id`]. A kill keeps `result` only if that ID holds
+/// when the unpatched build reruns the confirmed trace's input. If the unpatched build violates the ID there
 /// too, the lane is `baseline-fails`: the defect is the pinned revision's.
 /// If that run is undecided, or never ran, the lane is a harness failure
 /// (`unconfirmed`): the unpatched build couldn't judge the kill's input, so
@@ -735,7 +791,7 @@ struct KillFollowUps {
     confirmation: FollowUp,
     shrunk: Option<FollowUp>,
     /// The unpatched build's runs of the kill's traces.
-    checks: Vec<UnpatchedCheck>,
+    runs: Vec<UnpatchedRun>,
     /// The confirmed trace's full report, if the kill confirmed.
     report: Option<String>,
 }
@@ -1442,9 +1498,10 @@ impl Runner {
     }
 
     /// Runs the kill's `which` trace, at `trace`, on `harness`'s unpatched
-    /// build, under the memory `cap` and within `child`, and judges whether
-    /// it violates `id` there. A trace with its `input.bin` reruns that
-    /// input, and any other trace replays. Writes under `dir`.
+    /// build, under the memory `cap` and within `child`, for each case of
+    /// the kill to judge its ID on ([`UnpatchedRun::judge`]). A trace with
+    /// its `input.bin` reruns that input, and any other trace replays.
+    /// Writes under `dir`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_unpatched(
         &self,
@@ -1452,11 +1509,10 @@ impl Runner {
         harness: &str,
         which: KillTrace,
         trace: &Path,
-        id: &str,
         dir: &Path,
         cap: Option<u64>,
         child: Duration,
-    ) -> Result<UnpatchedCheck, BoxError> {
+    ) -> Result<UnpatchedRun, BoxError> {
         let input = trace.join("input.bin");
         // A mutant's trace holds the mutant's picks, so the unpatched build
         // leaves them on most replays. A trace with its input reruns that
@@ -1491,13 +1547,11 @@ impl Runner {
             report
         };
         let ended = run_lane_child(&mut run, &log, Some(child))?;
-        let written = fs::read_to_string(&report).ok();
-        let (outcome, detail) =
-            judge_unpatched(id, which, command, written.as_deref(), &ended.to_string());
-        Ok(UnpatchedCheck {
+        Ok(UnpatchedRun {
             trace: which,
-            outcome,
-            detail,
+            command,
+            report: fs::read_to_string(&report).ok(),
+            ended: ended.to_string(),
             log: self.relative(&log),
         })
     }
@@ -1740,7 +1794,7 @@ impl Runner {
                                 (KillTrace::Confirmed, Some(&confirmation)),
                                 (KillTrace::Shrunk, shrunk.as_ref()),
                             ];
-                            let mut checks = Vec::new();
+                            let mut runs = Vec::new();
                             for (which, follow_up) in traces {
                                 if let Some(FollowUp {
                                     ok: true,
@@ -1748,12 +1802,11 @@ impl Runner {
                                     ..
                                 }) = follow_up
                                 {
-                                    checks.push(self.run_unpatched(
+                                    runs.push(self.run_unpatched(
                                         lanes,
                                         harness,
                                         which,
                                         &self.out.join(trace),
-                                        &kill.id,
                                         &kill_dir,
                                         cap,
                                         confirm_child(run_time),
@@ -1773,7 +1826,7 @@ impl Runner {
                                 KillFollowUps {
                                     confirmation,
                                     shrunk,
-                                    checks,
+                                    runs,
                                     report,
                                 },
                             );
@@ -1781,7 +1834,7 @@ impl Runner {
                         let KillFollowUps {
                             confirmation,
                             shrunk,
-                            checks,
+                            runs,
                             report,
                         } = &follow_ups[&kill.id];
                         result = confirmed(result, confirmation);
@@ -1791,10 +1844,13 @@ impl Runner {
                             &kill.id,
                             report.as_deref(),
                         );
-                        result = unpatched_class(result, checks);
+                        let judged = unpatched_id(&result, &case.property, &kill.id);
+                        let checks: Vec<UnpatchedCheck> =
+                            runs.iter().map(|run| run.judge(judged)).collect();
+                        result = unpatched_class(result, &checks);
                         lane.confirmation = Some(confirmation.clone());
                         lane.shrunk.clone_from(shrunk);
-                        lane.unpatched.clone_from(checks);
+                        lane.unpatched = checks;
                         lane.input = kill.input.map(|input| self.relative(&input));
                         lane.family = search.family();
                         lane.violated = Some(kill.id);

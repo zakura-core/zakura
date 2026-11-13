@@ -22,9 +22,9 @@ use super::{
     generate::{
         baseline_lane, campaign_class, co_violation_confirmed, co_violations, confirm_child,
         confirmed, judge_unpatched, no_generator as no_generator_of, plan, shrink_wall,
-        unpatched_class, write_exclusions, FollowUp, GenBaseline, GenerateConfig, GenerateMode,
-        GeneratorBaselineFailure, GeneratorReport, Kill, KillTrace, Lanes, OnUnpatched,
-        PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck,
+        unpatched_class, unpatched_id, write_exclusions, FollowUp, GenBaseline, GenerateConfig,
+        GenerateMode, GeneratorBaselineFailure, GeneratorReport, Kill, KillTrace, Lanes,
+        OnUnpatched, PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck, UnpatchedRun,
     },
     merge_alone, parse_flags, planted_cases, selects, summarize, test_executables, triage,
     BaselineReport, BuildIdentity, CaseReport, GenerateFlags, ListedCase, LoopCase, Mutant, Report,
@@ -1341,6 +1341,7 @@ fn a_kill_that_fails_unpatched_is_a_property_finding() {
     let killed = classify::Classified::new(Class::KilledByNamedRule, None, "the kill");
     let check = |trace, outcome| UnpatchedCheck {
         trace,
+        property: None,
         outcome,
         detail: "the trace violates it on the unpatched build too".to_owned(),
         log: format!("mutants/x/unpatched-{trace:?}-replay.log").into(),
@@ -1670,7 +1671,7 @@ fn a_co_violation_kill_needs_its_property_in_the_confirmation() {
     #[cfg(unix)]
     {
         let cases = [generator_case(NAMED, &[OTHER]), generator_case(OTHER, &[])];
-        let holds = full_report(&[], &[OTHER]);
+        let holds = full_report(&[], &[OTHER, NAMED]);
         let lanes = fake_kill(OTHER, &[OTHER, NAMED], &both, Some(&holds), &cases);
         assert_eq!(lanes[0].result.class, Class::KilledByNamedRule, "{lanes:?}");
         assert_eq!(lanes[0].violated.as_deref(), Some(OTHER));
@@ -1681,6 +1682,17 @@ fn a_co_violation_kill_needs_its_property_in_the_confirmation() {
             "{lanes:?}"
         );
         assert_eq!(lanes[1].result.class, Class::KilledByNamedRule, "{lanes:?}");
+
+        // The unpatched build violates OTHER, the allowed co-violation, and
+        // holds NAMED. The NAMED case's kill rests on NAMED, so it stands.
+        // The OTHER case's kill rests on OTHER, so its baseline fails.
+        let pinned = full_report(&[OTHER], &[NAMED]);
+        let lanes = fake_kill(OTHER, &[OTHER, NAMED], &both, Some(&pinned), &cases);
+        assert_eq!(lanes[0].result.class, Class::KilledByNamedRule, "{lanes:?}");
+        assert_eq!(lanes[0].unpatched[0].property.as_deref(), Some(NAMED));
+        assert_eq!(lanes[0].unpatched[0].outcome, OnUnpatched::Holds);
+        assert_eq!(lanes[1].result.class, Class::BaselineFails, "{lanes:?}");
+        assert_eq!(lanes[1].unpatched[0].property.as_deref(), Some(OTHER));
     }
 }
 
@@ -2745,12 +2757,12 @@ fn the_unpatched_build_reruns_a_kills_input() {
                 "block-sync/storage",
                 which,
                 trace,
-                NAMED,
                 &dir,
                 None,
                 Duration::from_secs(30),
             )
             .unwrap()
+            .judge(NAMED)
     };
 
     let rerun = check(KillTrace::Confirmed, &confirmed);
@@ -2912,4 +2924,58 @@ fn a_run_alone_replaces_only_the_lanes_that_reran() {
     assert!(merged.rerun_alone);
     assert_eq!(merged.generator.len(), 1);
     assert_eq!(merged.generator[0].result.class, Class::Survived);
+}
+
+/// A kill by the named rule that stopped on an allowed co-violation is
+/// judged on the unpatched build by the case's property, not by the
+/// co-violation that stopped the search: an unpatched run that violates
+/// only the co-violation leaves the kill. A kill by another rule is judged
+/// by its killing ID.
+#[test]
+fn the_unpatched_check_judges_a_named_kill_by_the_cases_property() {
+    let named = classify::Classified::new(Class::KilledByNamedRule, None, "the kill");
+    let other = classify::Classified {
+        other: Some(OTHER.to_owned()),
+        ..classify::Classified::new(Class::KilledByOtherRule, None, "the kill")
+    };
+    assert_eq!(unpatched_id(&named, NAMED, OTHER), NAMED);
+    assert_eq!(unpatched_id(&other, NAMED, OTHER), OTHER);
+
+    // The unpatched build violates the allowed co-violation, `OTHER`, on
+    // the confirmed trace, and holds the case's property.
+    let report = json!({"properties": [
+        {"property": NAMED, "violations": []},
+        {"property": OTHER, "violations": [{"step": 3}]},
+    ]})
+    .to_string();
+    let run = UnpatchedRun {
+        trace: KillTrace::Confirmed,
+        command: "record",
+        report: Some(report),
+        ended: "exited 0".to_owned(),
+        log: "mutants/x/unpatched-confirmed-record.log".into(),
+    };
+    let check = run.judge(unpatched_id(&named, NAMED, OTHER));
+    assert_eq!(check.property.as_deref(), Some(NAMED));
+    assert_eq!(check.outcome, OnUnpatched::Holds, "{}", check.detail);
+    assert_eq!(unpatched_class(named.clone(), &[check]), named);
+
+    // Judged by the killing ID, the same run would have failed the kill's
+    // baseline.
+    let check = run.judge(OTHER);
+    assert_eq!(check.outcome, OnUnpatched::Violated);
+    let failed = unpatched_class(named, std::slice::from_ref(&check));
+    assert_eq!(failed.class, Class::BaselineFails);
+
+    // A finding names the ID its check judged.
+    let mut lane =
+        GeneratorReport::unsearched("block-sync/storage", 11, GenerateMode::Inproc, failed);
+    lane.violated = Some(NAMED.to_owned());
+    lane.unpatched = vec![check];
+    assert_eq!(
+        lane.finding()
+            .and_then(|finding| finding.property)
+            .as_deref(),
+        Some(OTHER)
+    );
 }

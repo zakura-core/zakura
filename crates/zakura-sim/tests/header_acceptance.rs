@@ -8301,6 +8301,12 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
+        "tests/header_recovery_prefix.rs",
+        "a_stalled_trigger_recovers_at_the_step_cutoff",
+        "pick",
+        "finds the source's `Recover` pick by its fixed name, the lookup `run` makes, not a join of two records",
+    ),
+    (
         "tests/header_wire_crossing.rs",
         "held_applied",
         "id",

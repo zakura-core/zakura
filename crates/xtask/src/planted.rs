@@ -240,6 +240,8 @@ struct Case {
     /// The simulator fuzz target that runs the input's harness, with
     /// `--targets`.
     target: Option<String>,
+    /// Why no fuzz target confirms the case, if none does.
+    no_target: Option<String>,
 }
 
 /// What a case runs, with paths relative to the repository root.
@@ -345,6 +347,12 @@ struct CaseFile {
     /// case names `set` or `also_violates`, not both.
     #[serde(default)]
     set: Vec<String>,
+    /// Why `--targets` doesn't confirm the case through its fuzz target, if
+    /// it doesn't, such as a patched run that takes longer than
+    /// [`TARGET_CHILD`] under AddressSanitizer. `--targets` lists the case
+    /// with this reason and runs the others. The case's other runs still
+    /// show the catch.
+    no_target: Option<String>,
 }
 
 /// A committed fuzz input's sidecar, as `zakura-sim`'s tests check it.
@@ -531,17 +539,22 @@ pub(super) fn run(
         .collect();
     if targets {
         let harnesses = sim_minimize::fuzz_targets(repo_root)?;
-        let mut on_targets = Vec::new();
-        for mut case in cases {
+        for case in &mut cases {
             // A typed case has no fuzz input for a target to run.
             if let Witness::Input(input) = &case.witness {
                 case.target = target_of(&harnesses, &harness_of(repo_root, input)?);
             }
-            if case.target.is_some() {
-                on_targets.push(case);
-            }
         }
-        cases = on_targets;
+        let skipped;
+        (cases, skipped) = through_targets(cases);
+        for (case, why) in &skipped {
+            println!(
+                "{} {}: not confirmed through {}: {why}",
+                case.property,
+                case.patch.display(),
+                case.target.as_deref().unwrap_or_default()
+            );
+        }
         for (target, harness) in &harnesses {
             let Some(harness) = harness else { continue };
             let names: Vec<String> = cases
@@ -627,6 +640,23 @@ pub(super) fn case_index(repo_root: &Path, property: &str, name: &str) -> Result
         .ok_or_else(|| format!("{property}/{name} has no planted case").into())
 }
 
+/// Splits `cases`, each with its fuzz target if one runs its input, into
+/// the cases `--targets` confirms through their target, and the cases with
+/// a target whose `no_target` says why not, with that reason. It drops a
+/// case with no target.
+fn through_targets(cases: Vec<Case>) -> (Vec<Case>, Vec<(Case, String)>) {
+    let mut confirmed = Vec::new();
+    let mut skipped = Vec::new();
+    for mut case in cases {
+        match (&case.target, case.no_target.take()) {
+            (Some(_), Some(why)) => skipped.push((case, why)),
+            (Some(_), None) => confirmed.push(case),
+            (None, _) => {}
+        }
+    }
+    (confirmed, skipped)
+}
+
 /// Every case under `repo_root`'s [`PLANTED_DIR`], in path order.
 fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
     let root = repo_root.join(PLANTED_DIR);
@@ -642,6 +672,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 checks,
                 also_violates,
                 set,
+                no_target,
             } = toml::from_str(
                 &fs::read_to_string(&case_file)
                     .map_err(|error| format!("{}: {error}", case_file.display()))?,
@@ -681,6 +712,12 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                     .into());
                 }
             }
+            if no_target
+                .as_deref()
+                .is_some_and(|why| why.trim().is_empty())
+            {
+                return Err(format!("{}: `no_target` names no reason", case_file.display()).into());
+            }
             if !set.is_empty() && !also_violates.is_empty() {
                 return Err(format!(
                     "{}: a case names either `set` or `also_violates`, not both",
@@ -696,6 +733,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 also_violates,
                 set,
                 target: None,
+                no_target,
             })
         })
         .collect()
@@ -2012,6 +2050,57 @@ mod tests {
         );
     }
 
+    /// `--targets` confirms a case with a target through it, lists a case
+    /// with a target and a `no_target` reason with that reason, and drops
+    /// a case no target runs. Only a case with a target needs the reason.
+    #[test]
+    fn no_target_keeps_a_case_off_its_target() {
+        let case = |name: &str, target: Option<&str>, no_target: Option<&str>| Case {
+            property: format!("p/{name}"),
+            patch: PathBuf::from(format!("qa/planted/p/{name}/case.patch")),
+            witness: Witness::Input(PathBuf::from("in.bin")),
+            checks: Vec::new(),
+            also_violates: Vec::new(),
+            set: Vec::new(),
+            target: target.map(str::to_owned),
+            no_target: no_target.map(str::to_owned),
+        };
+        let (confirmed, skipped) = through_targets(vec![
+            case("runs", Some("t"), None),
+            case("slow", Some("t"), Some("too slow")),
+            case("untargeted", None, Some("unused")),
+            case("plain", None, None),
+        ]);
+        let names = |cases: Vec<&Case>| -> Vec<String> {
+            cases
+                .into_iter()
+                .map(|case| case.property.clone())
+                .collect()
+        };
+        assert_eq!(names(confirmed.iter().collect()), ["p/runs"]);
+        assert_eq!(
+            names(skipped.iter().map(|(case, _)| case).collect()),
+            ["p/slow"]
+        );
+        assert_eq!(skipped[0].1, "too slow");
+
+        let repo_root = crate::repo_root().expect("xtask lives in the workspace");
+        let harnesses = sim_minimize::fuzz_targets(&repo_root).expect("cargo metadata reads it");
+        for case in cases(&repo_root).expect("the planted cases parse") {
+            if case.no_target.is_some() {
+                let Witness::Input(input) = &case.witness else {
+                    panic!("{}: a typed case runs on no target", case.property);
+                };
+                let harness = harness_of(&repo_root, input).expect("the input has a sidecar");
+                assert!(
+                    target_of(&harnesses, &harness).is_some(),
+                    "{}: `no_target` on a case no target runs",
+                    case.property
+                );
+            }
+        }
+    }
+
     /// A harness maps to the first target by name that runs it, and a
     /// target that runs no harness maps nothing.
     #[test]
@@ -2178,6 +2267,7 @@ mod tests {
             also_violates: Vec::new(),
             set: Vec::new(),
             target: None,
+            no_target: None,
         };
         let fuzz = Case {
             witness: Witness::Input("a.bin".into()),
@@ -2519,6 +2609,7 @@ mod tests {
             also_violates: Vec::new(),
             set: Vec::new(),
             target: None,
+            no_target: None,
         };
         let judge = |binary: &Path, case: &Case| {
             judge_patched(
@@ -2606,6 +2697,7 @@ mod tests {
             also_violates: Vec::new(),
             set: Vec::new(),
             target: None,
+            no_target: None,
         };
         let scratch = dir.path().join("case");
         fs::create_dir_all(&scratch).unwrap();
@@ -2673,6 +2765,7 @@ mod tests {
             also_violates: Vec::new(),
             set: set.to_vec(),
             target: Some("header_sync".to_owned()),
+            no_target: None,
         };
         assert_eq!(nested.beside(), set);
         let both = r#"

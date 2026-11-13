@@ -366,12 +366,15 @@ cargo xtask sim-targets --out <dir> [--target <name>]... [--sanitizer address|no
 ```
 
 For each target, it resolves the harness through
-`[package.metadata.zakura-sim.targets]`, runs each of the harness's admitted
-seeds in the `zakura-sim` process, builds the target with the pinned
-nightly, and runs the built target once on the seeds, with the suite row's
-libFuzzer arguments and `ZAKURA_SIM_STATS` set. The target's stats file
-must name the harness the table maps it to, so a target whose
-`sim_target!` runs another harness fails. Each target gets one status:
+`[package.metadata.zakura-sim.targets]`, loads the harness's admitted
+seeds, builds the target with the pinned nightly, and runs the built target
+once on the seeds, with the suite row's libFuzzer arguments and
+`ZAKURA_SIM_STATS` set. The target's stats file must name the harness the
+table maps it to, so a target whose `sim_target!` runs another harness
+fails, and its counts say which properties applied. The `zakura-sim`
+process runs no seed itself: Linux carries a process's peak resident size
+across `exec`, and `-rss_limit_mb` reads that peak, so a large checker
+would fail its targets out of memory. Each target gets one status:
 
 - `ready`: the target accepted every seed, its stats name its harness and
   count every seed, and a seed's run applied a property of the harness's
@@ -411,7 +414,10 @@ patched target must crash with the property alone and name the harness,
 replay must match Exact. It builds the patched `zakura-sim` and target in
 `target/planted/confirm-builds/`, outside the scratch worktree, so later
 runs reuse the builds, and both binaries must embed the patched checkout's
-source digest. It prints each target's bypasses, or that it has none.
+source digest. It prints each target's bypasses, or that it has none. A
+case whose file sets `no_target` to a reason, such as a patched run longer
+than the 300-second limit under AddressSanitizer, isn't confirmed through
+its target: `--targets` prints the case with the reason and runs the rest.
 
 The nightly `zakura_sim targets` job in `tests-unit.yml` runs
 `cargo xtask sim-targets`. It also runs on manual dispatch, never on pull

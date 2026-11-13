@@ -2407,6 +2407,7 @@ fn planted_repo() -> (
         also_violates: vec!["p/also".to_owned()],
         set: Vec::new(),
         target: None,
+        no_target: None,
     };
     let targets = BTreeMap::from([
         ("t_one".to_owned(), Some("h/one".to_owned())),

@@ -229,9 +229,11 @@ alone is another violation. A campaign stops at its first finding.
 - `median_detection_secs`: the Kaplan-Meier median of the time to
   detection over the detected and censored seeds, or `null` when half the
   seeds or more end censored;
-- `baseline` and `mutant`: the original's and the mutant's campaigns,
-  those where the property applied, their applicable runs, and the median
-  of the unique abstract states each campaign reached.
+- `baseline` and `mutant`: the original's and the mutant's campaigns on
+  the detected and censored seeds, those where the property applied, their
+  applicable runs, and the median of the unique abstract states each
+  campaign reached. An unscored seed's campaigns stay out, even when they
+  left facts.
 
 Each seed's class decides its place: only an intended violation is a
 detection. A campaign's time to detection is the fuzzing time its worker

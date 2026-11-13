@@ -1901,16 +1901,22 @@ fn each_arm_summarizes_its_seeds() {
         (4, 0, 2, 2)
     );
     assert_eq!(off.median_detection_secs, None);
-    // The harness failure's campaign still left facts.
+    // The harness failure's campaigns left facts, but the totals count
+    // only the timed seeds 1 and 2.
     assert_eq!(
         (
             off.mutant.campaigns,
             off.mutant.applicable,
             off.mutant.applicable_runs
         ),
-        (3, 2, 52)
+        (2, 1, 50)
     );
     assert_eq!(off.mutant.features_reached, Some(1.0));
+    assert_eq!(
+        (off.baseline.campaigns, off.baseline.applicable_runs),
+        (2, 200)
+    );
+    assert_eq!(off.baseline.features_reached, Some(11.5));
     let json = serde_json::to_value(&arms).expect("the comparison serializes");
     assert_eq!(json[1]["arm"], "off");
     assert_eq!(json[1]["median_detection_secs"], Value::Null);

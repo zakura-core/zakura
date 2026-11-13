@@ -6,8 +6,8 @@
 //! libFuzzer reads the collector's features. [`compare`] reports, for each
 //! arm, the seeds that detected the intended property, the censored seeds
 //! that didn't, the median time to detection, and the applicable runs and
-//! unique abstract states of the original and mutant campaigns. It reports
-//! only: no threshold decides a result.
+//! unique abstract states of the original and mutant campaigns of the
+//! timed seeds. It reports only: no threshold decides a result.
 
 use std::{collections::BTreeMap, fmt};
 
@@ -72,9 +72,10 @@ pub(super) struct ArmSummary {
     /// The Kaplan-Meier median time to detection, in seconds, over the
     /// detected and censored seeds ([`median_detection`]).
     pub(super) median_detection_secs: Option<f64>,
-    /// The original build's campaigns of the case's target.
+    /// The original build's campaigns of the case's target, on the
+    /// detected and censored seeds.
     pub(super) baseline: CampaignTotals,
-    /// The mutant's campaigns.
+    /// The mutant's campaigns, on the detected and censored seeds.
     pub(super) mutant: CampaignTotals,
 }
 
@@ -139,16 +140,24 @@ pub(super) fn compare(seeds: &[SeedResult]) -> Vec<ArmSummary> {
     }
     arms.into_iter()
         .map(|(arm, seeds)| {
-            let scored: Vec<Scored> = seeds.iter().map(|seed| score(seed)).collect();
+            let scored: Vec<(&SeedResult, Scored)> =
+                seeds.iter().map(|seed| (*seed, score(seed))).collect();
             let times: Vec<(f64, bool)> = scored
                 .iter()
-                .filter_map(|scored| match scored {
+                .filter_map(|(_, scored)| match scored {
                     Scored::Detected(secs) => Some((*secs, true)),
                     Scored::Censored(secs) => Some((*secs, false)),
                     Scored::Unscored => None,
                 })
                 .collect();
-            let count = |want: fn(&Scored) -> bool| scored.iter().filter(|s| want(s)).count();
+            let count = |want: fn(&Scored) -> bool| scored.iter().filter(|(_, s)| want(s)).count();
+            // A harness failure, an unpaired build or a failed baseline can
+            // still leave facts, which the totals leave out with the seed.
+            let timed: Vec<&SeedResult> = scored
+                .iter()
+                .filter(|(_, scored)| *scored != Scored::Unscored)
+                .map(|(seed, _)| *seed)
+                .collect();
             ArmSummary {
                 arm,
                 seeds: seeds.len(),
@@ -156,8 +165,8 @@ pub(super) fn compare(seeds: &[SeedResult]) -> Vec<ArmSummary> {
                 censored: count(|s| matches!(s, Scored::Censored(_))),
                 unscored: count(|s| matches!(s, Scored::Unscored)),
                 median_detection_secs: median_detection(&times),
-                baseline: totals(seeds.iter().filter_map(|seed| seed.baseline.as_ref())),
-                mutant: totals(seeds.iter().filter_map(|seed| seed.mutant.as_ref())),
+                baseline: totals(timed.iter().filter_map(|seed| seed.baseline.as_ref())),
+                mutant: totals(timed.iter().filter_map(|seed| seed.mutant.as_ref())),
             }
         })
         .collect()

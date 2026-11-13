@@ -130,7 +130,8 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
     let config: Config = toml::from_str(&saved_config).unwrap();
 
     let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
-    let selected = super::super::limit_initial_peers(&config, book_tx).await;
+    let selected = super::super::limit_initial_peers(&config, &book_tx).await;
+    drop(book_tx);
     let assert_alternating = |peers: &[PeerSocketAddr]| {
         assert_eq!(peers.len(), 4);
         assert_eq!(peers[0], cached[0]);
@@ -216,10 +217,11 @@ async fn single_startup_slot_dials_seed_and_keeps_cache_for_discovery() {
     let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
     let selected = tokio::time::timeout(
         PEER_CACHE_TEST_TIMEOUT,
-        super::super::limit_initial_peers(&config, book_tx),
+        super::super::limit_initial_peers(&config, &book_tx),
     )
     .await
     .expect("startup peer selection finishes within the test deadline");
+    drop(book_tx);
     assert_eq!(selected, IndexSet::from([seed]));
     let mut discovered = IndexSet::new();
     while let Some(change) = book_rx.recv().await {
@@ -269,10 +271,11 @@ async fn startup_dial_limit_counts_ip_diversity_before_truncation() {
         let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
         let selected = tokio::time::timeout(
             PEER_CACHE_TEST_TIMEOUT,
-            super::super::limit_initial_peers(&config, book_tx),
+            super::super::limit_initial_peers(&config, &book_tx),
         )
         .await
         .expect("startup peer selection finishes within the test deadline");
+        drop(book_tx);
         let expected = if max_connections_per_ip == 1 {
             IndexSet::from([cached[0], cached[3], cached[4]])
         } else {

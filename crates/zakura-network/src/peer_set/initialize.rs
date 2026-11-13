@@ -597,7 +597,7 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let initial_peers = limit_initial_peers(&config, address_book_updater).await;
+    let initial_peers = limit_initial_peers(&config, &address_book_updater).await;
 
     let mut handshake_success_total: usize = 0;
     let mut handshake_error_total: usize = 0;
@@ -672,6 +672,12 @@ where
                 handshake_error_total += 1;
                 let addr_label = addr.addr_label(config.expose_peer_addresses);
 
+                // Like crawler dials, a failed startup dial must not look never-attempted,
+                // or the crawler retries it ahead of untried candidates.
+                let _ = address_book_updater
+                    .send(MetaAddr::new_errored(addr, None))
+                    .await;
+
                 // this is verbose, but it's better than just hanging with no output when there are errors
                 let mut expected_error = false;
                 if let Some(io_error) = e.downcast_ref::<tokio::io::Error>() {
@@ -729,7 +735,7 @@ where
 /// Also sends every initial peer to the `address_book_updater`.
 async fn limit_initial_peers(
     config: &Config,
-    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
 ) -> IndexSet<PeerSocketAddr> {
     let all_peers = config.initial_peers().await;
     let mut initial_peers = IndexSet::new();

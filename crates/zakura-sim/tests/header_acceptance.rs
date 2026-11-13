@@ -6987,6 +6987,20 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "the_path_break_names_the_sent_page",
     ),
     (
+        "PageRef",
+        "src/harness/header_acceptance/companions.rs",
+        "path_break",
+        "src/harness/header_acceptance/companions.rs",
+        "the_path_break_names_the_sent_page",
+    ),
+    (
+        "PeerNameRef",
+        "src/harness/header_acceptance/companions.rs",
+        "page_peer",
+        "src/harness/header_acceptance/companions.rs",
+        "the_page_s_peer_joins_its_harness_name",
+    ),
+    (
         "SessionRef",
         "src/harness/header_acceptance/actions.rs",
         "admitted_on",

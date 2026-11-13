@@ -118,6 +118,15 @@ pub struct SubscriptionRef {
     pub subscription: u64,
 }
 
+/// One scenario peer, by the harness name a `Session` row gives it, such
+/// as `peer-0`: the whole of a harness peer's identity within its run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerNameRef {
+    /// The harness name.
+    pub peer: String,
+}
+impl Ref for PeerNameRef {}
+
 /// One page of headers on a subscription: the subscription, the frame's
 /// position among its stream's reads, and the headers in order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

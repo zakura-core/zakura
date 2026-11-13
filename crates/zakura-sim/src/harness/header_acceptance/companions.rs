@@ -38,11 +38,14 @@ use zakura_network::zakura::observe::ReactorEvent;
 
 use super::{
     binding::{self, Expect, Field},
-    refs::{FindingRef, FrameRef, PageRef, ReadRef, Ref, SessionRef, StreamRef, SubscriptionRef},
+    refs::{
+        FindingRef, FrameRef, PageRef, PeerNameRef, ReadRef, Ref, SessionRef, StreamRef,
+        SubscriptionRef,
+    },
     CaseRef,
 };
 use crate::{
-    harness::header_node::authority::{Attribution, AuthorityRule, AuthoritySubject},
+    harness::header_node::authority::AuthorityRule,
     model::{is_fault_cause, Label},
     peer::SentPages,
     Observation, PropertyOutcome, PropertyReport,
@@ -318,13 +321,47 @@ fn session_stream(obs: &Observation) -> Option<StreamRef> {
 }
 
 /// The peer `page` came from, as `peers` names it for its harness name, by
-/// `(name, peer)`, in hex as findings spell it.
+/// `(name, peer)`, in hex as findings spell it: the one peer joined on that
+/// name ([`PeerNameRef`]).
 fn page_peer(page: &RejectedPage, peers: &[(String, String)]) -> Result<String, String> {
-    peers
-        .iter()
-        .find(|(name, _)| *name == page.peer)
-        .map(|(_, peer)| peer.clone())
-        .ok_or_else(|| format!("no peer is named {}", page.peer))
+    let want = PeerNameRef {
+        peer: page.peer.clone(),
+    };
+    let named = PeerNameRef::joined(&want, peers, |(name, _)| {
+        Some(PeerNameRef { peer: name.clone() })
+    });
+    match named[..] {
+        [(_, peer)] => Ok(peer.clone()),
+        _ => Err(format!(
+            "{} peers are named {}, not one",
+            named.len(),
+            page.peer
+        )),
+    }
+}
+
+/// The page `record`, a claim store record, attributes a `rule` break to,
+/// if its subject is a page a reader tagged: its subscription, its frame
+/// and its headers, as [`PageRef`] names them.
+fn attributed_page(record: &Value, rule: AuthorityRule) -> Option<PageRef> {
+    let attribution = &record["attribution"];
+    if attribution["rule"] != serde_json::to_value(rule).ok()? {
+        return None;
+    }
+    let subject = &attribution["subject"];
+    if subject["subject"] != "page" {
+        return None;
+    }
+    serde_json::from_value(serde_json::json!({
+        "subscription": {
+            "peer": subject["peer"],
+            "session": subject["session"],
+            "subscription": subject["subscription"],
+        },
+        "frame": subject["frame"],
+        "headers": subject["headers"],
+    }))
+    .ok()
 }
 
 /// What the peer sent as `page`: its peer ([`page_peer`]) and the header
@@ -443,30 +480,21 @@ pub fn path_break(
         return Err(format!("{COMMIT} is {:?}", report.outcome));
     }
     let subject = page.page(sent);
-    let expected = serde_json::to_value(Attribution {
-        rule: AuthorityRule::Path,
-        subject: AuthoritySubject::Page {
-            peer: subject.subscription.peer,
-            session: subject.subscription.session,
-            subscription: subject.subscription.subscription,
-            headers: subject.headers,
-            frame: Some(subject.frame),
-        },
-    })
-    .map_err(|error| format!("the expected attribution doesn't serialize: {error}"))?;
     let records = claims
         .as_array()
         .ok_or("the claim store's snapshot isn't a list")?;
+    let breaks = PageRef::joined(&subject, records, |record| {
+        attributed_page(record, AuthorityRule::Path)
+    });
     let reported = |violation: &crate::Violation| {
         Some(FindingRef {
             step: violation.step,
             detail: violation.actual.clone(),
         })
     };
-    let found = records.iter().any(|record| {
+    let found = breaks.iter().any(|record| {
         let finding = record["step"].as_u64().zip(record["detail"].as_str());
         record["claim"] == "CommitOnlyAuthorized"
-            && record["attribution"] == expected
             && finding.is_some_and(|(step, detail)| {
                 let finding = FindingRef {
                     step,
@@ -479,7 +507,7 @@ pub fn path_break(
         Ok(())
     } else {
         Err(format!(
-            "no retained {COMMIT} violation is the path break {expected}"
+            "no retained {COMMIT} violation is the path break of {subject:?}"
         ))
     }
 }
@@ -1018,6 +1046,35 @@ mod tests {
             frame.inbound && rejected_page(&moved).is_ok()
         });
         assert_eq!(keys, 6);
+    }
+
+    /// The rejected page's peer is the one scenario peer its `Session`
+    /// row's harness name joins, on its whole [`PeerNameRef`]: the same
+    /// page with its peer's name moved names another peer or none (Rule
+    /// 25's template), and a name two peers share names none.
+    #[test]
+    fn the_page_s_peer_joins_its_harness_name() {
+        let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
+        let peers = vec![
+            ("peer-0".to_owned(), "ab".to_owned()),
+            ("peer-1".to_owned(), "cd".to_owned()),
+        ];
+        let own = PeerNameRef {
+            peer: page.peer.clone(),
+        };
+        let keys = assert_one_key_off::<PeerNameRef>(&own, |name| {
+            let moved = RejectedPage {
+                peer: name.peer.clone(),
+                ..page.clone()
+            };
+            page_peer(&moved, &peers) == Ok("ab".to_owned())
+        });
+        assert_eq!(keys, 1);
+        let shared = vec![
+            ("peer-0".to_owned(), "ab".to_owned()),
+            ("peer-0".to_owned(), "cd".to_owned()),
+        ];
+        assert!(page_peer(&page, &shared).is_err());
     }
 
     /// The rejected page's peer and hashes come from its frame's evidence:

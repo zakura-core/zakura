@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the fleet installer: the node list, the config edit and the files it writes."""
 
+import contextlib
 import hashlib
 import io
 import shutil
@@ -253,8 +254,18 @@ class InstalledFilesTests(unittest.TestCase):
         self.assertEqual(archive.extractfile("node.conf").read(), b"[Service]\n")
 
     def test_a_node_is_told_every_other_node_s_name_and_address(self):
-        drop_in = fleet.peer_names_drop_in(self.remote, [self.local, self.remote])
+        drop_in = fleet.peer_names_drop_in(fleet.named_peers(self.remote, [self.local, self.remote], frozenset()))
         self.assertEqual(drop_in.splitlines()[1:], ["[Service]", "Environment=ZAKURA_TRACE_PEER_NAMES=us-east-0=192.0.2.1"])
+
+    def test_a_node_with_a_private_address_is_named_to_no_node(self):
+        private = fleet.parse_private_addresses('["::ffff:192.0.2.1"]')
+        self.assertEqual(fleet.named_peers(self.remote, [self.local, self.remote], private), [])
+        self.assertNotIn("192.0.2.1", fleet.peer_names_drop_in([]))
+
+    def test_a_private_list_that_cannot_be_read_is_refused(self):
+        for listed in ("", "{}", '["not an address"]', "[1]"):
+            with self.assertRaises(fleet.FleetError):
+                fleet.parse_private_addresses(listed)
 
     def test_a_node_reached_by_host_name_cannot_be_named(self):
         named = load(NODE_LIST.replace("root@192.0.2.2", "root@archive.example"))[1]
@@ -444,9 +455,27 @@ class StepTests(unittest.TestCase):
 
     def test_peer_names_are_written_once_as_a_drop_in_of_the_node_service(self):
         nodes = load(NODE_LIST)
-        self.assertEqual(fleet.set_peer_names(self.node, nodes), "names its 1 fleet peers once the node next starts")
+        self.assertEqual(
+            fleet.set_peer_names(self.node, nodes, frozenset()), "names its 1 fleet peers once the node next starts"
+        )
         self.assertIn(b"ZAKURA_TRACE_PEER_NAMES=us-east-0=192.0.2.1\n", self.drop_in)
-        self.assertEqual(fleet.set_peer_names(self.node, nodes), "already names its 1 fleet peers")
+        self.assertEqual(fleet.set_peer_names(self.node, nodes, frozenset()), "already names its 1 fleet peers")
+
+    def test_a_private_peer_is_left_out_and_only_counted(self):
+        line = fleet.set_peer_names(self.node, load(NODE_LIST), frozenset({"192.0.2.1"}))
+        self.assertEqual(line, "names its 0 fleet peers once the node next starts, leaving out 1 with a private address")
+        self.assertNotIn(b"192.0.2.1", self.drop_in)
+
+    def test_no_peer_names_are_written_without_the_private_list(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as node_list, \
+                contextlib.redirect_stderr(io.StringIO()):
+            node_list.write(NODE_LIST)
+            node_list.flush()
+            missing = node_list.name + ".missing"
+            self.assertEqual(
+                fleet.main(["peer-names", "--config", node_list.name, "--private-addresses", missing]), 2
+            )
+        self.assertNotIn(fleet.WRITE_DROP_IN_SCRIPT, self.steps)
 
     def test_one_failing_node_does_not_stop_the_others(self):
         def step(node):

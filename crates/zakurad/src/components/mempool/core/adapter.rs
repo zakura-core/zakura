@@ -10,7 +10,8 @@
 //! The core knows nothing about peers, so the per-peer state is here, as
 //! today's pool keeps it: at most [`MAX_INBOUND_CONCURRENCY_PER_PEER`]
 //! undecided transactions from one peer, and the legacy peers' transaction
-//! cooldowns. A verdict says what its body earned, and this applies it to the
+//! cooldowns. Today's node-wide [`MAX_INBOUND_CONCURRENCY`] is here too, so a
+//! body waiting for a slow core's reservation still counts against it. A verdict says what its body earned, and this applies it to the
 //! legacy peer that served the body. A v2 peer reaching the pool through here
 //! is counted and never charged, as today.
 //!
@@ -49,7 +50,8 @@ use super::{
         crawler::RATE_LIMIT_DELAY,
         downloads::{
             fetch_transaction, peer_source_from_queue_source, transaction_in_best_chain,
-            TransactionDownloadVerifyError, MAX_INBOUND_CONCURRENCY_PER_PEER,
+            TransactionDownloadVerifyError, MAX_INBOUND_CONCURRENCY,
+            MAX_INBOUND_CONCURRENCY_PER_PEER,
         },
         peer_cooldown::PeerCooldowns,
         pending_outputs::PendingOutputsFull,
@@ -84,9 +86,9 @@ struct Shared {
     /// The largest body the pool takes, which today's downloader checks
     /// before a cooldown.
     max_transaction_bytes: u64,
-    /// Queued items not yet answered at their second stage, for today's
-    /// `mempool.currently.queued.transactions` gauge.
-    in_flight: std::sync::atomic::AtomicUsize,
+    /// Queued items not yet answered at their second stage, at most
+    /// [`MAX_INBOUND_CONCURRENCY`]. See [`QueueSlot`].
+    queued: std::sync::Mutex<usize>,
     /// Undecided transactions from each peer, counted from the reservation to
     /// the verdict.
     per_peer: std::sync::Mutex<HashMap<QueueSource, usize>>,
@@ -128,7 +130,7 @@ impl CoreMempool {
                 cooldowns: PeerCooldowns::default(),
                 may_cool,
                 max_transaction_bytes,
-                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                queued: std::sync::Mutex::new(0),
                 per_peer: std::sync::Mutex::new(HashMap::new()),
                 read_state: std::sync::Mutex::new(read_state),
                 expose_peer_addresses,
@@ -332,8 +334,10 @@ async fn queue(
         Gossip::Id(_) => Intent::Fetch,
     };
     // Today's order: the node's limit, then the peer's. Both answer
-    // `FullQueue`, so the peer's is checked first here, before a slot is
-    // taken.
+    // `FullQueue`, before the core is asked for a slot.
+    let Some(queue_slot) = QueueSlot::take(&shared) else {
+        return Err(MempoolError::FullQueue.into());
+    };
     let slot = match &from {
         Some(peer) => match PeerSlot::take(&shared, peer) {
             Some(slot) => Some(slot),
@@ -352,7 +356,6 @@ async fn queue(
     // its peer until its verdict, so one peer cannot hold more than its
     // share of waiters.
     metrics::counter!("mempool.queued.transactions.total").increment(1);
-    shared.set_in_flight(1);
     let (answer, receiver) = oneshot::channel();
     tokio::spawn(async move {
         // Today's download task has one deadline, `RATE_LIMIT_DELAY`, for the
@@ -361,10 +364,58 @@ async fn queue(
         let deadline = tokio::time::Instant::now() + RATE_LIMIT_DELAY;
         let result = bring_in(&shared, reservation, item, from, deadline).await;
         drop(slot);
-        shared.set_in_flight(-1);
+        drop(queue_slot);
         let _ = answer.send(result);
     });
     Ok(receiver)
+}
+
+/// One of today's [`MAX_INBOUND_CONCURRENCY`] node-wide slots, held from the
+/// request until its item is answered at the second stage, as today's
+/// downloader counts a queued item. That bounds the bodies this adapter holds,
+/// including ones waiting for a reservation. Dropping it frees the slot.
+struct QueueSlot {
+    shared: Arc<Shared>,
+}
+
+impl QueueSlot {
+    /// Takes a slot, or `None` if all are in use.
+    fn take(shared: &Arc<Shared>) -> Option<Self> {
+        let mut queued = shared
+            .queued
+            .lock()
+            .expect("no code panics while holding the queued count");
+        if *queued >= MAX_INBOUND_CONCURRENCY {
+            set_queued_gauge(*queued);
+            return None;
+        }
+        *queued += 1;
+        set_queued_gauge(*queued);
+        Some(Self {
+            shared: shared.clone(),
+        })
+    }
+}
+
+impl Drop for QueueSlot {
+    /// Frees the slot.
+    fn drop(&mut self) {
+        let mut queued = self
+            .shared
+            .queued
+            .lock()
+            .expect("no code panics while holding the queued count");
+        *queued = queued.saturating_sub(1);
+        set_queued_gauge(*queued);
+    }
+}
+
+/// Sets today's `mempool.currently.queued.transactions` gauge. Called under
+/// the count's lock, so the last value written is the current count.
+fn set_queued_gauge(queued: usize) {
+    // A count of at most `MAX_INBOUND_CONCURRENCY`, far below where `f64`
+    // loses precision.
+    metrics::gauge!("mempool.currently.queued.transactions").set(queued as f64);
 }
 
 /// One undecided transaction counted against a peer, from its reservation
@@ -584,23 +635,6 @@ async fn bring_in(
 }
 
 impl Shared {
-    /// Moves the count of queued items in flight by `by`, and sets today's
-    /// gauge for it.
-    fn set_in_flight(&self, by: isize) {
-        use std::sync::atomic::Ordering;
-        let now = if by >= 0 {
-            self.in_flight
-                .fetch_add(by.unsigned_abs(), Ordering::Relaxed)
-                .saturating_add(by.unsigned_abs())
-        } else {
-            self.in_flight
-                .fetch_sub(by.unsigned_abs(), Ordering::Relaxed)
-                .saturating_sub(by.unsigned_abs())
-        };
-        // A count of tasks, far below where `f64` loses precision.
-        metrics::gauge!("mempool.currently.queued.transactions").set(now as f64);
-    }
-
     /// The legacy peer to charge for a body `peer` served: the peer, unless
     /// the pool must never charge it.
     fn supplier(&self, peer: PeerSocketAddr) -> Option<PeerSocketAddr> {
@@ -1114,6 +1148,133 @@ mod tests {
             .is_cooling_down(addr.ip(), Instant::now())
     }
 
+    /// What one push from `peer` that the core rejects with `charge` did to
+    /// that peer, with `exempt` peers and a node for which `may_cool` says
+    /// whether a cooldown may start: whether it is cooling down, and the
+    /// misbehavior reported for it, if any.
+    async fn charged_by_one_push(
+        peer: std::net::SocketAddr,
+        charge: Charge,
+        exempt: Exempt,
+        may_cool: bool,
+    ) -> (bool, Option<(PeerSocketAddr, u32)>) {
+        use zakura_node_services::mempool::port::{
+            pool_port, PoolCommand, Rejection, RejectionScope, ReservationId,
+        };
+
+        let (handle, mut inbox) = pool_port();
+        let (misbehavior, mut reports) = mpsc::channel(1);
+        let core = CoreMempool::new(
+            handle,
+            Timeout::new(
+                BoxCloneSyncService::new(NeverReady),
+                TRANSACTION_DOWNLOAD_TIMEOUT,
+            ),
+            BoxCloneSyncService::new(NeverReady),
+            Arc::new(move |_| may_cool),
+            chain_holding(None),
+            super::super::super::Config::default().max_transaction_bytes,
+            false,
+            misbehavior,
+            Arc::new(exempt),
+        );
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let queued = tokio::spawn(queue(
+            core.shared.clone(),
+            Gossip::Tx(body),
+            Some(QueueSource::LegacySocket(peer)),
+        ));
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the push reserves first");
+        };
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            tx_id,
+            false,
+            true,
+            Default::default(),
+        )));
+        let receiver = queued
+            .await
+            .expect("the task does not panic")
+            .expect("the push passes the first stage");
+        let Some(PoolCommand::Submit {
+            reservation, reply, ..
+        }) = inbox.next().await
+        else {
+            panic!("the push is submitted");
+        };
+        let _accepted = reservation.accept();
+        let _ = reply.send(Verdict::Rejected(Rejection {
+            scope: RejectionScope::ExactTip,
+            charge,
+            tip: Height(0),
+            detail: Arc::new(std::io::Error::other("invalid")),
+        }));
+        let _ = receiver.await.expect("the push is answered");
+        (
+            core.shared
+                .cooldowns
+                .is_cooling_down(peer.ip(), Instant::now()),
+            reports.try_recv().ok(),
+        )
+    }
+
+    /// A ban charge bans the legacy peer that pushed the body with today's
+    /// full misbehavior score, whether or not the node is current, as today's
+    /// `transaction_data_failure_bans_peer_without_a_current_tip` pins for
+    /// today's pool. It starts no cooldown.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ban_charge_bans_its_peer_even_when_the_node_is_not_current() {
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 1], 8233));
+        for current in [true, false] {
+            let (cooling, report) =
+                charged_by_one_push(peer, Charge::Ban, Exempt::default(), current).await;
+            assert!(!cooling, "a ban starts no cooldown");
+            assert_eq!(
+                report,
+                Some((peer.into(), zn::constants::MAX_PEER_MISBEHAVIOR_SCORE)),
+                "the peer is banned, current: {current}"
+            );
+        }
+    }
+
+    /// A zcashd-compat sidecar and a configured unconditional peer are never
+    /// banned or cooled down, including through an IPv4-mapped address, as
+    /// today's `zcashd_compat_peer_is_never_penalized` and
+    /// `unconditional_peers_are_never_penalized` pin for today's pool. A
+    /// peer outside both is charged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn exempt_peers_are_never_charged() {
+        let unconditional: zn::Config = toml::from_str("unconditional_peers = ['198.51.100.0/24']")
+            .expect("a valid network config");
+        let exempt = || Exempt {
+            zcashd_compat: [std::net::IpAddr::from([192, 0, 2, 1])]
+                .into_iter()
+                .collect(),
+            unconditional: unconditional.unconditional_peers.clone(),
+        };
+        for (address, charged) in [
+            ("192.0.2.1:8233", false),
+            ("[::ffff:192.0.2.1]:8233", false),
+            ("198.51.100.7:8233", false),
+            ("[::ffff:198.51.100.7]:8233", false),
+            ("203.0.113.9:8233", true),
+        ] {
+            let peer: std::net::SocketAddr = address.parse().expect("a valid address");
+            let (_, report) = charged_by_one_push(peer, Charge::Ban, exempt(), true).await;
+            assert_eq!(report.is_some(), charged, "banned: {address}");
+            let (cooling, report) =
+                charged_by_one_push(peer, Charge::Cooldown, exempt(), true).await;
+            assert_eq!(cooling, charged, "cooling down: {address}");
+            assert!(report.is_none(), "a cooldown is not a ban: {address}");
+        }
+    }
+
     /// A cooldown charge cools the peer that pushed the body only while the
     /// node is current and its best tip is still the one the failure was
     /// verified at, asked when the verdict arrives, as today's pool asks when
@@ -1262,19 +1423,15 @@ mod tests {
             .map(|(n, id)| tokio::spawn(queue(core.shared.clone(), Gossip::Id(*id), Some(peer(n)))))
             .collect();
 
-        // The core grants its slots and refuses the rest, then stops taking
+        // The adapter's node-wide limit, which is the core's, refuses the
+        // offers past it. The core grants every slot, then stops taking
         // commands.
-        for granted in 0..offered {
+        for granted in 0..MAX_PENDING {
             let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
-                panic!("each offer reserves");
+                panic!("each offer within the limit reserves");
             };
-            let answer = if granted < MAX_PENDING {
-                let id = ReservationId(u64::try_from(granted).expect("few"));
-                Ok(inbox.grant(id, tx_id, false, true, Default::default()))
-            } else {
-                Err(Unreserved::NoRoom)
-            };
-            let _ = reply.send(answer);
+            let id = ReservationId(u64::try_from(granted).expect("few"));
+            let _ = reply.send(Ok(inbox.grant(id, tx_id, false, true, Default::default())));
         }
         let mut refused = 0;
         for task in queued {
@@ -1306,5 +1463,97 @@ mod tests {
             waiting += 1;
         }
         assert_eq!(waiting, MAX_PENDING, "each body waits under its slot");
+    }
+
+    /// Bodies pushed while the core takes no commands wait for their
+    /// reservations under today's node-wide limit, so the adapter holds no
+    /// more of them than today's pool would. The pushes past the limit are
+    /// refused at once as a full queue.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pushed_bodies_waiting_for_a_paused_core_stay_within_the_node_limit() {
+        use zakura_chain::transaction::{LockTime, Transaction, UnminedTx};
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let pushed = MAX_INBOUND_CONCURRENCY + 100;
+        let template = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let (handle, mut inbox) = pool_port();
+        let core = adapter_on(handle);
+        // Five pushes from each of many peers, so no peer's limit is reached.
+        let pushes: Vec<_> = (0..pushed)
+            .map(|n| {
+                let mut transaction = Transaction::clone(template.transaction());
+                let height = u32::try_from(n + 1).expect("few pushes");
+                if let Transaction::V1 { lock_time, .. }
+                | Transaction::V2 { lock_time, .. }
+                | Transaction::V3 { lock_time, .. }
+                | Transaction::V4 { lock_time, .. }
+                | Transaction::V5 { lock_time, .. } = &mut transaction
+                {
+                    *lock_time = LockTime::Height(Height(height));
+                }
+                let peer = u16::try_from(n / MAX_INBOUND_CONCURRENCY_PER_PEER).expect("few peers");
+                let [high, low] = peer.to_be_bytes();
+                let peer = QueueSource::LegacySocket(std::net::SocketAddr::from((
+                    [10, 2, high, low],
+                    8233,
+                )));
+                tokio::spawn(queue(
+                    core.shared.clone(),
+                    Gossip::Tx(UnminedTx::from(transaction)),
+                    Some(peer),
+                ))
+            })
+            .collect();
+
+        // The core answers nothing. Each push within the limit waits for its
+        // reservation, holding its body.
+        let mut waiting = Vec::new();
+        for _ in 0..MAX_INBOUND_CONCURRENCY {
+            let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
+                panic!("each push within the limit reserves");
+            };
+            waiting.push(reply);
+        }
+        // Every push past the limit is answered without the core.
+        for _ in 0..1_000 {
+            if pushes.iter().filter(|push| push.is_finished()).count()
+                == pushed - MAX_INBOUND_CONCURRENCY
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let mut refused = 0;
+        for push in pushes {
+            if push.is_finished() {
+                let answer = push.await.expect("the task does not panic");
+                assert!(
+                    matches!(
+                        answer.map_err(|error| error.downcast::<MempoolError>().map(|e| *e)),
+                        Err(Ok(MempoolError::FullQueue))
+                    ),
+                    "a push past the limit is a full queue"
+                );
+                refused += 1;
+            }
+        }
+        assert_eq!(
+            refused,
+            pushed - MAX_INBOUND_CONCURRENCY,
+            "the pushes past the limit"
+        );
+        assert!(
+            inbox.try_next().is_none(),
+            "no push past the limit reached the core"
+        );
+        assert_eq!(
+            *core.shared.queued.lock().expect("not poisoned"),
+            MAX_INBOUND_CONCURRENCY,
+            "the waiting pushes fill the node's limit"
+        );
     }
 }

@@ -2260,15 +2260,7 @@ fn hand_written_rows() -> Vec<Row> {
             name: despite.name.to_owned(),
         }],
         G23,
-        Expected::Caught {
-            case: despite,
-            harness: WIRE,
-            set: &[COMMIT],
-            found: Found::AtStep,
-            companions: super::companions::COMPANIONS,
-            not_applicable: super::not_applicable::expected(despite),
-            patched_not_applicable: super::not_applicable::patched_expected(despite),
-        },
+        despite_close_caught(),
     ));
     rows.push(sim_row(COMMIT, storage_harnesses, commit));
 
@@ -3074,7 +3066,8 @@ pub struct GateRequirement {
 /// transitional until the hdr-14 PR that builds them. The obligations
 /// themselves are listed apart, in
 /// [`GATE_OBLIGATIONS`](super::required::GATE_OBLIGATIONS), so an entry
-/// deleted here still leaves its key required.
+/// deleted here still leaves its key required. [`DESPITE_CLOSE_CAUGHT`],
+/// which takes its case's `Caught`, has no entry here.
 pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     GateRequirement {
         name: "gate-1/a-a-and-a-b-a",
@@ -3124,16 +3117,6 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
             test: sim_test(
                 WIRE_WITNESS,
                 "each_invalid_label_witness_has_a_conformant_control",
-            ),
-        },
-    },
-    GateRequirement {
-        name: "gate-2/despite-close/caught",
-        gates: G2,
-        expected: Expected::Passes {
-            test: sim_test(
-                DESPITE_CLOSE_TESTS,
-                "the_path_break_needs_a_retained_violation",
             ),
         },
     },
@@ -3529,7 +3512,30 @@ const fn bound_open(name: &'static str, reason: &'static str) -> GateRequirement
     }
 }
 
-/// The [`GATE_REQUIREMENTS`] as expected results.
+/// The gate obligation the despite-close case's own catch serves, which
+/// its obligation permits ([`Permit::Caught`](obligation::Permit::Caught)),
+/// so it has no [`GATE_REQUIREMENTS`] entry.
+pub const DESPITE_CLOSE_CAUGHT: &str = "gate-2/despite-close/caught";
+
+/// The despite-close case's `Caught`: its baseline holds, its patched run
+/// violates `commit-only-authorized` at a step, and its `Draft` run's three
+/// companions hold. Its row's [`Key::Case`] and [`DESPITE_CLOSE_CAUGHT`]
+/// both take it.
+fn despite_close_caught() -> Expected {
+    let despite = super::companions::DESPITE_CLOSE;
+    Expected::Caught {
+        case: despite,
+        harness: WIRE,
+        set: &[COMMIT],
+        found: Found::AtStep,
+        companions: super::companions::COMPANIONS,
+        not_applicable: super::not_applicable::expected(despite),
+        patched_not_applicable: super::not_applicable::patched_expected(despite),
+    }
+}
+
+/// The [`GATE_REQUIREMENTS`] as expected results, and
+/// [`DESPITE_CLOSE_CAUGHT`] as the despite-close case's `Caught`.
 pub fn requirement_results() -> Vec<ExpectedResult> {
     GATE_REQUIREMENTS
         .iter()
@@ -3542,6 +3548,13 @@ pub fn requirement_results() -> Vec<ExpectedResult> {
                 requirement.expected.clone(),
             )
         })
+        .chain([result(
+            vec![Key::Requirement {
+                name: DESPITE_CLOSE_CAUGHT.to_owned(),
+            }],
+            G2,
+            despite_close_caught(),
+        )])
         .collect()
 }
 

@@ -881,3 +881,338 @@ patch = "discovery-table/wants-unnamed-services/wants-unnamed-services.patch"
 property = "discovery/s4v2/services/sender-within-owed"
 harness = "discovery/wire"
 families = ["get-header-sync-service"]
+
+# The handshake cases. Each family draws the test's scenario through
+# `handshake/wire`'s or `handshake/counts`'s decoder.
+
+[[drawn-witness]]
+patch = "teardown/admitted-keeps-setup-slot/admitted-keeps-setup-slot.patch"
+property = "session/capacity-conserved"
+harness = "handshake/wire"
+families = ["partial-session"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-network-binding/skip-network-binding.patch"
+property = "handshake/hello/wrong-network-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-authenticated-identity/skip-authenticated-identity.patch"
+property = "handshake/hello/identity-mismatch-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/accept-unoffered-capability/accept-unoffered-capability.patch"
+property = "handshake/ack/unoffered-capability-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-nonce-echo/skip-nonce-echo.patch"
+property = "handshake/ack/bad-nonce-echo-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-hello-magic/skip-hello-magic.patch"
+property = "handshake/hello/bad-magic-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-hello-version/skip-hello-version.patch"
+property = "handshake/hello/bad-version-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-hello-protocol/skip-hello-protocol.patch"
+property = "handshake/hello/bad-protocol-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-handshake-path/skip-handshake-path.patch"
+property = "handshake/hello/bad-path-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-remote-role/skip-remote-role.patch"
+property = "handshake/hello/bad-role-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-chain-binding/skip-chain-binding.patch"
+property = "handshake/hello/wrong-chain-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-required-channel/skip-required-channel.patch"
+property = "handshake/hello/missing-capability-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-ack-protocol/skip-ack-protocol.patch"
+property = "handshake/ack/bad-protocol-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-ack-magic/skip-ack-magic.patch"
+property = "handshake/ack/bad-magic-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-ack-version/skip-ack-version.patch"
+property = "handshake/ack/bad-version-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-native-initiator-nonce/skip-native-initiator-nonce.patch"
+property = "handshake/hello/nonzero-initiator-nonce-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-native-responder-nonce/skip-native-responder-nonce.patch"
+property = "handshake/hello/nonzero-responder-nonce-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-native-transcript/skip-native-transcript.patch"
+property = "handshake/hello/nonzero-native-transcript-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-frame-limits/skip-frame-limits.patch"
+property = "handshake/hello/bad-frame-limit-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-frame-limits/skip-frame-limits.patch"
+property = "handshake/ack/bad-frame-limit-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-message-limits/skip-message-limits.patch"
+property = "handshake/hello/bad-message-limit-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-message-limits/skip-message-limits.patch"
+property = "handshake/ack/bad-message-limit-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-stream-limits/skip-stream-limits.patch"
+property = "handshake/hello/bad-stream-limit-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-stream-limits/skip-stream-limits.patch"
+property = "handshake/ack/bad-stream-limit-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-queue-limits/skip-queue-limits.patch"
+property = "handshake/hello/bad-queue-limit-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-queue-limits/skip-queue-limits.patch"
+property = "handshake/ack/bad-queue-limit-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-idle-limits/skip-idle-limits.patch"
+property = "handshake/hello/bad-idle-limit-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-idle-limits/skip-idle-limits.patch"
+property = "handshake/ack/bad-idle-limit-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-requested-limit-ceilings/skip-requested-limit-ceilings.patch"
+property = "handshake/ack/limits-above-request-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-prelude-magic/skip-prelude-magic.patch"
+property = "handshake/prelude/bad-magic-resets"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/fallback-for-unknown-stream/fallback-for-unknown-stream.patch"
+property = "handshake/prelude/unknown-kind-resets"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-prelude-capability/skip-prelude-capability.patch"
+property = "handshake/prelude/unnegotiated-capability-resets"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-selected-stream-version/skip-selected-stream-version.patch"
+property = "handshake/prelude/unselected-version-resets"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/allow-unexpected-request-id/allow-unexpected-request-id.patch"
+property = "handshake/prelude/unexpected-request-id-closes"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/allow-missing-request-id/allow-missing-request-id.patch"
+property = "handshake/prelude/request-without-id-closes"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-prelude-frame-cap/skip-prelude-frame-cap.patch"
+property = "handshake/prelude/undersized-cap-closes"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/allow-ineligible-opener/allow-ineligible-opener.patch"
+property = "handshake/prelude/ineligible-opener-closes"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-control-read-hard-cap/skip-control-read-hard-cap.patch"
+property = "handshake/hello/oversize-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-control-read-hard-cap/skip-control-read-hard-cap.patch"
+property = "handshake/ack/oversize-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-admission/allow-one-extra-registration/allow-one-extra-registration.patch"
+property = "handshake/connections-per-address-bounded"
+harness = "handshake/wire"
+families = ["shared-addresses"]
+
+[[drawn-witness]]
+patch = "handshake-admission/retain-pending-charge/retain-pending-charge.patch"
+property = "handshake/counts-match-permits"
+harness = "handshake/counts"
+families = ["untagged"]
+
+[[drawn-witness]]
+patch = "handshake-admission/remove-inbound-reserve/remove-inbound-reserve.patch"
+property = "handshake/pending-bounded"
+harness = "handshake/wire"
+families = ["dial-reserve"]
+
+[[drawn-witness]]
+patch = "handshake-admission/remove-inbound-reserve/remove-inbound-reserve.patch"
+property = "handshake/dial-reserve-kept"
+harness = "handshake/wire"
+families = ["dial-reserve"]
+
+[[drawn-witness]]
+patch = "handshake-table/refuse-conformant-hello/refuse-conformant-hello.patch"
+property = "handshake/hello/conformant-never-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/refuse-conformant-ack/refuse-conformant-ack.patch"
+property = "handshake/ack/conformant-never-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/refuse-conformant-prelude/refuse-conformant-prelude.patch"
+property = "handshake/prelude/conformant-never-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-release/retain-quic-slot/retain-quic-slot.patch"
+property = "handshake/hello/refusal-releases-slot"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-release/retain-quic-slot/retain-quic-slot.patch"
+property = "handshake/ack/refusal-releases-slot"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-quic/skip-pending-address-limit/skip-pending-address-limit.patch"
+property = "handshake/quic/pending-per-address-bounded"
+harness = "handshake/wire"
+families = ["quic-pending"]
+
+[[drawn-witness]]
+patch = "handshake-quic/skip-retry-threshold/skip-retry-threshold.patch"
+property = "handshake/quic/retry-before-unvalidated-accept"
+harness = "handshake/wire"
+families = ["quic-retry"]
+
+[[drawn-witness]]
+patch = "handshake-quic/skip-inbound-tls-deadline/skip-inbound-tls-deadline.patch"
+property = "handshake/quic/finishes-in-time"
+harness = "handshake/wire"
+families = ["quic-timeout"]
+
+[[drawn-witness]]
+patch = "handshake-quic/accept-unsupported-alpn/accept-unsupported-alpn.patch"
+property = "handshake/quic/alpn-required"
+harness = "handshake/wire"
+families = ["quic-alpn"]
+
+[[drawn-witness]]
+patch = "handshake-quic/accept-wrong-dialed-key/accept-wrong-dialed-key.patch"
+property = "handshake/quic/identity-required"
+harness = "handshake/wire"
+families = ["quic-identity"]
+
+[[drawn-witness]]
+patch = "handshake-admission/ignore-transport-reservations/ignore-transport-reservations.patch"
+property = "handshake/pending-bounded"
+harness = "handshake/wire"
+families = ["dial-reserve"]
+
+# `dial-reserve` draws the nine-second return path only under transport
+# pressure, and it adds listening peers the test leaves out.
+[[drawn-witness]]
+patch = "handshake-release/no-closing-deadline/no-closing-deadline.patch"
+property = "handshake/hello/refusal-releases-slot"
+harness = "handshake/wire"
+families = ["dial-reserve"]

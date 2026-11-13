@@ -1411,8 +1411,9 @@ fn new_protected_test_connection() -> (
     super::new_protected_test_connection()
 }
 
-/// A block we announce, the peer's request for it and the block write are each traced
-/// under the peer's name, in the order they happen.
+/// A block we announce, the peer's request for it and the block write (or the block being
+/// missing) are each traced under the peer's name, in the order they happen. A block the peer
+/// asks for without our having announced it to the peer is not traced.
 #[tokio::test(start_paused = true)]
 async fn announcing_and_serving_a_block_is_traced() {
     use crate::{
@@ -1445,30 +1446,48 @@ async fn announcing_and_serving_a_block_is_traced() {
         .zcash_deserialize_into()
         .unwrap();
     let hash = block.hash();
+    // Announced to the peer, then gone by the time the peer asks for it.
     let missing = block::Hash([7; 32]);
+    // Never announced to the peer.
+    let unannounced = block::Hash([8; 32]);
 
-    let advertisement = tokio::spawn(gossip.advertise(hash));
+    let advertisement = tokio::spawn(gossip.clone().advertise(hash));
     assert_eq!(
         outbound.next().await.unwrap(),
         Message::Inv(vec![hash.into()])
     );
+    let missing_advertisement = tokio::spawn(gossip.advertise(missing));
+    assert_eq!(
+        outbound.next().await.unwrap(),
+        Message::Inv(vec![missing.into()])
+    );
     peer_tx
-        .send(Ok(Message::GetData(vec![hash.into(), missing.into()])))
+        .send(Ok(Message::GetData(vec![
+            hash.into(),
+            missing.into(),
+            unannounced.into(),
+        ])))
         .await
         .unwrap();
     inbound
-        .expect_request(Request::BlocksByHash(IndexSet::from([hash, missing])))
+        .expect_request(Request::BlocksByHash(IndexSet::from([
+            hash,
+            missing,
+            unannounced,
+        ])))
         .await
         .respond(Response::Blocks(vec![
             InventoryResponse::Available((block.clone().into(), None)),
             InventoryResponse::Missing(missing),
+            InventoryResponse::Missing(unannounced),
         ]));
     assert_eq!(outbound.next().await.unwrap(), Message::Block(block.into()));
     assert_eq!(
         outbound.next().await.unwrap(),
-        Message::NotFound(vec![missing.into()])
+        Message::NotFound(vec![missing.into(), unannounced.into()])
     );
     advertisement.abort();
+    missing_advertisement.abort();
     connection_task.abort();
 
     let rows: Vec<_> = written
@@ -1486,6 +1505,7 @@ async fn announcing_and_serving_a_block_is_traced() {
         rows,
         [
             ("block_inv_sent".to_owned(), hash.to_string()),
+            ("block_inv_sent".to_owned(), missing.to_string()),
             ("block_getdata_received".to_owned(), hash.to_string()),
             ("block_getdata_received".to_owned(), missing.to_string()),
             ("block_sent".to_owned(), hash.to_string()),

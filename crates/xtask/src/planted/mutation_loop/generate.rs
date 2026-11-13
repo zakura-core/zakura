@@ -121,22 +121,25 @@ pub(super) const EXCLUDED_DIRS: &[&str] = &[
 /// the repository root.
 const FUZZ_DIR: &str = "qa/fuzz/sim";
 
-/// Every path, relative to the repository root, whose change can change
-/// any case's generator lanes under `flags`, beside the case's own paths:
-/// the work list, whose `[[no-generator]]` records decide which cases get
-/// a lane, then [`EXCLUDED_DIRS`], whose inputs an `inproc` search skips,
-/// or [`FUZZ_DIR`], whose targets a `libfuzzer` lane builds. None with the
-/// lanes off.
-pub(super) fn watched(flags: &GenerateFlags) -> Vec<PathBuf> {
-    if !flags.on() {
-        return Vec::new();
-    }
-    let mut paths = vec![PathBuf::from(WORK_LIST)];
-    match flags.mode {
-        GenerateMode::Inproc => paths.extend(EXCLUDED_DIRS.iter().map(PathBuf::from)),
-        GenerateMode::Libfuzzer => paths.push(PathBuf::from(FUZZ_DIR)),
-    }
-    paths
+/// True if `changed`, paths relative to the repository root, holds one
+/// whose change can change any case's generator lanes under `flags`: the
+/// work list, whose `[[no-generator]]` records decide which cases get a
+/// lane, then a `.bin` input under [`EXCLUDED_DIRS`], the only files an
+/// `inproc` search skips ([`write_exclusions`]), or a file under
+/// [`FUZZ_DIR`], whose targets a `libfuzzer` lane builds. False with the
+/// lanes off, so a triage-only commit selects no case.
+pub(super) fn affected(flags: &GenerateFlags, changed: &[PathBuf]) -> bool {
+    flags.on()
+        && changed.iter().any(|path| {
+            path == Path::new(WORK_LIST)
+                || match flags.mode {
+                    GenerateMode::Inproc => {
+                        path.extension().is_some_and(|extension| extension == "bin")
+                            && EXCLUDED_DIRS.iter().any(|dir| path.starts_with(dir))
+                    }
+                    GenerateMode::Libfuzzer => path.starts_with(FUZZ_DIR),
+                }
+        })
 }
 
 /// The file every `inproc` search reads its exclusions from, under

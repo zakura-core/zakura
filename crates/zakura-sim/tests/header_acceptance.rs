@@ -549,7 +549,7 @@ fn every_required_key_is_covered_once_with_its_gates() {
             reason: "replaced",
             owner: "test",
             approval: Approval::Pending,
-            until: Some("hdr-14.4"),
+            until: Some("hdr-14.8"),
         };
         m.expected.push(open);
     });
@@ -2998,11 +2998,10 @@ fn every_narrowing_entry_has_a_test_or_its_pr() {
 /// refuses.
 ///
 /// hdr-14.8's frozen-head run is still to come, and the node cleanup keys
-/// wait for its per-run cleanup record. hdr-14.4 and hdr-9d.1 merged
-/// without the evidence their rows wait for: `sim/no-livelock`'s
-/// header-harness catch, and the bound table's per-row fixtures. They stay here, named, until those are built or Adam
-/// approves standing exclusions for them.
-const OPEN_PRS: &[&str] = &["hdr-14.4", "hdr-14.8", "hdr-9d.1"];
+/// wait for its per-run cleanup record. hdr-9d.1 merged without the
+/// evidence its row waits for: the bound table's per-row fixtures. It stays
+/// here, named, until those are built or Adam approves an exclusion.
+const OPEN_PRS: &[&str] = &["hdr-14.8", "hdr-9d.1"];
 
 #[test]
 fn every_transitional_row_names_an_open_pr() {
@@ -3019,8 +3018,19 @@ fn every_transitional_row_names_an_open_pr() {
         *owner = "";
     }
     assert!(!open_errors(&ownerless).is_empty());
+    // No catch key is transitional any more, so the control makes
+    // `sim/no-livelock`'s standing exclusion a transitional Open first.
     let livelock = "sim/no-livelock";
     let mut replaced = manifest.expected.clone();
+    let open = replaced
+        .iter_mut()
+        .find(|r| r.keys.contains(&Key::catch(livelock)))
+        .expect("sim/no-livelock's catch key is covered");
+    let Expected::Open { until, .. } = &mut open.expected else {
+        panic!("sim/no-livelock's catch is an Open");
+    };
+    *until = Some("hdr-14.8");
+    assert_eq!(open_errors(&replaced), Vec::<String>::new());
     let caught = replaced
         .iter()
         .find_map(|r| match r.expected {

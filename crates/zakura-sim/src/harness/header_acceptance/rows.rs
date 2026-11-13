@@ -1249,13 +1249,6 @@ pub fn native_open(until: &'static str) -> Expected {
     )
 }
 
-/// `key`'s expected result with the gates `gates`: the transitional `Open`
-/// [`owed_open`] writes for it.
-fn owed(key: Key, gates: &[Gate]) -> ExpectedResult {
-    let open = owed_open(&key).expect("every key a row calls owed for has an owed_open entry");
-    result(vec![key], gates, open)
-}
-
 /// The witness and bypass tests `COVERAGE` names for a header row, each an
 /// executed `Passes`. Listed here by hand, so the static check compares them
 /// with `COVERAGE`.
@@ -1353,15 +1346,23 @@ pub struct StandingExclusion {
 }
 
 /// The approved standing exclusions of passing, catch and missing-source
-/// keys: `headers/long-payload-closes`' catch, by Adam's hdr-14.5 ruling.
-/// The two `over-owed-closes` catch exclusions still await approval, so
-/// they block.
-pub static STANDING_EXCLUSIONS: &[StandingExclusion] = &[StandingExclusion {
-    key: ("catch", "header-sync/s5v9/headers/long-payload-closes", ""),
-    owner: "hdr-14",
-    reason: LONG_PAGE_UNREACHED,
-    approval: HDR_14_5_RULING,
-}];
+/// keys: `headers/long-payload-closes`' catch, by Adam's hdr-14.5 ruling,
+/// and `sim/no-livelock`'s catch, by his hdr-14.4 one. The two
+/// `over-owed-closes` catch exclusions still await approval, so they block.
+pub static STANDING_EXCLUSIONS: &[StandingExclusion] = &[
+    StandingExclusion {
+        key: ("catch", "header-sync/s5v9/headers/long-payload-closes", ""),
+        owner: "hdr-14",
+        reason: LONG_PAGE_UNREACHED,
+        approval: HDR_14_5_RULING,
+    },
+    StandingExclusion {
+        key: ("catch", "sim/no-livelock", ""),
+        owner: "hdr-14",
+        reason: LIVELOCK_UNCATCHABLE,
+        approval: LIVELOCK_RULING,
+    },
+];
 
 /// Whether `exclusions` grants `key` exactly the standing `Open` `expected`.
 pub fn exclusion_granted(exclusions: &[StandingExclusion], key: &Key, expected: &Expected) -> bool {
@@ -1397,22 +1398,25 @@ const OPERATION_IDS_UNREACHED: &str =
      storage operations and logs their submissions and completions, so only storage-fake code \
      can break the rule and no production patch can";
 
-/// Why `sim/no-livelock`'s catch is still owed.
-const SIM_WIDE_CATCH: &str = "the sim-wide IDs' bypasses run on test-only harnesses, so a \
-                              header-harness catch or an approved Open is still owed";
+/// Why `sim/no-livelock` has no planted catch: a node spin never ends by
+/// itself, so a case's `Draft` run can't complete. The step loop's detector
+/// is shown on a header fixture by
+/// `tests/header_hold_release.rs::a_spin_with_a_held_reply_open_violates_no_livelock`.
+const LIVELOCK_UNCATCHABLE: &str =
+    "a planted livelock keeps a node task ready at one instant, and the step loop moves the \
+     clock only once no task is ready, so the spin never ends by itself: its Draft run, which \
+     must complete past the stop, runs to its budget and then to the drain's bound, the \
+     harness failure DrainBound; no header fixture holds finite work at one instant near the \
+     limit (honest recoveries take about 480 of 5,000 steps), so no honest patch spins long \
+     enough and then stops. The detector itself is shown on the held-locator header fixture \
+     by tests/header_hold_release.rs::a_spin_with_a_held_reply_open_violates_no_livelock, \
+     whose test-only Spinning harness violates sim/no-livelock with no panic and no harness \
+     failure";
 
-/// The transitional `Open` each transitional passing or catch key owes,
-/// whole: its reason, owner and the PR it waits for, written from the
-/// plan's PR table. `sim/no-livelock`'s catch is hdr-14.4's.
-/// [`Key::covers`] takes a transitional `Open` on such a key only if it's
-/// exactly this one.
-pub fn owed_open(key: &Key) -> Option<Expected> {
-    let (reason, until) = match key {
-        Key::Catch { property } if property == SIM_WIDE[1] => (SIM_WIDE_CATCH, "hdr-14.4"),
-        _ => return None,
-    };
-    Some(transitional(reason, "Adam's side", until))
-}
+/// Adam's approval of `sim/no-livelock`'s catch exclusion.
+const LIVELOCK_RULING: Approval = Approval::Adam {
+    record: "Adam, 2026-11-12, hdr-14.4 sim/no-livelock catch exclusion",
+};
 
 /// Every native mutation directory there has been, written apart from
 /// `NATIVE_MUTATIONS`, so a mutation whose directory and classification are
@@ -2909,7 +2913,16 @@ fn hand_written_rows() -> Vec<Row> {
     // (`TEST_ONLY_WITNESSES`), so its counted history is a liveness
     // fixture, which declares `BoundedAdversary` from its start.
     let mut livelock = holds(SIM_WIDE[1], NONE, HOLD_WITNESSES);
-    livelock.push(owed(Key::catch(SIM_WIDE[1]), NONE));
+    livelock.push(result(
+        vec![Key::catch(SIM_WIDE[1])],
+        NONE,
+        Expected::Open {
+            reason: LIVELOCK_UNCATCHABLE,
+            owner: "hdr-14",
+            approval: LIVELOCK_RULING,
+            until: None,
+        },
+    ));
     rows.push(sim_row(SIM_WIDE[1], node_harnesses, livelock));
 
     rows

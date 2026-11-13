@@ -61,6 +61,12 @@ mod height_map;
 pub use height_map::benchmark::{benchmark_height_map, HeightMapBenchmarkSample};
 mod index;
 #[cfg(feature = "internal-bench")]
+mod snapshot_cycle_benchmark;
+#[cfg(feature = "internal-bench")]
+pub use snapshot_cycle_benchmark::{
+    benchmark_chain_snapshot_cycle, ChainSnapshotBenchmarkConfig, ChainSnapshotBenchmarkSample,
+};
+#[cfg(feature = "internal-bench")]
 mod transparent_index_benchmark;
 #[cfg(feature = "internal-bench")]
 pub use transparent_index_benchmark::{

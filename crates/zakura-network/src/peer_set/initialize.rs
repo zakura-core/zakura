@@ -9,10 +9,7 @@ use std::{
     convert::Infallible,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -26,7 +23,7 @@ use indexmap::IndexSet;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
-    time::{sleep, Instant},
+    time::Instant,
 };
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::task::AbortOnDropHandle;
@@ -64,6 +61,12 @@ use crate::{
 mod tests;
 
 mod recent_by_ip;
+mod unconditional_peers;
+
+use unconditional_peers::{
+    keep_unconditional_peers_connected, leave_out_undialable_unconditional_peers,
+    unconditional_peer_dial_addrs,
+};
 
 /// A successful outbound peer connection attempt or inbound connection handshake.
 ///
@@ -255,6 +258,8 @@ where
         info!("legacy P2P disabled; not opening Zcash protocol listener");
         (None, config.listen_addr)
     };
+    let mut config = config;
+    leave_out_undialable_unconditional_peers(&mut config, listen_addr);
     // Clone the inbound service for the Zakura legacy-gossip sink before the
     // handshake builder consumes the original below. The factory only runs when
     // `v2_p2p` is enabled; otherwise the endpoint is `None` and the clone drops.
@@ -341,7 +346,7 @@ where
             .with_advertised_services(advertised_services)
             .with_user_agent(user_agent)
             .with_latest_chain_tip(latest_chain_tip.clone())
-            .with_peer_registry(peer_registry)
+            .with_peer_registry(peer_registry.clone())
             .with_protected_peer_ips(protected_peer_ips)
             .with_bans(bans.clone())
             .with_tcp_warmup(peer::TcpWarmup::spawn(
@@ -413,7 +418,7 @@ where
     ];
 
     if let Some(tcp_listener) = tcp_listener {
-        // Connect peerset_tx to the 3 peer sources:
+        // Connect peerset_tx to the 4 peer sources:
         //
         // 1. Incoming peer connections, via a listener.
         let listen_fut = accept_inbound_connections(
@@ -429,7 +434,22 @@ where
             listen_fut.in_current_span(),
         ))));
 
-        // 2. Initial peers, specified in the config and cached on disk.
+        // 2. Unconditional peers, which are dialed again whenever they are not connected.
+        let unconditional_dial_addrs = unconditional_peer_dial_addrs(&config, listen_addr);
+        if !unconditional_dial_addrs.is_empty() {
+            let unconditional_peers_fut = keep_unconditional_peers_connected(
+                config.clone(),
+                unconditional_dial_addrs,
+                peer_registry,
+                outbound_connector.clone(),
+                peerset_tx.clone(),
+            );
+            task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
+                unconditional_peers_fut.in_current_span(),
+            ))));
+        }
+
+        // 3. Initial peers, specified in the config and cached on disk.
         let initial_peers_fut = add_initial_peers(
             config.clone(),
             outbound_connector.clone(),
@@ -439,7 +459,7 @@ where
         let initial_peers_join =
             AbortOnDropHandle::new(tokio::spawn(erased(initial_peers_fut.in_current_span())));
 
-        // 3. Outgoing peers we connect to in response to load.
+        // 4. Outgoing peers we connect to in response to load.
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
 
         // Wait for the initial seed peer count
@@ -485,7 +505,6 @@ where
             peerset_tx,
             active_outbound_connections,
             address_book_updater,
-            Arc::new(AtomicBool::new(false)),
         );
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             crawl_fut.in_current_span(),
@@ -616,53 +635,44 @@ where
         "connecting to initial peer set"
     );
 
-    // # Security
-    //
-    // Resists distributed denial of service attacks by making sure that
-    // new peer connections are initiated at least `MIN_OUTBOUND_PEER_CONNECTION_INTERVAL` apart.
-    //
-    // # Correctness
-    //
-    // Each `FuturesUnordered` can hold one `Buffer` or `Batch` reservation for
-    // an indefinite period. We can use `FuturesUnordered` without filling
-    // the underlying network buffers, because we immediately drive this
-    // single `FuturesUnordered` to completion, and handshakes have a short timeout.
-    let mut handshakes: FuturesUnordered<_> = initial_peers
-        .into_iter()
-        .enumerate()
-        .map(|(i, addr)| {
-            let connection_tracker = active_outbound_connections.track_connection();
+    // Admit only a bounded window of attempts. The selected prefix still obeys
+    // the total target, per-IP limit, and cached/seed preference order.
+    // Completed attempts refill the window without delaying unrelated peers.
+    let mut remaining_peers = initial_peers.into_iter();
+    let mut handshakes = FuturesUnordered::new();
+
+    loop {
+        while handshakes.len() < constants::INITIAL_PEER_DIAL_CONCURRENCY {
+            let Some(addr) = remaining_peers.next() else {
+                break;
+            };
             let req = OutboundConnectorRequest {
                 addr,
-                connection_tracker,
+                connection_tracker: active_outbound_connections.track_connection(),
             };
             let outbound_connector = outbound_connector.clone();
 
-            // Spawn a new task to make the outbound connection.
-            tokio::spawn(erased(
+            // Drive handshakes independently of peer-set delivery, but abort
+            // outstanding attempts if startup fails or its caller shuts down.
+            let task = AbortOnDropHandle::new(tokio::spawn(erased(
                 async move {
-                    // Only spawn one outbound connector per
-                    // `MIN_OUTBOUND_PEER_CONNECTION_INTERVAL`,
-                    // by sleeping for the interval multiplied by the peer's index in the list.
-                    sleep(
-                        constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL.saturating_mul(i as u32),
-                    )
-                    .await;
-
-                    // As soon as we create the connector future,
-                    // the handshake starts running as a spawned task.
                     outbound_connector
                         .oneshot(req)
                         .map_err(move |e| (addr, e))
                         .await
                 }
                 .in_current_span(),
-            ))
-            .wait_for_panics()
-        })
-        .collect();
+            )));
+            handshakes.push(async move {
+                task.await
+                    .panic_if_task_has_panicked()
+                    .expect("initial peer handshake tasks are not cancelled individually")
+            });
+        }
 
-    while let Some(handshake_result) = handshakes.next().await {
+        let Some(handshake_result) = handshakes.next().await else {
+            break;
+        };
         match handshake_result {
             Ok(change) => {
                 handshake_success_total += 1;
@@ -732,8 +742,10 @@ where
 /// `peerset_initial_target_size`.
 ///
 /// Returns the first candidates in the order provided by [`Config::initial_peers`],
-/// skipping addresses that exceed the per-IP connection limit. Skipped addresses
-/// do not consume a startup slot; later candidates can fill it.
+/// skipping the addresses of dialed unconditional peers, which have slots of their own,
+/// and addresses that exceed the per-IP connection limit. Each dialed unconditional peer
+/// counts against the limit of its IP, so a startup dial never takes the room it needs.
+/// Skipped addresses do not consume a startup slot; later candidates can fill it.
 ///
 /// Also sends every initial peer to the `address_book_updater`.
 async fn limit_initial_peers(
@@ -742,7 +754,13 @@ async fn limit_initial_peers(
 ) -> IndexSet<PeerSocketAddr> {
     let all_peers = config.initial_peers().await;
     let mut initial_peers = IndexSet::new();
+    let unconditional_dial_addrs = config
+        .unconditional_peers
+        .dial_addrs(config.network.default_port());
     let mut selected_per_ip = HashMap::new();
+    for addr in &unconditional_dial_addrs {
+        *selected_per_ip.entry(addr.ip()).or_insert(0) += 1;
+    }
 
     // Config has validated and interleaved cached peers with shuffled seeds.
     // Feed every candidate to discovery, even beyond the startup dial limit.
@@ -750,8 +768,12 @@ async fn limit_initial_peers(
         let _ = address_book_updater
             .send(MetaAddr::new_initial_peer(peer))
             .await;
+        let canonical_peer = canonical_peer_addr(peer);
+        if unconditional_dial_addrs.contains(&canonical_peer) {
+            continue;
+        }
         if initial_peers.len() < config.peerset_initial_target_size {
-            let count = selected_per_ip.entry(peer.ip()).or_insert(0);
+            let count = selected_per_ip.entry(canonical_peer.ip()).or_insert(0);
             if *count < config.max_connections_per_ip {
                 initial_peers.insert(peer);
                 *count += 1;
@@ -823,6 +845,9 @@ const MIN_INBOUND_ACCEPT_BURST_INTERVAL: Duration = Duration::from_millis(100);
 /// Limits the number of active inbound connections based on `config`,
 /// and waits `min_inbound_peer_connection_interval` between connections.
 ///
+/// The unconditional peers that Zakura dials also share slots of their own, outside
+/// that limit, see [`Config::unconditional_peer_connection_limit`].
+///
 /// A bounded accept burst drains connections that are already queued by the
 /// kernel. Without it, the normal one-second handshake pacing can keep a full
 /// listen backlog from ever reaching a configured local sidecar connection.
@@ -850,6 +875,10 @@ where
     );
     let mut active_zcashd_compat_connections =
         ActiveConnectionCounter::new_counter_with(1, "zcashd-compat Inbound Connection");
+    let mut active_unconditional_connections = ActiveConnectionCounter::new_counter_with(
+        config.unconditional_peer_connection_limit(),
+        "Unconditional Peer Inbound Connections",
+    );
     let zcashd_compat_peer_ips: HashSet<_> = zcashd_compat_peer_ips
         .into_iter()
         .map(|ip| canonical_socket_addr(SocketAddr::new(ip, 0)).ip())
@@ -907,30 +936,36 @@ where
             let active_public_inbound_connections = active_inbound_connections.update_count();
             let active_zcashd_compat_inbound_connections =
                 active_zcashd_compat_connections.update_count();
+            let active_unconditional_inbound_connections =
+                active_unconditional_connections.update_count();
             let active_total_inbound_connections =
                 active_public_inbound_connections + active_zcashd_compat_inbound_connections;
             let canonical_ip = canonical_socket_addr(addr.remove_socket_addr_privacy()).ip();
             let is_zcashd_compat_peer = zcashd_compat_peer_ips.contains(&canonical_ip);
-            let connection_tracker = if is_zcashd_compat_peer {
-                if active_zcashd_compat_inbound_connections >= zcashd_compat_reserved_slots
-                    || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
-                {
-                    // Too many zcashd-compat or total open inbound connections already.
-                    // Close the connection.
-                    std::mem::drop(tcp_stream);
-                    // Allow invalid connections to be cleared quickly,
-                    // but still put a limit on our CPU and network usage from failed connections.
-                    tokio::time::sleep(constants::MIN_INBOUND_PEER_FAILED_CONNECTION_INTERVAL)
-                        .await;
-                    continue;
-                }
-
+            let connection_tracker = if is_zcashd_compat_peer
+                && active_zcashd_compat_inbound_connections < zcashd_compat_reserved_slots
+                && active_total_inbound_connections < config.peerset_inbound_connection_limit()
+            {
                 active_zcashd_compat_connections.track_connection()
-            } else if active_public_inbound_connections >= public_inbound_connection_limit
+            } else if config.unconditional_peers.is_dial_address(addr.ip())
+                && active_unconditional_inbound_connections
+                    < config.unconditional_peer_connection_limit()
+                && active_unconditional_connections.connections_from(canonical_ip)
+                    < config.max_connections_per_ip
+            {
+                // These slots skip the wait between inbound connections from one IP, so a
+                // dialed peer that lost its connection can reconnect at once. One IP holds
+                // at most `max_connections_per_ip` of them, so it cannot take the slot of
+                // another listed peer. A peer that gets no slot here competes for a public
+                // slot, and waits like any other.
+                active_unconditional_connections.track_connection_from(canonical_ip)
+            } else if is_zcashd_compat_peer
+                || active_public_inbound_connections >= public_inbound_connection_limit
                 || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
                 || recent_inbound_connections.is_past_limit_or_add(addr.ip())
             {
-                // Too many open inbound connections or pending handshakes already.
+                // A zcashd-compat peer never takes a public slot. Otherwise there are too
+                // many open inbound connections or pending handshakes already.
                 // Close the connection.
                 std::mem::drop(tcp_stream);
                 // Allow invalid connections to be cleared quickly,
@@ -1095,6 +1130,51 @@ enum CrawlerAction {
 const OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR: usize = 80;
 const OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR: usize = 100;
 
+/// The crawler's local peer replenishment demand, in connection attempts.
+///
+/// The periodic crawl sets it to the outbound deficit. Each demand action, from
+/// the channel or from this budget, consumes one unit, even if it crawls instead
+/// of dialing. A failed dial gives its unit back only if the dial consumed one and
+/// the dial put its demand back on the channel. Otherwise the budget would grow
+/// without a matching decrement and keep dialing past the target.
+#[derive(Debug, Default)]
+struct ReplenishmentBudget {
+    remaining: usize,
+}
+
+impl ReplenishmentBudget {
+    /// Whether the crawler should start another replenishment action.
+    fn has_demand(&self) -> bool {
+        self.remaining > 0
+    }
+
+    /// Consumes one unit for a demand action. Returns whether a unit was consumed,
+    /// which is whether a failure of this action may be credited back.
+    fn consume(&mut self) -> bool {
+        let consumed = self.has_demand();
+        self.remaining = self.remaining.saturating_sub(1);
+        consumed
+    }
+
+    /// Drops the remaining demand, because the outbound connection limit is reached.
+    fn clear(&mut self) {
+        self.remaining = 0;
+    }
+
+    /// Gives back one unit for a failed dial, when `consumed_and_restored`: the
+    /// dial consumed a unit, and it put its demand back on the channel.
+    fn credit_failed_dial(&mut self, consumed_and_restored: bool) {
+        if consumed_and_restored {
+            self.remaining = self.remaining.saturating_add(1);
+        }
+    }
+
+    /// Replaces the remaining demand with the deficit the periodic crawl computed.
+    fn refresh(&mut self, demand: usize) {
+        self.remaining = demand;
+    }
+}
+
 /// Returns the number of outbound peers needed to reach 80% of the configured
 /// peer set target size, bounded by the outbound connection limit.
 ///
@@ -1159,7 +1239,6 @@ fn outbound_peer_replenishment_demand(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
-        force_failed_dial_demand_restore_full,
     ),
     fields(
         new_peer_interval = ?config.crawl_new_peer_interval,
@@ -1174,9 +1253,6 @@ async fn crawl_and_dial<C, S>(
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     mut active_outbound_connections: ActiveConnectionCounter,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-    // When true, failed dials report a full demand channel so tests can cover
-    // unrestored-demand credit gating without racing the crawler select loop.
-    force_failed_dial_demand_restore_full: Arc<AtomicBool>,
 ) -> Result<(), BoxError>
 where
     C: Service<
@@ -1220,10 +1296,7 @@ where
 
     let mut crawl_timer = IntervalStream::new(crawl_timer).map(|tick| TimerCrawl { tick });
 
-    // Periodic replenishment is best-effort. Every consumed demand action
-    // decrements this counter, even if it crawls instead of dialing. The next
-    // periodic crawl refreshes any remaining deficit.
-    let remaining_replenishment_demand = AtomicUsize::new(0);
+    let mut replenishment = ReplenishmentBudget::default();
 
     // # Concurrency
     //
@@ -1256,9 +1329,7 @@ where
                 }),
             // Existing channel demand gets priority over local replenishment.
             // Each action consumes one unit of replenishment demand below.
-            _ = future::ready(()),
-                if remaining_replenishment_demand.load(Ordering::Relaxed) > 0 =>
-            {
+            _ = future::ready(()), if replenishment.has_demand() => {
                 Ok(DemandHandshakeOrCrawl {
                     restore_replenishment_demand: false,
                 })
@@ -1267,21 +1338,12 @@ where
 
         let crawler_action = match crawler_action {
             Ok(DemandHandshakeOrCrawl { .. }) => {
-                // Only credit later if this action actually consumed a timer
-                // replenishment unit. Channel demand with remaining == 0 must
-                // not invent local budget on failure.
-                let restore_replenishment_demand =
-                    remaining_replenishment_demand.load(Ordering::Relaxed) > 0;
-                let _ = remaining_replenishment_demand.try_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |demand| Some(demand.saturating_sub(1)),
-                );
+                let restore_replenishment_demand = replenishment.consume();
 
                 if active_outbound_connections.update_count()
                     >= config.peerset_outbound_connection_limit()
                 {
-                    remaining_replenishment_demand.store(0, Ordering::Relaxed);
+                    replenishment.clear();
                     Ok(DemandDrop)
                 } else {
                     Ok(DemandHandshakeOrCrawl {
@@ -1310,8 +1372,6 @@ where
                 let address_book_updater = address_book_updater.clone();
                 let demand_tx = demand_tx.clone();
                 let expose_peer_addresses = config.expose_peer_addresses;
-                let force_failed_dial_demand_restore_full =
-                    force_failed_dial_demand_restore_full.clone();
 
                 // Increment the connection count before we spawn the connection.
                 let outbound_connection_tracker = active_outbound_connections.track_connection();
@@ -1347,7 +1407,6 @@ where
                                 address_book_updater,
                                 demand_tx,
                                 expose_peer_addresses,
-                                force_failed_dial_demand_restore_full,
                             )
                             .await?
                             {
@@ -1401,12 +1460,7 @@ where
             Ok(HandshakeFailed {
                 restore_replenishment_demand,
             }) => {
-                // Credit only when this attempt spent timer budget and dial()
-                // successfully restored MorePeers. A full channel must not
-                // credit, or remaining would rise without a matching decrement.
-                if restore_replenishment_demand {
-                    let _ = remaining_replenishment_demand.fetch_add(1, Ordering::Relaxed);
-                }
+                replenishment.credit_failed_dial(restore_replenishment_demand);
             }
             Ok(DemandCrawlFinished) => {
                 // This is set to trace level because when the peerset is
@@ -1422,7 +1476,7 @@ where
                     peerset_target_size,
                     outbound_connection_limit,
                 );
-                remaining_replenishment_demand.store(replenishment_demand, Ordering::Relaxed);
+                replenishment.refresh(replenishment_demand);
 
                 // This is the only place the crawler's view of its own outbound
                 // connections is visible, and a node that stops replenishing looks
@@ -1520,13 +1574,7 @@ enum DialOutcome {
 /// so callers do not credit replenishment budget without a later decrement.
 fn try_restore_demand_after_failed_dial(
     demand_tx: &mut futures::channel::mpsc::Sender<MorePeers>,
-    force_failed_dial_demand_restore_full: &AtomicBool,
 ) -> Result<bool, BoxError> {
-    // Tests can force a full-channel outcome without racing the crawler select.
-    if force_failed_dial_demand_restore_full.load(Ordering::Relaxed) {
-        return Ok(false);
-    }
-
     match demand_tx.try_send(MorePeers) {
         Ok(()) => Ok(true),
         Err(send_error) if send_error.is_disconnected() => Err(send_error.into()),
@@ -1550,7 +1598,6 @@ fn try_restore_demand_after_failed_dial(
     address_book_updater,
     demand_tx,
     expose_peer_addresses,
-    force_failed_dial_demand_restore_full,
 ), fields(peer = %candidate.addr.addr_label(expose_peer_addresses)))]
 async fn dial<C>(
     candidate: MetaAddr,
@@ -1561,7 +1608,6 @@ async fn dial<C>(
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
     mut demand_tx: futures::channel::mpsc::Sender<MorePeers>,
     expose_peer_addresses: bool,
-    force_failed_dial_demand_restore_full: Arc<AtomicBool>,
 ) -> Result<DialOutcome, BoxError>
 where
     C: Service<
@@ -1612,9 +1658,8 @@ where
                 .downcast_ref::<peer::HandshakeError>()
                 .is_some_and(peer::HandshakeError::is_neutral_disconnect);
 
-            // Silence verbose info logs in production, but keep logs if the number of connections is low.
-            // Also silence them completely in tests.
-            if outbound_connections <= MAX_CONNECTIONS_FOR_INFO_LOG && !cfg!(test) {
+            // Silence verbose info logs, but keep logs if the number of connections is low.
+            if outbound_connections <= MAX_CONNECTIONS_FOR_INFO_LOG {
                 info!(?error, peer = %addr_label, "failed to make outbound connection to peer");
             } else {
                 debug!(?error, peer = %addr_label, "failed to make outbound connection to peer");
@@ -1635,10 +1680,7 @@ where
             // # Security
             //
             // Handshake failures are rate-limited by peer attempt timeouts.
-            let demand_restored = try_restore_demand_after_failed_dial(
-                &mut demand_tx,
-                &force_failed_dial_demand_restore_full,
-            )?;
+            let demand_restored = try_restore_demand_after_failed_dial(&mut demand_tx)?;
 
             Ok(DialOutcome::Failed { demand_restored })
         }

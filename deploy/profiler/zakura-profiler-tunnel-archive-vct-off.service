@@ -1,0 +1,15 @@
+[Unit]
+Description=SSH tunnel from the dashboard to the continuous profiler on archive-vct-off
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The profiler listens only on its own host's loopback; this makes it reachable at
+# 127.0.0.1:8098 here, over the SSH access the dashboard already has to that node.
+ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:8098:127.0.0.1:8097 root@104.131.174.28
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

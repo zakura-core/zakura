@@ -28,7 +28,7 @@ macro_rules! report {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests;
 
 /// Observes whether transport skipped an attempt without retaining its work or
@@ -411,7 +411,7 @@ impl RequestWrite {
     }
 
     pub(super) fn has_height_above(&self, floor: block::Height) -> bool {
-        #[cfg(test)]
+        #[cfg(all(test, not(zakura_sim)))]
         tests::before_reset_height_check();
         self.items.last().is_some_and(|(height, _)| *height > floor)
     }
@@ -471,7 +471,7 @@ impl Drop for RequestWrite {
             }
             WRITTEN => {}
             state => {
-                #[cfg(test)]
+                #[cfg(all(test, not(zakura_sim)))]
                 tests::before_drop_cleanup();
                 self.expire_unwritten();
                 if state == STARTED {

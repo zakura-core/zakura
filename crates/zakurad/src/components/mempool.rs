@@ -1089,7 +1089,7 @@ impl Service<Request> for Mempool {
                             .increment(1),
                             _ => metrics::counter!(
                                 "mempool.failed.verify.tasks.total",
-                                "reason" => error.to_string()
+                                "reason" => error.metric_label()
                             )
                             .increment(1),
                         }

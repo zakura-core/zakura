@@ -61,7 +61,7 @@ mod service;
 mod source;
 mod state;
 mod status;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests;
 mod trace;
 mod wire;

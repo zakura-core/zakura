@@ -22,7 +22,7 @@ use std::{
 
 use futures::{FutureExt, TryFutureExt};
 use thiserror::Error;
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::sync::oneshot;
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 use tracing::{instrument, Instrument, Span};
 
@@ -33,6 +33,7 @@ use zakura_chain::{
 
 use zakura_node_services::mempool;
 use zakura_node_services::task::{spawn_buffer, spawn_erased};
+use zakura_rt::task::JoinHandle;
 use zakura_state as zs;
 
 use crate::{

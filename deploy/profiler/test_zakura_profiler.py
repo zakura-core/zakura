@@ -1130,10 +1130,7 @@ class ApiTests(unittest.TestCase):
         profiler = profiler_module.Profiler(args, store)
         profiler.state = "ok"
         self.queries = profiler_module.Queries(store, profiler)
-        page = Path(__file__).resolve().with_name("page.html")
-        self.server = ThreadingHTTPServer(
-            ("127.0.0.1", 0), profiler_module.make_handler(self.queries, profiler, page)
-        )
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), profiler_module.make_handler(self.queries, profiler))
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -1287,11 +1284,9 @@ class ApiTests(unittest.TestCase):
         )
         self.assertIsNone(profiler_module.parse_timesync_offset("Failed to query server: unit not found\n"))
 
-    def test_page_and_health_are_served(self):
-        code, body = self.get("/")
-        self.assertEqual(code, 200)
-        self.assertIn(b"continuous CPU profile", body)
+    def test_health_is_served_and_the_page_lives_on_the_dashboard(self):
         self.assertEqual(self.get("/healthz"), (200, b"ok\n"))
+        self.assertEqual(self.get("/")[0], 404)
 
 
 if __name__ == "__main__":

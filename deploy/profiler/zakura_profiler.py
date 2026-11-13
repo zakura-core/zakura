@@ -5,8 +5,8 @@ Runs beside the node and never inside it. In a loop it asks `perf` to sample whe
 node's threads are on the CPU for one window (a minute by default), turns the samples
 into a tree of functions and CPU time, and stores one small file per window and one per
 hour. A loopback HTTP server answers with flame graphs for a time range, a CPU timeline
-and the profiler's own status; the cluster status dashboard forwards those to the public
-page.
+and the profiler's own status; the cluster status dashboard forwards those to the CPU
+profile section of its node page.
 
 It is built to stay out of the node's way: the systemd unit runs it at idle priority
 under a hard CPU and memory ceiling, only the `perf record` child runs at normal
@@ -909,7 +909,7 @@ class Queries:
         }
 
 
-def make_handler(queries, profiler, page_path):
+def make_handler(queries, profiler):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         timeout = 15
@@ -934,8 +934,6 @@ def make_handler(queries, profiler, page_path):
             parsed = urllib.parse.urlparse(self.path)
             params = dict(urllib.parse.parse_qsl(parsed.query))
             try:
-                if parsed.path == "/":
-                    return self.reply(200, page_path.read_bytes(), "text/html; charset=utf-8")
                 if parsed.path == "/healthz":
                     return self.reply(200, b"ok\n", "text/plain; charset=utf-8")
                 if parsed.path == "/api/status":
@@ -992,8 +990,7 @@ def main(argv=None):
     store = Store(args.data_dir)
     profiler = Profiler(args, store)
     queries = Queries(store, profiler)
-    page_path = Path(__file__).resolve().with_name("page.html")
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(queries, profiler, page_path))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(queries, profiler))
     server.daemon_threads = True
 
     def shut_down(*_):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import http.client
 import importlib.util
 import json
 import io
@@ -1822,12 +1823,23 @@ class ProfilerRouteTests(unittest.TestCase):
             with error:
                 return error.code, error.read(), error.headers
 
-    def test_profile_page_comes_from_the_nodes_profiler_and_is_never_cached(self):
-        code, body, headers = self.fetch("/profile/profiled")
+    def test_the_old_profile_page_address_opens_the_node_pages_profile(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        self.addCleanup(connection.close)
+        connection.request("GET", "/profile/profiled")
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.status, 302)
+        self.assertEqual(response.headers["Location"], "/node/profiled#profile")
+        self.assertEqual(StubProfiler.requests, [])
+
+    def test_the_node_page_holds_the_cpu_profile_and_a_jump_bar(self):
+        code, body, _ = self.fetch("/node/profiled")
         self.assertEqual(code, 200)
-        self.assertIn(b"<title>profile</title>", body)
-        self.assertIn("no-store", headers["Cache-Control"])
-        self.assertEqual(StubProfiler.requests, ["/"])
+        self.assertIn(b'id="node-nav"', body)
+        self.assertIn(b'<section class="pf" id="profile"', body)
+        # The profile reads the forwarder, never a page of the profiler's own.
+        self.assertIn(b'const BASE = "/profile/" + encodeURIComponent(node);', body)
 
     def test_profile_data_forwards_only_the_parameters_each_request_accepts(self):
         code, body, _ = self.fetch(
@@ -1858,9 +1870,6 @@ class ProfilerRouteTests(unittest.TestCase):
         self.profiler.shutdown()
         self.profiler.server_close()
         self.assertEqual(self.fetch("/profile/profiled/api/status")[0], 502)
-        code, body, _ = self.fetch("/profile/profiled")
-        self.assertEqual(code, 502)
-        self.assertIn(b"not answering", body)
         self.assertEqual(status.profiler_summary(self.profiler_url), {"state": "unreachable"})
         # Reopen so tearDown can close it like any other test.
         self.profiler = status.ThreadingHTTPServer(("127.0.0.1", 0), StubProfiler)
@@ -1883,10 +1892,11 @@ class ProfilerRouteTests(unittest.TestCase):
         )
         self.assertNotIn("profiler", rows["plain"])
 
-    def test_page_links_a_profiled_node_to_its_flame_graph(self):
+    def test_page_links_a_profiled_node_to_its_cpu_profile_section(self):
         self.assertIn("function profilerBadge(row)", status.PAGE)
         self.assertIn('<a class="node-link badge tone-', status.PAGE)
-        self.assertIn("href=\"/profile/'", status.PAGE)
+        self.assertIn("href=\"/node/'", status.PAGE)
+        self.assertIn("'#profile\" title=\"'", status.PAGE)
 
     def test_profiler_url_is_read_from_the_monitor_table(self):
         template = (

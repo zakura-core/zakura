@@ -12,8 +12,8 @@ version 1) for zakura.com/nu7/. A node's optional `monitor` table selects how it
 is reached: `local = true` probes it on this host without SSH, and `status_url`
 reads a remote node's deploy/nu7-fork/miner/remote-status.py report instead.
 `profiler_url` names the node's continuous CPU profiler (deploy/profiler/): the
-fleet table marks such a node as profiled and `/profile/<name>` shows its flame
-graphs, forwarded from that URL.
+fleet table marks such a node as profiled and its `/node/<name>` page shows its
+flame graphs, read through `/profile/<name>/api/`.
 
 Only the Python stdlib is used.
 """
@@ -3291,6 +3291,108 @@ footer {
   .topbar { align-items: flex-start; }
   .search input { width: 130px; }
 }
+/* ---------- node page: section jump bar ---------- */
+.node-nav {
+  position: sticky;
+  top: 8px;
+  z-index: 4;
+  display: flex;
+  gap: 6px;
+  padding: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  background: rgba(18, 16, 29, 0.92);
+  backdrop-filter: blur(8px);
+}
+.node-nav button {
+  flex: none;
+  color: var(--ink-2);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  padding: 5px 12px;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+.node-nav button:hover { color: var(--ink); background: var(--raised); }
+.node-nav button[aria-current="true"] { color: var(--ink); border-color: var(--pink); background: var(--pink-soft); }
+.node-nav button:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
+#node-view [data-jump-target] { scroll-margin-top: 64px; }
+
+/* ---------- node page: CPU profile ---------- */
+/* Category colours: seven hues checked for colour-blind separation on --surface,
+   plus two greys for time outside the node's own subsystems. */
+:root {
+  --c-verification: #3987e5; --c-propagation: #d95926; --c-arrival: #199e70;
+  --c-rpc: #c98500; --c-mempool: #d55181; --c-network: #008300; --c-commit: #9085e9;
+  --c-kernel: #8d899e; --c-other: #6b6780;
+  --on-mark: #07060e;
+}
+.pf { display: grid; gap: 16px; min-width: 0; }
+.pf-panel { display: grid; gap: 12px; }
+.pf .section-head { margin-bottom: 0; }
+.pf h3 { font-size: 0.95rem; font-weight: 640; margin: 0; }
+.pf-note { color: var(--muted); font-size: 0.83rem; max-width: 86ch; }
+.pf-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.pf-tile { background: var(--raised); border: 1px solid var(--line); border-radius: var(--r-md); padding: 10px 12px; display: grid; gap: 2px; }
+.pf-tile b { font-family: var(--mono); font-size: 1.12rem; font-weight: 500; font-variant-numeric: tabular-nums; }
+.pf-tile span { color: var(--muted); font-size: 0.75rem; }
+.pf-controls { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center; }
+.pf-group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.pf-group > span { color: var(--muted); font-size: 0.75rem; margin-right: 2px; }
+.pf button, .pf input[type="search"] {
+  font: inherit; font-size: 0.8rem; color: var(--ink-2); background: var(--raised);
+  border: 1px solid var(--line-hi); border-radius: var(--r-sm); padding: 4px 10px;
+}
+.pf button { cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+.pf button:hover { color: var(--ink); border-color: var(--muted); }
+.pf button[aria-pressed="true"] { color: var(--ink); border-color: var(--pink); background: var(--pink-soft); }
+.pf button:focus-visible, .pf input:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
+.pf input[type="search"] { width: 240px; max-width: 100%; }
+.pf-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: none; }
+.pf-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 0.75rem; color: var(--ink-2); }
+.pf-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.pf-chart { overflow-x: auto; min-width: 0; }
+.pf svg { display: block; }
+.pf svg text { font-family: var(--mono); font-size: 11px; fill: var(--muted); }
+#pf-timeline { cursor: crosshair; user-select: none; touch-action: pan-y; }
+#pf-flame rect.pf-f { cursor: pointer; stroke: var(--surface); stroke-width: 1; }
+#pf-flame rect.pf-f:hover { filter: brightness(1.18); }
+#pf-flame text { fill: var(--on-mark); pointer-events: none; }
+#pf-flame .pf-dim { opacity: 0.28; }
+#pf-flame .pf-hit { stroke: var(--ink); stroke-width: 1.5; }
+.pf-crumb { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); overflow-wrap: anywhere; }
+.pf-detail { background: var(--raised); border: 1px solid var(--line); border-radius: var(--r-md); padding: 10px 12px; display: grid; gap: 8px; }
+.pf-detail .pf-name { font-family: var(--mono); font-size: 0.75rem; overflow-wrap: anywhere; max-height: 7.5em; overflow-y: auto; }
+.pf-detail .pf-facts { display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--ink-2); font-size: 0.8rem; }
+.pf-detail .pf-facts b { font-family: var(--mono); font-weight: 500; color: var(--ink); }
+/* The fleet table's rules (a 1080px minimum width, separate borders) are not for these. */
+.pf table { width: 100%; min-width: 0; border-collapse: collapse; font-size: 0.8rem; }
+.pf th, .pf td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; font-size: 0.8rem; }
+.pf th { font-weight: 600; color: var(--muted); font-size: 0.68rem; letter-spacing: 0.06em; text-transform: uppercase; }
+.pf td.pf-num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.pf td.pf-fn { font-family: var(--mono); font-size: 0.75rem; overflow-wrap: anywhere; }
+.pf td.pf-fn button { all: unset; cursor: pointer; color: var(--ink); }
+.pf td.pf-fn button:hover { color: var(--pink-hi); }
+.pf-bar { height: 6px; border-radius: 3px; min-width: 2px; }
+#pf-stages text.pf-label { fill: var(--ink-2); font-family: inherit; font-size: 13px; }
+#pf-stages text.pf-value { fill: var(--ink); }
+#pf-stages rect.pf-hit { fill: transparent; }
+#pf-stages rect.pf-hit:hover { fill: var(--pink-soft); }
+#pf-block-table td button { all: unset; cursor: pointer; color: var(--pink-hi); font-family: var(--mono); }
+#pf-block-table td button:hover { text-decoration: underline; }
+#pf-block-table td button:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
+#pf-block-table tr[aria-selected="true"] td { background: var(--pink-soft); }
+.pf-mini { display: flex; height: 8px; min-width: 120px; gap: 1px; }
+.pf-mini i { display: block; height: 100%; min-width: 1px; border-radius: 1px; }
+.pf-tip { position: fixed; pointer-events: none; z-index: 5; max-width: min(560px, 92vw); background: var(--raised); border: 1px solid var(--line-hi); border-radius: var(--r-sm); padding: 8px 10px; font-size: 0.75rem; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45); }
+.pf-tip .pf-name { font-family: var(--mono); overflow-wrap: anywhere; color: var(--ink); display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden; }
+.pf-tip .pf-row { display: flex; gap: 8px; align-items: center; color: var(--ink-2); }
+.pf-tip .pf-row b { font-family: var(--mono); font-weight: 500; color: var(--ink); margin-left: auto; padding-left: 16px; }
+.pf-empty { color: var(--muted); padding: 28px 0; text-align: center; }
+.pf-about summary { cursor: pointer; font-weight: 640; font-size: 0.95rem; }
+.pf-about[open] summary { margin-bottom: 4px; }
+.pf-notes { margin: 0; padding-left: 18px; display: grid; gap: 4px; color: var(--ink-2); font-size: 0.8rem; max-width: 96ch; }
 </style>
 </head>
 <body>
@@ -3430,7 +3532,14 @@ footer {
       </div>
     </section>
 
-    <section class="panel pad">
+    <nav class="panel node-nav" id="node-nav" aria-label="Sections of this page">
+      <button data-jump="node-overview">Overview</button>
+      <button data-jump="node-details">Chain, sync and peers</button>
+      <button data-jump="node-events">Events</button>
+      <button data-jump="profile" id="node-nav-profile" hidden>CPU profile</button>
+    </nav>
+
+    <section class="panel pad" id="node-overview" data-jump-target>
       <div class="section-head">
         <div>
           <p class="eyebrow">Host</p>
@@ -3452,7 +3561,7 @@ footer {
       <div class="sparks" id="node-sparks"></div>
     </section>
 
-    <div class="node-grid">
+    <div class="node-grid" id="node-details" data-jump-target>
       <article class="panel pad">
         <div class="section-head"><div><p class="eyebrow">Consensus</p><h2>Chain</h2></div></div>
         <div class="kv" id="node-chain"></div>
@@ -3467,7 +3576,7 @@ footer {
       </article>
     </div>
 
-    <section class="panel pad">
+    <section class="panel pad" id="node-events" data-jump-target>
       <div class="section-head">
         <div>
           <p class="eyebrow">Recent</p>
@@ -3480,6 +3589,83 @@ footer {
       <div id="node-last-log"></div>
       <div class="subhead"><p class="eyebrow">Recent log errors</p></div>
       <div id="node-logs"></div>
+    </section>
+
+    <section class="pf" id="profile" data-jump-target aria-labelledby="pf-h" hidden>
+      <div class="panel pad pf-panel">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Continuous CPU profile</p>
+            <h2 id="pf-h">Where this node spends its CPU</h2>
+          </div>
+          <span class="badge" id="pf-state">not loaded</span>
+        </div>
+        <p class="section-note" id="pf-freshness">Loads when you scroll here.</p>
+        <div class="pf-tiles" id="pf-tiles"></div>
+      </div>
+
+      <div class="panel pad pf-panel" role="region" aria-labelledby="pf-tl-h">
+        <div class="pf-controls">
+          <h3 id="pf-tl-h">CPU over time</h3>
+          <div class="pf-group" id="pf-ranges" role="group" aria-label="Time range"></div>
+          <button id="pf-live" hidden>Back to live</button>
+        </div>
+        <p class="pf-note" id="pf-tl-note">Cores the node kept busy, by what the innermost node code in each sample was doing. Drag across the chart to look at just that stretch.</p>
+        <div class="pf-chart"><svg id="pf-timeline" role="img" aria-label="CPU cores busy over time by category"></svg></div>
+        <div class="pf-legend" id="pf-legend"></div>
+      </div>
+
+      <div class="panel pad pf-panel" role="region" aria-labelledby="pf-fl-h">
+        <div class="pf-controls">
+          <h3 id="pf-fl-h">Where the CPU time goes</h3>
+          <div class="pf-group" role="group" aria-label="Samples to include">
+            <button data-pf-lens="all">All the time</button>
+            <button data-pf-lens="block">While a block lands</button>
+          </div>
+          <input type="search" id="pf-search" placeholder="Highlight functions…" aria-label="Highlight functions by name">
+          <span class="pf-note" id="pf-search-note"></span>
+        </div>
+        <div class="pf-group" id="pf-views" role="group" aria-label="View"></div>
+        <p class="pf-note" id="pf-fl-note"></p>
+        <div class="pf-crumb" id="pf-crumb"></div>
+        <div class="pf-chart"><svg id="pf-flame" role="img" aria-label="Flame graph of CPU time by call stack"></svg></div>
+        <div class="pf-empty" id="pf-flame-empty" hidden></div>
+        <div class="pf-detail" id="pf-detail" hidden>
+          <div class="pf-name" id="pf-detail-name"></div>
+          <div class="pf-facts" id="pf-detail-facts"></div>
+          <div class="pf-group">
+            <button id="pf-focus-fn">Show this function everywhere it runs</button>
+            <button id="pf-zoom-out">Zoom out</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel pad pf-panel" role="region" aria-labelledby="pf-st-h" id="pf-stages-panel" hidden>
+        <div class="pf-controls">
+          <h3 id="pf-st-h">A block's path through the node</h3>
+          <div class="pf-group" id="pf-paths" role="group" aria-label="How the blocks arrived"></div>
+          <div class="pf-group" role="group" aria-label="Stages to show">
+            <button data-pf-scale="all">Whole path</button>
+            <button data-pf-scale="inside">After the download</button>
+          </div>
+          <button id="pf-stage-median" hidden>Back to the typical block</button>
+        </div>
+        <p class="pf-note" id="pf-st-note"></p>
+        <div class="pf-chart"><svg id="pf-stages" role="img" aria-label="Time a block spends in each stage"></svg></div>
+        <div class="pf-chart"><table id="pf-block-table"></table></div>
+      </div>
+
+      <div class="panel pad pf-panel" role="region" aria-labelledby="pf-top-h">
+        <h3 id="pf-top-h">Functions with the most time of their own</h3>
+        <p class="pf-note">Time sampled in the function itself, not in what it calls, added up over every place it appears in this view. Click one to see everything under it.</p>
+        <div class="pf-chart"><table id="pf-top"></table></div>
+      </div>
+
+      <details class="panel pad pf-panel pf-about">
+        <summary>What the profile shows and what it leaves out</summary>
+        <ul class="pf-notes" id="pf-notes"></ul>
+      </details>
+      <div class="pf-tip" id="pf-tip" hidden></div>
     </section>
   </div>
 
@@ -3618,9 +3804,9 @@ function profilerBadge(row) {
     ? 'Continuous CPU profile: sampling at ' + profiler.rate_hz + ' Hz, using '
       + (profiler.overhead_pct_last_hour == null ? 'under 1' : profiler.overhead_pct_last_hour)
       + '% of one core. Open the flame graph.'
-    : 'Continuous CPU profiler is ' + profiler.state + '. Open the profile page.';
-  return '<a class="node-link badge tone-' + (working ? 'info' : 'warn') + '" href="/profile/'
-    + encodeURIComponent(row.name) + '" title="' + esc(title) + '">'
+    : 'Continuous CPU profiler is ' + profiler.state + '. Open the CPU profile.';
+  return '<a class="node-link badge tone-' + (working ? 'info' : 'warn') + '" href="/node/'
+    + encodeURIComponent(row.name) + '#profile" title="' + esc(title) + '">'
     + (working ? 'profiled' : 'profiler ' + esc(profiler.state)) + '</a>';
 }
 function tipEventLabel(event) {
@@ -4388,6 +4574,7 @@ function renderNode(data) {
   renderNodePeers(data);
   renderNodeEvents(data);
   renderFreshness();
+  showProfile(data.node || {});
 }
 
 function render() {
@@ -4427,6 +4614,543 @@ async function tick() {
     return;
   }
   render();
+}
+
+/* ---------- node page: jump bar ---------- */
+// The bar scrolls instead of linking, so the URL fragment stays free for the CPU
+// profile's own view (#profile&range=...).
+function setupNodeNav() {
+  const nav = el('node-nav');
+  nav.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-jump]');
+    if (button) el(button.dataset.jump).scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+  const targets = [...document.querySelectorAll('#node-view [data-jump-target]')];
+  const mark = () => {
+    // The section being read is the last one whose top has passed just under the bar.
+    let current = targets[0];
+    for (const target of targets) {
+      if (!target.hidden && target.getBoundingClientRect().top <= 96) current = target;
+    }
+    for (const button of nav.querySelectorAll('button')) {
+      button.setAttribute('aria-current', String(button.dataset.jump === current.id));
+    }
+  };
+  addEventListener('scroll', mark, { passive: true });
+  mark();
+}
+
+/* ---------- node page: CPU profile ---------- */
+// Shown only for a node that runs the continuous profiler. Its data loads when the
+// section comes near the screen, or at once when the URL asks for it.
+let profileStarted = false;
+function showProfile(row) {
+  if (profileStarted || !row.profiler) return;
+  profileStarted = true;
+  el('profile').hidden = false;
+  el('node-nav-profile').hidden = false;
+  const begin = () => startProfile(row.name || NODE_NAME);
+  if (location.hash.startsWith('#profile')) {
+    begin();
+    el('profile').scrollIntoView({ block: 'start' });
+    return;
+  }
+  const observer = new IntersectionObserver((entries) => {
+    if (!entries.some((entry) => entry.isIntersecting)) return;
+    observer.disconnect();
+    begin();
+  }, { rootMargin: '600px 0px' });
+  observer.observe(el('profile'));
+}
+
+
+// The node page's CPU profile section. It reads the node's profiler through the
+// dashboard's /profile/<node>/api/ forwarder. Its view (range, category, lens,
+// function) is kept in the URL fragment after "#profile", so a link can open it.
+function startProfile(node) {
+const BASE = "/profile/" + encodeURIComponent(node);
+const ROW = 19, REFRESH_MS = 60000;
+const VIEW_LABEL = { all: "Whole process" };
+const el = id => document.getElementById("pf-" + id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const color = cat => `var(--c-${cat})`;
+
+const state = { range: "1h", from: null, to: null, view: "all", lens: "all", focus: "", zoom: [], search: "", scale: "all", block: null, path: null };
+let meta = null, status = null, flame = null, timeline = null, selected = null, labels = {}, blockStages = null;
+// The colour of each stage is the colour of the subsystem that does the work.
+const STAGE_CATEGORY = {
+  header_fetch: "arrival", header_check: "arrival", body_request: "arrival", body_download: "arrival", submit: "arrival",
+  verify: "verification", writer_wait: "commit", writer_commit: "commit", status_fanout: "propagation",
+};
+const DOWNLOAD_STAGES = ["header_fetch", "header_check", "body_request", "body_download"];
+const PATH_LABEL = { legacy: "legacy network", zakura: "Zakura block sync", unknown: "not recorded" };
+const PATH_PHRASE = { legacy: "the legacy Zcash network", zakura: "Zakura's own block sync", unknown: "a path the trace did not record" };
+const BLOCK_ROWS = 12;
+
+function readHash() {
+  if (!location.hash.startsWith("#profile")) return;
+  const params = new URLSearchParams(location.hash.slice("#profile".length));
+  for (const key of ["range", "view", "lens", "focus"]) if (params.get(key)) state[key] = params.get(key);
+  if (params.get("from") && params.get("to")) { state.from = +params.get("from"); state.to = +params.get("to"); }
+}
+let changed = false;
+function writeHash() {
+  const params = new URLSearchParams();
+  if (state.from) { params.set("from", state.from); params.set("to", state.to); } else params.set("range", state.range);
+  params.set("view", state.view); params.set("lens", state.lens);
+  if (state.focus) params.set("focus", state.focus);
+  // Leave the URL alone until someone changes the view, so loading the section
+  // while scrolling past it does not rewrite the address.
+  if (location.hash.startsWith("#profile") || changed) history.replaceState(null, "", "#profile&" + params);
+}
+function rangeParams() {
+  return state.from ? { from: state.from, to: state.to } : { range: state.range };
+}
+async function api(path, params) {
+  const query = params ? "?" + new URLSearchParams(params) : "";
+  const response = await fetch(`${BASE}/api/${path}${query}`, { cache: "no-store" });
+  if (response.status === 503) throw new Error("the profiler is busy; try again in a minute");
+  if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
+  return response.json();
+}
+
+// ---- formatting ----
+function cpu(us) {
+  if (us >= 60e6) return (us / 60e6).toFixed(1) + " min";
+  if (us >= 1e6) return (us / 1e6).toFixed(us >= 1e7 ? 1 : 2) + " s";
+  if (us >= 1e3) return (us / 1e3).toFixed(us >= 1e5 ? 0 : 1) + " ms";
+  return Math.round(us) + " µs";
+}
+function ms(value) {
+  if (value == null) return "–";
+  if (value >= 1000) return (value / 1000).toFixed(2) + " s";
+  if (value >= 100) return Math.round(value) + " ms";
+  if (value >= 1) return value.toFixed(value >= 10 ? 1 : 2) + " ms";
+  return Math.round(value * 1000) + " µs";
+}
+const pct = (part, whole) => whole > 0 ? (100 * part / whole).toFixed(part / whole < 0.01 ? 2 : 1) + "%" : "–";
+const cores = value => value >= 1 ? value.toFixed(2) : value.toFixed(3);
+const clockSeconds = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+function clock(t, withDate) {
+  const d = new Date(t * 1000);
+  const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return withDate ? d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + hm : hm;
+}
+function ago(seconds) {
+  if (seconds < 90) return Math.round(seconds) + " s ago";
+  if (seconds < 5400) return Math.round(seconds / 60) + " min ago";
+  return (seconds / 3600).toFixed(1) + " h ago";
+}
+// A short label for a frame: drop generic arguments, keep the last path segments.
+function shortName(full) {
+  if (full.startsWith("thread: ") || full.startsWith("[") || full.startsWith("(")) return full;
+  let out = "", depth = 0;
+  for (const ch of full) {
+    if (ch === "<") { depth++; if (depth > 1) continue; }
+    if (ch === ">") { depth--; if (depth >= 1) continue; }
+    if (depth <= 1) out += ch;
+  }
+  out = out.replace(/<([^<>]*?) as [^<>]*>/g, "$1").replace(/[<>]/g, "").replace(/::\{closure#\d+\}/g, "{closure}");
+  const parts = out.split("::");
+  return parts.length > 3 ? parts.slice(-3).join("::") : out;
+}
+
+// ---- tooltip ----
+const tip = el("tip");
+function showTip(event, html) {
+  tip.innerHTML = html; tip.hidden = false;
+  const box = tip.getBoundingClientRect();
+  tip.style.left = Math.max(8, Math.min(event.clientX + 14, innerWidth - box.width - 8)) + "px";
+  tip.style.top = Math.max(8, Math.min(event.clientY + 16, innerHeight - box.height - 8)) + "px";
+}
+const hideTip = () => { tip.hidden = true; };
+
+// ---- header ----
+function renderStatus() {
+  const tone = { ok: "tone-ok", stale: "tone-warn", starting: "tone-warn", "waiting for node": "tone-warn", error: "tone-bad" }[status.state] || "tone-warn";
+  const badge = el("state");
+  badge.className = "badge " + tone;
+  badge.textContent = status.state === "ok" ? "profiling" : status.state;
+  badge.title = status.error || "";
+  el("freshness").textContent = status.last_window_end
+    ? `Last sample window ended ${ago(Date.now() / 1000 - status.last_window_end)}. Refreshes every minute.`
+    : "Collecting the first sample window…";
+}
+function renderTiles() {
+  const tiles = [];
+  if (flame && flame.covered_seconds) {
+    tiles.push([cores(flame.whole_us / 1e6 / flame.covered_seconds), state.lens === "block" ? "cores busy, averaged over the whole range" : "cores the node kept busy"]);
+    if (state.view !== "all" || state.focus) tiles.push([pct(flame.total_us, flame.whole_us), "of that CPU is in this view"]);
+    tiles.push([flame.samples.toLocaleString(), "samples in range"]);
+    tiles.push([flame.blocks.toLocaleString(), "blocks announced in range"]);
+  }
+  tiles.push([status.rate_hz + " Hz", "sampling rate right now"]);
+  tiles.push([status.overhead_pct_last_hour == null ? "–" : status.overhead_pct_last_hour + "%", "of one core used by the profiler, last hour"]);
+  if (status.lost_windows_last_hour || status.dropped_windows) tiles.push([status.lost_windows_last_hour + " / " + status.dropped_windows, "windows with lost samples (1 h) / dropped"]);
+  el("tiles").innerHTML = tiles.map(([value, label]) => `<div class="pf-tile"><b>${esc(value)}</b><span>${esc(label)}</span></div>`).join("");
+}
+
+// ---- controls ----
+function renderControls() {
+  el("ranges").innerHTML = meta.ranges.map(r => `<button data-pf-range="${r}" aria-pressed="${!state.from && state.range === r}">${r}</button>`).join("");
+  el("views").innerHTML = "<span>View</span>" + meta.views.map(v =>
+    `<button data-pf-view="${v}" aria-pressed="${!state.focus && state.view === v}">${v === "all" ? "" : `<i class="pf-swatch" style="background:${color(v)}"></i>`}${esc(VIEW_LABEL[v] || labels[v])}</button>`).join("")
+    + (state.focus ? `<button data-pf-view="" aria-pressed="true" title="${esc(state.focus)}">Function: ${esc(shortName(state.focus)).slice(0, 60)} ✕</button>` : "");
+  document.querySelectorAll("[data-pf-lens]").forEach(b => b.setAttribute("aria-pressed", b.dataset.pfLens === state.lens));
+  el("live").hidden = !state.from;
+  el("legend").innerHTML = meta.categories.map(c => `<span><i class="pf-swatch" style="background:${color(c.id)}"></i>${esc(c.label)}</span>`).join("");
+}
+document.getElementById("profile").addEventListener("click", event => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  changed = true;
+  if (button.dataset.pfRange) { state.range = button.dataset.pfRange; state.from = state.to = null; reload(); }
+  else if (button.dataset.pfView !== undefined) { state.view = button.dataset.pfView || state.view; state.focus = ""; state.zoom = []; reload(); }
+  else if (button.dataset.pfLens) { state.lens = button.dataset.pfLens; reload(); }
+  else if (button.id === "live") { state.from = state.to = null; reload(); }
+  else if (button.id === "focus-fn" && selected) { state.focus = selected.name.slice(0, 300); state.zoom = []; reload(); }
+  else if (button.id === "zoom-out") { state.zoom.pop(); selected = null; drawFlame(); }
+  else if (button.dataset.pfScale) { state.scale = button.dataset.pfScale; drawStages(); }
+  else if (button.id === "stage-median") { state.block = null; drawStages(); }
+  else if (button.dataset.pfPath) { state.path = button.dataset.pfPath; state.block = null; drawStages(); }
+  else if (button.dataset.pfBlock) { state.block = state.block === button.dataset.pfBlock ? null : button.dataset.pfBlock; drawStages(); }
+  else if (button.dataset.pfCpu) {
+    // The minute of samples that contains this block, narrowed to the moments around blocks.
+    const when = +button.dataset.pfCpu;
+    state.from = Math.floor(when - 65); state.to = Math.ceil(when + 1); state.lens = "block"; state.zoom = [];
+    reload().then(() => el("fl-h").scrollIntoView({ behavior: "smooth", block: "start" }));
+  }
+  else if (button.dataset.pfFn !== undefined) { state.focus = flame.top[+button.dataset.pfFn][0].slice(0, 300); state.zoom = []; reload(); }
+});
+el("search").addEventListener("input", event => { state.search = event.target.value.trim().toLowerCase(); drawFlame(); });
+
+// ---- timeline ----
+function drawTimeline() {
+  const svg = el("timeline");
+  const W = Math.max(560, svg.parentElement.clientWidth), H = 150, left = 44, bottom = 22, top = 8;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", W); svg.setAttribute("height", H);
+  const t = timeline;
+  if (!t || !t.buckets.length) { svg.innerHTML = `<text x="${W / 2}" y="${H / 2}" text-anchor="middle">No samples in this range yet</text>`; return; }
+  const order = meta.categories.map(c => c.id);
+  const totals = t.buckets.map(b => order.reduce((sum, c) => sum + (b.us[c] || 0), 0) / 1e6 / b.seconds);
+  const peak = Math.max(...totals, 0.01);
+  const x = time => left + (time - t.from) / (t.to - t.from) * (W - left - 6);
+  const y = value => top + (1 - value / peak) * (H - top - bottom);
+  const barW = Math.max(1, (W - left - 6) * t.step / (t.to - t.from) - 1);
+  let out = "";
+  for (const fraction of [0, 0.5, 1]) {
+    const yy = y(peak * fraction);
+    out += `<line x1="${left}" x2="${W - 6}" y1="${yy}" y2="${yy}" stroke="var(--line)"/><text x="${left - 6}" y="${yy + 4}" text-anchor="end">${cores(peak * fraction)}</text>`;
+  }
+  t.buckets.forEach((b, i) => {
+    let base = 0;
+    for (const c of order) {
+      const value = (b.us[c] || 0) / 1e6 / b.seconds;
+      if (!value) continue;
+      const y1 = y(base + value), y0 = y(base);
+      out += `<rect x="${x(b.t).toFixed(1)}" y="${y1.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(0.5, y0 - y1).toFixed(1)}" fill="${color(c)}"/>`;
+      base += value;
+    }
+  });
+  if (t.blocks && t.blocks.length <= 400) for (const when of t.blocks) out += `<line x1="${x(when).toFixed(1)}" x2="${x(when).toFixed(1)}" y1="${H - bottom + 1}" y2="${H - bottom + 6}" stroke="var(--ink-2)"/>`;
+  const long = t.to - t.from > 86400;
+  [[t.from, "start"], [(t.from + t.to) / 2, "middle"], [t.to, "end"]].forEach(([when, anchor]) => {
+    out += `<text x="${x(when)}" y="${H - 4}" text-anchor="${anchor}">${clock(when, long)}</text>`;
+  });
+  out += `<rect id="pf-brush" y="${top}" height="${H - top - bottom}" width="0" fill="var(--pink-soft)" stroke="var(--pink)" visibility="hidden"/>`;
+  svg.innerHTML = out;
+  el("tl-note").textContent = "Cores the node kept busy, by what the innermost node code in each sample was doing. "
+    + (t.blocks && t.blocks.length <= 400 ? "Ticks under the chart are block announcements. " : `${t.block_count.toLocaleString()} blocks were announced in this range. `)
+    + "Drag across the chart to look at just that stretch.";
+  svg._geometry = { left, W, x, bucketAt: px => { const time = t.from + (px - left) / (W - left - 6) * (t.to - t.from); return t.buckets.find(b => time >= b.t && time < b.t + t.step); }, timeAt: px => t.from + (Math.min(Math.max(px, left), W - 6) - left) / (W - left - 6) * (t.to - t.from) };
+}
+(function timelineInteraction() {
+  const svg = el("timeline");
+  let dragStart = null;
+  const px = event => (event.clientX - svg.getBoundingClientRect().left) * (svg.viewBox.baseVal.width / svg.getBoundingClientRect().width);
+  svg.addEventListener("pointerdown", event => { if (svg._geometry) { dragStart = px(event); svg.setPointerCapture(event.pointerId); } });
+  svg.addEventListener("pointermove", event => {
+    const g = svg._geometry; if (!g) return;
+    const at = px(event);
+    if (dragStart != null) {
+      const brush = svg.querySelector("#pf-brush");
+      const a = Math.max(g.left, Math.min(dragStart, at)), b = Math.min(g.W - 6, Math.max(dragStart, at));
+      brush.setAttribute("x", a); brush.setAttribute("width", Math.max(0, b - a)); brush.setAttribute("visibility", "visible");
+      hideTip(); return;
+    }
+    const bucket = g.bucketAt(at);
+    if (!bucket) return hideTip();
+    const rows = meta.categories.filter(c => bucket.us[c.id]).map(c => [c, bucket.us[c.id] / 1e6 / bucket.seconds]).sort((a, b) => b[1] - a[1]);
+    const total = rows.reduce((sum, row) => sum + row[1], 0);
+    showTip(event, `<div class="pf-row"><span>${clock(bucket.t, true)}</span><b>${cores(total)} cores</b></div>`
+      + rows.map(([c, value]) => `<div class="pf-row"><i class="pf-swatch" style="background:${color(c.id)}"></i><span>${esc(c.label)}</span><b>${cores(value)}</b></div>`).join(""));
+  });
+  svg.addEventListener("pointerup", event => {
+    const g = svg._geometry;
+    if (g && dragStart != null) {
+      const a = g.timeAt(Math.min(dragStart, px(event))), b = g.timeAt(Math.max(dragStart, px(event)));
+      if (b - a >= 2 * timeline.step) { changed = true; state.from = Math.floor(a); state.to = Math.ceil(b); reload(); }
+      else svg.querySelector("#pf-brush").setAttribute("visibility", "hidden");
+    }
+    dragStart = null;
+  });
+  svg.addEventListener("pointerleave", hideTip);
+})();
+
+// ---- flame graph ----
+let tree = null, drawn = [];
+function buildTree() {
+  const root = { name: "root", v: flame.total_us, s: 0, cat: "other", children: [], parent: null, depth: 0, x0: 0 };
+  const nodes = new Array(flame.n.length);
+  for (let i = 0; i < nodes.length; i++) {
+    const parent = flame.p[i] < 0 ? root : nodes[flame.p[i]];
+    nodes[i] = { name: flame.names[flame.n[i]], cat: flame.categories[flame.n[i]], v: flame.v[i], s: flame.s[i], children: [], parent, depth: parent.depth + 1, x0: 0 };
+    parent.children.push(nodes[i]);
+  }
+  const pending = [root];
+  while (pending.length) {
+    const node = pending.pop();
+    node.children.sort((a, b) => b.v - a.v);
+    let x = node.x0;
+    for (const child of node.children) { child.x0 = x; x += child.v; pending.push(child); }
+  }
+  root.name = state.focus ? "Everything under the chosen function" : state.view === "all" ? "All CPU time" : labels[state.view];
+  tree = root;
+}
+function zoomNode() {
+  let node = tree;
+  for (const name of state.zoom) {
+    const next = node.children.find(child => child.name === name);
+    if (!next) break;
+    node = next;
+  }
+  return node;
+}
+function pathOf(node) { const path = []; for (let n = node; n && n.parent; n = n.parent) path.unshift(n.name); return path; }
+function drawFlame() {
+  const svg = el("flame"), empty = el("flame-empty");
+  if (!flame || !flame.total_us) {
+    svg.innerHTML = ""; svg.setAttribute("height", 0); empty.hidden = false; el("detail").hidden = true; el("crumb").textContent = "";
+    empty.textContent = !flame ? "Loading…" : state.lens === "block" ? "No samples fell inside a block's window in this range and view. Try a longer range." : "No samples in this range and view yet.";
+    return;
+  }
+  empty.hidden = true;
+  const focus = zoomNode();
+  const W = Math.max(560, svg.parentElement.clientWidth);
+  const scale = W / focus.v;
+  drawn = [];
+  let out = "", maxDepth = focus.depth, matched = 0;
+  const query = state.search;
+  // Ancestors of the zoomed frame span the full width; its subtree is laid out below.
+  for (let n = focus.parent; n; n = n.parent) drawn.push({ node: n, x: 0, w: W, above: true });
+  const pending = [focus];
+  while (pending.length) {
+    const node = pending.pop();
+    const w = node.v * scale;
+    if (w < 0.6) continue;
+    drawn.push({ node, x: (node.x0 - focus.x0) * scale, w });
+    if (node.depth > maxDepth) maxDepth = node.depth;
+    for (const child of node.children) pending.push(child);
+  }
+  if (query) {
+    const walk = [focus];
+    while (walk.length) {
+      const node = walk.pop();
+      if (node !== tree && node.name.toLowerCase().includes(query)) { matched += node.v; continue; }
+      for (const child of node.children) walk.push(child);
+    }
+  }
+  drawn.forEach((d, i) => {
+    const node = d.node, y = node.depth * ROW;
+    const hit = query && node.name.toLowerCase().includes(query);
+    const cls = "pf-f" + (d.above || (query && !hit) ? " pf-dim" : "") + (hit ? " pf-hit" : "");
+    out += `<rect class="${cls}" data-i="${i}" x="${d.x.toFixed(1)}" y="${y}" width="${Math.max(1, d.w).toFixed(1)}" height="${ROW - 1}" rx="2" fill="${node === tree ? "var(--line-hi)" : color(node.cat)}"/>`;
+    if (d.w > 34) {
+      const label = shortName(node.name), room = Math.floor((d.w - 8) / 6.7);
+      const text = label.length > room ? label.slice(0, Math.max(1, room - 1)) + "…" : label;
+      out += `<text x="${(d.x + 4).toFixed(1)}" y="${y + 13}"${node === tree ? ' style="fill:var(--ink)"' : ""}${d.above ? ' opacity="0.5"' : ""}>${esc(text)}</text>`;
+    }
+  });
+  const H = (maxDepth + 1) * ROW + 2;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", W); svg.setAttribute("height", H);
+  svg.innerHTML = out;
+  el("crumb").textContent = focus === tree ? "Click a bar to zoom into it." : "Zoomed into: " + pathOf(focus).map(shortName).join(" › ");
+  el("search-note").textContent = query ? `${pct(matched, focus.v)} of what is shown` : "";
+  const lead = Math.abs(status.block_window_ms[0]), tail = status.block_window_ms[1];
+  el("fl-note").textContent = (state.lens === "block"
+    ? `Only samples taken from ${lead} ms before to ${tail} ms after a block announcement: ${cpu(flame.whole_us)} of CPU across ${flame.blocks.toLocaleString()} blocks. `
+    : "")
+    + (state.focus ? "Everything that ran under this function, merged across every place it was called from. "
+      : state.view === "all" ? "Top row is the kind of thread; below it, each bar is a function and the bars under it are what it called. Width is CPU time. "
+      : `Each tower starts at the outermost ${labels[state.view].toLowerCase()} function on the stack, merged across every task and thread it ran on. Width is CPU time. `);
+  renderDetail(focus === tree ? null : focus);
+}
+function renderDetail(node) {
+  selected = node;
+  el("detail").hidden = !node;
+  if (!node) return;
+  el("detail-name").textContent = node.name;
+  const seconds = flame.covered_seconds || 1;
+  el("detail-facts").innerHTML = [
+    ["CPU time", cpu(node.v)], ["of this view", pct(node.v, flame.total_us)], ["of all node CPU", pct(node.v, flame.whole_us)],
+    ["in the function itself", cpu(node.s)], ["cores on average", cores(node.v / 1e6 / seconds)],
+  ].map(([label, value]) => `<span>${label} <b>${value}</b></span>`).join("");
+  el("focus-fn").hidden = node.name.startsWith("thread: ") || node.name.startsWith("(");
+}
+(function flameInteraction() {
+  const svg = el("flame");
+  const nodeAt = event => { const rect = event.target.closest("rect.pf-f"); return rect ? drawn[+rect.dataset.i].node : null; };
+  svg.addEventListener("click", event => {
+    const node = nodeAt(event); if (!node) return;
+    state.zoom = pathOf(node === zoomNode() && node.parent ? node.parent : node);
+    drawFlame();
+  });
+  svg.addEventListener("pointermove", event => {
+    const node = nodeAt(event); if (!node) return hideTip();
+    showTip(event, `<div class="pf-name">${esc(node.name)}</div>`
+      + `<div class="pf-row"><i class="pf-swatch" style="background:${color(node.cat)}"></i><span>${esc(labels[node.cat] || "")}</span><b>${cpu(node.v)}</b></div>`
+      + `<div class="pf-row"><span>of this view</span><b>${pct(node.v, flame.total_us)}</b></div>`
+      + `<div class="pf-row"><span>of all node CPU</span><b>${pct(node.v, flame.whole_us)}</b></div>`
+      + `<div class="pf-row"><span>in the function itself</span><b>${cpu(node.s)}</b></div>`);
+  });
+  svg.addEventListener("pointerleave", hideTip);
+})();
+
+// ---- a block's path: wall-clock time per stage, from the node's trace points ----
+function drawStages() {
+  const panel = el("stages-panel"), data = blockStages;
+  panel.hidden = !data;
+  if (!data) return;
+  document.querySelectorAll("[data-pf-scale]").forEach(b => b.setAttribute("aria-pressed", b.dataset.pfScale === state.scale));
+  const svg = el("stages"), table = el("block-table");
+  const total = data.blocks.length;
+  // Most common arrival path first; the typical block is shown for one path at a time.
+  const paths = Object.keys(data.paths).sort((a, b) => data.paths[b].blocks - data.paths[a].blocks);
+  if (!paths.includes(state.path)) state.path = paths[0];
+  el("paths").innerHTML = paths.length < 2 ? "" : "<span>Arrived over</span>" + paths.map(path =>
+    `<button data-pf-path="${esc(path)}" aria-pressed="${path === state.path}">${esc(PATH_LABEL[path] || path)} (${data.paths[path].blocks})</button>`).join("");
+  if (!total) {
+    svg.innerHTML = ""; svg.setAttribute("height", 0); table.innerHTML = ""; el("stage-median").hidden = true;
+    el("st-note").textContent = "No block has been recorded yet. This needs the node's trace files switched on (trace_dir under [network.zakura] in its config) and fills in with the next block.";
+    return;
+  }
+  const block = data.blocks.find(b => b.hash === state.block) || null;
+  el("stage-median").hidden = !block;
+  const typical = data.paths[block ? block.path : state.path];
+  const value = stage => block ? block.ms[stage] : typical.median_ms[stage];
+  const stages = data.stages.filter(s => value(s.id) != null && (state.scale === "all" || !DOWNLOAD_STAGES.includes(s.id)));
+  const span = stages.reduce((sum, s) => sum + value(s.id), 0) || 1;
+  const W = Math.max(560, svg.parentElement.clientWidth), ROWH = 26, left = 168, right = 236, top = 4, bottom = 22;
+  const H = top + stages.length * ROWH + bottom, plot = W - left - right;
+  let out = "", at = 0;
+  for (const fraction of [0, 0.5, 1]) {
+    const x = left + plot * fraction;
+    out += `<line x1="${x}" x2="${x}" y1="${top}" y2="${H - bottom + 4}" stroke="var(--line)"/><text x="${x}" y="${H - 5}" text-anchor="${fraction ? fraction === 1 ? "end" : "middle" : "start"}">${fraction ? ms(span * fraction) : "0"}</text>`;
+  }
+  stages.forEach((stage, i) => {
+    const v = value(stage.id), y = top + i * ROWH, w = Math.max(2, plot * v / span);
+    const x = Math.min(left + plot * at / span, left + plot - w);
+    const other = block ? `typical ${ms(typical.median_ms[stage.id])}` : `slowest tenth ${ms(typical.p90_ms[stage.id])}`;
+    out += `<text class="pf-label" x="0" y="${y + 17}">${esc(stage.label)}</text>`
+      + `<rect x="${x.toFixed(1)}" y="${y + 5}" width="${w.toFixed(1)}" height="${ROWH - 10}" rx="3" fill="${color(STAGE_CATEGORY[stage.id])}"/>`
+      + `<text class="pf-value" x="${left + plot + 10}" y="${y + 17}">${ms(v)}</text><text x="${left + plot + 82}" y="${y + 17}">${other}</text>`
+      + `<rect class="pf-hit" data-stage="${esc(stage.id)}" x="0" y="${y}" width="${W}" height="${ROWH}"/>`;
+    at += v;
+  });
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", W); svg.setAttribute("height", H);
+  svg.innerHTML = out;
+  const mix = paths.map(path => `${data.paths[path].blocks} over ${PATH_PHRASE[path] || path}`).join(", ");
+  el("st-note").textContent = (block
+    ? `Block ${block.height.toLocaleString()}, which arrived over ${PATH_PHRASE[block.path] || block.path}. `
+    : `Of the last ${total} blocks, ${mix}. Bars are the typical (median) time in each stage for the ${typical.blocks} that arrived over ${PATH_PHRASE[state.path] || state.path}. `)
+    + "This is time on the clock, waiting included, from the node's own trace points; each bar starts where the one above it ends. "
+    + ((block ? block.path : state.path) === "legacy" ? "For a block from the legacy network the record starts when its download finishes, so it has no header stages. " : "")
+    + (block ? "" : "Pick a block below to see its own path.");
+  const rows = data.blocks.slice(-BLOCK_ROWS).reverse();
+  const widest = Math.max(...rows.map(insideMs), 0.001);
+  table.innerHTML = "<tr><th>Block</th><th>Announced</th><th>Came over</th><th>Download</th><th>Verify</th><th>Writer</th><th>Peers told</th><th>After the download</th><th></th></tr>"
+    + rows.map(b => {
+      const writer = b.ms.writer_wait == null ? null : b.ms.writer_wait + b.ms.writer_commit;
+      const told = b.status_peers ? `${b.status_peers} · typical ${ms(b.ms.status_fanout)} · last ${ms(b.status_slowest_ms)}` : "–";
+      const mini = data.stages.filter(s => !DOWNLOAD_STAGES.includes(s.id) && b.ms[s.id] != null)
+        .map(s => `<i style="width:${(100 * b.ms[s.id] / widest).toFixed(2)}%;background:${color(STAGE_CATEGORY[s.id])}"></i>`).join("");
+      return `<tr aria-selected="${b.hash === state.block}"><td><button data-pf-block="${esc(b.hash)}" title="${esc(b.hash)}">${b.height.toLocaleString()}${b.reorg ? " (reorg)" : ""}</button></td>`
+        + `<td class="pf-num">${b.t ? clockSeconds(b.t) : "–"}</td><td>${esc(PATH_LABEL[b.path] || b.path)}</td>`
+        + `<td class="pf-num">${ms(b.ms.body_download)}</td><td class="pf-num">${ms(b.ms.verify)}</td><td class="pf-num">${ms(writer)}</td><td class="pf-num">${told}</td>`
+        + `<td style="width:18%"><div class="pf-mini" title="${ms(insideMs(b))} from download to peers told">${mini}</div></td>`
+        + `<td>${b.t ? `<button data-pf-cpu="${b.t}">CPU around it</button>` : ""}</td></tr>`;
+    }).join("");
+}
+// Time from the block being in hand to its peers being told.
+function insideMs(block) {
+  return Object.entries(block.ms).reduce((sum, [stage, value]) => sum + (DOWNLOAD_STAGES.includes(stage) || value == null ? 0 : value), 0);
+}
+(function stageInteraction() {
+  const svg = el("stages");
+  svg.addEventListener("pointermove", event => {
+    const hit = event.target.closest("rect.pf-hit");
+    const stage = hit && blockStages && blockStages.stages.find(s => s.id === hit.dataset.stage);
+    if (!stage) return hideTip();
+    const shown = blockStages.blocks.find(b => b.hash === state.block);
+    const typical = blockStages.paths[shown ? shown.path : state.path];
+    showTip(event, `<div class="pf-row"><i class="pf-swatch" style="background:${color(STAGE_CATEGORY[stage.id])}"></i><span>${esc(stage.label)}</span></div>`
+      + `<div class="pf-row"><span>${esc(stage.where)}</span></div>`
+      + `<div class="pf-row"><span>typical block</span><b>${ms(typical.median_ms[stage.id])}</b></div>`
+      + `<div class="pf-row"><span>slowest tenth of blocks</span><b>${ms(typical.p90_ms[stage.id])}</b></div>`);
+  });
+  svg.addEventListener("pointerleave", hideTip);
+})();
+
+function renderTop() {
+  const rows = flame ? flame.top.slice(0, 20) : [];
+  const peak = rows.length ? rows[0][1] : 1;
+  el("top").innerHTML = "<tr><th>Function</th><th>Own CPU time</th><th>Of this view</th><th></th></tr>" + rows.map(([name, us], i) => {
+    const cat = flame.categories[flame.names.indexOf(name)] || "other";
+    return `<tr><td class="pf-fn"><button data-pf-fn="${i}" title="${esc(name)}">${esc(shortName(name))}</button></td><td class="pf-num">${cpu(us)}</td><td class="pf-num">${pct(us, flame.total_us)}</td>`
+      + `<td style="width:28%"><div class="pf-bar" style="width:${(100 * us / peak).toFixed(1)}%;background:${color(cat)}"></div></td></tr>`;
+  }).join("");
+}
+function renderNotes() {
+  const lead = Math.abs(status.block_window_ms[0]), tail = status.block_window_ms[1];
+  el("notes").innerHTML = [
+    `Samples are taken from outside the node with <span class="pf-mono">perf</span>, ${status.window_seconds} seconds at a time, only while a node thread is on a CPU. Time spent waiting (on the network, a lock, a disk read) is not here, so a slow block download does not show up.`,
+    "The sampling rate drops automatically when the node is busy, so the profiler's cost stays bounded. All figures are CPU time, already corrected for the rate.",
+    `"While a block lands" keeps the samples from ${lead} ms before to ${tail} ms after each block announcement in the node log: the end of the download, verification, the commit and the hand-off to gossip.`,
+    "Functions the compiler inlined are counted in the function they were inlined into. A tower that starts at “[stack truncated]” is a stack the unwinder could not follow to its thread's start.",
+    `Per-minute detail is kept for 48 hours and hourly detail for ${status.retention_days} days.`,
+    ...(status.stage_timeline ? ["“A block's path through the node” is a different measurement: time on the clock between the node's own trace points for each block, so it includes waiting. It has no trace point between the new tip and the hand-off to legacy gossip, or per legacy peer; “Tell peers” covers Zakura peers only, counting status messages queued within a second of the new tip."] : []),
+  ].map(text => `<li>${text}</li>`).join("");
+}
+
+async function reload() {
+  writeHash(); renderControls();
+  try {
+    const params = rangeParams();
+    const flameParams = { ...params, view: state.view, lens: state.lens };
+    if (state.focus) flameParams.focus = state.focus;
+    [status, timeline, flame, blockStages] = await Promise.all([
+      api("status"), api("timeline", params), api("flame", flameParams),
+      // The stage timeline is extra: the profile still shows when it cannot be read.
+      status && status.stage_timeline ? api("blocks", { limit: 200 }).catch(() => blockStages) : null,
+    ]);
+  } catch (error) {
+    el("freshness").textContent = "Could not load the profile: " + error.message;
+    return;
+  }
+  renderStatus(); renderTiles(); drawTimeline(); buildTree(); drawFlame(); drawStages(); renderTop(); renderNotes();
+}
+async function start() {
+  readHash();
+  try { status = await api("status"); } catch (error) { el("freshness").textContent = "Could not reach the profiler: " + error.message; setTimeout(start, 10000); return; }
+  meta = { ranges: status.ranges, views: status.views, categories: status.categories };
+  labels = Object.fromEntries(meta.categories.map(c => [c.id, c.label]));
+  if (!meta.views.includes(state.view)) state.view = "all";
+  if (!meta.ranges.includes(state.range)) state.range = "1h";
+  await reload();
+  setInterval(() => { if (!state.from && !document.hidden) reload(); }, REFRESH_MS);
+  let resize; addEventListener("resize", () => { clearTimeout(resize); resize = setTimeout(() => { drawTimeline(); drawFlame(); drawStages(); }, 150); });
+}
+start();
 }
 
 /* ---------- interaction ---------- */
@@ -4485,6 +5209,7 @@ el('expand-toggle').addEventListener('click', (event) => {
   event.currentTarget.textContent = state.expandAll ? 'Collapse all' : 'Expand all';
   if (state.data) renderTable(state.data);
 });
+if (NODE_NAME) setupNodeNav();
 tick();
 setInterval(tick, REFRESH_MS);
 setInterval(renderFreshness, 1000);
@@ -4739,10 +5464,11 @@ class Handler(BaseHTTPRequestHandler):
         return str(peer_address)
 
     def serve_profile(self, parsed: urllib.parse.ParseResult) -> None:
-        """Forward the profile page and its data requests to the node's own profiler.
+        """Forward the node page's CPU profile requests to the node's own profiler.
 
-        `/profile/<node>` is the page; `/profile/<node>/api/<request>` is one of the
-        requests in PROFILER_API, with only the parameters listed there.
+        `/profile/<node>/api/<request>` is one of the requests in PROFILER_API, with
+        only the parameters listed there. `/profile/<node>` itself, the address of the
+        profile's former page, sends the browser to the node page's profile section.
         """
         assert COLLECTOR is not None
         name, _, rest = parsed.path[len("/profile/"):].partition("/")
@@ -4758,11 +5484,12 @@ class Handler(BaseHTTPRequestHandler):
                 {**NO_STORE, "Retry-After": str(int(PUBLIC_RATE_WINDOW))},
             )
         if request is None:
-            status, body, _ = fetch_profiler(node.profiler_url, "/", PROFILER_REQUEST_TIMEOUT_SECONDS)
-            if status != 200:
-                body = b"The profiler on this node is not answering.\n"
-            content_type = "text/html; charset=utf-8" if status == 200 else "text/plain; charset=utf-8"
-            return self.send_body(status, body, content_type, NO_STORE)
+            self.send_response(302)
+            self.send_header("Location", "/node/" + urllib.parse.quote(node.name, safe="") + "#profile")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
         params = [
             (key, value)
             for key, value in urllib.parse.parse_qsl(parsed.query)

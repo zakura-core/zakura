@@ -1236,5 +1236,25 @@
       "test_target": "handshake"
     },
     "fault_class": "request-authorization"
+  },
+  {
+    "patch": "handshake-admission/ignore-transport-reservations/ignore-transport-reservations.patch",
+    "entry": "handshake-admission",
+    "property": "handshake/pending-bounded",
+    "witness": {
+      "test": "pending_transport_load_bounds_outbound_control_handshakes",
+      "test_target": "handshake"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "handshake-release/no-closing-deadline/no-closing-deadline.patch",
+    "entry": "handshake-release",
+    "property": "handshake/hello/refusal-releases-slot",
+    "witness": {
+      "test": "slow_link_refusal_releases_the_quic_slot",
+      "test_target": "handshake"
+    },
+    "fault_class": "resource-lifetime"
   }
 ]

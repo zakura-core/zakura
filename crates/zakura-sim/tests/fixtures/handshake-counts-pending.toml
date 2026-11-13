@@ -1,0 +1,10 @@
+# Inbound TLS owners contend with outbound control claims for the same budget.
+harness = "handshake/counts"
+generator = 5
+sha256 = "72ea68e827e7efa5fc884bf54006c20173bc3602a747348253f34b06d7ca8cdb"
+scenario_sha256 = "feca88c3b27fda2b752ecf9f95f6a5c93a73bc960477ea7a425e2988579ce4d3"
+source = "crates/zakura-sim/src/harness/handshake_counts.rs"
+
+[[witness]]
+property = "handshake/pending-bounded"
+expect = "holds"

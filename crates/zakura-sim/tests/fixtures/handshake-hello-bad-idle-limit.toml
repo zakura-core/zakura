@@ -1,5 +1,5 @@
 harness = "handshake/wire"
-generator = 8
+generator = 11
 sha256 = "8c89f8d8b545ff76b8bc2a78addbe86867308f52ec92927b6721d6aa5e33c797"
 scenario_sha256 = "8dd647a3e75d29a00537a3db62f29f3e2c0a8a42c73e931b462e716a720ae2d4"
 source = "crates/zakura-sim/tests/support/handshake_seeds.rs"

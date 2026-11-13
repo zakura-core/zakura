@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -4728,7 +4728,7 @@
+             ..
+         } = &registration
+         {
+-            if self.capability_epoch.load(Ordering::SeqCst) != context.capability_epoch {
++            if false {
+                 #[cfg(any(test, zakura_sim))]
+                 self.registration_refused(&close_cause, &connection, "capabilities_changed");
+                 connection.close(

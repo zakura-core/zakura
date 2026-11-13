@@ -260,6 +260,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
     let mut publish = Box::pin(zakura_rt::time::sleep(Duration::ZERO));
     let mut publish_deadline: Option<Instant> = None;
     let mut closing_seen = false;
+    let mut closing_deadline = None;
     if *closing.borrow() {
         task.close(
             VarInt::from_u32(0),
@@ -268,12 +269,20 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
     }
 
     loop {
+        if closing_deadline.is_some_and(|deadline| now() >= deadline) {
+            break;
+        }
         task.drive();
         if task.conn.is_drained() {
             break;
         }
         if !closing_seen && task.conn.is_closed() {
             closing_seen = true;
+            // quinn-proto drains for three probe timeouts, which the peer's
+            // RTT sets. Cap the drain at SHUTDOWN_DRAIN so a slow or delaying
+            // peer can't hold a closing slot longer (ADM-13). A late packet
+            // after the cap at worst draws a stateless reset.
+            closing_deadline = Some(now() + super::endpoint::SHUTDOWN_DRAIN);
             if !task.enter_closing(&mut datagrams) {
                 // ADM-13: the closing allowance is full, so drop the state
                 // now. Dropping the task reports the connection drained.
@@ -291,7 +300,13 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
             Some(_) => {}
             None => publish_deadline = None,
         }
-        match task.conn.poll_timeout() {
+        match task
+            .conn
+            .poll_timeout()
+            .into_iter()
+            .chain(closing_deadline)
+            .min()
+        {
             Some(deadline) if timer_deadline != Some(deadline) => {
                 timer
                     .as_mut()

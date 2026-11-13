@@ -90,18 +90,23 @@ impl HasView for Wire {
 
 impl Subsystem for Wire {
     const NAME: &'static str = "handshake/wire";
-    const GENERATOR: u32 = 8;
+    const GENERATOR: u32 = 11;
     const SCENARIO_BYTES: usize = 32;
     type Scenario = Scenario;
     type Prepared = Prepared;
 
     fn config(scenario: &Scenario) -> RunConfig {
         let mut config = wire_config();
-        config.budget = config.budget.max(
-            u64::try_from(scenario.peers.len())
-                .expect("peer count fits u64")
-                .saturating_mul(2_000),
-        );
+        let attempts: u64 = scenario
+            .peers
+            .iter()
+            .map(|peer| {
+                peer.handshake
+                    .as_ref()
+                    .map_or(1, |script| u64::from(script.retries) + 1)
+            })
+            .sum();
+        config.budget = config.budget.max(attempts.saturating_mul(2_000));
         config.budget = config.budget.max(
             scenario
                 .peers
@@ -445,6 +450,15 @@ impl Subsystem for Wire {
                 script.bind_ip = Some("192.0.2.1".parse().unwrap());
                 script.retries = byte(1) % 32;
                 script.retry_delay_ms = u64::from(byte(2));
+                if byte(4) & 1 != 0 {
+                    scenario.net.default_link.min_delay_ms = 0;
+                    scenario.net.default_link.max_delay_ms = 0;
+                    scenario.net.default_link.reorder = false;
+                }
+                if byte(4) & 2 != 0 {
+                    script.retry_delay_ms = 1_000;
+                }
+                scenario.peers = vec![PeerSpec::dialing(); usize::from(byte(5) % 16) + 1];
             }
             6 => {
                 scenario.capability_flip = match byte(1) % 4 {
@@ -456,8 +470,9 @@ impl Subsystem for Wire {
                 script.dial_delay_ms = 1;
             }
             7 => {
-                let incoming = usize::from(byte(1) % 96);
-                let outgoing = usize::from(byte(2) % 8) + 1;
+                let transport_pressure = byte(6) & 0x80 != 0;
+                let incoming = usize::from(byte(1) % if transport_pressure { 9 } else { 96 });
+                let outgoing = usize::from(byte(2) % if transport_pressure { 32 } else { 8 }) + 1;
                 scenario.peers = (0..incoming)
                     .map(|index| {
                         let mut peer = PeerSpec::dialing();
@@ -473,11 +488,31 @@ impl Subsystem for Wire {
                         let mut peer = PeerSpec::listening();
                         peer.handshake = Some(HandshakeSpec {
                             dial_delay_ms: u64::from(byte(4)) * 10,
+                            length_delay_ms: if transport_pressure { 8_000 } else { 0 },
                             ..HandshakeSpec::default()
                         });
                         peer
                     }))
                     .collect();
+                if transport_pressure {
+                    scenario.net.default_link = super::LinkSpec {
+                        min_delay_ms: 0,
+                        max_delay_ms: 0,
+                        reorder: false,
+                        loss_budget: 0,
+                    };
+                    for (index, peer) in scenario.peers.iter().take(incoming).enumerate() {
+                        scenario.net.links.push(super::LinkEntry {
+                            src: NODE_ADDR,
+                            dst: peer.address(index, 0),
+                            model: super::LinkSpec {
+                                min_delay_ms: 9_000,
+                                max_delay_ms: 9_000,
+                                ..scenario.net.default_link
+                            },
+                        });
+                    }
+                }
                 return scenario;
             }
             8 => {
@@ -517,8 +552,14 @@ impl Subsystem for Wire {
             }
             _ => unreachable!("ten families"),
         }
-        for peer in &mut scenario.peers {
-            peer.handshake = Some(script.clone());
+        for (index, peer) in scenario.peers.iter_mut().enumerate() {
+            let mut script = script.clone();
+            // The retry family staggers its dialers.
+            if byte(0) % 10 == 5 {
+                script.dial_delay_ms =
+                    u64::try_from(index).expect("peer index fits u64") * u64::from(byte(6)) * 4;
+            }
+            peer.handshake = Some(script);
         }
         scenario
     }

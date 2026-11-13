@@ -1,0 +1,45 @@
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -4972,41 +4972,8 @@
+                 Admit::Retry
+             };
+         }
+-        #[cfg(any(test, zakura_sim))]
+-        let fresh = !counts.has_cadence_host(incoming.remote.ip());
+-        let cadence = counts.admit_cadence(
+-            incoming.remote.ip(),
+-            self.supervisor.max_connections_per_ip,
+-            self.limits
+-                .max_connections
+-                .saturating_add(self.limits.max_pending_handshakes),
+-            Instant::now(),
+-        );
+-        if cadence != super::HandshakeCadenceAdmission::Admit {
+-            counts.release_transport();
+-        }
+         drop(counts);
+-        #[cfg(any(test, zakura_sim))]
+-        self.observe_handshake_cadence(
+-            incoming.remote,
+-            match cadence {
+-                super::HandshakeCadenceAdmission::Admit => "admitted",
+-                super::HandshakeCadenceAdmission::Exhausted => "exhausted",
+-                super::HandshakeCadenceAdmission::Capacity => "capacity",
+-            },
+-            fresh && cadence == super::HandshakeCadenceAdmission::Admit,
+-        );
+-        match cadence {
+-            super::HandshakeCadenceAdmission::Admit => Admit::Accept,
+-            super::HandshakeCadenceAdmission::Exhausted
+-            | super::HandshakeCadenceAdmission::Capacity => {
+-                if incoming.validated {
+-                    Admit::Refuse
+-                } else {
+-                    Admit::Retry
+-                }
+-            }
+-        }
++        Admit::Accept
+     }
+ 
+     fn cancel_admission(&self, incoming: &IncomingInfo) {

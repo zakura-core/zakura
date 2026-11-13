@@ -146,6 +146,33 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             })),
         });
     }
+    for (id, claim) in [
+        (
+            "handshake/attempts-within-cadence",
+            "Accepted TLS attempts consume only initial, refilled, or refunded address tokens.",
+        ),
+        (
+            "handshake/cadence-never-refuses-conformant",
+            "The cadence never refuses an attempt whose address has a token.",
+        ),
+    ] {
+        properties.push(Property {
+            id: PropertyId::new(id),
+            claim,
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Closes],
+            status: Status::Active,
+            check: check_cadence::<S>,
+            witness: Some(TriggerHistory::Log(
+                if id == "handshake/attempts-within-cadence" {
+                    cadence_burst_reached
+                } else {
+                    cadence_attempt_reached
+                },
+            )),
+        });
+    }
     properties.push(Property {
         id: PropertyId::new("session/stream-opens-bounded"),
         claim: "Setup and installed stream owners stay within the negotiated limit; inbound setup starts stay within the configured burst and refill rate, and teardown returns every stream permit.",
@@ -158,9 +185,9 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
     });
     properties.push(Property {
         id: PropertyId::new("session/renegotiation-covers-inflight-handshakes"),
-        claim: "Capability enablement closes every connection whose handshake captured the old capability mask.",
+        claim: "Capability enablement removes every registration whose handshake captured the old capability mask.",
         kind: Kind::Liveness { bound: LivenessBound::BeforeQuiescence },
-        assumes: &[], needs: &[Source::Closes], status: Status::Known { issue: 2334 },
+        assumes: &[], needs: &[Source::Closes], status: Status::Active,
         check: check_epoch::<S>, witness: Some(TriggerHistory::Log(capability_flip_reached)),
     });
     for (id, claim) in [
@@ -183,11 +210,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::Closes],
-            status: if id == "handshake/pending-bounded" {
-                Status::Known { issue: 2341 }
-            } else {
-                Status::Active
-            },
+            status: Status::Active,
             check: check_counts::<S>,
             witness: Some(TriggerHistory::PropertyLog(admission_reached)),
         });
@@ -210,7 +233,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         },
         assumes: &[],
         needs: &[Source::Closes],
-        status: Status::Known { issue: 2333 },
+        status: Status::Active,
         check: check_deadline::<S>,
         witness: Some(TriggerHistory::Log(paced_control_reached)),
     });
@@ -511,9 +534,233 @@ fn check_quic_deadline<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     }
 }
 
+fn cadence_attempt_reached(log: &crate::ObservationLog) -> bool {
+    log.entries().iter().any(|entry| {
+        matches!(&entry.obs,
+            Observation::Transport { event: TransportFact::HandshakeCadence { action, .. }, .. }
+                if action == "admitted" || action == "exhausted"
+        )
+    })
+}
+
+fn cadence_burst_reached(log: &crate::ObservationLog) -> bool {
+    let mut now = 0;
+    let mut attempts = std::collections::BTreeMap::<_, std::collections::VecDeque<u64>>::new();
+    for entry in log.entries() {
+        if let Observation::TimeAdvanced { to_ns, .. } = entry.obs {
+            now = to_ns;
+        }
+        let Observation::Transport {
+            instance,
+            remote,
+            event,
+            ..
+        } = &entry.obs
+        else {
+            continue;
+        };
+        if !matches!(event, TransportFact::QuicHandshakeStarted)
+            && !matches!(event, TransportFact::HandshakeCadence { action, .. } if action == "exhausted")
+        {
+            continue;
+        }
+        let remote: std::net::SocketAddr = remote
+            .parse()
+            .expect("transport addresses use socket syntax");
+        let times = attempts
+            .entry((*instance, scripted_host(remote.ip())))
+            .or_default();
+        while times.front().is_some_and(|at| now - at >= 1_000_000_000) {
+            times.pop_front();
+        }
+        times.push_back(now);
+        if times.len() > 16 {
+            return true;
+        }
+    }
+    false
+}
+
+// The scripted address families use native IPv4, mapped IPv4, and global IPv6 /64s.
+fn scripted_host(ip: std::net::IpAddr) -> std::net::IpAddr {
+    use std::net::{IpAddr, Ipv6Addr};
+    match ip {
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
+            let segments = v6.segments();
+            if (0x2000..0x4000).contains(&segments[0]) {
+                IpAddr::V6(Ipv6Addr::new(
+                    segments[0],
+                    segments[1],
+                    segments[2],
+                    segments[3],
+                    0,
+                    0,
+                    0,
+                    0,
+                ))
+            } else {
+                ip
+            }
+        }
+        _ => ip,
+    }
+}
+
+/// Counts actual QUIC attempts for the rate bound. Checks admission decisions
+/// against a separate balance that includes charges cancelled before TLS.
+fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    use std::collections::BTreeMap;
+    use zakura_network::zakura::DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF;
+
+    let rate = cx.id().as_str() == "handshake/attempts-within-cadence";
+    if !cx.observations().any(|obs| {
+        matches!(
+            obs,
+            Observation::Transport {
+                event: TransportFact::HandshakeCadence { .. },
+                ..
+            }
+        ) || (rate
+            && matches!(
+                obs,
+                Observation::Transport {
+                    event: TransportFact::QuicHandshakeStarted,
+                    ..
+                }
+            ))
+    }) {
+        return Verdict::NotApplicable;
+    }
+    let mut now = 0u64;
+    let mut limits = BTreeMap::new();
+    let mut balances = BTreeMap::new();
+    for entry in cx.log.entries() {
+        if let Observation::TimeAdvanced { to_ns, .. } = entry.obs {
+            now = to_ns;
+        }
+        let Observation::Transport {
+            instance,
+            remote,
+            event,
+            ..
+        } = &entry.obs
+        else {
+            continue;
+        };
+        if let TransportFact::HandshakeCounts {
+            address_cap,
+            connection_cap,
+            cap,
+            ..
+        } = event
+        {
+            limits.insert(*instance, (*address_cap, connection_cap + cap));
+        }
+        if !matches!(
+            event,
+            TransportFact::HandshakeCadence { .. } | TransportFact::QuicHandshakeStarted
+        ) {
+            continue;
+        }
+        let Some(&(address_cap, expected_hosts)) = limits.get(instance) else {
+            return cx.violated(
+                "admission limits observed before a cadence charge",
+                "missing limits",
+            );
+        };
+        let cap = u32::try_from(address_cap).unwrap();
+        let interval = u64::try_from(DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF.as_nanos()).unwrap()
+            / u64::from(cap);
+        let (action, fresh) = match event {
+            TransportFact::QuicHandshakeStarted => ("started", false),
+            TransportFact::HandshakeCadence {
+                action,
+                fresh,
+                capacity,
+                refill_ns,
+                hosts,
+                host_limit,
+            } => {
+                if rate
+                    && (*capacity != cap
+                        || *refill_ns != interval
+                        || *host_limit != expected_hosts
+                        || hosts > host_limit)
+                {
+                    return cx.violated("cadence derives its rate and memory bounds from admission and redial limits", format!("{event:?}"));
+                }
+                if action == "capacity" {
+                    if !rate && hosts < host_limit {
+                        return cx.violated(
+                            "a new address enters a non-full cadence ledger",
+                            format!("{event:?}"),
+                        );
+                    }
+                    continue;
+                }
+                (action.as_str(), *fresh)
+            }
+            _ => unreachable!("only cadence and QUIC attempt events pass the filter"),
+        };
+        let remote: std::net::SocketAddr = remote
+            .parse()
+            .expect("transport addresses use socket syntax");
+        let (tokens, last) = balances
+            .entry((*instance, scripted_host(remote.ip())))
+            .or_insert((cap, now));
+        let earned = now.saturating_sub(*last) / interval;
+        *tokens = tokens
+            .saturating_add(u32::try_from(earned).unwrap_or(u32::MAX))
+            .min(cap);
+        *last += earned * interval;
+        if fresh {
+            if rate && *tokens != cap {
+                return cx.violated(
+                    "a depleted address retains its cadence debt",
+                    remote.to_string(),
+                );
+            }
+            *last = now;
+        }
+        match action {
+            "started" if rate => {
+                if *tokens == 0 {
+                    return cx.violated("TLS requires an address token", remote.to_string());
+                }
+                *tokens = tokens.saturating_sub(1);
+            }
+            "admitted" if !rate => *tokens = tokens.saturating_sub(1),
+            "registered" => *tokens = tokens.saturating_add(1).min(cap),
+            "cancelled" if !rate => *tokens = tokens.saturating_add(1).min(cap),
+            "exhausted" if !rate && *tokens != 0 => {
+                return cx.violated(
+                    "an address with a token is never exhausted",
+                    remote.to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+    Verdict::Holds
+}
+
 fn epoch_closed(key: &ObligationKey, obs: &Observation) -> bool {
-    matches!(obs, Observation::PeerConnectionClosed { shared_id, .. }
-        if key.subject == Subject::Session(shared_id.clone()))
+    // Local deregistration completes before the peer receives the neutral close.
+    match obs {
+        Observation::PeerConnectionClosed { shared_id, .. } => {
+            key.subject == Subject::Session(shared_id.clone())
+        }
+        Observation::Transport {
+            event: TransportFact::Handshake {
+                shared_id, stage, ..
+            },
+            ..
+        } => stage == "registration-released" && key.subject == Subject::Session(shared_id.clone()),
+        _ => false,
+    }
 }
 
 fn check_epoch<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
@@ -690,7 +937,10 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             }
             "handshake/pending-bounded" => {
                 let inbound_cap = cap - if *cap >= 2 { (cap / 4).max(1) } else { 0 };
-                if pending + quic_pending > *cap || inbound + quic_pending > inbound_cap {
+                // The synchronous handoff counts one owner in both stages until QUIC releases it.
+                if *quic_handoffs == 0
+                    && (pending + quic_pending > *cap || inbound + quic_pending > inbound_cap)
+                {
                     return cx.violated(
                         format!("pending <= {cap}; inbound <= {inbound_cap}"),
                         format!("control {pending}/{inbound}, QUIC {quic_pending}"),
@@ -939,25 +1189,48 @@ fn check_deadline<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     }
 }
 
+// A deadline violation stops the trace before the handshake releases its claim.
 fn paced_control_reached(log: &crate::ObservationLog) -> bool {
     log.entries().iter().any(|entry| {
-        let Observation::Transport {
-            event:
-                TransportFact::Handshake {
-                    shared_id,
-                    stage,
-                    elapsed_ms: Some(elapsed),
-                    ..
-                },
+        let Observation::PeerHandshake {
+            shared_id,
+            row,
+            label,
             ..
         } = &entry.obs
         else {
             return false;
         };
-        stage == "released" && *elapsed >= 9_000 && log.entries().iter().any(|entry| {
-            matches!(&entry.obs, Observation::PeerHandshake { shared_id: sent_id, row, label, .. }
-                if sent_id == shared_id && row == "hello" && label == "paced")
-        })
+        if row != "hello" || label != "paced" {
+            return false;
+        }
+        let mut now = 0;
+        let mut started = None;
+        for entry in log.entries() {
+            match &entry.obs {
+                Observation::TimeAdvanced { to_ns, .. } => {
+                    now = *to_ns;
+                    if started.is_some_and(|start| now.saturating_sub(start) >= 9_000_000_000) {
+                        return true;
+                    }
+                }
+                Observation::Transport {
+                    event:
+                        TransportFact::Handshake {
+                            shared_id: observed,
+                            stage,
+                            ..
+                        },
+                    ..
+                } if observed == shared_id => match stage.as_str() {
+                    "started" => started = Some(now),
+                    "released" => started = None,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        false
     })
 }
 

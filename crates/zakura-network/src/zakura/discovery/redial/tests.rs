@@ -942,3 +942,40 @@ async fn a_panicking_dial_traces_its_end() {
     let phases: Vec<_> = rows().into_iter().map(|row| row.2).collect();
     assert_eq!(phases, ["recorded", "worker_panicked"]);
 }
+
+#[test]
+fn sixteen_failed_redialers_fit_the_handshake_cadence() {
+    use crate::zakura::{
+        handshake_cadence, HandshakeCadenceAdmission, HandshakeCounts,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
+        DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
+    };
+    let cap = DEFAULT_ZAKURA_MAX_CONNS_PER_IP;
+    let cadence = handshake_cadence(cap);
+    let mut dialers: Vec<_> = (0..cap)
+        .map(|_| {
+            RedialState::new(RedialPolicy::maintain(
+                DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
+                DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
+            ))
+        })
+        .collect();
+    let mut counts = HandshakeCounts::default();
+    let host = "192.0.2.1".parse().unwrap();
+    let mut now = Instant::now();
+    for _ in 0..8 {
+        let mut next = None;
+        for dialer in &mut dialers {
+            assert_eq!(
+                counts.admit_cadence(host, cap, 1, now),
+                HandshakeCadenceAdmission::Admit
+            );
+            let RedialNext::RetryAfter(delay) = dialer.record(DialResult::Failed) else {
+                panic!("failed production dials must back off");
+            };
+            assert!(delay >= cadence.send_interval);
+            next = Some(next.map_or(delay, |earlier: Duration| earlier.min(delay)));
+        }
+        now += next.unwrap();
+    }
+}

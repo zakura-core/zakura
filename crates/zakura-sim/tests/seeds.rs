@@ -182,6 +182,45 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "handshake-counts-owners" => value(zakura_sim::record::machine::MachineScenario {
             input: vec![0, 0, 0, 2, 0, 0, 3, 0, 0, 5, 0, 0],
         }),
+        "handshake-counts-pending" => value(zakura_sim::record::machine::MachineScenario {
+            input: vec![128, 1, 128],
+        }),
+        "handshake-counts-cadence" => value(zakura_sim::record::machine::MachineScenario {
+            input: [8, 0, 0].repeat(32),
+        }),
+        "handshake-cadence-burst" | "handshake-cadence-conformant" => {
+            let conformant = stem == "handshake-cadence-conformant";
+            let mut scenario = zakura_sim::harness::handshake_wire::Scenario::default();
+            scenario.net.default_link.min_delay_ms = 0;
+            scenario.net.default_link.max_delay_ms = 0;
+            scenario.net.default_link.reorder = false;
+            scenario.peers = (0..if conformant { 16 } else { 1 })
+                .map(|index| {
+                    let mut peer = zakura_sim::peer::PeerSpec::dialing();
+                    peer.handshake = Some(zakura_sim::peer::handshake::options::HandshakeSpec {
+                        control: zakura_sim::peer::handshake::options::ControlFault::Network,
+                        bind_ip: Some("192.0.2.1".parse().unwrap()),
+                        retries: if conformant { 1 } else { 31 },
+                        retry_delay_ms: if conformant { 1_000 } else { 0 },
+                        dial_delay_ms: index * 60,
+                        ..Default::default()
+                    });
+                    peer
+                })
+                .collect();
+            value(scenario)
+        }
+        "handshake-slow-control" => {
+            let mut scenario = zakura_sim::harness::handshake_wire::Scenario::default();
+            scenario.peers[0].handshake =
+                Some(zakura_sim::peer::handshake::options::HandshakeSpec {
+                    length_delay_ms: 9_000,
+                    payload_delay_ms: 9_000,
+                    ..Default::default()
+                });
+            value(scenario)
+        }
+
         "header-sync-storage-default" => value(StorageScenario::default()),
         "block-reactor-identity" => value(zakura_sim::record::machine::MachineScenario {
             input: vec![0, 0, 1, 200, 1, 0, 1, 0, 4, 0, 30, 0, 0, 9, 1, 200],

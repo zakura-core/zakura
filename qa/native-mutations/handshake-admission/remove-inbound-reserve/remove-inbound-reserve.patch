@@ -1,11 +1,8 @@
 --- a/crates/zakura-network/src/zakura/transport/handshake_counts.rs
 +++ b/crates/zakura-network/src/zakura/transport/handshake_counts.rs
-@@ -224,6 +224,5 @@
- 
- /// Leaves a quarter of a cap for dials, with at least one dial slot when possible.
+@@ -339,4 +339,3 @@
  pub fn inbound_share(cap: usize) -> usize {
 -    let reserve = if cap >= 2 { (cap / 4).max(1) } else { 0 };
 -    cap - reserve
--}
 +    cap
-+}
+ }

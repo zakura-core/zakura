@@ -1028,7 +1028,7 @@ pub struct CountsStep {
     pub actual: CountsView,
     /// The independently counted live owners.
     pub expected: CountsView,
-    /// Whether this history admitted any connection.
+    /// Whether this history reached an admission decision.
     pub active: bool,
     /// Each named rule violated at this operation.
     pub failures: Vec<(String, MachineFailure)>,

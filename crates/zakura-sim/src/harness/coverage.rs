@@ -434,25 +434,6 @@ pub static COVERAGE: &[Coverage] = &[
         "handshake-table/skip-control-read-hard-cap/skip-control-read-hard-cap.patch",
         "ack_guards_refuse_each_corrupt_field",
     ),
-    Coverage {
-        property: "handshake/finishes-in-time",
-        passing: passes("tests/handshake.rs", "honest_control_handshake_holds"),
-        bypass: Bypass::Test(sim_test(
-            "tests/handshake.rs",
-            "slow_control_steps_exceed_the_overall_deadline",
-        )),
-    },
-    Coverage {
-        property: "session/renegotiation-covers-inflight-handshakes",
-        passing: passes(
-            "tests/handshake.rs",
-            "capability_flip_covers_inflight_handshake",
-        ),
-        bypass: Bypass::Test(sim_test(
-            "tests/handshake.rs",
-            "capability_flip_covers_inflight_handshake",
-        )),
-    },
     handshake_guard(
         "handshake/hello/wrong-network-refused",
         "handshake-table/skip-network-binding/skip-network-binding.patch",
@@ -624,6 +605,38 @@ pub static COVERAGE: &[Coverage] = &[
             "installed_services_follow_each_peers_negotiation",
         ),
         bypass: Bypass::Planted("install-unnegotiated-service"),
+    },
+    Coverage {
+        property: "handshake/attempts-within-cadence",
+        passing: passes(
+            "tests/handshake.rs",
+            "fast_fail_handshakes_exhaust_the_address_cadence",
+        ),
+        bypass: Bypass::Planted("bypass-cadence-admission"),
+    },
+    Coverage {
+        property: "handshake/cadence-never-refuses-conformant",
+        passing: passes(
+            "tests/handshake.rs",
+            "sixteen_conformant_dialers_share_an_address_cadence",
+        ),
+        bypass: Bypass::Planted("refuse-funded-attempt"),
+    },
+    Coverage {
+        property: "session/renegotiation-covers-inflight-handshakes",
+        passing: passes(
+            "tests/handshake.rs",
+            "capability_flip_covers_inflight_handshake",
+        ),
+        bypass: Bypass::Planted("stale-capability-snapshot"),
+    },
+    Coverage {
+        property: "handshake/finishes-in-time",
+        passing: passes(
+            "tests/handshake.rs",
+            "slow_control_steps_share_one_deadline",
+        ),
+        bypass: Bypass::Planted("no-overall-deadline"),
     },
     Coverage {
         property: super::super::domain::block_sync::PAYLOAD_INVENTORY_AGREES,

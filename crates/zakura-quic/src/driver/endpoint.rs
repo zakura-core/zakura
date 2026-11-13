@@ -501,6 +501,7 @@ impl<F: SocketFactory> EndpointTask<F> {
                 // ADM-12: a live slot. Closed connections draining hold their
                 // own allowance, so they don't count here (ADM-13).
                 let Some(slot) = self.shared.connections.claim_inbound() else {
+                    acceptor.cancel_admission(&info);
                     metrics::counter!("zakura.quic.incoming.refused").increment(1);
                     tracing::trace!(target: "zakura_quic", remote = %info.remote, "connection cap full");
                     let transmit = self.endpoint.refuse(incoming, &mut self.response_buf);
@@ -508,10 +509,12 @@ impl<F: SocketFactory> EndpointTask<F> {
                     return;
                 };
                 // ADM-7: count the handshake from Accept until it finishes.
-                let pending = self.shared.pending.enter(pending_group);
+                let pending = self.shared.pending.enter(pending_group, acceptor.clone());
                 let probe = Arc::new(CongestionProbe::default());
                 let mut server = (*server).clone();
                 server.transport_config(self.shared.connection_transport(probe.clone(), io.gso()));
+                #[cfg(zakura_sim)]
+                self.shared.observe_handshake_attempt(remote);
                 match self.endpoint.accept(
                     incoming,
                     now(),
@@ -691,6 +694,8 @@ mod tests {
             max_bidi_streams: 16,
             tls: TlsConfig::new(&secret),
             pending: PendingTable::default(),
+            #[cfg(zakura_sim)]
+            admission_observer: std::sync::Mutex::new(None),
             connections: ConnectionSlots::new(16, 0, None, 16),
             hooks: Arc::default(),
             shutdown: watch::Sender::new(false),

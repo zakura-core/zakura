@@ -1,8 +1,12 @@
 //! Admission histories against the production machine and independent live owners.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
+use zakura_rt::time::Instant;
 
-use zakura_network::zakura::{HandshakeCounts, IpAdmission};
+use zakura_network::zakura::{HandshakeCadenceAdmission, HandshakeCounts, IpAdmission};
 
 use super::{machine::Machine, HarnessEntry};
 use crate::property::Status;
@@ -16,6 +20,11 @@ pub const ADDRESS: &str = "handshake/connections-per-address-bounded";
 pub const RESERVE: &str = "handshake/dial-reserve-kept";
 /// Conservation of admission charges.
 pub const COUNTS: &str = "handshake/counts-match-permits";
+
+/// Failed attempts consume only the cadence's rate and capacity.
+pub const CADENCE: &str = "handshake/attempts-within-cadence";
+/// Attempts inside the cadence retain admission eligibility.
+pub const CONFORMANT: &str = "handshake/cadence-never-refuses-conformant";
 
 const HOSTS: usize = 8;
 const SLOTS: usize = 128;
@@ -32,9 +41,19 @@ const MACHINE: Machine = Machine {
     claim: "Admission charges match live connection owners.",
     rules: &[
         (
+            CADENCE,
+            "Failed attempts consume only initial, refilled, and refunded tokens.",
+            Status::Active,
+        ),
+        (
+            CONFORMANT,
+            "An address with an available token is never refused by the cadence.",
+            Status::Active,
+        ),
+        (
             PENDING,
             "QUIC and control handshakes stay within total, inbound and address bounds.",
-            Status::Known { issue: 2341 },
+            Status::Active,
         ),
         (
             ADDRESS,
@@ -52,7 +71,7 @@ const MACHINE: Machine = Machine {
             Status::Active,
         ),
     ],
-    generator: 3,
+    generator: 5,
     budget: 513,
     history,
     reached: |steps, _| {
@@ -165,7 +184,11 @@ fn release(counts: &mut HandshakeCounts, owner: Owner) {
 
 fn release_handshake(counts: &mut HandshakeCounts, owner: Owner) {
     match owner.phase {
-        Phase::Quic => {}
+        Phase::Quic => {
+            if owner.inbound {
+                counts.release_transport();
+            }
+        }
         Phase::Control => {
             counts.release_pending(owner.inbound);
             if owner.inbound {
@@ -202,6 +225,15 @@ fn operations(input: &[u8]) -> Vec<u8> {
                 operations.extend([0, slot, host, 2, slot, 0, 3, slot, 0]);
             }
         }
+        1 if input.get(2).is_some_and(|byte| byte & 0x80 != 0) => {
+            for slot in 0..24u8 {
+                let host = if slot % 8 < 4 { slot % 8 } else { slot % 8 + 4 };
+                operations.extend([0, slot, host]);
+            }
+            for slot in 24..33 {
+                operations.extend([1, slot, 0, 2, slot, 0]);
+            }
+        }
         1 => {
             for slot in 0..26 {
                 let host = slot % 4 + (slot / 12) * 8;
@@ -226,13 +258,76 @@ fn operations(input: &[u8]) -> Vec<u8> {
     operations
 }
 
+struct CadenceOracle {
+    origin: Instant,
+    now_ns: u64,
+    last: [Option<u64>; HOSTS],
+    tokens: [u32; HOSTS],
+}
+
+impl CadenceOracle {
+    fn now(&self) -> Instant {
+        self.origin + Duration::from_nanos(self.now_ns)
+    }
+
+    fn refill(&mut self, host: usize) {
+        // The harness admits sixteen nodes per address, each retrying once a second.
+        let last = self.last[host].get_or_insert(self.now_ns);
+        while self.tokens[host] < 16 && self.now_ns - *last >= 62_500_000 {
+            *last += 62_500_000;
+            self.tokens[host] += 1;
+        }
+        // A full bucket skips complete refill intervals while retaining their phase.
+        *last += ((self.now_ns - *last) / 62_500_000) * 62_500_000;
+    }
+
+    fn attempt(
+        &mut self,
+        counts: &mut HandshakeCounts,
+        host: usize,
+        ip: IpAddr,
+        failures: &mut Vec<(String, MachineFailure)>,
+    ) -> bool {
+        self.refill(host);
+        let admitted =
+            counts.admit_cadence(ip, ADDRESS_CAP, CONNECTION_CAP + PENDING_CAP, self.now())
+                == HandshakeCadenceAdmission::Admit;
+        if admitted && self.tokens[host] == 0 {
+            failure(
+                failures,
+                CADENCE,
+                "an exhausted address started another TLS attempt",
+            );
+        }
+        if !admitted && self.tokens[host] != 0 {
+            failure(failures, CONFORMANT, "an address with a token was refused");
+        }
+        if admitted {
+            self.tokens[host] = self.tokens[host].saturating_sub(1);
+        }
+        admitted
+    }
+
+    fn refund(&mut self, counts: &mut HandshakeCounts, host: usize, ip: IpAddr) {
+        self.refill(host);
+        self.tokens[host] = (self.tokens[host] + 1).min(16);
+        counts.refund_cadence(ip, self.now());
+    }
+}
+
 fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
     let mut counts = HandshakeCounts::default();
+    let mut cadence = CadenceOracle {
+        origin: Instant::now(),
+        now_ns: 0,
+        last: [None; HOSTS],
+        tokens: [16; HOSTS],
+    };
     let mut owners = [None; SLOTS];
     let mut history = Vec::new();
     let mut active = false;
     for (index, bytes) in operations(input).chunks(3).enumerate() {
-        let op = bytes[0] % 7;
+        let op = bytes[0] % 10;
         let slot = usize::from(*bytes.get(1).unwrap_or(&0)) % SLOTS;
         let arg = *bytes.get(2).unwrap_or(&0);
         let (host, ip) = address(arg);
@@ -267,6 +362,10 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 } else {
                     counts.claim_connection(false, CONNECTION_CAP)
                 };
+                active |= admitted;
+                let admitted =
+                    admitted && (!inbound || cadence.attempt(&mut counts, host, ip, &mut failures));
+                let admitted = admitted && (!inbound || counts.claim_transport(PENDING_CAP));
                 // Count actual admitted owners. Bounds below judge the admission decision.
                 if admitted {
                     owners[slot] = Some(Owner {
@@ -293,8 +392,16 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 let view = expected(&owners);
                 let connection_claimed =
                     !owner.inbound || counts.claim_connection(true, CONNECTION_CAP);
-                let claimed =
-                    connection_claimed && counts.claim_pending(owner.inbound, PENDING_CAP);
+                let claimed = connection_claimed
+                    && if owner.inbound {
+                        counts.claim_transferred_pending();
+                        true
+                    } else {
+                        counts.claim_pending(false, PENDING_CAP)
+                    };
+                if owner.inbound && !claimed {
+                    counts.release_transport();
+                }
                 if !owner.inbound
                     && view.pending - view.inbound_pending < PENDING_CAP - INBOUND_CAP
                     && !claimed
@@ -322,6 +429,9 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 let registered = counts.can_register(owner.ip, ADDRESS_CAP, false);
                 release_handshake(&mut counts, owner);
                 if registered {
+                    if owner.inbound {
+                        cadence.refund(&mut counts, owner.host, owner.ip);
+                    }
                     counts.add_registered(owner.ip);
                     owner.phase = Phase::Registered;
                     owners[slot] = Some(owner);
@@ -347,6 +457,22 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                     counts.add_registered(owner.ip);
                 }
             }
+            (7, _) => {
+                cadence.now_ns += (u64::from(bytes.get(1).copied().unwrap_or(0))
+                    + 256 * u64::from(arg))
+                    * 1_000_000
+            }
+            (8, _) => {
+                // TLS fails immediately, so the admitted attempt retains its charge.
+                active = true;
+                cadence.attempt(&mut counts, host, ip, &mut failures);
+            }
+            (9, Some(owner)) if owner.inbound && owner.phase == Phase::Quic => {
+                // A transport Retry or capacity refusal starts no TLS work.
+                cadence.refund(&mut counts, owner.host, owner.ip);
+                release(&mut counts, owner);
+                owners[slot] = None;
+            }
             _ => {}
         }
         let actual = actual(&counts);
@@ -363,6 +489,13 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
             .flatten()
             .filter(|owner| owner.inbound && owner.phase == Phase::Quic)
             .count();
+        if counts.transport_pending() != quic_total {
+            failure(
+                &mut failures,
+                COUNTS,
+                "transport reservations differ from live owners",
+            );
+        }
         let per_host_full = (0..HOSTS).any(|host| {
             let quic = owners
                 .iter()
@@ -418,7 +551,7 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
     let actual = actual(&counts);
     let expected = CountsView::default();
     let mut failures = Vec::new();
-    if actual != expected {
+    if actual != expected || counts.transport_pending() != 0 {
         failure(&mut failures, COUNTS, "teardown retained a charge");
     }
     history.push((
@@ -444,6 +577,26 @@ mod tests {
             steps.iter().all(|(_, step)| step.failure().is_none()),
             "{steps:?}"
         );
+    }
+
+    #[test]
+    fn failed_attempts_exhaust_aliases_and_time_restores_their_cadence() {
+        let mut input = Vec::new();
+        for _ in 0..20 {
+            input.extend([8, 0, 0, 8, 0, 4]);
+        }
+        input.extend([7, 125, 0, 8, 0, 0, 8, 0, 4, 8, 0, 0]);
+        holds(&input);
+    }
+
+    #[test]
+    fn registrations_and_transport_retries_refund_their_attempts() {
+        let mut input = Vec::new();
+        for _ in 0..40 {
+            input.extend([0, 0, 0, 9, 0, 0]);
+            input.extend([0, 0, 0, 2, 0, 0, 3, 0, 0, 4, 0, 0]);
+        }
+        holds(&input);
     }
 
     #[test]
@@ -494,35 +647,18 @@ mod tests {
     }
 
     #[test]
-    fn outbound_control_claims_ignore_pending_quic_owners() {
-        let mut input = Vec::new();
-        for slot in 0..24u8 {
-            let host = if slot % 8 < 4 { slot % 8 } else { slot % 8 + 4 };
-            input.extend([0, slot, host]);
-        }
-        for slot in 24..33 {
-            input.extend([1, slot, 0, 2, slot, 0]);
-        }
+    fn outbound_control_claims_include_pending_quic_owners() {
+        let input = [0x80, 1, 0x80];
         let steps = history(&input);
-        let MachineStep::Handshake(last) = &steps.last().unwrap().1 else {
-            panic!("the admission harness records handshake steps");
-        };
-        assert_eq!(last.actual.pending, 9);
-        assert_eq!(last.actual.inbound_pending, 0);
-        assert_eq!(last.failures.len(), 1);
-        assert_eq!(last.failures[0].0, PENDING);
-        assert_eq!(
-            last.failures[0].1.message,
-            "live handshake owners exceed a pending bound"
-        );
-        assert!(steps[..steps.len() - 1]
-            .iter()
-            .all(|(_, step)| step.failure().is_none()));
+        assert!(steps.iter().any(|(_, step)| matches!(step,
+            MachineStep::Handshake(step) if step.actual.pending == 8 && step.actual.inbound_pending == 0
+        )));
+        assert!(steps.iter().all(|(_, step)| step.failure().is_none()));
         (ENTRY.witness)(
             &(ENTRY.draw)(&input),
             crate::PlanInput::Bytes(Vec::new()),
             PENDING,
-            crate::witness::Expect::Violated,
+            crate::witness::Expect::Holds,
             &[],
             &mut crate::NullSink,
         )

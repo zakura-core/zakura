@@ -1,8 +1,8 @@
 --- a/crates/zakura-quic/src/endpoint.rs
 +++ b/crates/zakura-quic/src/endpoint.rs
-@@ -849,14 +849,6 @@
-         .is_some_and(|limit| info.pending_from_ip >= limit as usize)
+@@ -871,15 +871,6 @@
      {
+         acceptor.cancel_admission(info);
          return Admit::Refuse;
 -    }
 -    // Rule 5.
@@ -11,6 +11,7 @@
 -            .retry_threshold
 -            .is_some_and(|threshold| info.pending_total >= threshold as usize)
 -    {
+-        acceptor.cancel_admission(info);
 -        return Admit::Retry;
      }
      Admit::Accept

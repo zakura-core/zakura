@@ -31,7 +31,7 @@ fn counts_trace_replays_with_each_named_rule() {
         dir.path(),
     )
     .unwrap();
-    assert_eq!(trace.meta.properties.len(), 4);
+    assert_eq!(trace.meta.properties.len(), 6);
     replay_with(&trace, &handshake_counts::ENTRY, ReplayOptions::default()).unwrap();
 }
 
@@ -305,13 +305,8 @@ fn inbound_connection_pressure_preserves_a_wire_dial() {
 }
 
 #[test]
-fn slow_control_steps_exceed_the_overall_deadline() {
-    let mut scenario = Scenario::default();
-    scenario.peers[0].handshake = Some(HandshakeSpec {
-        length_delay_ms: 9_000,
-        payload_delay_ms: 9_000,
-        ..HandshakeSpec::default()
-    });
+fn slow_control_steps_share_one_deadline() {
+    let scenario = Wire::draw(include_bytes!("fixtures/handshake-slow-control.bin"));
     let entry = harness::find(Wire::NAME).unwrap();
     let report = (entry.run)(
         &serde_json::to_value(scenario).unwrap(),
@@ -323,25 +318,15 @@ fn slow_control_steps_exceed_the_overall_deadline() {
     zakura_sim::witness::judge_report::<Wire>(
         &report,
         "handshake/finishes-in-time",
-        zakura_sim::witness::Expect::Violated,
+        zakura_sim::witness::Expect::Holds,
     )
     .unwrap();
-    let deadline = report
-        .properties
-        .iter()
-        .find(|property| property.property == "handshake/finishes-in-time")
-        .unwrap();
-    assert!(
-        matches!(deadline.outcome, PropertyOutcome::Violated { .. }),
-        "{deadline:?}"
-    );
-    assert!(
-        deadline
-            .violations
-            .iter()
-            .any(|violation| violation.actual.ends_with("Some(18000) ms")),
-        "{deadline:?}"
-    );
+    assert_held(&report, "handshake/finishes-in-time");
+    assert_held(&report, "handshake/hello/refusal-releases-slot");
+    assert!(report.log.entries().iter().any(|entry| matches!(&entry.obs,
+        zakura_sim::Observation::Transport { event: zakura_sim::observe::TransportFact::Handshake { stage, elapsed_ms: Some(10_000), .. }, .. }
+            if stage == "released"
+    )), "the control claim must release at the overall ten-second deadline");
 }
 
 #[test]
@@ -362,18 +347,26 @@ fn capability_flip_covers_inflight_handshake() {
         });
         let report = run(scenario);
         use zakura_sim::{observe::TransportFact, Observation};
-        let expected = if order == CapabilityFlip::AfterRegistration {
-            zakura_sim::witness::Expect::Holds
-        } else {
-            zakura_sim::witness::Expect::Violated
-        };
         zakura_sim::witness::judge_report::<Wire>(
             &report,
             "session/renegotiation-covers-inflight-handshakes",
-            expected,
+            zakura_sim::witness::Expect::Holds,
         )
         .unwrap();
         let entries = report.log.entries();
+        assert!(
+            entries.iter().any(|entry| matches!(&entry.obs,
+                Observation::Transport { event: TransportFact::Handshake { stage, .. }, .. }
+                    if stage == "registration-released"
+            )),
+            "the stale registration must finish deregistering"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(&entry.obs, Observation::Session { .. })),
+            "a stale snapshot must install no service session"
+        );
         let registered = entries.iter().position(|entry| matches!(&entry.obs,
             Observation::Transport { event: TransportFact::Handshake { stage, .. }, .. } if stage == "registered"
         )).unwrap();
@@ -763,10 +756,95 @@ fn complete_session_transfers_setup_to_installed_owners() {
 }
 
 #[test]
-fn pending_transport_load_exposes_outbound_control_overcommit() {
+fn fast_fail_handshakes_exhaust_the_address_cadence() {
+    let report = run(Wire::draw(include_bytes!(
+        "fixtures/handshake-cadence-burst.bin"
+    )));
+    for id in [
+        "handshake/attempts-within-cadence",
+        "handshake/cadence-never-refuses-conformant",
+    ] {
+        assert_held(&report, id);
+        zakura_sim::witness::judge_report::<Wire>(&report, id, zakura_sim::witness::Expect::Holds)
+            .unwrap();
+    }
+    assert!(report.log.entries().iter().any(|entry| matches!(&entry.obs,
+        zakura_sim::Observation::Transport { event: zakura_sim::observe::TransportFact::HandshakeCadence { action, .. }, .. }
+            if action == "exhausted"
+    )), "fast failures must reach the cadence refusal");
+    assert!(
+        report
+            .log
+            .entries()
+            .iter()
+            .filter(|entry| matches!(
+                &entry.obs,
+                zakura_sim::Observation::Transport {
+                    event: zakura_sim::observe::TransportFact::QuicHandshakeStarted,
+                    ..
+                }
+            ))
+            .count()
+            >= 16,
+        "the witness must consume the burst with actual TLS attempts"
+    );
+}
+
+#[test]
+fn sixteen_conformant_dialers_share_an_address_cadence() {
+    let report = run(Wire::draw(include_bytes!(
+        "fixtures/handshake-cadence-conformant.bin"
+    )));
+    assert_held(&report, "handshake/cadence-never-refuses-conformant");
+    zakura_sim::witness::judge_report::<Wire>(
+        &report,
+        "handshake/cadence-never-refuses-conformant",
+        zakura_sim::witness::Expect::Holds,
+    )
+    .unwrap();
+    let mut admitted = 0;
+    let mut now = 0;
+    let mut last_admitted = 0;
+    for entry in report.log.entries() {
+        if let zakura_sim::Observation::TimeAdvanced { to_ns, .. } = entry.obs {
+            now = to_ns;
+        }
+        if let zakura_sim::Observation::Transport {
+            event: zakura_sim::observe::TransportFact::HandshakeCadence { action, .. },
+            ..
+        } = &entry.obs
+        {
+            assert_ne!(
+                action, "exhausted",
+                "sixteen one-second dialers keep to the cadence"
+            );
+        }
+        if matches!(
+            &entry.obs,
+            zakura_sim::Observation::Transport {
+                event: zakura_sim::observe::TransportFact::QuicHandshakeStarted,
+                ..
+            }
+        ) {
+            admitted += 1;
+            last_admitted = now;
+        }
+    }
+    assert!(
+        last_admitted <= 3_000_000_000,
+        "the retry loop must not wait for shutdown drains between attempts"
+    );
+    assert!(
+        admitted >= 32,
+        "all sixteen dialers must reach TLS twice; observed {admitted}"
+    );
+}
+
+#[test]
+fn slow_link_refusal_releases_the_quic_slot() {
     use zakura_sim::{
         harness::{LinkEntry, LinkSpec},
-        peer::{PeerSpec, NODE_ADDR},
+        peer::NODE_ADDR,
     };
     let mut scenario = Scenario::default();
     scenario.net.default_link = LinkSpec {
@@ -775,7 +853,45 @@ fn pending_transport_load_exposes_outbound_control_overcommit() {
         reorder: false,
         loss_budget: 0,
     };
-    scenario.peers = (0..8).map(|_| PeerSpec::dialing()).collect();
+    scenario.peers[0].handshake = Some(HandshakeSpec {
+        open_delay_ms: 10_160,
+        ..HandshakeSpec::default()
+    });
+    scenario.net.links.push(LinkEntry {
+        src: NODE_ADDR,
+        dst: scenario.peers[0].address(0, 0),
+        model: LinkSpec {
+            min_delay_ms: 9_000,
+            max_delay_ms: 9_000,
+            ..scenario.net.default_link
+        },
+    });
+    let report = run(scenario);
+    assert_held(&report, "handshake/hello/refusal-releases-slot");
+}
+
+#[test]
+fn pending_transport_load_bounds_outbound_control_handshakes() {
+    use zakura_sim::{
+        harness::{LinkEntry, LinkSpec},
+        observe::TransportFact,
+        peer::{PeerSpec, NODE_ADDR},
+        Observation,
+    };
+    let mut scenario = Scenario::default();
+    scenario.net.default_link = LinkSpec {
+        min_delay_ms: 0,
+        max_delay_ms: 0,
+        reorder: false,
+        loss_budget: 0,
+    };
+    scenario.peers = (0..8)
+        .map(|_| {
+            let mut peer = PeerSpec::dialing();
+            peer.handshake = Some(HandshakeSpec::default());
+            peer
+        })
+        .collect();
     for (index, peer) in scenario.peers.iter().enumerate() {
         scenario.net.links.push(LinkEntry {
             src: NODE_ADDR,
@@ -796,13 +912,43 @@ fn pending_transport_load_exposes_outbound_control_overcommit() {
         });
         peer
     }));
-    zakura_sim::witness::witness_into::<Wire>(
-        &scenario,
-        PlanInput::Bytes(Vec::new()),
-        "handshake/pending-bounded",
-        zakura_sim::witness::Expect::Violated,
-        &[],
-        &mut NullSink,
-    )
-    .unwrap();
+    let mut input = [0; Wire::SCENARIO_BYTES];
+    input[..7].copy_from_slice(&[7, 8, 31, 0, 2, 0, 0x80]);
+    assert_eq!(Wire::draw(&input), scenario);
+    let report = run(Wire::draw(&input));
+    assert_held(&report, "handshake/pending-bounded");
+    assert_held(&report, "handshake/counts-match-permits");
+    assert!(
+        report.log.entries().iter().any(|entry| matches!(
+            &entry.obs,
+            Observation::Transport {
+                event: TransportFact::HandshakeCounts {
+                    quic_pending,
+                    pending,
+                    cap,
+                    quic_handoffs: 0,
+                    ..
+                },
+                ..
+            } if *quic_pending > 0 && pending + quic_pending == *cap
+        )),
+        "the witness must fill the combined transport and control budget: {:?}",
+        report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Transport {
+                    event:
+                        TransportFact::HandshakeCounts {
+                            pending,
+                            quic_pending,
+                            ..
+                        },
+                    ..
+                } => Some((*pending, *quic_pending)),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    );
 }

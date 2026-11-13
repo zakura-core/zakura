@@ -1423,6 +1423,19 @@ const PATCHED: &[PatchedNa] = &[
         ],
         other: &[],
     },
+    // Its Draft run, which ends at the recovery's deadline: the stalled
+    // round dispatches no prepare, so no held prepare reply wakes the
+    // reactor, and no chain effect goes stale.
+    PatchedNa {
+        property: "header-sync/bounded-adversary-progress",
+        name: "stalled-successor-on-faults",
+        applies: &[],
+        never: &[
+            "header-sync/hold-release-wakes",
+            "header-sync/stale-chain-effect-inert",
+        ],
+        other: &[],
+    },
 ];
 
 /// Each case's expected `NotApplicable` reports, by its whole

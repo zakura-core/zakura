@@ -10,8 +10,8 @@ use zakura_chain::{
 use zakura_node_services::mempool::{
     port::{
         model::{ModelTx, ModelUnreserved, ModelVerdict, Outcome, PoolModel, Step, T_VERIFY},
-        ChainReason, Charge, Generation, GenerationRead, Intent, LocalFault, RejectionScope,
-        Source, Supplier, MAX_PENDING, MAX_PENDING_PER_SOURCE,
+        ChainReason, Change, Charge, Generation, GenerationRead, Intent, LocalFault,
+        RejectionScope, Source, Supplier, MAX_PENDING, MAX_PENDING_PER_SOURCE,
     },
     QueueSource,
 };
@@ -71,8 +71,8 @@ fn finish(
     let started = reactor.take_started();
     assert_eq!(started.len(), 1, "exactly one job is running");
     let step = pool.outcome(started[0], outcome, stable(), stable(), now);
-    reactor.pool_step(&step, now, pool);
-    let effects = reactor.tick(now, pool);
+    // The verdict's own effects, with no later input to flush them.
+    let effects = reactor.pool_step(&step, now, pool);
     (step, effects)
 }
 
@@ -792,4 +792,254 @@ fn abandoned_requests_free_their_core_slots_and_stay_bounded_on_each_session() {
     reactor.tx(s[0], tx(0), REQUEST_TIMEOUT + secs(1), &mut pool);
     assert_eq!(pool.bodies_held(), 0);
     reactor.assert_invariants();
+}
+
+// Cases from the fourth review.
+
+#[test]
+fn a_verdict_frees_a_request_slot_and_the_next_id_is_asked_at_once() {
+    let (mut pool, mut reactor, s) = setup(1);
+    for n in 0..6 {
+        reactor.announce(s[0], id(n), 300, secs(0), &mut pool);
+    }
+    // Five answered and awaiting verdicts. The sixth id waits for room.
+    for n in 0..5 {
+        reactor.tx(s[0], tx(n), secs(0), &mut pool);
+    }
+    let started = reactor.take_started();
+    assert_eq!(reactor.in_use(&v2(1)), 5);
+
+    // The verdict itself asks for the sixth. No tick is needed.
+    let step = pool.outcome(started[0], Outcome::Pass, stable(), stable(), secs(1));
+    let effects = reactor.pool_step(&step, secs(1), &mut pool);
+    assert_eq!(effects, vec![ask(s[0], 5)]);
+}
+
+#[test]
+fn a_late_body_for_an_id_that_was_announced_again_is_delivered() {
+    let (mut pool, mut reactor, s) = setup(2);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.tick(REQUEST_TIMEOUT, &mut pool);
+    assert!(!reactor.wants(id(1)));
+
+    // Another peer announces it, and is asked. The node wants it again.
+    let effects = reactor.announce(s[1], id(1), 300, REQUEST_TIMEOUT, &mut pool);
+    assert_eq!(effects, vec![ask(s[1], 1)]);
+
+    // The first peer's old answer arrives. It answers a request this node
+    // sent, for an id it wants, and goes in under the new slot.
+    let effects = reactor.tx(s[0], tx(1), REQUEST_TIMEOUT + secs(1), &mut pool);
+    assert!(effects.is_empty());
+    assert_eq!(pool.bodies_held(), 1);
+    assert_eq!(pool.slots_in_use(), 1);
+    assert_eq!(reactor.verifying(&v2(1)), 1);
+    reactor.assert_invariants();
+    pool.assert_invariants();
+}
+
+#[test]
+fn two_live_sessions_of_one_peer_share_its_pending_bound() {
+    let (mut pool, mut reactor, s) = setup(1);
+    let second = reactor.connect(v2(1), false, MAX_REQUESTS_PER_PEER);
+    let total = u16::try_from(PENDING_PER_PEER).expect("fits the test's ids");
+    for n in 0..total {
+        reactor.announce(s[0], id(n), 300, secs(0), &mut pool);
+    }
+    // The peer's bound is used up. Its other session adds nothing.
+    reactor.announce(second, id(total), 300, secs(0), &mut pool);
+    assert_eq!(reactor.overflowed, 1);
+    assert_eq!(reactor.pending(&v2(1)), PENDING_PER_PEER);
+    reactor.assert_invariants();
+}
+
+#[test]
+fn a_fetch_every_peer_answered_without_a_body_is_a_failed_fetch() {
+    let (mut pool, mut reactor, s) = setup(2);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.announce(s[1], id(1), 300, secs(0), &mut pool);
+    reactor.take_pool_steps();
+
+    // Both peers answer that they do not have it. Nothing is still out, so
+    // the fetch failed, and the core logs that as a failed download.
+    reactor.not_found(s[0], id(1), secs(1), &mut pool);
+    reactor.not_found(s[1], id(1), secs(2), &mut pool);
+    let logged: Vec<Change> = reactor
+        .take_pool_steps()
+        .into_iter()
+        .flat_map(|step| step.changes)
+        .collect();
+    assert_eq!(logged, vec![Change::Refused(id(1))]);
+
+    // A peer that only went quiet may still answer. That is not a failed
+    // fetch, and nothing is logged.
+    reactor.announce(s[0], id(2), 300, secs(3), &mut pool);
+    reactor.take_pool_steps();
+    reactor.tick(secs(3) + REQUEST_TIMEOUT, &mut pool);
+    assert!(!reactor.wants(id(2)));
+    assert!(reactor
+        .take_pool_steps()
+        .iter()
+        .all(|step| step.changes.is_empty()));
+}
+
+/// A small deterministic generator, so the run replays exactly.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self, bound: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 33) % bound
+    }
+
+    fn pick(&mut self, len: usize) -> usize {
+        let bound = u64::try_from(len).expect("a test list fits in u64");
+        usize::try_from(self.next(bound)).expect("an index below a usize fits in usize")
+    }
+}
+
+#[test]
+fn a_random_run_always_drains_once_the_sessions_end() {
+    for seed in 0..300 {
+        let mut rng = Lcg(seed);
+        // A small core, so the run reaches a full one.
+        let mut pool = PoolModel::new(Height(100), Generation(0)).with_limits(6, 2, 3);
+        let mut reactor = ReactorModel::new(MAX_TX);
+        let mut now = secs(0);
+        let mut live: Vec<SessionId> = Vec::new();
+        // Requests on the wire: the session and the id.
+        let mut asked: Vec<(SessionId, u16)> = Vec::new();
+        let mut jobs = Vec::new();
+
+        let apply = |effects: Vec<RelayEffect>,
+                     reactor: &mut ReactorModel,
+                     pool: &mut PoolModel,
+                     live: &mut Vec<SessionId>,
+                     asked: &mut Vec<(SessionId, u16)>,
+                     now: Duration| {
+            let mut pending = effects;
+            while let Some(effect) = pending.pop() {
+                match effect {
+                    RelayEffect::Ask {
+                        session,
+                        id: asked_id,
+                    } => {
+                        let n = (0..16u16).find(|n| id(*n) == asked_id).expect("a test id");
+                        asked.push((session, n));
+                    }
+                    // A closed connection ends its session.
+                    RelayEffect::Close(session) => {
+                        live.retain(|s| *s != session);
+                        asked.retain(|(s, _)| *s != session);
+                        pending.extend(reactor.end(session, now, pool));
+                    }
+                }
+            }
+        };
+
+        for _ in 0..400 {
+            now += Duration::from_millis(rng.next(4_000));
+            let n = u16::try_from(rng.next(16)).expect("small");
+            let peer = u8::try_from(rng.next(3) + 1).expect("small");
+            let effects = match rng.next(12) {
+                0 => {
+                    let served = usize::try_from(rng.next(6) + 1).expect("small");
+                    live.push(reactor.connect(v2(peer), rng.next(2) == 0, served));
+                    Vec::new()
+                }
+                1 if !live.is_empty() => {
+                    let session = live.swap_remove(rng.pick(live.len()));
+                    asked.retain(|(s, _)| *s != session);
+                    reactor.end(session, now, &mut pool)
+                }
+                2..=5 if !live.is_empty() => {
+                    let session = live[rng.pick(live.len())];
+                    reactor.announce(session, id(n), 300, now, &mut pool)
+                }
+                6..=7 if !asked.is_empty() => {
+                    let (session, n) = asked.swap_remove(rng.pick(asked.len()));
+                    if rng.next(4) == 0 {
+                        reactor.not_found(session, id(n), now, &mut pool)
+                    } else {
+                        reactor.tx(session, tx(n), now, &mut pool)
+                    }
+                }
+                // A body nobody asked for.
+                8 if !live.is_empty() && rng.next(6) == 0 => {
+                    let session = live[rng.pick(live.len())];
+                    if asked.contains(&(session, n)) {
+                        Vec::new()
+                    } else {
+                        reactor.tx(session, tx(n), now, &mut pool)
+                    }
+                }
+                9..=10 => {
+                    jobs.extend(reactor.take_started());
+                    if jobs.is_empty() {
+                        Vec::new()
+                    } else {
+                        let job = jobs.swap_remove(rng.pick(jobs.len()));
+                        let outcome = match rng.next(5) {
+                            0 => Outcome::Fail {
+                                scope: RejectionScope::ExactTip,
+                                charge: Charge::Ban,
+                            },
+                            1 => Outcome::Fail {
+                                scope: RejectionScope::ExactTip,
+                                charge: Charge::Cooldown,
+                            },
+                            2 => Outcome::LocalFault(LocalFault::StateUnavailable),
+                            _ => Outcome::Pass,
+                        };
+                        let step = pool.outcome(job, outcome, stable(), stable(), now);
+                        reactor.pool_step(&step, now, &mut pool)
+                    }
+                }
+                _ => {
+                    let step = pool.tick(now);
+                    let mut effects = reactor.pool_step(&step, now, &mut pool);
+                    effects.extend(reactor.tick(now, &mut pool));
+                    effects
+                }
+            };
+            apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
+            reactor.assert_invariants();
+            pool.assert_invariants();
+        }
+
+        // Drain. Every session ends and time goes by. The verifications
+        // still running end in a local fault on some runs and pass on the
+        // others, because a fault after the last session ended is its own
+        // way to get stuck.
+        for session in live.drain(..) {
+            reactor.end(session, now, &mut pool);
+        }
+        for _ in 0..200 {
+            jobs.extend(reactor.take_started());
+            if reactor.wanted_count() == 0 && pool.slots_in_use() == 0 && jobs.is_empty() {
+                break;
+            }
+            for job in std::mem::take(&mut jobs) {
+                let outcome = if seed % 2 == 0 {
+                    Outcome::LocalFault(LocalFault::StateUnavailable)
+                } else {
+                    Outcome::Pass
+                };
+                let step = pool.outcome(job, outcome, stable(), stable(), now);
+                reactor.pool_step(&step, now, &mut pool);
+            }
+            now += RETRY_MAX + T_VERIFY;
+            let step = pool.tick(now);
+            reactor.pool_step(&step, now, &mut pool);
+            reactor.tick(now, &mut pool);
+            reactor.assert_invariants();
+        }
+
+        // Nothing is left wanted with nobody to ask, and the reactor holds
+        // no slot at the core.
+        assert_eq!(reactor.wanted_count(), 0, "seed {seed}: an id is stuck");
+        assert_eq!(pool.slots_in_use(), 0, "seed {seed}: a core slot is stuck");
+    }
 }

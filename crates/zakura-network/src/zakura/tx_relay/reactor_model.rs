@@ -26,8 +26,11 @@
 //!   of five ids requested or awaiting a verdict is the peer's, over all of
 //!   its sessions. A ban closes every session the peer has.
 //! - **A slot covers a fetch the node is waiting for.** When the node stops
-//!   waiting it frees the slot. A request can still be outstanding then, and
-//!   its late body is dropped here, before it reaches the core. Those
+//!   waiting it frees the slot. A request can still be outstanding then. If
+//!   its body arrives while the node does not want the id, the body is
+//!   dropped here, before it reaches the core. If the id was announced again
+//!   in between, the body answers a request this node sent for an id it
+//!   wants, and is delivered under a slot like any other. Those
 //!   requests are bounded by five on each session. Holding the slot instead
 //!   would let peers that never answer fill the core.
 //!
@@ -223,12 +226,15 @@ impl ReactorModel {
         if already_announced {
             return Vec::new();
         }
-        let announcer = self.session_at(session);
-        if announcer.pending >= PENDING_PER_PEER {
+        // The bound is the peer's, over all of its live sessions. An id it
+        // announced on two of them counts twice.
+        let peer = self.sessions[&session].peer.clone();
+        if self.pending(&peer) >= PENDING_PER_PEER {
             // Honest announcers overlap, so this is dropped and counted.
             self.overflowed = self.overflowed.saturating_add(1);
             return Vec::new();
         }
+        let announcer = self.session_at(session);
         announcer.pending = announcer.pending.saturating_add(1);
         match self.wanted_of.get(&id).copied() {
             Some(key) => self.wanted_at(key).announcers.push(session),
@@ -324,9 +330,15 @@ impl ReactorModel {
 
     /// Something the pool did after another input: verdicts for bodies this
     /// reactor submitted.
-    pub(crate) fn pool_step(&mut self, step: &Step, now: ModelTime, pool: &mut PoolModel) {
+    pub(crate) fn pool_step(
+        &mut self,
+        step: &Step,
+        now: ModelTime,
+        pool: &mut PoolModel,
+    ) -> Vec<RelayEffect> {
         self.verdicts(step, now, pool);
         self.pump(now, pool);
+        self.take_effects()
     }
 
     /// Time passed.
@@ -395,6 +407,11 @@ impl ReactorModel {
             .collect()
     }
 
+    /// How many ids the node wants.
+    pub(crate) fn wanted_count(&self) -> usize {
+        self.wanted.len()
+    }
+
     /// Whether the node still wants `id`.
     pub(crate) fn wants(&self, id: UnminedTxId) -> bool {
         self.wanted_of.contains_key(&id)
@@ -410,6 +427,15 @@ impl ReactorModel {
     /// Bodies `peer` supplied that are awaiting a verdict.
     pub(crate) fn verifying(&self, peer: &QueueSource) -> usize {
         self.verifying.get(peer).copied().unwrap_or(0)
+    }
+
+    /// Undecided ids `peer` has announced, over all of its sessions.
+    pub(crate) fn pending(&self, peer: &QueueSource) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.peer == *peer)
+            .map(|session| session.pending)
+            .sum()
     }
 
     /// Ids requested from `peer` or supplied by it and awaiting a verdict,
@@ -444,7 +470,7 @@ impl ReactorModel {
                 "tx-relay/in-flight-within-caps: ids requested or awaiting a verdict"
             );
             assert!(
-                session.pending <= PENDING_PER_PEER,
+                self.pending(&session.peer) <= PENDING_PER_PEER,
                 "tx-relay/pending-within-bound"
             );
             for (index, id) in session.outstanding.iter().enumerate() {
@@ -695,10 +721,23 @@ impl ReactorModel {
     /// Stops fetching an id and frees its slot at the core. The id is
     /// fetched again only if a peer announces it again.
     fn give_up(&mut self, key: u64, now: ModelTime, pool: &mut PoolModel) {
+        let id = self.wanted_at(key).id;
         if let Some(reservation) = self.wanted_at(key).reservation.take() {
+            // Every peer asked has answered, and none had it: the fetch
+            // failed, and the core logs that as it does a failed download.
+            // If a request is still out, the node only stopped waiting, and
+            // the slot is dropped without a word.
+            let still_out = self
+                .sessions
+                .values()
+                .any(|session| session.outstanding.contains(&id));
             // Another caller may be waiting on this slot's body. Its verdict
             // is in the step, which is kept for it.
-            let step = pool.release(reservation, now);
+            let step = if still_out {
+                pool.release(reservation, now)
+            } else {
+                pool.fetch_failed(reservation, now)
+            };
             self.pool_steps.push(step);
         }
         self.forget(key);

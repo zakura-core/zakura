@@ -9,9 +9,12 @@
 //! verification is not run here. The model says which job to start, and the
 //! test feeds back the [`Outcome`].
 //!
-//! Two things are left out. Eviction at the pool's cost limit is the moved
-//! storage code's rule, so the model assumes the pool stays below it. A
-//! cooldown lasts [`COOLDOWN`] each time and does not escalate.
+//! Three things are left out, because they are rules of the storage code
+//! that moves unchanged and keeps its own tests. Eviction at the pool's cost
+//! limit: the model assumes the pool stays below it. The snapshot's mining
+//! order, by ancestor-package fee: the model has no fees, and
+//! [`PoolModel::visible`] is oldest first, which is not that order. And
+//! cooldown escalation: a cooldown lasts [`COOLDOWN`] each time.
 //!
 //! A slot outlives its admission while the caller that reserved it is still
 //! fetching. If another caller's body decides the id first, the reserving
@@ -23,9 +26,12 @@
 //! batch's snapshot before it starts that batch's jobs, so a verification
 //! reads a pool at least as new as the one that started it.
 //!
-//! The model is synchronous, so it has no bodies in transit. The port keeps
-//! those bounded: a body travels only under a reservation that holds a slot,
-//! or under the one joined reservation the core asked to bring it.
+//! The model is synchronous, so it has no bodies in transit. What it bounds
+//! is what the core holds: one body for each undecided transaction. A body
+//! on its way to the core is its caller's to bound. A fetched body travels
+//! under a slot. A body a caller held before it reserved, such as one a
+//! peer pushed, is held by that caller whatever the core answers, and the
+//! core asks at most one such caller at a time to send it.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -63,6 +69,10 @@ pub const COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// How long a chain-scoped rejection is remembered unless the model is told
 /// otherwise. Today's default `eviction_memory_time`.
 pub const REJECTION_MEMORY: Duration = Duration::from_secs(60 * 60);
+
+/// The most distinct outpoints callers can wait for at once. Today's
+/// `MAX_PENDING_OUTPUTS`.
+pub const MAX_OUTPUT_WAITS: usize = 65_536;
 
 /// The most pooled ancestors a new transaction can have. Today's
 /// `MAX_MEMPOOL_ANCESTORS`.
@@ -231,14 +241,36 @@ pub enum Effect {
         /// Its verdict.
         verdict: ModelVerdict,
     },
-    /// The transparent outputs of a newly admitted transaction reach their
-    /// waiters, in the same step as the admission.
+    /// The transparent outputs of a transaction that just became visible
+    /// are available, in the same step.
     Outputs {
         /// The transaction.
         tx: transaction::Hash,
         /// How many outputs it creates.
         count: u32,
     },
+    /// A caller waiting for an output is answered with it.
+    OutputReady {
+        /// The waiting caller.
+        waiter: WaiterId,
+        /// The output.
+        outpoint: OutPoint,
+    },
+    /// A caller waiting for an output is told the pool turned off.
+    OutputWaitEnded(WaiterId),
+}
+
+/// The answer to [`PoolModel::await_output`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum OutputAnswer {
+    /// A visible pooled transaction creates the output.
+    Ready,
+    /// Nothing visible creates it. The caller waits under this name.
+    Waiting(WaiterId),
+    /// Too many distinct outpoints are being waited on.
+    TooManyWaiters,
+    /// The pool is off.
+    Inactive,
 }
 
 /// What one input caused, in order.
@@ -456,6 +488,13 @@ struct JoinTicket {
     brings: bool,
 }
 
+/// A slot kept for a fetch that is still out after its id was decided.
+#[derive(Clone, Debug)]
+struct Lease {
+    source: Source,
+    tx_id: UnminedTxId,
+}
+
 /// One chain-scoped rejection list: when each entry was made, oldest first.
 #[derive(Debug, Default)]
 struct ChainList {
@@ -479,7 +518,7 @@ pub struct PoolModel {
     /// their own fetch was still out. Each keeps its slot until its caller
     /// submits or drops it, so a source cannot have more fetches out than
     /// slots.
-    leases: HashMap<ReservationId, Source>,
+    leases: HashMap<ReservationId, Lease>,
     tickets: BTreeMap<ReservationId, JoinTicket>,
     /// The pool, oldest first.
     pool: BTreeMap<u64, Pooled>,
@@ -492,6 +531,11 @@ pub struct PoolModel {
     rejected_chain: HashMap<ChainReason, ChainList>,
     rejection_memory: Duration,
     cooldowns: HashMap<CooldownKey, ModelTime>,
+    max_pending: usize,
+    max_per_source: usize,
+    max_revalidating: usize,
+    /// Callers waiting for an output, by outpoint, in the order they came.
+    output_waiters: HashMap<OutPoint, Vec<WaiterId>>,
     /// Changes returned in earlier steps. Each step is one batch of the log,
     /// so this is the log position of the last one.
     logged: u64,
@@ -520,9 +564,23 @@ impl PoolModel {
             rejected_chain: HashMap::new(),
             rejection_memory: REJECTION_MEMORY,
             cooldowns: HashMap::new(),
+            max_pending: MAX_PENDING,
+            max_per_source: MAX_PENDING_PER_SOURCE,
+            max_revalidating: MAX_REVALIDATING,
+            output_waiters: HashMap::new(),
             logged: 0,
             step: Step::default(),
         }
+    }
+
+    /// The same model with smaller limits, so a short random run reaches
+    /// every full state. The node's limit, one source's, and revalidation's
+    /// share of the node's.
+    pub fn with_limits(mut self, pending: usize, per_source: usize, revalidating: usize) -> Self {
+        self.max_pending = pending;
+        self.max_per_source = per_source;
+        self.max_revalidating = revalidating;
+        self
     }
 
     /// The same model with the configured `eviction_memory_time`.
@@ -560,11 +618,10 @@ impl PoolModel {
             return self.join(key, source, intent);
         }
         // Today's order: the node's limit, then the source's.
-        if self.slots_in_use() >= MAX_PENDING {
+        if self.slots_in_use() >= self.max_pending {
             return Err(ModelUnreserved::NoRoom(NoRoom::Node));
         }
-        if matches!(source, Source::Peer(_))
-            && self.counted_against(&source) >= MAX_PENDING_PER_SOURCE
+        if matches!(source, Source::Peer(_)) && self.counted_against(&source) >= self.max_per_source
         {
             return Err(ModelUnreserved::NoRoom(NoRoom::Source));
         }
@@ -605,7 +662,9 @@ impl PoolModel {
     /// stream reports a download that failed.
     pub fn fetch_failed(&mut self, reservation: ReservationId, now: ModelTime) -> Step {
         self.advance(now);
-        if let Some(tx_id) = self.reserved_for(reservation) {
+        // An id that another caller's body already decided has its outcome
+        // in the log. A late failure of this fetch adds nothing to it.
+        if let Some(tx_id) = self.undecided_for(reservation) {
             self.step.changes.push(Change::Refused(tx_id));
         }
         self.drop_reservation(reservation);
@@ -938,6 +997,45 @@ impl PoolModel {
         self.take_step()
     }
 
+    /// [`super::PoolHandle::await_output`]. The lookup and the registration
+    /// are one input, so no admission can fall between them.
+    pub fn await_output(&mut self, outpoint: OutPoint, now: ModelTime) -> OutputAnswer {
+        self.advance(now);
+        if !self.active {
+            return OutputAnswer::Inactive;
+        }
+        if self.offers(&outpoint) {
+            return OutputAnswer::Ready;
+        }
+        // Today's limit is on distinct outpoints. Another caller for one
+        // already waited on is not refused.
+        if !self.output_waiters.contains_key(&outpoint)
+            && self.output_waiters.len() >= MAX_OUTPUT_WAITS
+        {
+            return OutputAnswer::TooManyWaiters;
+        }
+        let waiter = WaiterId(self.fresh());
+        self.output_waiters
+            .entry(outpoint)
+            .or_default()
+            .push(waiter);
+        OutputAnswer::Waiting(waiter)
+    }
+
+    /// A caller stopped waiting for an output. Its place no longer counts
+    /// toward the limit.
+    pub fn cancel_output_wait(&mut self, waiter: WaiterId) {
+        self.output_waiters.retain(|_, waiters| {
+            waiters.retain(|waiting| *waiting != waiter);
+            !waiters.is_empty()
+        });
+    }
+
+    /// Distinct outpoints callers are waiting for.
+    pub fn output_waits(&self) -> usize {
+        self.output_waiters.len()
+    }
+
     /// [`super::PoolHandle::report_violation`].
     pub fn violation(&mut self, peer: QueueSource, now: ModelTime) {
         self.advance(now);
@@ -960,6 +1058,16 @@ impl PoolModel {
             self.remove_one(key, RemovalReason::Deactivated);
         }
         self.clear_all_rejections();
+        // Nobody is left waiting on a pool that is off.
+        let mut waiting: Vec<WaiterId> = self
+            .output_waiters
+            .drain()
+            .flat_map(|(_, waiters)| waiters)
+            .collect();
+        waiting.sort();
+        self.step
+            .effects
+            .extend(waiting.into_iter().map(Effect::OutputWaitEnded));
         self.active = false;
         self.take_step()
     }
@@ -988,7 +1096,7 @@ impl PoolModel {
         self.admissions
             .values()
             .map(|admission| &admission.source)
-            .chain(self.leases.values())
+            .chain(self.leases.values().map(|lease| &lease.source))
             .filter(|counted| *counted == source)
             .count()
     }
@@ -1052,12 +1160,12 @@ impl PoolModel {
     /// If one is broken.
     pub fn assert_invariants(&self) {
         assert!(
-            self.slots_in_use() <= MAX_PENDING,
+            self.slots_in_use() <= self.max_pending,
             "pool/admissions-within-limits: the node's limit"
         );
         let mut sources: HashMap<&Source, usize> = HashMap::new();
-        for source in self.leases.values() {
-            *sources.entry(source).or_default() += 1;
+        for lease in self.leases.values() {
+            *sources.entry(&lease.source).or_default() += 1;
         }
         for admission in self.admissions.values() {
             *sources.entry(&admission.source).or_default() += 1;
@@ -1074,13 +1182,13 @@ impl PoolModel {
         for (source, count) in sources {
             if matches!(source, Source::Peer(_)) {
                 assert!(
-                    count <= MAX_PENDING_PER_SOURCE,
+                    count <= self.max_per_source,
                     "pool/admissions-within-limits: one source's limit"
                 );
             }
         }
         assert!(
-            self.revalidating() <= MAX_REVALIDATING,
+            self.revalidating() <= self.max_revalidating,
             "the revalidation share"
         );
         assert!(
@@ -1123,14 +1231,23 @@ impl PoolModel {
 
     // Rules.
 
-    /// The id an undecided reservation was granted for.
-    fn reserved_for(&self, reservation: ReservationId) -> Option<UnminedTxId> {
+    /// The id a reservation was granted for, while its admission is
+    /// undecided.
+    fn undecided_for(&self, reservation: ReservationId) -> Option<UnminedTxId> {
         let key = self
             .tickets
             .get(&reservation)
             .map(|ticket| ticket.admission)
             .or_else(|| self.owners.get(&reservation).copied())?;
         self.admissions.get(&key).map(|admission| admission.tx_id)
+    }
+
+    /// The id a reservation was granted for, for as long as the model knows
+    /// the reservation: while its admission is undecided, and while it
+    /// holds a lease after that.
+    fn reserved_for(&self, reservation: ReservationId) -> Option<UnminedTxId> {
+        self.undecided_for(reservation)
+            .or_else(|| self.leases.get(&reservation).map(|lease| lease.tx_id))
     }
 
     /// Ends a reservation that brought no body: frees its lease, or its
@@ -1219,6 +1336,9 @@ impl PoolModel {
                 // conflict, and nothing is cached against the transaction
                 // the pool holds.
                 if self.pooled.contains_key(&hash) {
+                    // Today's change stream reports an insertion the pool
+                    // refused, this one included.
+                    self.step.changes.push(Change::Refused(tx.id));
                     self.decide(
                         key,
                         ModelVerdict::Rejected {
@@ -1259,10 +1379,7 @@ impl PoolModel {
                 }
                 let pool_key = self.fresh();
                 self.step.changes.push(Change::Added(tx.id));
-                self.step.effects.push(Effect::Outputs {
-                    tx: hash,
-                    count: tx.outputs,
-                });
+                self.offer_outputs(hash, tx.outputs);
                 self.pool.insert(
                     pool_key,
                     Pooled {
@@ -1354,17 +1471,17 @@ impl PoolModel {
                 let (id, hidden_at, count) = (pooled.tx.id, pooled.hidden_at, pooled.tx.outputs);
                 self.step.changes.push(Change::Revealed { id, hidden_at });
                 // Its outputs are available again, to waiters as well.
-                self.step.effects.push(Effect::Outputs { tx: hash, count });
+                self.offer_outputs(hash, count);
                 self.wake(hash);
             }
             // A block the core never saw mined it. Its dependents stay and
             // are checked against the chain when their turn comes.
             Outcome::AlreadyMined => {
-                let tx_id = self.pooled_at(key).tx.id;
                 // Its job has reported, so there is nothing to cancel.
                 self.pooled_at(key).hidden = Some(Hidden::Queued);
                 self.remove_one(key, RemovalReason::Mined);
-                self.cache(tx_id, RejectionScope::EffectsChain(ChainReason::Mined));
+                // Found by a lookup, not in a block the core saw connect, so
+                // it is not cached. A later submission is looked up again.
                 self.wake(hash);
             }
             // As for a new transaction: a parent that became visible after
@@ -1418,8 +1535,13 @@ impl PoolModel {
         if admission.owner_waiting {
             // The reserving caller's fetch is still out. Its body will
             // arrive decoded, so its slot is not free yet.
-            self.leases
-                .insert(admission.owner, admission.source.clone());
+            self.leases.insert(
+                admission.owner,
+                Lease {
+                    source: admission.source.clone(),
+                    tx_id: admission.tx_id,
+                },
+            );
         }
         // A reservation that joined this admission dies with it.
         self.tickets.retain(|_, ticket| ticket.admission != key);
@@ -1508,6 +1630,21 @@ impl PoolModel {
         }
     }
 
+    /// The outputs of a transaction that just became visible are available.
+    /// Every caller waiting for one of them is answered, in the order the
+    /// callers came, in this step.
+    fn offer_outputs(&mut self, tx: transaction::Hash, count: u32) {
+        self.step.effects.push(Effect::Outputs { tx, count });
+        for index in 0..count {
+            let outpoint = OutPoint { hash: tx, index };
+            for waiter in self.output_waiters.remove(&outpoint).unwrap_or_default() {
+                self.step
+                    .effects
+                    .push(Effect::OutputReady { waiter, outpoint });
+            }
+        }
+    }
+
     /// Runs every parked admission again.
     fn rerun_parked(&mut self) {
         let parked: Vec<u64> = self
@@ -1580,7 +1717,9 @@ impl PoolModel {
             .map(|(key, _)| *key)
             .collect();
         for key in queued {
-            if self.revalidating() >= MAX_REVALIDATING || self.slots_in_use() >= MAX_PENDING {
+            if self.revalidating() >= self.max_revalidating
+                || self.slots_in_use() >= self.max_pending
+            {
                 break;
             }
             let tx = self.pool[&key].tx.clone();
@@ -1670,10 +1809,8 @@ impl PoolModel {
     }
 
     /// Moves time to `now`. A parked transaction's wait counts only the time
-    /// nobody was bringing one of its parents in: no admission held the
-    /// parent's body, and the parent was not hidden in the pool. A visible
-    /// parent does not stop the wait, because the child was already woken
-    /// for it.
+    /// none of its parents was being verified, as a new transaction or as a
+    /// hidden one. Nothing else stops the wait.
     fn advance(&mut self, now: ModelTime) {
         let elapsed = now.saturating_sub(self.now);
         self.now = self.now.max(now);
@@ -1698,15 +1835,21 @@ impl PoolModel {
                 list.at.remove(&oldest);
             }
         }
+        // A parent is on its way only while a verification of it is running.
+        // A parent that is itself parked, or hidden and waiting for a slot,
+        // may never come. Stopping the clock for those could leave a full
+        // core where the parked transactions hold the very slots their
+        // parent needs.
         let arriving: HashSet<transaction::Hash> = self
             .admissions
             .values()
+            .filter(|admission| matches!(admission.stage, Stage::Verifying { .. }))
             .filter_map(|admission| admission.body.as_ref())
             .map(|tx| tx.id.mined_id())
             .chain(
                 self.pool
                     .values()
-                    .filter(|pooled| pooled.hidden.is_some())
+                    .filter(|pooled| matches!(pooled.hidden, Some(Hidden::Running { .. })))
                     .map(|pooled| pooled.tx.id.mined_id()),
             )
             .collect();

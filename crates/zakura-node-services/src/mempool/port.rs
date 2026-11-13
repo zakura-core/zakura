@@ -945,8 +945,9 @@ impl PoolHandle {
     /// is whose bytes these are, which can be another peer.
     ///
     /// A joined reservation that does not want the body sends none. The
-    /// body is dropped here, so at most one copy of a transaction waits for
-    /// the core beside the one the core holds.
+    /// body is dropped here. This keeps copies of one transaction from
+    /// queuing for the core. It is not a bound on bodies callers hold: a
+    /// caller that had the body before it reserved holds it either way.
     ///
     /// Cancelling this before the core takes the command frees the slot.
     pub async fn submit(

@@ -155,6 +155,26 @@ class TraceConfigTests(unittest.TestCase):
         with self.assertRaises(fleet.FleetError):
             fleet.with_trace_dir("[network\n")
 
+    def test_peer_addresses_are_switched_on_where_the_config_is_silent(self):
+        edited = fleet.with_peer_addresses(DUAL_CONFIG)
+        added = "expose_peer_addresses = true\n"
+        self.assertEqual(edited.replace(added, "", 1), DUAL_CONFIG)
+        self.assertIn("[network]\n" + added + 'listen_addr = "0.0.0.0:8233"', edited)
+        self.assertTrue(fleet.exposes_peer_addresses(edited))
+        self.assertEqual(fleet.with_peer_addresses(edited), edited)
+
+    def test_a_config_that_hides_peer_addresses_on_purpose_is_left_alone(self):
+        hidden = DUAL_CONFIG.replace("[network]\n", "[network]\nexpose_peer_addresses = false\n")
+        self.assertEqual(fleet.with_peer_addresses(hidden), hidden)
+        self.assertFalse(fleet.exposes_peer_addresses(hidden))
+
+    def test_both_settings_can_be_added_to_one_config(self):
+        edited = fleet.with_peer_addresses(fleet.with_trace_dir(LEGACY_CONFIG))
+        parsed = tomllib.loads(edited)
+        self.assertEqual(parsed["network"]["expose_peer_addresses"], True)
+        self.assertEqual(parsed["network"]["zakura"], {"trace_dir": "/mnt/data/zakura-traces"})
+        self.assertEqual(parsed["network"]["listen_addr"], "0.0.0.0:8233")
+
     def test_the_config_path_is_read_from_the_service_command_line(self):
         shown = (
             "{ path=/usr/local/bin/zakurad ; argv[]=/usr/local/bin/zakurad -c /root/.config/zakura.toml start ;"
@@ -356,6 +376,7 @@ class StepTests(unittest.TestCase):
         first = fleet.ensure_trace_config(self.node, load(NODE_LIST))
         self.assertIn("updated trace settings in /etc/zakura/zakura.toml", first)
         self.assertEqual(fleet.trace_dir_of(self.config), fleet.TRACE_DIR)
+        self.assertTrue(fleet.exposes_peer_addresses(self.config))
         written = self.config
         self.assertIn("already writes trace files to /mnt/data/zakura-traces", fleet.ensure_trace_config(self.node, load(NODE_LIST)))
         self.assertEqual(self.config, written)
@@ -392,6 +413,18 @@ class StepTests(unittest.TestCase):
         with self.assertRaisesRegex(fleet.FleetError, "did not confirm trace retention"):
             fleet.ensure_trace_config(self.node, load(NODE_LIST))
         self.assertEqual(self.config, DUAL_CONFIG)
+
+    def test_a_node_that_hides_peer_addresses_is_reported_and_keeps_its_choice(self):
+        self.config = DUAL_CONFIG.replace("[network]\n", "[network]\nexpose_peer_addresses = false\n")
+        self.assertTrue(fleet.ensure_trace_config(self.node, load(NODE_LIST)).endswith("its config keeps peer addresses hidden"))
+        self.assertFalse(fleet.exposes_peer_addresses(self.config))
+
+    def test_a_node_that_already_traces_gets_peer_addresses_after_its_profiler_is_running(self):
+        self.config = fleet.with_trace_dir(DUAL_CONFIG)
+        self.assertIn("updated trace settings in", fleet.ensure_trace_config(self.node, load(NODE_LIST)))
+        self.assertTrue(fleet.exposes_peer_addresses(self.config))
+        self.assertFalse(self.managed)
+        self.assertLess(self.steps.index(fleet.INSTALL_SCRIPT), self.steps.index(fleet.WRITE_CONFIG_SCRIPT))
 
     def test_the_profiler_is_pointed_at_the_trace_directory_in_the_node_s_config(self):
         fleet.ensure_trace_config(self.node, load(NODE_LIST))

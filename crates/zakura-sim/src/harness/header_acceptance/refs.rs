@@ -83,6 +83,26 @@ impl From<&FrameRef> for StreamRef {
     }
 }
 
+/// One connection, the whole identity a close or a punishment names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionRef {
+    /// The connection.
+    pub connection: u64,
+}
+impl Ref for ConnectionRef {}
+
+/// One QUIC stream of one connection, as an adversary's `ActRan` names
+/// the stream it wrote on: a frame's [`StreamRef`] without its kind and
+/// version, which the act doesn't name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuicStreamRef {
+    /// The connection.
+    pub connection: u64,
+    /// The QUIC stream.
+    pub quic_stream: u64,
+}
+impl Ref for QuicStreamRef {}
+
 /// One frame as its session's reader names it: the session, and the
 /// frame's position among the stream's reads. A session is one connection
 /// and QUIC stream, so this names the frame on the reader's side.

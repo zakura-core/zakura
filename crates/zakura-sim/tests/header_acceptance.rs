@@ -7092,6 +7092,48 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "the_mixed_joins_fail_one_identity_off",
     ),
     (
+        "PeerNameRef",
+        "tests/header_mixed_resources.rs",
+        "links_of",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
+    (
+        "ConnectionRef",
+        "src/harness/header_acceptance/companions.rs",
+        "fault_close",
+        "src/harness/header_acceptance/companions.rs",
+        "the_fault_close_joins_the_rejected_frames_connection",
+    ),
+    (
+        "FrameRef",
+        "tests/header_wire_crossing.rs",
+        "judged_at",
+        "tests/header_wire_crossing.rs",
+        "an_over_window_crossing_grant_is_bad_cursor_and_closed",
+    ),
+    (
+        "ConnectionRef",
+        "tests/header_wire_crossing.rs",
+        "closed_on_its_judgment",
+        "tests/header_wire_crossing.rs",
+        "an_over_window_crossing_grant_is_bad_cursor_and_closed",
+    ),
+    (
+        "ConnectionRef",
+        "tests/header_wire_crossing.rs",
+        "unpunished",
+        "tests/header_wire_crossing.rs",
+        "a_crossing_close_is_conformant_and_unpunished",
+    ),
+    (
+        "QuicStreamRef",
+        "tests/header_wire_crossing.rs",
+        "act_frame",
+        "tests/header_wire_crossing.rs",
+        "an_act_s_frame_joins_its_quic_stream",
+    ),
+    (
         "StorageOpRef",
         "tests/header_mixed_resources.rs",
         "reply_crosses_reset",
@@ -7838,5 +7880,494 @@ fn every_artifact_read_goes_through_binding() {
             std::panic::catch_unwind(|| artifact_reads(&planted, "tool.rs")).is_err(),
             "{hidden}"
         );
+    }
+}
+/// hdr-14's own witness tests, whose identity assertions Rule 25 covers
+/// beside the acceptance layer's ([`raw_join_scope`]). Older witnesses
+/// assert hdr-3 to hdr-13's properties and predate the rule.
+const RULE_25_WITNESSES: &[&str] = &[
+    "tests/header_catch_not_applicable.rs",
+    "tests/header_cleanup.rs",
+    "tests/header_despite_close.rs",
+    "tests/header_mixed_resources.rs",
+    "tests/header_node_session_ends.rs",
+    "tests/header_wire_crossing.rs",
+    "tests/header_wire_witness.rs",
+];
+
+/// The words a name of an identity holds, as one of its `_`-separated
+/// parts: a peer, connection, session, subscription, stream, frame or
+/// page, an operation, call or sequence number, a storage instance, a
+/// peer's incarnation, a link, a version, an ID, or a serialized
+/// attribution.
+const IDENTITY_WORDS: &[&str] = &[
+    "peer",
+    "conn",
+    "connection",
+    "session",
+    "subscription",
+    "stream",
+    "frame",
+    "page",
+    "op",
+    "call",
+    "seq",
+    "instance",
+    "incarnation",
+    "link",
+    "version",
+    "id",
+    "attribution",
+];
+
+/// The comparisons [`raw_joins`] finds that aren't identity joins, as
+/// `(file, function, names, why)`: the comparison's identity names, sorted
+/// and space-separated, and why it compares no identity.
+const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
+    (
+        "src/harness/header_acceptance/actions.rs",
+        "of",
+        "link",
+        "builds each peer's link list, skipping a link it already holds; `show` joins it by `LinkRef`",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "attributed_page",
+        "attribution",
+        "filters a record's rule and subject kind; the page it names joins by `PageRef`",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "caught_draft",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "contract_standing",
+        "id",
+        "contract IDs, the manifest's names for contracts",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "evaluate",
+        "id",
+        "contract and expected-result IDs, the manifest's keys, whose joins the evaluator's full-identity tests cover",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "key_state",
+        "id",
+        "contract IDs, the manifest's names for contracts",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "same_run",
+        "id",
+        "a whole `RunId`, the manifest's typed run identity, compared whole",
+    ),
+    (
+        "src/harness/header_acceptance/not_applicable.rs",
+        "lists",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/required.rs",
+        "required_keys",
+        "id",
+        "contract IDs, the manifest's names for contracts",
+    ),
+    (
+        "src/harness/header_acceptance/rows.rs",
+        "hand_written_rows",
+        "id",
+        "a property ID choosing its row's watched set",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "a_a_and_a_b_a",
+        "id",
+        "trace digests, compared to show two recordings are one run, not joined",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "draft_witness",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/witness.rs",
+        "judge",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/witness.rs",
+        "of",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "each_declared_list_matches_its_baseline",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "every_node_catch_declares_its_not_applicable",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "no_list_accepts_an_incomplete_reason",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "the_patched_list_judges_the_draft_run",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "violating",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_mixed_resources.rs",
+        "witnessed",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_node_session_ends.rs",
+        "a_link_the_harness_closes_shows_in_the_next_view",
+        "session_id",
+        "the storage view keys its lives by session ID alone, one per link in a run, so it's the view's whole identity; a view freshness test, not a history judgment",
+    ),
+    (
+        "tests/header_wire_crossing.rs",
+        "held_applied",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "act_frame",
+        "connection",
+        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "each_invalid_label_witness_has_a_conformant_control",
+        "connection",
+        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "each_invalid_label_witness_has_a_conformant_control",
+        "connection quic_stream seq",
+        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "honest_peer_never_punished",
+        "connection",
+        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "joins_the_frames",
+        "PEER_TO_NODE link",
+        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "joins_the_frames",
+        "first_frame seq",
+        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "joins_the_frames",
+        "id",
+        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "outcome",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "peer_connections",
+        "peer",
+        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "the_harness_registers_the_generated_header_ids",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary",
+        "ID",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+];
+
+/// The files [`raw_joins`] reads, relative to the crate: every acceptance
+/// source but `refs.rs`, where the join is defined, the witness judge, and
+/// [`RULE_25_WITNESSES`].
+fn raw_join_scope() -> Vec<String> {
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<String> = std::fs::read_dir(krate.join(ACCEPTANCE_SRC))
+        .expect("the acceptance source reads")
+        .map(|entry| entry.expect("an entry reads").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .map(|path| {
+            path.strip_prefix(krate)
+                .expect("under the crate")
+                .display()
+                .to_string()
+        })
+        .filter(|file| !file.ends_with("/refs.rs"))
+        .collect();
+    files.push("src/harness/header_acceptance.rs".to_owned());
+    files.push("src/witness.rs".to_owned());
+    files.extend(RULE_25_WITNESSES.iter().map(|file| (*file).to_owned()));
+    files.sort();
+    files
+}
+
+/// Each raw identity comparison in the Rust source `text`, the file
+/// `file`, as `(function, names)`: an `==` or `!=`, or a `contains` call,
+/// either side of which names an identity, by a path, field, method or
+/// JSON key one of whose `_`-separated parts is an [`IDENTITY_WORDS`] word,
+/// with those names, sorted and space-separated. Macro arguments and match
+/// guards count, and a one-key-off control's closure doesn't, since it
+/// judges a join's result. Test code under `src` is skipped, since it tests the
+/// code rather than judging a history; a witness test's file is all read.
+/// It can't see a comparison through a helper whose name holds no such
+/// word, `assert_eq!`'s equality, or a join the types make, such as a map
+/// keyed by an identity.
+fn raw_joins(text: &str, file: &str) -> BTreeSet<(String, String)> {
+    use syn::visit::Visit;
+    /// Whether `name` holds an identity word as one of its parts.
+    fn identity(name: &str) -> bool {
+        name.split('_')
+            .any(|part| IDENTITY_WORDS.contains(&part.to_ascii_lowercase().as_str()))
+    }
+    /// Every identity name `expr` holds.
+    fn identities(expr: &syn::Expr) -> BTreeSet<String> {
+        /// Collects them.
+        #[derive(Default)]
+        struct Names(BTreeSet<String>);
+        impl<'ast> Visit<'ast> for Names {
+            fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
+                let name = ident.to_string();
+                if identity(&name) {
+                    self.0.insert(name);
+                }
+            }
+
+            fn visit_expr_index(&mut self, index: &'ast syn::ExprIndex) {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(key),
+                    ..
+                }) = &*index.index
+                {
+                    if identity(&key.value()) {
+                        self.0.insert(key.value());
+                    }
+                }
+                syn::visit::visit_expr_index(self, index);
+            }
+
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                for expr in macro_exprs(mac) {
+                    self.visit_expr(&expr);
+                }
+            }
+        }
+        let mut names = Names::default();
+        names.visit_expr(expr);
+        names.0
+    }
+    /// Whether `attrs` mark test-only code: `#[test]`, or `#[cfg(test)]`.
+    fn test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("test")
+                || (attr.path().is_ident("cfg")
+                    && attr
+                        .meta
+                        .require_list()
+                        .is_ok_and(|list| list.tokens.to_string() == "test"))
+        })
+    }
+    /// Collects the comparisons, by enclosing function.
+    struct Raw {
+        skip_tests: bool,
+        within: Vec<String>,
+        found: BTreeSet<(String, String)>,
+    }
+    impl Raw {
+        /// Notes a comparison of `sides`, if one names an identity.
+        fn compare(&mut self, sides: &[&syn::Expr]) {
+            let names: BTreeSet<String> = sides.iter().flat_map(|side| identities(side)).collect();
+            if !names.is_empty() {
+                let within = self.within.last().cloned().unwrap_or_default();
+                let names: Vec<String> = names.into_iter().collect();
+                self.found.insert((within, names.join(" ")));
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Raw {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !(self.skip_tests && test_only(&item.attrs)) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !(self.skip_tests && test_only(&item.attrs)) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !(self.skip_tests && test_only(&item.attrs)) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_expr_binary(&mut self, binary: &'ast syn::ExprBinary) {
+            if matches!(binary.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) {
+                self.compare(&[&binary.left, &binary.right]);
+            }
+            syn::visit::visit_expr_binary(self, binary);
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            let control = matches!(&*call.func, syn::Expr::Path(path)
+                if path.path.segments.last().is_some_and(|last| last.ident == "assert_one_key_off"));
+            if control {
+                // A control's closure judges a join's result, as `==` of
+                // what the join found; the join itself is elsewhere.
+                if let Some(positive) = call.args.first() {
+                    self.visit_expr(positive);
+                }
+            } else {
+                syn::visit::visit_expr_call(self, call);
+            }
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "contains" {
+                let mut sides: Vec<&syn::Expr> = vec![&call.receiver];
+                sides.extend(call.args.iter());
+                self.compare(&sides);
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            for expr in macro_exprs(mac) {
+                self.visit_expr(&expr);
+            }
+        }
+    }
+    let parsed = syn::parse_file(text).unwrap_or_else(|error| panic!("{file} parses: {error}"));
+    let mut raw = Raw {
+        skip_tests: file.starts_with("src/"),
+        within: Vec::new(),
+        found: BTreeSet::new(),
+    };
+    raw.visit_file(&parsed);
+    raw.found
+}
+
+/// Rule 25's raw-join scan: in [`raw_join_scope`], every comparison that
+/// names an identity ([`raw_joins`]) is one [`NOT_RAW_JOINS`] lists, with
+/// why it joins no identity, and each listed one is still there; any
+/// other identity join goes through a typed ref. A planted raw join on a
+/// peer, an operation, a JSON attribution or by `contains` fails the scan,
+/// and a comparison of a kind or a count, or a control's closure judging
+/// a join's result, doesn't.
+#[test]
+fn identity_joins_go_through_refs() {
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found = BTreeSet::new();
+    for file in raw_join_scope() {
+        let text = std::fs::read_to_string(krate.join(&file)).expect("a source file reads");
+        for (within, names) in raw_joins(&text, &file) {
+            found.insert((file.clone(), within, names));
+        }
+    }
+    let allowed: BTreeSet<(String, String, String)> = NOT_RAW_JOINS
+        .iter()
+        .map(|(file, within, names, why)| {
+            assert!(!why.is_empty(), "{file} {within} has no reason");
+            (
+                (*file).to_owned(),
+                (*within).to_owned(),
+                (*names).to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        allowed.len(),
+        NOT_RAW_JOINS.len(),
+        "an entry is listed twice"
+    );
+    let raw: Vec<_> = found.difference(&allowed).collect();
+    assert!(
+        raw.is_empty(),
+        "raw identity joins outside refs.rs: {raw:#?}"
+    );
+    let stale: Vec<_> = allowed.difference(&found).collect();
+    assert!(
+        stale.is_empty(),
+        "listed comparisons that are gone: {stale:?}"
+    );
+
+    for (planted, names) in [
+        ("fn p(a: &str, b: &str) -> bool { a == b }", None),
+        ("fn p(kind: &str) -> bool { kind == \"invalidate\" }", None),
+        ("fn p(frames: &[u64]) -> bool { frames.len() == 1 }", None),
+        ("fn p(peer: &str, name: &str) -> bool { name == peer }", Some("peer")),
+        ("fn p(id: u64, op: u64) -> bool { matches!(id, x if x == op) }", Some("op")),
+        (
+            "fn p(record: &Value, want: &Value) -> bool { record[\"attribution\"] == *want }",
+            Some("attribution"),
+        ),
+        ("fn p(links: &[u64], conn: u64) -> bool { links.contains(&conn) }", Some("conn")),
+        (
+            "fn p(peer: &PeerNameRef) { assert_one_key_off::<PeerNameRef>(peer, |p| p.peer == peer.peer); }",
+            None,
+        ),
+        (
+            "fn p(o: &Obs, c: u64) -> bool { match o { Obs::Closed { connection } if *connection == c => true, _ => false } }",
+            Some("connection"),
+        ),
+    ] {
+        let found = raw_joins(planted, "tests/t.rs");
+        let want: BTreeSet<(String, String)> = names
+            .map(|names| ("p".to_owned(), names.to_owned()))
+            .into_iter()
+            .collect();
+        assert_eq!(found, want, "{planted}");
     }
 }

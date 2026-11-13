@@ -28,7 +28,8 @@ use zakura_network::zakura::observe::ReactorEvent;
 use zakura_sim::harness::header_acceptance::{
     history::run_declared,
     refs::{
-        CallOpRef, DispatchRef, Ref, ReleaseRef, StaleCallRef, StorageOpRef, StorageRef, WorkRef,
+        CallOpRef, DispatchRef, PeerNameRef, Ref, ReleaseRef, StaleCallRef, StorageOpRef,
+        StorageRef, WorkRef,
     },
 };
 use zakura_sim::{
@@ -591,29 +592,12 @@ fn witnessed(label: &str, run: &Run) {
     );
     let facts = run.sessions.facts();
     for peer in [SOURCE, SERVED] {
-        let links: Vec<(u64, u64)> = facts
-            .iter()
-            .filter_map(|fact| match fact {
-                SessionFact::LinkOpened {
-                    peer: at,
-                    connection,
-                    session_id,
-                    ..
-                } if at == peer => Some((*connection, *session_id)),
-                _ => None,
-            })
-            .collect();
-        let admitted: Vec<u64> = facts
-            .iter()
-            .filter_map(|fact| match fact {
-                SessionFact::SessionAdmitted {
-                    peer: at,
-                    session_id,
-                    ..
-                } if at == peer => Some(*session_id),
-                _ => None,
-            })
-            .collect();
+        let (links, admitted) = links_of(
+            &facts,
+            &PeerNameRef {
+                peer: peer.to_owned(),
+            },
+        );
         let [(old_connection, old_session), (new_connection, new_session)] = links[..] else {
             panic!("{label}: {peer} links twice: {links:?}");
         };
@@ -621,6 +605,32 @@ fn witnessed(label: &str, run: &Run) {
         assert_ne!(old_session, new_session, "{label}: {peer}");
         assert_eq!(admitted, [old_session, new_session], "{label}: {peer}");
     }
+}
+
+/// `peer`'s links in `facts`, as `(connection, session)`, and the sessions
+/// the node admitted from it, each fact joined on the peer's whole
+/// [`PeerNameRef`].
+fn links_of(facts: &[SessionFact], peer: &PeerNameRef) -> (Vec<(u64, u64)>, Vec<u64>) {
+    let named = |fact: &SessionFact| match fact {
+        SessionFact::LinkOpened { peer, .. } | SessionFact::SessionAdmitted { peer, .. } => {
+            Some(PeerNameRef { peer: peer.clone() })
+        }
+        _ => None,
+    };
+    let mut links = Vec::new();
+    let mut admitted = Vec::new();
+    for fact in PeerNameRef::joined(peer, facts, named) {
+        match fact {
+            SessionFact::LinkOpened {
+                connection,
+                session_id,
+                ..
+            } => links.push((*connection, *session_id)),
+            SessionFact::SessionAdmitted { session_id, .. } => admitted.push(*session_id),
+            _ => {}
+        }
+    }
+    (links, admitted)
 }
 
 /// The Plan bytes the committed fixture runs under: a fixed draw.
@@ -692,10 +702,22 @@ fn the_mixed_joins_fail_one_identity_off() {
     )
     .expect("the fixture is a storage scenario");
     let plan = fs::read(fixture_file("plan")).expect("the Plan is committed");
-    let selected = Selected::of(&run(&committed, Plan::from_fuzz(&plan)));
+    let ran = run(&committed, Plan::from_fuzz(&plan));
+    let selected = Selected::of(&ran);
     selected
         .held_prepare_joined()
         .expect("the committed run joins");
+    // Each mirror's links and admissions join on its whole name: the
+    // other mirror's name, one key off, finds its other links.
+    let facts = ran.sessions.facts();
+    for peer in [SOURCE, SERVED] {
+        let own = PeerNameRef {
+            peer: peer.to_owned(),
+        };
+        let found = links_of(&facts, &own);
+        assert_eq!(found.0.len(), 2, "{peer}");
+        assert_one_key_off::<PeerNameRef>(&own, |moved| links_of(&facts, moved) == found);
+    }
     selected
         .apply_reply_crosses_reset()
         .expect("the committed reply crosses");

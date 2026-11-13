@@ -3679,6 +3679,7 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "identity_refs_are_defined_only_in_refs",
     "every_artifact_read_goes_through_binding",
     "every_ref_has_a_one_key_off_control",
+    "identity_joins_go_through_refs",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.

@@ -39,8 +39,8 @@ use zakura_network::zakura::observe::ReactorEvent;
 use super::{
     binding::{self, Expect, Field},
     refs::{
-        FindingRef, FrameRef, PageRef, PeerNameRef, ReadRef, Ref, SessionRef, StreamRef,
-        SubscriptionRef,
+        ConnectionRef, FindingRef, FrameRef, PageRef, PeerNameRef, ReadRef, Ref, SessionRef,
+        StreamRef, SubscriptionRef,
     },
     CaseRef,
 };
@@ -397,19 +397,20 @@ pub fn fault_close(
         .iter()
         .position(|obs| FrameRef::joins(&page.frame, obs, judged_frame))
         .ok_or_else(|| format!("the node never judged {page:?}"))?;
-    // A close names only its connection, which is the whole of its
-    // identity.
+    // A close names only its connection ([`ConnectionRef`]).
     let connection = page.frame.connection;
-    let close = observations
-        .iter()
-        .enumerate()
-        .find_map(|(at, obs)| match obs {
-            Observation::ConnectionClosed {
-                connection: c,
-                cause,
-            } if *c == connection => Some((at, cause)),
-            _ => None,
-        });
+    let closed = |obs: &Observation| match obs {
+        Observation::ConnectionClosed { connection, .. } => Some(ConnectionRef {
+            connection: *connection,
+        }),
+        _ => None,
+    };
+    let close = observations.iter().enumerate().find_map(|(at, obs)| {
+        let Observation::ConnectionClosed { cause, .. } = obs else {
+            return None;
+        };
+        ConnectionRef::joins(&ConnectionRef { connection }, obs, closed).then_some((at, cause))
+    });
     match close {
         None => Err(format!("connection {connection} never closed")),
         Some((at, cause)) if at < judged => Err(format!(
@@ -958,6 +959,12 @@ mod tests {
                 reason: CONTENT_FAULT.into(),
             }];
             fault_close(&closed, &refusals, &page).is_ok()
+        });
+        // The close joins on its whole connection.
+        let own = ConnectionRef { connection: 1 };
+        assert_one_key_off::<ConnectionRef>(&own, |close| {
+            let log = log(1, close.connection, "service_protocol_reject");
+            fault_close(&log, &linkage, &page).is_ok()
         });
         assert!(fault_close(&log(1, 2, "service_protocol_reject"), &linkage, &page).is_err());
         assert!(fault_close(&log(1, 1, "service_local_shutdown"), &linkage, &page).is_err());

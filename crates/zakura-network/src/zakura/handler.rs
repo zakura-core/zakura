@@ -4820,6 +4820,18 @@ impl ZakuraProtocolHandler {
         }
         // A registered connection now counts as registered in `ip_slots`.
         drop(context.control_handshake);
+        // Registration refunds the attempt's cadence token, even when a local
+        // capability change closes the connection below.
+        if matches!(registration, ZakuraRegistration::Registered { .. })
+            && context.direction == ServicePeerDirection::Inbound
+        {
+            self.supervisor
+                .ip_slots
+                .counts()
+                .refund_cadence(connection.admitted_ip(), Instant::now());
+            #[cfg(any(test, zakura_sim))]
+            self.observe_handshake_cadence(connection.admitted_addr(), "registered", false);
+        }
         if let ZakuraRegistration::Registered {
             conn_id,
             peer_id,
@@ -4854,6 +4866,8 @@ impl ZakuraProtocolHandler {
                         elapsed: None,
                     }
                 );
+                // A local decision closed the peer, so the dialer retries
+                // without backing off.
                 if let Some(report) = context.registration_report {
                     let _ = report.send(DialRegistration::LocalLimit);
                 }
@@ -4881,14 +4895,6 @@ impl ZakuraProtocolHandler {
                 remote_ip,
                 disconnect_token,
             } => {
-                if context.direction == ServicePeerDirection::Inbound {
-                    self.supervisor
-                        .ip_slots
-                        .counts()
-                        .refund_cadence(connection.admitted_ip(), Instant::now());
-                    #[cfg(any(test, zakura_sim))]
-                    self.observe_handshake_cadence(connection.admitted_addr(), "registered", false);
-                }
                 metrics::counter!("zakura.p2p.conn.accepted", "role" => context.role).increment(1);
                 context.conn.trace_connection(
                     "accepted",
@@ -5836,7 +5842,8 @@ fn trace_conn_id(connection: &Connection) -> u64 {
 pub(crate) enum DialRegistration {
     /// The supervisor registered the peer on this connection.
     Registered,
-    /// This node's admission limits refused to register the peer.
+    /// This node's admission limits refused to register the peer, or a local
+    /// capability change closed its registration.
     LocalLimit,
 }
 

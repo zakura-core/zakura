@@ -1,9 +1,14 @@
 # The committed fuzz input `sync-wire-reset-mid-write.bin`: the harness that
 # runs it, the generator version it was built for, and its SHA-256. Its
 # two bytes pick a combination of fuzz-13's actions, and its Plan resets a
-# block request mid-write, zakura#2378's known failure.
+# block request mid-write, zakura#2378's known failure. It sits outside the
+# seed corpus because it fails by design.
 harness = "sync/wire"
 generator = 4
 sha256 = "76d83d066171d41d8d1aaef3043a4d2c5c213e5ba1d62afe0634db17101422e2"
 scenario_sha256 = "784be2ca7bbb2e844ea0896ccb491a7f08219c9bc7b14792e190661e6ccc3164"
 source = "crates/zakura-sim/tests/sync_wire.rs"
+
+[[witness]]
+property = "session/stalled-service-isolated"
+expect = "violated"

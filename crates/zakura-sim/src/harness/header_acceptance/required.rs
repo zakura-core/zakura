@@ -42,16 +42,16 @@ pub struct Inventories<'a> {
     /// Every planted case under `qa/planted/header-sync/` and
     /// `qa/planted/header/`, as `(property directory, case name)`.
     pub planted: &'a [(String, String)],
-    /// Each planted case's harness, by `(property directory, case name)`,
-    /// read from its committed input's sidecar
+    /// Each planted case's harness, by its whole [`PlantedRef`], read from
+    /// its committed input's sidecar
     /// ([`planted_harness`](super::planted_harness)) apart from the rows.
     /// A case with no readable harness counts as a node case.
-    pub planted_harnesses: &'a BTreeMap<(String, String), String>,
+    pub planted_harnesses: &'a [(PlantedRef, String)],
     /// Every planted case whose `.toml` names `missing_evidence`, a
     /// harness-caught case with no `Draft` run
     /// ([`planted_harness_caught`](super::planted_harness_caught)), read
     /// apart from the rows.
-    pub harness_caught: &'a BTreeSet<(String, String)>,
+    pub harness_caught: &'a [PlantedRef],
     /// Every directory under `qa/native-mutations/header-sync/`, retired
     /// ones included.
     pub native: &'a [String],
@@ -826,6 +826,20 @@ pub fn counted_runs(expected: &Expected) -> (Vec<RunId>, Vec<RunId>) {
     }
 }
 
+/// `case`'s harness among `harnesses`, joined on its whole [`PlantedRef`],
+/// if it has one.
+fn harness_of<'a>(harnesses: &'a [(PlantedRef, String)], case: &PlantedRef) -> Option<&'a str> {
+    PlantedRef::joined(case, harnesses, |(planted, _)| Some(planted.clone()))
+        .first()
+        .map(|(_, harness)| harness.as_str())
+}
+
+/// Whether `case` is among `caught`, the harness-caught cases, joined on
+/// its whole [`PlantedRef`].
+fn is_harness_caught(caught: &[PlantedRef], case: &PlantedRef) -> bool {
+    !PlantedRef::joined(case, caught, |planted| Some(planted.clone())).is_empty()
+}
+
 /// Every key acceptance requires, with the gates it serves.
 ///
 /// A header ID owes a passing key, and an `Active` one a catch key too.
@@ -956,17 +970,16 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
             name: name.clone(),
             run,
         };
-        let machine = inv
-            .planted_harnesses
-            .get(&(property.clone(), name.clone()))
+        let planted = PlantedRef {
+            property: property.clone(),
+            name: name.clone(),
+        };
+        let machine = harness_of(inv.planted_harnesses, &planted)
             .is_some_and(|harness| (inv.machine)(harness));
         for run in [CaseRun::Baseline, CaseRun::Patched] {
             keys.insert(Key::Replay { run: case(run) }, BTreeSet::from([Gate::G1]));
         }
-        if inv
-            .harness_caught
-            .contains(&(property.clone(), name.clone()))
-        {
+        if is_harness_caught(inv.harness_caught, &planted) {
             keys.insert(
                 Key::Cleanup {
                     run: case(CaseRun::Baseline),
@@ -1048,6 +1061,83 @@ mod tests {
             not_applicable: &[],
             patched_not_applicable: None,
         }
+    }
+
+    /// What [`required_keys`] reads of one planted case, `planted`, on
+    /// `harness`, harness-caught or not, with every other inventory empty.
+    fn one_case_keys(
+        planted: (String, String),
+        harnesses: &[(PlantedRef, String)],
+        harness_caught: &[PlantedRef],
+    ) -> BTreeMap<Key, BTreeSet<Gate>> {
+        required_keys(&Inventories {
+            registered: &[],
+            needs: &[],
+            planted: &[planted],
+            planted_harnesses: harnesses,
+            harness_caught,
+            native: &[],
+            coverage_tests: &[],
+            contracts: &[],
+            required_contracts: &[],
+            narrowing: &[],
+            requirements: &[],
+            composition: &[],
+            reasons: &[],
+            expected: &[],
+            histories: &[],
+            machine: |harness| harness == "header/reactor",
+        })
+    }
+
+    /// The case `reserved-flags-skipped` under one of its properties.
+    fn reserved_flags() -> PlantedRef {
+        PlantedRef {
+            property: "header-sync/s5v9/status/reserved-flags-closes".to_owned(),
+            name: "reserved-flags-skipped".to_owned(),
+        }
+    }
+
+    /// The `Draft` run's replay key of `case`, which a node case owes and
+    /// a machine or harness-caught case doesn't.
+    fn draft_replay(case: &PlantedRef) -> Key {
+        Key::Replay {
+            run: RunId::Case {
+                property: case.property.clone(),
+                name: case.name.clone(),
+                run: CaseRun::Draft,
+            },
+        }
+    }
+
+    /// A planted case's harness is read for it only on its whole
+    /// [`PlantedRef`] (Rule 25's template): a case whose harness is a
+    /// machine owes no `Draft` replay, and with the harness listed under
+    /// the case's property or name moved it owes one, as a node case.
+    #[test]
+    fn a_case_s_harness_joins_its_whole_case() {
+        let case = reserved_flags();
+        let planted = (case.property.clone(), case.name.clone());
+        let keys = assert_one_key_off::<PlantedRef>(&case, |listed| {
+            let harnesses = [(listed.clone(), "header/reactor".to_owned())];
+            !one_case_keys(planted.clone(), &harnesses, &[]).contains_key(&draft_replay(&case))
+        });
+        assert_eq!(keys, 2);
+    }
+
+    /// A planted case is harness-caught only on its whole [`PlantedRef`]
+    /// (Rule 25's template): a node case listed harness-caught owes no
+    /// `Draft` replay, and with the listed case's property or name moved it
+    /// owes one.
+    #[test]
+    fn a_harness_caught_case_joins_its_whole_case() {
+        let case = reserved_flags();
+        let planted = (case.property.clone(), case.name.clone());
+        let keys = assert_one_key_off::<PlantedRef>(&case, |listed| {
+            !one_case_keys(planted.clone(), &[], std::slice::from_ref(listed))
+                .contains_key(&draft_replay(&case))
+        });
+        assert_eq!(keys, 2);
     }
 
     /// A [`Permit::Caught`] takes the `Caught` of its case only on the

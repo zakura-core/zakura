@@ -43,6 +43,7 @@ use super::{
     Approval, CaseRun, Expected, ExpectedId, ExpectedNa, ExpectedResult, Found, Gate, Key,
     Manifest, ResultCtx, RunId, TestRef, GATES,
 };
+use crate::harness::header_acceptance::refs::{PlantedRef, Ref, TestIdRef};
 
 /// An acceptance run's results, as the acceptance tool writes them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1041,11 +1042,15 @@ fn expected_harness(manifest: &Manifest, expected: &Expected) -> Option<String> 
 }
 
 /// The harness of execution `run`: a history's own, or the harness of the
-/// case whose run it is.
+/// case whose run it is, joined on the case's whole [`PlantedRef`].
 fn replayed_harness(manifest: &Manifest, run: &RunId) -> Option<String> {
     match run {
         RunId::History { harness, .. } => Some(harness.clone()),
         RunId::Case { property, name, .. } => {
+            let want = PlantedRef {
+                property: property.clone(),
+                name: name.clone(),
+            };
             manifest
                 .expected
                 .iter()
@@ -1053,7 +1058,7 @@ fn replayed_harness(manifest: &Manifest, run: &RunId) -> Option<String> {
                     Expected::Caught { case, harness, .. }
                     | Expected::MachineCaught { case, harness }
                     | Expected::HarnessCaught { case, harness, .. }
-                        if case.property == property && case.name == name =>
+                        if PlantedRef::joins(&want, &case, |case| Some(case.planted())) =>
                     {
                         Some(harness.to_owned())
                     }
@@ -1064,25 +1069,32 @@ fn replayed_harness(manifest: &Manifest, run: &RunId) -> Option<String> {
 }
 
 /// The `Draft` override `run` should carry: a case's set for its `Draft`
-/// run, and nothing for every other execution.
+/// run, joined on the case's whole [`PlantedRef`], and nothing for every
+/// other execution.
 fn expected_override(manifest: &Manifest, run: &RunId) -> BTreeSet<String> {
     match run {
         RunId::Case {
             property,
             name,
             run: CaseRun::Draft,
-        } => manifest
-            .expected
-            .iter()
-            .find_map(|result| match result.expected {
-                Expected::Caught { case, set, .. }
-                    if case.property == property && case.name == name =>
-                {
-                    Some(set.iter().map(|id| (*id).to_owned()).collect())
-                }
-                _ => None,
-            })
-            .unwrap_or_default(),
+        } => {
+            let want = PlantedRef {
+                property: property.clone(),
+                name: name.clone(),
+            };
+            manifest
+                .expected
+                .iter()
+                .find_map(|result| match result.expected {
+                    Expected::Caught { case, set, .. }
+                        if PlantedRef::joins(&want, &case, |case| Some(case.planted())) =>
+                    {
+                        Some(set.iter().map(|id| (*id).to_owned()).collect())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default()
+        }
         _ => BTreeSet::new(),
     }
 }
@@ -1440,14 +1452,22 @@ fn companions_shown(
     Ok(())
 }
 
-/// A test result's verdict: the filter executed exactly `test`, by its own
-/// package, file and name, and it passed.
+/// A test result's verdict: the filter executed exactly `test`, joined on
+/// its whole [`TestIdRef`], and it passed.
 fn judge_test(actual: &Actual, test: TestRef) -> Result<(), String> {
     let Actual::Test { ran, .. } = actual else {
         return Err(format!("a {:?} result isn't a test's", kind_of(actual)));
     };
     match ran.as_slice() {
-        [one] if one.package == test.package && one.file == test.file && one.test == test.test => {
+        [one]
+            if TestIdRef::joins(&TestIdRef::of(test), one, |one| {
+                Some(TestIdRef {
+                    package: one.package.clone(),
+                    file: one.file.clone(),
+                    test: one.test.clone(),
+                })
+            }) =>
+        {
             match one.outcome {
                 TestOutcome::Passed => Ok(()),
                 outcome => Err(format!("{} ended {outcome:?}", test.test)),
@@ -1778,4 +1798,83 @@ fn caught_draft(
     }
     exactly_violated(run, set)?;
     others_pass(run, set, not_applicable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+
+    /// The committed manifest's first node `Caught`, with a nonempty set,
+    /// as its case's whole identity.
+    fn a_caught_case() -> PlantedRef {
+        Manifest::committed()
+            .expected
+            .iter()
+            .find_map(|result| match result.expected {
+                Expected::Caught { case, set, .. } if !set.is_empty() => Some(case.planted()),
+                _ => None,
+            })
+            .expect("the committed manifest has a node catch")
+    }
+
+    /// The run of `case` in role `run`.
+    fn case_run(case: &PlantedRef, run: CaseRun) -> RunId {
+        RunId::Case {
+            property: case.property.clone(),
+            name: case.name.clone(),
+            run,
+        }
+    }
+
+    /// A replayed case's run takes its harness from only its own case,
+    /// joined on the case's whole [`PlantedRef`] (Rule 25's template): the
+    /// run of a committed catch has a harness, and the run with the case's
+    /// property or name moved has none.
+    #[test]
+    fn a_replayed_run_s_harness_joins_its_whole_case() {
+        let manifest = Manifest::committed();
+        let case = a_caught_case();
+        let keys = assert_one_key_off::<PlantedRef>(&case, |want| {
+            replayed_harness(&manifest, &case_run(want, CaseRun::Patched)).is_some()
+        });
+        assert_eq!(keys, 2);
+    }
+
+    /// A `Draft` run's override comes from only its own case, joined on
+    /// the case's whole [`PlantedRef`] (Rule 25's template): a committed
+    /// node catch's `Draft` run carries its set, and the run with the
+    /// case's property or name moved carries nothing.
+    #[test]
+    fn a_draft_override_joins_its_whole_case() {
+        let manifest = Manifest::committed();
+        let case = a_caught_case();
+        let keys = assert_one_key_off::<PlantedRef>(&case, |want| {
+            !expected_override(&manifest, &case_run(want, CaseRun::Draft)).is_empty()
+        });
+        assert_eq!(keys, 2);
+    }
+
+    /// A test result passes only for the filter having run exactly its
+    /// test, joined on its whole [`TestIdRef`] (Rule 25's template): a run
+    /// of the test passes, and a run of the test with its package, file or
+    /// name moved doesn't.
+    #[test]
+    fn a_test_result_joins_its_whole_test() {
+        let test = super::super::sim_test("tests/header_acceptance.rs", "a_test");
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(test), |ran| {
+            let actual = Actual::Test {
+                ran: vec![TestRan {
+                    package: ran.package.clone(),
+                    file: ran.file.clone(),
+                    test: ran.test.clone(),
+                    outcome: TestOutcome::Passed,
+                }],
+                binary_source: None,
+                checkout_source: None,
+            };
+            judge_test(&actual, test).is_ok()
+        });
+        assert_eq!(keys, 3);
+    }
 }

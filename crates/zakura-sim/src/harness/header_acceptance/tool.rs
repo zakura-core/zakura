@@ -139,7 +139,7 @@ use super::{
         ObligationState, Report, ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
     history::{Declaration, DeclaredHistory, Ran, PLAN_FILE, RAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
-    refs::{DeclarationRef, PlantedRef, Ref, TriggerRef},
+    refs::{DeclarationRef, HistoryRunRef, PlantedRef, Ref, TestIdRef, TriggerRef},
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
     rows::HEADER_HARNESSES,
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
@@ -783,13 +783,16 @@ pub fn plan(manifest: &Manifest, repo: &Path) -> Result<RunPlan, String> {
 /// `StaysNotApplicable` records its history under that target's `holds`
 /// witness, so the recording shows the history's own trigger: its
 /// `NotApplicable` target, a row no scenario reaches, has no trigger a run
-/// can show.
+/// can show. The history is joined on its whole [`HistoryRunRef`].
 fn history_target(history: super::HistoryRef) -> Result<&'static str, String> {
-    super::rows::history_targets()
-        .into_iter()
-        .find(|(counted, _)| *counted == history)
-        .map(|(_, target)| target)
-        .ok_or_else(|| format!("{history:?} isn't a counted history, so it has no target"))
+    let want = HistoryRunRef::of(history);
+    let targets = super::rows::history_targets();
+    HistoryRunRef::joined(&want, &targets, |(counted, _)| {
+        Some(HistoryRunRef::of(*counted))
+    })
+    .first()
+    .map(|(_, target)| *target)
+    .ok_or_else(|| format!("{history:?} isn't a counted history, so it has no target"))
 }
 
 /// A history's task, recording its witness of `property` with `expect`.
@@ -815,12 +818,18 @@ fn history_task(
 /// recorded run's directory within it, `run` for a history and the role's
 /// name for a planted case's run. `None` if no task records it, as for a
 /// native mutation's run, whose witness test isn't a recorded run. A
-/// planted case's run is joined to its task on its whole [`PlantedRef`].
+/// history's run is joined to its task on its whole [`HistoryRunRef`], and
+/// a planted case's on its whole [`PlantedRef`].
 pub fn recorded_at(tasks: &[Task], run: &RunId) -> Option<(usize, &'static str)> {
+    let history = HistoryRunRef::of_run(run);
     tasks.iter().enumerate().find_map(|(index, task)| {
         let dir = match (task, run) {
             (Task::History { expected, .. }, RunId::History { .. })
-                if history_of(expected) == Some(run) =>
+                if history.as_ref().is_some_and(|want| {
+                    HistoryRunRef::joins(want, expected, |expected| {
+                        history_of(expected).and_then(HistoryRunRef::of_run)
+                    })
+                }) =>
             {
                 "run"
             }
@@ -1415,14 +1424,20 @@ fn integrity_execution(
         unreachable!("an integrity run's input is a history");
     };
     let artifact = at.test(dir, role).ok();
+    let own = TestIdRef {
+        package: package.clone(),
+        file: file.clone(),
+        test: name.clone(),
+    };
     let mut end = match &artifact {
         Some(test) if test.killed => End::Killed,
         // The artifact must be the history's own witness test, by package,
-        // file and name, or it's not that history's run.
-        Some(test) if test.package != *package || test.file != *file => End::Failed {
+        // file and name, joined on its whole [`TestIdRef`], or it's not
+        // that history's run.
+        Some(test) if !TestIdRef::joins(&own, test, ran_test) => End::Failed {
             why: format!(
-                "it ran {}/{}, not {package}/{file}",
-                test.package, test.file
+                "it ran {}/{} {:?}, not {package}/{file}::{name}",
+                test.package, test.file, test.tests
             ),
         },
         // Its binary must embed the checkout it ran in, which is S for the
@@ -1440,9 +1455,6 @@ fn integrity_execution(
             }
         }
         Some(test) => match test.tests.as_slice() {
-            [(ran, _)] if ran != name => End::Failed {
-                why: format!("it ran {ran}, not {name}"),
-            },
             [(_, result)] if result == "ok" && test.exited_ok => End::Completed,
             [(_, result)] if result == "FAILED" && reports_diagnostic(&test.log, diagnostic) => {
                 End::HarnessFailure {
@@ -2028,15 +2040,19 @@ fn history_execution(
         (_, None) => execution.trigger = false,
         _ => {}
     }
+    let own = TestIdRef {
+        package: package.to_owned(),
+        file: file.to_owned(),
+        test: name.to_owned(),
+    };
     let passed = at.test(dir, "").is_ok_and(|ran| {
-        ran.package == package
-            && ran.file == file
+        TestIdRef::joins(&own, &ran, ran_test)
             && !ran.killed
             && ran.exited_ok
             && known(Some(subject_source))
             && ran.binary_source.as_deref() == Some(subject_source)
             && ran.checkout_source.as_deref() == Some(subject_source)
-            && ran.tests == [(name.to_owned(), "ok".to_owned())]
+            && ran.tests.iter().all(|(_, result)| result == "ok")
     });
     if !passed {
         fail(
@@ -2514,10 +2530,15 @@ pub fn unit_refusal(
             Ok(ran) => ran,
             Err(why) => return Some(format!("{run}: no test artifact of its build: {why}")),
         };
-        if ran.killed || ran.package != *package || ran.file != *file {
+        let own = TestIdRef {
+            package: package.clone(),
+            file: file.clone(),
+            test: test.clone(),
+        };
+        if ran.killed || !TestIdRef::joins(&own, &ran, ran_test) {
             return Some(format!(
-                "{run}: it ran {}/{} (killed: {})",
-                ran.package, ran.file, ran.killed
+                "{run}: it ran {}/{} {:?} (killed: {})",
+                ran.package, ran.file, ran.tests, ran.killed
             ));
         }
         let patched = run == "patched";
@@ -2535,7 +2556,7 @@ pub fn unit_refusal(
         };
         executables.insert(run, executable);
         let result = match ran.tests.as_slice() {
-            [(name, result)] if name == test => result.as_str(),
+            [(_, result)] => result.as_str(),
             tests => return Some(format!("{run}: the filter ran {tests:?}")),
         };
         if !patched && !(result == "ok" && ran.exited_ok) {
@@ -2709,19 +2730,32 @@ fn declaration<'a>(
 
 /// Every counted history the committed inventory
 /// ([`counted_histories`](super::rows::counted_histories)) names for the
-/// witness test `test` in `package`'s `file`, as its harness and case.
-pub fn inventory_cases(package: &str, file: &str, test: &str) -> BTreeSet<(String, String)> {
-    super::rows::counted_histories()
-        .into_iter()
-        .filter(|history| {
-            (
-                history.witness.package,
-                history.witness.file,
-                history.witness.test,
-            ) == (package, file, test)
-        })
-        .map(|history| (history.harness.to_owned(), history.case.to_owned()))
-        .collect()
+/// witness test `test` in `package`'s `file`, joined on the test's whole
+/// [`TestIdRef`], as the [`DeclarationRef`] of its harness and case by
+/// that test.
+pub fn inventory_cases(package: &str, file: &str, test: &str) -> Vec<DeclarationRef> {
+    let want = TestIdRef {
+        package: package.to_owned(),
+        file: file.to_owned(),
+        test: test.to_owned(),
+    };
+    let counted = super::rows::counted_histories();
+    TestIdRef::joined(&want, &counted, |history| {
+        Some(TestIdRef::of(history.witness))
+    })
+    .into_iter()
+    .map(|history| DeclarationRef {
+        test: test.to_owned(),
+        harness: history.harness.to_owned(),
+        case: history.case.to_owned(),
+    })
+    .collect()
+}
+
+/// Whether `declared` is among `all`, joined on its whole
+/// [`DeclarationRef`]: one case name on two harnesses is two histories.
+fn declared_in(all: &[DeclarationRef], declared: &DeclarationRef) -> bool {
+    !DeclarationRef::joined(declared, all, |listed| Some(listed.clone())).is_empty()
 }
 
 /// Why the declarations a counted witness test made under
@@ -2732,7 +2766,7 @@ pub fn inventory_cases(package: &str, file: &str, test: &str) -> BTreeSet<(Strin
 /// another test declared. Empty when they match, or when the inventory
 /// names no history for the test, which then counts none.
 pub fn inventory_errors<'a>(
-    inventory: &BTreeSet<(String, String)>,
+    inventory: &[DeclarationRef],
     declared: impl IntoIterator<Item = &'a DeclaredHistory>,
     test: &str,
 ) -> Vec<String> {
@@ -2740,32 +2774,54 @@ pub fn inventory_errors<'a>(
         return Vec::new();
     }
     let mut errors = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = Vec::new();
     for history in declared {
-        let key = (history.harness.clone(), history.case.clone());
+        let key = DeclarationRef {
+            test: test.to_owned(),
+            harness: history.harness.clone(),
+            case: history.case.clone(),
+        };
         if !libtest_names(&history.test, test) {
             errors.push(format!(
                 "{} declared {} on {}, inside {test}'s run",
                 history.test, history.case, history.harness
             ));
-        } else if !inventory.contains(&key) {
+        } else if !declared_in(inventory, &key) {
             errors.push(format!(
                 "{test} declared {} on {}, which the inventory doesn't count",
                 history.case, history.harness
             ));
-        } else if !seen.insert(key) {
+        } else if declared_in(&seen, &key) {
             errors.push(format!(
                 "{test} declared {} on {} twice",
                 history.case, history.harness
             ));
+        } else {
+            seen.push(key);
         }
     }
-    for (harness, case) in inventory.difference(&seen) {
-        errors.push(format!(
-            "{test} didn't declare its counted history {case} on {harness}"
-        ));
+    for counted in inventory {
+        if !declared_in(&seen, counted) {
+            errors.push(format!(
+                "{test} didn't declare its counted history {} on {}",
+                counted.case, counted.harness
+            ));
+        }
     }
     errors
+}
+
+/// The one test the filter ran in `ran`, by its whole identity, or `None`
+/// if it ran none or several.
+fn ran_test(ran: &TestRun) -> Option<TestIdRef> {
+    match ran.tests.as_slice() {
+        [(test, _)] => Some(TestIdRef {
+            package: ran.package.clone(),
+            file: ran.file.clone(),
+            test: test.clone(),
+        }),
+        _ => None,
+    }
 }
 
 /// Whether libtest's thread name `thread` names the test `test`: the test
@@ -3021,19 +3077,23 @@ pub fn committed_required(
     let planted = planted_cases(repo)?;
     let native = native_dirs(repo)?;
     let coverage = coverage_tests();
-    let planted_harnesses: BTreeMap<(String, String), String> = planted
+    let planted_ref = |property: &String, name: &String| PlantedRef {
+        property: property.clone(),
+        name: name.clone(),
+    };
+    let planted_harnesses: Vec<(PlantedRef, String)> = planted
         .iter()
         .filter_map(|(property, name)| {
             let harness = super::planted_harness(repo, property, name).ok()?;
-            Some(((property.clone(), name.clone()), harness))
+            Some((planted_ref(property, name), harness))
         })
         .collect();
-    let harness_caught: BTreeSet<(String, String)> = planted
+    let harness_caught: Vec<PlantedRef> = planted
         .iter()
         .filter(|(property, name)| {
             super::planted_harness_caught(repo, property, name).unwrap_or(false)
         })
-        .cloned()
+        .map(|(property, name)| planted_ref(property, name))
         .collect();
     Ok(required_keys(&Inventories {
         registered: &registered,
@@ -5084,6 +5144,216 @@ mod tests {
         }
     }
 
+    /// `text`, for the life of the test, as a static field.
+    fn leaked(text: &str) -> &'static str {
+        Box::leak(text.to_owned().into_boxed_str())
+    }
+
+    /// The history `want` names, its fields leaked for the life of the
+    /// test.
+    fn history_named(want: &HistoryRunRef) -> super::super::HistoryRef {
+        super::super::HistoryRef {
+            harness: leaked(&want.harness),
+            witness: super::super::TestRef {
+                package: leaked(&want.package),
+                file: leaked(&want.file),
+                test: leaked(&want.test),
+            },
+            case: leaked(&want.case),
+        }
+    }
+
+    /// The run of the history `want` names.
+    fn history_run_of(want: &HistoryRunRef) -> RunId {
+        RunId::History {
+            harness: want.harness.clone(),
+            package: want.package.clone(),
+            file: want.file.clone(),
+            test: want.test.clone(),
+            case: want.case.clone(),
+        }
+    }
+
+    /// A history's run is recorded at its own task, joined on its whole
+    /// [`HistoryRunRef`] (Rule 25's template): the committed plan's first
+    /// history task records its history's run, and the run with its
+    /// harness, its witness's package, file or name, or its case moved is
+    /// recorded at none.
+    #[test]
+    fn a_history_run_is_recorded_at_its_whole_history() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plan = plan(&Manifest::committed(), &repo).expect("the committed manifest plans");
+        let (at, run) = plan
+            .tasks
+            .iter()
+            .enumerate()
+            .find_map(|(at, task)| match task {
+                Task::History { expected, .. } => Some((at, history_of(expected)?.clone())),
+                _ => None,
+            })
+            .expect("the committed plan records a history");
+        assert_eq!(recorded_at(&plan.tasks, &run), Some((at, "run")));
+        let own = HistoryRunRef::of_run(&run).expect("it's a history's run");
+        let keys = assert_one_key_off::<HistoryRunRef>(&own, |want| {
+            recorded_at(&plan.tasks, &history_run_of(want)).is_some()
+        });
+        assert_eq!(keys, 5);
+    }
+
+    /// A `StaysNotApplicable` history's target is its own history's, joined
+    /// on its whole [`HistoryRunRef`] (Rule 25's template): the first
+    /// counted history with a target has one, and the history with its
+    /// harness, its witness's package, file or name, or its case moved has
+    /// none.
+    #[test]
+    fn a_history_s_target_joins_its_whole_history() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let (history, _) = super::super::rows::history_targets()[0];
+        let keys = assert_one_key_off::<HistoryRunRef>(&HistoryRunRef::of(history), |want| {
+            history_target(history_named(want)).is_ok()
+        });
+        assert_eq!(keys, 5);
+    }
+
+    /// A counted witness test's inventory is its own test's, joined on the
+    /// test's whole [`TestIdRef`] (Rule 25's template): the storage
+    /// witness's 32 histories are found for it, and none for the test with
+    /// its package, file or name moved.
+    #[test]
+    fn a_counted_test_s_inventory_joins_its_whole_test() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let own = TestIdRef {
+            package: "zakura-sim".to_owned(),
+            file: "tests/header_node.rs".to_owned(),
+            test: "node_syncs_from_a_mirror_on_controlled_storage".to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&own, |want| {
+            !inventory_cases(&want.package, &want.file, &want.test).is_empty()
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// A declared history counts in its test's inventory only on its whole
+    /// [`DeclarationRef`] (Rule 25's template): a test declaring the one
+    /// history its inventory names has no error, and the declaration with
+    /// its test, its harness or its case moved does.
+    #[test]
+    fn a_declared_history_joins_its_whole_declaration() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let own = DeclarationRef {
+            test: "a_test".to_owned(),
+            harness: NODE.to_owned(),
+            case: "plan 0".to_owned(),
+        };
+        let inventory = [own.clone()];
+        let keys = assert_one_key_off::<DeclarationRef>(&own, |want| {
+            let declared = DeclaredHistory {
+                run_id: AT.run_id.to_owned(),
+                index: AT.index,
+                role: String::new(),
+                test: format!("a::{}", want.test),
+                harness: want.harness.clone(),
+                case: want.case.clone(),
+                scenario_sha256: String::new(),
+                plan_sha256: String::new(),
+            };
+            inventory_errors(&inventory, [&declared], &want.test).is_empty()
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// A history's witness test passes only as its own test, joined on its
+    /// whole [`TestIdRef`] (Rule 25's template): a history task whose test
+    /// artifact ran its witness test passes it, and one whose artifact ran
+    /// the test with its package, file or name moved doesn't.
+    #[test]
+    fn a_history_s_witness_test_joins_its_whole_test() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let own = TestIdRef {
+            package: "zakura-sim".to_owned(),
+            file: "tests/header_node.rs".to_owned(),
+            test: "test".to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&own, |ran| {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            history_task_dir(dir.path(), None);
+            let path = dir.path().join(TEST_FILE);
+            let mut artifact: TestRun =
+                serde_json::from_str(&fs::read_to_string(&path).expect("it was written"))
+                    .expect("it reads back");
+            artifact.package = ran.package.clone();
+            artifact.file = ran.file.clone();
+            for (test, _) in &mut artifact.tests {
+                test.clone_from(&ran.test);
+            }
+            fs::write(
+                &path,
+                serde_json::to_string(&artifact).expect("it serializes"),
+            )
+            .expect("the temp dir is writable");
+            let end = history_execution(
+                (dir.path(), &AT),
+                history_run(),
+                NODE,
+                ("p/a", None),
+                ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
+                "s",
+            )
+            .end;
+            !matches!(&end, End::Failed { why } if why.contains("didn't pass at S"))
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// An integrity run is its history's only if its artifact ran the
+    /// history's own witness test, joined on its whole [`TestIdRef`]
+    /// (Rule 25's template): a clean unpatched run of it completes, and
+    /// the run of the test with its package, file or name moved fails.
+    #[test]
+    fn an_integrity_run_s_test_joins_its_whole_test() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let input = history_run();
+        let own = TestIdRef {
+            package: "zakura-sim".to_owned(),
+            file: "tests/header_node.rs".to_owned(),
+            test: "a_test".to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&own, |ran| {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            declare_and_record(dir.path(), "a_test", "plan 0", "subject", None);
+            let artifact = TestRun {
+                run_id: "r".into(),
+                index: 0,
+                role: String::new(),
+                executable_sha256: None,
+                package: ran.package.clone(),
+                file: ran.file.clone(),
+                tests: vec![(ran.test.clone(), "ok".into())],
+                killed: false,
+                exited_ok: true,
+                log: String::new(),
+                binary_source: Some("subject".into()),
+                checkout_source: Some("subject".into()),
+            };
+            fs::write(
+                dir.path().join(TEST_FILE),
+                serde_json::to_string(&artifact).expect("a test run serializes"),
+            )
+            .expect("the temp dir is writable");
+            integrity_execution(
+                (dir.path(), &AT, ""),
+                RunId::native("raw-budget-lease", CaseRun::Unpatched),
+                &input,
+                NODE,
+                "OwnedMismatch",
+                "subject",
+            )
+            .end == End::Completed
+        });
+        assert_eq!(keys, 3);
+    }
+
     /// A planted case's patched witness is the one the planted runner
     /// records: the nested `target-page-refused` and `wedged-run-loop` cases
     /// name a `set`, so their tasks expect `violated-set` with exactly that
@@ -6471,6 +6741,81 @@ mod tests {
         }
     }
 
+    /// A unit witness's runs count only as runs of its own test, joined on
+    /// the test's whole [`TestIdRef`] (Rule 25's template): the caught
+    /// runs of the retired mutation's witness count, and the same runs of
+    /// the test with its package, file or name moved don't.
+    #[test]
+    fn a_unit_run_s_test_joins_its_whole_test() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plan = plan(&Manifest::committed(), &repo).expect("the committed manifest plans");
+        let task = plan
+            .tasks
+            .iter()
+            .find(
+                |task| matches!(task, Task::Unit { patch, .. } if patch == "readmission-unchecked"),
+            )
+            .expect("the retired mutation's witness is planned")
+            .clone();
+        let Task::Unit {
+            patch_file,
+            package,
+            file,
+            test,
+            failure,
+            shows,
+            ..
+        } = &task
+        else {
+            unreachable!("found as a unit task");
+        };
+        let log = format!("{failure}\n  left: {}\n", shows.join(" "));
+        let own = TestIdRef {
+            package: package.clone(),
+            file: file.clone(),
+            test: test.clone(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&own, |ran| {
+            let dir = tempfile::tempdir().unwrap();
+            for (run, source, exe, result) in [
+                ("unpatched", "src-s", "exe-s", "ok"),
+                ("patched", "src-p", "exe-p", "FAILED"),
+                ("restored", "src-s", "exe-s", "ok"),
+            ] {
+                let at = dir.path().join(run);
+                fs::create_dir_all(&at).unwrap();
+                let artifact = serde_json::json!({
+                    "run_id": AT.run_id,
+                    "index": AT.index,
+                    "role": run,
+                    "executable_sha256": exe,
+                    "package": ran.package,
+                    "file": ran.file,
+                    "tests": [[ran.test, result]],
+                    "killed": false,
+                    "exited_ok": result == "ok",
+                    "log": log,
+                    "binary_source": NOT_EMBEDDED,
+                    "checkout_source": source,
+                });
+                let build = serde_json::json!({
+                    "run_id": AT.run_id,
+                    "index": AT.index,
+                    "role": run,
+                    "base": "s",
+                    "patch_sha256": digest(&repo.join(patch_file)),
+                    "source": source,
+                    "executable_sha256": exe,
+                });
+                fs::write(at.join(TEST_FILE), artifact.to_string()).unwrap();
+                fs::write(at.join(PATCHED_BUILD_FILE), build.to_string()).unwrap();
+            }
+            unit_refusal(&repo, ("s", "src-s"), &task, (dir.path(), &AT)).is_none()
+        });
+        assert_eq!(keys, 3);
+    }
+
     /// F3: the unit witness's runs count only as this run's own task's
     /// ([`binding::TEST`], [`binding::UNIT_BUILD`]). The caught pair naming
     /// this task's run at each role, its test naming the executable its
@@ -7182,7 +7527,7 @@ mod tests {
         };
         let all: Vec<(&str, &str)> = inventory
             .iter()
-            .map(|(_, case)| (test, case.as_str()))
+            .map(|counted| (test, counted.case.as_str()))
             .collect();
         assert_eq!(
             inventory_errors(&inventory, &declare(&all), test),
@@ -7215,7 +7560,7 @@ mod tests {
         );
         assert!(inventory_cases("zakura-sim", file, "not_counted").is_empty());
         assert_eq!(
-            inventory_errors(&BTreeSet::new(), &declare(&all), "not_counted"),
+            inventory_errors(&[], &declare(&all), "not_counted"),
             Vec::<String>::new()
         );
     }

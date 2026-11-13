@@ -6360,6 +6360,53 @@ mod tests {
         );
     }
 
+    /// A declaration records and reconciles only with the scenario and
+    /// Plan its test wrote: another attempt's Plan, one unused trailing
+    /// byte longer, or its scenario, left beside an otherwise valid
+    /// declaration, is refused before the runner gets arguments to record
+    /// it, and so is a declaration naming both Plan forms.
+    #[test]
+    fn another_attempt_s_plan_beside_a_declaration_is_refused() {
+        use super::super::history::declare_into;
+        let (scenario, plan) = storage_history();
+        let test = "another_attempt_s_plan_beside_a_declaration_is_refused";
+        let declare = |plan: Vec<u8>, scenario: &Value| {
+            let root = tempfile::tempdir().expect("a temp dir can be created");
+            declare_into(
+                root.path(),
+                &at_for(),
+                NODE,
+                "plan 0",
+                scenario,
+                &crate::PlanInput::Bytes(plan),
+            )
+            .expect("the declaration writes");
+            root
+        };
+        let args = |root: &Path| declared_record_args(root, (AT, ""), NODE, test, "plan 0");
+        let own = declare(plan.clone(), &scenario);
+        assert!(args(own.path()).is_ok(), "{:?}", args(own.path()));
+        let mut longer = plan.clone();
+        longer.push(0);
+        let mut moved = scenario.clone();
+        moved["policy"] = Value::Null;
+        for (file, other) in [
+            (PLAN_FILE, declare(longer, &scenario)),
+            (SCENARIO_FILE, declare(plan.clone(), &moved)),
+        ] {
+            let own = declare(plan.clone(), &scenario);
+            fs::copy(
+                other.path().join("0").join(file),
+                own.path().join("0").join(file),
+            )
+            .expect("the temp dir is writable");
+            assert!(args(own.path()).is_err(), "{file}");
+        }
+        let both = declare(plan.clone(), &scenario);
+        fs::write(both.path().join("0").join(SCRIPT_FILE), "{}").expect("writable");
+        assert!(args(both.path()).is_err());
+    }
+
     /// Writes into `dir` what the runner leaves for a history task whose
     /// test `test` declared [`storage_history`] as `plan 0`: the test's
     /// passing artifact from a binary embedding `s`, its declaration, and
@@ -6604,6 +6651,8 @@ mod tests {
                     test: format!("a::{by}"),
                     harness: NODE.to_owned(),
                     case: (*case).to_owned(),
+                    scenario_sha256: String::new(),
+                    plan_sha256: String::new(),
                 })
                 .collect()
         };

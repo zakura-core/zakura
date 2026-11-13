@@ -73,6 +73,10 @@ pub enum Field {
     Role,
     /// The SHA-256 of the executable a run ran.
     Executable,
+    /// The SHA-256 of the scenario file a declaration wrote.
+    ScenarioFile,
+    /// The SHA-256 of the Plan file a declaration wrote.
+    PlanFile,
 }
 
 impl Field {
@@ -101,6 +105,8 @@ impl Field {
             Field::Plan => "ran the Plan",
             Field::Role => "names the role",
             Field::Executable => "ran the executable",
+            Field::ScenarioFile => "wrote the scenario",
+            Field::PlanFile => "wrote the Plan",
         }
     }
 
@@ -252,15 +258,24 @@ pub const REPLAY_LOG: Kind = Kind {
 /// ([`DeclaredHistory`](super::history::DeclaredHistory)), which the
 /// declaring test stamps with the run, task and role the runner ran it for
 /// ([`HISTORIES_FOR_VAR`](super::history::HISTORIES_FOR_VAR)), as the
-/// runner's own artifacts name them ([`TEST`]).
+/// runner's own artifacts name them ([`TEST`]), and with the SHA-256 of
+/// the scenario and Plan files it wrote beside it ([`read_declaration`]).
 pub const DECLARATION: Kind = Kind {
     name: "history.json",
     carries: &[
         (Field::RunId, "/run_id"),
         (Field::TaskIndex, "/index"),
         (Field::Role, "/role"),
+        (Field::ScenarioFile, "/scenario_sha256"),
+        (Field::PlanFile, "/plan_sha256"),
     ],
-    required: &[Field::RunId, Field::TaskIndex, Field::Role],
+    required: &[
+        Field::RunId,
+        Field::TaskIndex,
+        Field::Role,
+        Field::ScenarioFile,
+        Field::PlanFile,
+    ],
     closed: false,
 };
 
@@ -605,15 +620,37 @@ pub fn read(kind: &Kind, path: &Path, expect: &Expect) -> Result<Value, String> 
 }
 
 /// The declaration in `dir`: its [`DECLARATION`] file, if it's bound to
-/// what `expect` names ([`check`]), and the JSON text of the scenario the
-/// same test wrote beside it, in the directory only that test created
-/// ([`declare_into`](super::history::declare_into)), or why not.
+/// what `expect` names and to the scenario and Plan files beside it, by
+/// their SHA-256 ([`check`]), and the JSON text of that scenario, or why
+/// not. So a scenario or Plan another attempt left beside a declaration
+/// isn't recorded as it, nor reconciled with its trace. The Plan file is
+/// the one of [`PLAN_FILE`](super::history::PLAN_FILE) and
+/// [`SCRIPT_FILE`](super::history::SCRIPT_FILE) there is.
 pub fn read_declaration(dir: &Path, expect: &Expect) -> Result<(Value, String), String> {
-    use super::history::{HISTORY_FILE, SCENARIO_FILE};
-    let history = read(&DECLARATION, &dir.join(HISTORY_FILE), expect)?;
+    use super::history::{HISTORY_FILE, PLAN_FILE, SCENARIO_FILE, SCRIPT_FILE};
     let path = dir.join(SCENARIO_FILE);
     let scenario =
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let plan = match (dir.join(PLAN_FILE), dir.join(SCRIPT_FILE)) {
+        (bytes, script) if bytes.exists() != script.exists() => match bytes.exists() {
+            true => bytes,
+            false => script,
+        },
+        _ => return Err("its declaration names neither or both Plan forms".to_owned()),
+    };
+    let expect = expect
+        .clone()
+        .with_read(
+            Field::ScenarioFile,
+            sha256_file(&path),
+            "its scenario can't be read",
+        )
+        .with_read(
+            Field::PlanFile,
+            sha256_file(&plan),
+            "its Plan can't be read",
+        );
+    let history = read(&DECLARATION, &dir.join(HISTORY_FILE), &expect)?;
     Ok((history, scenario))
 }
 

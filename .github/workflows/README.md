@@ -32,7 +32,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 | `changelog.yml` | Requires one fragment for Rust/Cargo.toml PRs and tests release assembly. | Every PR/push/merge group |
 | `coverage.yml` | llvm-cov + nextest coverage uploaded to Codecov. A 120-minute instrumented build, kept off the PR path. | Push to `main`/`release/**`, nightly, manual |
 | `benchmarks.yml` | Criterion benchmarks. Runs on PRs carrying the `C-benchmark` label; results publish to the dashboard data on `gh-pages/dev/bench`. | Labeled PRs, manual |
-| `zcashd-compat-regtest.yml` | zcashd interoperability regtest suite (spawns fresh `zakurad` + `zcashd`, no external infrastructure). Runs for changes to the compatibility code, tests, or manifest. | PR on relevant paths, nightly, manual |
+| `zcashd-compat-regtest.yml` | zcashd interoperability regtest suite (spawns fresh `zakurad` + `zcashd`, no external infrastructure), once with today's pool and once with the pool core. Runs for changes to the compatibility code, tests, manifest, or pool core. | PR on relevant paths, nightly, manual |
 
 ## Release pipeline
 

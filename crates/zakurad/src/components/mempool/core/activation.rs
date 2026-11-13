@@ -100,7 +100,34 @@ impl Activation {
             let on = *active.borrow();
             let next = self.next(on, current);
             if next != on {
-                tracing::info!(on = next, "the pool core is turning on or off");
+                // Today's pool's log lines, which operators and the
+                // acceptance tests look for.
+                if next {
+                    let reason = if self.is_enabled_by_debug() {
+                        tracing::info!(
+                            best_tip_height = ?self.latest_chain_tip.best_tip_height(),
+                            enable_at_height = ?self.debug_enable_at_height,
+                            "enabling mempool for debugging"
+                        );
+                        "debug height reached"
+                    } else {
+                        "estimated close to the network tip"
+                    };
+                    tracing::info!(
+                        tip_height = ?self.latest_chain_tip.best_tip_height(),
+                        reason,
+                        "activating mempool"
+                    );
+                } else {
+                    tracing::info!(
+                        estimated_distance_to_network_tip = ?self
+                            .chain_tip_change
+                            .estimate_distance_to_network_chain_tip()
+                            .map(|(distance, _height)| distance),
+                        disable_distance = zs::MAX_BLOCK_REORG_HEIGHT,
+                        "deactivating mempool: Zakura is far from the network tip"
+                    );
+                }
                 active.send_replace(next);
             }
             if active.is_closed() {

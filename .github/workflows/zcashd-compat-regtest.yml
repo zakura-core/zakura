@@ -6,8 +6,10 @@ name: zcashd-compat Regtest
 # external infrastructure is required. It uses the P2P sidecar zcashd that
 # crates/zakurad/zcashd-compat-manifest.json pins.
 #
-# It runs for pull requests that change the zcashd-compat code, its tests or the
-# manifest, nightly, and on demand.
+# It runs once with each pool: today's, and the pool core behind the
+# `[mempool] implementation` switch. It runs for pull requests that change the
+# zcashd-compat code, its tests, the manifest or the pool core, nightly, and on
+# demand.
 on:
   workflow_dispatch:
   schedule:
@@ -19,6 +21,8 @@ on:
       - "crates/zakurad/tests/common/zcashd_compat/**"
       - "crates/zakurad/tests/common/zcashd_compat.rs"
       - "crates/zakurad/zcashd-compat-manifest.json"
+      - "crates/zakurad/src/components/mempool/core/**"
+      - "crates/zakura-mempool/**"
       - "scripts/make/zcashd-compat.mk"
 
 concurrency:
@@ -37,11 +41,15 @@ env:
 
 jobs:
   zcashd-compat-regtest:
-    name: zcashd-compat regtest suite
+    name: zcashd-compat regtest suite (${{ matrix.pool }} pool)
     permissions:
       contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        pool: [classic, core]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -63,4 +71,8 @@ jobs:
 
       # Uses the embedded zcashd download (TEST_ZCASHD_PATH unset).
       - name: Run zcashd-compat regtest suite
+        env:
+          # zakurad reads `ZAKURA_SECTION__KEY` over its config file, and the
+          # suite's zakurad inherits this.
+          ZAKURA_MEMPOOL__IMPLEMENTATION: ${{ matrix.pool }}
         run: make compat-test-regtest

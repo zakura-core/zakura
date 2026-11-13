@@ -516,16 +516,26 @@ impl Config {
     /// With larger budgets, shared addresses keep their cache position.
     /// An exhausted list yields the rest of the other list.
     ///
+    /// Loads the cache while seeds resolve. When the cache has valid peers, a
+    /// restart dials them after one round of seed lookups, even if every seed
+    /// lookup fails. Seed lookups only retry until they succeed when there are
+    /// no valid cached peers.
+    ///
     /// # Panics
     ///
     /// If a configured address is an invalid [`SocketAddr`] or DNS name.
     pub async fn initial_peers(&self) -> IndexSet<PeerSocketAddr> {
-        // TODO: do DNS and disk in parallel if startup speed becomes important
-        let dns_peers = Config::resolve_peers(
-            &self.initial_peer_hostnames().iter().cloned().collect(),
-            self.expose_peer_addresses,
+        let hostnames: HashSet<String> = self.initial_peer_hostnames().iter().cloned().collect();
+        let (dns_peers, disk_peers) = futures::future::join(
+            Config::resolve_peers_once(&hostnames, self.expose_peer_addresses),
+            self.load_valid_peer_cache(),
         )
         .await;
+        let dns_peers = if dns_peers.is_empty() && disk_peers.is_empty() {
+            Config::resolve_peers(&hostnames, self.expose_peer_addresses).await
+        } else {
+            dns_peers
+        };
 
         // Validate seeds before shuffling, without preferring any listening port.
         let mut valid_seeds = Vec::new();
@@ -543,28 +553,12 @@ impl Config {
         dns_peers.shuffle(&mut rand_10::rng());
 
         if self.network.is_regtest() {
-            // Only return local peer addresses and skip loading the peer cache on Regtest.
+            // Only return local peer addresses. Regtest never loads the peer cache.
             dns_peers
                 .into_iter()
                 .filter(PeerSocketAddr::is_localhost)
                 .collect()
         } else {
-            // Ignore disk errors because the cache is optional and the method already logs them.
-            let mut disk_peers = self.load_peer_cache().await.unwrap_or_default();
-            disk_peers.retain(|addr| {
-                match address_is_valid_for_outbound_connections(*addr, self.network.clone()) {
-                    Ok(_) => true,
-                    Err(error) => {
-                        info!(
-                            peer = %addr.addr_label(self.expose_peer_addresses),
-                            ?error,
-                            "invalid initial peer from disk cache",
-                        );
-                        false
-                    }
-                }
-            });
-
             // With one slot, seed membership must survive even if a seed is cached.
             // Otherwise remove overlap so a duplicate cannot consume a seed turn.
             if self.peerset_initial_target_size != 1 {
@@ -601,8 +595,6 @@ impl Config {
         peers: &HashSet<String>,
         expose_peer_addresses: bool,
     ) -> HashSet<PeerSocketAddr> {
-        use futures::stream::StreamExt;
-
         if peers.is_empty() {
             warn!(
                 "no initial peers in the network config. \
@@ -618,14 +610,7 @@ impl Config {
             // no peers in the combined list. DNS failures are correlated, so all
             // peers can fail DNS, leaving Zakura with a small list of custom IP
             // address peers. Individual retries avoid this issue.
-            let peer_addresses = peers
-                .iter()
-                .map(|s| {
-                    Config::resolve_host(s, MAX_SINGLE_SEED_PEER_DNS_RETRIES, expose_peer_addresses)
-                })
-                .collect::<futures::stream::FuturesUnordered<_>>()
-                .concat()
-                .await;
+            let peer_addresses = Config::resolve_peers_once(peers, expose_peer_addresses).await;
 
             if peer_addresses.is_empty() {
                 tracing::info!(
@@ -639,6 +624,54 @@ impl Config {
                 return peer_addresses;
             }
         }
+    }
+
+    /// Concurrently resolves `peers` into zero or more IP addresses, making one
+    /// round of lookups with a timeout of a few seconds on each DNS request.
+    ///
+    /// Returns an empty set if every lookup fails or times out.
+    async fn resolve_peers_once(
+        peers: &HashSet<String>,
+        expose_peer_addresses: bool,
+    ) -> HashSet<PeerSocketAddr> {
+        use futures::stream::StreamExt;
+
+        peers
+            .iter()
+            .map(|s| {
+                Config::resolve_host(s, MAX_SINGLE_SEED_PEER_DNS_RETRIES, expose_peer_addresses)
+            })
+            .collect::<futures::stream::FuturesUnordered<_>>()
+            .concat()
+            .await
+    }
+
+    /// Loads cached peers from disk, keeping only addresses valid for outbound
+    /// connections on the configured network.
+    ///
+    /// Returns an empty set on Regtest, when the cache is disabled or missing,
+    /// or when it can't be read. Read errors are logged by
+    /// [`load_peer_cache`](Self::load_peer_cache).
+    async fn load_valid_peer_cache(&self) -> IndexSet<PeerSocketAddr> {
+        if self.network.is_regtest() {
+            return IndexSet::new();
+        }
+
+        let mut disk_peers = self.load_peer_cache().await.unwrap_or_default();
+        disk_peers.retain(|addr| {
+            match address_is_valid_for_outbound_connections(*addr, self.network.clone()) {
+                Ok(_) => true,
+                Err(error) => {
+                    info!(
+                        peer = %addr.addr_label(self.expose_peer_addresses),
+                        ?error,
+                        "invalid initial peer from disk cache",
+                    );
+                    false
+                }
+            }
+        });
+        disk_peers
     }
 
     /// Resolves `host` into zero or more IP addresses, retrying up to

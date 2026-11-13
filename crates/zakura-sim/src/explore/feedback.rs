@@ -64,7 +64,8 @@ pub const FEEDBACK_BACKEND: &str = "libfuzzer-extra-counters";
 ///   (E2b).
 /// - 3: adds fuzz-12's hold, header lease level, fork work and recovery
 ///   conditions features.
-pub const FEEDBACK_VERSION: u32 = 3;
+/// - 4: adds fuzz-13's conformant crossing feature.
+pub const FEEDBACK_VERSION: u32 = 4;
 
 /// How many features the counters hold: every [`Feature`] index.
 pub const FEATURES: usize = 1 << 16;

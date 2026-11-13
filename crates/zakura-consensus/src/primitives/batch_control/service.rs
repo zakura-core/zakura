@@ -13,12 +13,12 @@ use futures_core::ready;
 use tokio::{
     pin,
     sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore, TryAcquireError},
-    task::JoinHandle,
 };
 use tokio_util::sync::PollSemaphore;
 use tower::Service;
 use tracing::{info_span, Instrument};
 use zakura_node_services::task::spawn_erased;
+use zakura_rt::task::JoinHandle;
 
 use super::RequestWeight;
 

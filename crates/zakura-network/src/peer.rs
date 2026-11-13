@@ -1,5 +1,6 @@
 //! Peer connection handling.
 
+mod announced_blocks;
 pub(crate) mod block_gossip;
 mod client;
 mod connection;
@@ -9,6 +10,7 @@ mod handshake;
 mod load_tracked_client;
 mod minimum_peer_version;
 mod priority;
+pub(crate) mod tcp_warmup;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 #[allow(unused_imports)]
@@ -20,6 +22,8 @@ pub(crate) use client::tests::connected::ConnectedClient;
 pub(crate) use client::tests::ReceiveRequestAttempt;
 #[cfg(test)]
 pub(crate) use handshake::register_inventory_status;
+
+pub(crate) use announced_blocks::AnnouncedBlocks;
 
 use client::{ClientRequestReceiver, InProgressClientRequest, MustUseClientResponseSender};
 
@@ -39,3 +43,4 @@ pub use priority::{
     address_is_valid_for_inbound_listeners, address_is_valid_for_outbound_connections,
     PeerPreference,
 };
+pub(crate) use tcp_warmup::TcpWarmup;

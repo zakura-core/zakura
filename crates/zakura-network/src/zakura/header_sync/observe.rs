@@ -697,6 +697,20 @@ pub enum ReactorEvent {
         /// The refused session's ID, as its service handed it over.
         session_id: u64,
     },
+    /// The service refused a frame from `peer` on session `session_id` as a
+    /// protocol violation, for `reason`, and the session's pipe ends it.
+    /// Reported from the session's own task to the capacity handle, at the
+    /// refusal, before the transport records the connection's close cause or
+    /// the reactor hears of the disconnect, so a session replaced meanwhile
+    /// still reports it.
+    FrameRefused {
+        /// The peer whose frame was refused.
+        peer: ZakuraPeerId,
+        /// The session the frame came on.
+        session_id: u64,
+        /// The rule the frame broke, as the violation's trace row names it.
+        reason: &'static str,
+    },
     /// The reactor installed a readmission cooldown for `peer` after a fault
     /// in session `origin`'s work. Reported right after the `Misbehavior` it
     /// follows, and only when an entry is installed, so a zero cooldown

@@ -24,7 +24,7 @@ use tokio::{
     time::{error, timeout, Instant},
 };
 use tokio_stream::wrappers::IntervalStream;
-use tokio_util::codec::Framed;
+use tokio_util::{codec::Framed, task::AbortOnDropHandle};
 use tower::Service;
 use tracing::Instrument;
 use tracing::{span, Level, Span};
@@ -42,8 +42,8 @@ use crate::{
     inbound_resources::{InboundBudget, TCP_INBOUND_RETAINED_BYTES},
     meta_addr::MetaAddrChange,
     peer::{
-        CancelHeartbeatTask, Client, ClientRequest, Connection, ConnectionRequests, ErrorSlot,
-        HandshakeError, MinimumPeerVersion, PeerError,
+        AnnouncedBlocks, CancelHeartbeatTask, Client, ClientRequest, Connection,
+        ConnectionRequests, ErrorSlot, HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
     },
     peer_registry::PeerRegistry,
     peer_set::{ConnectionTracker, InventoryChange},
@@ -102,6 +102,9 @@ where
     /// The live ban list, rechecked by each connection before it writes a block advert.
     bans: BannedIps,
 
+    /// Warms each new connection's send direction, if warm-up is enabled.
+    tcp_warmup: Option<TcpWarmup>,
+
     parent_span: Span,
 }
 
@@ -150,6 +153,7 @@ where
             protected_peer_ips: self.protected_peer_ips.clone(),
             inbound_budget: self.inbound_budget.clone(),
             bans: self.bans.clone(),
+            tcp_warmup: self.tcp_warmup.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -508,6 +512,7 @@ where
     protected_peer_ips: Option<Arc<HashSet<IpAddr>>>,
     latest_chain_tip: C,
     bans: Option<BannedIps>,
+    tcp_warmup: Option<TcpWarmup>,
 }
 
 impl<S, C> Builder<S, C>
@@ -593,6 +598,7 @@ where
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips,
             bans: self.bans,
+            tcp_warmup: self.tcp_warmup,
         }
     }
 
@@ -627,6 +633,14 @@ where
     /// If this is unset, block adverts are not checked against bans when they are written.
     pub fn with_bans(mut self, bans: BannedIps) -> Self {
         self.bans = Some(bans);
+        self
+    }
+
+    /// Warm each new connection's send direction with padded pings. Optional.
+    ///
+    /// If this is unset or `None`, connections are not warmed.
+    pub fn with_tcp_warmup(mut self, tcp_warmup: Option<TcpWarmup>) -> Self {
+        self.tcp_warmup = tcp_warmup;
         self
     }
 
@@ -681,6 +695,7 @@ where
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
             inbound_budget: InboundBudget::new(TCP_INBOUND_RETAINED_BYTES),
             bans: self.bans.unwrap_or_default(),
+            tcp_warmup: self.tcp_warmup,
             parent_span: Span::current(),
         })
     }
@@ -709,6 +724,7 @@ where
             protected_peer_ips: None,
             latest_chain_tip: NoChainTip,
             bans: None,
+            tcp_warmup: None,
         }
     }
 }
@@ -1576,6 +1592,7 @@ where
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
         let bans = self.bans.clone();
+        let tcp_warmup = self.tcp_warmup.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
         let peer_registry = self.peer_registry.clone();
 
@@ -1742,6 +1759,8 @@ where
             // Bound pending adverts; slow peers can catch up through later tip gossip.
             let (block_advert_tx, block_advert_rx) =
                 tokio::sync::mpsc::channel(super::block_gossip::BLOCK_ADVERT_QUEUE);
+            let (warmup_tx, warmup_rx) =
+                tokio::sync::mpsc::channel(super::tcp_warmup::WARMUP_QUEUE);
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let error_slot = ErrorSlot::default();
 
@@ -1776,6 +1795,9 @@ where
             // (This significantly improves performance, by reducing time system calls.)
             let inbound_ts_collector = address_book_updater.clone();
             let inbound_inv_collector = inv_collector.clone();
+            // Block gossip skips this peer for the blocks it announces to us.
+            let announced_blocks = AnnouncedBlocks::default();
+            let inbound_announced_blocks = announced_blocks.clone();
             let ts_inner_conn_span = connection_span.clone();
             let inv_inner_conn_span = connection_span.clone();
             let peer_rx = peer_rx
@@ -1829,9 +1851,15 @@ where
                 })
                 .then(move |msg| {
                     let inbound_inv_collector = inbound_inv_collector.clone();
+                    let inbound_announced_blocks = inbound_announced_blocks.clone();
                     let span = debug_span!(parent: inv_inner_conn_span.clone(), "inventory_filter");
-                    register_inventory_status(msg, connected_addr, inbound_inv_collector)
-                        .instrument(span)
+                    register_inventory_status(
+                        msg,
+                        connected_addr,
+                        inbound_inv_collector,
+                        inbound_announced_blocks,
+                    )
+                    .instrument(span)
                 })
                 .boxed();
 
@@ -1867,6 +1895,7 @@ where
                 ConnectionRequests {
                     client_rx: server_rx,
                     block_advert_rx,
+                    warmup_rx,
                     minimum_peer_version,
                     bans,
                 },
@@ -1892,6 +1921,19 @@ where
                 .boxed(),
             );
 
+            // The warm-up task ends by itself when the connection closes its warm-up channel.
+            if let (Some(tcp_warmup), Some(peer_addr)) =
+                (tcp_warmup, connected_addr.get_transient_addr())
+            {
+                tokio::spawn(
+                    tcp_warmup
+                        .run(canonical_ip(peer_addr.ip()), warmup_tx)
+                        .instrument(
+                            tracing::debug_span!(parent: connection_span.clone(), "tcp_warmup"),
+                        ),
+                );
+            }
+
             let heartbeat_task = tokio::spawn(
                 send_periodic_heartbeats_with_shutdown_handle(
                     connected_addr,
@@ -1905,6 +1947,7 @@ where
             );
 
             let client = Client {
+                announced_blocks,
                 block_uploads,
                 request_slot,
                 peer_registry_updater: client_peer_registry_updater,
@@ -1924,8 +1967,9 @@ where
         // Correctness: As a defence-in-depth against hangs, wrap the entire handshake in a timeout.
         let fut = timeout(constants::HANDSHAKE_TIMEOUT, fut);
 
-        // Spawn a new task to drive this handshake, forwarding panics to the calling task.
-        tokio::spawn(erased(fut.instrument(negotiator_span)))
+        // Keep the spawned handshake owned by its caller. Dropping a timed-out
+        // connector must also release the inner handshake's stream and tracker.
+        AbortOnDropHandle::new(tokio::spawn(erased(fut.instrument(negotiator_span))))
             .map(
                 |join_result: Result<
                     Result<Result<Client, HandshakeError>, error::Elapsed>,
@@ -1948,11 +1992,28 @@ where
 }
 
 /// Register any advertised or missing inventory in `msg` for `connected_addr`.
+///
+/// Also records the blocks this peer announces in `announced_blocks`, so block gossip can skip
+/// a peer that already has the block. Unlike the inventory registry, this covers every block
+/// `inv`, solicited or not, and connections without a transient address. Requests for block
+/// bodies withdraw the peer's earlier claim to have those blocks.
 pub(crate) async fn register_inventory_status(
     msg: Result<Message, SerializationError>,
     connected_addr: ConnectedAddr,
     inv_collector: broadcast::Sender<InventoryChange>,
+    announced_blocks: AnnouncedBlocks,
 ) -> Result<Message, SerializationError> {
+    match &msg {
+        Ok(Message::Inv(items)) => {
+            announced_blocks.record(items.iter().filter_map(InventoryHash::block_hash));
+        }
+        // A request for the body or a missing response contradicts an earlier announcement.
+        Ok(Message::GetData(items) | Message::NotFound(items)) => {
+            announced_blocks.forget(items.iter().filter_map(InventoryHash::block_hash));
+        }
+        _ => {}
+    }
+
     match (&msg, connected_addr.get_transient_addr()) {
         (Ok(Message::Inv(advertised)), Some(transient_addr)) => {
             // We ignore inventory messages with more than one

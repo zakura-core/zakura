@@ -16,7 +16,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -45,7 +45,8 @@ use crate::{
         initialize::{
             accept_inbound_connections, add_initial_peers, batch_misbehavior_reports,
             crawl_and_dial, open_listener, outbound_peer_replenishment_demand, DiscoveredPeer,
-            MISBEHAVIOR_BATCH_INTERVAL, OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR,
+            ReplenishmentBudget, MISBEHAVIOR_BATCH_INTERVAL,
+            OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR,
             OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR,
         },
         set::MorePeers,
@@ -188,8 +189,8 @@ async fn peer_cache_order_controls_startup_dials_even_after_failure() {
     assert_alternating(&attempts.iter().map(|(addr, _)| *addr).collect::<Vec<_>>());
     for pair in attempts.windows(2) {
         assert_eq!(
-            pair[1].1 - pair[0].1,
-            constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL
+            pair[1].1, pair[0].1,
+            "startup attempts do not wait for a timer"
         );
     }
 }
@@ -986,7 +987,6 @@ async fn crawler_failed_dials_do_not_shrink_replenishment_budget() {
         constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL,
         ReplenishmentCrawlerOptions {
             fail_first_dials: FAILED_DIALS,
-            ..ReplenishmentCrawlerOptions::default()
         },
     )
     .await;
@@ -1000,27 +1000,51 @@ async fn crawler_failed_dials_do_not_shrink_replenishment_budget() {
         .await;
 }
 
-/// When demand cannot be restored (full channel), failed dials must not credit
-/// replenishment budget. Crediting without a queued `MorePeers` would leave
+/// A failed dial gives back its replenishment unit only when it consumed one and
+/// its demand went back on the channel. Crediting an unrestored dial would leave
 /// `remaining` unchanged and keep local replenishment dialing past the target.
-#[tokio::test(start_paused = true)]
-async fn crawler_unrestored_failed_dials_do_not_credit_replenishment() {
-    let mut harness = spawn_replenishment_crawler_with(
-        0,
-        0,
-        constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL,
-        ReplenishmentCrawlerOptions {
-            fail_first_dials: CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS,
-            force_failed_dial_demand_restore_full: true,
-        },
-    )
-    .await;
+#[test]
+fn failed_dials_credit_replenishment_only_when_demand_was_restored() {
+    let mut budget = ReplenishmentBudget::default();
+    budget.refresh(2);
 
-    harness.wait_for_crawl_start().await;
-    harness.release_crawl();
-    harness
-        .assert_connection_attempts(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS)
-        .await;
+    let consumed = budget.consume();
+    assert!(consumed);
+    let demand_restored = false;
+    budget.credit_failed_dial(consumed && demand_restored);
+    assert!(budget.has_demand(), "one unit is still left");
+
+    let consumed = budget.consume();
+    assert!(consumed);
+    budget.credit_failed_dial(consumed && demand_restored);
+    assert!(
+        !budget.has_demand(),
+        "unrestored failures do not credit, so the budget runs out"
+    );
+
+    budget.refresh(1);
+    let consumed = budget.consume();
+    let demand_restored = true;
+    budget.credit_failed_dial(consumed && demand_restored);
+    assert!(
+        budget.has_demand(),
+        "a restored failure gives its unit back"
+    );
+}
+
+/// Channel demand that arrives when the budget is empty consumes nothing, so its
+/// failure cannot invent local budget. Reaching the connection limit drops it all.
+#[test]
+fn replenishment_budget_ignores_channel_demand_and_clears_at_the_limit() {
+    let mut budget = ReplenishmentBudget::default();
+    let consumed = budget.consume();
+    assert!(!consumed, "an empty budget has nothing to consume");
+    budget.credit_failed_dial(consumed);
+    assert!(!budget.has_demand());
+
+    budget.refresh(3);
+    budget.clear();
+    assert!(!budget.has_demand());
 }
 
 #[test]
@@ -1032,9 +1056,8 @@ fn try_restore_demand_after_failed_dial_reports_full_channel() {
         .try_send(MorePeers)
         .expect("test demand channel accepts the sender's reserved slot");
 
-    let demand_restored =
-        super::super::try_restore_demand_after_failed_dial(&mut demand_tx, &AtomicBool::new(false))
-            .expect("full channel is not a fatal restore error");
+    let demand_restored = super::super::try_restore_demand_after_failed_dial(&mut demand_tx)
+        .expect("full channel is not a fatal restore error");
     assert!(
         !demand_restored,
         "a full demand channel must not report a successful restore"
@@ -1047,27 +1070,11 @@ fn try_restore_demand_after_failed_dial_reports_full_channel() {
 fn try_restore_demand_after_failed_dial_reports_success() {
     let (mut demand_tx, demand_rx) = mpsc::channel::<MorePeers>(1);
 
-    let demand_restored =
-        super::super::try_restore_demand_after_failed_dial(&mut demand_tx, &AtomicBool::new(false))
-            .expect("empty channel accepts restored demand");
+    let demand_restored = super::super::try_restore_demand_after_failed_dial(&mut demand_tx)
+        .expect("empty channel accepts restored demand");
     assert!(
         demand_restored,
         "an empty demand channel must report a successful restore"
-    );
-
-    std::mem::drop(demand_rx);
-}
-
-#[test]
-fn try_restore_demand_after_failed_dial_honors_force_full() {
-    let (mut demand_tx, demand_rx) = mpsc::channel::<MorePeers>(1);
-
-    let demand_restored =
-        super::super::try_restore_demand_after_failed_dial(&mut demand_tx, &AtomicBool::new(true))
-            .expect("forced full channel is not a fatal restore error");
-    assert!(
-        !demand_restored,
-        "forced full-channel mode must not report a successful restore"
     );
 
     std::mem::drop(demand_rx);
@@ -2088,37 +2095,31 @@ async fn listener_peer_limit_many_handshake_ok_stay_open() {
     );
 }
 
-/// Test if the initial seed peer connections is rate-limited.
+/// Immediate startup failures do not delay the next attempt.
 #[tokio::test]
-async fn add_initial_peers_is_rate_limited() {
+async fn add_initial_peers_immediate_failures_do_not_wait() {
     let _init_guard = zakura_test::init();
 
     // This test should not require network access.
 
-    // We don't need to actually connect to the peers; we only need to check
-    // if the connection attempts is rate-limited. Therefore, just return an error.
+    // Return immediate errors so every completion can refill the startup window.
     let outbound_connector =
         service_fn(|_| async { Err("test outbound connector always returns errors".into()) });
 
     const PEER_COUNT: usize = 10;
 
-    let before = Instant::now();
+    tokio::time::pause();
+    let before = tokio::time::Instant::now();
 
     let (initial_peers_task_handle, peerset_rx, address_book_updater_task_handle) =
         spawn_add_initial_peers(PEER_COUNT, outbound_connector).await;
     let connections = peerset_rx.take(PEER_COUNT).collect::<Vec<_>>().await;
 
-    let elapsed = Instant::now() - before;
+    let elapsed = tokio::time::Instant::now() - before;
 
-    // Errors are ignored, so we don't expect any peers here
+    // Errors are ignored, so we don't expect any peers here.
     assert_eq!(connections.len(), 0);
-    // Make sure the rate limiting worked by checking if it took long enough
-    assert!(
-        elapsed
-            > constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL
-                .saturating_mul((PEER_COUNT - 1) as u32),
-        "elapsed only {elapsed:?}"
-    );
+    assert_eq!(elapsed, Duration::ZERO, "startup must not add a timer");
 
     let initial_peers_result = initial_peers_task_handle.await;
     assert!(
@@ -2619,8 +2620,6 @@ impl ReplenishmentCrawlerTestHarness {
 struct ReplenishmentCrawlerOptions {
     /// Fail the first N outbound dials before succeeding.
     fail_first_dials: usize,
-    /// Report failed-dial demand restores as full-channel misses.
-    force_failed_dial_demand_restore_full: bool,
 }
 
 async fn spawn_replenishment_crawler(
@@ -2768,9 +2767,6 @@ async fn spawn_replenishment_crawler_with(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
-        Arc::new(AtomicBool::new(
-            options.force_failed_dial_demand_restore_full,
-        )),
     ));
 
     ReplenishmentCrawlerTestHarness {
@@ -2999,7 +2995,6 @@ async fn spawn_boxed_crawler_with_peer_limit(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
-        Arc::new(AtomicBool::new(false)),
     );
     let crawl_task_handle = tokio::spawn(crawl_fut);
 

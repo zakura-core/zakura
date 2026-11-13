@@ -7161,6 +7161,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/actions.rs",
         "a_pick_joins_its_declared_action_whole",
     ),
+    (
+        "PickRef",
+        "src/harness/header_acceptance/actions.rs",
+        "is_harness_driven",
+        "src/harness/header_acceptance/actions.rs",
+        "a_harness_driven_pick_joins_its_whole_identity",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.
@@ -7940,6 +7947,12 @@ const IDENTITY_WORDS: &[&str] = &[
 /// `(file, function, names, why)`: the comparison's identity names, sorted
 /// and space-separated, and why it compares no identity.
 const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
+    (
+        "src/harness/header_acceptance/actions.rs",
+        "harness_driven",
+        "pick",
+        "finds the `Recover` steps by their action's name, a kind; the driven picks it builds join by `PickRef`",
+    ),
     (
         "src/harness/header_acceptance/actions.rs",
         "of",

@@ -16,7 +16,7 @@
 //! A policy hold is a constraint on storage completions, not an act, so it
 //! isn't an action here. Its scripted `Release` step is. Neither is a step
 //! a harness source offers by its own condition rather than a script
-//! ([`HARNESS_DRIVEN`]), whose own properties judge it.
+//! ([`harness_driven`]), whose own properties judge it.
 
 use serde_json::Value;
 
@@ -37,23 +37,41 @@ use crate::{
     trace::Trace,
 };
 
-/// The `peer:` actions a harness source offers when its own condition
+/// The actions a harness source offers as `node` when its own condition
 /// comes due, not from a scenario's script: liveness and recovery's
-/// `node:finish`, release-wake's `node:settle`, and recovery's `recovered`,
-/// `recovery-relink` and `recovery-unreached`. A pick of one isn't an
-/// undeclared action.
-pub const HARNESS_DRIVEN: [&str; 5] = [
-    "finish",
-    "settle",
-    "recovered",
-    "recovery-relink",
-    "recovery-unreached",
-];
+/// `finish`, release-wake's `settle`, and recovery's `recovered` and
+/// `recovery-unreached`.
+const NODE_DRIVEN: [&str; 4] = ["finish", "settle", "recovered", "recovery-unreached"];
 
-/// Whether `pick` is a [`HARNESS_DRIVEN`] action.
-fn harness_driven(pick: &str) -> bool {
-    pick.rsplit_once(':')
-        .is_some_and(|(_, action)| HARNESS_DRIVEN.contains(&action))
+/// The action recovery offers as its source peer, the peer a `Recover`
+/// step names, while that peer has no live session.
+const RECOVERY_RELINK: &str = "recovery-relink";
+
+/// Every `peer:` pick a harness source offers by its own condition in a run
+/// that declares `declared`, not from a scenario's script, whole: each of
+/// [`NODE_DRIVEN`] as `node`, and [`RECOVERY_RELINK`] as each `Recover`
+/// step's peer. A pick of one isn't an undeclared action. Another peer's
+/// pick of one of those actions is, since no source offers it.
+fn harness_driven(declared: &[Declared]) -> Vec<PickRef> {
+    let node = NODE_DRIVEN.iter().map(|action| PickRef {
+        peer: "node".to_owned(),
+        action: (*action).to_owned(),
+    });
+    let recover = ControlAction::Recover.name();
+    let sources = declared
+        .iter()
+        .filter(|action| action.control.is_some() && action.pick.action == recover)
+        .map(|action| PickRef {
+            peer: action.pick.peer.clone(),
+            action: RECOVERY_RELINK.to_owned(),
+        });
+    node.chain(sources).collect()
+}
+
+/// Whether `pick` is one of `driven` ([`harness_driven`]), joined by its
+/// whole [`PickRef`], so an action's name alone never makes a pick driven.
+fn is_harness_driven(driven: &[PickRef], pick: &PickRef) -> bool {
+    !PickRef::joined(pick, driven, |at| Some(at.clone())).is_empty()
 }
 
 /// What shows that a picked action took effect.
@@ -633,18 +651,26 @@ pub fn judge(
     end: &End,
     witnessed: bool,
 ) -> Actions {
-    let picks: Vec<&str> = trace
+    let driven = harness_driven(declared);
+    let mut picks = Vec::new();
+    for step in trace
         .steps
         .iter()
-        .map(|step| step.pick.as_str())
-        .filter(|pick| pick.starts_with("peer:") && !harness_driven(pick))
-        .collect();
+        .filter(|step| step.pick.starts_with("peer:"))
+    {
+        // A `peer:` pick of no peer and action is undeclared.
+        let Some(pick) = pick_ref(&step.pick) else {
+            return Actions::Incomplete;
+        };
+        if !is_harness_driven(&driven, &pick) {
+            picks.push(pick);
+        }
+    }
     // Each script's actions are picked in order, so each pick takes the
     // next undone declared action of its script with that identity.
     let mut picked = vec![false; declared.len()];
     for pick in &picks {
-        let Some(at) = pick_ref(pick).and_then(|pick| next_declared(declared, &picked, &pick))
-        else {
+        let Some(at) = next_declared(declared, &picked, pick) else {
             return Actions::Incomplete;
         };
         let action = &declared[at];
@@ -888,6 +914,45 @@ mod tests {
             })
         );
         assert_eq!(pick_ref("peer:node"), None);
+    }
+
+    /// A harness-driven pick is ignored only by its whole [`PickRef`]
+    /// (Rule 25's template): `node`'s `finish` and a `Recover` step's
+    /// source's `recovery-relink` are driven, and the same pick with only
+    /// its peer or only its action moved isn't. In the close-relink-close
+    /// history, a `node:finish` pick leaves the run complete, but
+    /// `mirror-0`'s `finish`, which no source offers, is undeclared.
+    #[test]
+    fn a_harness_driven_pick_joins_its_whole_identity() {
+        let (trace, report, declared) = close_relink_close();
+        let recover = Declared {
+            pick: PickRef {
+                peer: "mirror-1".into(),
+                action: "recover".into(),
+            },
+            script: "control".into(),
+            control: Some(3),
+            effect: Effect::AtPick,
+        };
+        let driven = harness_driven(&[recover]);
+        for (peer, action) in [("node", "finish"), ("mirror-1", "recovery-relink")] {
+            let pick = PickRef {
+                peer: peer.into(),
+                action: action.into(),
+            };
+            assert_one_key_off::<PickRef>(&pick, |pick| is_harness_driven(&driven, pick));
+        }
+
+        let with = |pick: &str| {
+            let mut trace = trace.clone();
+            let mut extra = trace.steps.last().expect("the run took steps").clone();
+            extra.pick = pick.to_owned();
+            trace.steps.push(extra);
+            judge(&declared, &trace, &report, &End::Completed, false)
+        };
+        assert_eq!(with("peer:node:finish"), Actions::Complete);
+        assert_eq!(with("peer:mirror-0:finish"), Actions::Incomplete);
+        assert_eq!(with("peer:mirror-0:recovery-relink"), Actions::Incomplete);
     }
 
     /// Each fact takes its cause by its whole stamp (Rule 25's template):

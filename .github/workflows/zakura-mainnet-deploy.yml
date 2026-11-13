@@ -157,6 +157,7 @@ jobs:
           ZAKURA_MAC_CRANELIFT_REFERENCE_SSH_KEY: ${{ secrets.MAC_VERIFIER_REFERENCE_SSH_KEY }}
           ZAKURA_MAC_CRANELIFT_REFERENCE_KNOWN_HOSTS: ${{ secrets.MAC_VERIFIER_REFERENCE_KNOWN_HOSTS }}
           ZAKURA_MAC_CRANELIFT_ID: ${{ secrets.MAC_VERIFIER_ID }}
+          ZAKURA_STATUS_DASHBOARD_PASSWORD: ${{ secrets.ZAKURA_STATUS_DASHBOARD_PASSWORD }}
         run: python3 deploy/deployer/zakura-mac-cranelift-manager.py "$MAC_OPERATION"
 
   # Compatibility monitoring only: installs the same commit's monitoring package on
@@ -825,8 +826,28 @@ jobs:
 
       - name: Install cluster status dashboard
         if: always()
+        env:
+          DASHBOARD_PASSWORD: ${{ secrets.ZAKURA_STATUS_DASHBOARD_PASSWORD }}
         run: |
           set -euo pipefail
+
+          # The fleet pages need a shared password. Refuse to install without
+          # it rather than serve them publicly. The host keeps only its hash;
+          # the cookie secret survives deploys so logins do too (delete its
+          # line from the env file to sign everyone out).
+          if [ -z "${DASHBOARD_PASSWORD:-}" ]; then
+            echo "secret ZAKURA_STATUS_DASHBOARD_PASSWORD is not set; not serving the dashboard without a password" >&2
+            exit 1
+          fi
+          dashboard_env="/etc/zakura-mainnet-dashboard/dashboard.env"
+          sudo mkdir -p /etc/zakura-mainnet-dashboard
+          session_secret="$(sudo sed -n 's/^ZAKURA_DASHBOARD_SESSION_SECRET=//p' "$dashboard_env" 2>/dev/null || true)"
+          if [ -z "$session_secret" ]; then
+            session_secret="$(openssl rand -hex 32)"
+          fi
+          password_hash="$(printf '%s\n' "$DASHBOARD_PASSWORD" | python3 deploy/runner/zakura-cluster-status.py --print-password-hash)"
+          printf 'ZAKURA_DASHBOARD_PASSWORD_HASH=%s\nZAKURA_DASHBOARD_SESSION_SECRET=%s\n' "$password_hash" "$session_secret" \
+            | sudo install -m 600 -o root -g root /dev/stdin "$dashboard_env"
 
           dashboard_dir="/opt/zakura-mainnet-dashboard"
           sudo install -d -m 755 "$dashboard_dir"
@@ -875,6 +896,7 @@ jobs:
           [Service]
           Type=simple
           WorkingDirectory=/opt/zakura-mainnet-dashboard
+          EnvironmentFile=/etc/zakura-mainnet-dashboard/dashboard.env
           ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zakura-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --network mainnet --interval 10 --stale-after 300 --state-file /var/lib/zakura-mainnet-dashboard/orphan-pairs.json
           Restart=always
           RestartSec=5

@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
+import hmac
+import html
 import ipaddress
 import json
 import logging
@@ -29,8 +32,10 @@ import math
 import os
 import statistics
 import re
+import secrets
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import tomllib
@@ -4401,10 +4406,124 @@ setInterval(renderFreshness, 1000);
 </html>"""
 
 
+# -- the shared dashboard password --------------------------------------------
+# One password gates the fleet pages and their data. Only its salted PBKDF2
+# hash and a random cookie secret reach this process, through the environment.
+# A login sets a cookie holding an expiry and an HMAC of it under the secret,
+# so rotating the secret signs everyone out.
+SESSION_COOKIE = "zakura_status_session"
+SESSION_SECONDS = 7 * 86400
+PASSWORD_HASH_ALGORITHM = "pbkdf2_sha256"
+PASSWORD_HASH_ITERATIONS = 200_000
+MAX_LOGIN_BODY = 4096
+
+
+def hash_password(password: str, salt: bytes | None = None,
+                  iterations: int = PASSWORD_HASH_ITERATIONS) -> str:
+    """`pbkdf2_sha256$<iterations>$<salt hex>$<hash hex>` for a password."""
+    salt = secrets.token_bytes(16) if salt is None else salt
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return f"{PASSWORD_HASH_ALGORITHM}${iterations}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    """Whether a password matches a hash from `hash_password`; false for a malformed hash."""
+    try:
+        algorithm, iterations, salt_hex, digest_hex = encoded.split("$")
+        if algorithm != PASSWORD_HASH_ALGORITHM:
+            return False
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations))
+    except ValueError:
+        return False
+    return hmac.compare_digest(actual, expected)
+
+
+def parse_cookies(header: str | None) -> dict[str, str]:
+    """The cookies in a `Cookie` request header."""
+    cookies = {}
+    for part in (header or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name:
+            cookies[name] = value
+    return cookies
+
+
+@dataclass(frozen=True)
+class DashboardLogin:
+    """The password hash and the secret that signs login cookies."""
+
+    password_hash: str
+    session_secret: str
+
+    def _signature(self, expiry: int) -> str:
+        return hmac.new(self.session_secret.encode(), str(expiry).encode(), hashlib.sha256).hexdigest()
+
+    def issue_token(self, now: float) -> str:
+        """A cookie value `<expiry>.<signature>` that `token_valid` accepts for `SESSION_SECONDS`."""
+        expiry = int(now) + SESSION_SECONDS
+        return f"{expiry}.{self._signature(expiry)}"
+
+    def token_valid(self, token: str | None, now: float) -> bool:
+        """Whether a cookie value was signed under this secret and has not expired."""
+        try:
+            expiry_text, signature = (token or "").split(".", 1)
+            expiry = int(expiry_text)
+        except ValueError:
+            return False
+        return hmac.compare_digest(signature, self._signature(expiry)) and expiry > now
+
+
+def dashboard_login_from_env(environ) -> DashboardLogin | None:
+    """The login gate configured by `ZAKURA_DASHBOARD_PASSWORD_HASH`, or None when no password is set."""
+    password_hash = environ.get("ZAKURA_DASHBOARD_PASSWORD_HASH", "").strip()
+    session_secret = environ.get("ZAKURA_DASHBOARD_SESSION_SECRET", "").strip()
+    if not password_hash:
+        return None
+    if not session_secret:
+        raise ValueError("ZAKURA_DASHBOARD_PASSWORD_HASH needs ZAKURA_DASHBOARD_SESSION_SECRET to sign login cookies")
+    if not password_hash.startswith(PASSWORD_HASH_ALGORITHM + "$"):
+        raise ValueError("ZAKURA_DASHBOARD_PASSWORD_HASH is not a pbkdf2_sha256 hash")
+    return DashboardLogin(password_hash, session_secret)
+
+
+LOGIN_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zakura fleet status</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #5d6677; --line: #d8dde6; --accent: #2f6fde; --bad: #c0392b; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #11151c; --card: #1a2029; --text: #e6e9ef; --muted: #98a2b3; --line: #2c3442; --accent: #6b9bff; --bad: #ff7b6b; } }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, sans-serif; }
+  form { width: min(340px, calc(100vw - 32px)); background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 24px; display: grid; gap: 12px; }
+  h1 { margin: 0; font-size: 18px; }
+  p { margin: 0; color: var(--muted); }
+  input, button { font: inherit; padding: 9px 11px; border-radius: 7px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  button { background: var(--accent); border-color: var(--accent); color: #fff; cursor: pointer; }
+  .error { color: var(--bad); }
+</style>
+</head>
+<body>
+<form method="post" action="/login">
+  <h1>Zakura fleet status</h1>
+  <p>Enter the dashboard password.</p>
+  <p class="error">{{error}}</p>
+  <input type="password" name="password" autocomplete="current-password" autofocus required aria-label="Password">
+  <button type="submit">Sign in</button>
+</form>
+</body>
+</html>"""
+
+
 COLLECTOR: ClusterCollector | None = None
 ACTIVATION_FEED = None
 TRUSTED_PROXY_IPS = set()
 RATE_LIMITER = RateLimiter()
+DASHBOARD_LOGIN: DashboardLogin | None = None
+# Password guesses per client per minute.
+LOGIN_RATE_LIMITER = RateLimiter(limit=10, window=60)
 # The page and its data both change every poll, and the HTML carries no
 # fingerprint. Without this a browser heuristically caches the page and keeps
 # serving a stale build after a dashboard deploy.
@@ -4412,6 +4531,10 @@ NO_STORE = {
     "Cache-Control": "no-store, must-revalidate",
     "X-Content-Type-Options": "nosniff",
 }
+# The fleet pages and their data need the dashboard password when one is set.
+# The public APIs (`/ironwood-status.json`, `/v1/*`) and `/healthz` stay open.
+PASSWORD_GATED_PAGES = {"/", "/data"}
+PASSWORD_GATED_PREFIXES = ("/data/node/", "/node/", "/profile/")
 
 
 class BoundedHTTPServer(ThreadingHTTPServer):
@@ -4558,8 +4681,70 @@ class Handler(BaseHTTPRequestHandler):
         status, body, _ = fetch_profiler(node.profiler_url, path, PROFILER_REQUEST_TIMEOUT_SECONDS)
         return self.send_body(status, body, "application/json", NO_STORE)
 
+    def is_local_client(self) -> bool:
+        """A process on this host talking to the port directly, not through the reverse proxy.
+
+        Caddy always adds `X-Forwarded-For`, so a loopback request without it
+        comes from a local reader such as the fleet watchdog.
+        """
+        try:
+            peer = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        return peer.is_loopback and "X-Forwarded-For" not in self.headers
+
+    def logged_in(self) -> bool:
+        """No password is configured, the client is local, or it carries a valid login cookie."""
+        if DASHBOARD_LOGIN is None or self.is_local_client():
+            return True
+        token = parse_cookies(self.headers.get("Cookie")).get(SESSION_COOKIE)
+        return DASHBOARD_LOGIN.token_valid(token, time.time())
+
+    def send_login_page(self, status: int, error: str = "") -> None:
+        page = LOGIN_PAGE.replace("{{error}}", html.escape(error))
+        self.send_body(status, page.encode(), "text/html; charset=utf-8", NO_STORE)
+
+    def redirect_home(self, cookie: str) -> None:
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header("Set-Cookie", cookie)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self) -> None:
+        if urllib.parse.urlparse(self.path).path != "/login" or DASHBOARD_LOGIN is None:
+            return self.send_body(404, b"not found\n", "text/plain; charset=utf-8",
+                                  {"X-Content-Type-Options": "nosniff"})
+        if not LOGIN_RATE_LIMITER.allow(self.rate_limit_client()):
+            return self.send_login_page(429, "Too many attempts; wait a minute and try again")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_LOGIN_BODY:
+            return self.send_login_page(413, "Request too large")
+        form = urllib.parse.parse_qs(self.rfile.read(length).decode(errors="replace"))
+        password = form.get("password", [""])[0]
+        if not verify_password(password, DASHBOARD_LOGIN.password_hash):
+            return self.send_login_page(401, "Wrong password")
+        token = DASHBOARD_LOGIN.issue_token(time.time())
+        self.redirect_home(f"{SESSION_COOKIE}={token}; Max-Age={SESSION_SECONDS}; Path=/; HttpOnly; Secure; SameSite=Lax")
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/logout":
+            return self.redirect_home(f"{SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax")
+        if parsed.path in PASSWORD_GATED_PAGES or parsed.path.startswith(PASSWORD_GATED_PREFIXES):
+            if not self.logged_in():
+                is_page = parsed.path == "/" or (parsed.path.startswith(("/node/", "/profile/"))
+                                                 and "/api/" not in parsed.path)
+                if is_page:
+                    return self.send_login_page(200)
+                return self.send_json(401, {"error": "login required"}, NO_STORE)
+        return self.serve_get(parsed)
+
+    def serve_get(self, parsed: urllib.parse.ParseResult) -> None:
         if parsed.path.startswith("/profile/"):
             return self.serve_profile(parsed)
         if parsed.path == "/data":
@@ -4676,9 +4861,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global COLLECTOR, ACTIVATION_FEED, TRUSTED_PROXY_IPS
+    global COLLECTOR, ACTIVATION_FEED, TRUSTED_PROXY_IPS, DASHBOARD_LOGIN
 
     parser = argparse.ArgumentParser(description="Serve a Zakura fleet status dashboard.")
+    if sys.argv[1:] == ["--print-password-hash"]:
+        password = sys.stdin.readline().rstrip("\n")
+        if not password:
+            sys.exit("empty password on stdin")
+        print(hash_password(password))
+        return
     parser.add_argument("--config", required=True, help="path to deploy/deployer nodes TOML")
     parser.add_argument("--host", default="0.0.0.0", help="dashboard bind host")
     parser.add_argument("--port", type=int, default=8090, help="dashboard bind port")
@@ -4734,6 +4925,7 @@ def main() -> None:
                         help="explicit reverse-proxy IP allowed to supply X-Forwarded-For; repeat per IP")
     args = parser.parse_args()
     TRUSTED_PROXY_IPS = set(args.trusted_proxy)
+    DASHBOARD_LOGIN = dashboard_login_from_env(os.environ)
 
     nodes = load_nodes(Path(args.config))
     state_file = Path(args.state_file) if args.state_file else None
@@ -4761,6 +4953,7 @@ def main() -> None:
         f"cluster status dashboard bound on {args.host}:{args.port}; "
         f"polling {len(nodes)} node(s) every {args.interval}s"
         + (f"; state {state_file}" if state_file else "")
+        + ("; fleet pages need the dashboard password" if DASHBOARD_LOGIN else "; no dashboard password set")
     )
     BoundedHTTPServer((args.host, args.port), Handler).serve_forever()
 

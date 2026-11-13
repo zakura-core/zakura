@@ -4291,6 +4291,8 @@ const PEER_ROWS = [
   ['Handshake failures', 'zcash_net_peer_handshake_failures_total'],
   ['Mempool transactions', 'zcash_mempool_size_transactions'],
 ];
+// zcashd names itself "MagicBean" when it connects; show the name people know it by.
+function peerSoftwareName(agent) { return String(agent).replace('MagicBean', 'zcashd'); }
 function renderNodePeers(data) {
   const row = data.node || {};
   const m = row.metrics || {};
@@ -4311,7 +4313,7 @@ function renderNodePeers(data) {
   if (row.metrics_error) html += metricsUnavailable(row);
   if (subversions.length) {
     html += '<div class="subhead"><p class="eyebrow">Peer versions</p></div><div class="kv">'
-      + subversions.map((entry) => kvRow(String(entry[0]), num(entry[1]))).join('')
+      + subversions.map((entry) => kvRow(peerSoftwareName(entry[0]), num(entry[1]))).join('')
       + '</div>';
   } else if (row.peer_info_error) {
     html += '<p class="note-off">getpeerinfo unavailable: ' + esc(row.peer_info_error) + '</p>';

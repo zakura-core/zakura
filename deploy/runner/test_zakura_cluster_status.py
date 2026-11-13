@@ -1935,6 +1935,9 @@ class PropagationRouteTests(unittest.TestCase):
         # The downloads each node made: the slowest ones, and the outside peers that served them.
         for part in (b'<table id="slowest">', b'<table id="outside">', b'"private peer"'):
             self.assertIn(part, body)
+        # zcashd is shown by that name, not by the "MagicBean" it sends when connecting.
+        self.assertIn(b'.replace("MagicBean", "zcashd")', body)
+        self.assertIn("kvRow(peerSoftwareName(entry[0]), num(entry[1]))", status.PAGE)
         # A node's name on the page leads to that node's own page.
         self.assertIn(b'"/node/" + encodeURIComponent(name)', body)
 

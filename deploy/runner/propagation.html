@@ -276,9 +276,11 @@ function sourceLink(name, outside) { return name === "outside" ? outside : nodeL
 function nodeCell(name) { return el("td", {}, nodeLink(name)); }
 
 // What a peer says it runs, as its handshake wrote it: "/Zakura:1.8.7/" reads "Zakura 1.8.7".
+// zcashd names itself "MagicBean" there, so it is shown by the name people know it by.
 function software(agent) {
   if (!agent) return "unknown software";
-  const parts = agent.split("/").filter(Boolean).map((part) => part.replace(":", " "));
+  const parts = agent.split("/").filter(Boolean)
+    .map((part) => part.replace(":", " ").replace("MagicBean", "zcashd"));
   return parts.length ? parts.join(", ") : agent;
 }
 // Who served a download: one of our nodes, an outside peer by address, a peer whose address

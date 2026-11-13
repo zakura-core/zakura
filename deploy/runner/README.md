@@ -88,7 +88,8 @@ node has a "Downloaded from" column. "Slowest downloads" lists the 50 slowest
 single attempts over the blocks shown, with the node that made it, the peer,
 its software, the block and its size; selecting one shows its block. "Peers
 outside the fleet" has one row per outside IP address, slowest first: its
-software (`/Zakura:1.8.7/` reads "Zakura 1.8.7"), which of our nodes
+software (`/Zakura:1.8.7/` reads "Zakura 1.8.7", and zcashd's `/MagicBean:6.2.0/`
+reads "zcashd 6.2.0"), which of our nodes
 downloaded from it, how many attempts there were and how many failed, and the
 median, 9-in-10 and slowest time of the ones that delivered a block.
 

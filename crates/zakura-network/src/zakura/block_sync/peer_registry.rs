@@ -300,14 +300,15 @@ pub(super) struct OutstandingClaim {
 /// Runs `$write` on the registry's peer table under the registry lock, and
 /// returns its result once the lock is released. `$generation` is the
 /// routine generation the call comes from. Test and simulator builds
-/// fingerprint `$peer`'s entry before and after `$write`, under the same
-/// lock, and report a change to an entry another generation owns, whether
-/// or not the writer reports itself.
+/// compare `$peer`'s entry before and after `$write`, under the same lock,
+/// and report a change to an entry another generation owns, whether or
+/// not the writer reports itself. They fingerprint the entry only when
+/// another generation owns it ([`PeerTable::before_write`]).
 macro_rules! gated_write {
     ($registry:expr, $peer:expr, $writer:ident, $generation:expr, |$table:ident| $write:expr) => {{
         let mut peers = $registry.lock();
         #[cfg(any(test, zakura_sim))]
-        let before = peers.state.fingerprint($peer);
+        let before = peers.state.before_write($peer, $generation);
         let $table = &mut peers.state;
         let written = $write;
         #[cfg(any(test, zakura_sim))]

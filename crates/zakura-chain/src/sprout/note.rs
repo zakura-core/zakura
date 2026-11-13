@@ -11,4 +11,4 @@ pub use mac::Mac;
 
 pub use ciphertexts::EncryptedNote;
 
-pub use nullifiers::{Nullifier, NullifierSeed};
+pub use nullifiers::Nullifier;

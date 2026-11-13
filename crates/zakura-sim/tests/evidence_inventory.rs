@@ -184,6 +184,13 @@ const REGISTERED: &[Store] = &[
         ),
     ),
     store(
+        "src/harness/header_node/grown.rs",
+        "GrowEvidence",
+        "0",
+        &[HeaderTap],
+        ("header_node", "grow_steps_record_their_growths"),
+    ),
+    store(
         "src/harness/header_node/stale.rs",
         "StaleEvidence",
         "0",

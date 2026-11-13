@@ -51,6 +51,7 @@ use super::{
         ends::EndEvidence,
         fault::{FaultCheck, FaultEvidence},
         fork_choice::{settled::ForkFixture, ForkChoiceEvidence},
+        grown::GrowEvidence,
         hold_wake::HoldWakeEvidence,
         outstanding::{admitted_peer_limit, OutstandingEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
@@ -736,6 +737,8 @@ pub struct Ports {
     /// the harness and the node's tap record during the run. It holds the
     /// node's stamps.
     pub ends: EndEvidence,
+    /// Each growth the harness's control steps completed.
+    pub grown: GrowEvidence,
     /// When the node's reset check first applied, which its tap finds
     /// during the run.
     pub round_life: RoundLifeEvidence,
@@ -793,6 +796,7 @@ impl Ports {
             wake: WakeEvidence::new(&stores, None),
             hold_wake: HoldWakeEvidence::new(&stores),
             ends: EndEvidence::new(&stores),
+            grown: GrowEvidence::new(&stores),
             round_life: RoundLifeEvidence::new(&stores),
             retirement: RetirementEvidence::new(&stores),
             chain_effect: ChainEffectEvidence::new(&stores),
@@ -1405,6 +1409,7 @@ impl Subsystem for Storage {
             Topology::new(nodes, effects.clone())
                 .with_tap(shutdown)
                 .with_sessions(ports.sessions.clone())
+                .with_grown(ports.grown.clone())
                 .with_delayed_page(ports.delayed_page.clone()),
         );
         let mut mirror_links = Vec::new();

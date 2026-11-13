@@ -7375,6 +7375,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "tests/header_wire_prepare_fault.rs",
         "a_late_penalty_joins_its_origin_session",
     ),
+    (
+        "ControlRef",
+        "src/harness/header_acceptance/actions.rs",
+        "grew",
+        "src/harness/header_acceptance/actions.rs",
+        "a_grow_joins_its_whole_step",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.

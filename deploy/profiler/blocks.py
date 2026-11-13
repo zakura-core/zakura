@@ -297,7 +297,8 @@ class TraceFollower:
 
     The node never rotates its trace files, so this also empties any table that has
     grown past `table_cap_bytes`. That is safe while the node runs: it opens the files
-    for append, so its next row lands at the start of the emptied file.
+    for append, so its next row lands at the start of the emptied file. A cap of zero
+    leaves every table alone, for a directory whose files something else needs whole.
     """
 
     def __init__(self, trace_dir, table_cap_bytes):
@@ -331,6 +332,8 @@ class TraceFollower:
         return self._stages.finished()
 
     def _cap_tables(self):
+        if not self.table_cap_bytes:
+            return
         try:
             names = os.listdir(self.trace_dir)
         except OSError:

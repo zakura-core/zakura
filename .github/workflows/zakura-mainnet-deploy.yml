@@ -408,6 +408,11 @@ jobs:
           # compat host does not. Used only for the dashboard's disk probe.
           state_cache_dir = "/mnt/data/zakura-cache"
 
+          # Each node's `monitor.profiler_url` is where the dashboard reaches that node's
+          # continuous profiler (deploy/profiler/): us-east-0, the dashboard host, on the
+          # profiler's own port, every other node through an SSH tunnel on the port named.
+          # deploy.py ignores it.
+
           # Public mainnet node ids (crates/zakura-network/src/zakura/handler.rs). Used by
           # the dashboard to label each host; not deployed to the nodes.
           [defaults.zakura]
@@ -426,46 +431,55 @@ jobs:
           [[nodes]]
           name       = "asia-0"
           ssh_string = "root@165.22.54.66"
+          monitor    = { profiler_url = "http://127.0.0.1:8099" }
           commit     = "${REF}"
 
           [[nodes]]
           name       = "us-0"
           ssh_string = "root@104.131.184.123"
+          monitor    = { profiler_url = "http://127.0.0.1:8100" }
           commit     = "${REF}"
 
           [[nodes]]
           name       = "us-east-0"
           ssh_string = "root@159.65.183.89"
+          monitor    = { profiler_url = "http://127.0.0.1:8097" }
           commit     = "${REF}"
 
           [[nodes]]
           name       = "us-west-0"
           ssh_string = "root@143.244.184.176"
+          monitor    = { profiler_url = "http://127.0.0.1:8101" }
           commit     = "${REF}"
 
           [[nodes]]
           name       = "canada-0"
           ssh_string = "root@159.203.38.10"
+          monitor    = { profiler_url = "http://127.0.0.1:8102" }
           commit     = "${REF}"
 
           [[nodes]]
           name       = "europe-west-0"
           ssh_string = "root@64.227.44.93"
+          monitor    = { profiler_url = "http://127.0.0.1:8103" }
           commit     = "${REF}"
 
           [[nodes]]
           name       = "europe-central-0"
           ssh_string = "root@161.35.156.226"
+          monitor    = { profiler_url = "http://127.0.0.1:8104" }
           commit     = "${REF}"
 
           [[nodes]]
           name       = "asia-south-0"
           ssh_string = "root@139.59.64.115"
+          monitor    = { profiler_url = "http://127.0.0.1:8105" }
           commit     = "${REF}"
 
           [[nodes]]
           name       = "asia-pacific-0"
           ssh_string = "root@168.144.173.250"
+          monitor    = { profiler_url = "http://127.0.0.1:8106" }
           commit     = "${REF}"
 
           [[nodes]]
@@ -487,6 +501,7 @@ jobs:
           name       = "archive-vct-off"
           release_state_publisher = true
           ssh_string = "root@104.131.174.28"
+          monitor    = { profiler_url = "http://127.0.0.1:8098" }
           commit     = "${REF}"
           rpc_listen_addr = "127.0.0.1:8232"
           log_file   = "/var/log/zakura/zakura.log"
@@ -559,6 +574,24 @@ jobs:
           REMOTE
             echo "::warning::failed to suppress compatibility watchdog alerts; continuing deploy" >&2
           fi
+
+      - name: Switch on trace files
+        # The profiler reads each node's trace files for per-block timings. This adds
+        # `trace_dir` to a node config that has none and changes nothing else; the
+        # restart in the next step makes the node read it. A node this cannot edit is
+        # reported and deployed as it is.
+        env:
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+
+          args=(--config deploy/deployer/nodes.ci.toml)
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
+          fi
+
+          python3 deploy/profiler/fleet.py ensure-trace-config "${args[@]}" \
+            || echo "::warning::trace files could not be switched on for every node; see the step log" >&2
 
       - name: Deploy fleet
         working-directory: deploy/deployer
@@ -811,15 +844,6 @@ jobs:
               print "rpc_config_path = \"/root/.cache/zakura/.cookie\""
               in_compat = 0
             }
-            # The continuous profiler installed below samples the node on this host.
-            $0 ~ /^name[[:space:]]*=[[:space:]]*"us-east-0"/ {
-              print "monitor    = { profiler_url = \"http://127.0.0.1:8097\" }"
-            }
-            # The legacy-only node runs its own profiler, reached through the SSH
-            # tunnel installed below.
-            $0 ~ /^name[[:space:]]*=[[:space:]]*"archive-vct-off"/ {
-              print "monitor    = { profiler_url = \"http://127.0.0.1:8098\" }"
-            }
           ' "$RUNNER_TEMP/dashboard.nodes.toml" > "$RUNNER_TEMP/dashboard.nodes.toml.tmp"
           mv "$RUNNER_TEMP/dashboard.nodes.toml.tmp" "$RUNNER_TEMP/dashboard.nodes.toml"
           # The managed install caches each sidecar release under its tag.
@@ -868,34 +892,24 @@ jobs:
 
       - name: Install continuous profiler
         if: always()
+        env:
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
-          # Samples this host's zakurad from outside the process and serves the flame
-          # graphs the dashboard links to. See deploy/profiler/README.md.
-          if ! command -v perf >/dev/null || ! command -v c++filt >/dev/null; then
-            echo "perf or c++filt is missing on this host; the profiler was not installed." >&2
-            exit 0
+          # Each node gets a profiler that samples its zakurad from outside the process
+          # and serves the flame graphs the dashboard links to. A profiler listens only
+          # on its own host, so this host keeps an SSH tunnel to each of the others.
+          # See deploy/profiler/README.md. A profiler that fails to install never fails
+          # the deploy: the dashboard shows which nodes have one.
+          args=(--config deploy/deployer/nodes.ci.toml)
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
-          profiler_dir="/opt/zakura-profiler"
-          sudo install -d -m 755 "$profiler_dir"
-          sudo install -m 644 deploy/profiler/zakura_profiler.py deploy/profiler/stacks.py \
-            deploy/profiler/blocks.py deploy/profiler/page.html "$profiler_dir/"
-          sudo install -m 644 deploy/profiler/zakura-profiler.service \
-            /etc/systemd/system/zakura-profiler.service
-          sudo systemctl daemon-reload
-          sudo systemctl enable zakura-profiler.service
-          sudo systemctl restart zakura-profiler.service
-          sudo systemctl --no-pager --full status zakura-profiler.service || true
 
-          # archive-vct-off runs the same profiler, installed by hand, listening on
-          # its own loopback. This forwards it to 127.0.0.1:8098 here over the SSH
-          # access the dashboard already uses for that node.
-          sudo install -m 644 deploy/profiler/zakura-profiler-tunnel-archive-vct-off.service \
-            /etc/systemd/system/zakura-profiler-tunnel-archive-vct-off.service
-          sudo systemctl daemon-reload
-          sudo systemctl enable zakura-profiler-tunnel-archive-vct-off.service
-          sudo systemctl restart zakura-profiler-tunnel-archive-vct-off.service
+          python3 deploy/profiler/fleet.py install "${args[@]}" \
+            || echo "::warning::the profiler was not installed on every node; see the step log" >&2
+          python3 deploy/profiler/fleet.py tunnels --config deploy/deployer/nodes.ci.toml
 
       - name: Install public broadcast gateway
         if: always()

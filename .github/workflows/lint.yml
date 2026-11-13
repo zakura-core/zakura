@@ -289,7 +289,9 @@ jobs:
 
       - name: Continuous profiler tests
         if: ${{ !cancelled() }}
-        run: python3 deploy/profiler/test_zakura_profiler.py
+        run: |
+          python3 deploy/profiler/test_zakura_profiler.py
+          python3 deploy/profiler/test_fleet.py
 
       - name: Compatibility monitoring tests
         if: ${{ !cancelled() }}

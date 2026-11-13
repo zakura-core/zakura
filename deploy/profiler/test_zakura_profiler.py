@@ -590,6 +590,13 @@ class TraceFollowingTests(unittest.TestCase):
         self.append("chain_tip", tip_row(9_000_000, height=51, block_hash="cd" * 32))
         self.assertEqual([record["height"] for record in follower.poll()], list(range(12)) + [50])
 
+    def test_a_cap_of_zero_never_empties_a_table(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=0)
+        self.append("discovery", *[trace_row("peer_seen", index, peer="p" * 40) for index in range(40)])
+        size = (self.directory / "discovery.jsonl").stat().st_size
+        follower.poll()
+        self.assertEqual((self.directory / "discovery.jsonl").stat().st_size, size)
+
     def test_a_missing_trace_directory_yields_nothing(self):
         follower = blocks.TraceFollower(str(self.directory / "absent"), table_cap_bytes=2000)
         self.assertEqual(follower.poll(), [])

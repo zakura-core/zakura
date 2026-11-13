@@ -7,11 +7,14 @@
 //! executes each by its exact name at the subject commit.
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
+use support::one_key_off::assert_one_key_off;
 use zakura_sim::{
     harness::{
         self,
@@ -26,7 +29,7 @@ use zakura_sim::{
                 ResultRecord, TestOutcome, TestRan,
             },
             reasons::{NA_REASONS, NOT_HEADER},
-            refs::PlantedRef,
+            refs::{PlantedRef, Ref, TestIdRef},
             required::{gate_rule, required_keys, Inventories, Registered, GATE_OBLIGATIONS},
             rows::{self, NativeClass, HEADER_HARNESSES},
             sim_test, Approval, CaseRef, CaseRun, Expected, ExpectedId, ExpectedResult, Found,
@@ -2525,8 +2528,39 @@ fn test_exists(test: TestRef) -> Result<(), String> {
     }
 }
 
+/// Whether a row of `expected`, one with a case key, catches `case`, by a
+/// `Caught` or `HarnessCaught` joined on its whole [`PlantedRef`].
+fn row_catches(expected: &[ExpectedResult], case: &PlantedRef) -> bool {
+    let rows: Vec<&ExpectedResult> = expected
+        .iter()
+        .filter(|result| {
+            result
+                .keys
+                .iter()
+                .any(|key| matches!(key, Key::Case { .. }))
+        })
+        .collect();
+    !PlantedRef::joined(case, rows, |result| match result.expected {
+        Expected::Caught { case, .. } | Expected::HarnessCaught { case, .. } => {
+            Some(case.planted())
+        }
+        _ => None,
+    })
+    .is_empty()
+}
+
+/// Whether `expected` is the `Passes` of exactly `test`, joined on its
+/// whole [`TestIdRef`].
+fn passes_test(expected: &Expected, test: TestRef) -> bool {
+    TestIdRef::joins(&TestIdRef::of(test), expected, |expected| match expected {
+        Expected::Passes { test } => Some(TestIdRef::of(*test)),
+        _ => None,
+    })
+}
+
 /// Every proving catch of `manifest`'s contracts that doesn't name a
-/// committed planted case with a row's `Caught`.
+/// committed planted case with a row's `Caught`, joined on its whole
+/// [`PlantedRef`].
 fn catch_errors(manifest: &Manifest) -> Vec<String> {
     let mut errors = Vec::new();
     for contract in &manifest.contracts {
@@ -2541,18 +2575,7 @@ fn catch_errors(manifest: &Manifest) -> Vec<String> {
                     contract.id, case.property, case.name
                 ));
             }
-            let caught = manifest.expected.iter().any(|result| {
-                result
-                    .keys
-                    .iter()
-                    .any(|key| matches!(key, Key::Case { .. }))
-                    && matches!(
-                        result.expected,
-                        Expected::Caught { case: c, .. } | Expected::HarnessCaught { case: c, .. }
-                            if c == *case
-                    )
-            });
-            if !caught {
+            if !row_catches(&manifest.expected, &case.planted()) {
                 errors.push(format!(
                     "{:?}'s catch {}/{} has no row's Caught",
                     contract.id, case.property, case.name
@@ -2568,6 +2591,26 @@ fn every_referenced_test_exists() {
     let manifest = Manifest::committed();
     // Every proving catch names a committed case and a row's catch of it.
     assert_eq!(catch_errors(&manifest), Vec::<String>::new());
+    // A row's catch counts for a proving catch only on the case's whole
+    // `PlantedRef` (Rule 25's template): each `reserved-flags-skipped`
+    // case, a name several properties share, has its row's catch, and
+    // with its property or its name moved has none.
+    let shared: Vec<PlantedRef> = manifest
+        .expected
+        .iter()
+        .filter_map(|result| match result.expected {
+            Expected::Caught { case, .. } if case.name == "reserved-flags-skipped" => {
+                Some(case.planted())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(shared.len() > 1, "{shared:?}");
+    for case in &shared {
+        let keys =
+            assert_one_key_off::<PlantedRef>(case, |want| row_catches(&manifest.expected, want));
+        assert_eq!(keys, 2);
+    }
     assert!(manifest
         .contracts
         .iter()
@@ -7747,6 +7790,20 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/tool.rs",
         "a_draft_s_row_joins_its_whole_property",
     ),
+    (
+        "PlantedRef",
+        "tests/header_acceptance.rs",
+        "row_catches",
+        "tests/header_acceptance.rs",
+        "every_referenced_test_exists",
+    ),
+    (
+        "TestIdRef",
+        "tests/header_acceptance.rs",
+        "passes_test",
+        "tests/header_acceptance.rs",
+        "each_node_harness_s_missing_sources_are_its_own_test_s",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.
@@ -9299,12 +9356,6 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "tests/header_acceptance.rs",
-        "catch_errors",
-        "c==*case",
-        "a static check that each contract's proving catch has a row's `Caught`, whole `CaseRef`s of the committed tables",
-    ),
-    (
-        "tests/header_acceptance.rs",
         "control_gaps",
         "control==test",
         "the control scan's own test names, not acceptance evidence",
@@ -9332,12 +9383,6 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "delivered_obligations_verify_on_their_evidence",
         "history.harness==harness",
         "picks the test's fixture history by a literal harness, a test building its input",
-    ),
-    (
-        "tests/header_acceptance.rs",
-        "each_node_harness_s_missing_sources_are_its_own_test_s",
-        "*t==test",
-        "a static check that a key's covering pass is the harness's own test, whole `TestRef`s of the committed tables",
     ),
     (
         "tests/header_acceptance.rs",
@@ -10005,6 +10050,12 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "row.property==\"header-sync/honest-progress\"",
         "picks the test's fixture row by a literal property, a test building its input",
     ),
+    (
+        "tests/header_acceptance.rs",
+        "every_referenced_test_exists",
+        "case.name==\"reserved-flags-skipped\"",
+        "picks the test's fixture cases by a literal name, a test building its input",
+    ),
 ];
 
 /// The PR base, the closing PR's merge base with main: code there predates
@@ -10671,9 +10722,22 @@ fn each_node_harness_s_missing_sources_are_its_own_test_s() {
             .unwrap_or_else(|| panic!("{harness} is a node harness with no missing-source test"));
         assert_eq!(test.file, "tests/header_acceptance_sources.rs", "{harness}");
         assert!(
-            matches!(expected, Expected::Passes { test: t } if *t == test),
+            passes_test(expected, test),
             "{key:?} is covered by {expected:?}, not {test:?}"
         );
+        // The pass is the harness's own test only on its whole `TestIdRef`
+        // (Rule 25's template): the test with its package, file or name
+        // moved isn't the one that covers the key.
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(test), |want| {
+            let leak = |text: &str| -> &'static str { Box::leak(text.to_owned().into_boxed_str()) };
+            let moved = TestRef {
+                package: leak(&want.package),
+                file: leak(&want.file),
+                test: leak(&want.test),
+            };
+            passes_test(expected, moved)
+        });
+        assert_eq!(keys, 3);
     }
 }
 

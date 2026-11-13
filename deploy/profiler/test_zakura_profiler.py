@@ -434,7 +434,8 @@ class TraceRetentionTests(unittest.TestCase):
                     follower.join(timeout=2)
         self.assertFalse(recorder.is_alive())
         self.assertFalse(follower.is_alive())
-        self.assertEqual(self.table.stat().st_size, 0)
+        self.assertFalse(self.table.exists())
+        self.assertGreater(self.table.with_suffix(".jsonl.1").stat().st_size, 1024 * 1024)
         self.assertEqual(len(self.profiler._jobs), 0)
         self.assertTrue(self.profiler.status()["trace_retention"]["ready"])
 
@@ -442,7 +443,7 @@ class TraceRetentionTests(unittest.TestCase):
         self.profiler._trace_checked_at = time.monotonic() - 31
         self.assertFalse(self.profiler.status()["trace_retention"]["ready"])
 
-    def test_a_failed_stage_write_is_reported_after_the_trace_file_is_capped(self):
+    def test_a_failed_stage_write_is_reported_after_the_trace_file_is_rotated(self):
         failed = threading.Event()
         with (
             patch.object(self.profiler.store, "add_block_stages", side_effect=OSError("disk write failed")),
@@ -456,10 +457,11 @@ class TraceRetentionTests(unittest.TestCase):
                 self.profiler.stop()
                 follower.join(timeout=2)
         self.assertFalse(follower.is_alive())
-        self.assertEqual(self.table.stat().st_size, 0)
+        self.assertFalse(self.table.exists())
+        self.assertGreater(self.table.with_suffix(".jsonl.1").stat().st_size, 1024 * 1024)
         self.assertFalse(self.profiler.status()["trace_retention"]["ready"])
 
-    def test_a_table_that_cannot_be_emptied_is_reported_and_not_ready(self):
+    def test_a_table_that_cannot_be_rotated_is_reported_and_not_ready(self):
         failed = threading.Event()
         real_fail = self.profiler.fail
 
@@ -469,7 +471,7 @@ class TraceRetentionTests(unittest.TestCase):
 
         size = self.table.stat().st_size
         with (
-            patch.object(blocks.os, "truncate", side_effect=PermissionError("the table is read-only")),
+            patch.object(blocks.os, "replace", side_effect=PermissionError("the table is read-only")),
             patch.object(self.profiler, "fail", side_effect=report_failure),
         ):
             follower = threading.Thread(target=self.profiler.trace_loop)
@@ -835,6 +837,28 @@ class TraceFollowingTests(unittest.TestCase):
             self.assertEqual(moved.read_bytes(), b"new\n" * 10)
             self.assertFalse(current.exists())
 
+    def test_rotation_keeps_the_unread_tail_while_the_writer_has_not_reopened(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=20)
+        current = self.directory / "block_sync.jsonl"
+        moved = self.directory / "block_sync.jsonl.1"
+        current.write_bytes(b"initial\n")
+        follower.poll()
+        with open(current, "ab") as handle:
+            handle.write(b"old\n" * 30)
+        with mock.patch.object(blocks, "MAX_READ_BYTES", 16):
+            follower.poll()
+            original = moved.read_bytes()
+            self.assertGreater(len(original), 2 * follower.table_cap_bytes)
+            # An updated writer can be delayed before its next sync creates the replacement.
+            follower.poll()
+            self.assertFalse(current.exists())
+            self.assertEqual(moved.read_bytes(), original)
+            current.write_bytes(b"new\n" * 10)
+            for _ in range(20):
+                follower.poll()
+            self.assertEqual(moved.read_bytes(), b"new\n" * 10)
+            self.assertFalse(current.exists())
+
     def test_a_renamed_table_that_keeps_growing_is_emptied_at_twice_the_cap(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
         self.append("chain_tip", *self.twelve_tips())
@@ -863,29 +887,31 @@ class TraceFollowingTests(unittest.TestCase):
         self.assertEqual(follower.poll(), [])
         self.assertIsNone(follower.trim_failure)
 
-    def test_a_table_that_cannot_be_emptied_is_a_failure_until_it_is_emptied(self):
+    def test_a_table_that_cannot_be_rotated_is_a_failure_until_it_is_rotated(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
         rows = [trace_row("peer_seen", index, peer="p" * 40) for index in range(40)]
         self.append("discovery", *rows)
         self.append("block_sync", *rows)
         stuck = str(self.directory / "discovery.jsonl")
-        real_truncate = os.truncate
+        real_replace = os.replace
 
-        def refuse_one_table(path, length):
+        def refuse_one_table(path, destination):
             if path == stuck:
                 raise PermissionError("the table is read-only")
-            real_truncate(path, length)
+            real_replace(path, destination)
 
-        with patch.object(blocks.os, "truncate", side_effect=refuse_one_table):
+        with patch.object(blocks.os, "replace", side_effect=refuse_one_table):
             follower.poll()
         self.assertIsInstance(follower.trim_failure, PermissionError)
         self.assertGreater(os.path.getsize(stuck), 2000)
-        # The table that could be emptied was, despite the one that could not.
-        self.assertEqual((self.directory / "block_sync.jsonl").stat().st_size, 0)
+        # The other table was rotated despite the failure.
+        self.assertFalse((self.directory / "block_sync.jsonl").exists())
+        self.assertGreater((self.directory / "block_sync.jsonl.1").stat().st_size, 2000)
 
         follower.poll()
         self.assertIsNone(follower.trim_failure)
-        self.assertEqual(os.path.getsize(stuck), 0)
+        self.assertFalse(os.path.exists(stuck))
+        self.assertGreater(os.path.getsize(stuck + ".1"), 2000)
 
 
 class ApiTests(unittest.TestCase):

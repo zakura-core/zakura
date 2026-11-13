@@ -71,17 +71,19 @@ renames any table in that directory that grows past `--trace-table-cap-mb`
 The node notices within about a second and starts a new `<table>.jsonl`, so no
 row is lost: the older rows are in `<table>.jsonl.1` and the newest in
 `<table>.jsonl`. Reads stay bounded per poll; if the renamed file takes several
-polls to drain, the profiler retains both files and postpones the next rotation.
+polls to drain, the profiler retains it even while the node has not created its
+replacement, and postpones the next rotation.
 Each table normally uses about twice the cap, but can temporarily exceed it
 while the profiler catches up. A node build
 from before the node did this keeps writing to the renamed file; the profiler
-empties that file once it reaches twice the cap, which loses the rows it had
-not read yet. Leave `--trace-dir` off if something else needs the complete
-tables. A cap of 0 disables rotation.
+empties that file once it reaches twice the cap and its observed backlog has
+been read. This can lose rows appended between the read and the emptying. If
+the profiler cannot catch up, the file can grow beyond twice the cap. Leave
+`--trace-dir` off if something else needs the complete tables. A cap of 0 disables rotation.
 Trace reading and rotation run in their own worker every five seconds, including
 when `perf` cannot start or produces no samples. The status endpoint reports the
 configured trace directory, cap, and whether that worker has completed a recent
-poll that left every table under the cap. A table it could not rotate makes it
+poll without a file-rotation error. A table it could not rotate makes it
 not ready and is reported as the profiler's error.
 
 ## Installing

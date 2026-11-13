@@ -407,13 +407,13 @@ class TraceFollower:
         except OSError as error:
             self.trim_failure = error
             return
-        # Once the node has opened a replacement, finish reading the old file before
-        # truncating it or replacing it with another rotation. Without a replacement,
-        # the old-node fallback below still bounds a writer that never reopens.
+        # Finish reading the old file before truncating it or replacing it with
+        # another rotation. A missing replacement can also mean an updated writer
+        # is delayed before reopening, so it does not make unread rows safe to delete.
         protected_paths = {
             path
             for follower in self._followers.values()
-            if follower.draining_moved_file and os.path.exists(follower.path)
+            if follower.draining_moved_file
             for path in (follower.path, follower.moved_path)
         }
         moved_suffix = TABLE_SUFFIX + MOVED_SUFFIX
@@ -426,8 +426,8 @@ class TraceFollower:
                 size = os.path.getsize(path)
                 if name.endswith(moved_suffix):
                     # A node build that does not start a new file keeps growing the
-                    # renamed one. Emptying it in place bounds the disk it uses, at the
-                    # cost of the rows not read yet.
+                    # renamed one. After reading its backlog, emptying it in place
+                    # bounds disk use, but can lose rows appended since the read.
                     if size > 2 * self.table_cap_bytes:
                         os.truncate(path, 0)
                 elif name.endswith(TABLE_SUFFIX) and size > self.table_cap_bytes:

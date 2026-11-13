@@ -117,8 +117,9 @@ pub struct ChainInner {
     //
     /// The contextually valid blocks which form this non-finalized partial chain, in height order.
     ///
-    /// Blocks are immutable once pushed, so chain snapshots share each block record.
-    pub(crate) blocks: BTreeMap<block::Height, Arc<ContextuallyVerifiedBlock>>,
+    /// Blocks are immutable once pushed, so chain snapshots share each block record, and
+    /// share the index itself in chunks: copying a chain does not visit every block.
+    pub(crate) blocks: HeightMap<Arc<ContextuallyVerifiedBlock>>,
 
     /// An index of block heights for each block hash in `blocks`.
     pub(crate) height_by_hash: SharedMap<block::Hash, block::Height>,
@@ -381,7 +382,7 @@ impl Chain {
     #[cfg(any(test, feature = "proptest-impl"))]
     fn without_finalized_entries(&self) -> ChainInner {
         let mut inner = self.inner.clone();
-        if let Some(root) = inner.blocks.keys().next().copied() {
+        if let Some(root) = inner.blocks.first_key_value().map(|(height, _)| *height) {
             for partition in 0..SHARED_MAP_PARTITIONS {
                 inner
                     .tx_loc_by_hash
@@ -597,7 +598,7 @@ impl Chain {
     /// visits every partition every `SHARED_MAP_PARTITIONS / FINALIZED_PARTITIONS_PER_ROOT`
     /// finalized blocks.
     fn sweep_finalized_entries(&mut self) {
-        let Some(root) = self.blocks.keys().next().copied() else {
+        let Some(root) = self.blocks.first_key_value().map(|(height, _)| *height) else {
             // An empty chain is dropped by its caller.
             return;
         };
@@ -614,7 +615,7 @@ impl Chain {
     /// Returns the block at the provided height and all of its descendant blocks.
     pub fn child_blocks(&self, block_height: &block::Height) -> Vec<ContextuallyVerifiedBlock> {
         self.blocks
-            .range(block_height..)
+            .range(*block_height..)
             .map(|(_h, b)| b.as_ref().clone())
             .collect()
     }
@@ -633,9 +634,8 @@ impl Chain {
     /// Returns the height of the chain root.
     pub fn non_finalized_root_height(&self) -> block::Height {
         self.blocks
-            .keys()
-            .next()
-            .cloned()
+            .first_key_value()
+            .map(|(height, _)| *height)
             .expect("only called while blocks is populated")
     }
 
@@ -1619,8 +1619,8 @@ impl Chain {
     /// Returns the block hash of the tip block.
     pub fn non_finalized_tip_hash(&self) -> block::Hash {
         self.blocks
-            .values()
-            .next_back()
+            .last_key_value()
+            .map(|(_, block)| block)
             .expect("only called while blocks is populated")
             .hash
     }
@@ -1636,8 +1636,8 @@ impl Chain {
     /// Returns the block hash of the non-finalized root block.
     pub fn non_finalized_root_hash(&self) -> block::Hash {
         self.blocks
-            .values()
-            .next()
+            .first_key_value()
+            .map(|(_, block)| block)
             .expect("only called while blocks is populated")
             .hash
     }
@@ -1699,13 +1699,15 @@ impl Chain {
     /// Return the non-finalized tip height for this chain,
     /// or `None` if `self.blocks` is empty.
     fn max_block_height(&self) -> Option<block::Height> {
-        self.blocks.keys().next_back().cloned()
+        self.blocks.last_key_value().map(|(height, _)| *height)
     }
 
     /// Return the non-finalized tip block for this chain,
     /// or `None` if `self.blocks` is empty.
     pub fn tip_block(&self) -> Option<&ContextuallyVerifiedBlock> {
-        self.blocks.values().next_back().map(Arc::as_ref)
+        self.blocks
+            .last_key_value()
+            .map(|(_, block)| block.as_ref())
     }
 
     /// Returns true if the non-finalized part of this chain is empty.
@@ -2131,7 +2133,11 @@ impl Chain {
             // earlier in this block are not in `blocks` yet, but are duplicates.
             assert!(
                 prior_location.is_none_or(|prior| {
-                    prior.height < self.blocks.keys().next().copied().unwrap_or(height)
+                    prior.height
+                        < self
+                            .blocks
+                            .first_key_value()
+                            .map_or(height, |(root, _)| *root)
                 }),
                 "transactions must be unique within a single chain"
             );
@@ -2407,7 +2413,11 @@ impl
             let prior_spend = self.spent_utxos.insert(spent_outpoint, spend);
             assert!(
                 prior_spend.is_none_or(|prior| {
-                    prior.height < self.blocks.keys().next().copied().unwrap_or(height)
+                    prior.height
+                        < self
+                            .blocks
+                            .first_key_value()
+                            .map_or(height, |(root, _)| *root)
                 }),
                 "unexpected duplicate spent output: should be checked earlier"
             );

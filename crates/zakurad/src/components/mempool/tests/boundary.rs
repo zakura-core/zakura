@@ -1317,6 +1317,48 @@ async fn change_stream_reports_admissions_and_refusals(mode: Mode) {
     );
 }
 
+/// The core only: a peer's pushes that join an undecided body still count
+/// against its limit of five until that body's verdict. Five joins leave no
+/// room for the peer's sixth push, which is dropped unverified, and the
+/// verdict frees the room again. Today's pool refuses the joins as already
+/// queued, so nothing joins there.
+#[tokio::test(flavor = "multi_thread")]
+async fn joined_pushes_count_against_their_peer_until_the_verdict() {
+    let mut harness = active_pool(Mode::Core).await;
+    let mut bodies = samples(2);
+    let (held, other) = (bodies.remove(0), bodies.remove(0));
+
+    let receiver = harness
+        .queue_one(held.transaction.clone())
+        .await
+        .expect("a new body passes the first stage");
+    let verification = harness
+        .verifier
+        .expect_request_that(|request| matches!(request, tx::Request::Mempool { .. }))
+        .await;
+
+    let push = |tx: &VerifiedUnminedTx, copies: usize| Request::QueueFromPeer {
+        transactions: (0..copies).map(|_| tx.transaction.clone().into()).collect(),
+        source: legacy_peer(1),
+    };
+    harness
+        .ask(push(&held, MAX_INBOUND_CONCURRENCY_PER_PEER))
+        .await;
+    harness.ask(push(&other, 1)).await;
+    harness.verifier.expect_no_requests().await;
+
+    verification.respond(Ok::<_, TransactionError>(passed(&held, Vec::new())));
+    harness
+        .outcome(receiver)
+        .await
+        .expect("the held body is admitted");
+    // The joined pushes get the same verdict, and their tasks free the
+    // room as they finish.
+    time::sleep(Duration::from_millis(200)).await;
+    harness.ask(push(&other, 1)).await;
+    harness.verify(Ok(passed(&other, Vec::new()))).await;
+}
+
 /// The core only: a body whose id is already being verified joins that
 /// verification, and both submissions get its verdict at the second stage.
 /// Today's pool refuses the second one as already queued.

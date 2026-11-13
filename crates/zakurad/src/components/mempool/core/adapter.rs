@@ -324,8 +324,9 @@ async fn queue(
         Ok(reservation) => reservation,
         Err(refused) => return first_stage_refusal(refused),
     };
-    // A joined submission takes no slot, so it counts against nobody.
-    let slot = slot.filter(|_| !reservation.joined());
+    // A joined submission takes no core slot, but it still counts against
+    // its peer until its verdict, so one peer cannot hold more than its
+    // share of waiters.
     let (answer, receiver) = oneshot::channel();
     tokio::spawn(async move {
         let result = bring_in(&shared, reservation, item, from).await;
@@ -424,13 +425,11 @@ async fn bring_in(
     from: Option<QueueSource>,
 ) -> Result<(), BoxError> {
     let tx_id = item.id();
-    let (tx, supplier) = match item {
+    // The body, and the legacy peer whose bytes it is, if any.
+    let (tx, sender) = match item {
         Gossip::Tx(tx) => {
-            let supplier = match &from {
-                Some(QueueSource::LegacySocket(addr)) => {
-                    shared.supplier(PeerSocketAddr::from(*addr))
-                }
-                // v2 peers through the adapter are not charged, as today.
+            let sender = match &from {
+                Some(QueueSource::LegacySocket(addr)) => Some(PeerSocketAddr::from(*addr)),
                 Some(QueueSource::Zakura(_)) | None => None,
             };
             metrics::counter!(
@@ -438,7 +437,7 @@ async fn bring_in(
                 "version" => format!("{}", tx.transaction().version()),
             )
             .increment(1);
-            (tx, supplier)
+            (tx, sender)
         }
         Gossip::Id(_) => {
             let source = from.as_ref().and_then(peer_source_from_queue_source);
@@ -466,29 +465,7 @@ async fn bring_in(
                 }
             };
             match fetched {
-                Ok((tx, served_by)) => {
-                    // Today's downloader does not verify a body that a
-                    // cooling peer served. The failure reaches the change
-                    // stream, and the slot is freed.
-                    if served_by.is_some_and(|addr| {
-                        shared.cooldowns.is_cooling_down(addr.ip(), Instant::now())
-                    }) {
-                        metrics::counter!("mempool.peer_cooldown.ignored.transactions.total")
-                            .increment(1);
-                        shared.handle.fetch_failed(reservation).await;
-                        return Err(format!(
-                            "failed to validate tx: {tx_id}, error: {}",
-                            TransactionDownloadVerifyError::PeerCoolingDown
-                        )
-                        .into());
-                    }
-                    // A v2 peer's body is not charged, as today.
-                    let supplier = match (&from, served_by) {
-                        (Some(QueueSource::Zakura(_)), _) | (_, None) => None,
-                        (_, Some(addr)) => shared.supplier(addr),
-                    };
-                    (tx, supplier)
-                }
+                Ok((tx, served_by)) => (tx, served_by),
                 Err(error) => {
                     metrics::counter!(
                         "mempool.failed.verify.tasks.total",
@@ -500,6 +477,25 @@ async fn bring_in(
                 }
             }
         }
+    };
+    // Today's downloader does not verify a body from a cooling peer, pushed
+    // or served, and checks just before verification. So does this, after
+    // any wait for the reservation or the fetch, so a cooldown that started
+    // meanwhile still applies. The failure reaches the change stream, and
+    // the slot is freed.
+    if sender.is_some_and(|addr| shared.cooldowns.is_cooling_down(addr.ip(), Instant::now())) {
+        metrics::counter!("mempool.peer_cooldown.ignored.transactions.total").increment(1);
+        shared.handle.fetch_failed(reservation).await;
+        return Err(format!(
+            "failed to validate tx: {tx_id}, error: {}",
+            TransactionDownloadVerifyError::PeerCoolingDown
+        )
+        .into());
+    }
+    // A v2 peer's body is not charged, as today, and nor is an exempt peer's.
+    let supplier = match &from {
+        Some(QueueSource::Zakura(_)) => None,
+        _ => sender.and_then(|addr| shared.supplier(addr)),
     };
     let verdict = shared.handle.submit(reservation, tx).await;
     if let (Verdict::Rejected(rejection), Some(peer)) = (&verdict, supplier) {
@@ -792,5 +788,70 @@ mod tests {
             RATE_LIMIT_DELAY,
             "today's whole-task deadline"
         );
+    }
+
+    /// A peer that starts cooling down while its pushed body waits for its
+    /// reservation does not get that body verified: the body never reaches
+    /// the core, and its slot is freed through `fetch_failed`, as today's
+    /// downloader checks just before verification.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_push_from_a_peer_that_cools_down_while_it_waits_is_not_verified() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
+
+        let (handle, mut inbox) = pool_port();
+        let outbound = Timeout::new(
+            BoxCloneSyncService::new(NeverReady),
+            TRANSACTION_DOWNLOAD_TIMEOUT,
+        );
+        let core = CoreMempool::new(
+            handle,
+            outbound,
+            BoxCloneSyncService::new(NeverReady),
+            chain_holding(None),
+            false,
+            mpsc::channel(1).0,
+            Arc::new(Exempt::default()),
+        );
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 1], 8233));
+        let queued = tokio::spawn(queue(
+            core.shared.clone(),
+            Gossip::Tx(body.clone()),
+            Some(QueueSource::LegacySocket(peer)),
+        ));
+
+        // The reservation is asked for. Before it is granted, another of the
+        // peer's transactions starts its cooldown.
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the push reserves first");
+        };
+        core.shared
+            .cooldowns
+            .record_invalid_transaction(peer.ip(), Instant::now());
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            tx_id,
+            false,
+            true,
+            Default::default(),
+        )));
+
+        let receiver = queued
+            .await
+            .expect("the task does not panic")
+            .expect("the push passes the first stage");
+        let Some(PoolCommand::FetchFailed(reservation)) = inbox.next().await else {
+            panic!("the body is not submitted");
+        };
+        assert_eq!(reservation.accept(), ReservationId(1));
+        let error = receiver
+            .await
+            .expect("the push is answered")
+            .expect_err("a cooling peer's body is refused");
+        assert!(error.to_string().contains("cooldown"), "{error}");
     }
 }

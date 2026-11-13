@@ -541,7 +541,7 @@ impl<E: Clone> Storage<E> {
     /// Currently, we implement: per-transaction sigops limit, standard input script checks,
     /// input scriptSig size/push-only checks, standard output script checks (including OP_RETURN
     /// limits), and dust checks.
-    fn standardness(&self, tx: &VerifiedUnminedTx) -> Result<(), NonStandardTransactionError> {
+    pub fn standardness(&self, tx: &VerifiedUnminedTx) -> Result<(), NonStandardTransactionError> {
         use zcash_script::script::{self, Evaluable as _};
 
         let transaction = tx.transaction.transaction().as_ref();

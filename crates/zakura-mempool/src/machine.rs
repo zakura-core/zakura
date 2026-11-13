@@ -1451,6 +1451,17 @@ impl<E: VerifyError> MempoolState<E> {
                     self.refuse(key, MempoolError::InMempool);
                     return;
                 }
+                // Today's insertion checks standardness before conflicts, so a
+                // body that is both non-standard and conflicting is refused as
+                // non-standard, for these exact bytes. Insertion checks it
+                // again, one more pass over the scripts, which is small beside
+                // the verification this outcome came from.
+                if let Err(error) = self.storage.standardness(&tx) {
+                    self.storage
+                        .reject_exact(tx.transaction.id(), error.clone().into());
+                    self.refuse(key, MempoolError::NonStandardTransaction(error));
+                    return;
+                }
                 if self.storage.has_spend_conflicts(&tx.transaction) {
                     // The pool took a conflicting transaction while this one
                     // was verified.

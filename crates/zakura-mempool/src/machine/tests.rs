@@ -1981,3 +1981,84 @@ fn an_admission_that_evicts_logs_both_changes() {
         .collect();
     assert_eq!(snapshot, visible, "the snapshot holds the pool");
 }
+
+/// Sol's case from M1 review round 8: a verified body that both conflicts
+/// with a pooled one and has a dust output is refused as non-standard, for
+/// its exact bytes, as today's insertion checks standardness first.
+#[test]
+fn a_dust_body_that_also_conflicts_is_refused_as_non_standard() {
+    use crate::{storage::NonStandardTransactionError, MempoolError};
+
+    let mut runner = TestRunner::deterministic();
+    let coin = OutPoint {
+        hash: transaction::Hash([0xd5; 32]),
+        index: 0,
+    };
+    let pooled = build(&mut runner, &[coin], 1, None);
+    let mut dust = build(&mut runner, &[coin], 1, None);
+    let mut transaction = Transaction::clone(dust.real.transaction.transaction());
+    if let Transaction::V6 { outputs, .. } = &mut transaction {
+        outputs[0].value = Amount::try_from(1).expect("a valid test amount");
+    }
+    dust.real = VerifiedUnminedTx::new(
+        Arc::new(transaction).into(),
+        Amount::try_from(1_000_000).expect("a valid test fee"),
+        0,
+        0,
+        Arc::new(Vec::new()),
+    )
+    .expect("the test fee passes the ZIP-317 checks");
+    dust.model.id = dust.real.transaction.id();
+
+    let base = Instant::now();
+    let mut machine = Machine::new(
+        &Config {
+            tx_cost_limit: u64::MAX / 2,
+            ..Config::default()
+        },
+        tip(START, 0),
+        Generation(0),
+        base,
+    );
+    let read = GenerationRead::Stable(Generation(0));
+    let decide = |machine: &mut Machine, tx: &Tx| -> Verdict {
+        let grant = machine
+            .reserve(tx.id(), Intent::Deliver, base)
+            .expect("room for a reservation");
+        assert!(machine.effects().is_empty());
+        let (waiter, step) = machine.submit(grant.id, tx.real.transaction.clone(), base);
+        let Some(Effect::Start { job, .. }) = step.effects.first().cloned() else {
+            panic!("a body starts a job: {step:?}");
+        };
+        let step = machine.outcome(
+            job,
+            Outcome::Pass {
+                tx: tx.real.clone(),
+                pool_inputs: Vec::new(),
+            },
+            read,
+            read,
+            base,
+            chrono::Utc::now(),
+        );
+        machine.assert_invariants();
+        step.verdict(waiter).cloned().expect("the pass decides it")
+    };
+    assert!(matches!(decide(&mut machine, &pooled), Verdict::Admitted));
+    let Verdict::Rejected(rejection) = decide(&mut machine, &dust) else {
+        panic!("a dust body is refused");
+    };
+    assert_eq!(rejection.scope, RejectionScope::ExactTip);
+    assert!(
+        matches!(
+            rejection
+                .detail
+                .downcast_ref::<MempoolError<TestVerifyError>>(),
+            Some(MempoolError::NonStandardTransaction(
+                NonStandardTransactionError::IsDust
+            ))
+        ),
+        "{:?}",
+        rejection.detail
+    );
+}

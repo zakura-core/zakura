@@ -531,6 +531,34 @@ class LogFollowingTests(unittest.TestCase):
         self.path.write_bytes(b"new\n")
         self.assertEqual(follower.read_new_lines(), [b"new"])
 
+    def test_a_renamed_file_is_read_to_its_end_before_the_new_one(self):
+        moved = self.path.with_name("node.log.1")
+        follower = blocks.FileFollower(self.path, moved_path=moved)
+        self.path.write_bytes(b"one\n")
+        self.assertEqual(follower.read_new_lines(), [b"one"])
+        os.replace(self.path, moved)
+        # The writer has not started a new file yet and still appends to the renamed one.
+        with open(moved, "ab") as handle:
+            handle.write(b"two\n")
+        self.assertEqual(follower.read_new_lines(), [b"two"])
+        with open(moved, "ab") as handle:
+            handle.write(b"three\n")
+        self.path.write_bytes(b"four\n")
+        self.assertEqual(follower.read_new_lines(), [b"three", b"four"])
+        self.assertEqual(follower.read_new_lines(), [])
+
+    def test_a_renamed_file_that_is_not_the_one_being_followed_is_skipped(self):
+        moved = self.path.with_name("node.log.1")
+        follower = blocks.FileFollower(self.path, moved_path=moved)
+        self.path.write_bytes(b"one\n")
+        self.assertEqual(follower.read_new_lines(), [b"one"])
+        # The followed file went somewhere else, and an unrelated file has the renamed name.
+        os.replace(self.path, self.path.with_name("node.log.elsewhere"))
+        moved.write_bytes(b"unrelated\n")
+        self.assertEqual(follower.read_new_lines(), [])
+        self.path.write_bytes(b"two\n")
+        self.assertEqual(follower.read_new_lines(), [b"two"])
+
 
 NODE_RUN = "100-1794528928000000000"
 BLOCK_HASH = "ab" * 32
@@ -666,10 +694,15 @@ class TraceFollowingTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
 
-    def append(self, table, *rows):
-        with open(self.directory / f"{table}.jsonl", "a") as handle:
+    def append(self, table, *rows, renamed=False):
+        """Append rows to a table, or to the file it was renamed to when it passed the cap."""
+        name = f"{table}.jsonl.1" if renamed else f"{table}.jsonl"
+        with open(self.directory / name, "a") as handle:
             for row in rows:
                 handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+    def size(self, name):
+        return (self.directory / name).stat().st_size
 
     def test_blocks_are_joined_across_tables_and_other_rows_are_skipped(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
@@ -687,17 +720,56 @@ class TraceFollowingTests(unittest.TestCase):
         (record,) = follower.poll()
         self.assertEqual((record["height"], record["path"], record["ms"]["verify"]), (10, "legacy", 5.5))
 
-    def test_a_table_over_the_cap_is_emptied_and_followed_from_its_new_start(self):
+    def twelve_tips(self):
+        """Enough `chain_tip` rows, for heights 0 to 11, to pass a 2000-byte cap."""
+        return [tip_row(1_000_000 + index, height=index, block_hash=f"{index:064x}") for index in range(12)]
+
+    def heights(self, records):
+        return [record["height"] for record in records]
+
+    def test_a_table_over_the_cap_is_renamed_and_no_row_is_lost(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
-        self.append("discovery", *[trace_row("peer_seen", index, peer="p" * 40) for index in range(40)])
-        self.append("chain_tip", *[tip_row(1_000_000 + index, height=index, block_hash=f"{index:064x}") for index in range(12)])
+        # A table the profiler does not read is kept under the cap too.
+        self.append("discovery", *[trace_row("peer_seen", index, peer="p" * 40) for index in range(20)])
+        self.append("chain_tip", *self.twelve_tips())
+        written = {name: self.size(name) for name in ("discovery.jsonl", "chain_tip.jsonl")}
         follower.poll()
-        self.assertEqual((self.directory / "discovery.jsonl").stat().st_size, 0)
-        self.assertEqual((self.directory / "chain_tip.jsonl").stat().st_size, 0)
-        # The node keeps appending to the emptied file.
-        self.append("chain_tip", tip_row(1_100_000, height=50))
+        for name, size in written.items():
+            self.assertFalse((self.directory / name).exists())
+            self.assertEqual(self.size(name + ".1"), size)
+        # The node appends to the renamed file until its next sync, then starts a new one.
+        self.append("chain_tip", tip_row(1_100_000, height=50), renamed=True)
         self.append("chain_tip", tip_row(9_000_000, height=51, block_hash="cd" * 32))
-        self.assertEqual([record["height"] for record in follower.poll()], list(range(12)) + [50])
+        self.assertEqual(self.heights(follower.poll()), list(range(12)) + [50])
+
+    def test_a_renamed_table_is_followed_until_the_node_starts_a_new_one(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
+        self.append("chain_tip", *self.twelve_tips())
+        follower.poll()
+        self.append(
+            "chain_tip", tip_row(1_100_000, height=50), tip_row(9_000_000, height=51, block_hash="cd" * 32),
+            renamed=True,
+        )  # fmt: skip
+        self.assertEqual(self.heights(follower.poll()), list(range(12)) + [50])
+        self.assertFalse((self.directory / "chain_tip.jsonl").exists())
+        self.append("chain_tip", tip_row(20_000_000, height=52, block_hash="ef" * 32))
+        self.assertEqual(self.heights(follower.poll()), [51])
+
+    def test_a_renamed_table_that_keeps_growing_is_emptied_at_twice_the_cap(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
+        self.append("chain_tip", *self.twelve_tips())
+        follower.poll()
+        self.assertLess(self.size("chain_tip.jsonl.1"), 4000)
+        # A node build that never starts a new file keeps appending to the renamed one.
+        self.append("chain_tip", *self.twelve_tips(), renamed=True)
+        self.assertGreater(self.size("chain_tip.jsonl.1"), 4000)
+        follower.poll()
+        self.assertEqual(self.size("chain_tip.jsonl.1"), 0)
+        self.append(
+            "chain_tip", tip_row(30_000_000, height=60), tip_row(40_000_000, height=61, block_hash="cd" * 32),
+            renamed=True,
+        )  # fmt: skip
+        self.assertIn(60, self.heights(follower.poll()))
 
     def test_a_cap_of_zero_never_empties_a_table(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=0)

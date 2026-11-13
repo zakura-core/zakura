@@ -111,6 +111,14 @@ its inode can mix old and new bytes without an error. **Do not run
 copytruncate log rotation on collected files.** The continuous-sync
 controller's logrotate template uses copytruncate today.
 
+To bound a collected file, rename it instead. The writer checks about once a
+second that each file is still at its path and starts a new one if it was
+renamed or deleted, so the renamed file keeps every row written so far and the
+new file has a new `ETag`. A collector then restarts the table from byte 0;
+rows written between its last request and the rename are only in the renamed
+file, which the endpoint does not serve. The continuous profiler
+(`deploy/profiler/`) rotates tables this way.
+
 The trace writer buffers rows and can drop them under load, so an export is
 not complete evidence. There is no ordering across tables.
 

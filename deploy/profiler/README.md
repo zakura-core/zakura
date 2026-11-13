@@ -66,13 +66,19 @@ node's `monitor.profiler_url` setting and serves it publicly, rate limited, at
 `/profile/<node>`.
 
 The node never rotates its trace tables. Given `--trace-dir`, the profiler
-empties any table in that directory that grows past `--trace-table-cap-mb`
-(200 MB by default). With a cap of 0 it never empties one: use that, or leave
-`--trace-dir` off, where something else needs the complete tables.
-Trace reading and capping run in their own worker every five seconds, including
+renames any table in that directory that grows past `--trace-table-cap-mb`
+(200 MB by default) to `<table>.jsonl.1`, replacing the one renamed before it.
+The node notices within about a second and starts a new `<table>.jsonl`, so no
+row is lost: the older rows are in `<table>.jsonl.1` and the newest in
+`<table>.jsonl`, and each table uses at most about twice the cap. A node build
+from before the node did this keeps writing to the renamed file; the profiler
+empties that file once it reaches twice the cap, which loses the rows it had
+not read yet. Leave `--trace-dir` off if something else needs the complete
+tables. A cap of 0 disables rotation.
+Trace reading and rotation run in their own worker every five seconds, including
 when `perf` cannot start or produces no samples. The status endpoint reports the
 configured trace directory, cap, and whether that worker has completed a recent
-poll that left every table under the cap. A table it could not empty makes it
+poll that left every table under the cap. A table it could not rotate makes it
 not ready and is reported as the profiler's error.
 
 ## Installing

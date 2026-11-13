@@ -29,10 +29,16 @@ Block = collections.namedtuple("Block", "time height hash")
 
 
 class FileFollower:
-    """Reads the complete lines appended to a file since the previous read."""
+    """Reads the complete lines appended to a file since the previous read.
 
-    def __init__(self, path, lookback_bytes=INITIAL_LOOKBACK_BYTES):
+    Given `moved_path`, it also follows the file through a rotation by rename: when
+    the file it was reading has been renamed to `moved_path`, it reads the rest of
+    that file before it starts on the new file at `path`.
+    """
+
+    def __init__(self, path, lookback_bytes=INITIAL_LOOKBACK_BYTES, moved_path=None):
         self.path = path
+        self.moved_path = moved_path
         self._lookback_bytes = lookback_bytes
         self._offset = None
         self._inode = None
@@ -42,29 +48,59 @@ class FileFollower:
         """The lines completed since the last call, without their newlines.
 
         A file that was replaced or truncated is read again from its start. A missing
-        file yields nothing and is retried on the next call.
+        file yields nothing and is retried on the next call, unless the file being
+        followed is now at `moved_path`, which is then followed there.
         """
         try:
             with open(self.path, "rb") as handle:
-                stat = os.fstat(handle.fileno())
-                if self._offset is None:
-                    self._offset = max(0, stat.st_size - self._lookback_bytes)
-                    # Start mid-file on a line boundary: drop the first, partial line.
-                    skip_first = self._offset > 0
-                elif stat.st_ino != self._inode or stat.st_size < self._offset:
-                    self._offset, self._partial, skip_first = 0, b"", False
-                else:
-                    skip_first = False
-                self._inode = stat.st_ino
-                handle.seek(self._offset)
-                data = handle.read(min(stat.st_size - self._offset, MAX_READ_BYTES))
+                return self._read_current(handle)
+        except FileNotFoundError:
+            return self._read_moved()
         except OSError:
             return []
+
+    def _read_current(self, handle):
+        """The new lines of the file open at `path`, after any left in the file it replaced."""
+        stat = os.fstat(handle.fileno())
+        earlier, skip_first = [], False
+        if self._offset is None:
+            self._offset = max(0, stat.st_size - self._lookback_bytes)
+            # Start mid-file on a line boundary: drop the first, partial line.
+            skip_first = self._offset > 0
+        elif stat.st_ino != self._inode:
+            # A new file has the name. Its writer stopped writing the old file before
+            # creating this one, so what the old file holds now is all it will hold.
+            earlier = self._read_moved()
+            self._offset, self._partial = 0, b""
+        elif stat.st_size < self._offset:
+            self._offset, self._partial = 0, b""
+        self._inode = stat.st_ino
+        lines = self._read_appended(handle, stat.st_size)
+        if skip_first and lines:
+            lines.pop(0)
+        return earlier + lines
+
+    def _read_moved(self):
+        """The new lines of the followed file, if it is the file now at `moved_path`."""
+        if self.moved_path is None or self._inode is None:
+            return []
+        try:
+            with open(self.moved_path, "rb") as handle:
+                stat = os.fstat(handle.fileno())
+                if stat.st_ino != self._inode:
+                    return []
+                if stat.st_size < self._offset:
+                    self._offset, self._partial = 0, b""
+                return self._read_appended(handle, stat.st_size)
+        except OSError:
+            return []
+
+    def _read_appended(self, handle, size):
+        handle.seek(self._offset)
+        data = handle.read(min(size - self._offset, MAX_READ_BYTES))
         self._offset += len(data)
         lines = (self._partial + data).split(b"\n")
         self._partial = lines.pop()
-        if skip_first and lines:
-            lines.pop(0)
         return lines
 
 
@@ -95,6 +131,9 @@ def announcements(lines):
 # time between two rows of the same process is exact. The rows below are the ones that
 # mark a block's way through the node; each names its block by hash, by height, or both.
 
+# A trace table is `<table>.jsonl`; the one rotated out before it is `<table>.jsonl.1`.
+TABLE_SUFFIX = ".jsonl"
+MOVED_SUFFIX = ".1"
 TRACE_TABLES = {
     "header_sync": ("header_request_sent", "header_response_received", "header_target_admitted"),
     "block_sync": ("block_get_blocks_sent", "block_body_received", "block_body_submitted", "block_status_sent"),
@@ -295,24 +334,23 @@ class BlockStages:
 class TraceFollower:
     """Follows the node's trace tables and returns finished per-block records.
 
-    The node never rotates its trace files, so this also empties any table that has
-    grown past `table_cap_bytes`. That is safe while the node runs: it opens the files
-    for append, so its next row lands at the start of the emptied file. A cap of zero
-    leaves every table alone, for a directory whose files something else needs whole.
-
-    `trim_failure` is the error that kept the last `poll` from emptying a table past
-    the cap, or `None` when every table is under it. While it is set the tables are
-    not bounded, whatever was read.
+    The node never rotates its trace files, so this also renames any table that has
+    grown past `table_cap_bytes` to `<table>.jsonl.1`, replacing the one before it.
+    Nothing is lost while the node runs: it keeps appending to the renamed file until
+    its next sync, about a second later, then starts a new file under the old name,
+    and the rows left in the renamed file are read before the new file is.
     """
 
     def __init__(self, trace_dir, table_cap_bytes):
+        self.trim_failure = None
         self.trace_dir = trace_dir
         self.table_cap_bytes = table_cap_bytes
-        self.trim_failure = None
-        self._followers = {
-            table: FileFollower(os.path.join(trace_dir, table + ".jsonl"), lookback_bytes=2 * 1024 * 1024)
-            for table in TRACE_TABLES
-        }
+        self._followers = {}
+        for table in TRACE_TABLES:
+            path = os.path.join(trace_dir, table + TABLE_SUFFIX)
+            self._followers[table] = FileFollower(
+                path, lookback_bytes=2 * 1024 * 1024, moved_path=path + MOVED_SUFFIX
+            )
         self._markers = {
             table: tuple(('"event":"%s"' % event).encode() for event in events)
             for table, events in TRACE_TABLES.items()
@@ -333,11 +371,11 @@ class TraceFollower:
                     continue
                 if isinstance(row, dict):
                     self._stages.feed(row)
-        self._cap_tables()
+        self._rotate_full_tables()
         return self._stages.finished()
 
-    def _cap_tables(self):
-        """Empty every table past the cap, and record in `trim_failure` the first that could not be."""
+    def _rotate_full_tables(self):
+        """Rename full tables and record the first failure in `trim_failure`."""
         self.trim_failure = None
         if not self.table_cap_bytes:
             return
@@ -349,15 +387,21 @@ class TraceFollower:
         except OSError as error:
             self.trim_failure = error
             return
-        for name in names:
-            if not name.endswith(".jsonl"):
-                continue
+        moved_suffix = TABLE_SUFFIX + MOVED_SUFFIX
+        # Renamed files first, so one renamed in this pass is not also checked as one.
+        for name in sorted(names, key=lambda name: not name.endswith(moved_suffix)):
             path = os.path.join(self.trace_dir, name)
             try:
-                if os.path.getsize(path) > self.table_cap_bytes:
-                    os.truncate(path, 0)
+                size = os.path.getsize(path)
+                if name.endswith(moved_suffix):
+                    # A node build that does not start a new file keeps growing the
+                    # renamed one. Emptying it in place bounds the disk it uses, at the
+                    # cost of the rows not read yet.
+                    if size > 2 * self.table_cap_bytes:
+                        os.truncate(path, 0)
+                elif name.endswith(TABLE_SUFFIX) and size > self.table_cap_bytes:
+                    os.replace(path, path + MOVED_SUFFIX)
             except FileNotFoundError:
-                # Removed since the directory was listed.
                 continue
             except OSError as error:
                 # Keep going: one table that cannot be emptied must not stop the others.

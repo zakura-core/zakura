@@ -7,7 +7,10 @@
 //! contract in [`REQUIRED_CONTRACTS`], unless a [`NARROWING`] entry whose
 //! own test passed releases it.
 
-use super::{sim_test, Approval, CaseRef, Expected, ExpectedResult, Key, ResultKind, TestRef};
+use super::{
+    refs::{PlantedRef, Ref},
+    sim_test, Approval, CaseRef, Expected, ExpectedResult, Key, ResultKind, TestRef,
+};
 
 /// A contract's ID, as the plan's table numbers them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -960,18 +963,19 @@ const C2_CATCHES: &[CaseRef] = &[CaseRef {
 }];
 
 /// `commit-only-authorized/later-ancestor`: its patched `Draft` run, through
-/// the real reactor tap, gives two `path` findings at one boundary, on the
-/// one page it stages under the wrong ancestor, each in the recorded full
-/// report.
+/// the real reactor tap, breaks `commit-only-authorized` on the one page it
+/// stages under the wrong ancestor. Its catch judges that break only, not
+/// how many findings the run kept or what each names (narrowed by Adam's
+/// 2026-11-13 rule; see [`C21_CATCHES`] and [`C22_CATCHES`]).
 const LATER_ANCESTOR: CaseRef = CaseRef {
     property: "header-sync/commit-only-authorized",
     name: "later-ancestor",
 };
 
-/// C21's proving catches: [`LATER_ANCESTOR`], the real-tap two-finding
-/// history the claim-reading tests can't give, since `ClaimRun` and the
-/// scripted claim cases insert their claim records themselves (Adam's
-/// ruling on question 8), and `two-reserved-flags-skipped`, the generated
+/// C21's proving catches: [`LATER_ANCESTOR`], the authority check firing
+/// through the real tap (its two findings at one boundary are shown only on
+/// the claim-reading tests' inserted records; their real-path count is a
+/// follow-up), and `two-reserved-flags-skipped`, the generated
 /// receiver checks' two findings at one boundary through the real reader,
 /// which C21_PROVING's
 /// `two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary`
@@ -984,12 +988,12 @@ const C21_CATCHES: &[CaseRef] = &[
     },
 ];
 
-/// C22's proving catches (Adam's ruling on question 8): [`LATER_ANCESTOR`]'s
-/// two findings at one boundary, and `overgrant`, whose patched `Draft`
-/// run's first finding is its initial `Open`'s credit break, naming the
-/// update and no page. Both come through the real reactor tap, where the
-/// sidecar test's `ClaimRun` inserts its claim records itself and the real
-/// header run finds no authority break.
+/// C22's proving catches (Adam's ruling on question 8): [`LATER_ANCESTOR`]
+/// and `overgrant`, each breaking `commit-only-authorized` through the real
+/// reactor tap. Their catches judge the break only. What each finding names
+/// is shown by [`C22_PROVING`] on scripted and inserted claim records, and
+/// judging the attribution on these real-tap runs is a follow-up (Adam's
+/// 2026-11-13 rule).
 const C22_CATCHES: &[CaseRef] = &[
     LATER_ANCESTOR,
     CaseRef {
@@ -1552,7 +1556,10 @@ pub fn contract_table() -> Vec<Contract> {
                  Their unit-level proof stays: `check_honest_never_punished` and \
                  `downstream::check_with` keep every finding at a step, as \
                  every_punishment_of_an_honest_peer_at_a_step_is_reported and \
-                 every_sender_violation_at_a_step_is_reported show.",
+                 every_sender_violation_at_a_step_is_reported show. Narrowed again by \
+                 Adam's 2026-11-13 rule: later-ancestor's catch shows the check firing \
+                 through the real tap, and its two findings at one boundary are shown \
+                 only on inserted claim records; their real-path count is a follow-up.",
                 C21_PROVING,
                 "hf-8, with its planted catches",
             )
@@ -1563,7 +1570,10 @@ pub fn contract_table() -> Vec<Contract> {
                 C22,
                 "Adam's harness",
                 "Each commit-only-authorized finding names its rule kind and its actual \
-                 subject.",
+                 subject, as the checker's tests and the recorded sidecars show on scripted \
+                 and inserted claim records. later-ancestor's and overgrant's catches show \
+                 the check firing through the real tap; judging their findings' attribution \
+                 on those runs is a follow-up (Adam's 2026-11-13 rule).",
                 C22_PROVING,
                 "hf-9, and E4 for its proving test",
             )
@@ -1758,14 +1768,7 @@ pub fn contract_test_results(table: &[Contract], rows: &[ExpectedResult]) -> Vec
     });
     let catches = satisfied.flat_map(|contract| {
         contract.proving_catches.iter().filter_map(|&case| {
-            let caught = rows.iter().find_map(|result| match result.expected {
-                Expected::Caught { case: c, .. } | Expected::HarnessCaught { case: c, .. }
-                    if c == case =>
-                {
-                    Some(result.expected.clone())
-                }
-                _ => None,
-            })?;
+            let caught = caught_result(rows, &case.planted())?;
             Some(ExpectedResult {
                 keys: vec![contract_catch_key(contract.id, case)],
                 gates: Vec::new(),
@@ -1774,6 +1777,19 @@ pub fn contract_test_results(table: &[Contract], rows: &[ExpectedResult]) -> Vec
         })
     });
     tests.chain(catches).collect()
+}
+
+/// The `Caught` or `HarnessCaught` the first result of `rows` naming
+/// `case` expects, joined on the case's whole [`PlantedRef`], so a case
+/// under another property with the same name never stands in for it.
+fn caught_result(rows: &[ExpectedResult], case: &PlantedRef) -> Option<Expected> {
+    let caught = PlantedRef::joined(case, rows, |result| match result.expected {
+        Expected::Caught { case, .. } | Expected::HarnessCaught { case, .. } => {
+            Some(case.planted())
+        }
+        _ => None,
+    });
+    caught.first().map(|result| result.expected.clone())
 }
 
 /// The [`Key::ContractCatch`] for `contract`'s proving catch `case`.
@@ -1822,4 +1838,60 @@ pub fn narrowing_test_results(entries: &[Narrowing]) -> Vec<ExpectedResult> {
             },
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::header_acceptance::{
+        refs::one_key_off::assert_one_key_off, ExpectedNa, Found,
+    };
+
+    /// A contract's proving catch takes the result of its own case only
+    /// on the case's whole [`PlantedRef`] (Rule 25's template): among the
+    /// catches of `later-ancestor`, `overgrant` under the same property and
+    /// a `later-ancestor` under another, the key's case finds its own
+    /// result, and the case with its property or its name moved finds
+    /// none.
+    #[test]
+    fn a_contract_catch_joins_its_whole_case() {
+        const NONE: &[ExpectedNa] = &[];
+        let caught = |case: CaseRef, harness: &'static str| ExpectedResult {
+            keys: Vec::new(),
+            gates: Vec::new(),
+            expected: Expected::Caught {
+                case,
+                harness,
+                set: &[],
+                found: Found::AtStep,
+                companions: &[],
+                not_applicable: NONE,
+                patched_not_applicable: None,
+            },
+        };
+        let rows = [
+            caught(
+                CaseRef {
+                    property: "header-sync/another",
+                    name: LATER_ANCESTOR.name,
+                },
+                "same name",
+            ),
+            caught(
+                CaseRef {
+                    property: LATER_ANCESTOR.property,
+                    name: "overgrant",
+                },
+                "same property",
+            ),
+            caught(LATER_ANCESTOR, "own"),
+        ];
+        let keys = assert_one_key_off::<PlantedRef>(&LATER_ANCESTOR.planted(), |case| {
+            matches!(
+                caught_result(&rows, case),
+                Some(Expected::Caught { harness: "own", .. })
+            )
+        });
+        assert_eq!(keys, 2);
+    }
 }

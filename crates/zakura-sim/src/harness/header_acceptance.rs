@@ -59,7 +59,7 @@ pub use rows::{
 };
 
 use crate::property::{Source, Status};
-use refs::{PlantedRef, Ref};
+use refs::{HistoryRunRef, PlantedRef, PropertyRef, Ref, TestIdRef};
 
 /// One of sim-6.2's six gates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -737,6 +737,121 @@ fn proving_catch(property: &str, name: &str, case: &CaseRef) -> bool {
     PlantedRef::joins(&want, case, |case| Some(case.planted()))
 }
 
+/// Whether `case` is the one a [`Key::Case`] names by `property` and
+/// `name`, joined on its whole [`PlantedRef`].
+fn case_key_case(property: &str, name: &str, case: &CaseRef) -> bool {
+    let want = PlantedRef {
+        property: property.to_owned(),
+        name: name.to_owned(),
+    };
+    PlantedRef::joins(&want, case, |case| Some(case.planted()))
+}
+
+/// Whether `case` is under the property a [`Key::Catch`] names, joined on
+/// its whole [`PropertyRef`]: a case's property directory is its
+/// property's ID.
+fn catch_property(property: &str, case: &CaseRef) -> bool {
+    let want = PropertyRef {
+        property: property.to_owned(),
+    };
+    PropertyRef::joins(&want, case, |case| {
+        Some(PropertyRef {
+            property: case.property.to_owned(),
+        })
+    })
+}
+
+/// Whether `class` is a duplicate of `case`, the planted case it names,
+/// joined on the case's whole [`PlantedRef`].
+fn duplicate_of(class: &NativeClass, case: &CaseRef) -> bool {
+    let NativeClass::Duplicate {
+        property,
+        case: name,
+    } = class
+    else {
+        return false;
+    };
+    let want = PlantedRef {
+        property: (*property).to_owned(),
+        name: (*name).to_owned(),
+    };
+    PlantedRef::joins(&want, case, |case| Some(case.planted()))
+}
+
+/// Whether `history` is the one a [`Key::History`]'s `run` names, joined on
+/// its whole [`HistoryRunRef`].
+fn history_key_history(run: &RunId, history: &HistoryRef) -> bool {
+    HistoryRunRef::of_run(run).is_some_and(|want| {
+        HistoryRunRef::joins(&want, history, |history| Some(HistoryRunRef::of(*history)))
+    })
+}
+
+/// Whether `history` is the one a [`Key::NaList`]'s `run` names, joined on
+/// its whole [`HistoryRunRef`].
+fn list_key_history(run: &RunId, history: &HistoryRef) -> bool {
+    HistoryRunRef::of_run(run).is_some_and(|want| {
+        HistoryRunRef::joins(&want, history, |history| Some(HistoryRunRef::of(*history)))
+    })
+}
+
+/// The test a key names by `package`, `file` and `test`, as joins name it.
+fn key_test(package: &str, file: &str, test: &str) -> TestIdRef {
+    TestIdRef {
+        package: package.to_owned(),
+        file: file.to_owned(),
+        test: test.to_owned(),
+    }
+}
+
+/// Whether `t` is the test a [`Key::Witness`] names, joined on its whole
+/// [`TestIdRef`].
+fn witness_key_test(package: &str, file: &str, test: &str, t: &TestRef) -> bool {
+    TestIdRef::joins(&key_test(package, file, test), t, |t| {
+        Some(TestIdRef::of(*t))
+    })
+}
+
+/// Whether `t` is the test a [`Key::ContractTest`] names, joined on its
+/// whole [`TestIdRef`].
+fn contract_key_test(package: &str, file: &str, test: &str, t: &TestRef) -> bool {
+    TestIdRef::joins(&key_test(package, file, test), t, |t| {
+        Some(TestIdRef::of(*t))
+    })
+}
+
+/// Whether `t` is the acceptance test a [`Key::Composition`] names by
+/// `test`, joined on its whole [`TestIdRef`].
+fn composition_key_test(test: &str, t: &TestRef) -> bool {
+    let want = key_test("zakura-sim", rows::ACCEPTANCE_TESTS, test);
+    TestIdRef::joins(&want, t, |t| Some(TestIdRef::of(*t)))
+}
+
+/// Whether `t` is the test a narrowing entry's `test` names, joined on its
+/// whole [`TestIdRef`]. A pending entry names none.
+fn narrowing_key_test(test: contracts::NarrowingTest, t: &TestRef) -> bool {
+    let contracts::NarrowingTest::Test(want) = test else {
+        return false;
+    };
+    TestIdRef::joins(&TestIdRef::of(want), t, |t| Some(TestIdRef::of(*t)))
+}
+
+/// Whether `t` is `harness`'s missing-source test
+/// ([`rows::missing_source_test`]), joined on its whole [`TestIdRef`].
+fn missing_source_key_test(harness: &str, t: &TestRef) -> bool {
+    rows::missing_source_test(harness)
+        .is_some_and(|want| TestIdRef::joins(&TestIdRef::of(want), t, |t| Some(TestIdRef::of(*t))))
+}
+
+/// Whether `test` is the one [`rows::reason_test`] names to show `reason`,
+/// joined on its whole [`TestIdRef`].
+fn reason_shown_by(reason: crate::NaReason, test: &TestRef) -> bool {
+    rows::reason_test(reason).is_some_and(|want| {
+        TestIdRef::joins(&TestIdRef::of(want), test, |test| {
+            Some(TestIdRef::of(*test))
+        })
+    })
+}
+
 impl Key {
     /// Whether `expected` is a result that can satisfy this key: the same
     /// kind of obligation, naming the same item in every identity field.
@@ -758,26 +873,23 @@ impl Key {
     /// narrowing test key is matched against `narrowing`, the manifest's
     /// entries.
     pub fn covers(&self, expected: &Expected, narrowing: &[contracts::Narrowing]) -> bool {
-        let test_is = |package: &str, file: &str, name: &str, test: &TestRef| {
-            test.package == package && test.file == file && test.test == name
-        };
         match (self, expected) {
             (Key::Passing { property }, Expected::Holds { property: p, .. })
             | (Key::Passing { property }, Expected::StaysNotApplicable { property: p, .. }) => {
                 property == p
             }
             (Key::Catch { property }, Expected::Caught { case, set, .. }) => {
-                case.property == property && set.contains(&property.as_str())
+                catch_property(property, case) && set.contains(&property.as_str())
             }
             (Key::Catch { property }, Expected::MachineCaught { case, .. }) => {
-                case.property == property
+                catch_property(property, case)
             }
             (
                 Key::Case { property, name },
                 Expected::Caught { case, .. }
                 | Expected::MachineCaught { case, .. }
                 | Expected::HarnessCaught { case, .. },
-            ) => case.property == property && case.name == name,
+            ) => case_key_case(property, name, case),
             // A contract's proving catch takes the `Caught` or
             // `HarnessCaught` of exactly that case, and nothing else.
             (
@@ -793,7 +905,7 @@ impl Key {
                 | Expected::StaysNotApplicable {
                     history, property, ..
                 },
-            ) => RunId::from(*history) == *run && property == target,
+            ) => history_key_history(run, history) && property == target,
             (
                 Key::Native { patch },
                 Expected::IntegrityCaught {
@@ -826,16 +938,9 @@ impl Key {
             }
             // A duplicate native mutation's key takes the catch of exactly
             // the planted case its classification names.
-            (Key::Native { patch }, Expected::Caught { case, .. }) => {
-                NATIVE_MUTATIONS.iter().any(|mutation| {
-                    mutation.patch == patch
-                        && mutation.class
-                            == NativeClass::Duplicate {
-                                property: case.property,
-                                case: case.name,
-                            }
-                })
-            }
+            (Key::Native { patch }, Expected::Caught { case, .. }) => NATIVE_MUTATIONS
+                .iter()
+                .any(|mutation| mutation.patch == patch && duplicate_of(&mutation.class, case)),
             (Key::Cleanup { run }, Expected::Open { .. }) => {
                 let machine =
                     matches!(run, RunId::History { harness, .. } if rows::is_machine(harness));
@@ -851,12 +956,10 @@ impl Key {
             (
                 Key::NaList { run },
                 Expected::Holds { history, .. } | Expected::StaysNotApplicable { history, .. },
-            ) => RunId::from(*history) == *run,
+            ) => list_key_history(run, history),
             // A reason's key takes the pass of exactly the test that shows
             // it, or, for a reason with none, the Open that blocks.
-            (Key::NaReason { reason }, Expected::Passes { test }) => {
-                rows::reason_test(*reason) == Some(*test)
-            }
+            (Key::NaReason { reason }, Expected::Passes { test }) => reason_shown_by(*reason, test),
             (Key::NaReason { reason }, Expected::Open { .. }) => {
                 rows::reason_test(*reason).is_none() && same_open(expected, &rows::REASON_UNSHOWN)
             }
@@ -889,7 +992,7 @@ impl Key {
                     test,
                 },
                 Expected::Passes { test: t },
-            ) => test_is(package, file, test, t),
+            ) => witness_key_test(package, file, test, t),
             (
                 Key::ContractTest {
                     package,
@@ -898,16 +1001,13 @@ impl Key {
                     ..
                 },
                 Expected::Passes { test: t },
-            ) => test_is(package, file, test, t),
+            ) => contract_key_test(package, file, test, t),
             (Key::Composition { test }, Expected::Passes { test: t }) => {
-                test_is("zakura-sim", rows::ACCEPTANCE_TESTS, test, t)
+                composition_key_test(test, t)
             }
-            (Key::NarrowingTest { entry }, Expected::Passes { test: t }) => {
-                narrowing.iter().any(|narrowing| {
-                    narrowing.entry == entry
-                        && matches!(narrowing.test, contracts::NarrowingTest::Test(n) if n == *t)
-                })
-            }
+            (Key::NarrowingTest { entry }, Expected::Passes { test: t }) => narrowing
+                .iter()
+                .any(|narrowing| narrowing.entry == entry && narrowing_key_test(narrowing.test, t)),
             // A native mutation's or a narrowing entry's transitional Open
             // must be exactly the one its classification or entry writes:
             // reason, owner, approval and PR.
@@ -930,7 +1030,7 @@ impl Key {
                 })
             }
             (Key::MissingSource { harness, .. }, Expected::Passes { test: t }) => {
-                rows::missing_source_test(harness) == Some(*t)
+                missing_source_key_test(harness, t)
             }
             (
                 Key::Case { .. } | Key::Replay { .. } | Key::Witness { .. } | Key::History { .. },
@@ -1201,5 +1301,321 @@ mod tests {
             key.covers(&caught, &[])
         });
         assert_eq!(keys, 2);
+    }
+
+    /// `text`, for the life of the test, as a static case or test field.
+    fn leaked(text: &str) -> &'static str {
+        Box::leak(text.to_owned().into_boxed_str())
+    }
+
+    /// The `reserved-flags-skipped` case under one of its properties, and
+    /// its `Caught` on `header-sync/wire`.
+    fn reserved_flags_caught() -> (CaseRef, Expected) {
+        let case = CaseRef {
+            property: "header-sync/s5v9/status/reserved-flags-closes",
+            name: "reserved-flags-skipped",
+        };
+        let caught = Expected::Caught {
+            case,
+            harness: "header-sync/wire",
+            set: &[],
+            found: Found::AtStep,
+            companions: &[],
+            not_applicable: &[],
+            patched_not_applicable: None,
+        };
+        (case, caught)
+    }
+
+    /// A case key takes the catch of its case only on the case's whole
+    /// [`PlantedRef`] (Rule 25's template): the key naming
+    /// `reserved-flags-skipped` under its property covers that case's
+    /// `Caught`, and the key with its property or its name moved covers it
+    /// no more.
+    #[test]
+    fn a_case_key_joins_its_whole_case() {
+        let (case, caught) = reserved_flags_caught();
+        let keys = assert_one_key_off::<PlantedRef>(&case.planted(), |want| {
+            let key = Key::Case {
+                property: want.property.clone(),
+                name: want.name.clone(),
+            };
+            key.covers(&caught, &[])
+        });
+        assert_eq!(keys, 2);
+    }
+
+    /// A catch key takes a case's catch only under the case's own property,
+    /// joined on its whole [`PropertyRef`] (Rule 25's template): the key of
+    /// a machine case's property covers its `MachineCaught`, which has no
+    /// set to check beside it, and the key with the property moved doesn't.
+    #[test]
+    fn a_catch_key_joins_its_case_s_property() {
+        let case = CaseRef {
+            property: "header/reactor-policy",
+            name: "a-case",
+        };
+        let caught = Expected::MachineCaught {
+            case,
+            harness: "header/reactor",
+        };
+        let own = PropertyRef {
+            property: case.property.to_owned(),
+        };
+        let keys = assert_one_key_off::<PropertyRef>(&own, |want| {
+            let key = Key::Catch {
+                property: want.property.clone(),
+            };
+            key.covers(&caught, &[])
+        });
+        assert_eq!(keys, 1);
+    }
+
+    /// A duplicate native mutation's key takes the catch of only the case
+    /// its class names, joined on the case's whole [`PlantedRef`] (Rule
+    /// 25's template): `misstored-page`'s key covers `stored-order`'s
+    /// `Caught`, and not that `Caught` with its case's property or name
+    /// moved.
+    #[test]
+    fn a_duplicate_joins_its_whole_case() {
+        let (_, caught) = reserved_flags_caught();
+        let Expected::Caught {
+            harness,
+            set,
+            found,
+            companions,
+            not_applicable,
+            patched_not_applicable,
+            ..
+        } = caught
+        else {
+            unreachable!("it's built as a Caught");
+        };
+        let (patch, covered) = NATIVE_MUTATIONS
+            .iter()
+            .find_map(|mutation| match mutation.class {
+                NativeClass::Duplicate { property, case } => Some((
+                    mutation.patch,
+                    CaseRef {
+                        property,
+                        name: case,
+                    },
+                )),
+                _ => None,
+            })
+            .expect("a native mutation duplicates a planted case");
+        let key = Key::Native {
+            patch: patch.to_owned(),
+        };
+        let keys = assert_one_key_off::<PlantedRef>(&covered.planted(), |want| {
+            let caught = Expected::Caught {
+                case: CaseRef {
+                    property: leaked(&want.property),
+                    name: leaked(&want.name),
+                },
+                harness,
+                set,
+                found,
+                companions,
+                not_applicable,
+                patched_not_applicable,
+            };
+            key.covers(&caught, &[])
+        });
+        assert_eq!(keys, 2);
+    }
+
+    /// A reason's key takes the pass of only the test that shows it,
+    /// joined on its whole [`TestIdRef`] (Rule 25's template): the key of
+    /// the first reason [`rows::REASON_TESTS`] shows covers its test's
+    /// `Passes`, and not a `Passes` of that test with its package, file or
+    /// name moved.
+    #[test]
+    fn a_reason_s_pass_joins_its_whole_test() {
+        let (reason, test) = rows::REASON_TESTS[0];
+        let key = Key::NaReason { reason };
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(test), |want| {
+            let test = TestRef {
+                package: leaked(&want.package),
+                file: leaked(&want.file),
+                test: leaked(&want.test),
+            };
+            key.covers(&Expected::Passes { test }, &[])
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// The run of the history `want` names.
+    fn history_run(want: &HistoryRunRef) -> RunId {
+        RunId::History {
+            harness: want.harness.clone(),
+            package: want.package.clone(),
+            file: want.file.clone(),
+            test: want.test.clone(),
+            case: want.case.clone(),
+        }
+    }
+
+    /// The first counted history, its target and its `Holds`.
+    fn a_history_s_holds() -> (HistoryRef, &'static str, Expected) {
+        let (history, target) = rows::history_targets()[0];
+        let holds = Expected::Holds {
+            property: target,
+            history,
+            not_applicable: &[],
+        };
+        (history, target, holds)
+    }
+
+    /// A history key takes the pass of only its own history, joined on its
+    /// whole [`HistoryRunRef`] (Rule 25's template): the key of a counted
+    /// history and its target covers that history's `Holds`, and the key
+    /// with the history's harness, its witness's package, file or name, or
+    /// its case moved doesn't.
+    #[test]
+    fn a_history_key_joins_its_whole_history() {
+        let (history, target, holds) = a_history_s_holds();
+        let keys = assert_one_key_off::<HistoryRunRef>(&HistoryRunRef::of(history), |want| {
+            let key = Key::History {
+                run: history_run(want),
+                target: target.to_owned(),
+            };
+            key.covers(&holds, &[])
+        });
+        assert_eq!(keys, 5);
+    }
+
+    /// A node history's list key takes the whole-report pass of only its
+    /// own history, joined on its whole [`HistoryRunRef`] (Rule 25's
+    /// template): the list key of a counted history covers that history's
+    /// `Holds`, and the key with the history's harness, its witness's
+    /// package, file or name, or its case moved doesn't.
+    #[test]
+    fn a_list_key_joins_its_whole_history() {
+        let (history, _, holds) = a_history_s_holds();
+        let keys = assert_one_key_off::<HistoryRunRef>(&HistoryRunRef::of(history), |want| {
+            let key = Key::NaList {
+                run: history_run(want),
+            };
+            key.covers(&holds, &[])
+        });
+        assert_eq!(keys, 5);
+    }
+
+    /// `want`'s test, its fields leaked for the life of the test.
+    fn test_of(want: &TestIdRef) -> TestRef {
+        TestRef {
+            package: leaked(&want.package),
+            file: leaked(&want.file),
+            test: leaked(&want.test),
+        }
+    }
+
+    /// A witness key takes the pass of only its own test, joined on its
+    /// whole [`TestIdRef`]: two files can hold a test of one name.
+    #[test]
+    fn a_witness_key_joins_its_whole_test() {
+        let own = super::sim_test("tests/a_witness.rs", "a_test");
+        let key = Key::Witness {
+            package: own.package.to_owned(),
+            file: own.file.to_owned(),
+            test: own.test.to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(own), |want| {
+            key.covers(
+                &Expected::Passes {
+                    test: test_of(want),
+                },
+                &[],
+            )
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// A contract's test key takes the pass of only its own test, joined on
+    /// its whole [`TestIdRef`].
+    #[test]
+    fn a_contract_test_key_joins_its_whole_test() {
+        let own = super::sim_test("tests/a_witness.rs", "a_test");
+        let key = Key::ContractTest {
+            contract: "C2".to_owned(),
+            package: own.package.to_owned(),
+            file: own.file.to_owned(),
+            test: own.test.to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(own), |want| {
+            key.covers(
+                &Expected::Passes {
+                    test: test_of(want),
+                },
+                &[],
+            )
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// A composition key takes the pass of only its own acceptance test,
+    /// joined on its whole [`TestIdRef`].
+    #[test]
+    fn a_composition_key_joins_its_whole_test() {
+        let own = super::sim_test(rows::ACCEPTANCE_TESTS, "a_check");
+        let key = Key::Composition {
+            test: own.test.to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(own), |want| {
+            key.covers(
+                &Expected::Passes {
+                    test: test_of(want),
+                },
+                &[],
+            )
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// A narrowing entry's test key takes the pass of only the entry's own
+    /// test, joined on its whole [`TestIdRef`].
+    #[test]
+    fn a_narrowing_key_joins_its_whole_test() {
+        let (entry, own) = contracts::NARROWING
+            .iter()
+            .find_map(|narrowing| match narrowing.test {
+                contracts::NarrowingTest::Test(test) => Some((narrowing.entry, test)),
+                contracts::NarrowingTest::Pending { .. } => None,
+            })
+            .expect("a narrowing entry has its test");
+        let key = Key::NarrowingTest {
+            entry: entry.to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(own), |want| {
+            key.covers(
+                &Expected::Passes {
+                    test: test_of(want),
+                },
+                contracts::NARROWING,
+            )
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// A missing-source key takes the pass of only its harness's own
+    /// missing-source test, joined on its whole [`TestIdRef`].
+    #[test]
+    fn a_missing_source_key_joins_its_whole_test() {
+        let harness = "header-sync/smoke";
+        let own = rows::missing_source_test(harness).expect("smoke has its missing-source test");
+        let key = Key::MissingSource {
+            harness: harness.to_owned(),
+            source: "a source".to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(own), |want| {
+            key.covers(
+                &Expected::Passes {
+                    test: test_of(want),
+                },
+                &[],
+            )
+        });
+        assert_eq!(keys, 3);
     }
 }

@@ -7,8 +7,9 @@
 //! [`INVENTORY_FINGERPRINT`] pins them apart from the lists, the way C20
 //! pins `NotApplicable`'s producers: a canonical text of the required
 //! contract IDs, each narrowing entry's name, contracts and test, the
-//! composition checks, each native mutation's full classification, and
-//! every approved exception. [`inventory_errors`], run on the gate's own
+//! composition checks, each native mutation's full classification, each
+//! gate obligation with its gates and permit, each contract's proving
+//! tests and catches, and every approved exception. [`inventory_errors`], run on the gate's own
 //! path ([`super::tool::evaluate_artifacts`]), fails the record when the
 //! text and the pin disagree, or when the required keys don't hold an
 //! obligation per entry, so no list edit or test deletion can remove the
@@ -26,15 +27,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{
     contracts::{ContractState, NarrowingTest, REQUIRED_CONTRACTS},
     evaluate::Evaluation,
-    required::{Permit, GATE_OBLIGATIONS},
-    rows::{NativeClass, NativeMutation, StandingExclusion, STANDING_EXCLUSIONS},
-    Approval, Expected, Gate, Key, Manifest, COMPOSITION_CHECKS, NATIVE_MUTATIONS,
+    required::GATE_OBLIGATIONS,
+    rows::{NativeClass, NativeMutation, StandingExclusion, STANDING_EXCLUSIONS, TIER_APPROVALS},
+    Approval, Expected, Gate, Key, Manifest, Tier, COMPOSITION_CHECKS, NATIVE_MUTATIONS,
 };
 
 /// The fingerprint of the committed inventories' canonical text
 /// ([`canonical`]): the first 16 hex digits of its SHA-256. Moving it
 /// needs a reread of every changed line and Adam's approval.
-pub const INVENTORY_FINGERPRINT: &str = "abf4771b55e236e6";
+pub const INVENTORY_FINGERPRINT: &str = "ed5c8ece20e1ca76";
 
 /// What the inventories hold that the manifest doesn't carry.
 pub struct Lists<'a> {
@@ -46,6 +47,8 @@ pub struct Lists<'a> {
     pub exclusions: &'a [StandingExclusion],
     /// The gate obligations no row owns.
     pub obligations: &'a [super::required::GateObligation],
+    /// Each tier exclusion Adam approved for one property and tier.
+    pub tier_approvals: &'a [(&'a str, Tier, Approval)],
 }
 
 impl Lists<'static> {
@@ -56,6 +59,7 @@ impl Lists<'static> {
             native: NATIVE_MUTATIONS,
             exclusions: STANDING_EXCLUSIONS,
             obligations: GATE_OBLIGATIONS,
+            tier_approvals: TIER_APPROVALS,
         }
     }
 }
@@ -148,14 +152,20 @@ pub fn errors_against(
 /// The inventories' canonical text, one sorted line per entry with
 /// tab-separated fields: each required contract ID; each narrowing entry's
 /// name, contracts and test; each composition check; each native
-/// mutation's patch and full class; and each approved exception. An
+/// mutation's patch and full class; each gate obligation; each contract's
+/// proving tests and catches; and each approved exception. An
 /// approved `Open` is one line per distinct template (its key's kind,
 /// reason, owner, record and `until`), so another key under an existing
 /// template, such as a new machine history's cleanup, doesn't move the
 /// pin, but a copied approval on a new template does. Each standing
-/// exclusion, standing gate permit, excluded contract and approved
-/// `StaysNotApplicable` is a line of its own. Pending exceptions aren't
-/// lines: they block anyway.
+/// exclusion, excluded contract and approved `StaysNotApplicable` is a
+/// line of its own, and so is each gate obligation, with its gates and
+/// full permit, so one removed from both its lists moves the pin, and each
+/// contract's proving test and proving catch, so one removed while its
+/// contract still has others moves it too. Each tier approval is a line of
+/// its own, by property and tier, since it's scoped to that one key: a copy
+/// of one to another property, under the same exclusion text, moves the pin.
+/// Pending exceptions aren't lines: they block anyway.
 fn canonical(manifest: &Manifest, lists: &Lists<'_>) -> Vec<String> {
     let mut lines = Vec::new();
     for id in &manifest.required_contracts {
@@ -212,20 +222,22 @@ fn canonical(manifest: &Manifest, lists: &Lists<'_>) -> Vec<String> {
             exclusion.key, exclusion.owner, exclusion.reason, exclusion.approval
         ));
     }
+    for (property, tier, approval) in lists.tier_approvals {
+        lines.push(format!("tier-approval\t{property}\t{tier:?}\t{approval:?}"));
+    }
     for obligation in lists.obligations {
-        if let Permit::Standing {
-            owner,
-            reason,
-            approval,
-        } = obligation.permit
-        {
-            lines.push(format!(
-                "standing-permit\t{}\t{owner}\t{reason}\t{approval:?}",
-                obligation.name
-            ));
-        }
+        lines.push(format!(
+            "gate-obligation\t{}\t{:?}\t{:?}",
+            obligation.name, obligation.gates, obligation.permit
+        ));
     }
     for contract in &manifest.contracts {
+        for test in contract.proving {
+            lines.push(format!("contract-proving\t{:?}\t{test:?}", contract.id));
+        }
+        for case in contract.proving_catches {
+            lines.push(format!("contract-catch\t{:?}\t{case:?}", contract.id));
+        }
         if let ContractState::Excluded { reason, approval } = contract.state {
             lines.push(format!(
                 "excluded-contract\t{:?}\t{reason}\t{approval:?}",
@@ -327,6 +339,28 @@ mod tests {
         assert!(moved(&dropped, &lists));
         assert!(!errors_against(&dropped, &required, &lists, &pin).is_empty());
 
+        // One of C19's two proving tests, or one of C21's two proving
+        // catches, removed, leaving the contract satisfied with the other.
+        let c19 = manifest
+            .contracts
+            .iter()
+            .position(|contract| matches!(contract.id, ContractId::C19))
+            .expect("C19 has a row");
+        assert_eq!(manifest.contracts[c19].state, ContractState::Satisfied);
+        assert!(manifest.contracts[c19].proving.len() > 1);
+        let mut unproven = manifest.clone();
+        unproven.contracts[c19].proving = &manifest.contracts[c19].proving[1..];
+        assert!(moved(&unproven, &lists));
+        let c21 = manifest
+            .contracts
+            .iter()
+            .position(|contract| matches!(contract.id, ContractId::C21))
+            .expect("C21 has a row");
+        assert!(manifest.contracts[c21].proving_catches.len() > 1);
+        let mut uncaught = manifest.clone();
+        uncaught.contracts[c21].proving_catches = &manifest.contracts[c21].proving_catches[1..];
+        assert!(moved(&uncaught, &lists));
+
         // A narrowing entry renamed, added, or widened to another contract.
         let mut renamed = manifest.clone();
         renamed.narrowing[0].entry = "N9";
@@ -387,6 +421,43 @@ mod tests {
         regated.insert(key, BTreeSet::from([Gate::G5]));
         assert!(!errors_against(&manifest, &regated, &lists, &pin).is_empty());
 
+        // A test-backed gate obligation removed from its list (and, as an
+        // honest edit would, from `GATE_REQUIREMENTS`, which the pin doesn't
+        // read), or its gates or test changed.
+        let cleanup = "gate-5/bound-table/publisher-capacity-waits/cleanup";
+        let at = lists
+            .obligations
+            .iter()
+            .position(|obligation| obligation.name == cleanup)
+            .expect("the cleanup obligation is listed");
+        assert!(matches!(
+            lists.obligations[at].permit,
+            super::super::required::Permit::Test(_)
+        ));
+        let mut obligations = lists.obligations.to_vec();
+        obligations.remove(at);
+        let fewer = Lists {
+            obligations: &obligations,
+            ..Lists::committed()
+        };
+        assert!(moved(&manifest, &fewer));
+        let mut obligations = lists.obligations.to_vec();
+        obligations[at].gates = &[Gate::G6];
+        let regated = Lists {
+            obligations: &obligations,
+            ..Lists::committed()
+        };
+        assert!(moved(&manifest, &regated));
+        let mut obligations = lists.obligations.to_vec();
+        obligations[at].permit = super::super::required::Permit::Test(
+            crate::harness::header_acceptance::sim_test("tests/other.rs", "another_test"),
+        );
+        let retested = Lists {
+            obligations: &obligations,
+            ..Lists::committed()
+        };
+        assert!(moved(&manifest, &retested));
+
         // An approval copied onto a pending Open, or an approved reason
         // reworded, moves the pin.
         let pending = manifest
@@ -430,6 +501,32 @@ mod tests {
         let mut another = manifest.clone();
         another.expected.push(another.expected[approved].clone());
         assert!(!moved(&another, &lists));
+    }
+
+    /// Each tier approval is pinned by its property and tier (round 10's
+    /// T9): copying one approval to another property moves the pin, though
+    /// its approved `Open`'s template is the same, and so does moving one to
+    /// another tier.
+    #[test]
+    fn a_copied_tier_approval_moves_the_pin() {
+        let (manifest, _) = committed();
+        let approval = Approval::Adam {
+            record: "a plan decision",
+        };
+        let one = [("header-sync/a", Tier::Table, approval)];
+        let copied = [
+            ("header-sync/a", Tier::Table, approval),
+            ("header-sync/b", Tier::Table, approval),
+        ];
+        let retiered = [("header-sync/a", Tier::Machine, approval)];
+        let with = |approvals| Lists {
+            tier_approvals: approvals,
+            ..Lists::committed()
+        };
+        let pinned = print(&manifest, &with(&one));
+        assert_ne!(print(&manifest, &with(&copied)), pinned);
+        assert_ne!(print(&manifest, &with(&retiered)), pinned);
+        assert_ne!(print(&manifest, &Lists::committed()), pinned);
     }
 
     /// An inventory error fails an otherwise passing evaluation: it's a

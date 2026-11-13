@@ -7,6 +7,7 @@
 //! static checks in `tests/header_acceptance.rs` compare two independent
 //! lists.
 
+use super::refs::{HistoryRunRef, PlantedRef, Ref};
 use super::required as obligation;
 use super::{
     sim_test, Approval, CaseRef, Expected, ExpectedNa, ExpectedResult, Found, Gate, HistoryRef,
@@ -979,34 +980,45 @@ pub fn counted_results(expected: &[ExpectedResult]) -> Vec<ExpectedResult> {
         results.push(result(vec![Key::Cleanup { run }], G1, cleanup));
     }
     for run in listed {
-        let pass = expected
-            .iter()
-            .find_map(|result| match result.expected {
-                Expected::Holds { history, .. } | Expected::StaysNotApplicable { history, .. }
-                    if RunId::from(history) == run =>
-                {
-                    Some(result.expected.clone())
-                }
-                _ => None,
-            })
+        let pass = history_pass(expected, &run)
             .expect("every counted history has its whole-report pass, by attach_history_passes");
         results.push(result(vec![Key::NaList { run }], &[Gate::G6], pass));
     }
     results
 }
 
+/// The `Holds` or `StaysNotApplicable` of `expected` that judges history
+/// `run`'s whole report, joined on the history's whole [`HistoryRunRef`],
+/// if one does.
+fn history_pass(expected: &[ExpectedResult], run: &RunId) -> Option<Expected> {
+    let want = HistoryRunRef::of_run(run)?;
+    expected.iter().find_map(|result| match result.expected {
+        Expected::Holds { history, .. } | Expected::StaysNotApplicable { history, .. }
+            if HistoryRunRef::joins(&want, &history, |history| {
+                Some(HistoryRunRef::of(*history))
+            }) =>
+        {
+            Some(result.expected.clone())
+        }
+        _ => None,
+    })
+}
+
 /// Gives each counted history its whole-report key: on the row's own
-/// result when a row's `Holds` already judges that history for its target,
-/// or as a `Holds` of its target otherwise.
+/// result when a row's `Holds` already judges that history, joined on its
+/// whole [`HistoryRunRef`], for its target, or as a `Holds` of its target
+/// otherwise.
 pub fn attach_history_passes(expected: &mut Vec<ExpectedResult>) {
     for (history, target) in history_targets() {
         let key = Key::History {
             run: history.into(),
             target: target.to_owned(),
         };
+        let want = HistoryRunRef::of(history);
         let row = expected.iter_mut().find(|result| {
             matches!(result.expected, Expected::Holds { property, history: h, .. }
-                if h == history && property == target)
+                if HistoryRunRef::joins(&want, &h, |h| Some(HistoryRunRef::of(*h)))
+                    && property == target)
         });
         match row {
             Some(result) => result.keys.push(key),
@@ -3875,7 +3887,8 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
 /// The native mutations' expected results: an `IntegrityCaught` for gate 6,
 /// a transitional `Open` until the PR that moves it, for a retired one the
 /// `UnitCaught` of its witness, or, for a duplicate, the `Caught` among
-/// `expected` of the planted case covering it, on gate 6. A moved one has
+/// `expected` of the planted case covering it, joined on the case's whole
+/// [`PlantedRef`], on gate 6. A moved one has
 /// no key, and nor has a duplicate whose case no `Caught` names, so its key
 /// blocks.
 pub fn native_results(expected: &[ExpectedResult]) -> Vec<ExpectedResult> {
@@ -3901,14 +3914,20 @@ pub fn native_results(expected: &[ExpectedResult]) -> Vec<ExpectedResult> {
                     patch: mutation.patch,
                     witness,
                 },
-                NativeClass::Duplicate { property, case } => expected
-                    .iter()
-                    .find(|result| {
-                        matches!(result.expected, Expected::Caught { case: c, .. }
-                            if c.property == property && c.name == case)
-                    })?
-                    .expected
-                    .clone(),
+                NativeClass::Duplicate { property, case } => {
+                    let want = PlantedRef {
+                        property: property.to_owned(),
+                        name: case.to_owned(),
+                    };
+                    expected
+                        .iter()
+                        .find(|result| {
+                            matches!(result.expected, Expected::Caught { case: c, .. }
+                                if PlantedRef::joins(&want, &c, |c| Some(c.planted())))
+                        })?
+                        .expected
+                        .clone()
+                }
                 NativeClass::Moved { .. } => return None,
             };
             Some(result(key, &[Gate::G6], expected))
@@ -4289,4 +4308,121 @@ pub fn tier_results(registered: &[super::Registered]) -> Vec<ExpectedResult> {
         }
     }
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+
+    /// `text`, for the life of the test, as a static field.
+    fn leaked(text: &str) -> &'static str {
+        Box::leak(text.to_owned().into_boxed_str())
+    }
+
+    /// The history `want` names, its fields leaked for the life of the test.
+    fn history_of(want: &HistoryRunRef) -> HistoryRef {
+        HistoryRef {
+            harness: leaked(&want.harness),
+            witness: TestRef {
+                package: leaked(&want.package),
+                file: leaked(&want.file),
+                test: leaked(&want.test),
+            },
+            case: leaked(&want.case),
+        }
+    }
+
+    /// A node history's list key takes only its own history's whole-report
+    /// pass, joined on the history's whole [`HistoryRunRef`] (Rule 25's
+    /// template): a counted node history's run finds its `Holds`, and the
+    /// run with its harness, its witness's package, file or name, or its
+    /// case moved finds none.
+    #[test]
+    fn a_history_s_pass_joins_its_whole_history() {
+        let history = counted_histories()
+            .into_iter()
+            .find(|history| !is_machine(history.harness))
+            .expect("a node history is counted");
+        let expected = [result(
+            Vec::new(),
+            &[],
+            Expected::Holds {
+                property: "a/property",
+                history,
+                not_applicable: &[],
+            },
+        )];
+        let keys = assert_one_key_off::<HistoryRunRef>(&HistoryRunRef::of(history), |want| {
+            history_pass(&expected, &RunId::from(history_of(want))).is_some()
+        });
+        assert_eq!(keys, 5);
+    }
+
+    /// A counted history's whole-report key goes on a row's `Holds` only
+    /// if it judges that history, joined on its whole [`HistoryRunRef`]
+    /// (Rule 25's template): the row of a counted history and its target
+    /// takes the key, and the row with the history's harness, its
+    /// witness's package, file or name, or its case moved doesn't.
+    #[test]
+    fn a_history_s_row_joins_its_whole_history() {
+        let (history, target) = history_targets()[0];
+        let keys = assert_one_key_off::<HistoryRunRef>(&HistoryRunRef::of(history), |want| {
+            let mut expected = vec![result(
+                Vec::new(),
+                &[],
+                Expected::Holds {
+                    property: target,
+                    history: history_of(want),
+                    not_applicable: &[],
+                },
+            )];
+            attach_history_passes(&mut expected);
+            !expected[0].keys.is_empty()
+        });
+        assert_eq!(keys, 5);
+    }
+
+    /// A duplicate native mutation's result is the `Caught` of only the
+    /// case its class names, joined on the case's whole [`PlantedRef`]
+    /// (Rule 25's template): with that case's `Caught` among the expected
+    /// results, the duplicate has a result, and with the case's property or
+    /// name moved it has none.
+    #[test]
+    fn a_duplicate_s_result_joins_its_whole_case() {
+        let (patch, covered) = NATIVE_MUTATIONS
+            .iter()
+            .find_map(|mutation| match mutation.class {
+                NativeClass::Duplicate { property, case } => Some((
+                    mutation.patch,
+                    CaseRef {
+                        property,
+                        name: case,
+                    },
+                )),
+                _ => None,
+            })
+            .expect("a native mutation duplicates a planted case");
+        let key = [Key::Native {
+            patch: patch.to_owned(),
+        }];
+        let keys = assert_one_key_off::<PlantedRef>(&covered.planted(), |want| {
+            let caught = Expected::Caught {
+                case: CaseRef {
+                    property: leaked(&want.property),
+                    name: leaked(&want.name),
+                },
+                harness: "header-sync/wire",
+                set: &[],
+                found: Found::AtStep,
+                companions: &[],
+                not_applicable: &[],
+                patched_not_applicable: None,
+            };
+            native_results(&[result(Vec::new(), &[], caught)])
+                .iter()
+                .any(|result| result.keys == key)
+        });
+        assert_eq!(keys, 2);
+    }
 }

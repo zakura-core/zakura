@@ -22,7 +22,9 @@ use serde_json::Value;
 
 use super::{
     evaluate::{Actions, End},
-    refs::{ControlRef, LinkRef, PickRef, Ref, SessionRef, StampRef},
+    refs::{
+        ActNameRef, ControlRef, LinkRef, PeerNameRef, PickRef, Ref, ScriptRef, SessionRef, StampRef,
+    },
 };
 use crate::{
     harness::{
@@ -108,7 +110,9 @@ pub enum Effect {
     Queued,
     /// An adversary's act, which a passing witness judgement of the run
     /// shows wrote its frames: the judge fails a run where a scripted act
-    /// was skipped or never ran.
+    /// was skipped or never ran. Its evidence names the act but not the
+    /// peer, so it shows a peer's act only when no other peer declares an
+    /// act of that name ([`one_peer_declares`]).
     ActRan,
     /// A wire peer's act on its own link, which the node's `sessions`
     /// store shows on that link ([`LinkRef`]): `peer`'s `link`th
@@ -503,8 +507,9 @@ fn session_links(report: &FullReport, fact: &str) -> Vec<LinkRef> {
 /// origin names no link, so its end shows nothing.
 #[derive(Debug, Default)]
 struct Sessions {
-    /// Each peer's links, in first-admission order.
-    links: std::collections::BTreeMap<String, Vec<u64>>,
+    /// Every link the node admitted a session on, once each, in
+    /// first-admission order.
+    links: Vec<LinkRef>,
     /// Each admitted session and its link, in the store's order.
     admitted: Vec<(SessionRef, u64)>,
     /// Each ended session's link and reason, in the store's order.
@@ -544,9 +549,14 @@ impl Sessions {
                 else {
                     continue;
                 };
-                let links = sessions.links.entry(peer.clone()).or_default();
-                if !links.contains(&link) {
-                    links.push(link);
+                // A link is new unless an earlier admission was on its
+                // whole ref, its peer and connection.
+                let opened = LinkRef {
+                    peer: peer.clone(),
+                    connection: link,
+                };
+                if LinkRef::joined(&opened, &sessions.links, |at| Some(at.clone())).is_empty() {
+                    sessions.links.push(opened);
                 }
                 sessions.admitted.push((SessionRef { peer, session }, link));
             } else if fact.starts_with("Ended {") {
@@ -572,12 +582,19 @@ impl Sessions {
             .map(|(_, link)| *link)
     }
 
-    /// `peer`'s `link`th link, if the node admitted that many.
+    /// `peer`'s `link`th link, if the node admitted that many: its links
+    /// joined on the peer's whole [`PeerNameRef`], in first-admission
+    /// order.
     fn link(&self, peer: &str, link: usize) -> Option<LinkRef> {
-        Some(LinkRef {
+        let peer = PeerNameRef {
             peer: peer.to_owned(),
-            connection: *self.links.get(peer)?.get(link)?,
-        })
+        };
+        let own = PeerNameRef::joined(&peer, &self.links, |at| {
+            Some(PeerNameRef {
+                peer: at.peer.clone(),
+            })
+        });
+        own.get(link).map(|at| (*at).clone())
     }
 
     /// How many sessions on `link` the node ended for `reason`.
@@ -589,17 +606,7 @@ impl Sessions {
     /// Whether the node admitted a session on `link`, joined by its whole
     /// ref, its peer and connection: what shows a redial's link.
     fn opened(&self, link: &LinkRef) -> bool {
-        let opened: Vec<LinkRef> = self
-            .links
-            .iter()
-            .flat_map(|(peer, links)| {
-                links.iter().map(|&connection| LinkRef {
-                    peer: peer.clone(),
-                    connection,
-                })
-            })
-            .collect();
-        !LinkRef::joined(link, &opened, |at| Some(at.clone())).is_empty()
+        !LinkRef::joined(link, &self.links, |at| Some(at.clone())).is_empty()
     }
 }
 
@@ -664,6 +671,29 @@ fn own_effect<'a>(facts: &'a [Fact], named: &[bool], cause: &ControlRef) -> Opti
         .copied()
 }
 
+/// Whether exactly one peer of `declared` declares acts named `act`, joined
+/// on its whole [`ActNameRef`]. A passing witness matches the acts a run
+/// scripted to the acts that ran by name and count alone, so its evidence
+/// shows a peer's acts of that name only then. Two peers declaring one
+/// act could otherwise share it: one peer's act run twice standing for
+/// the other's, which never ran. No act runs undeclared, since an
+/// undeclared pick leaves the run incomplete.
+fn one_peer_declares(declared: &[Declared], act: &ActNameRef) -> bool {
+    let acts = declared
+        .iter()
+        .filter(|action| matches!(action.effect, Effect::ActRan));
+    let named = ActNameRef::joined(act, acts, |action| {
+        Some(ActNameRef {
+            act: action.pick.action.clone(),
+        })
+    });
+    let peers: std::collections::BTreeSet<&str> = named
+        .iter()
+        .map(|action| action.pick.peer.as_str())
+        .collect();
+    peers.len() == 1
+}
+
 /// The first of `declared` not yet `picked` that `pick` takes, joined by
 /// its whole [`PickRef`], so a pick never takes another peer's action or
 /// another action of its peer.
@@ -676,6 +706,23 @@ fn next_declared(declared: &[Declared], picked: &[bool], pick: &PickRef) -> Opti
     PickRef::joined(pick, &undone, |(_, action)| Some(action.pick.clone()))
         .first()
         .map(|(at, _)| *at)
+}
+
+/// Whether an action of `declared` before the one at `at`, in its script,
+/// joined on its whole [`ScriptRef`], is still undone by `picked`: a
+/// script's actions are picked in order.
+fn earlier_undone(declared: &[Declared], picked: &[bool], at: usize) -> bool {
+    let script = ScriptRef {
+        script: declared[at].script.clone(),
+    };
+    let before: Vec<(usize, &Declared)> = declared[..at].iter().enumerate().collect();
+    ScriptRef::joined(&script, &before, |(_, other)| {
+        Some(ScriptRef {
+            script: other.script.clone(),
+        })
+    })
+    .iter()
+    .any(|(before, _)| !picked[*before])
 }
 
 /// Whether `run`, a node history's recording that ended `end`, carried
@@ -716,12 +763,7 @@ pub fn judge(
         let Some(at) = next_declared(declared, &picked, pick) else {
             return Actions::Incomplete;
         };
-        let action = &declared[at];
-        let earlier_undone = declared[..at]
-            .iter()
-            .enumerate()
-            .any(|(before, other)| other.script == action.script && !picked[before]);
-        if earlier_undone {
+        if earlier_undone(declared, &picked, at) {
             return Actions::Incomplete;
         }
         picked[at] = true;
@@ -753,6 +795,7 @@ pub fn judge(
         std::collections::BTreeMap::new();
     // Each in-turn step's effect, its first fact, follows the one before.
     let mut turn = 0;
+    let every = declared;
     let shown: Vec<bool> = declared
         .iter()
         .map(|declared| match &declared.effect {
@@ -782,7 +825,12 @@ pub fn judge(
                     None => false,
                 }
             }
-            Effect::ActRan => witnessed,
+            Effect::ActRan => {
+                let act = ActNameRef {
+                    act: declared.pick.action.clone(),
+                };
+                witnessed && one_peer_declares(every, &act)
+            }
             // The node shows a link act the `nth` time, from 0, a script
             // acted that way there: a link it admitted for a redial, and
             // more ends for the reason a close or finish leaves than acts
@@ -1050,6 +1098,33 @@ mod tests {
         assert_eq!(pick_ref("peer:node"), None);
     }
 
+    /// The scripted `redial` of `peer-0` after its `close` can't be taken
+    /// before it: an earlier action is undone only in its own script,
+    /// joined on its whole [`ScriptRef`] (Rule 25's template), so with the
+    /// `close`'s script moved, the `redial` has nothing undone before it.
+    #[test]
+    fn an_earlier_action_joins_its_whole_script() {
+        let action = |script: &str, action: &str| Declared {
+            pick: PickRef {
+                peer: "peer-0".into(),
+                action: action.into(),
+            },
+            script: script.into(),
+            control: None,
+            effect: Effect::AtPick,
+        };
+        let keys = assert_one_key_off::<ScriptRef>(
+            &ScriptRef {
+                script: "peer-0".into(),
+            },
+            |want| {
+                let declared = [action(&want.script, "close"), action("peer-0", "redial")];
+                earlier_undone(&declared, &[false, false], 1)
+            },
+        );
+        assert_eq!(keys, 1);
+    }
+
     /// A harness-driven pick is ignored only by its whole [`PickRef`]
     /// (Rule 25's template): `node`'s `finish` and a `Recover` step's
     /// source's `recovery-relink` are driven, and the same pick with only
@@ -1272,6 +1347,128 @@ mod tests {
             judge(&declared, &trace, &report, &End::Completed, false),
             Actions::Complete
         );
+    }
+
+    /// A session's admission opens a new link unless an earlier admission
+    /// was on its whole link (Rule 25's template): after `a` on 7 and `b`
+    /// on 8, a third admission on `a`'s link 7 adds none, and the same
+    /// admission with only its peer or only its connection moved adds one.
+    #[test]
+    fn an_admission_joins_its_earlier_link_whole() {
+        let report = |probe: &LinkRef| {
+            let admitted = |peer: &str, session: u64, connection: u64| {
+                format!(
+                    "SessionAdmitted {{ peer: \"{peer}\", session_id: {session}, origin: \
+                     Some(SessionOrigin {{ connection: {connection} }}) }}"
+                )
+            };
+            let facts = format!(
+                "[{}, {}, {}]",
+                admitted("a", 1, 7),
+                admitted("b", 2, 8),
+                admitted(&probe.peer, 3, probe.connection)
+            );
+            FullReport::new(
+                &[],
+                Some(json!([{"store": "sessions", "snapshot": {"facts": facts}}])),
+            )
+        };
+        let earlier = LinkRef {
+            peer: "a".to_owned(),
+            connection: 7,
+        };
+        let keys = assert_one_key_off::<LinkRef>(&earlier, |probe| {
+            Sessions::of(&report(probe)).links.len() == 2
+        });
+        assert_eq!(keys, 2);
+    }
+
+    /// A peer's links are the node's links on the peer's whole name (Rule
+    /// 25's template): in the close-relink-close history, each peer's
+    /// first link is found by its own name, and by no other.
+    #[test]
+    fn a_peer_s_links_join_its_whole_name() {
+        let (_, report, _) = close_relink_close();
+        let sessions = Sessions::of(&report);
+        let peers: std::collections::BTreeSet<String> =
+            sessions.links.iter().map(|at| at.peer.clone()).collect();
+        assert!(peers.len() > 1, "{sessions:?}");
+        for peer in peers {
+            let first = sessions
+                .link(&peer, 0)
+                .expect("each linked peer has a first link");
+            let keys = assert_one_key_off::<PeerNameRef>(&PeerNameRef { peer }, |want| {
+                sessions.link(&want.peer, 0).as_ref() == Some(&first)
+            });
+            assert_eq!(keys, 1);
+        }
+    }
+
+    /// The bad-content input's run, whose one peer, `peer-0`, declares one
+    /// `bad-content` act.
+    fn bad_content() -> (Trace, FullReport, Vec<Declared>) {
+        let input = std::fs::read(fixture("header-wire-bad-content.bin")).expect("it reads");
+        wire(crate::harness::RecordInput::Input(&input))
+    }
+
+    /// A witness's act evidence names acts but not peers, so it shows an
+    /// act only as the one peer declaring that name's: the bad-content
+    /// run, witnessed, is complete, and the same run with a second peer
+    /// declaring and picking the same act is incomplete, since one peer's
+    /// act run twice could stand for the other's.
+    #[test]
+    fn a_shared_act_isn_t_shown_by_the_witness() {
+        let (trace, report, declared) = bad_content();
+        let judged = |trace: &Trace, declared: &[Declared]| {
+            judge(declared, trace, &report, &End::Completed, true)
+        };
+        assert_eq!(judged(&trace, &declared), Actions::Complete);
+        assert_eq!(
+            judge(&declared, &trace, &report, &End::Completed, false),
+            Actions::Incomplete,
+            "the act needs the witness"
+        );
+
+        let [act] = &declared[..] else {
+            panic!("one declared act: {declared:?}");
+        };
+        let other = Declared {
+            pick: PickRef {
+                peer: "peer-1".to_owned(),
+                action: act.pick.action.clone(),
+            },
+            script: "peer-1".to_owned(),
+            ..act.clone()
+        };
+        // `peer-0`'s only declared action is its act, so its one pick is.
+        let at = trace
+            .steps
+            .iter()
+            .position(|step| step.pick.starts_with("peer:peer-0:"))
+            .expect("the run picks its act");
+        let mut shared = trace.clone();
+        let mut step = shared.steps[at].clone();
+        step.pick = format!("peer:peer-1:{}", act.pick.action);
+        shared.steps.insert(at + 1, step);
+        let both = [act.clone(), other];
+        assert_eq!(judged(&shared, &both), Actions::Incomplete);
+    }
+
+    /// An act is one peer's only by every declared act of its whole name
+    /// (Rule 25's template): `peer-0` alone declares `bad-content`, and
+    /// the act with its name moved is declared by no peer.
+    #[test]
+    fn an_act_joins_its_declarers_by_its_whole_name() {
+        let (_, _, declared) = bad_content();
+        let [act] = &declared[..] else {
+            panic!("one declared act: {declared:?}");
+        };
+        let named = ActNameRef {
+            act: act.pick.action.clone(),
+        };
+        let keys =
+            assert_one_key_off::<ActNameRef>(&named, |act| one_peer_declares(&declared, act));
+        assert_eq!(keys, 1);
     }
 
     /// A session's end takes the link its admission names, joined by the

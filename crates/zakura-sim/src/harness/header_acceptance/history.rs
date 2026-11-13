@@ -269,10 +269,17 @@ pub fn declare_into(
     plan: &PlanInput,
 ) -> Result<PathBuf, String> {
     fs::create_dir_all(root).map_err(|error| error.to_string())?;
-    let dir = (0u64..)
-        .map(|index| root.join(index.to_string()))
-        .find(|dir| fs::create_dir(dir).is_ok())
-        .expect("some index is free");
+    let mut index = 0u64;
+    let dir = loop {
+        let dir = root.join(index.to_string());
+        match fs::create_dir(&dir) {
+            Ok(()) => break dir,
+            // Only an occupied index moves on. Any other error would fail
+            // every index after it too.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => index += 1,
+            Err(error) => return Err(format!("{}: {error}", dir.display())),
+        }
+    };
     let put = |name: &str, bytes: &[u8]| {
         fs::write(dir.join(name), bytes).map_err(|error| format!("{name}: {error}"))
     };
@@ -476,6 +483,32 @@ mod tests {
                 .as_ref()
                 .is_err_and(|why| why.contains("names the run an earlier attempt")),
             "{refused:?}"
+        );
+    }
+
+    /// A directory that can't be created for any reason but an occupied
+    /// index fails the declaration at once, rather than trying the next
+    /// index forever: here, a root the test can't write into.
+    #[cfg(unix)]
+    #[test]
+    fn a_persistent_creation_error_fails_the_declaration() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("a temp dir can be created");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let declared = declare_into(
+            root.path(),
+            &task(),
+            "h",
+            "a",
+            &serde_json::json!({}),
+            &PlanInput::Bytes(vec![1]),
+        );
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            declared
+                .as_ref()
+                .is_err_and(|why| why.contains(&root.path().join("0").display().to_string())),
+            "{declared:?}"
         );
     }
 

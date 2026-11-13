@@ -287,8 +287,10 @@ pub mod bound_unshown {
     pub const SUBSCRIPTION_SLOTS: &str = "no fixture opens a second subscription while the \
         first's terminal write finishes, so the 2-slot margin is never used";
     /// The sent-cursor ring.
-    pub const SENT_RING: &str = "no fixture sends a subscription anywhere near 4,096 pages, so \
-        its sent-cursor ring never nears its limit";
+    pub const SENT_RING: &str = "the sent-cursor ring is structurally unreachable: every page \
+        spends at least one header of credit, and a subscription holds at most 4,000 headers \
+        of credit past its acknowledged cursor, so reserve_page's credit check refuses before \
+        the 4,096-entry ring fills";
     /// Node serving output.
     pub const NODE_OUTPUT: &str = "the node's output grants are listed, not checked: their \
         limit follows the configured session count through the toolkit's sizing";

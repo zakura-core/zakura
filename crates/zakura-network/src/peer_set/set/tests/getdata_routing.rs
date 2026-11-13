@@ -155,6 +155,7 @@ fn reach_network_tip(tip: &MockChainTipSender) {
 struct StoragePeers {
     set: PeerSet<TestDiscover, MockChainTip>,
     _guard: PeerSetGuard,
+    tip: MockChainTipSender,
     archive: TestPeer,
     pruned: TestPeer,
     inventory: tokio::sync::broadcast::Sender<InventoryChange>,
@@ -170,7 +171,7 @@ impl StoragePeers {
             PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED,
             Some(inventory.clone()),
         );
-        let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let (minimum, tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
         let mut builder = PeerSetBuilder::new();
         builder.inv_stream = Some(receiver);
         let (mut set, guard) = builder
@@ -183,6 +184,7 @@ impl StoragePeers {
         Self {
             set,
             _guard: guard,
+            tip,
             archive,
             pruned,
             inventory,
@@ -321,6 +323,145 @@ async fn pruned_routing_notfound_excludes_archive_but_keeps_connection() {
         "notfound does not disconnect the archive"
     );
     assert_eq!(peers.archive.written_now().await, None);
+}
+
+/// Catch-up can request blocks a pruned peer still holds. A silent archive must not capture
+/// retries forever, including when the downloader cancels before the connection's timeout.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_retries_unanswered_archive_with_pruned_peer() {
+    let _init_guard = zakura_test::init();
+    let first: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let second: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+
+    for cancel in [false, true] {
+        for batch in [false, true] {
+            let mut peers = StoragePeers::new().await;
+            peers.tip.send_best_tip_height(block::Height(3_500_000));
+            peers
+                .tip
+                .send_estimated_distance_to_network_chain_tip(Some(100));
+            let blocks = if batch {
+                vec![first.clone(), second.clone()]
+            } else {
+                vec![first.clone()]
+            };
+            let hashes: HashSet<_> = blocks.iter().map(|block| block.hash()).collect();
+            let request = Request::BlocksByHash(hashes.iter().copied().collect());
+            let response = peers.set.call(request.clone());
+            assert!(matches!(
+                StoragePeers::next_message(&mut peers.archive).await,
+                Message::GetData(_)
+            ));
+            if cancel {
+                tokio::time::advance(crate::constants::REQUEST_TIMEOUT / 2).await;
+                drop(response);
+            } else {
+                tokio::time::advance(crate::constants::REQUEST_TIMEOUT).await;
+                assert!(response.await.is_err());
+            }
+            // Let the connection process cancellation without advancing the clock.
+            assert_eq!(peers.archive.written_now().await, None);
+
+            let retry = peers.set.ready().await.unwrap().call(request);
+            let Message::GetData(inventory) = StoragePeers::next_message(&mut peers.pruned).await
+            else {
+                panic!("the retry asks the pruned peer for the blocks");
+            };
+            assert_eq!(
+                inventory.into_iter().collect::<HashSet<_>>(),
+                hashes.iter().copied().map(Into::into).collect()
+            );
+            for block in blocks {
+                peers
+                    .pruned
+                    .peer_inbound
+                    .send(Ok(Message::Block(block.into())))
+                    .await
+                    .unwrap();
+            }
+            let Response::Blocks(received) = retry.await.unwrap() else {
+                panic!("the retry returns the requested blocks");
+            };
+            assert_eq!(received.len(), hashes.len());
+            assert_eq!(
+                received
+                    .into_iter()
+                    .map(|block| block.available().unwrap().0.hash())
+                    .collect::<HashSet<_>>(),
+                hashes
+            );
+            peers.set.ready().await.unwrap();
+            assert!(peers.set.ready_services.contains_key(&peers.archive.addr));
+            assert_eq!(peers.archive.written_now().await, None);
+
+            // A known source still gets a chance to serve a block. Success restores its
+            // archive preference for subsequent requests without a known source.
+            for source in [Some(peers.archive.addr), None] {
+                let hashes = iter::once(first.hash()).collect();
+                let request = match source {
+                    Some(addr) => Request::BlocksByHashFrom {
+                        hashes,
+                        source: crate::PeerSource::LegacySocket(addr),
+                    },
+                    None => Request::BlocksByHash(hashes),
+                };
+                let response = peers.set.ready().await.unwrap().call(request);
+                assert_eq!(
+                    StoragePeers::next_message(&mut peers.archive).await,
+                    Message::GetData(vec![first.hash().into()])
+                );
+                assert_eq!(peers.pruned.written_now().await, None);
+                peers
+                    .archive
+                    .peer_inbound
+                    .send(Ok(Message::Block(first.clone().into())))
+                    .await
+                    .unwrap();
+                assert!(matches!(response.await, Ok(Response::Blocks(_))));
+            }
+        }
+    }
+}
+
+/// Failed peers remain usable when every candidate has left a block request unanswered.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_retries_when_all_candidates_left_blocks_unanswered() {
+    let _init_guard = zakura_test::init();
+    let mut peers = StoragePeers::new().await;
+    for addr in [peers.archive.addr, peers.pruned.addr] {
+        let response = peers
+            .set
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::BlocksByHashFrom {
+                hashes: iter::once(BLOCK_HASH).collect(),
+                source: crate::PeerSource::LegacySocket(addr),
+            });
+        let peer = if addr == peers.archive.addr {
+            &mut peers.archive
+        } else {
+            &mut peers.pruned
+        };
+        StoragePeers::next_message(peer).await;
+        tokio::time::advance(crate::constants::REQUEST_TIMEOUT).await;
+        assert!(response.await.is_err());
+    }
+
+    let _retry = peers
+        .set
+        .ready()
+        .await
+        .unwrap()
+        .call(StoragePeers::block_request());
+    assert_eq!(
+        StoragePeers::next_message(&mut peers.archive).await,
+        Message::GetData(vec![BLOCK_HASH.into()])
+    );
 }
 
 /// `getblocks` returns block hashes, which pruned peers keep, so it has no storage preference: a
@@ -463,8 +604,8 @@ impl ArchiveAmongPruned {
     }
 }
 
-/// A syncing node asks for blocks that pruned peers have deleted, so while a peer without the
-/// pruned hint is ready, no block request goes to a pruned peer.
+/// A syncing node can ask for blocks pruned peers have deleted, so an unflagged peer that has
+/// not left a block request unanswered keeps priority.
 #[tokio::test(start_paused = true)]
 async fn pruned_routing_skips_pruned_peers_while_syncing() {
     let _init_guard = zakura_test::init();
@@ -499,8 +640,8 @@ async fn pruned_routing_treats_pruned_peers_alike_near_the_tip() {
     );
 }
 
-/// While syncing, an archive peer that is busy with another response still gets the block request,
-/// although an idle pruned peer could take it at once: the pruned peer would answer `notfound`.
+/// While syncing, a busy archive peer that has not left blocks unanswered keeps priority over
+/// an idle pruned peer, which might no longer hold the requested block.
 #[tokio::test(start_paused = true)]
 async fn pruned_routing_keeps_busy_archive_over_idle_pruned_while_syncing() {
     let _init_guard = zakura_test::init();

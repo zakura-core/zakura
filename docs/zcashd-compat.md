@@ -237,9 +237,12 @@ Pruned storage is supported for the fronting Zakura. All Zakura nodes advertise
 `NODE_NETWORK`, including pruned nodes with or without zcashd-compat enabled,
 so peers can discover, reconnect to, and download recent blocks from them.
 Pruned nodes also advertise the experimental `NODE_PRUNED` flag (bit 25).
-While an updated Zakura node is still syncing, it downloads blocks from peers
-that do not advertise that flag, whatever their other service bits, and asks a
-pruned peer only when no other peer is ready. A peer that advertised the block,
+While an updated Zakura node is still syncing, it prefers peers that do not
+advertise that flag, whatever their other service bits. Peers that have left a
+block request unanswered are skipped when another candidate is available, so
+responsive pruned peers can serve retries during catch-up. A successful block
+response restores the peer's eligibility; if every candidate has left a block
+unanswered, all remain eligible. A peer that advertised the block,
 or a block's known source, keeps priority. Near the network tip, pruned peers
 are treated like any other peer, because they keep the recent blocks.
 `getblocks` requests go to any peer at any time, since pruned nodes keep block

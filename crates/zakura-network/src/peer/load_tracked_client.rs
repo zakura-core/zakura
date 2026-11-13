@@ -116,13 +116,19 @@ impl LoadTrackedClient {
         self.request_slot.is_free()
     }
 
+    /// Returns true if a block request timed out or was cancelled after at least half its timeout,
+    /// and the peer has not completed a successful block response since then.
+    pub(crate) fn has_unanswered_block_request(&self) -> bool {
+        self.request_slot.block_request_unanswered()
+    }
+
     /// Returns true if block routing should prefer this advertiser over its busy advertisers.
     ///
     /// A connection can write a request now, and the peer did not leave its last block request
     /// unanswered. Otherwise routing only offers this advertiser through ordinary load balancing,
     /// so a peer that withholds blocks can't win every retry while other advertisers are busy.
     pub(crate) fn is_preferred_block_source(&self) -> bool {
-        self.can_send_request_now() && !self.request_slot.block_request_unanswered()
+        self.can_send_request_now() && !self.has_unanswered_block_request()
     }
 
     /// Retrieve the peer's self-reported chain height from its handshake.

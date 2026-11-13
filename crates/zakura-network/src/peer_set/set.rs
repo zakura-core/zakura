@@ -989,10 +989,13 @@ where
 
     /// Performs P2C on `candidates` for a request for block bodies.
     ///
-    /// While this node is still syncing, it asks for old blocks, which a pruned peer has deleted
-    /// and answers with `notfound`. So peers that advertise the pruned hint are left out, unless
-    /// every candidate advertises it. The hint is self-reported: a peer that omits it is asked like
-    /// any archive peer.
+    /// While syncing, requests can be for blocks a pruned peer has deleted. Prefer peers without
+    /// the pruned hint, unless all candidates advertise it. The hint is self-reported.
+    ///
+    /// First leave out peers that have left a block request unanswered, unless that would remove
+    /// every candidate. Otherwise a silent archive peer can capture every retry even when a
+    /// pruned peer still holds the requested blocks. A successful block response clears this
+    /// penalty; merely being busy with another response does not incur it.
     ///
     /// Near the network tip this node asks for recent blocks, which pruned peers keep, so all
     /// candidates are treated alike.
@@ -1000,6 +1003,21 @@ where
         if self.is_near_network_tip() {
             return self.select_p2c_peer_from_list(candidates);
         }
+
+        let responsive_candidates: HashSet<D::Key> = candidates
+            .iter()
+            .filter(|key| {
+                self.ready_services
+                    .get(key)
+                    .is_some_and(|service| !service.has_unanswered_block_request())
+            })
+            .copied()
+            .collect();
+        let candidates = if responsive_candidates.is_empty() {
+            candidates
+        } else {
+            &responsive_candidates
+        };
 
         let archive_candidates: HashSet<D::Key> = candidates
             .iter()

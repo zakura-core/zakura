@@ -392,12 +392,14 @@ class PropagationView:
         Raises `ValueError` or `OSError` when the list of private addresses cannot be
         read: without it, a private peer cannot be told from any other.
         """
-        protected = private_addresses()
-
-        def is_private(ip: str) -> bool:
-            return address_key(ip) in protected
-
         with self._lock:
+            # A queued request must not rebuild the cache with a privacy list it
+            # read before another request installed a newer view.
+            protected = private_addresses()
+
+            def is_private(ip: str) -> bool:
+                return address_key(ip) in protected
+
             if (
                 self._joined is None
                 or self._joined_for != protected

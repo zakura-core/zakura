@@ -19,8 +19,12 @@
 //! A slot is held until the caller that reserved it submits its body or drops
 //! the reservation, and at least until the verdict. So if another caller's
 //! body decides the id while the first caller's fetch is still out, that
-//! fetch still holds its slot. A source never has more fetches out than
-//! slots.
+//! fetch still holds its slot.
+//!
+//! A caller drops a reservation when it stops waiting for the body. If its
+//! peer can still answer after that, the caller owns the bound on those late
+//! bodies, and drops each one before it reaches the core. Holding the slot
+//! instead would let peers that never answer fill the core.
 //!
 //! A slot is counted against the source that reserved it until the verdict,
 //! whoever supplies the body. So a caller that asks a second peer for the same
@@ -700,6 +704,10 @@ impl ChangeLog {
 /// The visible pool at one moment. Immutable once published.
 #[derive(Clone, Debug)]
 pub struct PoolSnapshot {
+    /// Whether the pool is on. An inactive pool is empty, and a reader
+    /// answers as today's inactive pool does, which is not how an empty
+    /// active pool answers.
+    pub active: bool,
     /// The tip the pool is valid for.
     pub tip: ChainTip,
     /// The generation of that tip.
@@ -730,6 +738,7 @@ impl PoolSnapshot {
             spent.extend(tx.transaction.transaction().spent_outpoints());
         }
         Self {
+            active: true,
             tip,
             generation,
             last_change,
@@ -737,6 +746,22 @@ impl PoolSnapshot {
             dependencies,
             by_mined_id,
             spent,
+        }
+    }
+
+    /// The snapshot of a pool that is off. The core publishes one when it
+    /// turns off, and a new active one when it turns on, though no
+    /// transaction changed.
+    pub fn inactive(tip: ChainTip, generation: Generation, last_change: ChangeSeq) -> Self {
+        Self {
+            active: false,
+            ..Self::new(
+                tip,
+                generation,
+                last_change,
+                Vec::new(),
+                TransactionDependencies::default(),
+            )
         }
     }
 
@@ -799,6 +824,8 @@ pub enum PoolCommand {
         /// Where the verdict goes.
         reply: oneshot::Sender<Verdict>,
     },
+    /// [`PoolHandle::fetch_failed`]. The reservation is still armed.
+    FetchFailed(Reservation),
     /// [`PoolHandle::report_violation`].
     ReportViolation(Violation),
     /// [`PoolHandle::await_output`]. The core looks the output up and, if it
@@ -954,6 +981,20 @@ impl PoolHandle {
         verdict
             .await
             .unwrap_or(Verdict::LocalFault(LocalFault::Stopped))
+    }
+
+    /// Report that the fetch `reservation` was taken for ended without a
+    /// body. The slot is freed, as by a drop, and the failure reaches the
+    /// change log, as a failed download reaches today's change stream.
+    ///
+    /// A caller that only stops waiting, and may still get the body, drops
+    /// the reservation and does not call this.
+    pub async fn fetch_failed(&self, reservation: Reservation) {
+        // If the core is gone the reservation is dropped with the command.
+        let _ = self
+            .commands
+            .send(PoolCommand::FetchFailed(reservation))
+            .await;
     }
 
     /// Report a wire violation by a peer that submitted nothing, so its

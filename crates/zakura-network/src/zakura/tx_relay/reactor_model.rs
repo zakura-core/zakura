@@ -20,8 +20,16 @@
 //! - **A verdict ends the fetch** for every announcer.
 //! - **A session owns what it was asked.** A request belongs to the session
 //!   it was sent on until that session answers it or ends, even after the
-//!   node has stopped waiting, given up or been told about the id again. A
-//!   body a session supplied counts against it until the verdict.
+//!   node has stopped waiting, given up or been told about the id again.
+//! - **A peer owns what it supplied.** A body counts against the peer that
+//!   sent it until the verdict, whatever happens to the session. The limit
+//!   of five ids requested or awaiting a verdict is the peer's, over all of
+//!   its sessions. A ban closes every session the peer has.
+//! - **A slot covers a fetch the node is waiting for.** When the node stops
+//!   waiting it frees the slot. A request can still be outstanding then, and
+//!   its late body is dropped here, before it reaches the core. Those
+//!   requests are bounded by five on each session. Holding the slot instead
+//!   would let peers that never answer fill the core.
 //!
 //! Left out: the wire rules of one session (`Hello`, the byte rate, serving),
 //! which belong to the per-session machine.
@@ -96,19 +104,8 @@ struct Session {
     /// Requests sent on this session with no answer yet, including ones the
     /// node stopped waiting for.
     outstanding: Vec<UnminedTxId>,
-    /// Bodies this session supplied that are awaiting a verdict.
-    verifying: usize,
     /// Undecided ids this session has announced.
     pending: usize,
-}
-
-impl Session {
-    /// Whether one more id can be requested: within the peer's `Hello`, and
-    /// within the limit on ids requested or awaiting a verdict.
-    fn has_room(&self) -> bool {
-        self.outstanding.len() < self.max_requests
-            && self.outstanding.len().saturating_add(self.verifying) < MAX_REQUESTS_PER_PEER
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -120,10 +117,10 @@ enum Fetch {
         session: SessionId,
         deadline: ModelTime,
     },
-    /// A body is at the core.
+    /// A body is at the core, supplied by `supplier`.
     Submitted {
         waiter: WaiterId,
-        supplier: SessionId,
+        supplier: QueueSource,
     },
     /// Waiting to try again.
     Backoff { until: ModelTime },
@@ -154,6 +151,9 @@ pub(crate) struct ReactorModel {
     max_tx_bytes: u32,
     next: u64,
     sessions: BTreeMap<SessionId, Session>,
+    /// Bodies each peer supplied that are awaiting a verdict. A peer's count
+    /// outlives its sessions.
+    verifying: HashMap<QueueSource, usize>,
     /// Every id this node wants, oldest first.
     wanted: BTreeMap<u64, Wanted>,
     wanted_of: HashMap<UnminedTxId, u64>,
@@ -171,6 +171,7 @@ impl ReactorModel {
             max_tx_bytes,
             next: 0,
             sessions: BTreeMap::new(),
+            verifying: HashMap::new(),
             wanted: BTreeMap::new(),
             wanted_of: HashMap::new(),
             effects: Vec::new(),
@@ -197,7 +198,6 @@ impl ReactorModel {
                 dialed,
                 max_requests: requests_served.min(MAX_REQUESTS_PER_PEER),
                 outstanding: Vec::new(),
-                verifying: 0,
                 pending: 0,
             },
         );
@@ -287,12 +287,9 @@ impl ReactorModel {
                     },
                 };
                 if let Some((waiter, step)) = arrival {
-                    self.wanted_at(key).fetch = Fetch::Submitted {
-                        waiter,
-                        supplier: session,
-                    };
-                    self.session_at(session).verifying =
-                        self.session_at(session).verifying.saturating_add(1);
+                    let supplier = self.sessions[&session].peer.clone();
+                    *self.verifying.entry(supplier.clone()).or_default() += 1;
+                    self.wanted_at(key).fetch = Fetch::Submitted { waiter, supplier };
                     self.route(step, now, pool);
                 }
             }
@@ -410,11 +407,20 @@ impl ReactorModel {
             .map_or(0, |session| session.outstanding.len())
     }
 
-    /// Bodies `session` supplied that are awaiting a verdict.
-    pub(crate) fn verifying(&self, session: SessionId) -> usize {
+    /// Bodies `peer` supplied that are awaiting a verdict.
+    pub(crate) fn verifying(&self, peer: &QueueSource) -> usize {
+        self.verifying.get(peer).copied().unwrap_or(0)
+    }
+
+    /// Ids requested from `peer` or supplied by it and awaiting a verdict,
+    /// over all of its sessions.
+    pub(crate) fn in_use(&self, peer: &QueueSource) -> usize {
         self.sessions
-            .get(&session)
-            .map_or(0, |session| session.verifying)
+            .values()
+            .filter(|session| session.peer == *peer)
+            .map(|session| session.outstanding.len())
+            .sum::<usize>()
+            .saturating_add(self.verifying(peer))
     }
 
     /// Whether `session` is live.
@@ -434,8 +440,7 @@ impl ReactorModel {
                 "tx-relay/in-flight-within-caps: requests outstanding on one session"
             );
             assert!(
-                session.outstanding.len().saturating_add(session.verifying)
-                    <= MAX_REQUESTS_PER_PEER,
+                self.in_use(&session.peer) <= MAX_REQUESTS_PER_PEER,
                 "tx-relay/in-flight-within-caps: ids requested or awaiting a verdict"
             );
             assert!(
@@ -510,26 +515,38 @@ impl ReactorModel {
             let found = self
                 .wanted
                 .iter()
-                .find_map(|(key, wanted)| match wanted.fetch {
+                .find_map(|(key, wanted)| match &wanted.fetch {
                     Fetch::Submitted {
                         waiter: submitted,
                         supplier,
-                    } if submitted == *waiter => Some((*key, supplier)),
+                    } if submitted == waiter => Some((*key, supplier.clone())),
                     _ => None,
                 });
             let Some((key, supplier)) = found else {
                 continue;
             };
             // The body is no longer awaiting a verdict.
-            if let Some(session) = self.sessions.get_mut(&supplier) {
-                session.verifying = session.verifying.saturating_sub(1);
+            if let Some(count) = self.verifying.get_mut(&supplier) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.verifying.remove(&supplier);
+                }
             }
             match verdict {
                 ModelVerdict::Admitted => self.forget(key),
                 ModelVerdict::Rejected { charge, .. } => {
                     self.forget(key);
-                    if *charge == Charge::Ban && self.sessions.contains_key(&supplier) {
-                        self.effects.push(RelayEffect::Close(supplier));
+                    if *charge == Charge::Ban {
+                        // The ban is the peer's. The session that sent the
+                        // body may have ended and been replaced since.
+                        let live: Vec<SessionId> = self
+                            .sessions
+                            .iter()
+                            .filter(|(_, session)| session.peer == supplier)
+                            .map(|(id, _)| *id)
+                            .collect();
+                        self.effects
+                            .extend(live.into_iter().map(RelayEffect::Close));
                     }
                 }
                 // The body is gone and so is its slot. The transaction may
@@ -561,7 +578,7 @@ impl ReactorModel {
     fn pump(&mut self, now: ModelTime, pool: &mut PoolModel) {
         // An idle id is waiting for a request slot. With none free, nothing
         // can start.
-        if !self.sessions.values().any(Session::has_room) {
+        if !self.sessions.keys().any(|session| self.has_room(*session)) {
             return;
         }
         let idle: Vec<u64> = self
@@ -598,8 +615,7 @@ impl ReactorModel {
         let mut candidates: Vec<SessionId> = untried
             .into_iter()
             .filter(|session| {
-                let session = &self.sessions[session];
-                session.has_room() && !session.outstanding.contains(&id)
+                self.has_room(*session) && !self.sessions[session].outstanding.contains(&id)
             })
             .collect();
         candidates.sort_by_key(|session| !self.sessions[session].dialed);
@@ -610,7 +626,7 @@ impl ReactorModel {
             // The core would refuse this peer's body. That holds for a
             // handoff too, where the slot is already taken under another
             // peer and the core is not asked again.
-            if pool.cooling(&peer) {
+            if pool.cooling(&peer, now) {
                 refused = true;
                 continue;
             }
@@ -658,6 +674,15 @@ impl ReactorModel {
         if refused {
             Self::back_off(self.wanted_at(key), now);
         }
+    }
+
+    /// Whether one more id can be requested on `session`: within its
+    /// `Hello`, and within its peer's limit on ids requested or awaiting a
+    /// verdict.
+    fn has_room(&self, session: SessionId) -> bool {
+        let session = &self.sessions[&session];
+        session.outstanding.len() < session.max_requests
+            && self.in_use(&session.peer) < MAX_REQUESTS_PER_PEER
     }
 
     /// An attempt ended without a body. The id goes to its next announcer,

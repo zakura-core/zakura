@@ -1667,7 +1667,7 @@ fn a_block_caches_what_it_mined_what_conflicted_and_what_expired() {
     // The query takes no slot and does not depend on room.
     let asked: HashSet<_> = [id(1), id(3), id(40)].into_iter().collect();
     let cached: HashSet<_> = [id(1), id(3)].into_iter().collect();
-    assert_eq!(model.rejected_ids(&asked), cached);
+    assert_eq!(model.rejected_ids(&asked, secs(1)), cached);
     assert_eq!(model.slots_in_use(), 0);
 }
 
@@ -1719,17 +1719,21 @@ fn the_rejection_lists_and_the_cooldowns_stay_bounded() {
     model.assert_invariants();
 
     let over = u16::try_from(MAX_COOLDOWNS + 1).expect("the limit fits the test's ids");
-    for n in 0..over {
+    let address = |n: u16| {
         let [high, low] = n.to_be_bytes();
-        let address = SocketAddr::from(([10, 1, high, low], 8233));
-        model.violation(QueueSource::LegacySocket(address), secs(u64::from(n)));
+        QueueSource::LegacySocket(SocketAddr::from(([10, 1, high, low], 8233)))
+    };
+    // All at one time, so none of them ends before the last one starts.
+    for n in 0..over {
+        model.violation(address(n), secs(0));
     }
     model.assert_invariants();
-    // The first cooldown ended soonest, so it made room for the last.
-    assert!(!model.cooling(&QueueSource::LegacySocket(SocketAddr::from((
-        [10, 1, 0, 0],
-        8233
-    )))));
+    // One made room for the last, and the last is in.
+    let cooling = (0..over)
+        .filter(|n| model.cooling(&address(*n), secs(0)))
+        .count();
+    assert_eq!(cooling, MAX_COOLDOWNS);
+    assert!(model.cooling(&address(over - 1), secs(0)));
 }
 
 // Cases from Sol's review of the contract's first version.
@@ -2372,4 +2376,181 @@ async fn a_caller_can_see_which_peers_are_cooling_down() {
     assert!(handle.is_cooling(&v2(1), now));
     assert!(!handle.is_cooling(&v2(2), now));
     assert!(!handle.is_cooling(&v2(1), until));
+}
+
+// Cases from the third review.
+
+fn witnessed(n: u16, authorizing: u8) -> UnminedTxId {
+    use zakura_chain::transaction::{AuthDigest, WtxId};
+    UnminedTxId::Witnessed(WtxId {
+        id: hash(n),
+        auth_digest: AuthDigest([authorizing; 32]),
+    })
+}
+
+#[test]
+fn a_wrong_body_is_refused_and_frees_the_slot_in_the_model_too() {
+    let mut model = new_model();
+    let reservation = model
+        .reserve(id(1), peer(1), Intent::Fetch, secs(0))
+        .expect("room");
+    let (waiter, step) = model.submit(reservation.id, tx(2), Supplier::Peer(legacy(1)), secs(0));
+    assert_eq!(
+        step.verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::WrongTransaction))
+    );
+    assert!(step.started().is_empty());
+    assert_eq!(model.slots_in_use(), 0);
+    model.assert_invariants();
+}
+
+#[test]
+fn a_failed_fetch_is_logged_and_answers_anyone_waiting_on_it() {
+    let mut model = new_model();
+    let fetching = model
+        .reserve(id(1), Source::Node, Intent::Fetch, secs(0))
+        .expect("room");
+    let bringer = model
+        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .expect("joins");
+    let waiting = model
+        .reserve(id(1), peer(3), Intent::Deliver, secs(0))
+        .expect("joins");
+    let (waiter, _) = model.wait(waiting.id, id(1), Supplier::Peer(legacy(3)), secs(0));
+    model.release(bringer.id, secs(0));
+
+    // The crawler's download fails. Today's change stream reports that.
+    let step = model.fetch_failed(fetching.id, secs(1));
+    assert_eq!(step.changes, vec![Change::Refused(id(1))]);
+    assert_eq!(
+        step.verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::NoBody))
+    );
+    assert_eq!(model.slots_in_use(), 0);
+
+    // A caller that only stops waiting logs nothing.
+    let fetching = model
+        .reserve(id(2), Source::Node, Intent::Fetch, secs(1))
+        .expect("room");
+    assert_eq!(model.release(fetching.id, secs(2)), Step::default());
+}
+
+#[test]
+fn a_transaction_found_already_mined_is_answered_the_same_way_each_time() {
+    let mut model = new_model();
+    // The pool started after this transaction was mined, so no block the
+    // core saw named it.
+    for attempt in 0..2 {
+        let (waiter, job) = bring_in(&mut model, tx(1), legacy(attempt));
+        let step = model.outcome(job, Outcome::AlreadyMined, stable(0), stable(0), secs(0));
+        // The verdict comes after the lookup both times. Nothing is cached
+        // that would answer the second one at the reservation instead.
+        assert_eq!(
+            step.verdict(waiter),
+            Some(rejected(RejectionScope::Uncached, Charge::None))
+        );
+    }
+}
+
+#[test]
+fn a_second_set_of_authorizing_data_is_a_duplicate_not_a_conflict() {
+    let mut model = new_model();
+    let coin = hash(900);
+    let variant = |authorizing| {
+        let mut tx = ModelTx::new(witnessed(1, authorizing));
+        tx.spends.push(output(900, 0));
+        tx
+    };
+    assert_eq!(coin, output(900, 0).hash);
+    // Both are verified at once. They spend the same input, because they
+    // are the same transaction.
+    let (first, first_job) = bring_in(&mut model, variant(1), legacy(1));
+    let (second, second_job) = bring_in(&mut model, variant(2), legacy(2));
+    let step = model.outcome(first_job, Outcome::Pass, stable(0), stable(0), secs(0));
+    assert_eq!(step.verdict(first), Some(ModelVerdict::Admitted));
+
+    let step = model.outcome(second_job, Outcome::Pass, stable(0), stable(0), secs(0));
+    assert_eq!(
+        step.verdict(second),
+        Some(rejected(RejectionScope::Uncached, Charge::None))
+    );
+    // Nothing is cached against the transaction the pool holds.
+    let pooled: HashSet<_> = [witnessed(1, 1), witnessed(1, 2)].into_iter().collect();
+    assert!(model.rejected_ids(&pooled, secs(0)).is_empty());
+    assert_eq!(model.visible(), vec![witnessed(1, 1)]);
+}
+
+#[test]
+fn a_hidden_transaction_that_is_woken_and_parks_again_keeps_its_wait() {
+    let mut model = new_model();
+    // The child spends two mined parents.
+    let child = tx(3).spending(hash(1), 0).spending(hash(2), 0);
+    admit(&mut model, child, 3, 0);
+    let step = model.transition(reorg(1, 98), secs(0));
+    let both = Outcome::MissingInputs(vec![output(1, 0), output(2, 0)]);
+    model.outcome(the_job(&step), both, stable(1), stable(1), secs(0));
+
+    // Forty seconds later the first parent arrives and wakes it. The second
+    // is still missing.
+    // Nobody was bringing either parent in until now, so the forty seconds
+    // count.
+    let reservation = model
+        .reserve(id(1), peer(1), Intent::Fetch, secs(40))
+        .expect("room");
+    let (_, step) = model.submit(reservation.id, tx(1), Supplier::Peer(legacy(1)), secs(40));
+    let step = model.outcome(
+        the_job(&step),
+        Outcome::Pass,
+        stable(1),
+        stable(1),
+        secs(40),
+    );
+    let child_job = step.started()[0];
+    model.outcome(child_job, missing(2), stable(1), stable(1), secs(40));
+
+    // It has twenty seconds left, not another sixty.
+    assert!(model.tick(secs(59)).changes.is_empty());
+    assert_eq!(
+        model.tick(secs(60)).changes,
+        vec![Change::Removed {
+            id: id(3),
+            reason: RemovalReason::Invalidated
+        }]
+    );
+}
+
+#[test]
+fn the_rejection_query_uses_the_time_it_is_asked_at() {
+    let mut model = new_model();
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    model.outcome(
+        job,
+        Outcome::Fail {
+            scope: RejectionScope::EffectsChain(ChainReason::Expired),
+            charge: Charge::None,
+        },
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+    // No input moves the model's clock between these.
+    let asked: HashSet<_> = [id(1)].into_iter().collect();
+    assert_eq!(
+        model.rejected_ids(&asked, REJECTION_MEMORY - secs(1)),
+        asked
+    );
+    assert!(model.rejected_ids(&asked, REJECTION_MEMORY).is_empty());
+    assert!(!model.cooling(&v2(1), secs(0)));
+}
+
+#[test]
+fn a_snapshot_says_whether_the_pool_is_on() {
+    let tip = ChainTip {
+        hash: zakura_chain::block::Hash([0; 32]),
+        height: Height(100),
+    };
+    assert!(snapshot_at(ChangeSeq(0)).active);
+    let off = PoolSnapshot::inactive(tip, Generation(0), ChangeSeq(0));
+    assert!(!off.active);
+    assert!(off.transactions.is_empty());
 }

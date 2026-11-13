@@ -418,11 +418,9 @@ enum Hidden {
     Retry {
         at: ModelTime,
     },
-    /// Parents are missing. `waited` counts as a parked admission's wait
-    /// does.
+    /// Parents are missing.
     Parked {
         on: Vec<transaction::Hash>,
-        waited: Duration,
     },
 }
 
@@ -436,6 +434,10 @@ struct Pooled {
     visible_at: u64,
     /// The log position of its latest `Hidden` entry.
     hidden_at: ChangeSeq,
+    /// The time spent hidden and parked with nobody bringing a parent in,
+    /// since it was last visible. Waking and parking again does not reset
+    /// it.
+    parked_for: Duration,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -544,14 +546,14 @@ impl PoolModel {
             return Err(ModelUnreserved::Inactive);
         }
         if let Source::Peer(peer) = &source {
-            if self.cooling(peer) {
+            if self.cooling(peer, now) {
                 return Err(ModelUnreserved::CoolingDown);
             }
         }
         if self.pooled.contains_key(&tx_id.mined_id()) {
             return Err(ModelUnreserved::Pooled);
         }
-        if let Some(scope) = self.cached_rejection(tx_id) {
+        if let Some(scope) = self.cached_rejection(tx_id, now) {
             return Err(ModelUnreserved::Rejected(scope));
         }
         if let Some(key) = self.admission_of.get(&tx_id).copied() {
@@ -593,18 +595,20 @@ impl PoolModel {
     /// A reservation dropped before the core accepted it.
     pub fn release(&mut self, reservation: ReservationId, now: ModelTime) -> Step {
         self.advance(now);
-        let key = match self.tickets.remove(&reservation) {
-            Some(ticket) => Some(ticket.admission),
-            None => self.owners.remove(&reservation).inspect(|key| {
-                if let Some(admission) = self.admissions.get_mut(key) {
-                    admission.owner_waiting = false;
-                }
-            }),
-        };
-        if let Some(key) = key {
-            self.settle_bodyless(key);
+        self.drop_reservation(reservation);
+        self.start_revalidations();
+        self.take_step()
+    }
+
+    /// [`super::PoolHandle::fetch_failed`]: the caller's fetch ended without
+    /// a body. Unlike a plain drop, this is logged, because today's change
+    /// stream reports a download that failed.
+    pub fn fetch_failed(&mut self, reservation: ReservationId, now: ModelTime) -> Step {
+        self.advance(now);
+        if let Some(tx_id) = self.reserved_for(reservation) {
+            self.step.changes.push(Change::Refused(tx_id));
         }
-        self.leases.remove(&reservation);
+        self.drop_reservation(reservation);
         self.start_revalidations();
         self.take_step()
     }
@@ -645,6 +649,20 @@ impl PoolModel {
     ) -> (WaiterId, Step) {
         self.advance(now);
         let waiter = WaiterId(self.fresh());
+        // The handle checks the body against the reservation before it
+        // sends anything. A wrong body drops the reservation.
+        if self
+            .reserved_for(reservation)
+            .is_some_and(|reserved| reserved != tx_id)
+        {
+            self.drop_reservation(reservation);
+            self.step.effects.push(Effect::Verdict {
+                waiter,
+                verdict: ModelVerdict::LocalFault(LocalFault::WrongTransaction),
+            });
+            self.start_revalidations();
+            return (waiter, self.take_step());
+        }
         let (key, ticket_source) = match self.tickets.remove(&reservation) {
             Some(ticket) => (Some(ticket.admission), Some(ticket.source)),
             None => (self.owners.remove(&reservation), None),
@@ -666,7 +684,7 @@ impl PoolModel {
         };
         // The source was checked when it reserved. The supplier can be
         // another peer, or have entered a cooldown since.
-        if matches!(&supplier, Supplier::Peer(peer) if self.cooling(peer)) {
+        if matches!(&supplier, Supplier::Peer(peer) if self.cooling(peer, now)) {
             if self.admission_at(key).owner == reservation {
                 self.admission_at(key).owner_waiting = false;
             }
@@ -892,7 +910,11 @@ impl PoolModel {
         for key in keys {
             // An earlier removal in this loop can have taken this one with
             // it, as a dependent.
-            let Some(hidden) = self.pool.get(&key).map(|pooled| pooled.hidden.clone()) else {
+            let Some((hidden, parked_for)) = self
+                .pool
+                .get(&key)
+                .map(|pooled| (pooled.hidden.clone(), pooled.parked_for))
+            else {
                 continue;
             };
             match hidden {
@@ -905,7 +927,7 @@ impl PoolModel {
                     self.pooled_at(key).hidden = Some(Hidden::Queued);
                 }
                 // Its parent never came back.
-                Some(Hidden::Parked { waited, .. }) if waited >= T_PARK => {
+                Some(Hidden::Parked { .. }) if parked_for >= T_PARK => {
                     let hash = self.pooled_at(key).tx.id.mined_id();
                     self.remove_with_dependents(hash, RemovalReason::Invalidated);
                 }
@@ -1005,18 +1027,21 @@ impl PoolModel {
             .is_some_and(|admission| matches!(admission.stage, Stage::Parked { .. }))
     }
 
-    /// Whether the core refuses `peer` for now. A legacy peer is matched by
-    /// its canonical IP address.
-    pub fn cooling(&self, peer: &QueueSource) -> bool {
-        self.cooldowns.contains_key(&CooldownKey::from(peer))
+    /// Whether the core refuses `peer` at `now`. A legacy peer is matched by
+    /// its canonical IP address. This reads the cooldown's own end time, so
+    /// it is right whichever input last moved the model's clock.
+    pub fn cooling(&self, peer: &QueueSource, now: ModelTime) -> bool {
+        self.cooldowns
+            .get(&CooldownKey::from(peer))
+            .is_some_and(|until| *until > now)
     }
 
     /// [`super::PoolHandle::rejected_ids`]: the members of `ids` a cached
-    /// rejection covers. Takes no slot.
-    pub fn rejected_ids(&self, ids: &HashSet<UnminedTxId>) -> HashSet<UnminedTxId> {
+    /// rejection covers at `now`. Takes no slot.
+    pub fn rejected_ids(&self, ids: &HashSet<UnminedTxId>, now: ModelTime) -> HashSet<UnminedTxId> {
         ids.iter()
             .copied()
-            .filter(|id| self.cached_rejection(*id).is_some())
+            .filter(|id| self.cached_rejection(*id, now).is_some())
             .collect()
     }
 
@@ -1098,6 +1123,34 @@ impl PoolModel {
 
     // Rules.
 
+    /// The id an undecided reservation was granted for.
+    fn reserved_for(&self, reservation: ReservationId) -> Option<UnminedTxId> {
+        let key = self
+            .tickets
+            .get(&reservation)
+            .map(|ticket| ticket.admission)
+            .or_else(|| self.owners.get(&reservation).copied())?;
+        self.admissions.get(&key).map(|admission| admission.tx_id)
+    }
+
+    /// Ends a reservation that brought no body: frees its lease, or its
+    /// place in an admission, and ends that admission if nobody can still
+    /// bring its body.
+    fn drop_reservation(&mut self, reservation: ReservationId) {
+        let key = match self.tickets.remove(&reservation) {
+            Some(ticket) => Some(ticket.admission),
+            None => self.owners.remove(&reservation).inspect(|key| {
+                if let Some(admission) = self.admissions.get_mut(key) {
+                    admission.owner_waiting = false;
+                }
+            }),
+        };
+        if let Some(key) = key {
+            self.settle_bodyless(key);
+        }
+        self.leases.remove(&reservation);
+    }
+
     /// Joins an id that is already undecided, if `source` may.
     fn join(
         &mut self,
@@ -1160,7 +1213,21 @@ impl PoolModel {
                     Outcome::PassUsing(inputs) => inputs,
                     _ => Vec::new(),
                 };
-                // Today's insertion checks, in today's order.
+                // Today's insertion checks, in today's order. First, another
+                // set of authorizing data for the same effects got in while
+                // this one was verified. That is a duplicate, not a
+                // conflict, and nothing is cached against the transaction
+                // the pool holds.
+                if self.pooled.contains_key(&hash) {
+                    self.decide(
+                        key,
+                        ModelVerdict::Rejected {
+                            scope: RejectionScope::Uncached,
+                            charge: Charge::None,
+                        },
+                    );
+                    return;
+                }
                 if self
                     .pool
                     .values()
@@ -1204,17 +1271,18 @@ impl PoolModel {
                         backoff: REVALIDATE_RETRY,
                         visible_at: pool_key,
                         hidden_at: ChangeSeq(0),
+                        parked_for: Duration::ZERO,
                     },
                 );
                 self.pooled.insert(hash, pool_key);
                 self.decide(key, ModelVerdict::Admitted);
                 self.wake(hash);
             }
-            Outcome::AlreadyMined => self.reject(
-                key,
-                RejectionScope::EffectsChain(ChainReason::Mined),
-                Charge::None,
-            ),
+            // Found in the best chain by this job's own lookup. Today that
+            // leaves the rejection lists alone, so a second submission gets
+            // the same answer at the same stage. Only a block the core sees
+            // connect fills the mined list.
+            Outcome::AlreadyMined => self.reject(key, RejectionScope::Uncached, Charge::None),
             Outcome::Fail { scope, charge } => self.reject(key, scope, charge),
             Outcome::MissingInputs(missing) => {
                 // One of the missing outputs became available after this job
@@ -1282,6 +1350,7 @@ impl PoolModel {
                 pooled.hidden = None;
                 pooled.backoff = REVALIDATE_RETRY;
                 pooled.visible_at = visible_at;
+                pooled.parked_for = Duration::ZERO;
                 let (id, hidden_at, count) = (pooled.tx.id, pooled.hidden_at, pooled.tx.outputs);
                 self.step.changes.push(Change::Revealed { id, hidden_at });
                 // Its outputs are available again, to waiters as well.
@@ -1317,10 +1386,7 @@ impl PoolModel {
                         on.push(outpoint.hash);
                     }
                 }
-                self.pooled_at(key).hidden = Some(Hidden::Parked {
-                    on,
-                    waited: Duration::ZERO,
-                });
+                self.pooled_at(key).hidden = Some(Hidden::Parked { on });
             }
             Outcome::Fail { .. } => {
                 // Its job has reported, so there is nothing to cancel.
@@ -1388,7 +1454,7 @@ impl PoolModel {
                 charge: Charge::None,
             };
         }
-        if let Some(scope) = self.cached_rejection(tx_id) {
+        if let Some(scope) = self.cached_rejection(tx_id, self.now) {
             return ModelVerdict::Rejected {
                 scope,
                 charge: Charge::None,
@@ -1436,7 +1502,7 @@ impl PoolModel {
             self.start_admission(key);
         }
         for pooled in self.pool.values_mut() {
-            if matches!(&pooled.hidden, Some(Hidden::Parked { on, .. }) if on.contains(&parent)) {
+            if matches!(&pooled.hidden, Some(Hidden::Parked { on }) if on.contains(&parent)) {
                 pooled.hidden = Some(Hidden::Queued);
             }
         }
@@ -1652,9 +1718,9 @@ impl PoolModel {
             }
         }
         for pooled in self.pool.values_mut() {
-            if let Some(Hidden::Parked { on, waited }) = &mut pooled.hidden {
+            if let Some(Hidden::Parked { on }) = &pooled.hidden {
                 if !on.iter().any(|parent| arriving.contains(parent)) {
-                    *waited = waited.saturating_add(elapsed);
+                    pooled.parked_for = pooled.parked_for.saturating_add(elapsed);
                 }
             }
         }
@@ -1704,7 +1770,7 @@ impl PoolModel {
         }
     }
 
-    fn cached_rejection(&self, tx_id: UnminedTxId) -> Option<RejectionScope> {
+    fn cached_rejection(&self, tx_id: UnminedTxId, now: ModelTime) -> Option<RejectionScope> {
         let hash = tx_id.mined_id();
         if self.rejected_exact.contains(&tx_id) {
             return Some(RejectionScope::ExactTip);
@@ -1721,7 +1787,8 @@ impl PoolModel {
         .find(|reason| {
             self.rejected_chain
                 .get(reason)
-                .is_some_and(|list| list.at.contains_key(&hash))
+                .and_then(|list| list.at.get(&hash))
+                .is_some_and(|at| at.saturating_add(self.rejection_memory) > now)
         })
         .map(RejectionScope::EffectsChain)
     }

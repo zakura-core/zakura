@@ -16,12 +16,14 @@ Four steps, each safe to repeat:
         changes, and the node is not restarted: the settings take effect the next
         time it starts. An existing trace directory is preserved.
 
-    fleet.py peer-names --config nodes.toml [--node NAME]
+    fleet.py peer-names --config nodes.toml --private-addresses FILE [--node NAME]
         Tell the node the names of the other nodes in the list, by address, so its
         trace files name them when a block is announced or served over the legacy
         network; the cluster view (deploy/runner/propagation.py) joins nodes on
-        those names. The node is not restarted: the names take effect the next time
-        it starts.
+        those names. A node whose address is in FILE (a JSON list of addresses, `-`
+        for stdin; the dashboard host's private list) is named to no node, and
+        nothing is written when FILE cannot be read. The node is not restarted: the
+        names take effect the next time it starts.
 
     fleet.py install --config nodes.toml [--node NAME]
         Copy the profiler to the node, point it at that node's log and trace files,
@@ -426,20 +428,52 @@ def peer_address(node):
         raise FleetError(f"{node.name} is reached at {host!r}, which is not an IP address") from error
 
 
-def peer_names_drop_in(node, nodes):
-    """The service drop-in that names every node in `nodes` but `node` itself."""
-    names = ",".join(f"{peer.name}={peer_address(peer)}" for peer in nodes if peer.name != node.name)
+def address_key(text):
+    """One spelling of an IP address, with an IPv4 address written in IPv6 form as IPv4."""
+    address = ipaddress.ip_address(text)
+    return str(getattr(address, "ipv4_mapped", None) or address)
+
+
+def parse_private_addresses(text):
+    """The set of addresses in a private list (a JSON list of IP address strings).
+
+    Raises `FleetError` for anything else, so that peer names are never written
+    without the list.
+    """
+    try:
+        listed = json.loads(text)
+        if not isinstance(listed, list) or not all(isinstance(item, str) for item in listed):
+            raise ValueError("not a list of addresses")
+        return frozenset(address_key(item) for item in listed)
+    except ValueError as error:
+        raise FleetError(f"the private address list cannot be read ({error})") from None
+
+
+def named_peers(node, nodes, private):
+    """The nodes in `nodes` that `node` is told about: every other node, except one whose
+    address is in `private`, since the drop-in can be read by anyone on the node."""
+    return [peer for peer in nodes if peer.name != node.name and address_key(peer_address(peer)) not in private]
+
+
+def peer_names_drop_in(peers):
+    """The service drop-in that names each node in `peers` by its address."""
+    names = ",".join(f"{peer.name}={peer_address(peer)}" for peer in peers)
     return f"# Written by deploy/profiler/fleet.py.\n[Service]\nEnvironment={PEER_NAMES_VARIABLE}={names}\n"
 
 
-def set_peer_names(node, nodes):
-    """Give the node its fleet peers' names; returns a line saying what was done."""
+def set_peer_names(node, nodes, private):
+    """Give the node its fleet peers' names, leaving out the `private` addresses; returns a
+    line saying what was done."""
     unit = node.service_name if "." in node.service_name else node.service_name + ".service"
-    drop_in = peer_names_drop_in(node, nodes)
+    peers = named_peers(node, nodes, private)
+    drop_in = peer_names_drop_in(peers)
     result = remote(node, WRITE_DROP_IN_SCRIPT, unit, PEER_NAMES_DROP_IN, stdin=drop_in.encode()).strip()
+    # A count only: the line goes to the workflow log.
+    left_out = len(nodes) - 1 - len(peers)
+    kept = f", leaving out {left_out} with a private address" if left_out else ""
     if result == "unchanged":
-        return f"already names its {len(nodes) - 1} fleet peers"
-    return f"names its {len(nodes) - 1} fleet peers once the node next starts"
+        return f"already names its {len(peers)} fleet peers{kept}"
+    return f"names its {len(peers)} fleet peers once the node next starts{kept}"
 
 
 def install_profiler(node):
@@ -504,6 +538,11 @@ def parse_args(argv):
         step = steps.add_parser(name)
         step.add_argument("--config", required=True, help="the deployer's node list")
         step.add_argument("--node", default="", help="only this node; all profiled nodes when empty")
+        if name == "peer-names":
+            step.add_argument(
+                "--private-addresses", required=True,
+                help="JSON list of addresses never to name to a node, `-` for stdin",
+            )
     tunnels = steps.add_parser("tunnels")
     tunnels.add_argument("--config", required=True, help="the deployer's node list")
     return parser.parse_args(argv)
@@ -520,6 +559,18 @@ def main(argv=None):
         install_tunnels(nodes)
         return 0
     fleet = nodes
+    private = frozenset()
+    if args.step == "peer-names":
+        try:
+            if args.private_addresses == "-":
+                listed = sys.stdin.read()
+            else:
+                with open(args.private_addresses, encoding="utf-8") as handle:
+                    listed = handle.read()
+            private = parse_private_addresses(listed)
+        except (OSError, FleetError) as error:
+            print(f"peer names not written: {error}", file=sys.stderr)
+            return 2
     if args.node:
         nodes = [node for node in nodes if node.name == args.node]
         if not nodes:
@@ -527,7 +578,7 @@ def main(argv=None):
             return 0
     step = {
         "ensure-trace-config": ensure_trace_config,
-        "peer-names": lambda node: set_peer_names(node, fleet),
+        "peer-names": lambda node: set_peer_names(node, fleet, private),
         "install": install_profiler,
     }[args.step]
     return 1 if for_each_node(nodes, step) else 0

@@ -125,6 +125,21 @@ class JoinTests(unittest.TestCase):
         self.assertEqual([block["height"] for block in joined["blocks"]], [10, 9])
         self.assertEqual(len(propagation.join(reports, NODE_IDS, limit=1)["blocks"]), 1)
 
+    def test_a_malformed_record_costs_only_that_block_on_that_node(self):
+        good = self.reports["us-0"]["blocks"][0]
+        malformed = [
+            {"wall": {"tip": START}},
+            {**good, "hash": "cd" * 32, "wall": {**good["wall"], "heard": "soon"}},
+            {**good, "hash": "ef" * 32, "height": "ten"},
+            {**good, "hash": "01" * 32, "peers": {"name:us-east-0": {"told": float("nan")}}},
+            {**good, "hash": "23" * 32, "heard_from": ["not", "a", "label"]},
+            "not a record",
+        ]
+        joined = self.join(**{"us-0": report(*malformed, good)})
+        self.assertEqual([block["hash"] for block in joined["blocks"]], [BLOCK])
+        self.assertEqual(sorted(joined["blocks"][0]["nodes"]), ["us-0", "us-east-0"])
+        self.assertEqual(self.join(**{"us-0": {"blocks": "not a list"}})["blocks"][0]["first_node"], "us-east-0")
+
     def test_the_summary_gives_each_node_s_intervals_and_each_pair_s_hop_time(self):
         summary = self.join()["summary"]
         east = summary["nodes"]["us-east-0"]

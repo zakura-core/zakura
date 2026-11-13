@@ -598,8 +598,11 @@ jobs:
 
           # Each node is also told the names of the other nodes, by address, so its
           # trace files say which of them a block was announced to or served to. The
-          # block propagation page joins the nodes on those names.
-          python3 deploy/profiler/fleet.py peer-names "${args[@]}" \
+          # block propagation page joins the nodes on those names. The names land in a
+          # file anyone on the node can read, so a node on this host's private address
+          # list is named to no node; without the list, no names are written.
+          sudo -n cat /etc/zakura-mainnet-dashboard/private/addresses.json \
+            | python3 deploy/profiler/fleet.py peer-names --private-addresses - "${args[@]}" \
             || echo "::warning::fleet peer names could not be set on every node; see the step log" >&2
 
       - name: Deploy fleet

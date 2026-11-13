@@ -124,8 +124,10 @@ commands accept `--node NAME` to act on one node.
 ```bash
 # Before the node restarts: install retention, then enable trace writes.
 python3 deploy/profiler/fleet.py ensure-trace-config --config nodes.toml
-# Before the node restarts: tell it the names of the other nodes.
-python3 deploy/profiler/fleet.py peer-names --config nodes.toml
+# Before the node restarts: tell it the other nodes' names, except private ones.
+sudo -n cat /etc/zakura-mainnet-dashboard/private/addresses.json \
+  | python3 deploy/profiler/fleet.py peer-names --config nodes.toml \
+      --private-addresses -
 # To refresh the profiler alone, without changing the node's config:
 python3 deploy/profiler/fleet.py install --config nodes.toml
 # On the dashboard host: one SSH tunnel per node on another host.
@@ -174,7 +176,10 @@ node changes, and no address leaves the node except through the profiler's
 the address each is reached at over SSH. The node then writes that name, and
 never the address, in the trace rows for a legacy peer connecting from it. It
 does not restart the node: the names take effect when the node next starts. A
-node build that does not know the variable ignores it.
+node build that does not know the variable ignores it. Anyone on the node can
+read the drop-in, so a node whose address is on the private list
+(`--private-addresses`, the dashboard host's list) is named to no node, and
+nothing is written when that list cannot be read.
 
 **`install`** needs `perf` on the node (the `linux-tools` package) and installs
 `binutils` when `c++filt` is missing. It writes the node's own name, log file

@@ -18,6 +18,7 @@ are reduced to "a private peer" here, before anything is summarised or returned.
 
 import hashlib
 import ipaddress
+import math
 import time
 
 # The points on a block's way through one node, in order.
@@ -148,39 +149,67 @@ def ninth_decile(values):
     return ordered[min(len(ordered) - 1, len(ordered) * 9 // 10)] if ordered else None
 
 
+def seconds(value):
+    """`value` as a time in seconds; raises `TypeError` unless it is a finite number."""
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise TypeError("a time is a finite number")
+    return value
+
+
+def node_record(record, node, fleet, fleet_addresses, is_private):
+    """One block record of a node's report with peers resolved to node names, or `None`
+    when it lacks a tip time.
+
+    Raises `KeyError`, `TypeError`, `ValueError` or `AttributeError` for a record that is
+    not shaped the way the profiler writes it.
+    """
+    wall = record.get("wall") or {}
+    tip, logged = wall.get("tip"), record.get("t")
+    if tip is None:
+        return None
+    if not isinstance(record["hash"], str) or not isinstance(record.get("height"), (int, type(None))):
+        raise TypeError("a block is named by a hash string and an integer height")
+    shift, clock = 0.0, "trace"
+    if logged is not None and abs(seconds(logged) - seconds(tip)) > CLOCK_TRUST_SECONDS:
+        shift, clock = logged - tip, "log"
+    peers = {}
+    for peer, steps in (record.get("peers") or {}).items():
+        name = fleet.get(peer)
+        if name is not None and name != node:
+            peers.setdefault(name, {}).update({step: seconds(when) + shift for step, when in steps.items()})
+    return {
+        "height": record.get("height"),
+        "path": record.get("path"),
+        "reorg": bool(record.get("reorg")),
+        "size": record.get("size") if isinstance(record.get("size"), int) else None,
+        "clock": clock,
+        "from": fleet.get(record.get("heard_from"), OUTSIDE),
+        "from_peer": outside_announcer(record, fleet, fleet_addresses, is_private),
+        "wall": {point: seconds(wall[point]) + shift for point in POINTS if point in wall},
+        "peers": peers,
+        "downloads": node_downloads(record, fleet, fleet_addresses, is_private),
+    }
+
+
 def node_blocks(report, node, fleet, fleet_addresses, is_private):
     """One node's report as `{block hash: its record}`, with peers resolved to node names.
 
     Times stay in unix seconds. A record whose trace clock disagrees with the node log
     is moved onto the log's clock and marked `clock: "log"`: times within a node run
     are exact, so the log's time for the tip places all of them.
+
+    A record that is not shaped the way the profiler writes it is left out, so that one
+    bad record costs only that block on that node, not the whole view.
     """
     blocks = {}
-    for record in report.get("blocks", ()):
-        wall = record.get("wall") or {}
-        tip, logged = wall.get("tip"), record.get("t")
-        if tip is None:
+    records = report.get("blocks")
+    for record in records if isinstance(records, list) else ():
+        try:
+            joined = node_record(record, node, fleet, fleet_addresses, is_private)
+        except (KeyError, TypeError, ValueError, AttributeError):
             continue
-        shift, clock = 0.0, "trace"
-        if logged is not None and abs(logged - tip) > CLOCK_TRUST_SECONDS:
-            shift, clock = logged - tip, "log"
-        peers = {}
-        for peer, steps in (record.get("peers") or {}).items():
-            name = fleet.get(peer)
-            if name is not None and name != node:
-                peers.setdefault(name, {}).update({step: when + shift for step, when in steps.items()})
-        blocks[record["hash"]] = {
-            "height": record.get("height"),
-            "path": record.get("path"),
-            "reorg": bool(record.get("reorg")),
-            "size": record.get("size") if isinstance(record.get("size"), int) else None,
-            "clock": clock,
-            "from": fleet.get(record.get("heard_from"), OUTSIDE),
-            "from_peer": outside_announcer(record, fleet, fleet_addresses, is_private),
-            "wall": {point: wall[point] + shift for point in POINTS if point in wall},
-            "peers": peers,
-            "downloads": node_downloads(record, fleet, fleet_addresses, is_private),
-        }
+        if joined is not None:
+            blocks[record["hash"]] = joined
     return blocks
 
 

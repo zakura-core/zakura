@@ -59,6 +59,9 @@ harness's record covers each seed whose class and other rule are the
 record's. A seed whose result differs stays untriaged. The loop copies each
 record onto the lanes it matches, lists as stale each record whose case ran
 and that matches no lane, and prints how many lanes still need one.
+`cargo xtask planted triage --report <file> [--out <file>]` applies the
+current records afresh to a saved report, such as the joint run's
+cumulative one.
 
 `python3 scripts/mutation_joint_run.py run --previous <report.json> --out
 <dir>` runs the loop with generator lanes on the cases changed since the

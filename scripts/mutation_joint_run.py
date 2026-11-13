@@ -14,8 +14,9 @@ in the first three lists:
   report but not in the previous one, or that are new.
 - `new_property_findings`: what a generator's search on the unpatched build
   stopped at, if the previous report didn't list it.
-- `untriaged`: every lane of the new report that survived, or that another
-  rule killed, and has no record in `qa/native-mutations/triage.toml`.
+- `untriaged`: every lane of the new report, or of the routine's cumulative
+  report, that survived, or that another rule killed, and has no record in
+  `qa/native-mutations/triage.toml`.
 
 The new report holds only the cases a change since the previous pin
 affects, so a case missing from it is unchanged, not fixed. The loop runs
@@ -26,12 +27,15 @@ checkout to `origin/main`, runs the full planted sim suite, runs the loop
 with generator lanes on what changed since the last pin (every case on its
 first run), and optionally runs the libFuzzer lane on the same cases. A
 `--changed-since` report holds only the cases it reran, so the routine
-diffs each new report against a cumulative one, `<state>/cumulative.json`
+merges each new report into a cumulative one, `<state>/cumulative.json`
 (`cumulative-libfuzzer.json` for the libFuzzer lane): every case's latest
-result and every property finding so far. It then merges the new report
-into it. Each run writes under `<state>/runs/<UTC time>-<commit>/`, and
-`<state>/latest.json` names the last pin. `--dry-run` prints the steps
-without running any.
+result and every property finding so far. `cargo xtask planted triage` then
+applies the checkout's triage records to the cumulative report afresh, so a
+triage-only commit, which selects no case, still updates it. The routine
+diffs the new report against the previous cumulative one, and lists the
+cumulative report's untriaged lanes. Each run writes under
+`<state>/runs/<UTC time>-<commit>/`, and `<state>/latest.json` names the
+last pin. `--dry-run` prints the steps without running any.
 """
 
 import argparse
@@ -86,8 +90,8 @@ def finding_key(finding):
     return (finding.get("property"), finding["harness"], finding["seed"], finding.get("mode", "inproc"))
 
 
-def diff(previous, new):
-    """Return what `new` reports that `previous` doesn't, and what in `new` still needs triage."""
+def diff(previous, new, current=None):
+    """Return what `new` reports that `previous` doesn't, and what in `current`, or `new` without it, still needs triage."""
     before = lanes(previous)
     surviving = [
         {"lane": list(key), "was": before.get(key)}
@@ -108,7 +112,7 @@ def diff(previous, new):
         "newly_surviving": surviving,
         "newly_failing_baselines": failing,
         "new_property_findings": findings,
-        "untriaged": untriaged(new),
+        "untriaged": untriaged(new if current is None else current),
     }
 
 
@@ -139,18 +143,18 @@ def read_json(path):
     return json.loads(path.read_text()) if path.exists() else {}
 
 
-def write_diff(previous, new_path):
-    """Diff `previous` against the report at `new_path`, print the diff, write it beside the report, and return it."""
-    changes = diff(previous, json.loads(Path(new_path).read_text()))
+def write_diff(changes, out_dir):
+    """Print `changes`, and write them to `out_dir`'s diff file."""
     text = json.dumps(changes, indent=2) + "\n"
-    (Path(new_path).parent / DIFF_FILE).write_text(text)
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    (Path(out_dir) / DIFF_FILE).write_text(text)
     sys.stdout.write(text)
-    return changes
 
 
 def report_diff(previous_path, new_path):
     """Diff two reports, print the diff, write it beside the new one, and return the exit status."""
-    changes = write_diff(json.loads(Path(previous_path).read_text()), new_path)
+    changes = diff(json.loads(Path(previous_path).read_text()), json.loads(Path(new_path).read_text()))
+    write_diff(changes, Path(new_path).parent)
     return 1 if has_news(changes) else 0
 
 
@@ -204,6 +208,16 @@ def routine_steps(checkout, run_dir, latest, args):
     return steps
 
 
+def triage_step(checkout, lane, cumulative_path):
+    """Return the step that applies the checkout's triage records afresh to a lane's cumulative report, in place."""
+    return {
+        "name": f"triage-{lane}",
+        "argv": ["cargo", "xtask", "planted", "triage", "--report", str(cumulative_path)],
+        "env": {},
+        "cwd": str(checkout),
+    }
+
+
 def pin(checkout):
     """Fetch `origin/main` into `checkout`, detach it there, and return the commit."""
     git = ["git", "-C", str(checkout)]
@@ -230,7 +244,9 @@ def routine(args):
     if args.dry_run:
         run_dir = state / "runs" / "<UTC time>-<commit>"
         steps = routine_steps(checkout, run_dir, latest, args)
-        sys.stdout.write(json.dumps({"latest": latest, "pin": "origin/main", "steps": steps}, indent=2) + "\n")
+        triage = [triage_step(checkout, lane, state / name) for lane, name in CUMULATIVE_FILES.items()]
+        plan = {"latest": latest, "pin": "origin/main", "steps": steps, "triage": triage}
+        sys.stdout.write(json.dumps(plan, indent=2) + "\n")
         return 0
     pinned = pin(checkout)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -243,15 +259,23 @@ def routine(args):
     status = 0 if all(code == 0 for code in ended.values()) else 1
     for lane, cumulative_file in CUMULATIVE_FILES.items():
         report = run_dir / lane / REPORT_FILE
-        if not report.exists():
-            continue
         cumulative_path = state / cumulative_file
+        if not report.exists() and not cumulative_path.exists():
+            continue
         cumulative = read_json(cumulative_path)
-        changes = write_diff(cumulative, report)
+        # A run that selected no case, such as one after a triage-only
+        # commit, writes no report, and the cumulative report still takes
+        # the checkout's triage.
+        new = read_json(report) if report.exists() else {"pinned": cumulative.get("pinned"), "cases": []}
+        merged = merge(cumulative, new)
+        cumulative_path.write_text(json.dumps(merged, indent=2) + "\n")
+        step = triage_step(checkout, lane, cumulative_path)
+        ended[step["name"]] = run_step(step, run_dir)
+        status = status or int(ended[step["name"]] != 0)
+        changes = diff(cumulative, new, read_json(cumulative_path))
+        write_diff(changes, run_dir / lane)
         record["news"][lane] = has_news(changes)
         status = status or int(record["news"][lane])
-        merged = merge(cumulative, json.loads(report.read_text()))
-        cumulative_path.write_text(json.dumps(merged, indent=2) + "\n")
     if ended.get("loop") == 0 or (run_dir / "loop" / REPORT_FILE).exists():
         (state / LATEST_FILE).write_text(json.dumps({"pinned": pinned, "run": str(run_dir)}, indent=2) + "\n")
     else:

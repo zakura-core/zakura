@@ -89,6 +89,8 @@ mod generate;
 mod tests;
 mod triage;
 
+pub(crate) use triage::run as triage;
+
 use classify::{Class, Classified, Ended, GenerateFacts, Observed, Reason, Trigger};
 use generate::{
     GenerateConfig, GenerateFlags, GeneratorBaselineFailure, GeneratorReport, Lanes,

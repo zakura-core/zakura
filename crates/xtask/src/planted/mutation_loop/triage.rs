@@ -14,6 +14,7 @@
 use std::{fs, io, path::Path};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::{
     classify::{Class, Classified},
@@ -179,9 +180,10 @@ pub(super) fn read(root: &Path) -> Result<Vec<Record>, BoxError> {
 }
 
 /// Copies each of `records` onto every lane of `cases` it names that needs
-/// triage, with the lane's class and other rule. Returns the stale records:
-/// those whose case ran and that matched no lane. A record for a case
-/// `--only` or `--changed-since` left out isn't judged.
+/// triage, with the lane's class and other rule, and clears every other
+/// lane's triage. Returns the stale records: those whose case ran and that
+/// matched no lane. A record for a case `--only` or `--changed-since` left
+/// out isn't judged.
 pub(super) fn apply<'a>(cases: &mut [CaseReport], records: &'a [Record]) -> Vec<&'a Record> {
     let mut used = vec![false; records.len()];
     let mut find = |case: &CaseReport, lane: &str, result: &Classified| {
@@ -192,16 +194,16 @@ pub(super) fn apply<'a>(cases: &mut [CaseReport], records: &'a [Record]) -> Vec<
         Some(records[index].triage())
     };
     for case in cases.iter_mut() {
-        if needs_triage(case.result.class) {
-            case.triage = find(case, WITNESS_LANE, &case.result);
-        }
+        case.triage = needs_triage(case.result.class)
+            .then(|| find(case, WITNESS_LANE, &case.result))
+            .flatten();
         let generator = std::mem::take(&mut case.generator);
         case.generator = generator
             .into_iter()
             .map(|mut lane| {
-                if needs_triage(lane.result.class) {
-                    lane.triage = find(case, &lane.harness, &lane.result);
-                }
+                lane.triage = needs_triage(lane.result.class)
+                    .then(|| find(case, &lane.harness, &lane.result))
+                    .flatten();
                 lane
             })
             .collect();
@@ -232,4 +234,85 @@ pub(super) fn untriaged(cases: &[CaseReport]) -> usize {
                     .count()
         })
         .sum()
+}
+
+/// Applies `records` to the cases of `report`, a loop report or a merge of
+/// several, as [`apply`] does, and changes nothing else in it. The report's
+/// `summary` counts classes, not triage, so it stays. Returns the stale
+/// records.
+pub(super) fn reapply<'a>(
+    report: &mut Value,
+    records: &'a [Record],
+) -> Result<Vec<&'a Record>, BoxError> {
+    let values = report
+        .get_mut("cases")
+        .and_then(Value::as_array_mut)
+        .ok_or("the report has no `cases` list")?;
+    let mut cases = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            serde_json::from_value::<CaseReport>(value.clone())
+                .map_err(|error| format!("case {index}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let stale = apply(&mut cases, records);
+    // Only each lane's `triage` changes, so a field this build doesn't read
+    // survives.
+    for (value, case) in values.iter_mut().zip(&cases) {
+        set_triage(value, case.triage.as_ref())?;
+        let lanes = value.get_mut("generator").and_then(Value::as_array_mut);
+        for (lane, report) in lanes.into_iter().flatten().zip(&case.generator) {
+            set_triage(lane, report.triage.as_ref())?;
+        }
+    }
+    Ok(stale)
+}
+
+/// Sets the `triage` field of the lane `value`, or removes it for `None`.
+fn set_triage(value: &mut Value, triage: Option<&Triage>) -> Result<(), BoxError> {
+    let lane = value.as_object_mut().ok_or("a lane isn't a JSON object")?;
+    match triage {
+        Some(triage) => {
+            lane.insert("triage".to_owned(), serde_json::to_value(triage)?);
+        }
+        None => {
+            lane.remove("triage");
+        }
+    }
+    Ok(())
+}
+
+/// Runs `cargo xtask planted triage --report <file> [--out <file>]`: applies
+/// `repo_root`'s [`TRIAGE_FILE`] to the report afresh ([`reapply`]), writes
+/// it to `--out`, or back to `--report` without one, and prints the stale
+/// records and the lanes still untriaged.
+pub(crate) fn run(
+    repo_root: &Path,
+    mut args: impl Iterator<Item = String>,
+) -> Result<(), BoxError> {
+    let (mut report, mut out) = (None, None);
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--report" if report.is_none() => report = Some(value),
+            "--out" if out.is_none() => out = Some(value),
+            _ => return Err(format!("unknown or repeated flag `{flag}`").into()),
+        }
+    }
+    let report = report.ok_or(crate::UsageError("`planted triage` needs --report <file>"))?;
+    let out = out.unwrap_or_else(|| report.clone());
+    let records = read(repo_root)?;
+    let mut value: Value = serde_json::from_slice(&fs::read(&report)?)
+        .map_err(|error| format!("{report}: {error}"))?;
+    for stale in reapply(&mut value, &records)? {
+        println!("stale triage: {}: it matches no lane", stale.describe());
+    }
+    let cases: Vec<CaseReport> = serde_json::from_value(value["cases"].clone())?;
+    fs::write(&out, serde_json::to_string_pretty(&value)? + "\n")?;
+    println!(
+        "{} lanes untriaged ({TRIAGE_FILE}); report in {out}",
+        untriaged(&cases)
+    );
+    Ok(())
 }

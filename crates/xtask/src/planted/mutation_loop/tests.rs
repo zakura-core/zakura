@@ -2532,6 +2532,101 @@ fn a_triage_record_names_its_other_rule_only_for_another_rules_kill() {
     );
 }
 
+/// `planted triage` applies the checkout's records to a report afresh: a
+/// lane that now matches a record gets it, a lane whose old triage no
+/// longer matches loses it, and nothing else in the report changes.
+#[test]
+fn triage_reapplies_to_a_merged_report() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join(triage::TRIAGE_FILE);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(
+        &file,
+        format!(
+            r##"
+[[triage]]
+patch = "a.patch"
+property = "{NAMED}"
+lane = "witness"
+class = "survived"
+stage = "observation"
+reason = "recorded after the run"
+
+[[triage]]
+patch = "b.patch"
+property = "{NAMED}"
+lane = "witness"
+class = "survived"
+stage = "generator"
+reason = "b.patch is killed now"
+"##
+        ),
+    )
+    .unwrap();
+    let records = triage::read(root.path()).unwrap();
+    let case = |patch: &str, class, triage: Option<triage::Triage>| {
+        let mut case = serde_json::to_value(CaseReport {
+            patch: patch.to_owned(),
+            patch_sha256: String::new(),
+            property: NAMED.to_owned(),
+            entry: None,
+            table: None,
+            witness: WitnessSpec::Test {
+                test: "t".to_owned(),
+                test_target: "block_table".to_owned(),
+            },
+            also_violates: Vec::new(),
+            result: classify::Classified::new(class, None, "why"),
+            trigger: None,
+            baseline: BaselineReport {
+                passed: true,
+                detail: None,
+                millis: 1,
+                rerun_alone: false,
+            },
+            millis: None,
+            peak_rss_kib: None,
+            log: None,
+            rerun_alone: false,
+            generator: vec![GeneratorReport::unsearched(
+                "block-sync/storage",
+                11,
+                GenerateMode::Inproc,
+                classify::Classified::new(Class::KilledByNamedRule, None, "why"),
+            )],
+            no_generator: None,
+            triage,
+        })
+        .unwrap();
+        case["later_field"] = json!("kept");
+        case
+    };
+    let old = triage::Triage {
+        stage: triage::Stage::Generator,
+        reason: "an old record".to_owned(),
+        issue: None,
+    };
+    let mut report = json!({
+        "pinned": "p",
+        "cases": [
+            case("a.patch", Class::Survived, None),
+            case("b.patch", Class::KilledByNamedRule, Some(old.clone())),
+            case("c.patch", Class::Survived, Some(old)),
+        ],
+        "property_findings": [{"harness": "h", "seed": 1}],
+    });
+    let stale = triage::reapply(&mut report, &records).unwrap();
+    assert_eq!(stale, vec![&records[1]], "b.patch is killed now");
+    let cases = report["cases"].as_array().unwrap();
+    assert_eq!(cases[0]["triage"]["reason"], "recorded after the run");
+    assert!(cases[1].get("triage").is_none(), "{}", cases[1]);
+    assert!(cases[2].get("triage").is_none(), "c.patch has no record");
+    assert!(cases[0]["generator"][0].get("triage").is_none());
+    assert_eq!(cases[0]["later_field"], "kept");
+    assert_eq!(report["property_findings"][0]["seed"], 1);
+    assert!(triage::reapply(&mut json!({"pinned": "p"}), &records).is_err());
+}
+
 /// The committed triage records read, each naming its class.
 #[test]
 fn the_committed_triage_records_read() {

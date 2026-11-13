@@ -182,13 +182,22 @@ class RoutineTests(unittest.TestCase):
 
 
 class CumulativeTests(unittest.TestCase):
-    def routine(self, state, reports, libfuzzer_seconds="0"):
-        """Run the routine once with each step writing `reports[name]` as its report, if it has one."""
+    def routine(self, state, reports, libfuzzer_seconds="0", triage=None):
+        """Run the routine once with each step writing `reports[name]` as its report, if it has one.
+
+        A `triage-<lane>` step calls `triage(argv)` if given, and the steps
+        that ran are in `self.ran`.
+        """
+        self.ran = []
+
         def run_step(step, run_dir):
+            self.ran.append(step)
             if step["name"] in reports:
                 out = Path(run_dir) / step["name"]
                 out.mkdir()
                 (out / joint.REPORT_FILE).write_text(json.dumps(reports[step["name"]]))
+            if step["name"].startswith("triage-") and triage:
+                triage(step["argv"])
             return 0
 
         # Each run pins a new commit, so its run directory is new.
@@ -220,6 +229,36 @@ class CumulativeTests(unittest.TestCase):
             self.assertEqual(self.routine(state, {"loop": killed, "libfuzzer": news}, "60"), 1)
             self.assertEqual(self.routine(state, {"loop": killed, "libfuzzer": news}, "60"), 0)
             self.assertTrue((Path(state) / "cumulative-libfuzzer.json").exists())
+
+    def test_the_cumulative_report_takes_the_checkouts_triage_every_run(self):
+        survivor = case("one.patch", "survived")
+        with tempfile.TemporaryDirectory() as state:
+            cumulative = Path(state) / "cumulative.json"
+            self.routine(state, {"loop": {"cases": [survivor]}})
+            triage = [step for step in self.ran if step["name"] == "triage-loop"]
+            self.assertEqual(triage[0]["argv"], [
+                "cargo", "xtask", "planted", "triage", "--report", str(cumulative),
+            ])
+            self.assertEqual(triage[0]["cwd"], str(Path("/c").resolve()))
+            first = sorted(Path(state, "runs").iterdir())[0]
+            self.assertEqual(len(json.loads((first / "loop" / joint.DIFF_FILE).read_text())["untriaged"]), 1)
+
+            # A triage-only commit selects no case, so the loop writes no
+            # report, and the routine still applies the new record to the
+            # merged report before it lists the untriaged lanes.
+            def record(argv):
+                path = Path(argv[argv.index("--report") + 1])
+                merged = json.loads(path.read_text())
+                self.assertEqual([entry["patch"] for entry in merged["cases"]], ["one.patch"])
+                merged["cases"][0]["triage"] = {"stage": "observation", "reason": "why"}
+                path.write_text(json.dumps(merged))
+
+            self.assertEqual(self.routine(state, {}, triage=record), 0)
+            self.assertEqual([step["name"] for step in self.ran], ["suite", "loop", "triage-loop"])
+            second = sorted(Path(state, "runs").iterdir())[1]
+            changes = json.loads((second / "loop" / joint.DIFF_FILE).read_text())
+            self.assertEqual(changes["untriaged"], [])
+            self.assertEqual(json.loads(cumulative.read_text())["cases"][0]["triage"]["reason"], "why")
 
     def test_merge_keeps_every_property_finding(self):
         merged = joint.merge(

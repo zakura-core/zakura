@@ -353,10 +353,17 @@ class PropagationView:
     (`propagation.join`, in the module beside this script) puts them on one time axis.
     Requests that arrive while a round is under way wait for it instead of starting
     another.
+
+    The profilers' records name the peers a node downloaded from by address. The join
+    is told which addresses are private (`private_addresses`), and keeps neither the
+    address nor anything else about such a peer.
     """
 
     def __init__(self, nodes: list[Node], join):
         self.nodes = [node for node in nodes if node.profiler_url]
+        # Every node in the list is ours, with a profiler or not, so a download from
+        # any of them is shown under its name.
+        self.fleet_addresses = {ssh_host(node.ssh_string): node.name for node in nodes}
         self.join = join
         self._lock = threading.Lock()
         self._joined: dict | None = None
@@ -376,7 +383,16 @@ class PropagationView:
         return report if isinstance(report, dict) else None
 
     def data(self) -> dict:
-        """The joined view, at most `PROPAGATION_CACHE_SECONDS` old."""
+        """The joined view, at most `PROPAGATION_CACHE_SECONDS` old.
+
+        Raises `ValueError` or `OSError` when the list of private addresses cannot be
+        read: without it, a private peer cannot be told from any other.
+        """
+        protected = private_addresses()
+
+        def is_private(ip: str) -> bool:
+            return address_key(ip) in protected
+
         with self._lock:
             if self._joined is None or time.monotonic() - self._fetched_at >= PROPAGATION_CACHE_SECONDS:
                 reports: dict[str, dict | None] = {}
@@ -386,7 +402,11 @@ class PropagationView:
                             (node.name for node in self.nodes), pool.map(self.fetch_report, self.nodes)
                         ))
                 self._joined = self.join(
-                    reports, {node.name: node.node_id for node in self.nodes}, limit=PROPAGATION_BLOCKS
+                    reports,
+                    {node.name: node.node_id for node in self.nodes},
+                    limit=PROPAGATION_BLOCKS,
+                    fleet_addresses=self.fleet_addresses,
+                    is_private=is_private,
                 )
                 self._fetched_at = time.monotonic()
             return self._joined
@@ -4276,6 +4296,8 @@ const PEER_ROWS = [
   ['Handshake failures', 'zcash_net_peer_handshake_failures_total'],
   ['Mempool transactions', 'zcash_mempool_size_transactions'],
 ];
+// zcashd names itself "MagicBean" when it connects; show the name people know it by.
+function peerSoftwareName(agent) { return String(agent).replace('MagicBean', 'zcashd'); }
 function renderNodePeers(data) {
   const row = data.node || {};
   const m = row.metrics || {};
@@ -4296,7 +4318,7 @@ function renderNodePeers(data) {
   if (row.metrics_error) html += metricsUnavailable(row);
   if (subversions.length) {
     html += '<div class="subhead"><p class="eyebrow">Peer versions</p></div><div class="kv">'
-      + subversions.map((entry) => kvRow(String(entry[0]), num(entry[1]))).join('')
+      + subversions.map((entry) => kvRow(peerSoftwareName(entry[0]), num(entry[1]))).join('')
       + '</div>';
   } else if (row.peer_info_error) {
     html += '<p class="note-off">getpeerinfo unavailable: ' + esc(row.peer_info_error) + '</p>';
@@ -4811,7 +4833,11 @@ class Handler(BaseHTTPRequestHandler):
                 {**NO_STORE, "Retry-After": str(int(PUBLIC_RATE_WINDOW))},
             )
         if parsed.path == "/propagation/data":
-            return self.send_json(200, PROPAGATION.data(), NO_STORE)
+            try:
+                joined = PROPAGATION.data()
+            except (OSError, ValueError):
+                return self.send_json(503, {"error": "privacy configuration unavailable"}, NO_STORE)
+            return self.send_json(200, joined, NO_STORE)
         try:
             page = PROPAGATION_PAGE.read_bytes()
         except OSError:

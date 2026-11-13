@@ -45,6 +45,14 @@ status dashboard reads them from every node and joins them into the block
 propagation page (`deploy/runner/README.md`). That request is for the
 dashboard only and is not among those it passes through to the public.
 
+**Who served each block.** Each record also lists the node's attempts to
+download the block, up to 16: the network stack, how long the attempt took,
+how it ended, and the peer's software as its handshake gave it. When the node
+writes peer addresses (`expose_peer_addresses`) an attempt also has the
+peer's IP address; otherwise the address is absent. These addresses are every
+peer's, with nothing left out, which is why `/api/propagation` is not passed
+through: the dashboard drops the private ones when it joins the nodes.
+
 ## Staying out of the node's way
 
 - Parsing, storage and serving run at idle scheduling priority and idle I/O

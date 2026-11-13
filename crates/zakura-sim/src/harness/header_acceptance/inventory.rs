@@ -8,7 +8,8 @@
 //! pins `NotApplicable`'s producers: a canonical text of the required
 //! contract IDs, each narrowing entry's name, contracts and test, the
 //! composition checks, each native mutation's full classification, each
-//! gate obligation with its gates and permit, and every approved exception. [`inventory_errors`], run on the gate's own
+//! gate obligation with its gates and permit, each contract's proving
+//! tests and catches, and every approved exception. [`inventory_errors`], run on the gate's own
 //! path ([`super::tool::evaluate_artifacts`]), fails the record when the
 //! text and the pin disagree, or when the required keys don't hold an
 //! obligation per entry, so no list edit or test deletion can remove the
@@ -148,16 +149,18 @@ pub fn errors_against(
 /// The inventories' canonical text, one sorted line per entry with
 /// tab-separated fields: each required contract ID; each narrowing entry's
 /// name, contracts and test; each composition check; each native
-/// mutation's patch and full class; each gate obligation; and each
-/// approved exception. An
+/// mutation's patch and full class; each gate obligation; each contract's
+/// proving tests and catches; and each approved exception. An
 /// approved `Open` is one line per distinct template (its key's kind,
 /// reason, owner, record and `until`), so another key under an existing
 /// template, such as a new machine history's cleanup, doesn't move the
 /// pin, but a copied approval on a new template does. Each standing
 /// exclusion, excluded contract and approved `StaysNotApplicable` is a
 /// line of its own, and so is each gate obligation, with its gates and
-/// full permit, so one removed from both its lists moves the pin. Pending
-/// exceptions aren't lines: they block anyway.
+/// full permit, so one removed from both its lists moves the pin, and each
+/// contract's proving test and proving catch, so one removed while its
+/// contract still has others moves it too. Pending exceptions aren't
+/// lines: they block anyway.
 fn canonical(manifest: &Manifest, lists: &Lists<'_>) -> Vec<String> {
     let mut lines = Vec::new();
     for id in &manifest.required_contracts {
@@ -221,6 +224,12 @@ fn canonical(manifest: &Manifest, lists: &Lists<'_>) -> Vec<String> {
         ));
     }
     for contract in &manifest.contracts {
+        for test in contract.proving {
+            lines.push(format!("contract-proving\t{:?}\t{test:?}", contract.id));
+        }
+        for case in contract.proving_catches {
+            lines.push(format!("contract-catch\t{:?}\t{case:?}", contract.id));
+        }
         if let ContractState::Excluded { reason, approval } = contract.state {
             lines.push(format!(
                 "excluded-contract\t{:?}\t{reason}\t{approval:?}",
@@ -321,6 +330,28 @@ mod tests {
             .retain(|contract| contract.id != ContractId::C22);
         assert!(moved(&dropped, &lists));
         assert!(!errors_against(&dropped, &required, &lists, &pin).is_empty());
+
+        // One of C19's two proving tests, or one of C21's two proving
+        // catches, removed, leaving the contract satisfied with the other.
+        let c19 = manifest
+            .contracts
+            .iter()
+            .position(|contract| matches!(contract.id, ContractId::C19))
+            .expect("C19 has a row");
+        assert_eq!(manifest.contracts[c19].state, ContractState::Satisfied);
+        assert!(manifest.contracts[c19].proving.len() > 1);
+        let mut unproven = manifest.clone();
+        unproven.contracts[c19].proving = &manifest.contracts[c19].proving[1..];
+        assert!(moved(&unproven, &lists));
+        let c21 = manifest
+            .contracts
+            .iter()
+            .position(|contract| matches!(contract.id, ContractId::C21))
+            .expect("C21 has a row");
+        assert!(manifest.contracts[c21].proving_catches.len() > 1);
+        let mut uncaught = manifest.clone();
+        uncaught.contracts[c21].proving_catches = &manifest.contracts[c21].proving_catches[1..];
+        assert!(moved(&uncaught, &lists));
 
         // A narrowing entry renamed, added, or widened to another contract.
         let mut renamed = manifest.clone();

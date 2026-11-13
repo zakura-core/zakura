@@ -383,6 +383,52 @@ class PerfScriptTests(unittest.TestCase):
         self.assertEqual((status["state"], status["error"]), ("error", "perf record could not start"))
 
 
+class ScratchBudgetTests(unittest.TestCase):
+    """Windows on disk at once stay within the scratch budget the unit's memory limit allows."""
+
+    MIB = 1024 * 1024
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.scratch = Path(directory.name)
+        args = argparse.Namespace(
+            node_name="n", service="zakurad", window=60, log_file="", perf="perf",
+            scratch_dir=str(self.scratch), trace_dir="", trace_table_cap_mb=0,
+        )
+        self.profiler = profiler_module.Profiler(args, profiler_module.Store(self.scratch / "store"))
+
+    def window(self, name, mib):
+        """A scratch file of `mib` MiB that takes no real space."""
+        path = self.scratch / f"{name}.data"
+        with path.open("wb") as handle:
+            handle.truncate(mib * self.MIB)
+        return {"path": path}
+
+    def test_an_empty_scratch_directory_allows_a_full_window(self):
+        self.assertEqual(self.profiler.make_room(), profiler_module.MAX_WINDOW_BYTES)
+
+    def test_waiting_windows_are_dropped_oldest_first_but_never_the_one_being_read(self):
+        reading = self.window("reading", 300)
+        oldest, newest = self.window("oldest", 100), self.window("newest", 100)
+        self.profiler._processing = reading
+        self.profiler._jobs.extend([oldest, newest])
+
+        room = self.profiler.make_room()
+
+        self.assertEqual(room, (512 - 300 - 100) * self.MIB)
+        self.assertEqual(list(self.profiler._jobs), [newest])
+        self.assertEqual(self.profiler.dropped_windows, 1)
+        self.assertFalse(oldest["path"].exists())
+        self.assertTrue(reading["path"].exists())
+
+    def test_no_window_starts_while_the_one_being_read_leaves_too_little_room(self):
+        reading = self.window("reading", 500)
+        self.profiler._processing = reading
+        self.assertLess(self.profiler.make_room(), profiler_module.MIN_WINDOW_BYTES)
+        self.assertTrue(reading["path"].exists())
+
+
 class TraceRetentionTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()

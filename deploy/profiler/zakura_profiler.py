@@ -49,7 +49,13 @@ SAMPLE_BUDGET = 3000
 STACK_BYTES = 65528
 # perf stops a window early at this size, so a sudden burst of node activity cannot
 # fill the scratch directory before the rate has adapted.
-MAX_WINDOW_BYTES = "256M"
+MAX_WINDOW_BYTES = 256 * 1024 * 1024
+# Every window on disk at once (being recorded, waiting and being read) stays under
+# this. The scratch directory is a tmpfs, so its files count against the unit's 1 GiB
+# memory limit (zakura-profiler.service) alongside the profiler and `perf script`.
+SCRATCH_BUDGET_BYTES = 512 * 1024 * 1024
+# A window is not started with less room than this; waiting windows are dropped first.
+MIN_WINDOW_BYTES = 32 * 1024 * 1024
 # A sample counts as "while a block was processed" from this long before the block's
 # announcement until this long after it.
 BLOCK_LEAD_SECONDS = 0.25
@@ -499,6 +505,8 @@ class Profiler:
         self._perf = None
         self._jobs = collections.deque()
         self._job_ready = threading.Condition()
+        # The window `process_loop` is reading, whose file is still on disk.
+        self._processing = None
         self._cpu_mark = sum(os.times()[:4])
         self._trace_checked_at = None
 
@@ -556,6 +564,11 @@ class Profiler:
                 self.state = "waiting for node"
                 self._stop.wait(10)
                 continue
+            room = self.make_room()
+            if room < MIN_WINDOW_BYTES:
+                # Only the window being read is left, and it is large: wait for it.
+                self._stop.wait(5)
+                continue
             build = self.node_build(pid)
             rate = self.rate
             data_path = scratch / f"{int(time.time())}.data"
@@ -563,7 +576,7 @@ class Profiler:
             command = [
                 self.args.perf, "record", "-e", "cpu-clock", "-k", "CLOCK_REALTIME",
                 "-F", str(rate), "-g", "--call-graph", f"dwarf,{STACK_BYTES}",
-                "-p", str(pid), "-o", str(data_path), f"--max-size={MAX_WINDOW_BYTES}",
+                "-p", str(pid), "-o", str(data_path), f"--max-size={room}B",
                 "--", "sleep", str(self.args.window),
             ]  # fmt: skip
             try:
@@ -603,6 +616,26 @@ class Profiler:
                 self._jobs.append(job)
                 self._job_ready.notify()
 
+    def make_room(self):
+        """Bytes the next window may use within `SCRATCH_BUDGET_BYTES`, at most
+        `MAX_WINDOW_BYTES`, after dropping waiting windows, oldest first, while there is
+        less than `MIN_WINDOW_BYTES`. The window being read is never dropped."""
+
+        def size(job):
+            try:
+                return job["path"].stat().st_size
+            except OSError:
+                return 0
+
+        with self._job_ready:
+            while True:
+                on_disk = [job for job in (self._processing, *self._jobs) if job is not None]
+                room = SCRATCH_BUDGET_BYTES - sum(size(job) for job in on_disk)
+                if room >= MIN_WINDOW_BYTES or not self._jobs:
+                    return max(0, min(room, MAX_WINDOW_BYTES))
+                self._jobs.popleft()["path"].unlink(missing_ok=True)
+                self.dropped_windows += 1
+
     def process_loop(self):
         """Turn recorded windows into stored trees, one at a time."""
         while not self._stop.is_set():
@@ -612,6 +645,7 @@ class Profiler:
                 if self._stop.is_set():
                     return
                 job = self._jobs.popleft()
+                self._processing = job
             try:
                 self.process_window(job)
                 self.state = "ok"
@@ -619,7 +653,9 @@ class Profiler:
             except Exception as error:  # noqa: BLE001 - one bad window must not end profiling
                 self.fail(f"processing a window failed ({type(error).__name__})", str(error))
             finally:
-                job["path"].unlink(missing_ok=True)
+                with self._job_ready:
+                    job["path"].unlink(missing_ok=True)
+                    self._processing = None
             try:
                 self.store.roll_up_hours(time.time())
                 self.store.prune(time.time())

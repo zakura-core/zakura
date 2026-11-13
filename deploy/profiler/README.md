@@ -80,7 +80,7 @@ or arrange separate retention: stopping the profiler does not stop trace writes.
 | `/etc/systemd/system/zakura-profiler.service` | the unit, with the resource limits |
 | `/etc/systemd/system/zakura-profiler.service.d/node.conf` | this node's name, log file and trace directory |
 | `/mnt/data/zakura-profiler/` | one file per minute for 48 hours, one per hour for 14 days, capped at 2 GiB |
-| `/run/zakura-profiler/` | scratch space in memory for the window being sampled |
+| `/run/zakura-profiler/` | scratch space in memory for sampled windows, 512 MiB at most in all |
 
 The service listens on `127.0.0.1:8097`. The dashboard reaches it through the
 node's `monitor.profiler_url` setting and serves it publicly, rate limited, at

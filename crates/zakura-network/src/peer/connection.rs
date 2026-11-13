@@ -691,14 +691,14 @@ where
     /// A connection tracker that reduces the open connection count when dropped.
     /// Used to limit the number of open connections in Zebra.
     ///
-    /// This field does nothing until it is dropped.
+    /// Counts this connection until it is dropped. [`Self::shutdown`] marks it when the peer
+    /// ended the connection.
     ///
     /// # Security
     ///
     /// If this connection tracker or `Connection`s are leaked,
     /// the number of active connections will appear higher than it actually is.
     /// If enough connections leak, Zebra will stop making new connections.
-    #[allow(dead_code)]
     pub(super) connection_tracker: ConnectionTracker,
 
     /// The configured log label for this peer. Usually the remote IP and port.
@@ -2260,6 +2260,12 @@ where
             debug!(%error,
                    connection_state = ?self.state,
                    "shutting down peer service with error");
+        }
+
+        // Only a connection that the peer ended can get a held seat. One that this node ended,
+        // to shed load or to drop a stalled or banned peer, must not.
+        if error.is_peer_disconnect() {
+            self.connection_tracker.mark_closed_by_peer();
         }
 
         // Prepare to flush any pending client requests.

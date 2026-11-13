@@ -828,7 +828,7 @@ const MIN_INBOUND_ACCEPT_BURST_INTERVAL: Duration = Duration::from_millis(100);
 /// kernel. Without it, the normal one-second handshake pacing can keep a full
 /// listen backlog from ever reaching a configured local sidecar connection.
 ///
-/// When a long-lived public peer disconnects, its seat stays reserved for its IP
+/// When a long-lived public peer closes its connection, its seat stays reserved for its IP
 /// address for a short time, so a node that restarts can connect again. See
 /// [`held_seats`] for the rules and their security argument.
 #[instrument(skip(config, listener, handshaker, peerset_tx), fields(listener_addr = ?listener.local_addr()))]

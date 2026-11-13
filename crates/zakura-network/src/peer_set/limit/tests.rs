@@ -32,6 +32,7 @@ async fn a_tracker_with_an_address_reports_the_connection_it_closes() {
 
     tokio::time::advance(OPEN_FOR).await;
     let closed_at = Instant::now();
+    tracker.mark_closed_by_peer();
     drop(tracker);
 
     assert_eq!(counter.take_closed_connections(), vec![]);
@@ -47,17 +48,34 @@ async fn a_tracker_with_an_address_reports_the_connection_it_closes() {
     assert_eq!(counter.take_closed_connections(), vec![]);
 }
 
+/// A connection that this node closed reports nothing, however long it was open.
+#[tokio::test(start_paused = true)]
+async fn a_connection_this_node_closed_reports_nothing() {
+    let _init_guard = zakura_test::init();
+
+    let mut counter = ActiveConnectionCounter::new_counter();
+    let mut tracker = counter.track_connection_from(peer_ip());
+    tracker.mark_open();
+
+    tokio::time::advance(OPEN_FOR).await;
+    drop(tracker);
+
+    assert_eq!(counter.update_count(), 0);
+    assert_eq!(counter.take_closed_connections(), vec![]);
+}
+
 /// A connection that fails before it opens was never used, so it reports nothing.
 #[tokio::test(start_paused = true)]
 async fn a_connection_that_never_opened_reports_nothing() {
     let _init_guard = zakura_test::init();
 
     let mut counter = ActiveConnectionCounter::new_counter();
-    let tracker = counter.track_connection_from(peer_ip());
+    let mut tracker = counter.track_connection_from(peer_ip());
 
     assert_eq!(counter.update_count(), 1);
 
     tokio::time::advance(OPEN_FOR).await;
+    tracker.mark_closed_by_peer();
     drop(tracker);
 
     assert_eq!(counter.update_count(), 0);
@@ -75,6 +93,7 @@ async fn a_tracker_without_an_address_reports_nothing() {
     tracker.mark_open();
 
     tokio::time::advance(OPEN_FOR).await;
+    tracker.mark_closed_by_peer();
     drop(tracker);
 
     assert_eq!(counter.update_count(), 0);

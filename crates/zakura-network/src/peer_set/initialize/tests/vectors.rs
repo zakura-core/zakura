@@ -1994,6 +1994,13 @@ async fn expect_no_inbound_seat(
     );
 }
 
+/// Closes `seat` the way its peer would, so the listener can hold the seat for the peer.
+fn close_by_peer(seat: InboundSeat) {
+    let (peer_stream, listener_stream, mut connection_tracker) = seat;
+    connection_tracker.mark_closed_by_peer();
+    drop((peer_stream, listener_stream, connection_tracker));
+}
+
 /// Moves the listener's clock forward by `duration`, without waiting for it.
 async fn advance_listener_clock(duration: Duration) {
     tokio::time::pause();
@@ -2001,8 +2008,9 @@ async fn advance_listener_clock(duration: Duration) {
     tokio::time::resume();
 }
 
-/// Test the listener keeps the seat of a long-lived peer for its IP address after it
-/// disconnects, refuses that seat to other peers, and releases it when the hold ends.
+/// Test the listener keeps the seat of a long-lived peer for its IP address after the peer
+/// closes its connection, refuses that seat to other peers, and releases it when the hold
+/// ends. A long-lived connection that this node closed holds no seat.
 #[tokio::test]
 async fn listener_holds_the_seat_of_a_long_lived_peer() {
     let _init_guard = zakura_test::init();
@@ -2092,7 +2100,11 @@ async fn listener_holds_the_seat_of_a_long_lived_peer() {
     expect_no_inbound_seat(other_ip, listen_port, &mut accepted_rx).await;
 
     // A peer that leaves after a short connection holds no seat, so another peer takes it.
-    returning_seat.take();
+    close_by_peer(
+        returning_seat
+            .take()
+            .expect("the returning peer has a seat"),
+    );
     other_seats.push(take_inbound_seat(other_ip, listen_port, &mut accepted_rx).await);
 
     // Give the returning peer a seat again, and let every connection grow old enough.
@@ -2102,7 +2114,11 @@ async fn listener_holds_the_seat_of_a_long_lived_peer() {
 
     // A long-lived peer that leaves keeps its seat: other peers are refused, and it
     // connects again.
-    returning_seat.take();
+    close_by_peer(
+        returning_seat
+            .take()
+            .expect("the returning peer has a seat"),
+    );
     expect_no_inbound_seat(other_ip, listen_port, &mut accepted_rx).await;
     returning_seat = Some(take_inbound_seat(returning_ip, listen_port, &mut accepted_rx).await);
     expect_no_inbound_seat(other_ip, listen_port, &mut accepted_rx).await;
@@ -2114,9 +2130,20 @@ async fn listener_holds_the_seat_of_a_long_lived_peer() {
 
     // A held seat that its peer does not take back goes to another peer when the hold ends.
     advance_listener_clock(constants::MIN_HELD_SEAT_CONNECTION_AGE).await;
-    returning_seat.take();
+    close_by_peer(
+        returning_seat
+            .take()
+            .expect("the returning peer has a seat"),
+    );
     expect_no_inbound_seat(other_ip, listen_port, &mut accepted_rx).await;
     advance_listener_clock(constants::INBOUND_SEAT_HOLD_DURATION).await;
+    other_seats.push(take_inbound_seat(other_ip, listen_port, &mut accepted_rx).await);
+
+    // A long-lived connection that this node closed, for example to shed load, holds no seat.
+    other_seats.pop();
+    let evicted_seat = take_inbound_seat(returning_ip, listen_port, &mut accepted_rx).await;
+    advance_listener_clock(constants::MIN_HELD_SEAT_CONNECTION_AGE).await;
+    drop(evicted_seat);
     other_seats.push(take_inbound_seat(other_ip, listen_port, &mut accepted_rx).await);
 
     listen_task_handle.abort();

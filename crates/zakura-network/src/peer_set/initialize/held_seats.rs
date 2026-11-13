@@ -11,6 +11,9 @@
 //! A hold gives a peer nothing that staying connected would not:
 //! - a seat is held only for an IP address that just occupied one, and only that address
 //!   can take it back,
+//! - the peer must have closed the connection itself: one that this node closed, to shed load
+//!   or to drop a stalled or banned peer, holds no seat, so a hold never undoes this node's
+//!   own decision to disconnect a peer,
 //! - the connection must have been open for the minimum age, and the hold is no longer
 //!   than that age, so a peer holds a seat for at most as long as it used it,
 //! - each IP address has at most one held seat, and

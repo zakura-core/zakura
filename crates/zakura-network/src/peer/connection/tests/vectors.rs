@@ -162,6 +162,58 @@ async fn connection_shutdown_times_out_stalled_peer_tx_close() {
     );
 }
 
+/// A connection marks its tracker closed by the peer only when the peer ended it, so a
+/// connection that this node closes is not reported.
+#[tokio::test(start_paused = true)]
+async fn only_a_connection_that_its_peer_ended_is_reported() {
+    let _init_guard = zakura_test::init();
+
+    for peer_ends_it in [true, false] {
+        let mut active_connections = ActiveConnectionCounter::new_counter();
+        let mut connection_tracker =
+            active_connections.track_connection_from(std::net::Ipv4Addr::LOCALHOST.into());
+        connection_tracker.mark_open();
+        let (connection, client_tx, shared_error_slot) =
+            super::new_never_closing_test_connection::<crate::BoxError>(connection_tracker);
+        let (peer_tx, peer_rx) = mpsc::channel(1);
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+        tokio::task::yield_now().await;
+
+        // The peer closes its side, or this node drops the connection's client.
+        let (_peer_tx, _client_tx) = if peer_ends_it {
+            drop(peer_tx);
+            (None, Some(client_tx))
+        } else {
+            drop(client_tx);
+            (Some(peer_tx), None)
+        };
+
+        tokio::time::advance(REQUEST_TIMEOUT).await;
+        connection_task
+            .await
+            .expect("connection task should not panic");
+
+        let expected_error = if peer_ends_it {
+            "ConnectionClosed"
+        } else {
+            "ClientDropped"
+        };
+        assert_eq!(
+            shared_error_slot
+                .try_get_error()
+                .expect("a closed connection has an error")
+                .inner_debug(),
+            expected_error,
+        );
+        assert_eq!(active_connections.update_count(), 0);
+        assert_eq!(
+            active_connections.take_closed_connections().len(),
+            usize::from(peer_ends_it),
+            "only a connection that its peer ended is reported"
+        );
+    }
+}
+
 /// A stalled writer close cannot turn a failed connection into a successful advertisement.
 #[tokio::test(start_paused = true)]
 async fn failed_connection_notifies_gossip_before_writer_close() {

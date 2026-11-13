@@ -459,6 +459,94 @@ pub struct ActNameRef {
 }
 impl Ref for ActNameRef {}
 
+/// One test: its package, its file relative to the package, and its
+/// name, everything a test artifact, a history's witness or a passing
+/// result names of the test it ran. Two files can hold a test of one name,
+/// so a name alone names none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestIdRef {
+    /// The test's package.
+    pub package: String,
+    /// The test's file, relative to its package.
+    pub file: String,
+    /// The test's name.
+    pub test: String,
+}
+impl Ref for TestIdRef {}
+
+impl TestIdRef {
+    /// The whole identity of `test`.
+    pub fn of(test: super::TestRef) -> Self {
+        TestIdRef {
+            package: test.package.to_owned(),
+            file: test.file.to_owned(),
+            test: test.test.to_owned(),
+        }
+    }
+}
+
+/// One acceptance history, as its run names it: its harness, its witness
+/// test's package, file and name, and its case within that test. A case
+/// name is per test, and one test can run a case on two harnesses.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryRunRef {
+    /// The harness.
+    pub harness: String,
+    /// The witness test's package.
+    pub package: String,
+    /// The witness test's file, relative to its package.
+    pub file: String,
+    /// The witness test's name.
+    pub test: String,
+    /// The case within that test.
+    pub case: String,
+}
+impl Ref for HistoryRunRef {}
+
+impl HistoryRunRef {
+    /// The whole identity of `history`.
+    pub fn of(history: super::HistoryRef) -> Self {
+        HistoryRunRef {
+            harness: history.harness.to_owned(),
+            package: history.witness.package.to_owned(),
+            file: history.witness.file.to_owned(),
+            test: history.witness.test.to_owned(),
+            case: history.case.to_owned(),
+        }
+    }
+
+    /// The history `run` is, if it's a history's run rather than a planted
+    /// case's.
+    pub fn of_run(run: &super::RunId) -> Option<Self> {
+        match run {
+            super::RunId::History {
+                harness,
+                package,
+                file,
+                test,
+                case,
+            } => Some(HistoryRunRef {
+                harness: harness.clone(),
+                package: package.clone(),
+                file: file.clone(),
+                test: test.clone(),
+                case: case.clone(),
+            }),
+            super::RunId::Case { .. } => None,
+        }
+    }
+}
+
+/// One property, by its ID, as a catch key names the property whose
+/// planted cases it takes: a case's property directory is its property's
+/// ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PropertyRef {
+    /// The property's ID.
+    pub property: String,
+}
+impl Ref for PropertyRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

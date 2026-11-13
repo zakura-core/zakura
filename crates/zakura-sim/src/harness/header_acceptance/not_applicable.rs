@@ -29,7 +29,7 @@
 use std::{collections::BTreeMap, sync::OnceLock};
 
 use super::{
-    refs::{Ref, WitnessRef},
+    refs::{PlantedRef, Ref, WitnessRef},
     rows::harness_matrix,
     sim_test, CaseRef, ExpectedNa, HistoryRef, RunId, TestRef,
 };
@@ -1425,14 +1425,32 @@ const PATCHED: &[PatchedNa] = &[
     },
 ];
 
-/// A case's expected `NotApplicable` reports: its counted runs', and its
-/// patched completed runs' where they differ.
-type Lists = (Vec<ExpectedNa>, Option<Vec<ExpectedNa>>);
+/// Each case's expected `NotApplicable` reports, by its whole
+/// [`PlantedRef`].
+type CaseLists = Vec<(PlantedRef, Vec<ExpectedNa>)>;
 
-/// Every case [`CASES`] or [`SHARED`] holds, by target and name, with
-/// [`PATCHED`]'s changes.
-fn lists() -> &'static BTreeMap<(&'static str, &'static str), Lists> {
-    static LISTS: OnceLock<BTreeMap<(&'static str, &'static str), Lists>> = OnceLock::new();
+/// The lists of `all` that are `case`'s, joined on its whole
+/// [`PlantedRef`]: cases under two properties can share a name.
+fn of_case<'a>(all: &'a CaseLists, case: &PlantedRef) -> Vec<&'a Vec<ExpectedNa>> {
+    PlantedRef::joined(case, all, |(listed, _)| Some(listed.clone()))
+        .into_iter()
+        .map(|(_, list)| list)
+        .collect()
+}
+
+/// `case`, by property and name, as joins name it.
+fn planted(property: &str, name: &str) -> PlantedRef {
+    PlantedRef {
+        property: property.to_owned(),
+        name: name.to_owned(),
+    }
+}
+
+/// Every case [`CASES`] or [`SHARED`] holds, by target and name, with its
+/// counted runs' list; and, apart, each case [`PATCHED`] changes, with its
+/// patched completed runs' list.
+fn lists() -> &'static (CaseLists, CaseLists) {
+    static LISTS: OnceLock<(CaseLists, CaseLists)> = OnceLock::new();
     LISTS.get_or_init(|| {
         // The reasons' names and the generated IDs, built once, so the
         // leak is bounded.
@@ -1448,7 +1466,16 @@ fn lists() -> &'static BTreeMap<(&'static str, &'static str), Lists> {
             }
         };
         let matrix = harness_matrix();
-        let mut lists = BTreeMap::new();
+        let mut lists = CaseLists::new();
+        let list_once = |lists: &mut CaseLists, case: PlantedRef, list| {
+            assert!(
+                of_case(lists, &case).is_empty(),
+                "{}/{} is listed once",
+                case.property,
+                case.name
+            );
+            lists.push((case, list));
+        };
         for entry in CASES {
             let (property, on): (&'static str, _) = match entry.property {
                 Target::Generated(suffix) => (
@@ -1467,8 +1494,7 @@ fn lists() -> &'static BTreeMap<(&'static str, &'static str), Lists> {
                     reason: reason(id, entry.undeclared),
                 })
                 .collect();
-            let fresh = lists.insert((property, entry.name), (list, None)).is_none();
-            assert!(fresh, "{property}/{} is listed once", entry.name);
+            list_once(&mut lists, planted(property, entry.name), list);
         }
         for group in SHARED {
             let list: Vec<ExpectedNa> = matrix
@@ -1483,16 +1509,15 @@ fn lists() -> &'static BTreeMap<(&'static str, &'static str), Lists> {
                 })
                 .collect();
             for &(property, case) in group.cases {
-                let fresh = lists
-                    .insert((property, case), (list.clone(), None))
-                    .is_none();
-                assert!(fresh, "{property}/{case} is listed once");
+                list_once(&mut lists, planted(property, case), list.clone());
             }
         }
+        let mut patched_lists = CaseLists::new();
         for change in PATCHED {
-            let (counted, patched) = lists
-                .get_mut(&(change.property, change.name))
-                .unwrap_or_else(|| panic!("{}/{} has a list", change.property, change.name));
+            let case = planted(change.property, change.name);
+            let [counted] = of_case(&lists, &case)[..] else {
+                panic!("{}/{} has a list", change.property, change.name);
+            };
             let mut list: Vec<ExpectedNa> = counted
                 .iter()
                 .filter(|na| !change.applies.contains(&na.property))
@@ -1522,9 +1547,9 @@ fn lists() -> &'static BTreeMap<(&'static str, &'static str), Lists> {
                     reason: why,
                 });
             }
-            *patched = Some(list);
+            list_once(&mut patched_lists, case, list);
         }
-        lists
+        (lists, patched_lists)
     })
 }
 
@@ -1535,18 +1560,28 @@ fn lists() -> &'static BTreeMap<(&'static str, &'static str), Lists> {
 /// expects none, so a catch declared without its runs' reports can't
 /// verify.
 pub fn expected(case: CaseRef) -> &'static [ExpectedNa] {
-    lists()
-        .get(&(case.property, case.name))
-        .map_or(&[], |(counted, _)| counted.as_slice())
+    expected_of(&case.planted())
+}
+
+/// [`expected`] of `case`, by its whole [`PlantedRef`].
+fn expected_of(case: &PlantedRef) -> &'static [ExpectedNa] {
+    of_case(&lists().0, case)
+        .first()
+        .map_or(&[], |counted| counted.as_slice())
 }
 
 /// The `NotApplicable` reports `case`'s patched completed runs expect beside
 /// its set, its `Draft` run and a patched run found at the end, where
 /// [`PATCHED`] says they differ from [`expected`]'s.
 pub fn patched_expected(case: CaseRef) -> Option<&'static [ExpectedNa]> {
-    lists()
-        .get(&(case.property, case.name))
-        .and_then(|(_, patched)| patched.as_deref())
+    patched_expected_of(&case.planted())
+}
+
+/// [`patched_expected`] of `case`, by its whole [`PlantedRef`].
+fn patched_expected_of(case: &PlantedRef) -> Option<&'static [ExpectedNa]> {
+    of_case(&lists().1, case)
+        .first()
+        .map(|patched| patched.as_slice())
 }
 
 /// The IDs every recorded `header-sync/flood` history holds.
@@ -3158,6 +3193,20 @@ static HISTORIES: &[HistoryNa] = &[
 mod tests {
     use super::*;
     use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+
+    /// A catch's `NotApplicable` lists are its own case's only, joined on
+    /// the case's whole [`PlantedRef`] (Rule 25's template): a case
+    /// [`PATCHED`] changes has a counted and a patched list, and with its
+    /// property or its name moved it has neither.
+    #[test]
+    fn a_case_s_lists_join_its_whole_case() {
+        let change = &PATCHED[0];
+        let case = planted(change.property, change.name);
+        let keys = assert_one_key_off::<PlantedRef>(&case, |want| {
+            !expected_of(want).is_empty() && patched_expected_of(want).is_some()
+        });
+        assert_eq!(keys, 2);
+    }
 
     /// A counted history takes its `NotApplicable` group only on its
     /// harness and whole witness test, its package included, joined on

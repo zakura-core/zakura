@@ -63,7 +63,7 @@
 //! response whose payload arrived before its precheck's checkpoint.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, VecDeque},
     net::SocketAddr,
     rc::Rc,
@@ -82,6 +82,7 @@ use super::{
     stage::{discovery_stage, header_stage, NodeView, Stage},
 };
 use crate::{
+    evidence::LiveEvidence,
     model::{is_fault_cause, FrameHeader, FrameModel, Label, ReaderEnd},
     observe::{
         PeerCredit, ReactorFact, StorageFact, StorageRequest, StreamId, TransitionFact,
@@ -106,6 +107,71 @@ struct Waiting {
 /// What the peers' tasks recorded and the identity map hasn't placed yet,
 /// oldest first.
 pub(crate) type PeerRecords = Rc<RefCell<VecDeque<PeerRecord>>>;
+
+/// The scripted peers' records as their checkpoint reads them live: every
+/// record the peers pushed, those [`super::PeerControl`] took off the queue
+/// and those still on it. A record pushed after the last observation is one
+/// the run never saw.
+pub(crate) struct PeerFeed {
+    /// The peers' queue.
+    records: PeerRecords,
+    /// Records taken off the queue, placed or failed.
+    taken: Cell<u64>,
+    /// Placed frames the evidence holds back from the log, as of its last
+    /// observation ([`WireEvidence::withheld`]).
+    withheld: Cell<usize>,
+}
+
+impl PeerFeed {
+    /// The feed of `records`, none taken yet.
+    pub(crate) fn new(records: PeerRecords) -> Self {
+        PeerFeed {
+            records,
+            taken: Cell::new(0),
+            withheld: Cell::new(0),
+        }
+    }
+
+    /// Counts `count` more records taken off the queue, with `withheld`
+    /// placed frames held back from the log now.
+    pub(crate) fn took(&self, count: u64, withheld: usize) {
+        self.taken.set(self.taken.get().saturating_add(count));
+        self.withheld.set(withheld);
+    }
+}
+
+impl LiveEvidence for PeerFeed {
+    /// Every record the peers pushed: those taken, then those queued.
+    fn last_seq(&self) -> u64 {
+        // A usize always fits in a u64 on supported targets.
+        let queued = self.records.borrow().len() as u64;
+        self.taken.get().saturating_add(queued)
+    }
+
+    /// Never: a peer's task runs only inside its run.
+    fn refused_outside_run(&self) -> bool {
+        false
+    }
+
+    /// Always healthy: a record is either taken or queued.
+    fn health(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// A record still queued, or a placed frame still held back, when the
+    /// run ends: the log freezes before either can reach it, so the wire
+    /// checks never judged it. A violation's ending counts too, since the
+    /// peers already produced the evidence a whole report would judge.
+    fn unfinished(&self, _end: &crate::RunEnd) -> Option<&'static str> {
+        if !self.records.borrow().is_empty() {
+            Some("UnplacedRecords: the run ended with peer records no registered connection placed")
+        } else if self.withheld.get() > 0 {
+            Some("WithheldFrames: the run ended with placed peer frames held back from the log")
+        } else {
+            None
+        }
+    }
+}
 
 /// The ID both ends of a connection derive from its TLS handshake.
 pub(crate) type SharedId = [u8; 16];
@@ -156,8 +222,9 @@ pub(crate) enum RecordBody {
         /// bounds the node's answer. Not logged.
         asks: Option<Asked>,
     },
-    /// [`Observation::PeerWritten`].
-    Written { seq: u64 },
+    /// [`Observation::PeerWritten`]. Every frame of one `write_all` shares
+    /// its `order` stamp.
+    Written { seq: u64, order: u64 },
     /// [`Observation::PeerClosed`].
     Closed,
     /// [`Observation::ActRan`].
@@ -173,6 +240,7 @@ pub(crate) enum RecordBody {
         credit: Option<PeerCredit>,
         frame: Frame,
         at: Duration,
+        order: u64,
     },
 }
 
@@ -286,12 +354,13 @@ impl WireEvidence {
     }
 
     /// Reads the identity rows logged since the last call, logs every record
-    /// they place, then the P3b observations the node's new evidence means.
+    /// they place, then the P3b observations the node's new evidence means,
+    /// and returns what it logged, in order.
     pub(crate) fn observe(
         &mut self,
         records: &PeerRecords,
         log: &mut ObservationLog,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<Observation>, String> {
         let start = self.seen;
         for entry in &log.entries()[start..] {
             if let Observation::Transport {
@@ -389,11 +458,18 @@ impl WireEvidence {
             }
             projected.append(&mut self.late);
         }
-        for obs in placed.into_iter().chain(projected) {
-            log.push(obs);
+        let logged: Vec<Observation> = placed.into_iter().chain(projected).collect();
+        for obs in &logged {
+            log.push(obs.clone());
         }
         self.seen = log.entries().len();
-        Ok(())
+        Ok(logged)
+    }
+
+    /// How many placed peer frames it holds back from the log: discovery
+    /// requests waiting for the node's count to settle their label.
+    pub(crate) fn withheld(&self) -> usize {
+        self.unsettled.len()
     }
 
     /// The shared ID of the connection whose handshake outcome the tap
@@ -469,10 +545,11 @@ impl WireEvidence {
                 }
                 frame
             }
-            RecordBody::Written { seq } => Observation::PeerWritten {
+            RecordBody::Written { seq, order } => Observation::PeerWritten {
                 connection,
                 quic_stream,
                 seq,
+                order,
             },
             RecordBody::Closed => Observation::PeerClosed {
                 connection,
@@ -495,6 +572,7 @@ impl WireEvidence {
                 credit,
                 frame,
                 at,
+                order,
             } => {
                 let received = Observation::PeerReceived {
                     connection,
@@ -503,6 +581,7 @@ impl WireEvidence {
                     message_type,
                     payload,
                     credit,
+                    order,
                 };
                 let sent = match self.discovery_sender.as_mut() {
                     Some(sender) if Some(stream) == self.discovery => {
@@ -1083,7 +1162,7 @@ mod tests {
         Rc::new(RefCell::new(VecDeque::from([PeerRecord {
             remote: remote(0),
             quic_stream: 4,
-            body: RecordBody::Written { seq: 0 },
+            body: RecordBody::Written { seq: 0, order: 1 },
         }])))
     }
 
@@ -1107,6 +1186,7 @@ mod tests {
                 credit: None,
                 frame: frame.clone(),
                 at: Duration::ZERO,
+                order: 1,
             },
         }])));
         let mut log = ObservationLog::default();
@@ -1303,7 +1383,10 @@ mod tests {
         let written = |n, seq| PeerRecord {
             remote: remote(n),
             quic_stream: 4,
-            body: RecordBody::Written { seq },
+            body: RecordBody::Written {
+                seq,
+                order: seq + 1,
+            },
         };
         let placed = |log: &ObservationLog| -> Vec<(u64, u64)> {
             log.entries()
@@ -1390,7 +1473,10 @@ mod tests {
         let written = |n, seq| PeerRecord {
             remote: remote(n),
             quic_stream: 4,
-            body: RecordBody::Written { seq },
+            body: RecordBody::Written {
+                seq,
+                order: seq + 1,
+            },
         };
         let placed = |log: &ObservationLog| -> Vec<(u64, u64)> {
             log.entries()
@@ -1719,6 +1805,17 @@ mod tests {
                 }
             }
             Ok(())
+        }
+
+        /// Nothing: it finishes no submitted work.
+        fn recovery(&self, _now: zakura_scheduler::SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+        /// Nothing: it has no holds.
+        fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+        /// None: it holds no submitted work.
+        fn holds_work(&self) -> Option<String> {
+            None
         }
     }
 

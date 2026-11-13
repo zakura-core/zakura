@@ -18,6 +18,11 @@ serves both the existing fleet dashboard and a narrow public API:
 - `GET /data` retains the existing fleet dashboard and watchdog response.
 - `GET /node/<name>` serves the per-node detail page.
 - `GET /data/node/<name>` returns that node's detail payload.
+- `GET /profile/<name>` serves the CPU flame graphs of a node that runs the
+  [continuous profiler](../profiler/README.md), and `GET /profile/<name>/api/...`
+  forwards the page's requests to it. A node has one when its entry sets
+  `monitor = { profiler_url = "http://host:port" }`; the fleet table marks it
+  "profiled".
 
 The public Ironwood response is unavailable with HTTP `503` if the service
 cannot verify a matching network, Ironwood pool, tip, or source client, or if

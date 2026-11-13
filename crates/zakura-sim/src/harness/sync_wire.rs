@@ -252,7 +252,9 @@ fn configs(
 }
 
 /// [`sync_config`], with room for QUIC's own steps for each fixture block
-/// and each block a `Control` step grows or forks.
+/// and each block a `Control` step grows or forks, and the harness timer
+/// cap: a peer asleep in its redial settle at the budget is a bounded tail
+/// the drain must let finish ([`crate::sim::HARNESS_TIMER_CAP`]).
 pub fn wire_config(scenario: &SyncWireScenario) -> RunConfig {
     let config = sync_config(&scenario.sync);
     let blocks = u64::from(scenario.sync.blocks) + scenario.sync.changed();
@@ -261,6 +263,7 @@ pub fn wire_config(scenario: &SyncWireScenario) -> RunConfig {
             .sync
             .steps
             .unwrap_or(40_000 + WIRE_STEPS_PER_BLOCK * blocks),
+        harness_timer_cap: crate::sim::HARNESS_TIMER_CAP,
         ..config
     }
 }

@@ -12,10 +12,12 @@ use sha2::{Digest, Sha256};
 
 use super::{HarnessEntry, HarnessError};
 use crate::{
+    record::{FullReport, Record, FULL_REPORT_FILE},
     trace::{
-        meta::{hex, Derivation, InputRef},
+        meta::{hex, Derivation, InputRef, PlanRef},
         read::refuse_symlinked_dir,
-        FileSink, ReadError, Trace, TraceReader, INPUT_FILE, MAX_INPUT_BYTES, TRACE_FILE,
+        FileSink, ReadError, Trace, TraceReader, INPUT_FILE, MAX_INPUT_BYTES, MAX_REPORT_BYTES,
+        TRACE_FILE,
     },
     witness::{Expect, WitnessError},
     Plan, PlanInput, RecordSink,
@@ -70,6 +72,17 @@ pub enum RecordError {
     /// The witness test couldn't run: the harness doesn't register the
     /// property, or the property has no trigger-history check.
     Witness(WitnessError),
+    /// The run's `Draft` override ([`super::with_draft`]) names a property
+    /// the harness doesn't register, or overrides a machine harness, whose
+    /// one property can't run as `Draft`. Nothing was written.
+    UnregisteredDraft {
+        /// The property.
+        property: String,
+    },
+    /// The run wrote its `end` record but sent no full report, so its
+    /// violations and stores would be lost (C8). A harness run always sends
+    /// one, so a sink that wraps another without forwarding it does this.
+    NoReport,
     /// The run [`crate::trace::record_failure`] was handed doesn't violate
     /// the property it was asked to record.
     NotViolated {
@@ -100,6 +113,15 @@ impl fmt::Display for RecordError {
             RecordError::Io(error) => write!(f, "writing the trace failed: {error}"),
             RecordError::Read(error) => write!(f, "the trace didn't read back: {error}"),
             RecordError::Witness(error) => write!(f, "the witness test can't run: {error}"),
+            RecordError::NoReport => {
+                f.write_str("the run ended but sent no full report for full-report.json")
+            }
+            RecordError::UnregisteredDraft { property } => {
+                write!(
+                    f,
+                    "the Draft override names {property}, which the harness can't check as Draft"
+                )
+            }
             RecordError::NotViolated { property } => {
                 write!(f, "the run doesn't violate {property}")
             }
@@ -216,8 +238,21 @@ pub(crate) fn write_trace<T>(
     out: &Path,
     run: impl FnOnce(&Value, PlanInput, &mut dyn RecordSink) -> Result<T, RecordError>,
 ) -> Result<(Trace, T), RecordError> {
+    if let Some(property) = super::draft()
+        .into_iter()
+        .find(|id| harness.machine || harness.status(id).is_none())
+    {
+        return Err(RecordError::UnregisteredDraft { property });
+    }
     let mut meta = (harness.meta)(scenario).map_err(RecordError::Harness)?;
     meta.derived_from = derived_from;
+    // A full input names its Plan bytes through `input`.
+    meta.plan = match (&plan, input) {
+        (_, Some(_)) => None,
+        (PlanInput::Bytes(bytes), None) => Some(PlanRef::bytes(bytes)),
+        (PlanInput::Script(script), None) => Some(PlanRef::script(script)),
+        (PlanInput::Trace(_) | PlanInput::Skip(_), None) => None,
+    };
     refuse_symlinked_dir(out).map_err(RecordError::Refused)?;
     if fs::symlink_metadata(out.join(TRACE_FILE)).is_ok() {
         return Err(RecordError::Io(io::Error::new(
@@ -237,21 +272,165 @@ pub(crate) fn write_trace<T>(
         });
         write_input(out, input).map_err(RecordError::Io)?;
     }
-    let mut sink = FileSink::create(out, &meta).map_err(RecordError::Io)?;
+    let mut sink = Reported {
+        file: FileSink::create(out, &meta).map_err(RecordError::Io)?,
+        held: Vec::new(),
+        report: None,
+    };
     let result = run(&meta.scenario, plan, &mut sink)?;
-    sink.finish().map_err(RecordError::Io)?;
+    let Reported {
+        mut file,
+        held,
+        report,
+    } = sink;
+    // Beside the trace, so a judge reads every violation and the stores
+    // without rerunning (C8). A run that never reached its end sends none.
+    // The `end` record is written only once the report is, so a recording
+    // that fails here leaves an incomplete trace, never a complete one
+    // without its report.
+    match (report, held.is_empty()) {
+        (Some(report), _) => {
+            let bytes = report_bytes(&report, MAX_REPORT_BYTES);
+            let written = bytes.and_then(|bytes| write_new(&out.join(FULL_REPORT_FILE), &bytes));
+            if let Err(error) = written {
+                file.finish().map_err(RecordError::Io)?;
+                return Err(RecordError::Io(error));
+            }
+        }
+        (None, false) => {
+            file.finish().map_err(RecordError::Io)?;
+            return Err(RecordError::NoReport);
+        }
+        (None, true) => {}
+    }
+    for record in held {
+        file.record(record);
+    }
+    file.finish().map_err(RecordError::Io)?;
     let trace = TraceReader::open(out).map_err(RecordError::Read)?;
     Ok((trace, result))
+}
+
+/// A trace's file sink that keeps the run's full report for
+/// [`FULL_REPORT_FILE`].
+struct Reported {
+    file: FileSink,
+    /// The run's `end` record and any after it, held until the report is
+    /// written.
+    held: Vec<Record>,
+    report: Option<FullReport>,
+}
+
+impl RecordSink for Reported {
+    /// Writes the record, or holds it from the `end` record on.
+    fn record(&mut self, record: Record) {
+        if self.held.is_empty() && !matches!(record, Record::End(_)) {
+            self.file.record(record);
+        } else {
+            self.held.push(record);
+        }
+    }
+
+    /// Keeps the report.
+    fn report(&mut self, report: &FullReport) {
+        self.report = Some(report.clone());
+    }
+}
+
+/// `report` as [`FULL_REPORT_FILE`] holds it, one line. Fails if it's over
+/// `limit` bytes, as a replay would refuse it.
+fn report_bytes(report: &FullReport, limit: u64) -> io::Result<Vec<u8>> {
+    let bytes = format!("{}\n", report.to_line()).into_bytes();
+    // A usize always fits in a u64 on supported targets.
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the full report is {} bytes, over the {limit} a replay reads",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Writes `input` to `out`'s `input.bin`, creating `out` if needed. Fails if
 /// the file already exists, so a trace's input is never overwritten.
 fn write_input(out: &Path, input: &[u8]) -> io::Result<()> {
     fs::create_dir_all(out)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(out.join(INPUT_FILE))?;
-    file.write_all(input)?;
+    write_new(&out.join(INPUT_FILE), input)
+}
+
+/// Writes `bytes` to a new file at `path`. Fails if anything, a symlink
+/// included, is already there, so nothing is overwritten or written through
+/// a link.
+fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
     file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Passes records on and drops the run's full report, as a wrapping
+    /// sink that forgets to forward it would.
+    struct DropsReport<'a>(&'a mut dyn RecordSink);
+
+    impl RecordSink for DropsReport<'_> {
+        /// Forwards the record.
+        fn record(&mut self, record: Record) {
+            self.0.record(record);
+        }
+    }
+
+    /// A full report over the replay's read limit fails the recording
+    /// rather than leave a sidecar every replay would refuse.
+    #[test]
+    fn a_report_over_the_read_limit_is_refused() {
+        let report = FullReport::new(&[], None);
+        let line = report_bytes(&report, MAX_REPORT_BYTES).expect("an empty report fits");
+        // A usize always fits in a u64 on supported targets.
+        let len = line.len() as u64;
+        assert!(report_bytes(&report, len).is_ok());
+        let error = report_bytes(&report, len - 1).expect_err("one byte over");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// C8: a run that wrote its `end` record but sent no full report fails
+    /// the recording, and leaves its trace without the `end` record, so a
+    /// sink that loses the report can't leave a trace that looks complete
+    /// without it.
+    #[test]
+    fn a_finished_run_without_its_report_fails_the_recording() {
+        let harness = super::super::find("race/lost-update").expect("the race is registered");
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let scenario = harness.scenario(&[0, 1]);
+        let result = write_trace(
+            harness,
+            &scenario,
+            Plan::from_fuzz(&[]),
+            None,
+            None,
+            &dir.path().join("trace"),
+            |scenario, plan, sink| {
+                (harness.run)(scenario, plan, &mut DropsReport(sink))
+                    .map(drop)
+                    .map_err(RecordError::Harness)
+            },
+        );
+        assert!(matches!(result, Err(RecordError::NoReport)), "{result:?}");
+        let left = TraceReader::open(&dir.path().join("trace"));
+        assert!(
+            matches!(
+                left,
+                Err(crate::trace::ReadError::Invalid(
+                    crate::trace::Invalid::Truncated { .. }
+                ))
+            ),
+            "{left:?}"
+        );
+        assert!(!dir.path().join("trace").join(FULL_REPORT_FILE).exists());
+    }
 }

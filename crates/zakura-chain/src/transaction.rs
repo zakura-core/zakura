@@ -8,7 +8,6 @@ mod auth_digest;
 mod hash;
 mod joinsplit;
 mod lock_time;
-mod memo;
 mod serialize;
 mod sighash;
 mod txid;
@@ -25,7 +24,6 @@ pub use auth_digest::AuthDigest;
 pub use hash::{Hash, WtxId};
 pub use joinsplit::{JoinSplitData, JoinSplitPubKey, JoinSplitSig};
 pub use lock_time::LockTime;
-pub use memo::Memo;
 use redjubjub::{Binding, Signature};
 pub use sapling::FieldNotPresent;
 pub use serialize::{
@@ -503,11 +501,6 @@ impl Transaction {
         !self.outputs().is_empty()
     }
 
-    /// Does this transaction have transparent inputs or outputs?
-    pub fn has_transparent_inputs_or_outputs(&self) -> bool {
-        self.has_transparent_inputs() || self.has_transparent_outputs()
-    }
-
     /// Does this transaction have transparent or shielded inputs?
     pub fn has_transparent_or_shielded_inputs(&self) -> bool {
         self.has_transparent_inputs() || self.has_shielded_inputs()
@@ -943,6 +936,7 @@ impl Transaction {
 
     /// Access the JoinSplit public validating key in this transaction,
     /// regardless of version, if any.
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub fn sprout_joinsplit_pub_key(&self) -> Option<JoinSplitPubKey> {
         match self {
             // JoinSplits with Bctv14 Proofs

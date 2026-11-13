@@ -3863,8 +3863,7 @@ where
 
             // - Processing fetched data to create a transaction template
             //
-            // Apart from random weighted transaction selection,
-            // the template only depends on the previously fetched data.
+            // The template only depends on the previously fetched data.
             // This processing fails only if the coinbase transaction cannot be built.
 
             tracing::debug!(
@@ -3877,7 +3876,7 @@ where
 
             let height = chain_info.tip_height.next().map_misc_error()?;
 
-            // Randomly select some mempool transactions.
+            // Select mempool transactions by ancestor-package priority.
             let selection_started = std::time::Instant::now();
             let mempool_txs = select_mempool_transactions(
                 &self.network,

@@ -102,7 +102,9 @@ impl AddressBookUpdater {
         .with_unconditional_peers(config.unconditional_peers.clone());
         if !config.unconditional_peers.is_empty() {
             if config.expose_peer_addresses {
-                let unconditional_peers: Vec<_> = config.unconditional_peers.iter().collect();
+                // Two entries with different ports name the same address.
+                let unconditional_peers: std::collections::BTreeSet<_> =
+                    config.unconditional_peers.iter().collect();
                 info!(
                     ?unconditional_peers,
                     "ignoring misbehavior reports from unconditional peers"

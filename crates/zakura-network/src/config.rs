@@ -50,12 +50,14 @@ use crate::{
 };
 
 mod cache_dir;
+mod tcp_warmup;
 mod unconditional_peers;
 
 #[cfg(test)]
 mod tests;
 
 pub use cache_dir::CacheDir;
+pub use tcp_warmup::TcpWarmupConfig;
 pub use unconditional_peers::UnconditionalPeers;
 
 pub(crate) use cache_dir::{
@@ -364,22 +366,46 @@ pub struct Config {
     /// to logs, trace directories, and downstream monitoring systems.
     pub expose_peer_addresses: bool,
 
-    /// Peer IP addresses and CIDR ranges that Zakura never scores or bans.
+    /// Peers that Zakura never scores or bans, and keeps connected where it can.
     ///
-    /// Each entry is an IP address, such as `"192.0.2.1"`, or a CIDR range, such as
+    /// Each entry is an IP address, such as `"192.0.2.1"`, an IP address and port, such
+    /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, or a CIDR range, such as
     /// `"2001:db8::/32"`. CIDR ranges with host bits set are rejected.
+    /// Use this setting for peers you operate, such as your own nodes, miners, or
+    /// sidecars.
+    ///
     /// Zakura ignores misbehavior reports for these peers, so their
-    /// misbehavior score stays at zero and Zakura never bans their IP address. Use this
-    /// setting for peers you operate, such as your own nodes, miners, or sidecars, so
-    /// that tip lag, upgrade boundaries, or bugs cannot get them banned.
+    /// misbehavior score stays at zero and Zakura never bans their IP address. Tip lag,
+    /// upgrade boundaries, or bugs cannot get them banned. This also exempts them from
+    /// mempool cooldowns and their disconnects.
     ///
-    /// This setting exempts peers from misbehavior scores, bans, and mempool
-    /// cooldowns and their disconnects. Zakura still applies connection limits to these
-    /// peers, and still disconnects them on protocol
-    /// errors or inbound overload.
+    /// Zakura also dials every entry that names one address, and dials it again whenever
+    /// no connection to that peer is open, in either direction. An entry without a port
+    /// is dialed on the network's default port. A CIDR range is only dialed when it
+    /// covers a single address, such as `"192.0.2.1/32"`. A dial to a peer that accepts
+    /// no connections fails quietly, and each failure doubles the delay before the next
+    /// dial, up to ten minutes. Zakura keeps at most `max_connections_per_ip` connections
+    /// to one IP, so it does not dial further entries on that IP.
     ///
-    /// Entries match legacy peer IP addresses. An IPv4 entry also matches the
-    /// IPv4-mapped IPv6 form of the same address. The default is empty.
+    /// Each dialed address adds one outbound and one inbound connection slot on top of the
+    /// connection limits. Zakura dials each address on an outbound slot of its own, so a
+    /// full outbound peer set never blocks the dial. Its other dials leave the address the
+    /// room it needs under `max_connections_per_ip`: the startup dials to seed and cached
+    /// peers leave it out and count it against its IP's limit, and the crawler never
+    /// dials its IP. The inbound slots are a pool that only dialed addresses
+    /// can use, so a node whose other inbound slots are full still accepts a listed peer
+    /// that dials it, unless connections from listed peers already fill the pool. One IP
+    /// holds at most `max_connections_per_ip` of the pool's slots. A connection in the
+    /// pool also skips the wait that Zakura imposes between inbound connections from one
+    /// IP, so a listed peer can reconnect at once. A peer that is only in a range of
+    /// several addresses gets none of this, and nor does an entry that Zakura cannot
+    /// dial, such as its own listener.
+    /// Zakura still applies the per-IP connection limit to these peers, and still
+    /// disconnects them on protocol errors or inbound overload.
+    ///
+    /// Entries match legacy peer IP addresses, and only the legacy P2P stack dials them.
+    /// An IPv4 entry also matches the IPv4-mapped IPv6 form of the same address. The
+    /// default is empty.
     ///
     /// # Security
     ///
@@ -434,6 +460,9 @@ pub struct Config {
     /// Experimental.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub advert_delay: Duration,
+
+    /// Settings for warming new legacy TCP connections with padded pings.
+    pub tcp_warmup: TcpWarmupConfig,
 }
 
 impl Config {
@@ -465,7 +494,9 @@ impl Config {
             / OUTBOUND_PEER_LIMIT_DIVISOR
     }
 
-    /// The maximum number of inbound connections that Zakura will accept at the same time.
+    /// The maximum number of inbound connections that Zakura will accept at the same time,
+    /// besides the slots of dialed unconditional peers, see
+    /// [`unconditional_peer_connection_limit`](Self::unconditional_peer_connection_limit).
     /// When this limit is reached, Zakura drops new inbound connections,
     /// without handshaking on them.
     ///
@@ -476,10 +507,28 @@ impl Config {
         self.peerset_initial_target_size * INBOUND_PEER_LIMIT_MULTIPLIER
     }
 
+    /// The maximum number of connections that Zakura opens to stay connected to its
+    /// [`unconditional_peers`](Self::unconditional_peers): one for each dialed address.
+    ///
+    /// These connections are counted separately from
+    /// [`peerset_outbound_connection_limit`](Self::peerset_outbound_connection_limit), so
+    /// a full outbound peer set never blocks them. The inbound listener adds as many
+    /// slots outside
+    /// [`peerset_inbound_connection_limit`](Self::peerset_inbound_connection_limit), as a
+    /// pool that only these peers can use.
+    pub fn unconditional_peer_connection_limit(&self) -> usize {
+        self.unconditional_peers.dial_limit()
+    }
+
     /// The maximum number of inbound and outbound connections that Zakura will have
     /// at the same time.
+    ///
+    /// Each dialed unconditional peer has two slots here, one outbound and one inbound,
+    /// although with the default `max_connections_per_ip` it uses one at a time.
     pub fn peerset_total_connection_limit(&self) -> usize {
-        self.peerset_outbound_connection_limit() + self.peerset_inbound_connection_limit()
+        self.peerset_outbound_connection_limit()
+            + self.peerset_inbound_connection_limit()
+            + 2 * self.unconditional_peer_connection_limit()
     }
 
     /// The most bytes that TCP decoders can hold for incomplete messages across every
@@ -511,16 +560,26 @@ impl Config {
     /// With larger budgets, shared addresses keep their cache position.
     /// An exhausted list yields the rest of the other list.
     ///
+    /// Loads the cache while seeds resolve. When the cache has valid peers, a
+    /// restart dials them after one round of seed lookups, even if every seed
+    /// lookup fails. Seed lookups only retry until they succeed when there are
+    /// no valid cached peers.
+    ///
     /// # Panics
     ///
     /// If a configured address is an invalid [`SocketAddr`] or DNS name.
     pub async fn initial_peers(&self) -> IndexSet<PeerSocketAddr> {
-        // TODO: do DNS and disk in parallel if startup speed becomes important
-        let dns_peers = Config::resolve_peers(
-            &self.initial_peer_hostnames().iter().cloned().collect(),
-            self.expose_peer_addresses,
+        let hostnames: HashSet<String> = self.initial_peer_hostnames().iter().cloned().collect();
+        let (dns_peers, disk_peers) = futures::future::join(
+            Config::resolve_peers_once(&hostnames, self.expose_peer_addresses),
+            self.load_valid_peer_cache(),
         )
         .await;
+        let dns_peers = if dns_peers.is_empty() && disk_peers.is_empty() {
+            Config::resolve_peers(&hostnames, self.expose_peer_addresses).await
+        } else {
+            dns_peers
+        };
 
         // Validate seeds before shuffling, without preferring any listening port.
         let mut valid_seeds = Vec::new();
@@ -538,28 +597,12 @@ impl Config {
         dns_peers.shuffle(&mut rand_10::rng());
 
         if self.network.is_regtest() {
-            // Only return local peer addresses and skip loading the peer cache on Regtest.
+            // Only return local peer addresses. Regtest never loads the peer cache.
             dns_peers
                 .into_iter()
                 .filter(PeerSocketAddr::is_localhost)
                 .collect()
         } else {
-            // Ignore disk errors because the cache is optional and the method already logs them.
-            let mut disk_peers = self.load_peer_cache().await.unwrap_or_default();
-            disk_peers.retain(|addr| {
-                match address_is_valid_for_outbound_connections(*addr, self.network.clone()) {
-                    Ok(_) => true,
-                    Err(error) => {
-                        info!(
-                            peer = %addr.addr_label(self.expose_peer_addresses),
-                            ?error,
-                            "invalid initial peer from disk cache",
-                        );
-                        false
-                    }
-                }
-            });
-
             // With one slot, seed membership must survive even if a seed is cached.
             // Otherwise remove overlap so a duplicate cannot consume a seed turn.
             if self.peerset_initial_target_size != 1 {
@@ -596,8 +639,6 @@ impl Config {
         peers: &HashSet<String>,
         expose_peer_addresses: bool,
     ) -> HashSet<PeerSocketAddr> {
-        use futures::stream::StreamExt;
-
         if peers.is_empty() {
             warn!(
                 "no initial peers in the network config. \
@@ -613,14 +654,7 @@ impl Config {
             // no peers in the combined list. DNS failures are correlated, so all
             // peers can fail DNS, leaving Zakura with a small list of custom IP
             // address peers. Individual retries avoid this issue.
-            let peer_addresses = peers
-                .iter()
-                .map(|s| {
-                    Config::resolve_host(s, MAX_SINGLE_SEED_PEER_DNS_RETRIES, expose_peer_addresses)
-                })
-                .collect::<futures::stream::FuturesUnordered<_>>()
-                .concat()
-                .await;
+            let peer_addresses = Config::resolve_peers_once(peers, expose_peer_addresses).await;
 
             if peer_addresses.is_empty() {
                 tracing::info!(
@@ -634,6 +668,54 @@ impl Config {
                 return peer_addresses;
             }
         }
+    }
+
+    /// Concurrently resolves `peers` into zero or more IP addresses, making one
+    /// round of lookups with a timeout of a few seconds on each DNS request.
+    ///
+    /// Returns an empty set if every lookup fails or times out.
+    async fn resolve_peers_once(
+        peers: &HashSet<String>,
+        expose_peer_addresses: bool,
+    ) -> HashSet<PeerSocketAddr> {
+        use futures::stream::StreamExt;
+
+        peers
+            .iter()
+            .map(|s| {
+                Config::resolve_host(s, MAX_SINGLE_SEED_PEER_DNS_RETRIES, expose_peer_addresses)
+            })
+            .collect::<futures::stream::FuturesUnordered<_>>()
+            .concat()
+            .await
+    }
+
+    /// Loads cached peers from disk, keeping only addresses valid for outbound
+    /// connections on the configured network.
+    ///
+    /// Returns an empty set on Regtest, when the cache is disabled or missing,
+    /// or when it can't be read. Read errors are logged by
+    /// [`load_peer_cache`](Self::load_peer_cache).
+    async fn load_valid_peer_cache(&self) -> IndexSet<PeerSocketAddr> {
+        if self.network.is_regtest() {
+            return IndexSet::new();
+        }
+
+        let mut disk_peers = self.load_peer_cache().await.unwrap_or_default();
+        disk_peers.retain(|addr| {
+            match address_is_valid_for_outbound_connections(*addr, self.network.clone()) {
+                Ok(_) => true,
+                Err(error) => {
+                    info!(
+                        peer = %addr.addr_label(self.expose_peer_addresses),
+                        ?error,
+                        "invalid initial peer from disk cache",
+                    );
+                    false
+                }
+            }
+        });
+        disk_peers
     }
 
     /// Resolves `host` into zero or more IP addresses, retrying up to
@@ -692,11 +774,7 @@ impl Config {
             Ok(Ok(ip_addrs)) => {
                 let ip_addrs: Vec<PeerSocketAddr> = ip_addrs.map(canonical_peer_addr).collect();
 
-                // This log is needed for user debugging, but it's annoying during tests.
-                #[cfg(not(test))]
                 info!(seed = ?host, remote_ip_count = ?ip_addrs.len(), "resolved seed peer IP addresses");
-                #[cfg(test)]
-                debug!(seed = ?host, remote_ip_count = ?ip_addrs.len(), "resolved seed peer IP addresses");
 
                 for ip in &ip_addrs {
                     // Count each initial peer, recording the seed config and resolved IP address.
@@ -771,15 +849,7 @@ impl Config {
             })
             .collect();
 
-        // This log is needed for user debugging, but it's annoying during tests.
-        #[cfg(not(test))]
         info!(
-            cached_ip_count = ?peer_list.len(),
-            ?peer_cache_file,
-            "loaded cached peer IP addresses"
-        );
-        #[cfg(test)]
-        debug!(
             cached_ip_count = ?peer_list.len(),
             ?peer_cache_file,
             "loaded cached peer IP addresses"
@@ -811,6 +881,7 @@ impl Config {
     ///
     /// Atomic writes avoid corrupting the cache if Zakura panics or crashes, or if multiple Zakura
     /// instances try to read and write the same cache file.
+    #[cfg(test)]
     pub async fn update_peer_cache(&self, peer_list: IndexSet<PeerSocketAddr>) -> io::Result<()> {
         let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(&self.network) else {
             return Ok(());
@@ -1110,6 +1181,7 @@ impl Default for Config {
             advert_window_small_size_bytes: DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
             advert_window_full_size_bytes: DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
             advert_delay: DEFAULT_ADVERT_DELAY,
+            tcp_warmup: TcpWarmupConfig::default(),
         }
     }
 }
@@ -1337,6 +1409,7 @@ struct DConfig {
     /// for small blocks.
     #[serde(skip_serializing)]
     advert_delay_min: Option<de::IgnoredAny>,
+    tcp_warmup: TcpWarmupConfig,
 }
 
 impl Default for DConfig {
@@ -1368,6 +1441,7 @@ impl Default for DConfig {
             advert_delay: None,
             advert_delay_max: None,
             advert_delay_min: None,
+            tcp_warmup: config.tcp_warmup,
         }
     }
 }
@@ -1443,6 +1517,7 @@ impl From<Config> for DConfig {
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
             advert_delay,
+            tcp_warmup,
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -1492,6 +1567,7 @@ impl From<Config> for DConfig {
             advert_delay: Some(advert_delay),
             advert_delay_max: None,
             advert_delay_min: None,
+            tcp_warmup,
         }
     }
 }
@@ -1527,6 +1603,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_delay,
             advert_delay_max,
             advert_delay_min: _,
+            tcp_warmup,
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
@@ -1543,6 +1620,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_delay,
         )
         .map_err(de::Error::custom)?;
+        tcp_warmup.validate().map_err(de::Error::custom)?;
 
         let network = match (dnetwork, testnet_parameters) {
             (DNetwork::ConfiguredTestnet(params), None) => {
@@ -1690,6 +1768,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
             advert_delay,
+            tcp_warmup,
         })
     }
 }

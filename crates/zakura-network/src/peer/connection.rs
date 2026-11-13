@@ -41,6 +41,7 @@ use crate::{
         block_gossip::{BlockAdvert, BlockAdvertError, BLOCK_REQUEST_WAIT},
         connection::peer_tx::PeerTx,
         error::AlreadyErrored,
+        tcp_warmup::WarmupChunk,
         ClientRequest, ClientRequestReceiver, ConnectionInfo, ErrorSlot, InProgressClientRequest,
         MinimumPeerVersion, MustUseClientResponseSender, PeerError, SharedPeerError,
     },
@@ -179,6 +180,8 @@ impl Handler {
                     let duration = ping_sent_at.elapsed();
                     Handler::Finished(Ok(Response::Pong(duration)))
                 } else {
+                    // Another ping's pong, such as a warm-up ping's, is handled by the caller.
+                    ignored_msg = Some(Message::Pong(rsp_nonce));
                     Handler::Ping {
                         nonce,
                         ping_sent_at,
@@ -430,7 +433,13 @@ impl Handler {
                         .iter()
                         .all(|item| matches!(item, InventoryHash::Block(_))) =>
             {
-                let response = Response::BlockHashes(block_hashes(&items[..]).collect());
+                // Truncate rather than reject: zcashd can add one extra hash to a full
+                // response, and a peer can always send the maximum number of junk hashes.
+                let response = Response::BlockHashes(
+                    block_hashes(&items[..])
+                        .take(constants::MAX_FIND_BLOCKS_RESPONSE_HASHES)
+                        .collect(),
+                );
                 if let [InventoryHash::Block(_)] = items[..] {
                     ignored_msg = Some(Message::Inv(items));
                 }
@@ -596,8 +605,17 @@ pub(crate) struct ConnectionRequests<C> {
     pub(crate) client_rx: futures::channel::mpsc::Receiver<ClientRequest>,
     /// Block adverts, read even while a request is awaiting its response.
     pub(crate) block_advert_rx: tokio::sync::mpsc::Receiver<BlockAdvert>,
+    /// Warm-up pings, written only when nothing else is ready.
+    pub(crate) warmup_rx: tokio::sync::mpsc::Receiver<WarmupChunk>,
     pub(crate) minimum_peer_version: MinimumPeerVersion<C>,
     pub(crate) bans: BannedIps,
+}
+
+/// A warm-up ping that is waiting for its `pong`.
+#[derive(Debug)]
+struct PendingWarmup {
+    nonce: Nonce,
+    pong: tokio::sync::oneshot::Sender<()>,
 }
 
 /// The channels, services, and associated state for a peer connection.
@@ -647,6 +665,13 @@ where
     /// burst of adverts to one connection does not wait the delay once each.
     advert_waiting_since: Option<tokio::time::Instant>,
 
+    /// Receives warm-up pings from this connection's warm-up task, if it has one.
+    pub(super) warmup_rx: tokio::sync::mpsc::Receiver<WarmupChunk>,
+
+    /// The last warm-up ping, until its `pong` arrives. The warm-up task waits for each `pong`
+    /// before it sends the next ping.
+    pending_warmup: Option<PendingWarmup>,
+
     /// Live authorization, rechecked immediately before advert writes.
     minimum_peer_version: MinimumPeerVersion<C>,
     bans: BannedIps,
@@ -665,6 +690,10 @@ where
 
     /// Reports requested blocks and completed framed writes to gossip schedulers.
     pub(super) block_uploads: super::block_gossip::BlockUploads,
+
+    /// Records the block announcements this connection writes, and the blocks the peer
+    /// asks for and is sent, when the node writes trace files.
+    gossip_trace: super::gossip_trace::PeerGossipTrace,
 
     /// Tells the client and peer set whether this connection is free to write a new request.
     pub(super) request_slot: super::client::RequestSlot,
@@ -774,6 +803,7 @@ where
         ConnectionRequests {
             client_rx,
             block_advert_rx,
+            warmup_rx,
             minimum_peer_version,
             bans,
         }: ConnectionRequests<C>,
@@ -794,11 +824,14 @@ where
             client_rx: client_rx.into(),
             block_advert_rx,
             advert_waiting_since: None,
+            warmup_rx,
+            pending_warmup: None,
             minimum_peer_version,
             bans,
             error_slot,
             peer_tx: peer_tx.into(),
             block_uploads: Default::default(),
+            gossip_trace: Default::default(),
             request_slot: Default::default(),
             connection_tracker,
             addr_label,
@@ -807,6 +840,15 @@ where
             inbound_budget,
             response_charge: None,
         }
+    }
+
+    /// Makes this connection write its block gossip to `gossip_trace`.
+    pub(super) fn with_gossip_trace(
+        mut self,
+        gossip_trace: super::gossip_trace::PeerGossipTrace,
+    ) -> Self {
+        self.gossip_trace = gossip_trace;
+        self
     }
 }
 
@@ -924,6 +966,11 @@ where
                             continue;
                         }
                         req = self.client_rx.next() => Either::Right(req),
+                        // A closed warm-up channel disables only this branch.
+                        Some(chunk) = self.warmup_rx.recv() => {
+                            self.send_warmup_ping(chunk).await;
+                            continue;
+                        }
                     };
                     match incoming {
                         Either::Left(None) => {
@@ -989,7 +1036,8 @@ where
                     // - cancellation, then
                     // - timeout, then
                     // - peer messages, then
-                    // - block adverts.
+                    // - block adverts, then
+                    // - warm-up pings.
                     //
                     // (Messages to other peers are processed concurrently.)
                     //
@@ -1043,6 +1091,10 @@ where
                         msg = peer_rx.next().instrument(span.clone()), if !advert_due => msg,
                         Some(advert) = self.block_advert_rx.recv() => {
                             self.send_block_advert(advert, overdue_advert_wait).await;
+                            continue;
+                        }
+                        Some(chunk) = self.warmup_rx.recv() => {
+                            self.send_warmup_ping(chunk).await;
                             continue;
                         }
                     };
@@ -1226,6 +1278,7 @@ where
             Ok(true) => {
                 // Mark the write before reading the peer's next message, which can be its getdata.
                 self.block_uploads.advertised(advert.hash);
+                self.gossip_trace.block_inv_sent(advert.hash);
                 let _ = advert.result.send(Ok(()));
             }
             Ok(false) => {
@@ -1239,6 +1292,32 @@ where
                 let _ = advert.result.send(Err(error.clone().into()));
                 self.fail_with(error).await;
             }
+        }
+    }
+
+    /// Writes a warm-up ping and records it as awaiting its `pong`.
+    ///
+    /// Does not change the state of any request that is awaiting its response, and does not
+    /// time out: the warm-up task stops waiting on its own.
+    async fn send_warmup_ping(&mut self, chunk: WarmupChunk) {
+        let WarmupChunk {
+            nonce,
+            padding,
+            written,
+            pong,
+        } = chunk;
+        if written.send(()).is_err() {
+            // The warm-up stopped while the ping was queued.
+            return;
+        }
+
+        match self
+            .peer_tx
+            .send(Message::PaddedPing { nonce, padding })
+            .await
+        {
+            Ok(()) => self.pending_warmup = Some(PendingWarmup { nonce, pong }),
+            Err(error) => self.fail_with(error).await,
         }
     }
 
@@ -1469,6 +1548,8 @@ where
                 }
                 Consumed
             }
+            // The decoder returns padded pings as `Ping`, so peers never send this variant.
+            Message::PaddedPing { .. } => Unused,
             // These messages shouldn't be sent outside of a handshake.
             Message::Version { .. } => {
                 self.fail_with(PeerError::DuplicateHandshake).await;
@@ -1494,9 +1575,17 @@ where
                 debug!(%msg, "got notfound message unsolicited or from canceled request");
                 Unused
             }
-            Message::Pong(_) => {
-                debug!(%msg, "got pong message unsolicited or from canceled request");
-                Unused
+            Message::Pong(nonce) => {
+                if let Some(pending) = self
+                    .pending_warmup
+                    .take_if(|pending| pending.nonce == nonce)
+                {
+                    let _ = pending.pong.send(());
+                    Consumed
+                } else {
+                    debug!(%msg, "got pong message unsolicited or from canceled request");
+                    Unused
+                }
             }
             Message::Block(_) => {
                 debug!(%msg, "got block message unsolicited or from canceled request");
@@ -1599,7 +1688,10 @@ where
                         .any(|item| matches!(item, InventoryHash::Block(_))) =>
                 {
                     let hashes = block_hashes(items)
-                        .inspect(|hash| self.block_uploads.requested(*hash))
+                        .inspect(|hash| {
+                            self.block_uploads.requested(*hash);
+                            self.gossip_trace.block_getdata_received(*hash);
+                        })
                         .collect();
 
                     if self.connection_info.is_protected_peer {
@@ -1907,9 +1999,11 @@ where
                                 return;
                             }
                             self.block_uploads.written(hash);
+                            self.gossip_trace.block_sent(hash);
                         }
                         Missing(hash) => {
                             self.block_uploads.unavailable(hash);
+                            self.gossip_trace.block_unavailable(hash);
                             missing_hashes.push(hash.into());
                         }
                     }

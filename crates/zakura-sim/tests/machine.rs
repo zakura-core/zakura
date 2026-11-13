@@ -5,6 +5,7 @@ use std::{path::Path, sync::atomic::AtomicBool};
 
 use serde_json::json;
 use tempfile::TempDir;
+use zakura_sim::NaReason;
 use zakura_sim::{
     harness::{
         self,
@@ -19,7 +20,8 @@ use zakura_sim::{
         ReplayOptions, Trace, TraceReader,
     },
     witness::{Expect, WitnessError},
-    MemorySink, NullSink, PlanInput, PropertyOutcome, Record,
+    Checker, HarnessFailure, MemorySink, NullSink, ObservationLog, Outcome, PlanInput,
+    PropertyOutcome, PropertyReport, Record, RunEnd, StepCtx, Unfinished, Violation,
 };
 
 /// An operation with no effect.
@@ -168,22 +170,89 @@ fn a_driver_failure_is_not_a_detection() {
 #[test]
 fn a_harness_failure_leaves_no_property_held() {
     // CHARGE holds and reaches the trigger, then PANIC ends the run as a
-    // harness failure. As in `Sim::run`, the property is inconclusive.
+    // harness failure. As in `Sim::run`, the property is `HarnessFailed`.
     let mut sink = MemorySink::default();
     let scenario = (ENTRY.draw)(&input(&[CHARGE, PANIC]));
     let error = (ENTRY.run)(&scenario, PlanInput::Bytes(Vec::new()), &mut sink).unwrap_err();
     let HarnessError::Run { report, .. } = error else {
         panic!("{error}");
     };
-    let inconclusive = PropertyOutcome::Inconclusive {
-        reason: "harness-failed".to_owned(),
-    };
+    let harness_failed = PropertyOutcome::not_applicable(NaReason::HarnessFailed);
     assert_eq!(report.properties.len(), 1);
-    assert_eq!(report.properties[0].outcome, inconclusive);
+    assert_eq!(report.properties[0].outcome, harness_failed);
     let Some(Record::End(end)) = sink.records.last() else {
         panic!("the run ends with its end record");
     };
     assert_eq!(end.properties, report.properties);
+}
+
+/// An extra checker that holds its one property and finds a harness
+/// failure only at the run's end.
+#[derive(Default)]
+struct FailsAtEnd {
+    failure: Option<HarnessFailure>,
+}
+
+impl Checker for FailsAtEnd {
+    fn after_step(&mut self, _: &StepCtx<'_>) -> Option<Violation> {
+        None
+    }
+
+    /// Reports `test/late` held, and finds missing evidence.
+    fn at_end(&mut self, end: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        self.failure = Some(HarnessFailure::MissingEvidence {
+            property: "test/late".to_owned(),
+            step: end.steps,
+            detail: "the end found the evidence short".to_owned(),
+        });
+        vec![PropertyReport::new(
+            "test/late",
+            PropertyOutcome::Held { applicable: 1 },
+        )]
+    }
+
+    /// The failure `at_end` found, once.
+    fn harness_failure(&mut self) -> Option<HarnessFailure> {
+        self.failure.take()
+    }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> Unfinished {
+        Unfinished::default()
+    }
+}
+
+/// A failure only the extra checker finds, at the machine run's end, fails
+/// the run, as in `Sim::run`: the run ends `Harness`, and neither the
+/// machine's property nor the extra checker's is held. The end is a fresh
+/// harness end, after an idle end or a violation alike, so it keeps no
+/// rest and no run-level violation (Terra 4, round 3).
+#[test]
+fn an_extra_checkers_end_failure_fails_the_run() {
+    for operation in [CHARGE, BREAK] {
+        let mut extra = FailsAtEnd::default();
+        let run = (ENTRY.run_bytes)(&input(&[operation]), &mut NullSink, Some(&mut extra));
+        let report = run.report().expect("the machine ran");
+        assert_eq!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+        assert!(matches!(
+            report.end.harness,
+            Some(HarnessFailure::MissingEvidence { .. })
+        ));
+        assert_eq!(report.end.rest, None, "{:?}", report.end);
+        assert!(!report.end.at_rest());
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        if operation == CHARGE {
+            let harness_failed = PropertyOutcome::not_applicable(NaReason::HarnessFailed);
+            assert!(
+                report
+                    .properties
+                    .iter()
+                    .all(|property| property.outcome == harness_failed),
+                "{:?}",
+                report.properties
+            );
+        }
+    }
 }
 
 #[test]
@@ -193,7 +262,10 @@ fn a_run_applies_only_once_it_reaches_the_trigger() {
         let report = (ENTRY.run)(&scenario, PlanInput::Bytes(Vec::new()), &mut NullSink).unwrap();
         report.properties[0].outcome.clone()
     };
-    assert_eq!(outcome(&[IDLE, IDLE]), PropertyOutcome::NotApplicable);
+    assert_eq!(
+        outcome(&[IDLE, IDLE]),
+        PropertyOutcome::not_applicable(NaReason::NeverApplied)
+    );
     assert_eq!(
         outcome(&[IDLE, CHARGE, IDLE]),
         PropertyOutcome::Held { applicable: 2 }
@@ -239,7 +311,9 @@ fn a_witness_needs_its_trigger_history() {
     for expect in [Expect::Applicable, Expect::Holds] {
         assert_eq!(
             witness(&[IDLE], FIXTURE.name, expect),
-            Err(WitnessError::Outcome(PropertyOutcome::NotApplicable))
+            Err(WitnessError::Outcome(PropertyOutcome::not_applicable(
+                NaReason::NeverApplied
+            )))
         );
     }
     assert_eq!(

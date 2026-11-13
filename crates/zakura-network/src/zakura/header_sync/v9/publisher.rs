@@ -107,9 +107,9 @@ use state::{
     PublisherState, Recheck, Stall,
 };
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 pub(crate) use tests::FakePort;
 
 /// Lease attempts one page makes before it waits for a wake.

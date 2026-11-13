@@ -374,6 +374,7 @@ impl History {
                 quic_stream: self.quic_stream,
                 seq,
                 message_type: frame.message_type,
+                order: 0,
             },
         );
         self

@@ -51,11 +51,13 @@ where
     }
 
     /// Returns whether the set contains no values.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.counts.is_empty()
     }
 
     /// Iterates over each distinct value once.
+    #[cfg(test)]
     pub(crate) fn distinct_values(&self) -> impl Iterator<Item = &T> {
         self.counts.keys()
     }

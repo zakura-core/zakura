@@ -164,7 +164,43 @@ def status(mac, linux, identifier):
     audit_public_privacy()
 
 
+STATUS_DASHBOARD_HOST = 'status.mainnet.zakura.valargroup.dev'
+
+
+def dashboard_session():
+    """A login cookie for the password-gated status dashboard.
+
+    Checks first that the fleet data is refused without a login, so the audit
+    also catches the gate being dropped.
+    """
+    import http.client
+    import urllib.parse
+
+    def request(method, path, body=None, headers=None):
+        connection = http.client.HTTPSConnection(STATUS_DASHBOARD_HOST, timeout=15)
+        try:
+            connection.request(method, path, body=body, headers=headers or {})
+            response = connection.getresponse()
+            response.read(64 * 1024)
+            return response.status, response.getheader('Set-Cookie') or ''
+        finally:
+            connection.close()
+
+    status, _ = request('GET', '/data')
+    if status != 401:
+        raise ValueError(f'status dashboard served /data without a login (HTTP {status})')
+    password = os.environ.get('ZAKURA_STATUS_DASHBOARD_PASSWORD', '')
+    if not password:
+        raise ValueError('ZAKURA_STATUS_DASHBOARD_PASSWORD is not set; cannot audit the gated dashboard')
+    status, cookie = request('POST', '/login', urllib.parse.urlencode({'password': password}),
+                             {'Content-Type': 'application/x-www-form-urlencoded'})
+    if status != 303 or not cookie:
+        raise ValueError(f'status dashboard login failed (HTTP {status})')
+    return cookie.split(';', 1)[0]
+
+
 def audit_public_privacy():
+    """Fail if the private Mac address appears anywhere a dashboard visitor can read."""
     import urllib.request
     import urllib.parse
     from html.parser import HTMLParser
@@ -180,11 +216,12 @@ def audit_public_privacy():
         def handle_starttag(self, tag, attrs):
             if tag == 'script' and dict(attrs).get('src'):
                 self.sources.append(dict(attrs)['src'])
-    base = 'https://status.mainnet.zakura.valargroup.dev'
+    base = 'https://' + STATUS_DASHBOARD_HOST
+    cookie = dashboard_session()
     routes = ['/', '/node/mac-os-cranelift', '/data', '/data/node/mac-os-cranelift', '/ironwood-status.json']
     for route in routes:
         url = urllib.parse.urljoin(base, route)
-        with urllib.request.urlopen(url, timeout=15) as response:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={'Cookie': cookie}), timeout=15) as response:
             payload = response.read(8 * 1024 * 1024 + 1)
         if len(payload) > 8 * 1024 * 1024:
             raise ValueError('public privacy audit response too large')
@@ -208,7 +245,7 @@ def audit_public_privacy():
             if len(parser.sources) > 16:
                 raise ValueError('unexpected number of dashboard scripts')
             routes.extend(parser.sources)
-    print('Exact private Mac address absent from public HTML, JavaScript and JSON', flush=True)
+    print('Exact private Mac address absent from dashboard HTML, JavaScript and JSON', flush=True)
 
 
 def require_healthy(mac, reference):

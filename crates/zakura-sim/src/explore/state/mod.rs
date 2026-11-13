@@ -9,7 +9,7 @@
 //!
 //! # Index layout
 //!
-//! [`FEEDBACK_VERSION`] 3 fixes this layout. Each [`Family`] owns 4,096
+//! [`FEEDBACK_VERSION`] 4 fixes this layout. Each [`Family`] owns 4,096
 //! indices from `family × 4096`, in [`Family::ALL`]'s order. A family splits
 //! its span into blocks, one per [`StateFeature`] variant. A block's index is
 //! mixed-radix over the variant's fields, in field order, each field by its
@@ -31,6 +31,7 @@
 //! | | | +1536 | `HeaderLease`: class × level |
 //! | `regulation` | 20480 | +0 | `Frame`: row × direction × label × stage |
 //! | | | +2048 | `Transition`: transition |
+//! | | | +3072 | `ConformantCrossing` |
 //! | `hold` | 24576 | +0 | `Hold`: operation × part × stage |
 //! | `reorg-stage` | 28672 | +0 | `ReorgStage`: stage |
 //! | `recovery` | 32768 | +0 | `Obligation`: namespace × point |
@@ -52,6 +53,7 @@
 //! table requires, and the features that show it, or why none does yet.
 
 mod collector;
+pub mod crossing;
 
 pub use collector::collector;
 
@@ -972,6 +974,9 @@ pub enum StateFeature {
     },
     /// A regulation table changed state.
     Transition(Transition),
+    /// A peer's conformant `subscribe-headers` update crossed the node's
+    /// ending of the same subscription in flight ([`crossing`]).
+    ConformantCrossing,
     /// After block sync's body-work epoch first advanced, its newest-epoch
     /// work reached `stage`.
     ReorgStage(ReorgStage),
@@ -1048,7 +1053,9 @@ impl StateFeature {
             | StateFeature::HeaderCapacity { .. }
             | StateFeature::CadenceEmptied { .. }
             | StateFeature::HeaderLease { .. } => Family::Budget,
-            StateFeature::Frame { .. } | StateFeature::Transition(_) => Family::Regulation,
+            StateFeature::Frame { .. }
+            | StateFeature::Transition(_)
+            | StateFeature::ConformantCrossing => Family::Regulation,
             StateFeature::Hold { .. } => Family::Hold,
             StateFeature::ReorgStage(_) => Family::ReorgStage,
             StateFeature::Obligation { .. } | StateFeature::ConditionsEstablished => {
@@ -1086,6 +1093,7 @@ impl StateFeature {
             | StateFeature::CallEnded { .. }
             | StateFeature::CadenceEmptied { .. } => 1024,
             StateFeature::Transition(_) => 2048,
+            StateFeature::ConformantCrossing => 3072,
         }
     }
 
@@ -1160,7 +1168,7 @@ impl StateFeature {
                 digit!(part, HeldPart),
                 digit!(stage, HoldStage),
             ]),
-            StateFeature::ConditionsEstablished => 0,
+            StateFeature::ConditionsEstablished | StateFeature::ConformantCrossing => 0,
             StateFeature::CadenceEmptied { row, direction } => {
                 mix(&[digit!(row, Row), digit!(direction, Direction)])
             }
@@ -1310,6 +1318,7 @@ impl StateFeature {
                 .copied()
                 .map(StateFeature::Transition),
         );
+        all.push(StateFeature::ConformantCrossing);
         all.extend(
             ReorgStage::ALL
                 .iter()
@@ -1597,19 +1606,46 @@ pub const REQUIRED: &[RequiredState] = &[
             )
         },
     ),
-    waiting(
+    // fuzz-13: the saved Plan `reopen`, the only stream replacement
+    // production has, since a second header-sync session never runs beside
+    // the first on one connection. Its fuzz target mapping waits for
+    // fuzz-10's `header_sync_wire` target.
+    collected(
         Family::Replacement,
         "stream replacement",
-        "M6a and G2b",
-        "no harness replaces a service stream; G2b adds the action once M6a supplies \
-         its identities",
+        &[HEADER_WIRE],
+        true,
+        |f| {
+            matches!(
+                f,
+                StateFeature::Replacement {
+                    kind: ReplacementKind::Stream,
+                    service: StreamService::HeaderSync,
+                    ..
+                }
+            )
+        },
     ),
-    waiting(
+    // fuzz-13: the saved Plan `old-page-after-reopen`, where an old
+    // session's invalid page is judged at its preparation, after the
+    // reopen. A frame the old session's reader decides can't be judged
+    // after the replacement: a session reports its exit only once its
+    // stream workers end, so that part of the row is excluded. Its fuzz
+    // target mapping waits for fuzz-10's `header_sync_wire` target.
+    collected(
         Family::Replacement,
         "old-session traffic delivered",
-        "G2b",
-        "no witness delivers a replaced session's frame; G2b's replacement actions \
-         reach it",
+        &[HEADER_WIRE],
+        true,
+        |f| {
+            matches!(
+                f,
+                StateFeature::Replacement {
+                    event: ReplacementEvent::OldTrafficAfter,
+                    ..
+                }
+            )
+        },
     ),
     collected(Family::Budget, "empty", &[BLOCK], true, |f| {
         matches!(
@@ -1727,11 +1763,15 @@ pub const REQUIRED: &[RequiredState] = &[
         true,
         |f| matches!(f, StateFeature::Transition(_)),
     ),
-    waiting(
+    // fuzz-13: the saved Plan `outcome-crossing`, judged by
+    // [`crossing::CrossingJoin`]. Its fuzz target mapping waits for
+    // fuzz-10's `header_sync_wire` target.
+    collected(
         Family::Regulation,
         "conformant crossed updates",
-        "G2b",
-        "no peer script crosses an update with an outcome; G2b's protocol actions add it",
+        &[HEADER_WIRE],
+        true,
+        |f| *f == StateFeature::ConformantCrossing,
     ),
     collected(
         Family::Hold,

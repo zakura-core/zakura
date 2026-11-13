@@ -23,7 +23,7 @@ use zakura_sim::{
     explore::{input_path, save_failure, Bucket, ExploreRun},
     harness::{self, entry, HarnessEntry, RecordError, Subsystem},
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Verdict},
-    record::{EndRecord, OutcomeKind},
+    record::{EndRecord, OutcomeKind, FULL_REPORT_FILE},
     trace::{
         record_failure, Trace, TraceReader, DIVERGENCE_FILE, FIRST_END_FILE, INPUT_FILE,
         NONDETERMINISTIC_DIR, PROPERTIES_FILE, RECORDING_DIR, REPLAY_DIR, TRACES_DIR,
@@ -166,6 +166,20 @@ fn record_failure_writes_the_same_violation() {
     let again = record_failure(race, &scenario, &input, &id, &first, root.path()).unwrap();
     assert_eq!((&again.dir, &again.id), (&trace.dir, &trace.id));
     assert_eq!(entries(&parent).len(), 1);
+
+    // The trace's ID doesn't cover its full report: a saved copy that lost
+    // it gets the new one back, and one whose report differs fails the save
+    // and keeps its own.
+    let report = trace.dir.join(FULL_REPORT_FILE);
+    let kept = std::fs::read(&report).unwrap();
+    std::fs::remove_file(&report).unwrap();
+    record_failure(race, &scenario, &input, &id, &first, root.path()).unwrap();
+    assert_eq!(std::fs::read(&report).unwrap(), kept);
+    std::fs::write(&report, "other\n").unwrap();
+    let result = record_failure(race, &scenario, &input, &id, &first, root.path());
+    assert!(matches!(result, Err(RecordError::Io(_))), "{result:?}");
+    assert_eq!(std::fs::read(&report).unwrap(), b"other\n");
+    assert_eq!(entries(&parent).len(), 1);
 }
 
 #[test]
@@ -235,6 +249,17 @@ impl ActionSource for Clock {
             source: "clock".into(),
             event,
         });
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 

@@ -15,8 +15,8 @@ use crate::{
     parameters::{OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID, TX_V5_VERSION_GROUP_ID},
     primitives::{Halo2Proof, ZkSnarkProof},
     serialization::{
-        zcash_serialize_empty_list, zcash_serialize_external_count, AtLeastOne, CompactSizeMessage,
-        ReadZcashExt, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashSerialize,
+        zcash_serialize_empty_list, AtLeastOne, CompactSizeMessage, ReadZcashExt,
+        SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashSerialize,
     },
 };
 
@@ -157,27 +157,19 @@ fn serialize_optional_sapling_shielded_data<W: io::Write + ?Sized>(
 
 impl ZcashSerialize for sapling::ShieldedData<sapling::SharedAnchor> {
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
-        // Collect arrays for Spends
-        // There's no unzip3, so we have to unzip twice.
-        let (spend_prefixes, spend_proofs_sigs): (Vec<_>, Vec<_>) = self
-            .spends()
-            .cloned()
-            .map(sapling::Spend::<sapling::SharedAnchor>::into_v5_parts)
-            .map(|(prefix, proof, sig)| (prefix, (proof, sig)))
-            .unzip();
-        let (spend_proofs, spend_sigs) = spend_proofs_sigs.into_iter().unzip();
-
-        // Collect arrays for Outputs
-        let (output_prefixes, output_proofs): (Vec<_>, _) = self
-            .outputs()
-            .cloned()
-            .map(sapling::Output::into_v5_parts)
-            .unzip();
+        // V5 groups each field across all spends and outputs, so each list
+        // below walks the bundle again, writing the fields in place.
 
         // Denoted as `nSpendsSapling` and `vSpendsSapling` in the spec.
-        spend_prefixes.zcash_serialize(writer)?;
+        CompactSizeMessage::try_from(self.spends().count())?.zcash_serialize(writer)?;
+        for spend in self.spends() {
+            spend.zcash_serialize_v5_prefix(writer)?;
+        }
         // Denoted as `nOutputsSapling` and `vOutputsSapling` in the spec.
-        output_prefixes.zcash_serialize(writer)?;
+        CompactSizeMessage::try_from(self.outputs().count())?.zcash_serialize(writer)?;
+        for output in self.outputs() {
+            output.zcash_serialize_v5_prefix(writer)?;
+        }
 
         // Denoted as `valueBalanceSapling` in the spec.
         self.value_balance.zcash_serialize(writer)?;
@@ -190,12 +182,18 @@ impl ZcashSerialize for sapling::ShieldedData<sapling::SharedAnchor> {
         }
 
         // Denoted as `vSpendProofsSapling` in the spec.
-        zcash_serialize_external_count(&spend_proofs, writer)?;
+        for spend in self.spends() {
+            spend.zkproof.zcash_serialize(writer)?;
+        }
         // Denoted as `vSpendAuthSigsSapling` in the spec.
-        zcash_serialize_external_count(&spend_sigs, writer)?;
+        for spend in self.spends() {
+            spend.spend_auth_sig.zcash_serialize(writer)?;
+        }
 
         // Denoted as `vOutputProofsSapling` in the spec.
-        zcash_serialize_external_count(&output_proofs, writer)?;
+        for output in self.outputs() {
+            output.zkproof.zcash_serialize(writer)?;
+        }
 
         // Denoted as `bindingSigSapling` in the spec.
         writer.write_all(&<[u8; 64]>::from(self.binding_sig)[..])?;
@@ -429,16 +427,13 @@ fn serialize_orchard_shielded_data_with_flags<W: io::Write + ?Sized>(
     writer: &mut W,
     allow_cross_address_bit: bool,
 ) -> Result<(), io::Error> {
-    // Split the AuthorizedAction
-    let (actions, sigs): (Vec<orchard::Action>, Vec<Signature<SpendAuth>>) = orchard_shielded_data
-        .actions
-        .iter()
-        .cloned()
-        .map(orchard::AuthorizedAction::into_parts)
-        .unzip();
+    let actions = &orchard_shielded_data.actions;
 
     // Denoted as `nActionsOrchard` and `vActionsOrchard` in the spec.
-    actions.zcash_serialize(writer)?;
+    CompactSizeMessage::try_from(actions.len())?.zcash_serialize(writer)?;
+    for authorized_action in actions.iter() {
+        authorized_action.action.zcash_serialize(writer)?;
+    }
 
     // Denoted as `flagsOrchard` in the spec.
     serialize_orchard_flags(orchard_shielded_data.flags, writer, allow_cross_address_bit)?;
@@ -457,7 +452,9 @@ fn serialize_orchard_shielded_data_with_flags<W: io::Write + ?Sized>(
     orchard_shielded_data.proof.zcash_serialize(writer)?;
 
     // Denoted as `vSpendAuthSigsOrchard` in the spec.
-    zcash_serialize_external_count(&sigs, writer)?;
+    for authorized_action in actions.iter() {
+        authorized_action.spend_auth_sig.zcash_serialize(writer)?;
+    }
 
     // Denoted as `bindingSigOrchard` in the spec.
     orchard_shielded_data.binding_sig.zcash_serialize(writer)?;

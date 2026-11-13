@@ -864,10 +864,22 @@ mod tests {
         may_cool: impl Fn(Height) -> bool + Send + Sync + 'static,
         max_transaction_bytes: u64,
     ) -> CoreMempool {
-        let outbound = Timeout::new(
+        adapter_fetching(
+            handle,
+            may_cool,
+            max_transaction_bytes,
             BoxCloneSyncService::new(NeverReady),
-            TRANSACTION_DOWNLOAD_TIMEOUT,
-        );
+        )
+    }
+
+    /// [`adapter_with`], fetching through `network`.
+    fn adapter_fetching(
+        handle: PoolHandle,
+        may_cool: impl Fn(Height) -> bool + Send + Sync + 'static,
+        max_transaction_bytes: u64,
+        network: Outbound,
+    ) -> CoreMempool {
+        let outbound = Timeout::new(network, TRANSACTION_DOWNLOAD_TIMEOUT);
         CoreMempool::new(
             handle,
             outbound,
@@ -1167,5 +1179,132 @@ mod tests {
             panic!("the oversized body goes on to the core, which checks its size");
         };
         let _accepted = reservation.accept();
+    }
+
+    /// The decoded-body handoff gate: with the core's slots full and its
+    /// task no longer taking commands, completed fetches hold no more
+    /// decoded bodies than today's bound, one per slot. Every offer past the
+    /// slots is refused before anything is fetched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn decoded_bodies_stay_within_the_slots_while_the_core_is_paused() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zakura_chain::transaction::{LockTime, Transaction, UnminedTx};
+        use zakura_node_services::mempool::port::{
+            pool_port, PoolCommand, ReservationId, MAX_PENDING,
+        };
+
+        let offered = MAX_PENDING + 100;
+        let template = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        // One distinct body for each offer.
+        let bodies: Arc<HashMap<UnminedTxId, UnminedTx>> = Arc::new(
+            (0..offered)
+                .map(|n| {
+                    let mut transaction = Transaction::clone(template.transaction());
+                    let height = u32::try_from(n + 1).expect("few offers");
+                    if let Transaction::V1 { lock_time, .. }
+                    | Transaction::V2 { lock_time, .. }
+                    | Transaction::V3 { lock_time, .. }
+                    | Transaction::V4 { lock_time, .. }
+                    | Transaction::V5 { lock_time, .. } = &mut transaction
+                    {
+                        *lock_time = LockTime::Height(Height(height));
+                    }
+                    let body = UnminedTx::from(transaction);
+                    (body.id(), body)
+                })
+                .collect(),
+        );
+        assert_eq!(bodies.len(), offered, "each offer has its own body");
+        // A network that serves every body it is asked for, and counts them.
+        let served = Arc::new(AtomicUsize::new(0));
+        let network = {
+            let (bodies, served) = (bodies.clone(), served.clone());
+            BoxCloneSyncService::new(tower::service_fn(move |request: zn::Request| {
+                let (bodies, served) = (bodies.clone(), served.clone());
+                async move {
+                    let ids = match request {
+                        zn::Request::TransactionsById(ids)
+                        | zn::Request::TransactionsByIdFrom { ids, .. } => ids,
+                        other => unreachable!("only bodies are fetched: {other:?}"),
+                    };
+                    let found: Vec<_> = ids
+                        .iter()
+                        .filter_map(|id| bodies.get(id).cloned())
+                        .map(|body| zn::InventoryResponse::Available((body, None)))
+                        .collect();
+                    served.fetch_add(found.len(), Ordering::SeqCst);
+                    Ok::<_, BoxError>(zn::Response::Transactions(found))
+                }
+            }))
+        };
+
+        let (handle, mut inbox) = pool_port();
+        let core = adapter_fetching(
+            handle,
+            |_| true,
+            super::super::super::Config::default().max_transaction_bytes,
+            network,
+        );
+        // Five offers from each of many peers, so no peer's limit is reached.
+        let peer = |n: usize| {
+            let n = u16::try_from(n / MAX_INBOUND_CONCURRENCY_PER_PEER).expect("few peers");
+            let [high, low] = n.to_be_bytes();
+            QueueSource::LegacySocket(std::net::SocketAddr::from(([10, 1, high, low], 8233)))
+        };
+        let ids: Vec<UnminedTxId> = bodies.keys().copied().collect();
+        let queued: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .map(|(n, id)| tokio::spawn(queue(core.shared.clone(), Gossip::Id(*id), Some(peer(n)))))
+            .collect();
+
+        // The core grants its slots and refuses the rest, then stops taking
+        // commands.
+        for granted in 0..offered {
+            let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+                panic!("each offer reserves");
+            };
+            let answer = if granted < MAX_PENDING {
+                let id = ReservationId(u64::try_from(granted).expect("few"));
+                Ok(inbox.grant(id, tx_id, false, true, Default::default()))
+            } else {
+                Err(Unreserved::NoRoom)
+            };
+            let _ = reply.send(answer);
+        }
+        let mut refused = 0;
+        for task in queued {
+            if task.await.expect("the task does not panic").is_err() {
+                refused += 1;
+            }
+        }
+        assert_eq!(refused, offered - MAX_PENDING, "the offers past the slots");
+
+        // Every granted fetch completes while the core takes nothing.
+        for _ in 0..1_000 {
+            if served.load(Ordering::SeqCst) == MAX_PENDING {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            MAX_PENDING,
+            "one decoded body per slot, and none for a refused offer"
+        );
+        let mut waiting = 0;
+        while let Some(command) = inbox.try_next() {
+            let PoolCommand::Submit { reservation, .. } = command else {
+                panic!("only bodies wait for the core: {command:?}");
+            };
+            let _accepted = reservation.accept();
+            waiting += 1;
+        }
+        assert_eq!(waiting, MAX_PENDING, "each body waits under its slot");
     }
 }

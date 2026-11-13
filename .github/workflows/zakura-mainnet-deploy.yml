@@ -575,11 +575,9 @@ jobs:
             echo "::warning::failed to suppress compatibility watchdog alerts; continuing deploy" >&2
           fi
 
-      - name: Switch on trace files
-        # The profiler reads each node's trace files for per-block timings. This adds
-        # `trace_dir` to a node config that has none and changes nothing else; the
-        # restart in the next step makes the node read it. A node this cannot edit is
-        # reported and deployed as it is.
+      - name: Install profiler and prepare trace files
+        # Verify retention before adding trace_dir. If installation fails, a node
+        # without trace files keeps its original config; deployment can continue.
         env:
           NODE: ${{ inputs.node }}
         run: |
@@ -591,7 +589,7 @@ jobs:
           fi
 
           python3 deploy/profiler/fleet.py ensure-trace-config "${args[@]}" \
-            || echo "::warning::trace files could not be switched on for every node; see the step log" >&2
+            || echo "::warning::profiling could not be prepared on every node; see the step log" >&2
 
       - name: Deploy fleet
         working-directory: deploy/deployer
@@ -890,26 +888,12 @@ jobs:
           sudo systemctl restart zakura-mainnet-dashboard.service
           sudo systemctl --no-pager --full status zakura-mainnet-dashboard.service || true
 
-      - name: Install continuous profiler
+      - name: Install profiler tunnels
         if: always()
-        env:
-          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
-
-          # Each node gets a profiler that samples its zakurad from outside the process
-          # and serves the flame graphs the dashboard links to. A profiler listens only
-          # on its own host, so this host keeps an SSH tunnel to each of the others.
-          # See deploy/profiler/README.md. A profiler that fails to install never fails
-          # the deploy: the dashboard shows which nodes have one.
-          args=(--config deploy/deployer/nodes.ci.toml)
-          if [ -n "${NODE}" ]; then
-            args+=(--node "${NODE}")
-          fi
-
-          python3 deploy/profiler/fleet.py install "${args[@]}" \
-            || echo "::warning::the profiler was not installed on every node; see the step log" >&2
-          python3 deploy/profiler/fleet.py tunnels --config deploy/deployer/nodes.ci.toml
+          python3 deploy/profiler/fleet.py tunnels --config deploy/deployer/nodes.ci.toml \
+            || echo "::warning::profiler tunnels could not be installed; see the step log" >&2
 
       - name: Install public broadcast gateway
         if: always()

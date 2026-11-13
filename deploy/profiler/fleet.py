@@ -9,10 +9,10 @@ its entry says where the dashboard reaches its profiler:
 Three steps, each safe to repeat:
 
     fleet.py ensure-trace-config --config nodes.toml [--node NAME]
-        Add `trace_dir` under `[network.zakura]` in the node's own config when it has
-        none, so the node writes the trace files the profiler reads for per-block
-        timings. Nothing else in the file changes, and the node is not restarted: the
-        setting takes effect the next time it starts.
+        Install the profiler and verify trace retention before adding `trace_dir`
+        under `[network.zakura]` in a node config that has none. Nothing else in the
+        file changes, and the node is not restarted: the setting takes effect the
+        next time it starts. An existing trace directory is preserved.
 
     fleet.py install --config nodes.toml [--node NAME]
         Copy the profiler to the node, point it at that node's log and trace files,
@@ -244,12 +244,13 @@ systemctl daemon-reload
 systemctl enable --quiet {PROFILER_UNIT}
 systemctl restart {PROFILER_UNIT}
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    if curl -fsS --max-time 3 http://127.0.0.1:{PROFILER_PORT}/api/status >/dev/null 2>&1; then
+    if curl -fsS --max-time 3 http://127.0.0.1:{PROFILER_PORT}/api/status 2>/dev/null | \
+        python3 -c 'import json, sys; expected = {{"directory": sys.argv[1], "cap_mb": int(sys.argv[2]), "ready": True}} if sys.argv[1] else None; sys.exit(json.load(sys.stdin).get("trace_retention") != expected)' "$1" "$2"; then
         exit 0
     fi
     sleep 1
 done
-echo "the profiler did not answer on 127.0.0.1:{PROFILER_PORT}" >&2
+echo "the profiler did not confirm trace retention on 127.0.0.1:{PROFILER_PORT}" >&2
 exit 4
 """
 
@@ -309,12 +310,14 @@ def read_node_config(node):
 
 
 def ensure_trace_config(node):
-    """Make the node write trace files; returns a line saying what was done."""
+    """Start verified retention before enabling new trace writes; never restart the node."""
     path, text = read_node_config(node)
     edited = with_trace_dir(text)
     if edited == text:
+        install_profiler(node)
         return f"already writes trace files to {trace_dir_of(text)}"
     remote(node, CLAIM_TRACE_SCRIPT, TRACE_DIR)
+    start_profiler(node, TRACE_DIR, manage_traces=True)
     remote(node, WRITE_CONFIG_SCRIPT, path, stdin=edited.encode())
     if remote(node, 'cat "$1"', path) != edited:
         raise FleetError(f"{path} does not hold what was written")
@@ -326,8 +329,17 @@ def install_profiler(node):
     _, text = read_node_config(node)
     trace_dir = trace_dir_of(text)
     managed = bool(trace_dir and remote(node, READ_TRACE_MARKER_SCRIPT, trace_dir) == "managed")
-    remote(node, INSTALL_SCRIPT, stdin=profiler_archive(unit_drop_in(node, trace_dir, manage_traces=managed)))
+    start_profiler(node, trace_dir, manage_traces=managed)
     return "profiler running" + (f", reading {trace_dir}" if trace_dir else ", no trace files")
+
+
+def start_profiler(node, trace_dir, *, manage_traces):
+    """Install the selected trace policy and wait until that exact policy is running."""
+    cap = TRACE_TABLE_CAP_MB if manage_traces else 0
+    remote(
+        node, INSTALL_SCRIPT, trace_dir or "", str(cap),
+        stdin=profiler_archive(unit_drop_in(node, trace_dir, manage_traces=manage_traces)),
+    )
 
 
 def run_local(command, stdin=None):

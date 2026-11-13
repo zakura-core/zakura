@@ -11,6 +11,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -379,6 +380,88 @@ class PerfScriptTests(unittest.TestCase):
         self.profiler.fail("perf record could not start", "Permission denied: /root/secret")
         status = self.profiler.status()
         self.assertEqual((status["state"], status["error"]), ("error", "perf record could not start"))
+
+
+class TraceRetentionTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        args = argparse.Namespace(
+            node_name="n", service="zakurad", window=60, log_file="", perf="perf",
+            scratch_dir=str(self.directory / "scratch"), trace_dir=str(self.directory / "traces"),
+            trace_table_cap_mb=1,
+        )
+        Path(args.trace_dir).mkdir()
+        self.profiler = profiler_module.Profiler(args, profiler_module.Store(self.directory / "store"))
+        self.table = Path(args.trace_dir) / "discovery.jsonl"
+        self.table.write_bytes(b"x" * (1024 * 1024 + 1))
+
+    def test_retention_keeps_running_when_perf_cannot_start(self):
+        failed = threading.Event()
+        followed = threading.Event()
+        real_fail = self.profiler.fail
+        real_add = self.profiler.store.add_block_stages
+
+        def report_failure(*arguments):
+            real_fail(*arguments)
+            failed.set()
+
+        def remember_stages(records):
+            real_add(records)
+            followed.set()
+
+        with (
+            patch.object(self.profiler, "main_pid", return_value=123),
+            patch.object(self.profiler, "node_build", return_value="test"),
+            patch.object(profiler_module.subprocess, "Popen", side_effect=OSError("perf is unavailable")),
+            patch.object(self.profiler, "fail", side_effect=report_failure),
+            patch.object(self.profiler.store, "add_block_stages", side_effect=remember_stages),
+        ):
+            recorder = threading.Thread(target=self.profiler.record_loop)
+            follower = threading.Thread(target=self.profiler.trace_loop)
+            recorder.start()
+            try:
+                self.assertTrue(failed.wait(2), "CPU sampling must fail before retention starts")
+                self.assertFalse(self.profiler.status()["trace_retention"]["ready"])
+                follower.start()
+                self.assertTrue(followed.wait(2), "trace following must run without a CPU window")
+            finally:
+                self.profiler.stop()
+                recorder.join(timeout=2)
+                if follower.ident is not None:
+                    follower.join(timeout=2)
+        self.assertFalse(recorder.is_alive())
+        self.assertFalse(follower.is_alive())
+        self.assertEqual(self.table.stat().st_size, 0)
+        self.assertEqual(len(self.profiler._jobs), 0)
+        self.assertTrue(self.profiler.status()["trace_retention"]["ready"])
+
+    def test_a_stale_retention_worker_is_not_ready(self):
+        self.profiler._trace_checked_at = time.monotonic() - 31
+        self.assertFalse(self.profiler.status()["trace_retention"]["ready"])
+
+    def test_a_failed_stage_write_is_reported_after_the_trace_file_is_capped(self):
+        failed = threading.Event()
+        with (
+            patch.object(self.profiler.store, "add_block_stages", side_effect=OSError("disk write failed")),
+            patch.object(self.profiler, "fail", side_effect=lambda *_: failed.set()),
+        ):
+            follower = threading.Thread(target=self.profiler.trace_loop)
+            follower.start()
+            try:
+                self.assertTrue(failed.wait(2))
+            finally:
+                self.profiler.stop()
+                follower.join(timeout=2)
+        self.assertFalse(follower.is_alive())
+        self.assertEqual(self.table.stat().st_size, 0)
+        self.assertFalse(self.profiler.status()["trace_retention"]["ready"])
+
+    def test_an_unconfigured_trace_reader_exits_without_claiming_readiness(self):
+        self.profiler.traces = None
+        self.profiler.trace_loop()
+        self.assertIsNone(self.profiler.status()["trace_retention"])
 
 
 class LogFollowingTests(unittest.TestCase):

@@ -47,8 +47,9 @@ and the hand-off to legacy gossip.
 - The page reports the profiler's own CPU cost and any windows with lost
   samples.
 
-To switch it off: `systemctl disable --now zakura-profiler`. The node is not
-affected.
+To switch CPU sampling and trace retention off: `systemctl disable --now
+zakura-profiler`. First remove the node's `trace_dir` setting and restart the node,
+or arrange separate retention: stopping the profiler does not stop trace writes.
 
 ## Files and storage
 
@@ -68,6 +69,10 @@ The node never rotates its trace tables. Given `--trace-dir`, the profiler
 empties any table in that directory that grows past `--trace-table-cap-mb`
 (200 MB by default). With a cap of 0 it never empties one: use that, or leave
 `--trace-dir` off, where something else needs the complete tables.
+Trace reading and capping run in their own worker every five seconds, including
+when `perf` cannot start or produces no samples. The status endpoint reports the
+configured trace directory, cap, and whether that worker has completed a recent
+poll.
 
 ## Installing
 
@@ -81,24 +86,28 @@ ssh_string = "root@203.0.113.10"
 monitor    = { profiler_url = "http://127.0.0.1:8100" }
 ```
 
-The mainnet deploy workflow runs the three steps below on every deploy. Each is
-safe to repeat, and each takes `--node NAME` to act on one node.
+The mainnet deploy workflow prepares each node before deploying its binary and
+installs the tunnels afterwards. The commands are safe to repeat; the two node
+commands accept `--node NAME` to act on one node.
 
 ```bash
-# Before the node restarts: make it write trace tables.
+# Before the node restarts: install retention, then enable trace writes.
 python3 deploy/profiler/fleet.py ensure-trace-config --config nodes.toml
-# Copy the profiler to each node and start it.
+# To refresh the profiler alone, without changing the node's config:
 python3 deploy/profiler/fleet.py install --config nodes.toml
 # On the dashboard host: one SSH tunnel per node on another host.
 python3 deploy/profiler/fleet.py tunnels --config nodes.toml
 ```
 
 **`ensure-trace-config`** reads the config file named on the node's service
-command line and adds `trace_dir = "/mnt/data/zakura-traces"` under
+command line, installs the profiler, and verifies its trace-retention worker is
+running with the expected directory and cap. Only then does it add
+`trace_dir = "/mnt/data/zakura-traces"` under
 `[network.zakura]` when the config sets no `trace_dir`. It changes nothing else,
 keeps the first original as `<config>.before-trace-dir`, and does not restart
 the node: the setting takes effect when the node next starts. A config that
 already names a trace directory is left as it is.
+An installation or readiness failure leaves a node without tracing unchanged.
 
 When adding the setting, the installer creates a new trace directory containing
 `.zakura-profiler-managed`, its explicit permission to rotate files there on later

@@ -223,11 +223,14 @@ class StepTests(unittest.TestCase):
         self.config = DUAL_CONFIG
         self.archives = []
         self.managed = False
+        self.install_error = None
+        self.steps = []
         self.real_remote = fleet.remote
         fleet.remote = self.fake_remote
         self.addCleanup(lambda: setattr(fleet, "remote", self.real_remote))
 
     def fake_remote(self, node, script, *arguments, stdin=b""):
+        self.steps.append(script)
         if script.startswith("systemctl show"):
             return "{ argv[]=/usr/local/bin/zakurad -c /etc/zakura/zakura.toml start ; }"
         if script.startswith("cat "):
@@ -243,6 +246,9 @@ class StepTests(unittest.TestCase):
         if script == fleet.READ_TRACE_MARKER_SCRIPT:
             return "managed" if self.managed else ""
         if script == fleet.INSTALL_SCRIPT:
+            self.assertEqual(arguments, (fleet.TRACE_DIR, "200" if self.managed else "0"))
+            if self.install_error:
+                raise fleet.FleetError(self.install_error)
             self.archives.append(stdin)
             return ""
         raise AssertionError(f"unexpected remote script: {script[:40]}")
@@ -254,11 +260,28 @@ class StepTests(unittest.TestCase):
         written = self.config
         self.assertIn("already writes trace files to /mnt/data/zakura-traces", fleet.ensure_trace_config(self.node))
         self.assertEqual(self.config, written)
+        self.assertLess(self.steps.index(fleet.INSTALL_SCRIPT), self.steps.index(fleet.WRITE_CONFIG_SCRIPT))
+
+    def test_a_failed_install_leaves_new_trace_writes_disabled_and_can_be_retried(self):
+        self.install_error = "perf is not installed on this node"
+        with self.assertRaisesRegex(fleet.FleetError, "perf is not installed"):
+            fleet.ensure_trace_config(self.node)
+        self.assertEqual(self.config, DUAL_CONFIG)
+        self.assertNotIn(fleet.WRITE_CONFIG_SCRIPT, self.steps)
+        self.install_error = None
+        fleet.ensure_trace_config(self.node)
+        self.assertEqual(fleet.trace_dir_of(self.config), fleet.TRACE_DIR)
+
+    def test_a_retention_readiness_failure_also_prevents_enabling_traces(self):
+        self.install_error = "the profiler did not confirm trace retention"
+        with self.assertRaisesRegex(fleet.FleetError, "did not confirm trace retention"):
+            fleet.ensure_trace_config(self.node)
+        self.assertEqual(self.config, DUAL_CONFIG)
 
     def test_the_profiler_is_pointed_at_the_trace_directory_in_the_node_s_config(self):
         fleet.ensure_trace_config(self.node)
         self.assertEqual(fleet.install_profiler(self.node), "profiler running, reading /mnt/data/zakura-traces")
-        (sent,) = self.archives
+        sent = self.archives[-1]
         drop_in = tarfile.open(fileobj=io.BytesIO(sent)).extractfile("node.conf").read().decode()
         self.assertIn("--trace-dir /mnt/data/zakura-traces --trace-table-cap-mb 200", drop_in)
 
@@ -267,7 +290,7 @@ class StepTests(unittest.TestCase):
         fleet.ensure_trace_config(self.node)
         self.assertFalse(self.managed)
         fleet.install_profiler(self.node)
-        (sent,) = self.archives
+        sent = self.archives[-1]
         drop_in = tarfile.open(fileobj=io.BytesIO(sent)).extractfile("node.conf").read().decode()
         self.assertIn("--trace-dir /mnt/data/zakura-traces --trace-table-cap-mb 0", drop_in)
 

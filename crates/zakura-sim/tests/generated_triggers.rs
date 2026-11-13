@@ -12,7 +12,7 @@ use support::{
 };
 use zakura_network::zakura::Stream;
 use zakura_sim::{
-    harness::header_acceptance::refs::{ConnectionRef, PeerFrameRef},
+    harness::header_acceptance::refs::{ConnectionRef, ExchangeRef, PeerFrameRef, SourceFrameRef},
     model::Label,
     observe::{RowAt, StreamId, TransitionFact, TransportFact},
     property::PropertyId,
@@ -526,6 +526,118 @@ fn an_effect_joins_a_frame_judged_on_its_own_connection() {
         reaches(
             &work_id,
             [first.clone(), vec![work(on.connection, 0, 7)]].concat(),
+        )
+    });
+}
+
+/// `receiver-work-authorized`'s trigger joins each work to its source
+/// frame by the work's whole [`SourceFrameRef`]: connection 1's work from
+/// its `item` frame 0 reaches it after the node judged that frame, and
+/// after a judged frame with any one key moved, its stream's kind or
+/// version included, it doesn't.
+#[test]
+fn a_work_joins_its_whole_source_frame() {
+    let work_id = id(Some("item"), Template::WorkAuthorized);
+    let source = SourceFrameRef {
+        connection: 1,
+        kind: FEED_STREAM.kind,
+        version: FEED_STREAM.version,
+        seq: 0,
+    };
+    let moved = assert_one_key_off::<SourceFrameRef>(&source, |judged| {
+        let frame = PeerFrameRef {
+            connection: judged.connection,
+            kind: judged.kind,
+            version: judged.version,
+            quic_stream: None,
+            seq: judged.seq,
+        };
+        reaches(
+            &work_id,
+            vec![
+                peer_as(&frame, "item", Label::Conformant),
+                judged_as(&frame),
+                work(1, 0, 7),
+            ],
+        )
+    });
+    assert_eq!(moved, 4);
+}
+
+/// The peer's `row` frame 0 on the feed stream, on `exchange`'s
+/// connection and naming its key.
+fn peer_on(exchange: &ExchangeRef, row: &str) -> Observation {
+    Observation::PeerFrame {
+        connection: exchange.connection,
+        stream: stream(),
+        quic_stream: None,
+        seq: 0,
+        row: Some(row.to_owned()),
+        rule_stream: stream(),
+        label: Label::Conformant,
+        exhausted: false,
+        exchange: Some(exchange.exchange),
+        payload: 8,
+    }
+}
+
+/// `receiver-serving-bounded`'s trigger joins each serving owner to the
+/// request it serves by the owner's whole [`ExchangeRef`]: serving
+/// connection 1's `watch` request 7 reaches it after the node judged that
+/// request, and after a judged request with its connection or key moved
+/// it doesn't.
+#[test]
+fn a_serving_effect_joins_its_whole_exchange() {
+    let serving_id = id(Some("watch"), Template::ServingBounded);
+    let request = ExchangeRef {
+        connection: 1,
+        exchange: 7,
+    };
+    let moved = assert_one_key_off::<ExchangeRef>(&request, |judged| {
+        let frame = peer_on(judged, "watch");
+        let Observation::PeerFrame {
+            connection,
+            stream,
+            seq,
+            ..
+        } = frame
+        else {
+            unreachable!("`peer_on` is a peer's frame");
+        };
+        let judged = Observation::FrameJudged {
+            connection,
+            stream,
+            quic_stream: None,
+            seq,
+        };
+        reaches(&serving_id, vec![frame, judged, serving(1, 7)])
+    });
+    assert_eq!(moved, 2);
+}
+
+/// `conformant-never-closes` counts a punishment against the frames the
+/// node judged on the punished connection, joined by its whole
+/// [`ConnectionRef`]: connection 1's fault close after its own judged
+/// conformant frame reaches the trigger, and after that frame judged on
+/// another connection instead, it doesn't.
+#[test]
+fn a_punishment_counts_the_frames_judged_on_its_connection() {
+    let conformant = id(None, Template::ConformantNeverCloses);
+    assert_one_key_off::<ConnectionRef>(&ConnectionRef { connection: 1 }, |on| {
+        let frame = PeerFrameRef {
+            connection: on.connection,
+            kind: FEED_STREAM.kind,
+            version: FEED_STREAM.version,
+            quic_stream: None,
+            seq: 0,
+        };
+        reaches(
+            &conformant,
+            vec![
+                peer_as(&frame, "item", Label::Conformant),
+                judged_as(&frame),
+                fault_closed(1),
+            ],
         )
     });
 }

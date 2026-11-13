@@ -25,6 +25,7 @@ use zakura_network::zakura::{
 
 use super::stamp::Stamps;
 use crate::{
+    harness::header_acceptance::refs::{Ref, StampRef},
     stores::{debug_snapshot, EvidenceStores, Guard, Registered, Snapshot},
     RunEnd,
 };
@@ -449,7 +450,12 @@ impl AdoptionEvidence {
         let mut breaks = Vec::new();
         for (state_version, read) in self.publication_reads(queue) {
             found = match (read, found) {
-                (PublicationRead::Broken(stamp), found) if new.contains(&stamp) => {
+                (PublicationRead::Broken(stamp), found)
+                    if !StampRef::joined(&StampRef { stamp }, new, |at| {
+                        Some(StampRef { stamp: *at })
+                    })
+                    .is_empty() =>
+                {
                     breaks.push(format!(
                         "the reactor took {} {queue:?} events after state {state_version:?} \
                          was published, with no watch read of it",
@@ -592,6 +598,7 @@ mod tests {
     use crate::{
         domain::header_sync::{watch_end_violations, WATCH_OBSERVED_UNDER_FLOOD},
         end::Drain,
+        harness::header_acceptance::refs::one_key_off::assert_one_key_off,
         Outcome,
     };
     use zakura_scheduler::Status as SchedulerStatus;
@@ -815,6 +822,41 @@ mod tests {
             watch(vec![commit(2), read(2), commit(3), wire(TurnStart, 4)]),
             WatchRead::Open
         );
+    }
+
+    /// A broken publication is reported only at the step that added the
+    /// event that broke it, joined by that event's whole [`StampRef`]: the
+    /// third wire take after state 2's publication breaks the rule when
+    /// its stamp is new, and with only another stamp new the publication
+    /// counts as answered.
+    #[test]
+    fn a_break_joins_the_stamp_of_the_event_that_made_it() {
+        use TakePoint::{Select, TurnStart};
+        let evidence = evidence(
+            [
+                commit(2),
+                wire(TurnStart, 4),
+                wire(Select, 3),
+                wire(TurnStart, 2),
+            ]
+            .into_iter()
+            .map(|fact| (0, fact))
+            .collect(),
+            0,
+        );
+        let breaking = StampRef {
+            stamp: evidence
+                .facts()
+                .last()
+                .expect("the third take is recorded")
+                .stamp,
+        };
+        assert_one_key_off::<StampRef>(&breaking, |new| {
+            matches!(
+                evidence.watch_read(EventQueue::Wire, &[new.stamp]),
+                WatchRead::Broken(_)
+            )
+        });
     }
 
     /// A publication whose queue delivers an event before its watch read

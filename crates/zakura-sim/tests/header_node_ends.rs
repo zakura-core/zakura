@@ -10,11 +10,12 @@ mod support;
 use std::{cell::RefCell, io::Write, path::Path, process::Command};
 
 use serde_json::Value;
-use support::inputs;
+use support::{inputs, one_key_off::assert_one_key_off};
 use tempfile::TempDir;
 use zakura_sim::{
     harness::{
         self,
+        header_acceptance::refs::{CallRef, Ref, StampRef},
         header_node::{
             ends::{EndEvidence, EndFact, EnvironmentAction},
             policy::{Allow, Hold, OpKind, Select, Trigger},
@@ -291,11 +292,7 @@ fn overlapping_churns_each_name_their_own_step() {
                 "mirror-1" => 1,
                 other => panic!("only the churns act, not on {other}"),
             };
-            let cause = ran
-                .causes
-                .iter()
-                .find(|(at, _)| at == stamp)
-                .map(|(_, step)| *step);
+            let cause = cause_of(&ran.causes, &StampRef { stamp: *stamp });
             assert_eq!(cause, Some(expected), "{fact:?}: {:#?}", ran.causes);
             steps.push(expected);
         }
@@ -310,6 +307,46 @@ fn overlapping_churns_each_name_their_own_step() {
         }
     }
     assert!(overlapped > 0, "no plan interleaved the two churns");
+}
+
+/// The control step `causes`, as `(stamp, position)`, names for the fact
+/// `fact` stamps, joined by its whole [`StampRef`].
+fn cause_of(causes: &[(u64, usize)], fact: &StampRef) -> Option<usize> {
+    StampRef::joined(fact, causes, |(at, _)| Some(StampRef { stamp: *at }))
+        .first()
+        .map(|(_, step)| *step)
+}
+
+/// Each environment fact takes the cause its own stamp names: a fact
+/// stamped 5 takes the cause recorded under stamp 5, and none under a
+/// moved stamp.
+#[test]
+fn a_fact_takes_the_cause_of_its_whole_stamp() {
+    assert_one_key_off::<StampRef>(&StampRef { stamp: 5 }, |caused| {
+        cause_of(&[(caused.stamp, 1)], &StampRef { stamp: 5 }) == Some(1)
+    });
+}
+
+/// Whether `recorded`, the tap's `CallDropped` facts as `(stamp, call)`,
+/// names the calls the log's `CallEnded` `dropped` names, `logged`, one
+/// for one and in order, each joined by its whole [`CallRef`].
+fn recorded_as_logged(recorded: &[(u64, u64)], logged: &[u64]) -> bool {
+    recorded.len() == logged.len()
+        && recorded.iter().zip(logged).all(|((_, call), logged)| {
+            CallRef::joins(&CallRef { call: *logged }, call, |call| {
+                Some(CallRef { call: *call })
+            })
+        })
+}
+
+/// A recorded drop matches the log's only by its whole call: the tap's
+/// drops of calls 3 and 4 match the log's, and with call 4 moved they
+/// don't.
+#[test]
+fn a_recorded_drop_joins_the_logged_call() {
+    assert_one_key_off::<CallRef>(&CallRef { call: 4 }, |tapped| {
+        recorded_as_logged(&[(7, 3), (8, tapped.call)], &[3, 4])
+    });
 }
 
 /// A `Shutdown` step records one end for the node under test, with no
@@ -383,9 +420,9 @@ fn each_dropped_call_is_recorded_after_the_shutdown_it_follows() {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            recorded.iter().map(|(_, call)| *call).collect::<Vec<_>>(),
-            logged
+        assert!(
+            recorded_as_logged(&recorded, &logged),
+            "{recorded:?} {logged:?}"
         );
         let shutdown = ran
             .ends

@@ -43,6 +43,7 @@ use super::{
     ends::{EndEvidence, EndFact, EnvironmentAction},
 };
 use crate::{
+    harness::header_acceptance::refs::{CallRef, Ref},
     observe::{Entry, ReactorFact, StorageFact, StorageRequest, StorageResult},
     storage::{Blame, FaultAttributions, HEADER_SERVICE},
     stores::{debug_snapshot, EvidenceStores, Guard, Registered, Snapshot},
@@ -412,8 +413,11 @@ impl Judge {
             ReactorFact::CallEnded { call, end, .. } if end == "dropped" => {
                 self.dropped.insert(*call);
                 let dropped_failed = &mut self.dropped_failed;
+                let dropping = CallRef { call: *call };
                 self.failed.retain(|op, (request, _)| {
-                    let held = request.call == Some(*call);
+                    let held = CallRef::joins(&dropping, request, |request| {
+                        request.call.map(|call| CallRef { call })
+                    });
                     if held {
                         dropped_failed.insert(*op, *call);
                     }
@@ -797,7 +801,13 @@ impl FaultEvidence {
                 }
             )
         });
-        let dropped = stamp(&|fact| *fact == EndFact::CallDropped { call });
+        let wanted = CallRef { call };
+        let dropped = stamp(&|fact| {
+            CallRef::joins(&wanted, fact, |fact| match fact {
+                EndFact::CallDropped { call } => Some(CallRef { call: *call }),
+                _ => None,
+            })
+        });
         self.ends.reactor_exited().is_none()
             && shutdown
                 .zip(dropped)
@@ -968,6 +978,7 @@ impl FaultEnd {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
     use crate::observe::{StorageBranch, StoragePoint, WorkOwner, WorkScope};
 
     /// The one violation in `end`, if it holds exactly one and nothing
@@ -1425,6 +1436,48 @@ pub(crate) mod tests {
                 "{ends:?}"
             );
         }
+    }
+
+    /// The log of operation 1's failure with `aa` blamed, whose reply call
+    /// `dropped` held when the reactor dropped it.
+    fn dropped_with(dropped: u64) -> Vec<Entry> {
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.pop();
+        log.push(reactor(ReactorFact::CallEnded {
+            call: dropped,
+            end: "dropped".to_owned(),
+            op: Some(1),
+        }));
+        log.push(storage(13, StorageFact::ReplyDropped { id: 1 }));
+        log
+    }
+
+    /// The harness's stop clears a dropped fault only by the tap's
+    /// `CallDropped` of the call that held it, joined by its whole
+    /// [`CallRef`]: call 1's drop after the stop clears operation 1's
+    /// fault, and a drop of another call leaves it lost.
+    #[test]
+    fn a_stop_clears_only_the_dropped_call_it_names() {
+        let log = dropped_with(1);
+        let blamed = [(1, blame("aa"))];
+        assert_one_key_off::<CallRef>(&CallRef { call: 1 }, |tapped| {
+            let ends = [shutdown(), EndFact::CallDropped { call: tapped.call }];
+            evidence_ending(&blamed, &ends).check(&log) == FaultCheck::Nothing
+        });
+    }
+
+    /// A reactor's drop of a call takes the failed reply the call held,
+    /// joined by the request's whole [`CallRef`]: call 1's drop, which the
+    /// harness's stop explains, clears operation 1's fault, and the same
+    /// stop and drop of another call leave call 1's reply untaken.
+    #[test]
+    fn a_dropped_call_takes_only_the_reply_it_held() {
+        let blamed = [(1, blame("aa"))];
+        assert_one_key_off::<CallRef>(&CallRef { call: 1 }, |dropped| {
+            let ends = [shutdown(), EndFact::CallDropped { call: dropped.call }];
+            evidence_ending(&blamed, &ends).check(&dropped_with(dropped.call))
+                == FaultCheck::Nothing
+        });
     }
 
     /// A settled run's end reports every open finding, not just the

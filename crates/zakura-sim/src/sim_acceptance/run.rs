@@ -24,7 +24,10 @@ use super::{
 };
 use crate::{
     check::PropertyOutcome,
-    harness::header_acceptance::tool::{Containment, Record, RunPlan},
+    harness::header_acceptance::{
+        binding,
+        tool::{Containment, Record},
+    },
     property::Status,
     trace::TraceReader,
 };
@@ -1708,6 +1711,29 @@ fn minimize_build_refusal(dir: &Path, bound: &Bound<'_>, target: &str) -> Option
     None
 }
 
+/// What the minimization's kept trace says it is.
+struct KeptTrace<'a> {
+    /// The SHA-256 of the input it ran.
+    input: Option<&'a str>,
+    /// The simulator binary that recorded it.
+    binary: &'a str,
+    /// Its content-digest ID.
+    id: &'a str,
+}
+
+impl KeptTrace<'_> {
+    /// Whether this trace is `confirmation`'s run of the `minimized` input,
+    /// recorded by the `pinned` simulator. Each of the three must match.
+    fn bound(&self, confirmation: Option<&Value>, minimized: &str, pinned: Option<&str>) -> bool {
+        let confirmed_id = confirmation
+            .and_then(|c| c.get("trace_id"))
+            .and_then(Value::as_str);
+        self.input == Some(minimized)
+            && Some(self.binary) == pinned
+            && confirmed_id == Some(self.id)
+    }
+}
+
 /// Why the minimization's kept bundle doesn't stand, if it doesn't: the
 /// minimized input must hash to `minimized`, its confirmation must have
 /// confirmed `property` on it, and its trace must be a run of it recorded by
@@ -1763,14 +1789,12 @@ fn minimized_bundle_refusal(
     let Ok(kept) = TraceReader::open(&trace) else {
         return Some("the kept minimized trace doesn't read".to_owned());
     };
-    let bound = kept.meta.input.as_ref().map(|i| i.sha256.as_str()) == Some(minimized)
-        && Some(kept.meta.build.binary.as_str()) == pinned
-        && confirmation
-            .as_ref()
-            .and_then(|c| c.get("trace_id"))
-            .and_then(Value::as_str)
-            == Some(kept.id.as_str());
-    if !bound {
+    let kept_trace = KeptTrace {
+        input: kept.meta.input.as_ref().map(|i| i.sha256.as_str()),
+        binary: &kept.meta.build.binary,
+        id: &kept.id,
+    };
+    if !kept_trace.bound(confirmation.as_ref(), minimized, pinned) {
         return Some(
             "the kept trace isn't its confirmation's run of the minimized input".to_owned(),
         );
@@ -2910,7 +2934,8 @@ fn header_record(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let verified = header::read_bounded_json::<RunPlan>(&run_dir.join("plan.json"))
+    // `verify`'s own reader, so both paths refuse the same plans.
+    let verified = binding::read_plan(&run_dir.join("plan.json"))
         .and_then(|plan| {
             verify(
                 repo,
@@ -2954,7 +2979,7 @@ fn header_key_verdict(record: &Record, key: &crate::harness::header_acceptance::
 mod tests {
     use serde_json::json;
 
-    use super::{command_passed, exactly_one_passed, lane_bound, lane_passed, Verdict};
+    use super::{command_passed, exactly_one_passed, lane_bound, lane_passed, KeptTrace, Verdict};
 
     fn blocked(verdict: &Verdict) -> bool {
         matches!(verdict, Verdict::Blocked { .. })
@@ -2976,7 +3001,8 @@ mod tests {
     /// A lane blocks on a failed command or listing, a required target
     /// that wasn't built or lists nothing, a listed test that didn't run and
     /// pass (a `--skip`), a nonempty expected-empty target, an unrun
-    /// `run = true` ignored test, or any failure.
+    /// `run = true` ignored test, or any failure. A test is matched within
+    /// its own target, never by its name alone.
     #[test]
     fn a_lane_needs_its_whole_inventory() {
         let required = ["zakura-sim/draws".to_owned()];
@@ -3051,6 +3077,54 @@ mod tests {
         let failed =
             lane(json!({ "targets": { "zakura-sim/draws": [["a", "ok"], ["c", "FAILED"]] } }));
         assert!(blocked(&judge(&failed, &none)));
+        // One key off: the listed test's name ran, but in another target.
+        let elsewhere = lane(json!({
+            "listed": { "zakura-sim/draws": ["a"], "zakura-sim/net": ["a"], "zakura-rt/lib": [] },
+            "targets": { "zakura-sim/draws": [], "zakura-sim/net": [["a", "ok"]] },
+        }));
+        assert!(
+            blocked(&judge(&elsewhere, &none)),
+            "a listed test that ran only under another target blocks"
+        );
+        let ignored_elsewhere = lane(json!({
+            "listed": { "zakura-sim/draws": ["a"], "zakura-sim/net": ["slow"], "zakura-rt/lib": [] },
+            "targets": {
+                "zakura-sim/draws": [["a", "ok"], ["slow", "ignored"]],
+                "zakura-sim/net": [["slow", "ok"]],
+            },
+        }));
+        assert!(
+            blocked(&judge(
+                &ignored_elsewhere,
+                &["zakura-sim/draws::slow".to_owned()]
+            )),
+            "a `run = true` test that ran only under another target blocks"
+        );
+    }
+
+    /// The kept minimized trace binds only to its own confirmation, input
+    /// and simulator: one key off each blocks.
+    #[test]
+    fn a_kept_trace_binds_one_key_off() {
+        let kept = KeptTrace {
+            input: Some("in"),
+            binary: "sim",
+            id: "trace",
+        };
+        let confirmation = json!({ "trace_id": "trace" });
+        assert!(kept.bound(Some(&confirmation), "in", Some("sim")));
+        let other_run = json!({ "trace_id": "other" });
+        assert!(!kept.bound(Some(&other_run), "in", Some("sim")));
+        assert!(!kept.bound(Some(&json!({})), "in", Some("sim")));
+        assert!(!kept.bound(None, "in", Some("sim")));
+        assert!(!kept.bound(Some(&confirmation), "other", Some("sim")));
+        assert!(!kept.bound(Some(&confirmation), "in", Some("other")));
+        assert!(!kept.bound(Some(&confirmation), "in", None));
+        let no_input = KeptTrace {
+            input: None,
+            ..kept
+        };
+        assert!(!no_input.bound(Some(&confirmation), "in", Some("sim")));
     }
 
     /// A lane binds to S only when every target it listed or ran names its

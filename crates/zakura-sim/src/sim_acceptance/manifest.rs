@@ -96,7 +96,7 @@ impl fmt::Display for Expected {
     /// The result's ID, unique in the manifest.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Expected::Test(t) => write!(f, "test/{}/{}/{}", t.package, test_target(t), t.test),
+            Expected::Test(t) => write!(f, "test/{}/{}/{}", t.package, t.file, t.test),
             Expected::UnitTest { package, path } => write!(f, "unit/{package}/{path}"),
             Expected::Lane(id) => write!(f, "lane/{id}"),
             Expected::FuzzTest(name) => write!(f, "fuzz-test/{name}"),
@@ -164,8 +164,7 @@ const fn sim(file: &'static str, name: &'static str) -> Expected {
 }
 
 /// The stem of `test`'s file under its package's `tests/`, such as
-/// `fixtures`: the name of its integration test target, and how a result's
-/// ID names it.
+/// `fixtures`: the name of its integration test target.
 pub fn test_target(test: &TestRef) -> &'static str {
     test.file
         .strip_prefix("tests/")
@@ -234,7 +233,7 @@ pub fn rows_digest_of(rows: &[Row]) -> String {
 
 /// [`rows_digest`] at S, which a change to any row's fixed content must
 /// move.
-pub const ROWS_SHA256: &str = "af4ab39e5a84ae790f9c40d5612458254eb39cb2420946e923141805c3567d70";
+pub const ROWS_SHA256: &str = "8f63c02061842f55dd85e5a4d4ac945c903f302ac89eb3de4d973fb114dc3c49";
 
 /// The race agreement pairs: one per registered race fixture, so a new
 /// fixture joins S4.4 by itself ([`problems`] checks each has a saved

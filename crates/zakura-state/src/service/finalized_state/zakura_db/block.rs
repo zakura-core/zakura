@@ -535,7 +535,6 @@ impl ZakuraDb {
     }
 
     /// Returns the height for a canonical full-state or header-only hash.
-    #[allow(dead_code)]
     pub(crate) fn header_height(&self, hash: block::Hash) -> Option<block::Height> {
         self.height(hash).or_else(|| {
             let height_by_hash = self.db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();

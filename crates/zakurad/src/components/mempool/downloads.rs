@@ -806,7 +806,7 @@ where
     }
 
     /// Get the number of currently in-flight download tasks.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn in_flight(&self) -> usize {
         self.in_flight
     }

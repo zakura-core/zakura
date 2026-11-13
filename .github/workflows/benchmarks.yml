@@ -21,7 +21,7 @@ env:
     criterion -p zakura-chain --bench transaction
     criterion -p zakura-chain --bench block --features bench
     criterion -p zakura-chain --bench redpallas
-    criterion -p zakura-consensus --bench worst_case_tx_verification
+    criterion -p zakura-consensus --bench worst_case_tx_verification --features internal-bench
     criterion -p zakura --bench mempool_eviction --features mempool-bench
 
 jobs:

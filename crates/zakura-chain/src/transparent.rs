@@ -401,7 +401,6 @@ impl OutputIndex {
     }
 
     /// Create a transparent output index from `usize`.
-    #[allow(dead_code)]
     pub fn from_usize(output_index: usize) -> OutputIndex {
         OutputIndex(
             output_index
@@ -410,28 +409,13 @@ impl OutputIndex {
         )
     }
 
-    /// Return this index as `usize`.
-    #[allow(dead_code)]
-    pub fn as_usize(&self) -> usize {
-        self.0
-            .try_into()
-            .expect("the maximum valid index fits in usize")
-    }
-
     /// Create a transparent output index from `u64`.
-    #[allow(dead_code)]
     pub fn from_u64(output_index: u64) -> OutputIndex {
         OutputIndex(
             output_index
                 .try_into()
                 .expect("the maximum u64 index fits in the inner type"),
         )
-    }
-
-    /// Return this index as `u64`.
-    #[allow(dead_code)]
-    pub fn as_u64(&self) -> u64 {
-        self.0.into()
     }
 }
 

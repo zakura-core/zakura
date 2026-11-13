@@ -381,11 +381,7 @@ impl Drop for ReadStateService {
                 // runs the format check after its last commit.
                 // (We'd also like to abort the thread, but std::thread::JoinHandle can't do that.)
 
-                // This log is verbose during tests.
-                #[cfg(not(test))]
                 info!("waiting for the block write task to finish");
-                #[cfg(test)]
-                debug!("waiting for the block write task to finish");
                 let block_write_task_result = block_write_task_handle.join();
 
                 // We're the last database user, so we can tell it to shut down (blocking):

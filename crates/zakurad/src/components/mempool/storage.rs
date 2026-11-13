@@ -844,7 +844,7 @@ impl Storage {
     }
 
     /// Returns the cost of the transactions in the mempool, according to ZIP-401.
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "mempool-bench"))]
     pub fn total_cost(&self) -> u64 {
         self.verified.total_cost()
     }
@@ -917,7 +917,6 @@ impl Storage {
     /// Returns the number of rejected [`UnminedTxId`]s or [`transaction::Hash`]es.
     ///
     /// Transactions on multiple rejected lists are counted multiple times.
-    #[allow(dead_code)]
     pub fn rejected_transaction_count(&mut self) -> usize {
         self.tip_rejected_exact.len()
             + self.tip_rejected_same_effects.len()

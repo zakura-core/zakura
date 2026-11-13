@@ -281,7 +281,7 @@ impl ConnectedAddr {
     /// Returns a new outbound connected addr via `proxy`.
     ///
     /// `local_addr` is the ephemeral local address of the connection.
-    #[allow(unused)]
+    #[cfg(test)]
     pub fn new_outbound_proxy(proxy: SocketAddr, local_addr: SocketAddr) -> ConnectedAddr {
         OutboundProxy {
             proxy_addr: proxy,
@@ -293,7 +293,7 @@ impl ConnectedAddr {
     //
     // TODO: distinguish between direct listeners and proxy listeners in the
     //       rest of zakura-network
-    #[allow(unused)]
+    #[cfg(test)]
     pub fn new_inbound_proxy(proxy: SocketAddr) -> ConnectedAddr {
         InboundProxy {
             transient_addr: proxy,

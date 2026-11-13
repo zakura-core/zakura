@@ -6,6 +6,14 @@
 //! round's reservation, every call holding its round's own pages for the
 //! same owner, and a released round's reservation and unheld leases gone. These witnesses show the runs reach the cases that contract
 //! names.
+//!
+//! The fork witness steered so that both mirrors' rounds stage before the
+//! node's storage runs either preparation is committed as
+//! `tests/fixtures/header-authority-overlapping-forks`, the scenario and
+//! the script, which `foreign-leases` under
+//! `qa/planted/header-sync/commit-only-authorized/` runs on
+//! `header-sync/storage`. There the second mirror's prepare takes its round's
+//! leases while the first round's are still staged.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -13,31 +21,41 @@ mod support;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
+    fs,
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
 };
 
 use serde_json::Value;
-use support::inputs;
+use support::{
+    inputs,
+    one_key_off::assert_one_key_off,
+    steer::{before, steer, Steer},
+};
 use tempfile::TempDir;
 use zakura_network::zakura::observe::{ReactorEvent, ReservationEnd};
 use zakura_sim::{
+    domain::header_sync::COMMIT_ONLY_AUTHORIZED,
     harness::{
         self,
+        header_acceptance::refs::{Ref, StorageOpRef, StorageRef},
         header_node::Policy,
         header_node::{
             policy::Trigger, reservation::ReservationEvidence, session::SessionFact, Chain,
             ControlAction, ControlStep, Fork,
         },
         header_sync::{Dialer, HeaderWire, MirrorSpec, Storage, StorageScenario, WireScenario},
-        record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem,
+        record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem, WITNESS_FILE,
     },
-    observe::{ReactorCall, ReactorFact, TransitionFact, TransportFact},
+    observe::{
+        Entry, ReactorCall, ReactorFact, StorageFact, StorageRequest, TransitionFact, TransportFact,
+    },
     peer::{honest::HonestSpec, PeerSpec},
     record::RecordSink,
     trace::{replay_with, ReplayOptions, TraceReader},
-    MemorySink, Observation, PlanInput, RunReport,
+    witness::{check_witness, Expect, WitnessScenario},
+    Checker, MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport, StepCtx,
 };
 
 /// Runs `scenario` on freshly prepared ports under `input`. The run must end
@@ -507,4 +525,401 @@ fn the_reservation_witnesses_replay_in_a_fresh_process() {
         .map(|(facts, _)| facts)
         .unwrap_or_else(|| panic!("the child prints its facts: {stdout}"));
     assert_eq!(replayed, recorded);
+}
+
+/// The committed overlapping-forks scenario, as `header-sync/storage`'s
+/// JSON.
+const OVERLAPPING_FORKS: &str = "header-authority-overlapping-forks.json";
+
+/// The committed overlapping-forks script, a scripted Plan as JSON.
+const OVERLAPPING_FORKS_SCRIPT: &str = "header-authority-overlapping-forks.script.json";
+
+/// The committed fixture file `name`.
+fn fixture_file(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+/// What one storage fact says of the node's header preparations: a
+/// prepare's submission, with the supplier it prepares for, or an
+/// operation's completion, each by its operation's whole ref.
+#[derive(Clone, Debug)]
+enum PrepareEvent {
+    /// A `PrepareHeaderTarget` was submitted for the supplier.
+    Submitted(StorageOpRef, String),
+    /// An operation completed.
+    Completed(StorageOpRef),
+}
+
+/// The storage instance an `Observation::Storage` names.
+fn storage_of(service: &str, instance: u64) -> StorageRef {
+    StorageRef {
+        service: service.to_owned(),
+        instance,
+    }
+}
+
+/// Each storage fact in `entries` that [`PrepareEvent`] tracks, in order.
+fn prepare_events(entries: &[Entry]) -> Vec<PrepareEvent> {
+    entries
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Storage {
+                service,
+                instance,
+                fact,
+                ..
+            } => {
+                let op = |id: &u64| StorageOpRef {
+                    storage: storage_of(service, *instance),
+                    op: *id,
+                };
+                match fact {
+                    StorageFact::Submitted {
+                        id,
+                        request: StorageRequest::PrepareHeaderTarget { source, .. },
+                        ..
+                    } => Some(PrepareEvent::Submitted(op(id), source.clone())),
+                    StorageFact::Completed { id, .. } => Some(PrepareEvent::Completed(op(id))),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many suppliers had a prepare submitted when the first of their
+/// first prepares completed, joined by its [`StorageOpRef`], or `None` if
+/// none did, with each supplier's first prepare.
+fn first_prepare_ran(events: &[PrepareEvent]) -> (Option<usize>, BTreeMap<String, StorageOpRef>) {
+    let mut prepares = BTreeMap::new();
+    let mut first_ran = None;
+    for event in events {
+        match event {
+            PrepareEvent::Submitted(op, source) => {
+                prepares.entry(source.clone()).or_insert_with(|| op.clone());
+            }
+            PrepareEvent::Completed(done)
+                if prepares
+                    .values()
+                    .any(|first| StorageOpRef::joins(first, done, |done| Some(done.clone()))) =>
+            {
+                first_ran.get_or_insert(prepares.len());
+            }
+            PrepareEvent::Completed(_) => {}
+        }
+    }
+    (first_ran, prepares)
+}
+
+/// Whether the storage action `identity` runs one of `prepares`, joined by
+/// its [`StorageOpRef`]. A storage action's identity is
+/// `storage:<service>:<id>:<outcome>`, which names no instance, so the
+/// action's is the one instance of its service among `storages`; two are an
+/// error, since the identity can't tell them apart.
+fn runs_prepare(
+    storages: &BTreeSet<(String, u64)>,
+    prepares: &[(StorageOpRef, String)],
+    identity: &str,
+) -> Result<bool, String> {
+    let Some((service, id)) = identity
+        .strip_prefix("storage:")
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(service, rest)| Some((service, rest.split(':').next()?.parse::<u64>().ok()?)))
+    else {
+        return Ok(false);
+    };
+    let mut instances = storages
+        .iter()
+        .filter(|(named, _)| named == service)
+        .map(|(_, instance)| *instance);
+    let instance = match (instances.next(), instances.next()) {
+        (Some(instance), None) => instance,
+        (None, _) => return Ok(false),
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{identity} names no instance, and two of {service} ran: {storages:?}"
+            ))
+        }
+    };
+    let picked = StorageOpRef {
+        storage: storage_of(service, instance),
+        op: id,
+    };
+    Ok(prepares
+        .iter()
+        .any(|(prepare, _)| StorageOpRef::joins(&picked, prepare, |prepare| Some(prepare.clone()))))
+}
+
+/// A steering rule: the node's storage runs no preparation until it has
+/// been asked for one from each of two suppliers. Until then, a step that
+/// would run one picks something else, time advancing only if nothing else
+/// can. So each mirror's round stages its page and dispatches its prepare
+/// while the other's leases are still staged.
+fn both_prepares_before_either_runs(cx: &StepCtx<'_>) -> Result<Steer, String> {
+    let entries = before(cx);
+    let prepares: Vec<(StorageOpRef, String)> = prepare_events(entries)
+        .into_iter()
+        .filter_map(|event| match event {
+            PrepareEvent::Submitted(op, source) => Some((op, source)),
+            PrepareEvent::Completed(_) => None,
+        })
+        .collect();
+    let suppliers: BTreeSet<&String> = prepares.iter().map(|(_, source)| source).collect();
+    if suppliers.len() >= 2 {
+        return Ok(Steer::Fine);
+    }
+    let storages: BTreeSet<(String, u64)> = entries
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Storage {
+                service, instance, ..
+            } => Some((service.clone(), *instance)),
+            _ => None,
+        })
+        .collect();
+    let runs = |identity: &str| runs_prepare(&storages, &prepares, identity);
+    if !runs(&cx.pick.to_string())? {
+        return Ok(Steer::Fine);
+    }
+    let names: Vec<String> = cx
+        .enabled
+        .iter()
+        .map(|enabled| enabled.identity.to_string())
+        .collect();
+    let mut held = Vec::new();
+    for name in &names {
+        if !runs(name)? {
+            held.push(name);
+        }
+    }
+    held.iter()
+        .find(|name| !name.starts_with("advance-time"))
+        .or_else(|| held.first())
+        .map(|name| Steer::Pick((*name).clone()))
+        .ok_or_else(|| format!("only a held preparation can run: {names:?}"))
+}
+
+/// The steering rule's and the fixture witness's joins of a storage
+/// operation, by its whole [`StorageOpRef`]: a pick of header operation 5
+/// runs the prepare submitted as instance 0's operation 5, and the first
+/// of two suppliers' prepares ran when that operation completed. Moving
+/// the prepare's service, instance or operation, or the completion's,
+/// makes neither join.
+#[test]
+fn a_prepare_joins_its_pick_and_completion_by_its_whole_operation() {
+    let op = StorageOpRef {
+        storage: storage_of("header", 0),
+        op: 5,
+    };
+    let storages = BTreeSet::from([("header".to_owned(), 0)]);
+    assert_one_key_off::<StorageOpRef>(&op, |prepare| {
+        runs_prepare(
+            &storages,
+            &[(prepare.clone(), "m1".to_owned())],
+            "storage:header:5:success",
+        )
+        .expect("one header instance ran")
+    });
+    let other = StorageOpRef {
+        storage: storage_of("header", 0),
+        op: 6,
+    };
+    assert_one_key_off::<StorageOpRef>(&op, |done| {
+        let events = [
+            PrepareEvent::Submitted(op.clone(), "m1".to_owned()),
+            PrepareEvent::Submitted(other.clone(), "m2".to_owned()),
+            PrepareEvent::Completed(done.clone()),
+        ];
+        first_prepare_ran(&events).0 == Some(2)
+    });
+    let two = BTreeSet::from([("header".to_owned(), 0), ("header".to_owned(), 1)]);
+    assert!(runs_prepare(&two, &[(op, "m1".to_owned())], "storage:header:5:success").is_err());
+}
+
+/// Runs `scenario` under `plan` on `header-sync/storage` itself, with
+/// `extra` beside the registered properties, keeping a run that ended in a
+/// harness failure. Returns the report and its records.
+fn run_storage(
+    scenario: &StorageScenario,
+    plan: PlanInput,
+    extra: Option<&mut dyn Checker>,
+) -> (RunReport, Vec<String>) {
+    let mut sink = MemorySink::default();
+    let report =
+        match run_prepared::<Storage>(scenario, Storage::prepare(scenario), plan, &mut sink, extra)
+        {
+            Ok(report) => report,
+            Err(HarnessError::Run { report, .. }) => *report,
+            Err(error) => panic!("{error}"),
+        };
+    (report, sink.lines())
+}
+
+/// The default Plan on `header-sync/storage`, steered by
+/// [`both_prepares_before_either_runs`] over [`fork_witness`]: the script
+/// `foreign-leases`'s planted case runs.
+fn overlapping_forks_script() -> Plan {
+    let scenario = fork_witness();
+    let (_, plan, _) = steer(
+        Plan::from_fuzz(&[]),
+        &both_prepares_before_either_runs,
+        &mut |plan, checker| run_storage(&scenario, plan, Some(checker)),
+    );
+    let PlanInput::Script(plan) = plan else {
+        panic!(
+            "the default Plan runs the first preparation before the second, so steering scripts it"
+        );
+    };
+    plan
+}
+
+/// The committed overlapping-forks scenario and script, as `cargo xtask
+/// planted` reads them.
+fn committed_overlapping_forks() -> (StorageScenario, Plan) {
+    let read = |name: &str| {
+        fs::read_to_string(fixture_file(name)).unwrap_or_else(|error| panic!("{name}: {error}"))
+    };
+    let scenario = serde_json::from_str(&read(OVERLAPPING_FORKS))
+        .unwrap_or_else(|error| panic!("{OVERLAPPING_FORKS}: {error}"));
+    let script = serde_json::from_str(&read(OVERLAPPING_FORKS_SCRIPT))
+        .unwrap_or_else(|error| panic!("{OVERLAPPING_FORKS_SCRIPT}: {error}"));
+    (scenario, script)
+}
+
+/// The committed overlapping-forks fixture is what its builders give: the
+/// fork witness and the default Plan steered over it on
+/// `header-sync/storage`.
+#[test]
+fn the_overlapping_forks_fixture_matches_its_builders() {
+    let (scenario, script) = committed_overlapping_forks();
+    assert_eq!(
+        serde_json::to_value(&scenario).expect("scenarios serialize"),
+        serde_json::to_value(fork_witness()).expect("scenarios serialize"),
+        "run `regenerate_overlapping_forks_fixture`"
+    );
+    assert_eq!(
+        script,
+        overlapping_forks_script(),
+        "run `regenerate_overlapping_forks_fixture`"
+    );
+}
+
+/// Rewrites the committed overlapping-forks fixture from its builders.
+#[test]
+#[ignore = "rewrites the committed overlapping-forks fixture"]
+fn regenerate_overlapping_forks_fixture() {
+    let write = |name: &str, json: String| {
+        fs::write(fixture_file(name), json + "\n").expect("the fixture directory exists");
+    };
+    write(
+        OVERLAPPING_FORKS,
+        serde_json::to_string_pretty(&fork_witness()).expect("scenarios serialize"),
+    );
+    write(
+        OVERLAPPING_FORKS_SCRIPT,
+        serde_json::to_string_pretty(&overlapping_forks_script()).expect("Plans serialize"),
+    );
+}
+
+/// On `header-sync/storage` itself, the committed overlapping forks hold
+/// `header-sync/commit-only-authorized`, which applies, with their
+/// overlap: the node's storage is asked for both mirrors' preparations
+/// before it runs either, and both rounds stage their pages before either
+/// is released. So the second prepare took its round's leases while the
+/// first round's were staged, and held only its own.
+#[test]
+fn the_overlapping_forks_fixture_prepares_both_while_both_are_staged() {
+    let (scenario, script) = committed_overlapping_forks();
+    check_witness::<Storage>(
+        WitnessScenario {
+            scenario: scenario.clone(),
+            input: PlanInput::Script(script.clone()),
+        },
+        COMMIT_ONLY_AUTHORIZED,
+        Expect::Holds,
+    );
+    let (report, facts) = run(&scenario, PlanInput::Script(script));
+    let outcome = report
+        .properties
+        .iter()
+        .find(|property| property.property == COMMIT_ONLY_AUTHORIZED)
+        .map(|property| property.outcome.clone());
+    assert!(
+        matches!(outcome, Some(PropertyOutcome::Held { applicable }) if applicable > 0),
+        "{outcome:?}"
+    );
+    let (first_ran, prepares) = first_prepare_ran(&prepare_events(report.log.entries()));
+    assert_eq!(
+        first_ran,
+        Some(2),
+        "both suppliers' preparations were asked for before the first ran: {prepares:?}"
+    );
+    let mut staged = BTreeSet::new();
+    for fact in &facts {
+        match fact {
+            ReactorEvent::PageStaged { request, .. } => {
+                staged.insert(request.incarnation);
+            }
+            ReactorEvent::RoundReleased { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        staged.len(),
+        2,
+        "both rounds staged before either was released"
+    );
+}
+
+/// `record --witness` judges the committed overlapping forks as `cargo
+/// xtask planted` runs them, from the scenario's text and `--script`,
+/// expecting a hold, and `replay` reruns its trace Exact in a fresh
+/// process.
+#[test]
+fn the_overlapping_forks_fixture_records_and_replays_in_a_fresh_process() {
+    let zakura_sim = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+            .args(args)
+            .output()
+            .expect("the binary runs")
+    };
+    let dir = TempDir::new().expect("a temporary directory");
+    let trace = dir.path().join("trace");
+    let scenario =
+        fs::read_to_string(fixture_file(OVERLAPPING_FORKS)).expect("the fixture is committed");
+    let recorded = zakura_sim(&[
+        "record",
+        "--sim",
+        Storage::NAME,
+        "--scenario",
+        &scenario,
+        "--script",
+        fixture_file(OVERLAPPING_FORKS_SCRIPT)
+            .to_str()
+            .expect("the path is UTF-8"),
+        "--out",
+        trace.to_str().expect("the path is UTF-8"),
+        "--witness",
+        COMMIT_ONLY_AUTHORIZED,
+        "--expect",
+        "holds",
+    ]);
+    assert!(recorded.status.success(), "{recorded:?}");
+    let witness: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(trace.join(WITNESS_FILE)).expect("witness.json"))
+            .expect("witness.json is JSON");
+    assert_eq!(
+        witness["passed"],
+        serde_json::Value::Bool(true),
+        "{witness}"
+    );
+    let replayed = zakura_sim(&["replay", trace.to_str().expect("the path is UTF-8")]);
+    let stdout = String::from_utf8_lossy(&replayed.stdout);
+    assert!(
+        replayed.status.success() && stdout.contains("every pick, draw and observation matched"),
+        "{replayed:?}"
+    );
 }

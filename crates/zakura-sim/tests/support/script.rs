@@ -7,7 +7,7 @@ use zakura_rt::task::yield_now;
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
     property::{Assumptions, HasView, Property, Registry, RegistryChecker, Source, Sources},
-    ActionSource, Boundary, Identity, Observation, ObservationLog, Plan, RunReport,
+    ActionSource, Boundary, Identity, Observation, ObservationLog, Plan, RunReport, Sim,
 };
 
 use super::{config, run};
@@ -93,21 +93,27 @@ pub fn run_scripted<S: HasView>(
         assumptions,
         &Sources::observed(observed),
     );
-    let batches = Rc::new(RefCell::new(VecDeque::from(script)));
     // Each step offers the task first, then the script: byte 1 picks the
     // script while it lasts.
     run(
         config(1, 1_000),
         Plan::from_fuzz(&[1; 64]),
-        |sim| {
-            let left = Rc::clone(&batches);
-            sim.scheduler().spawn_root("node", async move {
-                while !left.borrow().is_empty() {
-                    yield_now().await;
-                }
-            });
-            sim.add_source(Box::new(Script(batches)));
-        },
+        |sim| feed(sim, script),
         &mut checker,
     )
+}
+
+/// Adds `script` to `sim` as a source that emits one batch per step, and a
+/// `node` task that stays ready until the script ends, as
+/// [`run_scripted`] runs it. A harness's `build` calls it to run a script
+/// under its own registry. Plan byte 1 picks the script while it lasts.
+pub fn feed(sim: &mut Sim, script: Vec<Vec<Observation>>) {
+    let batches = Rc::new(RefCell::new(VecDeque::from(script)));
+    let left = Rc::clone(&batches);
+    sim.scheduler().spawn_root("node", async move {
+        while !left.borrow().is_empty() {
+            yield_now().await;
+        }
+    });
+    sim.add_source(Box::new(Script(batches)));
 }

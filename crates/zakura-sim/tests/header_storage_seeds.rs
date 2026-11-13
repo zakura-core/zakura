@@ -67,7 +67,7 @@ type Seed = (&'static str, fn() -> StorageScenario, usize);
 
 /// The witness each seed carries, by stem: a property its run holds, which a
 /// planted case's patch on the same input violates.
-const WITNESSES: [(&str, &str); 3] = [
+const WITNESSES: [(&str, &str); 6] = [
     (
         "header-storage-close-relink",
         "header-sync/chunk-budget-bound",
@@ -77,15 +77,25 @@ const WITNESSES: [(&str, &str); 3] = [
         "header-sync/teardown-returns-baseline",
     ),
     (
+        "header-storage-close-relink",
+        "header-sync/outstanding-work-bounded",
+    ),
+    (
         "header-storage-stale-prepare",
+        "header-sync/stale-completion-inert",
+    ),
+    ("header-storage-default", "harness/direct-dispatch"),
+    (
+        "header-storage-stale-prepare-steps",
         "header-sync/stale-completion-inert",
     ),
 ];
 
-/// The witness scenarios `tests/explore_state.rs` draws from their seeds,
-/// so the fuzzer can reach the states they show. Generator 3 is their first
-/// generator, so they name no source.
-const DRAWN: [Seed; 3] = [
+/// The seeds generator 3 is the first to draw, so they name no source: the
+/// witness scenarios `tests/explore_state.rs` draws from their seeds, so
+/// the fuzzer can reach the states they show, and the stale planted cases'
+/// input ([`stale_prepare_steps`]).
+const DRAWN: [Seed; 4] = [
     (
         "header-storage-locator-dropped",
         storage_witnesses::dropped_locator,
@@ -101,7 +111,25 @@ const DRAWN: [Seed; 3] = [
         storage_witnesses::competing_mirrors,
         10,
     ),
+    (
+        "header-storage-stale-prepare-steps",
+        stale_prepare_steps,
+        11,
+    ),
 ];
+
+/// `header-storage-stale-prepare`'s scenario less its last control step, a
+/// close on a dropped read that never runs, under the same Plan slice: the
+/// same run, with every step it declares carried out. The stale planted
+/// cases run it, since acceptance judges their runs' declared actions.
+fn stale_prepare_steps() -> StorageScenario {
+    let mut scenario = StorageScenario::triggers();
+    scenario
+        .controls
+        .pop()
+        .expect("the trigger scenario has control steps");
+    scenario
+}
 
 /// Every migrated seed. `header-storage-stale-prepare` is the trigger scenario
 /// under the slice whose run ends a prepare after its round retired, while

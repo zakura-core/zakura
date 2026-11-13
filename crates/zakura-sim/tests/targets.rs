@@ -173,8 +173,8 @@ fn declared_targets_are_the_sim_packages() {
 }
 
 /// The discovery seed carries the lost-wakeup bypass, and the header
-/// storage seeds carry the planted cases that name the close-and-relink and
-/// stale-prepare seeds.
+/// storage seeds carry every planted case that names one of them as its
+/// input, including the native mutations hdr-14.4 moved onto them.
 #[test]
 fn bypasses_follow_their_committed_input() {
     let load = |harness| seed::load(&[fixtures()], Some(harness)).unwrap().admitted;
@@ -193,17 +193,22 @@ fn bypasses_follow_their_committed_input() {
     assert_eq!(
         patches,
         [
+            "qa/planted/harness/direct-dispatch/locator-to-action-channel.patch",
             "qa/planted/header-sync/chunk-budget-bound/uncapped-secondary-reservation.patch",
+            "qa/planted/header-sync/outstanding-work-bounded/secondary-reservation.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-charge.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-close.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-credit.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-release.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-retirement.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/consumed-locator-permit.patch",
             "qa/planted/header-sync/teardown-returns-baseline/forgotten-completion.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/forgotten-locator-permit.patch",
             "qa/planted/header-sync/teardown-returns-baseline/forgotten-retained-headers.patch",
             "qa/planted/header-sync/teardown-returns-baseline/kept-queue-lease.patch",
             "qa/planted/header-sync/teardown-returns-baseline/leaked-lease-clone.patch",
             "qa/planted/header-sync/teardown-returns-baseline/leaked-reservation-entry.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/shutdown-kept-queue.patch",
             "qa/planted/header-sync/teardown-returns-baseline/skipped-round-release.patch",
         ]
         .map(Path::new),

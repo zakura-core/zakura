@@ -12,6 +12,7 @@ use zakura_network::zakura::{
     observe::{ReactorEvent, ReservationPurpose},
     ZakuraPeerId,
 };
+use zakura_sim::stores::EvidenceStores;
 use zakura_sim::{
     domain::header_sync::{chunk_budget_bound, BudgetView, CHUNK_BUDGET_BOUND},
     harness::{
@@ -29,7 +30,7 @@ use zakura_sim::{
 use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture};
 
 /// The tap's claim breaks, with no probe reads.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Claims {
     capacity: CapacityEvidence,
     claims: ClaimEvidence,
@@ -71,16 +72,22 @@ fn over_budget(read: bool) -> (RunReport, Claims) {
     let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let unread = EvidenceStores::default();
     let view = Claims {
         claims: if read {
             tap.claims()
         } else {
-            ClaimEvidence::default()
+            ClaimEvidence::new(&unread)
         },
-        ..Claims::default()
+        capacity: CapacityEvidence::new(&unread),
     };
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         let capacity = observer
@@ -167,8 +174,13 @@ fn a_claim_taken_without_a_property_fails_at_the_next_drain() {
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     let claims = tap.claims();
-    let source =
-        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    let source = PolicySource::new(
+        &mut sim,
+        port,
+        Policy::converging(),
+        Effects::new(&EvidenceStores::default()),
+    )
+    .with_tap(tap);
     sim.add_source(Box::new(source));
     sim.scheduler().spawn_root("reactor", async move {
         let capacity = observer

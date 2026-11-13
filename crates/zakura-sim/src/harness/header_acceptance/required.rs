@@ -9,10 +9,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    contracts::{contract_test_key, Contract, ContractId, ContractState, Narrowing},
+    contracts::{
+        contract_catch_key, contract_test_key, Contract, ContractId, ContractState, Narrowing,
+    },
     reasons::NaEntry,
-    sim_test, Approval, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, RunId, TestRef,
-    Tier, PLAN, TIERS,
+    refs::{PlantedRef, Ref, TestIdRef},
+    sim_test, Approval, CaseRef, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, RunId,
+    TestRef, Tier, PLAN, TIERS,
 };
 use crate::property::Status;
 
@@ -39,11 +42,16 @@ pub struct Inventories<'a> {
     /// Every planted case under `qa/planted/header-sync/` and
     /// `qa/planted/header/`, as `(property directory, case name)`.
     pub planted: &'a [(String, String)],
-    /// Each planted case's harness, by `(property directory, case name)`,
-    /// read from its committed input's sidecar
+    /// Each planted case's harness, by its whole [`PlantedRef`], read from
+    /// its committed input's sidecar
     /// ([`planted_harness`](super::planted_harness)) apart from the rows.
     /// A case with no readable harness counts as a node case.
-    pub planted_harnesses: &'a BTreeMap<(String, String), String>,
+    pub planted_harnesses: &'a [(PlantedRef, String)],
+    /// Every planted case whose `.toml` names `missing_evidence`, a
+    /// harness-caught case with no `Draft` run
+    /// ([`planted_harness_caught`](super::planted_harness_caught)), read
+    /// apart from the rows.
+    pub harness_caught: &'a [PlantedRef],
     /// Every directory under `qa/native-mutations/header-sync/`, retired
     /// ones included.
     pub native: &'a [String],
@@ -81,6 +89,9 @@ pub struct Inventories<'a> {
 pub enum Permit {
     /// Exactly this test's `Passes`.
     Test(TestRef),
+    /// Exactly this planted case's `Caught`, the result its row's
+    /// [`Key::Case`] takes, joined on the case's whole [`PlantedRef`].
+    Caught(CaseRef),
     /// A transitional `Open` until exactly this PR, with exactly this
     /// reason, so another obligation's `Open` for the same PR doesn't
     /// satisfy it.
@@ -119,7 +130,8 @@ impl Permit {
     /// Whether `expected` is what this permits.
     pub fn allows(self, expected: &Expected) -> bool {
         match (self, expected) {
-            (Permit::Test(test), Expected::Passes { test: t }) => test == *t,
+            (Permit::Test(test), Expected::Passes { test: t }) => permitted_test(test, t),
+            (Permit::Caught(want), Expected::Caught { case, .. }) => permitted_catch(&want, case),
             (
                 Permit::Until { owner, pr, reason },
                 Expected::Open {
@@ -147,89 +159,184 @@ impl Permit {
     }
 }
 
-/// Why `gate-1/a-a-and-a-b-a` is open until hdr-14.7b, whose fresh-process
-/// recordings and replays it compares.
-pub const GATE_1_A_A_AND_A_B_A: &str =
-    "the acceptance tool runs each history A twice and between a distinct B in \
-                     one process, and compares traces, reports and store snapshots";
+/// Whether `case` is the planted case `want` a [`Permit::Caught`] names,
+/// joined on its whole [`PlantedRef`].
+fn permitted_catch(want: &CaseRef, case: &CaseRef) -> bool {
+    PlantedRef::joins(&want.planted(), case, |case| Some(case.planted()))
+}
 
-/// Why `gate-1/topology-freshness` is open until hf-7.
-pub const GATE_1_TOPOLOGY_FRESHNESS: &str =
-    "a topology change with no reactor event shows in the next view";
+/// Gate 1's topology freshness test (hf-7): a link the harness closes,
+/// with no reactor event between, shows in the next view.
+pub const TOPOLOGY_FRESHNESS_TEST: TestRef = sim_test(
+    "tests/header_node_session_ends.rs",
+    "a_link_the_harness_closes_shows_in_the_next_view",
+);
 
-/// Why `gate-1/store-inventory` is open until hf-6.
-pub const GATE_1_STORE_INVENTORY: &str =
-    "every store a header check reads is registered, behind a checkpoint and \
-                     has a producer test";
+/// Gate 1's store inventory, its first half (hf-6): every field holding
+/// shared state in the header harness's sources is a registered store or
+/// an allowed live resource.
+pub const STORE_INVENTORY_REGISTERED_TEST: TestRef = sim_test(
+    "tests/evidence_inventory.rs",
+    "every_shared_field_is_a_registered_store_or_allowed",
+);
 
-/// Why `gate-1/replay-store-control` is open until hdr-14.7b.
-pub const GATE_1_REPLAY_STORE_CONTROL: &str =
-    "a changed stored fact with every report the same must fail the replay \
-                     comparison";
+/// Gate 1's store inventory, its second half (hf-6, hf-7): every
+/// registered store names its checkpoint and a producer test that exists.
+pub const STORE_INVENTORY_PRODUCER_TEST: TestRef = sim_test(
+    "tests/evidence_inventory.rs",
+    "every_registered_store_names_its_checkpoint_and_producer",
+);
 
-/// Why `gate-2/despite-close/caught` is open until hdr-14.6.
-pub const GATE_2_DESPITE_CLOSE_CAUGHT: &str =
-    "the planted case under commit-only-authorized that keeps the fault close \
-                     but stages the rejected page";
+/// Gate 2's end-boundary preservation in the registry (C12): every
+/// distinct end finding at one boundary is kept.
+pub const END_BOUNDARY_REGISTRY_TEST: TestRef =
+    sim_test("tests/registry.rs", "every_end_finding_is_kept");
 
-/// Why `gate-2/despite-close/close-companion` is open until hdr-14.6.
-pub const GATE_2_DESPITE_CLOSE_CLOSE_COMPANION: &str =
-    "its patched Draft trace closes the rejected page's connection with a fault \
-                     cause";
+/// Gate 2's end-boundary preservation in the fault store (C13): a settled
+/// end reports every open fault, not just the first.
+pub const END_BOUNDARY_FAULT_STORE_TEST: TestRef = sim_test(
+    "src/harness/header_node/fault.rs",
+    "harness::header_node::fault::tests::the_end_reports_every_open_fault",
+);
 
-/// Why `gate-2/despite-close/staging-companion` is open until hdr-14.6.
-pub const GATE_2_DESPITE_CLOSE_STAGING_COMPANION: &str =
-    "its patched Draft trace stages the rejected page for that subscription and \
-                     those hashes";
+/// Gate 5's bound-table limit fixtures (hdr-9d.1): work slots, locator
+/// reads and node execution slots each reach their limit and no further
+/// while one more party waits, and the slot fixture's per-round
+/// reservations, staged capacity and request deadlines reach 16 with them.
+pub const BOUND_LIMIT_TEST: TestRef = sim_test(
+    "tests/header_outstanding.rs",
+    "the_limit_fixtures_reach_and_hold_their_bounds",
+);
 
-/// Why `gate-2/bad-content-fault-close/status` is open until hdr-14.6.
-pub const GATE_2_BAD_CONTENT_FAULT_CLOSE_STATUS: &str =
-    "the status bad-content history carries the fault-close assertion where the \
-                     close is owed";
+/// Gate 5's bound-table release and reuse: in each limit fixture's log, and
+/// for the reservation maps in the slot fixture's reservation facts, the
+/// waiting party gets its first unit only after a release, with fewer than
+/// the limit open.
+pub const BOUND_REUSE_TEST: TestRef = sim_test(
+    "tests/header_outstanding.rs",
+    "the_limit_fixtures_release_and_reuse_their_bounds",
+);
 
-/// Why `gate-2/bad-content-fault-close/subscribe-headers` is open until hdr-14.6.
-pub const GATE_2_BAD_CONTENT_FAULT_CLOSE_SUBSCRIBE_HEADERS: &str =
-    "the subscribe-headers bad-content history carries the fault-close assertion \
-                     where the close is owed";
+/// Gate 5's bound-table membership and cleanup witness: every membership
+/// or cleanup row held keys while the rule judged it in a committed
+/// witness that holds the property.
+pub const BOUND_MEMBERSHIP_TEST: TestRef = sim_test(
+    "tests/header_outstanding.rs",
+    "each_membership_row_holds_keys_in_a_committed_witness",
+);
 
-/// Why `gate-2/bad-content-fault-close/headers` is open until hdr-14.6.
-pub const GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS: &str =
-    "the headers bad-content history carries the fault-close assertion where the \
-                     close is owed";
+/// Gate 5's capacity-wait cleanup witness: two refusals, and the publisher
+/// keeps one wait at a time, so the pruning drops the stale one.
+pub const BOUND_WAITS_TEST: TestRef = sim_test(
+    "tests/header_outstanding.rs",
+    "the_capacity_waits_fixture_refuses_twice_and_holds",
+);
 
-/// Why `gate-2/bad-content-fault-close/headers-outcome` is open until hdr-14.6.
-pub const GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS_OUTCOME: &str =
-    "the headers-outcome bad-content history carries the fault-close assertion \
-                     where the close is owed";
+/// Who owns a bound-table row's missing evidence.
+pub const BOUND_OWNER: &str = "hdr-9d";
 
-/// Why `gate-2/end-boundary-preservation` is open until hdr-14.8.
-pub const GATE_2_END_BOUNDARY_PRESERVATION: &str =
-    "every distinct end finding at one boundary survives, which C12 and C13 \
-                     deliver";
+/// A bound-table row's obligation `name`, met by `test`'s pass.
+const fn bound_test(name: &'static str, test: TestRef) -> GateObligation {
+    GateObligation {
+        name,
+        gates: &[Gate::G5],
+        permit: Permit::Test(test),
+    }
+}
 
-/// Why `gate-3/crossing/unretained-open-then-outcome` is open until hdr-14.6.
-pub const GATE_3_CROSSING_UNRETAINED_OPEN_THEN_OUTCOME: &str =
-    "Act::UnretainedOpen then Act::OutcomeCrossing, labelled conformant with no \
-                     punishment";
+/// Adam's approval of the [`bound_unshown`] rows' standing exclusions,
+/// with their fixtures owed by a follow-up PR.
+pub const BOUND_UNSHOWN_RULING: Approval = Approval::Adam {
+    record: "Adam, 2026-11-12, gate-5 bound-table rows with no fixture evidence, fixtures in a follow-up",
+};
 
-/// Why `gate-3/crossing/crossing-close` is open until hdr-14.6.
-pub const GATE_3_CROSSING_CROSSING_CLOSE: &str =
-    "a subscription Close that crosses the node's ending, labelled conformant \
-                     with no punishment";
+/// A bound-table row's obligation `name` with no fixture evidence, met
+/// by its standing exclusion for `reason` under [`BOUND_UNSHOWN_RULING`].
+const fn bound_unshown(name: &'static str, reason: &'static str) -> GateObligation {
+    GateObligation {
+        name,
+        gates: &[Gate::G5],
+        permit: Permit::Standing {
+            owner: BOUND_OWNER,
+            reason,
+            approval: BOUND_UNSHOWN_RULING,
+        },
+    }
+}
 
-/// Why `gate-3/crossing/over-window-grant` is open until hdr-14.6.
-pub const GATE_3_CROSSING_OVER_WINDOW_GRANT: &str =
-    "a crossed Grant above the window, labelled bad-cursor and closed";
+/// The bound-table rows with no fixture evidence, each with the reason its
+/// exclusion would carry. `pub` so the manifest's rows write the same
+/// standing `Open`s, under [`BOUND_UNSHOWN_RULING`].
+pub mod bound_unshown {
+    /// The ordinary per-identity reservation.
+    pub const RESERVATION: &str = "no fixture reaches the 250-header per-identity \
+        reservation: the limit fixtures' mirrors advertise at most 235 headers per response";
+    /// The per-peer locator bound.
+    pub const LOCATOR_PER_PEER: &str = "no fixture asks for a second locator read for one \
+        peer while its first is in flight, so the one-per-peer bound is never at its limit";
+    /// One prepare and one apply per round.
+    pub const CALLS_PER_ROUND: &str = "no fixture offers a round a second prepare or apply \
+        while its first is pending, so the one-per-round bound is never at its limit";
+    /// Detached `RetainedHeaders`.
+    pub const DETACHED: &str = "detached RetainedHeaders count inside the chunk budget, which \
+        chunk-budget-bound judges, and no fixture holds one past its round";
+    /// Departed strikes.
+    pub const STRIKES: &str = "no committed storage fixture leaves a departed strike, so the \
+        map's limit and its maintenance expiry are never exercised";
+    /// Pending closes.
+    pub const PENDING_CLOSES: &str = "no committed storage fixture fills a session's queue so a \
+        Close is refused and waits to retry, so the map stays empty";
+    /// Status cadences.
+    pub const CADENCES: &str = "status cadences are listed, not checked: the storage harness \
+        has no transport, so no connection close removes an entry, and the removal is the \
+        transport cleanup's contract (RegisteredPeerCleanupGuard)";
+    /// Publisher tombstones.
+    pub const TOMBSTONES: &str = "no fixture keeps two ended subscriptions' tombstones on one \
+        session at once, so the 2-tombstone bound is never at its limit";
+    /// Publisher jobs.
+    pub const JOBS: &str = "no fixture asks a session's publisher for a second page job while \
+        one runs, so the one-job bound is never at its limit";
+    /// Publisher subscription slots.
+    pub const SUBSCRIPTION_SLOTS: &str = "no fixture opens a second subscription while the \
+        first's terminal write finishes, so the 2-slot margin is never used";
+    /// The sent-cursor ring.
+    pub const SENT_RING: &str = "no fixture sends a subscription anywhere near 4,096 pages, so \
+        its sent-cursor ring never nears its limit";
+    /// Peer execution slots.
+    pub const PEER_EXECUTION: &str = "the capacity-waits fixture holds a peer's 2 execution \
+        slots, but no fixture shows a third page job for that peer denied, released and reused";
+    /// Node serving output.
+    pub const NODE_OUTPUT: &str = "the node's output grants are listed, not checked: their \
+        limit follows the configured session count through the toolkit's sizing";
+    /// Per-peer serving output.
+    pub const PEER_OUTPUT: &str = "no fixture queues anywhere near 64 MiB of one peer's output, \
+        so the per-peer output bound never nears its limit";
+    /// Serving response counts.
+    pub const RESPONSE_COUNTS: &str = "response counts are listed, not checked: their limits \
+        follow the configured session count through the toolkit's sizing";
+    /// Retained-path leases.
+    pub const LEASES: &str = "the 8 node execution slots bound concurrent serving leases first, \
+        so no fixture reaches storage's 16 retained-path leases";
+    /// Readmission cooldowns.
+    pub const COOLDOWNS: &str = "readmission cooldowns are capped at the admitted peer limit \
+        (#2131), but no committed storage fixture installs one, so the cap and the \
+        maintenance expiry are never exercised";
+    /// Pruned peers.
+    pub const PRUNED_PEERS: &str = "pruned peers are capped at the admitted peer limit \
+        (#2209), but no committed storage fixture prunes a peer's history, so the cap is never \
+        exercised";
+    /// VCT repair rows.
+    pub const VCT_REPAIR: &str = "no committed storage fixture starts a VCT repair, so its \
+        sources, episodes and context reads stay empty; the repair harness's witnesses judge \
+        stale completion and outstanding work, not these rows' limits";
+}
 
-/// Why `gate-5/bound-table` is open until hdr-9d.1.
-pub const GATE_5_BOUND_TABLE: &str =
-    "each row of outstanding-work-bounded's bound table: its at-limit, \
-                     one-over-denied and release-then-reuse fixture, its cleanup or \
-                     conservation witness, or its exclusion";
-
-/// Why `gate-5/mixed-witness` is open until hdr-14.8.
-pub const GATE_5_MIXED_WITNESS: &str =
-    "one storage scenario running all four Sim resource IDs together";
+/// Why the repair reservation has no row result: the bound table marks it
+/// not judged, since the unclaimed chunk budget already bounds it, and no
+/// repair round is reachable in these fixtures.
+pub const BOUND_REPAIR_RESERVATION: &str = "the repair reservation is the unclaimed chunk \
+    budget, which chunk-budget-bound already bounds, so the bound table doesn't judge it, and \
+    no repair round is reachable in these fixtures";
 
 /// Every gate obligation no row owns, with its gates and what may satisfy
 /// it, written from the spec's gate table.
@@ -237,38 +344,33 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     GateObligation {
         name: "gate-1/a-a-and-a-b-a",
         gates: &[Gate::G1],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.7b",
-            reason: GATE_1_A_A_AND_A_B_A,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_acceptance_tool.rs",
+            "each_history_is_the_same_alone_and_after_another",
+        )),
     },
     GateObligation {
         name: "gate-1/topology-freshness",
         gates: &[Gate::G1],
-        permit: Permit::Until {
-            owner: "Adam's harness",
-            pr: "hf-7",
-            reason: GATE_1_TOPOLOGY_FRESHNESS,
-        },
+        permit: Permit::Test(TOPOLOGY_FRESHNESS_TEST),
     },
     GateObligation {
-        name: "gate-1/store-inventory",
+        name: "gate-1/store-inventory/registered",
         gates: &[Gate::G1],
-        permit: Permit::Until {
-            owner: "Adam's harness",
-            pr: "hf-6",
-            reason: GATE_1_STORE_INVENTORY,
-        },
+        permit: Permit::Test(STORE_INVENTORY_REGISTERED_TEST),
+    },
+    GateObligation {
+        name: "gate-1/store-inventory/checkpoint-and-producer",
+        gates: &[Gate::G1],
+        permit: Permit::Test(STORE_INVENTORY_PRODUCER_TEST),
     },
     GateObligation {
         name: "gate-1/replay-store-control",
         gates: &[Gate::G1],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.7b",
-            reason: GATE_1_REPLAY_STORE_CONTROL,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_acceptance_tool.rs",
+            "a_changed_stored_fact_fails_the_replay_comparison",
+        )),
     },
     GateObligation {
         name: "gate-2/conformant-control-per-fault",
@@ -281,65 +383,55 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     GateObligation {
         name: "gate-2/despite-close/caught",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_DESPITE_CLOSE_CAUGHT,
-        },
+        permit: Permit::Caught(super::companions::DESPITE_CLOSE),
     },
     GateObligation {
         name: "gate-2/despite-close/close-companion",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_DESPITE_CLOSE_CLOSE_COMPANION,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_despite_close.rs",
+            "the_fault_close_holds_on_the_unpatched_rejection",
+        )),
     },
     GateObligation {
         name: "gate-2/despite-close/staging-companion",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_DESPITE_CLOSE_STAGING_COMPANION,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_despite_close.rs",
+            "the_staging_companion_needs_the_rejected_page_staged",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-fault-close/status",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_BAD_CONTENT_FAULT_CLOSE_STATUS,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_table.rs",
+            "status_bad_content_closes_with_a_fault",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-fault-close/subscribe-headers",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_BAD_CONTENT_FAULT_CLOSE_SUBSCRIBE_HEADERS,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_table.rs",
+            "subscribe_headers_bad_content_closes_with_a_fault",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-fault-close/headers",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_table.rs",
+            "headers_bad_content_closes_with_a_fault",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-fault-close/headers-outcome",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS_OUTCOME,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_table.rs",
+            "headers_outcome_bad_content_closes_with_a_fault",
+        )),
     },
     GateObligation {
         name: "gate-2/bad-content-close-claim",
@@ -373,40 +465,38 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
         )),
     },
     GateObligation {
-        name: "gate-2/end-boundary-preservation",
+        name: "gate-2/end-boundary-preservation/registry",
         gates: &[Gate::G2],
-        permit: Permit::Until {
-            owner: "Evan (E9) and Adam's harness (hf-1 to hf-3)",
-            pr: "hdr-14.8",
-            reason: GATE_2_END_BOUNDARY_PRESERVATION,
-        },
+        permit: Permit::Test(END_BOUNDARY_REGISTRY_TEST),
+    },
+    GateObligation {
+        name: "gate-2/end-boundary-preservation/fault-store",
+        gates: &[Gate::G2],
+        permit: Permit::Test(END_BOUNDARY_FAULT_STORE_TEST),
     },
     GateObligation {
         name: "gate-3/crossing/unretained-open-then-outcome",
         gates: &[Gate::G3],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_3_CROSSING_UNRETAINED_OPEN_THEN_OUTCOME,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_crossing.rs",
+            "an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished",
+        )),
     },
     GateObligation {
         name: "gate-3/crossing/crossing-close",
         gates: &[Gate::G3],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_3_CROSSING_CROSSING_CLOSE,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_crossing.rs",
+            "a_crossing_close_is_conformant_and_unpunished",
+        )),
     },
     GateObligation {
         name: "gate-3/crossing/over-window-grant",
         gates: &[Gate::G3],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.6",
-            reason: GATE_3_CROSSING_OVER_WINDOW_GRANT,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_wire_crossing.rs",
+            "an_over_window_crossing_grant_is_bad_cursor_and_closed",
+        )),
     },
     GateObligation {
         name: "gate-3/no-request-row",
@@ -439,23 +529,180 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
             approval: Approval::Pending,
         },
     },
+    // `outstanding-work-bounded`'s bound table (hdr-9d.1), one obligation
+    // per row and kind of evidence: an admission row's at-limit and
+    // one-over-denied fixture and its release-then-reuse fixture, a
+    // membership, cleanup or conservation row's witness, or the exclusion
+    // a row with neither awaits.
+    bound_test("gate-5/bound-table/work-slots/at-limit", BOUND_LIMIT_TEST),
+    bound_test(
+        "gate-5/bound-table/work-slots/release-reuse",
+        BOUND_REUSE_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/reservation-maps/at-limit",
+        BOUND_LIMIT_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/reservation-maps/release-reuse",
+        BOUND_REUSE_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/request-deadlines/at-limit",
+        BOUND_LIMIT_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/request-deadlines/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/locator-reads/at-limit",
+        BOUND_LIMIT_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/locator-reads/release-reuse",
+        BOUND_REUSE_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/locator-reads/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/node-execution-slots/at-limit",
+        BOUND_LIMIT_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/node-execution-slots/release-reuse",
+        BOUND_REUSE_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/publisher-capacity-waits/cleanup",
+        BOUND_WAITS_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/close-deadlines/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/storage-calls/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/port-futures/conservation",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/cached-offers/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/supplier-order/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/completed-targets/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/subscriber-cursors/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/subscriber-subscriptions/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/publisher-tasks/cleanup",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/sessions/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/serving-peer-budgets/cleanup",
+        BOUND_MEMBERSHIP_TEST,
+    ),
     GateObligation {
-        name: "gate-5/bound-table",
+        name: "gate-5/bound-table/repair-reservation",
         gates: &[Gate::G5],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-9d.1",
-            reason: GATE_5_BOUND_TABLE,
+        permit: Permit::Standing {
+            owner: BOUND_OWNER,
+            reason: BOUND_REPAIR_RESERVATION,
+            approval: PLAN,
         },
     },
+    bound_unshown("gate-5/bound-table/reservation", bound_unshown::RESERVATION),
+    bound_unshown(
+        "gate-5/bound-table/locator-reads/per-peer",
+        bound_unshown::LOCATOR_PER_PEER,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/calls-per-round",
+        bound_unshown::CALLS_PER_ROUND,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/detached-headers",
+        bound_unshown::DETACHED,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/departed-strikes",
+        bound_unshown::STRIKES,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/pending-closes",
+        bound_unshown::PENDING_CLOSES,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/status-cadences",
+        bound_unshown::CADENCES,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/publisher-tombstones",
+        bound_unshown::TOMBSTONES,
+    ),
+    bound_unshown("gate-5/bound-table/publisher-jobs", bound_unshown::JOBS),
+    bound_unshown(
+        "gate-5/bound-table/subscription-slots",
+        bound_unshown::SUBSCRIPTION_SLOTS,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/sent-cursor-ring",
+        bound_unshown::SENT_RING,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/peer-execution-slots",
+        bound_unshown::PEER_EXECUTION,
+    ),
+    bound_unshown("gate-5/bound-table/node-output", bound_unshown::NODE_OUTPUT),
+    bound_unshown("gate-5/bound-table/peer-output", bound_unshown::PEER_OUTPUT),
+    bound_unshown(
+        "gate-5/bound-table/response-counts",
+        bound_unshown::RESPONSE_COUNTS,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/retained-path-leases",
+        bound_unshown::LEASES,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/readmission-cooldowns",
+        bound_unshown::COOLDOWNS,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/pruned-peers",
+        bound_unshown::PRUNED_PEERS,
+    ),
+    bound_unshown("gate-5/bound-table/vct-repair", bound_unshown::VCT_REPAIR),
+    // The one storage history running all four Sim resource IDs together,
+    // with its Shutdown and StopStorage picked and the node settled at its
+    // reactor's exit. Its four whole-report passes are history keys.
     GateObligation {
         name: "gate-5/mixed-witness",
         gates: &[Gate::G5],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.8",
-            reason: GATE_5_MIXED_WITNESS,
-        },
+        permit: Permit::Test(sim_test(
+            "tests/header_mixed_resources.rs",
+            "the_mixed_fixture_holds_every_resource_rule",
+        )),
     },
 ];
 
@@ -566,8 +813,37 @@ pub fn counted_runs(expected: &Expected) -> (Vec<RunId>, Vec<RunId>) {
             ],
             Vec::new(),
         ),
+        // Its patched run ends at a harness failure, so only the baseline
+        // owes a cleanup comparison.
+        Expected::HarnessCaught { case, .. } => (
+            vec![
+                RunId::case(case, CaseRun::Baseline),
+                RunId::case(case, CaseRun::Patched),
+            ],
+            vec![RunId::case(case, CaseRun::Baseline)],
+        ),
         _ => (Vec::new(), Vec::new()),
     }
+}
+
+/// Whether `t` is the test a [`Permit::Test`] names, `want`, joined on its
+/// whole [`TestIdRef`].
+fn permitted_test(want: TestRef, t: &TestRef) -> bool {
+    TestIdRef::joins(&TestIdRef::of(want), t, |t| Some(TestIdRef::of(*t)))
+}
+
+/// `case`'s harness among `harnesses`, joined on its whole [`PlantedRef`],
+/// if it has one.
+fn harness_of<'a>(harnesses: &'a [(PlantedRef, String)], case: &PlantedRef) -> Option<&'a str> {
+    PlantedRef::joined(case, harnesses, |(planted, _)| Some(planted.clone()))
+        .first()
+        .map(|(_, harness)| harness.as_str())
+}
+
+/// Whether `case` is among `caught`, the harness-caught cases, joined on
+/// its whole [`PlantedRef`].
+fn is_harness_caught(caught: &[PlantedRef], case: &PlantedRef) -> bool {
+    !PlantedRef::joined(case, caught, |planted| Some(planted.clone())).is_empty()
 }
 
 /// Every key acceptance requires, with the gates it serves.
@@ -576,7 +852,8 @@ pub fn counted_runs(expected: &Expected) -> (Vec<RunId>, Vec<RunId>) {
 /// Each planted case owes its own case key, each native mutation a key,
 /// each needed source a missing-source key, each `COVERAGE` test a witness
 /// key, each `Satisfied` contract's proving test and each narrowing entry
-/// a test key, each requirement and composition check its key, and each
+/// a test key, each such contract's proving catch a catch key, each
+/// requirement and composition check its key, and each
 /// counted execution a replay and, for a history, a cleanup comparison.
 /// Each `NotApplicable` reason owes its test, and each ID an entry for every
 /// tier other than its own.
@@ -639,6 +916,9 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
                 for &test in contract.proving {
                     keys.insert(contract_test_key(id, test), BTreeSet::new());
                 }
+                for &case in contract.proving_catches {
+                    keys.insert(contract_catch_key(id, case), BTreeSet::new());
+                }
             }
         }
     }
@@ -686,23 +966,33 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
     }
     // Every planted case's baseline and patched runs owe a replay, and a
     // node case's `Draft` run does too, its baseline and Draft runs a
-    // cleanup comparison as well, from the planted inventory itself. Only
-    // whether a node case's patched run completes, so owes a cleanup too,
-    // comes from its row's `found`, below.
+    // cleanup comparison as well, from the planted inventory itself. A
+    // harness-caught case has no `Draft` run, so only its baseline owes a
+    // cleanup. Only whether a node case's patched run completes, so owes a
+    // cleanup too, comes from its row's `found`, below.
     for (property, name) in inv.planted {
         let case = |run| RunId::Case {
             property: property.clone(),
             name: name.clone(),
             run,
         };
-        let machine = inv
-            .planted_harnesses
-            .get(&(property.clone(), name.clone()))
+        let planted = PlantedRef {
+            property: property.clone(),
+            name: name.clone(),
+        };
+        let machine = harness_of(inv.planted_harnesses, &planted)
             .is_some_and(|harness| (inv.machine)(harness));
         for run in [CaseRun::Baseline, CaseRun::Patched] {
             keys.insert(Key::Replay { run: case(run) }, BTreeSet::from([Gate::G1]));
         }
-        if !machine {
+        if is_harness_caught(inv.harness_caught, &planted) {
+            keys.insert(
+                Key::Cleanup {
+                    run: case(CaseRun::Baseline),
+                },
+                BTreeSet::from([Gate::G1]),
+            );
+        } else if !machine {
             keys.insert(
                 Key::Replay {
                     run: case(CaseRun::Draft),
@@ -748,4 +1038,155 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
         }
     }
     keys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::header_acceptance::{
+        companions::DESPITE_CLOSE, refs::one_key_off::assert_one_key_off, Found,
+    };
+
+    /// The case `planted` names, with its fields leaked to `'static` as a
+    /// [`CaseRef`] holds them.
+    fn case_of(planted: &PlantedRef) -> CaseRef {
+        CaseRef {
+            property: Box::leak(planted.property.clone().into_boxed_str()),
+            name: Box::leak(planted.name.clone().into_boxed_str()),
+        }
+    }
+
+    /// `case`'s `Caught`.
+    fn caught(case: CaseRef) -> Expected {
+        Expected::Caught {
+            case,
+            harness: "header-sync/wire",
+            set: &[],
+            found: Found::AtStep,
+            companions: &[],
+            not_applicable: &[],
+            patched_not_applicable: None,
+        }
+    }
+
+    /// What [`required_keys`] reads of one planted case, `planted`, on
+    /// `harness`, harness-caught or not, with every other inventory empty.
+    fn one_case_keys(
+        planted: (String, String),
+        harnesses: &[(PlantedRef, String)],
+        harness_caught: &[PlantedRef],
+    ) -> BTreeMap<Key, BTreeSet<Gate>> {
+        required_keys(&Inventories {
+            registered: &[],
+            needs: &[],
+            planted: &[planted],
+            planted_harnesses: harnesses,
+            harness_caught,
+            native: &[],
+            coverage_tests: &[],
+            contracts: &[],
+            required_contracts: &[],
+            narrowing: &[],
+            requirements: &[],
+            composition: &[],
+            reasons: &[],
+            expected: &[],
+            histories: &[],
+            machine: |harness| harness == "header/reactor",
+        })
+    }
+
+    /// The case `reserved-flags-skipped` under one of its properties.
+    fn reserved_flags() -> PlantedRef {
+        PlantedRef {
+            property: "header-sync/s5v9/status/reserved-flags-closes".to_owned(),
+            name: "reserved-flags-skipped".to_owned(),
+        }
+    }
+
+    /// The `Draft` run's replay key of `case`, which a node case owes and
+    /// a machine or harness-caught case doesn't.
+    fn draft_replay(case: &PlantedRef) -> Key {
+        Key::Replay {
+            run: RunId::Case {
+                property: case.property.clone(),
+                name: case.name.clone(),
+                run: CaseRun::Draft,
+            },
+        }
+    }
+
+    /// A planted case's harness is read for it only on its whole
+    /// [`PlantedRef`] (Rule 25's template): a case whose harness is a
+    /// machine owes no `Draft` replay, and with the harness listed under
+    /// the case's property or name moved it owes one, as a node case.
+    #[test]
+    fn a_case_s_harness_joins_its_whole_case() {
+        let case = reserved_flags();
+        let planted = (case.property.clone(), case.name.clone());
+        let keys = assert_one_key_off::<PlantedRef>(&case, |listed| {
+            let harnesses = [(listed.clone(), "header/reactor".to_owned())];
+            !one_case_keys(planted.clone(), &harnesses, &[]).contains_key(&draft_replay(&case))
+        });
+        assert_eq!(keys, 2);
+    }
+
+    /// A planted case is harness-caught only on its whole [`PlantedRef`]
+    /// (Rule 25's template): a node case listed harness-caught owes no
+    /// `Draft` replay, and with the listed case's property or name moved it
+    /// owes one.
+    #[test]
+    fn a_harness_caught_case_joins_its_whole_case() {
+        let case = reserved_flags();
+        let planted = (case.property.clone(), case.name.clone());
+        let keys = assert_one_key_off::<PlantedRef>(&case, |listed| {
+            !one_case_keys(planted.clone(), &[], std::slice::from_ref(listed))
+                .contains_key(&draft_replay(&case))
+        });
+        assert_eq!(keys, 2);
+    }
+
+    /// A [`Permit::Test`] takes the pass of only its own test, joined on its
+    /// whole [`TestIdRef`] (Rule 25's template): the permit of a test allows
+    /// its `Passes`, and not the `Passes` of the test with its package,
+    /// file or name moved.
+    #[test]
+    fn a_permitted_test_joins_its_whole_test() {
+        let own = sim_test("tests/a_witness.rs", "a_test");
+        let permit = Permit::Test(own);
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(own), |want| {
+            let leak = |text: &str| -> &'static str { Box::leak(text.to_owned().into_boxed_str()) };
+            let test = TestRef {
+                package: leak(&want.package),
+                file: leak(&want.file),
+                test: leak(&want.test),
+            };
+            permit.allows(&Expected::Passes { test })
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// A [`Permit::Caught`] takes the `Caught` of its case only on the
+    /// case's whole [`PlantedRef`] (Rule 25's template): the despite-close
+    /// permit allows that case's `Caught`, and another case's, with its
+    /// property or its name moved, it allows no more. Nor does it allow
+    /// the case's other results or a test's pass.
+    #[test]
+    fn a_permitted_catch_joins_its_whole_case() {
+        let permit = Permit::Caught(DESPITE_CLOSE);
+        let keys = assert_one_key_off::<PlantedRef>(&DESPITE_CLOSE.planted(), |planted| {
+            permit.allows(&caught(case_of(planted)))
+        });
+        assert_eq!(keys, 2);
+        assert!(!permit.allows(&Expected::MachineCaught {
+            case: DESPITE_CLOSE,
+            harness: "header-sync/wire",
+        }));
+        assert!(!permit.allows(&Expected::Passes {
+            test: sim_test(
+                "tests/header_despite_close.rs",
+                "the_path_break_needs_a_retained_violation",
+            ),
+        }));
+    }
 }

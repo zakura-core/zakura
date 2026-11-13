@@ -322,6 +322,7 @@ fn synthetic(
             outcome,
             steps: 3,
             violation: violation.map(|property| Violation {
+                subject: None,
                 property: property.to_owned(),
                 step: 3,
                 witness: vec![3],
@@ -637,6 +638,7 @@ struct ViolatesUnreported;
 impl Checker for ViolatesUnreported {
     fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
         Some(Violation {
+            subject: None,
             property: "test/extra".to_owned(),
             step: cx.step,
             witness: Vec::new(),

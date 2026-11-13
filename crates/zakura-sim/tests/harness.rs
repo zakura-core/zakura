@@ -381,6 +381,7 @@ fn a_spin_at_another_violations_step_is_still_reported() {
         .step;
     let mut other = check::after_step(|cx: &StepCtx<'_>| {
         (cx.step == spin).then(|| Violation {
+            subject: None,
             property: "test/other".to_owned(),
             step: cx.step,
             witness: vec![cx.step],
@@ -433,7 +434,16 @@ fn task_panic_violates_no_task_panic() {
 fn a_clean_run_holds_no_task_panic() {
     let entry = harness::find("header-sync/smoke").unwrap();
     let scenario = (entry.draw)(&[]);
-    let report = (entry.run)(&scenario, Plan::from_fuzz(&[]), &mut MemorySink::default()).unwrap();
+    // The run is the manifest history `empty input`, which the acceptance
+    // tool records from this declaration (C18).
+    let report = zakura_sim::harness::header_acceptance::history::run_declared(
+        "header-sync/smoke",
+        "empty input",
+        &scenario,
+        Plan::from_fuzz(&[]),
+        |scenario, plan, sink| (entry.run)(scenario, plan, sink),
+    )
+    .unwrap();
     assert_eq!(report.end.violation, None);
     assert!(matches!(
         outcome(&report, NO_TASK_PANIC),

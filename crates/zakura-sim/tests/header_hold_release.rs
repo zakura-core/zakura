@@ -9,6 +9,7 @@ mod support;
 use std::{fs, path::PathBuf, process::Command, time::Duration};
 
 use support::{byte_inputs, inputs};
+use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -20,7 +21,7 @@ use zakura_sim::{
     harness::{
         header_node::{
             ends::{EndFact, EnvironmentAction},
-            hold_wake::{HoldWakeEvidence, HoldWakeFact},
+            hold_wake::HoldWakeFact,
             policy::{Allow, Hold, OpKind, Select, Trigger},
             Policy,
         },
@@ -53,9 +54,18 @@ fn run(fixture: LivenessScenario, input: PlanInput) -> RunReport {
 
 /// [`run`], with what [`Reading`] keeps.
 fn run_reading(fixture: LivenessScenario, input: PlanInput) -> (RunReport, Reading) {
+    run_reading_into(fixture, input, &mut MemorySink::default())
+}
+
+/// [`run_reading`], recording into `sink`.
+fn run_reading_into(
+    fixture: LivenessScenario,
+    input: PlanInput,
+    sink: &mut dyn zakura_sim::RecordSink,
+) -> (RunReport, Reading) {
     let ports = Liveness::prepare(&fixture);
     let (hold_wake, ends) = (ports.hold_wake.clone(), ports.ends.clone());
-    let report = run_prepared::<Liveness>(&fixture, ports, input, &mut MemorySink::default(), None)
+    let report = run_prepared::<Liveness>(&fixture, ports, input, sink, None)
         .unwrap_or_else(|error| panic!("{fixture:?}: {error}"));
     assert!(
         matches!(report.end.outcome, Outcome::Idle { .. }),
@@ -285,7 +295,11 @@ fn fixture_file(name: &str, extension: &str) -> PathBuf {
 }
 
 /// Each committed fixture is its named fixture, as JSON, with the fixed
-/// Plan bytes, and holds and applies under them.
+/// Plan bytes, and holds and applies under them. Each also holds and
+/// applies `sim/no-livelock`: every liveness fixture declares
+/// `BoundedAdversary`, so the node waits out its held call without
+/// spinning at one instant, and the held-locator run is that ID's counted
+/// header history.
 #[test]
 fn the_committed_fixtures_match_their_names() {
     for (name, fixture) in committed_fixtures() {
@@ -302,13 +316,29 @@ fn the_committed_fixtures_match_their_names() {
             committed_plan(),
             "{name}: run `regenerate_hold_fixtures`"
         );
-        let report = run(fixture, zakura_sim::Plan::from_fuzz(&plan));
+        // Each run is a manifest history, which the acceptance tool
+        // records from this declaration (C18).
+        let report = run_declared(
+            Liveness::NAME,
+            &format!("header-hold-{name}"),
+            &fixture,
+            zakura_sim::Plan::from_fuzz(&plan),
+            |fixture, input, sink| run_reading_into(*fixture, input, sink).0,
+        );
         assert!(
             matches!(
                 outcome(&report, HOLD_RELEASE_WAKES),
                 PropertyOutcome::Held { applicable } if *applicable > 0
             ),
             "{name}"
+        );
+        assert!(
+            matches!(
+                outcome(&report, NO_LIVELOCK),
+                PropertyOutcome::Held { applicable } if *applicable > 0
+            ),
+            "{name}: {:?}",
+            outcome(&report, NO_LIVELOCK)
         );
     }
 }
@@ -326,8 +356,9 @@ fn regenerate_hold_fixtures() {
 }
 
 /// `record --witness` judges each committed fixture as `cargo xtask
-/// planted` runs it, expecting a hold, and `replay` reruns the trace Exact
-/// in a fresh process.
+/// planted` and the acceptance runner run it, expecting a hold of both its
+/// hold-wake property and `sim/no-livelock`, whose counted history it is,
+/// and `replay` reruns the trace Exact in a fresh process.
 #[test]
 fn the_committed_fixtures_record_and_replay_in_a_fresh_process() {
     let zakura_sim = |args: &[&str]| {
@@ -337,52 +368,54 @@ fn the_committed_fixtures_record_and_replay_in_a_fresh_process() {
             .expect("the binary runs")
     };
     for (name, _) in committed_fixtures() {
-        let dir = tempfile::TempDir::new().expect("a temporary directory");
-        let trace = dir.path().join("trace");
-        let scenario =
-            fs::read_to_string(fixture_file(name, "json")).expect("the fixture is committed");
-        let recorded = zakura_sim(&[
-            "record",
-            "--sim",
-            Liveness::NAME,
-            "--scenario",
-            &scenario,
-            "--plan",
-            fixture_file(name, "plan")
-                .to_str()
-                .expect("the path is UTF-8"),
-            "--out",
-            trace.to_str().expect("the path is UTF-8"),
-            "--witness",
-            HOLD_RELEASE_WAKES,
-            "--expect",
-            "holds",
-        ]);
-        assert!(recorded.status.success(), "{name}: {recorded:?}");
-        let witness: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(trace.join(zakura_sim::harness::WITNESS_FILE))
-                .expect("witness.json"),
-        )
-        .expect("witness.json is JSON");
-        assert_eq!(
-            witness["passed"],
-            serde_json::Value::Bool(true),
-            "{name}: {witness}"
-        );
-        let end: serde_json::Value = fs::read_to_string(trace.join("trace.jsonl"))
-            .expect("the trace is written")
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .find_map(|line| line.get("end").cloned())
-            .expect("the trace ends");
-        assert_eq!(end["outcome"], "idle", "{name}: {end}");
-        let replayed = zakura_sim(&["replay", trace.to_str().expect("the path is UTF-8")]);
-        let stdout = String::from_utf8_lossy(&replayed.stdout);
-        assert!(
-            replayed.status.success()
-                && stdout.contains("every pick, draw and observation matched"),
-            "{name}: {replayed:?}"
-        );
+        for property in [HOLD_RELEASE_WAKES, NO_LIVELOCK] {
+            let dir = tempfile::TempDir::new().expect("a temporary directory");
+            let trace = dir.path().join("trace");
+            let scenario =
+                fs::read_to_string(fixture_file(name, "json")).expect("the fixture is committed");
+            let recorded = zakura_sim(&[
+                "record",
+                "--sim",
+                Liveness::NAME,
+                "--scenario",
+                &scenario,
+                "--plan",
+                fixture_file(name, "plan")
+                    .to_str()
+                    .expect("the path is UTF-8"),
+                "--out",
+                trace.to_str().expect("the path is UTF-8"),
+                "--witness",
+                property,
+                "--expect",
+                "holds",
+            ]);
+            assert!(recorded.status.success(), "{name} {property}: {recorded:?}");
+            let witness: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(trace.join(zakura_sim::harness::WITNESS_FILE))
+                    .expect("witness.json"),
+            )
+            .expect("witness.json is JSON");
+            assert_eq!(
+                witness["passed"],
+                serde_json::Value::Bool(true),
+                "{name} {property}: {witness}"
+            );
+            let end: serde_json::Value = fs::read_to_string(trace.join("trace.jsonl"))
+                .expect("the trace is written")
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find_map(|line| line.get("end").cloned())
+                .expect("the trace ends");
+            assert_eq!(end["outcome"], "idle", "{name} {property}: {end}");
+            let replayed = zakura_sim(&["replay", trace.to_str().expect("the path is UTF-8")]);
+            let stdout = String::from_utf8_lossy(&replayed.stdout);
+            assert!(
+                replayed.status.success()
+                    && stdout.contains("every pick, draw and observation matched"),
+                "{name} {property}: {replayed:?}"
+            );
+        }
     }
 }
 
@@ -434,10 +467,9 @@ impl Subsystem for Probe {
 
     /// The storage harness's ports, with the hold-wake evidence armed.
     fn prepare(scenario: &StorageScenario) -> Ports {
-        Ports {
-            hold_wake: HoldWakeEvidence::armed(),
-            ..Storage::prepare(scenario)
-        }
+        let ports = Storage::prepare(scenario);
+        ports.hold_wake.arm();
+        ports
     }
 
     /// The storage harness.
@@ -668,10 +700,9 @@ impl Subsystem for Spinning {
 
     /// The storage harness's ports, with the hold-wake evidence armed.
     fn prepare(scenario: &StorageScenario) -> Ports {
-        Ports {
-            hold_wake: HoldWakeEvidence::armed(),
-            ..Storage::prepare(scenario)
-        }
+        let ports = Storage::prepare(scenario);
+        ports.hold_wake.arm();
+        ports
     }
 
     /// The storage harness, then the spinning task.

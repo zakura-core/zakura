@@ -138,6 +138,18 @@ run = false
 reason = "a tool, not a test: it rewrites the committed saved Plans"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_wire_witness.rs"
+test = "regenerate_planted_scenarios"
+run = false
+reason = "a tool, not a test: it rewrites the committed planted scenarios from their builders"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_wire_witness.rs"
+test = "regenerate_reserved_flags_twice_script"
+run = false
+reason = "a tool, not a test: it rewrites the committed two-frame reserved-flags script from its builder"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_authority.rs"
 test = "regenerate_authority_witnesses"
 run = false
@@ -148,6 +160,12 @@ file = "crates/zakura-sim/tests/header_reset_invalidates.rs"
 test = "regenerate_reset_witnesses"
 run = false
 reason = "a tool, not a test: it rewrites the committed reset witnesses from their builders"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_acceptance.rs"
+test = "regenerate_raw_join_baseline"
+run = false
+reason = "a tool, not a test: it rewrites the committed raw-join baseline from the PR base's sources, keeping only the hits the head still has"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_hold_release.rs"
@@ -166,6 +184,24 @@ file = "crates/zakura-sim/tests/header_recovery_progress.rs"
 test = "regenerate_recovery_fixtures"
 run = false
 reason = "a tool, not a test: it rewrites the committed recovery fixtures from their names"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_mixed_resources.rs"
+test = "regenerate_mixed_resources_fixture"
+run = false
+reason = "a tool, not a test: it rewrites the committed mixed resource fixture from its builder"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_wire_prepare_fault.rs"
+test = "regenerate_late_fault_fixture"
+run = false
+reason = "a tool, not a test: it rewrites the committed late-fault fixture from its builders"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_node_reservations.rs"
+test = "regenerate_overlapping_forks_fixture"
+run = false
+reason = "a tool, not a test: it rewrites the committed overlapping-forks fixture from its builders"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_stale_chain.rs"

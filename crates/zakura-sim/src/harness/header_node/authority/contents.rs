@@ -48,6 +48,10 @@ use zakura_storage::header::{
     evidence::ResultIdentity,
 };
 
+use super::{
+    finding::{spell_frontier, spell_hash, spell_maybe_frontier},
+    AuthorityFinding, AuthorityRule, AuthoritySubject, EngineRunRef, ResetFact,
+};
 use crate::{
     observe::{StorageFact, StorageRequest},
     storage::hash,
@@ -62,9 +66,9 @@ pub(super) struct Contents {
     /// The headers the judged reset runs left invalidated, oldest first.
     invalidated: Vec<String>,
     /// The drain's `Reset` facts not yet matched to their runs, oldest
-    /// first: whether each invalidated, and its target.
-    resets: VecDeque<(bool, String)>,
-    breaks: Vec<String>,
+    /// first.
+    resets: VecDeque<ResetFact>,
+    breaks: Vec<AuthorityFinding>,
 }
 
 impl Contents {
@@ -79,9 +83,16 @@ impl Contents {
             } => {
                 self.payloads.insert(*id, hashes.clone());
             }
-            StorageFact::Reset { kind, target, .. } => {
-                self.resets
-                    .push_back((kind == "invalidate", target.clone()));
+            StorageFact::Reset {
+                kind,
+                target,
+                generation,
+            } => {
+                self.resets.push_back(ResetFact {
+                    kind: kind.clone(),
+                    target: target.clone(),
+                    generation: *generation,
+                });
             }
             _ => {}
         }
@@ -98,38 +109,53 @@ impl Contents {
             // The engine's own snapshot is `expected-chain-selected`'s.
             snapshot: _,
         } = run;
-        let what = match kind {
-            RunKind::Apply(id, _) => format!("apply operation {}", id.0),
-            RunKind::HarnessCommit(_) => "a harness commit".to_owned(),
-            RunKind::Reset => "a reset".to_owned(),
+        let mut found = Vec::new();
+        // Each reset run is its oldest unmatched `Reset` fact's, so the
+        // invalidated set changes at the run that changed it.
+        let (what, run_ref, reset) = match kind {
+            RunKind::Apply(id, _) => (
+                format!("apply operation {}", id.0),
+                EngineRunRef::Apply { op: id.0 },
+                None,
+            ),
+            RunKind::HarnessCommit(hashes) => (
+                "a harness commit".to_owned(),
+                EngineRunRef::HarnessCommit {
+                    headers: hashes.iter().copied().map(hash).collect(),
+                },
+                None,
+            ),
+            RunKind::Reset => {
+                let fact = self.resets.pop_front();
+                let reset = match &fact {
+                    Some(fact) if fact.kind == "invalidate" => {
+                        self.invalidated.push(fact.target.clone());
+                        Some((true, fact.target.clone()))
+                    }
+                    Some(fact) => {
+                        self.invalidated.retain(|held| *held != fact.target);
+                        Some((false, fact.target.clone()))
+                    }
+                    None => {
+                        found.push("ran with no Reset fact".to_owned());
+                        None
+                    }
+                };
+                ("a reset".to_owned(), EngineRunRef::Reset { fact }, reset)
+            }
             RunKind::Locator(id, _) => {
                 // Its result is `reset-invalidates-work`'s locator-result
                 // rule's, judged against `before`.
                 if before != after {
-                    self.breaks.push(format!(
-                        "CommitOnlyAuthorized: locator read {} changed the engine's durable \
-                         state",
-                        id.0
+                    self.breaks.push(AuthorityFinding::new(
+                        AuthorityRule::Contents,
+                        AuthoritySubject::Engine(EngineRunRef::Locator { op: id.0 }),
+                        format!("locator read {} changed the engine's durable state", id.0),
                     ));
                     return true;
                 }
                 return false;
             }
-        };
-        let mut found = Vec::new();
-        // Each reset run is its oldest unmatched `Reset` fact's, so the
-        // invalidated set changes at the run that changed it.
-        let reset = match kind {
-            RunKind::Reset => {
-                let reset = self.resets.pop_front();
-                match &reset {
-                    Some((true, target)) => self.invalidated.push(target.clone()),
-                    Some((false, target)) => self.invalidated.retain(|held| held != target),
-                    None => found.push("ran with no Reset fact".to_owned()),
-                }
-                reset
-            }
-            _ => None,
         };
         let mut dropped: Vec<String> = before
             .graph
@@ -224,8 +250,11 @@ impl Contents {
         }
         let broke = !found.is_empty();
         for detail in found {
-            self.breaks
-                .push(format!("CommitOnlyAuthorized: {what} {detail}"));
+            self.breaks.push(AuthorityFinding::new(
+                AuthorityRule::Contents,
+                AuthoritySubject::Engine(run_ref.clone()),
+                format!("{what} {detail}"),
+            ));
         }
         broke
     }
@@ -442,9 +471,9 @@ impl Contents {
         let selected = frontiers.header_best;
         if selected_projection.last() != Some(&selected) {
             found.push(format!(
-                "left the selected projection ending at {:?}, not the selected frontier \
-                 {selected:?}",
-                selected_projection.last()
+                "left the selected projection ending at {}, not the selected frontier {}",
+                spell_maybe_frontier(selected_projection.last().copied()),
+                spell_frontier(selected)
             ));
         }
         // Integrated mode prefers the selected tip on equal work; headers-only
@@ -453,7 +482,8 @@ impl Contents {
             != (*mode == zakura_header_chain::EngineMode::Integrated).then_some(selected)
         {
             found.push(format!(
-                "left the preferred tip {preferred_header_tip:?}, not the selected frontier"
+                "left the preferred tip {}, not the selected frontier",
+                spell_maybe_frontier(*preferred_header_tip)
             ));
         }
         let score = nodes
@@ -468,15 +498,17 @@ impl Contents {
             || Some(header_best_score.suffix_work.as_u256()) != score
         {
             found.push(format!(
-                "left the selected score {header_best_score:?}, not the selected tip's work \
-                 above the anchor"
+                "left the selected score for tip {} with suffix work {:?}, not the selected \
+                 tip's work above the anchor",
+                spell_hash(header_best_score.tip_hash),
+                header_best_score.suffix_work
             ));
         }
         if selected_projection.first() != Some(finalized_frontier) {
             found.push(format!(
-                "left the selected projection starting at {:?}, not the finalized anchor \
-                 {finalized_frontier:?}",
-                selected_projection.first()
+                "left the selected projection starting at {}, not the finalized anchor {}",
+                spell_maybe_frontier(selected_projection.first().copied()),
+                spell_frontier(*finalized_frontier)
             ));
         }
         for pair in selected_projection.windows(2) {
@@ -487,16 +519,17 @@ impl Contents {
             });
             if !links {
                 found.push(format!(
-                    "left the selected projection holding {:?} after {:?}, which isn't its \
-                     held child",
-                    pair[1], pair[0]
+                    "left the selected projection holding {} after {}, which isn't its held \
+                     child",
+                    spell_frontier(pair[1]),
+                    spell_frontier(pair[0])
                 ));
             }
         }
     }
 
     /// The breaks found since the last call.
-    pub(super) fn take_breaks(&mut self) -> Vec<String> {
+    pub(super) fn take_breaks(&mut self) -> Vec<AuthorityFinding> {
         std::mem::take(&mut self.breaks)
     }
 }
@@ -629,13 +662,41 @@ fn reasons(
         };
         if !right {
             found.push(format!(
-                "left {} with direct reasons {new:?}, from {old:?}",
-                hash(*key)
+                "left {} with direct reasons {}, from {}",
+                hash(*key),
+                spell_reasons(new),
+                spell_reasons(&old)
             ));
         }
     }
     found.sort_unstable();
     found
+}
+
+/// `reasons` in order, as `[a, b]`, each with its hashes as
+/// [`spell_hash`] spells them and its other fields as their `Debug`.
+fn spell_reasons<'r>(reasons: impl IntoIterator<Item = &'r EligibilityReason>) -> String {
+    let reasons: Vec<String> = reasons
+        .into_iter()
+        .map(|reason| match reason {
+            EligibilityReason::SettledUpgradeConflict { height, expected } => format!(
+                "SettledUpgradeConflict at {} expecting {}",
+                height.0,
+                spell_hash(*expected)
+            ),
+            EligibilityReason::CheckpointConflict { height, expected } => format!(
+                "CheckpointConflict at {} expecting {}",
+                height.0,
+                spell_hash(*expected)
+            ),
+            EligibilityReason::FinalityConflict { finalized } => {
+                format!("FinalityConflict with {}", spell_frontier(*finalized))
+            }
+            other @ (EligibilityReason::ConsensusBodyInvalid { .. }
+            | EligibilityReason::OperatorInvalid { .. }) => format!("{other:?}"),
+        })
+        .collect();
+    format!("[{}]", reasons.join(", "))
 }
 
 /// The operator invalidation ID and reason digest for `target`, derived on

@@ -7,7 +7,10 @@
 //! contract in [`REQUIRED_CONTRACTS`], unless a [`NARROWING`] entry whose
 //! own test passed releases it.
 
-use super::{sim_test, Approval, Expected, ExpectedResult, Key, ResultKind, TestRef};
+use super::{
+    refs::{PlantedRef, Ref},
+    sim_test, Approval, CaseRef, Expected, ExpectedResult, Key, ResultKind, TestRef,
+};
 
 /// A contract's ID, as the plan's table numbers them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -129,6 +132,11 @@ pub struct Contract {
     /// The tests that prove it. A `Satisfied` contract needs at least one,
     /// each passing at the subject commit.
     pub proving: &'static [TestRef],
+    /// The planted cases whose `Caught` proves it beside its tests (Adam's
+    /// ruling on question 6, 2026-11-12). Each names a case a row catches,
+    /// and a `Satisfied` contract counts only once each one's catch
+    /// verified at the subject commit too.
+    pub proving_catches: &'static [CaseRef],
     /// Its state.
     pub state: ContractState,
     /// The PR or ask that delivers it.
@@ -327,98 +335,1105 @@ const C20_PROVING: &[TestRef] = &[sim_test(
     "the_not_applicable_inventory_lists_every_reason",
 )];
 
-/// A contract that waits for `delivery`, with no proving test yet.
-const fn blocked(
+/// C1's proving tests: every test of #1840's suites, `tests/drain.rs` and
+/// `tests/drains_dry.rs`, and the header histories the plan names: a stop
+/// picked at the cut settling in the drain, its drain-bound control, and
+/// a budget cut between a release's wake and its cached-pass refill.
+const C1_PROVING: &[TestRef] = &[
+    sim_test(
+        "tests/drain.rs",
+        "rule_1_the_drain_offers_recovery_actions_and_no_adversary_act",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "the_drain_completes_an_operation_a_hold_kept_from_live",
+    ),
+    sim_test("tests/drain.rs", "a_live_idle_end_enters_the_drain"),
+    sim_test(
+        "tests/drain.rs",
+        "a_held_ready_task_runs_before_its_obligation_expires",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_quiet_recovery_action_waits_for_no_task_ready",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "rule_2_an_obligation_opened_in_the_drain_expires_at_its_deadline",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "rule_2_a_dry_end_concludes_an_open_obligation",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "rule_2_a_drain_cut_off_with_an_obligation_open_names_it",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "rule_4_a_lost_assumption_withdraws_what_the_dry_end_would_conclude",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "rule_5_every_not_applicable_carries_its_reason",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "rule_6_a_failure_found_only_at_the_end_fails_the_run",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_late_datagram_opens_the_first_obligation_in_the_drain",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "an_ops_obligation_whose_task_sleeps_is_reached",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "an_earlier_timer_cancels_a_later_one_before_a_boundary",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_periodic_timer_past_the_cap_does_not_move_the_drain",
+    ),
+    sim_test("tests/drain.rs", "a_sleep_within_the_cap_is_reached"),
+    sim_test(
+        "tests/drain.rs",
+        "a_pending_recovery_completion_discharges_before_quiescence",
+    ),
+    sim_test("tests/drain.rs", "a_live_hold_does_not_postpone_quiescence"),
+    sim_test(
+        "tests/drain.rs",
+        "stranded_work_with_a_timed_obligation_open_fails_the_run",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "stranded_work_fails_the_run_before_a_quiescent_expiry",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_source_holding_work_at_a_dry_end_fails_the_run",
+    ),
+    sim_test("tests/drain.rs", "a_dry_end_leaves_a_fault_mark_unsettled"),
+    sim_test(
+        "tests/drain.rs",
+        "a_dry_end_fails_an_unread_boundary_as_missing_evidence",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_dry_end_leaves_a_header_teardown_mark_unsettled",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_dry_end_reads_a_watch_mark_as_node_stopped",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_dry_end_leaves_a_block_teardown_mark_unsettled",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_dry_end_leaves_an_unjudged_departure_unsettled",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_dry_end_leaves_an_unread_trigger_unsettled",
+    ),
+    sim_test("tests/drain.rs", "the_drain_retires_every_generator"),
+    sim_test(
+        "tests/drain.rs",
+        "a_worker_starved_drain_keeps_its_status_and_does_not_settle",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_duplicate_recovery_identity_at_a_live_idle_end_fails_the_run",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "the_drain_delivers_a_fake_datagram_in_flight",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_recovery_boundary_ahead_keeps_the_drain_from_quiescence",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_worker_starved_end_fails_rather_than_conclude",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_live_idle_end_enters_the_drain_before_judging",
+    ),
+    sim_test("tests/drains_dry.rs", "every_saved_plan_drains_dry"),
+    sim_test("tests/drains_dry.rs", "misend_rejects_every_unexpected_end"),
+    sim_test(
+        "tests/header_node_prereqs.rs",
+        "a_stop_picked_at_the_cut_settles_in_the_drain",
+    ),
+    sim_test(
+        "tests/header_node_prereqs.rs",
+        "a_run_cut_off_at_the_shutdown_pick_is_unsettled",
+    ),
+    sim_test(
+        "tests/header_release_wake.rs",
+        "a_budget_cut_between_a_wake_and_its_refill_holds_the_wake",
+    ),
+];
+
+/// C6's proving tests: the witness judge's unrelated-report and nested-set
+/// tests, its per-subject joins at the break's step and at the run's end,
+/// each with Rule 25's one-key-off controls, and the evaluator's check of a
+/// set judged on the Draft run.
+const C6_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::not_applicable_needs_its_property_unapplied_and_the_rest_whole",
+    ),
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::an_expected_stop_tolerates_only_stopped_by_violation",
+    ),
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::a_held_target_refuses_an_unrelated_incomplete",
+    ),
+    sim_test("tests/witness.rs", "a_missing_report_fails"),
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::a_violated_set_needs_exactly_its_members",
+    ),
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::every_member_violation_joins_the_case_s_break",
+    ),
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::a_member_at_the_break_s_step_joins_by_its_punishment",
+    ),
+    sim_test(
+        "src/witness.rs",
+        "witness::tests::an_end_found_member_joins_the_case_s_end_break_by_subject",
+    ),
+    sim_test(
+        "tests/header_acceptance.rs",
+        "the_evaluator_accepts_genuine_results",
+    ),
+];
+
+/// The nested cases whose catches prove C6: the honest-peer case joined at
+/// its break's step, the wedged loops joined at the end, and the three
+/// sets judged on their Draft runs.
+const C6_CATCHES: &[CaseRef] = &[
+    CaseRef {
+        property: "session/honest-never-punished",
+        name: "target-page-refused",
+    },
+    CaseRef {
+        property: "header-sync/watch-observed-under-flood",
+        name: "wedged-run-loop",
+    },
+    CaseRef {
+        property: "header-sync/watch-observed-under-lifecycle-flood",
+        name: "wedged-run-loop",
+    },
+    CaseRef {
+        property: "header-sync/s5v9/subscribe-headers/sender-within-credit",
+        name: "page-past-credit",
+    },
+    CaseRef {
+        property: "header-sync/s5v9/headers-outcome/bad-content-closes",
+        name: "outcome-window-unchecked",
+    },
+    CaseRef {
+        property: "header-sync/s5v9/subscribe-headers/sender-within-live",
+        name: "open-repeated",
+    },
+];
+
+/// C7's proving tests: each template's trigger, its sibling-row controls,
+/// and `sender-within-credit` refusing an applied `Open` or `Grant` alone.
+const C7_PROVING: &[TestRef] = &[
+    sim_test(
+        "tests/generated_triggers.rs",
+        "a_closes_trigger_needs_its_label_on_its_row",
+    ),
+    sim_test(
+        "tests/generated_triggers.rs",
+        "receiver_triggers_need_a_judged_frame",
+    ),
+    sim_test(
+        "tests/generated_triggers.rs",
+        "sender_response_triggers_need_the_exchange_first",
+    ),
+    sim_test(
+        "tests/generated_triggers.rs",
+        "sender_within_credit_needs_a_page_after_an_applied_grant",
+    ),
+    sim_test(
+        "tests/generated_triggers.rs",
+        "sender_within_live_needs_an_update",
+    ),
+    sim_test(
+        "tests/generated_triggers.rs",
+        "an_unknown_id_reaches_nothing",
+    ),
+    sim_test("tests/witness.rs", "a_trigger_sees_its_property_id"),
+];
+
+/// C8's proving tests: a sidecar refused when it differs only in a second
+/// violation or one stored fact, and a planted and a machine witness
+/// recording each keeping the report its judge read.
+const C8_PROVING: &[TestRef] = &[
+    sim_test(
+        "tests/full_report.rs",
+        "record_keeps_the_full_report_and_replay_matches_it",
+    ),
+    sim_test(
+        "tests/full_report.rs",
+        "a_planted_witness_recording_keeps_its_full_report",
+    ),
+    sim_test(
+        "tests/full_report.rs",
+        "a_machine_witness_recording_keeps_its_full_report",
+    ),
+    sim_test(
+        "tests/full_report.rs",
+        "a_machine_trace_keeps_its_full_report",
+    ),
+    sim_test(
+        "tests/full_report.rs",
+        "record_refuses_an_existing_full_report",
+    ),
+    sim_test(
+        "tests/full_report.rs",
+        "replay_refuses_a_report_that_isnt_a_bounded_regular_file",
+    ),
+    sim_test("tests/full_report.rs", "the_full_report_keeps_end_found"),
+    sim_test(
+        "tests/header_authority.rs",
+        "a_recorded_header_run_keeps_its_stores_in_the_full_report",
+    ),
+    sim_test(
+        "src/harness/record.rs",
+        "harness::record::tests::a_finished_run_without_its_report_fails_the_recording",
+    ),
+    sim_test(
+        "src/harness/record.rs",
+        "harness::record::tests::a_report_over_the_read_limit_is_refused",
+    ),
+    sim_test("tests/cli.rs", "replay_report_never_overwrites"),
+];
+
+/// C9's proving tests: a `Draft` trace past its first violation replaying
+/// Exact in a fresh process, and the override surviving shrinking and the
+/// step loop's livelock check.
+const C9_PROVING: &[TestRef] = &[
+    sim_test(
+        "tests/draft_override.rs",
+        "a_draft_override_records_and_replays",
+    ),
+    sim_test(
+        "tests/draft_override.rs",
+        "shrinking_a_draft_trace_keeps_the_override",
+    ),
+    sim_test("tests/harness.rs", "a_draft_livelock_records_and_runs_on"),
+];
+
+/// C12's proving tests: a step and an end finding of one ID, two end
+/// findings of one ID, and an `Active` and a `Known` ID's end findings at
+/// one boundary.
+const C12_PROVING: &[TestRef] = &[
+    sim_test("tests/registry.rs", "every_end_finding_is_kept"),
+    sim_test(
+        "tests/registry.rs",
+        "an_end_violation_counts_beside_earlier_violations",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::the_fault_check_reports_every_break_at_a_step",
+    ),
+];
+
+/// C14's proving tests: each registered store's producer test, as
+/// `tests/evidence_inventory.rs`'s `REGISTERED` names it, and that
+/// inventory's own checks, one of which pins this list to it.
+const C14_PROVING: &[TestRef] = &[
+    sim_test(
+        "tests/header_despite_close.rs",
+        "the_sent_pages_store_holds_what_the_peer_sent",
+    ),
+    sim_test(
+        "tests/header_node_ends.rs",
+        "close_and_relink_steps_record_the_connections_they_end",
+    ),
+    sim_test(
+        "tests/header_node_adoption.rs",
+        "new_work_carries_the_adopted_generation",
+    ),
+    sim_test(
+        "tests/header_node_sessions.rs",
+        "a_close_then_a_relink_ends_or_replaces_the_first_session",
+    ),
+    sim_test(
+        "tests/header_wire_cooldown.rs",
+        "a_late_fault_cools_down_the_peer_and_refuses_its_redial",
+    ),
+    sim_test(
+        "tests/header_publication.rs",
+        "each_served_witness_serves_what_it_names",
+    ),
+    sim_test("tests/header_teardown.rs", "teardown_waits_for_held_lease"),
+    sim_test(
+        "tests/header_budget_claims.rs",
+        "an_over_budget_reservation_violates_chunk_budget_bound",
+    ),
+    sim_test(
+        "tests/header_node_capacity.rs",
+        "the_probe_matches_the_accounting_through_close_relink_and_shutdown",
+    ),
+    sim_test(
+        "tests/header_node_reservations.rs",
+        "a_round_retires_with_headers_still_reserved",
+    ),
+    sim_test("tests/header_node.rs", "grow_steps_record_their_growths"),
+    sim_test(
+        "tests/header_stale.rs",
+        "the_stale_prepare_input_holds_stale_completion_inert",
+    ),
+    sim_test(
+        "tests/header_reset_invalidates.rs",
+        "every_witness_holds_and_applies",
+    ),
+    sim_test(
+        "tests/header_peer_retirement.rs",
+        "every_departure_fixture_holds",
+    ),
+    sim_test(
+        "tests/header_outstanding.rs",
+        "the_limit_fixtures_reach_and_hold_their_bounds",
+    ),
+    sim_test(
+        "tests/header_hold_release.rs",
+        "every_fixture_holds_and_takes_its_path",
+    ),
+    sim_test(
+        "tests/header_chain_selected.rs",
+        "every_witness_holds_and_applies",
+    ),
+    sim_test(
+        "tests/header_stale_chain.rs",
+        "every_witness_holds_and_applies",
+    ),
+    sim_test(
+        "tests/header_authority.rs",
+        "every_witness_holds_and_applies",
+    ),
+    sim_test(
+        "tests/header_release_wake.rs",
+        "the_fixtures_settle_after_their_measured_boundary_and_not_before",
+    ),
+    sim_test(
+        "tests/header_hostile_prefix.rs",
+        "every_prefix_class_recovers",
+    ),
+    sim_test(
+        "tests/header_recovery_prefix.rs",
+        "a_typed_prefix_stops_at_the_bound",
+    ),
+    sim_test(
+        "tests/header_fault_attribution.rs",
+        "an_attributed_prepare_failure_owes_its_source_a_penalty",
+    ),
+    sim_test(
+        "tests/header_node_session_ends.rs",
+        "each_recorded_end_is_its_links_cancellation",
+    ),
+    sim_test(
+        "tests/evidence_inventory.rs",
+        "every_shared_field_is_a_registered_store_or_allowed",
+    ),
+    sim_test(
+        "tests/evidence_inventory.rs",
+        "every_registered_store_names_its_checkpoint_and_producer",
+    ),
+    sim_test("tests/evidence_inventory.rs", "owed_to_hf7"),
+    sim_test("tests/evidence_inventory.rs", "the_scan_follows_aliases"),
+    sim_test("tests/evidence_inventory.rs", "the_scan_finds_atomics"),
+    sim_test(
+        "tests/evidence_inventory.rs",
+        "the_scan_reads_enum_variant_fields",
+    ),
+    sim_test(
+        "tests/evidence_inventory.rs",
+        "c14_is_proved_by_every_registered_store_s_producer",
+    ),
+];
+
+/// C18's proving tests: a case trace refused against another fixture's
+/// input, a typed trace refused against another valid scenario or other
+/// Plan bytes, a scripted Plan recorded, replayed and refused against
+/// another script, and a steered witness recorded and replayed through the
+/// executable.
+const C18_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::a_case_trace_ran_its_committed_input_and_witness",
+    ),
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::a_typed_trace_binds_to_its_scenario_and_plan",
+    ),
+    sim_test("tests/record.rs", "recording_a_script_names_it"),
+    sim_test("tests/record.rs", "recording_plan_bytes_writes_no_input"),
+    sim_test("tests/cli.rs", "record_a_script_against_a_scenario"),
+    sim_test(
+        "tests/header_wire_prepare_fault.rs",
+        "the_late_fault_fixture_records_and_replays_in_a_fresh_process",
+    ),
+];
+
+/// C5's proving tests: a stale-binary control for a catch, whose baseline
+/// must come from S's build and its patched run from the checkout its
+/// provenance check measured, one for a catch's rebuild, which must be of S
+/// itself with the case's patch, one for a standalone witness history, whose
+/// trace and witness test must both come from S's build, one for an
+/// integrity catch, whose patched test and history must come from the
+/// measured build of S with the mutation's committed patch, and one for a
+/// contract test, C5's own, whose binary must embed the subject's source,
+/// each with an unknown digest matching nothing, even on both sides, and a
+/// dirty checkout's agreeing digests anchoring nothing. Each runs in a
+/// `zakura-sim` test binary, which embeds the source digest the evaluator
+/// bootstraps C5 from.
+const C5_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::each_case_trace_comes_from_its_credited_binary",
+    ),
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::a_planted_build_from_another_base_is_refused",
+    ),
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::a_history_from_a_stale_binary_is_refused",
+    ),
+    sim_test(
+        "src/harness/header_acceptance/tool.rs",
+        "harness::header_acceptance::tool::tests::a_stale_integrity_build_is_refused",
+    ),
+    sim_test(
+        super::rows::ACCEPTANCE_TESTS,
+        "the_evaluator_applies_contracts_and_narrowing",
+    ),
+    sim_test(
+        super::rows::ACCEPTANCE_TESTS,
+        "the_evaluator_binds_runners_and_traces",
+    ),
+];
+
+/// C13's proving tests: the fault store's four histories through a
+/// recorded run's full report and its sidecar, each ending through the
+/// storage harness's own end wiring and replayed fresh (two untaken
+/// replies at the end, two breaks at one step, a break beside an open
+/// fault, and a self-exit after a reply beside a harness shutdown at the
+/// same point), and the store and check tests hf-1 to hf-3 added.
+const C13_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::two_untaken_replies_reach_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::two_breaks_at_one_step_reach_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::a_break_beside_an_open_fault_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::a_self_exit_after_a_reply_is_violated_and_a_shutdown_clears_it",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::the_fault_check_reports_every_break_at_a_step",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::the_end_reports_every_open_fault",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::every_break_is_reported_once",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::a_break_beside_an_open_fault_reports_both",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::only_the_harness_stop_clears_a_dropped_fault",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::a_drop_clears_its_fault_only_after_the_stop_began",
+    ),
+];
+
+/// C22's proving tests: the authority checker naming each finding's rule
+/// and subject, two page breaks at one step and the `overgrant` case's
+/// credit break on its `Open` with no page, each as reported and through a
+/// recorded run's sidecar, and a real header run's sidecar keeping every
+/// claim's attribution.
+const C22_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::each_page_finding_names_its_own_page",
+    ),
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::an_open_credit_break_names_its_update_and_no_page",
+    ),
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::each_finding_joins_on_its_full_identity",
+    ),
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::findings_one_key_apart_stay_distinct",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::commit_only_authorized_reports_each_page_it_names",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::commit_only_authorized_reports_each_ledger_page_it_names",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::commit_only_authorized_reports_the_overgrant_update_and_no_page",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::each_claim_case_keeps_its_findings_and_subjects_in_the_sidecar",
+    ),
+    sim_test(
+        "tests/header_authority.rs",
+        "a_recorded_header_run_keeps_its_stores_in_the_full_report",
+    ),
+];
+
+/// C19's proving tests: its honest half, a live cut at an unread boundary
+/// that the drain reads past and concludes, and the registry's dry-end
+/// rule, which fails an unread boundary as missing evidence.
+const C19_PROVING: &[TestRef] = &[
+    sim_test(
+        "tests/header_node_capacity.rs",
+        "a_drain_reads_past_an_unread_boundary_at_the_cut",
+    ),
+    sim_test(
+        "tests/drain.rs",
+        "a_dry_end_fails_an_unread_boundary_as_missing_evidence",
+    ),
+];
+
+/// C19's proving catch, its bug-only half through the real reactor:
+/// `release-relocks-budget`, whose reactor stays stopped mid-poll holding
+/// the budget's lock until a dry end, so its run ends at the missing
+/// evidence `HarnessCaught` names (Adam's ruling on question 7).
+const C19_CATCHES: &[CaseRef] = &[CaseRef {
+    property: "header-sync/chunk-budget-bound",
+    name: "release-relocks-budget",
+}];
+
+/// C2's proving catches: `idle-exit-drops-fault`, whose reactor walks
+/// away from owed work and whose owed penalty concludes `Violated` at the
+/// drain's end, as the end replay's `DroppedFault`, alone. Those are C2's
+/// two bug-only halves.
+const C2_CATCHES: &[CaseRef] = &[CaseRef {
+    property: "header-sync/header-fault-penalized",
+    name: "idle-exit-drops-fault",
+}];
+
+/// `commit-only-authorized/later-ancestor`: its patched `Draft` run, through
+/// the real reactor tap, breaks `commit-only-authorized` on the one page it
+/// stages under the wrong ancestor. Its catch judges that break only, not
+/// how many findings the run kept or what each names (narrowed by Adam's
+/// 2026-11-13 rule; see [`C21_CATCHES`] and [`C22_CATCHES`]).
+const LATER_ANCESTOR: CaseRef = CaseRef {
+    property: "header-sync/commit-only-authorized",
+    name: "later-ancestor",
+};
+
+/// C21's proving catches: [`LATER_ANCESTOR`], the authority check firing
+/// through the real tap (its two findings at one boundary are shown only on
+/// the claim-reading tests' inserted records; their real-path count is a
+/// follow-up), and `two-reserved-flags-skipped`, the generated
+/// receiver checks' two findings at one boundary through the real reader,
+/// which C21_PROVING's
+/// `two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary`
+/// reads from its `Draft` run's full report.
+const C21_CATCHES: &[CaseRef] = &[
+    LATER_ANCESTOR,
+    CaseRef {
+        property: "header-sync/s5v9/status/reserved-flags-closes",
+        name: "two-reserved-flags-skipped",
+    },
+];
+
+/// C22's proving catches (Adam's ruling on question 8): [`LATER_ANCESTOR`]
+/// and `overgrant`, each breaking `commit-only-authorized` through the real
+/// reactor tap. Their catches judge the break only. What each finding names
+/// is shown by [`C22_PROVING`] on scripted and inserted claim records, and
+/// judging the attribution on these real-tap runs is a follow-up (Adam's
+/// 2026-11-13 rule).
+const C22_CATCHES: &[CaseRef] = &[
+    LATER_ANCESTOR,
+    CaseRef {
+        property: "header-sync/commit-only-authorized",
+        name: "overgrant",
+    },
+];
+
+/// C15's proving tests: the release-wake fixtures' runs equal the runs
+/// without the release up to their measured boundary and then settle, on
+/// the committed inputs and on every plan, and two planted wake bypasses'
+/// patched `Draft` runs, one on each fixture, settle too, with the release
+/// picked after the bypassed wake's violation.
+const C15_PROVING: &[TestRef] = &[
+    sim_test(
+        "tests/header_release_wake.rs",
+        "the_fixtures_settle_after_their_measured_boundary_and_not_before",
+    ),
+    sim_test(
+        "tests/header_release_wake.rs",
+        "the_wake_fixtures_hold_under_every_plan",
+    ),
+    sim_test(
+        "tests/header_release_wake.rs",
+        "a_bypassed_wake_s_patched_draft_run_settles",
+    ),
+];
+
+/// C21's proving tests: for each `header-sync` check the header node
+/// harnesses register that can find two failures at one boundary, two
+/// distinct ones there surviving into the run's report and the full report
+/// recorded beside its trace, which a fresh replay sends again. The watch
+/// rules find theirs both at the boundary of a third event and at a
+/// settled end, so each path has its test. The settled end's also has one
+/// through the flood harness's own end path, and its store-level
+/// regression stays beside them. The
+/// claim-reading checks share one test, and `commit-only-authorized` and
+/// `header-fault-penalized` are C22's and C13's. `honest-progress` and
+/// `bounded-adversary-progress` find at most one failure in a run, as their
+/// checks say, so they have none. The generated receiver checks' is the
+/// reserved-flags case's patched `Draft` run.
+///
+/// The last two are the unit-level proof that stays for what C21 excludes
+/// as a real-path two-finding catch: `check_honest_never_punished` and
+/// `downstream::check_with`, which the sender templates share, record
+/// every finding at a step after the first, shown on scripted
+/// observations.
+const C21_PROVING: &[TestRef] = &[
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::every_operation_id_finding_at_a_step_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::each_claim_check_keeps_two_findings_at_a_boundary_in_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/fork_choice/tests.rs",
+        "harness::header_node::fork_choice::tests::a_selection_break_beside_a_settled_break_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/domain/header_sync.rs",
+        "domain::header_sync::tests::each_claim_case_keeps_its_findings_and_subjects_in_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/wake.rs",
+        "harness::header_node::wake::tests::every_unanswered_wake_at_a_boundary_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/hold_wake/tests.rs",
+        "harness::header_node::hold_wake::tests::every_unhandled_held_reply_at_a_boundary_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/adoption.rs",
+        "harness::header_node::adoption::tests::every_unread_publication_at_a_boundary_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_node/adoption.rs",
+        "harness::header_node::adoption::tests::a_settled_end_names_every_unread_publication",
+    ),
+    sim_test(
+        "src/harness/header_node/adoption.rs",
+        "harness::header_node::adoption::tests::every_unread_publication_at_a_settled_end_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync/flood.rs",
+        "harness::header_sync::flood::tests::the_flood_end_path_reports_every_unread_publication",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::two_breaks_at_one_step_reach_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync.rs",
+        "harness::header_sync::tests::two_untaken_replies_reach_the_sidecar",
+    ),
+    sim_test(
+        "tests/header_wire_witness.rs",
+        "two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary",
+    ),
+    sim_test(
+        "tests/header_wire_witness.rs",
+        "every_punishment_of_an_honest_peer_at_a_step_is_reported",
+    ),
+    sim_test(
+        "tests/sender_properties.rs",
+        "every_sender_violation_at_a_step_is_reported",
+    ),
+];
+
+/// A unit test of the planted runner, `xtask`'s `src/planted.rs`, by name.
+const fn planted_test(test: &'static str) -> TestRef {
+    TestRef {
+        package: "xtask",
+        file: "src/planted.rs",
+        test,
+    }
+}
+
+/// C4's proving tests: the planted runner's classification of baseline and
+/// patched runs, its fresh replay of every catch, typed and fuzz-input, a
+/// deadline killing a hung baseline, patched or campaign run, a recording
+/// that exits nonzero after a passing witness never counting, and its
+/// set-aware judgment of a nested case. The fresh-replay, hang and exit
+/// tests are `cfg(unix)`, which the acceptance host, Linux, builds.
+const C4_PROVING: &[TestRef] = &[
+    planted_test("planted::tests::planted_passes_only_on_its_own_id"),
+    planted_test("planted::tests::witness_flags_carry_the_co_violations"),
+    planted_test("planted::tests::listed_co_violations_are_expected"),
+    planted_test("planted::tests::planted_requires_the_trigger_history"),
+    planted_test("planted::tests::planted_requires_passing_baseline"),
+    planted_test("planted::tests::planted_patch_must_apply"),
+    planted_test("planted::tests::a_patch_may_not_change_the_witness"),
+    planted_test("planted::tests::campaign_failures_name_their_input"),
+    planted_test("planted::tests::every_catch_needs_its_fresh_replay"),
+    planted_test("planted::tests::the_runner_replays_every_caught_case"),
+    planted_test("planted::tests::a_replay_miss_reads_the_exit_status"),
+    planted_test("planted::tests::a_hung_patched_run_is_killed_and_never_caught"),
+    planted_test("planted::tests::a_hung_baseline_or_campaign_run_is_killed_and_never_passes"),
+    planted_test("planted::tests::a_recording_that_exits_nonzero_never_counts"),
+    planted_test("planted::tests::a_nested_case_needs_exactly_its_set"),
+    planted_test("planted::tests::a_typed_case_watches_and_runs_its_files"),
+];
+
+/// C17's proving tests: the freeze comparison's controls, a store whose
+/// freeze is skipped and a cleanup-time append to the log each failing it,
+/// the header witnesses keeping their stores and log through cleanup,
+/// each registered store's post-freeze pair, the store inventory, and the
+/// pairer's and the ledger's tests that each takes a fact once, the
+/// ledger's fed through the tap so the simulator build runs them.
+const C17_PROVING: &[TestRef] = &[
+    sim_test("src/stores.rs", "stores::tests::a_registered_store_keeps_its_freeze_through_cleanup"),
+    sim_test(
+        "src/stores.rs",
+        "stores::tests::a_store_whose_freeze_is_skipped_fails_the_comparison",
+    ),
+    sim_test(
+        "src/stores.rs",
+        "stores::tests::an_append_to_the_log_during_cleanup_fails_the_comparison",
+    ),
+    sim_test("src/stores.rs", "stores::tests::a_store_registered_after_the_freeze_starts_frozen"),
+    sim_test("tests/header_cleanup.rs", "storage_witnesses_keep_their_stores_through_cleanup"),
+    sim_test("tests/header_cleanup.rs", "the_wire_witness_keeps_its_stores_through_cleanup"),
+    sim_test(
+        "tests/header_cleanup.rs",
+        "the_release_wake_witnesses_keep_their_stores_through_cleanup",
+    ),
+    sim_test("tests/header_cleanup.rs", "a_completed_storage_run_releases_its_stores"),
+    sim_test(
+        "src/peer/evidence.rs",
+        "peer::evidence::tests::a_frozen_sent_page_store_drops_a_page",
+    ),
+    sim_test(
+        "src/storage/header.rs",
+        "storage::header::tests::a_frozen_attribution_store_drops_a_blame",
+    ),
+    sim_test(
+        "src/harness/header_node.rs",
+        "harness::header_node::tests::a_frozen_session_ends_store_drops_an_end",
+    ),
+    sim_test(
+        "src/harness/header_node/ends.rs",
+        "harness::header_node::ends::tests::a_frozen_end_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/adoption.rs",
+        "harness::header_node::adoption::tests::a_frozen_adoption_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/session/tests.rs",
+        "harness::header_node::session::tests::a_frozen_session_view_drops_an_event",
+    ),
+    sim_test(
+        "src/harness/header_node/fault.rs",
+        "harness::header_node::fault::tests::a_frozen_cooldown_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/publication/tests.rs",
+        "harness::header_node::publication::tests::a_frozen_publication_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/claim.rs",
+        "harness::header_node::claim::tests::a_frozen_settlement_store_drops_a_row",
+    ),
+    sim_test(
+        "src/harness/header_node/claim.rs",
+        "harness::header_node::claim::tests::a_frozen_claim_store_drops_a_break",
+    ),
+    sim_test(
+        "src/harness/header_node/capacity.rs",
+        "harness::header_node::capacity::tests::a_frozen_capacity_store_drops_a_boundary",
+    ),
+    sim_test(
+        "src/harness/header_node/reservation.rs",
+        "harness::header_node::reservation::tests::a_frozen_reservation_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/stale/tests.rs",
+        "harness::header_node::stale::tests::a_frozen_stale_store_drops_a_window",
+    ),
+    sim_test(
+        "src/harness/header_node/round_life/tests.rs",
+        "harness::header_node::round_life::tests::a_frozen_round_life_store_drops_its_applicability",
+    ),
+    sim_test(
+        "src/harness/header_node/retirement/tests.rs",
+        "harness::header_node::retirement::tests::a_frozen_retirement_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/outstanding/tests.rs",
+        "harness::header_node::outstanding::tests::a_frozen_outstanding_store_drops_a_peak",
+    ),
+    sim_test(
+        "src/harness/header_node/hold_wake/tests.rs",
+        "harness::header_node::hold_wake::tests::a_frozen_hold_wake_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/fork_choice/tests.rs",
+        "harness::header_node::fork_choice::tests::a_frozen_fork_choice_store_drops_a_settled_point",
+    ),
+    sim_test(
+        "src/harness/header_node/chain_effect/tests.rs",
+        "harness::header_node::chain_effect::tests::a_frozen_chain_effect_store_drops_its_applicability",
+    ),
+    sim_test(
+        "src/harness/header_node/authority/tests.rs",
+        "harness::header_node::authority::tests::a_frozen_authority_store_drops_its_applicability",
+    ),
+    sim_test(
+        "src/harness/header_node/wake.rs",
+        "harness::header_node::wake::tests::a_frozen_wake_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/grown.rs",
+        "harness::header_node::grown::tests::a_frozen_grow_store_drops_a_growth",
+    ),
+    sim_test(
+        "src/harness/header_node/recovery.rs",
+        "harness::header_node::recovery::tests::frozen_recovery_stores_drop_a_start_and_a_spend",
+    ),
+    sim_test("tests/evidence_inventory.rs", "every_shared_field_is_a_registered_store_or_allowed"),
+    sim_test(
+        "tests/evidence_inventory.rs",
+        "every_registered_store_names_its_checkpoint_and_producer",
+    ),
+    sim_test("tests/evidence_inventory.rs", "the_scan_follows_aliases"),
+    sim_test("tests/evidence_inventory.rs", "the_scan_finds_atomics"),
+    sim_test("tests/evidence_inventory.rs", "the_scan_reads_enum_variant_fields"),
+    sim_test(
+        "src/harness/header_node/pair.rs",
+        "harness::header_node::pair::tests::an_operation_or_a_call_pairs_once",
+    ),
+    sim_test("tests/header_pairing.rs", "a_call_dispatched_twice_is_refused"),
+    sim_test("tests/header_pairing.rs", "a_call_ended_twice_is_refused"),
+    sim_test("tests/header_pairing.rs", "headers_held_twice_are_refused"),
+    sim_test("tests/header_pairing.rs", "held_headers_ended_twice_are_refused"),
+];
+
+/// A contract whose delivery landed but whose proving tests don't yet cover
+/// it, waiting for `missing`.
+const fn waiting(
     id: ContractId,
     owner: &'static str,
     statement: &'static str,
     delivery: &'static str,
+    missing: &'static str,
 ) -> Contract {
     Contract {
         id,
         owner,
         statement,
         proving: &[],
+        proving_catches: &[],
         state: ContractState::Blocked {
-            waiting_for: delivery,
+            waiting_for: missing,
         },
         delivery,
     }
 }
 
+/// A delivered contract whose proving tests `proving` pass but don't yet
+/// prove it, waiting for `missing`. The tests stay named, so only the gap
+/// stands between it and [`satisfied`].
+const fn proved_short(
+    id: ContractId,
+    owner: &'static str,
+    statement: &'static str,
+    proving: &'static [TestRef],
+    delivery: &'static str,
+    missing: &'static str,
+) -> Contract {
+    Contract {
+        id,
+        owner,
+        statement,
+        proving,
+        proving_catches: &[],
+        state: ContractState::Blocked {
+            waiting_for: missing,
+        },
+        delivery,
+    }
+}
+
+/// A delivered contract, proved by `proving`.
+const fn satisfied(
+    id: ContractId,
+    owner: &'static str,
+    statement: &'static str,
+    proving: &'static [TestRef],
+    delivery: &'static str,
+) -> Contract {
+    Contract {
+        id,
+        owner,
+        statement,
+        proving,
+        proving_catches: &[],
+        state: ContractState::Satisfied,
+        delivery,
+    }
+}
+
 /// The contracts table, one row per contract. C3, C10 and C16 are
-/// delivered on `main`, and C20 by hdr-14.3. C14's proving tests are the store inventory's
-/// producer tests, which hf-6 adds, so it stays blocked until then.
+/// delivered on `main`, C20 by hdr-14.3, C1, C5, C7, C8, C9 and C12 by E1
+/// to E10, C18 by E10 with hdr-14.7b's binding, C14 and C17 by hf-6's
+/// stores, C13 by hf-1 to hf-3, C15 by hf-5, and C19, C21 and C22 by hf-4,
+/// hf-8 and hf-9 with their planted catches, C21 narrowed. Every other
+/// row's deliveries landed, and its state names what's still missing: C4's
+/// proving tests pass, but don't yet prove it.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
     vec![
-        blocked(
+        satisfied(
             C1,
             "Evan",
             "Run completion: the drain offers only recovery actions and advances time through \
              timer boundaries and obligation deadlines, every open obligation concludes, a \
              drain that hits its bound is a harness failure, and NotApplicable carries its \
              reason (zakura#1840).",
+            C1_PROVING,
             "E1",
         ),
-        blocked(
-            C2,
-            "Adam's harness",
-            "header-fault-penalized's open penalty and teardown's unsettled rounds and stop \
-             conclude under C1's drain.",
-            "hf-4, after E1",
-        ),
+        Contract {
+            proving_catches: C2_CATCHES,
+            ..waiting(
+                C2,
+                "Adam's harness",
+                "header-fault-penalized's open penalty and teardown's unsettled rounds and stop \
+                 conclude under C1's drain.",
+                "hf-4, after E1",
+                "a teardown cut on the wire and release-wake harnesses. hf-4's owed-penalty \
+                 and node-abandonment halves at the drain's end are C2_CATCHES",
+            )
+        },
         Contract {
             id: C3,
             owner: "Evan (trace-3)",
             statement: "Replay refuses a non-equivalent build, then compares the \
                         scenario-relevant meta fields, every step and the end record.",
             proving: C3_PROVING,
+            proving_catches: &[],
             state: ContractState::Satisfied,
             delivery: "on main",
         },
-        blocked(
+        proved_short(
             C4,
             "Evan (xt/planted.rs)",
             "The planted runner classifies baseline and patched runs, replays every catch \
              fresh, puts a deadline on every run and judges nested cases by their set.",
+            C4_PROVING,
             "E6",
+            "provenance for its `xtask` proving tests: the acceptance runner credits a test \
+             only from a binary embedding the subject's source digest, and `xtask`'s test \
+             binary embeds none",
         ),
-        blocked(
+        satisfied(
             C5,
             "Evan",
             "Every executed binary's source digest is computed and equals the checkout it \
              should come from, and unknown never matches.",
+            C5_PROVING,
             "E7",
         ),
-        blocked(
-            C6,
-            "Evan",
-            "The witness judge rejects any unrelated NotApplicable whose reason isn't benign, \
-             except StoppedByViolation under the expected stop, or a missing report, and \
-             judges a nested case's exact set in both runs, each nested finding from the \
-             case's own break: the same peer and the same punished event or frame.",
-            "E2",
-        ),
-        blocked(
+        Contract {
+            proving_catches: C6_CATCHES,
+            ..satisfied(
+                C6,
+                "Evan",
+                "The witness judge rejects any unrelated NotApplicable whose reason isn't \
+                 benign, except StoppedByViolation under the expected stop, or a missing \
+                 report, and judges a nested case's exact set. A set the patched run breaks is \
+                 judged in both runs, each nested finding joined to the case's own break by \
+                 the same subject: for a finding at a step, the same punishment, its peer and \
+                 punished event or frame, and for one the run's end found, the same \
+                 publication, its state version. A set that breaks only after the case's own \
+                 break is judged on its Draft run as a counterfactual of its baseline: every \
+                 member breaks there and none in the baseline, which proves each member \
+                 depends on the patch, not that it shares the case's subject.",
+                C6_PROVING,
+                "E2, with Rule 25's subject joins",
+            )
+        },
+        satisfied(
             C7,
             "Evan",
             "A trigger is handed its PropertyId, and each generated template has a receiver \
              trigger and a sender trigger that requires the guarded exchange.",
+            C7_PROVING,
             "E3",
         ),
-        blocked(
+        satisfied(
             C8,
             "Evan",
             "Witness functions return their report, and record and replay write a \
              full-report and store-snapshot sidecar.",
+            C8_PROVING,
             "E4",
         ),
-        blocked(
+        satisfied(
             C9,
             "Evan",
             "The Draft override is run configuration that record writes into meta and \
              replay rebuilds.",
+            C9_PROVING,
             "E5",
         ),
         Contract {
@@ -428,45 +1443,49 @@ pub fn contract_table() -> Vec<Contract> {
                         observes, is dropped, skips a boundary, records outside its run, \
                         publishes past what it delivered, or delivers a different log.",
             proving: C10_PROVING,
+            proving_catches: &[],
             state: ContractState::Satisfied,
             delivery: "on main",
         },
-        blocked(
+        waiting(
             C11,
             "Evan",
             "PeerRecords and WireEvidence's projections sit behind a peer-evidence \
              checkpoint.",
             "E8",
+            "a control that removing the peer checkpoint fails acceptance, a dropped \
+             PeerControl test, and the store inventory taking the peer fields off C11's \
+             allowance",
         ),
-        blocked(
+        satisfied(
             C12,
             "Evan",
             "The registry keeps every distinct end finding, not only an ID's first.",
+            C12_PROVING,
             "E9",
         ),
-        blocked(
+        satisfied(
             C13,
             "Adam's harness",
             "The fault store keeps every distinct fault and every break, and a dropped call \
              clears an untaken fault only after the harness's Shutdown.",
+            C13_PROVING,
             "hf-1, hf-2, hf-3",
         ),
-        blocked(
+        satisfied(
             C14,
             "each store's hdr chunk",
             "Harness evidence stores behind checkpoints keep what their producer tests show.",
+            C14_PROVING,
             "hf-6's store inventory",
         ),
-        // hf-5 (#2197) made the unpatched fixtures settle, which
-        // `the_fixtures_settle_after_their_measured_boundary_and_not_before`
-        // shows. No test yet shows a bypassed wake's patched run settling,
-        // the half a Draft run needs, so C15 stays blocked.
-        blocked(
+        satisfied(
             C15,
             "Adam's harness",
             "Release-wake fixtures release their remaining hold after the measured boundary, \
              including when a bypass stops the wake, so a Draft run can finish.",
-            "a test that a bypassed wake's patched run settles (hf-5's remaining half)",
+            C15_PROVING,
+            "hf-5",
         ),
         Contract {
             id: C16,
@@ -474,51 +1493,86 @@ pub fn contract_table() -> Vec<Contract> {
             statement: "The registry evaluates every property at a step before it returns \
                         the first Active violation, and keeps every violation found there.",
             proving: C16_PROVING,
+            proving_catches: &[],
             state: ContractState::Satisfied,
             delivery: "on main",
         },
-        blocked(
+        satisfied(
             C17,
             "Adam's harness",
             "Evidence stores freeze with the log and snapshot equal across cleanup, the whole \
              ObservationLog at the freeze equals the one Sim::run returns, and the pairer and \
              ledger consume each fact once.",
+            C17_PROVING,
             "hf-6",
         ),
-        blocked(
+        satisfied(
             C18,
             "Evan (trace-3)",
             "Each trace names exactly the scenario and input or Plan it ran, and the \
              executable records and replays scripted Plans.",
+            C18_PROVING,
             "E10",
         ),
-        blocked(
-            C19,
-            "Adam's harness",
-            "An unread final capacity boundary concludes under C1's drain or fails the run.",
-            "hf-4, with C2",
-        ),
+        Contract {
+            proving_catches: C19_CATCHES,
+            ..satisfied(
+                C19,
+                "Adam's harness",
+                "An unread final capacity boundary concludes under C1's drain or fails the run.",
+                C19_PROVING,
+                "hf-4, with C2, and its planted case",
+            )
+        },
         Contract {
             id: C20,
             owner: "Adam's harness",
             statement: "NA_REASONS and NOT_HEADER together list every NaReason, each once, and \
                         NA_REASONS each reason a header ID's report can carry.",
             proving: C20_PROVING,
+            proving_catches: &[],
             state: ContractState::Satisfied,
             delivery: "hdr-14.3",
         },
-        blocked(
-            C21,
-            "Adam's harness",
-            "Every header check keeps every finding at a boundary, not just its first.",
-            "hf-8",
-        ),
-        blocked(
-            C22,
-            "Adam's harness",
-            "Each commit-only-authorized finding names its rule kind and its actual subject.",
-            "hf-9, and E4 for its proving test",
-        ),
+        // Narrowed by Adam, 2026-11-12: two exclusions from its real-path
+        // proof, each with its unit-level proof kept (C21_PROVING's last two).
+        Contract {
+            proving_catches: C21_CATCHES,
+            ..satisfied(
+                C21,
+                "Adam's harness",
+                "Every header check keeps every finding at a boundary, not just its first: the \
+                 node checks, with commit-only-authorized through later-ancestor's real-tap \
+                 catch, and the generated `header-sync/s5v9` receiver checks, through \
+                 status/reserved-flags-closes' two-reserved-flags-skipped. It excludes two \
+                 things as real-path two-finding proof. `session/honest-never-punished`: \
+                 production closes one connection per task, so two punishments never share \
+                 a step. The generated `sender-*` templates: the sender case was untried. \
+                 Their unit-level proof stays: `check_honest_never_punished` and \
+                 `downstream::check_with` keep every finding at a step, as \
+                 every_punishment_of_an_honest_peer_at_a_step_is_reported and \
+                 every_sender_violation_at_a_step_is_reported show. Narrowed again by \
+                 Adam's 2026-11-13 rule: later-ancestor's catch shows the check firing \
+                 through the real tap, and its two findings at one boundary are shown \
+                 only on inserted claim records; their real-path count is a follow-up.",
+                C21_PROVING,
+                "hf-8, with its planted catches",
+            )
+        },
+        Contract {
+            proving_catches: C22_CATCHES,
+            ..satisfied(
+                C22,
+                "Adam's harness",
+                "Each commit-only-authorized finding names its rule kind and its actual \
+                 subject, as the checker's tests and the recorded sidecars show on scripted \
+                 and inserted claim records. later-ancestor's and overgrant's catches show \
+                 the check firing through the real tap; judging their findings' attribution \
+                 on those runs is a follow-up (Adam's 2026-11-13 rule).",
+                C22_PROVING,
+                "hf-9, and E4 for its proving test",
+            )
+        },
     ]
 }
 
@@ -578,6 +1632,9 @@ pub struct Narrowing {
     pub test: NarrowingTest,
 }
 
+/// The narrowing entries' tests' file.
+pub const NARROWING_TESTS: &str = "tests/header_acceptance_narrowing.rs";
+
 /// The node harnesses with no peers.
 const PEERLESS: &[&str] = &[
     "header-sync/smoke",
@@ -596,8 +1653,9 @@ fn every_execution(ctx: &ResultCtx, each: impl Fn(bool, RunBy) -> bool) -> bool 
             .all(|&(empty_override, run_by)| each(empty_override, run_by))
 }
 
-/// The only narrowing entries. Each is pending until hdr-14.7b, whose tool
-/// produces the results their tests judge, so none releases anything yet.
+/// The only narrowing entries, each with its test in [`NARROWING_TESTS`],
+/// which takes the results it releases from the committed manifest and
+/// fails if their runs carry the contract's evidence.
 pub const NARROWING: &[Narrowing] = &[
     Narrowing {
         entry: "N1",
@@ -610,14 +1668,20 @@ pub const NARROWING: &[Narrowing] = &[
                     .is_some_and(|harness| PEERLESS.contains(&harness))
         },
         reason: "those harnesses build no peers, so no PeerRecords exist",
-        test: NarrowingTest::Pending { until: "hdr-14.7b" },
+        test: NarrowingTest::Test(sim_test(
+            NARROWING_TESTS,
+            "n1_peerless_and_machine_results_read_no_peer_evidence",
+        )),
     },
     Narrowing {
         entry: "N2",
         contracts: &[ContractId::C9],
         releases: |ctx| ctx.kind != ResultKind::Caught && every_execution(ctx, |empty, _| empty),
         reason: "only Draft recordings and their replays read the override",
-        test: NarrowingTest::Pending { until: "hdr-14.7b" },
+        test: NarrowingTest::Test(sim_test(
+            NARROWING_TESTS,
+            "n2_released_results_carry_no_draft_override",
+        )),
     },
     Narrowing {
         entry: "N3",
@@ -630,7 +1694,10 @@ pub const NARROWING: &[Narrowing] = &[
                     .is_some_and(|harness| harness != "header-sync/release-wake")
         },
         reason: "only header-sync/release-wake builds the release-wake fixtures",
-        test: NarrowingTest::Pending { until: "hdr-14.7b" },
+        test: NarrowingTest::Test(sim_test(
+            NARROWING_TESTS,
+            "n3_only_release_wake_runs_a_wake_fixture",
+        )),
     },
     Narrowing {
         entry: "N4",
@@ -646,7 +1713,10 @@ pub const NARROWING: &[Narrowing] = &[
         releases: |ctx| ctx.machine,
         reason: "machine histories run a transport-free loop, not Sim::run, its drain, \
                  checkpoints or stores",
-        test: NarrowingTest::Pending { until: "hdr-14.7b" },
+        test: NarrowingTest::Test(sim_test(
+            NARROWING_TESTS,
+            "n4_machine_results_run_no_sim_drain_or_stores",
+        )),
     },
     Narrowing {
         entry: "N5",
@@ -657,7 +1727,10 @@ pub const NARROWING: &[Narrowing] = &[
         },
         reason: "the planted runner performs and replays its own cases, so only \
                  independently run histories are free of it",
-        test: NarrowingTest::Pending { until: "hdr-14.7b" },
+        test: NarrowingTest::Test(sim_test(
+            NARROWING_TESTS,
+            "n5_released_results_are_recorded_by_the_tool",
+        )),
     },
 ];
 
@@ -670,22 +1743,57 @@ pub const NARROWING: &[Narrowing] = &[
 /// can't compare, so a widened release, such as a harness added to
 /// `PEERLESS`, moves this one, and needs a reread of what each entry
 /// releases. Callees outside this file are their owners' contracts.
-pub const NARROWING_FINGERPRINT: &str = "409050b93c616bb3";
+pub const NARROWING_FINGERPRINT: &str = "cbe285413fc88ad5";
 
-/// The [`Key::ContractTest`] results: one `Passes` per proving test of each
-/// `Satisfied` contract.
-pub fn contract_test_results(table: &[Contract]) -> Vec<ExpectedResult> {
-    table
+/// The [`Key::ContractTest`] and [`Key::ContractCatch`] results of each
+/// `Satisfied` contract: one `Passes` per proving test, and per proving
+/// catch the `Caught` or `HarnessCaught` a result of `rows` names for that
+/// case. A catch no row names gets no result, so its key stays uncovered
+/// and blocks.
+pub fn contract_test_results(table: &[Contract], rows: &[ExpectedResult]) -> Vec<ExpectedResult> {
+    let satisfied = table
         .iter()
-        .filter(|contract| contract.state == ContractState::Satisfied)
-        .flat_map(|contract| {
-            contract.proving.iter().map(|&test| ExpectedResult {
-                keys: vec![contract_test_key(contract.id, test)],
+        .filter(|contract| contract.state == ContractState::Satisfied);
+    let tests = satisfied.clone().flat_map(|contract| {
+        contract.proving.iter().map(|&test| ExpectedResult {
+            keys: vec![contract_test_key(contract.id, test)],
+            gates: Vec::new(),
+            expected: Expected::Passes { test },
+        })
+    });
+    let catches = satisfied.flat_map(|contract| {
+        contract.proving_catches.iter().filter_map(|&case| {
+            let caught = caught_result(rows, &case.planted())?;
+            Some(ExpectedResult {
+                keys: vec![contract_catch_key(contract.id, case)],
                 gates: Vec::new(),
-                expected: Expected::Passes { test },
+                expected: caught,
             })
         })
-        .collect()
+    });
+    tests.chain(catches).collect()
+}
+
+/// The `Caught` or `HarnessCaught` the first result of `rows` naming
+/// `case` expects, joined on the case's whole [`PlantedRef`], so a case
+/// under another property with the same name never stands in for it.
+fn caught_result(rows: &[ExpectedResult], case: &PlantedRef) -> Option<Expected> {
+    let caught = PlantedRef::joined(case, rows, |result| match result.expected {
+        Expected::Caught { case, .. } | Expected::HarnessCaught { case, .. } => {
+            Some(case.planted())
+        }
+        _ => None,
+    });
+    caught.first().map(|result| result.expected.clone())
+}
+
+/// The [`Key::ContractCatch`] for `contract`'s proving catch `case`.
+pub fn contract_catch_key(contract: ContractId, case: CaseRef) -> Key {
+    Key::ContractCatch {
+        contract: contract.name(),
+        property: case.property.to_owned(),
+        name: case.name.to_owned(),
+    }
 }
 
 /// The [`Key::ContractTest`] for `contract`'s proving test `test`.
@@ -725,4 +1833,60 @@ pub fn narrowing_test_results(entries: &[Narrowing]) -> Vec<ExpectedResult> {
             },
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::header_acceptance::{
+        refs::one_key_off::assert_one_key_off, ExpectedNa, Found,
+    };
+
+    /// A contract's proving catch takes the result of its own case only
+    /// on the case's whole [`PlantedRef`] (Rule 25's template): among the
+    /// catches of `later-ancestor`, `overgrant` under the same property and
+    /// a `later-ancestor` under another, the key's case finds its own
+    /// result, and the case with its property or its name moved finds
+    /// none.
+    #[test]
+    fn a_contract_catch_joins_its_whole_case() {
+        const NONE: &[ExpectedNa] = &[];
+        let caught = |case: CaseRef, harness: &'static str| ExpectedResult {
+            keys: Vec::new(),
+            gates: Vec::new(),
+            expected: Expected::Caught {
+                case,
+                harness,
+                set: &[],
+                found: Found::AtStep,
+                companions: &[],
+                not_applicable: NONE,
+                patched_not_applicable: None,
+            },
+        };
+        let rows = [
+            caught(
+                CaseRef {
+                    property: "header-sync/another",
+                    name: LATER_ANCESTOR.name,
+                },
+                "same name",
+            ),
+            caught(
+                CaseRef {
+                    property: LATER_ANCESTOR.property,
+                    name: "overgrant",
+                },
+                "same property",
+            ),
+            caught(LATER_ANCESTOR, "own"),
+        ];
+        let keys = assert_one_key_off::<PlantedRef>(&LATER_ANCESTOR.planted(), |case| {
+            matches!(
+                caught_result(&rows, case),
+                Some(Expected::Caught { harness: "own", .. })
+            )
+        });
+        assert_eq!(keys, 2);
+    }
 }

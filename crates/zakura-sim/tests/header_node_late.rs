@@ -28,6 +28,7 @@ use std::{
 
 use support::inputs;
 use zakura_header_chain::{Frontier, VctRootRepairState, VctRootRepairStatus};
+use zakura_sim::stores::EvidenceStores;
 use zakura_sim::{
     check::after_step,
     domain::header_sync::STALE_COMPLETION_INERT,
@@ -1731,7 +1732,7 @@ fn vct_context_times_out_at_30_seconds() {
             storage_config(),
             input,
             |sim| {
-                let effects = Effects::default();
+                let effects = Effects::new(&EvidenceStores::default());
                 let policy = Policy {
                     holds: vec![hold(
                         Select::nth(OpKind::VctContext, 1),

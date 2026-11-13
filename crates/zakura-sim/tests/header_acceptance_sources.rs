@@ -13,7 +13,7 @@ use std::{cell::RefCell, collections::BTreeSet};
 use zakura_sim::{
     domain::{
         header_sync::{
-            capacity_release_wakes, watch_observed_under_flood,
+            capacity_release_wakes, hold_release_wakes, watch_observed_under_flood,
             watch_observed_under_lifecycle_flood,
         },
         header_sync_progress::bounded_adversary_progress,
@@ -21,8 +21,8 @@ use zakura_sim::{
     harness::{
         header_acceptance,
         header_sync::{
-            storage_properties, wire_properties, Flood, HeaderWire, ReleaseWake, RepairHarness,
-            Smoke, Storage,
+            storage_properties, wire_properties, Flood, HeaderWire, Liveness, ReleaseWake,
+            RepairHarness, Smoke, Storage,
         },
         run_harness, HarnessError, Subsystem,
     },
@@ -96,6 +96,17 @@ impl Own for RepairHarness {
     /// The storage harness's.
     fn own() -> Vec<Property<Without<Self>>> {
         storage_properties()
+    }
+}
+
+impl Own for Liveness {
+    /// The storage harness's, then `hold-release-wakes` and
+    /// `bounded-adversary-progress`, as the liveness harness registers them.
+    fn own() -> Vec<Property<Without<Self>>> {
+        let mut properties = storage_properties();
+        properties.push(hold_release_wakes());
+        properties.push(bounded_adversary_progress());
+        properties
     }
 }
 
@@ -354,4 +365,9 @@ fn flood_fails_without_each_source() {
 #[test]
 fn repair_fails_without_each_source() {
     fails_without_each_source::<RepairHarness>();
+}
+
+#[test]
+fn liveness_fails_without_each_source() {
+    fails_without_each_source::<Liveness>();
 }

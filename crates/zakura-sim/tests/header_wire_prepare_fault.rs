@@ -8,32 +8,45 @@
 //! disconnected while the node was preparing the page. That disconnect
 //! retires the round, so the failed prepare ends stale, and
 //! `header-sync/stale-completion-inert` holds through its penalty.
+//!
+//! That late fault is committed as `tests/fixtures/header-wire-late-fault`,
+//! the scenario and the steered script, which the planted cases under
+//! `qa/planted/header-sync/header-fault-penalized/` run on
+//! `header-sync/wire`. No Plan bytes reach it unsteered, since the peer's
+//! disconnect is enabled from its first page.
 #![cfg(zakura_sim)]
 
 mod support;
 
-use std::process::Command;
+use std::{fs, path::PathBuf, process::Command};
 
 use support::{
     inputs,
+    one_key_off::assert_one_key_off,
     prepare_fault::{disconnect_mid_prepare, scenario, LastView, Uncooled, Watched, CHAIN},
     steer::steer,
 };
 use zakura_sim::{
     domain::header_sync::STALE_COMPLETION_INERT,
     harness::{
+        header_acceptance::{
+            history::run_declared,
+            refs::{ConnectionRef, Ref, SessionIdRef},
+        },
         header_node::{
             fault::FaultEnd,
             stale::{StaleWindow, Staleness},
         },
-        header_sync::{StorageView, WirePorts, WireScenario, HEADER_FAULT_PENALIZED},
-        run_prepared, HarnessError, Subsystem,
+        header_sync::{HeaderWire, StorageView, WirePorts, WireScenario, HEADER_FAULT_PENALIZED},
+        run_prepared, HarnessError, Subsystem, WITNESS_FILE,
     },
-    model::Label,
-    observe::{ReactorFact, StorageFact, StorageRequest, StorageResult},
+    model::{is_fault_cause, Label},
+    observe::{Entry, ReactorFact, StorageFact, StorageRequest, StorageResult, StreamId},
     peer::{honest::HonestChain, PeerAction},
     property::HasView,
-    Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
+    witness::{check_witness, Expect, WitnessScenario},
+    Checker, MemorySink, NoChecks, Observation, ObservationLog, Plan, PlanInput, PropertyOutcome,
+    RecordSink, RunReport,
 };
 use zakura_storage::header::fixture::HeaderFixture;
 
@@ -106,6 +119,35 @@ struct Shape {
     misbehavior: Vec<(Option<u64>, Option<u64>)>,
     /// Where each `FrameJudged` of a `BadContent` page sits in the log.
     judged_bad: Vec<usize>,
+}
+
+/// Whether `shape` holds a `Misbehavior` from session `session`, joined
+/// by its origin's whole [`SessionIdRef`], that the node reported after
+/// the session ended, with no current session.
+fn penalized_late(shape: &Shape, session: u64) -> bool {
+    let sent = SessionIdRef {
+        session_id: session,
+    };
+    shape.misbehavior.iter().any(|(origin, current)| {
+        current.is_none()
+            && SessionIdRef::joins(&sent, origin, |origin| {
+                origin.map(|session_id| SessionIdRef { session_id })
+            })
+    })
+}
+
+/// A late penalty joins the session that sent the page by its whole
+/// origin: a `Misbehavior` from session 3 after it ended is session 3's,
+/// and one from another session isn't.
+#[test]
+fn a_late_penalty_joins_its_origin_session() {
+    assert_one_key_off::<SessionIdRef>(&SessionIdRef { session_id: 3 }, |origin| {
+        let shape = Shape {
+            misbehavior: vec![(Some(origin.session_id), None)],
+            ..Shape::default()
+        };
+        penalized_late(&shape, 3)
+    });
 }
 
 /// Reads `report`'s shape.
@@ -201,9 +243,90 @@ fn assert_penalized(label: &str, report: &RunReport, view: &StorageView) -> Shap
     shape
 }
 
+/// The causes the node closed each connection that carried a `BadContent`
+/// page in `entries` with, in log order, by that connection, each close
+/// joined to its page by its [`ConnectionRef`].
+fn bad_page_closes(entries: &[Entry]) -> Vec<(u64, Vec<String>)> {
+    let mut connections: Vec<u64> = entries
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::PeerFrame {
+                connection, label, ..
+            } if *label == Label::BadContent => Some(*connection),
+            _ => None,
+        })
+        .collect();
+    connections.dedup();
+    connections
+        .into_iter()
+        .map(|connection| {
+            let page = ConnectionRef { connection };
+            let causes = entries
+                .iter()
+                .filter(|entry| {
+                    ConnectionRef::joins(&page, *entry, |entry| match &entry.obs {
+                        Observation::ConnectionClosed { connection, .. } => Some(ConnectionRef {
+                            connection: *connection,
+                        }),
+                        _ => None,
+                    })
+                })
+                .filter_map(|entry| match &entry.obs {
+                    Observation::ConnectionClosed { cause, .. } => Some(cause.clone()),
+                    _ => None,
+                })
+                .collect();
+            (connection, causes)
+        })
+        .collect()
+}
+
+/// A bad page's close joins it by its connection: connection 1's
+/// `BadContent` page and a fault close of connection 1 are a close of the
+/// page's connection, and the same close of another connection isn't.
+#[test]
+fn a_bad_page_joins_the_close_of_its_own_connection() {
+    let page = ConnectionRef { connection: 1 };
+    let closes = |closed: &ConnectionRef| {
+        let mut log = ObservationLog::default();
+        log.push(Observation::PeerFrame {
+            connection: page.connection,
+            stream: StreamId {
+                kind: 64,
+                version: 1,
+            },
+            quic_stream: None,
+            seq: 0,
+            row: Some("headers".to_owned()),
+            rule_stream: StreamId {
+                kind: 64,
+                version: 1,
+            },
+            label: Label::BadContent,
+            exhausted: false,
+            exchange: None,
+            payload: 8,
+        });
+        log.push(Observation::ConnectionClosed {
+            connection: closed.connection,
+            cause: "service_protocol_reject".to_owned(),
+        });
+        bad_page_closes(log.entries())
+    };
+    assert_eq!(
+        closes(&page),
+        [(1, vec!["service_protocol_reject".to_owned()])]
+    );
+    assert_one_key_off::<ConnectionRef>(&page, |closed| {
+        closes(closed).iter().any(|(_, causes)| !causes.is_empty())
+    });
+}
+
 /// The node prepares the invalid tip, penalizes the peer and closes it. The
 /// close isn't one `conformant-never-closes` flags, since the page was judged
-/// at its preparation.
+/// at its preparation. The fault's session is still current, so its close
+/// is owed, and it closes the page's connection with a fault cause, as a
+/// subscriber's content rejection does.
 #[test]
 fn an_invalid_page_is_judged_at_prepare_and_penalized() {
     for (index, plan) in plans().into_iter().enumerate() {
@@ -215,6 +338,14 @@ fn an_invalid_page_is_judged_at_prepare_and_penalized() {
                 .iter()
                 .all(|(origin, current)| origin == current),
             "plan {index}: the session that sent the page was still current: {shape:?}"
+        );
+        let closes = bad_page_closes(report.log.entries());
+        assert!(
+            !closes.is_empty()
+                && closes
+                    .iter()
+                    .all(|(_, causes)| causes.first().is_some_and(|cause| is_fault_cause(cause))),
+            "plan {index}: the page's connection closed with a fault cause: {closes:?}"
         );
     }
 }
@@ -237,7 +368,7 @@ fn a_disconnect_mid_prepare_is_still_penalized() {
         let shape = assert_penalized(&format!("plan {index}"), &report, &view);
         let (_, session, _) = shape.prepare.expect("checked above");
         assert!(
-            shape.misbehavior.contains(&(Some(session), None)),
+            penalized_late(&shape, session),
             "plan {index}: the penalty came after the session ended: {shape:?}"
         );
         assert_stale_fault_inert(index, &report, &view, &shape);
@@ -402,4 +533,213 @@ fn the_evidence_replays_in_a_fresh_process() {
     };
     assert_eq!(line("ATTRIBUTIONS "), attributions);
     assert_eq!(line("LOG "), log);
+}
+
+/// The committed late-fault scenario, as `header-sync/wire`'s JSON.
+const LATE_FAULT: &str = "header-wire-late-fault.json";
+
+/// The committed late-fault script, a scripted Plan as JSON.
+const LATE_FAULT_SCRIPT: &str = "header-wire-late-fault.script.json";
+
+/// The committed fixture file `name`.
+fn fixture_file(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+/// The late-fault scenario: the peer disconnects after serving its invalid
+/// tip, and the node's first preparation is held.
+fn late_fault_scenario() -> WireScenario {
+    scenario(vec![PeerAction::Disconnect], true)
+}
+
+/// Runs `scenario` under `plan` on `header-sync/wire` itself, with
+/// `extra` beside the registered properties, keeping a run that ended in a
+/// harness failure. Returns the report and its records.
+fn run_wire(
+    scenario: &WireScenario,
+    plan: PlanInput,
+    extra: Option<&mut dyn Checker>,
+) -> (RunReport, Vec<String>) {
+    let mut sink = MemorySink::default();
+    let report = run_wire_into(scenario, plan, &mut sink, extra);
+    (report, sink.lines())
+}
+
+/// [`run_wire`], recording into `sink` and returning only the report.
+fn run_wire_into(
+    scenario: &WireScenario,
+    plan: PlanInput,
+    sink: &mut dyn RecordSink,
+    extra: Option<&mut dyn Checker>,
+) -> RunReport {
+    match run_prepared::<HeaderWire>(scenario, HeaderWire::prepare(scenario), plan, sink, extra) {
+        Ok(report) => report,
+        Err(HarnessError::Run { report, .. }) => *report,
+        Err(error) => panic!("{error}"),
+    }
+}
+
+/// The default Plan on `header-sync/wire`, steered by
+/// [`disconnect_mid_prepare`] over [`late_fault_scenario`]: the script a
+/// late fault's planted case runs.
+fn late_fault_script() -> Plan {
+    let scenario = late_fault_scenario();
+    let (_, plan, _) = steer(
+        Plan::from_fuzz(&[]),
+        &disconnect_mid_prepare,
+        &mut |plan, checker| run_wire(&scenario, plan, Some(checker)),
+    );
+    let PlanInput::Script(plan) = plan else {
+        panic!("the default Plan disconnects before the prepare, so steering scripts it");
+    };
+    plan
+}
+
+/// The committed late-fault scenario and script, as `cargo xtask planted`
+/// reads them.
+fn committed_late_fault() -> (WireScenario, Plan) {
+    let read = |name: &str| {
+        fs::read_to_string(fixture_file(name)).unwrap_or_else(|error| panic!("{name}: {error}"))
+    };
+    let scenario = serde_json::from_str(&read(LATE_FAULT))
+        .unwrap_or_else(|error| panic!("{LATE_FAULT}: {error}"));
+    let script = serde_json::from_str(&read(LATE_FAULT_SCRIPT))
+        .unwrap_or_else(|error| panic!("{LATE_FAULT_SCRIPT}: {error}"));
+    (scenario, script)
+}
+
+/// The committed late-fault fixture is what its builders give: the
+/// scenario and the default Plan steered over it on `header-sync/wire`.
+#[test]
+fn the_late_fault_fixture_matches_its_builders() {
+    let (scenario, script) = committed_late_fault();
+    assert_eq!(
+        scenario,
+        late_fault_scenario(),
+        "run `regenerate_late_fault_fixture`"
+    );
+    assert_eq!(
+        script,
+        late_fault_script(),
+        "run `regenerate_late_fault_fixture`"
+    );
+}
+
+/// Rewrites the committed late-fault fixture from its builders.
+#[test]
+#[ignore = "rewrites the committed late-fault fixture"]
+fn regenerate_late_fault_fixture() {
+    let write = |name: &str, json: String| {
+        fs::write(fixture_file(name), json + "\n").expect("the fixture directory exists");
+    };
+    write(
+        LATE_FAULT,
+        serde_json::to_string_pretty(&late_fault_scenario()).expect("scenarios serialize"),
+    );
+    write(
+        LATE_FAULT_SCRIPT,
+        serde_json::to_string_pretty(&late_fault_script()).expect("Plans serialize"),
+    );
+}
+
+/// On `header-sync/wire` itself, the committed late fault holds
+/// `header-sync/header-fault-penalized` with its trigger history and no
+/// violation, and the property applies. The fault is late: the node
+/// penalized the session that sent the invalid page after it ended. The
+/// run is the penalty's counted history, `committed late-fault input`,
+/// which the acceptance tool records from this declaration (C18).
+#[test]
+fn the_late_fault_fixture_penalizes_after_the_session_ended() {
+    let (scenario, script) = committed_late_fault();
+    check_witness::<HeaderWire>(
+        WitnessScenario {
+            scenario: scenario.clone(),
+            input: PlanInput::Script(script.clone()),
+        },
+        HEADER_FAULT_PENALIZED,
+        Expect::Holds,
+    );
+    let report = run_declared(
+        HeaderWire::NAME,
+        "committed late-fault input",
+        &scenario,
+        PlanInput::Script(script),
+        |scenario, plan, sink| run_wire_into(scenario, plan, sink, None),
+    );
+    assert!(
+        report.end.violation.is_none() && report.end.harness.is_none(),
+        "{:?}",
+        report.end
+    );
+    let outcome = report
+        .properties
+        .iter()
+        .find(|property| property.property == HEADER_FAULT_PENALIZED)
+        .map(|property| property.outcome.clone());
+    assert!(
+        matches!(outcome, Some(PropertyOutcome::Held { applicable }) if applicable > 0),
+        "{outcome:?}"
+    );
+    let shape = shape(&report);
+    let (_, session, _) = shape.prepare.expect("the node prepared the invalid tip");
+    assert_eq!(
+        shape.result,
+        Some(StorageResult::PrepareFailed {
+            category: "invalid_header".to_owned()
+        })
+    );
+    assert!(
+        penalized_late(&shape, session),
+        "the penalty came after the session ended: {shape:?}"
+    );
+}
+
+/// `record --witness` judges the committed late fault as `cargo xtask
+/// planted` runs it, from the scenario's text and `--script`, expecting a
+/// hold, and `replay` reruns its trace Exact in a fresh process.
+#[test]
+fn the_late_fault_fixture_records_and_replays_in_a_fresh_process() {
+    let zakura_sim = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+            .args(args)
+            .output()
+            .expect("the binary runs")
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary directory");
+    let trace = dir.path().join("trace");
+    let scenario = fs::read_to_string(fixture_file(LATE_FAULT)).expect("the fixture is committed");
+    let recorded = zakura_sim(&[
+        "record",
+        "--sim",
+        HeaderWire::NAME,
+        "--scenario",
+        &scenario,
+        "--script",
+        fixture_file(LATE_FAULT_SCRIPT)
+            .to_str()
+            .expect("the path is UTF-8"),
+        "--out",
+        trace.to_str().expect("the path is UTF-8"),
+        "--witness",
+        HEADER_FAULT_PENALIZED,
+        "--expect",
+        "holds",
+    ]);
+    assert!(recorded.status.success(), "{recorded:?}");
+    let witness: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(trace.join(WITNESS_FILE)).expect("witness.json"))
+            .expect("witness.json is JSON");
+    assert_eq!(
+        witness["passed"],
+        serde_json::Value::Bool(true),
+        "{witness}"
+    );
+    let replayed = zakura_sim(&["replay", trace.to_str().expect("the path is UTF-8")]);
+    let stdout = String::from_utf8_lossy(&replayed.stdout);
+    assert!(
+        replayed.status.success() && stdout.contains("every pick, draw and observation matched"),
+        "{replayed:?}"
+    );
 }

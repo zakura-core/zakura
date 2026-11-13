@@ -1,5 +1,12 @@
 # Short payload
 
+Retired as a duplicate of the planted case
+`qa/planted/header-sync/commit-only-authorized/dropped-payload-header`. Both
+plant the same `entries.pop()` in `WorkPolicy::begin_prepare`, and on that
+case's forks-sharing-a-header input both first violate
+`header-sync/commit-only-authorized` at step 738 with the same `WrongPayload`
+finding. The witness below is the retired mutation's own.
+
 `short-payload.patch` has `begin_prepare` leave the round's last staged
 header out of the prepare it sends. The prepare still names its round's owner
 and target, and holds all of the round's leases, so only its payload is

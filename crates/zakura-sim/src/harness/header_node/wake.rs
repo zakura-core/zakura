@@ -27,10 +27,7 @@
 //! Each fact takes the node's next stamp ([`super::stamp`]), which the
 //! storage view hands the registry as its view-side facts.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use zakura_header_chain::Frontier;
@@ -41,6 +38,7 @@ use zakura_network::zakura::{
 use zakura_scheduler::SimInstant;
 
 use super::{session::SessionEvidence, stamp::Stamps};
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
 use crate::{
     observe::{StorageFact, StorageRequest},
     property::EndedBy,
@@ -101,30 +99,53 @@ struct Store {
     facts: Vec<(u64, WakeFact)>,
 }
 
+impl Snapshot for Store {
+    /// Everything it holds.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
+}
+
 /// One reactor's wake facts, shared by its tap and whoever reads them.
 /// Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct WakeEvidence(Arc<Mutex<Store>>);
+#[derive(Clone, Debug)]
+pub struct WakeEvidence(Registered<Store>);
 
 impl WakeEvidence {
-    /// Evidence for a run that declares `fixture`, or none.
-    pub fn new(fixture: Option<WakeFixture>) -> WakeEvidence {
-        WakeEvidence(Arc::new(Mutex::new(Store {
-            fixture,
-            stamps: Stamps::default(),
-            facts: Vec::new(),
-        })))
+    /// Evidence in `stores`, the node's, for a run that declares
+    /// `fixture`, or none.
+    pub fn new(stores: &EvidenceStores, fixture: Option<WakeFixture>) -> WakeEvidence {
+        WakeEvidence(stores.register(
+            "wake",
+            Store {
+                fixture,
+                stamps: Stamps::default(),
+                facts: Vec::new(),
+            },
+        ))
+    }
+
+    /// Declares `fixture` on prepared ports, as [`WakeEvidence::new`] with
+    /// it does.
+    pub fn declare(&self, fixture: WakeFixture) {
+        self.change(|store| store.fixture = Some(fixture));
     }
 
     /// Stamps facts from `stamps`, the node's, from now on.
     pub(super) fn stamp_with(&self, stamps: Stamps) {
-        self.with(|store| store.stamps = stamps);
+        self.change(|store| store.stamps = stamps);
     }
 
     /// Runs `read` on the store. Nothing else is called while the lock is
     /// held.
-    fn with<R>(&self, read: impl FnOnce(&mut Store) -> R) -> R {
-        read(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    fn with<R>(&self, read: impl FnOnce(&Store) -> R) -> R {
+        self.0.read(read)
+    }
+
+    /// Runs `change` on the store, unless it's frozen, which drops the
+    /// change.
+    fn change<R>(&self, change: impl FnOnce(&mut Store) -> R) -> Option<R> {
+        self.0.write(change)
     }
 
     /// The declared fixture, if any.
@@ -134,7 +155,7 @@ impl WakeEvidence {
 
     /// Keeps `fact` with the next stamp.
     fn push(&self, fact: WakeFact) {
-        self.with(|store| {
+        self.change(|store| {
             let stamp = store.stamps.next();
             store.facts.push((stamp, fact));
         });
@@ -384,8 +405,18 @@ mod tests {
     };
 
     /// Wake evidence with no tap behind it.
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct Wakes(WakeEvidence);
+
+    impl Default for Wakes {
+        /// An empty store in a handle of its own.
+        fn default() -> Self {
+            Wakes(WakeEvidence::new(
+                &crate::stores::EvidenceStores::default(),
+                None,
+            ))
+        }
+    }
 
     impl WakeView for Wakes {
         fn wake(&self) -> &WakeEvidence {
@@ -496,6 +527,7 @@ mod tests {
         );
         let report = sim.run(&mut checker, &mut MemorySink::default());
         let found = |expected: String| Violation {
+            subject: None,
             property: CAPACITY_RELEASE_WAKES.to_owned(),
             step: 2,
             witness: vec![1, 2],
@@ -506,6 +538,81 @@ mod tests {
         assert_eq!(
             report.properties[0].violations,
             [found(discharged(&first, 3)), found(discharged(&second, 4))]
+        );
+    }
+
+    impl crate::harness::scripted::Script for Wakes {
+        const NAME: &'static str = "test/two-wakes";
+        /// Each wake's peer index and session, all opened at step 1.
+        type Case = Vec<(usize, u64)>;
+
+        /// Only `capacity-release-wakes`.
+        fn properties() -> Vec<crate::property::Property<crate::harness::scripted::ScriptRun<Wakes>>>
+        {
+            vec![capacity_release_wakes()]
+        }
+
+        /// The schedule and the view.
+        fn sources() -> Sources {
+            Sources::observed(&[Source::Schedule, Source::View])
+        }
+
+        /// Opens the case's wakes at the boundary after step 1, as a tap
+        /// would.
+        fn observe(&self, case: &Self::Case, log: &mut ObservationLog) {
+            if log.step() == 1 {
+                for &(index, session_id) in case {
+                    self.0.push(opened(&peer_id([7; 32], index), session_id));
+                }
+            }
+        }
+
+        /// Two: the wakes open after the first, and nothing runs after the
+        /// second.
+        fn steps(_: &Self::Case) -> usize {
+            2
+        }
+    }
+
+    /// C21 through the sidecar: the two unanswered wakes one boundary
+    /// opened are two `capacity-release-wakes` violations expiring together
+    /// at quiescence, each naming its own session, in the full report
+    /// recorded beside the trace and its fresh replay.
+    #[test]
+    fn every_unanswered_wake_at_a_boundary_reaches_the_sidecar() {
+        use crate::harness::scripted::{findings, sidecar};
+        let (first, second) = (peer_id([7; 32], 0), peer_id([7; 32], 1));
+        let full = sidecar::<Wakes>(&vec![(0, 3), (1, 4)], &[]);
+        let found = findings(&full, CAPACITY_RELEASE_WAKES);
+        let violation = |expected: String| Violation {
+            subject: None,
+            property: CAPACITY_RELEASE_WAKES.to_owned(),
+            step: 2,
+            witness: vec![1, 2],
+            expected,
+            actual: "the scheduler is Quiescent after step 2 with the obligation from step 1 open"
+                .to_owned(),
+        };
+        assert_eq!(
+            found.violations,
+            [
+                violation(discharged(&first, 3)),
+                violation(discharged(&second, 4))
+            ]
+        );
+        assert!(
+            matches!(found.outcome, crate::PropertyOutcome::Violated { .. }),
+            "{found:?}"
+        );
+    }
+
+    /// A wake fact kept after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_wake_store_drops_a_fact() {
+        crate::stores::assert_freeze_drops_writes(
+            |stores| WakeEvidence::new(stores, None),
+            |wake| wake.push(opened(&peer_id([7; 32], 0), 1)),
+            WakeEvidence::facts,
         );
     }
 }

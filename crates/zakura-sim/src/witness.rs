@@ -41,6 +41,12 @@ pub enum Expect {
     /// may report violations, as long as none stopped the run. A property
     /// with no trigger-history check passes on its outcome alone.
     Applicable,
+    /// The property stays `NotApplicable`, with any reason, while the run
+    /// reaches its trigger history, and the rest of the run is judged as
+    /// for [`Expect::Holds`]: no property is violated and none is left
+    /// incomplete. The trigger is the property's own, so a row no scenario
+    /// reaches, such as an `over-owed-closes` ID, can't pass this way.
+    NotApplicable,
 }
 
 impl Expect {
@@ -51,6 +57,7 @@ impl Expect {
             Expect::Violated => "violated",
             Expect::Applicable => "applicable",
             Expect::ViolatedSet => "violated-set",
+            Expect::NotApplicable => "not-applicable",
         }
     }
 }
@@ -65,10 +72,13 @@ impl FromStr for Expect {
             Expect::Violated,
             Expect::Applicable,
             Expect::ViolatedSet,
+            Expect::NotApplicable,
         ]
         .into_iter()
         .find(|expect| expect.name() == name)
-        .ok_or_else(|| format!("`{name}` isn't holds, violated, applicable or violated-set"))
+        .ok_or_else(|| {
+            format!("`{name}` isn't holds, violated, applicable, violated-set or not-applicable")
+        })
     }
 }
 
@@ -113,10 +123,10 @@ pub enum WitnessError {
         reason: NaReason,
     },
     /// A violation of a property of an [`Expect::ViolatedSet`] test's set
-    /// isn't joined to the case's own break: its witness's first step isn't
-    /// the step of any of the property's step-found violations, or the run's
-    /// end found it, with no step of its own. With no step, the report kept none of
-    /// the member's violations to join.
+    /// isn't joined to the case's own break: no violation of the property
+    /// found the same way names its subject, or, for a step's finding, none
+    /// that does broke at its witness's first step. With no step, the report
+    /// kept none of the member's violations to join.
     Unjoined {
         /// The set's property.
         property: String,
@@ -646,7 +656,8 @@ pub(crate) fn judge(
 /// [`judge`] on a run's `end` and property `reports`. Under
 /// [`Expect::Violated`], a violation of a property in `also_violates`
 /// isn't unrelated, and under [`Expect::ViolatedSet`] each of them must be
-/// violated. Under [`Expect::Holds`] and a violated expectation, another
+/// violated. Under [`Expect::Holds`], [`Expect::NotApplicable`] and a
+/// violated expectation, another
 /// property the run left with incomplete observations, a `NotApplicable`
 /// reason that isn't benign, fails the test too: the run can't show nothing
 /// else broke. The one exception is `StoppedByViolation` in a run the
@@ -701,7 +712,7 @@ fn judge_end(
     // `StoppedByViolation` says. Any unexpected stop failed above. A run
     // that went on to its end, as a `Draft` run does, leaves no such reason.
     let stopped = end.outcome == Outcome::Violation;
-    if expect == Expect::Holds || violated {
+    if matches!(expect, Expect::Holds | Expect::NotApplicable) || violated {
         let incomplete = reports
             .iter()
             .filter(|r| !expected(&r.property))
@@ -724,6 +735,10 @@ fn judge_end(
     match expect {
         Expect::Holds | Expect::Applicable => match outcome {
             PropertyOutcome::Held { applicable } if *applicable > 0 => Ok(()),
+            outcome => Err(WitnessError::Outcome(outcome.clone())),
+        },
+        Expect::NotApplicable => match outcome {
+            PropertyOutcome::NotApplicable { .. } => Ok(()),
             outcome => Err(WitnessError::Outcome(outcome.clone())),
         },
         Expect::Violated | Expect::ViolatedSet => {
@@ -752,30 +767,30 @@ fn judge_end(
 }
 
 /// Checks that every violation of every property in `set` is tied to
-/// `property`'s own break (C6): the violation's cause, its witness's first
-/// step, is the step one of `property`'s step-found violations broke at. A
-/// step check's witness is just its step, and an obligation's starts at the
-/// step that opened it, followed by any deferrals and its expiry. So a
-/// member broken at the break's step joins, a nested expiry opened at it
-/// joins, and an expiry opened before it, which the break didn't cause,
-/// doesn't, even when it's deferred or expires at the break's step. A
-/// violation the run's end found, an expiry at an idle end included, is
-/// never a break and never joins, so it fails closed, and so does a member whose report kept none of
-/// its violations, or every member when the report kept none of
+/// `property`'s own break (C6): it names the same subject
+/// ([`FindingSubject`](crate::check::FindingSubject)) as one of
+/// `property`'s violations the same way found, compared whole
+/// ([`Ref::joined`](crate::harness::header_acceptance::refs::Ref::joined)), so a member's punishment joins only the case's
+/// punishment of the same connection, by the same event, answering the
+/// same frame. A step's finding must also be caused there: its cause, its
+/// witness's first step, is the step that break broke at. A step check's
+/// witness is just its step, and an obligation's starts at the step that
+/// opened it, followed by any deferrals and its expiry, so an expiry
+/// opened before the break, which the break didn't cause, doesn't join,
+/// even when it's deferred or expires at the break's step. A finding the
+/// run's end found has no step of its own, so its subject alone ties it,
+/// to an end finding of `property`'s. A finding naming no subject never
+/// joins, so it fails closed, and so does a member whose report kept none
+/// of its violations, or every member when the report kept none of
 /// `property`'s.
-///
-/// Within one step this can't tell subjects apart: two findings about
-/// different connections at the step of the case's break both join.
 fn joined(reports: &[PropertyReport], property: &str, set: &[String]) -> Result<(), WitnessError> {
-    let step_found = |report: &PropertyReport| {
-        let steps = report.violations.len().saturating_sub(report.end_found);
-        report.violations[..steps].to_vec()
-    };
-    let own = reports
+    use crate::{check::FindingSubject, harness::header_acceptance::refs::Ref, Violation};
+    let (own_steps, own_ends) = reports
         .iter()
         .find(|r| r.property == property)
-        .map(step_found)
+        .map(found_where)
         .unwrap_or_default();
+    let subject = |violation: &Violation| violation.subject.clone();
     for member in set {
         let Some(report) = reports.iter().find(|r| &r.property == member) else {
             continue;
@@ -786,10 +801,26 @@ fn joined(reports: &[PropertyReport], property: &str, set: &[String]) -> Result<
                 step: None,
             });
         }
-        let steps = report.violations.len().saturating_sub(report.end_found);
-        for (at, violation) in report.violations.iter().enumerate() {
+        let (steps, ends) = found_where(report);
+        for violation in steps {
             let cause = violation.witness.first().copied().unwrap_or(violation.step);
-            let tied = at < steps && own.iter().any(|break_| break_.step == cause);
+            let tied = violation.subject.as_ref().is_some_and(|named| {
+                FindingSubject::joined(named, own_steps, subject)
+                    .iter()
+                    .any(|break_| break_.step == cause)
+            });
+            if !tied {
+                return Err(WitnessError::Unjoined {
+                    property: member.clone(),
+                    step: Some(violation.step),
+                });
+            }
+        }
+        for violation in ends {
+            let tied = violation
+                .subject
+                .as_ref()
+                .is_some_and(|named| !FindingSubject::joined(named, own_ends, subject).is_empty());
             if !tied {
                 return Err(WitnessError::Unjoined {
                     property: member.clone(),
@@ -799,6 +830,13 @@ fn joined(reports: &[PropertyReport], property: &str, set: &[String]) -> Result<
         }
     }
     Ok(())
+}
+
+/// `report`'s violations split into the ones its steps found and the ones
+/// the run's end found, the last `end_found`.
+fn found_where(report: &PropertyReport) -> (&[crate::Violation], &[crate::Violation]) {
+    let steps = report.violations.len().saturating_sub(report.end_found);
+    report.violations.split_at(steps)
 }
 
 #[cfg(test)]
@@ -825,9 +863,28 @@ mod tests {
         }
     }
 
-    /// `property`'s violation at `step`, depending on `witness`.
+    /// The one punishment every test violation names, so a set's join
+    /// comes down to its steps unless a test moves it.
+    fn punished() -> crate::check::FindingSubject {
+        crate::check::FindingSubject::Punishment {
+            connection: 1,
+            event: 40,
+            frame: Some(crate::check::FrameRef {
+                connection: 1,
+                kind: 5,
+                version: 9,
+                quic_stream: 4,
+                inbound: true,
+                seq: 3,
+            }),
+        }
+    }
+
+    /// `property`'s violation at `step`, depending on `witness`, about the
+    /// one test punishment ([`punished`]).
     fn violation(property: &str, step: u64, witness: &[u64]) -> Violation {
         Violation {
+            subject: Some(punished()),
             property: property.to_owned(),
             step,
             witness: witness.to_vec(),
@@ -850,6 +907,65 @@ mod tests {
                 },
             )
         }
+    }
+
+    /// A `NotApplicable` expectation passes only while its property stays
+    /// `NotApplicable` and nothing else is violated or left incomplete: its
+    /// property held, another property's violation, or another left
+    /// `assumptions-never-held`, fails it. The name reads back.
+    #[test]
+    fn not_applicable_needs_its_property_unapplied_and_the_rest_whole() {
+        let ended = RunEnd {
+            outcome: Outcome::Idle {
+                status: crate::IdleStatus::Quiescent,
+            },
+            steps: 5,
+            violation: None,
+            drain: None,
+            harness: None,
+            rest: None,
+        };
+        let report = |own: PropertyOutcome, other: PropertyOutcome| RunReport {
+            end: ended.clone(),
+            properties: vec![
+                PropertyReport::new("test/own", own),
+                PropertyReport::new("test/other", other),
+            ],
+            cleanup: Default::default(),
+            log: Default::default(),
+            picks: Vec::new(),
+            resolved: Default::default(),
+        };
+        let unapplied = PropertyOutcome::not_applicable(NaReason::NeverApplied);
+        let held = PropertyOutcome::Held { applicable: 1 };
+        let judged = |report: &RunReport| {
+            judge(
+                report,
+                "test/own",
+                Status::Active,
+                Expect::NotApplicable,
+                &[],
+            )
+        };
+        assert_eq!(judged(&report(unapplied.clone(), held.clone())), Ok(()));
+        assert_eq!(
+            judged(&report(held.clone(), held.clone())),
+            Err(WitnessError::Outcome(held.clone()))
+        );
+        let violated = PropertyOutcome::Violated { witness: vec![2] };
+        assert!(matches!(
+            judged(&report(unapplied.clone(), violated)),
+            Err(WitnessError::Unrelated { .. })
+        ));
+        let incomplete = PropertyOutcome::not_applicable(NaReason::AssumptionsNeverHeld);
+        assert!(matches!(
+            judged(&report(unapplied, incomplete)),
+            Err(WitnessError::UnrelatedIncomplete { .. })
+        ));
+        assert_eq!(
+            "not-applicable".parse::<Expect>(),
+            Ok(Expect::NotApplicable)
+        );
     }
 
     /// A run the property itself stopped fails `Holds` and `Applicable`
@@ -1082,12 +1198,13 @@ mod tests {
     }
 
     /// C6: every violation of every member must be tied to the case's own
-    /// break through its witness's first step. A member broken at the break's
-    /// step joins, and so does a nested expiry opened at it. A
-    /// member broken at another step only, one the run's end found, or one
-    /// whose report kept no violation fails closed. Two findings at the
-    /// break's step, as for two connections, both join: the witness can't
-    /// tell subjects apart within one step, and every one must join.
+    /// break through its witness's first step, beside its subject, which
+    /// every finding here shares ([`punished`]). A member broken at the
+    /// break's step joins, and so does a nested expiry opened at it. A
+    /// member broken at another step only, one the run's end found with no
+    /// subject, or one whose report kept no violation fails closed. Every
+    /// one of a member's violations must join: two about the case's
+    /// punishment at its step do, and one at another step fails the set.
     #[test]
     fn every_member_violation_joins_the_case_s_break() {
         let set = ["test/co".to_owned()];
@@ -1173,8 +1290,8 @@ mod tests {
             judged(violated_report("test/co", &[(2, &[2])])),
             unjoined(Some(2))
         );
-        // Two connections broken at the break's step both join, and every
-        // violation must: one at another step fails the set.
+        // Two findings about the break's punishment at its step both join,
+        // and every violation must: one at another step fails the set.
         assert_eq!(
             judged(violated_report("test/co", &[(3, &[3]), (3, &[3])])),
             Ok(())
@@ -1194,6 +1311,95 @@ mod tests {
                 PropertyOutcome::Violated { witness: vec![3] }
             )),
             unjoined(None)
+        );
+    }
+
+    /// C6's per-subject end join: a member's end finding joins the case's
+    /// own end finding about the same subject, and with any one key of that
+    /// subject moved it doesn't (Rule 25's template). A member's end finding
+    /// naming no subject, or a case whose own end finding names none,
+    /// doesn't join either.
+    #[test]
+    fn an_end_found_member_joins_the_case_s_end_break_by_subject() {
+        use crate::{
+            check::FindingSubject,
+            harness::header_acceptance::refs::one_key_off::assert_one_key_off,
+        };
+        let set = ["test/co".to_owned()];
+        let unread = FindingSubject::Publication {
+            state_version: "StateVersion(4)".to_owned(),
+        };
+        let at_end = |property: &str, subject: Option<&FindingSubject>| {
+            let mut found = violation(property, 6, &[6]);
+            found.subject = subject.cloned();
+            PropertyReport {
+                violations: vec![found],
+                end_found: 1,
+                ..PropertyReport::new(property, PropertyOutcome::Violated { witness: vec![6] })
+            }
+        };
+        let judged = |own: Option<&FindingSubject>, member: Option<&FindingSubject>| {
+            let mut report = stopped_by("test/own");
+            report.end.outcome = Outcome::Idle {
+                status: crate::IdleStatus::Quiescent,
+            };
+            report.end.violation = None;
+            report.end.steps = 6;
+            report.properties = vec![at_end("test/own", own), at_end("test/co", member)];
+            judge(
+                &report,
+                "test/own",
+                Status::Active,
+                Expect::ViolatedSet,
+                &set,
+            )
+        };
+        assert_eq!(judged(Some(&unread), Some(&unread)), Ok(()));
+        assert_one_key_off::<FindingSubject>(&unread, |member| {
+            judged(Some(&unread), Some(member)).is_ok()
+        });
+        let unjoined = Err(WitnessError::Unjoined {
+            property: "test/co".to_owned(),
+            step: Some(6),
+        });
+        assert_eq!(judged(Some(&unread), None), unjoined);
+        assert_eq!(judged(None, Some(&unread)), unjoined);
+    }
+
+    /// C6's per-subject join at the break's step: a member's punishment at
+    /// the step of the case's own joins only the case's punishment of the
+    /// same connection, by the same event, answering the same frame. Each
+    /// key of that subject moved on its own leaves it unjoined (Rule 25's
+    /// template), and so does a member naming no subject, though its step
+    /// is the break's.
+    #[test]
+    fn a_member_at_the_break_s_step_joins_by_its_punishment() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let set = ["test/co".to_owned()];
+        let judged = |subject: Option<crate::check::FindingSubject>| {
+            let mut member = violated_report("test/co", &[(3, &[3])]);
+            member.violations[0].subject = subject;
+            let mut report = stopped_by("test/own");
+            report.properties.push(member);
+            judge(
+                &report,
+                "test/own",
+                Status::Active,
+                Expect::ViolatedSet,
+                &set,
+            )
+        };
+        assert_eq!(judged(Some(punished())), Ok(()));
+        let keys = assert_one_key_off::<crate::check::FindingSubject>(&punished(), |subject| {
+            judged(Some(subject.clone())).is_ok()
+        });
+        assert_eq!(keys, 8);
+        assert_eq!(
+            judged(None),
+            Err(WitnessError::Unjoined {
+                property: "test/co".to_owned(),
+                step: Some(3),
+            })
         );
     }
 }

@@ -7,6 +7,7 @@
 //! static checks in `tests/header_acceptance.rs` compare two independent
 //! lists.
 
+use super::refs::{HistoryRunRef, PlantedRef, Ref};
 use super::required as obligation;
 use super::{
     sim_test, Approval, CaseRef, Expected, ExpectedNa, ExpectedResult, Found, Gate, HistoryRef,
@@ -90,6 +91,14 @@ const SIM_WIDE: [&str; 2] = ["sim/no-task-panic", "sim/no-livelock"];
 const PENALIZED: &str = "header-sync/header-fault-penalized";
 /// `session/honest-never-punished`.
 const HONEST: &str = "session/honest-never-punished";
+/// `header-sync/s5v9/conformant-never-closes`, the broader claim
+/// [`NESTS`] lists over [`HONEST`].
+const CONFORMANT: &str = "header-sync/s5v9/conformant-never-closes";
+
+/// The v9 subscriber's rule that an outcome nothing it sent asked for
+/// closes the subscription, which [`NESTS`] lists over the bad-content
+/// close.
+const UNSOLICITED: &str = "header-sync/s5v9/headers-outcome/unsolicited-closes";
 
 /// What the storage harness registers, which the release-wake, flood and
 /// repair harnesses register too, and the wire harness all but its last,
@@ -143,12 +152,47 @@ pub fn harness_matrix() -> Vec<(&'static str, &'static str, Status)> {
 /// The file of `header-sync/wire`'s generated witnesses.
 const WIRE_WITNESS: &str = "tests/header_wire_witness.rs";
 
+/// The file of the despite-close case's companion tests.
+const DESPITE_CLOSE_TESTS: &str = "tests/header_despite_close.rs";
+/// The acceptance tool's integration tests: gate 1's A/A and A/B/A
+/// comparison and its replay store control.
+const TOOL_TESTS: &str = "tests/header_acceptance_tool.rs";
+
+/// The file of `header-sync/wire`'s receiver-direction table checks, whose
+/// per-row content tests carry the fault close a content rejection owes.
+const TABLE_TESTS: &str = "tests/header_wire_table.rs";
+
+/// The file of gate 3's crossing histories on `header-sync/wire`, each a
+/// `subscribe-headers` update that crosses the node's ending.
+const CROSSING_TESTS: &str = "tests/header_wire_crossing.rs";
+
 /// One generated `s5v9` ID's row data: its suffix, the witness test that
-/// names its passing history, and the gates it serves.
+/// names its passing history, the gates it serves, and its catch.
 struct Generated {
     suffix: &'static str,
     witness: &'static str,
     gates: &'static [Gate],
+    catch: GeneratedCatch,
+}
+
+/// How a generated ID's catch is settled (decision 1): by its planted case
+/// under `qa/planted/header-sync/s5v9/`, or by an `Open` saying why no
+/// production patch breaks the ID alone.
+#[derive(Clone, Copy)]
+enum GeneratedCatch {
+    /// The case's name. Its set is the ID alone, and it's found at a step.
+    Case(&'static str),
+    /// [`Case`](GeneratedCatch::Case)'s case, and a second case of the ID,
+    /// caught the same way, that isn't its catch but proves something
+    /// beside it, such as a contract's.
+    Cases(&'static str, &'static str),
+    /// The case's name and the broader IDs its patch breaks only after the
+    /// case's own break, which [`NESTS`] lists over the ID: the patched run
+    /// stops at the ID alone, and the case's `Draft` run shows the ID and
+    /// every broader one ([`Found::AtStepSetOnDraft`]).
+    CaseSetOnDraft(&'static str, &'static [&'static str]),
+    /// The `Open`'s reason and its approval.
+    Open(&'static str, Approval),
 }
 
 /// The honest witness, and the check that the witnesses list every ID.
@@ -182,49 +226,233 @@ const G1: &[Gate] = &[Gate::G1];
 const NONE: &[Gate] = &[];
 
 /// Header sync's 32 generated IDs on `main`.
-const GENERATED: [Generated; 32] = [
-    gen("conformant-never-closes", EVERY, G2),
-    gen("status/sender-cadence", EVERY, G34),
-    gen("subscribe-headers/sender-within-live", EVERY, G3),
-    gen("subscribe-headers/sender-within-credit", EVERY, G3),
-    gen("headers/sender-answers-open", EVERY, G3),
-    gen("headers-outcome/sender-ends-once", EVERY, G3),
-    gen("undeclared-type-closes", STATUS, G2),
-    gen("status/reserved-flags-closes", STATUS, G2),
-    gen("status/short-payload-closes", STATUS, G2),
-    gen("status/long-payload-closes", STATUS, G2),
-    gen("status/bad-content-closes", STATUS, G2),
-    gen("status/cadence-never-closes", STATUS, G24),
-    gen("subscribe-headers/reserved-flags-closes", SUBSCRIBE, G2),
-    gen("subscribe-headers/short-payload-closes", SUBSCRIBE, G2),
-    gen("subscribe-headers/long-payload-closes", SUBSCRIBE, G2),
-    gen("subscribe-headers/over-live-closes", SUBSCRIBE, G23),
-    gen("subscribe-headers/over-credit-closes", SUBSCRIBE, G23),
-    gen("subscribe-headers/after-close-closes", SUBSCRIBE, G23),
-    gen("subscribe-headers/bad-cursor-closes", SUBSCRIBE, G23),
-    gen("subscribe-headers/bad-content-closes", SUBSCRIBE, G2),
-    gen("headers/reserved-flags-closes", HEADERS, G2),
-    gen("headers/short-payload-closes", HEADERS, G2),
-    gen("headers/long-payload-closes", HEADERS, G2),
-    gen("headers/unsolicited-closes", HEADERS, G2),
-    gen("headers/bad-content-closes", HEADERS, G2),
-    gen("headers/over-owed-closes", HEADERS, G23),
-    gen("headers-outcome/reserved-flags-closes", OUTCOME, G2),
-    gen("headers-outcome/short-payload-closes", OUTCOME, G2),
-    gen("headers-outcome/long-payload-closes", OUTCOME, G2),
-    gen("headers-outcome/unsolicited-closes", OUTCOME, G2),
-    gen("headers-outcome/bad-content-closes", OUTCOME, G2),
-    gen("headers-outcome/over-owed-closes", OUTCOME, G23),
-];
+const GENERATED: [Generated; 32] = {
+    use GeneratedCatch::{Case, CaseSetOnDraft, Cases, Open};
+    [
+        gen(
+            "conformant-never-closes",
+            EVERY,
+            G2,
+            Case("target-page-refused"),
+        ),
+        gen(
+            "status/sender-cadence",
+            EVERY,
+            G34,
+            Case("pacing-floors-cut"),
+        ),
+        gen(
+            "subscribe-headers/sender-within-live",
+            EVERY,
+            G3,
+            CaseSetOnDraft("open-repeated", &[CONFORMANT, HONEST]),
+        ),
+        gen(
+            "subscribe-headers/sender-within-credit",
+            EVERY,
+            G3,
+            CaseSetOnDraft("page-past-credit", &["sim/no-livelock"]),
+        ),
+        gen(
+            "headers/sender-answers-open",
+            EVERY,
+            G3,
+            Case("page-misnamed"),
+        ),
+        gen(
+            "headers-outcome/sender-ends-once",
+            EVERY,
+            G3,
+            Case("outcome-misnamed"),
+        ),
+        gen(
+            "undeclared-type-closes",
+            STATUS,
+            G2,
+            Case("undeclared-type-skipped"),
+        ),
+        gen(
+            "status/reserved-flags-closes",
+            STATUS,
+            G2,
+            // The second is C21's proof for the generated receiver checks.
+            Cases("reserved-flags-skipped", "two-reserved-flags-skipped"),
+        ),
+        gen(
+            "status/short-payload-closes",
+            STATUS,
+            G2,
+            Case("short-payload-skipped"),
+        ),
+        gen(
+            "status/long-payload-closes",
+            STATUS,
+            G2,
+            Case("oversize-skipped"),
+        ),
+        gen(
+            "status/bad-content-closes",
+            STATUS,
+            G2,
+            Case("work-anchor-unchecked"),
+        ),
+        gen(
+            "status/cadence-never-closes",
+            STATUS,
+            G24,
+            Case("exhausted-cadence-throttled"),
+        ),
+        gen(
+            "subscribe-headers/reserved-flags-closes",
+            SUBSCRIBE,
+            G2,
+            Case("reserved-flags-skipped"),
+        ),
+        gen(
+            "subscribe-headers/short-payload-closes",
+            SUBSCRIBE,
+            G2,
+            Case("short-payload-skipped"),
+        ),
+        gen(
+            "subscribe-headers/long-payload-closes",
+            SUBSCRIBE,
+            G2,
+            Case("oversize-skipped"),
+        ),
+        gen(
+            "subscribe-headers/over-live-closes",
+            SUBSCRIBE,
+            G23,
+            Case("no-slot-dropped"),
+        ),
+        gen(
+            "subscribe-headers/over-credit-closes",
+            SUBSCRIBE,
+            G23,
+            Case("above-reservation-skipped"),
+        ),
+        gen(
+            "subscribe-headers/after-close-closes",
+            SUBSCRIBE,
+            G23,
+            Case("after-close-dropped"),
+        ),
+        gen(
+            "subscribe-headers/bad-cursor-closes",
+            SUBSCRIBE,
+            G23,
+            Case("unknown-acknowledgement-dropped"),
+        ),
+        gen(
+            "subscribe-headers/bad-content-closes",
+            SUBSCRIBE,
+            G2,
+            Case("repeated-locator-unchecked"),
+        ),
+        gen(
+            "headers/reserved-flags-closes",
+            HEADERS,
+            G2,
+            Case("reserved-flags-skipped"),
+        ),
+        gen(
+            "headers/short-payload-closes",
+            HEADERS,
+            G2,
+            Case("short-payload-skipped"),
+        ),
+        gen(
+            "headers/long-payload-closes",
+            HEADERS,
+            G2,
+            Open(LONG_PAGE_UNREACHED, HDR_14_5_RULING),
+        ),
+        gen(
+            "headers/unsolicited-closes",
+            HEADERS,
+            G2,
+            Case("unsolicited-skipped"),
+        ),
+        gen(
+            "headers/bad-content-closes",
+            HEADERS,
+            G2,
+            Case("unlinked-page-dropped"),
+        ),
+        gen(
+            "headers/over-owed-closes",
+            HEADERS,
+            G23,
+            Open(NOT_OWED, Approval::Pending),
+        ),
+        gen(
+            "headers-outcome/reserved-flags-closes",
+            OUTCOME,
+            G2,
+            Case("reserved-flags-skipped"),
+        ),
+        gen(
+            "headers-outcome/short-payload-closes",
+            OUTCOME,
+            G2,
+            Case("short-payload-skipped"),
+        ),
+        gen(
+            "headers-outcome/long-payload-closes",
+            OUTCOME,
+            G2,
+            Case("oversize-skipped"),
+        ),
+        gen(
+            "headers-outcome/unsolicited-closes",
+            OUTCOME,
+            G2,
+            Case("unsolicited-skipped"),
+        ),
+        gen(
+            "headers-outcome/bad-content-closes",
+            OUTCOME,
+            G2,
+            CaseSetOnDraft("outcome-window-unchecked", &[UNSOLICITED]),
+        ),
+        gen(
+            "headers-outcome/over-owed-closes",
+            OUTCOME,
+            G23,
+            Open(NOT_OWED, Approval::Pending),
+        ),
+    ]
+};
 
 /// A [`Generated`] entry.
-const fn gen(suffix: &'static str, witness: &'static str, gates: &'static [Gate]) -> Generated {
+const fn gen(
+    suffix: &'static str,
+    witness: &'static str,
+    gates: &'static [Gate],
+    catch: GeneratedCatch,
+) -> Generated {
     Generated {
         suffix,
         witness,
         gates,
+        catch,
     }
 }
+
+/// Adam's hdr-14.5 ruling on the generated IDs' open catches.
+const HDR_14_5_RULING: Approval = Approval::Adam {
+    record: "Adam, 2026-11-12, hdr-14.5 ruling",
+};
+
+/// Why `headers/long-payload-closes` has no catch: no patch to one path
+/// breaks it alone.
+const LONG_PAGE_UNREACHED: &str =
+    "on the simulator's Regtest headers the node grants a subscription at most 4,000 smallest \
+     pages of byte credit, about 1 MiB, which is less than the headers row's 2 MiB maximum, so a \
+     page past that maximum is past its credit too, as the act's two labels say, and the \
+     subscriber's precheck refuses it before the frame filter's cap does; a patch that has the \
+     reader skip both refusals drains the page at 0 ns and breaks sim/no-livelock first";
 
 /// The generated IDs no header-sync scenario reaches, and why.
 const NOT_OWED: &str = "header sync's responses answer a subscription, whose pages spend credit, \
@@ -291,15 +519,58 @@ const CLOSE_RELINK_TEARDOWN: HistoryRef = HistoryRef {
     case: "committed close-relink input",
 };
 
-/// The committed stale-prepare input.
-const STALE_PREPARE: HistoryRef = HistoryRef {
+/// The committed close-relink input, under the stale witness. The
+/// committed stale-prepare input isn't counted: its scenario's last control
+/// step never runs within the step budget, so its actions never complete.
+const STALE_CLOSE_RELINK: HistoryRef = HistoryRef {
     harness: STORAGE,
     witness: sim_test(
         "tests/header_stale.rs",
-        "the_stale_prepare_input_holds_stale_completion_inert",
+        "the_close_relink_input_holds_stale_completion_inert",
     ),
-    case: "committed stale-prepare input",
+    case: "committed close-relink input",
 };
+
+/// The mixed resource witness's test (gate 5), which runs its committed
+/// fixture once.
+const MIXED_TEST: TestRef = sim_test(
+    "tests/header_mixed_resources.rs",
+    "the_mixed_fixture_holds_every_resource_rule",
+);
+
+/// Gate 5's mixed resource witness: the one storage history where close and
+/// relink churn, a reset, a reply hold, a held prepare, a `Shutdown` and a
+/// `StopStorage` run together. It's counted once per resource rule in
+/// [`MIXED_TARGETS`], each with its own whole-report pass, and its test's
+/// own pass is `gate-5/mixed-witness`, which also requires the control
+/// picks in order and the node settled at its reactor's exit. Like every
+/// `Holds`, these count only in the frozen-head run's record, which runs on
+/// `main` once hdr-14 has merged.
+const MIXED_RESOURCES: HistoryRef = HistoryRef {
+    harness: STORAGE,
+    witness: MIXED_TEST,
+    case: "header-resources-mixed",
+};
+
+/// The four `Sim` resource rules [`MIXED_RESOURCES`] judges.
+const MIXED_TARGETS: [&str; 4] = [CHUNK, TEARDOWN, STALE, OUTSTANDING];
+
+/// `property`'s `Holds` on [`MIXED_RESOURCES`]. It takes its key, the
+/// history's pass for `property`, from [`attach_history_passes`]. No
+/// storage scenario declares a livelock assumption or a recovery, so those
+/// two stay `NotApplicable`, and every other ID the storage harness
+/// registers must hold ([`super::not_applicable::history_expected`]).
+fn mixed(property: &'static str) -> ExpectedResult {
+    result(
+        Vec::new(),
+        G5,
+        Expected::Holds {
+            property,
+            history: MIXED_RESOURCES,
+            not_applicable: super::not_applicable::history_expected(MIXED_RESOURCES),
+        },
+    )
+}
 
 /// Each reset witness's name, as its witness test prefixes its executions.
 const RESET_CASES: [&str; 10] = [
@@ -579,6 +850,20 @@ const HONEST_PEER: HistoryRef = HistoryRef {
     case: "both ways",
 };
 
+/// The committed late-fault fixture on `header-sync/wire`: the node
+/// penalizes the session that sent an invalid page after that session
+/// ended. It's `header-fault-penalized`'s counted history, since that ID's
+/// `COVERAGE` test runs the test-only `test/header-wire-watched` harness
+/// ([`TEST_ONLY_WITNESSES`]).
+const LATE_FAULT: HistoryRef = HistoryRef {
+    harness: WIRE,
+    witness: sim_test(
+        "tests/header_wire_prepare_fault.rs",
+        "the_late_fault_fixture_penalizes_after_the_session_ended",
+    ),
+    case: "committed late-fault input",
+};
+
 /// The smoke harness's clean run.
 const SMOKE_RUN: HistoryRef = HistoryRef {
     harness: SMOKE,
@@ -630,7 +915,9 @@ fn transitional(reason: &'static str, owner: &'static str, until: &'static str) 
     }
 }
 
-/// `Holds` on `history` for `property`'s passing key.
+/// `Holds` on `history` for `property`'s passing key, expecting the
+/// history's own `NotApplicable` reports
+/// ([`super::not_applicable::history_expected`]).
 fn holds(property: &'static str, gates: &[Gate], history: HistoryRef) -> Vec<ExpectedResult> {
     vec![result(
         vec![Key::passing(property)],
@@ -638,15 +925,19 @@ fn holds(property: &'static str, gates: &[Gate], history: HistoryRef) -> Vec<Exp
         Expected::Holds {
             property,
             history,
-            not_applicable: &[],
+            not_applicable: super::not_applicable::history_expected(history),
         },
     )]
 }
 
 /// Each counted execution's replay and each counted history's cleanup
-/// comparison, once per execution however many rows count it. A machine
-/// history's cleanup key is an approved standing `Open`, and a node
-/// history's waits for hf-6's stores.
+/// comparison, once per execution however many rows count it, and each
+/// node history's expected `NotApplicable` list. A machine history's
+/// cleanup key is an approved standing `Open`, and a node history's waits
+/// for the per-run comparison ([`NODE_CLEANUP`]). A node history's list
+/// key takes the history's own whole-report pass from `expected`, which
+/// judges every report against the list its row carries
+/// ([`super::not_applicable::history_expected`]).
 pub fn counted_results(expected: &[ExpectedResult]) -> Vec<ExpectedResult> {
     let mut replayed = std::collections::BTreeSet::new();
     let mut cleaned = std::collections::BTreeSet::new();
@@ -689,23 +980,45 @@ pub fn counted_results(expected: &[ExpectedResult]) -> Vec<ExpectedResult> {
         results.push(result(vec![Key::Cleanup { run }], G1, cleanup));
     }
     for run in listed {
-        results.push(result(vec![Key::NaList { run }], &[Gate::G6], NA_LIST));
+        let pass = history_pass(expected, &run)
+            .expect("every counted history has its whole-report pass, by attach_history_passes");
+        results.push(result(vec![Key::NaList { run }], &[Gate::G6], pass));
     }
     results
 }
 
+/// The `Holds` or `StaysNotApplicable` of `expected` that judges history
+/// `run`'s whole report, joined on the history's whole [`HistoryRunRef`],
+/// if one does.
+fn history_pass(expected: &[ExpectedResult], run: &RunId) -> Option<Expected> {
+    let want = HistoryRunRef::of_run(run)?;
+    expected.iter().find_map(|result| match result.expected {
+        Expected::Holds { history, .. } | Expected::StaysNotApplicable { history, .. }
+            if HistoryRunRef::joins(&want, &history, |history| {
+                Some(HistoryRunRef::of(*history))
+            }) =>
+        {
+            Some(result.expected.clone())
+        }
+        _ => None,
+    })
+}
+
 /// Gives each counted history its whole-report key: on the row's own
-/// result when a row's `Holds` already judges that history for its target,
-/// or as a `Holds` of its target otherwise.
+/// result when a row's `Holds` already judges that history, joined on its
+/// whole [`HistoryRunRef`], for its target, or as a `Holds` of its target
+/// otherwise.
 pub fn attach_history_passes(expected: &mut Vec<ExpectedResult>) {
     for (history, target) in history_targets() {
         let key = Key::History {
             run: history.into(),
             target: target.to_owned(),
         };
+        let want = HistoryRunRef::of(history);
         let row = expected.iter_mut().find(|result| {
             matches!(result.expected, Expected::Holds { property, history: h, .. }
-                if h == history && property == target)
+                if HistoryRunRef::joins(&want, &h, |h| Some(HistoryRunRef::of(*h)))
+                    && property == target)
         });
         match row {
             Some(result) => result.keys.push(key),
@@ -717,7 +1030,7 @@ pub fn attach_history_passes(expected: &mut Vec<ExpectedResult>) {
                     Expected::Holds {
                         property: target,
                         history,
-                        not_applicable: &[],
+                        not_applicable: super::not_applicable::history_expected(history),
                     },
                 ));
             }
@@ -735,22 +1048,17 @@ pub const MACHINE_CLEANUP: Expected = Expected::Open {
     until: None,
 };
 
-/// A node execution's cleanup key, until hf-6's stores can be snapshotted.
+/// A node execution's cleanup key. hf-6 delivered the comparison itself,
+/// `cleanup::run_compared`, which C17's tests run on the witnesses, but no
+/// recorded run carries its result yet: the recorder doesn't compare a
+/// run's stores and log after cleanup with their freeze, so the acceptance
+/// tool has nothing per execution to read.
 pub const NODE_CLEANUP: Expected = Expected::Open {
-    reason: "the cleanup comparison snapshots the stores hf-6 registers",
+    reason: "each recorded node run's stores and log, compared after cleanup with their freeze \
+             (cleanup::run_compared), which the recorder doesn't write yet",
     owner: "Adam's harness",
     approval: Approval::Pending,
-    until: Some("hf-6"),
-};
-
-/// A node history's expected `NotApplicable` list, until C1's reasons let
-/// each one be written with the reason its report must carry.
-pub const NA_LIST: Expected = Expected::Open {
-    reason: "the history's expected NotApplicable reports, each with the reason C1 makes a \
-             report carry",
-    owner: "Adam's side",
-    approval: Approval::Pending,
-    until: Some("E1"),
+    until: Some("hdr-14.8"),
 };
 
 /// Whether `harness` is a machine, by
@@ -783,16 +1091,20 @@ fn plan_cases(prefix: &'static str, inputs: &'static str, count: usize) -> Vec<&
 /// from the tests. Each owes its replay, its cleanup comparison and, on a
 /// node harness, its expected `NotApplicable` list, whether or not a row's
 /// `Holds` names it. Tests that run several, such as the honest-peer
-/// witness's five, list each.
+/// witness's five, list each. A history [`history_targets`] counts for
+/// several targets is listed once.
 pub fn counted_histories() -> Vec<HistoryRef> {
+    let mut seen = std::collections::BTreeSet::new();
     history_targets()
         .into_iter()
         .map(|(history, _)| history)
+        .filter(|history| seen.insert(*history))
         .collect()
 }
 
 /// Every counted history with the property its whole-report pass judges as
-/// its target: the ID the witness test runs it for.
+/// its target: the ID the witness test runs it for. The mixed resource
+/// witness is run for each of its four rules, so it's listed once per rule.
 pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
     let mut histories = vec![(BOTH_WAYS, generated_ids()[0])];
     for (generated, id) in GENERATED.iter().zip(generated_ids()) {
@@ -877,14 +1189,16 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
             RECOVERY_ID,
         ));
     }
+    histories.extend(MIXED_TARGETS.map(|target| (MIXED_RESOURCES, target)));
     histories.extend([
         (CLOSE_RELINK_CAPACITY, CHUNK),
         (CLOSE_RELINK_TEARDOWN, TEARDOWN),
-        (STALE_PREPARE, STALE),
+        (STALE_CLOSE_RELINK, STALE),
         (RELEASE_INPUT, WAKES),
         (FLOOD_WIRE, WATCH_WIRE),
         (FLOOD_LIFECYCLE, WATCH_LIFECYCLE),
         (SMOKE_RUN, SIM_WIDE[0]),
+        (LATE_FAULT, PENALIZED),
         (REACTOR_RUN, REACTOR),
         (PUBLISHER_RUN, PUBLISHER),
     ]);
@@ -918,7 +1232,8 @@ fn caught(
             set,
             found,
             companions: &[],
-            not_applicable: &[],
+            not_applicable: super::not_applicable::expected(case),
+            patched_not_applicable: super::not_applicable::patched_expected(case),
         },
     )]
 }
@@ -944,26 +1259,6 @@ pub fn native_open(until: &'static str) -> Expected {
         "Adam's side",
         until,
     )
-}
-
-/// A retired native mutation's transitional `Open`: its witness is a test
-/// outside the simulator, which the runner doesn't run yet, so its key
-/// blocks until hdr-14.7b runs it unpatched, patched (with the required
-/// failure its README names) and restored.
-pub fn retired_open() -> Expected {
-    transitional(
-        "a retired native mutation's witness runs outside the simulator, which the runner can't \
-         run yet",
-        "the acceptance runner",
-        "hdr-14.7b",
-    )
-}
-
-/// `key`'s expected result with the gates `gates`: the transitional `Open`
-/// [`owed_open`] writes for it.
-fn owed(key: Key, gates: &[Gate]) -> ExpectedResult {
-    let open = owed_open(&key).expect("every key a row calls owed for has an owed_open entry");
-    result(vec![key], gates, open)
 }
 
 /// The witness and bypass tests `COVERAGE` names for a header row, each an
@@ -998,7 +1293,7 @@ pub fn witness_tests() -> Vec<TestRef> {
         ),
         CLOSE_RELINK_CAPACITY.witness,
         CLOSE_RELINK_TEARDOWN.witness,
-        STALE_PREPARE.witness,
+        STALE_CLOSE_RELINK.witness,
         RESET_WITNESSES.witness,
         CHAIN_WITNESSES.witness,
         AUTHORITY_WITNESSES.witness,
@@ -1063,9 +1358,23 @@ pub struct StandingExclusion {
 }
 
 /// The approved standing exclusions of passing, catch and missing-source
-/// keys. None is approved on `main`: the two `over-owed-closes` catch
-/// exclusions still await approval, so they block.
-pub static STANDING_EXCLUSIONS: &[StandingExclusion] = &[];
+/// keys: `headers/long-payload-closes`' catch, by Adam's hdr-14.5 ruling,
+/// and `sim/no-livelock`'s catch, by his hdr-14.4 one. The two
+/// `over-owed-closes` catch exclusions still await approval, so they block.
+pub static STANDING_EXCLUSIONS: &[StandingExclusion] = &[
+    StandingExclusion {
+        key: ("catch", "header-sync/s5v9/headers/long-payload-closes", ""),
+        owner: "hdr-14",
+        reason: LONG_PAGE_UNREACHED,
+        approval: HDR_14_5_RULING,
+    },
+    StandingExclusion {
+        key: ("catch", "sim/no-livelock", ""),
+        owner: "hdr-14",
+        reason: LIVELOCK_UNCATCHABLE,
+        approval: LIVELOCK_RULING,
+    },
+];
 
 /// Whether `exclusions` grants `key` exactly the standing `Open` `expected`.
 pub fn exclusion_granted(exclusions: &[StandingExclusion], key: &Key, expected: &Expected) -> bool {
@@ -1094,61 +1403,32 @@ pub fn exclusion_granted(exclusions: &[StandingExclusion], key: &Key, expected: 
     })
 }
 
-/// Why a reachable generated ID's catch is still owed.
-const GENERATED_CATCH: &str =
-    "one planted case per reachable generated ID, from about six production patches (decision 1)";
-/// Why a catch with only a scripted bypass is still owed.
-const SCRIPTED_CATCH: &str = "only a scripted bypass today: a production patch gets a Caught, \
-                              or harness-only breakage gets an approved Open";
-/// Why `header-fault-penalized`'s counted history is still owed.
-const PENALIZED_PASSING: &str = "a header-sync/wire history for the penalty, since its \
-                                 COVERAGE test runs test/header-wire-watched";
-/// Why `header-fault-penalized`'s catch is still owed.
-const PENALIZED_CATCH: &str = "late-fault-unpenalized, cooldown-session-gate and short-cooldown \
-                               move from native mutations to typed planted cases, after the ID \
-                               gets a trigger";
-/// Why `honest-never-punished`'s catch is still owed.
-const HONEST_CATCH: &str = "only a scripted bypass today, and any production punishment of an \
-                            honest peer also breaks conformant-never-closes, so its catch is \
-                            nested (decision 2)";
-/// Why a sim-wide ID's catch is still owed.
-const SIM_WIDE_CATCH: &str = "the sim-wide IDs' bypasses run on test-only harnesses, so a \
-                              header-harness catch or an approved Open is still owed";
-/// Why `sim/no-livelock`'s counted history is still owed.
-const LIVELOCK_PASSING: &str = "its witness runs the test-only test/probe harness, which the \
-                                executable can't replay, so a header-harness history or an \
-                                approved Open is owed";
+/// Why `storage-operation-ids` has no catch: its facts are written only by
+/// simulator code, which no production patch reaches.
+const OPERATION_IDS_UNREACHED: &str =
+    "only the controlled storage port, zakura-storage's ControlledPort, numbers the node's \
+     storage operations and logs their submissions and completions, so only storage-fake code \
+     can break the rule and no production patch can";
 
-/// The transitional `Open` each transitional passing or catch key owes,
-/// whole: its reason, owner and the PR it waits for, written from the
-/// plan's PR table. Every reachable generated ID's catch is hdr-14.5's, and
-/// the scripted-only and sim-wide IDs' catches and the two test-only
-/// witnesses' passing histories are hdr-14.4's. [`Key::covers`] takes a
-/// transitional `Open` on such a key only if it's exactly this one.
-pub fn owed_open(key: &Key) -> Option<Expected> {
-    let (reason, until) = match key {
-        Key::Catch { property }
-            if property.starts_with("header-sync/s5v9/")
-                && !property.ends_with("over-owed-closes") =>
-        {
-            (GENERATED_CATCH, "hdr-14.5")
-        }
-        Key::Catch { property }
-            if [OPERATION_IDS, DIRECT_DISPATCH].contains(&property.as_str()) =>
-        {
-            (SCRIPTED_CATCH, "hdr-14.4")
-        }
-        Key::Catch { property } if property == PENALIZED => (PENALIZED_CATCH, "hdr-14.4"),
-        Key::Catch { property } if property == HONEST => (HONEST_CATCH, "hdr-14.4"),
-        Key::Catch { property } if SIM_WIDE.contains(&property.as_str()) => {
-            (SIM_WIDE_CATCH, "hdr-14.4")
-        }
-        Key::Passing { property } if property == PENALIZED => (PENALIZED_PASSING, "hdr-14.4"),
-        Key::Passing { property } if property == SIM_WIDE[1] => (LIVELOCK_PASSING, "hdr-14.4"),
-        _ => return None,
-    };
-    Some(transitional(reason, "Adam's side", until))
-}
+/// Why `sim/no-livelock` has no planted catch: a node spin never ends by
+/// itself, so a case's `Draft` run can't complete. The step loop's detector
+/// is shown on a header fixture by
+/// `tests/header_hold_release.rs::a_spin_with_a_held_reply_open_violates_no_livelock`.
+const LIVELOCK_UNCATCHABLE: &str =
+    "a planted livelock keeps a node task ready at one instant, and the step loop moves the \
+     clock only once no task is ready, so the spin never ends by itself: its Draft run, which \
+     must complete past the stop, runs to its budget and then to the drain's bound, the \
+     harness failure DrainBound; no header fixture holds finite work at one instant near the \
+     limit (honest recoveries take about 480 of 5,000 steps), so no honest patch spins long \
+     enough and then stops. The detector itself is shown on the held-locator header fixture \
+     by tests/header_hold_release.rs::a_spin_with_a_held_reply_open_violates_no_livelock, \
+     whose test-only Spinning harness violates sim/no-livelock with no panic and no harness \
+     failure";
+
+/// Adam's approval of `sim/no-livelock`'s catch exclusion.
+const LIVELOCK_RULING: Approval = Approval::Adam {
+    record: "Adam, 2026-11-12, hdr-14.4 sim/no-livelock catch exclusion",
+};
 
 /// Every native mutation directory there has been, written apart from
 /// `NATIVE_MUTATIONS`, so a mutation whose directory and classification are
@@ -1207,22 +1487,26 @@ fn generated_ids() -> &'static [&'static str] {
 }
 
 /// A generated ID's row: its passing history, or its approval-pending
-/// `StaysNotApplicable`, and a transitional catch until hdr-14.5.
+/// `StaysNotApplicable`, and its catch: its planted case's `Caught`, or its
+/// `Open` under the approval its entry names. A second case's `Caught`
+/// covers that case's key alone.
 fn generated_row(generated: &Generated, property: &'static str) -> Row {
     let mut expected = if generated.suffix.ends_with("over-owed-closes") {
+        let history = if generated.witness == HEADERS {
+            wire_history(HEADERS, "headers/unsolicited-closes")
+        } else {
+            wire_history(OUTCOME, "headers-outcome/unsolicited-closes")
+        };
         let results = vec![result(
             vec![Key::passing(property)],
             generated.gates,
             Expected::StaysNotApplicable {
                 property,
-                history: if generated.witness == HEADERS {
-                    wire_history(HEADERS, "headers/unsolicited-closes")
-                } else {
-                    wire_history(OUTCOME, "headers-outcome/unsolicited-closes")
-                },
+                history,
+                na_reason: crate::NaReason::NeverApplied,
                 reason: NOT_OWED,
                 approval: Approval::Pending,
-                not_applicable: &[],
+                not_applicable: super::not_applicable::history_expected(history),
             },
         )];
         results
@@ -1234,19 +1518,52 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
         };
         holds(property, generated.gates, history)
     };
-    if !generated.suffix.ends_with("over-owed-closes") {
-        expected.push(owed(Key::catch(property), generated.gates));
-    } else {
-        expected.push(result(
+    let caught_by = |name, primary| {
+        // Built once per case for a fixed set of 30, so the leak is
+        // bounded.
+        let set: &'static [&'static str] = Box::leak(Box::new([property]));
+        caught(
+            WIRE,
+            case(property, name),
+            set,
+            Found::AtStep,
+            generated.gates,
+            primary,
+        )
+    };
+    match generated.catch {
+        GeneratedCatch::Case(name) => expected.extend(caught_by(name, true)),
+        GeneratedCatch::Cases(name, second) => {
+            expected.extend(caught_by(name, true));
+            expected.extend(caught_by(second, false));
+        }
+        GeneratedCatch::CaseSetOnDraft(name, broader) => {
+            // As for `Case`, the leak is bounded by the fixed table.
+            let set: &'static [&'static str] = Box::leak(
+                std::iter::once(property)
+                    .chain(broader.iter().copied())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+            expected.extend(caught(
+                WIRE,
+                case(property, name),
+                set,
+                Found::AtStepSetOnDraft,
+                generated.gates,
+                true,
+            ));
+        }
+        GeneratedCatch::Open(reason, approval) => expected.push(result(
             vec![Key::catch(property)],
             generated.gates,
             Expected::Open {
-                reason: NOT_OWED,
+                reason,
                 owner: "hdr-14",
-                approval: Approval::Pending,
+                approval,
                 until: None,
             },
-        ));
+        )),
     }
     Row {
         property,
@@ -1265,14 +1582,31 @@ fn hand_written_rows() -> Vec<Row> {
     let mut rows = Vec::new();
 
     let mut operation_ids = holds(OPERATION_IDS, G1, NODE_SYNC);
-    operation_ids.push(owed(Key::catch(OPERATION_IDS), G1));
+    operation_ids.push(result(
+        vec![Key::catch(OPERATION_IDS)],
+        G1,
+        Expected::Open {
+            reason: OPERATION_IDS_UNREACHED,
+            owner: "hdr-14",
+            approval: Approval::Pending,
+            until: None,
+        },
+    ));
     rows.push(sim_row(OPERATION_IDS, storage_harnesses, operation_ids));
 
     let mut direct = holds(DIRECT_DISPATCH, G1, NODE_SYNC);
-    direct.push(owed(Key::catch(DIRECT_DISPATCH), G1));
+    direct.extend(caught(
+        STORAGE,
+        case(DIRECT_DISPATCH, "locator-to-action-channel"),
+        &[DIRECT_DISPATCH],
+        Found::AtStep,
+        G1,
+        true,
+    ));
     rows.push(sim_row(DIRECT_DISPATCH, storage_harnesses, direct));
 
     let mut chunk = holds(CHUNK, G5, CLOSE_RELINK_CAPACITY);
+    chunk.push(mixed(CHUNK));
     chunk.extend(caught(
         STORAGE,
         case(CHUNK, "uncapped-secondary-reservation"),
@@ -1281,9 +1615,26 @@ fn hand_written_rows() -> Vec<Row> {
         G5,
         true,
     ));
+    // C19's bug-only half (Adam's ruling on question 7): a release that
+    // re-takes the budget's lock leaves a boundary unread at a dry end.
+    let relocks = case(CHUNK, "release-relocks-budget");
+    chunk.push(result(
+        vec![Key::Case {
+            property: CHUNK.to_owned(),
+            name: relocks.name.to_owned(),
+        }],
+        G5,
+        Expected::HarnessCaught {
+            case: relocks,
+            harness: STORAGE,
+            detail: UNREAD_BOUNDARY,
+            not_applicable: super::not_applicable::expected(relocks),
+        },
+    ));
     rows.push(sim_row(CHUNK, storage_harnesses, chunk));
 
     let mut teardown = holds(TEARDOWN, G5, CLOSE_RELINK_TEARDOWN);
+    teardown.push(mixed(TEARDOWN));
     // `forgotten-completion`'s leak shows only at the end, as an end finding.
     for (index, (name, found)) in [
         ("forgotten-completion", Found::AtEnd),
@@ -1292,6 +1643,11 @@ fn hand_written_rows() -> Vec<Row> {
         ("leaked-lease-clone", Found::AtStep),
         ("leaked-reservation-entry", Found::AtStep),
         ("skipped-round-release", Found::AtStep),
+        // hdr-14.4 moved the node-settlement native mutations here, each on
+        // the committed stop-storage seed, which shuts the node down.
+        ("shutdown-kept-queue", Found::AtStep),
+        ("consumed-locator-permit", Found::AtStep),
+        ("forgotten-locator-permit", Found::AtStep),
     ]
     .into_iter()
     .enumerate()
@@ -1307,7 +1663,8 @@ fn hand_written_rows() -> Vec<Row> {
     }
     rows.push(sim_row(TEARDOWN, storage_harnesses, teardown));
 
-    let mut stale = holds(STALE, G5, STALE_PREPARE);
+    let mut stale = holds(STALE, G5, STALE_CLOSE_RELINK);
+    stale.push(mixed(STALE));
     for (index, name) in [
         "stale-charge",
         "stale-credit",
@@ -1315,6 +1672,8 @@ fn hand_written_rows() -> Vec<Row> {
         "stale-retirement",
         "stale-acceptance",
         "stale-close",
+        // hdr-14.4 moved this native mutation here, on the churn witness.
+        "dropped-owner-check",
     ]
     .into_iter()
     .enumerate()
@@ -1420,6 +1779,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "skipped-retirement",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "stale-locator-round",
             STORAGE,
             &[RESET] as &'static [&'static str],
             Found::AtStep,
@@ -1622,6 +1987,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "foreign-leases",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "forwarded-length",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
@@ -1724,7 +2095,25 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "own9-join",
+            WIRE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "owner-swap",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "projection-to-side-tip",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "reordered-payload",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
             Found::AtStep,
@@ -1742,7 +2131,19 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "skewed-remaining",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "skipped-sequence",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "skipped-staging",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
             Found::AtStep,
@@ -1761,6 +2162,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "submitted-source-changed",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "swapped-payload",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
             Found::AtStep,
@@ -1856,11 +2263,24 @@ fn hand_written_rows() -> Vec<Row> {
             index == 0,
         ));
     }
+    // Gap 6: a page staged despite its connection's fault close, judged on
+    // the case's Draft run by its three companions (`companions`).
+    let despite = super::companions::DESPITE_CLOSE;
+    commit.push(result(
+        vec![Key::Case {
+            property: despite.property.to_owned(),
+            name: despite.name.to_owned(),
+        }],
+        G23,
+        despite_close_caught(),
+    ));
     rows.push(sim_row(COMMIT, storage_harnesses, commit));
 
     let mut outstanding = holds(OUTSTANDING, G5, OUTSTANDING_WITNESSES);
+    outstanding.push(mixed(OUTSTANDING));
     // The two cancellation cases' publishers linger at rest, which the end
-    // check finds.
+    // check finds after the drain. The run records that as its stopping
+    // `Violation`, so both are found at a step.
     for (index, (name, harness, set, found)) in [
         (
             "accepted-cursors-kept",
@@ -1878,13 +2298,13 @@ fn hand_written_rows() -> Vec<Row> {
             "cancellation-ignored",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
-            Found::AtEnd,
+            Found::AtStep,
         ),
         (
             "cancellation-ignored-at-capacity",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
-            Found::AtEnd,
+            Found::AtStep,
         ),
         (
             "close-kept-on-replace",
@@ -1972,6 +2392,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "reuse-skipped",
+            STORAGE,
+            &[OUTSTANDING] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "secondary-reservation",
             STORAGE,
             &[OUTSTANDING] as &'static [&'static str],
             Found::AtStep,
@@ -2306,12 +2732,22 @@ fn hand_written_rows() -> Vec<Row> {
         (WATCH_LIFECYCLE, &[WATCH_LIFECYCLE], FLOOD_LIFECYCLE),
     ] {
         let mut watch = holds(id, G1, history);
-        for (name, found) in [
+        let both: &'static [&'static str] = if id == WATCH_WIRE {
+            &[WATCH_WIRE, WATCH_LIFECYCLE]
+        } else {
+            &[WATCH_LIFECYCLE, WATCH_WIRE]
+        };
+        for (name, set, found) in [
             // The revert's starved watch stops the run at a step. The wedged
             // loop leaves a publication unread when the run settles, which
-            // its end check finds.
-            ("watch-check-revert", Found::AtStep),
-            ("wedged-run-loop", Found::AtEnd),
+            // both queues' end checks find, so its set is both rules (C6's
+            // per-subject end join ties them by that publication).
+            (
+                "watch-check-revert",
+                set as &'static [&'static str],
+                Found::AtStep,
+            ),
+            ("wedged-run-loop", both, Found::AtEnd),
         ] {
             watch.extend(caught(
                 FLOOD,
@@ -2327,15 +2763,50 @@ fn hand_written_rows() -> Vec<Row> {
 
     let penalized = PENALIZED;
     // Its COVERAGE test runs the test-only test/header-wire-watched
-    // harness (`TEST_ONLY_WITNESSES`), so its counted history waits for a
-    // registered one.
-    let mut fault = vec![owed(Key::passing(penalized), G2)];
-    fault.push(owed(Key::catch(penalized), G2));
+    // harness (`TEST_ONLY_WITNESSES`), so its counted history is the
+    // committed late fault on header-sync/wire.
+    let mut fault = holds(penalized, G2, LATE_FAULT);
+    // hdr-14.4 moved its three native mutations here, each a typed case on
+    // the scripted late-fault fixture, and each is found at a step.
+    for name in [
+        "late-fault-unpenalized",
+        "cooldown-session-gate",
+        "short-cooldown",
+    ] {
+        fault.extend(caught(
+            WIRE,
+            case(penalized, name),
+            &[PENALIZED],
+            Found::AtStep,
+            G2,
+            name == "late-fault-unpenalized",
+        ));
+    }
+    // C2's owed penalty concluding violated at the drain's end, through a
+    // node-side abandonment: the reactor's own exit drops the call holding
+    // the failed reply, and the end replay keeps it as a `DroppedFault`.
+    fault.extend(caught(
+        WIRE,
+        case(penalized, "idle-exit-drops-fault"),
+        &[PENALIZED],
+        Found::AtEnd,
+        G2,
+        false,
+    ));
     rows.push(sim_row(penalized, &[WIRE], fault));
 
     let honest = HONEST;
     let mut never = holds(honest, G2, HONEST_PEER);
-    never.push(owed(Key::catch(honest), G2));
+    // Any production punishment of an honest peer also breaks
+    // conformant-never-closes, so the catch is nested (decision 2).
+    never.extend(caught(
+        WIRE,
+        case(honest, "target-page-refused"),
+        &[HONEST, CONFORMANT],
+        Found::AtStep,
+        G2,
+        true,
+    ));
     rows.push(sim_row(honest, &[WIRE], never));
 
     let progress = PROGRESS_ID;
@@ -2356,6 +2827,8 @@ fn hand_written_rows() -> Vec<Row> {
         NONE,
         false,
     ));
+    // Still Draft at hdr-14.8: its promotion needs Evan's agreement, so the
+    // frozen-head run's record lists it under `drafts` until he gives it.
     rows.push(Row {
         property: progress,
         tier: Tier::Sim,
@@ -2427,13 +2900,33 @@ fn hand_written_rows() -> Vec<Row> {
     let node_harnesses: &'static [&'static str] =
         &[SMOKE, STORAGE, RELEASE_WAKE, WIRE, FLOOD, REPAIR, LIVENESS];
     let mut panic = holds(SIM_WIDE[0], NONE, SMOKE_RUN);
-    panic.push(owed(Key::catch(SIM_WIDE[0]), NONE));
+    // A publisher stop that asserts every subscription already ended
+    // panics the session's publisher on the committed serving-churn
+    // fixture, whose subscribers each leave mid-subscription.
+    panic.extend(caught(
+        STORAGE,
+        case(SIM_WIDE[0], "stop-asserts-subscriptions-ended"),
+        &[SIM_WIDE[0]],
+        Found::AtStep,
+        NONE,
+        true,
+    ));
     rows.push(sim_row(SIM_WIDE[0], node_harnesses, panic));
 
-    let livelock = vec![
-        owed(Key::passing(SIM_WIDE[1]), NONE),
-        owed(Key::catch(SIM_WIDE[1]), NONE),
-    ];
+    // Its COVERAGE witness runs the test-only test/probe harness
+    // (`TEST_ONLY_WITNESSES`), so its counted history is a liveness
+    // fixture, which declares `BoundedAdversary` from its start.
+    let mut livelock = holds(SIM_WIDE[1], NONE, HOLD_WITNESSES);
+    livelock.push(result(
+        vec![Key::catch(SIM_WIDE[1])],
+        NONE,
+        Expected::Open {
+            reason: LIVELOCK_UNCATCHABLE,
+            owner: "hdr-14",
+            approval: LIVELOCK_RULING,
+            until: None,
+        },
+    ));
     rows.push(sim_row(SIM_WIDE[1], node_harnesses, livelock));
 
     rows
@@ -2470,6 +2963,10 @@ fn machine_row(property: &'static str, expected: Vec<ExpectedResult>) -> Row {
         expected,
     }
 }
+
+/// What `chunk-budget-bound`'s missing evidence says of a boundary still
+/// unread at a dry end: the registry's unread-boundary detail.
+pub const UNREAD_BOUNDARY: &str = "with a boundary unread";
 
 /// One broader claim a planted case's set may add to its own ID.
 #[derive(Clone, Copy, Debug)]
@@ -2511,7 +3008,57 @@ pub static NESTS: &[Nest] = &[
         ],
         when: "the punished peer is marked honest",
     },
+    // The four below break only after the case's own break, so their cases
+    // judge the set on the Draft run (`Found::AtStepSetOnDraft`).
+    Nest {
+        broader: "sim/no-livelock",
+        over: &["header-sync/s5v9/subscribe-headers/sender-within-credit"],
+        when: SENDER_CREDIT_LIVELOCK,
+    },
+    Nest {
+        broader: UNSOLICITED,
+        over: &["header-sync/s5v9/headers-outcome/bad-content-closes"],
+        when: OUTCOME_UNSOLICITED,
+    },
+    Nest {
+        broader: "header-sync/s5v9/conformant-never-closes",
+        over: &["header-sync/s5v9/subscribe-headers/sender-within-live"],
+        when: OPEN_REPEATED_PUNISHED,
+    },
+    Nest {
+        broader: "session/honest-never-punished",
+        over: &["header-sync/s5v9/subscribe-headers/sender-within-live"],
+        when: OPEN_REPEATED_PUNISHED,
+    },
+    // A wedged run loop leaves its publication unread under both queues'
+    // rules at once, so each watch rule nests over the other.
+    Nest {
+        broader: WATCH_LIFECYCLE,
+        over: &[WATCH_WIRE],
+        when: WEDGED_LOOP,
+    },
+    Nest {
+        broader: WATCH_WIRE,
+        over: &[WATCH_LIFECYCLE],
+        when: WEDGED_LOOP,
+    },
 ];
+
+/// When `sim/no-livelock` breaks beside an over-credit page.
+const SENDER_CREDIT_LIVELOCK: &str = "the publisher goes on sending the held subscriber pages \
+                                      past its credit at zero time, so the run spins without \
+                                      time advancing";
+/// When `unsolicited-closes` breaks beside an unchecked outcome window.
+const OUTCOME_UNSOLICITED: &str = "the subscription ended on the early outcome, so the outcomes \
+                                   that follow for it are unsolicited and the subscriber never \
+                                   closes over them";
+/// When a repeated `Open` is punished.
+const OPEN_REPEATED_PUNISHED: &str = "the node goes on to close the honest peer's connection \
+                                      with a protocol reject over the subscription its repeated \
+                                      Open doubled";
+/// When a wedged loop breaks both watch rules.
+const WEDGED_LOOP: &str = "the run loop stops reading its committed watch, so the run settles \
+                           with the same publication unread under both queues' rules";
 
 /// A gate obligation no single ID owns (item 0's `GATE_REQUIREMENTS`),
 /// written from the spec's gate table.
@@ -2529,46 +3076,48 @@ pub struct GateRequirement {
 /// transitional until the hdr-14 PR that builds them. The obligations
 /// themselves are listed apart, in
 /// [`GATE_OBLIGATIONS`](super::required::GATE_OBLIGATIONS), so an entry
-/// deleted here still leaves its key required.
+/// deleted here still leaves its key required. [`DESPITE_CLOSE_CAUGHT`],
+/// which takes its case's `Caught`, has no entry here.
 pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     GateRequirement {
         name: "gate-1/a-a-and-a-b-a",
         gates: G1,
-        expected: Expected::Open {
-            reason: obligation::GATE_1_A_A_AND_A_B_A,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.7b"),
+        expected: Expected::Passes {
+            test: sim_test(
+                TOOL_TESTS,
+                "each_history_is_the_same_alone_and_after_another",
+            ),
         },
     },
     GateRequirement {
         name: "gate-1/topology-freshness",
         gates: G1,
-        expected: Expected::Open {
-            reason: obligation::GATE_1_TOPOLOGY_FRESHNESS,
-            owner: "Adam's harness",
-            approval: Approval::Pending,
-            until: Some("hf-7"),
+        expected: Expected::Passes {
+            test: obligation::TOPOLOGY_FRESHNESS_TEST,
         },
     },
     GateRequirement {
-        name: "gate-1/store-inventory",
+        name: "gate-1/store-inventory/registered",
         gates: G1,
-        expected: Expected::Open {
-            reason: obligation::GATE_1_STORE_INVENTORY,
-            owner: "Adam's harness",
-            approval: Approval::Pending,
-            until: Some("hf-6"),
+        expected: Expected::Passes {
+            test: obligation::STORE_INVENTORY_REGISTERED_TEST,
+        },
+    },
+    GateRequirement {
+        name: "gate-1/store-inventory/checkpoint-and-producer",
+        gates: G1,
+        expected: Expected::Passes {
+            test: obligation::STORE_INVENTORY_PRODUCER_TEST,
         },
     },
     GateRequirement {
         name: "gate-1/replay-store-control",
         gates: G1,
-        expected: Expected::Open {
-            reason: obligation::GATE_1_REPLAY_STORE_CONTROL,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.7b"),
+        expected: Expected::Passes {
+            test: sim_test(
+                TOOL_TESTS,
+                "a_changed_stored_fact_fails_the_replay_comparison",
+            ),
         },
     },
     GateRequirement {
@@ -2582,73 +3131,57 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
         },
     },
     GateRequirement {
-        name: "gate-2/despite-close/caught",
-        gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_DESPITE_CLOSE_CAUGHT,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
-        },
-    },
-    GateRequirement {
         name: "gate-2/despite-close/close-companion",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_DESPITE_CLOSE_CLOSE_COMPANION,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                DESPITE_CLOSE_TESTS,
+                "the_fault_close_holds_on_the_unpatched_rejection",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/despite-close/staging-companion",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_DESPITE_CLOSE_STAGING_COMPANION,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                DESPITE_CLOSE_TESTS,
+                "the_staging_companion_needs_the_rejected_page_staged",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/status",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_STATUS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(TABLE_TESTS, "status_bad_content_closes_with_a_fault"),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/subscribe-headers",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_SUBSCRIBE_HEADERS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                TABLE_TESTS,
+                "subscribe_headers_bad_content_closes_with_a_fault",
+            ),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/headers",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(TABLE_TESTS, "headers_bad_content_closes_with_a_fault"),
         },
     },
     GateRequirement {
         name: "gate-2/bad-content-fault-close/headers-outcome",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_BAD_CONTENT_FAULT_CLOSE_HEADERS_OUTCOME,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                TABLE_TESTS,
+                "headers_outcome_bad_content_closes_with_a_fault",
+            ),
         },
     },
     GateRequirement {
@@ -2686,44 +3219,50 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
             ),
         },
     },
+    // Every distinct end finding at one boundary survives: in the registry
+    // (C12, E9) and in the fault store (C13, hf-1 to hf-3).
     GateRequirement {
-        name: "gate-2/end-boundary-preservation",
+        name: "gate-2/end-boundary-preservation/registry",
         gates: G2,
-        expected: Expected::Open {
-            reason: obligation::GATE_2_END_BOUNDARY_PRESERVATION,
-            owner: "Evan (E9) and Adam's harness (hf-1 to hf-3)",
-            approval: Approval::Pending,
-            until: Some("hdr-14.8"),
+        expected: Expected::Passes {
+            test: obligation::END_BOUNDARY_REGISTRY_TEST,
+        },
+    },
+    GateRequirement {
+        name: "gate-2/end-boundary-preservation/fault-store",
+        gates: G2,
+        expected: Expected::Passes {
+            test: obligation::END_BOUNDARY_FAULT_STORE_TEST,
         },
     },
     GateRequirement {
         name: "gate-3/crossing/unretained-open-then-outcome",
         gates: G3,
-        expected: Expected::Open {
-            reason: obligation::GATE_3_CROSSING_UNRETAINED_OPEN_THEN_OUTCOME,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                CROSSING_TESTS,
+                "an_unretained_open_then_outcome_crossing_is_conformant_and_unpunished",
+            ),
         },
     },
     GateRequirement {
         name: "gate-3/crossing/crossing-close",
         gates: G3,
-        expected: Expected::Open {
-            reason: obligation::GATE_3_CROSSING_CROSSING_CLOSE,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                CROSSING_TESTS,
+                "a_crossing_close_is_conformant_and_unpunished",
+            ),
         },
     },
     GateRequirement {
         name: "gate-3/crossing/over-window-grant",
         gates: G3,
-        expected: Expected::Open {
-            reason: obligation::GATE_3_CROSSING_OVER_WINDOW_GRANT,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.6"),
+        expected: Expected::Passes {
+            test: sim_test(
+                CROSSING_TESTS,
+                "an_over_window_crossing_grant_is_bad_cursor_and_closed",
+            ),
         },
     },
     GateRequirement {
@@ -2760,29 +3299,241 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
             until: None,
         },
     },
+    // `outstanding-work-bounded`'s bound table, row by row.
+    bound_passes(
+        "gate-5/bound-table/work-slots/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/work-slots/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/reservation-maps/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/reservation-maps/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/request-deadlines/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/request-deadlines/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/locator-reads/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/locator-reads/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/locator-reads/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/node-execution-slots/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/node-execution-slots/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/publisher-capacity-waits/cleanup",
+        obligation::BOUND_WAITS_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/close-deadlines/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/storage-calls/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/port-futures/conservation",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/cached-offers/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/supplier-order/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/completed-targets/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/subscriber-cursors/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/subscriber-subscriptions/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/publisher-tasks/cleanup",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/sessions/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/serving-peer-budgets/cleanup",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
     GateRequirement {
-        name: "gate-5/bound-table",
+        name: "gate-5/bound-table/repair-reservation",
         gates: G5,
         expected: Expected::Open {
-            reason: obligation::GATE_5_BOUND_TABLE,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-9d.1"),
+            reason: obligation::BOUND_REPAIR_RESERVATION,
+            owner: obligation::BOUND_OWNER,
+            approval: PLAN,
+            until: None,
         },
     },
+    bound_open(
+        "gate-5/bound-table/reservation",
+        obligation::bound_unshown::RESERVATION,
+    ),
+    bound_open(
+        "gate-5/bound-table/locator-reads/per-peer",
+        obligation::bound_unshown::LOCATOR_PER_PEER,
+    ),
+    bound_open(
+        "gate-5/bound-table/calls-per-round",
+        obligation::bound_unshown::CALLS_PER_ROUND,
+    ),
+    bound_open(
+        "gate-5/bound-table/detached-headers",
+        obligation::bound_unshown::DETACHED,
+    ),
+    bound_open(
+        "gate-5/bound-table/departed-strikes",
+        obligation::bound_unshown::STRIKES,
+    ),
+    bound_open(
+        "gate-5/bound-table/pending-closes",
+        obligation::bound_unshown::PENDING_CLOSES,
+    ),
+    bound_open(
+        "gate-5/bound-table/status-cadences",
+        obligation::bound_unshown::CADENCES,
+    ),
+    bound_open(
+        "gate-5/bound-table/publisher-tombstones",
+        obligation::bound_unshown::TOMBSTONES,
+    ),
+    bound_open(
+        "gate-5/bound-table/publisher-jobs",
+        obligation::bound_unshown::JOBS,
+    ),
+    bound_open(
+        "gate-5/bound-table/subscription-slots",
+        obligation::bound_unshown::SUBSCRIPTION_SLOTS,
+    ),
+    bound_open(
+        "gate-5/bound-table/sent-cursor-ring",
+        obligation::bound_unshown::SENT_RING,
+    ),
+    bound_open(
+        "gate-5/bound-table/peer-execution-slots",
+        obligation::bound_unshown::PEER_EXECUTION,
+    ),
+    bound_open(
+        "gate-5/bound-table/node-output",
+        obligation::bound_unshown::NODE_OUTPUT,
+    ),
+    bound_open(
+        "gate-5/bound-table/peer-output",
+        obligation::bound_unshown::PEER_OUTPUT,
+    ),
+    bound_open(
+        "gate-5/bound-table/response-counts",
+        obligation::bound_unshown::RESPONSE_COUNTS,
+    ),
+    bound_open(
+        "gate-5/bound-table/retained-path-leases",
+        obligation::bound_unshown::LEASES,
+    ),
+    bound_open(
+        "gate-5/bound-table/readmission-cooldowns",
+        obligation::bound_unshown::COOLDOWNS,
+    ),
+    bound_open(
+        "gate-5/bound-table/pruned-peers",
+        obligation::bound_unshown::PRUNED_PEERS,
+    ),
+    bound_open(
+        "gate-5/bound-table/vct-repair",
+        obligation::bound_unshown::VCT_REPAIR,
+    ),
     GateRequirement {
         name: "gate-5/mixed-witness",
         gates: G5,
-        expected: Expected::Open {
-            reason: obligation::GATE_5_MIXED_WITNESS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.8"),
-        },
+        expected: Expected::Passes { test: MIXED_TEST },
     },
 ];
 
-/// The [`GATE_REQUIREMENTS`] as expected results.
+/// A bound-table row's requirement `name`, met by `test`'s pass.
+const fn bound_passes(name: &'static str, test: TestRef) -> GateRequirement {
+    GateRequirement {
+        name,
+        gates: G5,
+        expected: Expected::Passes { test },
+    }
+}
+
+/// A bound-table row's requirement `name` with no fixture evidence: the
+/// standing exclusion for `reason`, under the approval its obligation
+/// carries (see [`obligation::BOUND_UNSHOWN_RULING`]).
+const fn bound_open(name: &'static str, reason: &'static str) -> GateRequirement {
+    GateRequirement {
+        name,
+        gates: G5,
+        expected: Expected::Open {
+            reason,
+            owner: obligation::BOUND_OWNER,
+            approval: obligation::BOUND_UNSHOWN_RULING,
+            until: None,
+        },
+    }
+}
+
+/// The gate obligation the despite-close case's own catch serves, which
+/// its obligation permits ([`Permit::Caught`](obligation::Permit::Caught)),
+/// so it has no [`GATE_REQUIREMENTS`] entry.
+pub const DESPITE_CLOSE_CAUGHT: &str = "gate-2/despite-close/caught";
+
+/// The despite-close case's `Caught`: its baseline holds, its patched run
+/// violates `commit-only-authorized` at a step, and its `Draft` run's three
+/// companions hold. Its row's [`Key::Case`] and [`DESPITE_CLOSE_CAUGHT`]
+/// both take it.
+fn despite_close_caught() -> Expected {
+    let despite = super::companions::DESPITE_CLOSE;
+    Expected::Caught {
+        case: despite,
+        harness: WIRE,
+        set: &[COMMIT],
+        found: Found::AtStep,
+        companions: super::companions::COMPANIONS,
+        not_applicable: super::not_applicable::expected(despite),
+        patched_not_applicable: super::not_applicable::patched_expected(despite),
+    }
+}
+
+/// The [`GATE_REQUIREMENTS`] as expected results, and
+/// [`DESPITE_CLOSE_CAUGHT`] as the despite-close case's `Caught`.
 pub fn requirement_results() -> Vec<ExpectedResult> {
     GATE_REQUIREMENTS
         .iter()
@@ -2795,7 +3546,26 @@ pub fn requirement_results() -> Vec<ExpectedResult> {
                 requirement.expected.clone(),
             )
         })
+        .chain([result(
+            vec![Key::Requirement {
+                name: DESPITE_CLOSE_CAUGHT.to_owned(),
+            }],
+            G2,
+            despite_close_caught(),
+        )])
         .collect()
+}
+
+/// A retired native mutation's witness test outside the simulator, and the
+/// failure its README requires of the patched run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnitWitness {
+    /// The test, by its full libtest name.
+    pub test: TestRef,
+    /// The assertion message the patched run must fail with.
+    pub failure: &'static str,
+    /// What that assertion's `left` value must show, in order.
+    pub shows: &'static [&'static str],
 }
 
 /// What a native mutation under `qa/native-mutations/header-sync/` is.
@@ -2828,10 +3598,24 @@ pub enum NativeClass {
         /// The planted case it became.
         case: &'static str,
     },
-    /// It stays outside the simulator.
+    /// It stays outside the simulator, caught by `witness`, a test run
+    /// unpatched, patched and restored as a plain build: a `UnitCaught`
+    /// for gate 6.
     Retired {
         /// Why.
         reason: &'static str,
+        /// The test that catches it and the failure it must show.
+        witness: UnitWitness,
+    },
+    /// It's a duplicate of the existing planted case `case` under
+    /// `property`, an approved retirement. Its directory stays, so its key
+    /// stays required on gate 6, and that key shares the case's `Caught`:
+    /// it verifies only once that case is caught.
+    Duplicate {
+        /// The covering case's property.
+        property: &'static str,
+        /// The covering case.
+        case: &'static str,
     },
 }
 
@@ -2855,45 +3639,107 @@ const PROBE_ACCOUNTING: HistoryRef = HistoryRef {
     case: "plan 0 of inputs(16, 256)",
 };
 
-/// A [`NativeClass::ToMove`].
-const fn to_move(
-    patch: &'static str,
-    property: &'static str,
-    until: &'static str,
-) -> NativeMutation {
-    NativeMutation {
-        patch,
-        class: NativeClass::ToMove { property, until },
-    }
-}
+/// What [`PROBE_ACCOUNTING`]'s clean runs report `NotApplicable`, as its
+/// witness test's run of it reports them (round 9): no livelock bound or
+/// adversary is declared, and nothing goes stale or departs.
+const PROBE_ACCOUNTING_NA: &[ExpectedNa] = &[
+    ExpectedNa {
+        property: SIM_WIDE[1],
+        reason: "undeclared",
+    },
+    ExpectedNa {
+        property: RECOVERY_ID,
+        reason: "undeclared",
+    },
+    ExpectedNa {
+        property: STALE,
+        reason: "never-applied",
+    },
+    ExpectedNa {
+        property: CHAIN,
+        reason: "never-applied",
+    },
+    ExpectedNa {
+        property: RETIREMENT,
+        reason: "never-applied",
+    },
+];
 
 /// Every native mutation on `main`, classified. The ledger rules each one
 /// breaks move to the ID and PR the hdr-9–13 plan's evidence-rule
 /// classification gives them.
 pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
-    to_move("consumed-locator-permit", TEARDOWN, "hdr-14.4"),
-    to_move(
-        "cooldown-session-gate",
-        "header-sync/header-fault-penalized",
-        "hdr-14.4",
-    ),
-    to_move("dropped-owner-check", STALE, "hdr-14.4"),
-    to_move("foreign-leases", COMMIT, "hdr-9c.2a"),
-    to_move("forgotten-locator-permit", TEARDOWN, "hdr-14.4"),
-    to_move(
-        "late-fault-unpenalized",
-        "header-sync/header-fault-penalized",
-        "hdr-14.4",
-    ),
-    to_move("misstored-page", COMMIT, "hdr-9c.1a"),
-    to_move("own9-join", COMMIT, "hdr-9c.1a"),
-    to_move("owner-swap", COMMIT, "hdr-9c.2a"),
+    NativeMutation {
+        patch: "consumed-locator-permit",
+        class: NativeClass::Moved {
+            property: TEARDOWN,
+            case: "consumed-locator-permit",
+        },
+    },
+    NativeMutation {
+        patch: "cooldown-session-gate",
+        class: NativeClass::Moved {
+            property: PENALIZED,
+            case: "cooldown-session-gate",
+        },
+    },
+    NativeMutation {
+        patch: "dropped-owner-check",
+        class: NativeClass::Moved {
+            property: STALE,
+            case: "dropped-owner-check",
+        },
+    },
+    NativeMutation {
+        patch: "foreign-leases",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "foreign-leases",
+        },
+    },
+    NativeMutation {
+        patch: "forgotten-locator-permit",
+        class: NativeClass::Moved {
+            property: TEARDOWN,
+            case: "forgotten-locator-permit",
+        },
+    },
+    NativeMutation {
+        patch: "late-fault-unpenalized",
+        class: NativeClass::Moved {
+            property: PENALIZED,
+            case: "late-fault-unpenalized",
+        },
+    },
+    // Duplicates of a planted case: the same mutation one call apart,
+    // first failing with the same finding at the same step.
+    NativeMutation {
+        patch: "misstored-page",
+        class: NativeClass::Duplicate {
+            property: COMMIT,
+            case: "stored-order",
+        },
+    },
+    NativeMutation {
+        patch: "own9-join",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "own9-join",
+        },
+    },
+    NativeMutation {
+        patch: "owner-swap",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "owner-swap",
+        },
+    },
     NativeMutation {
         patch: "raw-budget-lease",
         class: NativeClass::Integrity {
             history: PROBE_ACCOUNTING,
             diagnostic: "OwnedMismatch",
-            not_applicable: &[],
+            not_applicable: PROBE_ACCOUNTING_NA,
         },
     },
     NativeMutation {
@@ -2901,7 +3747,7 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
         class: NativeClass::Integrity {
             history: PROBE_ACCOUNTING,
             diagnostic: "ReservedMismatch",
-            not_applicable: &[],
+            not_applicable: PROBE_ACCOUNTING_NA,
         },
     },
     NativeMutation {
@@ -2909,10 +3755,35 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
         class: NativeClass::Retired {
             reason: "its README says the simulator can't reach the readmission check, so it \
                      stays a zakura-network unit test",
+            // The README requires the 60 s cooldown's event assertion to
+            // fail, seeing `SessionAdmitted` for session 2 after
+            // `CooldownStarted`.
+            witness: UnitWitness {
+                test: TestRef {
+                    package: "zakura-network",
+                    file: "src/zakura/header_sync/reactor/tests/observer.rs",
+                    test: "zakura::header_sync::reactor::tests::observer::\
+                           a_late_fault_cools_down_the_peer_and_refuses_its_reconnect",
+                },
+                failure: "assertion `left == right` failed: cooldown 60s",
+                shows: &["CooldownStarted", "SessionAdmitted", "session_id: 2"],
+            },
         },
     },
-    to_move("reordered-payload", COMMIT, "hdr-9c.2a"),
-    to_move("secondary-reservation", OUTSTANDING, "hdr-9d.1"),
+    NativeMutation {
+        patch: "reordered-payload",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "reordered-payload",
+        },
+    },
+    NativeMutation {
+        patch: "secondary-reservation",
+        class: NativeClass::Moved {
+            property: OUTSTANDING,
+            case: "secondary-reservation",
+        },
+    },
     NativeMutation {
         patch: "session-view",
         class: NativeClass::Moved {
@@ -2920,21 +3791,55 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "session-view",
         },
     },
-    to_move(
-        "short-cooldown",
-        "header-sync/header-fault-penalized",
-        "hdr-14.4",
-    ),
-    to_move("short-payload", COMMIT, "hdr-9c.2a"),
-    to_move("shutdown-kept-queue", TEARDOWN, "hdr-14.4"),
-    to_move("skewed-remaining", COMMIT, "hdr-9c.1b"),
-    to_move("skipped-retention", OUTSTANDING, "hdr-9d.1"),
-    to_move("skipped-staging", COMMIT, "hdr-9c.1a"),
-    to_move(
-        "stale-locator-round",
-        "header-sync/reset-invalidates-work",
-        "hdr-9a.2",
-    ),
+    NativeMutation {
+        patch: "short-cooldown",
+        class: NativeClass::Moved {
+            property: PENALIZED,
+            case: "short-cooldown",
+        },
+    },
+    NativeMutation {
+        patch: "short-payload",
+        class: NativeClass::Duplicate {
+            property: COMMIT,
+            case: "dropped-payload-header",
+        },
+    },
+    NativeMutation {
+        patch: "shutdown-kept-queue",
+        class: NativeClass::Moved {
+            property: TEARDOWN,
+            case: "shutdown-kept-queue",
+        },
+    },
+    NativeMutation {
+        patch: "skewed-remaining",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "skewed-remaining",
+        },
+    },
+    NativeMutation {
+        patch: "skipped-retention",
+        class: NativeClass::Duplicate {
+            property: OUTSTANDING,
+            case: "retention-skipped",
+        },
+    },
+    NativeMutation {
+        patch: "skipped-staging",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "skipped-staging",
+        },
+    },
+    NativeMutation {
+        patch: "stale-locator-round",
+        class: NativeClass::Moved {
+            property: RESET,
+            case: "stale-locator-round",
+        },
+    },
     NativeMutation {
         patch: "stale-status-cache",
         class: NativeClass::Moved {
@@ -2942,7 +3847,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
             case: "stale-status-cache",
         },
     },
-    to_move("swapped-payload", COMMIT, "hdr-9c.2a"),
+    NativeMutation {
+        patch: "swapped-payload",
+        class: NativeClass::Moved {
+            property: COMMIT,
+            case: "swapped-payload",
+        },
+    },
     NativeMutation {
         patch: "unreleased-retirement",
         class: NativeClass::Moved {
@@ -2960,9 +3871,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
 ];
 
 /// The native mutations' expected results: an `IntegrityCaught` for gate 6,
-/// or a transitional `Open` until the PR that moves it. A retired one has
-/// no key.
-pub fn native_results() -> Vec<ExpectedResult> {
+/// a transitional `Open` until the PR that moves it, for a retired one the
+/// `UnitCaught` of its witness, or, for a duplicate, the `Caught` among
+/// `expected` of the planted case covering it, joined on the case's whole
+/// [`PlantedRef`], on gate 6. A moved one has
+/// no key, and nor has a duplicate whose case no `Caught` names, so its key
+/// blocks.
+pub fn native_results(expected: &[ExpectedResult]) -> Vec<ExpectedResult> {
     NATIVE_MUTATIONS
         .iter()
         .filter_map(|mutation| {
@@ -2981,7 +3896,24 @@ pub fn native_results() -> Vec<ExpectedResult> {
                     diagnostic,
                     not_applicable,
                 },
-                NativeClass::Retired { .. } => retired_open(),
+                NativeClass::Retired { witness, .. } => Expected::UnitCaught {
+                    patch: mutation.patch,
+                    witness,
+                },
+                NativeClass::Duplicate { property, case } => {
+                    let want = PlantedRef {
+                        property: property.to_owned(),
+                        name: case.to_owned(),
+                    };
+                    expected
+                        .iter()
+                        .find(|result| {
+                            matches!(result.expected, Expected::Caught { case: c, .. }
+                                if PlantedRef::joins(&want, &c, |c| Some(c.planted())))
+                        })?
+                        .expected
+                        .clone()
+                }
                 NativeClass::Moved { .. } => return None,
             };
             Some(result(key, &[Gate::G6], expected))
@@ -3025,12 +3957,21 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "the_evaluator_refuses_manifest_defects",
     "the_evaluator_accepts_genuine_results",
     "the_evaluator_applies_contracts_and_narrowing",
+    "the_evaluator_judges_a_harness_caught_case",
     "the_evaluator_joins_on_full_identity",
     "the_evaluator_decides_contracts_through_their_keys",
     "the_evaluator_binds_runners_and_traces",
     "the_evaluator_accepts_real_storage_and_release_wake_histories",
     "the_not_applicable_inventory_lists_every_reason",
     "the_narrowing_rules_match_their_pin",
+    "identity_refs_are_defined_only_in_refs",
+    "every_artifact_read_goes_through_binding",
+    "every_ref_has_a_one_key_off_control",
+    "identity_joins_go_through_refs",
+    "each_node_harness_s_missing_sources_are_its_own_test_s",
+    "delivered_obligations_verify_on_their_evidence",
+    "every_node_history_lists_its_not_applicable_reports",
+    "a_missing_bound_row_blocks",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.
@@ -3106,6 +4047,7 @@ pub fn missing_source_test(harness: &str) -> Option<TestRef> {
         WIRE => "wire_fails_without_each_source",
         FLOOD => "flood_fails_without_each_source",
         REPAIR => "repair_fails_without_each_source",
+        LIVENESS => "liveness_fails_without_each_source",
         _ => return None,
     };
     Some(sim_test(SOURCE_TESTS, test))
@@ -3145,7 +4087,8 @@ pub fn missing_source_results(keys: &[(String, String)]) -> Vec<ExpectedResult> 
 }
 
 /// The `NotApplicable` reasons' expected results, one per reason a header
-/// ID can carry ([`super::reasons::NA_REASONS`]).
+/// ID can carry ([`super::reasons::NA_REASONS`]): the pass of the test
+/// [`REASON_TESTS`] names for it, or [`REASON_UNSHOWN`] for one it doesn't.
 pub fn reason_results() -> Vec<ExpectedResult> {
     super::reasons::NA_REASONS
         .iter()
@@ -3155,19 +4098,116 @@ pub fn reason_results() -> Vec<ExpectedResult> {
                     reason: entry.reason,
                 }],
                 &[Gate::G6],
-                REASON_TEST,
+                reason_test(entry.reason).map_or(REASON_UNSHOWN, |test| Expected::Passes { test }),
             )
         })
         .collect()
 }
 
-/// A `NotApplicable` reason's test, until E1's tests show each at its
-/// trigger.
-pub const REASON_TEST: Expected = Expected::Open {
-    reason: "a test that shows this reason at its trigger",
+/// The test [`REASON_TESTS`] names for `reason`, if any.
+pub fn reason_test(reason: crate::NaReason) -> Option<TestRef> {
+    REASON_TESTS
+        .iter()
+        .find(|(r, _)| *r == reason)
+        .map(|&(_, test)| test)
+}
+
+/// The test that shows each `NotApplicable` reason a header ID can carry at
+/// its trigger, from E1's drain and registry tests: the run or the
+/// registry reaches the reason's condition, and the test requires the
+/// property's report to carry exactly that reason.
+pub static REASON_TESTS: &[(crate::NaReason, TestRef)] = {
+    use crate::{property::Pending, NaReason::*};
+    const DRAIN: &str = "tests/drain.rs";
+    const REGISTRY: &str = "tests/registry.rs";
+    &[
+        (
+            NeverApplied,
+            sim_test(DRAIN, "rule_5_every_not_applicable_carries_its_reason"),
+        ),
+        (
+            Undeclared,
+            sim_test(REGISTRY, "undeclared_assumption_not_applicable"),
+        ),
+        (
+            Excluded,
+            sim_test(REGISTRY, "excluded_source_not_applicable"),
+        ),
+        (
+            AssumptionsNeverHeld,
+            sim_test(REGISTRY, "assumptions_never_held_not_applicable"),
+        ),
+        (
+            AssumptionLost,
+            sim_test(
+                DRAIN,
+                "rule_4_a_lost_assumption_withdraws_what_the_dry_end_would_conclude",
+            ),
+        ),
+        (
+            StoppedByViolation,
+            sim_test(
+                "tests/header_recovery_livelock.rs",
+                "a_spin_after_recovered_violates_no_livelock",
+            ),
+        ),
+        (
+            HarnessFailed,
+            sim_test(
+                DRAIN,
+                "rule_6_a_failure_found_only_at_the_end_fails_the_run",
+            ),
+        ),
+        (
+            NodeStopped,
+            sim_test(DRAIN, "a_dry_end_reads_a_watch_mark_as_node_stopped"),
+        ),
+        (
+            Unsettled {
+                site: Pending::FaultOpen,
+            },
+            sim_test(DRAIN, "a_dry_end_leaves_a_fault_mark_unsettled"),
+        ),
+        (
+            Unsettled {
+                site: Pending::TeardownOpen,
+            },
+            sim_test(DRAIN, "a_dry_end_leaves_a_header_teardown_mark_unsettled"),
+        ),
+        (
+            Unsettled {
+                site: Pending::WatchOpen,
+            },
+            sim_test(DRAIN, "a_dry_end_reads_a_watch_mark_as_node_stopped"),
+        ),
+        (
+            Unsettled {
+                site: Pending::UnreadTrigger,
+            },
+            sim_test(DRAIN, "a_dry_end_leaves_an_unread_trigger_unsettled"),
+        ),
+        (
+            Unsettled {
+                site: Pending::UnjudgedDeparture,
+            },
+            sim_test(DRAIN, "a_dry_end_leaves_an_unjudged_departure_unsettled"),
+        ),
+        (
+            Unsettled {
+                site: Pending::TipUnpublished,
+            },
+            sim_test(DRAIN, "a_dry_end_leaves_an_unpublished_tip_unsettled"),
+        ),
+    ]
+};
+
+/// A `NotApplicable` reason no test in [`REASON_TESTS`] shows at its
+/// trigger. It blocks, so a reason added without its test can't pass.
+pub const REASON_UNSHOWN: Expected = Expected::Open {
+    reason: "no test shows this reason at its trigger",
     owner: "Adam's side",
     approval: Approval::Pending,
-    until: Some("E1"),
+    until: None,
 };
 
 /// Each non-`Real` tier exclusion Adam has approved, by its own
@@ -3254,4 +4294,121 @@ pub fn tier_results(registered: &[super::Registered]) -> Vec<ExpectedResult> {
         }
     }
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+
+    /// `text`, for the life of the test, as a static field.
+    fn leaked(text: &str) -> &'static str {
+        Box::leak(text.to_owned().into_boxed_str())
+    }
+
+    /// The history `want` names, its fields leaked for the life of the test.
+    fn history_of(want: &HistoryRunRef) -> HistoryRef {
+        HistoryRef {
+            harness: leaked(&want.harness),
+            witness: TestRef {
+                package: leaked(&want.package),
+                file: leaked(&want.file),
+                test: leaked(&want.test),
+            },
+            case: leaked(&want.case),
+        }
+    }
+
+    /// A node history's list key takes only its own history's whole-report
+    /// pass, joined on the history's whole [`HistoryRunRef`] (Rule 25's
+    /// template): a counted node history's run finds its `Holds`, and the
+    /// run with its harness, its witness's package, file or name, or its
+    /// case moved finds none.
+    #[test]
+    fn a_history_s_pass_joins_its_whole_history() {
+        let history = counted_histories()
+            .into_iter()
+            .find(|history| !is_machine(history.harness))
+            .expect("a node history is counted");
+        let expected = [result(
+            Vec::new(),
+            &[],
+            Expected::Holds {
+                property: "a/property",
+                history,
+                not_applicable: &[],
+            },
+        )];
+        let keys = assert_one_key_off::<HistoryRunRef>(&HistoryRunRef::of(history), |want| {
+            history_pass(&expected, &RunId::from(history_of(want))).is_some()
+        });
+        assert_eq!(keys, 5);
+    }
+
+    /// A counted history's whole-report key goes on a row's `Holds` only
+    /// if it judges that history, joined on its whole [`HistoryRunRef`]
+    /// (Rule 25's template): the row of a counted history and its target
+    /// takes the key, and the row with the history's harness, its
+    /// witness's package, file or name, or its case moved doesn't.
+    #[test]
+    fn a_history_s_row_joins_its_whole_history() {
+        let (history, target) = history_targets()[0];
+        let keys = assert_one_key_off::<HistoryRunRef>(&HistoryRunRef::of(history), |want| {
+            let mut expected = vec![result(
+                Vec::new(),
+                &[],
+                Expected::Holds {
+                    property: target,
+                    history: history_of(want),
+                    not_applicable: &[],
+                },
+            )];
+            attach_history_passes(&mut expected);
+            !expected[0].keys.is_empty()
+        });
+        assert_eq!(keys, 5);
+    }
+
+    /// A duplicate native mutation's result is the `Caught` of only the
+    /// case its class names, joined on the case's whole [`PlantedRef`]
+    /// (Rule 25's template): with that case's `Caught` among the expected
+    /// results, the duplicate has a result, and with the case's property or
+    /// name moved it has none.
+    #[test]
+    fn a_duplicate_s_result_joins_its_whole_case() {
+        let (patch, covered) = NATIVE_MUTATIONS
+            .iter()
+            .find_map(|mutation| match mutation.class {
+                NativeClass::Duplicate { property, case } => Some((
+                    mutation.patch,
+                    CaseRef {
+                        property,
+                        name: case,
+                    },
+                )),
+                _ => None,
+            })
+            .expect("a native mutation duplicates a planted case");
+        let key = [Key::Native {
+            patch: patch.to_owned(),
+        }];
+        let keys = assert_one_key_off::<PlantedRef>(&covered.planted(), |want| {
+            let caught = Expected::Caught {
+                case: CaseRef {
+                    property: leaked(&want.property),
+                    name: leaked(&want.name),
+                },
+                harness: "header-sync/wire",
+                set: &[],
+                found: Found::AtStep,
+                companions: &[],
+                not_applicable: &[],
+                patched_not_applicable: None,
+            };
+            native_results(&[result(Vec::new(), &[], caught)])
+                .iter()
+                .any(|result| result.keys == key)
+        });
+        assert_eq!(keys, 2);
+    }
 }

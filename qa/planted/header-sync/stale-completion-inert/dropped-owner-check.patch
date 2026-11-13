@@ -1,0 +1,18 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 15b6d86dee..88e65a2e28 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2235,10 +2235,9 @@ impl HeaderSyncReactor {
+         self.finish_vct_local_operation(owner, HeaderTargetPhase::Preparing);
+         end_retained(&mut retained, HeaderWorkEnd::Stale);
+         let settles_round = self.peer_work_queue.active(&peer).is_some_and(|active| {
+-            active.phase == HeaderTargetPhase::Preparing
+-                && active.source == source
+-                && active.owner == owner
+-        }) && self.settles_current_call(&peer, retained.as_ref());
++            // Mutation: a stale prepare settles whatever round its peer runs.
++            active.phase == HeaderTargetPhase::Preparing && active.source == source
++        });
+         if !settles_round {
+             if let HeaderTargetPreparationResult::Failed(error) = &result {
+                 // The round retired, but the same identity still sent the headers.

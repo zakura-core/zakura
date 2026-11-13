@@ -22,16 +22,15 @@
 //! starts, and a staged lease names its round itself. Facts under any other
 //! cause, such as the refresh right after the handler, aren't judged here.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::collections::{HashMap, HashSet};
 
 use zakura_header_chain::HeaderSyncWorkOwner;
 use zakura_network::zakura::{
     observe::{BudgetOwner, CallEnd, PortCall, ReactorCause, ReactorEvent},
     ZakuraPeerId,
 };
+
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
 
 /// A round, by its peer and incarnation.
 type Round = (ZakuraPeerId, u64);
@@ -62,16 +61,39 @@ pub struct StaleWindow {
     pub handled: bool,
 }
 
+impl Snapshot for Vec<StaleWindow> {
+    /// Every window, in order.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
+}
+
 /// The stale calls one reactor's tap found, shared by the tap and whoever
 /// reads them. Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct StaleEvidence(Arc<Mutex<Vec<StaleWindow>>>);
+#[derive(Clone, Debug)]
+pub struct StaleEvidence(Registered<Vec<StaleWindow>>);
 
 impl StaleEvidence {
+    /// An empty store in `stores`, the node's.
+    pub fn new(stores: &EvidenceStores) -> StaleEvidence {
+        StaleEvidence(stores.register("stale_calls", Vec::new()))
+    }
+
+    /// The handle that built the store, the node's.
+    pub fn stores(&self) -> &EvidenceStores {
+        self.0.stores()
+    }
+
     /// Runs `change` on the windows. Nothing else is called while the lock
     /// is held.
-    fn with<R>(&self, change: impl FnOnce(&mut Vec<StaleWindow>) -> R) -> R {
-        change(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    fn with<R>(&self, read: impl FnOnce(&Vec<StaleWindow>) -> R) -> R {
+        self.0.read(read)
+    }
+
+    /// Runs `change` on the store, unless it's frozen, which drops the
+    /// change.
+    fn change<R>(&self, change: impl FnOnce(&mut Vec<StaleWindow>) -> R) -> Option<R> {
+        self.0.write(change)
     }
 
     /// Every stale call so far, in the order they ended.
@@ -162,7 +184,7 @@ impl StaleCheck {
     /// The breaks found since the last call, and the step their drain is.
     /// Stale calls found since then are stamped with `step`.
     pub(super) fn drain(&mut self, step: u64) -> Vec<String> {
-        self.evidence.with(|windows| {
+        self.evidence.change(|windows| {
             for window in windows.iter_mut().filter(|window| window.step.is_none()) {
                 window.step = Some(step);
             }
@@ -297,11 +319,15 @@ impl StaleCheck {
             ReactorEvent::CallEnded { call, end } if *end != CallEnd::Dropped => {
                 self.ended_call(*call)
             }
-            ReactorEvent::Handled { call, .. } => self.evidence.with(|windows| {
-                if let Some(window) = windows.iter_mut().rev().find(|window| window.call == *call) {
-                    window.handled = true;
-                }
-            }),
+            ReactorEvent::Handled { call, .. } => {
+                self.evidence.change(|windows| {
+                    if let Some(window) =
+                        windows.iter_mut().rev().find(|window| window.call == *call)
+                    {
+                        window.handled = true;
+                    }
+                });
+            }
             ReactorEvent::Retired { request, .. } => {
                 self.retired
                     .insert((request.peer.clone(), request.incarnation));
@@ -357,7 +383,7 @@ impl StaleCheck {
         };
         if let Some(why) = ended.stale {
             let apply = ended.apply;
-            self.evidence.with(|windows| {
+            self.evidence.change(|windows| {
                 windows.push(StaleWindow {
                     call,
                     apply,

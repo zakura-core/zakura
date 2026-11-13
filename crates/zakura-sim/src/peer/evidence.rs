@@ -82,6 +82,7 @@ use super::{
     stage::{discovery_stage, header_stage, NodeView, Stage},
 };
 use crate::{
+    check::FrameRef,
     evidence::LiveEvidence,
     model::{is_fault_cause, FrameHeader, FrameModel, Label, ReaderEnd},
     observe::{
@@ -89,6 +90,7 @@ use crate::{
         TransportFact,
     },
     storage::{hash, hex, HEADER_SERVICE},
+    stores::{debug_snapshot, EvidenceStores, Registered, Snapshot},
     Observation, ObservationLog,
 };
 
@@ -221,6 +223,9 @@ pub(crate) enum RecordBody {
         /// What the frame asks for, if it's a discovery request, which
         /// bounds the node's answer. Not logged.
         asks: Option<Asked>,
+        /// The header hashes of the page the frame carries, in hex as
+        /// storage writes them, or none for any other frame. Not logged.
+        hashes: Vec<String>,
     },
     /// [`Observation::PeerWritten`]. Every frame of one `write_all` shares
     /// its `order` stamp.
@@ -242,6 +247,61 @@ pub(crate) enum RecordBody {
         at: Duration,
         order: u64,
     },
+}
+
+/// The header hashes of each page the peers sent, by its frame's whole
+/// [`FrameRef`], as the identity map places it: what the peer put on the
+/// wire, apart from what the node did with it. They stay out of the log.
+/// It's evidence, kept in the run's stores, so it freezes with the log.
+/// Cloning shares the store.
+#[derive(Clone, Debug)]
+pub struct SentPages(Registered<SentPageMap>);
+
+/// What [`SentPages`] holds: each sent page's header hashes, in hex, by
+/// frame.
+#[derive(Debug, Default)]
+pub struct SentPageMap(BTreeMap<FrameRef, Vec<String>>);
+
+impl Snapshot for SentPageMap {
+    /// Every page, by frame.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(&self.0)
+    }
+}
+
+impl SentPages {
+    /// An empty store in `stores`, the run's.
+    pub fn new(stores: &EvidenceStores) -> SentPages {
+        SentPages(stores.register("sent_pages", SentPageMap::default()))
+    }
+
+    /// Keeps `hashes` as the page of `frame`, unless the store froze.
+    pub(crate) fn record(&self, frame: FrameRef, hashes: Vec<String>) {
+        self.0.write(|pages| pages.0.insert(frame, hashes));
+    }
+
+    /// Every page the peers sent, as its frame and its header hashes, in
+    /// hex, in frame order. A reader joins the one it wants on its frame's
+    /// whole ref.
+    pub fn pages(&self) -> Vec<(FrameRef, Vec<String>)> {
+        self.0.read(|pages| {
+            pages
+                .0
+                .iter()
+                .map(|(frame, hashes)| (frame.clone(), hashes.clone()))
+                .collect()
+        })
+    }
+
+    /// How many pages it holds.
+    pub fn len(&self) -> usize {
+        self.0.read(|pages| pages.0.len())
+    }
+
+    /// Whether it holds no page.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A page carrying a header the peer's fixture made invalid.
@@ -302,6 +362,8 @@ pub(crate) struct WireEvidence {
     discovery: Option<StreamId>,
     /// Labels the node's frames on the discovery stream.
     discovery_sender: Option<DiscoverySender>,
+    /// Each placed page's header hashes, when a harness keeps them.
+    sent: Option<SentPages>,
     /// Each discovery request the peer's models labelled `OverMargin`, its
     /// `PeerFrame` waiting for the serving to count it.
     unsettled: BTreeMap<FrameKey, Unsettled>,
@@ -340,6 +402,15 @@ impl WireEvidence {
         WireEvidence {
             shared_ids,
             ..WireEvidence::default()
+        }
+    }
+
+    /// This evidence, also keeping each placed page's header hashes in
+    /// `sent`.
+    pub(crate) fn with_sent(self, sent: SentPages) -> Self {
+        WireEvidence {
+            sent: Some(sent),
+            ..self
         }
     }
 
@@ -516,8 +587,22 @@ impl WireEvidence {
                 payload,
                 prepares,
                 asks,
+                hashes,
             } => {
                 let key = (connection, quic_stream, seq);
+                if !hashes.is_empty() {
+                    if let Some(sent) = &self.sent {
+                        let frame = FrameRef {
+                            connection,
+                            kind: stream.kind,
+                            version: stream.version,
+                            quic_stream,
+                            inbound: true,
+                            seq,
+                        };
+                        sent.record(frame, hashes);
+                    }
+                }
                 self.labels.insert(key, label);
                 if let (Some(sender), Some(asks)) = (self.discovery_sender.as_mut(), asks) {
                     if Some(stream) == self.discovery {
@@ -1127,6 +1212,24 @@ fn rules(stream: StreamId) -> Option<&'static [MessageRule]> {
 
 #[cfg(test)]
 mod tests {
+    /// A sent page recorded after the run's stores froze is dropped.
+    #[test]
+    fn a_frozen_sent_page_store_drops_a_page() {
+        let frame = FrameRef {
+            connection: 1,
+            kind: 5,
+            version: 9,
+            quic_stream: 0,
+            inbound: true,
+            seq: 3,
+        };
+        crate::stores::assert_freeze_drops_writes(
+            super::SentPages::new,
+            |pages| pages.record(frame.clone(), vec!["ab".to_owned()]),
+            |pages| pages.pages(),
+        );
+    }
+
     use super::*;
     use crate::peer::peer_addr;
 
@@ -1289,6 +1392,7 @@ mod tests {
                 payload: 0,
                 prepares: None,
                 asks: None,
+                hashes: Vec::new(),
             },
         }));
         let mut evidence = with_ids(&[(1, 0)]);
@@ -1669,6 +1773,7 @@ mod tests {
                 payload: 6,
                 prepares: None,
                 asks: None,
+                hashes: Vec::new(),
             },
         }));
         let mut evidence = with_ids(&[(1, 0)]).with_discovery(stream);

@@ -76,7 +76,12 @@ const DEPARTED: usize = 4;
 /// The rule after mirror 2's admission, with a peer limit of 8 and a
 /// departed limit of [`DEPARTED`].
 fn rule() -> Outstanding {
-    let mut rule = Outstanding::new(OutstandingEvidence::default(), 8, DEPARTED, held());
+    let mut rule = Outstanding::new(
+        OutstandingEvidence::new(&EvidenceStores::default()),
+        8,
+        DEPARTED,
+        held(),
+    );
     rule.observe(&admitted(mirror(2), 1));
     rule
 }
@@ -85,7 +90,7 @@ fn rule() -> Outstanding {
 /// drain after its `Sizes` makes the rule applicable.
 #[test]
 fn matching_sizes_hold_and_apply() {
-    let evidence = OutstandingEvidence::default();
+    let evidence = OutstandingEvidence::new(&EvidenceStores::default());
     let mut rule = Outstanding::new(evidence.clone(), 8, DEPARTED, held());
     rule.observe(&admitted(mirror(2), 1));
     rule.observe(&locator(1, mirror(2)));
@@ -824,7 +829,7 @@ fn ended_subscriptions_shutdown_and_released_slots() {
         "{breaks:?}"
     );
 
-    let evidence = OutstandingEvidence::default();
+    let evidence = OutstandingEvidence::new(&EvidenceStores::default());
     let mut shut = Outstanding::new(evidence.clone(), 8, DEPARTED, held());
     shut.observe(&ReactorEvent::PublisherStarted {
         peer: mirror(2),
@@ -847,7 +852,7 @@ fn ended_subscriptions_shutdown_and_released_slots() {
 
     // A publisher whose session's token was cancelled lingers at rest,
     // whatever cancelled it, and one whose token holds doesn't.
-    let evidence = OutstandingEvidence::default();
+    let evidence = OutstandingEvidence::new(&EvidenceStores::default());
     let mut cancelled = Outstanding::new(evidence.clone(), 8, DEPARTED, held());
     for session_id in [6, 7] {
         cancelled.observe(&ReactorEvent::PublisherStarted {
@@ -1012,10 +1017,21 @@ fn retained_paths_hold_at_sixteen_and_break_past_it() {
 }
 
 /// What `outstanding-work-bounded` reads, with no tap behind it.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Probe {
     claims: super::super::claim::ClaimEvidence,
     outstanding: OutstandingEvidence,
+}
+
+impl Default for Probe {
+    /// Empty stores in one handle of their own.
+    fn default() -> Self {
+        let stores = EvidenceStores::default();
+        Probe {
+            claims: super::super::claim::ClaimEvidence::new(&stores),
+            outstanding: OutstandingEvidence::new(&stores),
+        }
+    }
 }
 
 impl crate::domain::header_sync::OutstandingView for Probe {
@@ -1401,5 +1417,17 @@ fn a_shutdown_judges_no_repair_context_read_by_age() {
             .iter()
             .any(|found| found.contains("repair context read")),
         "{found:?}"
+    );
+}
+
+/// A row's peak noted after the node's stores froze is dropped.
+#[test]
+fn a_frozen_outstanding_store_drops_a_peak() {
+    crate::stores::assert_freeze_drops_writes(
+        OutstandingEvidence::new,
+        |evidence| {
+            evidence.change(|store| store.peaks.insert("row", 3));
+        },
+        OutstandingEvidence::peaks,
     );
 }

@@ -163,7 +163,7 @@
       "when": {
         "submitted": {
           "kind": "prepare",
-          "nth": 6
+          "nth": 5
         }
       }
     },

@@ -29,6 +29,8 @@ pub struct FileSink {
     file: File,
     /// Bytes written so far.
     written: u64,
+    /// The SHA-256 state of those bytes, for [`FileSink::id_with`].
+    hasher: Sha256,
     /// The most bytes the file may hold.
     max_bytes: u64,
     /// The first write that failed or was refused. Later records are
@@ -74,6 +76,7 @@ impl FileSink {
         let mut sink = FileSink {
             file,
             written: 0,
+            hasher: Sha256::new(),
             max_bytes,
             error: None,
         };
@@ -89,10 +92,22 @@ impl FileSink {
         }
     }
 
+    /// The trace's ID ([`Trace::id`](super::Trace::id)) once `records` are
+    /// written after every record it holds, computed without writing them.
+    /// A sink that has already dropped a record names no file it will hold.
+    pub fn id_with(&self, records: &[Record]) -> String {
+        let mut hasher = self.hasher.clone();
+        for record in records {
+            hasher.update(line(record).as_bytes());
+        }
+        hex(&hasher.finalize())
+    }
+
     /// Writes `line` in one call, if it fits the limits.
     fn write(&mut self, line: &str) -> io::Result<()> {
         check_line(line, self.written, self.max_bytes)?;
         self.file.write_all(line.as_bytes())?;
+        self.hasher.update(line.as_bytes());
         // A usize always fits in a u64 on supported targets.
         self.written += line.len() as u64;
         Ok(())

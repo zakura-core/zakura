@@ -69,7 +69,7 @@ use super::{
         add_worktree, file_sha256, fresh_dir, head, hex, sim_build_failure, BuildFailure,
         INTERRUPTED_ERROR,
     },
-    planted_layout, provenance, remove_worktree, CaseFile, TypedFile, PLANTED_DIR, PROFILE, SHARED,
+    planted_layout, provenance, remove_worktree, CaseFile, PLANTED_DIR, PROFILE, SHARED,
 };
 use crate::{
     run_command,
@@ -462,7 +462,7 @@ pub(super) fn selects(prefix: &str, path: &str) -> bool {
 
 /// Every retained planted case whose property starts with one of
 /// `prefixes`, with its own committed witness. Fails on a case that names
-/// a nested `set`, which the loop's classes don't judge.
+/// a nested `set` or a `draft_set`, which the loop's classes don't judge.
 pub(super) fn planted_cases(
     repo_root: &Path,
     prefixes: &[String],
@@ -484,7 +484,10 @@ pub(super) fn planted_cases(
         matched.extend(prefixes.iter().filter(|prefix| selects(prefix, &path)));
         let case_file = patch.with_extension("toml");
         let CaseFile {
-            also_violates, set, ..
+            also_violates,
+            set,
+            draft_set,
+            ..
         } = toml::from_str(&fs::read_to_string(&case_file)?)
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
         // The loop's classes judge one property beside `also_violates`, so
@@ -492,6 +495,15 @@ pub(super) fn planted_cases(
         if !set.is_empty() {
             return Err(format!(
                 "{}: the loop doesn't judge a nested case's `set`; `cargo xtask planted` does",
+                case_file.display()
+            )
+            .into());
+        }
+        // Nor does it run the `Draft` run a `draft_set` case's catch needs.
+        if !draft_set.is_empty() {
+            return Err(format!(
+                "{}: the loop doesn't run a case's `draft_set` Draft run; `cargo xtask planted` \
+                 does",
                 case_file.display()
             )
             .into());
@@ -578,8 +590,9 @@ fn watched(repo_root: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> 
                 watched.push(input.with_extension("toml"));
                 watched.push(input);
             }
-            if let Some(TypedFile { scenario, plan, .. }) = file.typed {
-                watched.extend([scenario, plan]);
+            if let Some(typed) = file.typed {
+                let plan = typed.plan_file()?;
+                watched.extend([typed.scenario, plan.path().to_path_buf()]);
             }
             watched.extend(file.checks);
         }
@@ -1264,23 +1277,21 @@ fn runnable(tree: &Path, witness: &WitnessSpec, property: &str) -> Result<Runnab
             .map_err(|error| format!("{}: {error}", path.display()))?;
             match (file.input, file.typed) {
                 (Some(input), None) => input_args(&input),
-                (
-                    None,
-                    Some(TypedFile {
-                        harness,
-                        scenario,
-                        plan,
-                    }),
-                ) => Ok(Runnable::Record {
-                    harness,
-                    args: vec![
-                        "--scenario".to_owned(),
-                        fs::read_to_string(tree.join(&scenario))?,
-                        "--plan".to_owned(),
-                        tree.join(plan).to_string_lossy().into_owned(),
-                    ],
-                    property: property.to_owned(),
-                }),
+                (None, Some(typed)) => {
+                    let plan = typed
+                        .plan_file()
+                        .map_err(|error| format!("{}: {error}", path.display()))?;
+                    Ok(Runnable::Record {
+                        harness: typed.harness,
+                        args: vec![
+                            "--scenario".to_owned(),
+                            fs::read_to_string(tree.join(&typed.scenario))?,
+                            plan.flag().to_owned(),
+                            tree.join(plan.path()).to_string_lossy().into_owned(),
+                        ],
+                        property: property.to_owned(),
+                    })
+                }
                 _ => Err(format!(
                     "{}: names neither or both of input and typed",
                     path.display()

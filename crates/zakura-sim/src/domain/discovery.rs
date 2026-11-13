@@ -84,6 +84,7 @@ fn check_verification_capacity<S: HasView<View = VerificationView>>(
             .fetch_max(unsettled, Ordering::SeqCst);
         if unsettled > VERIFICATION_SLOTS {
             return Verdict::Violated(Violation {
+                subject: None,
                 property: VERIFICATION_CAPACITY.to_owned(),
                 step: cx.step,
                 witness: (1..=cx.step).collect(),
@@ -98,6 +99,7 @@ fn check_verification_capacity<S: HasView<View = VerificationView>>(
     }
     if view.free_slots != VERIFICATION_SLOTS {
         return Verdict::Violated(Violation {
+            subject: None,
             property: VERIFICATION_CAPACITY.to_owned(),
             step: cx.step,
             witness: (1..=cx.step).collect(),
@@ -181,6 +183,7 @@ fn check_wait_complete_wakes<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         return Verdict::Holds;
     }
     Verdict::Violated(Violation {
+        subject: None,
         property: WAIT_COMPLETE_WAKES.to_owned(),
         step: cx.step,
         witness: [state.last_check, Some(final_notify), state.last_notified]

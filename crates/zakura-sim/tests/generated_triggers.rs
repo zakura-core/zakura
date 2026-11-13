@@ -6,9 +6,13 @@
 
 mod support;
 
-use support::feed::{FEED, ITEM};
+use support::{
+    feed::{FEED, ITEM},
+    one_key_off::assert_one_key_off,
+};
 use zakura_network::zakura::Stream;
 use zakura_sim::{
+    harness::header_acceptance::refs::{ConnectionRef, ExchangeRef, PeerFrameRef, SourceFrameRef},
     model::Label,
     observe::{RowAt, StreamId, TransitionFact, TransportFact},
     property::PropertyId,
@@ -285,6 +289,462 @@ fn receiver_triggers_need_a_judged_frame() {
     ));
 }
 
+/// A fault close of connection `connection`.
+fn fault_closed(connection: u64) -> Observation {
+    Observation::ConnectionClosed {
+        connection,
+        cause: "service_protocol_reject".to_owned(),
+    }
+}
+
+/// `frame` moved to connection 2.
+fn on_two(frame: Observation) -> Observation {
+    match frame {
+        Observation::PeerFrame {
+            stream,
+            quic_stream,
+            seq,
+            row,
+            rule_stream,
+            label,
+            exhausted,
+            exchange,
+            payload,
+            ..
+        } => Observation::PeerFrame {
+            connection: 2,
+            stream,
+            quic_stream,
+            seq,
+            row,
+            rule_stream,
+            label,
+            exhausted,
+            exchange,
+            payload,
+        },
+        Observation::FrameJudged {
+            stream,
+            quic_stream,
+            seq,
+            ..
+        } => Observation::FrameJudged {
+            connection: 2,
+            stream,
+            quic_stream,
+            seq,
+        },
+        other => other,
+    }
+}
+
+/// `conformant-never-closes`'s trigger joins the punishment it counts to
+/// the connection it's on: connection 1's judged conformant frame doesn't
+/// reach it for a fault close or `Misbehavior` of connection 2 before the
+/// node judged anything there, and connection 2's own judged conformant
+/// frame does. A punishment the property doesn't count, after a
+/// non-conformant frame, leaves the trigger as connection 1's frame made it.
+#[test]
+fn conformant_never_closes_joins_the_punished_connection() {
+    let conformant = id(None, Template::ConformantNeverCloses);
+    let first = vec![peer(0, "item", Label::Conformant), judged(0)];
+    assert!(reaches(
+        &conformant,
+        [first.clone(), vec![fault_closed(1)]].concat()
+    ));
+    for punished in [fault_closed(2), Observation::Misbehavior { connection: 2 }] {
+        assert!(
+            !reaches(
+                &conformant,
+                [first.clone(), vec![punished.clone()]].concat()
+            ),
+            "{punished:?}"
+        );
+        let own: Vec<Observation> = first.iter().cloned().map(on_two).collect();
+        assert!(reaches(
+            &conformant,
+            [first.clone(), own, vec![punished.clone()]].concat()
+        ));
+    }
+    let bad = vec![
+        on_two(peer(0, "item", Label::LongPayload)),
+        on_two(judged(0)),
+    ];
+    assert!(reaches(
+        &conformant,
+        [first, bad, vec![fault_closed(2)]].concat()
+    ));
+}
+
+/// The node admitting work on `connection` from the peer's `item` frame
+/// `seq` of `watch` subscription `key`.
+fn work(connection: u64, seq: u64, key: u64) -> Observation {
+    Observation::WorkAdmitted {
+        connection,
+        frame: RowAt::new(stream(), "item"),
+        seq,
+        request: RowAt::new(stream(), "watch"),
+        exchange: key,
+        objects: 1,
+        bytes: 1,
+        ends: false,
+    }
+}
+
+/// The node starting to serve `connection`'s `watch` request `key`.
+fn serving(connection: u64, key: u64) -> Observation {
+    Observation::Serving {
+        connection,
+        request: RowAt::new(stream(), "watch"),
+        exchange: key,
+    }
+}
+
+/// The node's `item` output on `connection` for its `watch` request `key`.
+fn output(connection: u64, key: u64) -> Observation {
+    Observation::NodeOutput {
+        connection,
+        frame: RowAt::new(stream(), "item"),
+        request: RowAt::new(stream(), "watch"),
+        exchange: key,
+        payload: 8,
+        ends: false,
+    }
+}
+
+/// `receiver-work-authorized`'s trigger joins each work the node admits
+/// from its row to that work's own source frame: connection 1's judged
+/// frame doesn't reach it for work from connection 2, from another frame,
+/// from a frame the node judged only after the work, or from a frame the
+/// peer never sent. Connection 2's own judged frame does, whatever its
+/// label, since the violation is on its own trigger.
+#[test]
+fn work_authorized_joins_the_work_to_its_own_frame() {
+    let work_id = id(Some("item"), Template::WorkAuthorized);
+    let first = vec![peer(0, "item", Label::Conformant), judged(0)];
+    assert!(reaches(
+        &work_id,
+        [first.clone(), vec![work(1, 0, 7)]].concat()
+    ));
+    // One key off each: the connection and the frame.
+    assert!(!reaches(
+        &work_id,
+        [first.clone(), vec![work(2, 0, 7)]].concat()
+    ));
+    let other_row = vec![peer(1, "ended", Label::Conformant), judged(1)];
+    assert!(!reaches(
+        &work_id,
+        [first.clone(), other_row, vec![work(1, 1, 7)]].concat()
+    ));
+    // No source frame at all, beside connection 1's.
+    assert!(!reaches(
+        &work_id,
+        [first.clone(), vec![work(1, 5, 7)]].concat()
+    ));
+    assert!(!reaches(&work_id, vec![work(1, 0, 7)]));
+    // Judged only after the work.
+    assert!(!reaches(
+        &work_id,
+        vec![peer(0, "item", Label::Conformant), work(1, 0, 7), judged(0)]
+    ));
+    let own = vec![
+        on_two(peer(0, "item", Label::Unsolicited)),
+        on_two(judged(0)),
+    ];
+    assert!(reaches(
+        &work_id,
+        [first, own, vec![work(2, 0, 7)]].concat()
+    ));
+}
+
+/// The peer's frame `frame`, on `row` and labelled `label`, as its whole
+/// ref names it.
+fn peer_as(frame: &PeerFrameRef, row: &str, label: Label) -> Observation {
+    Observation::PeerFrame {
+        connection: frame.connection,
+        stream: StreamId {
+            kind: frame.kind,
+            version: frame.version,
+        },
+        quic_stream: frame.quic_stream,
+        seq: frame.seq,
+        row: Some(row.to_owned()),
+        rule_stream: stream(),
+        label,
+        exhausted: false,
+        exchange: Some(7),
+        payload: 8,
+    }
+}
+
+/// The node judging the peer's frame `frame`.
+fn judged_as(frame: &PeerFrameRef) -> Observation {
+    Observation::FrameJudged {
+        connection: frame.connection,
+        stream: StreamId {
+            kind: frame.kind,
+            version: frame.version,
+        },
+        quic_stream: frame.quic_stream,
+        seq: frame.seq,
+    }
+}
+
+/// A receiver trigger joins the frame the node judged to the frame the
+/// peer sent by its whole ref: connection 1's long `item` frame 2 on QUIC
+/// stream 3 reaches its `long-payload-closes` trigger only when the peer
+/// sent that same frame, and a label sent with any one key moved, the
+/// QUIC stream's included, labels another frame and reaches nothing.
+#[test]
+fn a_judged_frame_joins_its_whole_sent_frame() {
+    let item = id(Some("item"), Template::Closes(Label::LongPayload));
+    let frame = PeerFrameRef {
+        connection: 1,
+        kind: FEED_STREAM.kind,
+        version: FEED_STREAM.version,
+        quic_stream: Some(3),
+        seq: 2,
+    };
+    let moved = assert_one_key_off::<PeerFrameRef>(&frame, |sent| {
+        reaches(
+            &item,
+            vec![peer_as(sent, "item", Label::LongPayload), judged_as(&frame)],
+        )
+    });
+    assert_eq!(moved, 5);
+}
+
+/// A downstream trigger joins each effect to a frame the node judged on
+/// the effect's own connection: connection 1's work from its judged
+/// `item` frame reaches `receiver-work-authorized`'s trigger, and the same
+/// work admitted on another connection doesn't.
+#[test]
+fn an_effect_joins_a_frame_judged_on_its_own_connection() {
+    let work_id = id(Some("item"), Template::WorkAuthorized);
+    let first = vec![peer(0, "item", Label::Conformant), judged(0)];
+    assert_one_key_off::<ConnectionRef>(&ConnectionRef { connection: 1 }, |on| {
+        reaches(
+            &work_id,
+            [first.clone(), vec![work(on.connection, 0, 7)]].concat(),
+        )
+    });
+}
+
+/// `receiver-work-authorized`'s trigger joins each work to its source
+/// frame by the work's whole [`SourceFrameRef`]: connection 1's work from
+/// its `item` frame 0 reaches it after the node judged that frame, and
+/// after a judged frame with any one key moved, its stream's kind or
+/// version included, it doesn't.
+#[test]
+fn a_work_joins_its_whole_source_frame() {
+    let work_id = id(Some("item"), Template::WorkAuthorized);
+    let source = SourceFrameRef {
+        connection: 1,
+        kind: FEED_STREAM.kind,
+        version: FEED_STREAM.version,
+        seq: 0,
+    };
+    let moved = assert_one_key_off::<SourceFrameRef>(&source, |judged| {
+        let frame = PeerFrameRef {
+            connection: judged.connection,
+            kind: judged.kind,
+            version: judged.version,
+            quic_stream: None,
+            seq: judged.seq,
+        };
+        reaches(
+            &work_id,
+            vec![
+                peer_as(&frame, "item", Label::Conformant),
+                judged_as(&frame),
+                work(1, 0, 7),
+            ],
+        )
+    });
+    assert_eq!(moved, 4);
+}
+
+/// The peer's `row` frame 0 on the feed stream, on `exchange`'s
+/// connection and naming its key.
+fn peer_on(exchange: &ExchangeRef, row: &str) -> Observation {
+    Observation::PeerFrame {
+        connection: exchange.connection,
+        stream: stream(),
+        quic_stream: None,
+        seq: 0,
+        row: Some(row.to_owned()),
+        rule_stream: stream(),
+        label: Label::Conformant,
+        exhausted: false,
+        exchange: Some(exchange.exchange),
+        payload: 8,
+    }
+}
+
+/// `receiver-serving-bounded`'s trigger joins each serving owner to the
+/// request it serves by the owner's whole [`ExchangeRef`]: serving
+/// connection 1's `watch` request 7 reaches it after the node judged that
+/// request, and after a judged request with its connection or key moved
+/// it doesn't.
+#[test]
+fn a_serving_effect_joins_its_whole_exchange() {
+    let serving_id = id(Some("watch"), Template::ServingBounded);
+    let request = ExchangeRef {
+        connection: 1,
+        exchange: 7,
+    };
+    let moved = assert_one_key_off::<ExchangeRef>(&request, |judged| {
+        let frame = peer_on(judged, "watch");
+        let Observation::PeerFrame {
+            connection,
+            stream,
+            seq,
+            ..
+        } = frame
+        else {
+            unreachable!("`peer_on` is a peer's frame");
+        };
+        let judged = Observation::FrameJudged {
+            connection,
+            stream,
+            quic_stream: None,
+            seq,
+        };
+        reaches(&serving_id, vec![frame, judged, serving(1, 7)])
+    });
+    assert_eq!(moved, 2);
+}
+
+/// `conformant-never-closes` counts a punishment against the frames the
+/// node judged on the punished connection, joined by its whole
+/// [`ConnectionRef`]: connection 1's fault close after its own judged
+/// conformant frame reaches the trigger, and after that frame judged on
+/// another connection instead, it doesn't.
+#[test]
+fn a_punishment_counts_the_frames_judged_on_its_connection() {
+    let conformant = id(None, Template::ConformantNeverCloses);
+    assert_one_key_off::<ConnectionRef>(&ConnectionRef { connection: 1 }, |on| {
+        let frame = PeerFrameRef {
+            connection: on.connection,
+            kind: FEED_STREAM.kind,
+            version: FEED_STREAM.version,
+            quic_stream: None,
+            seq: 0,
+        };
+        reaches(
+            &conformant,
+            vec![
+                peer_as(&frame, "item", Label::Conformant),
+                judged_as(&frame),
+                fault_closed(1),
+            ],
+        )
+    });
+}
+
+/// `receiver-credit-conserved`'s trigger joins each page's work the node
+/// admits for its subscription to a judged page of that subscription on
+/// the work's own connection and key, granted credit before it. Connection
+/// 1's granted page doesn't reach it for connection 2's work, or for work
+/// of another subscription key, even with no page behind it. An ending's
+/// work, which the check doesn't count, leaves the trigger as it was.
+#[test]
+fn credit_conserved_joins_the_work_to_its_own_subscription() {
+    let credit = id(Some("watch"), Template::CreditConserved);
+    let first = vec![granted(7), peer(0, "item", Label::Conformant), judged(0)];
+    assert!(reaches(
+        &credit,
+        [first.clone(), vec![work(1, 0, 7)]].concat()
+    ));
+    // One key off each: the connection and the subscription.
+    assert!(!reaches(
+        &credit,
+        [first.clone(), vec![work(2, 0, 7)]].concat()
+    ));
+    assert!(!reaches(
+        &credit,
+        [first.clone(), vec![work(1, 0, 8)]].concat()
+    ));
+    let ending = match work(2, 9, 7) {
+        Observation::WorkAdmitted {
+            connection,
+            frame,
+            seq,
+            request,
+            exchange,
+            objects,
+            bytes,
+            ..
+        } => Observation::WorkAdmitted {
+            connection,
+            frame,
+            seq,
+            request,
+            exchange,
+            objects,
+            bytes,
+            ends: true,
+        },
+        _ => unreachable!(),
+    };
+    assert!(reaches(&credit, [first.clone(), vec![ending]].concat()));
+    let own_grant = Observation::CreditGranted {
+        connection: 2,
+        subscription: RowAt::new(stream(), "watch"),
+        exchange: 7,
+        objects: 4,
+        bytes: 64,
+        opens: true,
+    };
+    let own = vec![
+        own_grant,
+        on_two(peer(0, "item", Label::Conformant)),
+        on_two(judged(0)),
+    ];
+    assert!(reaches(&credit, [first, own, vec![work(2, 0, 7)]].concat()));
+}
+
+/// `receiver-serving-bounded`'s trigger joins each serving owner and output
+/// for a request of its row to a judged request with the effect's own
+/// connection and key. Connection 1's judged request doesn't reach it for
+/// serving or output on connection 2, or for another request key with no
+/// request behind it. Output for another request row, which the check
+/// doesn't count, leaves the trigger as it was.
+#[test]
+fn serving_bounded_joins_each_effect_to_its_own_request() {
+    let serving_id = id(Some("watch"), Template::ServingBounded);
+    let first = vec![peer(0, "watch", Label::Conformant), judged(0)];
+    for effect in [serving, output] {
+        assert!(reaches(
+            &serving_id,
+            [first.clone(), vec![effect(1, 7)]].concat()
+        ));
+        // One key off each: the connection and the request.
+        assert!(!reaches(
+            &serving_id,
+            [first.clone(), vec![effect(2, 7)]].concat()
+        ));
+        assert!(!reaches(
+            &serving_id,
+            [first.clone(), vec![effect(1, 8)]].concat()
+        ));
+        let own: Vec<Observation> = first.iter().cloned().map(on_two).collect();
+        assert!(reaches(
+            &serving_id,
+            [first.clone(), own, vec![effect(2, 7)]].concat()
+        ));
+    }
+    let elsewhere = Observation::NodeOutput {
+        connection: 2,
+        frame: RowAt::new(stream(), "ended"),
+        request: RowAt::new(stream(), "item"),
+        exchange: 7,
+        payload: 8,
+        ends: true,
+    };
+    assert!(reaches(&serving_id, [first, vec![elsewhere]].concat()));
+}
+
 /// The node applying the peer's grant of subscription `key` on connection
 /// 1's QUIC stream `quic`, as its regulation logs it.
 fn applied(quic: u64, key: u64) -> Observation {
@@ -327,8 +787,8 @@ fn sent(seq: u64, row: &str, label: Label) -> Observation {
 }
 
 /// `sender-within-credit` needs a page the node sent after it applied the
-/// peer's grant of that page's subscription, before it started writing. The
-/// peer's grant alone, a grant the peer only offered, the node's own
+/// peer's grant or `Open` of that page's subscription, before it started
+/// writing. The applied grant or `Open` alone, a grant the peer only offered, the node's own
 /// subscription update, a grant applied after the write started, a grant of
 /// another subscription, on another QUIC stream or on another connection,
 /// or an ending, which spends no credit, doesn't reach it. A page past its
@@ -345,6 +805,26 @@ fn sender_within_credit_needs_a_page_after_an_applied_grant() {
     ));
     assert!(!reaches(&credit, vec![grant.clone()]));
     assert!(!reaches(&credit, vec![page()]));
+    // The peer's `Open` applied with its initial credit, as its regulation
+    // logs it: alone it doesn't reach the trigger, and before a page it does.
+    let open = Observation::Transport {
+        instance: 0,
+        seq: 1,
+        node: "node".to_owned(),
+        connection: Some(1),
+        remote: "10.0.0.2:4000".to_owned(),
+        event: TransportFact::Regulated {
+            quic_stream: 4,
+            transition: TransitionFact::OpenApplied {
+                subscription: 7,
+                objects: 4,
+                bytes: 64,
+                seq: None,
+            },
+        },
+    };
+    assert!(!reaches(&credit, vec![open.clone()]));
+    assert!(reaches(&credit, vec![open, page()]));
     assert!(!reaches(
         &credit,
         vec![grant.clone(), sent(0, "watch", Label::Conformant)]

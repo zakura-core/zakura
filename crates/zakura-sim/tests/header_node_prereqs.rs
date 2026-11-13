@@ -19,6 +19,7 @@ use zakura_sim::{
     domain::header_sync::TEARDOWN_RETURNS_BASELINE,
     harness::{
         header_node::{
+            claim::SettlementEvidence,
             policy::{Allow, Hold, OpKind, Select, Trigger},
             Chain, ControlAction, ControlStep, Policy,
         },
@@ -177,35 +178,38 @@ fn a_shutdown_stops_the_node_and_passes_its_teardown_checks() {
     assert!(dropped > 0, "no plan stopped the node mid-prepare");
 }
 
-/// A run cut off right after it picks `Shutdown`, before the control task
-/// carries it out, with no drain to finish the stop, ends at the drain's
-/// bound: a harness failure that names the open teardown, so a chosen stop
-/// still never ends silently untaken. The stop counts from its pick. The
-/// test searches budgets for a run whose last step is that pick, with no
-/// drain.
-#[test]
-fn a_run_cut_off_at_the_shutdown_pick_is_unsettled() {
-    let scenario = scenario(
+/// The shutdown-only scenario the cut tests stop: a `Shutdown` step with no
+/// trigger, so the node stops as soon as the step loop offers it.
+fn stopping_at_once() -> StorageScenario {
+    scenario(
         Vec::new(),
         vec![ControlStep {
             peer: "node".to_owned(),
             action: ControlAction::Shutdown,
             when: None,
         }],
-    );
-    let cut = (1..64)
+    )
+}
+
+/// The first run of `scenario`, by live budget from 1, whose live phase
+/// ends at the `Shutdown` pick, with a drain of at most `drain_bound` steps,
+/// and the node's settlement evidence from that run. The stop counts from
+/// its pick, so in that run every step of it is left to the drain.
+fn cut_at_the_shutdown_pick(
+    scenario: &StorageScenario,
+    drain_bound: u64,
+) -> (RunReport, u64, SettlementEvidence) {
+    (1..64)
         .find_map(|budget| {
             let config = zakura_sim::RunConfig {
                 budget,
-                drain_bound: 0,
+                drain_bound,
                 ..zakura_sim::harness::header_sync::storage_config()
             };
             let mut sim = zakura_sim::Sim::new(config, PlanInput::Bytes(Vec::new()));
-            let storage = Rc::new(Storage::build(
-                &mut sim,
-                &scenario,
-                Storage::prepare(&scenario),
-            ));
+            let ports = Storage::prepare(scenario);
+            let rounds = ports.rounds.clone();
+            let storage = Rc::new(Storage::build(&mut sim, scenario, ports));
             let registry = Registry::new(storage_properties()).expect("unique IDs");
             let mut checker = RegistryChecker::new(
                 registry,
@@ -215,10 +219,23 @@ fn a_run_cut_off_at_the_shutdown_pick_is_unsettled() {
             );
             let report = sim.run(&mut checker, &mut MemorySink::default());
             drop((checker, storage));
-            let last = report.picks.last().map(|pick| pick.identity.as_str());
-            (last == Some("peer:node:shutdown")).then_some(report)
+            let picked = report
+                .picks
+                .iter()
+                .rfind(|pick| matches!(pick.phase, zakura_sim::check::Phase::Live))
+                .map(|pick| pick.identity.as_str());
+            (picked == Some("peer:node:shutdown")).then_some((report, budget, rounds))
         })
-        .expect("some budget ends the run at the shutdown pick");
+        .expect("some budget ends the live phase at the shutdown pick")
+}
+
+/// A run cut off right after it picks `Shutdown`, before the control task
+/// carries it out, with no drain to finish the stop, ends at the drain's
+/// bound: a harness failure that names the open teardown, so a chosen stop
+/// still never ends silently untaken.
+#[test]
+fn a_run_cut_off_at_the_shutdown_pick_is_unsettled() {
+    let (cut, _, _) = cut_at_the_shutdown_pick(&stopping_at_once(), 0);
     assert_eq!(
         cut.end.harness,
         Some(zakura_sim::HarnessFailure::DrainBound {
@@ -235,6 +252,38 @@ fn a_run_cut_off_at_the_shutdown_pick_is_unsettled() {
     assert_eq!(
         teardown,
         Some(PropertyOutcome::not_applicable(NaReason::HarnessFailed))
+    );
+}
+
+/// The same cut with the harness's own drain bound: the drain carries the
+/// stop out, the reactor's teardown settles at a drain step after the live
+/// phase, and `header-sync/teardown-returns-baseline` holds, so a stop the
+/// live phase only picked concludes under the drain (C2).
+#[test]
+fn a_stop_picked_at_the_cut_settles_in_the_drain() {
+    let drain_bound = zakura_sim::harness::header_sync::storage_config().drain_bound;
+    let (cut, budget, rounds) = cut_at_the_shutdown_pick(&stopping_at_once(), drain_bound);
+    assert_eq!(cut.end.harness, None, "{:?}", cut.end);
+    assert_eq!(cut.end.violation, None, "{:?}", cut.end);
+    assert!(cut.end.drain.is_some(), "the run drained: {:?}", cut.end);
+    let settled = rounds
+        .rows()
+        .into_iter()
+        .find(|row| row.settled)
+        .expect("the stopped node settles");
+    assert!(settled.shutdown, "{settled:?}");
+    assert!(
+        settled.step > budget,
+        "it settles in the drain, after the live phase's {budget} steps: {settled:?}"
+    );
+    let teardown = cut
+        .properties
+        .iter()
+        .find(|property| property.property == TEARDOWN_RETURNS_BASELINE)
+        .map(|property| property.outcome.clone());
+    assert!(
+        matches!(teardown, Some(PropertyOutcome::Held { .. })),
+        "{teardown:?}"
     );
 }
 

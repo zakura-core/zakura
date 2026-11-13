@@ -59,10 +59,9 @@
 //!
 //! [`Topology::link`]: super::Topology::link
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
-};
+use std::collections::{HashMap, HashSet};
+
+use serde_json::{json, Value};
 
 use zakura_network::zakura::{
     observe::ReactorEvent, ServicePeerDirection, SessionOrigin, SessionStep, TransportEvent,
@@ -71,7 +70,13 @@ use zakura_network::zakura::{
 use zakura_rt::sim::RunId;
 use zakura_scheduler::Status as SchedulerStatus;
 
-use crate::{peer::peer_of, property::EndedBy, RunEnd};
+use super::authority::{AuthorityFinding, AuthorityRule, AuthoritySubject};
+use crate::{
+    peer::peer_of,
+    property::EndedBy,
+    stores::{debug_snapshot, sorted_snapshot, EvidenceStores, Guard, Registered, Snapshot},
+    RunEnd,
+};
 
 /// One session or link fact about the node under test, in run order. Peers
 /// are named as the scenario names them.
@@ -167,8 +172,8 @@ pub enum EndCheck {
 
 /// A run's session view, shared by the node's tap and the topology's links.
 /// Cloning shares it.
-#[derive(Clone, Default)]
-pub struct SessionEvidence(Arc<Mutex<SessionLedger>>);
+#[derive(Clone)]
+pub struct SessionEvidence(Registered<SessionLedger>);
 
 impl std::fmt::Debug for SessionEvidence {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -190,19 +195,44 @@ struct SessionLedger {
     departed: HashSet<(ZakuraPeerId, u64)>,
     /// Own-9's facts, once the transport reports here.
     own9: Option<Own9>,
-    /// Set once the run's log froze. Nothing changes the view after that.
-    frozen: bool,
     /// Whether the run ended idle, once it has ended.
     idle: Option<bool>,
     /// The first rule the run broke.
     broken: Option<String>,
     /// The identity mismatches not yet drained: an admission whose peer,
     /// direction or session ID isn't its link's or transport row's, which
-    /// `header-sync/commit-only-authorized` claims.
-    claims: Vec<String>,
+    /// `header-sync/commit-only-authorized` claims as a provenance break.
+    claims: Vec<AuthorityFinding>,
     /// Whether an identity join was made since the last drain, which makes
     /// `header-sync/commit-only-authorized` applicable.
     identity_joined: bool,
+}
+
+impl Snapshot for SessionLedger {
+    /// Everything but the run it's bound to, whose ID differs between
+    /// processes, with each hashed collection sorted.
+    fn snapshot(&self) -> Value {
+        json!({
+            "joined": self.joined,
+            "facts": debug_snapshot(&self.facts),
+            "links": sorted_snapshot(&self.links),
+            "departed": sorted_snapshot(&self.departed),
+            "own9": self.own9.as_ref().map(|own9| json!({
+                "names": debug_snapshot(&own9.names),
+                "peers": sorted_snapshot(&own9.peers),
+                "rows": debug_snapshot(&own9.rows),
+                "installed": debug_snapshot(&own9.installed),
+                "exited": sorted_snapshot(&own9.exited),
+                "torn_down": sorted_snapshot(&own9.torn_down),
+                "origins": sorted_snapshot(&own9.origins),
+                "open": debug_snapshot(&own9.open),
+            })),
+            "idle": self.idle,
+            "broken": self.broken,
+            "claims": self.claims,
+            "identity_joined": self.identity_joined,
+        })
+    }
 }
 
 /// Own-9's facts about the node's sessions, as its transport reported them,
@@ -230,6 +260,7 @@ struct Own9 {
 }
 
 /// One own-9 `Session` row: an admitted service session.
+#[derive(Debug)]
 struct Row {
     connection: u64,
     quic_stream: u64,
@@ -240,6 +271,7 @@ struct Row {
 }
 
 /// One link the harness made.
+#[derive(Debug)]
 struct Link {
     peer: ZakuraPeerId,
     name: String,
@@ -256,10 +288,29 @@ struct Link {
 }
 
 impl SessionEvidence {
-    /// Locks the ledger. Every change completes under the lock, so a panic
-    /// elsewhere can't leave it half changed.
-    fn ledger(&self) -> MutexGuard<'_, SessionLedger> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    /// An empty view in `stores`, the node's. It freezes with them, so the
+    /// events the run's shutdown cleanup reports, such as a generation's
+    /// exit, change none of its facts, rules or end check.
+    pub fn new(stores: &EvidenceStores) -> SessionEvidence {
+        SessionEvidence(stores.register("sessions", SessionLedger::default()))
+    }
+
+    /// The handle that built the view, the node's.
+    pub fn stores(&self) -> &EvidenceStores {
+        self.0.stores()
+    }
+
+    /// Locks the ledger for reading. Nothing else is called while it's
+    /// held.
+    fn ledger(&self) -> Guard<'_, SessionLedger> {
+        self.0.lock()
+    }
+
+    /// Runs `change` on the ledger, unless the view is frozen. Every
+    /// change completes under the lock, so a panic elsewhere can't leave it
+    /// half changed.
+    fn change<R>(&self, change: impl FnOnce(&mut SessionLedger) -> R) -> Option<R> {
+        self.0.write(change)
     }
 
     /// Binds this view to `run`, the run of the tap that fills it.
@@ -268,44 +319,35 @@ impl SessionEvidence {
     ///
     /// If a tap already bound it, since one view serves one run.
     pub(crate) fn bind(&self, run: RunId) {
-        let mut ledger = self.ledger();
-        assert!(
-            ledger.run.is_none(),
-            "a session view serves one run, so each run prepares its own"
-        );
-        ledger.run = Some(run);
-    }
-
-    /// Freezes the view with its run's log, so the events the run's
-    /// shutdown cleanup reports, such as a generation's exit, change none of
-    /// its facts, rules or end check.
-    pub(crate) fn freeze(&self) {
-        self.ledger().frozen = true;
-    }
-
-    /// Locks the ledger for a change, or `None` once it's frozen.
-    fn live(&self) -> Option<MutexGuard<'_, SessionLedger>> {
-        Some(self.ledger()).filter(|ledger| !ledger.frozen)
+        self.change(|ledger| {
+            assert!(
+                ledger.run.is_none(),
+                "a session view serves one run, so each run prepares its own"
+            );
+            ledger.run = Some(run);
+        });
     }
 
     /// Turns the join on: the topology reports every link it makes here.
     pub(crate) fn expect_links(&self) {
-        self.ledger().joined = true;
+        self.change(|ledger| ledger.joined = true);
     }
 
     /// Turns the own-9 join on: the transport reports every event here.
     /// `names` gives each scripted peer's ID and name, by index, which also
     /// names the peer at a connection's address.
     pub(crate) fn expect_transport(&self, names: Vec<(ZakuraPeerId, String)>) {
-        self.ledger().own9 = Some(Own9 {
-            names,
-            peers: HashMap::new(),
-            rows: Vec::new(),
-            installed: Vec::new(),
-            exited: HashSet::new(),
-            torn_down: HashSet::new(),
-            origins: HashMap::new(),
-            open: Vec::new(),
+        self.change(|ledger| {
+            ledger.own9 = Some(Own9 {
+                names,
+                peers: HashMap::new(),
+                rows: Vec::new(),
+                installed: Vec::new(),
+                exited: HashSet::new(),
+                torn_down: HashSet::new(),
+                origins: HashMap::new(),
+                open: Vec::new(),
+            });
         });
     }
 
@@ -314,10 +356,7 @@ impl SessionEvidence {
     /// [`SessionEvidence::expect_transport`], and every event once the view
     /// froze are ignored.
     pub(crate) fn transport(&self, event: &TransportEvent) {
-        let Some(mut ledger) = self.live() else {
-            return;
-        };
-        match event {
+        self.change(|ledger| match event {
             TransportEvent::Registered {
                 conn_id, remote, ..
             } => {
@@ -342,7 +381,7 @@ impl SessionEvidence {
             } => ledger.retire(*conn_id, Some(*generation)),
             TransportEvent::TornDown { conn_id } => ledger.retire(*conn_id, None),
             _ => {}
-        }
+        });
     }
 
     /// Records whether the run ran dry idle: at rest
@@ -352,8 +391,8 @@ impl SessionEvidence {
     /// drain can leave a later timer pending, and a session whose
     /// retirement waits on one could still retire. That end doesn't count.
     pub fn end(&self, end: &RunEnd) {
-        self.ledger().idle =
-            Some(end.at_rest() && end.rest != Some(SchedulerStatus::WaitingOnTime));
+        let idle = end.at_rest() && end.rest != Some(SchedulerStatus::WaitingOnTime);
+        self.change(|ledger| ledger.idle = Some(idle));
     }
 
     /// Whether own-9 retired every session that left the reactor's view:
@@ -389,7 +428,8 @@ impl SessionEvidence {
         direction: ServicePeerDirection,
     ) {
         let connection = origin.connection;
-        let Some(mut ledger) = self.live() else {
+        let mut guard = self.ledger();
+        let Some(ledger) = guard.live() else {
             return;
         };
         ledger.facts.push(SessionFact::LinkOpened {
@@ -417,7 +457,8 @@ impl SessionEvidence {
 
     /// Records that the link on `connection` closed, unless it already did.
     pub(crate) fn link_closed(&self, connection: u64) {
-        let Some(mut ledger) = self.live() else {
+        let mut guard = self.ledger();
+        let Some(ledger) = guard.live() else {
             return;
         };
         let Some(link) = ledger.links.get_mut(&connection) else {
@@ -436,11 +477,11 @@ impl SessionEvidence {
     /// script, relink or shutdown does. A service that cancels a link's
     /// token reaches [`SessionEvidence::link_closed`] alone.
     pub(crate) fn harness_closed(&self, connection: u64) {
-        if let Some(mut ledger) = self.live() {
+        self.change(|ledger| {
             if let Some(link) = ledger.links.get_mut(&connection) {
                 link.closed_by_harness = true;
             }
-        }
+        });
     }
 
     /// Who ended the session `session_id` ([`EndedBy`]): the environment if
@@ -470,9 +511,7 @@ impl SessionEvidence {
     /// checking both rules. Events neither rule reads, and every event once
     /// the view froze, are ignored, so a tap feeds every event.
     pub(crate) fn reactor(&self, event: &ReactorEvent) {
-        if let Some(mut ledger) = self.live() {
-            ledger.reactor(event);
-        }
+        self.change(|ledger| ledger.reactor(event));
     }
 
     /// The first rule the run broke.
@@ -484,14 +523,16 @@ impl SessionEvidence {
     /// peer, direction or session ID isn't the one their link's origin or
     /// transport row carries. The service builds each `PeerSession` itself,
     /// so such a mismatch is a production defect with every fact truthful.
-    pub(crate) fn take_claims(&self) -> Vec<String> {
-        std::mem::take(&mut self.ledger().claims)
+    pub(crate) fn take_claims(&self) -> Vec<AuthorityFinding> {
+        self.change(|ledger| std::mem::take(&mut ledger.claims))
+            .unwrap_or_default()
     }
 
     /// Whether an admission's identity was joined to its link or transport
     /// row since the last call, mismatched or not.
     pub(crate) fn take_joined(&self) -> bool {
-        std::mem::take(&mut self.ledger().identity_joined)
+        self.change(|ledger| std::mem::take(&mut ledger.identity_joined))
+            .unwrap_or_default()
     }
 
     /// Every fact so far, in order.
@@ -689,11 +730,14 @@ impl SessionLedger {
             None
         };
         if let Some(expected) = mismatch {
-            let detail = format!(
-                "CommitOnlyAuthorized: the node admitted session {session_id} from {name}, \
-                 {direction:?}, with origin {origin:?}, but its link has {expected}"
-            );
-            self.claims.push(detail);
+            self.claims.push(AuthorityFinding::new(
+                AuthorityRule::Provenance,
+                AuthoritySubject::session(peer, session_id, Some(origin.connection)),
+                format!(
+                    "the node admitted session {session_id} from {name}, {direction:?}, with \
+                     origin {origin:?}, but its link has {expected}"
+                ),
+            ));
         }
         if std::mem::replace(&mut link.admitted, true) {
             return Err(format!(
@@ -764,10 +808,15 @@ impl SessionLedger {
         } else {
             None
         };
+        let subject = AuthoritySubject::session(peer, session_id, Some(connection));
         if let Some(expected) = mismatch {
-            self.claims.push(format!(
-                "CommitOnlyAuthorized: {admitted} on connection {connection}'s stream \
-                 {quic_stream}, but its Session row has {expected}"
+            self.claims.push(AuthorityFinding::new(
+                AuthorityRule::Provenance,
+                subject.clone(),
+                format!(
+                    "{admitted} on connection {connection}'s stream {quic_stream}, but its \
+                     Session row has {expected}"
+                ),
             ));
         }
         let installs = own9
@@ -782,9 +831,13 @@ impl SessionLedger {
             ));
         }
         if generation != session_id {
-            self.claims.push(format!(
-                "CommitOnlyAuthorized: {admitted} as generation {generation}, but the handler \
-                 installs each generation under its session ID"
+            self.claims.push(AuthorityFinding::new(
+                AuthorityRule::Provenance,
+                subject,
+                format!(
+                    "{admitted} as generation {generation}, but the handler installs each \
+                     generation under its session ID"
+                ),
             ));
         }
         own9.origins.insert((peer.clone(), session_id), origin);

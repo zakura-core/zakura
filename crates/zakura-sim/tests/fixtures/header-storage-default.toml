@@ -10,3 +10,7 @@ source = "crates/zakura-sim/tests/header_storage_seeds.rs"
 [derived_from]
 sha256 = "251c8894a914f36210e128139a57ffbb34a6ea871511f1d91387ace64e538148"
 generator = 2
+
+[[witness]]
+property = "harness/direct-dispatch"
+expect = "holds"

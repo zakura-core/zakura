@@ -15,7 +15,7 @@ use crate::harness::header_node::ready;
 fn seeded() -> (HeaderFixture, EnginePort, Publication, PublicationEvidence) {
     let fixture = HeaderFixture::regtest();
     let port = EnginePort::new(&fixture);
-    let evidence = PublicationEvidence::default();
+    let evidence = PublicationEvidence::new(&EvidenceStores::default());
     let check = Publication::new(evidence.clone(), port.snapshot());
     (fixture, port, check, evidence)
 }
@@ -270,7 +270,7 @@ fn status_queued(snapshot: &EngineSnapshot) -> ReactorEvent {
 fn armed(arming: Arming) -> (HeaderFixture, EnginePort, Publication, PublicationEvidence) {
     let fixture = HeaderFixture::regtest();
     let port = EnginePort::new(&fixture);
-    let evidence = PublicationEvidence::armed(arming);
+    let evidence = PublicationEvidence::armed(&EvidenceStores::default(), arming);
     let check = Publication::new(evidence.clone(), port.snapshot());
     (fixture, port, check, evidence)
 }
@@ -332,6 +332,67 @@ fn status_debts_open_at_admission_and_at_a_change() {
     assert_eq!(
         evidence.adopted_before(u64::MAX),
         Some(port.snapshot().state_version.get())
+    );
+}
+
+/// One adoption that changes what every paid session was advertised opens
+/// a debt for each, stamped in session order, so the facts and their
+/// stamps don't depend on how the check holds its sessions.
+#[test]
+fn an_adoption_stamps_its_debts_in_session_order() {
+    let (fixture, port, mut check, evidence) = armed(Arming {
+        armed: true,
+        status: true,
+    });
+    let seed = port.snapshot();
+    adopt(&mut check, &seed);
+    check.observe(&tip_published(&seed, true), true);
+    let sessions = [7, 2, 9, 4, 1, 12, 5, 3];
+    for session_id in sessions {
+        check.observe(
+            &ReactorEvent::SessionAdmitted {
+                peer: mirror(),
+                session_id,
+                direction: zakura_network::zakura::ServicePeerDirection::Inbound,
+                replaced: None,
+                origin: None,
+            },
+            true,
+        );
+        let ReactorEvent::StatusQueued { peer, status, .. } = status_queued(&seed) else {
+            unreachable!("`status_queued` queues a status");
+        };
+        check.observe(
+            &ReactorEvent::StatusQueued {
+                peer,
+                session_id,
+                status,
+            },
+            true,
+        );
+    }
+    let paid = evidence.facts().len();
+    let run = commit(&fixture, &port, 2);
+    check.run(&run, false);
+    check.publications(&port.take_publications());
+    adopt(&mut check, &run.snapshot);
+    let owed: Vec<(u64, u64)> = evidence.facts()[paid..]
+        .iter()
+        .filter_map(|(stamp, fact)| match fact {
+            PublicationFact::StatusOwed { session_id, .. } => Some((*stamp, *session_id)),
+            _ => None,
+        })
+        .collect();
+    let mut ordered = sessions;
+    ordered.sort_unstable();
+    assert_eq!(
+        owed.iter().map(|(_, session)| *session).collect::<Vec<_>>(),
+        ordered,
+        "{owed:?}"
+    );
+    assert!(
+        owed.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "{owed:?}"
     );
 }
 
@@ -486,4 +547,183 @@ fn a_store_must_be_the_whole_record() {
     let breaks = check.drain(2);
     assert_eq!(breaks.len(), 1, "{breaks:?}");
     assert!(breaks[0].contains("whose engine record is"), "{breaks:?}");
+}
+
+/// A publication fact kept after the node's stores froze is dropped.
+#[test]
+fn a_frozen_publication_store_drops_a_fact() {
+    crate::stores::assert_freeze_drops_writes(
+        |stores| {
+            PublicationEvidence::armed(
+                stores,
+                Arming {
+                    armed: true,
+                    status: false,
+                },
+            )
+        },
+        |evidence| {
+            evidence.keep(PublicationFact::Committed {
+                state_version: 1,
+                at: SimInstant::ZERO,
+            });
+        },
+        PublicationEvidence::facts,
+    );
+}
+
+/// Armed publication evidence and its node's claims, with no tap behind
+/// them.
+#[derive(Clone)]
+struct Boundary {
+    claims: super::super::claim::ClaimEvidence,
+    publication: PublicationEvidence,
+    ends: super::super::ends::EndEvidence,
+}
+
+impl Default for Boundary {
+    /// Empty stores in one handle of their own, the publication store
+    /// armed outside a status fixture.
+    fn default() -> Self {
+        let stores = EvidenceStores::default();
+        Boundary {
+            claims: super::super::claim::ClaimEvidence::new(&stores),
+            publication: PublicationEvidence::armed(
+                &stores,
+                Arming {
+                    armed: true,
+                    status: false,
+                },
+            ),
+            ends: super::super::ends::EndEvidence::new(&stores),
+        }
+    }
+}
+
+impl crate::domain::header_sync::PublicationView for Boundary {
+    fn claims(&self) -> &super::super::claim::ClaimEvidence {
+        &self.claims
+    }
+
+    fn publication(&self) -> &PublicationEvidence {
+        &self.publication
+    }
+
+    fn ends(&self) -> &super::super::ends::EndEvidence {
+        &self.ends
+    }
+}
+
+impl crate::property::HasView for Boundary {
+    type View = Boundary;
+
+    /// A copy sharing the stores.
+    fn view(&self) -> Boundary {
+        self.clone()
+    }
+
+    /// The publication store's stamps.
+    fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+        Some(
+            self.publication
+                .facts()
+                .into_iter()
+                .map(|(stamp, _)| stamp)
+                .filter(|stamp| after.is_none_or(|after| *stamp > after))
+                .collect(),
+        )
+    }
+}
+
+/// The claim break [`Boundary`]'s drain finds beside its commit: the
+/// commit's skipped publication.
+const SKIPPED: &str = "StatePublicationConsistent: the engine committed state version 2 and \
+                       the port's last publication in that step was None, not it";
+
+impl crate::harness::scripted::Script for Boundary {
+    const NAME: &'static str = "test/publication-break-beside-a-commit";
+    /// Whether step 1's drain also found the commit's publication skipped.
+    type Case = bool;
+
+    /// The publication check.
+    fn properties() -> Vec<crate::property::Property<crate::harness::scripted::ScriptRun<Boundary>>>
+    {
+        vec![crate::domain::header_sync::state_publication_consistent()]
+    }
+
+    /// The schedule and the view.
+    fn sources() -> crate::property::Sources {
+        use crate::property::Source;
+        crate::property::Sources::observed(&[Source::Schedule, Source::View])
+    }
+
+    /// At step 1: a commit of state version 2, which nothing adopts, and,
+    /// for a break, its skipped publication, as the tap's drain keeps
+    /// them.
+    fn observe(&self, broke: &bool, log: &mut crate::ObservationLog) {
+        let step = log.step();
+        if step != 1 {
+            return;
+        }
+        self.publication.keep(PublicationFact::Committed {
+            state_version: 2,
+            at: now(),
+        });
+        self.publication.change(|store| {
+            store.applicable.get_or_insert(step);
+        });
+        if *broke {
+            self.claims.record(super::super::claim::ClaimRecord {
+                step,
+                claim: super::super::claim::Claim::StatePublicationConsistent,
+                detail: SKIPPED.to_owned(),
+                attribution: None,
+            });
+        }
+    }
+}
+
+/// Sol P2: a claim break at the boundary that commits state version 2
+/// still registers the commit's adoption obligation, so a run that never
+/// adopts it reports both failures, in the full report recorded beside the
+/// trace and its fresh replay. Without the break, the obligation's failure
+/// is the same one.
+#[test]
+fn a_claim_break_beside_an_unadopted_commit_reports_both() {
+    use crate::{
+        domain::header_sync::STATE_PUBLICATION_CONSISTENT,
+        harness::scripted::{findings, sidecar},
+    };
+    let unadopted = crate::Violation {
+        subject: None,
+        property: STATE_PUBLICATION_CONSISTENT.to_owned(),
+        step: 1,
+        witness: vec![1],
+        expected: "Owner(\"adoption-of-state-version-2\") discharged before quiescence".to_owned(),
+        actual: "the scheduler is Quiescent after step 1 with the obligation from step 1 open"
+            .to_owned(),
+    };
+    let skipped = crate::Violation {
+        subject: None,
+        property: STATE_PUBLICATION_CONSISTENT.to_owned(),
+        step: 1,
+        witness: vec![1],
+        expected: "committed states are published and adopted as recorded, and advertised as \
+                   adopted"
+            .to_owned(),
+        actual: SKIPPED.to_owned(),
+    };
+    for (broke, expected) in [
+        (true, vec![skipped.clone(), unadopted.clone()]),
+        (false, vec![unadopted.clone()]),
+    ] {
+        let full = sidecar::<Boundary>(&broke, &[]);
+        let found = findings(&full, STATE_PUBLICATION_CONSISTENT);
+        assert_eq!(found.violations, expected, "broke: {broke}");
+        assert_eq!(
+            found.outcome,
+            crate::PropertyOutcome::Violated { witness: vec![1] },
+            "broke: {broke}"
+        );
+    }
 }

@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index 519a229164..f627b0e528 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -196,6 +196,12 @@ impl HeaderChunkBudget {
+             self.0
+                 .released
+                 .send_modify(|revision| *revision = revision.wrapping_add(1));
++            // Mutation: the release reads what's left while it still holds
++            // the budget's lock, so the reactor waits on itself. An
++            // unwinding release skips the read, as `report` does.
++            if !std::thread::panicking() {
++                let _ = self.remaining();
++            }
+         }
+     }
+ 

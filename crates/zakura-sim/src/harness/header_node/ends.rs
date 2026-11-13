@@ -13,9 +13,10 @@
 //! storage can commit before the control task runs. A cancel by the node's
 //! service writes nothing here.
 //!
-//! The store freezes with the run's log, as the adoption store does: the
-//! scheduler's shutdown can still run a harness task stopped partway, and
-//! a fact it records then would rewrite what the run ended with.
+//! The store freezes with the run's log, as every store its
+//! [`EvidenceStores`] handle builds does: the scheduler's shutdown can
+//! still run a harness task stopped partway, and a fact it records then
+//! would rewrite what the run ended with.
 //!
 //! A reactor that returns without the harness stopping it is the node's
 //! own end, not missing evidence, so the tap records it as
@@ -26,10 +27,14 @@
 //! Each fact takes the node's next stamp ([`super::stamp`]). The store
 //! holds the node's stamps, which the tap it's handed to shares with every
 //! other store it keeps.
-
-use std::sync::{Arc, Mutex, PoisonError};
+//!
+//! An environment fact a scripted `Control` step's execution recorded also
+//! names that step, by its position in the control script, in the store's
+//! causes, so each fact is joined to the pick that made it: a churn's
+//! relinks to the churn step, never to a later `Relink`.
 
 use super::stamp::Stamps;
+use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot};
 
 /// The environment action that ended something.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +64,13 @@ pub enum EndFact {
         /// What it did.
         action: EnvironmentAction,
     },
+    /// The reactor reported call `call` dropped (`CallEnded` `Dropped`),
+    /// recorded as the tap saw it, so its stamp orders the drop against a
+    /// `Shutdown`'s.
+    CallDropped {
+        /// The reactor's call number.
+        call: u64,
+    },
     /// The reactor's task ended without the harness stopping it and
     /// without unwinding.
     ReactorExited {
@@ -74,16 +86,35 @@ struct Store {
     stamps: Stamps,
     /// Each fact with its stamp, in stamp order.
     facts: Vec<(u64, EndFact)>,
-    /// Set when the run's log froze. Facts after it are dropped.
-    frozen: bool,
+    /// Each fact a scripted control step's execution recorded, by its
+    /// stamp, with that step's position in the control script, in stamp
+    /// order.
+    causes: Vec<(u64, usize)>,
+}
+
+impl Snapshot for Store {
+    /// The stamp counter and every fact.
+    fn snapshot(&self) -> serde_json::Value {
+        debug_snapshot(self)
+    }
 }
 
 /// One node's end facts, shared by its tap, its harness and whoever reads
 /// them. Cloning shares the store.
-#[derive(Clone, Debug, Default)]
-pub struct EndEvidence(Arc<Mutex<Store>>);
+#[derive(Clone, Debug)]
+pub struct EndEvidence(Registered<Store>);
 
 impl EndEvidence {
+    /// A store in `stores`, with new stamps.
+    pub fn new(stores: &EvidenceStores) -> EndEvidence {
+        EndEvidence(stores.register("ends", Store::default()))
+    }
+
+    /// The handle that built the store, the node's.
+    pub fn stores(&self) -> &EvidenceStores {
+        self.0.stores()
+    }
+
     /// The node's stamps, which this store's facts take.
     pub fn stamps(&self) -> Stamps {
         self.with(|store| store.stamps.clone())
@@ -91,23 +122,32 @@ impl EndEvidence {
 
     /// Runs `read` on the store. Nothing else is called while the lock is
     /// held.
-    fn with<R>(&self, read: impl FnOnce(&mut Store) -> R) -> R {
-        read(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    fn with<R>(&self, read: impl FnOnce(&Store) -> R) -> R {
+        self.0.read(read)
     }
 
     /// Keeps `fact` with the next stamp, unless the store is frozen.
     pub(super) fn record(&self, fact: EndFact) {
-        self.with(|store| {
-            if !store.frozen {
-                let stamp = store.stamps.next();
-                store.facts.push((stamp, fact));
+        self.record_caused(fact, None);
+    }
+
+    /// [`EndEvidence::record`], naming `control`, the position in the
+    /// control script of the step whose execution recorded `fact`, if one
+    /// did.
+    pub(super) fn record_caused(&self, fact: EndFact, control: Option<usize>) {
+        self.0.write(|store| {
+            let stamp = store.stamps.next();
+            store.facts.push((stamp, fact));
+            if let Some(control) = control {
+                store.causes.push((stamp, control));
             }
         });
     }
 
-    /// Stops recording facts. The tap calls it when the run's log freezes.
-    pub(super) fn freeze(&self) {
-        self.with(|store| store.frozen = true);
+    /// Every fact a scripted control step's execution recorded, by its
+    /// stamp, with that step's position in the control script.
+    pub fn causes(&self) -> Vec<(u64, usize)> {
+        self.with(|store| store.causes.clone())
     }
 
     /// Every fact so far, with its stamp, in stamp order.
@@ -131,7 +171,7 @@ impl EndEvidence {
         self.with(|store| {
             store.facts.iter().find_map(|(_, fact)| match fact {
                 EndFact::ReactorExited { step } => Some(*step),
-                EndFact::Environment { .. } => None,
+                EndFact::Environment { .. } | EndFact::CallDropped { .. } => None,
             })
         })
     }
@@ -140,22 +180,29 @@ impl EndEvidence {
 #[cfg(test)]
 mod tests {
     use super::{EndEvidence, EndFact, EnvironmentAction};
+    use crate::stores::EvidenceStores;
 
     /// Facts take the shared counter's stamps, so another store's stamps
     /// interleave with them, and a stamp the store doesn't hold finds
     /// nothing.
     #[test]
     fn end_facts_share_the_node_stamps() {
-        let ends = EndEvidence::default();
+        let stores = EvidenceStores::default();
+        let ends = EndEvidence::new(&stores);
         let stamps = ends.stamps();
         let close = EndFact::Environment {
             peer: "mirror-0".to_owned(),
             connection: Some(4),
             action: EnvironmentAction::Close,
         };
-        ends.record(close.clone());
+        ends.record_caused(close.clone(), Some(0));
         assert_eq!(stamps.next(), 2, "another store's fact");
         ends.record(EndFact::ReactorExited { step: 9 });
+        assert_eq!(
+            ends.causes(),
+            [(1, 0)],
+            "only a control step's fact names it"
+        );
         assert_eq!(
             ends.facts(),
             [(1, close.clone()), (3, EndFact::ReactorExited { step: 9 })]
@@ -163,13 +210,23 @@ mod tests {
         assert_eq!(ends.fact(1), Some(close));
         assert_eq!(ends.fact(2), None);
         assert_eq!(ends.reactor_exited(), Some(9));
-        ends.freeze();
+        stores.freeze();
         ends.record(EndFact::ReactorExited { step: 10 });
         assert_eq!(ends.facts().len(), 2, "a frozen store keeps nothing more");
         assert_eq!(
             stamps.after(Some(3)),
             Vec::<u64>::new(),
             "and takes no stamp"
+        );
+    }
+
+    /// An end fact recorded after the node's stores froze is dropped.
+    #[test]
+    fn a_frozen_end_store_drops_a_fact() {
+        crate::stores::assert_freeze_drops_writes(
+            EndEvidence::new,
+            |ends| ends.record(EndFact::ReactorExited { step: 1 }),
+            EndEvidence::facts,
         );
     }
 }

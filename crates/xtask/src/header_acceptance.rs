@@ -10,14 +10,26 @@
 //!    in its own target directory;
 //! 2. asks `header-acceptance plan` for the tasks the manifest names;
 //! 3. runs each task, every child with a deadline, writing its artifacts
-//!    under `artifacts/<task index>/` in the run directory: each test by
-//!    its exact name, each planted case through `cargo xtask planted` (the
-//!    planted runner's baseline and patched runs, contract C4) with its
-//!    patch rebuilt in its own target directory for the `Draft` run and its
-//!    binary's provenance checked, and each integrity mutation's history
-//!    unpatched, patched and restored;
+//!    under `artifacts/<task index>/` in the run directory, as the reader's
+//!    contract (`tool`'s module doc) gives them: each test by its exact
+//!    name; each history's witness test, declaring its histories, then the
+//!    task's declaration recorded and replayed fresh by S's `zakura-sim`;
+//!    each planted case through `cargo xtask planted` (the planted runner's
+//!    baseline and patched runs and their fresh replays, contract C4, and
+//!    its target confirmation's run), with its patch rebuilt in its own
+//!    target directory, its binaries' provenance checked, and, for a node
+//!    case, its `Draft` run recorded, replayed and judged for companions
+//!    by that build; each integrity mutation's history unpatched, patched
+//!    and restored, each recorded by its own checkout's build; and each
+//!    retired mutation's unit witness unpatched, patched and restored as a
+//!    plain build;
 //! 4. has `header-acceptance evaluate` assemble the result file and write
 //!    the record, and prints its counts.
+//!
+//! `--only <index>,...` makes a partial run, for an operator checking a few
+//! of the plan's tasks through this same path: it runs only those tasks,
+//! evaluates, and leaves the record retired, since a run that skipped tasks
+//! never fully succeeds.
 //!
 //! S is `HEAD` of a checkout with no change at all, untracked files
 //! included, so every input the run reads (the planted catalogue under
@@ -94,8 +106,32 @@ const TARGET_FILE: &str = "target.json";
 /// The planted runner's verdict on a case, as the reader's `VERDICT_FILE`
 /// names it.
 const VERDICT_FILE: &str = "verdict.json";
+/// The variable a counted witness test declares its histories under, as
+/// the reader's `HISTORIES_VAR` names it.
+const HISTORIES_VAR: &str = "ZAKURA_SIM_HISTORIES";
+/// The variable naming the run, task and role each declaration carries, as
+/// the reader's `HISTORIES_FOR_VAR` names it.
+const HISTORIES_FOR_VAR: &str = "ZAKURA_SIM_HISTORIES_FOR";
 /// The task a directory is for, as the reader's `TASK_FILE` names it.
 const TASK_FILE: &str = "task.json";
+/// A planted case's confirmation run, as the reader's `CONFIRMATION_DIR`
+/// names it.
+const CONFIRMATION_DIR: &str = "confirmation";
+/// A case's rebuild check, as the reader's `PROVENANCE_FILE` names it.
+const PROVENANCE_FILE: &str = "provenance.json";
+/// An integrity mutation's patched build, as the reader's
+/// `PATCHED_BUILD_FILE` names it.
+const PATCHED_BUILD_FILE: &str = "build.json";
+/// A `Draft` run's companions, as the reader's `COMPANIONS_FILE` names it.
+const COMPANIONS_FILE: &str = "companions.json";
+/// A recorded run's fresh replay's full report, as the reader's
+/// `FULL_REPORT_FILE` names it.
+const FULL_REPORT_FILE: &str = "full-report.json";
+/// How a fresh replay's child ended, as the reader's `REPLAY_FILE` names it.
+const REPLAY_FILE: &str = "replay.json";
+/// How a tool recording's child ended, as the reader's `RECORDING_FILE`
+/// names it.
+const RECORDING_FILE: &str = "recorded.json";
 
 /// Set once this process adopts its orphaned descendants ([`contain`]).
 static SUBREAPER: AtomicBool = AtomicBool::new(false);
@@ -255,7 +291,8 @@ pub(super) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         let commit = args.next().ok_or(UsageError("expected S's commit"))?;
         return run_in_subject(repo_root, &commit, args);
     }
-    let options = options(repo_root, args)?;
+    let (args, only) = split_only(args)?;
+    let options = options(repo_root, args.into_iter())?;
     let out = options.out.clone();
     // The run starts here, retiring the record (the record invariant, in
     // the module doc).
@@ -280,7 +317,7 @@ pub(super) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
     };
     let root = run_dir.join(SUBJECT_DIR);
     add_worktree(repo_root, &run, &root, &subject.commit)?;
-    let result = hand_off(&root, &run, &subject.commit);
+    let result = hand_off(&root, &run, &subject.commit, only.as_ref());
     let removed = remove_worktrees_under(repo_root, &run, &run_dir);
     let log = result?;
     removed?;
@@ -298,6 +335,16 @@ pub(super) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         }
     }
     let summary = fs::read_to_string(&log)?;
+    // A partial run retired the record when it started, and never
+    // publishes one: it didn't run every task.
+    if only.is_some() {
+        print!("{summary}");
+        println!(
+            "partial run (--only): no record published; its results are in {}",
+            run_dir.join("results.json").display()
+        );
+        return Ok(());
+    }
     publish_record(&out, &run_dir)?;
     // Nothing after the record is published can fail the run.
     {
@@ -307,6 +354,39 @@ pub(super) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         let _ = writeln!(stdout, "record: {}", out.join(RECORD).display());
     }
     Ok(())
+}
+
+/// The flag naming the task indices a partial run runs ([`split_only`]).
+const ONLY: &str = "--only";
+
+/// Takes `--only <index>[,<index>...]` out of `args`, once at most: the
+/// plan's task indices a partial run runs, for an operator checking a few
+/// tasks through the real runner. Every other task's directory is left
+/// unwritten, so its result blocks, and the run publishes no record.
+fn split_only(
+    args: impl Iterator<Item = String>,
+) -> Result<(Vec<String>, Option<BTreeSet<usize>>), BoxError> {
+    let mut rest = Vec::new();
+    let mut only = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg != ONLY {
+            rest.push(arg);
+            continue;
+        }
+        let list = args
+            .next()
+            .ok_or(UsageError("expected task indices after `--only`"))?;
+        let indices = list
+            .split(',')
+            .map(|index| index.parse::<usize>())
+            .collect::<Result<BTreeSet<usize>, _>>()
+            .map_err(|_| UsageError("`--only` takes comma-separated task indices"))?;
+        if only.replace(indices).is_some() {
+            return Err(Box::new(UsageError("expected at most one `--only`")));
+        }
+    }
+    Ok((rest, only))
 }
 
 /// The published record, directly under `--out`.
@@ -325,7 +405,7 @@ const SUBJECT_DIR: &str = "subject";
 const LOCK_FILE: &str = ".lock";
 
 /// A run directory's target directories, dropped once the run succeeds.
-const RUN_TARGETS: [&str; 5] = ["xtask-target", "build", "tests", "native", "cases"];
+const RUN_TARGETS: [&str; 6] = ["xtask-target", "build", "tests", "native", "unit", "cases"];
 
 /// Takes `--out`'s lock ([`LOCK_FILE`]) for the whole run, or fails if
 /// another run holds it, then starts the run: its first change to `--out`
@@ -738,7 +818,12 @@ const IN_SUBJECT_DEADLINE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// experiments with it ([`run_in_subject`]), so the code that runs every
 /// task and reads its artifacts is S's, not the caller's, whatever the
 /// caller's checkout held when it started. Returns the evaluator's log.
-fn hand_off(root: &Path, options: &Options, commit: &str) -> Result<PathBuf, BoxError> {
+fn hand_off(
+    root: &Path,
+    options: &Options,
+    commit: &str,
+    only: Option<&BTreeSet<usize>>,
+) -> Result<PathBuf, BoxError> {
     let logs = options.out.join("logs");
     let target = options.out.join("xtask-target");
     let cargo_path = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
@@ -759,6 +844,10 @@ fn hand_off(root: &Path, options: &Options, commit: &str) -> Result<PathBuf, Box
         .arg(options.deadline.as_secs().to_string())
         .env("CARGO", &cargo_path)
         .current_dir(root);
+    if let Some(only) = only {
+        let list: Vec<String> = only.iter().map(usize::to_string).collect();
+        inner.arg(ONLY).arg(list.join(","));
+    }
     let log = logs.join("in-subject.log");
     child(&mut inner, &log, IN_SUBJECT_DEADLINE)
         .exited_ok()
@@ -781,7 +870,8 @@ fn run_in_subject(
     commit: &str,
     args: impl Iterator<Item = String>,
 ) -> Result<(), BoxError> {
-    let options = options(repo_root, args)?;
+    let (args, only) = split_only(args)?;
+    let options = options(repo_root, args.into_iter())?;
     let root = options.out.join(SUBJECT_DIR);
     if resolved(repo_root) != resolved(&root) {
         return Err(format!(
@@ -805,7 +895,13 @@ fn run_in_subject(
         .ok_or("a run directory has a name")?
         .to_string_lossy()
         .into_owned();
-    let log = run_at(repo_root, &options, &subject, contained, &run_id)?;
+    let log = run_at(
+        repo_root,
+        &options,
+        &subject,
+        (contained, only.as_ref()),
+        &run_id,
+    )?;
     stop_if_interrupted()?;
     if ESCAPED.load(Ordering::Relaxed) {
         return Err(
@@ -825,7 +921,7 @@ fn run_at(
     root: &Path,
     options: &Options,
     subject: &Subject,
-    contained: bool,
+    (contained, only): (bool, Option<&BTreeSet<usize>>),
     run_id: &str,
 ) -> Result<PathBuf, BoxError> {
     let out = &options.out;
@@ -866,6 +962,10 @@ fn run_at(
         .exited_ok()
         .map_err(|end| format!("building the simulator {end}"))?;
     let tool = build.join(planted::PROFILE).join("header-acceptance");
+    let tools = Tools {
+        tool: tool.clone(),
+        sim: build.join(planted::PROFILE).join("zakura-sim"),
+    };
 
     let plan_file = out.join("plan.json");
     let mut plan = Command::new(&tool);
@@ -885,7 +985,15 @@ fn run_at(
 
     let worktree = out.join("worktree");
     add_worktree(root, options, &worktree, &subject.commit)?;
-    let result = run_tasks(root, options, subject, tasks, &artifacts, &worktree);
+    let result = run_tasks(
+        root,
+        options,
+        subject,
+        (run_id, &tools, only),
+        tasks,
+        &artifacts,
+        &worktree,
+    );
     let removed = remove_worktree(root, options, &worktree);
     result?;
     removed?;
@@ -1079,6 +1187,27 @@ fn git(options: &Options, dir: &Path, args: &[&OsStr]) -> Result<(), String> {
             let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
             format!("`git {}` {end}", args.join(" "))
         })
+}
+
+/// The commit `dir`'s checkout was made from, its `HEAD`, read by `git
+/// rev-parse` under the run's deadline, or [`provenance::UNKNOWN`] if git
+/// can't say.
+fn head_of(options: &Options, dir: &Path) -> String {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let log = options.out.join("logs").join(format!(
+        "head-{}.log",
+        CALLS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut command = planted::git(dir);
+    command.args(["rev-parse", "--verify", "HEAD"]);
+    if !child(&mut command, &log, options.deadline).exited() {
+        return provenance::UNKNOWN.to_owned();
+    }
+    fs::read_to_string(&log)
+        .ok()
+        .and_then(|text| text.lines().last().map(str::trim).map(str::to_owned))
+        .filter(|commit| commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| provenance::UNKNOWN.to_owned())
 }
 
 /// How a child ended, with its log.
@@ -1747,31 +1876,71 @@ fn processes() -> Option<Vec<(i32, i32, i32)>> {
 #[cfg(unix)]
 const PS_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Runs every task in `tasks`, writing artifacts under `artifacts`: each
-/// property's planted cases first, through [`run_planted`], then every
-/// task in order.
+/// S's own `header-acceptance` and `zakura-sim`, built under the run's
+/// target directory.
+struct Tools {
+    /// `header-acceptance`, whose `record-args` gives a declared history's
+    /// recording arguments as the reader binds them.
+    tool: PathBuf,
+    /// `zakura-sim`, which records and replays every run S itself makes.
+    sim: PathBuf,
+}
+
+/// Runs every task in `tasks` for the run `run_id`, with S's `tools`,
+/// writing artifacts under `artifacts`: each property's planted cases
+/// first, through [`run_planted`], then every task in order. With `only`,
+/// a partial run's indices ([`split_only`]), it runs and binds only those.
+/// The run and task whose directory an artifact goes in, which every
+/// artifact the runner writes there names beside its role, as the
+/// reader's `TaskAt` reads it.
+#[derive(Clone, Copy, Debug)]
+struct TaskId<'a> {
+    /// The run's ID.
+    run_id: &'a str,
+    /// The task's index in its plan.
+    index: usize,
+}
+
+impl TaskId<'_> {
+    /// `fields` with this task's run at `role` named, as the reader's
+    /// `binding::TEST`, `UNIT_BUILD` and `REPLAY` carry them.
+    fn name(&self, role: &str, mut fields: Value) -> Value {
+        fields["run_id"] = json!(self.run_id);
+        fields["index"] = json!(self.index);
+        fields["role"] = json!(role);
+        fields
+    }
+}
+
 fn run_tasks(
     repo_root: &Path,
     options: &Options,
     subject: &Subject,
+    (run_id, tools, only): (&str, &Tools, Option<&BTreeSet<usize>>),
     tasks: &[Value],
     artifacts: &Path,
     worktree: &Path,
 ) -> Result<(), BoxError> {
-    // Each task directory names the task it's for, as the reader's
-    // `task_binding` does, before anything is written into it, so the
-    // reader takes a directory only as its own task's.
-    for (index, task) in tasks.iter().enumerate() {
+    let runs = |index: usize| only.is_none_or(|only| only.contains(&index));
+    let tasks: Vec<(usize, &Value)> = tasks
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| runs(*index))
+        .collect();
+    // Each task directory names the run and the task it's for, as the
+    // reader's `task_binding` does, before anything is written into it, so
+    // the reader takes a directory only as this run's own task's.
+    for &(index, task) in &tasks {
         let dir = artifacts.join(index.to_string());
         fs::create_dir_all(&dir)?;
         fs::write(
             dir.join(TASK_FILE),
-            json!({ "index": index, "task": task }).to_string(),
+            json!({ "run_id": run_id, "index": index, "task": task }).to_string(),
         )?;
     }
     // Each property's cases, as `(task index, case name)`.
     let mut by_property: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
-    for (index, task) in tasks.iter().enumerate() {
+    for &(index, task) in &tasks {
         if let Some(case) = task.get("case") {
             by_property
                 .entry(text(case, "property")?)
@@ -1779,25 +1948,40 @@ fn run_tasks(
                 .push((index, text(case, "name")?));
         }
     }
+    // Each case's target confirmation, waiting for the source its rebuild
+    // measures ([`case_task`]).
+    let mut confirmations = BTreeMap::new();
     for (property, cases) in &by_property {
         stop_if_interrupted()?;
-        run_planted(repo_root, options, property, cases, artifacts)?;
+        confirmations.extend(run_planted(
+            repo_root,
+            options,
+            property,
+            cases,
+            (artifacts, run_id),
+        )?);
     }
     let mut broken: Option<String> = None;
-    for (index, task) in tasks.iter().enumerate() {
+    for &(index, task) in &tasks {
         stop_if_interrupted()?;
         let dir = artifacts.join(index.to_string());
         fs::create_dir_all(&dir)?;
+        let id = TaskId { run_id, index };
         if let Some(test) = task.get("test") {
             run_test(
                 repo_root,
                 options,
                 Some(&subject.source),
                 test,
-                &dir,
-                &options.out.join("tests"),
+                (&dir, id, ""),
+                (&options.out.join("tests"), None, true),
             )?;
-        } else if task.get("case").is_some() || task.get("integrity").is_some() {
+        } else if let Some(history) = task.get("history") {
+            run_history(repo_root, options, subject, tools, history, (&dir, id))?;
+        } else if task.get("case").is_some()
+            || task.get("integrity").is_some()
+            || task.get("unit").is_some()
+        {
             // A scratch worktree that failed once can't be trusted for the
             // tasks after it, which leave their artifacts missing, so their
             // results block and the rest of the run still records.
@@ -1805,10 +1989,20 @@ fn run_tasks(
                 fs::write(dir.join("setup.log"), format!("not run: {why}\n"))?;
                 continue;
             }
-            let ran = match (task.get("case"), task.get("integrity")) {
-                (Some(case), _) => case_task(options, subject, case, &dir, worktree)?,
-                (_, Some(integrity)) => run_integrity(options, subject, integrity, &dir, worktree),
-                _ => unreachable!("the task is a case or an integrity mutation"),
+            let at = Checkouts {
+                subject: repo_root,
+                worktree,
+            };
+            let ran = match (task.get("case"), task.get("integrity"), task.get("unit")) {
+                (Some(case), _, _) => {
+                    let confirmation = confirmations.remove(&index);
+                    case_task(options, subject, at, case, (&dir, id), confirmation)?
+                }
+                (_, Some(integrity), _) => {
+                    run_integrity(options, subject, tools, integrity, (&dir, id), worktree)
+                }
+                (_, _, Some(unit)) => run_unit(options, subject, unit, (&dir, id), worktree),
+                _ => unreachable!("the task is a case, an integrity mutation or a unit witness"),
             };
             stop_if_interrupted()?;
             if let Err(why) = ran {
@@ -1826,20 +2020,28 @@ fn run_tasks(
 
 /// Runs `property`'s planted cases (each `(task index, case name)` in
 /// `cases`) through `cargo xtask planted <property>`, and copies each
-/// case's baseline and patched runs under its task's directory. The
-/// runner's case directories are cleared first, so every trace copied is
-/// this invocation's, and a killed invocation marks both runs of every case
-/// [`KILLED`]. Each case's [`VERDICT_FILE`] holds the runner's own verdict
-/// on it ([`case_verdict`]), which covers its campaign as well as its
-/// traces. Then it runs `--targets` for the property and writes each case's
-/// [`TARGET_FILE`] from it.
+/// case's baseline and patched runs under its task's directory, each with
+/// the fresh replay the planted runner made of it by the binary that
+/// recorded it. The runner's case directories are cleared first, so every
+/// trace copied is this invocation's, and a killed invocation marks both
+/// runs of every case [`KILLED`] and keeps none of their replays. Each
+/// case's [`VERDICT_FILE`] holds the runner's own verdict on it
+/// ([`case_verdict`]), which covers its campaign as well as its traces,
+/// bound to the two traces it judged by SHA-256. Then it runs `--targets`
+/// for the property, copies each confirmed case's confirmation run to its
+/// [`CONFIRMATION_DIR`], and returns each case's target check by task
+/// index ([`confirmation_check`]). A check whose case runs on no target
+/// names no source yet: its [`case_task`] gives it the source its rebuild
+/// measured, which the reader requires of every check. Each copied replay
+/// is named as this run's (`run_id`) task's at its run's role
+/// ([`name_replay`]).
 fn run_planted(
     repo_root: &Path,
     options: &Options,
     property: &str,
     cases: &[(usize, String)],
-    artifacts: &Path,
-) -> Result<(), BoxError> {
+    (artifacts, run_id): (&Path, &str),
+) -> Result<BTreeMap<usize, Value>, BoxError> {
     let stem = property.replace('/', "-");
     let ended = planted_child(repo_root, options, property, false, &stem)?;
     stop_if_interrupted()?;
@@ -1849,31 +2051,145 @@ fn run_planted(
         let slot = planted::case_index(repo_root, property, name)?;
         copy_planted_runs(repo_root, slot, &dir)?;
         // A verdict line carries no time, so one may have been printed after
-        // the deadline: a killed invocation's every case is killed.
+        // the deadline: a killed invocation's every case is killed, and so
+        // is any replay it made.
         if ended.killed() {
             for run in ["baseline", "patched"] {
                 fs::write(dir.join(run).join(KILLED), "")?;
+                let replay = dir.join(run).join(planted::REPLAY_DIR);
+                if replay.exists() {
+                    fs::remove_dir_all(replay)?;
+                }
             }
         }
+        for run in ["baseline", "patched"] {
+            let id = TaskId {
+                run_id,
+                index: *index,
+            };
+            name_replay(&dir.join(run), id, run)?;
+        }
         let refused = case_verdict(&log, property, name, ended.killed()).err();
-        fs::write(
-            dir.join(VERDICT_FILE),
-            serde_json::to_string_pretty(
-                &json!({ "property": property, "name": name, "refused": refused }),
-            )?,
-        )?;
+        write_verdict(&dir, property, name, refused)?;
     }
     let ended = planted_child(repo_root, options, property, true, &stem)?;
     stop_if_interrupted()?;
     let log = fs::read_to_string(&ended.log).unwrap_or_default();
+    let mut checks = BTreeMap::new();
     for (index, name) in cases {
         let check = target_check(&log, ended.killed(), property, name);
-        fs::write(
-            artifacts.join(index.to_string()).join(TARGET_FILE),
-            serde_json::to_string_pretty(&check)?,
-        )?;
+        let dir = artifacts.join(index.to_string());
+        // The `--targets` run numbers its cases among those on a target.
+        let scratch = planted::target_case_index(repo_root, property, name)
+            .map_err(|error| error.to_string())
+            .and_then(|slot| {
+                let slot =
+                    slot.ok_or("the --targets run listed the case, and it runs on no target")?;
+                Ok(repo_root
+                    .join("target/planted")
+                    .join(format!("case-{slot}"))
+                    .join("target"))
+            });
+        checks.insert(*index, confirmation_check(check, scratch, &dir)?);
     }
+    Ok(checks)
+}
+
+/// Writes case `name` of `property`'s [`VERDICT_FILE`] in `dir`: the
+/// planted runner's verdict, `refused` or not, bound to the baseline and
+/// patched traces beside it, which it judged, by SHA-256. A trace that
+/// can't be read is named by none, which the reader refuses.
+fn write_verdict(
+    dir: &Path,
+    property: &str,
+    name: &str,
+    refused: Option<String>,
+) -> Result<(), BoxError> {
+    let judged = |run: &str| sha256_file(&dir.join(run).join("trace.jsonl"));
+    fs::write(
+        dir.join(VERDICT_FILE),
+        serde_json::to_string_pretty(&json!({
+            "property": property,
+            "name": name,
+            "baseline": judged("baseline"),
+            "patched": judged("patched"),
+            "refused": refused,
+        }))?,
+    )?;
     Ok(())
+}
+
+/// `check`, the target check [`target_check`] read for a case, completed
+/// with the confirmation run it names: for a case confirmed through a
+/// target, the `zakura-sim confirm` recording the planted runner made in
+/// `scratch`, its confirmation's directory (or why it has none), is copied
+/// whole to `dir`'s [`CONFIRMATION_DIR`], and the check names its trace
+/// and the input the target ran by SHA-256, and the source the planted
+/// runner's confirmation `zakura-sim` embeds (its report's
+/// `build.sim_build.source`), which the runner has checked is the patched
+/// checkout's. A
+/// confirmation whose files can't be read refuses the check. A case with
+/// no target, or a refused one, names no run or input, and its `source` is
+/// left for [`case_task`].
+fn confirmation_check(
+    mut check: Value,
+    scratch: Result<PathBuf, String>,
+    dir: &Path,
+) -> Result<Value, BoxError> {
+    check["source"] = Value::Null;
+    check["input_sha256"] = Value::Null;
+    check["trace"] = Value::Null;
+    if check["target"].is_null() || !check["refused"].is_null() {
+        return Ok(check);
+    }
+    let found = || -> Result<(String, String, String), String> {
+        let scratch = scratch?;
+        let read = |path: &Path| -> Result<Value, String> {
+            serde_json::from_str(
+                &fs::read_to_string(path)
+                    .map_err(|error| format!("{}: {error}", path.display()))?,
+            )
+            .map_err(|error| format!("{}: {error}", path.display()))
+        };
+        let source = read(&scratch.join("report.json"))?["build"]["sim_build"]["source"]
+            .as_str()
+            .ok_or("the confirmation's report names no simulator build source")?
+            .to_owned();
+        let confirm = scratch.join("original").join("confirm");
+        let trace = read(&confirm.join("confirmation.json"))?["trace"]
+            .as_str()
+            .ok_or("the confirmation names no trace")?
+            .to_owned();
+        let run = dir.join(CONFIRMATION_DIR);
+        fs::create_dir_all(&run).map_err(|error| error.to_string())?;
+        copy_tree(&confirm.join(trace), &run).map_err(|error| error.to_string())?;
+        let input = sha256_file(&scratch.join("original").join("input.bin"))
+            .ok_or("the confirmation's input can't be read")?;
+        let traced = sha256_file(&run.join("trace.jsonl"))
+            .ok_or("the confirmation's trace can't be read")?;
+        Ok((source, input, traced))
+    };
+    match found() {
+        Ok((source, input, trace)) => {
+            check["source"] = Value::String(source);
+            check["input_sha256"] = Value::String(input);
+            check["trace"] = Value::String(trace);
+        }
+        Err(why) => check["refused"] = Value::String(why),
+    }
+    Ok(check)
+}
+
+/// The SHA-256 of `path`'s bytes in hex, as the reader names a file, or
+/// `None` if it can't be read.
+fn sha256_file(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    fs::read(path).ok().map(|bytes| {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    })
 }
 
 /// Clears the planted runner's case directories, then runs `cargo xtask
@@ -1886,21 +2202,32 @@ fn planted_child(
     stem: &str,
 ) -> Result<Ended, BoxError> {
     clear_case_dirs(&repo_root.join("target/planted"))?;
-    let mut planted = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    planted
-        .current_dir(repo_root)
-        .env("CARGO_TERM_COLOR", "never")
-        .args(["xtask", "planted"])
-        .arg(property);
-    if targets {
-        planted.arg("--targets");
-    }
+    let mut planted = planted_command(repo_root, property, targets);
     let suffix = if targets { "-targets" } else { "" };
     let log = options
         .out
         .join("logs")
         .join(format!("planted-{stem}{suffix}.log"));
     Ok(child(&mut planted, &log, options.deadline))
+}
+
+/// `cargo xtask planted <property>` in `repo_root`, with `--targets` if
+/// `targets`. It builds `xtask` into `repo_root`'s own `target/`, never an
+/// inherited `CARGO_TARGET_DIR`: a shared one would get an `xtask` whose
+/// compiled-in repository root is this temporary checkout, and the caller's
+/// next `cargo xtask` there would run against this checkout's commit.
+fn planted_command(repo_root: &Path, property: &str, targets: bool) -> Command {
+    let mut planted = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    planted
+        .current_dir(repo_root)
+        .env_remove("CARGO_TARGET_DIR")
+        .env("CARGO_TERM_COLOR", "never")
+        .args(["xtask", "planted"])
+        .arg(property);
+    if targets {
+        planted.arg("--targets");
+    }
+    planted
 }
 
 /// Removes every `case-<n>` directory the planted runner left in `work`.
@@ -2013,38 +2340,49 @@ fn text(value: &Value, field: &str) -> Result<String, BoxError> {
 /// in, whose source digest is `source`, with its target directory under
 /// `targets`, and writes `test.json`: whether the child exited 0, since the
 /// reader counts an `ok` only if it did, and whether the test binary embeds
-/// `source`.
+/// `source`. With `histories`, the test runs with the reader's
+/// `HISTORIES_VAR` set to it, so it declares every history it runs there,
+/// and `HISTORIES_FOR_VAR` naming task `id`'s run at `role`, which each
+/// declaration carries.
+/// With `sim`, it builds and runs under the simulator's flags, and without,
+/// as a plain build. `test.json` names task `id`'s run at `role` and the
+/// SHA-256 of the executable it ran. Returns the executable it ran, if it
+/// found one.
 fn run_test(
     dir_root: &Path,
     options: &Options,
     source: Option<&str>,
     test: &Value,
-    out: &Path,
-    targets: &Path,
-) -> Result<(), BoxError> {
+    (out, id, role): (&Path, TaskId<'_>, &str),
+    (targets, histories, sim): (&Path, Option<&Path>, bool),
+) -> Result<Option<PathBuf>, BoxError> {
     let package = text(test, "package")?;
     let file = text(test, "file")?;
     let name = text(test, "test")?;
     let log = out.join("test.log");
     // Writes a `test.json` that ran nothing, with `why` as its log, so the
     // result blocks.
-    let ran_nothing = |why: &str, killed: bool| -> Result<(), BoxError> {
+    let ran_nothing = |why: &str, killed: bool| -> Result<Option<PathBuf>, BoxError> {
         stop_if_interrupted()?;
         fs::write(&log, why)?;
         fs::write(
             out.join("test.json"),
-            serde_json::to_string_pretty(&json!({
-                "package": package,
-                "file": file,
-                "tests": [],
-                "killed": killed,
-                "exited_ok": false,
-                "log": why,
-                "binary_source": null,
-                "checkout_source": source,
-            }))?,
+            serde_json::to_string_pretty(&id.name(
+                role,
+                json!({
+                    "executable_sha256": null,
+                    "package": package,
+                    "file": file,
+                    "tests": [],
+                    "killed": killed,
+                    "exited_ok": false,
+                    "log": why,
+                    "binary_source": null,
+                    "checkout_source": source,
+                }),
+            ))?,
         )?;
-        Ok(())
+        Ok(None)
     };
     // The test runs by the target whose source is the declared file, which
     // isn't always the file's stem.
@@ -2071,6 +2409,9 @@ fn run_test(
         TargetKind::Bin => build.args(["--bin", &target.name]),
     };
     build.args(["--no-run", "--message-format=json"]);
+    if !sim {
+        build.env_remove("RUSTFLAGS");
+    }
     let built = child(&mut build, &build_log, options.deadline);
     let messages = fs::read_to_string(&build_log).unwrap_or_default();
     if let Err(end) = built.exited_ok() {
@@ -2097,9 +2438,15 @@ fn run_test(
             "CARGO",
             env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo")),
         )
-        .env("RUSTFLAGS", SIM_RUSTFLAGS)
         .env("CARGO_TARGET_DIR", targets)
         .env("CARGO_TERM_COLOR", "never");
+    if sim {
+        run.env("RUSTFLAGS", SIM_RUSTFLAGS);
+    }
+    if let Some(histories) = histories {
+        run.env(HISTORIES_VAR, histories)
+            .env(HISTORIES_FOR_VAR, id.name(role, json!({})).to_string());
+    }
     let ended = child(&mut run, &log, options.deadline);
     stop_if_interrupted()?;
     let text_log = fs::read_to_string(&log).unwrap_or_default();
@@ -2112,18 +2459,22 @@ fn run_test(
     };
     fs::write(
         out.join("test.json"),
-        serde_json::to_string_pretty(&json!({
-            "package": package,
-            "file": file,
-            "tests": tests,
-            "killed": ended.killed(),
-            "exited_ok": ended.exited(),
-            "log": text_log,
-            "binary_source": binary_source,
-            "checkout_source": source,
-        }))?,
+        serde_json::to_string_pretty(&id.name(
+            role,
+            json!({
+                "executable_sha256": sha256_file(&executable),
+                "package": package,
+                "file": file,
+                "tests": tests,
+                "killed": ended.killed(),
+                "exited_ok": ended.exited(),
+                "log": text_log,
+                "binary_source": binary_source,
+                "checkout_source": source,
+            }),
+        ))?,
     )?;
-    Ok(())
+    Ok(Some(executable))
 }
 
 /// An integration-test target, as `cargo metadata` gives it.
@@ -2401,26 +2752,274 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// The two checkouts a task reads: S's own, `subject`, whose committed
+/// inputs every recording runs, and the scratch `worktree` it patches.
+#[derive(Clone, Copy)]
+struct Checkouts<'a> {
+    /// S's checkout.
+    subject: &'a Path,
+    /// The scratch worktree, reset to S around each task.
+    worktree: &'a Path,
+}
+
+/// Runs a `zakura-sim record` child, `sim` with `args` and `--out <out>`,
+/// under the deadline, its output in `<out>.log`, for task `id`'s run at
+/// `role`. A child killed at its deadline leaves [`KILLED`] in `out`. How
+/// it ended goes to `out`'s [`RECORDING_FILE`], named as that run with the
+/// SHA-256 of the trace it left, so the reader refuses a recording whose
+/// child failed whatever artifacts it wrote. Returns whether it exited 0.
+fn record_run(
+    options: &Options,
+    sim: &Path,
+    args: &[OsString],
+    (out, id, role): (&Path, TaskId<'_>, &str),
+) -> Result<bool, BoxError> {
+    let mut record = Command::new(sim);
+    record.arg("record").args(args).arg("--out").arg(out);
+    let ended = child(&mut record, &out.with_extension("log"), options.deadline);
+    stop_if_interrupted()?;
+    fs::create_dir_all(out)?;
+    if ended.killed() {
+        fs::write(out.join(KILLED), "")?;
+    }
+    let status = json!({
+        "trace": sha256_file(&out.join("trace.jsonl")),
+        "exited_ok": ended.exited(),
+        "killed": ended.killed(),
+    });
+    fs::write(
+        out.join(RECORDING_FILE),
+        serde_json::to_string_pretty(&id.name(role, status))?,
+    )?;
+    Ok(ended.exited())
+}
+
+/// The recorded run in `run`'s fresh replay, by `sim`, the binary that
+/// recorded it: a separate `zakura-sim replay <run> --report
+/// <run>/replay/full-report.json` under the deadline, and how it ended as
+/// `<run>/replay/replay.json`, the reader's `ReplayRun`, named as task
+/// `id`'s run at `role` ([`name_replay`]). A run with no trace, or one
+/// killed at its deadline, gets none.
+fn fresh_replay(
+    options: &Options,
+    sim: &Path,
+    (run, id, role): (&Path, TaskId<'_>, &str),
+) -> Result<(), BoxError> {
+    if !run.join("trace.jsonl").is_file() || run.join(KILLED).exists() {
+        return Ok(());
+    }
+    let dir = run.join(planted::REPLAY_DIR);
+    fs::create_dir_all(&dir)?;
+    let mut replay = Command::new(sim);
+    replay
+        .arg("replay")
+        .arg(run)
+        .arg("--report")
+        .arg(dir.join(FULL_REPORT_FILE));
+    let log = run.with_extension("replay.log");
+    let ended = child(&mut replay, &log, options.deadline);
+    stop_if_interrupted()?;
+    fs::write(
+        dir.join(REPLAY_FILE),
+        serde_json::to_string_pretty(&json!({
+            "exited_ok": ended.exited(),
+            "killed": ended.killed(),
+            "log": fs::read_to_string(&log).unwrap_or_default(),
+        }))?,
+    )?;
+    name_replay(run, id, role)
+}
+
+/// Names the fresh replay of the recorded run in `run`, if it has one, as
+/// task `id`'s run at `role`: its `replay.json` gets the run's ID, the
+/// task's index, the role, the SHA-256 of `run`'s trace and the source the
+/// replay's own full report names, the build that replayed it, as the
+/// reader's `binding::REPLAY` carries them. A trace or report that can't be
+/// read is named by none, which the reader refuses.
+fn name_replay(run: &Path, id: TaskId<'_>, role: &str) -> Result<(), BoxError> {
+    let dir = run.join(planted::REPLAY_DIR);
+    let file = dir.join(REPLAY_FILE);
+    if !file.is_file() {
+        return Ok(());
+    }
+    let mut replay: Value = serde_json::from_str(&fs::read_to_string(&file)?)?;
+    let source = fs::read_to_string(dir.join(FULL_REPORT_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|report| report.get("source").cloned())
+        .unwrap_or(Value::Null);
+    replay["trace"] = json!(sha256_file(&run.join("trace.jsonl")));
+    replay["source"] = source;
+    fs::write(&file, serde_json::to_string_pretty(&id.name(role, replay))?)?;
+    Ok(())
+}
+
+/// Records into `out`, with `sim`, the one history the witness test `test`
+/// declared under `declared` as `case` on `harness`, run for task `id` at
+/// `role`, with the arguments S's `tool` gives it (`header-acceptance
+/// record-args`, the reader's `record_args`), and `witness`, a property and
+/// its `--expect`, if any. The recording is that task's run at
+/// `recorded_as` ([`record_run`]).
+/// A declaration the reader wouldn't take leaves `out` missing, with why in
+/// `<out>.log`. Returns whether it recorded.
+fn record_declared(
+    options: &Options,
+    (tool, sim): (&Path, &Path),
+    (declared, harness, test, case): (&Path, &str, &str, &str),
+    (id, role): (TaskId<'_>, &str),
+    (out, recorded_as): (&Path, &str),
+    witness: Option<(&str, &str)>,
+) -> Result<bool, BoxError> {
+    let file = out.with_extension("args.json");
+    let mut args = Command::new(tool);
+    args.arg("record-args")
+        .arg("--declared")
+        .arg(declared)
+        .args([
+            "--harness",
+            harness,
+            "--test",
+            test,
+            "--case",
+            case,
+            "--run-id",
+            id.run_id,
+            "--index",
+            &id.index.to_string(),
+            "--role",
+            role,
+            "--out",
+        ])
+        .arg(&file);
+    let ended = child(&mut args, &out.with_extension("args.log"), options.deadline);
+    stop_if_interrupted()?;
+    if !ended.exited() {
+        return Ok(false);
+    }
+    let mut args: Vec<OsString> = serde_json::from_str::<Vec<String>>(&fs::read_to_string(&file)?)?
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    if let Some((property, expect)) = witness {
+        args.extend(["--witness", property, "--expect", expect].map(OsString::from));
+    }
+    record_run(options, sim, &args, (out, id, recorded_as))?;
+    Ok(true)
+}
+
+/// Runs history task `history` in `dir`: its witness test at S, by its
+/// exact name, declaring under `dir/declared`; then the declaration the
+/// task names, recorded by S's `zakura-sim` into `dir/run` with the task's
+/// witness, `--witness <property> --expect <expect>` when it names an
+/// expectation, and that run's fresh replay by the same binary.
+fn run_history(
+    repo_root: &Path,
+    options: &Options,
+    subject: &Subject,
+    tools: &Tools,
+    history: &Value,
+    (dir, id): (&Path, TaskId<'_>),
+) -> Result<(), BoxError> {
+    let test = text(history, "test")?;
+    let declared = dir.join("declared");
+    run_test(
+        repo_root,
+        options,
+        Some(&subject.source),
+        history,
+        (dir, id, ""),
+        (&options.out.join("tests"), Some(&declared), true),
+    )?;
+    let property = text(history, "property")?;
+    let expect = history.get("expect").and_then(Value::as_str);
+    let run = dir.join("run");
+    let (harness, case) = (text(history, "harness")?, text(history, "case")?);
+    let named = (
+        declared.as_path(),
+        harness.as_str(),
+        test.as_str(),
+        case.as_str(),
+    );
+    if record_declared(
+        options,
+        (&tools.tool, &tools.sim),
+        named,
+        (id, ""),
+        (&run, "run"),
+        expect.map(|expect| (property.as_str(), expect)),
+    )? {
+        fresh_replay(options, &tools.sim, (&run, id, "run"))?;
+    }
+    Ok(())
+}
+
+/// `zakura-sim record`'s arguments for `input`, a case task's `CaseInput`,
+/// from S's checkout `repo_root`: `--input` with the committed input's
+/// path, or `--scenario` with the scenario file's JSON text, as the CLI
+/// parses it, and `--plan` or `--script` with the Plan file's path.
+fn case_input_args(repo_root: &Path, input: &Value) -> Result<Vec<OsString>, BoxError> {
+    let path = |at: &Value, field: &str| -> Result<OsString, BoxError> {
+        Ok(repo_root.join(text(at, field)?).into_os_string())
+    };
+    let scenario = |at: &Value| -> Result<OsString, BoxError> {
+        let file = repo_root.join(text(at, "scenario")?);
+        Ok(fs::read_to_string(&file)
+            .map_err(|error| format!("{}: {error}", file.display()))?
+            .into())
+    };
+    if let Some(fuzz) = input.get("fuzz") {
+        Ok(vec!["--input".into(), path(fuzz, "input")?])
+    } else if let Some(typed) = input.get("typed") {
+        Ok(vec![
+            "--scenario".into(),
+            scenario(typed)?,
+            "--plan".into(),
+            path(typed, "plan")?,
+        ])
+    } else if let Some(scripted) = input.get("scripted") {
+        Ok(vec![
+            "--scenario".into(),
+            scenario(scripted)?,
+            "--script".into(),
+            path(scripted, "script")?,
+        ])
+    } else {
+        Err(format!("a case input of no known kind: {input}").into())
+    }
+}
+
 /// Runs planted case `case`'s rebuild ([`rebuild_case`]) in a target
-/// directory of its own, `cases/<task index>` under the run directory, then
-/// removes that directory whatever the rebuild did, a missing one counting
-/// as removed. Nothing reads the binary after its provenance check, so each
-/// case's build (gigabytes) lasts only through it. hdr-14.7b, which records
-/// the `Draft` run from that binary, moves the removal after the recording.
-/// The outer error is the run's, a target it couldn't remove. The inner
-/// result is the rebuild's, a setup failure of this task.
+/// directory of its own, `cases/<task index>` under the run directory,
+/// which records its `Draft` run and judges its companions from that build,
+/// then writes its [`TARGET_FILE`] from `confirmation`, the check
+/// [`run_planted`] read, with the source the rebuild measured for a case on
+/// no target. It then removes the target directory whatever the rebuild
+/// did, a missing one counting as removed, so each case's build
+/// (gigabytes) lasts only through its own recordings. The outer error is
+/// the run's, a target it couldn't remove. The inner result is the
+/// rebuild's, a setup failure of this task.
 fn case_task(
     options: &Options,
     subject: &Subject,
+    at: Checkouts<'_>,
     case: &Value,
-    dir: &Path,
-    worktree: &Path,
+    (dir, id): (&Path, TaskId<'_>),
+    confirmation: Option<Value>,
 ) -> Result<Result<(), BoxError>, BoxError> {
     let target = options
         .out
         .join("cases")
         .join(dir.file_name().unwrap_or_default());
-    let rebuilt = rebuild_case(options, subject, case, dir, worktree, &target);
+    let rebuilt = rebuild_case(options, subject, at, case, (dir, id), &target).and_then(|source| {
+        let Some(mut check) = confirmation else {
+            return Ok(());
+        };
+        if check["source"].is_null() {
+            check["source"] = Value::String(source);
+        }
+        fs::write(dir.join(TARGET_FILE), serde_json::to_string_pretty(&check)?)?;
+        Ok(())
+    });
     match fs::remove_dir_all(&target) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2434,87 +3033,167 @@ fn case_task(
     Ok(rebuilt)
 }
 
-/// Rebuilds case `case`'s patch in `target`, for its `Draft` run, and
-/// checks the binary embeds the patched checkout's source digest (C5),
-/// writing the check to `dir`'s `provenance.json`. A patch that doesn't
-/// apply or build is a refused check, not an error. The `Draft` recording
-/// itself needs C9's override in `record`, so it waits for hdr-14.7b.
+/// Rebuilds case `case`'s patch on S in the worktree, into `target`, and
+/// checks both binaries it builds, `zakura-sim` and `header-acceptance`,
+/// embed the patched checkout's source digest (C5), writing the check to
+/// `dir`'s [`PROVENANCE_FILE`] with the commit the checkout was made from
+/// and the SHA-256 of the patch it applied. For a node case, whose task
+/// names `draft`, the rebuilt `zakura-sim` then records `dir/draft` from
+/// S's committed input with `--draft <set>` (C9) and the task's
+/// `draft_witness` ([`draft_witness_args`]), replays it fresh, and,
+/// if the task names companions, the rebuilt `header-acceptance` judges
+/// them on that trace into `dir/draft/companions.json`. A patch that
+/// doesn't apply or build is a refused check with no `Draft` run, not an
+/// error. Returns the source it measured.
 fn rebuild_case(
     options: &Options,
     subject: &Subject,
+    at: Checkouts<'_>,
     case: &Value,
-    dir: &Path,
-    worktree: &Path,
+    (dir, id): (&Path, TaskId<'_>),
     target: &Path,
-) -> Result<(), BoxError> {
+) -> Result<String, BoxError> {
+    let worktree = at.worktree;
     reset(options, worktree, &subject.commit)?;
     let patch = worktree.join(text(case, "patch")?);
+    // The patch the rebuild applies, which the reader compares with the
+    // case's committed patch at S.
+    let patch_sha256 = sha256_file(&patch).unwrap_or_else(|| provenance::UNKNOWN.to_owned());
     let applied = git(options, worktree, &["apply".as_ref(), patch.as_os_str()]);
+    let built = target.join(planted::PROFILE);
+    let binaries = [built.join("zakura-sim"), built.join("header-acceptance")];
     let refused = match applied {
         Err(why) => Some(format!("the patch doesn't apply: {why}")),
         Ok(()) => {
             let mut build = planted::cargo_sim(worktree, target);
+            build.args(["--bin", "header-acceptance"]);
             let ended = child(&mut build, &dir.join("build.log"), options.deadline);
             match ended.exited_ok() {
                 Err(why) => Some(format!("the patched build {why}")),
                 Ok(()) => match checkout_digest(options, worktree) {
                     Err(why) => Some(why.to_string()),
-                    Ok(read) => {
-                        let binary = target.join(planted::PROFILE).join("zakura-sim");
-                        match fs::read(&binary) {
-                            Ok(bytes) => planted::names_source(&bytes, &read.source).err(),
-                            Err(error) => Some(format!("{}: {error}", binary.display())),
-                        }
-                    }
+                    Ok(read) => binaries.iter().find_map(|binary| match fs::read(binary) {
+                        Ok(bytes) => planted::names_source(&bytes, &read.source)
+                            .err()
+                            .map(|why| format!("{}: {why}", binary.display())),
+                        Err(error) => Some(format!("{}: {error}", binary.display())),
+                    }),
                 },
             }
         }
     };
     let source = checkout_digest(options, worktree)
         .map_or_else(|_| provenance::UNKNOWN.to_owned(), |read| read.source);
+    let base = head_of(options, worktree);
     stop_if_interrupted()?;
-    // The patch the rebuild applied, which the reader compares with the
-    // case's committed patch at S.
-    let patch_sha256: String = {
-        use sha2::{Digest, Sha256};
-        fs::read(&patch)
-            .map(|bytes| {
-                Sha256::digest(bytes)
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect()
-            })
-            .unwrap_or_else(|_| provenance::UNKNOWN.to_owned())
-    };
     fs::write(
-        dir.join("provenance.json"),
-        serde_json::to_string_pretty(
-            &json!({ "source": source, "patch_sha256": patch_sha256, "refused": refused }),
-        )?,
+        dir.join(PROVENANCE_FILE),
+        serde_json::to_string_pretty(&json!({
+            "base": base,
+            "source": source,
+            "patch_sha256": patch_sha256,
+            "refused": refused,
+        }))?,
     )?;
-    reset(options, worktree, &subject.commit)
+    if let (None, Some(set)) = (&refused, case.get("draft").and_then(Value::as_array)) {
+        let [sim, judge] = &binaries;
+        let set: Vec<&str> = set.iter().filter_map(Value::as_str).collect();
+        let mut args: Vec<OsString> = vec!["--sim".into(), text(case, "harness")?.into()];
+        args.extend(case_input_args(at.subject, &case["input"])?);
+        args.extend(["--draft".into(), set.join(",").into()]);
+        args.extend(draft_witness_args(case)?);
+        let draft = dir.join("draft");
+        record_run(options, sim, &args, (&draft, id, "draft"))?;
+        fresh_replay(options, sim, (&draft, id, "draft"))?;
+        let named = case
+            .get("companions")
+            .and_then(Value::as_array)
+            .is_some_and(|companions| !companions.is_empty());
+        if named && draft.join("trace.jsonl").is_file() && !draft.join(KILLED).exists() {
+            let out = draft.join(COMPANIONS_FILE);
+            let mut companions = Command::new(judge);
+            companions
+                .arg("companions")
+                .arg("--trace")
+                .arg(&draft)
+                .arg("--out")
+                .arg(&out);
+            let ended = child(
+                &mut companions,
+                &dir.join("companions.log"),
+                options.deadline,
+            );
+            stop_if_interrupted()?;
+            // Only a judgement that ran to its end counts.
+            if !ended.exited() && out.exists() {
+                fs::remove_file(&out)?;
+            }
+        }
+    }
+    reset(options, worktree, &subject.commit)?;
+    Ok(source)
+}
+
+/// `zakura-sim record`'s witness arguments for case task `case`'s `Draft`
+/// run, from its `draft_witness`, the reader's `PatchedWitness`: `--witness
+/// <property> --expect <expect>`, then `--also-violates <beside,
+/// comma-separated>` if `beside` isn't empty.
+fn draft_witness_args(case: &Value) -> Result<Vec<OsString>, BoxError> {
+    let witness = case
+        .get("draft_witness")
+        .filter(|witness| !witness.is_null())
+        .ok_or_else(|| format!("a case with a Draft run names no draft_witness: {case}"))?;
+    let mut args: Vec<OsString> = vec![
+        "--witness".into(),
+        text(case, "property")?.into(),
+        "--expect".into(),
+        text(witness, "expect")?.into(),
+    ];
+    let beside = witness
+        .get("beside")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("a draft_witness with no beside: {witness}"))?
+        .iter()
+        .map(|id| id.as_str().map(str::to_owned))
+        .collect::<Option<Vec<String>>>()
+        .ok_or_else(|| format!("a draft_witness whose beside isn't IDs: {witness}"))?;
+    if !beside.is_empty() {
+        args.extend(["--also-violates".into(), beside.join(",").into()]);
+    }
+    Ok(args)
 }
 
 /// Runs integrity mutation `integrity`'s history test unpatched, patched
-/// and restored in `worktree`, writing each run's `test.json`. A patch
-/// that doesn't apply or revert is this task's failure, not the run's: it
-/// writes its reason to `setup.log` and leaves that run and the rest
-/// without artifacts, so the result blocks.
+/// and restored in `worktree`, each run in `dir/<run>`: the test by its
+/// exact name, declaring under `dir/<run>/declared` and writing its
+/// `test.json`, then the declaration the task's `case` names, recorded with
+/// no witness into `dir/<run>/history` by that checkout's own `zakura-sim`,
+/// built in the same target directory, with the arguments S's `tools` give
+/// it. Once the patch is applied, `dir/patched` gets its
+/// [`PATCHED_BUILD_FILE`]: the commit the checkout was made from, the
+/// SHA-256 of the patch and the patched source. A patch that doesn't apply
+/// or revert is this task's failure, not the run's: it writes its reason
+/// to `setup.log` and leaves that run and the rest without artifacts, so
+/// the result blocks.
 fn run_integrity(
     options: &Options,
     subject: &Subject,
+    tools: &Tools,
     integrity: &Value,
-    dir: &Path,
+    (dir, id): (&Path, TaskId<'_>),
     worktree: &Path,
 ) -> Result<(), BoxError> {
     reset(options, worktree, &subject.commit)?;
-    let test = json!({
+    let test = text(integrity, "test")?;
+    let witness = json!({
         "package": text(integrity, "package")?,
         "file": text(integrity, "file")?,
-        "test": text(integrity, "test")?,
+        "test": test,
     });
+    let (harness, case) = (text(integrity, "harness")?, text(integrity, "case")?);
     let targets = options.out.join("native");
     let patch = worktree.join(text(integrity, "patch_file")?);
+    let patch_sha256 = sha256_file(&patch).unwrap_or_else(|| provenance::UNKNOWN.to_owned());
     for run in ["unpatched", "patched", "restored"] {
         let setup = match run {
             "patched" => git(options, worktree, &["apply".as_ref(), patch.as_os_str()]),
@@ -2530,7 +3209,7 @@ fn run_integrity(
             fs::write(dir.join("setup.log"), format!("{run}: {why}\n"))?;
             break;
         }
-        // Each run's binary must embed the checkout it ran in: S's, or the
+        // Each run's binaries must embed the checkout it ran in: S's, or the
         // patched one's.
         let source = checkout_digest(options, worktree)
             .ok()
@@ -2538,7 +3217,121 @@ fn run_integrity(
             .filter(|source| source != provenance::UNKNOWN);
         let out = dir.join(run);
         fs::create_dir_all(&out)?;
-        run_test(worktree, options, source.as_deref(), &test, &out, &targets)?;
+        if run == "patched" {
+            fs::write(
+                out.join(PATCHED_BUILD_FILE),
+                serde_json::to_string_pretty(&json!({
+                    "base": head_of(options, worktree),
+                    "patch_sha256": patch_sha256,
+                    "source": source.as_deref().unwrap_or(provenance::UNKNOWN),
+                }))?,
+            )?;
+        }
+        let declared = out.join("declared");
+        run_test(
+            worktree,
+            options,
+            source.as_deref(),
+            &witness,
+            (&out, id, run),
+            (&targets, Some(&declared), true),
+        )?;
+        let mut build = planted::cargo_sim(worktree, &targets);
+        let ended = child(&mut build, &out.join("sim-build.log"), options.deadline);
+        stop_if_interrupted()?;
+        let sim = targets.join(planted::PROFILE).join("zakura-sim");
+        let own = ended.exited()
+            && source.as_deref().is_some_and(|source| {
+                fs::read(&sim).is_ok_and(|bytes| planted::names_source(&bytes, source).is_ok())
+            });
+        if own {
+            record_declared(
+                options,
+                (&tools.tool, &sim),
+                (&declared, &harness, &test, &case),
+                (id, run),
+                (&out.join("history"), &format!("{run}/history")),
+                None,
+            )?;
+        }
+    }
+    reset(options, worktree, &subject.commit)
+}
+
+/// Runs unit witness task `unit`, a retired native mutation's
+/// `zakura-network` test, unpatched, patched and restored in `worktree`,
+/// each in `dir/<run>`, as a plain build (no simulator cfg) in its own
+/// target directory, `unit` under the run directory. Each run writes its
+/// `test.json` and its [`PATCHED_BUILD_FILE`], the build's own
+/// provenance: the commit the checkout was made from, the SHA-256 of the
+/// patch (applied or not), the checkout's source digest, and the SHA-256
+/// of the test executable it ran, since a plain build embeds no source
+/// digest. Both name task `id`'s run at its role, `unpatched`, `patched`
+/// or `restored`. A patch that doesn't apply or revert is this task's
+/// failure, as for [`run_integrity`].
+fn run_unit(
+    options: &Options,
+    subject: &Subject,
+    unit: &Value,
+    (dir, id): (&Path, TaskId<'_>),
+    worktree: &Path,
+) -> Result<(), BoxError> {
+    reset(options, worktree, &subject.commit)?;
+    let witness = json!({
+        "package": text(unit, "package")?,
+        "file": text(unit, "file")?,
+        "test": text(unit, "test")?,
+    });
+    let targets = options.out.join("unit");
+    let patch = worktree.join(text(unit, "patch_file")?);
+    let patch_sha256 = sha256_file(&patch).unwrap_or_else(|| provenance::UNKNOWN.to_owned());
+    for run in ["unpatched", "patched", "restored"] {
+        let setup = match run {
+            "patched" => git(options, worktree, &["apply".as_ref(), patch.as_os_str()]),
+            "restored" => git(
+                options,
+                worktree,
+                &["apply".as_ref(), "-R".as_ref(), patch.as_os_str()],
+            ),
+            _ => Ok(()),
+        };
+        if let Err(why) = setup {
+            stop_if_interrupted()?;
+            fs::write(dir.join("setup.log"), format!("{run}: {why}\n"))?;
+            break;
+        }
+        let source = checkout_digest(options, worktree)
+            .ok()
+            .map(|read| read.source)
+            .filter(|source| source != provenance::UNKNOWN);
+        let out = dir.join(run);
+        fs::create_dir_all(&out)?;
+        let executable = run_test(
+            worktree,
+            options,
+            source.as_deref(),
+            &witness,
+            (&out, id, run),
+            (&targets, None, false),
+        )?;
+        // The source is read again after the run, so a build or test that
+        // changed the checkout's sources isn't credited to the first read.
+        let after = checkout_digest(options, worktree)
+            .ok()
+            .map(|read| read.source)
+            .filter(|after| Some(after) == source.as_ref());
+        fs::write(
+            out.join(PATCHED_BUILD_FILE),
+            serde_json::to_string_pretty(&id.name(
+                run,
+                json!({
+                    "base": head_of(options, worktree),
+                    "patch_sha256": patch_sha256,
+                    "source": after.as_deref().unwrap_or(provenance::UNKNOWN),
+                    "executable_sha256": executable.as_deref().and_then(sha256_file),
+                }),
+            ))?,
+        )?;
     }
     reset(options, worktree, &subject.commit)
 }
@@ -3358,6 +4151,474 @@ mod tests {
         repo
     }
 
+    /// A fake binary `name` in `dir` that runs `body` for any arguments and
+    /// exits 0 with none, so [`planted::wait_until_executable`] can start it.
+    #[cfg(unix)]
+    fn fake(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            format!("#!/bin/sh\n[ $# -gt 0 ] || exit 0\n{body}\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        planted::wait_until_executable(&path);
+        path
+    }
+
+    /// A `zakura-sim` stand-in: `record` writes a trace and its arguments
+    /// under `--out`, and `replay` writes its `--report` and says it
+    /// matched.
+    #[cfg(unix)]
+    fn fake_sim(dir: &Path) -> PathBuf {
+        fake(
+            dir,
+            "zakura-sim",
+            "if [ \"$1\" = replay ]; then\n\
+             printf '{}\\n' > \"$4\"; echo \"replayed trace t: every pick, draw and observation matched\"; exit 0\n\
+             fi\n\
+             out=; prev=\n\
+             for arg in \"$@\"; do [ \"$prev\" = --out ] && out=$arg; prev=$arg; done\n\
+             mkdir -p \"$out\"; printf 'trace\\n' > \"$out/trace.jsonl\"\n\
+             for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > \"$out/args\"",
+        )
+    }
+
+    /// A recorded run gets its fresh replay as the reader reads it: the
+    /// replay's own full report and `replay.json` under `<run>/replay/`, by
+    /// the binary that recorded the run. A recording killed at its deadline
+    /// leaves `killed` in its directory and gets no replay.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_run_replays_where_the_reader_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sim = fake_sim(dir.path());
+        let options = Options {
+            out: dir.path().to_owned(),
+            deadline: Duration::from_secs(60),
+        };
+        let run = dir.path().join("run");
+        let id = TaskId {
+            run_id: "r",
+            index: 3,
+        };
+        assert!(record_run(
+            &options,
+            &sim,
+            &["--sim".into(), "h".into()],
+            (&run, id, "run")
+        )
+        .unwrap());
+        assert_eq!(
+            fs::read_to_string(run.join("args")).unwrap(),
+            format!("record\n--sim\nh\n--out\n{}\n", run.display())
+        );
+        fresh_replay(&options, &sim, (&run, id, "run")).unwrap();
+        let replay = run.join("replay");
+        assert_eq!(
+            fs::read_to_string(replay.join(FULL_REPORT_FILE)).unwrap(),
+            "{}\n"
+        );
+        let ran: Value =
+            serde_json::from_str(&fs::read_to_string(replay.join(REPLAY_FILE)).unwrap()).unwrap();
+        assert_eq!(ran["exited_ok"], true);
+        assert_eq!(ran["killed"], false);
+        assert!(ran["log"].as_str().unwrap().contains("every pick, draw"));
+        // It names this run's task and role, the trace it replayed, and the
+        // build its own report names, here none.
+        assert_eq!(ran["run_id"], "r");
+        assert_eq!(ran["index"], 3);
+        assert_eq!(ran["role"], "run");
+        assert_eq!(ran["trace"], json!(sha256_file(&run.join("trace.jsonl"))));
+        assert_eq!(ran["source"], Value::Null);
+
+        let short = Options {
+            out: dir.path().to_owned(),
+            deadline: Duration::from_secs(1),
+        };
+        let killed = dir.path().join("killed");
+        let slow = fake(dir.path(), "slow", "sleep 30");
+        assert!(!record_run(&short, &slow, &[], (&killed, id, "run")).unwrap());
+        assert!(killed.join(KILLED).exists());
+        fresh_replay(&short, &sim, (&killed, id, "run")).unwrap();
+        assert!(!killed.join("replay").exists());
+    }
+
+    /// A recording's child's exit is kept beside its artifacts as the
+    /// reader reads it: a recorder that writes a complete run and then
+    /// exits 1 leaves `recorded.json` saying so, named as this task's run
+    /// at its role with the trace it left, and one that exits 0 says that.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorder_s_exit_is_kept_beside_its_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options {
+            out: dir.path().to_owned(),
+            deadline: Duration::from_secs(60),
+        };
+        let id = TaskId {
+            run_id: "r",
+            index: 3,
+        };
+        let failing = fake(
+            dir.path(),
+            "failing-sim",
+            "out=; prev=\n\
+             for arg in \"$@\"; do [ \"$prev\" = --out ] && out=$arg; prev=$arg; done\n\
+             mkdir -p \"$out\"; printf 'trace\\n' > \"$out/trace.jsonl\"\n\
+             printf '{\"passed\":true}' > \"$out/witness.json\"; exit 1",
+        );
+        let status = |run: &Path| -> Value {
+            serde_json::from_str(&fs::read_to_string(run.join("recorded.json")).unwrap()).unwrap()
+        };
+        let run = dir.path().join("draft");
+        assert!(!record_run(&options, &failing, &[], (&run, id, "draft")).unwrap());
+        assert!(run.join("witness.json").is_file());
+        assert_eq!(
+            status(&run),
+            json!({
+                "run_id": "r",
+                "index": 3,
+                "role": "draft",
+                "trace": sha256_file(&run.join("trace.jsonl")),
+                "exited_ok": false,
+                "killed": false,
+            })
+        );
+        let passing = dir.path().join("run");
+        let sim = fake_sim(dir.path());
+        assert!(record_run(&options, &sim, &[], (&passing, id, "run")).unwrap());
+        assert_eq!(status(&passing)["exited_ok"], true);
+        assert_eq!(status(&passing)["role"], "run");
+    }
+
+    /// A copied planted replay is named as this run's task's at its run's
+    /// role, with its trace's SHA-256 and the source its own report names,
+    /// which an earlier attempt's identical copy doesn't carry. A run with
+    /// no replay gets none.
+    #[test]
+    fn a_copied_replay_is_named_as_this_run_s() {
+        let run = tempfile::tempdir().unwrap();
+        name_replay(
+            run.path(),
+            TaskId {
+                run_id: "r",
+                index: 2,
+            },
+            "patched",
+        )
+        .unwrap();
+        assert!(!run.path().join("replay").exists());
+        let replay = run.path().join("replay");
+        fs::create_dir_all(&replay).unwrap();
+        fs::write(run.path().join("trace.jsonl"), "t\n").unwrap();
+        fs::write(replay.join(FULL_REPORT_FILE), r#"{"source":"s"}"#).unwrap();
+        fs::write(
+            replay.join(REPLAY_FILE),
+            r#"{"exited_ok":true,"killed":false,"log":"l"}"#,
+        )
+        .unwrap();
+        name_replay(
+            run.path(),
+            TaskId {
+                run_id: "r",
+                index: 2,
+            },
+            "patched",
+        )
+        .unwrap();
+        let named: Value =
+            serde_json::from_str(&fs::read_to_string(replay.join(REPLAY_FILE)).unwrap()).unwrap();
+        assert_eq!(
+            named,
+            json!({
+                "run_id": "r",
+                "index": 2,
+                "role": "patched",
+                "trace": sha256_file(&run.path().join("trace.jsonl")),
+                "source": "s",
+                "exited_ok": true,
+                "killed": false,
+                "log": "l",
+            })
+        );
+    }
+
+    /// A declared history is recorded with the arguments S's tool gives
+    /// it for the task's run at its role, then the task's witness. A
+    /// declaration the tool refuses isn't recorded at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_history_records_with_the_tool_s_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let sim = fake_sim(dir.path());
+        let tool = fake(
+            dir.path(),
+            "header-acceptance",
+            "out=; prev=\n\
+             for arg in \"$@\"; do [ \"$prev\" = --out ] && out=$arg; prev=$arg; done\n\
+             [ \"$9\" = c ] || exit 1\n\
+             [ \"${10} ${11} ${12} ${13} ${14} ${15}\" = '--run-id r --index 3 --role patched' ] \
+             || exit 1\n\
+             printf '[\"--sim\",\"h\",\"--scenario\",\"{}\",\"--plan\",\"p.bin\"]' > \"$out\"",
+        );
+        let options = Options {
+            out: dir.path().to_owned(),
+            deadline: Duration::from_secs(60),
+        };
+        let declared = dir.path().join("declared");
+        let run = dir.path().join("run");
+        let named = (declared.as_path(), "h", "t", "c");
+        let id = TaskId {
+            run_id: "r",
+            index: 3,
+        };
+        assert!(record_declared(
+            &options,
+            (&tool, &sim),
+            named,
+            (id, "patched"),
+            (&run, "patched/history"),
+            Some(("p/x", "holds"))
+        )
+        .unwrap());
+        assert_eq!(
+            fs::read_to_string(run.join("args")).unwrap(),
+            format!(
+                "record\n--sim\nh\n--scenario\n{{}}\n--plan\np.bin\n--witness\np/x\n--expect\nholds\n\
+                 --out\n{}\n",
+                run.display()
+            )
+        );
+        let other = dir.path().join("other");
+        let refused = (declared.as_path(), "h", "t", "d");
+        assert!(!record_declared(
+            &options,
+            (&tool, &sim),
+            refused,
+            (id, "patched"),
+            (&other, "patched/history"),
+            None
+        )
+        .unwrap());
+        assert!(!other.exists());
+    }
+
+    /// A case's input is recorded from S's committed files: a fuzz input by
+    /// path, a typed or scripted case's scenario as its JSON text and its
+    /// Plan by path.
+    #[test]
+    fn a_case_input_records_from_its_committed_files() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(repo.path().join("s.json"), "{\"a\":1}").unwrap();
+        let path = |file: &str| repo.path().join(file).into_os_string();
+        let args = |input: Value| case_input_args(repo.path(), &input).unwrap();
+        assert_eq!(
+            args(json!({ "fuzz": { "input": "i.bin" } })),
+            vec![OsString::from("--input"), path("i.bin")]
+        );
+        assert_eq!(
+            args(json!({ "typed": { "scenario": "s.json", "plan": "p.bin" } })),
+            vec![
+                "--scenario".into(),
+                "{\"a\":1}".into(),
+                "--plan".into(),
+                path("p.bin")
+            ]
+        );
+        assert_eq!(
+            args(json!({ "scripted": { "scenario": "s.json", "script": "p.json" } })),
+            vec![
+                "--scenario".into(),
+                "{\"a\":1}".into(),
+                "--script".into(),
+                path("p.json")
+            ]
+        );
+        assert!(case_input_args(repo.path(), &json!({ "other": {} })).is_err());
+    }
+
+    /// A case's `Draft` run records its task's `draft_witness` on the
+    /// case's property, with `--also-violates` only for a set beside it. A
+    /// case naming none records no `Draft` run.
+    #[test]
+    fn a_draft_run_records_its_task_s_witness() {
+        let case = |beside: Value| {
+            json!({
+                "property": "p",
+                "draft_witness": { "expect": "violated", "beside": beside },
+            })
+        };
+        let strings = |args: Vec<OsString>| -> Vec<String> {
+            args.into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect()
+        };
+        assert_eq!(
+            strings(draft_witness_args(&case(json!([]))).unwrap()),
+            ["--witness", "p", "--expect", "violated"]
+        );
+        assert_eq!(
+            strings(draft_witness_args(&case(json!(["q", "r"]))).unwrap()),
+            [
+                "--witness",
+                "p",
+                "--expect",
+                "violated",
+                "--also-violates",
+                "q,r"
+            ]
+        );
+        assert!(draft_witness_args(&json!({ "property": "p" })).is_err());
+        assert!(draft_witness_args(&json!({ "property": "p", "draft_witness": null })).is_err());
+    }
+
+    /// Each task directory names the run that wrote it, its index and its
+    /// task, as the reader's `task_binding` requires, before the task runs.
+    #[test]
+    fn a_task_directory_names_its_run() {
+        let out = tempfile::tempdir().unwrap();
+        let options = Options {
+            out: out.path().to_owned(),
+            deadline: Duration::from_secs(60),
+        };
+        let subject = Subject {
+            commit: "s".to_owned(),
+            source: "source".to_owned(),
+        };
+        let tools = Tools {
+            tool: PathBuf::from("header-acceptance"),
+            sim: PathBuf::from("zakura-sim"),
+        };
+        let task = json!({ "bogus": {} });
+        let tasks = [json!({ "skipped": {} }), task.clone()];
+        let artifacts = out.path().join("artifacts");
+        let only = BTreeSet::from([1]);
+        let ran = run_tasks(
+            out.path(),
+            &options,
+            &subject,
+            ("run-1", &tools, Some(&only)),
+            &tasks,
+            &artifacts,
+            out.path(),
+        );
+        assert!(ran.is_err_and(|error| error.to_string().contains("no known kind")));
+        let bound: Value =
+            serde_json::from_str(&fs::read_to_string(artifacts.join("1").join(TASK_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(
+            bound,
+            json!({ "run_id": "run-1", "index": 1, "task": task })
+        );
+        // A partial run binds no task it skips, so each such result blocks.
+        assert!(!artifacts.join("0").exists());
+    }
+
+    /// `--only` names a partial run's task indices once, and every other
+    /// argument passes through.
+    #[test]
+    fn a_partial_run_names_its_tasks_once() {
+        let split = |args: &[&str]| split_only(args.iter().map(|arg| (*arg).to_owned()));
+        let (rest, only) = split(&["--out", "o", "--only", "3,1"]).unwrap();
+        assert_eq!(rest, ["--out", "o"]);
+        assert_eq!(only, Some(BTreeSet::from([1, 3])));
+        assert_eq!(split(&["--out", "o"]).unwrap().1, None);
+        for refused in [
+            &["--only"][..],
+            &["--only", "a"],
+            &["--only", "1", "--only", "2"],
+        ] {
+            assert!(split(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    /// A case's verdict names the two traces beside it by SHA-256, and a
+    /// missing one by none.
+    #[test]
+    fn a_case_verdict_names_the_traces_it_judged() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("baseline")).unwrap();
+        fs::write(dir.path().join("baseline/trace.jsonl"), "b").unwrap();
+        write_verdict(dir.path(), "p", "n", Some("why".to_owned())).unwrap();
+        let verdict: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(VERDICT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(
+            verdict,
+            json!({
+                "property": "p",
+                "name": "n",
+                "baseline": "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+                "patched": null,
+                "refused": "why",
+            })
+        );
+    }
+
+    /// A confirmed case's check names its confirmation run, copied whole,
+    /// the input its target ran and the source its build embeds. A case on
+    /// no target, or a refused one, names none of them and waits for its
+    /// rebuild's source, and a confirmation whose files are missing refuses
+    /// the check.
+    #[test]
+    fn a_confirmation_is_copied_beside_its_check() {
+        let work = tempfile::tempdir().unwrap();
+        let scratch = work.path().join("case-1/target");
+        let confirm = scratch.join("original/confirm");
+        fs::create_dir_all(confirm.join("traces/p/t")).unwrap();
+        fs::write(confirm.join("traces/p/t/trace.jsonl"), "b").unwrap();
+        fs::write(
+            confirm.join("confirmation.json"),
+            r#"{"trace": "traces/p/t"}"#,
+        )
+        .unwrap();
+        fs::write(scratch.join("original/input.bin"), "b").unwrap();
+        fs::write(
+            scratch.join("report.json"),
+            r#"{"build": {"source": {"git": "s"}, "sim_build": {"source": "patched"}}}"#,
+        )
+        .unwrap();
+        let check = |target: Option<&str>, refused: Option<&str>| json!({ "property": "p", "name": "n", "target": target, "refused": refused });
+        let b = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d";
+        let dir = tempfile::tempdir().unwrap();
+        let confirmed =
+            confirmation_check(check(Some("fuzz"), None), Ok(scratch.clone()), dir.path()).unwrap();
+        assert_eq!(confirmed["source"], "patched");
+        assert_eq!(confirmed["input_sha256"], b);
+        assert_eq!(confirmed["trace"], b);
+        assert_eq!(confirmed["refused"], Value::Null);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(CONFIRMATION_DIR).join("trace.jsonl")).unwrap(),
+            "b"
+        );
+        for (target, refused) in [(None, None), (Some("fuzz"), Some("missed"))] {
+            let dir = tempfile::tempdir().unwrap();
+            let read = confirmation_check(check(target, refused), Ok(scratch.clone()), dir.path())
+                .unwrap();
+            for field in ["source", "input_sha256", "trace"] {
+                assert_eq!(read[field], Value::Null, "{field}");
+            }
+            assert_eq!(read["refused"], json!(refused));
+            assert!(!dir.path().join(CONFIRMATION_DIR).exists());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let missing = confirmation_check(
+            check(Some("fuzz"), None),
+            Ok(work.path().join("case-2/target")),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(missing["refused"]
+            .as_str()
+            .is_some_and(|why| why.contains("report.json")));
+        let unlisted =
+            confirmation_check(check(Some("fuzz"), None), Err("no slot".into()), dir.path())
+                .unwrap();
+        assert_eq!(unlisted["refused"], "no slot");
+    }
+
     /// A case task removes its target directory whatever its rebuild did:
     /// after a refused patch, with or without a target built, and after a
     /// setup failure. A target it can't remove fails the run, not the task.
@@ -3381,20 +4642,57 @@ mod tests {
         let case = json!({ "patch": "missing.patch" });
         let dir = out.path().join("artifacts/0");
         let target = out.path().join("cases/0");
+        let checkouts = Checkouts {
+            subject: repo.path(),
+            worktree: repo.path(),
+        };
+        // A case on no target, whose check names no source yet.
+        let unconfirmed = json!({
+            "property": "p",
+            "name": "n",
+            "target": null,
+            "source": null,
+            "input_sha256": null,
+            "trace": null,
+            "refused": null,
+        });
         let task = |subject: &Subject| {
             fs::create_dir_all(&dir).unwrap();
-            case_task(&options, subject, &case, &dir, repo.path())
+            case_task(
+                &options,
+                subject,
+                checkouts,
+                &case,
+                (
+                    &dir,
+                    TaskId {
+                        run_id: "r",
+                        index: 0,
+                    },
+                ),
+                Some(unconfirmed.clone()),
+            )
+        };
+        let read = |file: &str| -> Value {
+            serde_json::from_str(&fs::read_to_string(dir.join(file)).unwrap()).unwrap()
         };
         let refused = || {
-            let check: Value =
-                serde_json::from_str(&fs::read_to_string(dir.join("provenance.json")).unwrap())
-                    .unwrap();
-            check["refused"].as_str().unwrap_or_default().to_owned()
+            read("provenance.json")["refused"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
         };
-        // No target was ever built: the patch doesn't apply.
+        // No target was ever built: the patch doesn't apply. The check
+        // still names the checkout it was made from, and the target check
+        // the source the rebuild measured.
         assert!(matches!(task(&at(&commit)), Ok(Ok(()))));
         assert!(refused().contains("doesn't apply"), "{}", refused());
         assert!(!target.exists());
+        assert_eq!(read("provenance.json")["base"], commit.as_str());
+        assert_eq!(
+            read("target.json")["source"],
+            read("provenance.json")["source"]
+        );
         // A target left from building is removed too.
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("marker"), "built").unwrap();
@@ -4196,5 +5494,26 @@ mod tests {
             Duration::from_secs(2),
             ChildEnd::TimedOut,
         );
+    }
+
+    /// The planted child builds `xtask` in its own checkout, whatever
+    /// `CARGO_TARGET_DIR` the caller set, so it can't replace the caller's
+    /// `xtask` with one rooted in the temporary subject checkout.
+    #[test]
+    fn the_planted_child_never_inherits_a_target_dir() {
+        let repo = Path::new("/subject");
+        for targets in [false, true] {
+            let planted = planted_command(repo, "p", targets);
+            assert!(
+                planted
+                    .get_envs()
+                    .any(|(name, value)| name == "CARGO_TARGET_DIR" && value.is_none()),
+                "{targets}"
+            );
+            assert_eq!(planted.get_current_dir(), Some(repo));
+            let args: Vec<_> = planted.get_args().collect();
+            assert_eq!(args[..3], ["xtask", "planted", "p"]);
+            assert_eq!(args.len(), if targets { 4 } else { 3 });
+        }
     }
 }

@@ -3033,9 +3033,33 @@ fn a_random_run_with_small_limits_always_drains() {
         // The outcomes of the jobs that were cancelled along the way arrive
         // now, late, with no tick after them. Each is ignored, and none may
         // leave anything waiting to be started.
+        // What the pool shows, whom it refuses and which ids it remembers
+        // rejecting, before and after each one.
+        let ids: HashSet<UnminedTxId> = (0..12).map(id).collect();
+        let remembered = |model: &mut PoolModel| {
+            let rejected = model.rejected_ids(&ids, now);
+            assert!(
+                model.effects().is_empty(),
+                "seed {seed}: the pool had settled"
+            );
+            let cooling: Vec<bool> = (0..4).map(|p| model.cooling(&legacy(p), now)).collect();
+            (model.visible(), cooling, rejected)
+        };
+        let before = remembered(&mut model);
         for job in std::mem::take(&mut run.cancelled) {
             let read = stable(generation);
-            run.record(model.outcome(job, Outcome::Pass, read, read, now));
+            let step = model.outcome(job, Outcome::Pass, read, read, now);
+            // The pool has settled, so nothing is due and nothing is
+            // waiting. The late outcome does nothing at all.
+            assert!(
+                step.is_empty(),
+                "seed {seed}: a cancelled job's outcome did something: {step:?}"
+            );
+            assert_eq!(
+                remembered(&mut model),
+                before,
+                "seed {seed}: a cancelled job's outcome changed what the pool remembers"
+            );
         }
         assert!(
             run.jobs.is_empty() && model.hidden().is_empty() && model.slots_in_use() == 0,

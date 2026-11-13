@@ -84,9 +84,13 @@ fn finish(
 ) -> (Step, Vec<RelayEffect>) {
     let started = started(reactor);
     assert_eq!(started.len(), 1, "exactly one job is running");
-    let step = pool.outcome(started[0], outcome, stable(), stable(), now);
     // The verdict's own effects, with no later input to flush them.
-    let effects = reactor.pool_step(&step, now, pool);
+    let (_, step, effects) = reactor.outside(now, pool, |pool| {
+        (
+            (),
+            pool.outcome(started[0], outcome, stable(), stable(), now),
+        )
+    });
     (step, effects)
 }
 
@@ -390,8 +394,7 @@ fn a_verification_that_times_out_is_a_local_fault_for_the_reactor_too() {
     reactor.tx(s[0], tx(1), secs(0), &mut pool);
     started(&mut reactor);
 
-    let step = pool.tick(T_VERIFY);
-    reactor.pool_step(&step, T_VERIFY, &mut pool);
+    reactor.outside(T_VERIFY, &mut pool, |pool| ((), pool.tick(T_VERIFY)));
     assert!(reactor.wants(id(1)));
     assert!(!pool.cooling(&v2(1), secs(0)));
 }
@@ -824,8 +827,12 @@ fn a_verdict_frees_a_request_slot_and_the_next_id_is_asked_at_once() {
     assert_eq!(reactor.in_use(&v2(1)), 5);
 
     // The verdict itself asks for the sixth. No tick is needed.
-    let step = pool.outcome(started[0], Outcome::Pass, stable(), stable(), secs(1));
-    let effects = reactor.pool_step(&step, secs(1), &mut pool);
+    let (_, _, effects) = reactor.outside(secs(1), &mut pool, |pool| {
+        (
+            (),
+            pool.outcome(started[0], Outcome::Pass, stable(), stable(), secs(1)),
+        )
+    });
     assert_eq!(effects, vec![ask(s[0], 5)]);
 }
 
@@ -943,12 +950,20 @@ impl Ledger {
         }
     }
 
-    /// Consumes a step the test got from the pool itself. The steps of the
-    /// reactor's own earlier calls are consumed first, because the pool
-    /// produced them first.
-    fn take(&mut self, reactor: &mut ReactorModel, step: &Step) {
+    /// Makes a pool call from outside the reactor and consumes its step.
+    /// The steps of the reactor's own earlier calls are consumed first,
+    /// because the pool produced them first.
+    fn outside<T>(
+        &mut self,
+        reactor: &mut ReactorModel,
+        pool: &mut PoolModel,
+        now: Duration,
+        call: impl FnOnce(&mut PoolModel) -> (T, Step),
+    ) -> (T, Step, Vec<RelayEffect>) {
         self.absorb_all(reactor.take_pool_steps());
-        self.absorb(step);
+        let (answer, step, effects) = reactor.outside(now, pool, call);
+        self.absorb(&step);
+        (answer, step, effects)
     }
 
     fn absorb_all(&mut self, steps: Vec<Step>) {
@@ -1015,9 +1030,10 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                         .cancelled
                         .swap_remove(rng.pick(ledger.cancelled.len()));
                     let read = GenerationRead::Stable(Generation(generation));
-                    let step = pool.outcome(job, Outcome::Pass, read, read, now);
-                    ledger.take(&mut reactor, &step);
-                    reactor.pool_step(&step, now, &mut pool)
+                    let (_, _, effects) = ledger.outside(&mut reactor, &mut pool, now, |pool| {
+                        ((), pool.outcome(job, Outcome::Pass, read, read, now))
+                    });
+                    effects
                 }
                 // A legacy caller reserves the same id, to fetch or deliver.
                 12 => {
@@ -1027,52 +1043,54 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                     } else {
                         Intent::Deliver
                     };
-                    if let Ok(reserved) = pool.reserve(id(n), source, intent, now) {
-                        legacy_held.push((reserved, n, peer));
-                    }
                     // A reservation returns its answer. What the deadlines
                     // it found due caused is taken straight after.
-                    let step = pool.effects();
-                    ledger.take(&mut reactor, &step);
-                    reactor.pool_step(&step, now, &mut pool)
+                    let (reserved, _, effects) =
+                        ledger.outside(&mut reactor, &mut pool, now, |pool| {
+                            let reserved = pool.reserve(id(n), source, intent, now);
+                            (reserved, pool.effects())
+                        });
+                    if let Ok(reserved) = reserved {
+                        legacy_held.push((reserved, n, peer));
+                    }
+                    effects
                 }
                 // It brings its body, waits, or gives up.
                 13 if !legacy_held.is_empty() => {
                     let (reserved, n, peer) = legacy_held.swap_remove(rng.pick(legacy_held.len()));
                     let supplier = Supplier::Peer(legacy_peer(peer));
-                    let step = match rng.next(4) {
-                        0 => pool.release(reserved.id, now),
-                        _ if reserved.wants_body => {
-                            let (waiter, step) = pool.submit(reserved.id, tx(n), supplier, now);
-                            ledger.legacy_waiters.push(waiter);
-                            step
-                        }
-                        _ => {
-                            let (waiter, step) = pool.wait(reserved.id, id(n), supplier, now);
-                            ledger.legacy_waiters.push(waiter);
-                            step
-                        }
-                    };
-                    ledger.take(&mut reactor, &step);
-                    reactor.pool_step(&step, now, &mut pool)
+                    let choice = rng.next(4);
+                    let (waiter, _, effects) =
+                        ledger.outside(&mut reactor, &mut pool, now, |pool| match choice {
+                            0 => (None, pool.release(reserved.id, now)),
+                            _ if reserved.wants_body => {
+                                let (waiter, step) = pool.submit(reserved.id, tx(n), supplier, now);
+                                (Some(waiter), step)
+                            }
+                            _ => {
+                                let (waiter, step) = pool.wait(reserved.id, id(n), supplier, now);
+                                (Some(waiter), step)
+                            }
+                        });
+                    ledger.legacy_waiters.extend(waiter);
+                    effects
                 }
                 // A block connects, sometimes after a reorg.
                 14 => {
                     generation += 1;
-                    let step = pool.transition(
-                        ModelTransition {
-                            disconnected: usize::try_from(rng.next(3) / 2).expect("small"),
-                            connected: vec![ModelBlock {
-                                transactions: vec![tx(n)],
-                            }],
-                            tip: Height(100 + u32::try_from(generation).expect("small")),
-                            generation: Generation(generation),
-                            rules_change: false,
-                        },
-                        now,
-                    );
-                    ledger.take(&mut reactor, &step);
-                    reactor.pool_step(&step, now, &mut pool)
+                    let transition = ModelTransition {
+                        disconnected: usize::try_from(rng.next(3) / 2).expect("small"),
+                        connected: vec![ModelBlock {
+                            transactions: vec![tx(n)],
+                        }],
+                        tip: Height(100 + u32::try_from(generation).expect("small")),
+                        generation: Generation(generation),
+                        rules_change: false,
+                    };
+                    let (_, _, effects) = ledger.outside(&mut reactor, &mut pool, now, |pool| {
+                        ((), pool.transition(transition, now))
+                    });
+                    effects
                 }
                 0 => {
                     let served = usize::try_from(rng.next(6) + 1).expect("small");
@@ -1124,15 +1142,16 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                             _ => Outcome::Pass,
                         };
                         let read = GenerationRead::Stable(Generation(generation));
-                        let step = pool.outcome(job, outcome, read, read, now);
-                        ledger.take(&mut reactor, &step);
-                        reactor.pool_step(&step, now, &mut pool)
+                        let (_, _, effects) =
+                            ledger.outside(&mut reactor, &mut pool, now, |pool| {
+                                ((), pool.outcome(job, outcome, read, read, now))
+                            });
+                        effects
                     }
                 }
                 _ => {
-                    let step = pool.tick(now);
-                    ledger.take(&mut reactor, &step);
-                    let mut effects = reactor.pool_step(&step, now, &mut pool);
+                    let (_, _, mut effects) =
+                        ledger.outside(&mut reactor, &mut pool, now, |pool| ((), pool.tick(now)));
                     effects.extend(reactor.tick(now, &mut pool));
                     effects
                 }
@@ -1150,9 +1169,9 @@ fn a_random_run_always_drains_once_the_sessions_end() {
         // Everything the setup of the drain causes is a request on the wire
         // too, and is tracked like one.
         for (reserved, ..) in legacy_held.drain(..) {
-            let step = pool.release(reserved.id, now);
-            ledger.take(&mut reactor, &step);
-            let effects = reactor.pool_step(&step, now, &mut pool);
+            let (_, _, effects) = ledger.outside(&mut reactor, &mut pool, now, |pool| {
+                ((), pool.release(reserved.id, now))
+            });
             apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
         }
         let sessions_end = seed % 3 != 2;
@@ -1180,17 +1199,16 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                 // purpose, so the faults stop after a while.
                 let outcome = if round < 20 { outcome } else { Outcome::Pass };
                 let read = GenerationRead::Stable(Generation(generation));
-                let step = pool.outcome(job, outcome, read, read, now);
-                ledger.take(&mut reactor, &step);
                 // Every request the drain causes is a request on the wire,
                 // and is tracked like one.
-                let effects = reactor.pool_step(&step, now, &mut pool);
+                let (_, _, effects) = ledger.outside(&mut reactor, &mut pool, now, |pool| {
+                    ((), pool.outcome(job, outcome, read, read, now))
+                });
                 apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
             }
             now += RETRY_MAX + T_VERIFY;
-            let step = pool.tick(now);
-            ledger.take(&mut reactor, &step);
-            let mut effects = reactor.pool_step(&step, now, &mut pool);
+            let (_, _, mut effects) =
+                ledger.outside(&mut reactor, &mut pool, now, |pool| ((), pool.tick(now)));
             effects.extend(reactor.tick(now, &mut pool));
             apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
             reactor.assert_invariants();
@@ -1200,22 +1218,35 @@ fn a_random_run_always_drains_once_the_sessions_end() {
         // from arrive now, late. Each is ignored: it changes nothing in the
         // pool, logs nothing, and leaves nothing behind.
         let visible_before = pool.visible();
+        // Who the core refuses, the reactor's peers and the legacy ones.
+        let cooling = |pool: &PoolModel| -> Vec<bool> {
+            (1..=3)
+                .flat_map(|peer| [v2(peer), legacy_peer(peer)])
+                .map(|peer| pool.cooling(&peer, now))
+                .collect()
+        };
+        let cooling_before = cooling(&pool);
         for job in std::mem::take(&mut ledger.cancelled) {
             let read = GenerationRead::Stable(Generation(generation));
-            let step = pool.outcome(job, Outcome::Pass, read, read, now);
+            let (_, step, effects) = ledger.outside(&mut reactor, &mut pool, now, |pool| {
+                ((), pool.outcome(job, Outcome::Pass, read, read, now))
+            });
             assert!(
-                step.changes.is_empty(),
-                "seed {seed}: a cancelled job's outcome changed the pool"
+                step.is_empty(),
+                "seed {seed}: a cancelled job's outcome did something: {step:?}"
             );
-            ledger.take(&mut reactor, &step);
-            let effects = reactor.pool_step(&step, now, &mut pool);
+            assert_eq!(
+                pool.visible(),
+                visible_before,
+                "seed {seed}: a cancelled job's outcome changed what is visible"
+            );
+            assert_eq!(
+                cooling(&pool),
+                cooling_before,
+                "seed {seed}: a cancelled job's outcome charged somebody"
+            );
             apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
         }
-        assert_eq!(
-            pool.visible(),
-            visible_before,
-            "seed {seed}: a cancelled job's outcome changed what is visible"
-        );
         ledger.absorb_all(reactor.take_pool_steps());
         assert!(
             ledger.jobs.is_empty() || !sessions_end,
@@ -1246,9 +1277,8 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                     apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
                 }
                 now += RETRY_MAX;
-                let step = pool.tick(now);
-                ledger.take(&mut reactor, &step);
-                let mut effects = reactor.pool_step(&step, now, &mut pool);
+                let (_, _, mut effects) =
+                    ledger.outside(&mut reactor, &mut pool, now, |pool| ((), pool.tick(now)));
                 effects.extend(reactor.tick(now, &mut pool));
                 apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
             }
@@ -1351,18 +1381,17 @@ fn an_announcement_that_finds_a_deadline_due_passes_on_what_it_caused() {
     reactor.announce(first, id(2), 300, secs(0), &mut pool);
     reactor.tx(first, tx(2), secs(0), &mut pool);
     reactor.take_pool_steps();
-    let step = pool.transition(
-        ModelTransition {
+    let (_, step, _) = reactor.outside(secs(1), &mut pool, |pool| {
+        let transition = ModelTransition {
             disconnected: 1,
             connected: vec![ModelBlock::default()],
             tip: Height(100),
             generation: Generation(1),
             rules_change: false,
-        },
-        secs(1),
-    );
+        };
+        ((), pool.transition(transition, secs(1)))
+    });
     assert!(step.started().is_empty(), "the slot is taken");
-    reactor.pool_step(&step, secs(1), &mut pool);
     assert_eq!(reactor.verifying(&v2(1)), 1);
 
     // The last input is another peer's announcement, after transaction 2's
@@ -1459,9 +1488,8 @@ fn a_step_from_outside_is_consumed_after_the_reactors_earlier_steps() {
         .flat_map(|step| step.effects)
         .collect();
     // Then the pool is ticked from outside, at the job's deadline.
-    let step = pool.tick(T_VERIFY);
-    seen.extend(step.effects.iter().cloned());
-    reactor.pool_step(&step, T_VERIFY, &mut pool);
+    let (_, step, _) = reactor.outside(T_VERIFY, &mut pool, |pool| ((), pool.tick(T_VERIFY)));
+    seen.extend(step.effects);
 
     let started = seen
         .iter()
@@ -1475,13 +1503,85 @@ fn a_step_from_outside_is_consumed_after_the_reactors_earlier_steps() {
 }
 
 #[test]
-#[should_panic(expected = "before the reactor's earlier steps were taken")]
-fn a_step_from_outside_is_refused_while_the_reactors_own_are_untaken() {
+#[should_panic(expected = "while the reactor held steps of its own")]
+fn a_pool_call_from_outside_is_refused_while_the_reactors_own_steps_are_untaken() {
     let (mut pool, mut reactor, s) = setup(1);
     reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
     reactor.tx(s[0], tx(1), secs(0), &mut pool);
-    // The start of the job is still inside the reactor. Delivering the
-    // cancellation now would let it be consumed first.
-    let step = pool.tick(T_VERIFY);
-    reactor.pool_step(&step, T_VERIFY, &mut pool);
+    // The start of the job is still inside the reactor. The tick would
+    // cancel that job, and its caller could see the cancellation first. It
+    // is refused before it reaches the pool.
+    reactor.outside(T_VERIFY, &mut pool, |pool| ((), pool.tick(T_VERIFY)));
+}
+
+// Cases from the fifteenth review.
+
+#[test]
+fn a_pool_call_from_outside_reaches_the_reactor_before_its_next_input() {
+    let (mut pool, mut reactor, s) = setup(2);
+    reactor.announce(s[0], id(1), 300, secs(0), &mut pool);
+    reactor.tx(s[0], tx(1), secs(0), &mut pool);
+    // The caller takes the reactor's steps and reports the job's outcome.
+    // The call and the delivery of its step are one input, so the step
+    // cannot be held back behind a later input.
+    let jobs = started(&mut reactor);
+    let (_, step, _) = reactor.outside(secs(1), &mut pool, |pool| {
+        (
+            (),
+            pool.outcome(jobs[0], Outcome::Pass, stable(), stable(), secs(1)),
+        )
+    });
+    assert_eq!(step.changes, vec![Change::Added(id(1))]);
+    // The reactor has the verdict by the time the call returns.
+    assert!(!reactor.wants(id(1)));
+    assert_eq!(reactor.verifying(&v2(1)), 0);
+
+    // The next input makes pool calls of its own. Their steps are newer
+    // than the outcome's, and the caller already has that one.
+    reactor.announce(s[1], id(2), 300, secs(2), &mut pool);
+    reactor.tx(s[1], tx(2), secs(2), &mut pool);
+    assert_eq!(started(&mut reactor).len(), 1);
+
+    // The same again, with those steps taken: nothing is refused.
+    reactor.outside(secs(3), &mut pool, |pool| ((), pool.tick(secs(3))));
+    pool.assert_invariants();
+    reactor.assert_invariants();
+}
+
+#[test]
+fn an_outside_step_is_handed_to_its_caller_once() {
+    use zakura_node_services::mempool::port::model::Effect;
+    let (mut pool, mut reactor, s) = setup(1);
+    for n in 0..6 {
+        reactor.announce(s[0], id(n), 300, secs(0), &mut pool);
+    }
+    // Five answered and awaiting verdicts. The sixth id waits for room.
+    for n in 0..5 {
+        reactor.tx(s[0], tx(n), secs(0), &mut pool);
+    }
+    let jobs = started(&mut reactor);
+
+    // The first verdict frees a request position. In the same input the
+    // reactor asks for the sixth id.
+    let (_, step, effects) = reactor.outside(secs(1), &mut pool, |pool| {
+        (
+            (),
+            pool.outcome(jobs[0], Outcome::Pass, stable(), stable(), secs(1)),
+        )
+    });
+    assert_eq!(effects, vec![ask(s[0], 5)]);
+    let verdicts = |step: &Step| {
+        step.effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::Verdict { .. }))
+            .count()
+    };
+    // The caller has the outcome's own step, once.
+    assert_eq!(verdicts(&step), 1, "{step:?}");
+    // Whatever the reactor's own calls did in answer is left for the caller
+    // to take after it. The outcome's step is not in there a second time.
+    let after = reactor.take_pool_steps();
+    assert_eq!(after.iter().map(verdicts).sum::<usize>(), 0);
+    pool.assert_invariants();
+    reactor.assert_invariants();
 }

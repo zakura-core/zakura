@@ -336,30 +336,38 @@ impl ReactorModel {
         self.finish(now, pool)
     }
 
-    /// Something the pool did after another input: verdicts for bodies this
-    /// reactor submitted.
+    /// A pool call from outside the reactor, and what it did: verdicts for
+    /// bodies this reactor submitted.
     ///
-    /// The caller is whoever consumes the pool's steps. It takes the steps
-    /// of the reactor's own calls with [`Self::take_pool_steps`] before it
-    /// makes a pool call of its own, so that every step reaches it in the
-    /// order the pool produced them.
-    pub(crate) fn pool_step(
+    /// `call` makes the one pool call and returns its answer and its step.
+    /// The call and the delivery of its step are one input, so no other
+    /// input to the reactor can come between them. This is the only way the
+    /// reactor hears of a step it did not cause.
+    ///
+    /// The caller is whoever consumes the pool's steps. It consumes them in
+    /// the order the pool produced them: the steps of the reactor's earlier
+    /// calls, which it has to have taken with [`Self::take_pool_steps`]
+    /// before it calls this, then the step returned here, then what the
+    /// reactor did in answer, which is in [`Self::take_pool_steps`] after.
+    pub(crate) fn outside<T>(
         &mut self,
-        step: &Step,
         now: ModelTime,
         pool: &mut PoolModel,
-    ) -> Vec<RelayEffect> {
-        // The pool produced this step after every step it gave the reactor
-        // before. Whoever consumes the pool's steps has to have taken those
-        // first, or it could be told to cancel a job before it was told to
-        // start it.
+        call: impl FnOnce(&mut PoolModel) -> (T, Step),
+    ) -> (T, Step, Vec<RelayEffect>) {
+        // The pool is about to produce a step that goes straight to the
+        // caller. Whatever the reactor still holds is older, and a caller
+        // that has not taken it could be told to cancel a job before it was
+        // told to start it.
         assert!(
             self.pool_steps.is_empty(),
-            "a pool step from outside was delivered before the reactor's earlier steps were taken: {:?}",
+            "a pool call from outside was made while the reactor held steps of its own: {:?}",
             self.pool_steps
         );
-        self.verdicts(step, now, pool);
-        self.finish(now, pool)
+        let (answer, step) = call(pool);
+        self.verdicts(&step, now, pool);
+        let effects = self.finish(now, pool);
+        (answer, step, effects)
     }
 
     /// Time passed.

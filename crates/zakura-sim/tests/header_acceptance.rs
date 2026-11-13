@@ -7862,9 +7862,10 @@ fn artifact_reads(text: &str, file: &str) -> Vec<String> {
 }
 
 /// The files [`every_artifact_read_goes_through_binding`] reads, relative
-/// to the crate: the acceptance tool's parent module and every Rust file
+/// to the crate: the acceptance tool's parent module, every Rust file
 /// under [`ACCEPTANCE_SRC`], at any depth, but `binding.rs`, which is the
-/// boundary.
+/// boundary, and the `header-acceptance` command, which reads the plan and
+/// the trace it judges companions on.
 fn artifact_read_scope() -> Vec<String> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("the acceptance source reads") {
@@ -7877,7 +7878,10 @@ fn artifact_read_scope() -> Vec<String> {
         }
     }
     let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut paths = vec![krate.join(format!("{ACCEPTANCE_SRC}.rs"))];
+    let mut paths = vec![
+        krate.join(format!("{ACCEPTANCE_SRC}.rs")),
+        krate.join("src/bin/header-acceptance.rs"),
+    ];
     walk(&krate.join(ACCEPTANCE_SRC), &mut paths);
     let mut files: Vec<String> = paths
         .iter()
@@ -7905,6 +7909,7 @@ fn every_artifact_read_goes_through_binding() {
     for file in [
         "src/harness/header_acceptance.rs",
         "src/harness/header_acceptance/tool.rs",
+        "src/bin/header-acceptance.rs",
     ] {
         assert!(scope.iter().any(|at| at == file), "{file} is scanned");
     }

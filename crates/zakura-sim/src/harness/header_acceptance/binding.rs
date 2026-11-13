@@ -398,6 +398,17 @@ pub const TRACE_META: Kind = Kind {
     closed: false,
 };
 
+/// `header-acceptance plan`'s `plan.json`
+/// ([`RunPlan`](super::tool::RunPlan)). It names no execution, so it
+/// carries no field: the evaluator instead refuses any plan that isn't the
+/// one S's manifest gives (`tool::binding_refusal`).
+pub const PLAN: Kind = Kind {
+    name: "plan.json",
+    carries: &[],
+    required: &[],
+    closed: false,
+};
+
 /// What a reader expects an artifact to carry, by field. Expecting two
 /// values for one field, or one the reader couldn't read, refuses every
 /// artifact that carries it.
@@ -606,6 +617,13 @@ pub fn scenario_expect(
         .with(Field::Scenario, &described.scenario)
         .with(Field::InputSha256, Value::Null)
         .with(Field::Plan, &plan))
+}
+
+/// The run plan at `path` ([`PLAN`]), read as the trace reader reads its
+/// files, or why it can't be.
+pub fn read_plan(path: &Path) -> Result<super::tool::RunPlan, String> {
+    let plan = read_bounded(&PLAN, path, crate::trace::MAX_REPORT_BYTES, &Expect::new())?;
+    serde_json::from_value(plan).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// The JSON artifact of `kind` at `path`, if it's readable and bound to

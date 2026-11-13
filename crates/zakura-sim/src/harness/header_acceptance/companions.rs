@@ -605,16 +605,36 @@ pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
 /// trace by its recording build ([`binding::FULL_REPORT`]), so what's
 /// judged is that run. So this must
 /// run in the build that recorded the trace, the case's own patched one,
-/// where a patched behavior replays. An error says why there's no verdict.
-pub fn judge_trace(dir: &std::path::Path) -> Result<Verdicts, String> {
-    use crate::harness::{header_sync::HeaderWire, Subsystem};
+/// where a patched behavior replays. It reads the trace once, so the digest
+/// it returns ([`Judged::trace`]) names the very read every verdict came
+/// from. An error says why the trace can't be read.
+pub fn judge_trace(dir: &std::path::Path) -> Result<Judged, String> {
     let trace = binding::open_trace(dir)?;
+    Ok(Judged {
+        verdicts: judge_opened(&trace, dir),
+        trace: trace.id,
+    })
+}
+
+/// What [`judge_trace`] judged.
+#[derive(Clone, Debug)]
+pub struct Judged {
+    /// The digest of the trace it read.
+    pub trace: String,
+    /// Each companion's verdict on that trace, or why there's none.
+    pub verdicts: Result<Verdicts, String>,
+}
+
+/// [`judge_trace`]'s verdicts on `trace`, the one it read from `dir`, or
+/// why there are none.
+fn judge_opened(trace: &crate::trace::Trace, dir: &std::path::Path) -> Result<Verdicts, String> {
+    use crate::harness::{header_sync::HeaderWire, Subsystem};
     let expect = Expect::new()
         .with(Field::Harness, HeaderWire::NAME)
         .with(Field::Draft, [COMMIT]);
     let meta = serde_json::to_value(&trace.meta).map_err(|error| error.to_string())?;
     binding::check(&binding::TRACE_META, &meta, &expect)?;
-    let script = crate::plan::TraceScript::new(&trace, false).map_err(|error| error.to_string())?;
+    let script = crate::plan::TraceScript::new(trace, false).map_err(|error| error.to_string())?;
     let (evidence, rerun) = draft_run(&trace.meta.scenario, crate::PlanInput::Trace(script))?;
     // Bound as `record` bound the recorded one, so it's equal only to a
     // report of this trace by this build.
@@ -849,7 +869,12 @@ mod tests {
     #[test]
     fn the_trace_judge_judges_the_recorded_draft_run() {
         let dir = draft_recording();
-        let verdicts = judge_trace(dir.path()).expect("the recorded Draft run reruns");
+        let judged = judge_trace(dir.path()).expect("the trace reads");
+        let id = crate::trace::TraceReader::open(dir.path())
+            .expect("the trace reads")
+            .id;
+        assert_eq!(judged.trace, id, "the digest is the judged trace's");
+        let verdicts = judged.verdicts.expect("the recorded Draft run reruns");
         let names: Vec<&str> = verdicts.iter().map(|(name, _)| *name).collect();
         assert_eq!(names, COMPANIONS);
         let input = std::fs::read(dir.path().join(crate::trace::INPUT_FILE))
@@ -869,7 +894,9 @@ mod tests {
                 .expect("it reads");
         report.snapshot = Some(json!([]));
         std::fs::write(&path, report.to_line()).expect("the temp dir is writable");
-        assert!(judge_trace(dir.path()).is_err());
+        assert!(judge_trace(dir.path())
+            .and_then(|judged| judged.verdicts)
+            .is_err());
 
         let plain = tempfile::tempdir().expect("a temp dir can be created");
         crate::harness::record(
@@ -878,7 +905,9 @@ mod tests {
             plain.path(),
         )
         .expect("the run records");
-        assert!(judge_trace(plain.path()).is_err());
+        assert!(judge_trace(plain.path())
+            .and_then(|judged| judged.verdicts)
+            .is_err());
     }
 
     /// The trace judge reads the recorded full report only as a report of
@@ -888,7 +917,9 @@ mod tests {
     #[test]
     fn the_trace_judge_binds_the_recorded_report() {
         let dir = draft_recording();
-        assert!(judge_trace(dir.path()).is_ok());
+        assert!(judge_trace(dir.path())
+            .and_then(|judged| judged.verdicts)
+            .is_ok());
         let path = dir.path().join("trace.jsonl");
         let text = std::fs::read_to_string(&path).expect("the trace is readable");
         let (first, rest) = text.split_once('\n').expect("the trace has lines");
@@ -904,7 +935,7 @@ mod tests {
                 .expect("it reads");
         renamed["trace"] = json!(id);
         std::fs::write(&report, renamed.to_string()).expect("the temp dir is writable");
-        let refused = judge_trace(dir.path());
+        let refused = judge_trace(dir.path()).and_then(|judged| judged.verdicts);
         assert!(
             refused
                 .as_ref()

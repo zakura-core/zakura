@@ -1,12 +1,12 @@
 diff --git a/crates/zakura-mempool/src/machine.rs b/crates/zakura-mempool/src/machine.rs
-index 130703081e..26236fdf30 100644
+index 3bb9232bc0..95ef56378b 100644
 --- a/crates/zakura-mempool/src/machine.rs
 +++ b/crates/zakura-mempool/src/machine.rs
-@@ -1985,6 +1985,7 @@ impl<E: VerifyError> MempoolState<E> {
+@@ -2105,6 +2105,7 @@ impl<E: VerifyError> MempoolState<E> {
      /// Starts queued revalidations, parents first, while the revalidation
      /// share and the node's limit allow.
      fn start_revalidations(&mut self) {
 +        return;
-         let queued: Vec<u64> = self.queued.iter().copied().collect();
-         for key in queued {
-             if self.running >= self.limits.revalidating
+         // Walk the queue lazily, so a full share costs nothing and a start
+         // costs only the keys it passes.
+         let mut after = None;

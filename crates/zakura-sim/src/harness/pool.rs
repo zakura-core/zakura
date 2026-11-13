@@ -41,7 +41,7 @@ use zakura_node_services::{
         port::{
             chain_transitions, pool_port, ChainTip, ChainTransition, ChainTransitionSender, Change,
             ChangeSeq, ChangesSince, Charge, ConnectedBlock, Intent, LocalFault, PoolHandle,
-            Source as PoolSource, Supplier, Verdict, Violation,
+            PoolReader, Source as PoolSource, Supplier, Verdict, Violation,
         },
         QueueSource,
     },
@@ -309,7 +309,8 @@ impl std::error::Error for SimVerifyError {}
 /// The modeled verifier.
 #[derive(Clone)]
 struct SimVerifier {
-    handle: PoolHandle,
+    /// A reader, so the verifier the core owns does not keep it running.
+    pool: PoolReader,
     universe: Arc<Universe>,
     evidence: SharedEvidence,
     delay: Duration,
@@ -323,8 +324,9 @@ impl Verifier<SimVerifyError> for SimVerifier {
         tx: UnminedTx,
         _tip: ChainTip,
         _revalidation: bool,
+        _after_reset: bool,
     ) -> Pin<Box<dyn Future<Output = Outcome<SimVerifyError>> + Send>> {
-        let snapshot = self.handle.snapshot();
+        let snapshot = self.pool.snapshot();
         let verifier = self.clone();
         Box::pin(async move {
             if !verifier.delay.is_zero() {
@@ -977,7 +979,7 @@ impl Subsystem for PoolCoreHarness {
         let (handle, inbox) = pool_port();
         let (active, active_rx) = watch::channel(true);
         let verifier = SimVerifier {
-            handle: handle.clone(),
+            pool: handle.reader(),
             universe: Arc::clone(&universe),
             evidence: Arc::clone(&evidence),
             delay: Duration::from_millis(u64::from(scenario.verify_millis)),

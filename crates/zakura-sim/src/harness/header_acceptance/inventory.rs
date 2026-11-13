@@ -194,11 +194,13 @@ fn canonical(manifest: &Manifest, lists: &Lists<'_>) -> Vec<String> {
             Expected::StaysNotApplicable {
                 property,
                 history,
+                na_reason,
                 reason,
                 approval: Approval::Adam { record },
                 ..
             } => lines.push(format!(
-                "approved-stays-not-applicable\t{property}\t{history:?}\t{reason}\t{record}"
+                "approved-stays-not-applicable\t{property}\t{history:?}\t{}\t{reason}\t{record}",
+                na_reason.name()
             )),
             _ => {}
         }

@@ -969,3 +969,43 @@ fn node_sync_plans_witness_operation_ids() {
         assert_eq!(result, Ok(()), "plan {index}");
     }
 }
+
+/// Each `Grow` step of the grow scenario records its growth once the
+/// mirror's published tip is the grown one, in script order, naming the
+/// mirror and the step's position in the control script: `mirror-0` at
+/// step 0, `mirror-2` at step 1, then `mirror-0` again at step 2. Each
+/// grown mirror's tip is past where its chain started.
+#[test]
+fn grow_steps_record_their_growths() {
+    let scenario = StorageScenario::grow();
+    for input in inputs(8, 256) {
+        let (_, ports) = run(&scenario, input);
+        let grown: Vec<(String, Option<usize>)> = ports
+            .grown
+            .facts()
+            .into_iter()
+            .map(|grown| (grown.peer, grown.control))
+            .collect();
+        assert_eq!(
+            grown,
+            [
+                ("mirror-0".to_owned(), Some(0)),
+                ("mirror-2".to_owned(), Some(1)),
+                ("mirror-0".to_owned(), Some(2)),
+            ]
+        );
+        for (mirror, spec) in [(0, &scenario.mirrors[0]), (2, &scenario.mirrors[2])] {
+            let tip =
+                zakura_node_services::header_chain::Port::selected_chain(&*ports.mirrors[mirror])
+                    .borrow()
+                    .clone()
+                    .expect("a mirror publishes its chain")
+                    .frontiers
+                    .header_best;
+            assert!(
+                tip.height > spec.chain.tip(&ports.fixture).height,
+                "mirror-{mirror} grew"
+            );
+        }
+    }
+}

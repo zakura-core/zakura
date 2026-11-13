@@ -302,7 +302,7 @@ pub enum Expected {
         not_applicable: &'static [ExpectedNa],
     },
     /// The history's whole report passes and its target stays
-    /// `NotApplicable` with `reason`, while the history reaches its own
+    /// `NotApplicable` with `na_reason`, while the history reaches its own
     /// target's trigger, which the tool records under that target's `holds`
     /// witness.
     StaysNotApplicable {
@@ -310,7 +310,10 @@ pub enum Expected {
         property: &'static str,
         /// The history.
         history: HistoryRef,
-        /// The reason the target's report must carry.
+        /// The `NotApplicable` reason the target's report must carry.
+        na_reason: crate::NaReason,
+        /// Why the target stays `NotApplicable`: the prose `approval`
+        /// approves (Rule 19).
         reason: &'static str,
         /// The reason's approval (Rule 19).
         approval: Approval,

@@ -101,11 +101,10 @@ pub enum Effect {
         /// shutdown is recorded at its pick.
         in_turn: bool,
     },
-    /// The control task carries it out after its pick and no store records
-    /// it, so it's shown only by a later step of the same script whose
-    /// effect is shown: the task carries its queue out in pick order, and
-    /// a step the step loop runs is offered only once the queue is empty.
-    /// A grow.
+    /// The control task carries it out after its pick and records it in
+    /// the node's `grown` store once it completes, naming the step's
+    /// position in the control script, so it's shown by its own step's
+    /// fact ([`ControlRef`]). A grow.
     Queued,
     /// An adversary's act, which a passing witness judgement of the run
     /// shows wrote its frames: the judge fails a run where a scripted act
@@ -430,6 +429,47 @@ fn environment_facts(report: &FullReport) -> Vec<Fact> {
     found
 }
 
+/// Every growth the full report's `grown` store holds that a control step
+/// made, as that step's [`ControlRef`] with the action `grow`, read from
+/// its snapshot: `{"facts": [{"peer": "<peer>", "control": <position> |
+/// null}, ...]}`. Empty if the store isn't there.
+fn grown(report: &FullReport) -> Vec<ControlRef> {
+    let Some(facts) = snapshot(report, "grown")
+        .and_then(|grown| grown.get("facts"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    facts
+        .iter()
+        .filter_map(|fact| {
+            Some(ControlRef {
+                control: usize::try_from(fact.get("control")?.as_u64()?).ok()?,
+                peer: fact.get("peer")?.as_str()?.to_owned(),
+                action: GROW.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// A grow's action name, as its pick and its [`ControlRef`] name it.
+const GROW: &str = "grow";
+
+/// Whether `growths` ([`grown`]) hold the growth of `declared`'s own step,
+/// joined by its whole [`ControlRef`], so a grow is never shown by
+/// another step's or another peer's growth.
+fn grew(growths: &[ControlRef], declared: &Declared) -> bool {
+    let Some(control) = declared.control else {
+        return false;
+    };
+    let own = ControlRef {
+        control,
+        peer: declared.pick.peer.clone(),
+        action: GROW.to_owned(),
+    };
+    !ControlRef::joined(&own, growths, |at| Some(at.clone())).is_empty()
+}
+
 /// Every link the full report's `sessions` store shows with `fact`, which
 /// is `LinkOpened` or `LinkClosed`, in the store's order.
 fn session_links(report: &FullReport, fact: &str) -> Vec<LinkRef> {
@@ -696,12 +736,13 @@ pub fn judge(
         return Actions::Incomplete;
     }
     let sessions = Sessions::of(report);
+    let growths = grown(report);
     // How many earlier acts of each kind each peer's link has seen.
     let mut acted: std::collections::BTreeMap<(String, usize, LinkShows), usize> =
         std::collections::BTreeMap::new();
     // Each in-turn step's effect, its first fact, follows the one before.
     let mut turn = 0;
-    let mut shown: Vec<bool> = declared
+    let shown: Vec<bool> = declared
         .iter()
         .map(|declared| match &declared.effect {
             Effect::AtPick => true,
@@ -746,18 +787,10 @@ pub fn judge(
                 *nth += 1;
                 shown
             }
-            Effect::Queued | Effect::Unshown => false,
+            Effect::Queued => grew(&growths, declared),
+            Effect::Unshown => false,
         })
         .collect();
-    for at in 0..declared.len() {
-        if declared[at].effect == Effect::Queued {
-            shown[at] = (at + 1..declared.len()).any(|later| {
-                declared[later].script == declared[at].script
-                    && declared[later].effect != Effect::Queued
-                    && shown[later]
-            });
-        }
-    }
     if shown.iter().all(|shown| *shown) {
         Actions::Complete
     } else {
@@ -861,6 +894,97 @@ mod tests {
             judged(&edited(&report, "sessions", Some("facts"), closed, "")),
             Actions::Incomplete
         );
+    }
+
+    /// A storage history whose only control step grows `mirror-0` once the
+    /// node applies its first headers, recorded with no Plan bytes: its
+    /// trace and full report, and its declared actions.
+    fn trailing_grow() -> (Trace, FullReport, Vec<Declared>) {
+        let scenario = json!({
+            "controls": [
+                {"action": {"grow": {"len": 2}}, "peer": "mirror-0",
+                 "when": {"completed": {"held": false, "kind": "apply", "nth": 1, "session": null}}},
+            ],
+            "mirrors": [
+                {"chain": {"fork": null, "main": 5}, "dialer": "mirror"},
+            ],
+            "node": {"fork": null, "main": 2},
+            "policy": {"base": "success-only", "bound_ms": 5000, "holds": []},
+        });
+        let dir = tempfile::tempdir().expect("a temp dir can be created");
+        let entry = crate::harness::find("header-sync/storage").expect("it's registered");
+        let trace = crate::harness::record(
+            entry,
+            crate::harness::RecordInput::Plan {
+                scenario: &scenario,
+                plan: &[],
+            },
+            dir.path(),
+        )
+        .expect("the history records");
+        let text = std::fs::read_to_string(dir.path().join(crate::record::FULL_REPORT_FILE))
+            .expect("record writes the full report");
+        let report = serde_json::from_str(&text).expect("the full report reads back");
+        let declared = declared("header-sync/storage", &trace.meta.scenario).expect("it declares");
+        (trace, report, declared)
+    }
+
+    /// `report` with its `grown` store's facts replaced by `facts`.
+    fn with_growths(report: &FullReport, facts: Value) -> FullReport {
+        let mut report = report.clone();
+        let stores = report
+            .snapshot
+            .as_mut()
+            .and_then(Value::as_array_mut)
+            .expect("a node run keeps its stores");
+        let store = stores
+            .iter_mut()
+            .find(|found| found["store"] == "grown")
+            .expect("the grown store is there");
+        store["snapshot"]["facts"] = facts;
+        report
+    }
+
+    /// A grow that's its script's last step is shown by its own growth,
+    /// which the `grown` store records with the step's position. With the
+    /// growth gone, or naming another step, the run is incomplete.
+    #[test]
+    fn a_trailing_grow_is_shown_by_its_growth() {
+        let (trace, report, declared) = trailing_grow();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].effect, Effect::Queued);
+        let judged = |report: &FullReport| judge(&declared, &trace, report, &End::Completed, false);
+        let growths = grown(&report);
+        assert_eq!(growths.len(), 1);
+        assert!(grew(&growths, &declared[0]));
+        assert_eq!(judged(&report), Actions::Complete);
+        assert_eq!(
+            judged(&with_growths(&report, json!([]))),
+            Actions::Incomplete
+        );
+        assert_eq!(
+            judged(&with_growths(
+                &report,
+                json!([{"peer": "mirror-0", "control": 1}])
+            )),
+            Actions::Incomplete
+        );
+    }
+
+    /// A grow joins its own step's growth by the whole [`ControlRef`]
+    /// (Rule 25's template): the growth of `mirror-0` by step 0 shows the
+    /// declared grow, and the growth with only its position, peer or
+    /// action moved doesn't.
+    #[test]
+    fn a_grow_joins_its_whole_step() {
+        let (_, report, declared) = trailing_grow();
+        let own = grown(&report)
+            .into_iter()
+            .next()
+            .expect("the history records its growth");
+        assert_one_key_off::<ControlRef>(&own, |growth| {
+            grew(std::slice::from_ref(growth), &declared[0])
+        });
     }
 
     /// Each control step's effect joins on its whole cause: the fact its

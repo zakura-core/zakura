@@ -299,18 +299,21 @@ impl ZakuraHandshakeConnector {
         }
     }
 
-    /// Records in the trace which software a peer runs, once its legacy connection has
-    /// been upgraded to Zakura. Does nothing without a live Zakura endpoint.
+    /// Records in the trace where a peer connected from and which software it runs, once
+    /// its legacy connection has been upgraded to Zakura. `addr` is the address as the
+    /// node's privacy setting allows it to be written. Does nothing without a live Zakura
+    /// endpoint.
     pub(crate) fn trace_upgraded_peer(
         &self,
         peer_id: &ZakuraPeerId,
+        addr: &str,
         user_agent: &str,
         inbound: bool,
     ) {
         if let Some(endpoint) = self.endpoint.as_ref() {
             endpoint
                 .trace()
-                .emit_peer_upgraded(peer_id, user_agent, inbound);
+                .emit_peer_upgraded(peer_id, addr, user_agent, inbound);
         }
     }
 

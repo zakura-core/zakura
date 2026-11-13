@@ -1095,6 +1095,7 @@ where
             &connector,
             peer_registry,
             address_book_updater,
+            node_config.expose_peer_addresses,
         );
         return Ok(outcome);
     }
@@ -1185,6 +1186,7 @@ where
         &connector,
         peer_registry,
         address_book_updater,
+        node_config.expose_peer_addresses,
     );
 
     Ok(outcome)
@@ -1198,15 +1200,17 @@ fn record_zakura_upgrade(
     connector: &ZakuraHandshakeConnector,
     peer_registry: Option<&PeerRegistry>,
     address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
+    expose_peer_addresses: bool,
 ) {
     let ZakuraUpgradeOutcome::Upgraded { peer_id, conn_id } = outcome else {
         return;
     };
 
-    // Zakura trace rows name a peer only by its label, so this is where its software
-    // version is tied to that label.
+    // Zakura trace rows name a peer only by its label, so this is where its address and
+    // software version are tied to that label.
     connector.trace_upgraded_peer(
         peer_id,
+        &connected_addr.addr_label(expose_peer_addresses),
         &sanitize_subversion(&connection_info.remote.user_agent),
         connected_addr.is_inbound(),
     );

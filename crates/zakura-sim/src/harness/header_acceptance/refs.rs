@@ -459,6 +459,42 @@ pub struct ActNameRef {
 }
 impl Ref for ActNameRef {}
 
+/// One test: its package, its file relative to the package, and its
+/// name, everything a test artifact, a history's witness or a passing
+/// result names of the test it ran. Two files can hold a test of one name,
+/// so a name alone names none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestIdRef {
+    /// The test's package.
+    pub package: String,
+    /// The test's file, relative to its package.
+    pub file: String,
+    /// The test's name.
+    pub test: String,
+}
+impl Ref for TestIdRef {}
+
+impl TestIdRef {
+    /// The whole identity of `test`.
+    pub fn of(test: super::TestRef) -> Self {
+        TestIdRef {
+            package: test.package.to_owned(),
+            file: test.file.to_owned(),
+            test: test.test.to_owned(),
+        }
+    }
+}
+
+/// One property, by its ID, as a catch key names the property whose
+/// planted cases it takes: a case's property directory is its property's
+/// ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PropertyRef {
+    /// The property's ID.
+    pub property: String,
+}
+impl Ref for PropertyRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

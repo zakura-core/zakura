@@ -7532,6 +7532,34 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/actions.rs",
         "an_act_joins_its_declarers_by_its_whole_name",
     ),
+    (
+        "PlantedRef",
+        "src/harness/header_acceptance.rs",
+        "case_key_case",
+        "src/harness/header_acceptance.rs",
+        "a_case_key_joins_its_whole_case",
+    ),
+    (
+        "PropertyRef",
+        "src/harness/header_acceptance.rs",
+        "catch_property",
+        "src/harness/header_acceptance.rs",
+        "a_catch_key_joins_its_case_s_property",
+    ),
+    (
+        "PlantedRef",
+        "src/harness/header_acceptance.rs",
+        "duplicate_of",
+        "src/harness/header_acceptance.rs",
+        "a_duplicate_joins_its_whole_case",
+    ),
+    (
+        "TestIdRef",
+        "src/harness/header_acceptance.rs",
+        "reason_shown_by",
+        "src/harness/header_acceptance.rs",
+        "a_reason_s_pass_joins_its_whole_test",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.

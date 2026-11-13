@@ -176,8 +176,6 @@ src/harness/discovery_service.rs	sent_row	*s==stream
 src/harness/discovery_service.rs	wire_properties	SCRIPTED.contains(&property.id.as_str()
 src/harness/fixtures.rs	no_race_in	view.fixture().property()!=F::NAME
 src/harness/header_acceptance.rs	covers	RunId::from(*history)==*run
-src/harness/header_acceptance.rs	covers	case.name==name
-src/harness/header_acceptance.rs	covers	case.property==property
 src/harness/header_acceptance.rs	covers	covering==test
 src/harness/header_acceptance.rs	covers	mutation.class==NativeClass::Integrity{history:*history,diagnostic,not_applicable}
 src/harness/header_acceptance.rs	covers	p==property

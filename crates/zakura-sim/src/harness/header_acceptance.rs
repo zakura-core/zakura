@@ -59,7 +59,7 @@ pub use rows::{
 };
 
 use crate::property::{Source, Status};
-use refs::{PlantedRef, Ref};
+use refs::{PlantedRef, PropertyRef, Ref, TestIdRef};
 
 /// One of sim-6.2's six gates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -737,6 +737,57 @@ fn proving_catch(property: &str, name: &str, case: &CaseRef) -> bool {
     PlantedRef::joins(&want, case, |case| Some(case.planted()))
 }
 
+/// Whether `case` is the one a [`Key::Case`] names by `property` and
+/// `name`, joined on its whole [`PlantedRef`].
+fn case_key_case(property: &str, name: &str, case: &CaseRef) -> bool {
+    let want = PlantedRef {
+        property: property.to_owned(),
+        name: name.to_owned(),
+    };
+    PlantedRef::joins(&want, case, |case| Some(case.planted()))
+}
+
+/// Whether `case` is under the property a [`Key::Catch`] names, joined on
+/// its whole [`PropertyRef`]: a case's property directory is its
+/// property's ID.
+fn catch_property(property: &str, case: &CaseRef) -> bool {
+    let want = PropertyRef {
+        property: property.to_owned(),
+    };
+    PropertyRef::joins(&want, case, |case| {
+        Some(PropertyRef {
+            property: case.property.to_owned(),
+        })
+    })
+}
+
+/// Whether `class` is a duplicate of `case`, the planted case it names,
+/// joined on the case's whole [`PlantedRef`].
+fn duplicate_of(class: &NativeClass, case: &CaseRef) -> bool {
+    let NativeClass::Duplicate {
+        property,
+        case: name,
+    } = class
+    else {
+        return false;
+    };
+    let want = PlantedRef {
+        property: (*property).to_owned(),
+        name: (*name).to_owned(),
+    };
+    PlantedRef::joins(&want, case, |case| Some(case.planted()))
+}
+
+/// Whether `test` is the one [`rows::reason_test`] names to show `reason`,
+/// joined on its whole [`TestIdRef`].
+fn reason_shown_by(reason: crate::NaReason, test: &TestRef) -> bool {
+    rows::reason_test(reason).is_some_and(|want| {
+        TestIdRef::joins(&TestIdRef::of(want), test, |test| {
+            Some(TestIdRef::of(*test))
+        })
+    })
+}
+
 impl Key {
     /// Whether `expected` is a result that can satisfy this key: the same
     /// kind of obligation, naming the same item in every identity field.
@@ -767,17 +818,17 @@ impl Key {
                 property == p
             }
             (Key::Catch { property }, Expected::Caught { case, set, .. }) => {
-                case.property == property && set.contains(&property.as_str())
+                catch_property(property, case) && set.contains(&property.as_str())
             }
             (Key::Catch { property }, Expected::MachineCaught { case, .. }) => {
-                case.property == property
+                catch_property(property, case)
             }
             (
                 Key::Case { property, name },
                 Expected::Caught { case, .. }
                 | Expected::MachineCaught { case, .. }
                 | Expected::HarnessCaught { case, .. },
-            ) => case.property == property && case.name == name,
+            ) => case_key_case(property, name, case),
             // A contract's proving catch takes the `Caught` or
             // `HarnessCaught` of exactly that case, and nothing else.
             (
@@ -826,16 +877,9 @@ impl Key {
             }
             // A duplicate native mutation's key takes the catch of exactly
             // the planted case its classification names.
-            (Key::Native { patch }, Expected::Caught { case, .. }) => {
-                NATIVE_MUTATIONS.iter().any(|mutation| {
-                    mutation.patch == patch
-                        && mutation.class
-                            == NativeClass::Duplicate {
-                                property: case.property,
-                                case: case.name,
-                            }
-                })
-            }
+            (Key::Native { patch }, Expected::Caught { case, .. }) => NATIVE_MUTATIONS
+                .iter()
+                .any(|mutation| mutation.patch == patch && duplicate_of(&mutation.class, case)),
             (Key::Cleanup { run }, Expected::Open { .. }) => {
                 let machine =
                     matches!(run, RunId::History { harness, .. } if rows::is_machine(harness));
@@ -854,9 +898,7 @@ impl Key {
             ) => RunId::from(*history) == *run,
             // A reason's key takes the pass of exactly the test that shows
             // it, or, for a reason with none, the Open that blocks.
-            (Key::NaReason { reason }, Expected::Passes { test }) => {
-                rows::reason_test(*reason) == Some(*test)
-            }
+            (Key::NaReason { reason }, Expected::Passes { test }) => reason_shown_by(*reason, test),
             (Key::NaReason { reason }, Expected::Open { .. }) => {
                 rows::reason_test(*reason).is_none() && same_open(expected, &rows::REASON_UNSHOWN)
             }
@@ -1201,5 +1243,147 @@ mod tests {
             key.covers(&caught, &[])
         });
         assert_eq!(keys, 2);
+    }
+
+    /// `text`, for the life of the test, as a static case or test field.
+    fn leaked(text: &str) -> &'static str {
+        Box::leak(text.to_owned().into_boxed_str())
+    }
+
+    /// The `reserved-flags-skipped` case under one of its properties, and
+    /// its `Caught` on `header-sync/wire`.
+    fn reserved_flags_caught() -> (CaseRef, Expected) {
+        let case = CaseRef {
+            property: "header-sync/s5v9/status/reserved-flags-closes",
+            name: "reserved-flags-skipped",
+        };
+        let caught = Expected::Caught {
+            case,
+            harness: "header-sync/wire",
+            set: &[],
+            found: Found::AtStep,
+            companions: &[],
+            not_applicable: &[],
+            patched_not_applicable: None,
+        };
+        (case, caught)
+    }
+
+    /// A case key takes the catch of its case only on the case's whole
+    /// [`PlantedRef`] (Rule 25's template): the key naming
+    /// `reserved-flags-skipped` under its property covers that case's
+    /// `Caught`, and the key with its property or its name moved covers it
+    /// no more.
+    #[test]
+    fn a_case_key_joins_its_whole_case() {
+        let (case, caught) = reserved_flags_caught();
+        let keys = assert_one_key_off::<PlantedRef>(&case.planted(), |want| {
+            let key = Key::Case {
+                property: want.property.clone(),
+                name: want.name.clone(),
+            };
+            key.covers(&caught, &[])
+        });
+        assert_eq!(keys, 2);
+    }
+
+    /// A catch key takes a case's catch only under the case's own property,
+    /// joined on its whole [`PropertyRef`] (Rule 25's template): the key of
+    /// a machine case's property covers its `MachineCaught`, which has no
+    /// set to check beside it, and the key with the property moved doesn't.
+    #[test]
+    fn a_catch_key_joins_its_case_s_property() {
+        let case = CaseRef {
+            property: "header/reactor-policy",
+            name: "a-case",
+        };
+        let caught = Expected::MachineCaught {
+            case,
+            harness: "header/reactor",
+        };
+        let own = PropertyRef {
+            property: case.property.to_owned(),
+        };
+        let keys = assert_one_key_off::<PropertyRef>(&own, |want| {
+            let key = Key::Catch {
+                property: want.property.clone(),
+            };
+            key.covers(&caught, &[])
+        });
+        assert_eq!(keys, 1);
+    }
+
+    /// A duplicate native mutation's key takes the catch of only the case
+    /// its class names, joined on the case's whole [`PlantedRef`] (Rule
+    /// 25's template): `misstored-page`'s key covers `stored-order`'s
+    /// `Caught`, and not that `Caught` with its case's property or name
+    /// moved.
+    #[test]
+    fn a_duplicate_joins_its_whole_case() {
+        let (_, caught) = reserved_flags_caught();
+        let Expected::Caught {
+            harness,
+            set,
+            found,
+            companions,
+            not_applicable,
+            patched_not_applicable,
+            ..
+        } = caught
+        else {
+            unreachable!("it's built as a Caught");
+        };
+        let (patch, covered) = NATIVE_MUTATIONS
+            .iter()
+            .find_map(|mutation| match mutation.class {
+                NativeClass::Duplicate { property, case } => Some((
+                    mutation.patch,
+                    CaseRef {
+                        property,
+                        name: case,
+                    },
+                )),
+                _ => None,
+            })
+            .expect("a native mutation duplicates a planted case");
+        let key = Key::Native {
+            patch: patch.to_owned(),
+        };
+        let keys = assert_one_key_off::<PlantedRef>(&covered.planted(), |want| {
+            let caught = Expected::Caught {
+                case: CaseRef {
+                    property: leaked(&want.property),
+                    name: leaked(&want.name),
+                },
+                harness,
+                set,
+                found,
+                companions,
+                not_applicable,
+                patched_not_applicable,
+            };
+            key.covers(&caught, &[])
+        });
+        assert_eq!(keys, 2);
+    }
+
+    /// A reason's key takes the pass of only the test that shows it,
+    /// joined on its whole [`TestIdRef`] (Rule 25's template): the key of
+    /// the first reason [`rows::REASON_TESTS`] shows covers its test's
+    /// `Passes`, and not a `Passes` of that test with its package, file or
+    /// name moved.
+    #[test]
+    fn a_reason_s_pass_joins_its_whole_test() {
+        let (reason, test) = rows::REASON_TESTS[0];
+        let key = Key::NaReason { reason };
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(test), |want| {
+            let test = TestRef {
+                package: leaked(&want.package),
+                file: leaked(&want.file),
+                test: leaked(&want.test),
+            };
+            key.covers(&Expected::Passes { test }, &[])
+        });
+        assert_eq!(keys, 3);
     }
 }

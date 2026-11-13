@@ -4,6 +4,7 @@ use std::{
     fmt,
     io::{Cursor, Read, Write},
     panic::{self, AssertUnwindSafe},
+    sync::{Arc, Mutex},
 };
 
 #[cfg(test)]
@@ -12,6 +13,7 @@ use std::cell::Cell;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use chrono::{TimeZone, Utc};
+use indexmap::IndexMap;
 use tokio_util::codec::{Decoder, Encoder};
 
 use zakura_chain::{
@@ -63,6 +65,18 @@ pub(crate) const MAX_INCOMPLETE_MESSAGE_BYTES: usize = HEADER_LEN + MAX_PROTOCOL
 /// verack is 0 bytes. 1 KB provides headroom for future protocol changes.
 const MAX_HANDSHAKE_BODY_LEN: usize = 1024;
 
+/// The smallest `block` message body whose checksum is shared between connections.
+///
+/// Looking a checksum up hashes the block's header, which is about 1.5 kB. Hashing a body
+/// smaller than this costs too little for the lookup to save time.
+const MIN_SHARED_CHECKSUM_BODY_LEN: usize = 64 * 1024;
+
+/// The number of blocks whose checksums are remembered.
+///
+/// Peers request the newest few blocks in bursts. The rest of the room keeps those entries
+/// while syncing peers request older large blocks in between.
+const SHARED_CHECKSUM_BLOCKS: usize = 32;
+
 /// The parse error returned when a legacy message body parser panics.
 const PANICKED_MESSAGE_BODY_PARSE_ERROR: &str = "panic while parsing peer message body";
 
@@ -103,6 +117,48 @@ enum BodyDecodePanic {
     AfterTransactionConversion,
 }
 
+/// Checksums of the large `block` messages this node sent most recently.
+///
+/// Every peer that requests a block is sent the same body, so the checksum in the message
+/// header is the same for all of them. Hashing a full block takes milliseconds, and many peers
+/// request a new block at the same moment. Connections that share one `BlockChecksums` hash each
+/// block once between them.
+///
+/// A checksum is found by the block's hash. A node only sends blocks it holds, and it holds one
+/// body for each hash. The body length is checked as well, so a body of another length is hashed
+/// again rather than sent with a remembered checksum.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BlockChecksums(Arc<Mutex<IndexMap<block::Hash, (usize, sha256d::Checksum)>>>);
+
+impl BlockChecksums {
+    /// Returns the remembered checksum of the block `hash`, if its body was `body_len` bytes.
+    ///
+    /// A block that is found becomes the last one to be forgotten.
+    fn get(&self, hash: block::Hash, body_len: usize) -> Option<sha256d::Checksum> {
+        let mut checksums = self
+            .0
+            .lock()
+            .expect("the lock is only held for map operations, which do not panic");
+        let (remembered_len, checksum) = checksums.shift_remove(&hash)?;
+        checksums.insert(hash, (remembered_len, checksum));
+        (remembered_len == body_len).then_some(checksum)
+    }
+
+    /// Remembers `checksum` for the `body_len` byte body of the block `hash`, forgetting the
+    /// block that was sent least recently if there is no room.
+    fn insert(&self, hash: block::Hash, body_len: usize, checksum: sha256d::Checksum) {
+        let mut checksums = self
+            .0
+            .lock()
+            .expect("the lock is only held for map operations, which do not panic");
+        checksums.shift_remove(&hash);
+        if checksums.len() >= SHARED_CHECKSUM_BLOCKS {
+            checksums.shift_remove_index(0);
+        }
+        checksums.insert(hash, (body_len, checksum));
+    }
+}
+
 /// A codec which produces Bitcoin messages from byte streams and vice versa.
 pub struct Codec {
     builder: Builder,
@@ -119,6 +175,8 @@ pub struct Builder {
     version: Version,
     /// The maximum allowable message length.
     max_len: usize,
+    /// The block checksums this codec reuses. A codec has its own unless it is given shared ones.
+    block_checksums: BlockChecksums,
 }
 
 impl Codec {
@@ -128,6 +186,7 @@ impl Codec {
             network: Network::Mainnet,
             version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
             max_len: MAX_HANDSHAKE_BODY_LEN,
+            block_checksums: BlockChecksums::default(),
         }
     }
 
@@ -166,6 +225,13 @@ impl Builder {
     #[allow(dead_code)]
     pub fn with_max_body_len(mut self, len: usize) -> Self {
         self.max_len = len;
+        self
+    }
+
+    /// Share `block_checksums` with the other codecs that were given a clone of it, so a block
+    /// sent through several of them is hashed once.
+    pub(crate) fn with_block_checksums(mut self, block_checksums: BlockChecksums) -> Self {
+        self.block_checksums = block_checksums;
         self
     }
 }
@@ -245,7 +311,7 @@ impl Encoder<Message> for Codec {
 
             self.write_body(&item, dst)?;
         }
-        let checksum = message_checksum(&dst[start_len + HEADER_LEN..]);
+        let checksum = self.body_checksum(&item, &dst[start_len + HEADER_LEN..]);
         dst[start_len + 20..][..4].copy_from_slice(&checksum.0);
 
         Ok(())
@@ -266,6 +332,27 @@ impl Codec {
         self.write_body(msg, &mut writer)
             .expect("writer should never fail");
         writer.0
+    }
+
+    /// Returns the checksum of `body`, the serialized body of `msg`.
+    ///
+    /// A large block's checksum is taken from [`BlockChecksums`] when another send already
+    /// hashed that block, and is remembered there otherwise. Every other body is hashed.
+    fn body_checksum(&self, msg: &Message, body: &[u8]) -> sha256d::Checksum {
+        let block = match msg {
+            Message::Block(block) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => block,
+            _ => return message_checksum(body),
+        };
+
+        let hash = block.hash();
+        let block_checksums = &self.builder.block_checksums;
+        if let Some(checksum) = block_checksums.get(hash, body.len()) {
+            return checksum;
+        }
+
+        let checksum = message_checksum(body);
+        block_checksums.insert(hash, body.len(), checksum);
+        checksum
     }
 
     /// Write the body of the message into the given writer. This allows writing

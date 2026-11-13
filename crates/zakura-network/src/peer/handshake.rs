@@ -49,7 +49,9 @@ use crate::{
     peer_registry::PeerRegistry,
     peer_set::{ConnectionTracker, InventoryChange},
     protocol::{
-        external::{canonical_ip, types::*, AddrInVersion, Codec, InventoryHash, Message},
+        external::{
+            canonical_ip, types::*, AddrInVersion, BlockChecksums, Codec, InventoryHash, Message,
+        },
         internal::{Request, Response},
     },
     types::MetaAddr,
@@ -99,6 +101,9 @@ where
 
     /// Funds decoded TCP payloads across this node's connections.
     inbound_budget: InboundBudget,
+
+    /// Lets this node's connections hash a block they all send only once.
+    block_checksums: BlockChecksums,
 
     /// The live ban list, rechecked by each connection before it writes a block advert.
     bans: BannedIps,
@@ -157,6 +162,7 @@ where
             peer_registry: self.peer_registry.clone(),
             protected_peer_ips: self.protected_peer_ips.clone(),
             inbound_budget: self.inbound_budget.clone(),
+            block_checksums: self.block_checksums.clone(),
             bans: self.bans.clone(),
             tcp_warmup: self.tcp_warmup.clone(),
             gossip_trace: self.gossip_trace.clone(),
@@ -701,6 +707,7 @@ where
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
             inbound_budget: InboundBudget::new(TCP_INBOUND_RETAINED_BYTES),
+            block_checksums: BlockChecksums::default(),
             bans: self.bans.unwrap_or_default(),
             tcp_warmup: self.tcp_warmup,
             gossip_trace,
@@ -1571,6 +1578,7 @@ where
             connection_tracker,
         } = req;
         let inbound_budget = self.inbound_budget.clone();
+        let block_checksums = self.block_checksums.clone();
 
         let addr_label = connected_addr.addr_label(self.config.expose_peer_addresses);
         let negotiator_span = debug_span!(
@@ -1626,7 +1634,10 @@ where
 
             let mut peer_conn = Framed::new(
                 data_stream,
-                Codec::builder().for_network(&config.network).finish(),
+                Codec::builder()
+                    .for_network(&config.network)
+                    .with_block_checksums(block_checksums)
+                    .finish(),
             );
             let mut connection_tracker = connection_tracker;
 

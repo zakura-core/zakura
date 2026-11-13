@@ -9,9 +9,11 @@
 //! - **Reserve, then ask.** No `GetTxs` goes out for an id without a
 //!   reservation at the core. A full core means no request and a retry
 //!   after a delay.
-//! - **One reservation for the life of the fetch.** It is counted against
-//!   the first peer asked. A later announcer that answers is named as the
-//!   supplier. Nothing moves the reservation.
+//! - **One reservation while the node waits for a body.** It is counted
+//!   against the first peer asked. A later announcer that is asked at once
+//!   answers under it and is named as the supplier. Nothing moves the
+//!   reservation. If nobody can be asked, it is given back, and the next ask
+//!   takes a new one.
 //! - **One preferred attempt.** A `NotFound` or a timeout moves the id to
 //!   its next announcer. A request that timed out stays outstanding and
 //!   keeps its slot until its peer answers or its session ends.
@@ -483,15 +485,22 @@ impl ReactorModel {
         for wanted in self.wanted.values() {
             assert!(wanted.attempts <= MAX_ATTEMPTS, "attempts in one fetch");
             assert!(wanted.refetches <= MAX_REFETCHES, "fetches of one id");
-            if let Fetch::Asking { session, .. } = wanted.fetch {
-                assert!(
-                    self.sessions[&session].outstanding.contains(&wanted.id),
-                    "the session being asked has the request outstanding"
-                );
-                assert!(
-                    wanted.reservation.is_some(),
-                    "no request without a reservation"
-                );
+            match wanted.fetch {
+                Fetch::Asking { session, .. } => {
+                    assert!(
+                        self.sessions[&session].outstanding.contains(&wanted.id),
+                        "the session being asked has the request outstanding"
+                    );
+                    assert!(
+                        wanted.reservation.is_some(),
+                        "no request without a reservation"
+                    );
+                }
+                Fetch::Idle | Fetch::Backoff { .. } => assert!(
+                    wanted.reservation.is_none(),
+                    "no slot is held while the node waits for nobody"
+                ),
+                Fetch::Submitted { .. } => {}
             }
         }
     }
@@ -693,10 +702,18 @@ impl ReactorModel {
             self.effects.push(RelayEffect::Ask { session, id });
             return;
         }
-        // Nobody was asked. If the core refused every announcer that had
-        // room, try again after a delay. Otherwise the id waits for a
-        // request slot, which an answer or a session end frees, and either
-        // of those runs this again.
+        // Nobody was asked, so the node is not waiting for a body, and the
+        // slot goes back to the core. An idle id that kept it could hold it
+        // for as long as its announcers stay connected, full and silent.
+        // The next ask reserves again.
+        if let Some(reservation) = self.wanted_at(key).reservation.take() {
+            let step = pool.release(reservation, now);
+            self.pool_steps.push(step);
+        }
+        // If the core refused every announcer that had room, try again
+        // after a delay. Otherwise the id waits for a request slot, which an
+        // answer or a session end frees, and either of those runs this
+        // again.
         if refused {
             Self::back_off(self.wanted_at(key), now);
         }

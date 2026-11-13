@@ -9,7 +9,10 @@ use zakura_chain::{
 };
 use zakura_node_services::mempool::{
     port::{
-        model::{ModelTx, ModelUnreserved, ModelVerdict, Outcome, PoolModel, Step, T_VERIFY},
+        model::{
+            ModelBlock, ModelTransition, ModelTx, ModelUnreserved, ModelVerdict, Outcome,
+            PoolModel, Step, T_VERIFY,
+        },
         ChainReason, Change, Charge, Generation, GenerationRead, Intent, LocalFault,
         RejectionScope, Source, Supplier, MAX_PENDING, MAX_PENDING_PER_SOURCE,
     },
@@ -912,6 +915,10 @@ fn a_random_run_always_drains_once_the_sessions_end() {
         // Requests on the wire: the session and the id.
         let mut asked: Vec<(SessionId, u16)> = Vec::new();
         let mut jobs = Vec::new();
+        // What a legacy caller, competing for the same ids, still holds.
+        let mut legacy_held = Vec::new();
+        let mut generation = 0;
+        let legacy_peer = |n: u8| QueueSource::LegacySocket(([10, 0, 0, n], 8233).into());
 
         let apply = |effects: Vec<RelayEffect>,
                      reactor: &mut ReactorModel,
@@ -943,7 +950,52 @@ fn a_random_run_always_drains_once_the_sessions_end() {
             now += Duration::from_millis(rng.next(4_000));
             let n = u16::try_from(rng.next(16)).expect("small");
             let peer = u8::try_from(rng.next(3) + 1).expect("small");
-            let effects = match rng.next(12) {
+            let effects = match rng.next(15) {
+                // A legacy caller reserves the same id, to fetch or deliver.
+                12 => {
+                    let source = Source::Peer(legacy_peer(peer));
+                    let intent = if rng.next(2) == 0 {
+                        Intent::Fetch
+                    } else {
+                        Intent::Deliver
+                    };
+                    if let Ok(reserved) = pool.reserve(id(n), source, intent, now) {
+                        legacy_held.push((reserved, n, peer));
+                    }
+                    Vec::new()
+                }
+                // It brings its body, waits, or gives up.
+                13 if !legacy_held.is_empty() => {
+                    let (reserved, n, peer) = legacy_held.swap_remove(rng.pick(legacy_held.len()));
+                    let supplier = Supplier::Peer(legacy_peer(peer));
+                    let step = match rng.next(4) {
+                        0 => pool.release(reserved.id, now),
+                        _ if reserved.wants_body => {
+                            pool.submit(reserved.id, tx(n), supplier, now).1
+                        }
+                        _ => pool.wait(reserved.id, id(n), supplier, now).1,
+                    };
+                    jobs.extend(step.started());
+                    reactor.pool_step(&step, now, &mut pool)
+                }
+                // A block connects, sometimes after a reorg.
+                14 => {
+                    generation += 1;
+                    let step = pool.transition(
+                        ModelTransition {
+                            disconnected: usize::try_from(rng.next(3) / 2).expect("small"),
+                            connected: vec![ModelBlock {
+                                transactions: vec![tx(n)],
+                            }],
+                            tip: Height(100 + u32::try_from(generation).expect("small")),
+                            generation: Generation(generation),
+                            rules_change: false,
+                        },
+                        now,
+                    );
+                    jobs.extend(step.started());
+                    reactor.pool_step(&step, now, &mut pool)
+                }
                 0 => {
                     let served = usize::try_from(rng.next(6) + 1).expect("small");
                     live.push(reactor.connect(v2(peer), rng.next(2) == 0, served));
@@ -993,12 +1045,15 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                             2 => Outcome::LocalFault(LocalFault::StateUnavailable),
                             _ => Outcome::Pass,
                         };
-                        let step = pool.outcome(job, outcome, stable(), stable(), now);
+                        let read = GenerationRead::Stable(Generation(generation));
+                        let step = pool.outcome(job, outcome, read, read, now);
+                        jobs.extend(step.started());
                         reactor.pool_step(&step, now, &mut pool)
                     }
                 }
                 _ => {
                     let step = pool.tick(now);
+                    jobs.extend(step.started());
                     let mut effects = reactor.pool_step(&step, now, &mut pool);
                     effects.extend(reactor.tick(now, &mut pool));
                     effects
@@ -1009,16 +1064,26 @@ fn a_random_run_always_drains_once_the_sessions_end() {
             pool.assert_invariants();
         }
 
-        // Drain. Every session ends and time goes by. The verifications
-        // still running end in a local fault on some runs and pass on the
-        // others, because a fault after the last session ended is its own
-        // way to get stuck.
-        for session in live.drain(..) {
-            reactor.end(session, now, &mut pool);
+        // Drain. Time goes by and nothing else happens. On two runs in
+        // three every session ends first. On the third they stay connected
+        // and silent, which is its own way to get stuck: a peer that never
+        // answers and never leaves. The verifications still running end in
+        // a local fault on some runs and pass on the others.
+        for (reserved, ..) in legacy_held.drain(..) {
+            let step = pool.release(reserved.id, now);
+            jobs.extend(step.started());
+            reactor.pool_step(&step, now, &mut pool);
         }
-        for _ in 0..200 {
+        let sessions_end = seed % 3 != 2;
+        if sessions_end {
+            for session in live.drain(..) {
+                reactor.end(session, now, &mut pool);
+            }
+        }
+        for round in 0..200 {
             jobs.extend(reactor.take_started());
-            if reactor.wanted_count() == 0 && pool.slots_in_use() == 0 && jobs.is_empty() {
+            let settled = pool.slots_in_use() == 0 && pool.hidden().is_empty() && jobs.is_empty();
+            if settled && (reactor.wanted_count() == 0 || !sessions_end) {
                 break;
             }
             for job in std::mem::take(&mut jobs) {
@@ -1027,19 +1092,70 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                 } else {
                     Outcome::Pass
                 };
-                let step = pool.outcome(job, outcome, stable(), stable(), now);
+                // A pooled transaction is kept through local faults on
+                // purpose, so the faults stop after a while.
+                let outcome = if round < 20 { outcome } else { Outcome::Pass };
+                let read = GenerationRead::Stable(Generation(generation));
+                let step = pool.outcome(job, outcome, read, read, now);
+                jobs.extend(step.started());
                 reactor.pool_step(&step, now, &mut pool);
             }
             now += RETRY_MAX + T_VERIFY;
             let step = pool.tick(now);
+            jobs.extend(step.started());
             reactor.pool_step(&step, now, &mut pool);
             reactor.tick(now, &mut pool);
             reactor.assert_invariants();
         }
 
-        // Nothing is left wanted with nobody to ask, and the reactor holds
-        // no slot at the core.
-        assert_eq!(reactor.wanted_count(), 0, "seed {seed}: an id is stuck");
+        // The reactor holds no slot at the core, whether or not its peers
+        // left, and no body counts against a peer any more.
         assert_eq!(pool.slots_in_use(), 0, "seed {seed}: a core slot is stuck");
+        for peer in 1..=3 {
+            assert_eq!(
+                reactor.verifying(&v2(peer)),
+                0,
+                "seed {seed}: a peer's quota is stuck"
+            );
+        }
+        if sessions_end {
+            // Nothing is left wanted with nobody to ask.
+            assert_eq!(reactor.wanted_count(), 0, "seed {seed}: an id is stuck");
+            // A peer that comes back starts with its full allowance.
+            let back = reactor.connect(v2(1), false, MAX_REQUESTS_PER_PEER);
+            let effects = reactor.announce(back, id(15), 300, now, &mut pool);
+            let asked_or_known = effects == vec![ask(back, 15)] || !reactor.wants(id(15));
+            assert!(asked_or_known || pool.cooling(&v2(1), now), "seed {seed}");
+        }
+        reactor.assert_invariants();
     }
+}
+
+// Cases from the fifth review.
+
+#[test]
+fn an_id_waiting_for_a_busy_announcer_holds_no_core_slot() {
+    let (mut pool, mut reactor, s) = setup(2);
+    // Bob has five requests out and answers none of them.
+    for n in 10..15 {
+        reactor.announce(s[1], id(n), 300, secs(0), &mut pool);
+    }
+    // Alice is asked for an id that Bob also announced.
+    reactor.announce(s[0], id(1), 300, secs(1), &mut pool);
+    reactor.announce(s[1], id(1), 300, secs(1), &mut pool);
+
+    // Everyone times out. Bob is next for id 1, but has no request room,
+    // and both peers stay connected and silent.
+    reactor.tick(secs(1) + REQUEST_TIMEOUT, &mut pool);
+    assert!(reactor.wants(id(1)), "Bob may answer and free a request");
+    // The id waits, and the core is free for others meanwhile.
+    assert_eq!(pool.slots_in_use(), 0);
+    reactor.tick(secs(1) + REQUEST_TIMEOUT * 10, &mut pool);
+    assert_eq!(pool.slots_in_use(), 0);
+    reactor.assert_invariants();
+
+    // Bob answers one request. Now he can be asked, under a new slot.
+    let effects = reactor.not_found(s[1], id(10), secs(200), &mut pool);
+    assert_eq!(effects, vec![ask(s[1], 1)]);
+    assert_eq!(pool.slots_in_use(), 1);
 }

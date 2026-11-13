@@ -249,7 +249,10 @@ pub enum Effect {
         /// How many outputs it creates.
         count: u32,
     },
-    /// A caller waiting for an output is answered with it.
+    /// A caller waiting for an output is answered with it. The answer is
+    /// the output at `outpoint` of the transaction that just became visible.
+    /// The model carries no output values, so a comparison reads that value
+    /// from the transaction's body and checks the machine returned it.
     OutputReady {
         /// The waiting caller.
         waiter: WaiterId,
@@ -263,7 +266,8 @@ pub enum Effect {
 /// The answer to [`PoolModel::await_output`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum OutputAnswer {
-    /// A visible pooled transaction creates the output.
+    /// A visible pooled transaction creates the output, and the answer is
+    /// that output: the one at the outpoint asked for.
     Ready,
     /// Nothing visible creates it. The caller waits under this name.
     Waiting(WaiterId),
@@ -520,6 +524,10 @@ pub struct PoolModel {
     /// slots.
     leases: HashMap<ReservationId, Lease>,
     tickets: BTreeMap<ReservationId, JoinTicket>,
+    /// Joined reservations whose admission ended before their caller came
+    /// back. Each keeps its id, so a wrong body under it is still told
+    /// apart, as the handle would.
+    ended_joins: HashMap<ReservationId, UnminedTxId>,
     /// The pool, oldest first.
     pool: BTreeMap<u64, Pooled>,
     pooled: HashMap<transaction::Hash, u64>,
@@ -556,6 +564,7 @@ impl PoolModel {
             owners: HashMap::new(),
             leases: HashMap::new(),
             tickets: BTreeMap::new(),
+            ended_joins: HashMap::new(),
             pool: BTreeMap::new(),
             pooled: HashMap::new(),
             jobs: HashMap::new(),
@@ -736,6 +745,7 @@ impl PoolModel {
         let Some(key) = key else {
             // The fetch that held this slot is over.
             self.leases.remove(&reservation);
+            self.ended_joins.remove(&reservation);
             let verdict = self.stale_verdict(tx_id);
             self.step.effects.push(Effect::Verdict { waiter, verdict });
             self.start_revalidations();
@@ -1248,6 +1258,7 @@ impl PoolModel {
     fn reserved_for(&self, reservation: ReservationId) -> Option<UnminedTxId> {
         self.undecided_for(reservation)
             .or_else(|| self.leases.get(&reservation).map(|lease| lease.tx_id))
+            .or_else(|| self.ended_joins.get(&reservation).copied())
     }
 
     /// Ends a reservation that brought no body: frees its lease, or its
@@ -1266,6 +1277,7 @@ impl PoolModel {
             self.settle_bodyless(key);
         }
         self.leases.remove(&reservation);
+        self.ended_joins.remove(&reservation);
     }
 
     /// Joins an id that is already undecided, if `source` may.
@@ -1505,10 +1517,15 @@ impl PoolModel {
                 }
                 self.pooled_at(key).hidden = Some(Hidden::Parked { on });
             }
-            Outcome::Fail { .. } => {
+            Outcome::Fail { scope, .. } => {
+                let tx_id = self.pooled_at(key).tx.id;
                 // Its job has reported, so there is nothing to cancel.
                 self.pooled_at(key).hidden = Some(Hidden::Queued);
                 self.remove_with_dependents(hash, RemovalReason::Invalidated);
+                // Nobody is charged for a transaction that passed once. The
+                // rejection is still remembered, as today's retry after a
+                // reset remembers it, so it is not fetched again at once.
+                self.cache(tx_id, scope);
             }
             Outcome::LocalFault(_) => self.retry_later(key),
         }
@@ -1543,8 +1560,19 @@ impl PoolModel {
                 },
             );
         }
-        // A reservation that joined this admission dies with it.
-        self.tickets.retain(|_, ticket| ticket.admission != key);
+        // A reservation that joined this admission dies with it. Its caller
+        // may still come back with a body.
+        let tx_id = admission.tx_id;
+        let ended: Vec<ReservationId> = self
+            .tickets
+            .iter()
+            .filter(|(_, ticket)| ticket.admission == key)
+            .map(|(reservation, _)| *reservation)
+            .collect();
+        for reservation in ended {
+            self.tickets.remove(&reservation);
+            self.ended_joins.insert(reservation, tx_id);
+        }
         for waiter in admission.waiters {
             let verdict = match (verdict, &waiter.supplier) {
                 (ModelVerdict::Rejected { scope, charge }, Supplier::Peer(peer)) => {

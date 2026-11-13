@@ -2752,6 +2752,8 @@ struct Run {
     jobs: Vec<JobId>,
     waiters: Vec<WaiterId>,
     verdicts: Vec<WaiterId>,
+    /// Output waits that have had no answer and were not cancelled.
+    output_waits: Vec<WaiterId>,
 }
 
 impl Run {
@@ -2761,9 +2763,18 @@ impl Run {
                 Effect::Start { job, .. } => self.jobs.push(job),
                 Effect::Cancel(job) => self.jobs.retain(|running| *running != job),
                 Effect::Verdict { waiter, .. } => self.verdicts.push(waiter),
-                Effect::Outputs { .. }
-                | Effect::OutputReady { .. }
-                | Effect::OutputWaitEnded(_) => {}
+                // An output wait ends once: with its output, or because the
+                // pool turned off. An answer for a wait that is not out is
+                // a duplicate, or one for a caller that already left.
+                Effect::OutputReady { waiter, .. } | Effect::OutputWaitEnded(waiter) => {
+                    let index = self
+                        .output_waits
+                        .iter()
+                        .position(|waiting| *waiting == waiter)
+                        .expect("an output answer names a wait that is still out");
+                    self.output_waits.swap_remove(index);
+                }
+                Effect::Outputs { .. } => {}
             }
         }
     }
@@ -2793,7 +2804,8 @@ fn a_random_run_with_small_limits_always_drains() {
         // Granted reservations: id, transaction, peer, whether the core
         // wants the body.
         let mut granted: Vec<(ReservationId, u16, u16, bool)> = Vec::new();
-        let mut output_waits: Vec<WaiterId> = Vec::new();
+        // Whether a reading has told the core that a chain event is coming.
+        let mut chain_event_owed = false;
 
         for _ in 0..400 {
             now += Duration::from_millis(rng.next(9_000));
@@ -2852,9 +2864,24 @@ fn a_random_run_with_small_limits_always_drains() {
                         5 if n > 0 => Outcome::PassUsing(vec![output(n - 1, 0)]),
                         _ => Outcome::Pass,
                     };
-                    // Sometimes the first reading is one generation old.
-                    let before = stable(generation - rng.next(2).min(generation));
-                    run.record(model.outcome(job, outcome, before, stable(generation), now));
+                    // The readings are usually current. Sometimes the first
+                    // is one generation old. Sometimes the state was ahead of
+                    // the core, or changing, and then a chain event is owed:
+                    // the core waits for it and it has to come.
+                    let (before, after) = match rng.next(8) {
+                        0 => (stable(generation - 1.min(generation)), stable(generation)),
+                        1 => {
+                            chain_event_owed = true;
+                            (stable(generation + 1), stable(generation + 1))
+                        }
+                        2 => {
+                            chain_event_owed = true;
+                            (stable(generation), GenerationRead::Changing)
+                        }
+                        3 => (GenerationRead::Changing, GenerationRead::Changing),
+                        _ => (stable(generation), stable(generation)),
+                    };
+                    run.record(model.outcome(job, outcome, before, after, now));
                 }
                 10 => {
                     generation += 1;
@@ -2862,20 +2889,23 @@ fn a_random_run_with_small_limits_always_drains() {
                     let mut change = transition(generation, tip, vec![vec![random_body(n)]]);
                     change.disconnected = usize::try_from(rng.next(3) / 2).expect("small");
                     change.rules_change = rng.next(8) == 0;
+                    chain_event_owed = false;
                     run.record(model.transition(change, now));
                 }
                 11 if rng.next(4) == 0 => {
                     generation += 1;
                     tip += 1;
+                    chain_event_owed = false;
                     run.record(model.resync(Height(tip), Generation(generation), now));
                 }
                 12 => {
                     if let OutputAnswer::Waiting(waiter) = model.await_output(output(n, 0), now) {
-                        output_waits.push(waiter);
+                        run.output_waits.push(waiter);
                     }
                 }
-                13 if !output_waits.is_empty() => {
-                    let waiter = output_waits.swap_remove(rng.pick(output_waits.len()));
+                13 if !run.output_waits.is_empty() => {
+                    let pick = rng.pick(run.output_waits.len());
+                    let waiter = run.output_waits.swap_remove(pick);
                     model.cancel_output_wait(waiter);
                 }
                 _ => run.record(model.tick(now)),
@@ -2883,11 +2913,26 @@ fn a_random_run_with_small_limits_always_drains() {
             model.assert_invariants();
         }
 
-        // Drain. Callers drop what they still hold and time goes by. Nothing
-        // else happens.
+        // Drain. The chain event the readings promised arrives. Then callers
+        // drop what they still hold and time goes by. Nothing else happens.
+        if chain_event_owed {
+            generation += 1;
+            tip += 1;
+            run.record(model.transition(transition(generation, tip, vec![vec![]]), now));
+        }
         for (reservation, ..) in granted.drain(..) {
             run.record(model.release(reservation, now));
         }
+        // Callers still waiting for an output give up too. The model must
+        // be holding exactly the waits the run thinks are out.
+        for waiter in std::mem::take(&mut run.output_waits) {
+            model.cancel_output_wait(waiter);
+        }
+        assert_eq!(
+            model.output_waits(),
+            0,
+            "seed {seed}: an output wait is stuck"
+        );
         for round in 0..400 {
             if model.slots_in_use() == 0 && model.hidden().is_empty() && run.jobs.is_empty() {
                 break;
@@ -2921,4 +2966,71 @@ fn a_random_run_with_small_limits_always_drains() {
         run.verdicts.sort();
         assert_eq!(run.waiters, run.verdicts, "seed {seed}: verdicts");
     }
+}
+
+// Cases from the fifth review.
+
+#[test]
+fn a_joined_reservation_keeps_its_id_after_its_admission_ends() {
+    let mut model = new_model();
+    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    // Two callers join. Neither is asked for the body: the core has it.
+    let waits = model
+        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .expect("joins");
+    assert!(!waits.wants_body);
+    model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(1));
+
+    // The admission is over. A wrong body under the old reservation is
+    // still a wrong body, as the handle would say, not a stale one.
+    let (waiter, step) = model.submit(waits.id, tx(9), Supplier::Peer(legacy(2)), secs(2));
+    assert_eq!(
+        step.verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::WrongTransaction))
+    );
+
+    // The same for a joined caller that was asked for the body.
+    let owner = model
+        .reserve(id(3), peer(1), Intent::Fetch, secs(2))
+        .expect("room");
+    let brings = model
+        .reserve(id(3), peer(2), Intent::Deliver, secs(2))
+        .expect("joins");
+    assert!(brings.wants_body);
+    let (_, step) = model.submit(owner.id, tx(3), Supplier::Peer(legacy(1)), secs(2));
+    model.outcome(the_job(&step), Outcome::Pass, stable(0), stable(0), secs(3));
+    let (waiter, step) = model.submit(brings.id, tx(9), Supplier::Peer(legacy(2)), secs(4));
+    assert_eq!(
+        step.verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::WrongTransaction))
+    );
+    // With the right body it is a duplicate of what the pool holds.
+    let brings = model.reserve(id(3), peer(2), Intent::Deliver, secs(4));
+    assert_eq!(brings, Err(ModelUnreserved::Pooled));
+}
+
+#[test]
+fn a_pooled_transaction_that_fails_its_check_is_remembered_and_charges_nobody() {
+    let mut model = new_model();
+    admit(&mut model, tx(1), 1, 0);
+    let step = model.resync(Height(240), Generation(5), secs(1));
+    let step = model.outcome(
+        the_job(&step),
+        Outcome::Fail {
+            scope: RejectionScope::ExactTip,
+            charge: Charge::Ban,
+        },
+        stable(5),
+        stable(5),
+        secs(2),
+    );
+    // It passed once, so nobody is charged, and no verdict goes out.
+    assert!(step.effects.is_empty());
+    assert!(!model.cooling(&legacy(1), secs(2)));
+    // The rejection is cached as its scope says, so the next announcement
+    // does not fetch and verify it again.
+    assert_eq!(
+        model.reserve(id(1), peer(2), Intent::Fetch, secs(2)),
+        Err(ModelUnreserved::Rejected(RejectionScope::ExactTip))
+    );
 }

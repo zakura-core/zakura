@@ -10,10 +10,9 @@
 //!    snapshot of the pool after the last, so a verification that starts in
 //!    any of these steps reads a pool at least as new as the one that
 //!    started it.
-//! 2. It publishes the cooldowns, if one started.
-//! 3. It sends the answers to the commands it took, so no caller hears of a
-//!    change, such as a cooldown, before readers can see it.
-//! 4. It does each step's effects in order: starts and cancels
+//! 2. It sends the answers to the commands it took, so no caller hears of a
+//!    change before readers can see it.
+//! 3. It does each step's effects in order: starts and cancels
 //!    verifications, sends verdicts, and answers output waiters.
 //!
 //! The pool stays off until the chain names a real tip, whatever the
@@ -274,21 +273,17 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
         match command {
             PoolCommand::Reserve {
                 tx_id,
-                source,
                 intent,
                 reply,
             } => {
-                let answer = self
-                    .machine
-                    .reserve(tx_id, source, intent, now)
-                    .map(|grant| {
-                        let cancel = CancellationToken::new();
-                        if !grant.joined {
-                            self.fetches.insert(grant.id, cancel.clone());
-                        }
-                        self.inbox
-                            .grant(grant.id, tx_id, grant.joined, grant.wants_body, cancel)
-                    });
+                let answer = self.machine.reserve(tx_id, intent, now).map(|grant| {
+                    let cancel = CancellationToken::new();
+                    if !grant.joined {
+                        self.fetches.insert(grant.id, cancel.clone());
+                    }
+                    self.inbox
+                        .grant(grant.id, tx_id, grant.joined, grant.wants_body, cancel)
+                });
                 // A caller that left drops the reservation with the reply,
                 // which frees the slot.
                 self.reply(move || {
@@ -300,7 +295,6 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             PoolCommand::Submit {
                 reservation,
                 transaction,
-                supplier,
                 reply,
             } => {
                 // The caller gave up after the command was queued. Dropping
@@ -311,22 +305,18 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 }
                 let id = reservation.accept();
                 self.fetches.remove(&id);
-                let (waiter, step) = self.machine.submit(id, transaction, supplier, now);
+                let (waiter, step) = self.machine.submit(id, transaction, now);
                 self.verdicts.insert(waiter, reply);
                 self.finish(step);
             }
-            PoolCommand::Join {
-                reservation,
-                supplier,
-                reply,
-            } => {
+            PoolCommand::Join { reservation, reply } => {
                 if reply.is_closed() {
                     drop(reservation);
                     return;
                 }
                 let tx_id = reservation.tx_id();
                 let id = reservation.accept();
-                let (waiter, step) = self.machine.wait(id, tx_id, supplier, now);
+                let (waiter, step) = self.machine.wait(id, tx_id, now);
                 self.verdicts.insert(waiter, reply);
                 self.finish(step);
             }
@@ -339,11 +329,6 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             PoolCommand::Released(id) => {
                 self.fetches.remove(&id);
                 let step = self.machine.release(id, now);
-                self.finish(step);
-            }
-            PoolCommand::ReportViolation(violation) => {
-                self.machine.violation(&violation.peer, now);
-                let step = self.machine.effects();
                 self.finish(step);
             }
             PoolCommand::AwaitOutput { outpoint, reply } => {
@@ -459,9 +444,6 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             .map(|step| (step.changes, step.effects))
             .unzip();
         self.publish(batches);
-        if let Some(cooldowns) = self.machine.cooldowns_if_changed() {
-            self.inbox.publish_cooldowns(cooldowns);
-        }
         for reply in std::mem::take(&mut self.replies) {
             reply();
         }

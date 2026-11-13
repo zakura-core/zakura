@@ -40,14 +40,10 @@ use zakura_mempool::{
 };
 use zakura_node_services::{
     block_memory::TransactionHandle,
-    mempool::{
-        port::{
-            chain_transitions, pool_port, ChainTip, ChainTransition, ChainTransitionSender, Change,
-            ChangeSeq, ChangesSince, Charge, ConnectedBlock, Intent, LocalFault, PoolHandle,
-            PoolReader, PoolSnapshot, Reservation, Source as PoolSource, Supplier, Unreserved,
-            Verdict, Violation,
-        },
-        QueueSource,
+    mempool::port::{
+        chain_transitions, pool_port, ChainTip, ChainTransition, ChainTransitionSender, Change,
+        ChangeSeq, ChangesSince, Charge, ConnectedBlock, Intent, LocalFault, PoolHandle,
+        PoolReader, PoolSnapshot, Reservation, Verdict,
     },
 };
 use zakura_rt::sync::watch;
@@ -55,7 +51,7 @@ use zakura_scheduler::SchedulerConfig;
 
 use super::Subsystem;
 use crate::{
-    domain::pool::{self as properties, lock, PoolView, SharedEvidence, LIMITS, LOCAL},
+    domain::pool::{self as properties, lock, PoolView, SharedEvidence, LIMITS},
     property::{EndViolation, HasView, Property, Source, Sources},
     ObservationLog, RunConfig, RunEnd, Sim,
 };
@@ -95,9 +91,9 @@ impl Default for PoolScenario {
 enum Script {
     /// It is valid, given its parents.
     Valid,
-    /// It is invalid, and its supplier is charged a cooldown.
+    /// It is invalid, and earns its supplier a cooldown.
     Invalid,
-    /// It is invalid, and its supplier is banned.
+    /// It is invalid, and earns its supplier a ban.
     Banned,
 }
 
@@ -134,9 +130,9 @@ const T3: usize = 3;
 const T4: usize = 4;
 /// Expires three blocks after the start.
 const T5: usize = 5;
-/// Invalid, and charges its supplier a cooldown.
+/// Invalid, and earns its supplier a cooldown.
 const T6: usize = 6;
-/// Invalid, and bans its supplier.
+/// Invalid, and earns its supplier a ban.
 const T7: usize = 7;
 /// The parent T9 waits for.
 const T8: usize = 8;
@@ -150,9 +146,10 @@ const T11: usize = 11;
 const T12: usize = 12;
 /// Its reservation is abandoned.
 const T13: usize = 13;
-/// Offered by a peer that is cooling down.
+/// A late delivery.
 const T14: usize = 14;
-/// Invalid, and submitted by this node, so it charges nobody.
+/// Invalid, and submitted by this node. Its verdict carries its charge all
+/// the same, and the caller charges nobody.
 const T15: usize = 15;
 /// Seven bodies this node reserves at once, once the chain is quiet, so its
 /// reservations alone reach the node's limit.
@@ -434,22 +431,10 @@ struct Verifying {
 }
 
 impl Verifying {
-    /// Counts `index` as being verified, for a submission's source or, if
-    /// `revalidation`, toward the node's limit only.
+    /// Counts `index` as being verified, a revalidation if `revalidation`.
     fn start(evidence: &SharedEvidence, index: usize, revalidation: bool) -> Self {
         let mut shared = lock(evidence);
-        let source = if revalidation {
-            None
-        } else {
-            Some(
-                shared
-                    .slot_source
-                    .get(&index)
-                    .cloned()
-                    .unwrap_or_else(|| "an unknown source".to_owned()),
-            )
-        };
-        shared.verifying.insert(index, source);
+        shared.verifying.insert(index, revalidation);
         shared.count_slots();
         Verifying {
             evidence: Arc::clone(evidence),
@@ -472,103 +457,59 @@ enum Op {
     /// Reserves each id to fetch it, holding what is granted, then submits
     /// each granted body.
     Burst(&'static [usize]),
-    /// Reserves each id to fetch it, then submits the granted bodies at
-    /// once while it offers the refused ids again, which the source's
-    /// limit must still refuse while those bodies verify.
-    Overlap(&'static [usize]),
     /// Reserves an id with its body in hand, and submits it.
     Deliver(usize),
-    /// Reserves an id with its body in hand, and submits it as supplied by
-    /// the legacy peer numbered so.
-    Relay(usize, u8),
     /// Reserves an id to fetch it, then reports the fetch failed.
     FetchFails(usize),
     /// Reserves an id, then drops the reservation.
     Abandon(usize),
-    /// Reports a wire violation by this submitter's peer.
-    Violation,
     /// Waits this many seconds.
     Pause(u64),
     /// Waits for the chain script to finish, then this many seconds.
     AfterChain(u64),
 }
 
-/// A submitter: who it is, and what it does.
+/// A submitter: its task's name, and what it does. The core knows no peers,
+/// so submitters differ only in what they submit and when.
 struct Submitter {
     label: &'static str,
-    peer: Option<QueueSource>,
     script: &'static [Op],
-}
-
-impl Submitter {
-    /// The source its reservations count against.
-    fn source(&self) -> PoolSource {
-        self.peer.clone().map_or(PoolSource::Node, PoolSource::Peer)
-    }
-
-    /// Who its bodies are charged to.
-    fn supplier(&self) -> Supplier {
-        self.peer.clone().map_or(Supplier::Nobody, Supplier::Peer)
-    }
-}
-
-/// The legacy peers: each one's label and number.
-const PEERS: [(&str, u8); 4] = [("peer-a", 1), ("peer-b", 2), ("peer-c", 3), ("peer-d", 4)];
-
-/// A legacy peer at `10.0.0.<n>`.
-fn legacy(n: u8) -> QueueSource {
-    QueueSource::LegacySocket(([10, 0, 0, n], 8233).into())
-}
-
-/// The label of the legacy peer `peer`.
-fn label_of(peer: &QueueSource) -> String {
-    PEERS
-        .iter()
-        .find(|(_, n)| legacy(*n) == *peer)
-        .map_or_else(|| format!("{peer:?}"), |(label, _)| (*label).to_owned())
 }
 
 /// The run's submitters.
 fn submitters() -> Vec<Submitter> {
     vec![
-        // Three fetches, of which the source's limit of two grants two. The
-        // third is offered again while those two verify.
+        // Three fetches at once, then two children of the first.
         Submitter {
             label: "peer-a",
-            peer: Some(legacy(1)),
             script: &[
-                Op::Overlap(&[T0, T3, T11]),
+                Op::Burst(&[T0, T3, T11]),
                 Op::Pause(4),
                 Op::Burst(&[T1, T2]),
             ],
         },
-        // A conflict with peer-a's T3, then an invalid body this peer
-        // reserved and peer-d supplied, which cools peer-d alone.
+        // A conflict with peer-a's T3, then an invalid body that earns a
+        // cooldown.
         Submitter {
             label: "peer-b",
-            peer: Some(legacy(2)),
-            script: &[Op::Pause(1), Op::Deliver(T4), Op::Relay(T6, 4)],
+            script: &[Op::Pause(1), Op::Deliver(T4), Op::Deliver(T6)],
         },
-        // A body that bans this peer, a child before its parent, and a
-        // violation.
+        // A body that earns a ban, and a child before its parent.
         Submitter {
             label: "peer-c",
-            peer: Some(legacy(3)),
-            script: &[Op::Deliver(T7), Op::Deliver(T9), Op::Violation],
+            script: &[Op::Deliver(T7), Op::Deliver(T9)],
         },
-        // An offer the cooldown peer-b's relay caused refuses.
+        // A late delivery.
         Submitter {
             label: "peer-d",
-            peer: Some(legacy(4)),
             script: &[Op::Pause(6), Op::Deliver(T14)],
         },
         // This node: the parent T9 waits for, an expiring body, the body a
         // block will mine, a failed fetch, an abandoned reservation, an
-        // invalid body that charges nobody, and once the chain is quiet a
-        // burst past the node's limit.
+        // invalid body, and once the chain is quiet a burst past the node's
+        // limit.
         Submitter {
-            label: LOCAL,
-            peer: None,
+            label: "local",
             script: &[
                 Op::Pause(2),
                 Op::Deliver(T8),
@@ -592,7 +533,6 @@ async fn submit_all(
     evidence: SharedEvidence,
 ) {
     let at = Submitting {
-        submitter: &submitter,
         handle: &handle,
         universe: &universe,
         evidence: &evidence,
@@ -607,42 +547,12 @@ async fn submit_all(
                     }
                 }
                 for (tx, reservation) in granted {
-                    at.submit(tx, reservation, submitter.supplier()).await;
+                    at.submit(tx, reservation).await;
                 }
-            }
-            Op::Overlap(ids) => {
-                let mut granted = Vec::new();
-                let mut refused = Vec::new();
-                for &tx in ids {
-                    match at.reserve(tx, Intent::Fetch).await {
-                        Some(reservation) => granted.push((tx, reservation)),
-                        None => refused.push(tx),
-                    }
-                }
-                let submits = futures::future::join_all(
-                    granted
-                        .into_iter()
-                        .map(|(tx, reservation)| at.submit(tx, reservation, submitter.supplier())),
-                );
-                let again = async {
-                    zakura_rt::task::yield_now().await;
-                    for tx in refused {
-                        if let Some(reservation) = at.reserve(tx, Intent::Fetch).await {
-                            at.submit(tx, reservation, submitter.supplier()).await;
-                        }
-                    }
-                };
-                futures::future::join(submits, again).await;
             }
             Op::Deliver(tx) => {
                 if let Some(reservation) = at.reserve(tx, Intent::Deliver).await {
-                    at.submit(tx, reservation, submitter.supplier()).await;
-                }
-            }
-            Op::Relay(tx, supplier) => {
-                if let Some(reservation) = at.reserve(tx, Intent::Deliver).await {
-                    at.submit(tx, reservation, Supplier::Peer(legacy(supplier)))
-                        .await;
+                    at.submit(tx, reservation).await;
                 }
             }
             Op::FetchFails(tx) => {
@@ -655,17 +565,6 @@ async fn submit_all(
                 if let Some(reservation) = at.reserve(tx, Intent::Fetch).await {
                     lock(&evidence).held.remove(&tx);
                     drop(reservation);
-                }
-            }
-            Op::Violation => {
-                if let Some(peer) = submitter.peer.clone() {
-                    lock(&evidence).may_cool.insert(submitter.label.to_owned());
-                    handle
-                        .report_violation(Violation {
-                            peer,
-                            cause: "sim-violation",
-                        })
-                        .await;
                 }
             }
             Op::Pause(secs) => zakura_rt::time::sleep(Duration::from_secs(secs)).await,
@@ -685,108 +584,61 @@ async fn submit_all(
 /// One submitter's view of the run, for reserving and submitting.
 #[derive(Clone, Copy)]
 struct Submitting<'a> {
-    submitter: &'a Submitter,
     handle: &'a PoolHandle,
     universe: &'a Universe,
     evidence: &'a SharedEvidence,
 }
 
 impl Submitting<'_> {
-    /// Reserves `tx`, counting a grant as held. A cooldown refusal of a peer
-    /// nothing charged is a misattribution.
+    /// Reserves `tx`, counting a grant as held.
     async fn reserve(&self, tx: usize, intent: Intent) -> Option<Reservation> {
-        let label = self.submitter.label;
-        let answer = self
-            .handle
-            .reserve(self.universe.id(tx), self.submitter.source(), intent)
-            .await;
+        let answer = self.handle.reserve(self.universe.id(tx), intent).await;
+        let reservation = answer.ok()?;
         let mut evidence = lock(self.evidence);
-        match answer {
-            Ok(reservation) => {
-                evidence.held.insert(tx, label.to_owned());
-                evidence.slot_source.insert(tx, label.to_owned());
-                evidence.count_slots();
-                Some(reservation)
-            }
-            Err(Unreserved::CoolingDown) => {
-                if !evidence.may_cool.contains(label) && evidence.misattributed.is_none() {
-                    evidence.misattributed = Some(format!(
-                        "{label} was refused as cooling down, and nothing charged it"
-                    ));
-                }
-                None
-            }
-            Err(_) => None,
-        }
+        evidence.held.insert(tx);
+        evidence.count_slots();
+        Some(reservation)
     }
 
-    /// Submits `tx` under `reservation` as supplied by `supplier`, and
-    /// checks the verdict's charge against `tx`'s script and who is cooling
-    /// down once it arrives.
-    async fn submit(&self, tx: usize, reservation: Reservation, supplier: Supplier) {
-        let supplier_label = match &supplier {
-            Supplier::Peer(peer) => Some(label_of(peer)),
-            Supplier::Nobody => None,
-        };
-        let expected = match (UNIVERSE[tx].script, &supplier_label) {
-            // A valid body is rejected only by the pool's own rules, such as
-            // a conflict, and that charges nobody.
-            (Script::Valid, _) | (_, None) => Some(Charge::None),
-            (Script::Invalid, Some(_)) => Some(Charge::Cooldown),
-            (Script::Banned, Some(_)) => Some(Charge::Ban),
-        };
+    /// Submits `tx` under `reservation`, and checks the verdict's charge
+    /// against `tx`'s script: an invalid body earns a cooldown, a banned one
+    /// a ban, and a valid body the pool rejects for its own rules earns
+    /// nothing. Who is charged is the caller's, which the core never knows.
+    async fn submit(&self, tx: usize, reservation: Reservation) {
         {
             let mut evidence = lock(self.evidence);
             evidence.held.remove(&tx);
             evidence.submits_started += 1;
-            if let (Some(Charge::Cooldown), Some(label)) = (expected, &supplier_label) {
-                evidence.may_cool.insert(label.clone());
-            }
         }
         let body = self.universe.txs[tx].transaction.clone();
-        let verdict = self.handle.submit(reservation, body, supplier).await;
-        // Read before the evidence lock, since each cooldown read is a
-        // preemption point.
-        let now = zakura_rt::time::Instant::now();
-        let cooling: Vec<(&str, bool)> = PEERS
-            .iter()
-            .map(|(label, n)| (*label, self.handle.is_cooling(&legacy(*n), now)))
-            .collect();
+        let verdict = self.handle.submit(reservation, body).await;
         let mut evidence = lock(self.evidence);
         evidence.verifying.remove(&tx);
         evidence.submits_answered += 1;
         if matches!(verdict, Verdict::LocalFault(LocalFault::Stopped)) {
             // A dropped reply is `pool/verdict-for-every-submission`'s to
-            // report. It says nothing about who was charged.
+            // report. It says nothing about the charge.
             evidence.stopped.push(tx);
             return;
         }
-        let mut problem = None;
+        let charge = match &verdict {
+            Verdict::Rejected(rejection) => Some(rejection.charge),
+            _ => None,
+        };
+        let expected = match UNIVERSE[tx].script {
+            Script::Valid => charge.map(|_| Charge::None),
+            Script::Invalid => Some(Charge::Cooldown),
+            Script::Banned => Some(Charge::Ban),
+        };
         if let Some(expected) = expected {
-            let charge = match &verdict {
-                Verdict::Rejected(rejection) => Some(rejection.charge),
-                _ => None,
-            };
-            let applies = UNIVERSE[tx].script != Script::Valid || charge.is_some();
-            if applies {
-                evidence.charges_checked += 1;
-            }
-            if applies && charge != Some(expected) {
-                problem = Some(format!(
-                    "transaction {tx} from {supplier_label:?} got {verdict:?}, and its script charges {expected:?}"
+            *evidence
+                .charges_checked
+                .entry(format!("{expected:?}"))
+                .or_default() += 1;
+            if charge != Some(expected) && evidence.wrong_charge.is_none() {
+                evidence.wrong_charge = Some(format!(
+                    "transaction {tx} got {verdict:?}, and its script earns {expected:?}"
                 ));
-            }
-            if supplier_label.is_none() && UNIVERSE[tx].script != Script::Valid {
-                evidence.local_failures += 1;
-            }
-        }
-        if let (Some(Charge::Cooldown), Some(label)) = (expected, &supplier_label) {
-            let is_cooling = cooling
-                .iter()
-                .any(|(peer, cooling)| *peer == label.as_str() && *cooling);
-            evidence.charges.push((label.clone(), is_cooling));
-            if label.as_str() != self.submitter.label {
-                evidence.relayed_charges += 1;
             }
         }
         // The core publishes a step's changes before it answers, so an
@@ -801,17 +653,6 @@ impl Submitting<'_> {
             evidence.log_mismatch = Some(format!(
                 "transaction {tx} was admitted, and no publication before its verdict logged it"
             ));
-        }
-        if let Some((peer, _)) = cooling
-            .iter()
-            .find(|(peer, cooling)| *cooling && !evidence.may_cool.contains(*peer))
-        {
-            problem.get_or_insert(format!(
-                "{peer} is cooling down after transaction {tx}'s verdict, and nothing charged it"
-            ));
-        }
-        if evidence.misattributed.is_none() {
-            evidence.misattributed = problem;
         }
     }
 }
@@ -863,7 +704,7 @@ impl Chain {
         // from here on.
         {
             let mut evidence = lock(evidence);
-            evidence.verifying.retain(|_, source| source.is_some());
+            evidence.verifying.retain(|_, revalidation| !*revalidation);
             for _ in 0..disconnect {
                 for tx in self.blocks.pop().unwrap_or_default() {
                     evidence.mined.remove(&tx);
@@ -916,7 +757,7 @@ impl Chain {
         self.sender.borrow().begin_change();
         lock(evidence)
             .verifying
-            .retain(|_, source| source.is_some());
+            .retain(|_, revalidation| !*revalidation);
         zakura_rt::task::yield_now().await;
         let tip = self.current();
         self.sender.borrow_mut().finish_unknown_change(Some(tip));
@@ -1405,7 +1246,6 @@ impl Subsystem for PoolCoreHarness {
                 active_rx,
                 Limits {
                     pending: usize::try_from(LIMITS.pending).expect("a small limit"),
-                    per_source: usize::try_from(LIMITS.per_source).expect("a small limit"),
                     revalidating: 3,
                 },
             );

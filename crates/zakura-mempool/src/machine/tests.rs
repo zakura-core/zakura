@@ -18,7 +18,7 @@
 // The trace is for a developer chasing one failing seed.
 #![allow(clippy::print_stderr)]
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use proptest::{
     prelude::*,
@@ -38,18 +38,14 @@ use zakura_chain::{
 };
 use zakura_node_services::{
     block_memory::TransactionHandle,
-    mempool::{
-        port::{
-            model::{
-                Effect as ModelEffect, ModelBlock, ModelTransition, ModelTx, ModelUnreserved,
-                ModelVerdict, Outcome as ModelOutcome, OutputAnswer as ModelOutputAnswer,
-                PoolModel, Step as ModelStep,
-            },
-            ChainReason, ChainTip, ChainTransition, ChangeSeq, Charge, ConnectedBlock, Generation,
-            GenerationRead, Intent, LocalFault, RejectionScope, ReservationId, Source, Supplier,
-            Unreserved, Verdict,
+    mempool::port::{
+        model::{
+            Effect as ModelEffect, ModelBlock, ModelTransition, ModelTx, ModelUnreserved,
+            ModelVerdict, Outcome as ModelOutcome, OutputAnswer as ModelOutputAnswer, PoolModel,
+            Step as ModelStep,
         },
-        QueueSource,
+        ChainReason, ChainTip, ChainTransition, ChangeSeq, Charge, ConnectedBlock, Generation,
+        GenerationRead, Intent, LocalFault, RejectionScope, ReservationId, Unreserved, Verdict,
     },
 };
 use zakura_rt::collections::HashSet;
@@ -259,11 +255,6 @@ fn chance(rng: &mut TestRng, n: usize) -> bool {
     pick(rng, n) == 0
 }
 
-/// A legacy peer with its own IP address.
-fn legacy(n: u8) -> QueueSource {
-    QueueSource::LegacySocket(SocketAddr::from(([10, 0, 0, n], 8233)))
-}
-
 /// A tip at `height` on the fork numbered `fork`.
 pub(crate) fn tip(height: u32, fork: u8) -> ChainTip {
     let mut hash = [fork; 32];
@@ -287,8 +278,7 @@ fn model_verdict(verdict: &Verdict) -> ModelVerdict {
             scope: rejection.scope,
             charge: rejection.charge,
         },
-        Verdict::NoRoom(limit) => ModelVerdict::NoRoom(*limit),
-        Verdict::CoolingDown => ModelVerdict::CoolingDown,
+        Verdict::NoRoom => ModelVerdict::NoRoom,
         Verdict::LocalFault(fault) => ModelVerdict::LocalFault(*fault),
     }
 }
@@ -297,11 +287,10 @@ fn model_verdict(verdict: &Verdict) -> ModelVerdict {
 fn model_unreserved(unreserved: &Unreserved) -> ModelUnreserved {
     match unreserved {
         Unreserved::Inactive => ModelUnreserved::Inactive,
-        Unreserved::CoolingDown => ModelUnreserved::CoolingDown,
         Unreserved::Pooled => ModelUnreserved::Pooled,
         Unreserved::Pending => ModelUnreserved::Pending,
         Unreserved::Rejected(rejection) => ModelUnreserved::Rejected(rejection.scope),
-        Unreserved::NoRoom(limit) => ModelUnreserved::NoRoom(*limit),
+        Unreserved::NoRoom => ModelUnreserved::NoRoom,
         Unreserved::Stopped => unreachable!("the machine never answers that the core stopped"),
     }
 }
@@ -396,7 +385,6 @@ struct Held {
     id: ReservationId,
     tx: usize,
     wants_body: bool,
-    source: Source,
 }
 
 /// How often each kind of outcome happened over every run, so the test shows
@@ -461,7 +449,6 @@ struct Run {
     cancelled: Vec<(u64, UnminedTxId)>,
     /// Output waiters that may still be answered.
     output_waiters: Vec<u64>,
-    peers: Vec<QueueSource>,
     steps: usize,
     /// Whether the run is draining, when every job is answered for good.
     draining: bool,
@@ -484,7 +471,6 @@ impl Run {
         let txs = universe(&mut rng, &mut runner, size);
         let limits = Limits {
             pending: 6,
-            per_source: 2,
             revalidating: 3,
         };
         let base = Instant::now();
@@ -500,7 +486,7 @@ impl Run {
         )
         .with_limits(limits);
         let model = PoolModel::new(Height(START), Generation(0))
-            .with_limits(limits.pending, limits.per_source, limits.revalidating)
+            .with_limits(limits.pending, limits.revalidating)
             .with_rejection_memory(REJECTION_MEMORY);
         Self {
             rng,
@@ -518,7 +504,6 @@ impl Run {
             views: std::collections::HashMap::new(),
             cancelled: Vec::new(),
             output_waiters: Vec::new(),
-            peers: (1..=6).map(legacy).collect(),
             steps: 0,
             draining: false,
             mined: HashSet::default(),
@@ -707,19 +692,6 @@ impl Run {
             self.model.output_waits(),
             "step {step} ({what}): output waits"
         );
-        for peer in &self.peers {
-            let source = Source::Peer(peer.clone());
-            assert_eq!(
-                self.machine.counted_against(&source),
-                self.model.counted_against(&source),
-                "step {step} ({what}): slots counted against {peer:?}"
-            );
-            assert_eq!(
-                self.machine.is_cooling(peer, self.base + self.now),
-                self.model.cooling(peer, self.now),
-                "step {step} ({what}): cooldown of {peer:?}"
-            );
-        }
         for tx in &self.txs {
             assert_eq!(
                 self.machine.is_parked(tx.id()),
@@ -727,16 +699,6 @@ impl Run {
                 "step {step} ({what}): whether {:?} is parked",
                 tx.id()
             );
-        }
-    }
-
-    /// A random source: a peer or this node.
-    fn source(&mut self) -> Source {
-        if chance(&mut self.rng, 4) {
-            Source::Node
-        } else {
-            let peer = self.peers[pick(&mut self.rng, self.peers.len())].clone();
-            Source::Peer(peer)
         }
     }
 
@@ -759,8 +721,7 @@ impl Run {
             14 => self.transition(),
             15 => self.tick(),
             16 => self.await_output(),
-            17 => self.violation(),
-            18 => self.rejected_ids(),
+            17..=18 => self.rejected_ids(),
             _ => self.toggle(),
         }
     }
@@ -773,7 +734,6 @@ impl Run {
         } else {
             pick(&mut self.rng, self.txs.len())
         };
-        let source = self.source();
         let intent = if chance(&mut self.rng, 2) {
             Intent::Fetch
         } else {
@@ -781,8 +741,8 @@ impl Run {
         };
         let id = self.txs[tx].id();
         let at = self.at();
-        let real = self.machine.reserve(id, source.clone(), intent, at);
-        let model = self.model.reserve(id, source.clone(), intent, self.now);
+        let real = self.machine.reserve(id, intent, at);
+        let model = self.model.reserve(id, intent, self.now);
         match (&real, &model) {
             (Ok(grant), Ok(expected)) => {
                 assert_eq!(
@@ -801,7 +761,6 @@ impl Run {
                     id: grant.id,
                     tx,
                     wants_body: grant.wants_body,
-                    source,
                 });
             }
             (Err(refused), Err(expected)) => {
@@ -827,13 +786,6 @@ impl Run {
             return self.tick();
         }
         let held = self.held.swap_remove(pick(&mut self.rng, self.held.len()));
-        // Sometimes another peer answers, or nobody can be charged.
-        let supplier = match (&held.source, pick(&mut self.rng, 4)) {
-            (_, 0) => Supplier::Nobody,
-            (_, 1) => Supplier::Peer(self.peers[pick(&mut self.rng, self.peers.len())].clone()),
-            (Source::Peer(peer), _) => Supplier::Peer(peer.clone()),
-            (Source::Node, _) => Supplier::Nobody,
-        };
         // Rarely, a body that is not the transaction reserved.
         let tx = if chance(&mut self.rng, 20) {
             pick(&mut self.rng, self.txs.len())
@@ -845,14 +797,13 @@ impl Run {
         let ((real_waiter, real), (model_waiter, model)) = if held.wants_body {
             (
                 self.machine
-                    .submit(held.id, body.real.transaction.clone(), supplier.clone(), at),
-                self.model
-                    .submit(held.id, body.model.clone(), supplier, self.now),
+                    .submit(held.id, body.real.transaction.clone(), at),
+                self.model.submit(held.id, body.model.clone(), self.now),
             )
         } else {
             (
-                self.machine.wait(held.id, body.id(), supplier.clone(), at),
-                self.model.wait(held.id, body.id(), supplier, self.now),
+                self.machine.wait(held.id, body.id(), at),
+                self.model.wait(held.id, body.id(), self.now),
             )
         };
         assert_eq!(real_waiter.0, model_waiter.0, "step {}: waiter", self.steps);
@@ -1193,19 +1144,6 @@ impl Run {
         self.compare("await_output", real, model);
     }
 
-    fn violation(&mut self) {
-        // Rare, so peers are not all cooling down for most of a run.
-        if !chance(&mut self.rng, 4) {
-            return self.tick();
-        }
-        let peer = self.peers[pick(&mut self.rng, self.peers.len())].clone();
-        let at = self.at();
-        self.machine.violation(&peer, at);
-        self.model.violation(peer, self.now);
-        let (real, model) = (self.machine.effects(), self.model.effects());
-        self.compare("violation", real, model);
-    }
-
     fn rejected_ids(&mut self) {
         let ids: HashSet<UnminedTxId> = self.txs.iter().map(Tx::id).collect();
         let at = self.at();
@@ -1391,7 +1329,6 @@ fn pool_state_matches_model() {
             "removed Invalidated",
             "removed Deactivated",
             "verdict Admitted",
-            "verdict CoolingDown",
             "verdict LocalFault(NoBody)",
             "verdict LocalFault(PoolUnsettled)",
             "verdict LocalFault(VerifyTimeout)",
@@ -1399,10 +1336,8 @@ fn pool_state_matches_model() {
             "verdict LocalFault(Deactivated)",
             "unreserved Pending",
             "unreserved Pooled",
-            "unreserved CoolingDown",
             "unreserved Inactive",
-            "unreserved NoRoom(Node)",
-            "unreserved NoRoom(Source)",
+            "unreserved NoRoom",
         ] {
             assert!(
                 coverage.0.get(kind).is_some_and(|count| *count > 0),
@@ -1465,19 +1400,9 @@ impl Pair {
     /// Reserves `tx` for this node on both sides. Returns the reservation if
     /// both granted it, after checking both answered the same.
     fn reserve(&mut self, tx: &Tx) -> Option<ReservationId> {
-        self.reserve_from(tx, Source::Node)
-    }
-
-    /// Reserves `tx` with its body in hand for `source` on both sides. See
-    /// [`Self::reserve`].
-    fn reserve_from(&mut self, tx: &Tx, source: Source) -> Option<ReservationId> {
         let at = self.base + self.now;
-        let real = self
-            .machine
-            .reserve(tx.id(), source.clone(), Intent::Deliver, at);
-        let model = self
-            .model
-            .reserve(tx.id(), source, Intent::Deliver, self.now);
+        let real = self.machine.reserve(tx.id(), Intent::Deliver, at);
+        let model = self.model.reserve(tx.id(), Intent::Deliver, self.now);
         let granted = match (&real, &model) {
             (Ok(grant), Ok(expected)) => {
                 assert_eq!(grant.id, expected.id);
@@ -1496,22 +1421,11 @@ impl Pair {
 
     /// Submits `tx` under `reservation`, and returns the job that started.
     fn submit(&mut self, reservation: ReservationId, tx: &Tx) -> u64 {
-        self.submit_from(reservation, tx, Supplier::Nobody)
-    }
-
-    /// Submits `tx` under `reservation` as supplied by `supplier`, and
-    /// returns the job that started.
-    fn submit_from(&mut self, reservation: ReservationId, tx: &Tx, supplier: Supplier) -> u64 {
         let at = self.base + self.now;
-        let (_, real) = self.machine.submit(
-            reservation,
-            tx.real.transaction.clone(),
-            supplier.clone(),
-            at,
-        );
-        let (_, model) = self
-            .model
-            .submit(reservation, tx.model.clone(), supplier, self.now);
+        let (_, real) = self
+            .machine
+            .submit(reservation, tx.real.transaction.clone(), at);
+        let (_, model) = self.model.submit(reservation, tx.model.clone(), self.now);
         let started = self.same(real, model);
         assert_eq!(started.len(), 1, "a body starts one job");
         started[0]
@@ -1676,15 +1590,10 @@ fn hidden_transactions_count_against_the_cost_limit() {
     let read = GenerationRead::Stable(Generation(0));
     let admit = |machine: &mut Machine, tx: &Tx, read: GenerationRead| -> Verdict {
         let grant = machine
-            .reserve(tx.id(), Source::Node, Intent::Deliver, base)
+            .reserve(tx.id(), Intent::Deliver, base)
             .expect("room for a reservation");
         assert!(machine.effects().is_empty());
-        let (waiter, step) = machine.submit(
-            grant.id,
-            tx.real.transaction.clone(),
-            Supplier::Nobody,
-            base,
-        );
+        let (waiter, step) = machine.submit(grant.id, tx.real.transaction.clone(), base);
         let Some(Effect::Start { job, .. }) = step.effects.first().cloned() else {
             panic!("a body starts a job: {step:?}");
         };
@@ -1816,15 +1725,10 @@ fn a_refused_reveal_takes_its_cost_off_once() {
     let read1 = GenerationRead::Stable(Generation(1));
     let admit = |machine: &mut Machine, tx: &Tx, inputs: Vec<OutPoint>, read| {
         let grant = machine
-            .reserve(tx.id(), Source::Node, Intent::Deliver, base)
+            .reserve(tx.id(), Intent::Deliver, base)
             .expect("room for a reservation");
         assert!(machine.effects().is_empty());
-        let (waiter, step) = machine.submit(
-            grant.id,
-            tx.real.transaction.clone(),
-            Supplier::Nobody,
-            base,
-        );
+        let (waiter, step) = machine.submit(grant.id, tx.real.transaction.clone(), base);
         let job = started(&step)[0].0;
         let step = machine.outcome(job, pass(tx, inputs), read, read, base, chrono::Utc::now());
         machine.assert_invariants();
@@ -1905,16 +1809,11 @@ fn a_job_run_again_after_a_reset_is_marked() {
     let mut machine = Machine::new(&Config::default(), tip(START, 0), Generation(0), base);
     let start = |machine: &mut Machine, tx: &Tx| -> Step {
         let grant = machine
-            .reserve(tx.id(), Source::Node, Intent::Deliver, base)
+            .reserve(tx.id(), Intent::Deliver, base)
             .expect("room for a reservation");
         assert!(machine.effects().is_empty());
         machine
-            .submit(
-                grant.id,
-                tx.real.transaction.clone(),
-                Supplier::Nobody,
-                base,
-            )
+            .submit(grant.id, tx.real.transaction.clone(), base)
             .1
     };
     let marked = |step: &Step| -> Vec<bool> {
@@ -1975,32 +1874,24 @@ fn a_job_run_again_after_a_reset_is_marked() {
 }
 
 /// Terra's case from M1 review round 7: a body the pool refuses for its own
-/// policy, not for its verification, charges its peer supplier nothing. The
-/// random runs reach this only rarely.
+/// policy, not for its verification, earns its supplier nothing. `same`
+/// checks the verdict against the model's.
 #[test]
-fn a_policy_refusal_of_a_peer_body_charges_nobody() {
+fn a_policy_refusal_charges_nothing() {
     let mut runner = TestRunner::deterministic();
     let pooled = build(&mut runner, &[], 1, None);
     let other = twin(&pooled);
     let mut pair = Pair::new(Duration::from_secs(3600));
-    let peer = legacy(1);
 
     let first = pair.reserve(&pooled).expect("room for the first");
-    let second = pair
-        .reserve_from(&other, Source::Peer(peer.clone()))
-        .expect("an exact id of its own");
+    let second = pair.reserve(&other).expect("an exact id of its own");
     let first_job = pair.submit(first, &pooled);
-    let second_job = pair.submit_from(second, &other, Supplier::Peer(peer.clone()));
+    let second_job = pair.submit(second, &other);
     pair.pass(first_job, &pooled);
 
     // The twin passes its verification, and the pool refuses it because the
-    // same effects are already pooled. `same` checks the verdict against the
-    // model's, which charges nobody.
+    // same effects are already pooled.
     pair.pass(second_job, &other);
-    assert!(
-        !pair.machine.is_cooling(&peer, pair.base + pair.now),
-        "the peer that supplied the twin is not charged"
-    );
 }
 
 /// Terra's case from M1 review round 7: an admission that evicts another
@@ -2038,15 +1929,10 @@ fn an_admission_that_evicts_logs_both_changes() {
     let mut evictions = 0;
     for tx in &txs {
         let grant = machine
-            .reserve(tx.id(), Source::Node, Intent::Deliver, base)
+            .reserve(tx.id(), Intent::Deliver, base)
             .expect("room for a reservation");
         assert!(machine.effects().is_empty());
-        let (waiter, step) = machine.submit(
-            grant.id,
-            tx.real.transaction.clone(),
-            Supplier::Nobody,
-            base,
-        );
+        let (waiter, step) = machine.submit(grant.id, tx.real.transaction.clone(), base);
         let Some(Effect::Start { job, .. }) = step.effects.first().cloned() else {
             panic!("a body starts a job: {step:?}");
         };

@@ -400,12 +400,12 @@ pub static COVERAGE: &[Coverage] = &[
         "drop-rejection-replies",
     ),
     pool(
-        crate::domain::pool::SUPPLIER_CHARGED,
-        "skip-cooldown-publish",
+        crate::domain::pool::CHARGE_MATCHES_FAILURE,
+        "ban-a-conflict",
     ),
     pool(
         crate::domain::pool::ADMISSIONS_WITHIN_LIMITS,
-        "source-limit-off-by-one",
+        "node-limit-off-by-one",
     ),
     pool(crate::domain::pool::CONSISTENT, "ignore-spend-conflicts"),
     pool(crate::domain::pool::LOG_COMPLETE, "drop-removals-from-log"),

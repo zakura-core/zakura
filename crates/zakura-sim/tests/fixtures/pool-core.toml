@@ -11,7 +11,7 @@ property = "pool/verdict-for-every-submission"
 expect = "holds"
 
 [[witness]]
-property = "pool/supplier-charged"
+property = "pool/charge-matches-failure"
 expect = "holds"
 
 [[witness]]

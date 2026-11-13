@@ -7,17 +7,25 @@
 //! the body, so the core's limits count a transaction from its fetch to its
 //! verdict, as today's one count does.
 //!
+//! The core knows nothing about peers, so the per-peer state is here, as
+//! today's pool keeps it: at most [`MAX_INBOUND_CONCURRENCY_PER_PEER`]
+//! undecided transactions from one peer, and the legacy peers' transaction
+//! cooldowns. A verdict says what its body earned, and this applies it to the
+//! legacy peer that served the body. A v2 peer reaching the pool through here
+//! is counted and never charged, as today.
+//!
 //! One answer changes on purpose. A body whose id is already being verified
 //! joins that verification and gets its verdict at the second stage, up to
 //! the core's waiter limit, where today's pool refuses it at the first stage
 //! as already queued.
 
 use std::{
+    collections::HashMap,
     future::Future,
-    net::SocketAddr,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use futures::FutureExt;
@@ -29,7 +37,7 @@ use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
     port::{
         AwaitOutputError, Charge, Intent, LocalFault, PoolHandle, PoolSnapshot, Reservation,
-        Source, Supplier, Unreserved, Verdict,
+        Unreserved, Verdict,
     },
     CreatedOrSpent, Gossip, MempoolDisabledError, QueueSource, Request, Response,
 };
@@ -41,10 +49,12 @@ use super::{
         crawler::RATE_LIMIT_DELAY,
         downloads::{
             fetch_transaction, peer_source_from_queue_source, transaction_in_best_chain,
-            TransactionDownloadVerifyError,
+            TransactionDownloadVerifyError, MAX_INBOUND_CONCURRENCY_PER_PEER,
         },
+        peer_cooldown::PeerCooldowns,
         pending_outputs::PendingOutputsFull,
-        queue_source_log_label, ExactTipRejectionError, MempoolError, Outbound, ReadState,
+        queue_source_log_label, start_peer_cooldown, ExactTipRejectionError, MempoolError,
+        Outbound, ReadState,
     },
     Exempt,
 };
@@ -57,6 +67,14 @@ type Receiver = oneshot::Receiver<Result<(), BoxError>>;
 struct Shared {
     handle: PoolHandle,
     outbound: Timeout<Outbound>,
+    /// The peer set without the fetch timeout, for disconnecting a peer
+    /// after repeated cooldowns.
+    peers: Outbound,
+    /// The legacy peers in a transaction cooldown, keyed by IP address.
+    cooldowns: PeerCooldowns,
+    /// Undecided transactions from each peer, counted from the reservation to
+    /// the verdict.
+    per_peer: std::sync::Mutex<HashMap<QueueSource, usize>>,
     /// For the already-mined check before a fetch. The read state service
     /// is not `Sync`, so each fetch clones it under this lock.
     read_state: std::sync::Mutex<ReadState>,
@@ -77,6 +95,7 @@ impl CoreMempool {
     pub fn new(
         handle: PoolHandle,
         outbound: Timeout<Outbound>,
+        peers: Outbound,
         read_state: ReadState,
         expose_peer_addresses: bool,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
@@ -86,6 +105,9 @@ impl CoreMempool {
             shared: Arc::new(Shared {
                 handle,
                 outbound,
+                peers,
+                cooldowns: PeerCooldowns::default(),
+                per_peer: std::sync::Mutex::new(HashMap::new()),
                 read_state: std::sync::Mutex::new(read_state),
                 expose_peer_addresses,
                 misbehavior_sender,
@@ -226,6 +248,14 @@ async fn answer(
                 source = %queue_source_log_label(&source, shared.expose_peer_addresses),
                 "got mempool QueueFromPeer request"
             );
+            // Today's pool ignores everything a cooling legacy peer sends.
+            if let QueueSource::LegacySocket(addr) = &source {
+                if shared.cooldowns.is_cooling_down(addr.ip(), Instant::now()) {
+                    metrics::counter!("mempool.peer_cooldown.ignored.transactions.total")
+                        .increment(u64::try_from(transactions.len()).unwrap_or(u64::MAX));
+                    return Ok(Response::Queued(Vec::new()));
+                }
+            }
             // Today's pool drops what it cannot queue from a peer.
             for item in transactions {
                 let _ = queue(shared.clone(), item, Some(source.clone())).await;
@@ -279,33 +309,80 @@ async fn queue(
         Gossip::Tx(_) => Intent::Deliver,
         Gossip::Id(_) => Intent::Fetch,
     };
-    let source = from.clone().map_or(Source::Node, Source::Peer);
-    let reservation = match shared.handle.reserve(id, source, intent).await {
-        Ok(reservation) => reservation,
-        Err(refused) => return first_stage_refusal(refused, from.is_some()),
+    // Today's order: the node's limit, then the peer's. Both answer
+    // `FullQueue`, so the peer's is checked first here, before a slot is
+    // taken.
+    let slot = match &from {
+        Some(peer) => Some(PeerSlot::take(&shared, peer).ok_or(MempoolError::FullQueue)?),
+        None => None,
     };
+    let reservation = match shared.handle.reserve(id, intent).await {
+        Ok(reservation) => reservation,
+        Err(refused) => return first_stage_refusal(refused),
+    };
+    // A joined submission takes no slot, so it counts against nobody.
+    let slot = slot.filter(|_| !reservation.joined());
     let (answer, receiver) = oneshot::channel();
     tokio::spawn(async move {
         let result = bring_in(&shared, reservation, item, from).await;
+        drop(slot);
         let _ = answer.send(result);
     });
     Ok(receiver)
 }
 
+/// One undecided transaction counted against a peer, from its reservation
+/// until it is decided or dropped. Dropping it frees the count.
+struct PeerSlot {
+    shared: Arc<Shared>,
+    peer: QueueSource,
+}
+
+impl PeerSlot {
+    /// Counts one more transaction against `peer`, or `None` if the peer
+    /// already has [`MAX_INBOUND_CONCURRENCY_PER_PEER`].
+    fn take(shared: &Arc<Shared>, peer: &QueueSource) -> Option<Self> {
+        let mut counts = shared
+            .per_peer
+            .lock()
+            .expect("no code panics while holding the per-peer counts");
+        let count = counts.entry(peer.clone()).or_default();
+        if *count >= MAX_INBOUND_CONCURRENCY_PER_PEER {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            shared: shared.clone(),
+            peer: peer.clone(),
+        })
+    }
+}
+
+impl Drop for PeerSlot {
+    /// Frees the count, and forgets a peer with none.
+    fn drop(&mut self) {
+        let mut counts = self
+            .shared
+            .per_peer
+            .lock()
+            .expect("no code panics while holding the per-peer counts");
+        if let Some(count) = counts.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.peer);
+            }
+        }
+    }
+}
+
 /// Today's first-stage answer for a refused reservation, or a completed
 /// receiver where today's pool answers at the second stage.
-fn first_stage_refusal(refused: Unreserved, from_peer: bool) -> Result<Receiver, BoxError> {
+fn first_stage_refusal(refused: Unreserved) -> Result<Receiver, BoxError> {
     let error = match refused {
         Unreserved::Inactive => MempoolError::Disabled,
         Unreserved::Pooled => MempoolError::InMempool,
         Unreserved::Pending => MempoolError::AlreadyQueued,
-        Unreserved::NoRoom(_) => MempoolError::FullQueue,
-        Unreserved::CoolingDown => {
-            if from_peer {
-                metrics::counter!("mempool.peer_cooldown.ignored.transactions.total").increment(1);
-            }
-            return Err("the peer that sent the transaction is in a cooldown".into());
-        }
+        Unreserved::NoRoom => MempoolError::FullQueue,
         Unreserved::Stopped => return Err("the pool core has stopped".into()),
         Unreserved::Rejected(rejection) => {
             let Some(error) = rejection.detail.downcast_ref::<MempoolError>().cloned() else {
@@ -329,8 +406,9 @@ fn first_stage_refusal(refused: Unreserved, from_peer: bool) -> Result<Receiver,
     Err(error.into())
 }
 
-/// Brings `item`'s body in under `reservation`, submits it, applies a ban,
-/// and returns today's second-stage answer.
+/// Brings `item`'s body in under `reservation`, submits it, applies its
+/// charge to the legacy peer that served it, and returns today's
+/// second-stage answer.
 async fn bring_in(
     shared: &Shared,
     reservation: Reservation,
@@ -345,7 +423,7 @@ async fn bring_in(
                     shared.supplier(PeerSocketAddr::from(*addr))
                 }
                 // v2 peers through the adapter are not charged, as today.
-                Some(QueueSource::Zakura(_)) | None => Supplier::Nobody,
+                Some(QueueSource::Zakura(_)) | None => None,
             };
             metrics::counter!(
                 "mempool.pushed.transactions.total",
@@ -381,9 +459,24 @@ async fn bring_in(
             };
             match fetched {
                 Ok((tx, served_by)) => {
+                    // Today's downloader does not verify a body that a
+                    // cooling peer served. The failure reaches the change
+                    // stream, and the slot is freed.
+                    if served_by.is_some_and(|addr| {
+                        shared.cooldowns.is_cooling_down(addr.ip(), Instant::now())
+                    }) {
+                        metrics::counter!("mempool.peer_cooldown.ignored.transactions.total")
+                            .increment(1);
+                        shared.handle.fetch_failed(reservation).await;
+                        return Err(format!(
+                            "failed to validate tx: {tx_id}, error: {}",
+                            TransactionDownloadVerifyError::PeerCoolingDown
+                        )
+                        .into());
+                    }
                     // A v2 peer's body is not charged, as today.
                     let supplier = match (&from, served_by) {
-                        (Some(QueueSource::Zakura(_)), _) | (_, None) => Supplier::Nobody,
+                        (Some(QueueSource::Zakura(_)), _) | (_, None) => None,
                         (_, Some(addr)) => shared.supplier(addr),
                     };
                     (tx, supplier)
@@ -400,32 +493,32 @@ async fn bring_in(
             }
         }
     };
-    let verdict = shared
-        .handle
-        .submit(reservation, tx, supplier.clone())
-        .await;
-    if let (Verdict::Rejected(rejection), Supplier::Peer(QueueSource::LegacySocket(addr))) =
-        (&verdict, &supplier)
-    {
-        if rejection.charge == Charge::Ban {
-            let _ = shared.misbehavior_sender.try_send((
-                PeerSocketAddr::from(*addr),
-                zn::constants::MAX_PEER_MISBEHAVIOR_SCORE,
-            ));
+    let verdict = shared.handle.submit(reservation, tx).await;
+    if let (Verdict::Rejected(rejection), Some(peer)) = (&verdict, supplier) {
+        match rejection.charge {
+            Charge::None => {}
+            Charge::Cooldown => start_peer_cooldown(
+                &shared.cooldowns,
+                &shared.peers,
+                peer,
+                tx_id,
+                shared.expose_peer_addresses,
+            ),
+            Charge::Ban => {
+                let _ = shared
+                    .misbehavior_sender
+                    .try_send((peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
+            }
         }
     }
     second_stage(tx_id, verdict)
 }
 
 impl Shared {
-    /// The supplier for a body `peer` served: the peer, unless the pool
-    /// must never charge it.
-    fn supplier(&self, peer: PeerSocketAddr) -> Supplier {
-        if self.exempt.contains(peer) {
-            return Supplier::Nobody;
-        }
-        let addr: SocketAddr = *peer;
-        Supplier::Peer(QueueSource::LegacySocket(addr))
+    /// The legacy peer to charge for a body `peer` served: the peer, unless
+    /// the pool must never charge it.
+    fn supplier(&self, peer: PeerSocketAddr) -> Option<PeerSocketAddr> {
+        (!self.exempt.contains(peer)).then_some(peer)
     }
 }
 
@@ -468,13 +561,7 @@ fn second_stage(tx_id: UnminedTxId, verdict: Verdict) -> Result<(), BoxError> {
                 error => Err(error.clone().into()),
             }
         }
-        Verdict::NoRoom(_) => Err(MempoolError::FullQueue.into()),
-        Verdict::CoolingDown => {
-            metrics::counter!("mempool.peer_cooldown.ignored.transactions.total").increment(1);
-            Err(failed(
-                &"transaction was served by a peer in a transaction cooldown",
-            ))
-        }
+        Verdict::NoRoom => Err(MempoolError::FullQueue.into()),
         Verdict::LocalFault(LocalFault::VerifyTimeout) => {
             metrics::counter!("mempool.failed.verify.tasks.total", "reason" => "timeout")
                 .increment(1);

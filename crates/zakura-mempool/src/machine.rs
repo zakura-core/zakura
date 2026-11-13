@@ -7,9 +7,12 @@
 //!
 //! Its rules are the port's, which `zakura_node_services::mempool::port::model`
 //! restates as an independent model. The machine tests drive both with the
-//! same inputs and compare them. Three rules belong to storage and the model
-//! leaves them out: eviction at the cost limit, mining order and cooldown
-//! escalation.
+//! same inputs and compare them. Two rules belong to storage and the model
+//! leaves them out: eviction at the cost limit and mining order.
+//!
+//! It knows nothing about peers. Per-peer limits and cooldowns belong to the
+//! callers that see the peer. A verdict says what its body earned, and the
+//! caller applies that to whoever sent it.
 //!
 //! [`Storage`] holds exactly the visible pool. A transaction hidden while it is
 //! verified again leaves storage and waits here with its body. So the
@@ -36,21 +39,16 @@ use zakura_chain::{
     transaction::{self, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent::{self, OutPoint},
 };
-use zakura_node_services::mempool::{
-    port::{
-        ChainReason, ChainTip, ChainTransition, Change, ChangeSeq, Charge, CooldownKey, Generation,
-        GenerationRead, Intent, LocalFault, NoRoom, PoolSnapshot, Rejection, RejectionDetail,
-        RejectionScope, RemovalReason, ReservationId, Source, Supplier, Unreserved, Verdict,
-        MAX_OUTPUT_WAITS, MAX_PENDING, MAX_PENDING_PER_SOURCE, MAX_REVALIDATING, MAX_UNDECIDED,
-        MAX_WAITERS, REVALIDATE_RETRY, REVALIDATE_RETRY_MAX, T_PARK, T_VERIFY,
-    },
-    QueueSource,
+use zakura_node_services::mempool::port::{
+    ChainReason, ChainTip, ChainTransition, Change, ChangeSeq, Charge, Generation, GenerationRead,
+    Intent, LocalFault, PoolSnapshot, Rejection, RejectionDetail, RejectionScope, RemovalReason,
+    ReservationId, Unreserved, Verdict, MAX_OUTPUT_WAITS, MAX_PENDING, MAX_REVALIDATING,
+    MAX_UNDECIDED, MAX_WAITERS, REVALIDATE_RETRY, REVALIDATE_RETRY_MAX, T_PARK, T_VERIFY,
 };
 use zakura_rt::collections::{HashMap, HashSet};
 
 use crate::{
     config::Config,
-    peer_cooldown::CooldownTable,
     storage::{
         ExactTipRejectionError, RejectionError, SameEffectsChainRejectionError,
         SameEffectsTipRejectionError, Storage,
@@ -211,8 +209,6 @@ pub enum OutputAnswer {
 pub struct Limits {
     /// Undecided transactions node-wide, [`MAX_PENDING`].
     pub pending: usize,
-    /// Undecided transactions per peer source, [`MAX_PENDING_PER_SOURCE`].
-    pub per_source: usize,
     /// Running revalidations, [`MAX_REVALIDATING`].
     pub revalidating: usize,
 }
@@ -221,7 +217,6 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             pending: MAX_PENDING,
-            per_source: MAX_PENDING_PER_SOURCE,
             revalidating: MAX_REVALIDATING,
         }
     }
@@ -231,8 +226,6 @@ impl Default for Limits {
 #[derive(Clone, Debug)]
 struct Waiter {
     id: WaiterId,
-    source: Source,
-    supplier: Supplier,
 }
 
 /// Where an undecided transaction is.
@@ -257,7 +250,6 @@ struct Admission<E> {
     /// Whether the owner can still submit. False once it has submitted or
     /// released.
     owner_waiting: bool,
-    source: Source,
     body: Option<UnminedTx>,
     waiters: Vec<Waiter>,
     stage: Stage,
@@ -332,7 +324,6 @@ struct JoinTicket {
     /// The admission it joined. A later admission of the same id is another
     /// one, and this ticket does not reach it.
     admission: u64,
-    source: Source,
     /// Whether the core asked this caller for the body.
     brings: bool,
 }
@@ -340,7 +331,6 @@ struct JoinTicket {
 /// A slot kept for a fetch that is still out after its id was decided.
 #[derive(Clone, Debug)]
 struct Lease {
-    source: Source,
     tx_id: UnminedTxId,
     /// The verdict its admission got, which its caller gets too.
     verdict: Verdict,
@@ -436,9 +426,6 @@ pub struct MempoolState<E> {
     children: HashMap<transaction::Hash, BTreeMap<u64, transaction::Hash>>,
     /// Each job, with the event count when it started.
     jobs: HashMap<JobId, (JobTarget, u64)>,
-    cooldowns: CooldownTable<CooldownKey>,
-    /// Whether a cooldown started since the core's task last published them.
-    cooldowns_changed: bool,
     /// Callers waiting for an output, by outpoint, in the order they came.
     output_waiters: HashMap<OutPoint, Vec<WaiterId>>,
     /// Changes returned in earlier steps. Each step is one batch of the log,
@@ -472,8 +459,6 @@ impl<E: VerifyError> MempoolState<E> {
             hidden_cost: 0,
             children: HashMap::default(),
             jobs: HashMap::default(),
-            cooldowns: CooldownTable::default(),
-            cooldowns_changed: false,
             output_waiters: HashMap::default(),
             logged: 0,
             step: Step::default(),
@@ -488,12 +473,11 @@ impl<E: VerifyError> MempoolState<E> {
 
     // Inputs.
 
-    /// Reserve a slot for `tx_id`, counted against `source`. See
+    /// Reserve one of the node's slots for `tx_id`. See
     /// `PoolHandle::reserve`. What else this caused is in [`Self::effects`].
     pub fn reserve(
         &mut self,
         tx_id: UnminedTxId,
-        source: Source,
         intent: Intent,
         now: Instant,
     ) -> Result<Grant, Unreserved> {
@@ -504,11 +488,6 @@ impl<E: VerifyError> MempoolState<E> {
         // A slot a deadline just freed goes to a revalidation that was
         // already waiting for one, before this reservation counts slots.
         self.start_revalidations();
-        if let Source::Peer(peer) = &source {
-            if self.is_cooling(peer, self.now) {
-                return Err(Unreserved::CoolingDown);
-            }
-        }
         if self.pooled.contains_key(&tx_id.mined_id()) {
             return Err(Unreserved::Pooled);
         }
@@ -520,16 +499,10 @@ impl<E: VerifyError> MempoolState<E> {
             )));
         }
         if let Some(key) = self.admission_of.get(&tx_id).copied() {
-            return self.join(key, source, intent);
+            return self.join(key, intent);
         }
-        // Today's order: the node's limit, then the source's.
         if self.slots_in_use() >= self.limits.pending {
-            return Err(Unreserved::NoRoom(NoRoom::Node));
-        }
-        if matches!(source, Source::Peer(_))
-            && self.counted_against(&source) >= self.limits.per_source
-        {
-            return Err(Unreserved::NoRoom(NoRoom::Source));
+            return Err(Unreserved::NoRoom);
         }
         let owner = ReservationId(self.fresh());
         let key = self.fresh();
@@ -539,7 +512,6 @@ impl<E: VerifyError> MempoolState<E> {
                 tx_id,
                 owner,
                 owner_waiting: true,
-                source,
                 body: None,
                 waiters: Vec::new(),
                 stage: Stage::Reserved,
@@ -585,11 +557,10 @@ impl<E: VerifyError> MempoolState<E> {
         &mut self,
         reservation: ReservationId,
         tx: UnminedTx,
-        supplier: Supplier,
         now: Instant,
     ) -> (WaiterId, Step) {
         let tx_id = tx.id();
-        self.arrive(reservation, tx_id, Some(tx), supplier, now)
+        self.arrive(reservation, tx_id, Some(tx), now)
     }
 
     /// A joined reservation that does not want the body: the caller waits for
@@ -598,10 +569,9 @@ impl<E: VerifyError> MempoolState<E> {
         &mut self,
         reservation: ReservationId,
         tx_id: UnminedTxId,
-        supplier: Supplier,
         now: Instant,
     ) -> (WaiterId, Step) {
-        self.arrive(reservation, tx_id, None, supplier, now)
+        self.arrive(reservation, tx_id, None, now)
     }
 
     /// The outcome of `job`, with the generation read before its first state
@@ -848,14 +818,6 @@ impl<E: VerifyError> MempoolState<E> {
         });
     }
 
-    /// A wire violation by a peer that submitted nothing starts its
-    /// cooldown. What else this caused is in [`Self::effects`].
-    pub fn violation(&mut self, peer: &QueueSource, now: Instant) {
-        self.enter(now);
-        self.start_revalidations();
-        self.cool(peer);
-    }
-
     /// The node fell far behind the tip. Every undecided submission gets a
     /// verdict, and the pool empties.
     pub fn deactivate(&mut self, now: Instant) -> Step {
@@ -920,8 +882,8 @@ impl<E: VerifyError> MempoolState<E> {
     /// What the last input that answers its caller caused beside its answer:
     /// the verdicts of deadlines it found due, and the jobs it started. The
     /// caller takes this straight after [`Self::reserve`],
-    /// [`Self::await_output`], [`Self::rejected_ids`], [`Self::violation`]
-    /// and [`Self::activate`]. The next input panics if it was not taken.
+    /// [`Self::await_output`], [`Self::rejected_ids`] and
+    /// [`Self::activate`]. The next input panics if it was not taken.
     pub fn effects(&mut self) -> Step {
         self.take_step()
     }
@@ -980,41 +942,12 @@ impl<E: VerifyError> MempoolState<E> {
         admissions.flatten().chain(hidden).min()
     }
 
-    /// The cooldowns, if one started since the last call.
-    pub fn cooldowns_if_changed(&mut self) -> Option<HashMap<CooldownKey, Instant>> {
-        if !std::mem::take(&mut self.cooldowns_changed) {
-            return None;
-        }
-        Some(
-            self.cooldowns
-                .cooling(self.now)
-                .map(|(key, until)| (key.clone(), until))
-                .collect(),
-        )
-    }
-
-    /// Whether the core refuses `peer` at `now`.
-    pub fn is_cooling(&self, peer: &QueueSource, now: Instant) -> bool {
-        self.cooldowns
-            .is_cooling_down(&CooldownKey::from(peer), now)
-    }
-
     /// Undecided transactions, plus leases, plus running revalidations.
     pub fn slots_in_use(&self) -> usize {
         self.admissions
             .len()
             .saturating_add(self.leases.len())
             .saturating_add(self.running)
-    }
-
-    /// Slots counted against `source`.
-    pub fn counted_against(&self, source: &Source) -> usize {
-        self.admissions
-            .values()
-            .map(|admission| &admission.source)
-            .chain(self.leases.values().map(|lease| &lease.source))
-            .filter(|counted| *counted == source)
-            .count()
     }
 
     /// Reservations callers still hold, of every kind.
@@ -1098,23 +1031,6 @@ impl<E: VerifyError> MempoolState<E> {
             self.slots_in_use() <= self.limits.pending,
             "pool/admissions-within-limits: the node's limit"
         );
-        let mut sources: HashMap<&Source, usize> = HashMap::default();
-        for source in self
-            .admissions
-            .values()
-            .map(|admission| &admission.source)
-            .chain(self.leases.values().map(|lease| &lease.source))
-        {
-            *sources.entry(source).or_default() += 1;
-        }
-        for (source, count) in sources {
-            if matches!(source, Source::Peer(_)) {
-                assert!(
-                    count <= self.limits.per_source,
-                    "pool/admissions-within-limits: one source's limit"
-                );
-            }
-        }
         for admission in self.admissions.values() {
             assert!(
                 admission.waiters.len() <= MAX_WAITERS,
@@ -1336,7 +1252,6 @@ impl<E: VerifyError> MempoolState<E> {
         reservation: ReservationId,
         tx_id: UnminedTxId,
         body: Option<UnminedTx>,
-        supplier: Supplier,
         now: Instant,
     ) -> (WaiterId, Step) {
         self.enter(now);
@@ -1355,15 +1270,11 @@ impl<E: VerifyError> MempoolState<E> {
             });
             return (waiter, self.take_step());
         }
-        let (key, ticket_source, body) = match self.tickets.remove(&reservation) {
+        let (key, body) = match self.tickets.remove(&reservation) {
             // A joined caller that was not asked for the body sends none, as
             // the handle drops it.
-            Some(ticket) => (
-                Some(ticket.admission),
-                Some(ticket.source),
-                body.filter(|_| ticket.brings),
-            ),
-            None => (self.owners.remove(&reservation), None, body),
+            Some(ticket) => (Some(ticket.admission), body.filter(|_| ticket.brings)),
+            None => (self.owners.remove(&reservation), body),
         };
         // The admission the reservation was granted for, if it is still
         // undecided. A later admission of the same id has another key.
@@ -1375,7 +1286,7 @@ impl<E: VerifyError> MempoolState<E> {
         let Some(key) = key else {
             // The admission this reservation was granted for ended before
             // its caller came back. The caller gets that admission's verdict,
-            // charged to its own supplier, as if it had come in time.
+            // as if it had come in time.
             let ended = self
                 .leases
                 .remove(&reservation)
@@ -1385,40 +1296,16 @@ impl<E: VerifyError> MempoolState<E> {
                         .remove(&reservation)
                         .map(|(_, verdict)| verdict)
                 });
-            let verdict = match ended {
-                Some(verdict) => self.charged(&verdict, &supplier),
-                None => self.stale_verdict(tx_id),
-            };
+            let verdict = ended.unwrap_or_else(|| self.stale_verdict(tx_id));
             self.step.effects.push(Effect::Verdict { waiter, verdict });
             return (waiter, self.take_step());
         };
-        // The source was checked when it reserved. The supplier can be another
-        // peer, or have entered a cooldown since.
-        if matches!(&supplier, Supplier::Peer(peer) if self.is_cooling(peer, now)) {
-            if self.admission_at(key).owner == reservation {
-                self.admission_at(key).owner_waiting = false;
-            }
-            // Today's change stream reports a download refused because its
-            // peer was cooling down. Nothing is cached for it.
-            self.step.changes.push(Change::Refused(tx_id));
-            self.step.effects.push(Effect::Verdict {
-                waiter,
-                verdict: Verdict::CoolingDown,
-            });
-            self.settle_bodyless(key);
-            return (waiter, self.take_step());
-        }
         let start = {
             let admission = self.admission_at(key);
             if admission.owner == reservation {
                 admission.owner_waiting = false;
             }
-            let source = ticket_source.unwrap_or_else(|| admission.source.clone());
-            admission.waiters.push(Waiter {
-                id: waiter,
-                source,
-                supplier,
-            });
+            admission.waiters.push(Waiter { id: waiter });
             match body {
                 Some(tx) if admission.body.is_none() => {
                     admission.body = Some(tx);
@@ -1476,8 +1363,10 @@ impl<E: VerifyError> MempoolState<E> {
         self.ended_joins.remove(&reservation);
     }
 
-    /// Joins an id that is already undecided, if `source` may.
-    fn join(&mut self, key: u64, source: Source, intent: Intent) -> Result<Grant, Unreserved> {
+    /// Joins an id that is already undecided, if there is a place among its
+    /// waiters. Whether one peer may wait on an id twice is its caller's
+    /// rule.
+    fn join(&mut self, key: u64, intent: Intent) -> Result<Grant, Unreserved> {
         if intent == Intent::Fetch {
             return Err(Unreserved::Pending);
         }
@@ -1492,23 +1381,14 @@ impl<E: VerifyError> MempoolState<E> {
             .len()
             .saturating_add(tickets.len())
             .saturating_add(usize::from(admission.owner_waiting));
-        // A peer source waits on an id once. The reserving source counts while
-        // its body can still arrive.
-        let already_on_it = matches!(source, Source::Peer(_))
-            && ((admission.owner_waiting && admission.source == source)
-                || admission
-                    .waiters
-                    .iter()
-                    .any(|waiter| waiter.source == source)
-                || tickets.iter().any(|ticket| ticket.source == source));
-        if waiting >= MAX_WAITERS || already_on_it {
+        if waiting >= MAX_WAITERS {
             return Err(Unreserved::Pending);
         }
         // A joined caller is asked for the body only when nobody else can
         // bring it: the core has none, the reserving caller is not still
         // fetching or delivering it, and no other joined caller was asked.
-        // Otherwise a second decoded body would wait under the same slot,
-        // with nothing counted against the joining source. So a delivery
+        // Otherwise a second decoded body would wait under the same slot.
+        // So a delivery
         // that joins while the fetch is out waits for the fetch's verdict,
         // and its own copy is dropped, as today drops it.
         let brings = admission.body.is_none()
@@ -1519,7 +1399,6 @@ impl<E: VerifyError> MempoolState<E> {
             id,
             JoinTicket {
                 admission: key,
-                source,
                 brings,
             },
         );
@@ -1882,7 +1761,6 @@ impl<E: VerifyError> MempoolState<E> {
             self.leases.insert(
                 admission.owner,
                 Lease {
-                    source: admission.source.clone(),
                     tx_id: admission.tx_id,
                     verdict: verdict.clone(),
                 },
@@ -1903,29 +1781,10 @@ impl<E: VerifyError> MempoolState<E> {
                 .insert(reservation, (tx_id, verdict.clone()));
         }
         for waiter in admission.waiters {
-            let verdict = self.charged(&verdict, &waiter.supplier);
             self.step.effects.push(Effect::Verdict {
                 waiter: waiter.id,
-                verdict,
+                verdict: verdict.clone(),
             });
-        }
-    }
-
-    /// `verdict` as `supplier` gets it. A cooldown charge starts a peer
-    /// supplier's cooldown, and nobody else is charged.
-    fn charged(&mut self, verdict: &Verdict, supplier: &Supplier) -> Verdict {
-        match (verdict, supplier) {
-            (Verdict::Rejected(rejection), Supplier::Peer(peer)) => {
-                if rejection.charge == Charge::Cooldown {
-                    self.cool(peer);
-                }
-                verdict.clone()
-            }
-            (Verdict::Rejected(rejection), Supplier::Nobody) => Verdict::Rejected(Rejection {
-                charge: Charge::None,
-                ..rejection.clone()
-            }),
-            (other, _) => other.clone(),
         }
     }
 
@@ -2360,18 +2219,6 @@ impl<E: VerifyError> MempoolState<E> {
     /// The cached rejection that covers `tx_id` now, if any.
     fn cached_rejection(&self, tx_id: UnminedTxId) -> Option<MempoolError<E>> {
         self.storage.rejection_error(&tx_id, self.now)
-    }
-
-    /// Starts a peer's cooldown. A failure while the peer is already cooling
-    /// down changes nothing, as today.
-    fn cool(&mut self, peer: &QueueSource) {
-        if self
-            .cooldowns
-            .record_invalid_transaction(CooldownKey::from(peer), self.now)
-            .is_some()
-        {
-            self.cooldowns_changed = true;
-        }
     }
 
     /// Whether the tip has reached `expiry`.

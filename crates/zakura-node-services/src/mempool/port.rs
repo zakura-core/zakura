@@ -8,13 +8,19 @@
 //!
 //! A caller reserves before it fetches, and submits with the reservation:
 //!
-//! 1. [`PoolHandle::reserve`] takes a slot for one transaction id, counted
-//!    against a [`Source`]. It answers [`Unreserved`] when the id is already
+//! 1. [`PoolHandle::reserve`] takes one of the node's [`MAX_PENDING`] slots
+//!    for one transaction id. It answers [`Unreserved`] when the id is already
 //!    known or there is no room. Nothing is fetched without a reservation, so
 //!    one count covers a transaction from its fetch to its verdict.
-//! 2. [`PoolHandle::submit`] hands over the body and names the [`Supplier`]
-//!    whose bytes these are. It answers exactly one [`Verdict`].
+//! 2. [`PoolHandle::submit`] hands over the body. It answers exactly one
+//!    [`Verdict`], which says what the body earned its supplier.
 //! 3. Dropping a [`Reservation`] that was never submitted frees its slot.
+//!
+//! The core knows nothing about peers. Whoever sees a peer owns that peer's
+//! state: its share of the slots, its cooldown, and who supplied a body. The
+//! legacy adapter keeps today's per-peer limit and cooldowns, and `tx-relay`
+//! keeps its own. Each applies a verdict's [`Charge`] to the peer that sent
+//! the body, and charges nobody for a body that came from this node.
 //!
 //! A slot is held until the caller that reserved it submits its body or drops
 //! the reservation, and at least until the verdict. So if another caller's
@@ -28,19 +34,14 @@
 //!
 //! A caller whose reservation outlives its admission, because another
 //! caller's body decided the id first, gets that admission's verdict when it
-//! submits, charged to its own supplier, as if it had come in time.
-//!
-//! A slot is counted against the source that reserved it until the verdict,
-//! whoever supplies the body. So a caller that asks a second peer for the same
-//! id keeps its reservation and names that second peer as the supplier. No
-//! operation moves a reservation between sources.
+//! submits, as if it had come in time.
 //!
 //! Readers follow the pool without asking the core for work: the latest
 //! [`PoolSnapshot`] and the numbered [`ChangeEntry`] log.
 //!
 //! [`model`] restates these rules as an independent model.
 
-use std::{collections::VecDeque, fmt, net::IpAddr, sync::Arc, time::Duration};
+use std::{collections::VecDeque, fmt, sync::Arc, time::Duration};
 
 use zakura_chain::{
     block,
@@ -53,10 +54,9 @@ use zakura_rt::{
         atomic::{AtomicU64, Ordering},
         mpsc, oneshot, watch, CancellationToken, Mutex, PoisonError,
     },
-    time::Instant,
 };
 
-use super::{QueueSource, TransactionDependencies};
+use super::TransactionDependencies;
 use crate::block_memory::TransactionHandle;
 
 pub use chain::{
@@ -74,10 +74,6 @@ mod tests;
 /// `MAX_INBOUND_CONCURRENCY`.
 pub const MAX_PENDING: usize = 500;
 
-/// Undecided transactions counted against one peer source. Today's
-/// `MAX_INBOUND_CONCURRENCY_PER_PEER`.
-pub const MAX_PENDING_PER_SOURCE: usize = 5;
-
 /// Submissions that can wait on one undecided transaction. Provisional.
 pub const MAX_WAITERS: usize = 8;
 
@@ -93,10 +89,6 @@ pub const CHANGE_LOG_CAPACITY: usize = 24_384;
 /// Entries in each rejection list. A tip-scoped list that grows past this is
 /// cleared, as today. Each chain-scoped list drops its oldest entry.
 pub const MAX_REJECTIONS: usize = 40_000;
-
-/// Peers with a cooldown. A new one past this replaces the one that ends
-/// first, as today.
-pub const MAX_COOLDOWNS: usize = 20_000;
 
 /// How long one verification can take. Provisional.
 pub const T_VERIFY: Duration = Duration::from_secs(60);
@@ -140,52 +132,6 @@ pub const REVALIDATE_RETRY_MAX: Duration = Duration::from_secs(60);
 /// Commands that can wait for the core. A full queue makes
 /// [`PoolHandle::reserve`] and [`PoolHandle::submit`] wait.
 pub const COMMAND_QUEUE: usize = 1_024;
-
-/// Who an undecided transaction is counted against.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum Source {
-    /// A peer. At most [`MAX_PENDING_PER_SOURCE`] undecided transactions
-    /// count against it.
-    Peer(QueueSource),
-    /// This node: RPC, wallets and the crawler. Counted against
-    /// [`MAX_PENDING`] only.
-    Node,
-}
-
-/// Whose bytes a submission is. A verdict that charges anyone charges the
-/// supplier.
-///
-/// The source and the supplier can differ. A v2 peer that reaches the core
-/// through the legacy adapter is a source with no supplier. A `tx-relay`
-/// reservation is counted against the first peer asked, and the supplier is
-/// the peer that answered.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum Supplier {
-    /// The peer that sent the body.
-    Peer(QueueSource),
-    /// A local source, or a body nobody can be charged for.
-    Nobody,
-}
-
-/// What a cooldown is keyed by. A legacy peer is its canonical IP address,
-/// as today, so a new port or an IPv4-mapped form of the address does not
-/// escape it.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum CooldownKey {
-    /// A legacy peer's canonical IP address.
-    Ip(IpAddr),
-    /// A v2 peer's encoded id.
-    Peer(Vec<u8>),
-}
-
-impl From<&QueueSource> for CooldownKey {
-    fn from(peer: &QueueSource) -> Self {
-        match peer {
-            QueueSource::LegacySocket(address) => Self::Ip(address.ip().to_canonical()),
-            QueueSource::Zakura(id) => Self::Peer(id.clone()),
-        }
-    }
-}
 
 /// Why the caller is reserving.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -306,32 +252,21 @@ impl fmt::Debug for Reservation {
     }
 }
 
-/// Which limit refused a reservation.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum NoRoom {
-    /// [`MAX_PENDING`] is reached.
-    Node,
-    /// The source holds [`MAX_PENDING_PER_SOURCE`].
-    Source,
-}
-
 /// Why [`PoolHandle::reserve`] granted nothing. The caller fetches nothing.
 #[derive(Clone, Debug)]
 pub enum Unreserved {
     /// The pool is off, because the node is far from the tip.
     Inactive,
-    /// The source is in a cooldown.
-    CoolingDown,
     /// The transaction is in the pool.
     Pooled,
     /// The id is undecided and this reservation cannot join it: the intent
-    /// was [`Intent::Fetch`], the source already waits on it, or
-    /// [`MAX_WAITERS`] is reached. Today's `AlreadyQueued`.
+    /// was [`Intent::Fetch`], or [`MAX_WAITERS`] is reached. Today's
+    /// `AlreadyQueued`.
     Pending,
     /// A cached rejection covers the id.
     Rejected(Rejection),
-    /// A limit is reached. The caller can try again later.
-    NoRoom(NoRoom),
+    /// [`MAX_PENDING`] is reached. The caller can try again later.
+    NoRoom,
     /// The core has stopped.
     Stopped,
 }
@@ -364,13 +299,15 @@ pub enum ChainReason {
     Mined,
 }
 
-/// What a rejection costs the supplier.
+/// What a rejected body earned the peer that sent it. The caller that knows
+/// that peer applies it. A body that came from this node charges nobody,
+/// whatever its charge.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Charge {
     /// Nothing. The failure does not show the supplier misbehaved.
     None,
-    /// The core refuses the supplier's transactions for a while. The core
-    /// has already started the cooldown.
+    /// The caller refuses the supplier's transactions for a while, as
+    /// today's cooldown does.
     Cooldown,
     /// The caller bans or disconnects the supplier.
     Ban,
@@ -384,8 +321,7 @@ pub type RejectionDetail = Arc<dyn std::error::Error + Send + Sync + 'static>;
 pub struct Rejection {
     /// How long the rejection is remembered.
     pub scope: RejectionScope,
-    /// What it costs this submission's supplier. A local source and
-    /// [`Supplier::Nobody`] are never charged.
+    /// What the body earned its supplier. See [`Charge`].
     pub charge: Charge,
     /// Today's error value, for RPC and logs.
     pub detail: RejectionDetail,
@@ -423,25 +359,11 @@ pub enum Verdict {
     Admitted,
     /// The core refused the transaction.
     Rejected(Rejection),
-    /// A limit was reached. Only a submission without a slot can get this.
-    NoRoom(NoRoom),
-    /// The supplier is in a cooldown, so its body was not verified. Nothing
-    /// is cached and nobody else is charged. A supplier can enter a cooldown
-    /// after its body was asked for, or be named under another source's
-    /// reservation.
-    CoolingDown,
+    /// [`MAX_PENDING`] was reached. Only a submission without a slot can get
+    /// this.
+    NoRoom,
     /// A failure on this node.
     LocalFault(LocalFault),
-}
-
-/// A wire violation by a peer that submitted nothing. The core starts the
-/// peer's cooldown.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Violation {
-    /// The peer.
-    pub peer: QueueSource,
-    /// A fixed label for metrics and logs.
-    pub cause: &'static str,
 }
 
 /// Why [`PoolHandle::await_output`] cannot wait.
@@ -868,8 +790,6 @@ pub enum PoolCommand {
     Reserve {
         /// The transaction id.
         tx_id: UnminedTxId,
-        /// Who the slot counts against.
-        source: Source,
         /// Whether the caller will fetch or already holds the body.
         intent: Intent,
         /// Where the answer goes.
@@ -882,8 +802,6 @@ pub enum PoolCommand {
         reservation: Reservation,
         /// The body.
         transaction: UnminedTx,
-        /// Whose bytes it is.
-        supplier: Supplier,
         /// Where the verdict goes.
         reply: oneshot::Sender<Verdict>,
     },
@@ -892,15 +810,11 @@ pub enum PoolCommand {
     Join {
         /// The joined reservation. Still armed.
         reservation: Reservation,
-        /// Whose bytes the caller's copy was.
-        supplier: Supplier,
         /// Where the verdict goes.
         reply: oneshot::Sender<Verdict>,
     },
     /// [`PoolHandle::fetch_failed`]. The reservation is still armed.
     FetchFailed(Reservation),
-    /// [`PoolHandle::report_violation`].
-    ReportViolation(Violation),
     /// [`PoolHandle::await_output`]. The core looks the output up and, if it
     /// is missing, registers the waiter, in one step of its task. So an
     /// admission cannot fall between the lookup and the registration.
@@ -949,15 +863,11 @@ struct Shared {
     log: Mutex<ChangeLog>,
 }
 
-/// The peers in a cooldown, and when each one ends.
-pub type Cooldowns = Arc<HashMap<CooldownKey, Instant>>;
-
 /// The callers' side of the port. Cheap to clone.
 #[derive(Clone, Debug)]
 pub struct PoolHandle {
     commands: mpsc::Sender<PoolCommand>,
     snapshot: watch::Receiver<Option<Arc<PoolSnapshot>>>,
-    cooldowns: watch::Receiver<Cooldowns>,
     shared: Arc<Shared>,
 }
 
@@ -1010,7 +920,6 @@ pub struct PoolInbox {
     releases: mpsc::UnboundedReceiver<ReservationId>,
     release_handle: mpsc::UnboundedSender<ReservationId>,
     snapshot: watch::Sender<Option<Arc<PoolSnapshot>>>,
-    cooldowns: watch::Sender<Cooldowns>,
     shared: Arc<Shared>,
     /// Under the simulator, sees every publication. See
     /// [`Self::observe_publications`].
@@ -1043,13 +952,11 @@ pub fn pool_port() -> (PoolHandle, PoolInbox) {
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE);
     let (release_tx, release_rx) = mpsc::unbounded_channel();
     let (snapshot_tx, snapshot_rx) = watch::channel(None);
-    let (cooldowns_tx, cooldowns_rx) = watch::channel(Cooldowns::default());
     let shared = Arc::new(Shared::default());
     (
         PoolHandle {
             commands: commands_tx,
             snapshot: snapshot_rx,
-            cooldowns: cooldowns_rx,
             shared: shared.clone(),
         },
         PoolInbox {
@@ -1057,7 +964,6 @@ pub fn pool_port() -> (PoolHandle, PoolInbox) {
             releases: release_rx,
             release_handle: release_tx,
             snapshot: snapshot_tx,
-            cooldowns: cooldowns_tx,
             shared,
             #[cfg(zakura_sim)]
             publications: None,
@@ -1066,18 +972,16 @@ pub fn pool_port() -> (PoolHandle, PoolInbox) {
 }
 
 impl PoolHandle {
-    /// Reserve a slot for `tx_id`, counted against `source`, before fetching
-    /// or delivering its body.
+    /// Reserve one of the node's slots for `tx_id` before fetching or
+    /// delivering its body.
     pub async fn reserve(
         &self,
         tx_id: UnminedTxId,
-        source: Source,
         intent: Intent,
     ) -> Result<Reservation, Unreserved> {
         let (reply, answer) = oneshot::channel();
         let command = PoolCommand::Reserve {
             tx_id,
-            source,
             intent,
             reply,
         };
@@ -1089,21 +993,13 @@ impl PoolHandle {
 
     /// Submit the body `reservation` was taken for, and wait for its verdict.
     ///
-    /// The slot stays counted against the reservation's source. `supplier`
-    /// is whose bytes these are, which can be another peer.
-    ///
     /// A joined reservation that does not want the body sends none. The
     /// body is dropped here. This keeps copies of one transaction from
     /// queuing for the core. It is not a bound on bodies callers hold: a
     /// caller that had the body before it reserved holds it either way.
     ///
     /// Cancelling this before the core takes the command frees the slot.
-    pub async fn submit(
-        &self,
-        reservation: Reservation,
-        transaction: UnminedTx,
-        supplier: Supplier,
-    ) -> Verdict {
+    pub async fn submit(&self, reservation: Reservation, transaction: UnminedTx) -> Verdict {
         if transaction.id() != reservation.tx_id() {
             // Dropping the reservation frees its slot.
             return Verdict::LocalFault(LocalFault::WrongTransaction);
@@ -1113,16 +1009,11 @@ impl PoolHandle {
             PoolCommand::Submit {
                 reservation,
                 transaction,
-                supplier,
                 reply,
             }
         } else {
             drop(transaction);
-            PoolCommand::Join {
-                reservation,
-                supplier,
-                reply,
-            }
+            PoolCommand::Join { reservation, reply }
         };
         if self.commands.send(command).await.is_err() {
             return Verdict::LocalFault(LocalFault::Stopped);
@@ -1143,15 +1034,6 @@ impl PoolHandle {
         let _ = self
             .commands
             .send(PoolCommand::FetchFailed(reservation))
-            .await;
-    }
-
-    /// Report a wire violation by a peer that submitted nothing, so its
-    /// cooldown starts. Waits only while the command queue is full.
-    pub async fn report_violation(&self, violation: Violation) {
-        let _ = self
-            .commands
-            .send(PoolCommand::ReportViolation(violation))
             .await;
     }
 
@@ -1179,18 +1061,6 @@ impl PoolHandle {
             return HashSet::new();
         }
         answer.await.unwrap_or_default()
-    }
-
-    /// Whether the core refuses `peer`'s transactions at `now`.
-    ///
-    /// A caller checks this before it asks a peer for a body under a
-    /// reservation that another source holds. The core checked only that
-    /// source, and would refuse the body once it arrived.
-    pub fn is_cooling(&self, peer: &QueueSource, now: Instant) -> bool {
-        self.cooldowns
-            .borrow()
-            .get(&CooldownKey::from(peer))
-            .is_some_and(|until| *until > now)
     }
 
     /// The latest snapshot, or `None` until the core has attached and
@@ -1279,11 +1149,6 @@ impl PoolInbox {
             self.release_handle.clone(),
             cancel,
         )
-    }
-
-    /// Publish the peers in a cooldown, whenever one starts.
-    pub fn publish_cooldowns(&self, cooldowns: HashMap<CooldownKey, Instant>) {
-        self.cooldowns.send_replace(Arc::new(cooldowns));
     }
 
     /// Publish one batch: append `changes` to the log, then publish the

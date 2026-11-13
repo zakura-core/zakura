@@ -9,17 +9,20 @@
 //! verification is not run here. The model says which job to start, and the
 //! test feeds back the [`Outcome`].
 //!
-//! Three things are left out, because they are rules of the storage code
-//! that moves unchanged and keeps its own tests. Eviction at the pool's cost
-//! limit: the model assumes the pool stays below it. The snapshot's mining
-//! order, by ancestor-package fee: the model has no fees, and
-//! [`PoolModel::visible`] is oldest first, which is not that order. And
-//! cooldown escalation: a cooldown lasts [`COOLDOWN`] each time.
+//! Two things are left out, because they are rules of the pool's storage,
+//! which keeps its own tests. Eviction at the pool's cost limit: the model
+//! assumes the pool stays below it. And the snapshot's mining order, by
+//! ancestor-package fee: the model has no fees, and [`PoolModel::visible`] is
+//! oldest first, which is not that order.
+//!
+//! Nothing here is about one peer. Per-peer limits and cooldowns belong to
+//! the callers that see the peer, so a verdict only says what its body
+//! earned.
 //!
 //! A slot outlives its admission while the caller that reserved it is still
 //! fetching. If another caller's body decides the id first, the reserving
 //! caller's slot stays taken until it submits its body or drops the
-//! reservation. Otherwise a source could have more fetches out than slots.
+//! reservation. Otherwise a caller could have more fetches out than slots.
 //!
 //! Two orderings are decided on purpose and are not gaps.
 //!
@@ -62,12 +65,10 @@ use zakura_chain::{
 };
 
 use super::{
-    ChainReason, Change, ChangeEntry, ChangeSeq, Charge, CooldownKey, Generation, GenerationRead,
-    Intent, LocalFault, NoRoom, RejectionScope, RemovalReason, ReservationId, Source, Supplier,
-    MAX_COOLDOWNS, MAX_PENDING, MAX_PENDING_PER_SOURCE, MAX_REJECTIONS, MAX_REVALIDATING,
-    MAX_WAITERS,
+    ChainReason, Change, ChangeEntry, ChangeSeq, Charge, Generation, GenerationRead, Intent,
+    LocalFault, RejectionScope, RemovalReason, ReservationId, MAX_PENDING, MAX_REJECTIONS,
+    MAX_REVALIDATING, MAX_WAITERS,
 };
-use crate::mempool::QueueSource;
 
 /// Time since the model started.
 pub type ModelTime = Duration;
@@ -75,10 +76,6 @@ pub type ModelTime = Duration;
 pub use super::{
     MAX_OUTPUT_WAITS, MAX_UNDECIDED, REVALIDATE_RETRY, REVALIDATE_RETRY_MAX, T_PARK, T_VERIFY,
 };
-
-/// How long the core refuses a peer after a cooldown charge or a violation.
-/// Today's base cooldown.
-pub const COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
 /// How long a chain-scoped rejection is remembered unless the model is told
 /// otherwise. Today's default `eviction_memory_time`. A rejection made at `T`
@@ -184,13 +181,11 @@ pub enum ModelVerdict {
     Rejected {
         /// How long the rejection is remembered.
         scope: RejectionScope,
-        /// What it costs this waiter's supplier.
+        /// What the body earned its supplier.
         charge: Charge,
     },
-    /// A limit was reached.
-    NoRoom(NoRoom),
-    /// The supplier is in a cooldown, so its body was not verified.
-    CoolingDown,
+    /// The node's limit was reached.
+    NoRoom,
     /// A failure on this node.
     LocalFault(LocalFault),
 }
@@ -201,16 +196,14 @@ pub enum ModelVerdict {
 pub enum ModelUnreserved {
     /// The pool is off.
     Inactive,
-    /// The source is in a cooldown.
-    CoolingDown,
     /// The transaction is in the pool.
     Pooled,
     /// The id is undecided and cannot be joined.
     Pending,
     /// A cached rejection covers the id.
     Rejected(RejectionScope),
-    /// A limit is reached.
-    NoRoom(NoRoom),
+    /// The node's limit is reached.
+    NoRoom,
 }
 
 /// A granted reservation.
@@ -422,8 +415,6 @@ impl ModelReader {
 #[derive(Clone, Debug)]
 struct Waiter {
     id: WaiterId,
-    source: Source,
-    supplier: Supplier,
 }
 
 #[derive(Clone, Debug)]
@@ -446,7 +437,6 @@ struct Admission {
     /// Whether the owner can still submit. False once it has submitted or
     /// released.
     owner_waiting: bool,
-    source: Source,
     body: Option<ModelTx>,
     waiters: Vec<Waiter>,
     stage: Stage,
@@ -504,7 +494,6 @@ struct JoinTicket {
     /// The admission it joined. A later admission of the same id is another
     /// one, and this ticket does not reach it.
     admission: u64,
-    source: Source,
     /// Whether the core asked this caller for the body.
     brings: bool,
 }
@@ -512,7 +501,6 @@ struct JoinTicket {
 /// A slot kept for a fetch that is still out after its id was decided.
 #[derive(Clone, Debug)]
 struct Lease {
-    source: Source,
     tx_id: UnminedTxId,
     /// The verdict its admission got, which its caller gets too.
     verdict: ModelVerdict,
@@ -539,7 +527,7 @@ pub struct PoolModel {
     owners: HashMap<ReservationId, u64>,
     /// Reservations whose id was decided through someone else's body while
     /// their own fetch was still out. Each keeps its slot until its caller
-    /// submits or drops it, so a source cannot have more fetches out than
+    /// submits or drops it, so a caller cannot have more fetches out than
     /// slots.
     leases: HashMap<ReservationId, Lease>,
     tickets: BTreeMap<ReservationId, JoinTicket>,
@@ -561,9 +549,7 @@ pub struct PoolModel {
     /// One list for each reason, as today.
     rejected_chain: HashMap<ChainReason, ChainList>,
     rejection_memory: Duration,
-    cooldowns: HashMap<CooldownKey, ModelTime>,
     max_pending: usize,
-    max_per_source: usize,
     max_revalidating: usize,
     /// Callers waiting for an output, by outpoint, in the order they came.
     output_waiters: HashMap<OutPoint, Vec<WaiterId>>,
@@ -595,9 +581,7 @@ impl PoolModel {
             rejected_effects_tip: HashSet::new(),
             rejected_chain: HashMap::new(),
             rejection_memory: REJECTION_MEMORY,
-            cooldowns: HashMap::new(),
             max_pending: MAX_PENDING,
-            max_per_source: MAX_PENDING_PER_SOURCE,
             max_revalidating: MAX_REVALIDATING,
             output_waiters: HashMap::new(),
             logged: 0,
@@ -606,11 +590,9 @@ impl PoolModel {
     }
 
     /// The same model with smaller limits, so a short random run reaches
-    /// every full state. The node's limit, one source's, and revalidation's
-    /// share of the node's.
-    pub fn with_limits(mut self, pending: usize, per_source: usize, revalidating: usize) -> Self {
+    /// every full state. The node's limit, and revalidation's share of it.
+    pub fn with_limits(mut self, pending: usize, revalidating: usize) -> Self {
         self.max_pending = pending;
-        self.max_per_source = per_source;
         self.max_revalidating = revalidating;
         self
     }
@@ -629,12 +611,11 @@ impl PoolModel {
     /// its answer does not depend on whether a tick came just before it.
     /// Its own return value is the answer to the caller. What the deadlines
     /// caused is in [`Self::effects`], which the caller takes right after.
-    /// The same holds for [`Self::await_output`], [`Self::rejected_ids`],
-    /// [`Self::violation`] and [`Self::activate`].
+    /// The same holds for [`Self::await_output`], [`Self::rejected_ids`] and
+    /// [`Self::activate`].
     pub fn reserve(
         &mut self,
         tx_id: UnminedTxId,
-        source: Source,
         intent: Intent,
         now: ModelTime,
     ) -> Result<ModelReservation, ModelUnreserved> {
@@ -646,11 +627,6 @@ impl PoolModel {
         // A slot a deadline just freed goes to a revalidation that was
         // already waiting for one, before this reservation counts slots.
         self.start_revalidations();
-        if let Source::Peer(peer) = &source {
-            if self.cooling(peer, now) {
-                return Err(ModelUnreserved::CoolingDown);
-            }
-        }
         if self.pooled.contains_key(&tx_id.mined_id()) {
             return Err(ModelUnreserved::Pooled);
         }
@@ -658,15 +634,10 @@ impl PoolModel {
             return Err(ModelUnreserved::Rejected(scope));
         }
         if let Some(key) = self.admission_of.get(&tx_id).copied() {
-            return self.join(key, source, intent);
+            return self.join(key, intent);
         }
-        // Today's order: the node's limit, then the source's.
         if self.slots_in_use() >= self.max_pending {
-            return Err(ModelUnreserved::NoRoom(NoRoom::Node));
-        }
-        if matches!(source, Source::Peer(_)) && self.counted_against(&source) >= self.max_per_source
-        {
-            return Err(ModelUnreserved::NoRoom(NoRoom::Source));
+            return Err(ModelUnreserved::NoRoom);
         }
         let owner = ReservationId(self.fresh());
         let key = self.fresh();
@@ -676,7 +647,6 @@ impl PoolModel {
                 tx_id,
                 owner,
                 owner_waiting: true,
-                source,
                 body: None,
                 waiters: Vec::new(),
                 stage: Stage::Reserved,
@@ -723,11 +693,10 @@ impl PoolModel {
         &mut self,
         reservation: ReservationId,
         tx: ModelTx,
-        supplier: Supplier,
         now: ModelTime,
     ) -> (WaiterId, Step) {
         let tx_id = tx.id;
-        self.arrive(reservation, tx_id, Some(tx), supplier, now)
+        self.arrive(reservation, tx_id, Some(tx), now)
     }
 
     /// [`super::PoolHandle::submit`] under a joined reservation that does
@@ -737,10 +706,9 @@ impl PoolModel {
         &mut self,
         reservation: ReservationId,
         tx_id: UnminedTxId,
-        supplier: Supplier,
         now: ModelTime,
     ) -> (WaiterId, Step) {
-        self.arrive(reservation, tx_id, None, supplier, now)
+        self.arrive(reservation, tx_id, None, now)
     }
 
     fn arrive(
@@ -748,11 +716,9 @@ impl PoolModel {
         reservation: ReservationId,
         tx_id: UnminedTxId,
         body: Option<ModelTx>,
-        supplier: Supplier,
         now: ModelTime,
     ) -> (WaiterId, Step) {
         self.enter(now);
-        let now = self.now;
         let waiter = WaiterId(self.fresh());
         // The handle checks the body against the reservation before it
         // sends anything. A wrong body drops the reservation.
@@ -768,15 +734,11 @@ impl PoolModel {
             self.start_revalidations();
             return (waiter, self.take_step());
         }
-        let (key, ticket_source, body) = match self.tickets.remove(&reservation) {
+        let (key, body) = match self.tickets.remove(&reservation) {
             // A joined caller that was not asked for the body sends none, as
             // the handle drops it.
-            Some(ticket) => (
-                Some(ticket.admission),
-                Some(ticket.source),
-                body.filter(|_| ticket.brings),
-            ),
-            None => (self.owners.remove(&reservation), None, body),
+            Some(ticket) => (Some(ticket.admission), body.filter(|_| ticket.brings)),
+            None => (self.owners.remove(&reservation), body),
         };
         // The admission the reservation was granted for, if it is still
         // undecided. A later admission of the same id has another key.
@@ -788,7 +750,7 @@ impl PoolModel {
         let Some(key) = key else {
             // The admission this reservation was granted for ended before
             // its caller came back. The caller gets that admission's verdict,
-            // charged to its own supplier, as if it had come in time.
+            // as if it had come in time.
             let ended = self
                 .leases
                 .remove(&reservation)
@@ -798,31 +760,11 @@ impl PoolModel {
                         .remove(&reservation)
                         .map(|(_, verdict)| verdict)
                 });
-            let verdict = match ended {
-                Some(verdict) => self.charged(verdict, &supplier),
-                None => self.stale_verdict(tx_id),
-            };
+            let verdict = ended.unwrap_or_else(|| self.stale_verdict(tx_id));
             self.step.effects.push(Effect::Verdict { waiter, verdict });
             self.start_revalidations();
             return (waiter, self.take_step());
         };
-        // The source was checked when it reserved. The supplier can be
-        // another peer, or have entered a cooldown since.
-        if matches!(&supplier, Supplier::Peer(peer) if self.cooling(peer, now)) {
-            if self.admission_at(key).owner == reservation {
-                self.admission_at(key).owner_waiting = false;
-            }
-            // Today's change stream reports a download refused because its
-            // peer was cooling down. Nothing is cached for it.
-            self.step.changes.push(Change::Refused(tx_id));
-            self.step.effects.push(Effect::Verdict {
-                waiter,
-                verdict: ModelVerdict::CoolingDown,
-            });
-            self.settle_bodyless(key);
-            self.start_revalidations();
-            return (waiter, self.take_step());
-        }
         // The model's own clock, which never goes back, not the caller's.
         let clock = self.now;
         let start = {
@@ -830,12 +772,7 @@ impl PoolModel {
             if admission.owner == reservation {
                 admission.owner_waiting = false;
             }
-            let source = ticket_source.unwrap_or_else(|| admission.source.clone());
-            admission.waiters.push(Waiter {
-                id: waiter,
-                source,
-                supplier,
-            });
+            admission.waiters.push(Waiter { id: waiter });
             match body {
                 Some(tx) if admission.body.is_none() => {
                     admission.body = Some(tx);
@@ -1184,14 +1121,6 @@ impl PoolModel {
         self.output_waiters.values().map(Vec::len).sum()
     }
 
-    /// [`super::PoolHandle::report_violation`].
-    pub fn violation(&mut self, peer: QueueSource, now: ModelTime) {
-        self.enter(now);
-        // A retry or a slot that the time brought due is used at once.
-        self.start_revalidations();
-        self.cool(&peer);
-    }
-
     /// The node fell far behind the tip. Every undecided submission gets a
     /// verdict, and the pool empties.
     pub fn deactivate(&mut self, now: ModelTime) -> Step {
@@ -1240,11 +1169,11 @@ impl PoolModel {
     }
 
     /// What the last call to [`Self::reserve`], [`Self::await_output`],
-    /// [`Self::rejected_ids`], [`Self::violation`] or [`Self::activate`]
-    /// caused beside its answer:
-    /// the verdicts of deadlines it found due, and the jobs it started.
+    /// [`Self::rejected_ids`] or [`Self::activate`] caused beside its
+    /// answer: the verdicts of deadlines it found due, and the jobs it
+    /// started.
     ///
-    /// Every input has effects, and these five have an answer of their own
+    /// Every input has effects, and these four have an answer of their own
     /// as well. The caller takes this straight after each of them, so no
     /// verdict or job start waits for some later input. The next input
     /// panics if it was not taken, and so does
@@ -1261,17 +1190,6 @@ impl PoolModel {
             .len()
             .saturating_add(self.leases.len())
             .saturating_add(self.revalidating())
-    }
-
-    /// Slots counted against `source`: its undecided transactions, and its
-    /// fetches that are still out for ids decided through someone else.
-    pub fn counted_against(&self, source: &Source) -> usize {
-        self.admissions
-            .values()
-            .map(|admission| &admission.source)
-            .chain(self.leases.values().map(|lease| &lease.source))
-            .filter(|counted| *counted == source)
-            .count()
     }
 
     /// Reservations callers still hold, of every kind. Zero once every
@@ -1318,15 +1236,6 @@ impl PoolModel {
             .is_some_and(|admission| matches!(admission.stage, Stage::Parked { .. }))
     }
 
-    /// Whether the core refuses `peer` at `now`. A legacy peer is matched by
-    /// its canonical IP address. This reads the cooldown's own end time, so
-    /// it is right whichever input last moved the model's clock.
-    pub fn cooling(&self, peer: &QueueSource, now: ModelTime) -> bool {
-        self.cooldowns
-            .get(&CooldownKey::from(peer))
-            .is_some_and(|until| *until > now)
-    }
-
     /// [`super::PoolHandle::rejected_ids`]: the members of `ids` a cached
     /// rejection covers at `now`. Takes no slot.
     ///
@@ -1359,12 +1268,7 @@ impl PoolModel {
             self.slots_in_use() <= self.max_pending,
             "pool/admissions-within-limits: the node's limit"
         );
-        let mut sources: HashMap<&Source, usize> = HashMap::new();
-        for lease in self.leases.values() {
-            *sources.entry(&lease.source).or_default() += 1;
-        }
         for admission in self.admissions.values() {
-            *sources.entry(&admission.source).or_default() += 1;
             assert!(
                 admission.waiters.len() <= MAX_WAITERS,
                 "the waiter limit of one admission"
@@ -1374,14 +1278,6 @@ impl PoolModel {
                 matches!(admission.stage, Stage::Reserved),
                 "an admission has a body exactly when it has left the reserved stage"
             );
-        }
-        for (source, count) in sources {
-            if matches!(source, Source::Peer(_)) {
-                assert!(
-                    count <= self.max_per_source,
-                    "pool/admissions-within-limits: one source's limit"
-                );
-            }
         }
         assert!(
             self.revalidating() <= self.max_revalidating,
@@ -1396,7 +1292,6 @@ impl PoolModel {
                     .all(|list| list.at.len() <= MAX_REJECTIONS),
             "the rejection lists' limits"
         );
-        assert!(self.cooldowns.len() <= MAX_COOLDOWNS, "the cooldown limit");
         assert!(
             self.step.is_empty(),
             "an input's effects were left uncollected: {:?}",
@@ -1528,13 +1423,10 @@ impl PoolModel {
         self.ended_joins.remove(&reservation);
     }
 
-    /// Joins an id that is already undecided, if `source` may.
-    fn join(
-        &mut self,
-        key: u64,
-        source: Source,
-        intent: Intent,
-    ) -> Result<ModelReservation, ModelUnreserved> {
+    /// Joins an id that is already undecided, if there is a place among its
+    /// waiters. Whether one peer may wait on an id twice is its caller's
+    /// rule.
+    fn join(&mut self, key: u64, intent: Intent) -> Result<ModelReservation, ModelUnreserved> {
         if intent == Intent::Fetch {
             return Err(ModelUnreserved::Pending);
         }
@@ -1549,23 +1441,14 @@ impl PoolModel {
             .len()
             .saturating_add(tickets.len())
             .saturating_add(usize::from(admission.owner_waiting));
-        // A peer source waits on an id once. The reserving source counts
-        // while its body can still arrive.
-        let already_on_it = matches!(source, Source::Peer(_))
-            && ((admission.owner_waiting && admission.source == source)
-                || admission
-                    .waiters
-                    .iter()
-                    .any(|waiter| waiter.source == source)
-                || tickets.iter().any(|ticket| ticket.source == source));
-        if waiting >= MAX_WAITERS || already_on_it {
+        if waiting >= MAX_WAITERS {
             return Err(ModelUnreserved::Pending);
         }
         // A joined caller is asked for the body only when nobody else can
         // bring it: the core has none, the reserving caller is not still
         // fetching or delivering it, and no other joined caller was asked.
-        // Otherwise a second decoded body would wait under the same slot,
-        // with nothing counted against the joining source. So a delivery
+        // Otherwise a second decoded body would wait under the same slot.
+        // So a delivery
         // that joins while the fetch is out waits for the fetch's verdict,
         // and its own copy is dropped, as today drops it.
         let brings = admission.body.is_none()
@@ -1576,7 +1459,6 @@ impl PoolModel {
             id,
             JoinTicket {
                 admission: key,
-                source,
                 brings,
             },
         );
@@ -1889,7 +1771,7 @@ impl PoolModel {
     }
 
     /// Ends an admission: every waiter gets the verdict, and the slot is
-    /// free. A charge reaches only a waiter with a peer supplier.
+    /// free.
     fn decide(&mut self, key: u64, verdict: ModelVerdict) {
         let admission = self
             .admissions
@@ -1903,7 +1785,6 @@ impl PoolModel {
             self.leases.insert(
                 admission.owner,
                 Lease {
-                    source: admission.source.clone(),
                     tx_id: admission.tx_id,
                     verdict,
                 },
@@ -1923,29 +1804,10 @@ impl PoolModel {
             self.ended_joins.insert(reservation, (tx_id, verdict));
         }
         for waiter in admission.waiters {
-            let verdict = self.charged(verdict, &waiter.supplier);
             self.step.effects.push(Effect::Verdict {
                 waiter: waiter.id,
                 verdict,
             });
-        }
-    }
-
-    /// `verdict` as `supplier` gets it. A cooldown charge starts a peer
-    /// supplier's cooldown, and nobody else is charged.
-    fn charged(&mut self, verdict: ModelVerdict, supplier: &Supplier) -> ModelVerdict {
-        match (verdict, supplier) {
-            (ModelVerdict::Rejected { scope, charge }, Supplier::Peer(peer)) => {
-                if charge == Charge::Cooldown {
-                    self.cool(peer);
-                }
-                ModelVerdict::Rejected { scope, charge }
-            }
-            (ModelVerdict::Rejected { scope, .. }, Supplier::Nobody) => ModelVerdict::Rejected {
-                scope,
-                charge: Charge::None,
-            },
-            (other, _) => other,
         }
     }
 
@@ -2228,14 +2090,13 @@ impl PoolModel {
         }
     }
 
-    /// Moves time to `now`. A cooldown or a remembered rejection ends at its
-    /// time, whichever input comes next.
+    /// Moves time to `now`. A remembered rejection ends at its time,
+    /// whichever input comes next.
     fn advance(&mut self, now: ModelTime) {
         if now <= self.now {
             return;
         }
         self.now = now;
-        self.cooldowns.retain(|_, until| *until > now);
         let memory = self.rejection_memory;
         for list in self.rejected_chain.values_mut() {
             while let Some(oldest) = list.order.front().copied() {
@@ -2323,30 +2184,6 @@ impl PoolModel {
                 .is_some_and(|at| at.saturating_add(self.rejection_memory) >= now)
         })
         .map(RejectionScope::EffectsChain)
-    }
-
-    /// Starts a peer's cooldown. A new peer past the limit replaces the one
-    /// whose cooldown ends first.
-    fn cool(&mut self, peer: &QueueSource) {
-        let key = CooldownKey::from(peer);
-        // A failure while the peer is already cooling down changes nothing,
-        // as today. Two transactions of one peer that were being verified
-        // together do not make the cooldown longer.
-        if self.cooldowns.contains_key(&key) {
-            return;
-        }
-        if self.cooldowns.len() >= MAX_COOLDOWNS {
-            let earliest = self
-                .cooldowns
-                .iter()
-                .min_by_key(|(key, until)| (**until, (*key).clone()))
-                .map(|(key, _)| key.clone());
-            if let Some(earliest) = earliest {
-                self.cooldowns.remove(&earliest);
-            }
-        }
-        self.cooldowns
-            .insert(key, self.now.saturating_add(COOLDOWN));
     }
 
     /// Whether `outpoint` became available after the event count

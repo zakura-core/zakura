@@ -1131,6 +1131,48 @@ async fn one_peer_holds_at_most_five_fetches(mode: Mode) {
     }
 }
 
+/// The core only: a body that earns its legacy peer a cooldown silences that
+/// peer. Its next push is ignored and never verified, and another peer's push
+/// still is. The adapter keeps the cooldown, since the core knows no peers.
+///
+/// Today's pool does the same, and its own tests cover it
+/// (`sprout_deposits_start_cooldowns` and the peer cooldown tests). This
+/// harness cannot show it for today's pool: that pool starts cooldowns only
+/// while its tip is recent, and the harness's tip is the genesis block. The
+/// core's verifier is told it is current here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cooldown_failure_silences_the_peer_that_sent_it() {
+    let mut harness = active_pool(Mode::Core).await;
+    let mut bodies = samples(3);
+    let (failing, ignored, other) = (bodies.remove(0), bodies.remove(0), bodies.remove(0));
+
+    let push = |tx: &VerifiedUnminedTx, peer: u8| Request::QueueFromPeer {
+        transactions: vec![tx.transaction.clone().into()],
+        source: legacy_peer(peer),
+    };
+    harness.ask(push(&failing, 1)).await;
+    harness
+        .verify(Err(TransactionError::DisabledAddToSproutPool))
+        .await;
+    // The rejection is cached once the failure is handled. The cooldown
+    // starts with it, so the next push sees it.
+    let id = failing.transaction.id();
+    for _ in 0..100 {
+        if harness.rejected([id]).await.contains(&id) {
+            break;
+        }
+        time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(harness.rejected([id]).await, [id].into());
+    time::sleep(Duration::from_millis(200)).await;
+
+    harness.ask(push(&ignored, 1)).await;
+    harness.verifier.expect_no_requests().await;
+
+    harness.ask(push(&other, 2)).await;
+    harness.verify(Ok(passed(&other, Vec::new()))).await;
+}
+
 /// A block that mines an id a peer's fetch is waiting on frees that fetch's
 /// slot, as today's pool cancels the download, so the peer's next offer is
 /// taken.

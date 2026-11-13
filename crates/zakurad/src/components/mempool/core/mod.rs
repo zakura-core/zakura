@@ -222,7 +222,8 @@ pub(crate) fn assemble(
 
     let adapter = adapter::CoreMempool::new(
         handle.clone(),
-        Timeout::new(outbound, TRANSACTION_DOWNLOAD_TIMEOUT),
+        Timeout::new(outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
+        outbound,
         adapter_read_state,
         expose_peer_addresses,
         misbehavior_sender,

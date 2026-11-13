@@ -33,8 +33,6 @@ mod regulation;
 pub mod testkit;
 mod trace;
 pub mod transport;
-#[cfg(test)]
-mod tx_relay;
 pub mod wire_codec;
 
 pub use block_sync::*;

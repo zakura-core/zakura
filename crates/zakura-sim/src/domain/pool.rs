@@ -25,12 +25,11 @@ use crate::{
 
 /// Every submission gets exactly one verdict from the core.
 pub const VERDICT_FOR_EVERY_SUBMISSION: &str = "pool/verdict-for-every-submission";
-/// A rejection charges exactly its body's peer supplier, never the reserving
-/// source, another peer or a local submission, and a cooldown has started
-/// when the caller gets the verdict.
-pub const SUPPLIER_CHARGED: &str = "pool/supplier-charged";
-/// No source holds more slots than the core's limits, counting each
-/// reservation until its body is submitted and each body until its
+/// A rejected body's verdict carries the charge its failure earned. Who is
+/// charged is the caller's: the core knows no peers.
+pub const CHARGE_MATCHES_FAILURE: &str = "pool/charge-matches-failure";
+/// The sources together hold no more slots than the node's limit, counting
+/// each reservation until its body is submitted and each body until its
 /// verification ends.
 pub const ADMISSIONS_WITHIN_LIMITS: &str = "pool/admissions-within-limits";
 /// Every published snapshot is a consistent pool, with the dependency edges
@@ -45,7 +44,7 @@ pub const SURVIVES_REORG: &str = "pool/survives-reorg";
 /// Every property in this module, in report order.
 pub const IDS: [&str; 6] = [
     VERDICT_FOR_EVERY_SUBMISSION,
-    SUPPLIER_CHARGED,
+    CHARGE_MATCHES_FAILURE,
     ADMISSIONS_WITHIN_LIMITS,
     CONSISTENT,
     LOG_COMPLETE,
@@ -67,34 +66,20 @@ pub struct PoolEvidence {
     pub failed_outcomes: u64,
     /// Verifications that returned a failure that charges a cooldown.
     pub cooldown_failures: u64,
-    /// For each rejection that charged a peer supplier a cooldown: the peer,
-    /// and whether the port showed it cooling when the verdict arrived.
-    pub charges: Vec<(String, bool)>,
-    /// Verdicts whose charge was checked against their body's script.
-    pub charges_checked: u64,
-    /// Cooldowns that fell on a supplier other than the reserving source.
-    pub relayed_charges: u64,
-    /// Invalid bodies this node submitted, which charge nobody.
-    pub local_failures: u64,
-    /// The peers that may be cooling down: each supplied an invalid body or
-    /// reported a violation.
-    pub may_cool: BTreeSet<String>,
-    /// The first charge that fell on the wrong peer, or a verdict whose
-    /// charge differs from what its body's script says.
-    pub misattributed: Option<String>,
-    /// Reservations granted and not yet submitted, failed or dropped: the
-    /// transaction, and its source's label.
-    pub held: BTreeMap<usize, String>,
-    /// Transactions the verifier is checking: a submission's source label,
-    /// or `None` for a revalidation.
-    pub verifying: BTreeMap<usize, Option<String>>,
-    /// The source label each transaction was last granted to.
-    pub slot_source: BTreeMap<usize, String>,
-    /// The most slots counted at once, in all.
+    /// Verdicts whose charge was checked against their body's script, by
+    /// the charge expected.
+    pub charges_checked: BTreeMap<String, u64>,
+    /// The first verdict whose charge differs from what its body's script
+    /// earns.
+    pub wrong_charge: Option<String>,
+    /// Reservations granted and not yet submitted, failed or dropped.
+    pub held: BTreeSet<usize>,
+    /// Transactions the verifier is checking, and whether each is a
+    /// revalidation.
+    pub verifying: BTreeMap<usize, bool>,
+    /// The most slots counted at once.
     pub peak_total: u64,
-    /// The most slots counted at once against one peer source.
-    pub peak_source: u64,
-    /// The first count past a limit.
+    /// The first count past the node's limit.
     pub past_limit: Option<String>,
     /// The transactions the verifier passed.
     pub passed: BTreeSet<usize>,
@@ -138,16 +123,16 @@ pub struct PoolEvidence {
 
 impl PoolEvidence {
     /// Counts the slots certainly in use now, and records the first count
-    /// past a limit.
+    /// past the node's limit.
     ///
     /// A reservation counts from the moment its caller holds it until the
-    /// caller submits or drops it, and a submitted body while the verifier
-    /// checks it. A revalidation counts only toward the node's limit. Both
-    /// lie inside the time the core counts the slot, with one exception: a
-    /// job the core cancels keeps counting until its task is dropped, which
-    /// is later. The harness's scripts cancel only revalidations, at chain
-    /// changes, and the chain script stops counting those when it begins a
-    /// change. So on these scripts the count never exceeds the core's own.
+    /// caller submits or drops it, and a submitted body or a revalidation
+    /// while the verifier checks it. Both lie inside the time the core counts
+    /// the slot, with one exception: a job the core cancels keeps counting
+    /// until its task is dropped, which is later. The harness's scripts
+    /// cancel only revalidations, at chain changes, and the chain script
+    /// stops counting those when it begins a change. So on these scripts the
+    /// count never exceeds the core's own.
     ///
     /// The count leaves out a parked body, and a body between its
     /// submission and its verification. Whether the machine counts those
@@ -155,32 +140,14 @@ impl PoolEvidence {
     /// the model's answers. This property is about the task that drives the
     /// machine: reservations it hands out and bodies it verifies.
     pub fn count_slots(&mut self) {
-        let mut by_source: BTreeMap<String, u64> = BTreeMap::new();
-        for source in self.held.values().chain(self.verifying.values().flatten()) {
-            *by_source.entry(source.clone()).or_default() += 1;
-        }
         let total = u64::try_from(self.held.len() + self.verifying.len())
             .expect("the harness's universe is small");
         self.peak_total = self.peak_total.max(total);
-        let mut past = None;
-        for (source, count) in by_source.into_iter().filter(|(source, _)| source != LOCAL) {
-            self.peak_source = self.peak_source.max(count);
-            if count > LIMITS.per_source {
-                past.get_or_insert(format!("{source} holds {count} slots"));
-            }
-        }
-        if total > LIMITS.pending {
-            past.get_or_insert(format!("the sources hold {total} slots"));
-        }
-        if self.past_limit.is_none() {
-            self.past_limit = past;
+        if total > LIMITS.pending && self.past_limit.is_none() {
+            self.past_limit = Some(format!("the sources hold {total} slots"));
         }
     }
 }
-
-/// The label of the submitter that is this node. It has no limit of its
-/// own.
-pub const LOCAL: &str = "local";
 
 /// The evidence the harness's tasks share. Each task holds the lock only
 /// between preemption points, so a check never finds it held.
@@ -198,15 +165,10 @@ pub fn lock(evidence: &SharedEvidence) -> MutexGuard<'_, PoolEvidence> {
 pub struct Limits {
     /// The node-wide limit.
     pub pending: u64,
-    /// One source's limit.
-    pub per_source: u64,
 }
 
 /// The limits the harness runs the core with.
-pub const LIMITS: Limits = Limits {
-    pending: 6,
-    per_source: 2,
-};
+pub const LIMITS: Limits = Limits { pending: 6 };
 
 /// What a pool check reads: the shared evidence.
 pub type PoolView = SharedEvidence;
@@ -228,20 +190,20 @@ pub fn properties<S: HasView<View = PoolView>>() -> Vec<Property<S>> {
             })),
         },
         Property {
-            id: PropertyId::new(SUPPLIER_CHARGED),
-            claim: "a rejection charges exactly its body's peer supplier, never the reserving source, another peer or a local submission, and a cooldown has started when the caller gets the verdict",
+            id: PropertyId::new(CHARGE_MATCHES_FAILURE),
+            claim: "a rejected body's verdict carries the charge its failure earned: a cooldown for an invalid body, a ban for a banned one, and nothing for a valid body the pool refuses",
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View],
             status: Status::Active,
             check: check_charges::<S>,
             witness: Some(TriggerHistory::View(|view, _| {
-                lock(view).charges_checked > 0
+                !lock(view).charges_checked.is_empty()
             })),
         },
         Property {
             id: PropertyId::new(ADMISSIONS_WITHIN_LIMITS),
-            claim: "no peer source holds more slots than its limit, nor all sources more than the node's, counting reservations until submitted and bodies while verified",
+            claim: "the sources together never hold more slots than the node's limit, counting reservations until submitted and bodies while verified",
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View],
@@ -249,7 +211,7 @@ pub fn properties<S: HasView<View = PoolView>>() -> Vec<Property<S>> {
             check: check_admissions::<S>,
             witness: Some(TriggerHistory::View(|view, _| {
                 let evidence = lock(view);
-                evidence.peak_total >= LIMITS.pending || evidence.peak_source >= LIMITS.per_source
+                evidence.peak_total >= LIMITS.pending
             })),
         },
         Property {
@@ -316,23 +278,17 @@ fn check_verdicts<S: HasView<View = PoolView>>(cx: &mut CheckCtx<'_, S>) -> Verd
     }
 }
 
-/// [`SUPPLIER_CHARGED`] after a step.
+/// [`CHARGE_MATCHES_FAILURE`] after a step.
 fn check_charges<S: HasView<View = PoolView>>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     let view = cx.view();
     let evidence = lock(&view);
-    if let Some(problem) = &evidence.misattributed {
+    if let Some(problem) = &evidence.wrong_charge {
         return cx.violated(
-            "each charge on its body's peer supplier alone",
+            "each verdict's charge as its failure earns",
             problem.clone(),
         );
     }
-    if let Some((peer, _)) = evidence.charges.iter().find(|(_, cooling)| !cooling) {
-        return cx.violated(
-            "the charged supplier is cooling down when its verdict arrives",
-            format!("{peer} was not cooling down"),
-        );
-    }
-    if evidence.charges.is_empty() {
+    if evidence.charges_checked.is_empty() {
         Verdict::NotApplicable
     } else {
         Verdict::Holds
@@ -345,10 +301,7 @@ fn check_admissions<S: HasView<View = PoolView>>(cx: &mut CheckCtx<'_, S>) -> Ve
     let evidence = lock(&view);
     if let Some(count) = &evidence.past_limit {
         return cx.violated(
-            format!(
-                "at most {} slots per peer source and {} in all",
-                LIMITS.per_source, LIMITS.pending
-            ),
+            format!("at most {} slots in all", LIMITS.pending),
             count.clone(),
         );
     }

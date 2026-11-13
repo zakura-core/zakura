@@ -23,10 +23,9 @@ use zakura_node_services::{
     block_memory::TransactionHandle,
     mempool::port::{
         chain_transitions, pool_port, AwaitOutputError, ChainReason, ChainTip, ChainTransition,
-        ChainTransitionSender, ConnectedBlock, Intent, LocalFault, NoRoom, PoolHandle, PoolReader,
-        RejectionScope, Source, Supplier, Unreserved, Verdict,
+        ChainTransitionSender, ConnectedBlock, Intent, LocalFault, PoolHandle, PoolReader,
+        RejectionScope, Unreserved, Verdict,
     },
-    mempool::QueueSource,
 };
 use zakura_rt::{
     collections::{HashMap, HashSet},
@@ -38,7 +37,7 @@ use crate::{
     config::Config,
     machine::{
         tests::{build, tip, TestVerifyError, Tx},
-        Outcome,
+        Limits, Outcome,
     },
 };
 
@@ -169,8 +168,26 @@ impl Harness {
         Self::start_at(txs, Some(tip(100, 0)))
     }
 
+    /// Starts a core at height 100 that knows `txs` and holds at most five
+    /// undecided transactions.
+    fn start_small(txs: &[Tx]) -> Self {
+        Self::start_with(
+            txs,
+            Some(tip(100, 0)),
+            Limits {
+                pending: 5,
+                revalidating: 4,
+            },
+        )
+    }
+
     /// Starts a core at `start_tip` that knows `txs`.
     fn start_at(txs: &[Tx], start_tip: Option<ChainTip>) -> Self {
+        Self::start_with(txs, start_tip, Limits::default())
+    }
+
+    /// Starts a core at `start_tip` that knows `txs`, with `limits`.
+    fn start_with(txs: &[Tx], start_tip: Option<ChainTip>, limits: Limits) -> Self {
         let chain = chain_transitions(start_tip);
         let transitions = chain.transitions();
         let (start, events) = transitions
@@ -189,7 +206,7 @@ impl Harness {
             hooks: Arc::default(),
             panic_building: Arc::default(),
         };
-        let core = PoolCore::new(
+        let core = PoolCore::with_limits(
             &Config {
                 tx_cost_limit: u64::MAX / 2,
                 ..Config::default()
@@ -200,6 +217,7 @@ impl Harness {
             verifier.clone(),
             inbox,
             active_rx,
+            limits,
         );
         let core = tokio::spawn(core.run());
         Self {
@@ -216,13 +234,12 @@ impl Harness {
     async fn submit(&self, tx: &Tx) -> Verdict {
         let reservation = self
             .handle
-            .reserve(tx.id(), Source::Node, Intent::Deliver)
+            .reserve(tx.id(), Intent::Deliver)
             .await
             .expect("the core grants a reservation");
         tokio::time::timeout(
             ANSWER,
-            self.handle
-                .submit(reservation, tx.real.transaction.clone(), Supplier::Nobody),
+            self.handle.submit(reservation, tx.real.transaction.clone()),
         )
         .await
         .expect("the core answers in time")
@@ -317,12 +334,12 @@ impl Harness {
     async fn submit_in_background(&self, tx: &Tx) -> tokio::task::JoinHandle<Verdict> {
         let reservation = self
             .handle
-            .reserve(tx.id(), Source::Node, Intent::Deliver)
+            .reserve(tx.id(), Intent::Deliver)
             .await
             .expect("the core grants a reservation");
         let handle = self.handle.clone();
         let body = tx.real.transaction.clone();
-        tokio::spawn(async move { handle.submit(reservation, body, Supplier::Nobody).await })
+        tokio::spawn(async move { handle.submit(reservation, body).await })
     }
 
     /// Waits until the published snapshot satisfies `done`.
@@ -397,13 +414,12 @@ async fn a_child_woken_by_its_parent_reads_a_pool_that_holds_the_parent() {
     // The child first: its parent is missing, so it parks.
     let reservation = harness
         .handle
-        .reserve(child.id(), Source::Node, Intent::Deliver)
+        .reserve(child.id(), Intent::Deliver)
         .await
         .expect("the core grants a reservation");
     let handle = harness.handle.clone();
     let child_tx = child.real.transaction.clone();
-    let child_verdict =
-        tokio::spawn(async move { handle.submit(reservation, child_tx, Supplier::Nobody).await });
+    let child_verdict = tokio::spawn(async move { handle.submit(reservation, child_tx).await });
 
     // The parent's admission wakes the child in the same step. If the core
     // started the child's job before it published that step, the child's
@@ -492,13 +508,12 @@ async fn turning_the_pool_off_answers_every_undecided_submission() {
 
     let reservation = harness
         .handle
-        .reserve(parent.id(), Source::Node, Intent::Deliver)
+        .reserve(parent.id(), Intent::Deliver)
         .await
         .expect("the core grants a reservation");
     let handle = harness.handle.clone();
     let tx = parent.real.transaction.clone();
-    let verdict =
-        tokio::spawn(async move { handle.submit(reservation, tx, Supplier::Nobody).await });
+    let verdict = tokio::spawn(async move { handle.submit(reservation, tx).await });
     harness.round_trip().await;
 
     harness.active.send_replace(false);
@@ -527,12 +542,11 @@ async fn turning_the_pool_off_answers_every_undecided_submission() {
 async fn turning_the_pool_off_cancels_a_fetch_still_out() {
     let (parent, _) = parent_and_child();
     let harness = Harness::start(std::slice::from_ref(&parent));
-    let peer = Source::Peer(QueueSource::LegacySocket(([10, 0, 0, 1], 8233).into()));
     let fetch = harness
         .handle
-        .reserve(parent.id(), peer, Intent::Fetch)
+        .reserve(parent.id(), Intent::Fetch)
         .await
-        .expect("the peer has room");
+        .expect("the node has room");
     let cancel = fetch.cancellation();
     assert!(!cancel.is_cancelled());
 
@@ -564,31 +578,27 @@ async fn a_verifier_that_panics_is_a_local_fault() {
 async fn a_dropped_reservation_frees_its_slot() {
     let mut runner = TestRunner::deterministic();
     let txs: Vec<Tx> = (0..6).map(|_| build(&mut runner, &[], 1, None)).collect();
-    let harness = Harness::start(&txs);
-    let peer = Source::Peer(QueueSource::LegacySocket(([10, 0, 0, 1], 8233).into()));
+    let harness = Harness::start_small(&txs);
 
     let mut held = Vec::new();
     for tx in &txs[..5] {
         held.push(
             harness
                 .handle
-                .reserve(tx.id(), peer.clone(), Intent::Fetch)
+                .reserve(tx.id(), Intent::Fetch)
                 .await
-                .expect("the peer has room"),
+                .expect("the node has room"),
         );
     }
     assert!(matches!(
-        harness
-            .handle
-            .reserve(txs[5].id(), peer.clone(), Intent::Fetch)
-            .await,
-        Err(Unreserved::NoRoom(NoRoom::Source))
+        harness.handle.reserve(txs[5].id(), Intent::Fetch).await,
+        Err(Unreserved::NoRoom)
     ));
 
     drop(held.pop());
     let _granted = harness
         .handle
-        .reserve(txs[5].id(), peer, Intent::Fetch)
+        .reserve(txs[5].id(), Intent::Fetch)
         .await
         .expect("the dropped reservation's slot is free again");
 }
@@ -628,7 +638,7 @@ async fn a_block_with_a_conflicting_transaction_removes_the_pooled_one() {
     assert!(matches!(
         harness
             .handle
-            .reserve(pooled.id(), Source::Node, Intent::Deliver)
+            .reserve(pooled.id(), Intent::Deliver)
             .await,
         Err(Unreserved::Rejected(rejection))
             if rejection.scope == RejectionScope::EffectsChain(ChainReason::DuplicateSpend)
@@ -724,30 +734,29 @@ async fn a_revalidation_that_panics_is_tried_again_later() {
 async fn a_submission_cancelled_after_it_is_queued_frees_its_slot() {
     let mut runner = TestRunner::deterministic();
     let txs: Vec<Tx> = (0..6).map(|_| build(&mut runner, &[], 1, None)).collect();
-    let harness = Harness::start(&txs);
-    let peer = Source::Peer(QueueSource::LegacySocket(([10, 0, 0, 1], 8233).into()));
+    let harness = Harness::start_small(&txs);
 
     let mut held = Vec::new();
     for tx in &txs[..5] {
         held.push(
             harness
                 .handle
-                .reserve(tx.id(), peer.clone(), Intent::Fetch)
+                .reserve(tx.id(), Intent::Fetch)
                 .await
-                .expect("the peer has room"),
+                .expect("the node has room"),
         );
     }
     // The submission is queued for the core, then its caller gives up
     // before the core takes it.
     let reservation = held.pop().expect("five were reserved");
     let body = txs[4].real.transaction.clone();
-    let mut submit = Box::pin(harness.handle.submit(reservation, body, Supplier::Nobody));
+    let mut submit = Box::pin(harness.handle.submit(reservation, body));
     assert!(poll!(&mut submit).is_pending(), "the command is queued");
     drop(submit);
 
     let _granted = harness
         .handle
-        .reserve(txs[5].id(), peer, Intent::Fetch)
+        .reserve(txs[5].id(), Intent::Fetch)
         .await
         .expect("the cancelled submission's slot is free again");
 }
@@ -794,10 +803,7 @@ async fn a_pool_with_no_tip_stays_off_until_the_chain_names_one() {
     let mut harness = Harness::start_at(std::slice::from_ref(&parent), None);
     harness.snapshot_until(|snapshot| !snapshot.active).await;
     assert!(matches!(
-        harness
-            .handle
-            .reserve(parent.id(), Source::Node, Intent::Deliver)
-            .await,
+        harness.handle.reserve(parent.id(), Intent::Deliver).await,
         Err(Unreserved::Inactive)
     ));
 

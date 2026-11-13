@@ -4,11 +4,7 @@
 //! review findings on the M1 and M2 plans, and the test name says which
 //! rule it pins.
 
-use std::{
-    collections::HashSet,
-    net::{Ipv6Addr, SocketAddr},
-    time::Duration,
-};
+use std::{collections::HashSet, time::Duration};
 
 use zakura_chain::{
     block::Height,
@@ -19,16 +15,14 @@ use zakura_chain::{
 use super::{
     model::{
         Effect, JobId, ModelBlock, ModelReader, ModelTransition, ModelTx, ModelUnreserved,
-        ModelVerdict, Outcome, OutputAnswer, PoolModel, Step, WaiterId, COOLDOWN, MAX_UNDECIDED,
+        ModelVerdict, Outcome, OutputAnswer, PoolModel, Step, WaiterId, MAX_UNDECIDED,
         REJECTION_MEMORY, REVALIDATE_RETRY, T_PARK, T_VERIFY,
     },
     pool_port, ChainReason, ChainTip, Change, ChangeLog, ChangeSeq, ChangesSince, Charge,
-    CooldownKey, Generation, GenerationCell, GenerationRead, Intent, LocalFault, NoRoom,
-    PoolCommand, PoolSnapshot, RejectionScope, RemovalReason, ReservationId, Source, Supplier,
-    Unreserved, Verdict, Violation, CHANGE_LOG_CAPACITY, COMMAND_QUEUE, MAX_COOLDOWNS, MAX_PENDING,
-    MAX_PENDING_PER_SOURCE, MAX_REJECTIONS, MAX_REVALIDATING, MAX_WAITERS,
+    Generation, GenerationCell, GenerationRead, Intent, LocalFault, PoolCommand, PoolSnapshot,
+    RejectionScope, RemovalReason, ReservationId, Unreserved, Verdict, CHANGE_LOG_CAPACITY,
+    COMMAND_QUEUE, MAX_PENDING, MAX_REJECTIONS, MAX_REVALIDATING, MAX_WAITERS,
 };
-use crate::mempool::QueueSource;
 use crate::mempool::TransactionDependencies;
 
 fn hash(n: u16) -> transaction::Hash {
@@ -43,20 +37,6 @@ fn id(n: u16) -> UnminedTxId {
 
 fn tx(n: u16) -> ModelTx {
     ModelTx::new(id(n))
-}
-
-/// A legacy peer with its own IP address, since a cooldown is per address.
-fn legacy(n: u16) -> QueueSource {
-    let [high, low] = n.to_be_bytes();
-    QueueSource::LegacySocket(SocketAddr::from(([10, 0, high, low], 8233)))
-}
-
-fn v2(n: u8) -> QueueSource {
-    QueueSource::Zakura(vec![n])
-}
-
-fn peer(n: u16) -> Source {
-    Source::Peer(legacy(n))
 }
 
 fn stable(generation: u64) -> GenerationRead {
@@ -90,19 +70,19 @@ fn the_job(step: &Step) -> JobId {
     started[0]
 }
 
-/// Reserves, then submits `tx` from one peer that is both source and
-/// supplier. Returns the waiter and the job that started.
-fn bring_in(model: &mut PoolModel, tx: ModelTx, from: QueueSource) -> (WaiterId, JobId) {
+/// Reserves, then submits `tx`. Returns the waiter and the job that
+/// started.
+fn bring_in(model: &mut PoolModel, tx: ModelTx) -> (WaiterId, JobId) {
     let reservation = model
-        .reserve(tx.id, Source::Peer(from.clone()), Intent::Fetch, secs(0))
+        .reserve(tx.id, Intent::Fetch, secs(0))
         .expect("the test has room");
-    let (waiter, step) = model.submit(reservation.id, tx, Supplier::Peer(from), secs(0));
+    let (waiter, step) = model.submit(reservation.id, tx, secs(0));
     (waiter, the_job(&step))
 }
 
 /// Admits `tx` at generation `generation`.
-fn admit(model: &mut PoolModel, tx: ModelTx, from: u16, generation: u64) {
-    let (waiter, job) = bring_in(model, tx, legacy(from));
+fn admit(model: &mut PoolModel, tx: ModelTx, generation: u64) {
+    let (waiter, job) = bring_in(model, tx);
     let step = model.outcome(
         job,
         Outcome::Pass,
@@ -222,7 +202,7 @@ async fn a_dropped_reservation_reaches_the_core() {
     });
 
     let reservation = handle
-        .reserve(id(1), Source::Node, Intent::Fetch)
+        .reserve(id(1), Intent::Fetch)
         .await
         .expect("the test core grants it");
     let mut inbox = core.await.expect("the test core does not panic");
@@ -237,7 +217,7 @@ async fn a_stopped_core_answers_every_call() {
     let (handle, inbox) = pool_port();
     drop(inbox);
     assert!(matches!(
-        handle.reserve(id(1), Source::Node, Intent::Fetch).await,
+        handle.reserve(id(1), Intent::Fetch).await,
         Err(Unreserved::Stopped)
     ));
     assert!(handle.snapshot().is_none());
@@ -248,32 +228,28 @@ async fn a_stopped_core_answers_every_call() {
 #[test]
 fn a_slot_is_held_from_the_reservation_so_bodies_stay_within_the_node_limit() {
     let mut model = new_model();
-    let peers = u16::try_from(MAX_PENDING / MAX_PENDING_PER_SOURCE).expect("100 peers");
+    let full = u16::try_from(MAX_PENDING).expect("the limit fits the test's ids");
     let mut reservations = Vec::new();
-    let mut n = 0;
-    for p in 0..peers {
-        for _ in 0..MAX_PENDING_PER_SOURCE {
-            let reservation = model
-                .reserve(id(n), peer(p), Intent::Fetch, secs(0))
-                .expect("each peer has five slots");
-            reservations.push((reservation.id, n, p));
-            n += 1;
-        }
+    for n in 0..full {
+        let reservation = model
+            .reserve(id(n), Intent::Fetch, secs(0))
+            .expect("the node has room");
+        reservations.push((reservation.id, n));
     }
     // The node is full before one body has been fetched.
     assert_eq!(model.bodies_held(), 0);
     assert_eq!(
-        model.reserve(id(n), peer(peers), Intent::Fetch, secs(0)),
-        Err(ModelUnreserved::NoRoom(NoRoom::Node))
+        model.reserve(id(full), Intent::Fetch, secs(0)),
+        Err(ModelUnreserved::NoRoom)
     );
     assert_eq!(
-        model.reserve(id(n), Source::Node, Intent::Deliver, secs(0)),
-        Err(ModelUnreserved::NoRoom(NoRoom::Node))
+        model.reserve(id(full), Intent::Deliver, secs(0)),
+        Err(ModelUnreserved::NoRoom)
     );
 
     // Every fetch completes. No body exists outside a reservation.
-    for (reservation, n, p) in reservations {
-        model.submit(reservation, tx(n), Supplier::Peer(legacy(p)), secs(0));
+    for (reservation, n) in reservations {
+        model.submit(reservation, tx(n), secs(0));
     }
     assert_eq!(model.bodies_held(), MAX_PENDING);
     model.assert_invariants();
@@ -281,113 +257,34 @@ fn a_slot_is_held_from_the_reservation_so_bodies_stay_within_the_node_limit() {
 
 #[test]
 fn a_released_reservation_frees_its_slot() {
-    let mut model = new_model();
+    let mut model = new_model().with_limits(5, 4);
     let mut held = Vec::new();
     for n in 0..5 {
         held.push(
             model
-                .reserve(id(n), peer(1), Intent::Fetch, secs(0))
+                .reserve(id(n), Intent::Fetch, secs(0))
                 .expect("five fit"),
         );
     }
     assert_eq!(
-        model.reserve(id(9), peer(1), Intent::Fetch, secs(0)),
-        Err(ModelUnreserved::NoRoom(NoRoom::Source))
+        model.reserve(id(9), Intent::Fetch, secs(0)),
+        Err(ModelUnreserved::NoRoom)
     );
 
     // The fetch of id 0 failed, so its caller dropped the reservation.
     model.release(held[0].id, secs(0));
-    assert!(model
-        .reserve(id(9), peer(1), Intent::Fetch, secs(0))
-        .is_ok());
-    assert_eq!(model.counted_against(&peer(1)), 5);
+    assert!(model.reserve(id(9), Intent::Fetch, secs(0)).is_ok());
     assert_eq!(model.slots_in_use(), 5);
-}
-
-#[test]
-fn a_v2_peer_on_the_adapter_is_counted_and_never_charged() {
-    let mut model = new_model();
-    let source = Source::Peer(v2(1));
-    let mut first = None;
-    for n in 0..5 {
-        let reservation = model
-            .reserve(id(n), source.clone(), Intent::Deliver, secs(0))
-            .expect("five pushed bodies fit");
-        // The adapter does not record who served a body.
-        let (waiter, step) = model.submit(reservation.id, tx(n), Supplier::Nobody, secs(0));
-        first.get_or_insert((waiter, the_job(&step)));
-    }
-    // The sixth body from the same peer has no room, as today.
-    assert_eq!(
-        model.reserve(id(5), source, Intent::Deliver, secs(0)),
-        Err(ModelUnreserved::NoRoom(NoRoom::Source))
-    );
-
-    let (waiter, job) = first.expect("five were submitted");
-    let step = model.outcome(
-        job,
-        Outcome::Fail {
-            scope: RejectionScope::ExactTip,
-            charge: Charge::Ban,
-        },
-        stable(0),
-        stable(0),
-        secs(1),
-    );
-    assert_eq!(
-        step.verdict(waiter),
-        Some(rejected(RejectionScope::ExactTip, Charge::None))
-    );
 }
 
 // The model: one reservation, several suppliers.
 
 #[test]
-fn a_second_peer_can_answer_without_moving_the_reservation() {
-    let mut model = new_model();
-    let (alice, bob) = (legacy(1), legacy(2));
-    // Bob already has five undecided transactions of his own.
-    for n in 10..15 {
-        model
-            .reserve(id(n), Source::Peer(bob.clone()), Intent::Fetch, secs(0))
-            .expect("five fit");
-    }
-
-    // Alice is asked first and goes silent. Bob is asked next and answers.
-    let reservation = model
-        .reserve(id(1), Source::Peer(alice.clone()), Intent::Fetch, secs(0))
-        .expect("alice has room");
-    let (waiter, step) = model.submit(reservation.id, tx(1), Supplier::Peer(bob.clone()), secs(9));
-    let job = the_job(&step);
-
-    // The slot is still Alice's. Bob stays at his five.
-    assert_eq!(model.counted_against(&Source::Peer(alice)), 1);
-    assert_eq!(model.counted_against(&Source::Peer(bob)), 5);
-    model.assert_invariants();
-
-    // The bytes were Bob's, so the charge is Bob's.
-    let step = model.outcome(
-        job,
-        Outcome::Fail {
-            scope: RejectionScope::ExactTip,
-            charge: Charge::Ban,
-        },
-        stable(0),
-        stable(0),
-        secs(10),
-    );
-    assert_eq!(
-        step.verdict(waiter),
-        Some(rejected(RejectionScope::ExactTip, Charge::Ban))
-    );
-}
-
-#[test]
 fn a_joiner_that_comes_back_after_a_local_fault_gets_that_fault() {
     let mut model = new_model();
-    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (waiter, job) = bring_in(&mut model, tx(1));
     let late = model
-        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("joins");
     let step = model.outcome(
         job,
@@ -403,41 +300,37 @@ fn a_joiner_that_comes_back_after_a_local_fault_gets_that_fault() {
 
     // Nothing is cached after a local fault. The late joiner gets the
     // admission's verdict, and can submit again.
-    let (waiter, step) = model.submit(late.id, tx(1), Supplier::Peer(legacy(2)), secs(2));
+    let (waiter, step) = model.submit(late.id, tx(1), secs(2));
     assert_eq!(
         step.verdict(waiter),
         Some(ModelVerdict::LocalFault(LocalFault::StateUnavailable))
     );
-    assert!(model
-        .reserve(id(1), peer(2), Intent::Deliver, secs(2))
-        .is_ok());
+    assert!(model.reserve(id(1), Intent::Deliver, secs(2)).is_ok());
 }
 
 #[test]
 fn an_undecided_id_is_not_fetched_twice() {
     let mut model = new_model();
-    model
-        .reserve(id(1), peer(1), Intent::Fetch, secs(0))
-        .expect("room");
+    model.reserve(id(1), Intent::Fetch, secs(0)).expect("room");
     assert_eq!(
-        model.reserve(id(1), peer(2), Intent::Fetch, secs(0)),
+        model.reserve(id(1), Intent::Fetch, secs(0)),
         Err(ModelUnreserved::Pending)
     );
 }
 
 #[test]
-fn joined_submissions_share_one_verification_and_each_supplier_is_charged() {
+fn joined_submissions_share_one_verification_and_each_gets_its_charge() {
     let mut model = new_model();
-    let (first, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (first, job) = bring_in(&mut model, tx(1));
     let joined = model
-        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("joins");
-    let (second, step) = model.submit(joined.id, tx(1), Supplier::Peer(legacy(2)), secs(0));
+    let (second, step) = model.submit(joined.id, tx(1), secs(0));
     assert!(step.started().is_empty(), "no second verification");
     let local = model
-        .reserve(id(1), Source::Node, Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("joins");
-    let (rpc, _) = model.submit(local.id, tx(1), Supplier::Nobody, secs(0));
+    let (third, _) = model.submit(local.id, tx(1), secs(0));
     assert_eq!(model.slots_in_use(), 1, "a joined submission takes no slot");
 
     let step = model.outcome(
@@ -450,33 +343,20 @@ fn joined_submissions_share_one_verification_and_each_supplier_is_charged() {
         stable(0),
         secs(1),
     );
+    // Every waiter gets the charge the body earned. Each caller applies it
+    // to the peer that sent its copy, or to nobody for a local one.
     let charged = rejected(
         RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
         Charge::Cooldown,
     );
     assert_eq!(step.verdict(first), Some(charged));
     assert_eq!(step.verdict(second), Some(charged));
-    assert_eq!(
-        step.verdict(rpc),
-        Some(rejected(
-            RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
-            Charge::None
-        ))
-    );
+    assert_eq!(step.verdict(third), Some(charged));
     assert_eq!(step.changes, vec![Change::Refused(id(1))]);
 
-    // Both peer suppliers are cooling down. The cached rejection answers
-    // everyone else.
+    // The cached rejection answers everyone else.
     assert_eq!(
-        model.reserve(id(2), peer(1), Intent::Fetch, secs(1)),
-        Err(ModelUnreserved::CoolingDown)
-    );
-    assert_eq!(
-        model.reserve(id(2), peer(2), Intent::Fetch, secs(1)),
-        Err(ModelUnreserved::CoolingDown)
-    );
-    assert_eq!(
-        model.reserve(id(1), peer(3), Intent::Fetch, secs(1)),
+        model.reserve(id(1), Intent::Fetch, secs(1)),
         Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain(
             ChainReason::DuplicateSpend
         )))
@@ -484,22 +364,17 @@ fn joined_submissions_share_one_verification_and_each_supplier_is_charged() {
 }
 
 #[test]
-fn one_id_takes_a_bounded_number_of_waiters_and_one_per_peer() {
+fn one_id_takes_a_bounded_number_of_waiters() {
     let mut model = new_model();
-    bring_in(&mut model, tx(1), legacy(0));
-    // The same peer cannot wait on the id twice.
-    assert_eq!(
-        model.reserve(id(1), peer(0), Intent::Deliver, secs(0)),
-        Err(ModelUnreserved::Pending)
-    );
-    for p in 1..u16::try_from(MAX_WAITERS).expect("small") {
+    bring_in(&mut model, tx(1));
+    for _ in 1..MAX_WAITERS {
         let joined = model
-            .reserve(id(1), peer(p), Intent::Deliver, secs(0))
+            .reserve(id(1), Intent::Deliver, secs(0))
             .expect("the waiter limit is not reached");
-        model.submit(joined.id, tx(1), Supplier::Peer(legacy(p)), secs(0));
+        model.submit(joined.id, tx(1), secs(0));
     }
     assert_eq!(
-        model.reserve(id(1), peer(99), Intent::Deliver, secs(0)),
+        model.reserve(id(1), Intent::Deliver, secs(0)),
         Err(ModelUnreserved::Pending)
     );
     model.assert_invariants();
@@ -510,7 +385,7 @@ fn one_id_takes_a_bounded_number_of_waiters_and_one_per_peer() {
 #[test]
 fn an_outcome_that_saw_a_chain_change_gives_no_verdict_and_runs_again() {
     let mut model = new_model();
-    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (waiter, job) = bring_in(&mut model, tx(1));
 
     // State advanced during the verification. The outcome is a failure, but
     // it may be a failure against a mix of two chains.
@@ -536,7 +411,7 @@ fn an_outcome_that_saw_a_chain_change_gives_no_verdict_and_runs_again() {
 #[test]
 fn a_chain_that_goes_away_and_comes_back_is_still_a_change() {
     let mut model = new_model();
-    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (waiter, job) = bring_in(&mut model, tx(1));
 
     // Tip A, then B, then A again. The hash is the same, the generation is
     // not.
@@ -559,7 +434,7 @@ fn a_chain_that_goes_away_and_comes_back_is_still_a_change() {
 #[test]
 fn a_read_taken_while_state_is_changing_is_never_used() {
     let mut model = new_model();
-    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (waiter, job) = bring_in(&mut model, tx(1));
     let step = model.outcome(
         job,
         Outcome::Pass,
@@ -578,7 +453,7 @@ fn a_read_taken_while_state_is_changing_is_never_used() {
 #[test]
 fn an_old_outcome_that_the_core_is_already_past_runs_again_at_once() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     model.transition(transition(1, 101, vec![vec![]]), secs(1));
     // The worker read generation 0 both times, before the change.
     let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(2));
@@ -589,7 +464,7 @@ fn an_old_outcome_that_the_core_is_already_past_runs_again_at_once() {
 #[test]
 fn a_verification_that_runs_too_long_is_a_local_fault() {
     let mut model = new_model();
-    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (waiter, job) = bring_in(&mut model, tx(1));
     let step = model.tick(T_VERIFY);
     assert_eq!(
         step.verdict(waiter),
@@ -620,14 +495,14 @@ fn missing(parent: u16) -> Outcome {
 #[test]
 fn a_parked_child_runs_again_when_its_parent_is_admitted() {
     let mut model = new_model();
-    let (child, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    let (child, job) = bring_in(&mut model, child_of(2, 1));
     let step = model.outcome(job, missing(1), stable(0), stable(0), secs(1));
     assert_eq!(step, Step::default());
     assert!(model.is_parked(id(2)));
     // A parked transaction still holds its slot.
     assert_eq!(model.slots_in_use(), 1);
 
-    let (_, parent_job) = bring_in(&mut model, tx(1), legacy(2));
+    let (_, parent_job) = bring_in(&mut model, tx(1));
     let step = model.outcome(parent_job, Outcome::Pass, stable(0), stable(0), secs(2));
     let job = the_job(&step);
     let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(3));
@@ -638,8 +513,8 @@ fn a_parked_child_runs_again_when_its_parent_is_admitted() {
 #[test]
 fn a_parent_admitted_between_the_lookup_and_the_parking_does_not_strand_the_child() {
     let mut model = new_model();
-    let (_, child_job) = bring_in(&mut model, child_of(2, 1), legacy(1));
-    let (_, parent_job) = bring_in(&mut model, tx(1), legacy(2));
+    let (_, child_job) = bring_in(&mut model, child_of(2, 1));
+    let (_, parent_job) = bring_in(&mut model, tx(1));
 
     // The child's verifier looked first and found nothing. The parent is
     // admitted before the core handles the child's outcome.
@@ -654,7 +529,7 @@ fn a_parent_admitted_between_the_lookup_and_the_parking_does_not_strand_the_chil
 #[test]
 fn a_parked_child_runs_again_when_a_block_mines_its_parent() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    let (_, job) = bring_in(&mut model, child_of(2, 1));
     model.outcome(job, missing(1), stable(0), stable(0), secs(1));
 
     let step = model.transition(transition(1, 101, vec![vec![tx(1)]]), secs(2));
@@ -665,14 +540,14 @@ fn a_parked_child_runs_again_when_a_block_mines_its_parent() {
 #[test]
 fn a_child_parked_on_a_hidden_parent_runs_again_when_the_parent_passes() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(1), 0);
     let step = model.transition(reorg(1, 100), secs(1));
     assert_eq!(step.changes, vec![Change::Hidden(id(1))]);
     let parent_job = the_job(&step);
 
     // The parent is in the pool but hidden, so the verifier cannot see its
     // output.
-    let (child, job) = bring_in(&mut model, child_of(2, 1), legacy(2));
+    let (child, job) = bring_in(&mut model, child_of(2, 1));
     model.outcome(job, missing(1), stable(1), stable(1), secs(2));
     assert!(model.is_parked(id(2)));
 
@@ -688,10 +563,10 @@ fn a_child_parked_on_a_hidden_parent_runs_again_when_the_parent_passes() {
 #[test]
 fn a_child_of_a_hidden_parent_that_fails_is_rejected_for_an_unresolved_parent() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(1), 0);
     let step = model.transition(reorg(1, 100), secs(0));
     let parent_job = the_job(&step);
-    let (child, job) = bring_in(&mut model, child_of(2, 1), legacy(2));
+    let (child, job) = bring_in(&mut model, child_of(2, 1));
     model.outcome(job, missing(1), stable(1), stable(1), secs(0));
 
     assert_eq!(model.tick(secs(50)), Step::default());
@@ -729,15 +604,13 @@ fn a_child_of_a_hidden_parent_that_fails_is_rejected_for_an_unresolved_parent() 
 #[test]
 fn the_wait_for_a_parent_is_flat_and_does_not_stop_while_the_parent_is_verified() {
     let mut model = new_model();
-    let (child, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    let (child, job) = bring_in(&mut model, child_of(2, 1));
     model.outcome(job, missing(1), stable(0), stable(0), secs(0));
 
     // The parent's body arrives at forty seconds and its verification is
     // slow.
-    let reservation = model
-        .reserve(id(1), peer(2), Intent::Fetch, secs(30))
-        .expect("room");
-    model.submit(reservation.id, tx(1), Supplier::Peer(legacy(2)), secs(40));
+    let reservation = model.reserve(id(1), Intent::Fetch, secs(30)).expect("room");
+    model.submit(reservation.id, tx(1), secs(40));
 
     // The child's sixty seconds are not paused for that. This is today's
     // wait, and it is what keeps the child's lifetime bounded.
@@ -754,9 +627,9 @@ fn the_wait_for_a_parent_is_flat_and_does_not_stop_while_the_parent_is_verified(
 fn a_block_removes_a_pooled_transaction_that_conflicts_with_one_never_pooled() {
     let mut model = new_model();
     let coin = hash(900);
-    admit(&mut model, tx(1).spending(coin, 0), 1, 0);
-    admit(&mut model, child_of(2, 1), 2, 0);
-    admit(&mut model, tx(3), 3, 0);
+    admit(&mut model, tx(1).spending(coin, 0), 0);
+    admit(&mut model, child_of(2, 1), 0);
+    admit(&mut model, tx(3), 0);
 
     // The block mines transaction 7, which the pool never saw. It spends the
     // same output as transaction 1. Its id alone would not show that.
@@ -788,8 +661,8 @@ fn a_block_removes_a_pooled_transaction_that_conflicts_with_one_never_pooled() {
 #[test]
 fn a_mined_parent_leaves_its_child_in_the_pool() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
-    admit(&mut model, child_of(2, 1), 2, 0);
+    admit(&mut model, tx(1), 0);
+    admit(&mut model, child_of(2, 1), 0);
     model.transition(transition(1, 101, vec![vec![tx(1)]]), secs(1));
     assert_eq!(model.visible(), vec![id(2)]);
 }
@@ -799,7 +672,7 @@ fn a_block_expires_transactions_by_height() {
     let mut model = new_model();
     let mut expiring = tx(1);
     expiring.expiry = Some(Height(102));
-    admit(&mut model, expiring, 1, 0);
+    admit(&mut model, expiring, 0);
 
     let step = model.transition(transition(1, 101, vec![vec![]]), secs(1));
     assert!(step.changes.is_empty());
@@ -821,7 +694,7 @@ fn a_tip_change_forgets_tip_scoped_rejections_only() {
         (2, RejectionScope::EffectsTip),
         (3, RejectionScope::EffectsChain(ChainReason::DuplicateSpend)),
     ] {
-        let (_, job) = bring_in(&mut model, tx(n), legacy(n));
+        let (_, job) = bring_in(&mut model, tx(n));
         model.outcome(
             job,
             Outcome::Fail {
@@ -833,20 +706,16 @@ fn a_tip_change_forgets_tip_scoped_rejections_only() {
             secs(0),
         );
         assert_eq!(
-            model.reserve(id(n), peer(50), Intent::Fetch, secs(0)),
+            model.reserve(id(n), Intent::Fetch, secs(0)),
             Err(ModelUnreserved::Rejected(scope))
         );
     }
 
     model.transition(transition(1, 101, vec![vec![]]), secs(1));
-    assert!(model
-        .reserve(id(1), peer(50), Intent::Fetch, secs(1))
-        .is_ok());
-    assert!(model
-        .reserve(id(2), peer(50), Intent::Fetch, secs(1))
-        .is_ok());
+    assert!(model.reserve(id(1), Intent::Fetch, secs(1)).is_ok());
+    assert!(model.reserve(id(2), Intent::Fetch, secs(1)).is_ok());
     assert_eq!(
-        model.reserve(id(3), peer(50), Intent::Fetch, secs(1)),
+        model.reserve(id(3), Intent::Fetch, secs(1)),
         Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain(
             ChainReason::DuplicateSpend
         )))
@@ -856,8 +725,8 @@ fn a_tip_change_forgets_tip_scoped_rejections_only() {
 #[test]
 fn a_reorg_keeps_the_pool_and_verifies_it_again_parents_first() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
-    admit(&mut model, child_of(2, 1), 2, 0);
+    admit(&mut model, tx(1), 0);
+    admit(&mut model, child_of(2, 1), 0);
 
     let step = model.transition(reorg(1, 100), secs(1));
     assert_eq!(
@@ -886,7 +755,7 @@ fn a_reorg_keeps_the_pool_and_verifies_it_again_parents_first() {
 #[test]
 fn a_revalidation_that_hits_a_local_fault_keeps_the_transaction_and_tries_again() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(1), 0);
     let step = model.transition(reorg(1, 100), secs(0));
     let fault = Outcome::LocalFault(LocalFault::StateUnavailable);
 
@@ -919,8 +788,8 @@ fn a_revalidation_that_hits_a_local_fault_keeps_the_transaction_and_tries_again(
 #[test]
 fn a_missed_chain_event_checks_the_pool_and_every_parked_transaction_again() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
-    let (_, job) = bring_in(&mut model, child_of(3, 2), legacy(2));
+    admit(&mut model, tx(1), 0);
+    let (_, job) = bring_in(&mut model, child_of(3, 2));
     model.outcome(job, missing(2), stable(0), stable(0), secs(0));
     assert!(model.is_parked(id(3)));
 
@@ -950,7 +819,7 @@ fn revalidation_leaves_room_for_new_transactions() {
     let mut model = new_model();
     let pooled = u16::try_from(MAX_REVALIDATING + 50).expect("small");
     for n in 0..pooled {
-        admit(&mut model, tx(n), n, 0);
+        admit(&mut model, tx(n), 0);
     }
 
     let step = model.transition(reorg(1, 100), secs(1));
@@ -959,13 +828,11 @@ fn revalidation_leaves_room_for_new_transactions() {
 
     // New transactions still get in while the pool is checked again.
     for n in 0..u16::try_from(MAX_PENDING - MAX_REVALIDATING).expect("small") {
-        assert!(model
-            .reserve(id(1_000 + n), peer(1_000 + n), Intent::Fetch, secs(1))
-            .is_ok());
+        assert!(model.reserve(id(1_000 + n), Intent::Fetch, secs(1)).is_ok());
     }
     assert_eq!(
-        model.reserve(id(2_000), peer(2_000), Intent::Fetch, secs(1)),
-        Err(ModelUnreserved::NoRoom(NoRoom::Node))
+        model.reserve(id(2_000), Intent::Fetch, secs(1)),
+        Err(ModelUnreserved::NoRoom)
     );
 
     // A finished revalidation hands its place to the next queued one.
@@ -985,7 +852,7 @@ fn a_rejection_and_a_later_admission_of_one_id_keep_their_order_in_the_log() {
     let mut model = new_model();
     let mut log = ChangeLog::default();
 
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     let step = model.outcome(
         job,
         Outcome::Fail {
@@ -1002,7 +869,7 @@ fn a_rejection_and_a_later_admission_of_one_id_keep_their_order_in_the_log() {
             .transition(transition(1, 101, vec![vec![]]), secs(1))
             .changes,
     );
-    let (_, job) = bring_in(&mut model, tx(1), legacy(2));
+    let (_, job) = bring_in(&mut model, tx(1));
     let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), secs(2));
     log.append(step.changes);
 
@@ -1020,25 +887,11 @@ fn a_rejection_and_a_later_admission_of_one_id_keep_their_order_in_the_log() {
 // The model: cooldowns and the off switch.
 
 #[test]
-fn a_reported_violation_starts_a_cooldown_without_a_submission() {
-    let mut model = new_model();
-    model.violation(v2(1), secs(0));
-    assert_eq!(
-        model.reserve(id(1), Source::Peer(v2(1)), Intent::Fetch, secs(1)),
-        Err(ModelUnreserved::CoolingDown)
-    );
-    model.tick(COOLDOWN);
-    assert!(model
-        .reserve(id(1), Source::Peer(v2(1)), Intent::Fetch, COOLDOWN)
-        .is_ok());
-}
-
-#[test]
 fn turning_the_pool_off_answers_every_waiter() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
-    let (verifying, job) = bring_in(&mut model, tx(2), legacy(2));
-    let (parked, parked_job) = bring_in(&mut model, child_of(4, 3), legacy(3));
+    admit(&mut model, tx(1), 0);
+    let (verifying, job) = bring_in(&mut model, tx(2));
+    let (parked, parked_job) = bring_in(&mut model, child_of(4, 3));
     model.outcome(parked_job, missing(3), stable(0), stable(0), secs(0));
 
     let step = model.deactivate(secs(1));
@@ -1054,15 +907,13 @@ fn turning_the_pool_off_answers_every_waiter() {
         }]
     );
     assert_eq!(
-        model.reserve(id(5), peer(5), Intent::Fetch, secs(1)),
+        model.reserve(id(5), Intent::Fetch, secs(1)),
         Err(ModelUnreserved::Inactive)
     );
 
     model.activate(Height(500), Generation(9), secs(2));
     assert!(model.visible().is_empty());
-    assert!(model
-        .reserve(id(5), peer(5), Intent::Fetch, secs(2))
-        .is_ok());
+    assert!(model.reserve(id(5), Intent::Fetch, secs(2)).is_ok());
 }
 
 // A scripted random run.
@@ -1095,7 +946,7 @@ fn every_submission_gets_exactly_one_verdict_and_the_limits_hold() {
         let mut generation = 0;
         let mut tip = 100;
         let mut now = secs(0);
-        let mut reservations: Vec<(ReservationId, u16, u16)> = Vec::new();
+        let mut reservations: Vec<(ReservationId, u16)> = Vec::new();
         let mut jobs: Vec<JobId> = Vec::new();
         let mut waiters: Vec<WaiterId> = Vec::new();
         let mut verdicts: Vec<WaiterId> = Vec::new();
@@ -1119,7 +970,6 @@ fn every_submission_gets_exactly_one_verdict_and_the_limits_hold() {
         for _ in 0..600 {
             now += Duration::from_millis(rng.next(4_000));
             let n = u16::try_from(rng.next(40)).expect("small");
-            let p = u16::try_from(rng.next(6)).expect("small");
             match rng.next(10) {
                 0..=2 => {
                     let intent = if rng.next(2) == 0 {
@@ -1127,14 +977,14 @@ fn every_submission_gets_exactly_one_verdict_and_the_limits_hold() {
                     } else {
                         Intent::Deliver
                     };
-                    if let Ok(reservation) = model.reserve(id(n), peer(p), intent, now) {
-                        reservations.push((reservation.id, n, p));
+                    if let Ok(reservation) = model.reserve(id(n), intent, now) {
+                        reservations.push((reservation.id, n));
                     }
                     record(model.effects(), &mut jobs, &mut verdicts);
                 }
                 3..=4 if !reservations.is_empty() => {
                     let pick = rng.pick(reservations.len());
-                    let (reservation, n, p) = reservations.swap_remove(pick);
+                    let (reservation, n) = reservations.swap_remove(pick);
                     if rng.next(5) == 0 {
                         let step = model.release(reservation, now);
                         record(step, &mut jobs, &mut verdicts);
@@ -1145,8 +995,7 @@ fn every_submission_gets_exactly_one_verdict_and_the_limits_hold() {
                         } else {
                             tx(n)
                         };
-                        let (waiter, step) =
-                            model.submit(reservation, body, Supplier::Peer(legacy(p)), now);
+                        let (waiter, step) = model.submit(reservation, body, now);
                         waiters.push(waiter);
                         record(step, &mut jobs, &mut verdicts);
                     }
@@ -1224,19 +1073,12 @@ async fn cancelling_a_blocked_submission_frees_its_slot() {
     // The command queue is full, so the submission waits to be sent.
     for _ in 0..COMMAND_QUEUE {
         handle
-            .report_violation(Violation {
-                peer: v2(1),
-                cause: "test",
-            })
+            .fetch_failed(inbox.grant(ReservationId(9), tx_id, false, true, Default::default()))
             .await;
     }
     let caller = {
         let handle = handle.clone();
-        tokio::spawn(async move {
-            handle
-                .submit(reservation, transaction, Supplier::Nobody)
-                .await
-        })
+        tokio::spawn(async move { handle.submit(reservation, transaction).await })
     };
     tokio::task::yield_now().await;
     assert_eq!(inbox.released(), None);
@@ -1264,11 +1106,7 @@ async fn an_accepted_reservation_is_the_cores_and_a_dropped_command_is_not() {
     );
     let caller = {
         let handle = handle.clone();
-        tokio::spawn(async move {
-            handle
-                .submit(reservation, transaction, Supplier::Nobody)
-                .await
-        })
+        tokio::spawn(async move { handle.submit(reservation, transaction).await })
     };
 
     let Some(PoolCommand::Submit {
@@ -1300,11 +1138,7 @@ async fn a_joined_reservation_that_needs_no_body_sends_none() {
     );
     let caller = {
         let handle = handle.clone();
-        tokio::spawn(async move {
-            handle
-                .submit(reservation, transaction, Supplier::Peer(v2(1)))
-                .await
-        })
+        tokio::spawn(async move { handle.submit(reservation, transaction).await })
     };
 
     let Some(PoolCommand::Join { reply, .. }) = inbox.command().await else {
@@ -1328,7 +1162,7 @@ async fn a_body_for_another_id_is_refused_and_frees_the_slot() {
         Default::default(),
     );
     assert!(matches!(
-        handle.submit(reservation, body(2), Supplier::Nobody).await,
+        handle.submit(reservation, body(2)).await,
         Verdict::LocalFault(LocalFault::WrongTransaction)
     ));
     assert_eq!(inbox.released(), Some(ReservationId(9)));
@@ -1382,57 +1216,30 @@ fn a_reader_is_never_handed_changes_newer_than_its_snapshot() {
 }
 
 #[test]
-fn a_legacy_cooldown_key_is_the_canonical_ip() {
-    let plain = QueueSource::LegacySocket(SocketAddr::from(([10, 0, 0, 1], 8233)));
-    let other_port = QueueSource::LegacySocket(SocketAddr::from(([10, 0, 0, 1], 9999)));
-    let mapped = QueueSource::LegacySocket(SocketAddr::from((
-        Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001),
-        8233,
-    )));
-    assert_eq!(CooldownKey::from(&plain), CooldownKey::from(&other_port));
-    assert_eq!(CooldownKey::from(&plain), CooldownKey::from(&mapped));
-    assert_ne!(CooldownKey::from(&v2(1)), CooldownKey::from(&v2(2)));
-}
-
-#[test]
-fn a_cooldown_follows_a_legacy_peer_to_a_new_port() {
-    let mut model = new_model();
-    let first = QueueSource::LegacySocket(SocketAddr::from(([10, 9, 9, 9], 8233)));
-    let reconnected = QueueSource::LegacySocket(SocketAddr::from(([10, 9, 9, 9], 40_000)));
-    model.violation(first, secs(0));
-    assert_eq!(
-        model.reserve(id(1), Source::Peer(reconnected), Intent::Fetch, secs(1)),
-        Err(ModelUnreserved::CoolingDown)
-    );
-}
-
-#[test]
 fn a_delivery_that_joins_while_the_fetch_is_out_waits_for_it() {
     let mut model = new_model();
     // tx-relay reserved the id and is fetching it.
-    let fetch = model
-        .reserve(id(1), Source::Peer(v2(1)), Intent::Fetch, secs(0))
-        .expect("room");
+    let fetch = model.reserve(id(1), Intent::Fetch, secs(0)).expect("room");
     // Two legacy peers push it meanwhile. Neither is asked for its copy,
     // so no second body waits under the one slot, as today drops a pushed
     // copy of an id that is already queued.
     let first = model
-        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("joins");
     let second = model
-        .reserve(id(1), peer(3), Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("joins");
     assert!(!first.wants_body);
     assert!(!second.wants_body);
-    let (first_waiter, step) = model.wait(first.id, id(1), Supplier::Peer(legacy(2)), secs(0));
+    let (first_waiter, step) = model.wait(first.id, id(1), secs(0));
     assert!(step.started().is_empty());
-    let (second_waiter, step) = model.wait(second.id, id(1), Supplier::Peer(legacy(3)), secs(0));
+    let (second_waiter, step) = model.wait(second.id, id(1), secs(0));
     assert!(step.started().is_empty());
     assert_eq!(model.bodies_held(), 0);
     assert_eq!(model.slots_in_use(), 1, "the joiners hold no slot");
 
     // The fetch brings the body, and every waiter gets its verdict.
-    let (fetcher, step) = model.submit(fetch.id, tx(1), Supplier::Peer(v2(1)), secs(1));
+    let (fetcher, step) = model.submit(fetch.id, tx(1), secs(1));
     let step = model.outcome(the_job(&step), Outcome::Pass, stable(0), stable(0), secs(2));
     for waiter in [fetcher, first_waiter, second_waiter] {
         assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
@@ -1444,13 +1251,11 @@ fn a_delivery_that_joins_while_the_fetch_is_out_waits_for_it() {
 #[test]
 fn waiters_get_a_local_fault_when_nobody_brings_the_body() {
     let mut model = new_model();
-    let owner = model
-        .reserve(id(1), Source::Peer(v2(1)), Intent::Fetch, secs(0))
-        .expect("room");
+    let owner = model.reserve(id(1), Intent::Fetch, secs(0)).expect("room");
     let waiting = model
-        .reserve(id(1), peer(3), Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("joins");
-    let (waiter, _) = model.wait(waiting.id, id(1), Supplier::Peer(legacy(3)), secs(0));
+    let (waiter, _) = model.wait(waiting.id, id(1), secs(0));
 
     // The fetch fails, and nobody else was asked for the body.
     let step = model.release(owner.id, secs(1));
@@ -1465,9 +1270,9 @@ fn waiters_get_a_local_fault_when_nobody_brings_the_body() {
 #[test]
 fn a_joined_reservation_does_not_reach_a_later_admission_of_the_same_id() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     let alice = model
-        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("joins");
     model.outcome(
         job,
@@ -1478,11 +1283,11 @@ fn a_joined_reservation_does_not_reach_a_later_admission_of_the_same_id() {
     );
 
     // Bob starts a new admission of the same id.
-    let (bob, _) = bring_in(&mut model, tx(1), legacy(3));
+    let (bob, _) = bring_in(&mut model, tx(1));
     // Alice's old reservation ended with the first admission. It gets that
     // admission's verdict, and neither joins Bob's nor counts among its
     // waiters.
-    let (late, step) = model.submit(alice.id, tx(1), Supplier::Peer(legacy(2)), secs(2));
+    let (late, step) = model.submit(alice.id, tx(1), secs(2));
     assert_eq!(
         step.verdict(late),
         Some(ModelVerdict::LocalFault(LocalFault::StateUnavailable))
@@ -1494,10 +1299,10 @@ fn a_joined_reservation_does_not_reach_a_later_admission_of_the_same_id() {
 #[test]
 fn a_child_that_spends_an_output_its_visible_parent_lacks_is_not_verified_in_a_loop() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(1), 0);
     // The parent has one output. The child spends output 5 of it.
     let child = tx(2).spending(hash(1), 5);
-    let (waiter, job) = bring_in(&mut model, child, legacy(2));
+    let (waiter, job) = bring_in(&mut model, child);
     let no_such_output = Outcome::MissingInputs(vec![OutPoint {
         hash: hash(1),
         index: 5,
@@ -1520,7 +1325,7 @@ fn a_child_that_spends_an_output_its_visible_parent_lacks_is_not_verified_in_a_l
 #[test]
 fn waking_and_parking_again_does_not_restart_the_wait() {
     let mut model = new_model();
-    let (waiter, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    let (waiter, job) = bring_in(&mut model, child_of(2, 1));
     model.outcome(job, missing(1), stable(0), stable(0), secs(0));
 
     // Forty seconds parked. Then a block mines something with the parent's
@@ -1540,8 +1345,8 @@ fn waking_and_parking_again_does_not_restart_the_wait() {
 #[test]
 fn a_missed_block_that_mined_a_parent_keeps_its_child() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
-    admit(&mut model, child_of(2, 1), 2, 0);
+    admit(&mut model, tx(1), 0);
+    admit(&mut model, child_of(2, 1), 0);
 
     let step = model.resync(Height(240), Generation(5), secs(1));
     let parent_job = the_job(&step);
@@ -1571,7 +1376,7 @@ fn a_missed_block_that_mined_a_parent_keeps_its_child() {
 #[test]
 fn a_reorg_forgets_chain_scoped_rejections_too() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     // Rejected as expired at this height.
     model.outcome(
         job,
@@ -1587,11 +1392,9 @@ fn a_reorg_forgets_chain_scoped_rejections_too() {
     // The chain goes back below the expiry height. The old answer says
     // nothing about the new chain.
     model.transition(reorg(1, 90), secs(1));
-    assert!(model
-        .reserve(id(1), peer(2), Intent::Fetch, secs(1))
-        .is_ok());
+    assert!(model.reserve(id(1), Intent::Fetch, secs(1)).is_ok());
 
-    let (_, job) = bring_in(&mut model, tx(3), legacy(3));
+    let (_, job) = bring_in(&mut model, tx(3));
     model.outcome(
         job,
         Outcome::Fail {
@@ -1603,15 +1406,13 @@ fn a_reorg_forgets_chain_scoped_rejections_too() {
         secs(1),
     );
     model.resync(Height(200), Generation(4), secs(2));
-    assert!(model
-        .reserve(id(3), peer(4), Intent::Fetch, secs(2))
-        .is_ok());
+    assert!(model.reserve(id(3), Intent::Fetch, secs(2)).is_ok());
 }
 
 #[test]
 fn an_upgrade_activation_verifies_the_pool_again() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(1), 0);
 
     // No block left the chain, but the rules changed.
     let mut activation = transition(1, 101, vec![vec![]]);
@@ -1626,11 +1427,11 @@ fn an_upgrade_activation_verifies_the_pool_again() {
 fn a_block_caches_what_it_mined_what_conflicted_and_what_expired() {
     let mut model = new_model();
     let coin = hash(900);
-    admit(&mut model, tx(1).spending(coin, 0), 1, 0);
+    admit(&mut model, tx(1).spending(coin, 0), 0);
     let mut expiring = tx(2);
     expiring.expiry = Some(Height(101));
-    admit(&mut model, expiring, 2, 0);
-    admit(&mut model, tx(3), 3, 0);
+    admit(&mut model, expiring, 0);
+    admit(&mut model, tx(3), 0);
 
     let block = vec![tx(7).spending(coin, 0), tx(3)];
     model.transition(transition(1, 101, vec![block]), secs(1));
@@ -1644,7 +1445,7 @@ fn a_block_caches_what_it_mined_what_conflicted_and_what_expired() {
         (7, ChainReason::Mined),
     ] {
         assert_eq!(
-            model.reserve(id(n), peer(50), Intent::Fetch, secs(1)),
+            model.reserve(id(n), Intent::Fetch, secs(1)),
             Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain(
                 reason
             ))),
@@ -1661,7 +1462,7 @@ fn a_block_caches_what_it_mined_what_conflicted_and_what_expired() {
 #[test]
 fn a_chain_scoped_rejection_is_forgotten_after_its_memory_time() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     model.outcome(
         job,
         Outcome::Fail {
@@ -1676,19 +1477,19 @@ fn a_chain_scoped_rejection_is_forgotten_after_its_memory_time() {
     // forgets it after.
     model.tick(REJECTION_MEMORY);
     assert!(model
-        .reserve(id(1), peer(2), Intent::Fetch, REJECTION_MEMORY)
+        .reserve(id(1), Intent::Fetch, REJECTION_MEMORY)
         .is_err());
     let after = REJECTION_MEMORY + Duration::from_millis(1);
     model.tick(after);
-    assert!(model.reserve(id(1), peer(2), Intent::Fetch, after).is_ok());
+    assert!(model.reserve(id(1), Intent::Fetch, after).is_ok());
 }
 
 #[test]
-fn the_rejection_lists_and_the_cooldowns_stay_bounded() {
+fn the_rejection_lists_stay_bounded() {
     let mut model = new_model();
     let over = u16::try_from(MAX_REJECTIONS + 1).expect("the limit fits the test's ids");
     for n in 0..over {
-        let (_, job) = bring_in(&mut model, tx(n), legacy(n));
+        let (_, job) = bring_in(&mut model, tx(n));
         model.outcome(
             job,
             Outcome::Fail {
@@ -1701,27 +1502,8 @@ fn the_rejection_lists_and_the_cooldowns_stay_bounded() {
         );
     }
     // A tip-scoped list that passes its limit is cleared, as today.
-    assert!(model
-        .reserve(id(0), peer(1), Intent::Fetch, secs(0))
-        .is_ok());
+    assert!(model.reserve(id(0), Intent::Fetch, secs(0)).is_ok());
     model.assert_invariants();
-
-    let over = u16::try_from(MAX_COOLDOWNS + 1).expect("the limit fits the test's ids");
-    let address = |n: u16| {
-        let [high, low] = n.to_be_bytes();
-        QueueSource::LegacySocket(SocketAddr::from(([10, 1, high, low], 8233)))
-    };
-    // All at one time, so none of them ends before the last one starts.
-    for n in 0..over {
-        model.violation(address(n), secs(0));
-    }
-    model.assert_invariants();
-    // One made room for the last, and the last is in.
-    let cooling = (0..over)
-        .filter(|n| model.cooling(&address(*n), secs(0)))
-        .count();
-    assert_eq!(cooling, MAX_COOLDOWNS);
-    assert!(model.cooling(&address(over - 1), secs(0)));
 }
 
 // Cases from Sol's review of the contract's first version.
@@ -1737,8 +1519,8 @@ fn output(parent: u16, index: u32) -> OutPoint {
 fn a_child_verified_against_a_parent_the_pool_has_since_lost_is_not_admitted() {
     let mut model = new_model();
     let coin = hash(900);
-    admit(&mut model, tx(1).spending(coin, 0), 1, 0);
-    let (child, job) = bring_in(&mut model, child_of(2, 1), legacy(2));
+    admit(&mut model, tx(1).spending(coin, 0), 0);
+    let (child, job) = bring_in(&mut model, child_of(2, 1));
 
     // A block mines a transaction that conflicts with the parent. State is
     // at generation 1 and stable. The verifier reads that state, but the
@@ -1765,7 +1547,7 @@ fn a_child_verified_against_a_parent_the_pool_has_since_lost_is_not_admitted() {
 #[test]
 fn a_changing_read_that_the_core_has_already_applied_does_not_strand_the_job() {
     let mut model = new_model();
-    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (waiter, job) = bring_in(&mut model, tx(1));
     model.transition(transition(1, 101, vec![vec![]]), secs(1));
 
     // The worker read while generation 1 was becoming visible. By the time
@@ -1786,7 +1568,7 @@ fn a_changing_read_that_the_core_has_already_applied_does_not_strand_the_job() {
 #[test]
 fn a_change_in_flight_on_top_of_the_applied_generation_is_waited_for() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     let step = model.outcome(
         job,
         Outcome::Pass,
@@ -1803,9 +1585,9 @@ fn a_change_in_flight_on_top_of_the_applied_generation_is_waited_for() {
 #[test]
 fn a_fourth_transaction_in_a_chain_of_dependencies_is_rejected() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(1), 0);
     for n in 2..=3 {
-        let (waiter, job) = bring_in(&mut model, child_of(n, n - 1), legacy(n));
+        let (waiter, job) = bring_in(&mut model, child_of(n, n - 1));
         let step = model.outcome(
             job,
             Outcome::PassUsing(vec![output(n - 1, 0)]),
@@ -1817,7 +1599,7 @@ fn a_fourth_transaction_in_a_chain_of_dependencies_is_rejected() {
     }
 
     // Each of the four passes the verifier. The pool takes three.
-    let (waiter, job) = bring_in(&mut model, child_of(4, 3), legacy(4));
+    let (waiter, job) = bring_in(&mut model, child_of(4, 3));
     let step = model.outcome(
         job,
         Outcome::PassUsing(vec![output(3, 0)]),
@@ -1837,9 +1619,9 @@ fn a_fourth_transaction_beside_its_siblings_is_rejected_too() {
     let mut model = new_model();
     let mut parent = tx(1);
     parent.outputs = 3;
-    admit(&mut model, parent, 1, 0);
+    admit(&mut model, parent, 0);
     for (n, index) in [(2, 0), (3, 1)] {
-        let (waiter, job) = bring_in(&mut model, tx(n).spending(hash(1), index), legacy(n));
+        let (waiter, job) = bring_in(&mut model, tx(n).spending(hash(1), index));
         let step = model.outcome(
             job,
             Outcome::PassUsing(vec![output(1, index)]),
@@ -1851,7 +1633,7 @@ fn a_fourth_transaction_beside_its_siblings_is_rejected_too() {
     }
 
     // One ancestor only, but the group it would join already has three.
-    let (waiter, job) = bring_in(&mut model, tx(4).spending(hash(1), 2), legacy(4));
+    let (waiter, job) = bring_in(&mut model, tx(4).spending(hash(1), 2));
     let step = model.outcome(
         job,
         Outcome::PassUsing(vec![output(1, 2)]),
@@ -1866,31 +1648,9 @@ fn a_fourth_transaction_beside_its_siblings_is_rejected_too() {
 }
 
 #[test]
-fn a_cooled_supplier_cannot_bring_a_body_in_under_another_source() {
-    let mut model = new_model();
-    // The crawler reserved the id. Nothing is counted against a peer.
-    let crawled = model
-        .reserve(id(1), Source::Node, Intent::Fetch, secs(0))
-        .expect("room");
-    // The peer the body comes from enters a cooldown while it is fetched.
-    model.violation(legacy(5), secs(1));
-
-    let (waiter, step) = model.submit(crawled.id, tx(1), Supplier::Peer(legacy(5)), secs(2));
-    assert_eq!(step.verdict(waiter), Some(ModelVerdict::CoolingDown));
-    assert!(step.started().is_empty(), "its body is not verified");
-    // The change stream hears of it, as today's does.
-    assert_eq!(step.changes, vec![Change::Refused(id(1))]);
-    // Nothing is cached, and the slot is free.
-    assert_eq!(model.slots_in_use(), 0);
-    assert!(model
-        .reserve(id(1), peer(6), Intent::Fetch, secs(2))
-        .is_ok());
-}
-
-#[test]
 fn a_revealed_entry_says_when_the_transaction_was_hidden() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(1), 0);
     let step = model.transition(reorg(1, 100), secs(1));
     // Entry 1 added it. Entry 2 hides it.
     assert_eq!(step.changes, vec![Change::Hidden(id(1))]);
@@ -1914,14 +1674,14 @@ fn a_revealed_entry_says_when_the_transaction_was_hidden() {
 fn a_hidden_child_whose_parent_arrives_while_it_is_checked_is_checked_again() {
     let mut model = new_model();
     // The child is in the pool. Its parent was mined, so it is not.
-    admit(&mut model, child_of(2, 1), 2, 0);
+    admit(&mut model, child_of(2, 1), 0);
     // A reorg undoes the block that mined the parent.
     let step = model.transition(reorg(1, 99), secs(1));
     let child_job = the_job(&step);
 
     // The child's verifier looks first and misses the parent. The parent is
     // submitted again and admitted before the core handles that outcome.
-    let (_, parent_job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, parent_job) = bring_in(&mut model, tx(1));
     model.outcome(parent_job, Outcome::Pass, stable(1), stable(1), secs(2));
     let step = model.outcome(child_job, missing(1), stable(1), stable(1), secs(2));
 
@@ -1939,10 +1699,9 @@ fn a_hidden_child_whose_parent_arrives_while_it_is_checked_is_checked_again() {
 }
 
 #[test]
-fn a_cooldown_and_a_remembered_rejection_end_on_time_without_a_tick() {
+fn a_remembered_rejection_ends_on_time_without_a_tick() {
     let mut model = new_model();
-    model.violation(v2(1), secs(0));
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     model.outcome(
         job,
         Outcome::Fail {
@@ -1955,25 +1714,12 @@ fn a_cooldown_and_a_remembered_rejection_end_on_time_without_a_tick() {
     );
 
     // No tick in between. Each lookup uses the time of its own call.
-    assert_eq!(
-        model.reserve(
-            id(2),
-            Source::Peer(v2(1)),
-            Intent::Fetch,
-            COOLDOWN - secs(1)
-        ),
-        Err(ModelUnreserved::CoolingDown)
-    );
     assert!(model
-        .reserve(id(2), Source::Peer(v2(1)), Intent::Fetch, COOLDOWN)
-        .is_ok());
-    assert!(model
-        .reserve(id(1), peer(2), Intent::Fetch, REJECTION_MEMORY)
+        .reserve(id(1), Intent::Fetch, REJECTION_MEMORY)
         .is_err());
     assert!(model
         .reserve(
             id(1),
-            peer(2),
             Intent::Fetch,
             REJECTION_MEMORY + Duration::from_millis(1)
         )
@@ -1985,7 +1731,7 @@ fn each_chain_rejection_reason_keeps_its_own_list_and_the_configured_memory() {
     let memory = secs(120);
     let mut model = new_model().with_rejection_memory(memory);
     let coin = hash(900);
-    admit(&mut model, tx(1).spending(coin, 0), 1, 0);
+    admit(&mut model, tx(1).spending(coin, 0), 0);
     // One duplicate spend, then more mined transactions than one list holds.
     let block = vec![tx(7).spending(coin, 0)];
     model.transition(transition(1, 101, vec![block]), secs(0));
@@ -1996,24 +1742,17 @@ fn each_chain_rejection_reason_keeps_its_own_list_and_the_configured_memory() {
     // The mined list dropped its oldest entry. The duplicate spend is in
     // another list and is still remembered.
     assert_eq!(
-        model.reserve(id(1), peer(2), Intent::Fetch, secs(0)),
+        model.reserve(id(1), Intent::Fetch, secs(0)),
         Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain(
             ChainReason::DuplicateSpend
         )))
     );
-    assert!(model
-        .reserve(id(7), peer(2), Intent::Fetch, secs(0))
-        .is_ok());
+    assert!(model.reserve(id(7), Intent::Fetch, secs(0)).is_ok());
     model.assert_invariants();
 
     // The memory time is the configured one, not the default.
     assert!(model
-        .reserve(
-            id(1),
-            peer(3),
-            Intent::Fetch,
-            memory + Duration::from_millis(1)
-        )
+        .reserve(id(1), Intent::Fetch, memory + Duration::from_millis(1))
         .is_ok());
 }
 
@@ -2023,7 +1762,7 @@ fn a_reader_that_resynchronized_while_a_transaction_was_hidden_announces_its_rev
     let mut log = ChangeLog::default();
     // The session opens on an empty pool.
     let opened_at = log.last();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     log.append(
         model
             .outcome(job, Outcome::Pass, stable(0), stable(0), secs(0))
@@ -2081,39 +1820,38 @@ async fn a_dropped_reservation_wakes_an_idle_core() {
 
 #[test]
 fn a_fetch_that_is_still_out_keeps_its_slot_after_its_admission_ends() {
-    let mut model = new_model();
-    let alice = peer(1);
-    // Alice's five fetches are out.
+    let mut model = new_model().with_limits(5, 4);
+    // Five fetches are out, which fills the node.
     let fetching: Vec<_> = (0..5)
         .map(|n| {
             model
-                .reserve(id(n), alice.clone(), Intent::Fetch, secs(0))
+                .reserve(id(n), Intent::Fetch, secs(0))
                 .expect("five fit")
         })
         .collect();
     // The pool turns off and on again before her fetches come back. Their
     // admissions end, but five decoded bodies are still on their way, so
-    // she cannot start a sixth fetch.
+    // a sixth fetch cannot start.
     model.deactivate(secs(0));
     model.activate(Height(100), Generation(0), secs(0));
     assert!(model.effects().is_empty());
-    assert_eq!(model.counted_against(&alice), 5);
+    assert_eq!(model.slots_in_use(), 5);
     assert_eq!(
-        model.reserve(id(9), alice.clone(), Intent::Fetch, secs(1)),
-        Err(ModelUnreserved::NoRoom(NoRoom::Source))
+        model.reserve(id(9), Intent::Fetch, secs(1)),
+        Err(ModelUnreserved::NoRoom)
     );
     assert!(model.effects().is_empty());
 
     // One fetch comes back, and one fails. Each frees its slot. The one
     // that came back gets its admission's verdict.
-    let (late, step) = model.submit(fetching[0].id, tx(0), Supplier::Peer(legacy(1)), secs(2));
+    let (late, step) = model.submit(fetching[0].id, tx(0), secs(2));
     assert_eq!(
         step.verdict(late),
         Some(ModelVerdict::LocalFault(LocalFault::Deactivated))
     );
     model.release(fetching[1].id, secs(2));
-    assert_eq!(model.counted_against(&alice), 3);
-    assert!(model.reserve(id(9), alice, Intent::Fetch, secs(2)).is_ok());
+    assert_eq!(model.slots_in_use(), 3);
+    assert!(model.reserve(id(9), Intent::Fetch, secs(2)).is_ok());
     model.assert_invariants();
 }
 
@@ -2122,7 +1860,7 @@ fn a_rollback_runs_every_parked_transaction_again() {
     let mut model = new_model();
     // The tip spent the output the child needs, so the verifier does not
     // find it and the child parks.
-    let (_, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    let (_, job) = bring_in(&mut model, child_of(2, 1));
     model.outcome(job, missing(1), stable(0), stable(0), secs(0));
     assert!(model.is_parked(id(2)));
 
@@ -2137,7 +1875,7 @@ fn a_rollback_runs_every_parked_transaction_again() {
 fn a_hidden_transaction_waits_for_a_parent_that_is_on_its_way_back() {
     let mut model = new_model();
     // The child is pooled. Its parent was mined.
-    admit(&mut model, child_of(2, 1), 2, 0);
+    admit(&mut model, child_of(2, 1), 0);
     let step = model.transition(reorg(1, 99), secs(0));
     // The reorg undid the parent's block. The child's check does not find
     // the parent anywhere yet.
@@ -2146,7 +1884,7 @@ fn a_hidden_transaction_waits_for_a_parent_that_is_on_its_way_back() {
     assert_eq!(model.hidden(), vec![id(2)]);
 
     // The parent is delivered a second later.
-    let (_, parent_job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, parent_job) = bring_in(&mut model, tx(1));
     let step = model.outcome(parent_job, Outcome::Pass, stable(1), stable(1), secs(2));
     let child_job = step.started()[0];
     let step = model.outcome(
@@ -2163,7 +1901,7 @@ fn a_hidden_transaction_waits_for_a_parent_that_is_on_its_way_back() {
 #[test]
 fn a_hidden_transaction_whose_parent_never_returns_is_removed_after_its_wait() {
     let mut model = new_model();
-    admit(&mut model, child_of(2, 1), 2, 0);
+    admit(&mut model, child_of(2, 1), 0);
     let step = model.transition(reorg(1, 99), secs(0));
     model.outcome(the_job(&step), missing(1), stable(1), stable(1), secs(0));
 
@@ -2182,14 +1920,14 @@ fn a_reveal_cannot_grow_a_dependency_group_past_its_limit() {
     let mut model = new_model();
     // Three pooled children of one mined parent. Each stands alone.
     for (n, index) in [(2, 0), (3, 1), (4, 2)] {
-        admit(&mut model, tx(n).spending(hash(1), index), n, 0);
+        admit(&mut model, tx(n).spending(hash(1), index), 0);
     }
     // A reorg undoes the parent's block, and the parent is admitted again.
     let step = model.transition(reorg(1, 99), secs(0));
     let jobs = step.started();
     let mut parent = tx(1);
     parent.outputs = 3;
-    let (_, parent_job) = bring_in(&mut model, parent, legacy(1));
+    let (_, parent_job) = bring_in(&mut model, parent);
     model.outcome(parent_job, Outcome::Pass, stable(1), stable(1), secs(1));
 
     // Each child passes against the parent in the pool. The third would
@@ -2210,19 +1948,17 @@ fn a_reveal_cannot_grow_a_dependency_group_past_its_limit() {
     // The child that did not fit is remembered until the tip changes, so
     // it is not fetched again at once.
     assert_eq!(
-        model.reserve(id(4), peer(9), Intent::Fetch, secs(2)),
+        model.reserve(id(4), Intent::Fetch, secs(2)),
         Err(ModelUnreserved::Rejected(RejectionScope::EffectsTip))
     );
     model.transition(transition(2, 100, vec![vec![]]), secs(3));
-    assert!(model
-        .reserve(id(4), peer(9), Intent::Fetch, secs(3))
-        .is_ok());
+    assert!(model.reserve(id(4), Intent::Fetch, secs(3)).is_ok());
 }
 
 #[test]
 fn a_revealed_transaction_offers_its_outputs_to_waiters_again() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(1), 0);
     let step = model.transition(reorg(1, 100), secs(0));
     let step = model.outcome(the_job(&step), Outcome::Pass, stable(1), stable(1), secs(1));
     assert!(step.effects.contains(&Effect::Outputs {
@@ -2234,7 +1970,7 @@ fn a_revealed_transaction_offers_its_outputs_to_waiters_again() {
 #[test]
 fn a_local_fault_is_in_the_change_log_but_not_in_any_cache() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     let step = model.outcome(
         job,
         Outcome::LocalFault(LocalFault::VerifyPanicked),
@@ -2244,11 +1980,9 @@ fn a_local_fault_is_in_the_change_log_but_not_in_any_cache() {
     );
     // Today's change stream reports a verification that failed.
     assert_eq!(step.changes, vec![Change::Refused(id(1))]);
-    assert!(model
-        .reserve(id(1), peer(2), Intent::Fetch, secs(0))
-        .is_ok());
+    assert!(model.reserve(id(1), Intent::Fetch, secs(0)).is_ok());
 
-    let (_, _) = bring_in(&mut model, tx(2), legacy(3));
+    let (_, _) = bring_in(&mut model, tx(2));
     assert_eq!(model.tick(T_VERIFY).changes, vec![Change::Refused(id(2))]);
 }
 
@@ -2256,9 +1990,9 @@ fn a_local_fault_is_in_the_change_log_but_not_in_any_cache() {
 fn a_conflict_with_a_later_block_transaction_is_cached_though_its_parent_went_first() {
     let mut model = new_model();
     let (coin_u, coin_v) = (hash(900), hash(901));
-    admit(&mut model, tx(1).spending(coin_u, 0), 1, 0);
+    admit(&mut model, tx(1).spending(coin_u, 0), 0);
     let child = child_of(2, 1).spending(coin_v, 0);
-    let (waiter, job) = bring_in(&mut model, child, legacy(2));
+    let (waiter, job) = bring_in(&mut model, child);
     let step = model.outcome(
         job,
         Outcome::PassUsing(vec![output(1, 0)]),
@@ -2275,7 +2009,7 @@ fn a_conflict_with_a_later_block_transaction_is_cached_though_its_parent_went_fi
     assert!(model.visible().is_empty());
     for n in [1, 2] {
         assert_eq!(
-            model.reserve(id(n), peer(9), Intent::Fetch, secs(1)),
+            model.reserve(id(n), Intent::Fetch, secs(1)),
             Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain(
                 ChainReason::DuplicateSpend
             ))),
@@ -2303,7 +2037,7 @@ fn a_reader_that_reads_an_addition_after_it_was_hidden_announces_it_on_the_revea
     assert!(announced.is_empty());
 
     // A transaction is added and then hidden before the session reads.
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     log.append(
         model
             .outcome(job, Outcome::Pass, stable(0), stable(0), secs(0))
@@ -2329,7 +2063,7 @@ fn a_reader_that_announced_a_transaction_skips_its_reveal() {
     let mut log = ChangeLog::default();
     let (mut reader, _) = ModelReader::open(&model.visible(), log.last());
 
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(0));
     let entries = logged(&mut log, step, reader.cursor());
     assert_eq!(reader.read(&entries, &model.visible()), vec![id(1)]);
@@ -2347,7 +2081,7 @@ fn a_reader_that_announced_a_transaction_skips_its_reveal() {
 fn a_reader_that_opens_or_resynchronizes_while_a_transaction_is_hidden_announces_its_reveal() {
     let mut model = new_model();
     let mut log = ChangeLog::default();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     log.append(
         model
             .outcome(job, Outcome::Pass, stable(0), stable(0), secs(0))
@@ -2372,20 +2106,6 @@ fn a_reader_that_opens_or_resynchronizes_while_a_transaction_is_hidden_announces
     assert_eq!(early.read(&entries, &model.visible()), vec![id(1)]);
 }
 
-#[tokio::test]
-async fn a_caller_can_see_which_peers_are_cooling_down() {
-    use zakura_rt::time::Instant;
-    let (handle, inbox) = pool_port();
-    let now = Instant::now();
-    assert!(!handle.is_cooling(&v2(1), now));
-
-    let until = now + secs(600);
-    inbox.publish_cooldowns([(CooldownKey::from(&v2(1)), until)].into_iter().collect());
-    assert!(handle.is_cooling(&v2(1), now));
-    assert!(!handle.is_cooling(&v2(2), now));
-    assert!(!handle.is_cooling(&v2(1), until));
-}
-
 // Cases from the third review.
 
 fn witnessed(n: u16, authorizing: u8) -> UnminedTxId {
@@ -2399,10 +2119,8 @@ fn witnessed(n: u16, authorizing: u8) -> UnminedTxId {
 #[test]
 fn a_wrong_body_is_refused_and_frees_the_slot_in_the_model_too() {
     let mut model = new_model();
-    let reservation = model
-        .reserve(id(1), peer(1), Intent::Fetch, secs(0))
-        .expect("room");
-    let (waiter, step) = model.submit(reservation.id, tx(2), Supplier::Peer(legacy(1)), secs(0));
+    let reservation = model.reserve(id(1), Intent::Fetch, secs(0)).expect("room");
+    let (waiter, step) = model.submit(reservation.id, tx(2), secs(0));
     assert_eq!(
         step.verdict(waiter),
         Some(ModelVerdict::LocalFault(LocalFault::WrongTransaction))
@@ -2415,16 +2133,14 @@ fn a_wrong_body_is_refused_and_frees_the_slot_in_the_model_too() {
 #[test]
 fn a_failed_fetch_is_logged_and_answers_anyone_waiting_on_it() {
     let mut model = new_model();
-    let fetching = model
-        .reserve(id(1), Source::Node, Intent::Fetch, secs(0))
-        .expect("room");
+    let fetching = model.reserve(id(1), Intent::Fetch, secs(0)).expect("room");
     let bringer = model
-        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("joins");
     let waiting = model
-        .reserve(id(1), peer(3), Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("joins");
-    let (waiter, _) = model.wait(waiting.id, id(1), Supplier::Peer(legacy(3)), secs(0));
+    let (waiter, _) = model.wait(waiting.id, id(1), secs(0));
     model.release(bringer.id, secs(0));
 
     // The crawler's download fails. Today's change stream reports that.
@@ -2437,9 +2153,7 @@ fn a_failed_fetch_is_logged_and_answers_anyone_waiting_on_it() {
     assert_eq!(model.slots_in_use(), 0);
 
     // A caller that only stops waiting logs nothing.
-    let fetching = model
-        .reserve(id(2), Source::Node, Intent::Fetch, secs(1))
-        .expect("room");
+    let fetching = model.reserve(id(2), Intent::Fetch, secs(1)).expect("room");
     assert_eq!(model.release(fetching.id, secs(2)), Step::default());
 }
 
@@ -2448,8 +2162,8 @@ fn a_transaction_found_already_mined_is_answered_the_same_way_each_time() {
     let mut model = new_model();
     // The pool started after this transaction was mined, so no block the
     // core saw named it.
-    for attempt in 0..2 {
-        let (waiter, job) = bring_in(&mut model, tx(1), legacy(attempt));
+    for _ in 0..2 {
+        let (waiter, job) = bring_in(&mut model, tx(1));
         let step = model.outcome(job, Outcome::AlreadyMined, stable(0), stable(0), secs(0));
         // The verdict comes after the lookup both times. Nothing is cached
         // that would answer the second one at the reservation instead.
@@ -2472,8 +2186,8 @@ fn a_second_set_of_authorizing_data_is_a_duplicate_not_a_conflict() {
     assert_eq!(coin, output(900, 0).hash);
     // Both are verified at once. They spend the same input, because they
     // are the same transaction.
-    let (first, first_job) = bring_in(&mut model, variant(1), legacy(1));
-    let (second, second_job) = bring_in(&mut model, variant(2), legacy(2));
+    let (first, first_job) = bring_in(&mut model, variant(1));
+    let (second, second_job) = bring_in(&mut model, variant(2));
     let step = model.outcome(first_job, Outcome::Pass, stable(0), stable(0), secs(0));
     assert_eq!(step.verdict(first), Some(ModelVerdict::Admitted));
 
@@ -2495,7 +2209,7 @@ fn a_hidden_transaction_that_is_woken_and_parks_again_keeps_its_wait() {
     let mut model = new_model();
     // The child spends two mined parents.
     let child = tx(3).spending(hash(1), 0).spending(hash(2), 0);
-    admit(&mut model, child, 3, 0);
+    admit(&mut model, child, 0);
     let step = model.transition(reorg(1, 98), secs(0));
     let both = Outcome::MissingInputs(vec![output(1, 0), output(2, 0)]);
     model.outcome(the_job(&step), both, stable(1), stable(1), secs(0));
@@ -2503,10 +2217,8 @@ fn a_hidden_transaction_that_is_woken_and_parks_again_keeps_its_wait() {
     // Forty seconds later the first parent arrives and wakes it. The second
     // is still missing.
     // The first parent arrives at forty seconds.
-    let reservation = model
-        .reserve(id(1), peer(1), Intent::Fetch, secs(40))
-        .expect("room");
-    let (_, step) = model.submit(reservation.id, tx(1), Supplier::Peer(legacy(1)), secs(40));
+    let reservation = model.reserve(id(1), Intent::Fetch, secs(40)).expect("room");
+    let (_, step) = model.submit(reservation.id, tx(1), secs(40));
     let step = model.outcome(
         the_job(&step),
         Outcome::Pass,
@@ -2531,7 +2243,7 @@ fn a_hidden_transaction_that_is_woken_and_parks_again_keeps_its_wait() {
 #[test]
 fn the_rejection_query_uses_the_time_it_is_asked_at() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     model.outcome(
         job,
         Outcome::Fail {
@@ -2548,7 +2260,6 @@ fn the_rejection_query_uses_the_time_it_is_asked_at() {
     assert!(model
         .rejected_ids(&asked, REJECTION_MEMORY + Duration::from_millis(1))
         .is_empty());
-    assert!(!model.cooling(&v2(1), secs(0)));
 }
 
 #[test]
@@ -2572,7 +2283,7 @@ fn an_output_wait_is_answered_whichever_side_of_the_admission_it_arrives() {
     let OutputAnswer::Waiting(waiter) = model.await_output(output(1, 0), secs(0)) else {
         panic!("nothing creates the output yet");
     };
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(1));
     assert!(step.effects.contains(&Effect::OutputReady {
         waiter,
@@ -2595,7 +2306,7 @@ fn an_output_wait_is_answered_whichever_side_of_the_admission_it_arrives() {
 #[test]
 fn an_output_of_a_hidden_transaction_is_waited_for_until_the_reveal() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(1), 0);
     let step = model.transition(reorg(1, 100), secs(0));
     let OutputAnswer::Waiting(waiter) = model.await_output(output(1, 0), secs(1)) else {
         panic!("a hidden transaction offers nothing");
@@ -2659,11 +2370,7 @@ fn output_waits_are_limited_by_distinct_outpoints_and_end_when_the_pool_turns_of
 fn a_fetch_that_outlived_its_admission_still_knows_its_id() {
     let mut model = new_model();
     let fetching: Vec<_> = (0..2)
-        .map(|n| {
-            model
-                .reserve(id(n), peer(1), Intent::Fetch, secs(0))
-                .expect("room")
-        })
+        .map(|n| model.reserve(id(n), Intent::Fetch, secs(0)).expect("room"))
         .collect();
     // The admissions end while the fetches are out.
     model.deactivate(secs(0));
@@ -2672,7 +2379,7 @@ fn a_fetch_that_outlived_its_admission_still_knows_its_id() {
     assert_eq!(model.slots_in_use(), 2);
 
     // A wrong body is still a wrong body, as the handle would say.
-    let (waiter, step) = model.submit(fetching[0].id, tx(9), Supplier::Peer(legacy(1)), secs(1));
+    let (waiter, step) = model.submit(fetching[0].id, tx(9), secs(1));
     assert_eq!(
         step.verdict(waiter),
         Some(ModelVerdict::LocalFault(LocalFault::WrongTransaction))
@@ -2686,7 +2393,7 @@ fn a_fetch_that_outlived_its_admission_still_knows_its_id() {
 #[test]
 fn a_pooled_transaction_found_mined_by_lookup_is_not_cached_either() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(1), 0);
     let step = model.resync(Height(240), Generation(5), secs(1));
     model.outcome(
         the_job(&step),
@@ -2699,7 +2406,7 @@ fn a_pooled_transaction_found_mined_by_lookup_is_not_cached_either() {
 
     // The core never saw its block connect. A later submission is looked
     // up again, and is answered at that stage.
-    let (waiter, job) = bring_in(&mut model, tx(1), legacy(2));
+    let (waiter, job) = bring_in(&mut model, tx(1));
     let step = model.outcome(job, Outcome::AlreadyMined, stable(5), stable(5), secs(3));
     assert_eq!(
         step.verdict(waiter),
@@ -2710,16 +2417,15 @@ fn a_pooled_transaction_found_mined_by_lookup_is_not_cached_either() {
 #[test]
 fn parked_children_cannot_hold_the_slots_their_hidden_parent_needs() {
     // Four slots, so the test can fill the core.
-    let mut model = new_model().with_limits(4, 5, 3);
-    admit(&mut model, tx(1), 1, 0);
+    let mut model = new_model().with_limits(4, 3);
+    admit(&mut model, tx(1), 0);
     // Four local submissions spend the parent's output and are verifying.
     let mut children = Vec::new();
     for n in 2..6 {
         let reservation = model
-            .reserve(id(n), Source::Node, Intent::Deliver, secs(0))
+            .reserve(id(n), Intent::Deliver, secs(0))
             .expect("four fit");
-        let (waiter, step) =
-            model.submit(reservation.id, child_of(n, 1), Supplier::Nobody, secs(0));
+        let (waiter, step) = model.submit(reservation.id, child_of(n, 1), secs(0));
         children.push((waiter, the_job(&step)));
     }
 
@@ -2815,56 +2521,47 @@ fn random_body(n: u16) -> ModelTx {
 #[test]
 fn a_random_run_with_small_limits_always_drains() {
     // Limits small enough that a few hundred steps reach every full state:
-    // six slots, two for one source, three for revalidation.
+    // six slots, three of them for revalidation.
     for seed in 0..300 {
         let mut rng = Lcg(seed);
-        let mut model = new_model().with_limits(6, 2, 3);
+        let mut model = new_model().with_limits(6, 3);
         let mut run = Run::default();
         let mut generation = 0;
         let mut tip = 100;
         let mut now = secs(0);
-        // Granted reservations: id, transaction, peer, whether the core
-        // wants the body.
-        let mut granted: Vec<(ReservationId, u16, u16, bool)> = Vec::new();
+        // Granted reservations: id, transaction, whether the core wants the
+        // body.
+        let mut granted: Vec<(ReservationId, u16, bool)> = Vec::new();
         // Whether a reading has told the core that a chain event is coming.
         let mut chain_event_owed = false;
 
         for _ in 0..400 {
             now += Duration::from_millis(rng.next(9_000));
             let n = u16::try_from(rng.next(12)).expect("small");
-            let p = u16::try_from(rng.next(4)).expect("small");
             match rng.next(16) {
                 0..=3 => {
-                    let source = if p == 0 { Source::Node } else { peer(p) };
                     let intent = if rng.next(2) == 0 {
                         Intent::Fetch
                     } else {
                         Intent::Deliver
                     };
-                    if let Ok(reservation) = model.reserve(id(n), source, intent, now) {
-                        granted.push((reservation.id, n, p, reservation.wants_body));
+                    if let Ok(reservation) = model.reserve(id(n), intent, now) {
+                        granted.push((reservation.id, n, reservation.wants_body));
                     }
                     run.record(model.effects());
                 }
                 4..=6 if !granted.is_empty() => {
-                    let (reservation, n, p, wants_body) =
-                        granted.swap_remove(rng.pick(granted.len()));
-                    let supplier = if p == 0 {
-                        Supplier::Nobody
-                    } else {
-                        Supplier::Peer(legacy(p))
-                    };
+                    let (reservation, n, wants_body) = granted.swap_remove(rng.pick(granted.len()));
                     match rng.next(8) {
                         0 => run.record(model.release(reservation, now)),
                         1 => run.record(model.fetch_failed(reservation, now)),
                         _ if wants_body => {
-                            let (waiter, step) =
-                                model.submit(reservation, random_body(n), supplier, now);
+                            let (waiter, step) = model.submit(reservation, random_body(n), now);
                             run.waiters.push(waiter);
                             run.record(step);
                         }
                         _ => {
-                            let (waiter, step) = model.wait(reservation, id(n), supplier, now);
+                            let (waiter, step) = model.wait(reservation, id(n), now);
                             run.waiters.push(waiter);
                             run.record(step);
                         }
@@ -3030,8 +2727,8 @@ fn a_random_run_with_small_limits_always_drains() {
         // The outcomes of the jobs that were cancelled along the way arrive
         // now, late, with no tick after them. Each is ignored, and none may
         // leave anything waiting to be started.
-        // What the pool shows, whom it refuses and which ids it remembers
-        // rejecting, before and after each one.
+        // What the pool shows and which ids it remembers rejecting, before
+        // and after each one.
         let ids: HashSet<UnminedTxId> = (0..12).map(id).collect();
         let remembered = |model: &mut PoolModel| {
             let rejected = model.rejected_ids(&ids, now);
@@ -3039,8 +2736,7 @@ fn a_random_run_with_small_limits_always_drains() {
                 model.effects().is_empty(),
                 "seed {seed}: the pool had settled"
             );
-            let cooling: Vec<bool> = (0..4).map(|p| model.cooling(&legacy(p), now)).collect();
-            (model.visible(), cooling, rejected)
+            (model.visible(), rejected)
         };
         let before = remembered(&mut model);
         for job in std::mem::take(&mut run.cancelled) {
@@ -3090,46 +2786,44 @@ fn a_random_run_with_small_limits_always_drains() {
 #[test]
 fn a_joined_reservation_keeps_its_id_after_its_admission_ends() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     // Two callers join. Neither is asked for the body: the core has it.
     let waits = model
-        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("joins");
     assert!(!waits.wants_body);
     model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(1));
 
     // The admission is over. A wrong body under the old reservation is
     // still a wrong body, as the handle would say, not a stale one.
-    let (waiter, step) = model.submit(waits.id, tx(9), Supplier::Peer(legacy(2)), secs(2));
+    let (waiter, step) = model.submit(waits.id, tx(9), secs(2));
     assert_eq!(
         step.verdict(waiter),
         Some(ModelVerdict::LocalFault(LocalFault::WrongTransaction))
     );
 
     // The same for a caller that joined while the fetch was out.
-    let owner = model
-        .reserve(id(3), peer(1), Intent::Fetch, secs(2))
-        .expect("room");
+    let owner = model.reserve(id(3), Intent::Fetch, secs(2)).expect("room");
     let joined = model
-        .reserve(id(3), peer(2), Intent::Deliver, secs(2))
+        .reserve(id(3), Intent::Deliver, secs(2))
         .expect("joins");
     assert!(!joined.wants_body, "the fetch will bring the body");
-    let (_, step) = model.submit(owner.id, tx(3), Supplier::Peer(legacy(1)), secs(2));
+    let (_, step) = model.submit(owner.id, tx(3), secs(2));
     model.outcome(the_job(&step), Outcome::Pass, stable(0), stable(0), secs(3));
-    let (waiter, step) = model.submit(joined.id, tx(9), Supplier::Peer(legacy(2)), secs(4));
+    let (waiter, step) = model.submit(joined.id, tx(9), secs(4));
     assert_eq!(
         step.verdict(waiter),
         Some(ModelVerdict::LocalFault(LocalFault::WrongTransaction))
     );
     // Once it is pooled, a new reservation finds it there.
-    let again = model.reserve(id(3), peer(2), Intent::Deliver, secs(4));
+    let again = model.reserve(id(3), Intent::Deliver, secs(4));
     assert_eq!(again, Err(ModelUnreserved::Pooled));
 }
 
 #[test]
 fn a_pooled_transaction_that_fails_its_check_is_remembered_and_charges_nobody() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(1), 0);
     let step = model.resync(Height(240), Generation(5), secs(1));
     let step = model.outcome(
         the_job(&step),
@@ -3143,11 +2837,10 @@ fn a_pooled_transaction_that_fails_its_check_is_remembered_and_charges_nobody() 
     );
     // It passed once, so nobody is charged, and no verdict goes out.
     assert!(step.effects.is_empty());
-    assert!(!model.cooling(&legacy(1), secs(2)));
     // The rejection is cached as its scope says, so the next announcement
     // does not fetch and verify it again.
     assert_eq!(
-        model.reserve(id(1), peer(2), Intent::Fetch, secs(2)),
+        model.reserve(id(1), Intent::Fetch, secs(2)),
         Err(ModelUnreserved::Rejected(RejectionScope::ExactTip))
     );
 }
@@ -3157,23 +2850,16 @@ fn a_pooled_transaction_that_fails_its_check_is_remembered_and_charges_nobody() 
 #[test]
 fn a_parent_that_is_verified_again_and_again_cannot_hold_its_child_for_ever() {
     let mut model = new_model();
-    let (child, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    let (child, job) = bring_in(&mut model, child_of(2, 1));
     model.outcome(job, missing(1), stable(0), stable(0), secs(0));
 
     // The parent is submitted, its verification never finishes, it times
     // out, and it is submitted again at once.
     let mut now = secs(0);
     let mut answered = None;
-    for attempt in 0..4 {
-        let reservation = model
-            .reserve(id(1), peer(10 + attempt), Intent::Fetch, now)
-            .expect("room");
-        model.submit(
-            reservation.id,
-            tx(1),
-            Supplier::Peer(legacy(10 + attempt)),
-            now,
-        );
+    for _ in 0..4 {
+        let reservation = model.reserve(id(1), Intent::Fetch, now).expect("room");
+        model.submit(reservation.id, tx(1), now);
         now += T_VERIFY;
         let step = model.tick(now);
         if let Some(verdict) = step.verdict(child) {
@@ -3195,8 +2881,8 @@ fn a_missed_chain_event_past_an_expiry_height_expires_the_transaction() {
     let mut model = new_model();
     let mut expiring = tx(1);
     expiring.expiry = Some(Height(101));
-    admit(&mut model, expiring, 1, 0);
-    admit(&mut model, tx(2), 2, 0);
+    admit(&mut model, expiring, 0);
+    admit(&mut model, tx(2), 0);
 
     // The core missed the blocks, so no transition told it the height.
     let step = model.resync(Height(101), Generation(3), secs(1));
@@ -3212,7 +2898,7 @@ fn a_missed_chain_event_past_an_expiry_height_expires_the_transaction() {
     );
     model.assert_invariants();
     assert_eq!(
-        model.reserve(id(1), peer(3), Intent::Fetch, secs(1)),
+        model.reserve(id(1), Intent::Fetch, secs(1)),
         Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain(
             ChainReason::Expired
         )))
@@ -3241,7 +2927,7 @@ fn nothing_expired_gets_in_even_if_a_verification_passes_it() {
     let mut model = new_model();
     let mut expired = tx(1);
     expired.expiry = Some(Height(100));
-    let (waiter, job) = bring_in(&mut model, expired, legacy(1));
+    let (waiter, job) = bring_in(&mut model, expired);
     // The tip is at the expiry height. A verifier that passed it is wrong,
     // and the pool does not depend on it being right.
     let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(0));
@@ -3261,7 +2947,7 @@ fn nothing_expired_gets_in_even_if_a_verification_passes_it() {
 #[test]
 fn checking_a_transaction_again_and_again_does_not_extend_its_wait_for_a_parent() {
     let mut model = new_model();
-    let (child, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    let (child, job) = bring_in(&mut model, child_of(2, 1));
     model.outcome(job, missing(1), stable(0), stable(0), secs(0));
 
     // The chain keeps changing. Every twenty seconds a missed event runs
@@ -3301,7 +2987,7 @@ fn checking_a_transaction_again_and_again_does_not_extend_its_wait_for_a_parent(
 #[test]
 fn a_hidden_transaction_checked_again_and_again_does_not_outlive_its_wait() {
     let mut model = new_model();
-    admit(&mut model, child_of(2, 1), 2, 0);
+    admit(&mut model, child_of(2, 1), 0);
     let mut now = secs(0);
     let mut removed_at = None;
     for generation in 1..10u32 {
@@ -3346,10 +3032,10 @@ fn a_missed_block_that_mined_an_expired_parent_keeps_its_child() {
     let mut model = new_model();
     let mut parent = tx(1);
     parent.expiry = Some(Height(102));
-    admit(&mut model, parent, 1, 0);
+    admit(&mut model, parent, 0);
     let mut child = child_of(2, 1);
     child.expiry = Some(Height(200));
-    let (waiter, job) = bring_in(&mut model, child, legacy(2));
+    let (waiter, job) = bring_in(&mut model, child);
     let step = model.outcome(
         job,
         Outcome::PassUsing(vec![output(1, 0)]),
@@ -3381,20 +3067,20 @@ fn a_missed_block_that_mined_an_expired_parent_keeps_its_child() {
 #[test]
 fn a_parent_that_never_arrives_is_remembered_until_the_tip_changes() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    let (_, job) = bring_in(&mut model, child_of(2, 1));
     model.outcome(job, missing(1), stable(0), stable(0), secs(0));
     model.tick(T_PARK);
 
     // As today: the same bytes are not fetched and verified again at this
     // tip, and the adapter's rejection query sees it.
     assert_eq!(
-        model.reserve(id(2), peer(2), Intent::Fetch, T_PARK),
+        model.reserve(id(2), Intent::Fetch, T_PARK),
         Err(ModelUnreserved::Rejected(RejectionScope::ExactTip))
     );
     let asked: HashSet<_> = [id(2)].into_iter().collect();
     assert_eq!(model.rejected_ids(&asked, T_PARK), asked);
     model.transition(transition(1, 101, vec![vec![]]), T_PARK);
-    assert!(model.reserve(id(2), peer(2), Intent::Fetch, T_PARK).is_ok());
+    assert!(model.reserve(id(2), Intent::Fetch, T_PARK).is_ok());
 }
 
 #[test]
@@ -3419,8 +3105,8 @@ fn an_expired_hidden_parent_does_not_take_its_child_with_it() {
     let mut model = new_model();
     let mut parent = tx(1);
     parent.expiry = Some(Height(102));
-    admit(&mut model, parent, 1, 0);
-    let (waiter, job) = bring_in(&mut model, child_of(2, 1), legacy(2));
+    admit(&mut model, parent, 0);
+    let (waiter, job) = bring_in(&mut model, child_of(2, 1));
     let step = model.outcome(
         job,
         Outcome::PassUsing(vec![output(1, 0)]),
@@ -3455,8 +3141,8 @@ fn a_visible_expired_parent_still_takes_its_child_with_it() {
     let mut model = new_model();
     let mut parent = tx(1);
     parent.expiry = Some(Height(101));
-    admit(&mut model, parent, 1, 0);
-    let (_, job) = bring_in(&mut model, child_of(2, 1), legacy(2));
+    admit(&mut model, parent, 0);
+    let (_, job) = bring_in(&mut model, child_of(2, 1));
     model.outcome(
         job,
         Outcome::PassUsing(vec![output(1, 0)]),
@@ -3479,7 +3165,7 @@ fn inputs_that_arrive_one_at_a_time_earn_one_check_after_the_wait_and_no_more() 
         .spending(hash(1), 0)
         .spending(hash(2), 0)
         .spending(hash(3), 0);
-    let (waiter, job) = bring_in(&mut model, child, legacy(9));
+    let (waiter, job) = bring_in(&mut model, child);
     model.outcome(
         job,
         Outcome::MissingInputs(vec![output(1, 0), output(2, 0), output(3, 0)]),
@@ -3495,7 +3181,7 @@ fn inputs_that_arrive_one_at_a_time_earn_one_check_after_the_wait_and_no_more() 
     assert!(step.started().is_empty());
     let step = model.resync(Height(102), Generation(2), secs(59));
     let job = step.started()[0];
-    admit(&mut model, tx(2), 2, 2);
+    admit(&mut model, tx(2), 2);
     let step = model.outcome(
         job,
         Outcome::MissingInputs(vec![output(1, 0), output(2, 0), output(3, 0)]),
@@ -3508,7 +3194,7 @@ fn inputs_that_arrive_one_at_a_time_earn_one_check_after_the_wait_and_no_more() 
 
     // During that check the third parent arrives too. The first is still
     // missing, and the one extra check is used up.
-    admit(&mut model, tx(3), 3, 2);
+    admit(&mut model, tx(3), 2);
     let step = model.outcome(
         job,
         Outcome::MissingInputs(vec![output(1, 0), output(3, 0)]),
@@ -3524,15 +3210,13 @@ fn inputs_that_arrive_one_at_a_time_earn_one_check_after_the_wait_and_no_more() 
         Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
     );
     assert!(step.started().is_empty());
-    assert!(model
-        .reserve(id(9), peer(8), Intent::Fetch, secs(63))
-        .is_ok());
+    assert!(model.reserve(id(9), Intent::Fetch, secs(63)).is_ok());
 }
 
 #[test]
 fn a_hidden_transaction_whose_parent_never_returns_is_remembered_too() {
     let mut model = new_model();
-    admit(&mut model, child_of(2, 1), 2, 0);
+    admit(&mut model, child_of(2, 1), 0);
     let step = model.transition(reorg(1, 99), secs(0));
     model.outcome(the_job(&step), missing(1), stable(1), stable(1), secs(0));
     model.tick(T_PARK);
@@ -3540,7 +3224,7 @@ fn a_hidden_transaction_whose_parent_never_returns_is_remembered_too() {
 
     // The same bytes are not fetched again at this tip.
     assert_eq!(
-        model.reserve(id(2), peer(3), Intent::Fetch, T_PARK),
+        model.reserve(id(2), Intent::Fetch, T_PARK),
         Err(ModelUnreserved::Rejected(RejectionScope::ExactTip))
     );
 }
@@ -3548,7 +3232,7 @@ fn a_hidden_transaction_whose_parent_never_returns_is_remembered_too() {
 #[test]
 fn a_chain_that_changes_during_every_check_cannot_hold_a_slot_for_ever() {
     let mut model = new_model();
-    let (waiter, mut job) = bring_in(&mut model, tx(1), legacy(1));
+    let (waiter, mut job) = bring_in(&mut model, tx(1));
 
     // Every twenty seconds the chain changes, and each verification spans
     // the change, so no outcome can be trusted and each runs again.
@@ -3585,13 +3269,13 @@ fn a_chain_that_changes_during_every_check_cannot_hold_a_slot_for_ever() {
         ))
     );
     assert_eq!(model.slots_in_use(), 0);
-    assert!(model.reserve(id(1), peer(2), Intent::Fetch, now).is_ok());
+    assert!(model.reserve(id(1), Intent::Fetch, now).is_ok());
 }
 
 #[test]
 fn a_slot_is_held_at_most_its_limit_however_the_transaction_is_moved_about() {
     let mut model = new_model();
-    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (waiter, job) = bring_in(&mut model, tx(1));
     // The outcome waits for a chain event that the reading promised.
     model.outcome(
         job,
@@ -3615,7 +3299,7 @@ fn a_slot_is_held_at_most_its_limit_however_the_transaction_is_moved_about() {
 fn the_last_check_is_not_a_cached_rejection_when_the_last_parent_arrived_during_it() {
     let mut model = new_model();
     let child = tx(9).spending(hash(1), 0).spending(hash(2), 0);
-    let (waiter, job) = bring_in(&mut model, child, legacy(9));
+    let (waiter, job) = bring_in(&mut model, child);
     model.outcome(
         job,
         Outcome::MissingInputs(vec![output(1, 0), output(2, 0)]),
@@ -3627,7 +3311,7 @@ fn the_last_check_is_not_a_cached_rejection_when_the_last_parent_arrived_during_
     // during it. That earns the one extra check.
     let step = model.resync(Height(101), Generation(1), secs(59));
     let job = step.started()[0];
-    admit(&mut model, tx(1), 1, 1);
+    admit(&mut model, tx(1), 1);
     let step = model.outcome(
         job,
         Outcome::MissingInputs(vec![output(1, 0), output(2, 0)]),
@@ -3638,7 +3322,7 @@ fn the_last_check_is_not_a_cached_rejection_when_the_last_parent_arrived_during_
     let job = the_job(&step);
 
     // The extra check looks for the second parent just before it arrives.
-    admit(&mut model, tx(2), 2, 1);
+    admit(&mut model, tx(2), 1);
     let step = model.outcome(
         job,
         Outcome::MissingInputs(vec![output(2, 0)]),
@@ -3652,16 +3336,14 @@ fn the_last_check_is_not_a_cached_rejection_when_the_last_parent_arrived_during_
         step.verdict(waiter),
         Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
     );
-    assert!(model
-        .reserve(id(9), peer(8), Intent::Fetch, secs(63))
-        .is_ok());
+    assert!(model.reserve(id(9), Intent::Fetch, secs(63)).is_ok());
 }
 
 #[test]
 fn a_conflict_with_a_hidden_transaction_is_not_a_rejection() {
     let mut model = new_model();
     let coin = hash(900);
-    admit(&mut model, tx(1).spending(coin, 0), 1, 0);
+    admit(&mut model, tx(1).spending(coin, 0), 0);
     // The rules change. The pooled transaction is hidden until it has been
     // checked under the new ones.
     let mut change = transition(1, 101, vec![vec![]]);
@@ -3671,7 +3353,7 @@ fn a_conflict_with_a_hidden_transaction_is_not_a_rejection() {
 
     // A new transaction spends the same output and passes under the new
     // rules, before the old one's check has answered.
-    let (waiter, job) = bring_in(&mut model, tx(2).spending(coin, 0), legacy(2));
+    let (waiter, job) = bring_in(&mut model, tx(2).spending(coin, 0));
     let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), secs(2));
     // Which of the two is valid is not known yet. This is not a rejection,
     // and nothing is remembered against the new one.
@@ -3692,7 +3374,7 @@ fn a_conflict_with_a_hidden_transaction_is_not_a_rejection() {
         stable(1),
         secs(3),
     );
-    let (waiter, job) = bring_in(&mut model, tx(2).spending(coin, 0), legacy(2));
+    let (waiter, job) = bring_in(&mut model, tx(2).spending(coin, 0));
     let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), secs(4));
     assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
     model.assert_invariants();
@@ -3703,7 +3385,7 @@ fn a_deadline_that_has_passed_is_applied_before_the_input_that_shows_it() {
     // A pass that arrives after the slot's limit is too late, whether or
     // not a tick came first.
     let mut model = new_model();
-    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (waiter, job) = bring_in(&mut model, tx(1));
     model.outcome(
         job,
         Outcome::Pass,
@@ -3727,7 +3409,7 @@ fn a_deadline_that_has_passed_is_applied_before_the_input_that_shows_it() {
     assert!(model.visible().is_empty());
 
     // The same for one verification's own limit.
-    let (waiter, job) = bring_in(&mut model, tx(2), legacy(2));
+    let (waiter, job) = bring_in(&mut model, tx(2));
     let late = MAX_UNDECIDED + secs(1) + T_VERIFY;
     let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), late);
     assert_eq!(
@@ -3737,7 +3419,7 @@ fn a_deadline_that_has_passed_is_applied_before_the_input_that_shows_it() {
 
     // And a chain event that arrives after a parked wait has ended finds
     // the wait already decided.
-    let (waiter, job) = bring_in(&mut model, child_of(4, 3), legacy(3));
+    let (waiter, job) = bring_in(&mut model, child_of(4, 3));
     model.outcome(job, missing(3), stable(1), stable(1), late);
     let step = model.transition(transition(2, 102, vec![vec![tx(3)]]), late + T_PARK);
     assert_eq!(
@@ -3751,10 +3433,10 @@ fn after_a_reorg_a_passing_verifier_brings_the_whole_pool_back() {
     let mut model = new_model();
     let mut run = Run::default();
     // Two independent transactions, and a parent with its child.
-    admit(&mut model, tx(1), 1, 0);
-    admit(&mut model, tx(2), 2, 0);
-    admit(&mut model, tx(3), 3, 0);
-    let (waiter, job) = bring_in(&mut model, child_of(4, 3), legacy(4));
+    admit(&mut model, tx(1), 0);
+    admit(&mut model, tx(2), 0);
+    admit(&mut model, tx(3), 0);
+    let (waiter, job) = bring_in(&mut model, child_of(4, 3));
     let step = model.outcome(
         job,
         Outcome::PassUsing(vec![output(3, 0)]),
@@ -3798,11 +3480,11 @@ fn after_a_reorg_a_passing_verifier_brings_the_whole_pool_back() {
 #[test]
 fn a_late_outcome_still_starts_the_revalidation_its_timeout_made_room_for() {
     // One slot.
-    let mut model = new_model().with_limits(1, 5, 1);
-    admit(&mut model, tx(1), 1, 0);
+    let mut model = new_model().with_limits(1, 1);
+    admit(&mut model, tx(1), 0);
     // A new transaction takes the slot, and then a reorg hides the pooled
     // one. Its check has to wait for the slot.
-    let (waiter, job) = bring_in(&mut model, tx(2), legacy(2));
+    let (waiter, job) = bring_in(&mut model, tx(2));
     let step = model.transition(reorg(1, 100), secs(1));
     assert!(step.started().is_empty());
 
@@ -3822,14 +3504,14 @@ fn a_reservation_sees_the_deadlines_that_are_due_whether_or_not_a_tick_came_firs
     let late = T_VERIFY + secs(1);
     // With a tick first.
     let mut ticked = new_model();
-    let (waiter, _) = bring_in(&mut ticked, tx(1), legacy(1));
+    let (waiter, _) = bring_in(&mut ticked, tx(1));
     assert!(ticked.tick(late).verdict(waiter).is_some());
-    let with_tick = ticked.reserve(id(1), peer(2), Intent::Fetch, late).is_ok();
+    let with_tick = ticked.reserve(id(1), Intent::Fetch, late).is_ok();
 
     // Without one. The reservation is the first input to see the time.
     let mut direct = new_model();
-    let (waiter, _) = bring_in(&mut direct, tx(1), legacy(1));
-    let without_tick = direct.reserve(id(1), peer(2), Intent::Fetch, late).is_ok();
+    let (waiter, _) = bring_in(&mut direct, tx(1));
+    let without_tick = direct.reserve(id(1), Intent::Fetch, late).is_ok();
     assert!(with_tick && without_tick);
     // The earlier submission's verdict is there to take at once, with no
     // later input needed to bring it out.
@@ -3843,7 +3525,7 @@ fn a_reservation_sees_the_deadlines_that_are_due_whether_or_not_a_tick_came_firs
 #[test]
 fn the_deadline_that_was_due_first_decides_however_late_the_core_gets_to_it() {
     let parked_at_zero = |model: &mut PoolModel| {
-        let (waiter, job) = bring_in(model, child_of(2, 1), legacy(1));
+        let (waiter, job) = bring_in(model, child_of(2, 1));
         model.outcome(job, missing(1), stable(0), stable(0), secs(0));
         waiter
     };
@@ -3861,33 +3543,15 @@ fn the_deadline_that_was_due_first_decides_however_late_the_core_gets_to_it() {
     let after_both = MAX_UNDECIDED + secs(1);
     assert_eq!(late.tick(after_both).verdict(waiter), unresolved_parent);
     assert_eq!(
-        late.reserve(id(2), peer(3), Intent::Fetch, after_both),
+        late.reserve(id(2), Intent::Fetch, after_both),
         Err(ModelUnreserved::Rejected(RejectionScope::ExactTip))
     );
 }
 
 #[test]
-fn a_second_failure_while_a_peer_is_cooling_down_does_not_extend_the_cooldown() {
-    let mut model = new_model();
-    let (_, first) = bring_in(&mut model, tx(1), legacy(1));
-    let (_, second) = bring_in(&mut model, tx(2), legacy(1));
-    let cooldown = Outcome::Fail {
-        scope: RejectionScope::ExactTip,
-        charge: Charge::Cooldown,
-    };
-    model.outcome(first, cooldown.clone(), stable(0), stable(0), secs(1));
-    model.outcome(second, cooldown, stable(0), stable(0), secs(59));
-
-    // The cooldown ends when the first one said, as today.
-    let ends = secs(1) + COOLDOWN;
-    assert!(model.cooling(&legacy(1), ends - secs(1)));
-    assert!(!model.cooling(&legacy(1), ends));
-}
-
-#[test]
 fn a_late_outcome_that_brings_a_retry_due_starts_it() {
     let mut model = new_model();
-    admit(&mut model, tx(1), 1, 0);
+    admit(&mut model, tx(1), 0);
     let step = model.transition(reorg(1, 100), secs(0));
     let job = the_job(&step);
     // The check runs past its deadline. It is cancelled and a retry is set.
@@ -3910,11 +3574,11 @@ fn a_late_outcome_that_brings_a_retry_due_starts_it() {
 #[test]
 fn an_older_time_from_a_caller_does_not_turn_the_models_clock_back() {
     let mut model = new_model();
-    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (waiter, job) = bring_in(&mut model, tx(1));
     // Another input moves time far past this job's deadline, and is the
     // one that finds it due. Its effects are taken before anything else.
     let late = MAX_UNDECIDED + secs(1);
-    assert!(model.reserve(id(2), peer(2), Intent::Fetch, late).is_ok());
+    assert!(model.reserve(id(2), Intent::Fetch, late).is_ok());
     assert_eq!(
         model.effects().verdict(waiter),
         Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
@@ -3928,7 +3592,7 @@ fn an_older_time_from_a_caller_does_not_turn_the_models_clock_back() {
 
     // A second submission is judged on the model's clock too. Its deadline
     // runs from now, not from the stale time its caller passes.
-    let (waiter, job) = bring_in(&mut model, tx(3), legacy(3));
+    let (waiter, job) = bring_in(&mut model, tx(3));
     let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(2));
     assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
 }
@@ -3937,10 +3601,10 @@ fn an_older_time_from_a_caller_does_not_turn_the_models_clock_back() {
 #[should_panic(expected = "the previous input's effects were not collected")]
 fn the_next_input_refuses_to_run_over_uncollected_effects() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     // The reservation finds the job's deadline due. Its caller does not
     // take what that caused.
-    let _ = model.reserve(id(2), peer(2), Intent::Fetch, T_VERIFY + secs(1));
+    let _ = model.reserve(id(2), Intent::Fetch, T_VERIFY + secs(1));
     // The next input would hand that verdict over as if it were its own.
     model.outcome(job, Outcome::Pass, stable(0), stable(0), T_VERIFY + secs(2));
 }
@@ -3950,16 +3614,16 @@ fn the_next_input_refuses_to_run_over_uncollected_effects() {
 #[test]
 fn a_reservation_hands_over_at_once_what_its_deadlines_caused() {
     // One slot.
-    let mut model = new_model().with_limits(1, 5, 1);
-    admit(&mut model, tx(1), 1, 0);
-    let (waiter, _) = bring_in(&mut model, tx(2), legacy(2));
+    let mut model = new_model().with_limits(1, 1);
+    admit(&mut model, tx(1), 0);
+    let (waiter, _) = bring_in(&mut model, tx(2));
     let step = model.transition(reorg(1, 100), secs(1));
     assert!(step.started().is_empty(), "the slot is taken");
 
     // A reservation is the first input to see the admission's deadline. It
     // decides the admission and starts the check that was waiting.
     let late = T_VERIFY + secs(1);
-    let _ = model.reserve(id(3), peer(3), Intent::Fetch, late);
+    let _ = model.reserve(id(3), Intent::Fetch, late);
     let step = model.effects();
     assert_eq!(
         step.verdict(waiter),
@@ -3980,8 +3644,8 @@ fn a_reservation_hands_over_at_once_what_its_deadlines_caused() {
 #[should_panic(expected = "an input's effects were left uncollected")]
 fn effects_left_uncollected_fail_the_invariants() {
     let mut model = new_model();
-    bring_in(&mut model, tx(1), legacy(1));
-    let _ = model.reserve(id(2), peer(2), Intent::Fetch, T_VERIFY + secs(1));
+    bring_in(&mut model, tx(1));
+    let _ = model.reserve(id(2), Intent::Fetch, T_VERIFY + secs(1));
     model.assert_invariants();
 }
 
@@ -3989,7 +3653,7 @@ fn effects_left_uncollected_fail_the_invariants() {
 fn the_rejection_query_sees_the_deadlines_that_are_due_whether_or_not_a_tick_came_first() {
     let asked: HashSet<_> = [id(2)].into_iter().collect();
     let parked = |model: &mut PoolModel| {
-        let (waiter, job) = bring_in(model, child_of(2, 1), legacy(1));
+        let (waiter, job) = bring_in(model, child_of(2, 1));
         model.outcome(job, missing(1), stable(0), stable(0), secs(0));
         waiter
     };
@@ -4017,28 +3681,28 @@ fn the_rejection_query_sees_the_deadlines_that_are_due_whether_or_not_a_tick_cam
 #[test]
 fn a_joiner_whose_admission_was_decided_before_it_came_back_gets_that_verdict() {
     let mut model = new_model();
-    let (first, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (first, job) = bring_in(&mut model, tx(1));
     // An RPC caller joins while the first verification runs, then is slow
     // to send its join.
     let joined = model
-        .reserve(id(1), Source::Node, Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("a delivery joins an undecided id");
     assert!(!joined.wants_body, "the core already holds the body");
     let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(1));
     assert_eq!(step.verdict(first), Some(ModelVerdict::Admitted));
 
-    let (late, step) = model.wait(joined.id, id(1), Supplier::Nobody, secs(2));
+    let (late, step) = model.wait(joined.id, id(1), secs(2));
     assert_eq!(step.verdict(late), Some(ModelVerdict::Admitted));
     assert_eq!(model.caller_held(), 0);
     model.assert_invariants();
 }
 
 #[test]
-fn a_late_joiner_is_charged_for_a_cooldown_failure_as_an_early_one_is() {
+fn a_late_joiner_gets_a_cooldown_failure_with_its_charge_as_an_early_one_does() {
     let mut model = new_model();
-    let (_, job) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, job) = bring_in(&mut model, tx(1));
     let joined = model
-        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("a delivery joins an undecided id");
     model.outcome(
         job,
@@ -4050,29 +3714,23 @@ fn a_late_joiner_is_charged_for_a_cooldown_failure_as_an_early_one_is() {
         stable(0),
         secs(1),
     );
-    assert!(!model.cooling(&legacy(2), secs(1)));
 
-    let (late, step) = model.wait(joined.id, id(1), Supplier::Peer(legacy(2)), secs(2));
+    // Its caller applies the charge to whoever sent its copy.
+    let (late, step) = model.wait(joined.id, id(1), secs(2));
     assert_eq!(
         step.verdict(late),
         Some(rejected(RejectionScope::ExactTip, Charge::Cooldown))
-    );
-    assert!(
-        model.cooling(&legacy(2), secs(2)),
-        "its supplier is charged"
     );
 }
 
 #[test]
 fn a_block_that_mines_an_id_being_fetched_cancels_the_fetch_and_decides_it() {
     let mut model = new_model();
-    let fetch = model
-        .reserve(id(1), peer(1), Intent::Fetch, secs(0))
-        .expect("room");
+    let fetch = model.reserve(id(1), Intent::Fetch, secs(0)).expect("room");
     let joined = model
-        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
+        .reserve(id(1), Intent::Deliver, secs(0))
         .expect("joins");
-    let (waiter, _) = model.wait(joined.id, id(1), Supplier::Peer(legacy(2)), secs(0));
+    let (waiter, _) = model.wait(joined.id, id(1), secs(0));
 
     let step = model.transition(transition(1, 101, vec![vec![tx(1)]]), secs(1));
     assert!(
@@ -4095,13 +3753,9 @@ fn a_block_that_mines_an_id_being_fetched_cancels_the_fetch_and_decides_it() {
 
 #[test]
 fn turning_the_pool_off_stops_every_fetch_and_holds_its_slot_until_dropped() {
-    let mut model = new_model();
+    let mut model = new_model().with_limits(5, 4);
     let fetches: Vec<_> = (1..=5u16)
-        .map(|n| {
-            model
-                .reserve(id(n), peer(1), Intent::Fetch, secs(0))
-                .expect("room")
-        })
+        .map(|n| model.reserve(id(n), Intent::Fetch, secs(0)).expect("room"))
         .collect();
 
     let step = model.deactivate(secs(1));
@@ -4112,18 +3766,16 @@ fn turning_the_pool_off_stops_every_fetch_and_holds_its_slot_until_dropped() {
         );
     }
 
-    // Turned back on, the old fetches still hold the peer's slots until their
+    // Turned back on, the old fetches still hold their slots until their
     // callers drop them.
     model.activate(Height(100), Generation(0), secs(2));
     assert_eq!(
-        model.reserve(id(9), peer(1), Intent::Fetch, secs(2)),
-        Err(ModelUnreserved::NoRoom(NoRoom::Source))
+        model.reserve(id(9), Intent::Fetch, secs(2)),
+        Err(ModelUnreserved::NoRoom)
     );
     for fetch in &fetches {
         model.release(fetch.id, secs(2));
     }
-    assert!(model
-        .reserve(id(9), peer(1), Intent::Fetch, secs(2))
-        .is_ok());
+    assert!(model.reserve(id(9), Intent::Fetch, secs(2)).is_ok());
     model.assert_invariants();
 }

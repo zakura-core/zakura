@@ -36,16 +36,9 @@ fn summary(shared: &SharedEvidence) -> Vec<String> {
             "answered {} of {}",
             evidence.submits_answered, evidence.submits_started
         ),
-        format!("charges {:?}", evidence.charges),
-        format!(
-            "peak slots {} in all, {} for one peer",
-            evidence.peak_total, evidence.peak_source
-        ),
-        format!(
-            "relayed charges {}, local failures {}",
-            evidence.relayed_charges, evidence.local_failures
-        ),
-        format!("misattributed {:?}", evidence.misattributed),
+        format!("charges checked {:?}", evidence.charges_checked),
+        format!("peak slots {}", evidence.peak_total),
+        format!("wrong charge {:?}", evidence.wrong_charge),
         format!("past limit {:?}", evidence.past_limit),
         format!("passed {:?}", evidence.passed),
         format!("removals {}", evidence.removals_seen),
@@ -84,16 +77,13 @@ fn the_pool_core_seed_holds_every_pool_property() {
                 evidence.peak_total == pool::LIMITS.pending,
             ),
             (
-                "a peer's limit",
-                evidence.peak_source == pool::LIMITS.per_source,
+                "a cooldown charge",
+                evidence.charges_checked.contains_key("Cooldown"),
             ),
+            ("a ban charge", evidence.charges_checked.contains_key("Ban")),
             (
-                "a charge relayed to another supplier",
-                evidence.relayed_charges > 0,
-            ),
-            (
-                "a local failure that charges nobody",
-                evidence.local_failures > 0,
+                "a valid body refused for nothing",
+                evidence.charges_checked.contains_key("None"),
             ),
             ("a removal in the log", evidence.removals_seen > 0),
         ];

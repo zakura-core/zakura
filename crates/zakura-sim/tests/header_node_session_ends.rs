@@ -9,11 +9,12 @@ mod support;
 
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc, time::Duration};
 
-use support::{inputs, run};
+use support::{inputs, one_key_off::assert_one_key_off, run};
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
     check::after_step,
     harness::{
+        header_acceptance::refs::{ConnectionRef, Ref, SessionIdRef},
         header_node::{
             adoption::SessionLife, policy::Trigger, preload, tap::ReactorTap, Chain, Control,
             ControlAction, ControlStep, DispatchFlag, Effects, HeaderNode, Policy, PolicySource,
@@ -82,11 +83,7 @@ fn a_link_the_harness_closes_shows_in_the_next_view() {
                 .view();
             let before = previous.replace(view.sessions.clone());
             for life in &view.sessions {
-                let was = before
-                    .iter()
-                    .find(|earlier| earlier.session_id == life.session_id)
-                    .and_then(|earlier| earlier.until);
-                if let (None, Some(until)) = (was, life.until) {
+                if let (None, Some(until)) = (earlier_end(&before, life), life.until) {
                     shown.borrow_mut().push(Shown {
                         session_id: life.session_id,
                         until,
@@ -116,9 +113,7 @@ fn a_link_the_harness_closes_shows_in_the_next_view() {
         // Each mirror's first link: `mirror-0`'s is connection 1 and
         // `mirror-1`'s connection 2, the session IDs the same.
         for session_id in [1, 2] {
-            let first = shown
-                .iter()
-                .find(|shown| shown.session_id == session_id)
+            let first = first_shown(&shown, &SessionIdRef { session_id })
                 .unwrap_or_else(|| panic!("session {session_id} ended: {shown:#?}"));
             assert_eq!(first.pick.category, Category::Task, "{first:?}");
             // The control task, numbered by the scheduler.
@@ -140,8 +135,103 @@ fn a_link_the_harness_closes_shows_in_the_next_view() {
     }
 }
 
+/// The end the earlier view `before` showed for `life`'s session, joined
+/// by its [`SessionIdRef`], or `None` if it showed none.
+fn earlier_end(before: &[SessionLife], life: &SessionLife) -> Option<Duration> {
+    let session = SessionIdRef {
+        session_id: life.session_id,
+    };
+    SessionIdRef::joined(&session, before, |earlier| {
+        Some(SessionIdRef {
+            session_id: earlier.session_id,
+        })
+    })
+    .first()
+    .and_then(|earlier| earlier.until)
+}
+
+/// The first view that showed `session`'s end, joined by its
+/// [`SessionIdRef`].
+fn first_shown<'s>(shown: &'s [Shown], session: &SessionIdRef) -> Option<&'s Shown> {
+    SessionIdRef::joined(session, shown, |shown| {
+        Some(SessionIdRef {
+            session_id: shown.session_id,
+        })
+    })
+    .first()
+    .copied()
+}
+
+/// The view joins by its session: session 1's end shows only beside its
+/// own earlier life and first view, and a life or view of a session one
+/// key off is another's.
+#[test]
+fn a_view_joins_its_earlier_life_by_its_session() {
+    let session = SessionIdRef { session_id: 1 };
+    let ended = SessionLife {
+        session_id: 1,
+        from: Duration::ZERO,
+        until: Some(Duration::from_secs(1)),
+    };
+    assert_one_key_off::<SessionIdRef>(&session, |earlier| {
+        let before = [SessionLife {
+            session_id: earlier.session_id,
+            ..ended
+        }];
+        earlier_end(&before, &ended).is_some()
+    });
+    assert_one_key_off::<SessionIdRef>(&session, |shown| {
+        let views = [Shown {
+            session_id: shown.session_id,
+            until: Duration::from_secs(1),
+            pick: Identity::advance_time(SimInstant::ZERO),
+            now: Duration::from_secs(1),
+            reactor_event: false,
+            sessions: 2,
+        }];
+        first_shown(&views, &session).is_some()
+    });
+}
+
 /// Ends by connection ID, as virtual time since the run's start.
 type Ends = BTreeMap<u64, Duration>;
+
+/// Whether `ended` holds exactly `cancelled`'s ends: each joined by its
+/// link's [`ConnectionRef`], at the same time, and no other.
+fn same_ends(cancelled: &Ends, ended: &Ends) -> bool {
+    let recorded: Vec<(u64, Duration)> = ended.iter().map(|(link, at)| (*link, *at)).collect();
+    ended.len() == cancelled.len()
+        && cancelled.iter().all(|(connection, at)| {
+            let link = ConnectionRef {
+                connection: *connection,
+            };
+            let joined = ConnectionRef::joined(&link, &recorded, |(connection, _)| {
+                Some(ConnectionRef {
+                    connection: *connection,
+                })
+            });
+            matches!(joined[..], [(_, end)] if end == at)
+        })
+}
+
+/// The recorded and cancelled ends join by their link: connection 1's end
+/// at 1s matches only an end recorded for connection 1, and one for a
+/// connection one key off is another link's.
+#[test]
+fn an_end_joins_its_cancellation_by_its_connection() {
+    let link = ConnectionRef { connection: 1 };
+    let cancelled = Ends::from([(1, Duration::from_secs(1))]);
+    assert_one_key_off::<ConnectionRef>(&link, |recorded| {
+        same_ends(
+            &cancelled,
+            &Ends::from([(recorded.connection, Duration::from_secs(1))]),
+        )
+    });
+    assert!(!same_ends(
+        &cancelled,
+        &Ends::from([(1, Duration::from_secs(2))])
+    ));
+}
 
 /// The node at genesis with `mirror-0` at A5, dialing it, and `mirror-1`
 /// at A4, dialed by it, under the converging policy, run by `input`, with
@@ -257,7 +347,10 @@ fn each_recorded_end_is_its_links_cancellation() {
     for input in inputs(8, 256) {
         let seen = ends_run(input);
         for (step, cancelled, ended) in &seen {
-            assert_eq!(ended, cancelled, "after step {step}");
+            assert!(
+                same_ends(cancelled, ended),
+                "after step {step}: {ended:?} recorded, {cancelled:?} cancelled"
+            );
         }
         let (_, last, _) = seen.last().expect("the run took steps");
         assert_eq!(last.keys().copied().collect::<Vec<_>>(), [1, 2], "{last:?}");

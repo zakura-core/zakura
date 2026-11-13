@@ -336,6 +336,18 @@ pub struct PeerFrameRef {
 }
 impl Ref for PeerFrameRef {}
 
+/// One session as a store that keys its lives by session ID alone names
+/// it, the topology's
+/// [`SessionLife`](crate::harness::header_node::adoption::SessionLife)s,
+/// which hold one session per link in a run, so the ID is the whole
+/// identity they carry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionIdRef {
+    /// The session.
+    pub session_id: u64,
+}
+impl Ref for SessionIdRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

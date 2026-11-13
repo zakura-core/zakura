@@ -7241,6 +7241,27 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "tests/header_mixed_resources.rs",
         "the_mixed_joins_fail_one_identity_off",
     ),
+    (
+        "SessionIdRef",
+        "tests/header_node_session_ends.rs",
+        "earlier_end",
+        "tests/header_node_session_ends.rs",
+        "a_view_joins_its_earlier_life_by_its_session",
+    ),
+    (
+        "SessionIdRef",
+        "tests/header_node_session_ends.rs",
+        "first_shown",
+        "tests/header_node_session_ends.rs",
+        "a_view_joins_its_earlier_life_by_its_session",
+    ),
+    (
+        "ConnectionRef",
+        "tests/header_node_session_ends.rs",
+        "same_ends",
+        "tests/header_node_session_ends.rs",
+        "an_end_joins_its_cancellation_by_its_connection",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.
@@ -8253,12 +8274,6 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "witnessed",
         "id",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "tests/header_node_session_ends.rs",
-        "a_link_the_harness_closes_shows_in_the_next_view",
-        "session_id",
-        "the storage view keys its lives by session ID alone, one per link in a run, so it's the view's whole identity; a view freshness test, not a history judgment",
     ),
     (
         "tests/header_wire_crossing.rs",

@@ -1600,13 +1600,14 @@ fn case_errors(expected: &[ExpectedResult], cases: &[(String, String)]) -> Vec<S
     let mut named: BTreeMap<(String, String), Vec<(bool, &str)>> = BTreeMap::new();
     for result in expected {
         // A duplicate native mutation's key shares its covering case's
-        // catch, which the case's own row names, and so does a contract's
-        // proving catch.
-        if result
-            .keys
-            .iter()
-            .all(|key| matches!(key, Key::Native { .. } | Key::ContractCatch { .. }))
-        {
+        // catch, which the case's own row names, and so do a contract's
+        // proving catch and a gate requirement a case's catch serves.
+        if result.keys.iter().all(|key| {
+            matches!(
+                key,
+                Key::Native { .. } | Key::ContractCatch { .. } | Key::Requirement { .. }
+            )
+        }) {
             continue;
         }
         let (case, machine, declared) = match result.expected {
@@ -3130,17 +3131,74 @@ fn the_gate_requirements_match_their_obligations() {
         GATE_OBLIGATIONS.len(),
         "one obligation per name"
     );
-    assert_eq!(results, obligations);
-    for requirement in GATE_REQUIREMENTS {
-        let key = Key::Requirement {
-            name: requirement.name.into(),
-        };
-        assert!(
-            key.covers(&requirement.expected, NARROWING),
-            "{}",
-            requirement.name
-        );
+    // Each obligation is served by exactly one committed result with its
+    // gates, which its key covers: its `GATE_REQUIREMENTS` entry, or for
+    // `gate-2/despite-close/caught` its case's `Caught`.
+    for (name, gates) in &results {
+        assert_eq!(obligations.get(name), Some(gates), "{name}");
     }
+    let manifest = Manifest::committed();
+    let mut served: BTreeMap<String, Vec<&ExpectedResult>> = BTreeMap::new();
+    for result in &manifest.expected {
+        for key in &result.keys {
+            if let Key::Requirement { name } = key {
+                served.entry(name.clone()).or_default().push(result);
+            }
+        }
+    }
+    assert_eq!(
+        served.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        obligations.keys().copied().collect::<BTreeSet<_>>(),
+        "every obligation has a result and every requirement result an obligation"
+    );
+    for (name, found) in &served {
+        let [result] = found[..] else {
+            panic!("{name}: one result serves it: {found:?}");
+        };
+        let gates: BTreeSet<Gate> = result.gates.iter().copied().collect();
+        assert_eq!(obligations.get(name.as_str()), Some(&gates), "{name}");
+        let key = Key::Requirement { name: name.clone() };
+        assert!(key.covers(&result.expected, NARROWING), "{name}");
+    }
+    // Round-10 J4: the despite-close catch requirement takes its case's own
+    // `Caught`, the result the case's key takes, and no longer the
+    // unpatched negative control's pass. Another case's `Caught` doesn't
+    // satisfy it (`required`'s `a_permitted_catch_joins_its_whole_case`).
+    let despite = header_acceptance::companions::DESPITE_CLOSE;
+    let case_key = Key::Case {
+        property: despite.property.into(),
+        name: despite.name.into(),
+    };
+    let [catch] = served[rows::DESPITE_CLOSE_CAUGHT][..] else {
+        unreachable!("one result serves each obligation");
+    };
+    let own: Vec<&ExpectedResult> = manifest
+        .expected
+        .iter()
+        .filter(|result| result.keys.contains(&case_key))
+        .collect();
+    let [own] = own[..] else {
+        panic!("one result is the case's: {own:?}");
+    };
+    assert!(
+        matches!(catch.expected, Expected::Caught { .. }),
+        "{catch:?}"
+    );
+    // `Expected` has no `PartialEq`, so its whole `Debug` form stands in.
+    assert_eq!(
+        format!("{:?}", catch.expected),
+        format!("{:?}", own.expected)
+    );
+    let negative = Expected::Passes {
+        test: sim_test(
+            "tests/header_despite_close.rs",
+            "the_path_break_needs_a_retained_violation",
+        ),
+    };
+    let key = Key::Requirement {
+        name: rows::DESPITE_CLOSE_CAUGHT.into(),
+    };
+    assert!(!key.covers(&negative, NARROWING));
     // Another requirement's result, with the same gate, doesn't satisfy it:
     // the standing no-request-row exclusion copied onto a crossing history.
     let standing = GATE_REQUIREMENTS
@@ -7438,6 +7496,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "sent_at",
         "tests/header_despite_close.rs",
         "a_stored_page_joins_its_whole_frame",
+    ),
+    (
+        "PlantedRef",
+        "src/harness/header_acceptance/required.rs",
+        "permitted_catch",
+        "src/harness/header_acceptance/required.rs",
+        "a_permitted_catch_joins_its_whole_case",
     ),
 ];
 

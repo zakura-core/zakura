@@ -1981,6 +1981,23 @@ fn discovery_plans_paired_arms() {
     assert!(baselines.iter().all(|(case, _)| case.id == "sibling"));
 }
 
+/// The catalogue's and the case list's libFuzzer flags must each name a
+/// fuzz target.
+#[test]
+fn libfuzzer_flags_name_fuzz_targets() {
+    let root = crate::repo_root().expect("xtask lives in the workspace");
+    let targets = crate::sim_minimize::fuzz_targets(&root).expect("the fuzz package's targets");
+    let mut bounds = committed_catalogue().discovery;
+    check_libfuzzer_args(&bounds, &targets).expect("the catalogue's flags name targets");
+    check_libfuzzer_args(&committed_list().bounds, &targets)
+        .expect("the list's flags name targets");
+    bounds
+        .libfuzzer_args
+        .insert("no_such_target".to_owned(), vec!["-len_control=0".to_owned()]);
+    let error = check_libfuzzer_args(&bounds, &targets).expect_err("an unknown target fails");
+    assert!(error.contains("no_such_target"), "{error}");
+}
+
 /// Cases on one target share its original campaigns, and each reads the
 /// original's facts for its own property.
 #[test]

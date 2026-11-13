@@ -18,7 +18,7 @@ use super::{
     super::{
         cases, harness_of, patched_files, planted_layout::PLANTED_DIR, Case as Planted, Witness,
     },
-    file_sha256, Bounds, Case, ConfirmationBounds,
+    check_libfuzzer_args, file_sha256, Bounds, Case, ConfirmationBounds,
 };
 use crate::{sim_minimize::fuzz_targets, BoxError};
 
@@ -69,16 +69,7 @@ pub(super) fn read(repo_root: &Path) -> Result<(Vec<u8>, List), BoxError> {
     let file: ListFile = toml::from_str(std::str::from_utf8(&bytes)?)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let targets = fuzz_targets(repo_root)?;
-    if let Some(unknown) = file
-        .bounds
-        .libfuzzer_args
-        .keys()
-        .find(|target| !targets.contains_key(*target))
-    {
-        return Err(
-            format!("{LIST}: libFuzzer flags for {unknown}, which isn't a fuzz target").into(),
-        );
-    }
+    check_libfuzzer_args(&file.bounds, &targets).map_err(|error| format!("{LIST}: {error}"))?;
     let planted = cases(repo_root)?;
     let cases = resolve(repo_root, &file.cases, &planted, &targets)
         .map_err(|error| format!("{LIST}: {error}"))?;

@@ -75,7 +75,7 @@ use super::{
 use crate::{
     run_command,
     sim::SIM_RUSTFLAGS,
-    sim_minimize::{install_interrupt_handler, run_child, ChildEnd, INTERRUPTED},
+    sim_minimize::{fuzz_targets, install_interrupt_handler, run_child, ChildEnd, INTERRUPTED},
     BoxError, UsageError,
 };
 
@@ -393,6 +393,8 @@ fn pilot(
     let bytes = fs::read(repo_root.join(CATALOGUE))?;
     let catalogue: Catalogue = serde_json::from_slice(&bytes)?;
     check_exclusions(&catalogue.cases)?;
+    check_libfuzzer_args(&catalogue.discovery, &fuzz_targets(repo_root)?)
+        .map_err(|error| format!("{CATALOGUE}: {error}"))?;
     let cases = select(&catalogue.cases, &only)?;
     let mut meta = Meta {
         experiment: experiment.to_owned(),
@@ -576,6 +578,24 @@ fn check_exclusions(cases: &[Case]) -> Result<(), String> {
             .is_some_and(|reason| reason.trim().is_empty())
     }) {
         Some(case) => Err(format!("{}: discovery exclusion needs a reason", case.id)),
+        None => Ok(()),
+    }
+}
+
+/// Fails if `bounds` gives libFuzzer flags to a target that isn't one of
+/// the fuzz package's `targets`, since no campaign would pass them.
+fn check_libfuzzer_args(
+    bounds: &Bounds,
+    targets: &BTreeMap<String, Option<String>>,
+) -> Result<(), String> {
+    match bounds
+        .libfuzzer_args
+        .keys()
+        .find(|target| !targets.contains_key(*target))
+    {
+        Some(unknown) => Err(format!(
+            "libFuzzer flags for {unknown}, which isn't a fuzz target"
+        )),
         None => Ok(()),
     }
 }

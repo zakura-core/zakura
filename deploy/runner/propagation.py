@@ -17,9 +17,10 @@ are reduced to "a private peer" here, before anything is summarised or returned.
 """
 
 import hashlib
-import ipaddress
 import math
 import time
+
+from peer_addresses import canonical_ip
 
 # The points on a block's way through one node, in order.
 POINTS = ("heard", "asked", "body", "queued", "tip", "told")
@@ -72,23 +73,6 @@ def fleet_peers(node_ids):
         except ValueError:
             continue
     return names
-
-
-def canonical_ip(text):
-    """One spelling of the IP address in `text`, or `None` when it holds none.
-
-    A port after the address (`ip:port`, `[ip]:port`) is dropped, and an IPv4 address
-    written in IPv6 form comes back as IPv4, so that a private address is recognised
-    however a node wrote it.
-    """
-    if not isinstance(text, str):
-        return None
-    host = text.rsplit(":", 1)[0] if text.count(":") == 1 or text.startswith("[") else text
-    try:
-        address = ipaddress.ip_address(host.strip("[]"))
-    except ValueError:
-        return None
-    return str(getattr(address, "ipv4_mapped", None) or address)
 
 
 def download_peer(download, fleet, fleet_addresses, is_private):

@@ -859,7 +859,8 @@ jobs:
           sudo install -d -m 755 "$dashboard_dir"
           sudo install -m 755 deploy/runner/zakura-cluster-status.py "$dashboard_dir/zakura-cluster-status.py"
           # The block propagation page and the module that joins the nodes' reports for it.
-          sudo install -m 644 deploy/runner/propagation.py deploy/runner/propagation.html "$dashboard_dir/"
+          sudo install -m 644 deploy/runner/propagation.py deploy/runner/propagation.html \
+            deploy/profiler/peer_addresses.py "$dashboard_dir/"
           cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
           # Dashboard-only: deploy.py rejects these fields, so add cookie RPC
           # auth for the compatibility node into this copy (not the deploy config).

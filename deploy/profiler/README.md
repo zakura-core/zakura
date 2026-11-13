@@ -74,7 +74,7 @@ or arrange separate retention: stopping the profiler does not stop trace writes.
 
 | Path on the node | Contents |
 | --- | --- |
-| `/opt/zakura-profiler/` | `zakura_profiler.py`, `stacks.py`, `blocks.py`, `page.html` |
+| `/opt/zakura-profiler/` | `zakura_profiler.py`, `stacks.py`, `blocks.py`, `peer_addresses.py`, `page.html` |
 | `/etc/systemd/system/zakura-profiler.service` | the unit, with the resource limits |
 | `/etc/systemd/system/zakura-profiler.service.d/node.conf` | this node's name, log file and trace directory |
 | `/mnt/data/zakura-profiler/` | one file per minute for 48 hours, one per hour for 14 days, capped at 2 GiB |
@@ -202,7 +202,7 @@ To install by hand on one host instead:
 
 ```bash
 install -d /opt/zakura-profiler
-install -m 644 zakura_profiler.py stacks.py blocks.py page.html /opt/zakura-profiler/
+install -m 644 zakura_profiler.py stacks.py blocks.py peer_addresses.py page.html /opt/zakura-profiler/
 install -m 644 zakura-profiler.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now zakura-profiler

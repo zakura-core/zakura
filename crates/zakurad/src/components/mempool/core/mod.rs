@@ -196,7 +196,9 @@ pub(crate) fn assemble(
     let verifier = verifier::ConsensusVerifier::new(
         Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
         read_state,
-        handle.clone(),
+        // A reader, not a handle: the core owns the verifier, and a handle
+        // it held would keep the core's command channel open.
+        handle.reader(),
         config.max_transaction_bytes,
         network,
         current,
@@ -224,7 +226,7 @@ pub(crate) fn assemble(
     );
     let mempool = spawn_buffer(BoxService::new(adapter), MAX_INBOUND_CONCURRENCY);
     let verifier_pool = spawn_buffer(
-        BoxService::new(verifier::VerifierPool::new(handle)),
+        BoxService::new(verifier::VerifierPool::new(handle.reader())),
         MAX_INBOUND_CONCURRENCY,
     );
 

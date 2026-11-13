@@ -945,6 +945,21 @@ pub struct PoolHandle {
     shared: Arc<Shared>,
 }
 
+/// Read-only access to the pool's latest snapshot. Unlike a [`PoolHandle`],
+/// it sends no commands, so holding one does not keep the core running. A
+/// verifier the core owns reads the pool through one.
+#[derive(Clone, Debug)]
+pub struct PoolReader {
+    snapshot: watch::Receiver<Option<Arc<PoolSnapshot>>>,
+}
+
+impl PoolReader {
+    /// The latest snapshot, or `None` until the core has published one.
+    pub fn snapshot(&self) -> Option<Arc<PoolSnapshot>> {
+        self.snapshot.borrow().clone()
+    }
+}
+
 /// The core's side of the port.
 #[derive(Debug)]
 pub struct PoolInbox {
@@ -1115,6 +1130,13 @@ impl PoolHandle {
     /// published one.
     pub fn snapshot(&self) -> Option<Arc<PoolSnapshot>> {
         self.snapshot.borrow().clone()
+    }
+
+    /// A reader of the snapshot that does not keep the core running.
+    pub fn reader(&self) -> PoolReader {
+        PoolReader {
+            snapshot: self.snapshot.clone(),
+        }
     }
 
     /// Wait for a snapshot newer than the last one this handle saw. Returns

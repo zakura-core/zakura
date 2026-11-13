@@ -23,7 +23,7 @@ use zakura_node_services::{
     block_memory::TransactionHandle,
     mempool::port::{
         chain_transitions, pool_port, AwaitOutputError, ChainReason, ChainTip, ChainTransition,
-        ChainTransitionSender, ConnectedBlock, Intent, LocalFault, NoRoom, PoolHandle,
+        ChainTransitionSender, ConnectedBlock, Intent, LocalFault, NoRoom, PoolHandle, PoolReader,
         RejectionScope, Source, Supplier, Unreserved, Verdict,
     },
     mempool::QueueSource,
@@ -49,7 +49,7 @@ const ANSWER: Duration = Duration::from_secs(5);
 /// told to hold a transaction forever or to panic on it.
 #[derive(Clone)]
 struct SnapshotVerifier {
-    handle: PoolHandle,
+    pool: PoolReader,
     txs: Arc<HashMap<UnminedTxId, VerifiedUnminedTx>>,
     hold: Arc<Mutex<HashSet<UnminedTxId>>>,
     panic_on: Arc<Mutex<HashSet<UnminedTxId>>>,
@@ -60,6 +60,11 @@ struct SnapshotVerifier {
     gates: Arc<Mutex<HashMap<UnminedTxId, Arc<Notify>>>>,
     /// How many times each transaction was verified.
     calls: Arc<Mutex<HashMap<UnminedTxId, usize>>>,
+    /// Run once while the verifier builds the future for a transaction,
+    /// which is inside the core's step.
+    hooks: Arc<Mutex<HashMap<UnminedTxId, Box<dyn FnOnce() + Send>>>>,
+    /// Transactions whose future the verifier panics while building.
+    panic_building: Arc<Mutex<HashSet<UnminedTxId>>>,
 }
 
 impl Verifier<TestVerifyError> for SnapshotVerifier {
@@ -70,6 +75,22 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
         _revalidation: bool,
     ) -> Pin<Box<dyn Future<Output = Outcome<TestVerifyError>> + Send>> {
         let id = tx.id();
+        let hook = self
+            .hooks
+            .lock()
+            .expect("no test panics holding it")
+            .remove(&id);
+        if let Some(hook) = hook {
+            hook();
+        }
+        assert!(
+            !self
+                .panic_building
+                .lock()
+                .expect("no test panics holding it")
+                .remove(&id),
+            "the verifier panics while it builds this future"
+        );
         *self
             .calls
             .lock()
@@ -81,11 +102,7 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
             .lock()
             .expect("no test panics holding it")
             .remove(&id);
-        let mined = self
-            .mined
-            .lock()
-            .expect("no test panics holding it")
-            .clone();
+        let mined = self.mined.clone();
         let hold = self
             .hold
             .lock()
@@ -98,26 +115,10 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
             .contains(&id);
         // The pool as the core published it when it started this job.
         let snapshot = self
-            .handle
+            .pool
             .snapshot()
             .expect("the core publishes before it starts a job");
-        let known: HashSet<_> = self.txs.keys().map(UnminedTxId::mined_id).collect();
-        let (from_pool, missing): (Vec<OutPoint>, Vec<OutPoint>) = tx
-            .transaction()
-            .spent_outpoints()
-            .filter(|outpoint| known.contains(&outpoint.hash) && !mined.contains(&outpoint.hash))
-            .partition(|outpoint| snapshot.created_output(outpoint).is_some());
-        let outcome = if missing.is_empty() {
-            Outcome::Pass {
-                tx: self.txs[&id].clone(),
-                pool_inputs: from_pool,
-            }
-        } else {
-            Outcome::MissingInputs {
-                missing,
-                error: TestVerifyError,
-            }
-        };
+        let txs = self.txs.clone();
         Box::pin(async move {
             if let Some(gate) = gate {
                 gate.notified().await;
@@ -126,7 +127,27 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
                 std::future::pending::<()>().await;
             }
             assert!(!panics, "the verifier panics on this transaction");
-            outcome
+            // The chain is read only now, inside the generation readings.
+            let mined = mined.lock().expect("no test panics holding it").clone();
+            let known: HashSet<_> = txs.keys().map(UnminedTxId::mined_id).collect();
+            let (from_pool, missing): (Vec<OutPoint>, Vec<OutPoint>) = tx
+                .transaction()
+                .spent_outpoints()
+                .filter(|outpoint| {
+                    known.contains(&outpoint.hash) && !mined.contains(&outpoint.hash)
+                })
+                .partition(|outpoint| snapshot.created_output(outpoint).is_some());
+            if missing.is_empty() {
+                Outcome::Pass {
+                    tx: txs[&id].clone(),
+                    pool_inputs: from_pool,
+                }
+            } else {
+                Outcome::MissingInputs {
+                    missing,
+                    error: TestVerifyError,
+                }
+            }
         })
     }
 }
@@ -134,7 +155,8 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
 /// A running core and what drives it.
 struct Harness {
     handle: PoolHandle,
-    chain: ChainTransitionSender,
+    chain: Arc<Mutex<ChainTransitionSender>>,
+    core: tokio::task::JoinHandle<()>,
     active: watch::Sender<bool>,
     verifier: SnapshotVerifier,
     height: u32,
@@ -143,7 +165,12 @@ struct Harness {
 impl Harness {
     /// Starts a core at height 100 that knows `txs`.
     fn start(txs: &[Tx]) -> Self {
-        let chain = chain_transitions(Some(tip(100, 0)));
+        Self::start_at(txs, Some(tip(100, 0)))
+    }
+
+    /// Starts a core at `start_tip` that knows `txs`.
+    fn start_at(txs: &[Tx], start_tip: Option<ChainTip>) -> Self {
+        let chain = chain_transitions(start_tip);
         let transitions = chain.transitions();
         let (start, events) = transitions
             .subscribe()
@@ -151,13 +178,15 @@ impl Harness {
         let (handle, inbox) = pool_port();
         let (active, active_rx) = watch::channel(true);
         let verifier = SnapshotVerifier {
-            handle: handle.clone(),
+            pool: handle.reader(),
             txs: Arc::new(txs.iter().map(|tx| (tx.id(), tx.real.clone())).collect()),
             hold: Arc::default(),
             panic_on: Arc::default(),
             mined: Arc::default(),
             gates: Arc::default(),
             calls: Arc::default(),
+            hooks: Arc::default(),
+            panic_building: Arc::default(),
         };
         let core = PoolCore::new(
             &Config {
@@ -171,10 +200,11 @@ impl Harness {
             inbox,
             active_rx,
         );
-        tokio::spawn(core.run());
+        let core = tokio::spawn(core.run());
         Self {
             handle,
-            chain,
+            chain: Arc::new(Mutex::new(chain)),
+            core,
             active,
             verifier,
             height: 100,
@@ -206,7 +236,8 @@ impl Harness {
     /// that mines `txs`. The chain is marked as changing before anything else
     /// happens, as the state writer does.
     fn change(&mut self, disconnect: u32, fork: u8, txs: &[&Tx]) {
-        self.chain.begin_change();
+        let mut chain = self.chain.lock().expect("no test panics holding it");
+        chain.begin_change();
         {
             let mut mined = self
                 .verifier
@@ -219,11 +250,11 @@ impl Harness {
             }
             mined.extend(txs.iter().map(|tx| tx.id().mined_id()));
         }
-        let before = self.chain.tip().expect("the test chain has a tip");
+        let before = chain.tip().expect("the test chain has a tip");
         let height = self.height - disconnect + 1;
         self.height = height;
         let after = tip(height, fork);
-        self.chain.finish_change(after, |_, generation| {
+        chain.finish_change(after, |_, generation| {
             Some(ChainTransition {
                 before: Some(before),
                 disconnected: (0..disconnect)
@@ -667,4 +698,145 @@ async fn a_revalidation_that_panics_is_tried_again_later() {
         .snapshot_until(|snapshot| snapshot.transaction(&parent.id().mined_id()).is_some())
         .await;
     assert!(harness.calls(&parent) >= 3);
+}
+
+#[tokio::test]
+async fn a_submission_cancelled_after_it_is_queued_frees_its_slot() {
+    let mut runner = TestRunner::deterministic();
+    let txs: Vec<Tx> = (0..6).map(|_| build(&mut runner, &[], 1, None)).collect();
+    let harness = Harness::start(&txs);
+    let peer = Source::Peer(QueueSource::LegacySocket(([10, 0, 0, 1], 8233).into()));
+
+    let mut held = Vec::new();
+    for tx in &txs[..5] {
+        held.push(
+            harness
+                .handle
+                .reserve(tx.id(), peer.clone(), Intent::Fetch)
+                .await
+                .expect("the peer has room"),
+        );
+    }
+    // The submission is queued for the core, then its caller gives up
+    // before the core takes it.
+    let reservation = held.pop().expect("five were reserved");
+    let body = txs[4].real.transaction.clone();
+    let mut submit = Box::pin(harness.handle.submit(reservation, body, Supplier::Nobody));
+    assert!(poll!(&mut submit).is_pending(), "the command is queued");
+    drop(submit);
+
+    let _granted = harness
+        .handle
+        .reserve(txs[5].id(), peer, Intent::Fetch)
+        .await
+        .expect("the cancelled submission's slot is free again");
+}
+
+#[tokio::test]
+async fn a_verifier_that_panics_while_building_its_future_is_a_local_fault() {
+    let (parent, child) = parent_and_child();
+    let harness = Harness::start(&[parent.clone(), child.clone()]);
+    harness
+        .verifier
+        .panic_building
+        .lock()
+        .expect("no test panics holding it")
+        .insert(parent.id());
+
+    let verdict = harness.submit(&parent).await;
+    assert!(
+        matches!(verdict, Verdict::LocalFault(LocalFault::VerifyPanicked)),
+        "{verdict:?}"
+    );
+    // The core is still serving.
+    assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
+}
+
+#[tokio::test]
+async fn dropping_every_outside_handle_stops_the_core() {
+    let (parent, _) = parent_and_child();
+    let harness = Harness::start(std::slice::from_ref(&parent));
+    assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
+
+    // The verifier the core owns reads the pool through a reader, which does
+    // not keep the core running.
+    let Harness { handle, core, .. } = harness;
+    drop(handle);
+    tokio::time::timeout(ANSWER, core)
+        .await
+        .expect("the core stops once every handle is gone")
+        .expect("the core does not panic");
+}
+
+#[tokio::test]
+async fn a_pool_with_no_tip_stays_off_until_the_chain_names_one() {
+    let (parent, _) = parent_and_child();
+    let mut harness = Harness::start_at(std::slice::from_ref(&parent), None);
+    harness.snapshot_until(|snapshot| !snapshot.active).await;
+    assert!(matches!(
+        harness
+            .handle
+            .reserve(parent.id(), Source::Node, Intent::Deliver)
+            .await,
+        Err(Unreserved::Inactive)
+    ));
+
+    // The first block names a tip, and the pool turns on at it.
+    harness.height = 0;
+    {
+        let mut chain = harness.chain.lock().expect("no test panics holding it");
+        chain.begin_change();
+        let after = tip(1, 0);
+        chain.finish_change(after, |_, _| None);
+    }
+    harness
+        .snapshot_until(|snapshot| snapshot.active && snapshot.tip.height.0 == 1)
+        .await;
+    assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
+}
+
+#[tokio::test]
+async fn a_chain_change_before_the_worker_first_looks_runs_the_job_again() {
+    let (parent, _) = parent_and_child();
+    let harness = Harness::start(std::slice::from_ref(&parent));
+    // While the core starts the job, inside its step, a block lands. The job
+    // was bound to the tip before it, so its result cannot be trusted at the
+    // new tip, though both of the worker's readings agree with each other.
+    let chain = harness.chain.clone();
+    harness
+        .verifier
+        .hooks
+        .lock()
+        .expect("no test panics holding it")
+        .insert(
+            parent.id(),
+            Box::new(move || {
+                let mut chain = chain.lock().expect("no test panics holding it");
+                let before = chain.tip().expect("the test chain has a tip");
+                let after = tip(before.height.0 + 1, 0);
+                chain.begin_change();
+                chain.finish_change(after, |_, generation| {
+                    Some(ChainTransition {
+                        before: Some(before),
+                        disconnected: Vec::new(),
+                        connected: vec![ConnectedBlock {
+                            hash: after.hash,
+                            height: after.height,
+                            transactions: Vec::new(),
+                            transaction_hashes: Arc::new([]),
+                        }],
+                        after,
+                        generation,
+                        rules_change: false,
+                    })
+                });
+            }),
+        );
+
+    assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
+    assert_eq!(
+        harness.calls(&parent),
+        2,
+        "the job bound to the old tip ran again at the new one"
+    );
 }

@@ -38,7 +38,7 @@ use zakura_mempool::{
     storage::{ExactTipRejectionError, NonStandardTransactionError, RejectionError},
 };
 use zakura_node_services::mempool::{
-    port::{ChainTip, Charge, LocalFault, PoolHandle, PoolSnapshot},
+    port::{ChainTip, Charge, LocalFault, PoolReader, PoolSnapshot},
     OutputNotInPool, Request, Response,
 };
 use zakura_state as zs;
@@ -57,7 +57,7 @@ pub(crate) struct ConsensusVerifier {
     /// The read state service is not `Sync`, so each verification clones it
     /// under this lock.
     read_state: Arc<Mutex<ReadState>>,
-    handle: PoolHandle,
+    pool: PoolReader,
     max_transaction_bytes: u64,
     network: Network,
     /// Whether the node is current enough to start cooldowns. Today's pool
@@ -67,11 +67,11 @@ pub(crate) struct ConsensusVerifier {
 
 impl ConsensusVerifier {
     /// A verifier that calls `tx_verifier`, looks transactions up in
-    /// `read_state`, and reads the pool through `handle`.
+    /// `read_state`, and reads the pool through `pool`.
     pub fn new(
         tx_verifier: Timeout<TxVerifier>,
         read_state: ReadState,
-        handle: PoolHandle,
+        pool: PoolReader,
         max_transaction_bytes: u64,
         network: Network,
         current: Arc<AtomicBool>,
@@ -79,7 +79,7 @@ impl ConsensusVerifier {
         Self {
             tx_verifier,
             read_state: Arc::new(Mutex::new(read_state)),
-            handle,
+            pool,
             max_transaction_bytes,
             network,
             current,
@@ -225,7 +225,7 @@ impl Verifier<TransactionError> for ConsensusVerifier {
     ) -> Pin<Box<dyn Future<Output = Outcome<TransactionError>> + Send>> {
         // The core calls this after it published the step that starts the
         // job, so this is the pool the job started from.
-        let start = self.handle.snapshot();
+        let start = self.pool.snapshot();
         Box::pin(self.clone().check(tx, tip, revalidation, start))
     }
 }
@@ -235,13 +235,13 @@ impl Verifier<TransactionError> for ConsensusVerifier {
 /// or [`OutputNotInPool`].
 #[derive(Clone, Debug)]
 pub(super) struct VerifierPool {
-    handle: PoolHandle,
+    pool: PoolReader,
 }
 
 impl VerifierPool {
-    /// A handle that reads the pool through `handle`.
-    pub fn new(handle: PoolHandle) -> Self {
-        Self { handle }
+    /// A handle that reads the pool through `pool`.
+    pub fn new(pool: PoolReader) -> Self {
+        Self { pool }
     }
 }
 
@@ -258,7 +258,7 @@ impl Service<Request> for VerifierPool {
     fn call(&mut self, request: Request) -> Self::Future {
         let answer = match request {
             Request::AwaitOutput(outpoint) => self
-                .handle
+                .pool
                 .snapshot()
                 .and_then(|snapshot| snapshot.created_output(&outpoint).cloned())
                 .map(Response::UnspentOutput)

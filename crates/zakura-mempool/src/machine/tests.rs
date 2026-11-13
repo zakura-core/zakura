@@ -1718,3 +1718,129 @@ fn hidden_transactions_count_against_the_cost_limit() {
     }
     assert_eq!(machine.visible().len(), 2);
 }
+
+/// Sol's case from M1 review round 2: a reveal that storage refuses takes its
+/// body's cost off the hidden cost once, while another hidden body still
+/// counts. Three children of a mined parent come back after a reorg, the
+/// parent is pooled again, and the third child's reveal breaks the package
+/// limit.
+#[test]
+fn a_refused_reveal_takes_its_cost_off_once() {
+    let mut runner = TestRunner::deterministic();
+    let parent = build(&mut runner, &[], 3, None);
+    let children: Vec<Tx> = (0..3)
+        .map(|index| {
+            build(
+                &mut runner,
+                &[OutPoint {
+                    hash: parent.id().mined_id(),
+                    index,
+                }],
+                1,
+                None,
+            )
+        })
+        .collect();
+    let other = build(&mut runner, &[], 1, None);
+    let base = Instant::now();
+    let mut machine = Machine::new(
+        &Config {
+            tx_cost_limit: u64::MAX / 2,
+            ..Config::default()
+        },
+        tip(START, 0),
+        Generation(0),
+        base,
+    );
+    let pass = |tx: &Tx, inputs: Vec<OutPoint>| Outcome::Pass {
+        tx: tx.real.clone(),
+        pool_inputs: inputs,
+    };
+    let started = |step: &Step| -> Vec<(super::JobId, UnminedTxId)> {
+        step.effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Start { job, tx, .. } => Some((*job, tx.id())),
+                _ => None,
+            })
+            .collect()
+    };
+    let read0 = GenerationRead::Stable(Generation(0));
+    let read1 = GenerationRead::Stable(Generation(1));
+    let admit = |machine: &mut Machine, tx: &Tx, inputs: Vec<OutPoint>, read| {
+        let grant = machine
+            .reserve(tx.id(), Source::Node, Intent::Deliver, base)
+            .expect("room for a reservation");
+        assert!(machine.effects().is_empty());
+        let (waiter, step) = machine.submit(
+            grant.id,
+            tx.real.transaction.clone(),
+            Supplier::Nobody,
+            base,
+        );
+        let job = started(&step)[0].0;
+        let step = machine.outcome(job, pass(tx, inputs), read, read, base, chrono::Utc::now());
+        machine.assert_invariants();
+        assert!(matches!(step.verdict(waiter), Some(Verdict::Admitted)));
+    };
+
+    // The parent is on the chain, so its children spend it from there.
+    for child in children.iter().chain([&other]) {
+        admit(&mut machine, child, Vec::new(), read0);
+    }
+
+    // A reorg takes the parent off the chain and hides the pool.
+    let before = tip(START, 0);
+    let after = tip(START, 1);
+    let step = machine.transition(
+        ChainTransition {
+            before: Some(before),
+            disconnected: vec![before],
+            connected: vec![ConnectedBlock {
+                hash: after.hash,
+                height: after.height,
+                transactions: Vec::new(),
+                transaction_hashes: Arc::new([]),
+            }],
+            after,
+            generation: Generation(1),
+            rules_change: false,
+        },
+        base,
+    );
+    machine.assert_invariants();
+    let revalidations = started(&step);
+    assert_eq!(
+        revalidations.len(),
+        4,
+        "every hidden transaction is checked again"
+    );
+
+    // The parent comes back into the pool.
+    admit(&mut machine, &parent, Vec::new(), read1);
+
+    // Each child now spends the pooled parent. The third breaks the package
+    // limit, and the other transaction stays hidden throughout.
+    for (index, child) in children.iter().enumerate() {
+        let job = revalidations
+            .iter()
+            .find(|(_, id)| *id == child.id())
+            .expect("each child has a revalidation")
+            .0;
+        let inputs = vec![OutPoint {
+            hash: parent.id().mined_id(),
+            index: u32::try_from(index).expect("a small index"),
+        }];
+        machine.outcome(
+            job,
+            pass(child, inputs),
+            read1,
+            read1,
+            base,
+            chrono::Utc::now(),
+        );
+        machine.assert_invariants();
+    }
+    assert_eq!(machine.hidden(), vec![other.id()]);
+    assert_eq!(machine.visible().len(), 3, "the parent and two children");
+}

@@ -415,7 +415,9 @@ pub struct MempoolState<E> {
     hidden_cost: u64,
     /// The pooled transactions that spend each transaction's outputs,
     /// visible or hidden, so a removal finds its dependents without a scan.
-    children: HashMap<transaction::Hash, Vec<transaction::Hash>>,
+    /// Keyed by pool key, so a removal is logarithmic however many children
+    /// one confirmed parent has, and dependents are found oldest first.
+    children: HashMap<transaction::Hash, BTreeMap<u64, transaction::Hash>>,
     /// Each job, with the event count when it started.
     jobs: HashMap<JobId, (JobTarget, u64)>,
     cooldowns: CooldownTable<CooldownKey>,
@@ -1100,16 +1102,13 @@ impl<E: VerifyError> MempoolState<E> {
         );
         for (key, pooled) in &self.pool {
             let hash = pooled.id.mined_id();
-            let children: Vec<transaction::Hash> = self
+            let expected: BTreeMap<u64, transaction::Hash> = self
                 .pool
-                .values()
-                .filter(|child| child.parents.contains(&hash))
-                .map(|child| child.id.mined_id())
+                .iter()
+                .filter(|(_, child)| child.parents.contains(&hash))
+                .map(|(child_key, child)| (*child_key, child.id.mined_id()))
                 .collect();
-            let mut indexed = self.children.get(&hash).cloned().unwrap_or_default();
-            let mut expected = children;
-            indexed.sort_by_key(|hash| hash.0);
-            expected.sort_by_key(|hash| hash.0);
+            let indexed = self.children.get(&hash).cloned().unwrap_or_default();
             assert_eq!(
                 indexed, expected,
                 "the children index matches the pool at {key}"
@@ -1521,7 +1520,10 @@ impl<E: VerifyError> MempoolState<E> {
                 let pool_key = self.fresh();
                 let parents = parents_of(tx.transaction.transaction());
                 for parent in &parents {
-                    self.children.entry(*parent).or_default().push(hash);
+                    self.children
+                        .entry(*parent)
+                        .or_default()
+                        .insert(pool_key, hash);
                 }
                 self.pool.insert(
                     pool_key,
@@ -1645,13 +1647,16 @@ impl<E: VerifyError> MempoolState<E> {
                 // Today's insertion limits, as for a new transaction. A parent
                 // that was mined, then put back by a reorg, can have gained
                 // more pooled children than one group holds.
-                // It leaves the hidden cost whether or not storage takes it.
+                // While storage decides, this body is not also counted as
+                // held outside it. Its cost moves to storage only if storage
+                // takes it, and a removal below takes it off once otherwise.
                 let cost = self
                     .pooled_at(key)
                     .body
                     .as_ref()
                     .map_or(0, VerifiedUnminedTx::cost);
-                self.add_hidden_cost(cost, false);
+                self.storage
+                    .set_outside_cost(self.hidden_cost.saturating_sub(cost));
                 // A rejection cached for another authorization of these
                 // effects while this one was pooled says nothing about it, so
                 // the lists are not checked, as the model's reveal does not.
@@ -1664,11 +1669,13 @@ impl<E: VerifyError> MempoolState<E> {
                 );
                 self.forget_evicted(evicted);
                 if result.is_err() {
+                    self.storage.set_outside_cost(self.hidden_cost);
                     // Storage has cached what it refused.
                     self.set_hidden(key, Some(Hidden::Queued));
                     self.remove_with_dependents(hash, RemovalReason::Invalidated);
                     return;
                 }
+                self.add_hidden_cost(cost, false);
                 let visible_at = self.fresh();
                 self.set_hidden(key, None);
                 let pooled = self.pooled_at(key);
@@ -2138,11 +2145,12 @@ impl<E: VerifyError> MempoolState<E> {
         self.storage.set_outside_cost(self.hidden_cost);
     }
 
-    /// Takes `hash` off its parents' lists of children.
-    fn forget_parents(&mut self, hash: transaction::Hash, parents: &[transaction::Hash]) {
+    /// Takes the pooled transaction at `key` off its parents' lists of
+    /// children.
+    fn forget_parents(&mut self, key: u64, parents: &[transaction::Hash]) {
         for parent in parents {
             if let Some(children) = self.children.get_mut(parent) {
-                children.retain(|child| *child != hash);
+                children.remove(&key);
                 if children.is_empty() {
                     self.children.remove(parent);
                 }
@@ -2168,7 +2176,7 @@ impl<E: VerifyError> MempoolState<E> {
             .expect("the transaction was pooled a moment ago");
         let hash = pooled.id.mined_id();
         self.pooled.remove(&hash);
-        self.forget_parents(hash, &pooled.parents);
+        self.forget_parents(key, &pooled.parents);
         if visible {
             self.storage.remove_one(&hash);
         } else if let Some(body) = &pooled.body {
@@ -2191,7 +2199,11 @@ impl<E: VerifyError> MempoolState<E> {
             return;
         };
         self.remove_one(key, reason);
-        let dependents = self.children.get(&hash).cloned().unwrap_or_default();
+        let dependents: Vec<transaction::Hash> = self
+            .children
+            .get(&hash)
+            .map(|children| children.values().copied().collect())
+            .unwrap_or_default();
         for dependent in dependents {
             self.remove_with_dependents(dependent, RemovalReason::Invalidated);
         }
@@ -2212,7 +2224,7 @@ impl<E: VerifyError> MempoolState<E> {
                 .expect("an evicted transaction was pooled and visible");
             let hash = pooled.id.mined_id();
             self.pooled.remove(&hash);
-            self.forget_parents(hash, &pooled.parents);
+            self.forget_parents(key, &pooled.parents);
             self.step.changes.push(Change::Removed {
                 id: pooled.id,
                 reason: RemovalReason::Evicted,

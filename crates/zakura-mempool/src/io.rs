@@ -11,8 +11,15 @@
 //!    any of these steps reads a pool at least as new as the one that
 //!    started it.
 //! 2. It publishes the cooldowns, if one started.
-//! 3. It does each step's effects in order: starts and cancels
+//! 3. It sends the answers to the commands it took, so no caller hears of a
+//!    change, such as a cooldown, before readers can see it.
+//! 4. It does each step's effects in order: starts and cancels
 //!    verifications, sends verdicts, and answers output waiters.
+//!
+//! The pool stays off until the chain names a real tip, whatever the
+//! activity signal says. A verifier the core owns reads the pool through a
+//! `PoolReader`, so it does not keep the core running once every handle is
+//! gone.
 //!
 //! A verification runs in a task of its own, outside the core's task. It
 //! reads the generation before its first state lookup and after its last,
@@ -72,7 +79,7 @@ pub trait Verifier<E>: Clone + Send + Sync + 'static {
     /// The core calls this in the step that starts the job, after that
     /// step's snapshot is published. The returned future must not read the
     /// state until it is polled: the core reads the generation before it
-    /// polls it.
+    /// polls it. A panic here, or in the future, is a local fault.
     fn verify(
         &self,
         tx: UnminedTx,
@@ -110,6 +117,9 @@ pub struct PoolCore<E, V> {
     /// skips while it is off and takes when it turns on.
     chain_tip: ChainTip,
     chain_generation: Generation,
+    /// Whether the chain has named a real tip. Before it has, the pool stays
+    /// off, whatever the activity signal says.
+    has_tip: bool,
     /// Every verification reports here. At most one report per running job
     /// is in flight, and the machine bounds the jobs, so this is bounded.
     reports_tx: mpsc::UnboundedSender<Report<E>>,
@@ -123,6 +133,9 @@ pub struct PoolCore<E, V> {
     published: Option<Published>,
     /// Steps taken and not yet carried out.
     steps: Vec<Step>,
+    /// Answers to commands, sent once the steps before them are published,
+    /// so no caller hears of a change before readers can see it.
+    replies: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
@@ -179,6 +192,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             active,
             chain_tip,
             chain_generation: start.generation,
+            has_tip: start.tip.is_some(),
             reports_tx,
             reports,
             jobs: HashMap::default(),
@@ -186,15 +200,16 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             outputs: HashMap::default(),
             published: None,
             steps: Vec::new(),
+            replies: Vec::new(),
         }
     }
 
     /// Runs the core until every port handle is gone or the chain's sender
     /// is dropped.
     pub async fn run(mut self) {
-        // The machine starts on. Until the node is near the tip it is off,
-        // and the first snapshot says so.
-        if !*self.active.borrow_and_update() {
+        // The machine starts on. Until the node is near a tip the chain has
+        // named, it is off, and the first snapshot says so.
+        if !*self.active.borrow_and_update() || !self.has_tip {
             let step = self.machine.deactivate(time::Instant::now());
             self.finish(step);
         }
@@ -264,7 +279,9 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                     });
                 // A caller that left drops the reservation with the reply,
                 // which frees the slot.
-                let _ = reply.send(answer);
+                self.reply(move || {
+                    let _ = reply.send(answer);
+                });
                 let step = self.machine.effects();
                 self.finish(step);
             }
@@ -274,6 +291,12 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 supplier,
                 reply,
             } => {
+                // The caller gave up after the command was queued. Dropping
+                // the reservation frees its slot, as the port promises.
+                if reply.is_closed() {
+                    drop(reservation);
+                    return;
+                }
                 let id = reservation.accept();
                 let (waiter, step) = self.machine.submit(id, transaction, supplier, now);
                 self.verdicts.insert(waiter, reply);
@@ -284,6 +307,10 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 supplier,
                 reply,
             } => {
+                if reply.is_closed() {
+                    drop(reservation);
+                    return;
+                }
                 let tx_id = reservation.tx_id();
                 let id = reservation.accept();
                 let (waiter, step) = self.machine.wait(id, tx_id, supplier, now);
@@ -316,25 +343,27 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 for waiter in closed {
                     self.outputs.remove(&waiter);
                 }
-                match answer {
-                    OutputAnswer::Ready(output) => {
-                        let _ = reply.send(Ok(output));
-                    }
+                let answer = match answer {
+                    OutputAnswer::Ready(output) => Ok(output),
                     OutputAnswer::Waiting(waiter) => {
                         self.outputs.insert(waiter, reply);
+                        let step = self.machine.effects();
+                        return self.finish(step);
                     }
-                    OutputAnswer::TooManyWaiters => {
-                        let _ = reply.send(Err(AwaitOutputError::TooManyWaiters));
-                    }
-                    OutputAnswer::Inactive => {
-                        let _ = reply.send(Err(AwaitOutputError::Inactive));
-                    }
-                }
+                    OutputAnswer::TooManyWaiters => Err(AwaitOutputError::TooManyWaiters),
+                    OutputAnswer::Inactive => Err(AwaitOutputError::Inactive),
+                };
+                self.reply(move || {
+                    let _ = reply.send(answer);
+                });
                 let step = self.machine.effects();
                 self.finish(step);
             }
             PoolCommand::RejectedIds { ids, reply } => {
-                let _ = reply.send(self.machine.rejected_ids(ids, now));
+                let answer = self.machine.rejected_ids(ids, now);
+                self.reply(move || {
+                    let _ = reply.send(answer);
+                });
                 let step = self.machine.effects();
                 self.finish(step);
             }
@@ -356,7 +385,10 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 self.machine.resync(tip, generation, now)
             }
         };
+        self.has_tip = true;
         self.finish(step);
+        // The pool may have been waiting only for a real tip.
+        self.activity();
     }
 
     /// One verification's report.
@@ -375,7 +407,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
 
     /// The node moved toward or away from the tip.
     fn activity(&mut self) {
-        let active = *self.active.borrow_and_update();
+        let active = *self.active.borrow_and_update() && self.has_tip;
         if active == self.machine.is_active() {
             return;
         }
@@ -389,6 +421,12 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             let step = self.machine.deactivate(now);
             self.finish(step);
         }
+    }
+
+    /// Keeps an answer to send at the next [`Self::flush`], after the steps
+    /// taken so far are published.
+    fn reply(&mut self, send: impl FnOnce() + Send + 'static) {
+        self.replies.push(Box::new(send));
     }
 
     /// Keeps a step to carry out at the next [`Self::flush`].
@@ -407,6 +445,9 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
         self.publish(batches);
         if let Some(cooldowns) = self.machine.cooldowns_if_changed() {
             self.inbox.publish_cooldowns(cooldowns);
+        }
+        for reply in std::mem::take(&mut self.replies) {
+            reply();
         }
         for effect in effects.into_iter().flatten() {
             match effect {
@@ -461,11 +502,30 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
 
     /// Starts a verification task for `job`.
     fn start(&mut self, job: JobId, tx: UnminedTx, revalidation: bool) {
-        let verification = self.verifier.verify(tx, self.machine.tip(), revalidation);
+        // The job verifies for the machine's tip, which belongs to the
+        // generation the machine has applied. A worker that first reads any
+        // other generation would report a result for one tip as fresh at
+        // another, so its first reading is reported as unknown instead.
+        let bound = GenerationRead::Stable(self.machine.generation());
+        // A panic while the verifier builds its future is a local fault too,
+        // not the end of the core.
+        let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.verifier.verify(tx, self.machine.tip(), revalidation)
+        }))
+        .unwrap_or_else(|_| {
+            Box::pin(std::future::ready(Outcome::LocalFault(
+                LocalFault::VerifyPanicked,
+            )))
+        });
         let generation = self.generation.clone();
         let reports = self.reports_tx.clone();
         let handle = task::spawn_named("mempool-verify", async move {
-            let before = stable_reading(&generation).await;
+            let read = stable_reading(&generation).await;
+            let before = if read == bound {
+                read
+            } else {
+                GenerationRead::Changing
+            };
             // The verifier runs in a task of its own, so a panic in it is
             // a local fault and not the end of this one.
             let inner =

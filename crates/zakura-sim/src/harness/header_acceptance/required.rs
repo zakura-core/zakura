@@ -189,8 +189,8 @@ pub const END_BOUNDARY_FAULT_STORE_TEST: TestRef = sim_test(
 );
 
 /// Gate 5's bound-table limit fixtures (hdr-9d.1): work slots, locator
-/// reads and node execution slots each reach their limit and no further
-/// while one more party waits, and the slot fixture's per-round
+/// reads, and node and peer execution slots each reach their limit and no
+/// further while one more party waits, and the slot fixture's per-round
 /// reservations, staged capacity and request deadlines reach 16 with them.
 pub const BOUND_LIMIT_TEST: TestRef = sim_test(
     "tests/header_outstanding.rs",
@@ -290,9 +290,6 @@ pub mod bound_unshown {
     /// The sent-cursor ring.
     pub const SENT_RING: &str = "no fixture sends a subscription anywhere near 4,096 pages, so \
         its sent-cursor ring never nears its limit";
-    /// Peer execution slots.
-    pub const PEER_EXECUTION: &str = "the capacity-waits fixture holds a peer's 2 execution \
-        slots, but no fixture shows a third page job for that peer denied, released and reused";
     /// Node serving output.
     pub const NODE_OUTPUT: &str = "the node's output grants are listed, not checked: their \
         limit follows the configured session count through the toolkit's sizing";
@@ -567,6 +564,14 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
         BOUND_REUSE_TEST,
     ),
     bound_test(
+        "gate-5/bound-table/peer-execution-slots/at-limit",
+        BOUND_LIMIT_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/peer-execution-slots/release-reuse",
+        BOUND_REUSE_TEST,
+    ),
+    bound_test(
         "gate-5/bound-table/publisher-capacity-waits/cleanup",
         BOUND_WAITS_TEST,
     ),
@@ -660,10 +665,6 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
     bound_unshown(
         "gate-5/bound-table/sent-cursor-ring",
         bound_unshown::SENT_RING,
-    ),
-    bound_unshown(
-        "gate-5/bound-table/peer-execution-slots",
-        bound_unshown::PEER_EXECUTION,
     ),
     bound_unshown("gate-5/bound-table/node-output", bound_unshown::NODE_OUTPUT),
     bound_unshown("gate-5/bound-table/peer-output", bound_unshown::PEER_OUTPUT),

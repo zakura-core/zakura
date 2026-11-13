@@ -1,0 +1,84 @@
+{
+  "node": {
+    "main": 8,
+    "fork": null
+  },
+  "mirrors": [
+    {
+      "chain": {
+        "main": 2,
+        "fork": null
+      },
+      "dialer": "mirror"
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": [
+      {
+        "select": {
+          "kind": "read",
+          "nth": 1
+        },
+        "until": "released",
+        "then": [
+          "engine"
+        ],
+        "deadline_ms": 1000
+      },
+      {
+        "select": {
+          "kind": "acquire",
+          "nth": 2
+        },
+        "until": "released",
+        "then": [
+          "engine"
+        ],
+        "deadline_ms": 1000
+      }
+    ]
+  },
+  "controls": [
+    {
+      "peer": "mirror-0",
+      "action": "close",
+      "when": {
+        "submitted": {
+          "kind": "read",
+          "nth": 1
+        }
+      }
+    },
+    {
+      "peer": "mirror-0",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-0"
+      }
+    },
+    {
+      "peer": "mirror-0",
+      "action": "close",
+      "when": {
+        "submitted": {
+          "kind": "acquire",
+          "nth": 2
+        }
+      }
+    },
+    {
+      "peer": "mirror-0",
+      "action": "relink",
+      "when": {
+        "count": [
+          2,
+          {
+            "closed": "mirror-0"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -133,10 +133,14 @@ fn the_witnesses_hold_under_generated_plans() {
 /// reads fill the 16 permits and the 17th waits. In the serving fixture 11
 /// mirrors sit below the node, so the node serves each of them, and storage
 /// holds every serving read until 8 are submitted, so the reads fill the
-/// node's 8 execution slots and the rest wait. Each row reaches its limit
-/// and no further. In the slot fixture the 16 rounds' reservations, staged
-/// capacity entries and request deadlines, one per round, reach 16 with
-/// them. Each run then releases and reuses its row, which
+/// node's 8 execution slots and the rest wait. In the peer-execution
+/// fixture one mirror sits below the node and relinks twice. Storage holds
+/// its first session's page read and its second session's lease acquire,
+/// so those two page jobs hold the peer's 2 execution slots, and the third
+/// session's job waits for one. Each row reaches its limit and no further.
+/// In the slot fixture the 16 rounds' reservations, staged capacity entries
+/// and request deadlines, one per round, reach 16 with them. Each run then
+/// releases and reuses its row, which
 /// [`the_limit_fixtures_release_and_reuse_their_bounds`] checks.
 #[test]
 fn the_limit_fixtures_reach_and_hold_their_bounds() {
@@ -161,6 +165,13 @@ fn the_limit_fixtures_reach_and_hold_their_bounds() {
             "node execution slots",
             8,
             11,
+            &[][..],
+        ),
+        (
+            "header-outstanding-peer-execution",
+            "peer execution slots",
+            2,
+            1,
             &[][..],
         ),
     ] {
@@ -309,9 +320,11 @@ fn row_use(row: &RowUnits, entries: &[Entry]) -> RowUse {
 
 /// Each limit fixture's row, read from its log: work slots by rounds
 /// started and retired, locator reads by locator calls dispatched and
-/// locators returned, and node execution slots by serving reads submitted
-/// and pages returned.
-fn limit_rows() -> [RowUnits; 3] {
+/// locators returned, node execution slots by serving reads submitted and
+/// pages returned, and peer execution slots by each session's lease
+/// acquires submitted and pages returned. A page job takes its execution
+/// slots before its acquire and keeps them until its read returns.
+fn limit_rows() -> [RowUnits; 4] {
     [
         RowUnits {
             stem: "header-outstanding-slot-limit",
@@ -396,11 +409,41 @@ fn limit_rows() -> [RowUnits; 3] {
                 )
             },
         },
+        RowUnits {
+            stem: "header-outstanding-peer-execution",
+            limit: 2,
+            parties: 3,
+            opens: |entry| match &entry.obs {
+                Observation::Storage {
+                    instance: 0,
+                    fact:
+                        StorageFact::Submitted {
+                            request: StorageRequest::AcquireHeaderPath { session_id, .. },
+                            ..
+                        },
+                    ..
+                } => Some(session_id.to_string()),
+                _ => None,
+            },
+            releases: |entry| {
+                matches!(
+                    &entry.obs,
+                    Observation::Storage {
+                        instance: 0,
+                        fact: StorageFact::Completed {
+                            result: StorageResult::Page { .. },
+                            ..
+                        },
+                        ..
+                    }
+                )
+            },
+        },
     ]
 }
 
-/// Gate 5's bound-table rows for work slots, locator reads and node
-/// execution slots, by their limit fixtures' logs: each row reaches its
+/// Gate 5's bound-table rows for work slots, locator reads, and node and
+/// peer execution slots, by their limit fixtures' logs: each row reaches its
 /// limit and no further while one more party waits, so the next is denied,
 /// and that party gets its first unit only after a release, with fewer than
 /// the limit open, so a released unit is reused.

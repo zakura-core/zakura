@@ -3352,6 +3352,14 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
         obligation::BOUND_REUSE_TEST,
     ),
     bound_passes(
+        "gate-5/bound-table/peer-execution-slots/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/peer-execution-slots/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
         "gate-5/bound-table/publisher-capacity-waits/cleanup",
         obligation::BOUND_WAITS_TEST,
     ),
@@ -3452,10 +3460,6 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
     bound_open(
         "gate-5/bound-table/sent-cursor-ring",
         obligation::bound_unshown::SENT_RING,
-    ),
-    bound_open(
-        "gate-5/bound-table/peer-execution-slots",
-        obligation::bound_unshown::PEER_EXECUTION,
     ),
     bound_open(
         "gate-5/bound-table/node-output",

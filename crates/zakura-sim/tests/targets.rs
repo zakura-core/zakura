@@ -75,10 +75,16 @@ fn fixtures() -> PathBuf {
 /// property on a faulted frame. A target missing from the list has seeds
 /// that apply every own property. A listed property that a seed now applies
 /// fails the test until it leaves the list, so the list only shrinks.
+///
+/// `block-sync/capacity-release-wakes` applies only once the commit window
+/// fills, which only the capacity-release seeds in `fixtures/slow-seeds/`
+/// reach. Those run too long for a fuzz input, so they are outside the
+/// corpus, and their own tests apply the property.
 const UNAPPLIED: &[(&str, &[&str])] = &[
     (
         "block_sync_storage",
         &[
+            "block-sync/capacity-release-wakes",
             "block-sync/s6v3/block/bad-content-closes",
             "block-sync/s6v3/block/long-payload-closes",
             "block-sync/s6v3/block/over-owed-closes",

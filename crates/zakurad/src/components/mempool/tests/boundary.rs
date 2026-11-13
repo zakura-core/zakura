@@ -149,10 +149,29 @@ struct Harness {
     changes: MempoolTxSubscriber,
 }
 
+/// A transaction verifier, as the pools take it before buffering.
+type VerifierService = BoxService<tx::Request, tx::Response, TransactionError>;
+
 /// Build today's pool on Mainnet with the genesis block committed. The pool
 /// starts inactive.
 async fn pool(config: Config, peers: Peers, mode: Mode) -> Harness {
-    let network = Network::Mainnet;
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .as_slice()
+        .zcash_deserialize_into()
+        .expect("block test vectors are valid");
+    pool_on(config, peers, mode, None, Network::Mainnet, genesis).await
+}
+
+/// [`pool`] on `network` from its `genesis` block, verifying with
+/// `verifier_service` instead of the harness's mock if one is given.
+async fn pool_on(
+    config: Config,
+    peers: Peers,
+    mode: Mode,
+    verifier_service: Option<VerifierService>,
+    network: Network,
+    genesis: Arc<Block>,
+) -> Harness {
     let mock_peers: MockPeerSet = MockService::build()
         .with_max_request_delay(REQUEST_DELAY)
         .for_unit_tests();
@@ -182,7 +201,10 @@ async fn pool(config: Config, peers: Peers, mode: Mode) -> Harness {
     };
 
     let (sync_status, syncs) = crate::components::sync::SyncStatus::new();
-    let tx_verifier = tower::buffer::Buffer::new(BoxService::new(verifier.clone()), 1);
+    let tx_verifier = tower::buffer::Buffer::new(
+        verifier_service.unwrap_or_else(|| BoxService::new(verifier.clone())),
+        1,
+    );
     let (pool, subscriber) = match mode {
         Mode::Classic => {
             let (pool, subscriber) = Mempool::new(
@@ -257,9 +279,7 @@ async fn pool(config: Config, peers: Peers, mode: Mode) -> Harness {
         syncs,
         changes: subscriber,
     };
-    harness
-        .commit(zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice())
-        .await;
+    harness.commit_block(genesis).await;
     harness
 }
 
@@ -339,6 +359,11 @@ impl Harness {
         let block: Arc<Block> = bytes
             .zcash_deserialize_into()
             .expect("block test vectors are valid");
+        self.commit_block(block).await;
+    }
+
+    /// Commit `block` and wait for the tip to change.
+    async fn commit_block(&mut self, block: Arc<Block>) {
         self.state
             .ready()
             .await
@@ -1357,6 +1382,218 @@ async fn joined_pushes_count_against_their_peer_until_the_verdict() {
     time::sleep(Duration::from_millis(200)).await;
     harness.ask(push(&other, 1)).await;
     harness.verify(Ok(passed(&other, Vec::new()))).await;
+}
+
+/// Transactions in the recovery gate.
+const RECOVERY_POOL: usize = 1_500;
+
+/// How long the recovery gate's verifier takes for each transaction.
+const RECOVERY_VERIFY_DELAY: Duration = Duration::from_millis(40);
+
+/// `count` distinct transactions with no spends that conflict: copies of one
+/// sample that differ in their lock time.
+fn distinct(count: usize) -> Vec<VerifiedUnminedTx> {
+    use zakura_chain::transaction::{LockTime, Transaction, UnminedTx};
+
+    let template = samples(1).remove(0);
+    (0..count)
+        .map(|n| {
+            let mut transaction = Transaction::clone(template.transaction.transaction());
+            let height = Height(u32::try_from(n + 1).expect("few transactions"));
+            match &mut transaction {
+                Transaction::V1 { lock_time, .. }
+                | Transaction::V2 { lock_time, .. }
+                | Transaction::V3 { lock_time, .. }
+                | Transaction::V4 { lock_time, .. }
+                | Transaction::V5 { lock_time, .. }
+                | Transaction::V6 { lock_time, .. } => *lock_time = LockTime::Height(height),
+            }
+            VerifiedUnminedTx {
+                transaction: UnminedTx::from(transaction),
+                ..template.clone()
+            }
+        })
+        .collect()
+}
+
+/// A verifier that passes each of `txs`, taking [`RECOVERY_VERIFY_DELAY`]
+/// for each, and the most verifications it ran at once.
+fn delayed_verifier(
+    txs: &[VerifiedUnminedTx],
+) -> (VerifierService, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let txs: Arc<std::collections::HashMap<UnminedTxId, VerifiedUnminedTx>> = Arc::new(
+        txs.iter()
+            .map(|tx| (tx.transaction.id(), tx.clone()))
+            .collect(),
+    );
+    let running = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let service = {
+        let peak = peak.clone();
+        BoxService::new(tower::service_fn(move |request: tx::Request| {
+            let (txs, running, peak) = (txs.clone(), running.clone(), peak.clone());
+            async move {
+                let tx::Request::Mempool { transaction, .. } = request else {
+                    unreachable!("the pools verify only for the mempool");
+                };
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                time::sleep(RECOVERY_VERIFY_DELAY).await;
+                running.fetch_sub(1, Ordering::SeqCst);
+                Ok(passed(&txs[&transaction.id()], Vec::new()))
+            }
+        }))
+    };
+    (service, peak)
+}
+
+/// Queues every one of `txs` that `harness`'s pool does not hold, and
+/// returns how many it held before.
+async fn fill(harness: &mut Harness, txs: &[VerifiedUnminedTx]) -> usize {
+    let held = harness.ids().await;
+    let missing: Vec<Gossip> = txs
+        .iter()
+        .filter(|tx| !held.contains(&tx.transaction.id()))
+        .map(|tx| tx.transaction.clone().into())
+        .collect();
+    let _answers = harness.queue(missing).await;
+    held.len()
+}
+
+/// How a pool recovered from a reset: how long until it showed a
+/// transaction again, how long until it held every one, and the most
+/// verifications run at once while it recovered.
+#[derive(Debug)]
+struct Recovery {
+    first: Option<Duration>,
+    full: Option<Duration>,
+    peak: usize,
+}
+
+/// Fills `mode`'s pool with [`RECOVERY_POOL`] transactions, resets it with a
+/// network upgrade, and times its recovery. If `reannounce`, this node
+/// queues every transaction the pool lacks again until it holds them all, as
+/// peers announcing them again would, which today's pool needs: it requeues
+/// only as many as its queue holds and drops the rest.
+async fn recover(mode: Mode, reannounce: bool) -> Recovery {
+    use std::sync::atomic::Ordering;
+
+    use super::vector::{
+        generate_test_chain, nu_activation_test_network, NU5_ACTIVATION_TEST_HEIGHT,
+    };
+
+    let txs = distinct(RECOVERY_POOL);
+    let (verifier, peak) = delayed_verifier(&txs);
+    // A Testnet that activates NU5 low, so one block resets today's pool and
+    // hides the core's, as an upgrade does.
+    let network = nu_activation_test_network();
+    let reset_height = usize::try_from(NU5_ACTIVATION_TEST_HEIGHT).expect("a small height");
+    let mut blocks = generate_test_chain(&network, reset_height).into_iter();
+    let genesis = blocks.next().expect("the chain has a genesis block");
+    let mut harness = pool_on(
+        Config::default(),
+        Peers::Silent,
+        mode,
+        Some(verifier),
+        network,
+        genesis,
+    )
+    .await;
+    harness.activate().await;
+    // Every block before the one that resets.
+    for _ in 2..reset_height {
+        harness
+            .commit_block(blocks.next().expect("the chain reaches the reset"))
+            .await;
+    }
+
+    let deadline = time::Instant::now() + Duration::from_secs(120);
+    while fill(&mut harness, &txs).await < RECOVERY_POOL {
+        assert!(time::Instant::now() < deadline, "the pool fills");
+        time::sleep(RECOVERY_VERIFY_DELAY / 4).await;
+    }
+    peak.store(0, Ordering::SeqCst);
+
+    // The next block activates NU5 for the block after it, which resets
+    // today's pool and hides the core's pool to be verified again.
+    let reset = time::Instant::now();
+    harness
+        .commit_block(blocks.next().expect("the chain reaches the reset"))
+        .await;
+    let (mut first, mut full) = (None, None);
+    let deadline = reset + Duration::from_secs(60);
+    // One announcement round at a time, in the background, so a slow answer
+    // to it does not delay the samples.
+    let mut announcing: Option<tokio::task::JoinHandle<()>> = None;
+    while full.is_none() && time::Instant::now() < deadline {
+        let ids = harness.ids().await;
+        let held = ids.len();
+        if reannounce && announcing.as_ref().is_none_or(|round| round.is_finished()) {
+            let missing: Vec<Gossip> = txs
+                .iter()
+                .filter(|tx| !ids.contains(&tx.transaction.id()))
+                .map(|tx| tx.transaction.clone().into())
+                .collect();
+            if !missing.is_empty() {
+                let round = harness.start_call(Request::Queue(missing)).await;
+                announcing = Some(tokio::spawn(async move {
+                    let _answers = round.await;
+                }));
+            }
+        }
+        let polled = std::time::Instant::now();
+        let _ = polled;
+        if held > 0 && first.is_none() {
+            first = Some(reset.elapsed());
+        }
+        if held == RECOVERY_POOL {
+            full = Some(reset.elapsed());
+        }
+        time::sleep(RECOVERY_VERIFY_DELAY / 4).await;
+    }
+    Recovery {
+        first,
+        full,
+        peak: peak.load(Ordering::SeqCst),
+    }
+}
+
+/// The recovery gate: after a reset with 1,500 pooled transactions, the core
+/// shows a transaction again and holds every one no later than today's pool
+/// does with every transaction announced again. Without the announcements,
+/// the core alone gets every still-valid transaction back.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_core_recovers_from_a_reset_no_later_than_todays_pool() {
+    let classic = recover(Mode::Classic, true).await;
+    let core = recover(Mode::Core, true).await;
+    let core_alone = recover(Mode::Core, false).await;
+    // Allow for scheduling noise: one verification's delay on top.
+    let slack = RECOVERY_VERIFY_DELAY;
+    let (Some(classic_full), Some(core_full), Some(alone_full)) =
+        (classic.full, core.full, core_alone.full)
+    else {
+        panic!("every run recovers: {classic:?} {core:?} {core_alone:?}");
+    };
+    assert!(
+        core.first.expect("shown") <= classic.first.expect("shown") + slack,
+        "first transaction: core {core:?}, today's {classic:?}"
+    );
+    assert!(
+        core_full <= classic_full + slack,
+        "every transaction: core {core:?}, today's {classic:?}"
+    );
+    assert!(
+        alone_full <= classic_full + slack,
+        "the core alone: {core_alone:?}, today's {classic:?}"
+    );
+    for run in [&core, &core_alone] {
+        assert!(
+            run.peak <= zakura_node_services::mempool::port::MAX_REVALIDATING,
+            "the core verifies again within its share: {run:?}"
+        );
+    }
 }
 
 /// A recorder that keeps each counter's total and each gauge's last value,

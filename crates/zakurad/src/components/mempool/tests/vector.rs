@@ -3900,7 +3900,7 @@ fn pick_transaction_with_prevout(network: &Network) -> VerifiedUnminedTx {
 /// reset boundary is at NU5. Because [`ChainTipChange::action`] resets when the *next* height
 /// (`tip + 1`) is an activation height, committing the block at height
 /// `NU5_ACTIVATION_TEST_HEIGHT - 1` produces a [`TipAction::Reset`].
-const NU5_ACTIVATION_TEST_HEIGHT: u32 = 4;
+pub(super) const NU5_ACTIVATION_TEST_HEIGHT: u32 = 4;
 
 /// Build a configured Testnet that activates NU5 at [`NU5_ACTIVATION_TEST_HEIGHT`].
 ///
@@ -3909,7 +3909,7 @@ const NU5_ACTIVATION_TEST_HEIGHT: u32 = 4;
 /// `NU5_ACTIVATION_TEST_HEIGHT - 1` yields a [`TipAction::Reset`], because the next height is the
 /// NU5 activation height. The temporary Orchard-disabling soft fork is disabled so the only
 /// non-genesis reset boundary is the NU5 activation.
-fn nu_activation_test_network() -> Network {
+pub(super) fn nu_activation_test_network() -> Network {
     use zakura_chain::parameters::testnet::{
         ConfiguredActivationHeights, Parameters as TestnetParameters,
     };
@@ -3936,7 +3936,7 @@ fn nu_activation_test_network() -> Network {
 ///
 /// The blocks have valid commitments, so they can be committed to a state service via
 /// [`zakura_state::Request::CommitCheckpointVerifiedBlock`].
-fn generate_test_chain(network: &Network, count: usize) -> Vec<Arc<Block>> {
+pub(super) fn generate_test_chain(network: &Network, count: usize) -> Vec<Arc<Block>> {
     use proptest::{
         strategy::{Strategy, ValueTree},
         test_runner::TestRunner,

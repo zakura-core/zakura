@@ -10423,13 +10423,13 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "src/sim_acceptance/run.rs",
         "lane_passed",
         "test_name(n)==name",
-        "finds a listed test's outcome in the lane's own output by its name, an output check",
+        "finds a listed test's outcome in the lane's own output by its name within its target, with one-key-off target controls in a_lane_needs_its_whole_inventory",
     ),
     (
         "src/sim_acceptance/run.rs",
         "lane_passed",
         "tests.iter().filter(|(n,outcome)|test_name(n)==name&&outcome==\"ok\").count()==1",
-        "finds a listed test's outcome in the lane's own output by its name, an output check",
+        "finds a listed test's outcome in the lane's own output by its name within its target, with one-key-off target controls in a_lane_needs_its_whole_inventory",
     ),
     (
         "src/sim_acceptance/run.rs",
@@ -10463,9 +10463,15 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "src/sim_acceptance/run.rs",
-        "minimized_bundle_refusal",
-        "confirmation.as_ref().and_then(|c|c.get(\"trace_id\")).and_then(Value::as_str)==Some(kept.id.as_str())",
-        "checks the confirmation names the kept trace's content-digest ID, a binding check of one bundle, not a join of observations",
+        "bound",
+        "confirmed_id==Some(self.id)",
+        "joins the confirmation to the kept trace by the trace's content-digest ID, with one-key-off controls in a_kept_trace_binds_one_key_off. refs.rs has no trace ref type",
+    ),
+    (
+        "tests/sim_acceptance.rs",
+        "a_changed_row_field_fails_the_pin",
+        "Expected::Test(*test).to_string(),original",
+        "asserts that moving a test's file changes its result ID, a control, not a join",
     ),
     (
         "src/sim_acceptance/run.rs",

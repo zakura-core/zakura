@@ -1182,10 +1182,16 @@ const SHARED: &[Shared] = &[
             "header-sync/stale-completion-inert",
         ],
         undeclared: &[],
-        cases: &[(
-            "header-sync/bounded-adversary-progress",
-            "faulted-target-remembered",
-        )],
+        cases: &[
+            (
+                "header-sync/bounded-adversary-progress",
+                "faulted-target-remembered",
+            ),
+            (
+                "header-sync/bounded-adversary-progress",
+                "stalled-successor-on-faults",
+            ),
+        ],
     },
     Shared {
         harness: LIVENESS,

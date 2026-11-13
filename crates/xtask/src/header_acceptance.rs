@@ -2202,21 +2202,32 @@ fn planted_child(
     stem: &str,
 ) -> Result<Ended, BoxError> {
     clear_case_dirs(&repo_root.join("target/planted"))?;
-    let mut planted = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    planted
-        .current_dir(repo_root)
-        .env("CARGO_TERM_COLOR", "never")
-        .args(["xtask", "planted"])
-        .arg(property);
-    if targets {
-        planted.arg("--targets");
-    }
+    let mut planted = planted_command(repo_root, property, targets);
     let suffix = if targets { "-targets" } else { "" };
     let log = options
         .out
         .join("logs")
         .join(format!("planted-{stem}{suffix}.log"));
     Ok(child(&mut planted, &log, options.deadline))
+}
+
+/// `cargo xtask planted <property>` in `repo_root`, with `--targets` if
+/// `targets`. It builds `xtask` into `repo_root`'s own `target/`, never an
+/// inherited `CARGO_TARGET_DIR`: a shared one would get an `xtask` whose
+/// compiled-in repository root is this temporary checkout, and the caller's
+/// next `cargo xtask` there would run against this checkout's commit.
+fn planted_command(repo_root: &Path, property: &str, targets: bool) -> Command {
+    let mut planted = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    planted
+        .current_dir(repo_root)
+        .env_remove("CARGO_TARGET_DIR")
+        .env("CARGO_TERM_COLOR", "never")
+        .args(["xtask", "planted"])
+        .arg(property);
+    if targets {
+        planted.arg("--targets");
+    }
+    planted
 }
 
 /// Removes every `case-<n>` directory the planted runner left in `work`.
@@ -5483,5 +5494,26 @@ mod tests {
             Duration::from_secs(2),
             ChildEnd::TimedOut,
         );
+    }
+
+    /// The planted child builds `xtask` in its own checkout, whatever
+    /// `CARGO_TARGET_DIR` the caller set, so it can't replace the caller's
+    /// `xtask` with one rooted in the temporary subject checkout.
+    #[test]
+    fn the_planted_child_never_inherits_a_target_dir() {
+        let repo = Path::new("/subject");
+        for targets in [false, true] {
+            let planted = planted_command(repo, "p", targets);
+            assert!(
+                planted
+                    .get_envs()
+                    .any(|(name, value)| name == "CARGO_TARGET_DIR" && value.is_none()),
+                "{targets}"
+            );
+            assert_eq!(planted.get_current_dir(), Some(repo));
+            let args: Vec<_> = planted.get_args().collect();
+            assert_eq!(args[..3], ["xtask", "planted", "p"]);
+            assert_eq!(args.len(), if targets { 4 } else { 3 });
+        }
     }
 }

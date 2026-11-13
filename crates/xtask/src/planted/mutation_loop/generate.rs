@@ -36,8 +36,11 @@
 //! - **Classes.** A lane gets the witness lane's classes
 //!   ([`classify::generated`]).
 //! - **Confirmation.** A kill's input must violate the same ID in a fresh
-//!   `zakura-sim confirm`, and its trace must replay Exact. Otherwise the
-//!   lane is a harness failure (`unconfirmed`). The loop then shrinks the
+//!   `zakura-sim confirm`, and its trace must replay Exact. A kill of the
+//!   case's rule by a co-violation the case allows must also show the
+//!   case's property violated in the confirmed trace's full report
+//!   ([`co_violation_confirmed`]). Otherwise the lane is a harness failure
+//!   (`unconfirmed`). The loop then shrinks the
 //!   confirmed trace with `zakura-sim shrink` under `ZAKURA_SIM_EXPECT`,
 //!   within [`SHRINK_CANDIDATES`] and [`shrink_wall`].
 //! - **Unpatched check (mut-5).** The unpatched build's `zakura-sim` reruns
@@ -121,6 +124,10 @@ pub(super) const SEARCH_DIR: &str = "search";
 /// `zakura-sim generate`'s report file, under [`SEARCH_DIR`]. It is
 /// `zakura_sim::explore::generate::REPORT_FILE`.
 pub(super) const REPORT_FILE: &str = "generate.json";
+
+/// The full report a recorded trace holds. It is
+/// `zakura_sim::record::FULL_REPORT_FILE`.
+const FULL_REPORT_FILE: &str = "full-report.json";
 
 /// Where the loop keeps the unpatched build's `zakura-sim`, under `--out`.
 /// Slot 0 rebuilds mutants in its target directory, so the lanes can't
@@ -470,33 +477,68 @@ pub(in crate::planted) fn judge_unpatched(
             "the unpatched `zakura-sim {command}` of the {trace} trace wrote no report; it {ended}"
         ));
     };
+    match report_violates(report, id) {
+        Ok(true) => (
+            OnUnpatched::Violated,
+            format!("the {trace} trace violates {id} on the unpatched build too"),
+        ),
+        Ok(false) => (
+            OnUnpatched::Holds,
+            format!("{id} holds in the unpatched `zakura-sim {command}` of the {trace} trace"),
+        ),
+        Err(why) => undecided(format!(
+            "the unpatched `zakura-sim {command}` of the {trace} trace judges nothing: {why}"
+        )),
+    }
+}
+
+/// Whether `report`, a recorded trace's full report or a replay's
+/// `--report`, shows `id` violated, or why it doesn't judge `id`.
+fn report_violates(report: &str, id: &str) -> Result<bool, String> {
     let Ok(report) = serde_json::from_str::<serde_json::Value>(report) else {
-        return undecided(format!(
-            "the unpatched `zakura-sim {command}` of the {trace} trace wrote a report that isn't JSON"
-        ));
+        return Err("its report isn't JSON".to_owned());
     };
     let entry = report["properties"]
         .as_array()
         .into_iter()
         .flatten()
-        .find(|entry| entry["property"] == id);
-    let Some(entry) = entry else {
-        return undecided(format!(
-            "the unpatched `zakura-sim {command}` of the {trace} trace doesn't report {id}"
-        ));
-    };
-    let violations = entry["violations"].as_array().map_or(0, Vec::len);
-    if violations > 0 {
-        (
-            OnUnpatched::Violated,
-            format!("the {trace} trace violates {id} on the unpatched build too"),
-        )
-    } else {
-        (
-            OnUnpatched::Holds,
-            format!("{id} holds in the unpatched `zakura-sim {command}` of the {trace} trace"),
-        )
+        .find(|entry| entry["property"] == id)
+        .ok_or_else(|| format!("its report doesn't show {id}"))?;
+    Ok(entry["violations"]
+        .as_array()
+        .is_some_and(|violations| !violations.is_empty()))
+}
+
+/// A kill's class for a case of `property` once the fresh confirmation of
+/// the `kill` ID recorded `report`, the confirmed trace's full report. A
+/// search that stopped at a co-violation `kill` names the case's rule only
+/// because the run violated `property` too ([`classify::generated`]). The
+/// confirmation requires `kill` alone, so the named kill stands only if
+/// `report` shows `property` violated too. Otherwise the lane is a harness
+/// failure (`unconfirmed`). Any other `result` stays.
+pub(super) fn co_violation_confirmed(
+    result: Classified,
+    property: &str,
+    kill: &str,
+    report: Option<&str>,
+) -> Classified {
+    if result.class != Class::KilledByNamedRule || kill == property {
+        return result;
     }
+    let why = match report.map(|report| report_violates(report, property)) {
+        Some(Ok(true)) => return result,
+        Some(Ok(false)) => format!("{property} holds there"),
+        Some(Err(why)) => why,
+        None => "the confirmed trace has no full report".to_owned(),
+    };
+    Classified::new(
+        Class::HarnessFailure,
+        Some(Reason::Unconfirmed),
+        format!(
+            "{}, but the fresh confirmation of {kill} doesn't show {property} violated: {why}",
+            result.detail
+        ),
+    )
 }
 
 /// A kill's class once the unpatched build ran its traces. A kill keeps
@@ -655,6 +697,17 @@ pub(super) enum Searched {
     /// A campaign's records, or the class of the lane failure that left
     /// none.
     Campaign(Result<lane::Campaign, Classified>),
+}
+
+/// What ran after one kill of a search, which every case it decides
+/// shares.
+struct KillFollowUps {
+    confirmation: FollowUp,
+    shrunk: Option<FollowUp>,
+    /// The unpatched build's runs of the kill's traces.
+    checks: Vec<UnpatchedCheck>,
+    /// The confirmed trace's full report, if the kill confirmed.
+    report: Option<String>,
 }
 
 /// One harness and seed's search on one build.
@@ -1387,7 +1440,7 @@ impl Runner {
                 .arg(&input)
                 .arg("--out")
                 .arg(&out);
-            out.join("full-report.json")
+            out.join(FULL_REPORT_FILE)
         } else {
             let report = dir.join(format!("unpatched-{}-report.json", which.name()));
             if report.exists() {
@@ -1631,10 +1684,7 @@ impl Runner {
                     cap,
                 )?;
                 let run_time = per_run(baseline.millis, Some(lanes.flags.runs_for(harness)));
-                let mut follow_ups: BTreeMap<
-                    String,
-                    (FollowUp, Option<FollowUp>, Vec<UnpatchedCheck>),
-                > = BTreeMap::new();
+                let mut follow_ups: BTreeMap<String, KillFollowUps> = BTreeMap::new();
                 for (index, case) in &cases {
                     let (mut result, kill) = search.classify(&case.property, &case.also_violates);
                     let mut lane = GeneratorReport {
@@ -1674,10 +1724,38 @@ impl Runner {
                                     )?);
                                 }
                             }
-                            follow_ups.insert(kill.id.clone(), (confirmation, shrunk, checks));
+                            let report = confirmation
+                                .trace
+                                .as_ref()
+                                .filter(|_| confirmation.ok)
+                                .and_then(|trace| {
+                                    fs::read_to_string(self.out.join(trace).join(FULL_REPORT_FILE))
+                                        .ok()
+                                });
+                            follow_ups.insert(
+                                kill.id.clone(),
+                                KillFollowUps {
+                                    confirmation,
+                                    shrunk,
+                                    checks,
+                                    report,
+                                },
+                            );
                         }
-                        let (confirmation, shrunk, checks) = &follow_ups[&kill.id];
-                        result = unpatched_class(confirmed(result, confirmation), checks);
+                        let KillFollowUps {
+                            confirmation,
+                            shrunk,
+                            checks,
+                            report,
+                        } = &follow_ups[&kill.id];
+                        result = confirmed(result, confirmation);
+                        result = co_violation_confirmed(
+                            result,
+                            &case.property,
+                            &kill.id,
+                            report.as_deref(),
+                        );
+                        result = unpatched_class(result, checks);
                         lane.confirmation = Some(confirmation.clone());
                         lane.shrunk.clone_from(shrunk);
                         lane.unpatched.clone_from(checks);

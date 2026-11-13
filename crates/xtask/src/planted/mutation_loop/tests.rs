@@ -20,11 +20,11 @@ use super::{
         Reason, Record, Trigger,
     },
     generate::{
-        baseline_lane, campaign_class, co_violations, confirm_child, confirmed, judge_unpatched,
-        no_generator as no_generator_of, plan, shrink_wall, unpatched_class, write_exclusions,
-        FollowUp, GenBaseline, GenerateConfig, GenerateMode, GeneratorBaselineFailure,
-        GeneratorReport, Kill, KillTrace, Lanes, OnUnpatched, PropertyFinding, Search, Searched,
-        Unpatched, UnpatchedCheck,
+        baseline_lane, campaign_class, co_violation_confirmed, co_violations, confirm_child,
+        confirmed, judge_unpatched, no_generator as no_generator_of, plan, shrink_wall,
+        unpatched_class, write_exclusions, FollowUp, GenBaseline, GenerateConfig, GenerateMode,
+        GeneratorBaselineFailure, GeneratorReport, Kill, KillTrace, Lanes, OnUnpatched,
+        PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck,
     },
     parse_flags, planted_cases, selects, summarize, test_executables, triage, BaselineReport,
     BuildIdentity, CaseReport, GenerateFlags, LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
@@ -1403,6 +1403,7 @@ fn fake_sim(path: &Path, body: &str) {
 }
 
 /// A case of `property`, allowing `also_violates`, for a generator lane.
+#[cfg(unix)]
 fn generator_case(property: &str, also_violates: &[&str]) -> LoopCase {
     LoopCase {
         label: format!("bounds/{property}.patch"),
@@ -1563,6 +1564,70 @@ fn a_kill_the_unpatched_build_cannot_judge_is_unconfirmed() {
         "{}",
         lane.result.detail
     );
+}
+
+/// A search that stopped at a co-violation `Q` of the case's property `P`
+/// names `P`'s rule only because the run violated `P` too. The fresh
+/// confirmation requires `Q` alone, so the named kill stands only if the
+/// confirmed trace shows `P` violated as well.
+#[test]
+fn a_co_violation_kill_needs_its_property_in_the_confirmation() {
+    let named = classify::Classified::new(Class::KilledByNamedRule, None, "the kill");
+    let both = full_report(&[OTHER, NAMED], &[]);
+    let alone = full_report(&[OTHER], &[NAMED]);
+    let judged = |property, report: Option<&str>| {
+        let result = co_violation_confirmed(named.clone(), property, OTHER, report);
+        (result.class, result.reason)
+    };
+    let unconfirmed = (Class::HarnessFailure, Some(Reason::Unconfirmed));
+    assert_eq!(judged(NAMED, Some(&both)), (Class::KilledByNamedRule, None));
+    assert_eq!(judged(NAMED, Some(&alone)), unconfirmed);
+    assert_eq!(
+        judged(NAMED, Some(&full_report(&[OTHER], &[]))),
+        unconfirmed
+    );
+    assert_eq!(judged(NAMED, Some("not json")), unconfirmed);
+    assert_eq!(judged(NAMED, None), unconfirmed);
+    assert_eq!(
+        judged(OTHER, Some(&alone)),
+        (Class::KilledByNamedRule, None),
+        "the confirmation already requires the kill's own ID"
+    );
+    let detail = co_violation_confirmed(named.clone(), NAMED, OTHER, Some(&alone)).detail;
+    assert!(
+        detail.contains(&format!(
+            "confirmation of {OTHER} doesn't show {NAMED} violated"
+        )),
+        "{detail}"
+    );
+    let other = classify::Classified {
+        other: Some(OTHER.to_owned()),
+        ..classify::Classified::new(Class::KilledByOtherRule, None, "the kill")
+    };
+    assert_eq!(
+        co_violation_confirmed(other.clone(), NAMED, OTHER, None),
+        other
+    );
+
+    // Through the lane: one search stops at OTHER, which the NAMED case
+    // allows, and whose run violated NAMED too. A confirmation that shows
+    // NAMED keeps the named kill; one that doesn't leaves only the OTHER
+    // case's kill.
+    #[cfg(unix)]
+    {
+        let cases = [generator_case(NAMED, &[OTHER]), generator_case(OTHER, &[])];
+        let holds = full_report(&[], &[OTHER]);
+        let lanes = fake_kill(OTHER, &[OTHER, NAMED], &both, Some(&holds), &cases);
+        assert_eq!(lanes[0].result.class, Class::KilledByNamedRule, "{lanes:?}");
+        assert_eq!(lanes[0].violated.as_deref(), Some(OTHER));
+        let lanes = fake_kill(OTHER, &[OTHER, NAMED], &alone, Some(&holds), &cases);
+        assert_eq!(
+            (lanes[0].result.class, lanes[0].result.reason),
+            unconfirmed,
+            "{lanes:?}"
+        );
+        assert_eq!(lanes[1].result.class, Class::KilledByNamedRule, "{lanes:?}");
+    }
 }
 
 /// A kill's confirm or replay child gets ten of its search's runs, and at

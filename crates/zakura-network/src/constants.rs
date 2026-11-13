@@ -474,9 +474,10 @@ pub const MIN_PEER_SET_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// disconnected and banned.
 pub const MAX_PEER_MISBEHAVIOR_SCORE: u32 = 100;
 
-/// The most block hashes a Zakura native `FindBlocks` response may carry.
+/// The most block hashes a `FindBlocks` response may carry.
 ///
-/// A zakurad responder sends at most `MAX_FIND_BLOCK_HASHES_RESULTS` from
+/// Zakura native requesters reject longer responses, and legacy `inv` responses
+/// are truncated to this length. A zakurad responder sends at most `MAX_FIND_BLOCK_HASHES_RESULTS` from
 /// `zakura-state`; zakurad checks at compile time that the two match.
 pub const MAX_FIND_BLOCKS_RESPONSE_HASHES: usize = 500;
 

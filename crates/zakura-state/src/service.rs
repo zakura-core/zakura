@@ -299,6 +299,10 @@ pub struct ReadStateService {
     /// Shared fail-closed attachment result, visible to every clone without joining the worker.
     block_write_failure: Arc<write::BlockWriteFailure>,
 
+    /// The block writer's ordered best-chain changes and their generation, or
+    /// `None` for a read-only state with no writer.
+    chain_transitions: Option<zakura_node_services::mempool::port::ChainTransitions>,
+
     /// Note commitment frontiers this service has derived and root-checked for heights in a
     /// verified-commitment-trees fast-synced database's absent band.
     ///
@@ -523,6 +527,7 @@ impl StateService {
         let (chain_tip_sender, latest_chain_tip, chain_tip_change) =
             ChainTipSender::new(initial_tip, network);
         let (chain_tip_sender, block_announcements) = chain_tip_sender.with_block_announcements();
+        let chain_transitions = chain_tip_sender.chain_transitions();
 
         let finalized_state_for_writing = finalized_state.clone();
         let should_use_finalized_block_write_sender = non_finalized_state.is_chain_set_empty();
@@ -585,7 +590,8 @@ impl StateService {
             },
             historical_trees,
         )
-        .with_max_checkpoint_height(max_checkpoint_height);
+        .with_max_checkpoint_height(max_checkpoint_height)
+        .with_chain_transitions(chain_transitions);
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
             - HeightDiff::try_from(checkpoint_verify_concurrency_limit)
@@ -1699,6 +1705,7 @@ impl ReadStateService {
             non_finalized_state_receiver,
             block_write_task,
             block_write_failure,
+            chain_transitions: None,
             historical_trees,
             historical_subtrees,
             vct_root_repair_receiver,
@@ -1717,6 +1724,24 @@ impl ReadStateService {
     fn with_max_checkpoint_height(mut self, max_checkpoint_height: block::Height) -> Self {
         self.max_checkpoint_height = max_checkpoint_height;
         self
+    }
+
+    /// Attach the block writer's best-chain changes.
+    fn with_chain_transitions(
+        mut self,
+        chain_transitions: zakura_node_services::mempool::port::ChainTransitions,
+    ) -> Self {
+        self.chain_transitions = Some(chain_transitions);
+        self
+    }
+
+    /// The block writer's ordered best-chain changes: the generation readers
+    /// check around their lookups, and the one subscription the pool core
+    /// takes. `None` for a read-only state, which has no writer.
+    pub fn chain_transitions(
+        &self,
+    ) -> Option<&zakura_node_services::mempool::port::ChainTransitions> {
+        self.chain_transitions.as_ref()
     }
 
     /// Return the tip of the current best chain.

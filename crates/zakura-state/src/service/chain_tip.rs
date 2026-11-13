@@ -6,7 +6,10 @@
 //! * [ChainTipChange] to `await` specific changes to the chain tip.
 
 use std::{fmt, sync::Arc};
-use zakura_node_services::block_memory::TransactionHandle;
+use zakura_node_services::{
+    block_memory::TransactionHandle,
+    mempool::port::{self, chain_transitions, ChainTransitionSender, ChainTransitions},
+};
 
 use chrono::{DateTime, Utc};
 use futures::TryFutureExt;
@@ -98,6 +101,25 @@ impl fmt::Display for ChainTipBlock {
 }
 
 impl ChainTipBlock {
+    /// The tip as the pool port names it.
+    pub fn port_tip(&self) -> port::ChainTip {
+        port::ChainTip {
+            hash: self.hash,
+            height: self.height,
+        }
+    }
+
+    /// The block as the pool port's connected block. It shares this block's
+    /// transaction handles.
+    pub fn connected_block(&self) -> port::ConnectedBlock {
+        port::ConnectedBlock {
+            hash: self.hash,
+            height: self.height,
+            transactions: self.transactions.clone(),
+            transaction_hashes: self.transaction_hashes.clone(),
+        }
+    }
+
     /// Construct the initial tip from a retained finalized identity when checkpoint pruning
     /// intentionally skipped its raw transactions.
     pub(crate) fn from_pruned_finalized_header(
@@ -164,6 +186,38 @@ impl From<CheckpointVerifiedBlock> for ChainTipBlock {
     }
 }
 
+/// Whether the rules unmined transactions are verified under change at
+/// `height`: a network upgrade or the soft fork that temporarily disables
+/// Orchard actions activates there. The mempool verifies for the height after
+/// the tip, and clears itself when that height is one of these.
+pub fn activates_mempool_rules(network: &Network, height: block::Height) -> bool {
+    NetworkUpgrade::is_activation_height(network, height)
+        || network.is_temporary_orchard_disabling_soft_fork_activation_height(height)
+}
+
+/// Whether unmined transactions verified for the height after `before` are
+/// verified under different rules for the height after `after`: one of
+/// [`activates_mempool_rules`]' heights lies after one of those next heights
+/// and at or before the other. `None` is the tip before genesis.
+///
+/// It checks each height between the two, so it costs one map lookup per
+/// block the tip moved.
+pub fn mempool_rules_change(
+    network: &Network,
+    before: Option<block::Height>,
+    after: block::Height,
+) -> bool {
+    let before_next = before.map_or(0, |height| height.0.saturating_add(1));
+    let after_next = after.0.saturating_add(1);
+    let (low, high) = if before_next <= after_next {
+        (before_next, after_next)
+    } else {
+        (after_next, before_next)
+    };
+    (low.saturating_add(1)..=high)
+        .any(|height| activates_mempool_rules(network, block::Height(height)))
+}
+
 /// A sender for changes to the non-finalized and finalized chain tips.
 #[derive(Debug)]
 pub struct ChainTipSender {
@@ -176,6 +230,10 @@ pub struct ChainTipSender {
     /// The sender channel for chain tip data.
     sender: watch::Sender<ChainTipData>,
     announcements: Option<BlockAnnouncementSender>,
+
+    /// The ordered best-chain changes and their generation. The block writer
+    /// drives it around each change it publishes through this sender.
+    transitions: ChainTransitionSender,
 }
 
 impl ChainTipSender {
@@ -232,6 +290,7 @@ impl ChainTipSender {
             use_non_finalized_tip: false,
             sender,
             announcements: None,
+            transitions: chain_transitions(initial_tip.as_ref().map(ChainTipBlock::port_tip)),
         };
 
         let current = LatestChainTip::new(receiver);
@@ -244,12 +303,39 @@ impl ChainTipSender {
 
     /// Returns a clone of itself for sending finalized tip changes,
     /// used by `TrustedChainSync` in `zakura-rpc`.
+    ///
+    /// Its chain transitions are its own and have no consumer, because the pool
+    /// core follows the block writer's.
     pub fn finalized_sender(&self) -> Self {
+        let tip = self.sender.borrow().as_ref().map(ChainTipBlock::port_tip);
         Self {
             use_non_finalized_tip: false,
             sender: self.sender.clone(),
             announcements: self.announcements.clone(),
+            transitions: chain_transitions(tip),
         }
+    }
+
+    /// The handle the pool core subscribes to the best-chain changes with, and
+    /// its verification workers read the generation from.
+    pub fn chain_transitions(&self) -> ChainTransitions {
+        self.transitions.transitions()
+    }
+
+    /// The writer's half of the best-chain changes.
+    pub(crate) fn transition_sender(&self) -> &ChainTransitionSender {
+        &self.transitions
+    }
+
+    /// The writer's half of the best-chain changes, to finish a change.
+    pub(crate) fn transition_sender_mut(&mut self) -> &mut ChainTransitionSender {
+        &mut self.transitions
+    }
+
+    /// Whether [`Self::publish_finalized_commit`] publishes the committed block
+    /// as the best tip. It does until the non-finalized state has a tip.
+    pub(crate) fn publishes_finalized_tip(&self) -> bool {
+        !self.use_non_finalized_tip
     }
 
     /// Returns the hash of the last published best tip.
@@ -716,10 +802,7 @@ impl ChainTipChange {
             .next()
             .expect("chain tip height is far below Height::MAX");
         if Some(block.previous_block_hash) != self.last_change_hash
-            || NetworkUpgrade::is_activation_height(&self.network, next_height)
-            || self
-                .network
-                .is_temporary_orchard_disabling_soft_fork_activation_height(next_height)
+            || activates_mempool_rules(&self.network, next_height)
         {
             TipAction::reset_with(block)
         } else {

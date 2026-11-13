@@ -62,8 +62,11 @@ use crate::service::{
 };
 
 mod chain_tip_trace;
+mod chain_transition;
 mod vct_authentication_sweep;
 mod vct_write_retry;
+
+use zakura_node_services::mempool::port;
 
 use chain_tip_trace::ChainTipTrace;
 use vct_authentication_sweep::{recover_commit_boundary, VctAuthenticationSweeper};
@@ -1722,9 +1725,23 @@ fn update_latest_chain_channels(
     let tip_block = ChainTipBlock::from(tip_block);
 
     let tip_block_height = tip_block.height;
+    let new_tip = tip_block.port_tip();
+    let changes = chain_tip_sender.transition_sender().tip() != Some(new_tip);
+    let old_best = if changes {
+        chain_transition::old_best_chain(
+            chain_tip_sender.transition_sender().is_subscribed(),
+            &non_finalized_state_sender.borrow(),
+        )
+    } else {
+        None
+    };
 
     if let Some(backup_dir_path) = backup_dir_path {
         non_finalized_state.write_to_backup(backup_dir_path);
+    }
+
+    if changes {
+        chain_tip_sender.transition_sender().begin_change();
     }
 
     non_finalized_state.publish(non_finalized_state_sender);
@@ -1733,6 +1750,21 @@ fn update_latest_chain_channels(
         chain_tip_sender.publish_non_finalized_commit(tip_block, committed);
     } else {
         chain_tip_sender.set_best_non_finalized_tip(tip_block);
+    }
+
+    if changes {
+        chain_tip_sender
+            .transition_sender_mut()
+            .finish_change(new_tip, |before, generation| {
+                chain_transition::non_finalized_transition(
+                    &non_finalized_state.network,
+                    before,
+                    old_best?.as_deref(),
+                    Some(best_chain),
+                    new_tip,
+                    generation,
+                )
+            });
     }
 
     tip_block_height
@@ -1746,11 +1778,40 @@ fn update_channels_after_operator_change(
     backup_dir_path: Option<&Path>,
 ) {
     if non_finalized_state.is_chain_set_empty() {
+        // Clearing to no tip publishes nothing, so only a tip that moves is a change.
+        let new_tip = finalized_tip
+            .as_ref()
+            .map(ChainTipBlock::port_tip)
+            .filter(|tip| chain_tip_sender.transition_sender().tip() != Some(*tip));
+        let old_best = new_tip.and_then(|_| {
+            chain_transition::old_best_chain(
+                chain_tip_sender.transition_sender().is_subscribed(),
+                &non_finalized_state_sender.borrow(),
+            )
+        });
         if let Some(backup_dir_path) = backup_dir_path {
             non_finalized_state.write_to_backup(backup_dir_path);
         }
+        if new_tip.is_some() {
+            chain_tip_sender.transition_sender().begin_change();
+        }
         non_finalized_state.publish(non_finalized_state_sender);
         chain_tip_sender.clear_best_non_finalized_tip(finalized_tip);
+        if let Some(new_tip) = new_tip {
+            chain_tip_sender.transition_sender_mut().finish_change(
+                new_tip,
+                |before, generation| {
+                    chain_transition::non_finalized_transition(
+                        &non_finalized_state.network,
+                        before,
+                        old_best?.as_deref(),
+                        None,
+                        new_tip,
+                        generation,
+                    )
+                },
+            );
+        }
     } else {
         update_latest_chain_channels(
             non_finalized_state,
@@ -2730,12 +2791,21 @@ impl WriteBlockWorkerTask {
                 height: ordered_block.0.height,
                 origin: ordered_block.0.origin,
             };
+            // The committed block becomes the best tip, so its database write starts a
+            // best-chain change, unless the non-finalized state already publishes the tip.
+            let publishes_tip = chain_tip_sender.publishes_finalized_tip();
+            let began_change = std::cell::Cell::new(false);
+            let transitions = chain_tip_sender.transition_sender();
             // Try committing the block
             match finalized_state.commit_finalized_with_aux_and(
                 ordered_block,
                 prev_note_commitment_trees,
                 vct_auxiliary_window,
                 |db, batch, proof| {
+                    if publishes_tip {
+                        transitions.begin_change();
+                        began_change.set(true);
+                    }
                     let authentication = checkpoint_header_writer.and_then(|_writer| {
                         vct_authentication_window
                             .as_ref()
@@ -2781,17 +2851,58 @@ impl WriteBlockWorkerTask {
                         non_finalized_state,
                         header_chain_observers,
                     ) {
+                        // The writer stops without publishing the tip, so readers
+                        // resynchronize at whatever the database holds.
+                        if began_change.get() {
+                            let tip = finalized_state
+                                .db
+                                .tip()
+                                .map(|(height, hash)| port::ChainTip { hash, height });
+                            chain_tip_sender
+                                .transition_sender_mut()
+                                .finish_unknown_change(tip);
+                        }
                         return exit;
                     }
 
                     let tip_block = ChainTipBlock::from(finalized);
                     let committed_hash = tip_block.hash;
+                    let new_tip = tip_block.port_tip();
+                    let previous_block_hash = tip_block.previous_block_hash;
+                    let connected = (began_change.get()
+                        && chain_tip_sender.transition_sender().is_subscribed())
+                    .then(|| tip_block.connected_block());
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
                     chain_tip_sender.publish_finalized_commit(tip_block, committed_announcement);
+                    if began_change.get() {
+                        chain_tip_sender.transition_sender_mut().finish_change(
+                            new_tip,
+                            |before, generation| {
+                                chain_transition::checkpoint_transition(
+                                    &non_finalized_state.network,
+                                    before,
+                                    connected?,
+                                    previous_block_hash,
+                                    generation,
+                                )
+                            },
+                        );
+                    }
                     notify_block_committed(block_commit_sender, committed_hash);
                     let _ = response.send(Ok(committed_hash));
                 }
                 Err((ordered_block, error)) => {
+                    if began_change.get() {
+                        // The write may or may not have landed, so the queue resyncs at
+                        // whatever tip the database holds now.
+                        let tip = finalized_state
+                            .db
+                            .tip()
+                            .map(|(height, hash)| port::ChainTip { hash, height });
+                        chain_tip_sender
+                            .transition_sender_mut()
+                            .finish_unknown_change(tip);
+                    }
                     let mut attributed_failure_repair = None;
                     let mut failure_evidence_committed = false;
                     if let (Some(auxiliary_window), Some(failure)) = (

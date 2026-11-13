@@ -40,7 +40,7 @@ use std::{collections::VecDeque, fmt, net::IpAddr, sync::Arc};
 
 use zakura_chain::{
     block,
-    transaction::{self, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
 use zakura_rt::{
@@ -53,7 +53,14 @@ use zakura_rt::{
 };
 
 use super::{QueueSource, TransactionDependencies};
+use crate::block_memory::TransactionHandle;
 
+pub use chain::{
+    chain_transitions, AlreadySubscribed, ChainEvents, ChainStart, ChainTransitionSender,
+    ChainTransitions, MAX_QUEUED_TRANSITION_BLOCKS,
+};
+
+mod chain;
 #[cfg(any(test, feature = "test-support"))]
 pub mod model;
 #[cfg(test)]
@@ -482,7 +489,9 @@ pub struct ChainTip {
 ///
 /// It carries its transactions, not only their ids. The core removes the
 /// pool transactions that spend what these spend, and an id cannot find a
-/// conflict with a transaction that was never in the pool.
+/// conflict with a transaction that was never in the pool. They are the
+/// handles the state already holds, not copies, so a queued block keeps its
+/// decoded memory until the core takes it.
 #[derive(Clone, Debug)]
 pub struct ConnectedBlock {
     /// The block's hash.
@@ -490,7 +499,7 @@ pub struct ConnectedBlock {
     /// The block's height.
     pub height: block::Height,
     /// The block's transactions, in block order.
-    pub transactions: Vec<Arc<Transaction>>,
+    pub transactions: Vec<TransactionHandle>,
     /// The mined ids of `transactions`, in the same order.
     pub transaction_hashes: Arc<[transaction::Hash]>,
 }

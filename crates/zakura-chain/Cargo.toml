@@ -1,6 +1,6 @@
 [package]
 name = "zakura-chain"
-version = "14.0.0"
+version = "15.0.0"
 authors.workspace = true
 description = "Core Zcash data structures for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -26,6 +26,7 @@ json-conversion = [
 
 # Async error handling convenience traits
 async-error = [
+    "dep:futures",
     "tokio/rt",
 ]
 
@@ -35,6 +36,7 @@ internal-miner = ["equihash/solver"]
 # Test-only features
 
 proptest-impl = [
+    "dep:futures",
     "proptest",
     "proptest-derive",
     "rand_chacha_10",
@@ -92,7 +94,7 @@ hex = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["serde_derive", "rc"] }
 
 # Processing
-futures = { workspace = true }
+futures = { workspace = true, optional = true }
 itertools = { workspace = true }
 rayon = { workspace = true }
 ref-cast = { workspace = true }
@@ -115,6 +117,7 @@ zakura-test = { path = "../zakura-test/", version = "4.0.0", optional = true }
 bounded-vec = { version = "0.9.0", features = ["serde"] }
 
 [dev-dependencies]
+futures = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 

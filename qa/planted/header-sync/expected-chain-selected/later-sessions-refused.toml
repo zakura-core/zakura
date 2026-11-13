@@ -1,0 +1,14 @@
+# The reactor refuses every session while it holds one with another peer,
+# taking the capacity path. On the stronger-last witness, under its committed
+# plan, the node admits only the mirror whose lighter fork it reaches first,
+# so it never sees the heavier offer. Selection holds over what the engine
+# has. The settled points count each mirror's own admission of its session
+# with the node, so the node is judged once it goes idle, and convergence
+# fails there. The reactor and the service decide which session arrives
+# first, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-selection-stronger-last.json"
+plan = "crates/zakura-sim/tests/fixtures/header-selection-stronger-last.plan"

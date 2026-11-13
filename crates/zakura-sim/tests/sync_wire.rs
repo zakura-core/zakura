@@ -50,6 +50,17 @@ fn run_scenario(
     scenario: &<SyncWire as Subsystem>::Scenario,
     input: PlanInput,
 ) -> (RunReport, Vec<String>, SyncPorts) {
+    let (report, lines, ports) = run_scenario_judged_by_caller(scenario, input);
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    (report, lines, ports)
+}
+
+/// [`run_scenario`], but leaves an active property's violation to the
+/// caller. Still fails the test on a harness failure.
+fn run_scenario_judged_by_caller(
+    scenario: &<SyncWire as Subsystem>::Scenario,
+    input: PlanInput,
+) -> (RunReport, Vec<String>, SyncPorts) {
     let ports = SyncWire::prepare(scenario);
     let mut sink = MemorySink::default();
     let report = match run_prepared::<SyncWire>(scenario, ports.clone(), input, &mut sink, None) {
@@ -57,7 +68,6 @@ fn run_scenario(
         Err(HarnessError::Run { failure, report }) => panic!("{failure}: {:?}", report.end),
         Err(error) => panic!("{error}"),
     };
-    assert_eq!(report.end.violation, None, "{:?}", report.end);
     (report, sink.lines(), ports)
 }
 
@@ -570,6 +580,77 @@ fn curated_combined_actions_sync_both_tips() {
     }
 }
 
+/// The committed input, `sync-wire-reset-mid-write.bin`, that reaches
+/// zakura#2378. Its prefix picks fuzz-13's combined actions `FB 14`: the
+/// fork while storage holds a submission, with every read stalled. Its Plan
+/// picks each block request's writer last among the ready actions while its
+/// frame write is under way, as a slow thread would. The fork's tip reset
+/// then retires request 1/30 while its frame is partly written.
+const RESET_MID_WRITE: &str = "reset-mid-write";
+
+/// The steps at which a reset retired a block request whose frame write
+/// had started and not finished.
+fn mid_write_resets(log: &ObservationLog) -> Vec<u64> {
+    let mut last = BTreeMap::new();
+    let mut resets = Vec::new();
+    for entry in log.entries() {
+        if let Observation::BlockSync {
+            event: BlockSyncFact::Request { owner, step, .. },
+            ..
+        } = &entry.obs
+        {
+            let request = (owner.session_id, owner.request_id);
+            if step == "reset" {
+                if last.get(&request).map(String::as_str) == Some("started") {
+                    resets.push(entry.step);
+                }
+            } else {
+                last.insert(request, step.clone());
+            }
+        }
+    }
+    resets
+}
+
+/// zakura#2378's known failure: a reset that retires a block request mid-write
+/// cancels the whole block-sync session, and the writer fence closes the
+/// honest connection with `unfinished_exchange` while the session's other
+/// requests wait, which [`STALLED_SERVICE_ISOLATED`] forbids.
+///
+/// [`RESET_MID_WRITE`]'s run must reset a request mid-write and then end in
+/// exactly that violation. The test fails with "fixed: remove this
+/// expectation (zakura#2378)" once the reset no longer closes the
+/// connection, and asks for a new input if the schedule stops reaching the
+/// mid-write reset at all.
+#[test]
+fn a_mid_write_reset_closes_an_honest_connection_until_zakura_2378_is_fixed() {
+    let input = fs::read(fixtures().join(format!("sync-wire-{RESET_MID_WRITE}.bin")))
+        .expect("the input is committed");
+    let (prefix, plan) = input.split_at(SyncWire::SCENARIO_BYTES);
+    let (report, _, _) =
+        run_scenario_judged_by_caller(&SyncWire::draw(prefix), Plan::from_fuzz(plan));
+    assert!(
+        !mid_write_resets(&report.log).is_empty(),
+        "{RESET_MID_WRITE} no longer resets a block request mid-write, so it no longer \
+         reaches zakura#2378: build a new input: {:?}",
+        report.end
+    );
+    let violation = report.end.violation.as_ref().unwrap_or_else(|| {
+        panic!(
+            "{RESET_MID_WRITE} no longer violates {STALLED_SERVICE_ISOLATED}, so zakura#2378 \
+             is fixed: remove this expectation (zakura#2378): {:?}",
+            report.end
+        )
+    });
+    assert!(
+        violation.property == STALLED_SERVICE_ISOLATED
+            && violation.actual.contains("with cause unfinished_exchange"),
+        "{RESET_MID_WRITE} should violate {STALLED_SERVICE_ISOLATED} with an \
+         unfinished_exchange close until zakura#2378 is fixed, and violated another: \
+         {violation:?}"
+    );
+}
+
 /// The committed fixture directory.
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -681,7 +762,8 @@ fn saved_scenarios_replay_exact_in_a_fresh_process() {
 
 /// Rewrites every saved scenario's input, sidecar and end record, and each
 /// curated combination's input and sidecar. Each input is its prefix and
-/// the default Plan. Run it with `RUSTFLAGS="--cfg
+/// the default Plan. [`RESET_MID_WRITE`]'s input stays, and only its
+/// sidecar is rewritten. Run it with `RUSTFLAGS="--cfg
 /// zakura_sim" cargo test --manifest-path crates/zakura-sim/Cargo.toml
 /// --test sync_wire -- --ignored regenerate_saved_scenarios`.
 #[test]
@@ -742,4 +824,25 @@ fn regenerate_saved_scenarios() {
         );
         fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
     }
+    // The input is a search's result, so only its sidecar is rewritten.
+    let base = fixtures().join(format!("sync-wire-{RESET_MID_WRITE}"));
+    let input = fs::read(base.with_extension("bin")).expect("the input is committed");
+    let scenario = serde_json::to_value(SyncWire::draw(&input[..SyncWire::SCENARIO_BYTES]))
+        .expect("scenarios serialize");
+    let sidecar = format!(
+        "# The committed fuzz input `sync-wire-{RESET_MID_WRITE}.bin`: the harness that\n\
+         # runs it, the generator version it was built for, and its SHA-256. Its\n\
+         # two bytes pick a combination of fuzz-13's actions, and its Plan resets a\n\
+         # block request mid-write, zakura#2378's known failure.\n\
+         harness = \"{harness}\"\n\
+         generator = {generator}\n\
+         sha256 = \"{digest}\"\n\
+         scenario_sha256 = \"{scenario}\"\n\
+         source = \"crates/zakura-sim/tests/sync_wire.rs\"\n",
+        harness = SyncWire::NAME,
+        generator = SyncWire::GENERATOR,
+        digest = seed::sha256(&input),
+        scenario = seed::scenario_sha256(&scenario),
+    );
+    fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
 }

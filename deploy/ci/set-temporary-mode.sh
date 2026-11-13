@@ -4,9 +4,10 @@ set -euo pipefail
 readonly repo=zakura-core/zakura
 readonly state="${XDG_STATE_HOME:-$HOME/.local/state}/zakura-temporary-ci"
 readonly snapshot="$state/workflows.json"
+# Required PR checks, including semver-checks.yml, must stay enabled.
 readonly -a paused=(
   benchmarks.yml coverage.yml docs-check.yml test-crates.yml test-docker.yml
-  zcashd-compat-regtest.yml zakura-e2e.yml history-growth.yml semver-checks.yml
+  zcashd-compat-regtest.yml zakura-e2e.yml history-growth.yml
   cross-platform.yml zakura-vct-handoff-canary.yml header-fuzz.yml rpc-fuzz.yml
   p2p-fuzz.yml sim-fuzz.yml fuzz-campaign-check.yml fuzz-campaign.yml
   zakura-mac-cranelift.yml

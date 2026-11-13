@@ -56,7 +56,7 @@ use zakura_scheduler::SimInstant;
 use super::header_node::{session::SessionEvidence, HeaderNode};
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
-    net::Net,
+    net::{Net, WireOrder},
     observe::{
         HeaderCheckFact, KindLoad, SessionStepFact, TransitionFact, TransportFact, TransportLimits,
     },
@@ -370,6 +370,9 @@ struct TapState {
     sampling: bool,
     /// Each registered connection's resource probe, in registration order.
     probes: Mutex<Vec<(u64, ConnectionProbe)>>,
+    /// The run's wire-event stamps, which each frame write takes as it's
+    /// reported.
+    order: WireOrder,
 }
 
 /// Events reported and not yet drained.
@@ -391,6 +394,15 @@ enum Reported {
     SharedId { conn_id: u64, id: [u8; 16] },
     /// Connection `conn_id`'s resources changed to `load`.
     Load { conn_id: u64, load: TransportFact },
+    /// A frame write the transport reported, stamped with the run's
+    /// [`WireOrder`] when it was reported rather than when it's drained.
+    Written {
+        conn_id: u64,
+        quic_stream: u64,
+        seq: u64,
+        message_type: u16,
+        order: u64,
+    },
 }
 
 impl TapState {
@@ -401,7 +413,8 @@ impl TapState {
     }
 
     /// Numbers and buffers `event`, or refuses it outside the tap's run. A
-    /// transport event reaches the session view first. No step yields, and
+    /// transport event reaches the session view first, and a frame write
+    /// takes its [`WireOrder`] stamp before it's buffered. No step yields, and
     /// no std lock is held across another call.
     fn push(&self, event: Reported) {
         if zakura_rt::sim::run_id() != Some(self.run) {
@@ -411,6 +424,21 @@ impl TapState {
         if let (Some(sessions), Reported::Event(event)) = (&self.sessions, &event) {
             sessions.transport(event);
         }
+        let event = match event {
+            Reported::Event(TransportEvent::FrameWritten {
+                conn_id,
+                quic_stream,
+                seq,
+                message_type,
+            }) => Reported::Written {
+                conn_id,
+                quic_stream,
+                seq,
+                message_type,
+                order: self.order.next(),
+            },
+            event => event,
+        };
         let shared = match &event {
             Reported::Event(TransportEvent::Registered {
                 conn_id, shared_id, ..
@@ -572,6 +600,7 @@ impl TransportTap {
                 sessions,
                 sampling,
                 probes: Mutex::default(),
+                order: net.order(),
             }))
         });
         let state = observer.0.clone();
@@ -675,6 +704,24 @@ impl TransportTap {
             }
             Reported::Load { conn_id, load } => {
                 return Ok((Some(conn_id), self.remote(conn_id)?, load));
+            }
+            Reported::Written {
+                conn_id,
+                quic_stream,
+                seq,
+                message_type,
+                order,
+            } => {
+                return Ok((
+                    Some(conn_id),
+                    self.remote(conn_id)?,
+                    TransportFact::FrameWritten {
+                        quic_stream,
+                        seq,
+                        message_type,
+                        order,
+                    },
+                ));
             }
         };
         Ok(match event {
@@ -804,20 +851,9 @@ impl TransportTap {
                     message_type,
                 },
             ),
-            TransportEvent::FrameWritten {
-                conn_id,
-                quic_stream,
-                seq,
-                message_type,
-            } => (
-                Some(conn_id),
-                self.remote(conn_id)?,
-                TransportFact::FrameWritten {
-                    quic_stream,
-                    seq,
-                    message_type,
-                },
-            ),
+            TransportEvent::FrameWritten { .. } => {
+                unreachable!("`TapState::push` stamps every frame write as `Reported::Written`")
+            }
             TransportEvent::CloseDecided {
                 remote,
                 conn_id,

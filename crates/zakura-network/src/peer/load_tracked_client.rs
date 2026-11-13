@@ -54,6 +54,7 @@ impl From<Client> for LoadTrackedClient {
             sender: client.block_advert_tx.clone(),
             address: connection_info.connected_addr.get_transient_addr(),
             uploads: client.block_uploads.clone(),
+            announced: client.announced_blocks.clone(),
             registry: client.peer_registry_updater.clone(),
             version: connection_info.remote.version,
             sidecar: false,

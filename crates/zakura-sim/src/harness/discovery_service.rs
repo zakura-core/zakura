@@ -280,6 +280,7 @@ fn spawn_with(
             listening,
             chain: None,
             records: records.clone(),
+            order: net.order(),
             closed: PeerCloses::default(),
             taken: 0,
         };

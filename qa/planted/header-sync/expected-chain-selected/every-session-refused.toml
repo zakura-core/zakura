@@ -1,0 +1,15 @@
+# The reactor refuses every session, taking the capacity path. The mirrors
+# run the same reactor, so each refuses its session with the node too, and
+# no session is ever admitted on either end. On the stronger-last witness,
+# under its committed plan, the node stays at genesis with heavier chains
+# on offer. The settled points count each mirror's own decision on its
+# session with the node, a refusal at capacity included, so the node is
+# judged once it goes idle, and convergence fails there. The reactor's
+# admission decides when it refuses, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-selection-stronger-last.json"
+plan = "crates/zakura-sim/tests/fixtures/header-selection-stronger-last.plan"

@@ -197,7 +197,8 @@ pub const BOUND_LIMIT_TEST: TestRef = sim_test(
     "the_limit_fixtures_reach_and_hold_their_bounds",
 );
 
-/// Gate 5's bound-table release and reuse: in each limit fixture's log the
+/// Gate 5's bound-table release and reuse: in each limit fixture's log, and
+/// for the reservation maps in the slot fixture's reservation facts, the
 /// waiting party gets its first unit only after a release, with fewer than
 /// the limit open.
 pub const BOUND_REUSE_TEST: TestRef = sim_test(

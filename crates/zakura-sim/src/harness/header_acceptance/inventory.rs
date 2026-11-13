@@ -28,8 +28,8 @@ use super::{
     contracts::{ContractState, NarrowingTest, REQUIRED_CONTRACTS},
     evaluate::Evaluation,
     required::GATE_OBLIGATIONS,
-    rows::{NativeClass, NativeMutation, StandingExclusion, STANDING_EXCLUSIONS},
-    Approval, Expected, Gate, Key, Manifest, COMPOSITION_CHECKS, NATIVE_MUTATIONS,
+    rows::{NativeClass, NativeMutation, StandingExclusion, STANDING_EXCLUSIONS, TIER_APPROVALS},
+    Approval, Expected, Gate, Key, Manifest, Tier, COMPOSITION_CHECKS, NATIVE_MUTATIONS,
 };
 
 /// The fingerprint of the committed inventories' canonical text
@@ -47,6 +47,8 @@ pub struct Lists<'a> {
     pub exclusions: &'a [StandingExclusion],
     /// The gate obligations no row owns.
     pub obligations: &'a [super::required::GateObligation],
+    /// Each tier exclusion Adam approved for one property and tier.
+    pub tier_approvals: &'a [(&'a str, Tier, Approval)],
 }
 
 impl Lists<'static> {
@@ -57,6 +59,7 @@ impl Lists<'static> {
             native: NATIVE_MUTATIONS,
             exclusions: STANDING_EXCLUSIONS,
             obligations: GATE_OBLIGATIONS,
+            tier_approvals: TIER_APPROVALS,
         }
     }
 }
@@ -159,8 +162,10 @@ pub fn errors_against(
 /// line of its own, and so is each gate obligation, with its gates and
 /// full permit, so one removed from both its lists moves the pin, and each
 /// contract's proving test and proving catch, so one removed while its
-/// contract still has others moves it too. Pending exceptions aren't
-/// lines: they block anyway.
+/// contract still has others moves it too. Each tier approval is a line of
+/// its own, by property and tier, since it's scoped to that one key: a copy
+/// of one to another property, under the same exclusion text, moves the pin.
+/// Pending exceptions aren't lines: they block anyway.
 fn canonical(manifest: &Manifest, lists: &Lists<'_>) -> Vec<String> {
     let mut lines = Vec::new();
     for id in &manifest.required_contracts {
@@ -216,6 +221,9 @@ fn canonical(manifest: &Manifest, lists: &Lists<'_>) -> Vec<String> {
             "standing-exclusion\t{:?}\t{}\t{}\t{:?}",
             exclusion.key, exclusion.owner, exclusion.reason, exclusion.approval
         ));
+    }
+    for (property, tier, approval) in lists.tier_approvals {
+        lines.push(format!("tier-approval\t{property}\t{tier:?}\t{approval:?}"));
     }
     for obligation in lists.obligations {
         lines.push(format!(
@@ -493,6 +501,32 @@ mod tests {
         let mut another = manifest.clone();
         another.expected.push(another.expected[approved].clone());
         assert!(!moved(&another, &lists));
+    }
+
+    /// Each tier approval is pinned by its property and tier (round 10's
+    /// T9): copying one approval to another property moves the pin, though
+    /// its approved `Open`'s template is the same, and so does moving one to
+    /// another tier.
+    #[test]
+    fn a_copied_tier_approval_moves_the_pin() {
+        let (manifest, _) = committed();
+        let approval = Approval::Adam {
+            record: "a plan decision",
+        };
+        let one = [("header-sync/a", Tier::Table, approval)];
+        let copied = [
+            ("header-sync/a", Tier::Table, approval),
+            ("header-sync/b", Tier::Table, approval),
+        ];
+        let retiered = [("header-sync/a", Tier::Machine, approval)];
+        let with = |approvals| Lists {
+            tier_approvals: approvals,
+            ..Lists::committed()
+        };
+        let pinned = print(&manifest, &with(&one));
+        assert_ne!(print(&manifest, &with(&copied)), pinned);
+        assert_ne!(print(&manifest, &with(&retiered)), pinned);
+        assert_ne!(print(&manifest, &Lists::committed()), pinned);
     }
 
     /// An inventory error fails an otherwise passing evaluation: it's a

@@ -839,6 +839,47 @@ fn patches_come_from_the_pinned_revision() {
     remove_worktree(&root, &tree).expect("the worktree is removed");
 }
 
+/// The catalogue pins the fuzz builds' toolchain. A checkout's pairing
+/// takes it from the first build, refuses a later build whose compiler
+/// differs, and reports the first build's toolchain.
+#[test]
+fn fuzz_builds_share_one_toolchain() {
+    let catalogue = committed_catalogue();
+    let case = &catalogue.cases[0];
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let pinned = Pairing::of(&Pin::Catalogue(&catalogue), dir.path())
+        .toolchain()
+        .expect("the catalogue pins a toolchain");
+    assert_eq!(pinned["rustc"], catalogue.fuzz_build_inputs.rustc.as_str());
+    assert_eq!(
+        pinned["cargo_fuzz"],
+        catalogue.fuzz_build_inputs.cargo_fuzz.as_str()
+    );
+
+    // An original build of the checkout, with the compiler `rustc`.
+    let build = |rustc: &str| {
+        let mut identity = Pairing::of(&Pin::Checkout, dir.path()).expected(case, &Value::Null);
+        identity["rustc"] = Value::from(rustc);
+        identity["cargo_fuzz"] = Value::from("cargo-fuzz 0.13.2");
+        identity["dirty"] = Value::from(false);
+        identity
+    };
+    let pairing = Pairing::of(&Pin::Checkout, dir.path());
+    assert_eq!(pairing.toolchain(), None);
+    let (first, other) = (build("rustc 1"), build("rustc 2"));
+    let unpaired = |actual: &Value| {
+        paired_identity(&pairing.expected(case, actual), actual, FUZZ_FIELDS, false)
+    };
+    assert_eq!(unpaired(&first), None);
+    assert!(unpaired(&other)
+        .expect("the compiler differs")
+        .contains("rustc"));
+    assert_eq!(unpaired(&first), None);
+    let toolchain = pairing.toolchain().expect("a build finished");
+    assert_eq!(toolchain["rustc"], "rustc 1");
+    assert_eq!(toolchain["cargo_fuzz"], "cargo-fuzz 0.13.2");
+}
+
 /// The feedback runner's inputs from the tree must match `HEAD`: a changed,
 /// new or missing file fails, naming it.
 #[test]
@@ -931,6 +972,8 @@ fn meta() -> Meta {
         built_revision: "r".to_owned(),
         runner_revision: "h".to_owned(),
         reviewed_cases: 10,
+        sim_rustc: None,
+        fuzz_toolchain: None,
     }
 }
 

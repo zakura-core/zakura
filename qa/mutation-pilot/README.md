@@ -201,9 +201,15 @@ mutant runs `HEAD` with the case's patch. The list's cases come from the
 runner's tree. The list and each case's `.toml` must match `HEAD`, and
 `HEAD`'s checkout must hold the same patches, inputs and production files,
 so commit any change to the list or a case first. The simulator builds
-with the checkout's own toolchain. Each fuzz build must name the checkout's
-commit, lockfiles and the case's target and harness. An original's source
-digest must be the checkout's, and a mutant's must differ.
+with the checkout's own toolchain, and the report's `sim_rustc` records its
+`rustc --version`. Each fuzz build must name the checkout's commit,
+lockfiles and the case's target and harness. An original's source digest
+must be the checkout's, and a mutant's must differ. `zakura-sim campaign
+build` builds each fuzzer with the pinned nightly, and every fuzz build must
+share the first one's rustc, cargo-fuzz and libfuzzer-sys versions, RUSTFLAGS
+and cargo arguments, as the catalogue's pins fix them for `discovery`. A
+build whose compiler differs doesn't pair. The report's `fuzz_toolchain`
+records those fields.
 
 Each seed's arms run one after the other, and differ only in their store,
 name and feedback mode. The collector runs in both arms; the arm sets only

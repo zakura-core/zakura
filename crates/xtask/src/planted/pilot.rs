@@ -46,17 +46,19 @@
 //! case's patch. The list and its cases are read from the tree the runner
 //! runs from. The list and each case's file must match `HEAD`, and the
 //! checkout of `HEAD` must hold the same patches, inputs and production
-//! files. Each seed
-//! runs in both arms, semantic feedback on and off, which differ only in
-//! their store, name and feedback mode. The fuzzer must log the arm's mode
-//! at startup. It writes `feedback.json`, with `discovery.json`'s rows and
-//! each case's comparison of its arms ([`compare::compare`]).
+//! files. Every fuzz build must share the first one's toolchain
+//! ([`TOOLCHAIN_FIELDS`]), which the report records. Each seed runs in both
+//! arms, semantic feedback on and off, which differ only in their store,
+//! name and feedback mode. The fuzzer must log the arm's mode at startup.
+//! It writes `feedback.json`, with `discovery.json`'s rows and each case's
+//! comparison of its arms ([`compare::compare`]).
 //!
 //! Each result is exactly one class of the plan's table ([`Class`]). Each
 //! report counts its results by class and fault class, and the
 //! intended-detection rate's numerator and denominator.
 
 use std::{
+    cell::OnceCell,
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
@@ -145,10 +147,17 @@ const FUZZ_FIELDS: &[&str] = &[
     "cargo_args",
 ];
 
-/// The fuzz build identity's fields a build of `feedback`'s checkout must
-/// match: those the checkout fixes. Every build runs in one invocation
-/// with one toolchain, so the toolchain fields go unchecked.
-const CHECKOUT_FIELDS: &[&str] = &["target", "harness", "git", "lockfile", "fuzz_lockfile"];
+/// The fuzz build identity's fields that the toolchain and `zakura-sim
+/// campaign build`'s flags fix, rather than the checkout. The catalogue
+/// pins them. In `feedback`, every build must match the experiment's first
+/// fuzz build.
+const TOOLCHAIN_FIELDS: &[&str] = &[
+    "rustc",
+    "cargo_fuzz",
+    "libfuzzer_sys",
+    "rustflags",
+    "cargo_args",
+];
 
 /// The error that stops the pilot after SIGINT, SIGTERM or SIGHUP.
 pub(super) const INTERRUPTED_ERROR: &str =
@@ -253,6 +262,16 @@ struct Meta {
     runner_revision: String,
     /// Cases the catalogue, or `feedback`'s case list, holds.
     reviewed_cases: usize,
+    /// `rustc --version` of the toolchain that built `zakura-sim` for a
+    /// discovery experiment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sim_rustc: Option<String>,
+    /// The toolchain fields every fuzz build of a discovery experiment
+    /// pairs with ([`TOOLCHAIN_FIELDS`]): the catalogue's pins, or
+    /// `feedback`'s first fuzz build's. `None` before any fuzz build
+    /// finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fuzz_toolchain: Option<Value>,
 }
 
 /// A report: the run, its results, and their counts.
@@ -400,6 +419,8 @@ fn pilot(
         built_revision: String::new(),
         runner_revision: head(repo_root)?,
         reviewed_cases: catalogue.cases.len(),
+        sim_rustc: None,
+        fuzz_toolchain: None,
     };
     if experiment == "sensitivity" {
         if !seeds.is_empty() || !arms.is_empty() {
@@ -426,7 +447,15 @@ fn pilot(
         child: Duration::from_secs(catalogue.confirmation.child_seconds),
         pin: Pin::Catalogue(&catalogue),
     };
-    let rows = discovery(repo_root, &plan, &scored, &lanes(&seeds, &arms), &out, work)?;
+    let rows = discovery(
+        repo_root,
+        &plan,
+        &scored,
+        &lanes(&seeds, &arms),
+        &out,
+        work,
+        &mut meta,
+    )?;
     check_interrupt(&INTERRUPTED)?;
     write_report(&out, discovery_report(meta, rows, excluded)?)
 }
@@ -457,12 +486,14 @@ fn feedback_comparison(repo_root: &Path, flags: Flags, work: &Path) -> Result<Co
     let arms = select_allocated(&list.bounds.feedback_arms, &arms, "arm")?;
     fresh_dir(&out)?;
     let revision = head(repo_root)?;
-    let meta = Meta {
+    let mut meta = Meta {
         experiment: "feedback".to_owned(),
         catalogue_sha256: hex(&Sha256::digest(&bytes)),
         built_revision: revision.clone(),
         runner_revision: revision.clone(),
         reviewed_cases: list.cases.len(),
+        sim_rustc: None,
+        fuzz_toolchain: None,
     };
     let plan = Experiment {
         revision: &revision,
@@ -471,7 +502,15 @@ fn feedback_comparison(repo_root: &Path, flags: Flags, work: &Path) -> Result<Co
         child: Duration::from_secs(list.confirmation.child_seconds),
         pin: Pin::Checkout,
     };
-    let rows = discovery(repo_root, &plan, &cases, &lanes(&seeds, &arms), &out, work)?;
+    let rows = discovery(
+        repo_root,
+        &plan,
+        &cases,
+        &lanes(&seeds, &arms),
+        &out,
+        work,
+        &mut meta,
+    )?;
     check_interrupt(&INTERRUPTED)?;
     write_report(&out, discovery_report(meta, rows, Vec::new())?)
 }
@@ -513,7 +552,8 @@ enum Pin<'a> {
     /// The catalogue's pinned fuzz build inputs ([`FUZZ_FIELDS`]).
     Catalogue(&'a Catalogue),
     /// The checked-out revision's commit, source and lockfiles, which the
-    /// runner reads from its checkout ([`CHECKOUT_FIELDS`]).
+    /// runner reads from its checkout, and the first fuzz build's
+    /// toolchain ([`TOOLCHAIN_FIELDS`]).
     Checkout,
 }
 
@@ -999,7 +1039,8 @@ fn witness_run(
 }
 
 /// Runs `plan`'s discovery experiment for each case on `lanes`, writing
-/// stores and reports under `out` and building under `work`.
+/// stores and reports under `out` and building under `work`. Records the
+/// toolchains in `meta`.
 fn discovery(
     repo_root: &Path,
     plan: &Experiment,
@@ -1007,11 +1048,13 @@ fn discovery(
     lanes: &[Lane],
     out: &Path,
     work: &Path,
+    meta: &mut Meta,
 ) -> Result<Vec<DiscoveryCase>, BoxError> {
     let tree = work.join("baseline").join("worktree");
     add_worktree(repo_root, &tree, plan.revision)?;
     let rows = (|| {
         check_pins(&tree, plan.revision, cases)?;
+        meta.sim_rustc = sim_rustc(&tree, plan.toolchain);
         let pairing = Pairing::of(&plan.pin, &tree);
         let corpus = tree.join(&plan.bounds.corpus);
         check_empty_corpus(&corpus)?;
@@ -1063,6 +1106,7 @@ fn discovery(
             }
             rows.push(row);
         }
+        meta.fuzz_toolchain = pairing.toolchain();
         Ok::<_, BoxError>(rows)
     })();
     remove_worktree(repo_root, &tree)?;
@@ -1424,7 +1468,12 @@ fn campaign_lane(
         .pointer("/build/identity")
         .unwrap_or(&Value::Null);
     let unpaired: Vec<String> = [
-        paired_identity(&pairing.expected(case), actual, pairing.fields, mutated),
+        paired_identity(
+            &pairing.expected(case, actual),
+            actual,
+            FUZZ_FIELDS,
+            mutated,
+        ),
         arm_mismatch(&records.manifest, lane.arm, bounds.feedback_arms.len() > 1),
     ]
     .into_iter()
@@ -1615,14 +1664,17 @@ fn start_args(
 }
 
 /// The fuzz build identity an original campaign's build must have, less
-/// its target and harness, and the fields a mutant's build shares with it.
+/// its target and harness. A build must match its [`FUZZ_FIELDS`], and
+/// [`paired_identity`] checks `dirty` and `source` by whether the build is
+/// a mutant.
 struct Pairing {
     /// The identity's fields, with the names a manifest's build identity
     /// uses.
     identity: serde_json::Map<String, Value>,
-    /// The fields a build must match: all but `dirty` and `source`, which
-    /// [`paired_identity`] checks by whether the build is a mutant.
-    fields: &'static [&'static str],
+    /// For [`Pin::Checkout`], the first fuzz build's toolchain fields, which
+    /// every later build must share. `None` for the catalogue, which pins
+    /// them in `identity`.
+    first_toolchain: Option<OnceCell<serde_json::Map<String, Value>>>,
 }
 
 impl Pairing {
@@ -1647,23 +1699,50 @@ impl Pairing {
                 };
                 Pairing {
                     identity,
-                    fields: FUZZ_FIELDS,
+                    first_toolchain: None,
                 }
             }
             Pin::Checkout => Pairing {
                 identity: checkout_identity(tree),
-                fields: CHECKOUT_FIELDS,
+                first_toolchain: Some(OnceCell::new()),
             },
         }
     }
 
-    /// The identity `case`'s original build must have.
-    fn expected(&self, case: &Case) -> Value {
+    /// The identity `case`'s original build must have, for a build whose
+    /// identity is `actual`. For [`Pin::Checkout`], the first build it's
+    /// asked about fixes the toolchain fields.
+    fn expected(&self, case: &Case, actual: &Value) -> Value {
         let mut identity = self.identity.clone();
+        if let Some(first) = &self.first_toolchain {
+            identity.extend(first.get_or_init(|| toolchain_of(actual)).clone());
+        }
         identity.insert("target".to_owned(), Value::from(case.target.as_str()));
         identity.insert("harness".to_owned(), Value::from(case.harness.as_str()));
         Value::Object(identity)
     }
+
+    /// The toolchain fields every fuzz build pairs with, or `None` if
+    /// they're the first build's and no build has finished.
+    fn toolchain(&self) -> Option<Value> {
+        let toolchain = match &self.first_toolchain {
+            None => toolchain_of(&Value::Object(self.identity.clone())),
+            Some(first) => first.get()?.clone(),
+        };
+        Some(Value::Object(toolchain))
+    }
+}
+
+/// The [`TOOLCHAIN_FIELDS`] of the build identity `identity`, each `null`
+/// if it has none.
+fn toolchain_of(identity: &Value) -> serde_json::Map<String, Value> {
+    TOOLCHAIN_FIELDS
+        .iter()
+        .map(|field| {
+            let value = identity.get(field).cloned().unwrap_or(Value::Null);
+            ((*field).to_owned(), value)
+        })
+        .collect()
 }
 
 /// The fuzz build identity's fields that `tree`, a clean checkout, fixes:
@@ -2179,20 +2258,7 @@ fn build_sim(
     toolchain: Option<&str>,
     log: &Path,
 ) -> Result<Result<PathBuf, BuildFailure>, BoxError> {
-    let mut cargo = match toolchain {
-        Some(toolchain) => {
-            let mut rustup = Command::new("rustup");
-            rustup.args(["run", toolchain, "cargo"]);
-            rustup
-        }
-        // The runner's own toolchain override would win over the
-        // checkout's `rust-toolchain.toml`.
-        None => {
-            let mut cargo = Command::new("cargo");
-            cargo.env_remove("RUSTUP_TOOLCHAIN");
-            cargo
-        }
-    };
+    let mut cargo = sim_toolchain("cargo", toolchain);
     cargo
         .args(["build", "--locked"])
         .arg("--message-format=json")
@@ -2216,6 +2282,39 @@ fn build_sim(
             Err(sim_build_failure(end, &String::from_utf8_lossy(&text), why))
         }
     })
+}
+
+/// `program` of `toolchain`, or of the checkout's own toolchain without
+/// one, as [`build_sim`] runs it.
+fn sim_toolchain(program: &str, toolchain: Option<&str>) -> Command {
+    match toolchain {
+        Some(toolchain) => {
+            let mut rustup = Command::new("rustup");
+            rustup.args(["run", toolchain, program]);
+            rustup
+        }
+        // The runner's own toolchain override would win over the
+        // checkout's `rust-toolchain.toml`.
+        None => {
+            let mut command = Command::new(program);
+            command.env_remove("RUSTUP_TOOLCHAIN");
+            command
+        }
+    }
+}
+
+/// `rustc --version` of the toolchain that [`build_sim`] builds `tree`
+/// with, `toolchain` or the checkout's own, or `None` if it doesn't run.
+fn sim_rustc(tree: &Path, toolchain: Option<&str>) -> Option<String> {
+    let output = sim_toolchain("rustc", toolchain)
+        .arg("--version")
+        .current_dir(tree)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 /// What a failed `cargo build --message-format=json` that ended `end` and

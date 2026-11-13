@@ -811,7 +811,7 @@ jobs:
               print "rpc_config_path = \"/root/.cache/zakura/.cookie\""
               in_compat = 0
             }
-            # The continuous profiler installed below samples this host's own node.
+            # The continuous profiler installed below samples the node on this host.
             $0 ~ /^name[[:space:]]*=[[:space:]]*"us-east-0"/ {
               print "monitor    = { profiler_url = \"http://127.0.0.1:8097\" }"
             }

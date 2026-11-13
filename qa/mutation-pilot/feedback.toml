@@ -29,9 +29,15 @@ max_restarts = 0
 abandon_limit = 1
 sanitizer = "none"
 
-# Each target's extra libFuzzer flags, from its qa/suite.toml row.
+# Each target's extra libFuzzer flags, from its qa/suite.toml row. These
+# harnesses run about one input a second, so libFuzzer's default length
+# control would hold every input at 4 bytes for the whole campaign.
 [bounds.libfuzzer_args]
 header_sync_storage = ["-len_control=0"]
+header_sync_wire = ["-len_control=0"]
+sync_storage = ["-len_control=0"]
+sync_wire = ["-len_control=0"]
+discovery_wire = ["-len_control=0"]
 
 [confirmation]
 # The wire harnesses run to their step budget, so a confirmation child gets

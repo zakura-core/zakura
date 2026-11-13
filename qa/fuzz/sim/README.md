@@ -31,6 +31,12 @@ whose target has no harness or no campaign.
 
 ## Targets
 
+The storage and wire targets (`header_sync_storage`, `header_sync_wire`,
+`sync_storage`, `sync_wire`, `discovery_wire` and `block_sync_storage`) run
+about one input a second or slower. libFuzzer's default length control would
+hold their inputs at 4 bytes for a whole campaign, so their `qa/suite.toml`
+rows pass `-len_control=0`.
+
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
 - `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
   encodes the scenario in the action grammar of

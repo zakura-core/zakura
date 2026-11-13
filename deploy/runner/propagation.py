@@ -9,9 +9,15 @@ axis that starts when the first of them heard of the block.
 Two kinds of peer can be told apart. A Zakura peer is written as a label derived
 from its node id, which `peer_label` reproduces from the node ids in the node list. A
 legacy peer is written under the name its operator gave it.
+
+A node that is allowed to write its peers' addresses also reports, for every attempt
+to download a block, the peer's IP address and the software it says it runs. Those
+peers are listed by address, except the ones the caller says must stay private: they
+are reduced to "a private peer" here, before anything is summarised or returned.
 """
 
 import hashlib
+import ipaddress
 import time
 
 # The points on a block's way through one node, in order.
@@ -32,6 +38,14 @@ OUTSIDE = "outside"
 # A node log and trace clock that disagree about a block's tip time by more than this
 # are not one clock: the node's times are then moved onto its log's.
 CLOCK_TRUST_SECONDS = 0.05
+# Who served a download, as it may be shown: one of our nodes, a peer outside the fleet
+# by its address, a peer whose address must not be shown, or one whose address the
+# node did not record.
+PEER_FLEET, PEER_OUTSIDE, PEER_PRIVATE, PEER_HIDDEN = "fleet", "outside", "private", "hidden"
+DOWNLOADED = "available"
+SLOWEST_DOWNLOADS = 50
+MAX_OUTSIDE_PEERS = 200
+MAX_AGENT_LENGTH = 64
 
 
 def peer_label(node_id_hex):
@@ -57,6 +71,62 @@ def fleet_peers(node_ids):
     return names
 
 
+def canonical_ip(text):
+    """One spelling of the IP address in `text`, or `None` when it holds none.
+
+    A port after the address (`ip:port`, `[ip]:port`) is dropped, and an IPv4 address
+    written in IPv6 form comes back as IPv4, so that a private address is recognised
+    however a node wrote it.
+    """
+    if not isinstance(text, str):
+        return None
+    host = text.rsplit(":", 1)[0] if text.count(":") == 1 or text.startswith("[") else text
+    try:
+        address = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return None
+    return str(getattr(address, "ipv4_mapped", None) or address)
+
+
+def download_peer(download, fleet, fleet_addresses, is_private):
+    """Who served one download, holding only what may be shown about that peer.
+
+    A private address is recognised first, so that nothing else a node reported about
+    that peer (its software, its Zakura label) is carried any further.
+    """
+    address = canonical_ip(download.get("addr"))
+    if address is not None and is_private(address):
+        return {"kind": PEER_PRIVATE}
+    name = fleet.get(download.get("peer")) or fleet_addresses.get(address)
+    if name is not None:
+        return {"kind": PEER_FLEET, "name": name}
+    agent = download.get("agent")
+    agent = agent[:MAX_AGENT_LENGTH] if isinstance(agent, str) and agent else None
+    if address is None:
+        return {"kind": PEER_HIDDEN, "agent": agent}
+    return {"kind": PEER_OUTSIDE, "ip": address, "agent": agent}
+
+
+def node_downloads(record, fleet, fleet_addresses, is_private):
+    """One node's attempts to download one block, each with the peer that served it."""
+    downloads = []
+    for download in record.get("downloads") or ():
+        if not isinstance(download, dict):
+            continue
+        took, size = download.get("ms"), download.get("bytes")
+        downloads.append(
+            {
+                **download_peer(download, fleet, fleet_addresses, is_private),
+                "stack": download.get("stack"),
+                "ms": took if isinstance(took, (int, float)) else None,
+                "bytes": size if isinstance(size, int) else None,
+                "result": str(download.get("result")),
+                "route": download.get("route"),
+            }
+        )
+    return downloads
+
+
 def median(values):
     ordered = sorted(values)
     return ordered[len(ordered) // 2] if ordered else None
@@ -67,7 +137,7 @@ def ninth_decile(values):
     return ordered[min(len(ordered) - 1, len(ordered) * 9 // 10)] if ordered else None
 
 
-def node_blocks(report, node, fleet):
+def node_blocks(report, node, fleet, fleet_addresses, is_private):
     """One node's report as `{block hash: its record}`, with peers resolved to node names.
 
     Times stay in unix seconds. A record whose trace clock disagrees with the node log
@@ -92,10 +162,12 @@ def node_blocks(report, node, fleet):
             "height": record.get("height"),
             "path": record.get("path"),
             "reorg": bool(record.get("reorg")),
+            "size": record.get("size") if isinstance(record.get("size"), int) else None,
             "clock": clock,
             "from": fleet.get(record.get("heard_from"), OUTSIDE),
             "wall": {point: wall[point] + shift for point in POINTS if point in wall},
             "peers": peers,
+            "downloads": node_downloads(record, fleet, fleet_addresses, is_private),
         }
     return blocks
 
@@ -115,6 +187,7 @@ def joined_block(block_hash, records):
             "clock": record["clock"],
             "from": record["from"],
             "at": {point: offset(when) for point, when in record["wall"].items()},
+            "downloads": record["downloads"],
         }
         for node, record in records.items()
     }
@@ -135,6 +208,8 @@ def joined_block(block_hash, records):
         "hash": block_hash,
         "height": next(iter(records.values()))["height"],
         "reorg": any(record["reorg"] for record in records.values()),
+        # In bytes, from whichever node recorded it; `None` when none did.
+        "size": next((record["size"] for record in records.values() if record["size"] is not None), None),
         "origin": round(origin, 6),
         "first_node": first,
         "first_from": records[first]["from"],
@@ -182,23 +257,81 @@ def summarize(blocks, node_names):
     }
 
 
-def join(reports, node_ids, limit=100, now=None):
+def summarize_downloads(blocks):
+    """`(outside peers, slowest downloads)` over `blocks`.
+
+    An outside peer is one row per IP address: the software it last said it runs, which
+    of our nodes downloaded from it, how many attempts there were and how many failed,
+    and the median, 9-in-10 and slowest time of the ones that delivered the block. The
+    slowest downloads are single attempts, whoever served them, each with the node that
+    made it and the block's height, hash and size.
+    """
+    peers, attempts = {}, []
+    for block in blocks:
+        for node, view in block["nodes"].items():
+            for download in view["downloads"]:
+                if download["ms"] is not None:
+                    attempts.append(
+                        {"node": node, "height": block["height"], "hash": block["hash"], "size": block["size"],
+                         **download}
+                    )  # fmt: skip
+                if download["kind"] != PEER_OUTSIDE:
+                    continue
+                peer = peers.setdefault(
+                    download["ip"],
+                    {"ip": download["ip"], "agent": None, "nodes": set(), "downloads": 0, "failed": 0,
+                     "times": [], "last": 0.0},
+                )  # fmt: skip
+                peer["downloads"] += 1
+                peer["nodes"].add(node)
+                # Blocks come newest first, so the first software seen is the latest.
+                peer["agent"] = peer["agent"] or download["agent"]
+                peer["last"] = max(peer["last"], block["origin"])
+                if download["result"] != DOWNLOADED:
+                    peer["failed"] += 1
+                elif download["ms"] is not None:
+                    peer["times"].append(download["ms"])
+    outside = [
+        {
+            "ip": peer["ip"], "agent": peer["agent"], "nodes": sorted(peer["nodes"]),
+            "downloads": peer["downloads"], "failed": peer["failed"],
+            "median_ms": median(peer["times"]), "p90_ms": ninth_decile(peer["times"]),
+            "max_ms": max(peer["times"], default=None), "last": peer["last"],
+        }
+        for peer in peers.values()
+    ]  # fmt: skip
+    # Slowest first; a peer that never delivered a block has no time and comes last.
+    outside.sort(key=lambda peer: (peer["p90_ms"] is None, -(peer["p90_ms"] or 0), peer["ip"]))
+    attempts.sort(key=lambda attempt: (-attempt["ms"], attempt["node"]))
+    return outside[:MAX_OUTSIDE_PEERS], attempts[:SLOWEST_DOWNLOADS]
+
+
+def join(reports, node_ids, limit=100, now=None, fleet_addresses=None, is_private=None):
     """The cluster view from `{node name: its profiler's propagation report, or None}`.
 
     `node_ids` maps every fleet node name to its Zakura node id (empty when it has
     none). The newest `limit` blocks are returned, newest first; a node whose report
     is missing is listed under `unreachable`.
+
+    `fleet_addresses` maps the IP address of each fleet node to its name, so a download
+    from one of them is shown under that name. `is_private` says whether an IP address
+    must never be shown; such a peer appears only as a private peer, without its
+    address or software.
     """
     fleet = fleet_peers(node_ids)
+    addresses = {canonical_ip(ip): name for ip, name in (fleet_addresses or {}).items()}
+    addresses.pop(None, None)
+    is_private = is_private or (lambda ip: False)
     by_hash = {}
     for node, report in reports.items():
         if not isinstance(report, dict):
             continue
-        for block_hash, record in node_blocks(report, node, fleet).items():
+        for block_hash, record in node_blocks(report, node, fleet, addresses, is_private).items():
             by_hash.setdefault(block_hash, {})[node] = record
     blocks = [joined_block(block_hash, records) for block_hash, records in by_hash.items()]
     blocks.sort(key=lambda block: (block["height"] or 0, block["origin"]), reverse=True)
     blocks = blocks[:limit]
+    outside_peers, slowest_downloads = summarize_downloads(blocks)
     return {
         "generated_at": round(time.time() if now is None else now, 3),
         "nodes": list(node_ids),
@@ -210,4 +343,6 @@ def join(reports, node_ids, limit=100, now=None):
         "intervals": [name for name, _, _ in INTERVALS],
         "blocks": blocks,
         "summary": summarize(blocks, list(node_ids)),
+        "outside_peers": outside_peers,
+        "slowest_downloads": slowest_downloads,
     }

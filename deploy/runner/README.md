@@ -83,6 +83,51 @@ their combined error. A node whose trace clock disagrees with its log by more
 than 50 ms, as builds before the trace clock fix do, is placed by its log
 instead and marked.
 
+The page also says who served each block. In the selected block's table every
+node has a "Downloaded from" column. "Slowest downloads" lists the 50 slowest
+single attempts over the blocks shown, with the node that made it, the peer,
+its software, the block and its size; selecting one shows its block. "Peers
+outside the fleet" has one row per outside IP address, slowest first: its
+software (`/Zakura:1.8.7/` reads "Zakura 1.8.7", and zcashd's `/MagicBean:6.2.0/`
+reads "zcashd 6.2.0"), which of our nodes
+downloaded from it, how many attempts there were and how many failed, and the
+median, 9-in-10 and slowest time of the ones that delivered a block.
+
+A peer is one of four kinds. One of our nodes, recognised by its Zakura label
+or by the address the node list reaches it at, is shown by name. A peer whose
+address the node did not record reads "address hidden": that is every peer
+until a node runs a build that writes download rows and has restarted with
+`expose_peer_addresses` on (`deploy/profiler/README.md`). A peer whose address
+is on the dashboard's private list (below) reads "private peer". Any other is
+an outside peer, shown by IP address.
+
+A peer's software is the name it sent in the legacy handshake. A peer that
+sent an empty name reads "no name sent". A Zakura peer the node dialled
+directly, without a legacy handshake first, sends no name at all and gets no
+upgrade row, so its downloads read "address hidden" and "Zakura, version not
+recorded".
+
+Limits: a legacy download time is in whole milliseconds and includes any wait
+behind other requests on the same connection. A peer that connects to us does
+so from a temporary port, so peers are told apart by IP address alone and two
+nodes behind one address are one row.
+
+**Private addresses.** The addresses in
+`/etc/zakura-mainnet-dashboard/private/addresses.json` are never shown. The
+list exists only on the dashboard host, so that is where they are dropped:
+when the nodes' records are joined, a download from such an address keeps its
+time and loses its address, its software and its Zakura label, however the
+node wrote the address (with a port, or as IPv4 inside IPv6). If the list is
+required and cannot be read, `/propagation/data` answers 503 and serves
+nothing. Like every JSON response, the result then passes the dashboard's
+address filter. The privacy check that runs after a Mac dashboard deploy
+(`audit_public_privacy` in `deploy/deployer/zakura-mac-cranelift-manager.py`)
+fetches `/propagation` and `/propagation/data` and fails if the address
+appears. Like the other fleet pages, both need the dashboard password when one
+is set. Anything new that shows peer addresses must do the same three things:
+drop the private ones where the list is, refuse to serve without it, and be
+added to that check.
+
 Legacy announcements between our nodes are only visible when the nodes run a
 build that writes `legacy_gossip.jsonl` and know each other's names
 (`fleet.py peer-names`). Without those, a legacy node still appears with its

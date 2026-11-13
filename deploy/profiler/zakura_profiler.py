@@ -68,7 +68,9 @@ DEFAULT_TRACE_TABLE_CAP_MB = 200
 # What the page gets of each block's stage record.
 BLOCK_FIELDS = ("height", "hash", "t", "path", "size", "status_peers", "status_slowest_ms", "reorg", "ms")
 # What the cluster view needs of a block to join it with the same block on other nodes.
-PROPAGATION_FIELDS = ("height", "hash", "t", "path", "reorg", "ms", "wall", "heard_from", "peers", "unnamed")
+PROPAGATION_FIELDS = (
+    "height", "hash", "t", "path", "reorg", "ms", "size", "wall", "heard_from", "peers", "unnamed", "downloads",
+)  # fmt: skip
 # How far this host's clock is from true time, as `chronyc tracking` prints it.
 CLOCK_OFFSET = re.compile(r"System time\s*:\s*([0-9.]+) seconds (slow|fast)")
 CLOCK_RMS = re.compile(r"RMS offset\s*:\s*([0-9.]+) seconds")

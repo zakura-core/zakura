@@ -43,6 +43,8 @@ class FileFollower:
         self._offset = None
         self._inode = None
         self._partial = b""
+        # Rotation must retain the old file while bounded reads are still draining it.
+        self.draining_moved_file = False
 
     def read_new_lines(self):
         """The lines completed since the last call, without their newlines.
@@ -70,6 +72,8 @@ class FileFollower:
             # A new file has the name. Its writer stopped writing the old file before
             # creating this one, so what the old file holds now is all it will hold.
             earlier = self._read_moved()
+            if self.draining_moved_file:
+                return earlier
             self._offset, self._partial = 0, b""
         elif stat.st_size < self._offset:
             self._offset, self._partial = 0, b""
@@ -77,7 +81,8 @@ class FileFollower:
         return earlier + self._read_appended(handle, stat.st_size)
 
     def _read_moved(self):
-        """The new lines of the file at `moved_path`, if that is the file to follow."""
+        """Read one chunk of the renamed file and record whether unread bytes remain."""
+        self.draining_moved_file = False
         if self.moved_path is None:
             return []
         try:
@@ -86,12 +91,15 @@ class FileFollower:
                 if self._offset is None:
                     # Nothing is at `path` and nothing has been followed yet, so this
                     # is the file the writer still has open.
-                    return self._start_following(handle, stat)
-                if stat.st_ino != self._inode:
+                    lines = self._start_following(handle, stat)
+                elif stat.st_ino != self._inode:
                     return []
-                if stat.st_size < self._offset:
-                    self._offset, self._partial = 0, b""
-                return self._read_appended(handle, stat.st_size)
+                else:
+                    if stat.st_size < self._offset:
+                        self._offset, self._partial = 0, b""
+                    lines = self._read_appended(handle, stat.st_size)
+                self.draining_moved_file = self._offset < stat.st_size
+                return lines
         except OSError:
             return []
 
@@ -349,7 +357,8 @@ class TraceFollower:
     grown past `table_cap_bytes` to `<table>.jsonl.1`, replacing the one before it.
     Nothing is lost while the node runs: it keeps appending to the renamed file until
     its next sync, about a second later, then starts a new file under the old name,
-    and the rows left in the renamed file are read before the new file is.
+    and the rows left in the renamed file are read before the new file is. Rotation
+    waits while bounded reads drain the old file, temporarily allowing a larger table.
     """
 
     def __init__(self, trace_dir, table_cap_bytes):
@@ -398,10 +407,21 @@ class TraceFollower:
         except OSError as error:
             self.trim_failure = error
             return
+        # Once the node has opened a replacement, finish reading the old file before
+        # truncating it or replacing it with another rotation. Without a replacement,
+        # the old-node fallback below still bounds a writer that never reopens.
+        protected_paths = {
+            path
+            for follower in self._followers.values()
+            if follower.draining_moved_file and os.path.exists(follower.path)
+            for path in (follower.path, follower.moved_path)
+        }
         moved_suffix = TABLE_SUFFIX + MOVED_SUFFIX
         # Renamed files first, so one renamed in this pass is not also checked as one.
         for name in sorted(names, key=lambda name: not name.endswith(moved_suffix)):
             path = os.path.join(self.trace_dir, name)
+            if path in protected_paths:
+                continue
             try:
                 size = os.path.getsize(path)
                 if name.endswith(moved_suffix):

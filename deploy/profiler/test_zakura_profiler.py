@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from unittest.mock import patch
@@ -560,6 +561,38 @@ class LogFollowingTests(unittest.TestCase):
         self.path.write_bytes(b"new\n")
         self.assertEqual(follower.read_new_lines(), [b"last", b"new"])
 
+    def test_a_renamed_tail_is_drained_across_bounded_reads_before_the_new_file(self):
+        for tail in (b"a" * 15 + b"\n", b"old0001\nold0002\n" + b"split" * 5 + b"\nlast\n"):
+            with self.subTest(tail=tail), mock.patch.object(blocks, "MAX_READ_BYTES", 16):
+                moved = self.path.with_name("node.log.1")
+                self.path.write_bytes(b"initial\n")
+                follower = blocks.FileFollower(self.path, moved_path=moved)
+                self.assertEqual(follower.read_new_lines(), [b"initial"])
+                with open(self.path, "ab") as handle:
+                    handle.write(tail)
+                os.replace(self.path, moved)
+                self.path.write_bytes(b"new\n")
+
+                returned = []
+                for _ in range(10):
+                    returned.extend(follower.read_new_lines())
+                self.assertEqual(returned, tail.splitlines() + [b"new"])
+                self.assertEqual(follower.read_new_lines(), [])
+
+    def test_a_missing_renamed_file_does_not_block_switching_to_the_new_file(self):
+        with mock.patch.object(blocks, "MAX_READ_BYTES", 8):
+            moved = self.path.with_name("node.log.1")
+            self.path.write_bytes(b"initial\n")
+            follower = blocks.FileFollower(self.path, moved_path=moved)
+            self.assertEqual(follower.read_new_lines(), [b"initial"])
+            with open(self.path, "ab") as handle:
+                handle.write(b"old0001\nold0002\n")
+            os.replace(self.path, moved)
+            self.path.write_bytes(b"new\n")
+            self.assertEqual(follower.read_new_lines(), [b"old0001"])
+            moved.unlink()
+            self.assertEqual(follower.read_new_lines(), [b"new"])
+
     def test_a_renamed_file_that_is_not_the_one_being_followed_is_skipped(self):
         moved = self.path.with_name("node.log.1")
         follower = blocks.FileFollower(self.path, moved_path=moved)
@@ -779,6 +812,28 @@ class TraceFollowingTests(unittest.TestCase):
             renamed=True,
         )  # fmt: skip
         self.assertEqual(self.heights(restarted.poll()), list(range(12)) + [50])
+
+    def test_rotation_keeps_both_files_until_the_renamed_backlog_is_read(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=20)
+        current = self.directory / "block_sync.jsonl"
+        moved = self.directory / "block_sync.jsonl.1"
+        current.write_bytes(b"initial\n")
+        follower.poll()
+        with open(current, "ab") as handle:
+            handle.write(b"old\n" * 30)
+        with mock.patch.object(blocks, "MAX_READ_BYTES", 16):
+            follower.poll()
+            original = moved.read_bytes()
+            self.assertGreater(len(original), 2 * follower.table_cap_bytes)
+            current.write_bytes(b"new\n" * 10)
+            follower.poll()
+            # Neither the twice-cap fallback nor the next rotation may destroy the tail.
+            self.assertEqual(moved.read_bytes(), original)
+            self.assertEqual(current.read_bytes(), b"new\n" * 10)
+            for _ in range(20):
+                follower.poll()
+            self.assertEqual(moved.read_bytes(), b"new\n" * 10)
+            self.assertFalse(current.exists())
 
     def test_a_renamed_table_that_keeps_growing_is_emptied_at_twice_the_cap(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)

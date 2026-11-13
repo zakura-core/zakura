@@ -2156,3 +2156,82 @@ reason = "stale"
     );
     assert_eq!(killed[0].triage, None);
 }
+
+/// A mutant's trace leaves its picks on the unpatched build, so a trace with
+/// its input reruns that input with `record`, and only a trace without one
+/// replays.
+#[cfg(unix)]
+#[test]
+fn the_unpatched_build_reruns_a_kills_input() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tree = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let (runner, _, _, _) = one_case(tree.path(), out.path(), &tree.path().join("p"), true);
+    // A `zakura-sim` that logs its arguments. `record` writes a report that
+    // violates the named ID; `replay` leaves the picks and writes none.
+    let calls = out.path().join("calls");
+    let report = json!({"properties": [{"property": NAMED, "violations": [{"step": 3}]}]});
+    let sim = out.path().join("zakura-sim");
+    fs::write(
+        &sim,
+        format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> '{calls}'\n\
+             if [ \"$1\" = record ]; then\n\
+             while [ \"$1\" != --out ]; do shift; done\n\
+             mkdir -p \"$2\"; printf '%s' '{report}' > \"$2/full-report.json\"; exit 0\n\
+             fi\n\
+             echo 'the run asked for a pick after the trace'\"'\"'s last one' >&2; exit 1\n",
+            calls = calls.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&sim, fs::Permissions::from_mode(0o755)).unwrap();
+    let lanes = Lanes {
+        flags: GenerateFlags::default(),
+        plans: Vec::new(),
+        baselines: BTreeMap::new(),
+        exclude: out.path().join("exclude.txt"),
+        corpus: out.path().join("corpus"),
+        targets: BTreeMap::new(),
+        unpatched_sim: sim,
+    };
+    let confirmed = out.path().join("confirmed");
+    let shrunk = out.path().join("shrunk");
+    fs::create_dir_all(&confirmed).unwrap();
+    fs::create_dir_all(&shrunk).unwrap();
+    fs::write(confirmed.join("input.bin"), b"\xff\x07").unwrap();
+    let dir = out.path().join("kill");
+    fs::create_dir_all(&dir).unwrap();
+    let check = |which, trace: &Path| {
+        runner
+            .replay_unpatched(
+                &lanes,
+                "block-sync/storage",
+                which,
+                trace,
+                NAMED,
+                &dir,
+                None,
+                Duration::from_secs(30),
+            )
+            .unwrap()
+    };
+
+    let rerun = check(KillTrace::Confirmed, &confirmed);
+    assert_eq!(rerun.outcome, OnUnpatched::Violated, "{}", rerun.detail);
+    let replayed = check(KillTrace::Shrunk, &shrunk);
+    assert_eq!(replayed.outcome, OnUnpatched::Undecided);
+    let calls = fs::read_to_string(&calls).unwrap();
+    let calls: Vec<&str> = calls.lines().collect();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls[0].starts_with("record --sim block-sync/storage --input ")
+            && calls[0].contains("confirmed/input.bin --out "),
+        "{}",
+        calls[0]
+    );
+    assert!(calls[1].starts_with("replay "), "{}", calls[1]);
+    assert!(calls[1].contains("--allow-build-mismatch"), "{}", calls[1]);
+}

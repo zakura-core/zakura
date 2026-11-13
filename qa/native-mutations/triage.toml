@@ -10,15 +10,246 @@
 # issue = "#1234"           # optional
 
 [[triage]]
-patch = "shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
+patch = "qa/native-mutations/block-sync-table/admit-overlapping-range/admit-overlapping-range.patch"
+property = "block-sync/s6v3/get-blocks/receiver-serving-bounded"
+lane = "block-sync/storage"
+stage = "generator"
+reason = """No drawn peer sends `GetBlocks`, so `receiver-serving-bounded` never applies: block-sync/storage draws honest mirrors only. #2364 draws stream 6's probe scenarios, including an overlapping `GetBlocks`."""
+
+[[triage]]
+patch = "qa/native-mutations/block-sync-table/enforce-double-limit/enforce-double-limit.patch"
+property = "block-sync/s6v3/get-blocks/receiver-serving-bounded"
+lane = "block-sync/storage"
+stage = "generator"
+reason = """No drawn peer sends `GetBlocks`, so `receiver-serving-bounded` never applies: block-sync/storage draws honest mirrors only. #2364 draws stream 6's probe scenarios, including requests past twice the serving limit."""
+
+[[triage]]
+patch = "qa/native-mutations/block-sync-table/ignore-peer-inflight-limit/ignore-peer-inflight-limit.patch"
+property = "block-sync/s6v3/get-blocks/sender-within-limit"
+lane = "block-sync/storage"
+stage = "generator"
+reason = """Every drawn mirror advertises 32,000 requests in flight, far more than the node opens, so ignoring the advertised limit changes nothing. #2364 draws the probe that advertises one request in flight."""
+
+[[triage]]
+patch = "qa/native-mutations/block-sync-table/owe-largest-response/owe-largest-response.patch"
+property = "block-sync/s6v3/block/receiver-work-authorized"
+lane = "block-sync/storage"
+stage = "generator"
+reason = """Every drawn mirror advertises the largest response and sends bodies within it, so owing every range the largest response admits no unauthorized work. #2364 draws the probe that advertises 1,000 response bytes and sends a larger body."""
+
+[[triage]]
+patch = "qa/native-mutations/bounds/handover-double-release/handover-double-release.patch"
+property = "block-sync/input-decoded-bound"
+lane = "block-sync/storage"
+stage = "generator"
+reason = """Seeds 11, 23, 47 and 89 kill it on `decoded-input-stall`. Seed 179's 20 runs never draw that family, the only one whose sequencer stalls with decoded bodies queued."""
+
+[[triage]]
+patch = "qa/native-mutations/bounds/lookahead-gate-off/lookahead-gate-off.patch"
+property = "block-sync/retained-byte-bound"
+lane = "block-sync/storage"
+stage = "property"
+reason = """With the lookahead gate off, the node requests above the commit window, and `lookahead-overshoot-bound` names that first, before the retained bytes pass their bound."""
+
+[[triage]]
+patch = "qa/native-mutations/bounds/wide-floor-lane/wide-floor-lane.patch"
+property = "block-sync/reserved-byte-bound"
+lane = "block-sync/storage"
+stage = "generator"
+reason = """Seeds 11, 23, 47 and 89 end at the drain bound with a block-sync task unfinished, a harness end the loop doesn't count as a kill. Seed 179's 20 runs hold: none overdrafts the budget from a near-floor request."""
+
+[[triage]]
+patch = "qa/native-mutations/discovery-table/wants-every-service/wants-every-service.patch"
+property = "discovery/s4v2/services/sender-within-owed"
+lane = "discovery/wire"
+stage = "generator"
+reason = """No drawn peer sends `GetServices`, so `services/sender-within-owed` never applies: discovery/wire's drawn peers never ask. #2364 draws a peer that asks for header sync's service alone."""
+
+[[triage]]
+patch = "qa/native-mutations/discovery-table/wants-unnamed-services/wants-unnamed-services.patch"
+property = "discovery/s4v2/services/sender-within-owed"
+lane = "discovery/wire"
+stage = "generator"
+reason = """No drawn peer sends `GetServices`, so `services/sender-within-owed` never applies: discovery/wire's drawn peers never ask. #2364 draws a peer that asks for header sync's service alone."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/cadence-exhaustion-throttles/cadence-exhaustion-throttles.patch"
+property = "discovery/s4v2/hello/cadence-never-closes"
+lane = "discovery/wire"
+stage = "generator"
+reason = """No drawn peer sends `Hello` faster than its cadence, so `hello/cadence-never-closes` never applies. #2364 draws a `Hello` burst."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
+property = "discovery/s4v2/undeclared-type-closes"
+lane = "witness"
+stage = "property"
+reason = """The undeclared type reaches admission's table lookup, whose `expect` panics before discovery's codec can refuse the frame, so `sim/no-task-panic` fails first."""
+
+[[triage]]
+patch = "qa/native-mutations/stale-completion/mismatch-finishes-current/mismatch-finishes-current.patch"
+property = "block-sync/stale-completion-inert"
+lane = "block-sync/storage"
+stage = "schedule"
+reason = """Seeds 23, 47, 89 and 179 kill it on `stale-beside-current`. Seed 11 draws that family once, and its Plan doesn't deliver the stale completion beside the current one."""
+
+[[triage]]
+patch = "qa/native-mutations/stale-completion/mismatch-resubmits-current/mismatch-resubmits-current.patch"
+property = "block-sync/stale-completion-inert"
+lane = "block-sync/storage"
+stage = "schedule"
+reason = """Seeds 23, 47, 89 and 179 kill it on `stale-beside-current`. Seed 11 draws that family once, and its Plan doesn't deliver the stale completion beside the current one."""
+
+[[triage]]
+patch = "qa/native-mutations/submit-only-requested/competing-receipt-any-hash/competing-receipt-any-hash.patch"
+property = "block-sync/s6v3/block/receiver-work-authorized"
+lane = "block-sync/storage"
+stage = "schedule"
+reason = """Each seed draws `reset-mid-flight` one to three times, but no drawn Plan lands a body of the old chain at a height a published request of the new chain reserves."""
+
+[[triage]]
+patch = "qa/native-mutations/submit-only-requested/stale-body-credits-current-owner/stale-body-credits-current-owner.patch"
+property = "block-sync/s6v3/block/receiver-work-authorized"
+lane = "block-sync/storage"
+stage = "schedule"
+reason = """Each seed draws `reset-mid-flight` one to three times, but no drawn Plan delivers a body for a request after another request took its height."""
+
+[[triage]]
+patch = "qa/native-mutations/teardown/admitted-keeps-setup-slot/admitted-keeps-setup-slot.patch"
+property = "block-sync/teardown-returns-baseline"
+lane = "block-sync/storage"
+stage = "generator"
+reason = """No drawn scenario reserves session slots: block-sync/storage draws `peers_leave`, never `peers_leave_served`, so a leaked setup slot is never counted. #2364 draws `peers_leave_served`."""
+
+[[triage]]
+patch = "qa/native-mutations/teardown/drop-keeps-direction-slot/drop-keeps-direction-slot.patch"
+property = "block-sync/teardown-returns-baseline"
+lane = "block-sync/storage"
+stage = "generator"
+reason = """No drawn scenario reserves session slots: block-sync/storage draws `peers_leave`, never `peers_leave_served`, so a leaked direction slot is never counted. #2364 draws `peers_leave_served`."""
+
+[[triage]]
+patch = "qa/native-mutations/wakes/detached-finish-keeps-slot/detached-finish-keeps-slot.patch"
+property = "block-sync/capacity-release-wakes"
+lane = "block-sync/storage"
+stage = "schedule"
+reason = """Seed 179's 20 runs never draw `capacity-release`, so the property never applies. The other seeds draw it and find a violation."""
+
+[[triage]]
+patch = "qa/native-mutations/wakes/detached-release-unreported/detached-release-unreported.patch"
+property = "block-sync/capacity-release-wakes"
+lane = "block-sync/storage"
+stage = "schedule"
+reason = """Seeds 11–89 draw `capacity-release` one to three times, but no drawn Plan fills the submission window and then detaches it with a fork, as the witness's input does. Seed 179 never draws the family."""
+
+[[triage]]
+patch = "qa/native-mutations/wakes/judged-owner-epoch/judged-owner-epoch.patch"
+property = "block-sync/capacity-release-wakes"
+lane = "block-sync/storage"
+stage = "schedule"
+reason = """Seeds 11–89 draw `capacity-release` one to three times, but no drawn Plan delivers a stale reply that frees room while work waits, as the witness's input does. Seed 179 never draws the family."""
+
+[[triage]]
+patch = "qa/planted/block-sync/capacity-release-wakes/stale-completion-no-wake.patch"
+property = "block-sync/capacity-release-wakes"
+lane = "block-sync/storage"
+stage = "schedule"
+reason = """Seeds 11–89 draw `capacity-release` one to three times, but no drawn Plan delivers a stale completion that frees room while work waits, as the witness's input does. Seed 179 never draws the family."""
+
+[[triage]]
+patch = "qa/planted/block-sync/input-decoded-bound/no-room-check.patch"
+property = "block-sync/input-decoded-bound"
+lane = "block-sync/storage"
+stage = "generator"
+reason = """Seeds 11, 23, 47 and 89 kill it on `decoded-input-stall`. Seed 179's 20 runs never draw that family, the only one whose sequencer stalls with decoded bodies queued."""
+
+[[triage]]
+patch = "qa/planted/block-sync/retained-byte-bound/wide-commit-window.patch"
+property = "block-sync/retained-byte-bound"
+lane = "block-sync/storage"
+stage = "property"
+reason = """A wider commit window lets the node request above the window, and `lookahead-overshoot-bound` names that first, before the retained bytes pass their bound."""
+
+[[triage]]
+patch = "qa/planted/block-sync/stale-completion-inert/release-by-height.patch"
+property = "block-sync/stale-completion-inert"
+lane = "block-sync/storage"
+stage = "schedule"
+reason = """Seeds 23, 47, 89 and 179 kill it on `stale-beside-current`. Seed 11 draws that family once, and its Plan doesn't deliver the stale completion beside the current one."""
+
+[[triage]]
+patch = "qa/planted/block-sync/teardown-returns-baseline/kept-session-sender.patch"
+property = "block-sync/teardown-returns-baseline"
+lane = "block-sync/storage"
+stage = "generator"
+reason = """No drawn scenario reserves session slots: block-sync/storage draws `peers_leave`, never `peers_leave_served`, so a kept session sender's slot is never counted. #2364 draws `peers_leave_served`."""
+
+[[triage]]
+patch = "qa/planted/block/work-funding/floor-bypass-beyond-cap.patch"
+property = "block/work-funding"
+lane = "block/work-funding"
+stage = "generator"
+reason = """On seeds 23 and 179 the property applies in 840 of 19,961 runs and holds in each: few random byte strings make a floor request past the cap."""
+
+[[triage]]
+patch = "qa/planted/discovery/late-response-admitted/revoke-on-timeout.patch"
+property = "discovery/late-response-admitted"
+lane = "discovery/wire"
+stage = "schedule"
+reason = """Each seed draws `late-response` about 170 times, and no drawn Plan delivers the held `Peers` after the node's initial wait times out and before its session ends, so `late-response-admitted` never applies."""
+
+[[triage]]
+patch = "qa/planted/discovery/s4v2/conformant-never-closes/close-on-expired-hello.patch"
+property = "discovery/s4v2/conformant-never-closes"
+lane = "discovery/wire"
+stage = "generator"
+reason = """No drawn peer sends an expired `Hello`, a frame only local policy refuses, so closing on one changes no drawn run. #2364 draws the expired-`Hello` control."""
+
+[[triage]]
+patch = "qa/planted/discovery/s4v2/get-peers/cadence-never-closes/close-on-empty-get-peers-bucket.patch"
+property = "discovery/s4v2/get-peers/cadence-never-closes"
+lane = "discovery/wire"
+stage = "generator"
+reason = """No drawn peer empties the `get-peers` cadence bucket, so `get-peers/cadence-never-closes` never applies. #2364 draws a `GetPeers` run."""
+
+[[triage]]
+patch = "qa/planted/discovery/s4v2/get-services/cadence-never-closes/close-on-empty-get-services-bucket.patch"
+property = "discovery/s4v2/get-services/cadence-never-closes"
+lane = "discovery/wire"
+stage = "generator"
+reason = """No drawn peer empties the `get-services` cadence bucket, so `get-services/cadence-never-closes` never applies. #2364 draws a `GetServices` run."""
+
+[[triage]]
+patch = "qa/planted/discovery/s4v2/hello/cadence-never-closes/close-on-empty-hello-bucket.patch"
+property = "discovery/s4v2/hello/cadence-never-closes"
+lane = "discovery/wire"
+stage = "generator"
+reason = """No drawn peer empties the `hello` cadence bucket, so `hello/cadence-never-closes` never applies. #2364 draws a `Hello` burst."""
+
+[[triage]]
+patch = "qa/planted/discovery/s4v2/peers/sender-ends-once/answer-peers-twice.patch"
+property = "discovery/s4v2/peers/sender-ends-once"
+lane = "discovery/wire"
+stage = "generator"
+reason = """No drawn peer sends `GetPeers`, so `peers/sender-ends-once` never applies. #2364 draws a peer that asks for one peer."""
+
+[[triage]]
+patch = "qa/planted/discovery/s4v2/services/sender-ends-once/answer-services-twice.patch"
+property = "discovery/s4v2/services/sender-ends-once"
+lane = "discovery/wire"
+stage = "generator"
+reason = """No drawn peer sends `GetServices`, so `services/sender-ends-once` never applies. #2364 draws a peer that asks for header sync's service."""
+
+[[triage]]
+patch = "qa/planted/discovery/s4v2/services/sender-within-owed/ignore-wanted-services.patch"
+property = "discovery/s4v2/services/sender-within-owed"
+lane = "discovery/wire"
+stage = "generator"
+reason = """No drawn peer sends `GetServices`, so `services/sender-within-owed` never applies: discovery/wire's drawn peers never ask. #2364 draws a peer that asks for header sync's service alone."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
 property = "block-sync/s6v3/undeclared-type-closes"
 lane = "witness"
 stage = "property"
 reason = "The mutant lets an undeclared type reach admission, whose row `expect` panics the relay task before any close. `sim/no-task-panic` is the rule that sees it: a reader panic is the production effect, so no close ID can apply."
-
-[[triage]]
-patch = "shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
-property = "discovery/s4v2/undeclared-type-closes"
-lane = "witness"
-stage = "property"
-reason = "The mutant lets an undeclared type reach admission, whose row `expect` panics the stream worker before any close. `sim/no-task-panic` is the rule that sees it: a reader panic is the production effect, so no close ID can apply."

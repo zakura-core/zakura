@@ -3502,18 +3502,35 @@ fn each_result_identity_names_one_expectation() {
     assert_eq!(identity_errors(&changed).len(), 1);
 }
 
-/// Every test in this file is a composition check the acceptance run
-/// executes at the subject commit, and every check is a test here.
+/// Every test in this file that runs is a composition check the
+/// acceptance run executes at the subject commit, and every check is a
+/// test here that runs ([`test_fns`]). An `#[ignore]`d tool, such as
+/// `regenerate_raw_join_baseline`, isn't a check, and a listed check
+/// `#[ignore]`d no longer runs, so it fails this.
 #[test]
 fn the_composition_checks_are_every_static_check() {
     let source =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(rows::ACCEPTANCE_TESTS))
             .unwrap();
-    let tests = |source: &str| -> BTreeSet<String> { test_fns(source).into_keys().collect() };
+    let tests = |source: &str| -> BTreeSet<String> {
+        test_fns(source)
+            .into_iter()
+            .filter(|(_, gated)| !gated)
+            .map(|(name, _)| name)
+            .collect()
+    };
     let listed: BTreeSet<String> = COMPOSITION_CHECKS.iter().map(|c| (*c).to_owned()).collect();
     assert_eq!(tests(&source), listed);
     let added = format!("{source}\n#[test]\nfn an_unlisted_check() {{}}\n");
     assert_ne!(tests(&added), listed);
+    let tool = format!("{source}\n#[test]\n#[ignore = \"a tool\"]\nfn an_unlisted_tool() {{}}\n");
+    assert_eq!(tests(&tool), listed);
+    let gated = source.replace(
+        "#[test]\nfn the_composition_checks_are_every_static_check",
+        "#[test]\n#[ignore]\nfn the_composition_checks_are_every_static_check",
+    );
+    assert_ne!(gated, source);
+    assert_ne!(tests(&gated), listed);
     for unlisted in [
         "#[test]\n#[allow(clippy::unwrap_used)]\nfn an_unlisted_check() {}",
         "#[test]\n/// A documented check.\nfn an_unlisted_check() {}",
@@ -7168,6 +7185,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/actions.rs",
         "a_redial_joins_its_whole_link",
     ),
+    (
+        "CallRef",
+        "src/harness/header_sync.rs",
+        "storage_call_dispatched",
+        "src/harness/header_sync.rs",
+        "only_a_reactor_dispatch_meets_the_direct_dispatch_trigger",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.
@@ -7957,18 +7981,6 @@ fn every_artifact_read_goes_through_binding() {
         );
     }
 }
-/// hdr-14's own witness tests, whose identity assertions Rule 25 covers
-/// beside the acceptance layer's ([`raw_join_scope`]). Older witnesses
-/// assert hdr-3 to hdr-13's properties and predate the rule.
-const RULE_25_WITNESSES: &[&str] = &[
-    "tests/header_catch_not_applicable.rs",
-    "tests/header_cleanup.rs",
-    "tests/header_despite_close.rs",
-    "tests/header_mixed_resources.rs",
-    "tests/header_node_session_ends.rs",
-    "tests/header_wire_crossing.rs",
-    "tests/header_wire_witness.rs",
-];
 
 /// The words a name of an identity holds, as one of its `_`-separated
 /// parts: a peer, connection, session, subscription, stream, frame or
@@ -8002,6 +8014,30 @@ const IDENTITY_WORDS: &[&str] = &[
 /// and space-separated, and why it compares no identity.
 const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
     (
+        "src/domain/header_sync.rs",
+        "commit_only_authorized_reports_the_overgrant_update_and_no_page",
+        "attribution",
+        "asserts the claims store's whole serialized attribution against the finding's own, and its subject's kind; the finding's join is the witness judge's `FindingSubject`",
+    ),
+    (
+        "src/harness/header_acceptance/actions.rs",
+        "a_link_act_joins_its_whole_link",
+        "PEER_CLOSED link",
+        "counts the link's ends for one reason, after the control of `ends`' join",
+    ),
+    (
+        "src/harness/header_acceptance/actions.rs",
+        "a_pick_joins_its_declared_action_whole",
+        "peer pick_ref",
+        "checks the pick parser's output for a fixed pick string, not a join",
+    ),
+    (
+        "src/harness/header_acceptance/actions.rs",
+        "a_pick_joins_its_declared_action_whole",
+        "pick_ref",
+        "checks the pick parser refuses a pick with no action, not a join",
+    ),
+    (
         "src/harness/header_acceptance/actions.rs",
         "harness_driven",
         "pick",
@@ -8020,46 +8056,58 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "filters a record's rule and subject kind; the page it names joins by `PageRef`",
     ),
     (
+        "src/harness/header_acceptance/companions.rs",
+        "the_fault_close_joins_the_rejected_frames_connection",
+        "connection frame page peer quic_stream seq session subscription version",
+        "checks the rejected page read from the fixture is the one the test built; `fault_close`'s joins have their own controls",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "the_fault_close_joins_the_rejected_frames_connection",
+        "page",
+        "asserts the fault close judge's result, `Ok`, for the fixture's page; the join is inside the judge, under its control",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "the_path_break_names_the_sent_page",
+        "page",
+        "asserts the path break judge's result, `Ok`, for the fixture's page; the join is inside the judge, under its control",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "the_sent_page_comes_from_the_frames_evidence",
+        "page sent_page",
+        "asserts the sent page the judge finds for the fixture; the join is inside the judge, under its control",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "the_staged_page_joins_the_rejected_frame",
+        "page staged_page",
+        "asserts the staged page judge's result, `Ok`, for the fixture's page; the join is inside the judge, under its control",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "the_trace_judge_judges_the_recorded_draft_run",
+        "id",
+        "checks the trace judge returns the digest of the trace it read (round 9's C2-6), not a join of records",
+    ),
+    (
         "src/harness/header_acceptance/evaluate.rs",
         "caught_draft",
         "id",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
-        "src/harness/header_acceptance/evaluate.rs",
-        "contract_standing",
-        "id",
-        "contract IDs, the manifest's names for contracts",
-    ),
-    (
-        "src/harness/header_acceptance/evaluate.rs",
-        "evaluate",
-        "id",
-        "contract and expected-result IDs, the manifest's keys, whose joins the evaluator's full-identity tests cover",
-    ),
-    (
-        "src/harness/header_acceptance/evaluate.rs",
-        "key_state",
-        "id",
-        "contract IDs, the manifest's names for contracts",
-    ),
-    (
-        "src/harness/header_acceptance/evaluate.rs",
-        "same_run",
-        "id",
-        "a whole `RunId`, the manifest's typed run identity, compared whole",
+        "src/harness/header_acceptance/history.rs",
+        "declarations_read_back_in_order",
+        "run_id",
+        "checks a declaration reads back the run, task and role the test wrote, not a join",
     ),
     (
         "src/harness/header_acceptance/not_applicable.rs",
         "lists",
         "id",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "src/harness/header_acceptance/required.rs",
-        "required_keys",
-        "id",
-        "contract IDs, the manifest's names for contracts",
     ),
     (
         "src/harness/header_acceptance/rows.rs",
@@ -8075,21 +8123,51 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "src/harness/header_acceptance/tool.rs",
+        "a_run_s_actions_follow_its_harness",
+        "pick",
+        "removes the recording's last relink pick, the test's planted change, not a judgment",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "a_typed_case_is_planned_beside_a_fuzz_case",
+        "id",
+        "expected-result IDs, the manifest's keys, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
         "draft_witness",
         "id",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
-        "src/witness.rs",
-        "judge",
+        "tests/evidence_inventory.rs",
+        "c14_is_proved_by_every_registered_store_s_producer",
         "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
+        "contract IDs, the manifest's names for contracts",
     ),
     (
-        "src/witness.rs",
-        "of",
+        "tests/header_acceptance.rs",
+        "visit_expr_method_call",
+        "call",
+        "compares a parsed method call's name, Rust syntax, not run evidence",
+    ),
+    (
+        "tests/header_acceptance_narrowing.rs",
+        "n1_peerless_and_machine_results_read_no_peer_evidence",
+        "peer_kinds",
+        "asserts no input shows a peer kind, a kind check with no join",
+    ),
+    (
+        "tests/header_acceptance_narrowing.rs",
+        "not_tool_recorded",
         "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
+        "expected-result IDs, the manifest's keys, not run evidence",
+    ),
+    (
+        "tests/header_acceptance_narrowing.rs",
+        "peer_kinds",
+        "PEER_KINDS",
+        "filters observation kinds by the peer kinds' names, a kind check with no join",
     ),
     (
         "tests/header_catch_not_applicable.rs",
@@ -8141,36 +8219,6 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "tests/header_wire_witness.rs",
-        "act_frame",
-        "connection",
-        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
-    ),
-    (
-        "tests/header_wire_witness.rs",
-        "act_frame",
-        "pick",
-        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
-    ),
-    (
-        "tests/header_wire_witness.rs",
-        "each_invalid_label_witness_has_a_conformant_control",
-        "connection",
-        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
-    ),
-    (
-        "tests/header_wire_witness.rs",
-        "each_invalid_label_witness_has_a_conformant_control",
-        "connection quic_stream seq",
-        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
-    ),
-    (
-        "tests/header_wire_witness.rs",
-        "honest_peer_never_punished",
-        "connection",
-        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
-    ),
-    (
-        "tests/header_wire_witness.rs",
         "joins_the_frames",
         "PEER_TO_NODE link",
         "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
@@ -8189,67 +8237,124 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "tests/header_wire_witness.rs",
-        "outcome",
-        "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "tests/header_wire_witness.rs",
-        "peer_connections",
-        "peer",
-        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
-    ),
-    (
-        "tests/header_wire_witness.rs",
-        "the_harness_registers_the_generated_header_ids",
-        "id",
-        "property IDs, the manifest's and harness's names for properties, not run evidence",
-    ),
-    (
-        "tests/header_wire_witness.rs",
         "two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary",
         "ID",
         "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
 ];
 
-/// The files [`raw_joins`] reads, relative to the crate: every acceptance
-/// source but `refs.rs`, where the join is defined, the witness judge, and
-/// [`RULE_25_WITNESSES`].
-fn raw_join_scope() -> Vec<String> {
-    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files: Vec<String> = std::fs::read_dir(krate.join(ACCEPTANCE_SRC))
-        .expect("the acceptance source reads")
-        .map(|entry| entry.expect("an entry reads").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .map(|path| {
-            path.strip_prefix(krate)
-                .expect("under the crate")
-                .display()
-                .to_string()
-        })
-        .filter(|file| !file.ends_with("/refs.rs"))
+/// The PR base, hdr-14's parent: code there predates Rule 25, so only its
+/// raw joins may stay raw ([`RAW_JOIN_BASELINE`]).
+const RAW_JOIN_BASE: &str = "3675f1c486";
+
+/// The committed raw-join baseline, relative to the crate: each hit
+/// [`raw_joins`] finds in [`raw_join_scope`] at [`RAW_JOIN_BASE`] that's
+/// still at the head, one per line as `file<TAB>function<TAB>comparison`,
+/// which [`regenerate_raw_join_baseline`] writes. Taking only base hits, it
+/// never grows to hold a new one, and as head code changes it only shrinks.
+const RAW_JOIN_BASELINE: &str = "tests/fixtures/raw_join_baseline.txt";
+
+/// One raw identity comparison [`raw_joins`] finds.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RawJoin {
+    /// The function it's in, by name.
+    function: String,
+    /// Its identity names, sorted and space-separated.
+    names: String,
+    /// Its source text with all whitespace and trailing commas removed, so
+    /// a reformat keeps it ([`normalized`]).
+    text: String,
+}
+
+/// The files [`raw_joins`] reads, relative to the crate: every Rust file
+/// under `src` and `tests`, test modules included, but `refs.rs`, where
+/// the join is defined. `files` lists the crate's files, relative to it.
+fn raw_join_scope(files: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut scope: Vec<String> = files
+        .into_iter()
+        .filter(|file| file.starts_with("src/") || file.starts_with("tests/"))
+        .filter(|file| file.ends_with(".rs"))
+        .filter(|file| file != "src/harness/header_acceptance/refs.rs")
         .collect();
-    files.push("src/harness/header_acceptance.rs".to_owned());
-    files.push("src/witness.rs".to_owned());
-    files.extend(RULE_25_WITNESSES.iter().map(|file| (*file).to_owned()));
-    files.sort();
+    scope.sort();
+    scope
+}
+
+/// Every file of the crate at the head, relative to it.
+fn head_files() -> Vec<String> {
+    fn walk(dir: &Path, krate: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("the directory reads") {
+            let path = entry.expect("an entry reads").path();
+            if path.is_dir() {
+                walk(&path, krate, out);
+            } else {
+                let relative = path.strip_prefix(krate).expect("under the crate");
+                out.push(relative.display().to_string());
+            }
+        }
+    }
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk(&krate.join("src"), krate, &mut files);
+    walk(&krate.join("tests"), krate, &mut files);
     files
 }
 
-/// Each raw identity comparison in the Rust source `text`, the file
-/// `file`, as `(function, names)`: an `==` or `!=`, or a `contains` call,
-/// either side of which names an identity, by a path, field, method or
-/// JSON key one of whose `_`-separated parts is an [`IDENTITY_WORDS`] word,
-/// with those names, sorted and space-separated. Macro arguments and match
-/// guards count, and a one-key-off control's closure doesn't, since it
-/// judges a join's result. Test code under `src` is skipped, since it tests the
-/// code rather than judging a history; a witness test's file is all read.
-/// It can't see a comparison through a helper whose name holds no such
-/// word, `assert_eq!`'s equality, or a join the types make, such as a map
-/// keyed by an identity.
-fn raw_joins(text: &str, file: &str) -> BTreeSet<(String, String)> {
-    use syn::visit::Visit;
+/// `text` with every whitespace character removed, and a comma before a
+/// closing bracket, so a comparison rustfmt rewraps keeps its key.
+fn normalized(text: &str) -> String {
+    let mut out: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    for close in [")", "]", "}"] {
+        out = out.replace(&format!(",{close}"), close);
+    }
+    out
+}
+
+/// The source between `start` and `end` of `lines`, a file's lines,
+/// [`normalized`].
+fn span_text(
+    lines: &[&str],
+    start: proc_macro2::LineColumn,
+    end: proc_macro2::LineColumn,
+) -> String {
+    let mut text = String::new();
+    for line in start.line..=end.line {
+        let chars: Vec<char> = lines
+            .get(line.saturating_sub(1))
+            .copied()
+            .unwrap_or("")
+            .chars()
+            .collect();
+        let from = if line == start.line { start.column } else { 0 };
+        let to = if line == end.line {
+            end.column
+        } else {
+            chars.len()
+        };
+        let from = from.min(chars.len());
+        text.extend(&chars[from..to.clamp(from, chars.len())]);
+        text.push('\n');
+    }
+    normalized(&text)
+}
+
+/// Each raw identity comparison in the Rust source `text`, the file `file`
+/// ([`RawJoin`]): an `==` or `!=`, a `contains` call, or an `assert_eq!`
+/// or `assert_ne!` (and their `debug_` and `prop_` forms) of two
+/// arguments, either side of which names an identity, by a path, field,
+/// method or JSON key one of whose `_`-separated parts is an
+/// [`IDENTITY_WORDS`] word. Macro arguments count, a `matches!` guard and a
+/// match guard included, and test code counts like any other. A one-key-off
+/// control's closure doesn't, since it judges a join's result.
+///
+/// It's still blind to a join the types make, such as a map or set keyed by
+/// an identity (`get`, `entry`, `contains_key`, `insert`); a comparison
+/// through a helper, variable or field whose name holds no identity word,
+/// such as `a == b`; a pattern that matches an identity's literal value;
+/// an ordering comparison (`<`, `>=`); and a string join by prefix
+/// (`starts_with`, `strip_prefix`).
+fn raw_joins(text: &str, file: &str) -> BTreeSet<RawJoin> {
+    use syn::{spanned::Spanned, visit::Visit};
     /// Whether `name` holds an identity word as one of its parts.
     fn identity(name: &str) -> bool {
         name.split('_')
@@ -8291,55 +8396,56 @@ fn raw_joins(text: &str, file: &str) -> BTreeSet<(String, String)> {
         names.visit_expr(expr);
         names.0
     }
-    /// Whether `attrs` mark test-only code: `#[test]`, or `#[cfg(test)]`.
-    fn test_only(attrs: &[syn::Attribute]) -> bool {
-        attrs.iter().any(|attr| {
-            attr.path().is_ident("test")
-                || (attr.path().is_ident("cfg")
-                    && attr
-                        .meta
-                        .require_list()
-                        .is_ok_and(|list| list.tokens.to_string() == "test"))
-        })
-    }
+    /// The assertion macros whose first two arguments are compared.
+    const ASSERTS: &[&str] = &[
+        "assert_eq",
+        "assert_ne",
+        "debug_assert_eq",
+        "debug_assert_ne",
+        "prop_assert_eq",
+        "prop_assert_ne",
+    ];
     /// Collects the comparisons, by enclosing function.
-    struct Raw {
-        skip_tests: bool,
+    struct Raw<'a> {
+        lines: Vec<&'a str>,
         within: Vec<String>,
-        found: BTreeSet<(String, String)>,
+        found: BTreeSet<RawJoin>,
     }
-    impl Raw {
-        /// Notes a comparison of `sides`, if one names an identity.
+    impl Raw<'_> {
+        /// Notes a comparison of `sides`, from the first's start to the
+        /// last's end, if one names an identity.
         fn compare(&mut self, sides: &[&syn::Expr]) {
             let names: BTreeSet<String> = sides.iter().flat_map(|side| identities(side)).collect();
+            let (Some(first), Some(last)) = (sides.first(), sides.last()) else {
+                return;
+            };
             if !names.is_empty() {
-                let within = self.within.last().cloned().unwrap_or_default();
                 let names: Vec<String> = names.into_iter().collect();
-                self.found.insert((within, names.join(" ")));
+                self.found.insert(RawJoin {
+                    function: self.within.last().cloned().unwrap_or_default(),
+                    names: names.join(" "),
+                    text: span_text(&self.lines, first.span().start(), last.span().end()),
+                });
             }
         }
     }
-    impl<'ast> Visit<'ast> for Raw {
-        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-            if !(self.skip_tests && test_only(&item.attrs)) {
-                syn::visit::visit_item_mod(self, item);
-            }
-        }
-
+    impl<'ast> Visit<'ast> for Raw<'_> {
         fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-            if !(self.skip_tests && test_only(&item.attrs)) {
-                self.within.push(item.sig.ident.to_string());
-                syn::visit::visit_item_fn(self, item);
-                self.within.pop();
-            }
+            self.within.push(item.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, item);
+            self.within.pop();
         }
 
         fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-            if !(self.skip_tests && test_only(&item.attrs)) {
-                self.within.push(item.sig.ident.to_string());
-                syn::visit::visit_impl_item_fn(self, item);
-                self.within.pop();
-            }
+            self.within.push(item.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, item);
+            self.within.pop();
+        }
+
+        fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+            self.within.push(item.sig.ident.to_string());
+            syn::visit::visit_trait_item_fn(self, item);
+            self.within.pop();
         }
 
         fn visit_expr_binary(&mut self, binary: &'ast syn::ExprBinary) {
@@ -8373,14 +8479,23 @@ fn raw_joins(text: &str, file: &str) -> BTreeSet<(String, String)> {
         }
 
         fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-            for expr in macro_exprs(mac) {
-                self.visit_expr(&expr);
+            let exprs = macro_exprs(mac);
+            let asserts = mac
+                .path
+                .segments
+                .last()
+                .is_some_and(|last| ASSERTS.iter().any(|name| last.ident == name));
+            if let (true, [left, right, ..]) = (asserts, exprs.as_slice()) {
+                self.compare(&[left, right]);
+            }
+            for expr in &exprs {
+                self.visit_expr(expr);
             }
         }
     }
     let parsed = syn::parse_file(text).unwrap_or_else(|error| panic!("{file} parses: {error}"));
     let mut raw = Raw {
-        skip_tests: file.starts_with("src/"),
+        lines: text.lines().collect(),
         within: Vec::new(),
         found: BTreeSet::new(),
     };
@@ -8388,23 +8503,104 @@ fn raw_joins(text: &str, file: &str) -> BTreeSet<(String, String)> {
     raw.found
 }
 
-/// Rule 25's raw-join scan: in [`raw_join_scope`], every comparison that
-/// names an identity ([`raw_joins`]) is one [`NOT_RAW_JOINS`] lists, with
-/// why it joins no identity, and each listed one is still there; any
-/// other identity join goes through a typed ref. A planted raw join on a
-/// peer, an operation, a JSON attribution or by `contains` fails the scan,
-/// and a comparison of a kind or a count, or a control's closure judging
-/// a join's result, doesn't.
-#[test]
-fn identity_joins_go_through_refs() {
-    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut found = BTreeSet::new();
-    for file in raw_join_scope() {
-        let text = std::fs::read_to_string(krate.join(&file)).expect("a source file reads");
-        for (within, names) in raw_joins(&text, &file) {
-            found.insert((file.clone(), within, names));
+/// The committed [`RAW_JOIN_BASELINE`], as `(file, function, text)`.
+fn raw_join_baseline() -> BTreeSet<(String, String, String)> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(RAW_JOIN_BASELINE);
+    std::fs::read_to_string(&path)
+        .expect("the raw-join baseline is committed")
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let mut part = || {
+                parts
+                    .next()
+                    .unwrap_or_else(|| panic!("a baseline line has three fields: {line}"))
+                    .to_owned()
+            };
+            (part(), part(), part())
+        })
+        .collect()
+}
+
+/// Why `found`, each file's [`raw_joins`], breaks Rule 25's ratchet, one
+/// line each: a hit the `baseline`, as `(file, function, text)`, doesn't
+/// list and `allowed`, as `(file, function, names)`, doesn't excuse; a
+/// baseline line no hit matches any more, which must go; and an `allowed`
+/// entry that excuses no hit the baseline doesn't already list.
+fn raw_join_gaps(
+    found: &BTreeSet<(String, RawJoin)>,
+    baseline: &BTreeSet<(String, String, String)>,
+    allowed: &BTreeSet<(String, String, String)>,
+) -> Vec<String> {
+    let mut gaps = Vec::new();
+    let based = |file: &str, hit: &RawJoin| {
+        baseline.contains(&(file.to_owned(), hit.function.clone(), hit.text.clone()))
+    };
+    let new: Vec<&(String, RawJoin)> = found
+        .iter()
+        .filter(|(file, hit)| !based(file, hit))
+        .collect();
+    for (file, hit) in &new {
+        if !allowed.contains(&(file.clone(), hit.function.clone(), hit.names.clone())) {
+            gaps.push(format!(
+                "{file} {} joins {} raw: {}",
+                hit.function, hit.names, hit.text
+            ));
         }
     }
+    for (file, function, text) in baseline {
+        let still = found
+            .iter()
+            .any(|(at, hit)| at == file && hit.function == *function && hit.text == *text);
+        if !still {
+            gaps.push(format!(
+                "the baseline lists {file} {function} {text}, which is gone: run \
+                 `regenerate_raw_join_baseline`"
+            ));
+        }
+    }
+    for (file, function, names) in allowed {
+        let excuses = new
+            .iter()
+            .any(|(at, hit)| at == file && hit.function == *function && hit.names == *names);
+        if !excuses {
+            gaps.push(format!(
+                "NOT_RAW_JOINS lists {file} {function} {names}, which excuses nothing new"
+            ));
+        }
+    }
+    gaps
+}
+
+/// Every hit [`raw_joins`] finds in [`raw_join_scope`] at the head.
+fn head_raw_joins() -> BTreeSet<(String, RawJoin)> {
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found = BTreeSet::new();
+    for file in raw_join_scope(head_files()) {
+        let text = std::fs::read_to_string(krate.join(&file)).expect("a source file reads");
+        for hit in raw_joins(&text, &file) {
+            found.insert((file.clone(), hit));
+        }
+    }
+    found
+}
+
+/// Rule 25's raw-join scan, as a ratchet on the code hdr-14 adds: in
+/// [`raw_join_scope`], every comparison that names an identity
+/// ([`raw_joins`]) is one the PR base already had ([`RAW_JOIN_BASELINE`]),
+/// or one [`NOT_RAW_JOINS`] lists, with why it joins no identity. Each
+/// baseline line and each listed one is still needed ([`raw_join_gaps`]).
+/// Any other identity join goes through a typed ref. A planted raw join on
+/// a peer, an operation, a JSON attribution, by `contains` or by
+/// `assert_eq!` fails the scan, and a comparison of a kind or a count, or a
+/// control's closure judging a join's result, doesn't. So does a hit
+/// neither list holds, a gone baseline line, and an allowlist entry
+/// excusing only baseline hits.
+#[test]
+fn identity_joins_go_through_refs() {
+    let found = head_raw_joins();
+    let baseline = raw_join_baseline();
     let allowed: BTreeSet<(String, String, String)> = NOT_RAW_JOINS
         .iter()
         .map(|(file, within, names, why)| {
@@ -8421,16 +8617,30 @@ fn identity_joins_go_through_refs() {
         NOT_RAW_JOINS.len(),
         "an entry is listed twice"
     );
-    let raw: Vec<_> = found.difference(&allowed).collect();
-    assert!(
-        raw.is_empty(),
-        "raw identity joins outside refs.rs: {raw:#?}"
+    let gaps = raw_join_gaps(&found, &baseline, &allowed);
+    assert!(gaps.is_empty(), "Rule 25's raw-join ratchet: {gaps:#?}");
+
+    // The ratchet's own controls, on one planted hit.
+    let hit = |names: &str, text: &str| RawJoin {
+        function: "p".into(),
+        names: names.into(),
+        text: text.into(),
+    };
+    let planted: BTreeSet<(String, RawJoin)> =
+        [("tests/t.rs".to_owned(), hit("peer", "name==peer"))].into();
+    let key = |a: &str, b: &str, c: &str| (a.to_owned(), b.to_owned(), c.to_owned());
+    let none = BTreeSet::new();
+    assert_eq!(raw_join_gaps(&planted, &none, &none).len(), 1);
+    let based = [key("tests/t.rs", "p", "name==peer")].into();
+    assert_eq!(raw_join_gaps(&planted, &based, &none), Vec::<String>::new());
+    let excused = [key("tests/t.rs", "p", "peer")].into();
+    assert_eq!(
+        raw_join_gaps(&planted, &none, &excused),
+        Vec::<String>::new()
     );
-    let stale: Vec<_> = allowed.difference(&found).collect();
-    assert!(
-        stale.is_empty(),
-        "listed comparisons that are gone: {stale:?}"
-    );
+    let gone = [key("tests/t.rs", "p", "name==other_peer")].into();
+    assert_eq!(raw_join_gaps(&planted, &gone, &excused).len(), 1);
+    assert_eq!(raw_join_gaps(&planted, &based, &excused).len(), 1);
 
     for (planted, names) in [
         ("fn p(a: &str, b: &str) -> bool { a == b }", None),
@@ -8459,12 +8669,85 @@ fn identity_joins_go_through_refs() {
             "fn p(o: &Obs, c: u64) -> bool { match o { Obs::Closed { connection } if *connection == c => true, _ => false } }",
             Some("connection"),
         ),
+        ("fn p(a: &Act, b: &Frame) { assert_eq!(a.frame, b.clone()); }", Some("frame")),
+        ("fn p(a: u64, session: u64) { assert_ne!(a, session, \"{a}\"); }", Some("session")),
+        ("#[cfg(test)]\nmod t { #[test]\nfn p() { assert_eq!(1, conn()); } }", Some("conn")),
+        ("fn p(a: u64, b: u64) { assert_eq!(a, b); }", None),
     ] {
-        let found = raw_joins(planted, "tests/t.rs");
+        let found: BTreeSet<(String, String)> = raw_joins(planted, "src/t.rs")
+            .into_iter()
+            .map(|hit| (hit.function, hit.names))
+            .collect();
         let want: BTreeSet<(String, String)> = names
             .map(|names| ("p".to_owned(), names.to_owned()))
             .into_iter()
             .collect();
         assert_eq!(found, want, "{planted}");
     }
+    // A reformat keeps a hit's text, so the baseline still lists it.
+    let one = raw_joins(
+        "fn p(peer: &str, name: &str) -> bool { name == peer }",
+        "t.rs",
+    );
+    let wrapped = raw_joins(
+        "fn p(peer: &str, name: &str) -> bool {\n    name\n        == peer\n}",
+        "t.rs",
+    );
+    assert_eq!(one, wrapped);
+    assert_eq!(
+        one.iter().map(|hit| hit.text.as_str()).collect::<Vec<_>>(),
+        ["name==peer"]
+    );
+}
+
+/// Rewrites [`RAW_JOIN_BASELINE`]: every hit [`raw_joins`] finds in
+/// [`raw_join_scope`] at [`RAW_JOIN_BASE`], read by `git show`, that the
+/// head still has. It never adds a hit the base didn't have, so a raw join
+/// new in hdr-14 must become a typed ref with its control, or go in
+/// [`NOT_RAW_JOINS`] with why it joins no identity.
+#[test]
+#[ignore = "rewrites the committed raw-join baseline from the PR base"]
+fn regenerate_raw_join_baseline() {
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(krate)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).expect("git prints UTF-8")
+    };
+    let listed = git(&[
+        "ls-tree",
+        "-r",
+        "--name-only",
+        RAW_JOIN_BASE,
+        "--",
+        "src",
+        "tests",
+    ]);
+    let head = head_raw_joins();
+    let mut lines = BTreeSet::new();
+    for file in raw_join_scope(listed.lines().map(str::to_owned)) {
+        let text = git(&["show", &format!("{RAW_JOIN_BASE}:./{file}")]);
+        for hit in raw_joins(&text, &file) {
+            let at = (file.clone(), hit.clone());
+            if head.contains(&at) {
+                lines.insert(format!("{file}\t{}\t{}", hit.function, hit.text));
+            }
+        }
+    }
+    let mut out = format!(
+        "# Rule 25's raw-join baseline: every raw identity comparison the PR base \
+         ({RAW_JOIN_BASE}) had that the head still has, as file, function and \
+         comparison, tab-separated. Written by `regenerate_raw_join_baseline` in \
+         tests/header_acceptance.rs. Don't add lines by hand.\n"
+    );
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    std::fs::write(krate.join(RAW_JOIN_BASELINE), out).expect("the fixture directory exists");
 }

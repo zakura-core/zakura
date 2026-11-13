@@ -307,6 +307,15 @@ pub struct PickRef {
 }
 impl Ref for PickRef {}
 
+/// One reactor call, by the number its reactor gives it: the whole of what
+/// a storage submission names of the call that submitted it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRef {
+    /// The reactor call.
+    pub call: u64,
+}
+impl Ref for CallRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

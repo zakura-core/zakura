@@ -28,7 +28,11 @@
 
 use std::{collections::BTreeMap, sync::OnceLock};
 
-use super::{rows::harness_matrix, CaseRef, ExpectedNa, HistoryRef, RunId};
+use super::{
+    refs::{Ref, WitnessRef},
+    rows::harness_matrix,
+    sim_test, CaseRef, ExpectedNa, HistoryRef, RunId, TestRef,
+};
 use crate::NaReason;
 
 /// `header-sync/wire`.
@@ -1636,10 +1640,8 @@ const WIRE_HOLDS: &[&str] = &[
 struct HistoryNa {
     /// The harness its histories run on.
     harness: &'static str,
-    /// Their witness test's file.
-    file: &'static str,
-    /// Their witness test.
-    test: &'static str,
+    /// Their witness test: its package, file and name.
+    witness: TestRef,
     /// Its cases, each the start of a case name, so `held-locator ` names
     /// every plan of that witness and `""` every case of the test. A
     /// history must match exactly one group.
@@ -1650,18 +1652,26 @@ struct HistoryNa {
     undeclared: &'static [&'static str],
 }
 
-/// The groups of [`HISTORIES`] `history` matches: its harness, witness
-/// test and a case prefix.
+impl HistoryNa {
+    /// Its histories' harness and witness test, as joins name them.
+    fn witness(&self) -> WitnessRef {
+        WitnessRef::of(self.harness, self.witness)
+    }
+}
+
+/// The groups of [`HISTORIES`] `history` matches: its harness and whole
+/// witness test, its package included, joined on their [`WitnessRef`], and
+/// a case prefix.
 fn history_groups(history: HistoryRef) -> impl Iterator<Item = &'static HistoryNa> {
-    HISTORIES.iter().filter(move |group| {
-        group.harness == history.harness
-            && group.file == history.witness.file
-            && group.test == history.witness.test
-            && group
+    let want = WitnessRef::of(history.harness, history.witness);
+    WitnessRef::joined(&want, HISTORIES, |group| Some(group.witness()))
+        .into_iter()
+        .filter(move |group| {
+            group
                 .cases
                 .iter()
                 .any(|prefix| history.case.starts_with(prefix))
-    })
+        })
 }
 
 /// How many groups of [`HISTORIES`] `history` matches, for the static
@@ -1680,7 +1690,13 @@ pub fn history_groups_unmatched(histories: &[HistoryRef]) -> Vec<String> {
                 .iter()
                 .any(|&history| history_groups(history).any(|g| std::ptr::eq(g, *group)))
         })
-        .map(|group| format!("{}::{} {:?}", group.file, group.test, group.cases))
+        .map(|group| {
+            let witness = group.witness;
+            format!(
+                "{}/{}::{} {:?}",
+                witness.package, witness.file, witness.test, group.cases
+            )
+        })
         .collect()
 }
 
@@ -1738,24 +1754,30 @@ pub fn history_expected(history: HistoryRef) -> &'static [ExpectedNa] {
 static HISTORIES: &[HistoryNa] = &[
     HistoryNa {
         harness: "header-sync/flood",
-        file: "tests/header_flood_watch.rs",
-        test: "the_committed_flood_inputs_hold_their_watch_rules",
+        witness: sim_test(
+            "tests/header_flood_watch.rs",
+            "the_committed_flood_inputs_hold_their_watch_rules",
+        ),
         cases: &["committed lifecycle flood input"],
         applies: &[FLOOD_HOLDS],
         undeclared: &["sim/no-livelock"],
     },
     HistoryNa {
         harness: "header-sync/flood",
-        file: "tests/header_flood_watch.rs",
-        test: "the_committed_flood_inputs_hold_their_watch_rules",
+        witness: sim_test(
+            "tests/header_flood_watch.rs",
+            "the_committed_flood_inputs_hold_their_watch_rules",
+        ),
         cases: &["committed wire flood input"],
         applies: &[FLOOD_HOLDS, &["header-sync/teardown-returns-baseline"]],
         undeclared: &["sim/no-livelock"],
     },
     HistoryNa {
         harness: "header-sync/liveness",
-        file: "tests/header_hold_release.rs",
-        test: "the_committed_fixtures_match_their_names",
+        witness: sim_test(
+            "tests/header_hold_release.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
         cases: &["header-hold-held-apply"],
         applies: &[
             LIVENESS_HOLDS,
@@ -1768,16 +1790,20 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/liveness",
-        file: "tests/header_hold_release.rs",
-        test: "the_committed_fixtures_match_their_names",
+        witness: sim_test(
+            "tests/header_hold_release.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
         cases: &["header-hold-held-locator", "header-hold-serving-read"],
         applies: &[LIVENESS_HOLDS, &["header-sync/hold-release-wakes"]],
         undeclared: &["header-sync/bounded-adversary-progress"],
     },
     HistoryNa {
         harness: "header-sync/liveness",
-        file: "tests/header_hold_release.rs",
-        test: "the_committed_fixtures_match_their_names",
+        witness: sim_test(
+            "tests/header_hold_release.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
         cases: &["header-hold-held-prepare"],
         applies: &[
             LIVENESS_HOLDS,
@@ -1791,8 +1817,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/liveness",
-        file: "tests/header_peer_retirement.rs",
-        test: "the_committed_fixtures_match_their_names",
+        witness: sim_test(
+            "tests/header_peer_retirement.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
         cases: &[
             "header-retire-applying-relink",
             "header-retire-late-page",
@@ -1815,8 +1843,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/liveness",
-        file: "tests/header_peer_retirement.rs",
-        test: "the_committed_fixtures_match_their_names",
+        witness: sim_test(
+            "tests/header_peer_retirement.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
         cases: &["header-retire-awaiting-close"],
         applies: &[
             LIVENESS_HOLDS,
@@ -1830,8 +1860,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/liveness",
-        file: "tests/header_recovery_progress.rs",
-        test: "the_committed_fixtures_match_their_names",
+        witness: sim_test(
+            "tests/header_recovery_progress.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
         cases: &["header-recovery-closes"],
         applies: &[
             LIVENESS_HOLDS,
@@ -1845,8 +1877,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/liveness",
-        file: "tests/header_recovery_progress.rs",
-        test: "the_committed_fixtures_match_their_names",
+        witness: sim_test(
+            "tests/header_recovery_progress.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
         cases: &["header-recovery-departure"],
         applies: &[
             LIVENESS_HOLDS,
@@ -1861,8 +1895,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/liveness",
-        file: "tests/header_recovery_progress.rs",
-        test: "the_committed_fixtures_match_their_names",
+        witness: sim_test(
+            "tests/header_recovery_progress.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
         cases: &["header-recovery-faults"],
         applies: &[
             LIVENESS_HOLDS,
@@ -1876,8 +1912,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/liveness",
-        file: "tests/header_recovery_progress.rs",
-        test: "the_committed_fixtures_match_their_names",
+        witness: sim_test(
+            "tests/header_recovery_progress.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
         cases: &["header-recovery-successor"],
         applies: &[
             LIVENESS_HOLDS,
@@ -1890,16 +1928,20 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/release-wake",
-        file: "tests/header_release_wake.rs",
-        test: "the_release_wake_input_holds_capacity_release_wakes",
+        witness: sim_test(
+            "tests/header_release_wake.rs",
+            "the_release_wake_input_holds_capacity_release_wakes",
+        ),
         cases: &[""],
         applies: &[RELEASE_WAKE_HOLDS],
         undeclared: &["sim/no-livelock"],
     },
     HistoryNa {
         harness: "header-sync/repair",
-        file: "tests/header_repair.rs",
-        test: "the_committed_repair_inputs_hold_outstanding_work_bounded",
+        witness: sim_test(
+            "tests/header_repair.rs",
+            "the_committed_repair_inputs_hold_outstanding_work_bounded",
+        ),
         cases: &[
             "committed header-repair-applied input",
             "committed header-repair-apply-departs input",
@@ -1910,24 +1952,27 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/repair",
-        file: "tests/header_repair.rs",
-        test: "the_committed_repair_inputs_hold_outstanding_work_bounded",
+        witness: sim_test(
+            "tests/header_repair.rs",
+            "the_committed_repair_inputs_hold_outstanding_work_bounded",
+        ),
         cases: &["committed header-repair-supplier-pruned input"],
         applies: &[REPAIR_HOLDS],
         undeclared: &["sim/no-livelock"],
     },
     HistoryNa {
         harness: "header-sync/smoke",
-        file: "tests/harness.rs",
-        test: "a_clean_run_holds_no_task_panic",
+        witness: sim_test("tests/harness.rs", "a_clean_run_holds_no_task_panic"),
         cases: &[""],
         applies: &[SMOKE_HOLDS],
         undeclared: &["sim/no-livelock"],
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_authority.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_authority.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &["forks-sharing-a-header ", "multi-page-sync "],
         applies: &[
             STORAGE_HOLDS,
@@ -1943,8 +1988,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_authority.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_authority.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &["harness-commit "],
         applies: &[
             STORAGE_HOLDS,
@@ -1958,8 +2005,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_authority.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_authority.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &["relinked-mid-round "],
         applies: &[
             STORAGE_HOLDS,
@@ -1976,8 +2025,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_chain_selected.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_chain_selected.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &[
             "equal-work ",
             "heavier-offered-to-longer ",
@@ -2000,8 +2051,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_chain_selected.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_chain_selected.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &["harness-commit "],
         applies: &[
             STORAGE_HOLDS,
@@ -2015,8 +2068,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_mixed_resources.rs",
-        test: "the_mixed_fixture_holds_every_resource_rule",
+        witness: sim_test(
+            "tests/header_mixed_resources.rs",
+            "the_mixed_fixture_holds_every_resource_rule",
+        ),
         cases: &[""],
         applies: &[
             STORAGE_HOLDS,
@@ -2033,8 +2088,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_node.rs",
-        test: "node_syncs_from_a_mirror_on_controlled_storage",
+        witness: sim_test(
+            "tests/header_node.rs",
+            "node_syncs_from_a_mirror_on_controlled_storage",
+        ),
         cases: &[""],
         applies: &[
             STORAGE_HOLDS,
@@ -2050,8 +2107,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_node_capacity.rs",
-        test: "the_close_relink_input_holds_chunk_budget_bound",
+        witness: sim_test(
+            "tests/header_node_capacity.rs",
+            "the_close_relink_input_holds_chunk_budget_bound",
+        ),
         cases: &[""],
         applies: &[
             STORAGE_HOLDS,
@@ -2068,8 +2127,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_outstanding.rs",
-        test: "the_committed_witnesses_hold_outstanding_work_bounded",
+        witness: sim_test(
+            "tests/header_outstanding.rs",
+            "the_committed_witnesses_hold_outstanding_work_bounded",
+        ),
         cases: &[
             "header-authority-forks-sharing-a-header",
             "header-reset-held-apply",
@@ -2089,8 +2150,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_outstanding.rs",
-        test: "the_committed_witnesses_hold_outstanding_work_bounded",
+        witness: sim_test(
+            "tests/header_outstanding.rs",
+            "the_committed_witnesses_hold_outstanding_work_bounded",
+        ),
         cases: &[
             "header-authority-relinked-mid-round",
             "header-outstanding-churn",
@@ -2110,8 +2173,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_outstanding.rs",
-        test: "the_committed_witnesses_hold_outstanding_work_bounded",
+        witness: sim_test(
+            "tests/header_outstanding.rs",
+            "the_committed_witnesses_hold_outstanding_work_bounded",
+        ),
         cases: &["header-outstanding-capacity-waits"],
         applies: &[
             STORAGE_HOLDS,
@@ -2127,8 +2192,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_outstanding.rs",
-        test: "the_committed_witnesses_hold_outstanding_work_bounded",
+        witness: sim_test(
+            "tests/header_outstanding.rs",
+            "the_committed_witnesses_hold_outstanding_work_bounded",
+        ),
         cases: &["header-outstanding-serving-churn"],
         applies: &[
             STORAGE_HOLDS,
@@ -2143,8 +2210,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_outstanding.rs",
-        test: "the_committed_witnesses_hold_outstanding_work_bounded",
+        witness: sim_test(
+            "tests/header_outstanding.rs",
+            "the_committed_witnesses_hold_outstanding_work_bounded",
+        ),
         cases: &["header-outstanding-serving-replaced"],
         applies: &[
             STORAGE_HOLDS,
@@ -2158,8 +2227,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_outstanding.rs",
-        test: "the_committed_witnesses_hold_outstanding_work_bounded",
+        witness: sim_test(
+            "tests/header_outstanding.rs",
+            "the_committed_witnesses_hold_outstanding_work_bounded",
+        ),
         cases: &["header-reset-quiet-reset", "header-reset-quiet-reset-deep"],
         applies: &[
             STORAGE_HOLDS,
@@ -2172,8 +2243,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_publication.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_publication.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &[
             "grow ",
             "served-across-a-reset plan 4 of inputs(8, 256)",
@@ -2194,8 +2267,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_publication.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_publication.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &["harness-commit "],
         applies: &[
             STORAGE_HOLDS,
@@ -2209,8 +2284,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_publication.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_publication.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &[
             "invalidate-only ",
             "served-across-a-reset plan 0 of inputs(8, 256)",
@@ -2235,8 +2312,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_publication.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_publication.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &["quiet-reset ", "reset-inside-status-floor "],
         applies: &[
             STORAGE_HOLDS,
@@ -2249,8 +2328,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_publication.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_publication.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &["served ", "served-in-pages "],
         applies: &[
             STORAGE_HOLDS,
@@ -2264,8 +2345,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_publication.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_publication.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &["served-one-header "],
         applies: &[
             STORAGE_HOLDS,
@@ -2278,16 +2361,20 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_publication.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_publication.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &["startup-only "],
         applies: &[STORAGE_HOLDS],
         undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_reset_invalidates.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_reset_invalidates.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &[
             "completion-before-adoption ",
             "held-apply ",
@@ -2311,8 +2398,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_reset_invalidates.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_reset_invalidates.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &["quiet-reset ", "quiet-reset-deep "],
         applies: &[
             STORAGE_HOLDS,
@@ -2325,8 +2414,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_reset_invalidates.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_reset_invalidates.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &["session-replaced-read "],
         applies: &[
             STORAGE_HOLDS,
@@ -2343,8 +2434,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_stale.rs",
-        test: "the_close_relink_input_holds_stale_completion_inert",
+        witness: sim_test(
+            "tests/header_stale.rs",
+            "the_close_relink_input_holds_stale_completion_inert",
+        ),
         cases: &[""],
         applies: &[
             STORAGE_HOLDS,
@@ -2361,8 +2454,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_stale_chain.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_stale_chain.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &[
             "fork-stale-apply ",
             "pre-reset-commit ",
@@ -2382,8 +2477,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_stale_chain.rs",
-        test: "every_witness_holds_and_applies",
+        witness: sim_test(
+            "tests/header_stale_chain.rs",
+            "every_witness_holds_and_applies",
+        ),
         cases: &["reset-inside-status-floor "],
         applies: &[
             STORAGE_HOLDS,
@@ -2396,8 +2493,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/storage",
-        file: "tests/header_teardown.rs",
-        test: "the_close_relink_input_holds_teardown_returns_baseline",
+        witness: sim_test(
+            "tests/header_teardown.rs",
+            "the_close_relink_input_holds_teardown_returns_baseline",
+        ),
         cases: &[""],
         applies: &[
             STORAGE_HOLDS,
@@ -2414,16 +2513,20 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_prepare_fault.rs",
-        test: "the_late_fault_fixture_penalizes_after_the_session_ended",
+        witness: sim_test(
+            "tests/header_wire_prepare_fault.rs",
+            "the_late_fault_fixture_penalizes_after_the_session_ended",
+        ),
         cases: &["committed late-fault input"],
         applies: &[PENALTY, &["header-sync/header-fault-penalized"]],
         undeclared: PENALTY_UNDECLARED,
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_progress.rs",
-        test: "the_progress_fixture_holds_honest_progress",
+        witness: sim_test(
+            "tests/header_wire_progress.rs",
+            "the_progress_fixture_holds_honest_progress",
+        ),
         cases: &[""],
         applies: &[
             WIRE_HOLDS,
@@ -2442,8 +2545,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "each_invalid_label_witness_has_a_conformant_control",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "each_invalid_label_witness_has_a_conformant_control",
+        ),
         cases: &[
             "headers-outcome/min-payload",
             "headers/max-payload",
@@ -2465,16 +2570,20 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "each_invalid_label_witness_has_a_conformant_control",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "each_invalid_label_witness_has_a_conformant_control",
+        ),
         cases: &["status/min-payload"],
         applies: &[WIRE_HOLDS, &["sim/no-livelock"]],
         undeclared: &["header-sync/honest-progress"],
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "each_invalid_label_witness_has_a_conformant_control",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "each_invalid_label_witness_has_a_conformant_control",
+        ),
         cases: &[
             "subscribe-headers/min-payload",
             "subscribe-headers/second-open",
@@ -2496,8 +2605,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "every_generated_property_applies_in_its_witness",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "every_generated_property_applies_in_its_witness",
+        ),
         cases: &[""],
         applies: &[
             WIRE_HOLDS,
@@ -2517,8 +2628,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["headers/bad-content-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2537,8 +2650,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["headers/long-payload-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2557,8 +2672,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["headers/reserved-flags-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2577,8 +2694,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["headers/short-payload-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2597,8 +2716,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["headers/unsolicited-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2611,8 +2732,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "headers_outcome_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "headers_outcome_faults_apply_in_their_witnesses",
+        ),
         cases: &["headers-outcome/bad-content-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2631,8 +2754,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "headers_outcome_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "headers_outcome_faults_apply_in_their_witnesses",
+        ),
         cases: &["headers-outcome/long-payload-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2651,8 +2776,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "headers_outcome_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "headers_outcome_faults_apply_in_their_witnesses",
+        ),
         cases: &["headers-outcome/reserved-flags-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2671,8 +2798,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "headers_outcome_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "headers_outcome_faults_apply_in_their_witnesses",
+        ),
         cases: &["headers-outcome/short-payload-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2691,8 +2820,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "headers_outcome_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "headers_outcome_faults_apply_in_their_witnesses",
+        ),
         cases: &["headers-outcome/unsolicited-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2705,8 +2836,7 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "honest_peer_never_punished",
+        witness: sim_test("tests/header_wire_witness.rs", "honest_peer_never_punished"),
         cases: &["both ways"],
         applies: &[
             WIRE_HOLDS,
@@ -2726,8 +2856,7 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "honest_peer_never_punished",
+        witness: sim_test("tests/header_wire_witness.rs", "honest_peer_never_punished"),
         cases: &["bystander"],
         applies: &[
             WIRE_HOLDS,
@@ -2740,8 +2869,7 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "honest_peer_never_punished",
+        witness: sim_test("tests/header_wire_witness.rs", "honest_peer_never_punished"),
         cases: &["lossy "],
         applies: &[
             WIRE_HOLDS,
@@ -2758,8 +2886,7 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "honest_peer_never_punished",
+        witness: sim_test("tests/header_wire_witness.rs", "honest_peer_never_punished"),
         cases: &["redial"],
         applies: &[
             WIRE_HOLDS,
@@ -2777,8 +2904,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "status_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "status_faults_apply_in_their_witnesses",
+        ),
         cases: &["status/bad-content-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2791,8 +2920,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "status_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "status_faults_apply_in_their_witnesses",
+        ),
         cases: &["status/cadence-never-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2805,8 +2936,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "status_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "status_faults_apply_in_their_witnesses",
+        ),
         cases: &["status/long-payload-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2819,8 +2952,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "status_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "status_faults_apply_in_their_witnesses",
+        ),
         cases: &["status/reserved-flags-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2833,8 +2968,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "status_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "status_faults_apply_in_their_witnesses",
+        ),
         cases: &["status/short-payload-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2847,8 +2984,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "status_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "status_faults_apply_in_their_witnesses",
+        ),
         cases: &["undeclared-type-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2858,8 +2997,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "subscribe_headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["subscribe-headers/after-close-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2875,8 +3016,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "subscribe_headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["subscribe-headers/bad-content-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2889,8 +3032,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "subscribe_headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["subscribe-headers/bad-cursor-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2910,8 +3055,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "subscribe_headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["subscribe-headers/long-payload-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2924,8 +3071,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "subscribe_headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["subscribe-headers/over-credit-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2944,8 +3093,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "subscribe_headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["subscribe-headers/over-live-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2965,8 +3116,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "subscribe_headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["subscribe-headers/reserved-flags-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2979,8 +3132,10 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
-        file: "tests/header_wire_witness.rs",
-        test: "subscribe_headers_faults_apply_in_their_witnesses",
+        witness: sim_test(
+            "tests/header_wire_witness.rs",
+            "subscribe_headers_faults_apply_in_their_witnesses",
+        ),
         cases: &["subscribe-headers/short-payload-closes"],
         applies: &[
             WIRE_HOLDS,
@@ -2992,3 +3147,43 @@ static HISTORIES: &[HistoryNa] = &[
         undeclared: &["header-sync/honest-progress"],
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+
+    /// A counted history takes its `NotApplicable` group only on its
+    /// harness and whole witness test, its package included, joined on
+    /// their [`WitnessRef`] (Rule 25's template): every counted node
+    /// history that matches one group matches none with its harness or
+    /// its witness's package, file or name moved, and its case unchanged.
+    #[test]
+    fn a_history_s_group_joins_its_whole_witness() {
+        let leak = |text: &str| -> &'static str { Box::leak(text.to_owned().into_boxed_str()) };
+        let mut grouped = 0;
+        for history in super::super::rows::counted_histories() {
+            if history_groups_matched(history) != 1 {
+                continue;
+            }
+            let keys = assert_one_key_off::<WitnessRef>(
+                &WitnessRef::of(history.harness, history.witness),
+                |want| {
+                    let moved = HistoryRef {
+                        harness: leak(&want.harness),
+                        witness: TestRef {
+                            package: leak(&want.package),
+                            file: leak(&want.file),
+                            test: leak(&want.test),
+                        },
+                        case: history.case,
+                    };
+                    history_groups_matched(moved) == 1
+                },
+            );
+            assert_eq!(keys, 4);
+            grouped += 1;
+        }
+        assert!(grouped > 0);
+    }
+}

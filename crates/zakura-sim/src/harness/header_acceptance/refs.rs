@@ -421,6 +421,34 @@ pub struct PlantedRef {
 }
 impl Ref for PlantedRef {}
 
+/// One witness test's histories on one harness: the harness and the
+/// test's package, file and name, everything a counted history names but
+/// its case.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessRef {
+    /// The harness.
+    pub harness: String,
+    /// The test's package.
+    pub package: String,
+    /// The test's file, relative to its package.
+    pub file: String,
+    /// The test's name.
+    pub test: String,
+}
+impl Ref for WitnessRef {}
+
+impl WitnessRef {
+    /// `witness`'s histories on `harness`.
+    pub fn of(harness: &str, witness: super::TestRef) -> Self {
+        WitnessRef {
+            harness: harness.to_owned(),
+            package: witness.package.to_owned(),
+            file: witness.file.to_owned(),
+            test: witness.test.to_owned(),
+        }
+    }
+}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

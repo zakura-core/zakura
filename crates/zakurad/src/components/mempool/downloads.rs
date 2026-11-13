@@ -208,6 +208,21 @@ pub enum TransactionDownloadVerifyError {
     PeerCoolingDown,
 }
 
+impl TransactionDownloadVerifyError {
+    /// Returns a bounded metric label, excluding nested errors and transaction details.
+    pub(super) fn metric_label(&self) -> &'static str {
+        match self {
+            Self::InState => "in_state",
+            Self::StateError(_) => "state_error",
+            Self::DownloadFailed(_) => "download_failed",
+            Self::Cancelled => "cancelled",
+            Self::PolicyRejected(_) => "policy_rejected",
+            Self::Invalid { .. } => "invalid",
+            Self::PeerCoolingDown => "peer_cooling_down",
+        }
+    }
+}
+
 /// Represents a [`Stream`] of download and verification tasks.
 #[pin_project(PinnedDrop)]
 #[derive(Debug)]
@@ -806,7 +821,7 @@ where
     }
 
     /// Get the number of currently in-flight download tasks.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn in_flight(&self) -> usize {
         self.in_flight
     }
@@ -898,6 +913,39 @@ mod tests {
     type PendingNetwork = BoxCloneService<zn::Request, zn::Response, BoxError>;
     type PendingVerifier = BoxCloneService<tx::Request, tx::Response, BoxError>;
     type PendingState = BoxCloneService<zs::ReadRequest, zs::ReadResponse, BoxError>;
+
+    #[test]
+    fn download_verify_error_metric_labels_ignore_details() {
+        use zakura_consensus::error::TransactionError;
+
+        use TransactionDownloadVerifyError::*;
+
+        for detail in ["first error detail", "second error detail"] {
+            assert_eq!(
+                StateError(BoxError::from(detail).into()).metric_label(),
+                "state_error",
+            );
+            assert_eq!(
+                DownloadFailed(BoxError::from(detail).into()).metric_label(),
+                "download_failed",
+            );
+        }
+
+        for error in [
+            TransactionError::WrongVersion,
+            TransactionError::WrongConsensusBranchId,
+        ] {
+            let error = Invalid {
+                error,
+                advertiser_addr: None,
+                tip_height: None,
+                transaction_version: 5,
+                transaction_network_upgrade: None,
+                retried_after_tip_reset: false,
+            };
+            assert_eq!(error.metric_label(), "invalid");
+        }
+    }
 
     fn tx_id(index: u64) -> UnminedTxId {
         let mut bytes = [0; 32];

@@ -433,7 +433,13 @@ impl Handler {
                         .iter()
                         .all(|item| matches!(item, InventoryHash::Block(_))) =>
             {
-                let response = Response::BlockHashes(block_hashes(&items[..]).collect());
+                // Truncate rather than reject: zcashd can add one extra hash to a full
+                // response, and a peer can always send the maximum number of junk hashes.
+                let response = Response::BlockHashes(
+                    block_hashes(&items[..])
+                        .take(constants::MAX_FIND_BLOCKS_RESPONSE_HASHES)
+                        .collect(),
+                );
                 if let [InventoryHash::Block(_)] = items[..] {
                     ignored_msg = Some(Message::Inv(items));
                 }

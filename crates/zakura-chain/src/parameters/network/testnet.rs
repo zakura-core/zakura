@@ -74,6 +74,7 @@ pub struct ConfiguredFundingStreamRecipient {
 impl ConfiguredFundingStreamRecipient {
     /// Creates a new [`ConfiguredFundingStreamRecipient`] with the provided receiver and default
     /// values for other fields.
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub fn new_for(receiver: FundingStreamReceiver) -> Self {
         use FundingStreamReceiver::*;
         match receiver {
@@ -295,6 +296,7 @@ impl ConfiguredFundingStreams {
     /// # Panics
     ///
     /// If `height_range` is None.
+    #[cfg(test)]
     pub fn into_funding_streams_unchecked(self) -> FundingStreams {
         let height_range = self.height_range.expect("must have height range");
         let recipients = self

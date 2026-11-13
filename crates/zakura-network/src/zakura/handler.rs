@@ -4827,6 +4827,7 @@ fn sought_services_with_custom(custom_services: &[CustomService]) -> Vec<ZakuraS
 }
 
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
+#[cfg(test)]
 pub async fn spawn_zakura_endpoint(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
@@ -7949,7 +7950,7 @@ impl ZakuraHandlerError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests {
     mod bounded_decoding;
     pub(super) mod connection;

@@ -47,11 +47,20 @@ fn fixtures() -> PathBuf {
     root().join("crates/zakura-sim/tests/fixtures")
 }
 
+/// The targets whose seeds don't apply every property of their harness.
+/// Their seeds run honest and single-fault scenarios, and the coverage
+/// manifest names the test where each other property applies, such as a
+/// frame-conformance property on a faulted frame. Each still needs a seed
+/// that applies one of its harness's own properties, as readiness does, and
+/// `zakura-sim targets` lists the rest as applied in no seed.
+const PARTIAL_SEEDS: [&str; 3] = ["block_sync_storage", "discovery_wire", "header_sync_wire"];
+
 /// Each declared target resolves to its registered harness, its harness has
 /// admitted seeds and no rejected one, and the seeds apply each of the
-/// harness's own properties and those of every harness the target covers.
-/// A target without seeds, or whose seeds reach only the properties every
-/// harness checks, fails here before the nightly job runs it.
+/// harness's own properties and those of every harness the target covers,
+/// except for a target in [`PARTIAL_SEEDS`]. A target without seeds, or
+/// whose seeds reach only the properties every harness checks, fails here
+/// before the nightly job runs it.
 #[test]
 fn every_declared_target_runs_seeds_that_apply_its_properties() {
     let suite = suite();
@@ -102,7 +111,7 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
         let (applied, unapplied) = own_applicability(entry, &seeds);
         assert!(!applied.is_empty(), "{}", target.name);
         assert!(
-            unapplied.is_empty(),
+            unapplied.is_empty() || PARTIAL_SEEDS.contains(&target.name.as_str()),
             "{}: no seed applies {unapplied:?}",
             target.name
         );
@@ -164,8 +173,8 @@ fn declared_targets_are_the_sim_packages() {
 }
 
 /// The discovery seed carries the lost-wakeup bypass, and the header
-/// storage seeds carry the planted cases that name the close-and-relink and
-/// stale-prepare seeds.
+/// storage seeds carry every planted case that names one of them as its
+/// input, including the native mutations hdr-14.4 moved onto them.
 #[test]
 fn bypasses_follow_their_committed_input() {
     let load = |harness| seed::load(&[fixtures()], Some(harness)).unwrap().admitted;
@@ -184,17 +193,22 @@ fn bypasses_follow_their_committed_input() {
     assert_eq!(
         patches,
         [
+            "qa/planted/harness/direct-dispatch/locator-to-action-channel.patch",
             "qa/planted/header-sync/chunk-budget-bound/uncapped-secondary-reservation.patch",
+            "qa/planted/header-sync/outstanding-work-bounded/secondary-reservation.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-charge.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-close.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-credit.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-release.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-retirement.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/consumed-locator-permit.patch",
             "qa/planted/header-sync/teardown-returns-baseline/forgotten-completion.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/forgotten-locator-permit.patch",
             "qa/planted/header-sync/teardown-returns-baseline/forgotten-retained-headers.patch",
             "qa/planted/header-sync/teardown-returns-baseline/kept-queue-lease.patch",
             "qa/planted/header-sync/teardown-returns-baseline/leaked-lease-clone.patch",
             "qa/planted/header-sync/teardown-returns-baseline/leaked-reservation-entry.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/shutdown-kept-queue.patch",
             "qa/planted/header-sync/teardown-returns-baseline/skipped-round-release.patch",
         ]
         .map(Path::new),
@@ -449,4 +463,39 @@ fn quarantined_seeds_stay_in_the_report() {
     let written: Readiness =
         serde_json::from_slice(&fs::read(options.out.join(READINESS_FILE)).unwrap()).unwrap();
     assert_eq!(written, report);
+}
+
+/// The report lists each harness no target runs with its
+/// `[[missing-target]]` row, so it accounts for every harness, even when
+/// it checks only some targets. No missing target counts as not ready.
+#[test]
+fn the_report_lists_every_missing_target() {
+    use zakura_sim::campaign::{check_targets, Readiness, TargetsOptions, READINESS_FILE};
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, fixtures) = checkout(dir.path());
+    let options = TargetsOptions {
+        repo,
+        out: dir.path().join("out"),
+        targets: vec!["discovery_wait_complete".to_owned()],
+        sanitizer: "none".to_owned(),
+        target_dir: dir.path().join("target"),
+        fixtures: vec![fixtures],
+        child: std::time::Duration::from_secs(1),
+    };
+    let report = check_targets(&options, |_| {}).unwrap();
+    let missing = suite().missing_target;
+    assert!(!missing.is_empty(), "{SUITE_FILE} lists missing targets");
+    assert_eq!(report.missing_targets, missing);
+    // The one checked target has no seed, so it's the only row not ready.
+    let not_ready: Vec<&str> = report.not_ready().map(|row| row.target.as_str()).collect();
+    assert_eq!(not_ready, ["discovery_wait_complete"]);
+    let written: Readiness =
+        serde_json::from_slice(&fs::read(options.out.join(READINESS_FILE)).unwrap()).unwrap();
+    assert_eq!(written, report);
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(options.out.join(READINESS_FILE)).unwrap()).unwrap();
+    assert_eq!(
+        json["missing_targets"][0]["harness"],
+        missing[0].harness.as_str()
+    );
 }

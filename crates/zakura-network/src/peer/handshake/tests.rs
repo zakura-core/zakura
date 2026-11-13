@@ -47,6 +47,18 @@ fn peer_addr(port: u16) -> PeerSocketAddr {
 }
 
 #[test]
+fn serialization_error_metric_labels_ignore_details() {
+    for detail in ["first error detail", "second error detail"] {
+        let error = SerializationError::from(std::io::Error::other(detail));
+        assert_eq!(serialization_error_metric_label(&error), "io");
+        assert_eq!(
+            serialization_error_metric_label(&SerializationError::Parse(detail)),
+            "parse",
+        );
+    }
+}
+
+#[test]
 fn connected_addr_labels_require_explicit_opt_in() {
     let peer = ConnectedAddr::new_outbound_direct(
         "192.0.2.1:8233".parse().expect("valid test peer address"),
@@ -1229,4 +1241,43 @@ async fn body_requests_withdraw_only_requested_block_announcements() {
             }
         }
     }
+}
+
+/// Cancelling a connector also cancels its spawned handshake before the timeout.
+#[tokio::test]
+async fn dropping_handshake_future_releases_stream_and_tracker() {
+    use tokio::io::AsyncReadExt;
+
+    let _init_guard = zakura_test::init();
+    let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
+    let mut handshake =
+        test_handshake_without_zakura_connector(test_config(P2pStack::Legacy), book_tx);
+    let (local_stream, mut remote_stream) = duplex(16 * 1024);
+    let mut counter = ActiveConnectionCounter::new_counter();
+    tokio::time::pause();
+    let started_at = Instant::now();
+    let attempt = handshake.call(HandshakeRequest {
+        data_stream: local_stream,
+        connected_addr: ConnectedAddr::new_outbound_direct(peer_addr(8233)),
+        connection_tracker: counter.track_connection(),
+    });
+
+    // Seeing the version bytes proves the inner task is running and blocked on its peer.
+    timeout(constants::HANDSHAKE_TIMEOUT / 2, remote_stream.read_u8())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(counter.update_count(), 1);
+    drop(attempt);
+
+    let mut remaining = Vec::new();
+    timeout(
+        constants::HANDSHAKE_TIMEOUT / 2,
+        remote_stream.read_to_end(&mut remaining),
+    )
+    .await
+    .expect("cancellation closes the stream without waiting for handshake timeout")
+    .unwrap();
+    assert_eq!(counter.update_count(), 0);
+    assert_eq!(Instant::now(), started_at);
 }

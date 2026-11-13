@@ -110,8 +110,15 @@ fn a_sink_without_steps_gets_init_and_end() {
     let mut fast = NoSteps::default();
     (race.run)(&scenario, Plan::from_fuzz(&[3, 1, 4, 1, 5]), &mut fast).unwrap();
     assert!(full.records.len() > 2, "the full run has steps");
-    assert!(matches!(fast.0[..], [Record::Init(_), Record::End(_)]));
-    assert_eq!(fast.0[0], full.records[0], "the same init record");
+    let ([Record::Init(fast_init), Record::End(_)], Some(Record::Init(full_init))) =
+        (&fast.0[..], full.records.first())
+    else {
+        panic!("init and end only: {:?}", fast.0);
+    };
+    assert_eq!(fast_init.draws, full_init.draws, "the same init draws");
+    // Step 0's digest, like every step's, is taken only by a recording run.
+    assert!(full_init.obs.is_some());
+    assert_eq!(fast_init.obs, None);
     assert_eq!(
         fast.0[1],
         *full.records.last().unwrap(),

@@ -127,6 +127,7 @@ impl InventoryChange {
     }
 
     /// Returns a new missing inventory change from a single hash.
+    #[cfg(test)]
     pub fn new_missing(hash: InventoryHash, peer: PeerSocketAddr) -> Self {
         let bv = AtLeastOne::from_vec(vec![hash]).expect("bounded vec must fit");
         InventoryStatus::Missing((bv, peer))

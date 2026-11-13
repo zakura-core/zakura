@@ -1107,15 +1107,20 @@ fn a_random_run_always_drains_once_the_sessions_end() {
         // and silent, which is its own way to get stuck: a peer that never
         // answers and never leaves. The verifications still running end in
         // a local fault on some runs and pass on the others.
+        // Everything the setup of the drain causes is a request on the wire
+        // too, and is tracked like one.
         for (reserved, ..) in legacy_held.drain(..) {
             let step = pool.release(reserved.id, now);
             ledger.absorb(&step);
-            reactor.pool_step(&step, now, &mut pool);
+            let effects = reactor.pool_step(&step, now, &mut pool);
+            apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
         }
         let sessions_end = seed % 3 != 2;
         if sessions_end {
-            for session in live.drain(..) {
-                reactor.end(session, now, &mut pool);
+            while let Some(session) = live.pop() {
+                asked.retain(|(asked_on, _)| *asked_on != session);
+                let effects = reactor.end(session, now, &mut pool);
+                apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
             }
         }
         for round in 0..200 {
@@ -1192,6 +1197,15 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                 0,
                 "seed {seed}: an id is stuck while its announcer is connected"
             );
+            // The test's list of requests and the reactor's own count agree
+            // that nothing is still out on any connected session.
+            for session in &live {
+                assert_eq!(
+                    reactor.outstanding(*session),
+                    0,
+                    "seed {seed}: a request is out that the test never saw"
+                );
+            }
             for session in live.drain(..) {
                 reactor.end(session, now, &mut pool);
             }

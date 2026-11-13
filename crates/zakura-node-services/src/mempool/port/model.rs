@@ -21,6 +21,23 @@
 //! caller's slot stays taken until it submits its body or drops the
 //! reservation. Otherwise a source could have more fetches out than slots.
 //!
+//! Two orderings are decided on purpose and are not gaps.
+//!
+//! A deadline is decided on what the core has applied. A parent mined in a
+//! block the core has not read yet can lose that race by a moment. The
+//! transaction is then answered as today's timeout would answer it, and the
+//! tip change that follows forgets the rejection.
+//!
+//! While the chain changes faster than a check completes, pooled
+//! transactions stay hidden, because no check of them can be trusted. They
+//! hold no slot between checks. Today each of those changes empties the
+//! pool.
+//!
+//! A hidden transaction queued behind a hidden parent is waiting for that
+//! parent's check, not for a missing parent, and is decided when the parent
+//! is. A parent that keeps hitting local faults keeps both hidden. That is
+//! the rule for a pooled transaction on a node whose verifier is failing.
+//!
 //! Two rules are for the core's task, not the machine. A worker waits for a
 //! stable generation before its first lookup. And the core publishes a
 //! batch's snapshot before it starts that batch's jobs, so a verification
@@ -67,6 +84,17 @@ pub const T_VERIFY: Duration = Duration::from_secs(60);
 /// transaction with a missing input is answered within this long plus one
 /// verification, whatever its parents, the chain or its peers do.
 pub const T_PARK: Duration = Duration::from_secs(60);
+
+/// The longest an undecided transaction holds its slot after its body
+/// arrives: the wait for a parent plus one verification.
+///
+/// Every other deadline is about one stage, and a transaction can move
+/// between stages for as long as something keeps moving it: a chain that
+/// changes during every check, or inputs that arrive one at a time. This one
+/// is about the slot. When it ends the submission is answered with a local
+/// fault, nothing is cached and nobody is charged, because the core never
+/// got a trustworthy answer.
+pub const MAX_UNDECIDED: Duration = Duration::from_secs(120);
 
 /// How long the core refuses a peer after a cooldown charge or a violation.
 /// Today's base cooldown.
@@ -445,6 +473,11 @@ struct Admission {
     /// When one of its inputs was first found missing. Its wait for a
     /// parent runs from here and is never restarted.
     missing_since: Option<ModelTime>,
+    /// Whether the one check allowed after that wait ended has been used.
+    last_check_used: bool,
+    /// When its body arrived. Its slot is held at most [`MAX_UNDECIDED`]
+    /// from here.
+    body_at: Option<ModelTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -478,6 +511,8 @@ struct Pooled {
     /// When one of its inputs was first found missing since it was last
     /// visible. Its wait for a parent runs from here.
     missing_since: Option<ModelTime>,
+    /// Whether the one check allowed after that wait ended has been used.
+    last_check_used: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -656,6 +691,8 @@ impl PoolModel {
                 waiters: Vec::new(),
                 stage: Stage::Reserved,
                 missing_since: None,
+                last_check_used: false,
+                body_at: None,
             },
         );
         self.admission_of.insert(tx_id, key);
@@ -788,6 +825,7 @@ impl PoolModel {
             match body {
                 Some(tx) if admission.body.is_none() => {
                     admission.body = Some(tx);
+                    admission.body_at = Some(now);
                     true
                 }
                 // The core already holds these bytes, or the caller was not
@@ -962,6 +1000,14 @@ impl PoolModel {
         let mut timed_out = Vec::new();
         let mut unparked = Vec::new();
         for (key, admission) in &self.admissions {
+            // The slot's own deadline comes first, whatever the stage.
+            if admission
+                .body_at
+                .is_some_and(|at| at.saturating_add(MAX_UNDECIDED) <= now)
+            {
+                timed_out.push(*key);
+                continue;
+            }
             match &admission.stage {
                 Stage::Verifying { deadline, .. } if *deadline <= now => timed_out.push(*key),
                 Stage::Parked { .. }
@@ -1008,8 +1054,10 @@ impl PoolModel {
                 }
                 // Its parent never came back.
                 Some(Hidden::Parked { .. }) if parked_out => {
-                    let hash = self.pooled_at(key).tx.id.mined_id();
-                    self.remove_with_dependents(hash, RemovalReason::Invalidated);
+                    let tx_id = self.pooled_at(key).tx.id;
+                    self.remove_with_dependents(tx_id.mined_id(), RemovalReason::Invalidated);
+                    // Remembered like a new transaction's missing parent.
+                    self.cache(tx_id, RejectionScope::ExactTip);
                 }
                 _ => {}
             }
@@ -1439,6 +1487,7 @@ impl PoolModel {
                         visible_at: pool_key,
                         hidden_at: ChangeSeq(0),
                         missing_since: None,
+                        last_check_used: false,
                     },
                 );
                 self.pooled.insert(hash, pool_key);
@@ -1464,16 +1513,28 @@ impl PoolModel {
                 let arrived = missing
                     .iter()
                     .any(|outpoint| self.arrived_since(outpoint, started_at));
-                if arrived {
+                // Its wait runs from the first time an input was missing,
+                // and is never restarted.
+                let now = self.now;
+                let admission = self.admission_at(key);
+                let since = *admission.missing_since.get_or_insert(now);
+                let wait_over = since.saturating_add(T_PARK) <= now;
+                // After the wait, an input that arrived during this check
+                // earns one more check and no more. Otherwise inputs that
+                // keep arriving one at a time could hold the slot for as
+                // long as they kept coming.
+                let last_check = wait_over && arrived && !admission.last_check_used;
+                if last_check {
+                    admission.last_check_used = true;
+                }
+                if (arrived && !wait_over) || last_check {
                     self.start_admission(key);
                     return;
                 }
-                // Its wait runs from the first time an input was missing.
-                // A check that still finds one missing after the wait ended
-                // is the answer, however the check came to run again.
-                let now = self.now;
-                let since = *self.admission_at(key).missing_since.get_or_insert(now);
-                if since.saturating_add(T_PARK) <= now {
+                if wait_over {
+                    // Today a parent that never arrived is a missing-input
+                    // failure, remembered for these exact bytes until the
+                    // tip changes.
                     self.reject(key, RejectionScope::ExactTip, Charge::None);
                     return;
                 }
@@ -1543,6 +1604,7 @@ impl PoolModel {
                 pooled.backoff = REVALIDATE_RETRY;
                 pooled.visible_at = visible_at;
                 pooled.missing_since = None;
+                pooled.last_check_used = false;
                 let (id, hidden_at, count) = (pooled.tx.id, pooled.hidden_at, pooled.tx.outputs);
                 self.step.changes.push(Change::Revealed { id, hidden_at });
                 // Its outputs are available again, to waiters as well.
@@ -1559,25 +1621,32 @@ impl PoolModel {
                 // it is not cached. A later submission is looked up again.
                 self.wake(hash);
             }
-            // As for a new transaction: a parent that became visible after
-            // this job looked is a reason to look again, not a failure.
-            Outcome::MissingInputs(missing)
-                if missing
-                    .iter()
-                    .any(|outpoint| self.arrived_since(outpoint, started_at)) =>
-            {
-                self.pooled_at(key).hidden = Some(Hidden::Queued);
-            }
             // Its parent is in neither the chain nor the visible pool. After
             // a reorg that can be a mined parent that is on its way back, so
-            // it waits as a new transaction would, still hidden.
+            // it waits as a new transaction would, still hidden, and by the
+            // same rules.
             Outcome::MissingInputs(missing) => {
+                let arrived = missing
+                    .iter()
+                    .any(|outpoint| self.arrived_since(outpoint, started_at));
                 let now = self.now;
-                let since = *self.pooled_at(key).missing_since.get_or_insert(now);
-                if since.saturating_add(T_PARK) <= now {
+                let pooled = self.pooled_at(key);
+                let since = *pooled.missing_since.get_or_insert(now);
+                let wait_over = since.saturating_add(T_PARK) <= now;
+                let last_check = wait_over && arrived && !pooled.last_check_used;
+                if last_check {
+                    pooled.last_check_used = true;
+                }
+                if (arrived && !wait_over) || last_check {
+                    self.pooled_at(key).hidden = Some(Hidden::Queued);
+                    return;
+                }
+                if wait_over {
+                    let tx_id = self.pooled_at(key).tx.id;
                     // Its job has reported, so there is nothing to cancel.
                     self.pooled_at(key).hidden = Some(Hidden::Queued);
                     self.remove_with_dependents(hash, RemovalReason::Invalidated);
+                    self.cache(tx_id, RejectionScope::ExactTip);
                     return;
                 }
                 let mut on: Vec<transaction::Hash> = Vec::new();
@@ -1685,6 +1754,11 @@ impl PoolModel {
     }
 
     fn start_admission(&mut self, key: u64) {
+        // No new check starts once the slot's time is up.
+        if self.undecided_too_long(key) {
+            self.fail_locally(key, LocalFault::VerifyTimeout);
+            return;
+        }
         let job = JobId(self.fresh());
         let deadline = self.now.saturating_add(T_VERIFY);
         let admission = self.admission_at(key);
@@ -1696,6 +1770,14 @@ impl PoolModel {
             tx: tx_id,
             revalidation: false,
         });
+    }
+
+    /// Whether an admission has held its slot for [`MAX_UNDECIDED`] since
+    /// its body arrived.
+    fn undecided_too_long(&self, key: u64) -> bool {
+        self.admissions[&key]
+            .body_at
+            .is_some_and(|at| at.saturating_add(MAX_UNDECIDED) <= self.now)
     }
 
     /// Cancels the job of an admission that is being verified.
@@ -1748,14 +1830,20 @@ impl PoolModel {
     /// reached, and remembers each as expired. With `with_dependents`, what
     /// depends on it goes too.
     fn remove_expired(&mut self, with_dependents: bool) {
-        let expired: Vec<UnminedTxId> = self
+        let expired: Vec<(UnminedTxId, bool)> = self
             .pool
             .values()
             .filter(|pooled| pooled.tx.expiry.is_some_and(|expiry| self.tip >= expiry))
-            .map(|pooled| pooled.tx.id)
+            .map(|pooled| (pooled.tx.id, pooled.hidden.is_none()))
             .collect();
-        for tx_id in expired {
-            if with_dependents {
+        for (tx_id, visible) in expired {
+            // A hidden transaction has not been checked against the chain
+            // since a reorg or a missed event. It may have been mined in a
+            // block the core did not see, and then what spends its outputs
+            // is still valid. So only a visible one takes its dependents
+            // with it. A hidden one's dependents are hidden too, and are
+            // checked when their turn comes.
+            if with_dependents && visible {
                 self.remove_with_dependents(tx_id.mined_id(), RemovalReason::Expired);
             } else if let Some(key) = self.pooled.get(&tx_id.mined_id()).copied() {
                 self.remove_one(key, RemovalReason::Expired);

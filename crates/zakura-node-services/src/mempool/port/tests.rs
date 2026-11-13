@@ -19,8 +19,8 @@ use zakura_chain::{
 use super::{
     model::{
         Effect, JobId, ModelBlock, ModelReader, ModelTransition, ModelTx, ModelUnreserved,
-        ModelVerdict, Outcome, OutputAnswer, PoolModel, Step, WaiterId, COOLDOWN, REJECTION_MEMORY,
-        REVALIDATE_RETRY, T_PARK, T_VERIFY,
+        ModelVerdict, Outcome, OutputAnswer, PoolModel, Step, WaiterId, COOLDOWN, MAX_UNDECIDED,
+        REJECTION_MEMORY, REVALIDATE_RETRY, T_PARK, T_VERIFY,
     },
     pool_port, ChainReason, ChainTip, Change, ChangeLog, ChangeSeq, ChangesSince, Charge,
     CooldownKey, Generation, GenerationCell, GenerationRead, Intent, LocalFault, NoRoom,
@@ -3346,4 +3346,194 @@ fn waiting_for_one_output_and_leaving_many_times_keeps_nothing() {
     // kept for a caller that left.
     assert_eq!(model.output_waiters(), 0);
     assert_eq!(model.output_waits(), 0);
+}
+
+// Cases from the eighth review.
+
+#[test]
+fn an_expired_hidden_parent_does_not_take_its_child_with_it() {
+    let mut model = new_model();
+    let mut parent = tx(1);
+    parent.expiry = Some(Height(102));
+    admit(&mut model, parent, 1, 0);
+    let (waiter, job) = bring_in(&mut model, child_of(2, 1), legacy(2));
+    let step = model.outcome(
+        job,
+        Outcome::PassUsing(vec![output(1, 0)]),
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+    assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
+
+    // A missed block at 101 mined the parent. The resync is before its
+    // expiry height, so both are hidden and waiting to be checked.
+    model.resync(Height(101), Generation(1), secs(1));
+    assert_eq!(model.hidden(), vec![id(1), id(2)]);
+
+    // The next block reaches the parent's expiry height before its check
+    // has answered. The core does not know yet that the parent was mined.
+    let step = model.transition(transition(2, 102, vec![vec![]]), secs(2));
+    assert_eq!(
+        step.changes,
+        vec![Change::Removed {
+            id: id(1),
+            reason: RemovalReason::Expired
+        }]
+    );
+    // The child stays, hidden, and is checked against the chain.
+    assert_eq!(model.hidden(), vec![id(2)]);
+    model.assert_invariants();
+}
+
+#[test]
+fn a_visible_expired_parent_still_takes_its_child_with_it() {
+    let mut model = new_model();
+    let mut parent = tx(1);
+    parent.expiry = Some(Height(101));
+    admit(&mut model, parent, 1, 0);
+    let (_, job) = bring_in(&mut model, child_of(2, 1), legacy(2));
+    model.outcome(
+        job,
+        Outcome::PassUsing(vec![output(1, 0)]),
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+    // Every block was seen, and none mined the parent. It expired unmined,
+    // so its output will never exist.
+    let step = model.transition(transition(1, 101, vec![vec![]]), secs(1));
+    assert_eq!(step.changes.len(), 2);
+    assert!(model.visible().is_empty() && model.hidden().is_empty());
+}
+
+#[test]
+fn inputs_that_arrive_one_at_a_time_earn_one_check_after_the_wait_and_no_more() {
+    let mut model = new_model();
+    // The child spends three parents. The first never arrives.
+    let child = tx(9)
+        .spending(hash(1), 0)
+        .spending(hash(2), 0)
+        .spending(hash(3), 0);
+    let (waiter, job) = bring_in(&mut model, child, legacy(9));
+    model.outcome(
+        job,
+        Outcome::MissingInputs(vec![output(1, 0), output(2, 0), output(3, 0)]),
+        stable(0),
+        stable(0),
+        secs(0),
+    );
+
+    // After the wait has ended a block wakes the child, and while it is
+    // checked the second parent arrives. That earns one more check.
+    let step = model.transition(transition(1, 101, vec![vec![tx(50)]]), secs(59));
+    assert!(step.started().is_empty());
+    let step = model.resync(Height(102), Generation(2), secs(61));
+    let job = step.started()[0];
+    admit(&mut model, tx(2), 2, 2);
+    let step = model.outcome(
+        job,
+        Outcome::MissingInputs(vec![output(1, 0), output(2, 0), output(3, 0)]),
+        stable(2),
+        stable(2),
+        secs(62),
+    );
+    let job = the_job(&step);
+    assert_eq!(step.verdict(waiter), None);
+
+    // During that check the third parent arrives too. The first is still
+    // missing, and the one extra check is used up.
+    admit(&mut model, tx(3), 3, 2);
+    let step = model.outcome(
+        job,
+        Outcome::MissingInputs(vec![output(1, 0), output(3, 0)]),
+        stable(2),
+        stable(2),
+        secs(63),
+    );
+    assert_eq!(
+        step.verdict(waiter),
+        Some(rejected(RejectionScope::ExactTip, Charge::None))
+    );
+    assert!(step.started().is_empty());
+}
+
+#[test]
+fn a_hidden_transaction_whose_parent_never_returns_is_remembered_too() {
+    let mut model = new_model();
+    admit(&mut model, child_of(2, 1), 2, 0);
+    let step = model.transition(reorg(1, 99), secs(0));
+    model.outcome(the_job(&step), missing(1), stable(1), stable(1), secs(0));
+    model.tick(T_PARK);
+    assert!(model.hidden().is_empty());
+
+    // The same bytes are not fetched again at this tip.
+    assert_eq!(
+        model.reserve(id(2), peer(3), Intent::Fetch, T_PARK),
+        Err(ModelUnreserved::Rejected(RejectionScope::ExactTip))
+    );
+}
+
+#[test]
+fn a_chain_that_changes_during_every_check_cannot_hold_a_slot_for_ever() {
+    let mut model = new_model();
+    let (waiter, mut job) = bring_in(&mut model, tx(1), legacy(1));
+
+    // Every twenty seconds the chain changes, and each verification spans
+    // the change, so no outcome can be trusted and each runs again.
+    let mut now = secs(0);
+    let mut answered = None;
+    for generation in 1..20u64 {
+        now += secs(20);
+        let step = model.outcome(
+            job,
+            Outcome::Pass,
+            stable(generation - 1),
+            stable(generation),
+            now,
+        );
+        if let Some(verdict) = step.verdict(waiter) {
+            answered = Some((now, verdict));
+            break;
+        }
+        let step = model.transition(transition(generation, 100, vec![vec![]]), now);
+        if let Some(verdict) = step.verdict(waiter) {
+            answered = Some((now, verdict));
+            break;
+        }
+        job = step.started()[0];
+    }
+    // The slot comes back when its own time is up. The core never got an
+    // answer it could trust, so this is a local fault and nothing is
+    // remembered against the transaction.
+    assert_eq!(
+        answered,
+        Some((
+            MAX_UNDECIDED,
+            ModelVerdict::LocalFault(LocalFault::VerifyTimeout)
+        ))
+    );
+    assert_eq!(model.slots_in_use(), 0);
+    assert!(model.reserve(id(1), peer(2), Intent::Fetch, now).is_ok());
+}
+
+#[test]
+fn a_slot_is_held_at_most_its_limit_however_the_transaction_is_moved_about() {
+    let mut model = new_model();
+    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    // The outcome waits for a chain event that the reading promised.
+    model.outcome(
+        job,
+        Outcome::Pass,
+        stable(0),
+        GenerationRead::Changing,
+        secs(1),
+    );
+    // No event comes. A tick at the limit ends it.
+    assert_eq!(model.tick(MAX_UNDECIDED - secs(1)).verdict(waiter), None);
+    assert_eq!(
+        model.tick(MAX_UNDECIDED).verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
+    );
+    assert_eq!(model.slots_in_use(), 0);
 }

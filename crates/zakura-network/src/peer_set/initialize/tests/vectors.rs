@@ -570,11 +570,19 @@ async fn unconditional_peer_is_redialed_when_its_connection_closes() {
     tokio::time::sleep(constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY * 3).await;
     let failed_dials = dialer.dial_times().len();
 
-    // It comes back, and its connection stays open long enough to be healthy.
+    // It comes back, and its connection stays open just long enough to be healthy, long
+    // before the delay of the attempt that connected would end.
     dialer.set_dial(UnconditionalPeerDial::ConnectAndStayOpen);
+    tokio::time::timeout(constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY * 2, async {
+        while dialer.dial_times().len() == failed_dials {
+            tokio::time::sleep(constants::UNCONDITIONAL_PEER_CHECK_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the peer is dialed once its delay ends");
     tokio::time::sleep(
-        constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY * 2
-            + constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION * 2,
+        constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION
+            + constants::UNCONDITIONAL_PEER_CHECK_INTERVAL * 2,
     )
     .await;
     assert_eq!(

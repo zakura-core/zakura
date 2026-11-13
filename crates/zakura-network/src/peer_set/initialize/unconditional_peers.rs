@@ -397,6 +397,8 @@ where
                             >= constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION
                         {
                             peer.attempts = 0;
+                            // The delay of the attempt that connected no longer applies.
+                            peer.next_attempt = now;
                         }
                         continue;
                     }

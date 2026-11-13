@@ -61,6 +61,12 @@ use crate::{
 mod tests;
 
 mod recent_by_ip;
+mod unconditional_peers;
+
+use unconditional_peers::{
+    keep_unconditional_peers_connected, leave_out_undialable_unconditional_peers,
+    unconditional_peer_dial_addrs,
+};
 
 /// A successful outbound peer connection attempt or inbound connection handshake.
 ///
@@ -252,6 +258,8 @@ where
         info!("legacy P2P disabled; not opening Zcash protocol listener");
         (None, config.listen_addr)
     };
+    let mut config = config;
+    leave_out_undialable_unconditional_peers(&mut config, listen_addr);
     // Clone the inbound service for the Zakura legacy-gossip sink before the
     // handshake builder consumes the original below. The factory only runs when
     // `v2_p2p` is enabled; otherwise the endpoint is `None` and the clone drops.
@@ -338,7 +346,7 @@ where
             .with_advertised_services(advertised_services)
             .with_user_agent(user_agent)
             .with_latest_chain_tip(latest_chain_tip.clone())
-            .with_peer_registry(peer_registry)
+            .with_peer_registry(peer_registry.clone())
             .with_protected_peer_ips(protected_peer_ips)
             .with_bans(bans.clone())
             .with_tcp_warmup(peer::TcpWarmup::spawn(
@@ -410,7 +418,7 @@ where
     ];
 
     if let Some(tcp_listener) = tcp_listener {
-        // Connect peerset_tx to the 3 peer sources:
+        // Connect peerset_tx to the 4 peer sources:
         //
         // 1. Incoming peer connections, via a listener.
         let listen_fut = accept_inbound_connections(
@@ -426,7 +434,22 @@ where
             listen_fut.in_current_span(),
         ))));
 
-        // 2. Initial peers, specified in the config and cached on disk.
+        // 2. Unconditional peers, which are dialed again whenever they are not connected.
+        let unconditional_dial_addrs = unconditional_peer_dial_addrs(&config, listen_addr);
+        if !unconditional_dial_addrs.is_empty() {
+            let unconditional_peers_fut = keep_unconditional_peers_connected(
+                config.clone(),
+                unconditional_dial_addrs,
+                peer_registry,
+                outbound_connector.clone(),
+                peerset_tx.clone(),
+            );
+            task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
+                unconditional_peers_fut.in_current_span(),
+            ))));
+        }
+
+        // 3. Initial peers, specified in the config and cached on disk.
         let initial_peers_fut = add_initial_peers(
             config.clone(),
             outbound_connector.clone(),
@@ -436,7 +459,7 @@ where
         let initial_peers_join =
             AbortOnDropHandle::new(tokio::spawn(erased(initial_peers_fut.in_current_span())));
 
-        // 3. Outgoing peers we connect to in response to load.
+        // 4. Outgoing peers we connect to in response to load.
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
 
         // Wait for the initial seed peer count
@@ -719,8 +742,10 @@ where
 /// `peerset_initial_target_size`.
 ///
 /// Returns the first candidates in the order provided by [`Config::initial_peers`],
-/// skipping addresses that exceed the per-IP connection limit. Skipped addresses
-/// do not consume a startup slot; later candidates can fill it.
+/// skipping the addresses of dialed unconditional peers, which have slots of their own,
+/// and addresses that exceed the per-IP connection limit. Each dialed unconditional peer
+/// counts against the limit of its IP, so a startup dial never takes the room it needs.
+/// Skipped addresses do not consume a startup slot; later candidates can fill it.
 ///
 /// Also sends every initial peer to the `address_book_updater`.
 async fn limit_initial_peers(
@@ -729,7 +754,13 @@ async fn limit_initial_peers(
 ) -> IndexSet<PeerSocketAddr> {
     let all_peers = config.initial_peers().await;
     let mut initial_peers = IndexSet::new();
+    let unconditional_dial_addrs = config
+        .unconditional_peers
+        .dial_addrs(config.network.default_port());
     let mut selected_per_ip = HashMap::new();
+    for addr in &unconditional_dial_addrs {
+        *selected_per_ip.entry(addr.ip()).or_insert(0) += 1;
+    }
 
     // Config has validated and interleaved cached peers with shuffled seeds.
     // Feed every candidate to discovery, even beyond the startup dial limit.
@@ -737,8 +768,12 @@ async fn limit_initial_peers(
         let _ = address_book_updater
             .send(MetaAddr::new_initial_peer(peer))
             .await;
+        let canonical_peer = canonical_peer_addr(peer);
+        if unconditional_dial_addrs.contains(&canonical_peer) {
+            continue;
+        }
         if initial_peers.len() < config.peerset_initial_target_size {
-            let count = selected_per_ip.entry(peer.ip()).or_insert(0);
+            let count = selected_per_ip.entry(canonical_peer.ip()).or_insert(0);
             if *count < config.max_connections_per_ip {
                 initial_peers.insert(peer);
                 *count += 1;
@@ -810,6 +845,9 @@ const MIN_INBOUND_ACCEPT_BURST_INTERVAL: Duration = Duration::from_millis(100);
 /// Limits the number of active inbound connections based on `config`,
 /// and waits `min_inbound_peer_connection_interval` between connections.
 ///
+/// The unconditional peers that Zakura dials also share slots of their own, outside
+/// that limit, see [`Config::unconditional_peer_connection_limit`].
+///
 /// A bounded accept burst drains connections that are already queued by the
 /// kernel. Without it, the normal one-second handshake pacing can keep a full
 /// listen backlog from ever reaching a configured local sidecar connection.
@@ -837,6 +875,10 @@ where
     );
     let mut active_zcashd_compat_connections =
         ActiveConnectionCounter::new_counter_with(1, "zcashd-compat Inbound Connection");
+    let mut active_unconditional_connections = ActiveConnectionCounter::new_counter_with(
+        config.unconditional_peer_connection_limit(),
+        "Unconditional Peer Inbound Connections",
+    );
     let zcashd_compat_peer_ips: HashSet<_> = zcashd_compat_peer_ips
         .into_iter()
         .map(|ip| canonical_socket_addr(SocketAddr::new(ip, 0)).ip())
@@ -894,30 +936,36 @@ where
             let active_public_inbound_connections = active_inbound_connections.update_count();
             let active_zcashd_compat_inbound_connections =
                 active_zcashd_compat_connections.update_count();
+            let active_unconditional_inbound_connections =
+                active_unconditional_connections.update_count();
             let active_total_inbound_connections =
                 active_public_inbound_connections + active_zcashd_compat_inbound_connections;
             let canonical_ip = canonical_socket_addr(addr.remove_socket_addr_privacy()).ip();
             let is_zcashd_compat_peer = zcashd_compat_peer_ips.contains(&canonical_ip);
-            let connection_tracker = if is_zcashd_compat_peer {
-                if active_zcashd_compat_inbound_connections >= zcashd_compat_reserved_slots
-                    || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
-                {
-                    // Too many zcashd-compat or total open inbound connections already.
-                    // Close the connection.
-                    std::mem::drop(tcp_stream);
-                    // Allow invalid connections to be cleared quickly,
-                    // but still put a limit on our CPU and network usage from failed connections.
-                    tokio::time::sleep(constants::MIN_INBOUND_PEER_FAILED_CONNECTION_INTERVAL)
-                        .await;
-                    continue;
-                }
-
+            let connection_tracker = if is_zcashd_compat_peer
+                && active_zcashd_compat_inbound_connections < zcashd_compat_reserved_slots
+                && active_total_inbound_connections < config.peerset_inbound_connection_limit()
+            {
                 active_zcashd_compat_connections.track_connection()
-            } else if active_public_inbound_connections >= public_inbound_connection_limit
+            } else if config.unconditional_peers.is_dial_address(addr.ip())
+                && active_unconditional_inbound_connections
+                    < config.unconditional_peer_connection_limit()
+                && active_unconditional_connections.connections_from(canonical_ip)
+                    < config.max_connections_per_ip
+            {
+                // These slots skip the wait between inbound connections from one IP, so a
+                // dialed peer that lost its connection can reconnect at once. One IP holds
+                // at most `max_connections_per_ip` of them, so it cannot take the slot of
+                // another listed peer. A peer that gets no slot here competes for a public
+                // slot, and waits like any other.
+                active_unconditional_connections.track_connection_from(canonical_ip)
+            } else if is_zcashd_compat_peer
+                || active_public_inbound_connections >= public_inbound_connection_limit
                 || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
                 || recent_inbound_connections.is_past_limit_or_add(addr.ip())
             {
-                // Too many open inbound connections or pending handshakes already.
+                // A zcashd-compat peer never takes a public slot. Otherwise there are too
+                // many open inbound connections or pending handshakes already.
                 // Close the connection.
                 std::mem::drop(tcp_stream);
                 // Allow invalid connections to be cleared quickly,

@@ -521,6 +521,45 @@ fn test_reconnection_peers_skips_recently_updated_ip<
     }
 }
 
+/// The crawler's candidates leave out every address on the IP of a dialed unconditional
+/// peer, whatever its port, so another node on that IP cannot take the room the listed
+/// peer needs. Addresses on other IPs, including those only in a listed range, stay.
+#[test]
+fn reconnection_peers_leave_out_dialed_unconditional_peer_ips() {
+    let listed: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let same_ip: crate::PeerSocketAddr = "127.0.0.1:18233".parse().unwrap();
+    let in_range: crate::PeerSocketAddr = "127.0.0.4:8233".parse().unwrap();
+    let other: crate::PeerSocketAddr = "127.0.0.3:8233".parse().unwrap();
+
+    let unconditional_peers: UnconditionalPeers = ["127.0.0.1/32", "127.0.0.4/30"]
+        .iter()
+        .map(|net| net.parse::<ipnet::IpNet>().unwrap())
+        .collect();
+    let addrs = [listed, same_ip, in_range, other]
+        .map(|addr| {
+            MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, DateTime32::MIN)
+        })
+        .to_vec();
+    let address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        addrs,
+    )
+    .with_unconditional_peers(unconditional_peers);
+
+    let candidates: std::collections::HashSet<_> = address_book
+        .reconnection_peers(Instant::now(), Utc::now())
+        .map(|peer| peer.addr)
+        .collect();
+    assert_eq!(
+        candidates,
+        std::collections::HashSet::from([in_range, other])
+    );
+}
+
 /// Helper: build an address book with `unconditional_peers`, containing a
 /// responded entry for each of `addrs`.
 fn address_book_with_unconditional_peers(

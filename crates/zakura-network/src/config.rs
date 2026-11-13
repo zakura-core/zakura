@@ -366,22 +366,46 @@ pub struct Config {
     /// to logs, trace directories, and downstream monitoring systems.
     pub expose_peer_addresses: bool,
 
-    /// Peer IP addresses and CIDR ranges that Zakura never scores or bans.
+    /// Peers that Zakura never scores or bans, and keeps connected where it can.
     ///
-    /// Each entry is an IP address, such as `"192.0.2.1"`, or a CIDR range, such as
+    /// Each entry is an IP address, such as `"192.0.2.1"`, an IP address and port, such
+    /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, or a CIDR range, such as
     /// `"2001:db8::/32"`. CIDR ranges with host bits set are rejected.
+    /// Use this setting for peers you operate, such as your own nodes, miners, or
+    /// sidecars.
+    ///
     /// Zakura ignores misbehavior reports for these peers, so their
-    /// misbehavior score stays at zero and Zakura never bans their IP address. Use this
-    /// setting for peers you operate, such as your own nodes, miners, or sidecars, so
-    /// that tip lag, upgrade boundaries, or bugs cannot get them banned.
+    /// misbehavior score stays at zero and Zakura never bans their IP address. Tip lag,
+    /// upgrade boundaries, or bugs cannot get them banned. This also exempts them from
+    /// mempool cooldowns and their disconnects.
     ///
-    /// This setting exempts peers from misbehavior scores, bans, and mempool
-    /// cooldowns and their disconnects. Zakura still applies connection limits to these
-    /// peers, and still disconnects them on protocol
-    /// errors or inbound overload.
+    /// Zakura also dials every entry that names one address, and dials it again whenever
+    /// no connection to that peer is open, in either direction. An entry without a port
+    /// is dialed on the network's default port. A CIDR range is only dialed when it
+    /// covers a single address, such as `"192.0.2.1/32"`. A dial to a peer that accepts
+    /// no connections fails quietly, and each failure doubles the delay before the next
+    /// dial, up to ten minutes. Zakura keeps at most `max_connections_per_ip` connections
+    /// to one IP, so it does not dial further entries on that IP.
     ///
-    /// Entries match legacy peer IP addresses. An IPv4 entry also matches the
-    /// IPv4-mapped IPv6 form of the same address. The default is empty.
+    /// Each dialed address adds one outbound and one inbound connection slot on top of the
+    /// connection limits. Zakura dials each address on an outbound slot of its own, so a
+    /// full outbound peer set never blocks the dial. Its other dials leave the address the
+    /// room it needs under `max_connections_per_ip`: the startup dials to seed and cached
+    /// peers leave it out and count it against its IP's limit, and the crawler never
+    /// dials its IP. The inbound slots are a pool that only dialed addresses
+    /// can use, so a node whose other inbound slots are full still accepts a listed peer
+    /// that dials it, unless connections from listed peers already fill the pool. One IP
+    /// holds at most `max_connections_per_ip` of the pool's slots. A connection in the
+    /// pool also skips the wait that Zakura imposes between inbound connections from one
+    /// IP, so a listed peer can reconnect at once. A peer that is only in a range of
+    /// several addresses gets none of this, and nor does an entry that Zakura cannot
+    /// dial, such as its own listener.
+    /// Zakura still applies the per-IP connection limit to these peers, and still
+    /// disconnects them on protocol errors or inbound overload.
+    ///
+    /// Entries match legacy peer IP addresses, and only the legacy P2P stack dials them.
+    /// An IPv4 entry also matches the IPv4-mapped IPv6 form of the same address. The
+    /// default is empty.
     ///
     /// # Security
     ///
@@ -470,7 +494,9 @@ impl Config {
             / OUTBOUND_PEER_LIMIT_DIVISOR
     }
 
-    /// The maximum number of inbound connections that Zakura will accept at the same time.
+    /// The maximum number of inbound connections that Zakura will accept at the same time,
+    /// besides the slots of dialed unconditional peers, see
+    /// [`unconditional_peer_connection_limit`](Self::unconditional_peer_connection_limit).
     /// When this limit is reached, Zakura drops new inbound connections,
     /// without handshaking on them.
     ///
@@ -481,10 +507,28 @@ impl Config {
         self.peerset_initial_target_size * INBOUND_PEER_LIMIT_MULTIPLIER
     }
 
+    /// The maximum number of connections that Zakura opens to stay connected to its
+    /// [`unconditional_peers`](Self::unconditional_peers): one for each dialed address.
+    ///
+    /// These connections are counted separately from
+    /// [`peerset_outbound_connection_limit`](Self::peerset_outbound_connection_limit), so
+    /// a full outbound peer set never blocks them. The inbound listener adds as many
+    /// slots outside
+    /// [`peerset_inbound_connection_limit`](Self::peerset_inbound_connection_limit), as a
+    /// pool that only these peers can use.
+    pub fn unconditional_peer_connection_limit(&self) -> usize {
+        self.unconditional_peers.dial_limit()
+    }
+
     /// The maximum number of inbound and outbound connections that Zakura will have
     /// at the same time.
+    ///
+    /// Each dialed unconditional peer has two slots here, one outbound and one inbound,
+    /// although with the default `max_connections_per_ip` it uses one at a time.
     pub fn peerset_total_connection_limit(&self) -> usize {
-        self.peerset_outbound_connection_limit() + self.peerset_inbound_connection_limit()
+        self.peerset_outbound_connection_limit()
+            + self.peerset_inbound_connection_limit()
+            + 2 * self.unconditional_peer_connection_limit()
     }
 
     /// The most bytes that TCP decoders can hold for incomplete messages across every

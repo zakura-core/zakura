@@ -368,7 +368,9 @@ pub struct AddressBook {
 
     /// Peer IP addresses and ranges that are never scored or banned.
     ///
-    /// The address book drops misbehavior changes for these peers.
+    /// The address book drops misbehavior changes for these peers, and leaves the IPs
+    /// that Zakura dials to stay connected to them out of
+    /// [`reconnection_peers`](Self::reconnection_peers).
     unconditional_peers: UnconditionalPeers,
 
     /// The local listener address.
@@ -997,6 +999,10 @@ impl AddressBook {
 
     /// Return an iterator over peers that are due for a reconnection attempt,
     /// in reconnection attempt order.
+    ///
+    /// Leaves out every address on the IP of a dialed unconditional peer. Zakura keeps
+    /// that peer connected on a slot of its own, and a connection to another node on its
+    /// IP could take the room under `max_connections_per_ip` that the peer needs.
     pub fn reconnection_peers(
         &'_ self,
         instant_now: Instant,
@@ -1012,6 +1018,7 @@ impl AddressBook {
                 // Inbound entries stay in the book for liveness, bans, and per-IP dial
                 // limits, but their ephemeral source ports are not listeners to dial.
                 !peer.is_inbound()
+                    && !self.unconditional_peers.is_dial_address(peer.addr.ip())
                     && peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
                     && self.is_ready_for_connection_attempt_with_ip(&peer.addr.ip(), chrono_now)
             })

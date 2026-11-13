@@ -3,7 +3,7 @@
 //! These types can be used to count any kind of active resource.
 //! But they are currently used to track the number of open connections.
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, net::IpAddr, sync::Arc};
 
 use tokio::sync::mpsc;
 
@@ -15,7 +15,10 @@ use tokio::sync::mpsc;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum ConnectionStatus {
     Opened,
-    Closed,
+
+    /// The connection closed. Holds its IP if the counter counts it per IP, see
+    /// [`ActiveConnectionCounter::track_connection_from`].
+    Closed(Option<IpAddr>),
 }
 
 /// A counter for active connections.
@@ -35,6 +38,10 @@ pub struct ActiveConnectionCounter {
 
     /// The label for this connection counter, typically its type.
     label: Arc<str>,
+
+    /// The number of pending or open connections from each IP, for the trackers that
+    /// [`track_connection_from`](Self::track_connection_from) made.
+    count_by_ip: HashMap<IpAddr, usize>,
 
     /// The channel used to send opened or closed connection notifications.
     status_notification_tx: mpsc::UnboundedSender<ConnectionStatus>,
@@ -74,6 +81,7 @@ impl ActiveConnectionCounter {
             reserved_count: 0,
             limit,
             label: label.into(),
+            count_by_ip: HashMap::new(),
             status_notification_rx,
             status_notification_tx,
         }
@@ -83,7 +91,22 @@ impl ActiveConnectionCounter {
     ///
     /// When the returned tracker is dropped, this counter will be notified, and decreased by 1.
     pub fn track_connection(&mut self) -> ConnectionTracker {
-        ConnectionTracker::new(self)
+        ConnectionTracker::new(self, None)
+    }
+
+    /// Like [`track_connection`](Self::track_connection), and also counts the connection
+    /// against `ip` until the tracker is dropped, see
+    /// [`connections_from`](Self::connections_from).
+    pub fn track_connection_from(&mut self, ip: IpAddr) -> ConnectionTracker {
+        *self.count_by_ip.entry(ip).or_default() += 1;
+        ConnectionTracker::new(self, Some(ip))
+    }
+
+    /// Returns the number of pending or open connections from `ip` that
+    /// [`track_connection_from`](Self::track_connection_from) tracks, as of the last
+    /// [`update_count`](Self::update_count).
+    pub fn connections_from(&self, ip: IpAddr) -> usize {
+        self.count_by_ip.get(&ip).copied().unwrap_or(0)
     }
 
     /// Check for closed connection notifications, and return the current connection count.
@@ -107,8 +130,18 @@ impl ActiveConnectionCounter {
                         "a peer connection was opened",
                     );
                 }
-                ConnectionStatus::Closed => {
+                ConnectionStatus::Closed(ip) => {
                     self.count -= 1;
+
+                    if let Some(ip) = ip {
+                        let connections = self.count_by_ip.get_mut(&ip).expect(
+                            "track_connection_from counted the IP when it made the tracker",
+                        );
+                        *connections -= 1;
+                        if *connections == 0 {
+                            self.count_by_ip.remove(&ip);
+                        }
+                    }
 
                     debug!(
                         open_connections = ?self.count,
@@ -146,6 +179,9 @@ pub struct ConnectionTracker {
     /// connection has been opened and that another notification should not be sent on drop.
     has_marked_open: bool,
 
+    /// The IP that the counter counts this connection against, if any.
+    ip: Option<IpAddr>,
+
     /// The label for this connection counter, typically its type.
     label: Arc<str>,
 }
@@ -171,8 +207,9 @@ impl ConnectionTracker {
     /// Create and return a new active connection tracker, and add 1 to `counter`.
     /// All connection trackers share a label with their connection counter.
     ///
-    /// When the returned tracker is dropped, `counter` will be notified, and decreased by 1.
-    fn new(counter: &mut ActiveConnectionCounter) -> Self {
+    /// When the returned tracker is dropped, `counter` will be notified, and decreased by 1,
+    /// and so is its count for `ip`, if any.
+    fn new(counter: &mut ActiveConnectionCounter, ip: Option<IpAddr>) -> Self {
         counter.reserved_count += 1;
 
         debug!(
@@ -185,6 +222,7 @@ impl ConnectionTracker {
         Self {
             status_notification_tx: counter.status_notification_tx.clone(),
             has_marked_open: false,
+            ip,
             label: counter.label.clone(),
         }
     }
@@ -208,6 +246,8 @@ impl Drop for ConnectionTracker {
         // the count for pending connection attempts and the count for open connections in
         // the active connection tracker.
         self.mark_open();
-        let _ = self.status_notification_tx.send(ConnectionStatus::Closed);
+        let _ = self
+            .status_notification_tx
+            .send(ConnectionStatus::Closed(self.ip));
     }
 }

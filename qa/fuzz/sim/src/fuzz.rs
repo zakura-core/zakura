@@ -13,8 +13,8 @@ pub use zakura_sim::explore::EXPECT_VAR;
 use zakura_sim::{
     explore::{
         feedback::{Feedback, NewCollector},
-        input_path, save_failure, save_input, traces_root, Bucket, Classified, ExploreOutcome,
-        ExploreRun, Worker, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR,
+        input_path, save_failure, save_input, traces_root, violation_panic, Bucket, Classified,
+        ExploreOutcome, ExploreRun, Worker, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR,
     },
     harness::{fixtures, HarnessEntry, RecordError},
     property::PropertyId,
@@ -195,11 +195,7 @@ fn fail(entry: &'static HarnessEntry, input: &[u8], run: &ExploreRun, property: 
     )
     .unwrap_or_else(|error| panic!("harness: saving the input failed: {error}"));
     match saved.trace {
-        Ok(trace) => panic!(
-            "{property}: trace at {}; input at {}",
-            trace.dir.display(),
-            saved.input.display()
-        ),
+        Ok(trace) => panic!("{}", violation_panic(property, &trace.dir, &saved.input)),
         Err(error) => record_failed(property, error, &saved.input),
     }
 }

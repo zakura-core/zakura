@@ -22,7 +22,7 @@ use super::{
 use crate::{
     explore::{
         feedback::{FEEDBACK_LINE, FEEDBACK_VAR},
-        Bucket, ProcessFailure,
+        has_saved_input, violated_property, Bucket, ProcessFailure,
     },
     harness::HarnessEntry,
     seed,
@@ -788,7 +788,7 @@ fn probe_in(
     )?;
     let log = String::from_utf8_lossy(&log);
     let failure = ProcessFailure::of(exit, log.as_bytes());
-    if let Some(failure) = failure.filter(|_| !saved_active_input(&dir.join("sim"))) {
+    if let Some(failure) = failure.filter(|_| !violated_active(&log, &dir.join("sim"))) {
         let tail: Vec<&str> = log.lines().rev().take(20).collect();
         return Err(CampaignError::Refused(format!(
             "fuzzer {} failed its startup probe with {failure:?}:\n{}",
@@ -799,22 +799,20 @@ fn probe_in(
     FeedbackRecord::parse(&log).map_err(CampaignError::Refused)
 }
 
-/// Whether the fuzz target saved an input under `artifacts`'
-/// `inputs/active/<property-id>/`, which it does only for an input that
-/// violates an `Active` property.
-fn saved_active_input(artifacts: &Path) -> bool {
-    let active = artifacts.join("inputs").join(Bucket::Active.name());
-    let Ok(properties) = fs::read_dir(active) else {
-        return false;
-    };
-    properties.flatten().any(|property| {
-        fs::read_dir(property.path()).is_ok_and(|mut inputs| inputs.next().is_some())
-    })
+/// True if `log` holds a fuzz target's panic for a run that violates an
+/// `Active` property, whose input the target saved under `artifacts`. A
+/// harness failure also saves the inputs of the `Active` violations beside
+/// it, but its panic names no property.
+fn violated_active(log: &str, artifacts: &Path) -> bool {
+    log.lines()
+        .filter_map(violated_property)
+        .any(|property| has_saved_input(artifacts, Bucket::Active, property))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::explore::violation_panic;
 
     /// The feedback line parses to its fields, and a log without one has
     /// none.
@@ -831,25 +829,29 @@ mod tests {
         assert!(FeedbackRecord::parse("zakura-sim feedback: backend=x mode=on\n").is_err());
     }
 
-    /// Extra flags can't set what the supervisor sets.
-    /// Only an input under `inputs/active/<property-id>/` counts as a saved
-    /// `Active` violation.
+    /// Only a violation panic whose property has a saved `Active` input
+    /// counts: a harness failure's panic doesn't, nor does an input saved
+    /// in another bucket.
     #[test]
-    fn saved_active_inputs_are_found() {
+    fn violations_need_their_panic_and_saved_input() {
         let artifacts = tempfile::tempdir().unwrap();
-        assert!(!saved_active_input(artifacts.path()));
-        let active = artifacts.path().join("inputs").join("active");
-        let property = active.join("block-sync.payload-inventory-agrees");
-        fs::create_dir_all(&property).unwrap();
-        assert!(!saved_active_input(artifacts.path()));
-        let crash = artifacts.path().join("inputs").join("crash").join("p");
+        let property = "block-sync/payload-inventory-agrees";
+        let panic = violation_panic(property, Path::new("t"), Path::new("i"));
+        let log = format!("thread 'x' panicked at src/fuzz.rs:1:1:\n{panic}\n");
+        assert!(!violated_active(&log, artifacts.path()));
+        let crash = artifacts.path().join("inputs/crash").join(property);
         fs::create_dir_all(&crash).unwrap();
-        fs::write(crash.join("input"), b"").unwrap();
-        assert!(!saved_active_input(artifacts.path()));
-        fs::write(property.join("input"), b"").unwrap();
-        assert!(saved_active_input(artifacts.path()));
+        fs::write(crash.join("a.bin"), b"").unwrap();
+        assert!(!violated_active(&log, artifacts.path()));
+        let active = artifacts.path().join("inputs/active").join(property);
+        fs::create_dir_all(&active).unwrap();
+        fs::write(active.join("a.bin"), b"").unwrap();
+        assert!(violated_active(&log, artifacts.path()));
+        let harness = "thread 'x' panicked at src/fuzz.rs:1:1:\nharness: boom\n";
+        assert!(!violated_active(harness, artifacts.path()));
     }
 
+    /// Extra flags can't set what the supervisor sets.
     #[test]
     fn reserved_flags_are_refused() {
         let budget = |args: &[&str]| Budget {

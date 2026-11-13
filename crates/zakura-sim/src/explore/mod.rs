@@ -105,7 +105,9 @@ pub fn run_bytes<S: Subsystem>(
     let n = input.len().min(S::SCENARIO_BYTES);
     prefix[..n].copy_from_slice(&input[..n]);
     let scenario = S::draw(&prefix);
-    let result = run_harness::<S>(&scenario, Plan::from_fuzz(&input[n..]), sink, extra);
+    let result = crate::acceptance_runs::with_input(input, || {
+        run_harness::<S>(&scenario, Plan::from_fuzz(&input[n..]), sink, extra)
+    });
     let unclean = match &result {
         Ok(report) => {
             report.cleanup.leaked > 0

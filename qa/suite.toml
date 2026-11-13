@@ -321,6 +321,22 @@ build = "sim-asan"
 args = "test --locked -p zakura-rt -p zakura-scheduler --features zakura-scheduler/sanitizer --target x86_64-unknown-linux-gnu --tests"
 timeout-secs = 2700
 
+# zakura-sim's own release and AddressSanitizer runs (sim-7.2): the
+# library's unit tests and every test target a sched-4 certification row
+# maps. `cli` spawns the `zakura-sim` binary, which Cargo builds with the
+# same flags. `tests/suite.rs` fails if a sched-4 target is missing here.
+[[lane]]
+id = "sim-release/zakura-sim"
+build = "sim-release"
+args = "test --locked -p zakura-sim --release --lib --test draws --test race_fixtures --test discovery --test witness --test cli --test replay_exact --test idle --test time --test race_schedules"
+timeout-secs = 2700
+
+[[lane]]
+id = "sim-asan/zakura-sim"
+build = "sim-asan"
+args = "test --locked -p zakura-sim --features zakura-scheduler/sanitizer --target x86_64-unknown-linux-gnu --lib --test draws --test race_fixtures --test discovery --test witness --test cli --test race_schedules"
+timeout-secs = 2700
+
 # Fuzz targets. A `sim` target runs the one harness that
 # qa/fuzz/sim/Cargo.toml's `[package.metadata.zakura-sim.targets]` table
 # maps it to, and starts from that harness's admitted seeds. Its smoke run

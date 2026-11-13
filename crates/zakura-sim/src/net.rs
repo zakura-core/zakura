@@ -62,8 +62,9 @@ struct State {
     admitted: BTreeSet<Link>,
     /// How many of the network's events have been logged.
     seen: usize,
-    /// Each datagram sent and not yet gone: its length and send time.
-    in_flight: BTreeMap<DatagramId, (u64, u64)>,
+    /// Each datagram sent and not yet gone: its length, send time and
+    /// payload digest.
+    in_flight: BTreeMap<DatagramId, (u64, u64, Option<String>)>,
     /// The run's wire-event stamps.
     order: WireOrder,
 }
@@ -82,6 +83,9 @@ impl Net {
     /// time the source can't know.
     pub fn new(sim: SimNet, loss_after_admission: bool) -> Self {
         let sim_origin = hooks::now().expect("a Net is made inside a run, after Sim::new");
+        // Set before setup can send, so a send during setup is hashed when,
+        // and only when, the run records its steps.
+        sim.set_payload_digests(RECORDS_STEPS.with(std::cell::Cell::get));
         let std_origin = zakura_rt::time::Instant::now().into_std();
         assert!(
             !sim.events()
@@ -243,9 +247,10 @@ impl ActionSource for Net {
         let now = nanos(hooks::now().expect("a run observes its sources inside the run"));
         for event in events {
             let (id, outcome) = match event {
-                NetEvent::Sent { id, len } => {
+                NetEvent::Sent { id, len, digest } => {
+                    let digest = digest.map(|digest| crate::trace::meta::hex(&digest));
                     // usize always fits in u64 on supported targets.
-                    state.in_flight.insert(id, (len as u64, now));
+                    state.in_flight.insert(id, (len as u64, now, digest));
                     (id, DatagramOutcome::Sent)
                 }
                 NetEvent::Delivered { id } => (id, DatagramOutcome::Delivered),
@@ -259,8 +264,8 @@ impl ActionSource for Net {
                 } => (id, DatagramOutcome::Unbound),
                 NetEvent::Bound { .. } | NetEvent::Unbound { .. } => continue,
             };
-            let (len, sent_at) = match outcome {
-                DatagramOutcome::Sent => state.in_flight[&id],
+            let (len, sent_at, digest) = match outcome {
+                DatagramOutcome::Sent => state.in_flight[&id].clone(),
                 _ => state.in_flight.remove(&id).ok_or_else(|| {
                     format!("datagram {id:?} left the network without a send the source saw")
                 })?,
@@ -271,6 +276,7 @@ impl ActionSource for Net {
                 len,
                 outcome,
                 sent_at,
+                digest,
             });
         }
         Ok(())
@@ -290,6 +296,11 @@ impl ActionSource for Net {
         }
     }
 
+    /// Hashes each payload at its send while the run records its steps.
+    fn record_contents(&mut self, on: bool) {
+        self.0.borrow().sim.set_payload_digests(on);
+    }
+
     /// Nothing: the network has no holds.
     fn enter_drain(&mut self, _log: &mut ObservationLog) {}
 
@@ -297,5 +308,31 @@ impl ActionSource for Net {
     /// `recovery` reports that window.
     fn holds_work(&self) -> Option<String> {
         None
+    }
+}
+
+std::thread_local! {
+    /// Whether the run being set up on this thread records its steps, so
+    /// [`Net::new`] can turn payload hashing on or off before setup sends.
+    /// True outside a [`RecordsSteps`], for a run built by hand.
+    static RECORDS_STEPS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// While alive, has [`Net::new`] hash payloads only if the run being set
+/// up on this thread records its steps. Dropping it restores the previous
+/// setting, even on a panic.
+pub(crate) struct RecordsSteps(bool);
+
+impl RecordsSteps {
+    /// Sets the setting to `records_steps` until the guard drops.
+    pub(crate) fn set(records_steps: bool) -> Self {
+        RecordsSteps(RECORDS_STEPS.with(|cell| cell.replace(records_steps)))
+    }
+}
+
+impl Drop for RecordsSteps {
+    /// Puts the previous setting back.
+    fn drop(&mut self) {
+        RECORDS_STEPS.with(|cell| cell.set(self.0));
     }
 }

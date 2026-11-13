@@ -688,6 +688,7 @@ pub fn smoke_command(
         .args(files)
         .env(STATS_VAR, dir.join("stats"))
         .env(ARTIFACTS_VAR, dir.join("sim"))
+        .env(crate::acceptance_runs::PHASE_VAR, "fuzz-target")
         .env_remove(EXPECT_VAR)
         .env_remove(ABANDON_LIMIT_VAR);
     command

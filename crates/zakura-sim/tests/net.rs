@@ -275,6 +275,7 @@ fn echo_runs_under_sim() {
                 len,
                 outcome,
                 sent_at,
+                ..
             } = obs
             else {
                 unreachable!("`datagrams` keeps only datagrams");
@@ -354,6 +355,77 @@ fn deadlines_for_a_send(before: Duration, after: Duration) -> (Vec<SimInstant>, 
         })
         .expect("the datagram was sent");
     (deadlines.into_inner(), sent_at)
+}
+
+/// Runs one task that sends `payload` from `addr(1)` to `addr(2)`, keeping
+/// its records in `sink`.
+fn send_payload(payload: &'static [u8], sink: &mut dyn zakura_sim::RecordSink) -> RunReport {
+    let mut sim = Sim::new(run_config(), Plan::from_fuzz(&[]));
+    let net = scenario(link(100, true)).net();
+    sim.add_source(Box::new(net.clone()));
+    let sim_net = net.sim();
+    let (a, b) = (
+        sim_net.bind(addr(1)).unwrap(),
+        sim_net.bind(addr(2)).unwrap(),
+    );
+    sim.scheduler().spawn_root("t", async move {
+        let transmit = Transmit {
+            destination: addr(2),
+            ecn: None,
+            size: payload.len(),
+            segment_size: None,
+            src_ip: None,
+        };
+        a.try_send(&transmit, payload)
+            .expect("a simulated send never fails");
+    });
+    let report = sim.run(&mut NoChecks, sink);
+    drop(b);
+    report
+}
+
+/// The payload digests a run's datagram observations carry.
+fn payload_digests(report: &RunReport) -> Vec<Option<String>> {
+    datagrams(report)
+        .into_iter()
+        .map(|(_, obs)| match obs {
+            Observation::Datagram { digest, .. } => digest,
+            _ => unreachable!("`datagrams` keeps only datagrams"),
+        })
+        .collect()
+}
+
+/// A run that records its steps hashes each payload, so two runs that send
+/// different bytes of one length differ in their step digests. A run whose
+/// sink wants no steps, such as a fuzz iteration's, hashes nothing.
+#[test]
+fn recorded_steps_tell_equal_length_payloads_apart() {
+    let (mut hello, mut hellp) = (MemorySink::default(), MemorySink::default());
+    let hello_run = send_payload(b"hello", &mut hello);
+    let hellp_run = send_payload(b"hellp", &mut hellp);
+    // The datagram's send and its delivery both carry the send's digest.
+    let digests = payload_digests(&hello_run);
+    let [Some(hello_digest), rest @ ..] = &digests[..] else {
+        panic!("a hashed send: {digests:?}")
+    };
+    assert!(
+        rest.iter().all(|d| d.as_ref() == Some(hello_digest)),
+        "{digests:?}"
+    );
+    assert_eq!(hello_digest.len(), 64, "a SHA-256 in hex");
+    assert_ne!(payload_digests(&hello_run), payload_digests(&hellp_run));
+    assert_ne!(
+        hello.lines(),
+        hellp.lines(),
+        "one changed byte at one length changes the trace"
+    );
+
+    let unrecorded = send_payload(b"hello", &mut zakura_sim::NullSink);
+    let digests = payload_digests(&unrecorded);
+    assert!(
+        !digests.is_empty() && digests.iter().all(Option::is_none),
+        "{digests:?}"
+    );
 }
 
 /// The clock map holds after virtual time has moved and in a second run:

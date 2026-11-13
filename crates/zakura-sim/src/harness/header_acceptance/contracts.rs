@@ -168,6 +168,11 @@ const C3_PROVING: &[TestRef] = &[
     sim_test(REPLAY_EXACT, "drain_picks_replay"),
     sim_test(REPLAY_EXACT, "harness_failure_before_a_prefix_ends_fails"),
     sim_test(REPLAY_EXACT, "planted_host_clock_is_nondeterministic"),
+    sim_test(REPLAY_EXACT, "planted_payload_byte_is_nondeterministic"),
+    sim_test(
+        REPLAY_EXACT,
+        "changed_setup_observation_is_nondeterministic",
+    ),
     sim_test(REPLAY_EXACT, "effects_replay_child"),
     sim_test(REPLAY_EXACT, "effects_replay_in_a_fresh_process"),
     sim_test(REPLAY_EXACT, "replay_returns_the_violations_end_leaves_out"),

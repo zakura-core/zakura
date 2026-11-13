@@ -54,6 +54,40 @@ fn record_an_input() {
     );
 }
 
+/// `--measure` writes the run's steps, timing, trace size and stack pool.
+#[test]
+fn record_measures_its_run() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input");
+    std::fs::write(&input, [0, 1, 7, 3, 9, 1, 4, 2]).unwrap();
+    let out = dir.path().join("trace");
+    let measure = dir.path().join("measure.json");
+    let output = zakura_sim(&[
+        "record",
+        "--sim",
+        "discovery/wait-complete",
+        "--input",
+        input.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--measure",
+        measure.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let trace = TraceReader::open(&out).unwrap();
+    let measured: Value = serde_json::from_slice(&std::fs::read(&measure).unwrap()).unwrap();
+    assert_eq!(measured["steps"], trace.end.unwrap().steps);
+    assert_eq!(
+        measured["trace_bytes"],
+        std::fs::metadata(out.join("trace.jsonl")).unwrap().len()
+    );
+    assert!(measured["wall_ns"].as_u64().unwrap() > 0);
+    assert!(
+        measured["stack_pool"]["allocated"].as_u64().unwrap() > 0,
+        "{measured}"
+    );
+}
+
 #[test]
 fn record_a_plan_against_a_scenario() {
     let dir = TempDir::new().unwrap();

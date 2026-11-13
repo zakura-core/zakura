@@ -192,6 +192,28 @@ Before it panics, the target prints `zakura-sim-fuzz harness: <name>`. An
 abort, a stack overflow, a sanitizer report or a timeout still crashes the
 process, so `tmin`'s output is only a candidate.
 
+## Replay a trace
+
+A trace replays only on a build equivalent to the one that recorded it
+(`BuildInfo::equivalent`): same sources, same build flags, same profile. A
+trace from a clean debug simulator build replays from the checkout:
+
+```bash
+cargo xtask replay <trace dir>
+```
+
+`--observe` also writes the run's full observation log beside the trace,
+and `--allow-build-mismatch` replays on another build for diagnosis only,
+never as a success.
+
+A release trace, or one recorded on a patched checkout, needs the exact
+executable that recorded it. An acceptance archive keeps each one by its
+SHA-256, and its index names the executable for each trace:
+
+```bash
+<archive>/bin/<sha256>/zakura-sim replay <trace dir>
+```
+
 ## Minimizing a crash
 
 `cargo xtask sim-minimize` runs `tmin` with that variable set, and keeps a

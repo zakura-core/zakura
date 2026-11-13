@@ -256,8 +256,10 @@ fn record_and_replay(
     step: u64,
     partial: &Path,
 ) -> Result<Trace, Unchecked> {
-    let (trace, recorded) =
-        record_on_new_thread(harness, scenario, input, partial).map_err(Unchecked::Error)?;
+    let (trace, recorded) = crate::acceptance_runs::with_role("record", || {
+        record_on_new_thread(harness, scenario, input, partial)
+    })
+    .map_err(Unchecked::Error)?;
     let found = violated_at(&recorded, property);
     if found != Some(step) {
         return Err(Unchecked::Diverged(Box::new(Runs {
@@ -274,7 +276,9 @@ fn record_and_replay(
             replay: None,
         })));
     }
-    let (replayed, replay) = replay_keeping_on_new_thread(trace.clone(), harness);
+    let (replayed, replay) = crate::acceptance_runs::with_role("replay", || {
+        replay_keeping_on_new_thread(trace.clone(), harness)
+    });
     let detail = match replayed {
         Err(error) => format!("the replay of the recording failed: {error}"),
         Ok(replayed) if !replayed.verified() => {
@@ -514,11 +518,14 @@ pub(super) fn on_new_thread<T: Send + 'static>(
     // The caller's `Draft` override is run configuration, so the run on the
     // new thread keeps it.
     let draft = crate::harness::draft();
+    // So is the run's acceptance context, its input and role.
+    let context = crate::acceptance_runs::current();
     thread::Builder::new()
         .name("zakura-sim-run".to_owned())
         .spawn(move || {
-            let outcome =
-                panic::catch_unwind(AssertUnwindSafe(|| crate::harness::with_draft(&draft, job)));
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                crate::acceptance_runs::within(context, || crate::harness::with_draft(&draft, job))
+            }));
             let clean = matches!(outcome, Ok((_, true)));
             // The caller waits on this, so the send can't fail.
             let _ = done.send(outcome.map(|(value, _)| value));

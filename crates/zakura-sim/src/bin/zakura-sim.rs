@@ -102,10 +102,10 @@ mod cli {
             "Usage:\n  \
              zakura-sim record --sim <name> --input <file> --out <dir>\n      \
              [--witness <property> --expect <holds|violated|applicable|violated-set|not-applicable>\n      \
-             [--also-violates <ids>]] [--draft <ids>]\n  \
+             [--also-violates <ids>]] [--draft <ids>] [--measure <file>]\n  \
              zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>\n      \
              [--witness <property> --expect <holds|violated|applicable|violated-set|not-applicable>\n      \
-             [--also-violates <ids>]] [--draft <ids>]\n  \
+             [--also-violates <ids>]] [--draft <ids>] [--measure <file>]\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n      \
              [--report <file>]\n  \
              zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n  \
@@ -241,6 +241,7 @@ mod cli {
         expect: Option<String>,
         also_violates: Option<String>,
         draft: Option<String>,
+        measure: Option<PathBuf>,
     }
 
     /// `record`: runs one input on a harness and writes the trace.
@@ -323,17 +324,19 @@ mod cli {
             .draft
             .map(|ids| ids.split(',').map(str::to_owned).collect())
             .unwrap_or_default();
+        let started = std::time::Instant::now();
         let Some((property, expect)) = witness else {
             let trace = harness::with_draft(&draft, || harness::record(entry, what, &out))
                 .map_err(|error| Error::Failed(error.to_string()))?;
             print_trace(&trace, &out);
-            return Ok(());
+            return write_measure(flags.measure.as_deref(), &trace, &out, started.elapsed());
         };
         let (trace, result) = harness::with_draft(&draft, || {
             harness::record_witness(entry, what, &out, &property, expect, &also_violates)
         })
         .map_err(|error| Error::Failed(error.to_string()))?;
         print_trace(&trace, &out);
+        write_measure(flags.measure.as_deref(), &trace, &out, started.elapsed())?;
         let error = result.as_ref().err().map(ToString::to_string);
         // `trace` and `source` name the trace this judged and the build
         // that judged it, so the result never counts for another run.
@@ -362,6 +365,47 @@ mod cli {
                 expect.name()
             ))),
         }
+    }
+
+    /// Writes `--measure`'s file, if one was asked for: the run's steps, the
+    /// `elapsed` wall time of recording it (the run, its trace and any
+    /// witness check), steps per second, the trace's bytes, and this
+    /// thread's coroutine stack pool after the run (sched-4's measurements).
+    /// Stack depth isn't measured.
+    fn write_measure(
+        file: Option<&Path>,
+        trace: &trace::Trace,
+        out: &Path,
+        elapsed: Duration,
+    ) -> Result<(), Error> {
+        let Some(file) = file else {
+            return Ok(());
+        };
+        let steps = trace
+            .end
+            .as_ref()
+            .expect("record reads the trace back complete")
+            .steps;
+        let trace_bytes = std::fs::metadata(out.join(trace::TRACE_FILE))
+            .map_err(|error| Error::Failed(format!("reading the trace's size: {error}")))?
+            .len();
+        let secs = elapsed.as_secs_f64();
+        // u64 to f64 loses precision only past 2^53 steps.
+        let steps_per_sec = if secs > 0.0 { steps as f64 / secs } else { 0.0 };
+        let pool = zakura_scheduler::stack_pool();
+        let measure = json!({
+            "steps": steps,
+            "wall_ns": u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            "steps_per_sec": steps_per_sec,
+            "trace_bytes": trace_bytes,
+            "stack_pool": {
+                "allocated": pool.allocated,
+                "freed": pool.freed,
+                "idle": pool.idle,
+            },
+        });
+        std::fs::write(file, format!("{measure}\n"))
+            .map_err(|error| Error::Failed(format!("writing {}: {error}", file.display())))
     }
 
     /// Prints where `trace` went and how its run ended.
@@ -1181,6 +1225,7 @@ mod cli {
                 "--expect" => flags.expect.replace(value).is_some(),
                 "--also-violates" => flags.also_violates.replace(value).is_some(),
                 "--draft" => flags.draft.replace(value).is_some(),
+                "--measure" => flags.measure.replace(value.into()).is_some(),
                 _ => return Err(Error::Usage(format!("unknown flag `{flag}`"))),
             };
             if slot_taken {

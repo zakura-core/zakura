@@ -75,7 +75,7 @@ mod store;
 mod targets;
 mod verify;
 
-pub use build::{build_fuzzer, BuildIdentity, FuzzBuild, FUZZ_PACKAGE, NIGHTLY};
+pub use build::{build_fuzzer, fuzz_source, BuildIdentity, FuzzBuild, FUZZ_PACKAGE, NIGHTLY};
 pub use evidence::{evidence, Evidence, Incomplete, WorkerEvidence};
 pub use manifest::{
     prepare_resume, prepare_start, Budget, FeedbackRecord, HarnessRecord, LimitsRecord, Manifest,

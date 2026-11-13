@@ -28,6 +28,8 @@ zakura-node-services = { path = "../zakura-node-services" }
 zakura-rt = { path = "../zakura-rt" }
 
 [dev-dependencies]
+# `INVALID_COMPACT_DIFFICULTY`, which the workless-header tests use.
+zakura-chain = { path = "../zakura-chain", features = ["proptest-impl"] }
 # Judged auxiliary outcomes, which the repair row tests build directly.
 zakura-header-chain = { path = "../zakura-header-chain", features = ["test-support"] }
 # A paused clock for the lease idle-deadline tests.

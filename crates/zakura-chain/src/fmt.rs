@@ -13,16 +13,20 @@ pub mod time;
 pub use time::{duration_short, humantime_milliseconds, humantime_seconds};
 
 /// Wrapper to override `Debug`, redirecting it to only output the type's name.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
+///
+/// Property tests use it to keep failure output short.
+#[cfg(any(test, feature = "proptest-impl"))]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Arbitrary)]
 pub struct TypeNameToDebug<T>(pub T);
 
+#[cfg(any(test, feature = "proptest-impl"))]
 impl<T> fmt::Debug for TypeNameToDebug<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(std::any::type_name::<T>())
     }
 }
 
+#[cfg(any(test, feature = "proptest-impl"))]
 impl<T> ops::Deref for TypeNameToDebug<T> {
     type Target = T;
 
@@ -31,12 +35,14 @@ impl<T> ops::Deref for TypeNameToDebug<T> {
     }
 }
 
+#[cfg(any(test, feature = "proptest-impl"))]
 impl<T> ops::DerefMut for TypeNameToDebug<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
+#[cfg(any(test, feature = "proptest-impl"))]
 impl<T> From<T> for TypeNameToDebug<T> {
     fn from(t: T) -> Self {
         Self(t)

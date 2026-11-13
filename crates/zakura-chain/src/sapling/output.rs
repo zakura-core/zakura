@@ -84,6 +84,7 @@ impl Output {
     }
 
     /// Add a V4 transaction wrapper to this output.
+    #[cfg(test)]
     pub fn into_v4(self) -> OutputInTransactionV4 {
         OutputInTransactionV4(self)
     }
@@ -123,6 +124,7 @@ impl OutputInTransactionV4 {
     }
 
     /// Remove the V4 transaction wrapper from this output.
+    #[cfg(test)]
     pub fn into_output(self) -> Output {
         self.0
     }

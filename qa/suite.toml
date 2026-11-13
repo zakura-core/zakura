@@ -363,6 +363,40 @@ name = "sync_wire"
 smoke-secs = 60
 timeout-secs = 1800
 
+# `block-sync/storage`'s two-byte prefix picks a saved scenario or the
+# default one. A generated run takes about 96 s and needs about 7 GB, so the
+# row raises the RSS limit to 8 GiB, and its smoke and scheduled campaign run
+# the admitted seeds alone. libFuzzer runs the whole corpus before it checks
+# `-max_total_time`, and one second has passed by then, so it generates no
+# input, and the cached corpus never grows past the seeds. Long campaigns on a
+# remote host search the harness, as qa/fuzz/sim's README says under Long runs.
+[[target]]
+package = "sim"
+name = "block_sync_storage"
+smoke-secs = 1
+campaign-seconds = 1
+campaign-weekly-seconds = 1
+args = ["-rss_limit_mb=8192"]
+timeout-secs = 3600
+
+# `discovery/wire` runs the discovery node behind its real transport on
+# simulated QUIC. Its two-byte prefix picks a saved Plan's scenario or the
+# default one, so the target fuzzes the schedule of each.
+[[target]]
+package = "sim"
+name = "discovery_wire"
+smoke-secs = 60
+timeout-secs = 1800
+
+# `header-sync/wire` runs the header-sync node behind its real transport on
+# simulated QUIC. Its two-byte prefix picks a saved Plan's scenario or the
+# default one, so the target fuzzes the schedule of each.
+[[target]]
+package = "sim"
+name = "header_sync_wire"
+smoke-secs = 60
+timeout-secs = 1800
+
 # `fixtures/all` picks any race fixture in any variant, so the target's runs
 # cover each fixture's own harness and the fixed variants. Its report must
 # account for each fixture and variant.
@@ -488,21 +522,6 @@ reason = "no target: the harness has four fixed scenarios, the repair fixtures, 
 harness = "header-sync/liveness"
 owner = "E5a"
 reason = "no target: the harness has fixed scenarios, the hdr-10, hdr-11 and hdr-12 liveness fixtures, and no plan maps it to a target"
-
-[[missing-target]]
-harness = "block-sync/storage"
-owner = "E5a"
-reason = "no target yet; `cargo xtask sim-targets` checks one once its table entry, suite row and seeds land"
-
-[[missing-target]]
-harness = "header-sync/wire"
-owner = "E5a"
-reason = "no target yet; `cargo xtask sim-targets` checks one once its table entry, suite row and seeds land"
-
-[[missing-target]]
-harness = "discovery/wire"
-owner = "fuzz-10"
-reason = "no target yet; no plan maps it to a target, and disc-3 registers the properties one would check"
 
 # Planned rows from campaign.md's requirement map and the P4 plan. Each
 # stays in the report as unimplemented until its chunk registers it, and

@@ -372,6 +372,7 @@ impl NonEmptyHistoryTree {
     }
 
     /// Extend the history tree with the given blocks.
+    #[cfg(test)]
     pub fn try_extend<
         'a,
         T: IntoIterator<

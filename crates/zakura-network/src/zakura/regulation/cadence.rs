@@ -41,7 +41,7 @@ use crate::zakura::{
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod fuzz;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use fuzz::{replay_cadence_bytes, CadenceReplaySummary};
@@ -357,6 +357,7 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
     ///
     /// A value whose previous frame is still unwritten is due as soon as that
     /// write finishes; poll [`Self::send_due`] again after writes progress.
+    #[cfg(test)]
     pub(crate) fn next_due(&self) -> Option<Instant> {
         self.slots
             .iter()

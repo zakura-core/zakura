@@ -595,7 +595,11 @@ impl ChainTipChange {
     /// - `None` if there has been no change.
     ///
     /// See [`Self::wait_for_tip_change`] for details.
+    //
+    // The mempool calls this every time it is polled, so the span is trace level:
+    // at any other log level it is not created and its fields are not formatted.
     #[instrument(
+        level = "trace",
         skip(self),
         fields(
             last_change_hash = ?self.last_change_hash,

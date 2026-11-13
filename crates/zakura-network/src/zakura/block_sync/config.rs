@@ -572,6 +572,7 @@ impl ZakuraBlockSyncConfig {
 
     /// The most request bytes one session may have reserved:
     /// `C + (floor_bypass_slots + 1)·k·B`. The default is 32 MiB + 3 × 2 MB.
+    #[cfg(test)]
     pub fn owner_reservation_ceiling(&self) -> u64 {
         self.owner_reservation_cap().floor
     }

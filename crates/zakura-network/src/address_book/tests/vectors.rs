@@ -206,6 +206,16 @@ fn an_attempt_is_claimed_only_while_none_is_pending() {
         address_book.claim_attempt(addr),
         "an attempt that has failed no longer blocks a claim"
     );
+
+    let banned = "127.0.0.2:8233".parse().unwrap();
+    address_book.update(MetaAddr::new_misbehavior(
+        banned,
+        MAX_PEER_MISBEHAVIOR_SCORE,
+    ));
+    assert!(
+        !address_book.claim_attempt(banned),
+        "a banned address cannot be claimed"
+    );
 }
 
 /// Peer addresses stay redacted unless the address book is explicitly configured to expose them.

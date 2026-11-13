@@ -2671,6 +2671,53 @@ async fn crawler_checks_each_redial_right_before_dialing() {
     );
 }
 
+/// Test a redial checks its peer after it claims its attempt, so a peer that is banned or
+/// connects again while the claim waits for the address book is not dialed.
+#[tokio::test(start_paused = true)]
+// The test holds the address book lock across awaits, so that the redial's claim waits for it.
+#[allow(clippy::await_holding_lock)]
+async fn crawler_checks_a_redial_after_claiming_it() {
+    let _init_guard = zakura_test::init();
+
+    for ban in [true, false] {
+        let mut crawler =
+            spawn_redial_crawler(&[redial_test_peer()], RedialCrawlerOptions::default()).await;
+        let closed_at = crawler
+            .close_after(constants::MIN_REDIALED_CONNECTION_AGE)
+            .await;
+
+        let address_book = crawler.address_book.clone();
+        let mut held_address_book = address_book
+            .lock()
+            .expect("previous test thread panicked while holding the address book");
+        let first_redial = latest_redial_time(closed_at, constants::DROPPED_PEER_REDIAL_DELAYS[0]);
+        tokio::time::advance(first_redial - closed_at).await;
+        // Let the crawler start the redial, whose claim then waits for the address book.
+        for _ in 0..512 {
+            tokio::task::yield_now().await;
+        }
+
+        let _inbound_connection = if ban {
+            held_address_book.update(MetaAddr::new_misbehavior(
+                redial_test_peer(),
+                constants::MAX_PEER_MISBEHAVIOR_SCORE,
+            ));
+            None
+        } else {
+            Some(crawler.connect_inbound(redial_test_peer().ip()))
+        };
+        drop(held_address_book);
+
+        assert_eq!(
+            crawler
+                .redial_times_until(closed_at, closed_at + AFTER_EVERY_REDIAL)
+                .await,
+            vec![],
+            "a peer that is banned ({ban}) or connected while the claim waits is not dialed"
+        );
+    }
+}
+
 /// Test the crawler does not redial a peer while another dial to it is pending, and redials it
 /// at the next redial time once that dial has failed.
 #[tokio::test(start_paused = true)]
@@ -2795,7 +2842,10 @@ async fn crawler_does_not_redial_short_banned_or_connected_peers() {
         vec![],
         "a peer that is connected again is not redialed"
     );
+    // The redial claimed its attempt before it found the peer connected. End that attempt too,
+    // so only a stopped schedule keeps the later redials from dialing.
     drop(inbound_connection);
+    crawler.update_address_book(MetaAddr::new_errored(redial_test_peer(), None));
     assert_eq!(
         crawler
             .redial_times_until(closed_at, closed_at + AFTER_EVERY_REDIAL)

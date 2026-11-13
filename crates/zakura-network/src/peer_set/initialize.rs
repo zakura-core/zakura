@@ -1762,10 +1762,10 @@ enum RedialOutcome {
 
 /// Dials `addr` again after a long-lived connection to it closed, see [`dropped_peer_redials`].
 ///
-/// Checks the peer right before dialing, after any spacing delay: a peer that `bans` holds or
-/// that `peer_registry` shows connected is not dialed, and neither is one that another dial is
-/// attempting. The redial claims its attempt with [`AddressBook::claim_attempt`], under the
-/// lock that [`CandidateSet::next`] takes, so the crawler never dials the peer twice at once.
+/// Claims the attempt with [`AddressBook::claim_attempt`], under the lock that
+/// [`CandidateSet::next`] takes, so the crawler never dials the peer twice at once. Then, right
+/// before dialing, skips a peer that `bans` holds or that `peer_registry` shows connected,
+/// since either can change during the spacing delay or while the claim waits for the lock.
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(peer = %addr.addr_label(expose_peer_addresses)))]
 async fn redial<C>(
@@ -1790,10 +1790,6 @@ where
         + 'static,
     C::Future: Send + 'static,
 {
-    if bans.contains(addr.ip()) || peer_registry.is_connected_to(addr.ip()) {
-        return Ok(RedialOutcome::NotNeeded);
-    }
-
     // Correctness: run address book accesses on a blocking thread, as `CandidateSet::next`
     // does, to avoid deadlocks (see #1976).
     let claimed = tokio::task::spawn_blocking(move || {
@@ -1804,6 +1800,10 @@ where
     })
     .wait_for_panics()
     .await;
+
+    if bans.contains(addr.ip()) || peer_registry.is_connected_to(addr.ip()) {
+        return Ok(RedialOutcome::NotNeeded);
+    }
     if !claimed {
         return Ok(RedialOutcome::Failed);
     }

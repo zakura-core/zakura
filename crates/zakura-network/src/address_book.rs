@@ -635,17 +635,19 @@ impl AddressBook {
         self.peers.get(&addr)
     }
 
-    /// Returns `false` if an attempt to connect to `addr` is pending. Otherwise records an
-    /// attempt, as [`CandidateSet::next`] does for the peers it returns, and returns `true`.
+    /// Returns `false` if `addr` is banned, or an attempt to connect to it is pending. Otherwise
+    /// records an attempt, as [`CandidateSet::next`] does for the peers it returns, and returns
+    /// `true`.
     ///
     /// This can ignore the attempt if it is too close to an earlier change, which also keeps
     /// [`CandidateSet::next`] from returning `addr`.
     ///
     /// [`CandidateSet::next`]: crate::peer_set::CandidateSet::next
     pub(crate) fn claim_attempt(&mut self, addr: PeerSocketAddr) -> bool {
-        if self
-            .get(addr)
-            .is_some_and(|peer| peer.last_connection_state == PeerAddrState::AttemptPending)
+        if self.bans_by_ip.contains(addr.ip())
+            || self
+                .get(addr)
+                .is_some_and(|peer| peer.last_connection_state == PeerAddrState::AttemptPending)
         {
             return false;
         }

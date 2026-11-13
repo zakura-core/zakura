@@ -403,8 +403,9 @@ source digest. It prints each target's bypasses, or that it has none.
 The nightly `zakura_sim targets` job in `tests-unit.yml` runs
 `cargo xtask sim-targets`. It also runs on manual dispatch, never on pull
 requests. `planted --targets` rebuilds the patched `zakura-sim` and target
-for each case, which takes hours over the whole catalogue, so it runs on a
-remote host, as [Long runs](#long-runs) says.
+for each case, which takes hours over the whole catalogue, so the nightly
+`zakura_sim planted targets` job runs it in shards, as
+[Long runs](#long-runs) says.
 
 ## Seeds
 
@@ -590,9 +591,12 @@ case moves every later case to another shard, so across that change a case
 can run on two nights in a row or wait up to 13 nights. A shard that holds no
 case fails the run. Each shard has its own failure issue,
 `[nightly] zakura_sim planted shard <index>/14 failed`, and only a passing run
-of that shard closes it, so a pass of another shard can't close it. A remote
-host runs the rest, including `cargo xtask planted --targets`, and its results
-never block a pull request. No CI job runs `planted --targets`.
+of that shard closes it, so a pass of another shard can't close it. The
+`zakura_sim planted targets` job splits the cases that `--targets` keeps the
+same way, and runs `cargo xtask planted --targets --shard <index>/14`. Its
+failure issue for each shard is
+`[nightly] zakura_sim planted targets shard <index>/14 failed`. A remote
+host runs the rest, and its results never block a pull request.
 
 `scripts/sim-long-runs.sh` runs them from a checkout on that host. Each run
 writes under its own directory, `<out>/<UTC time>-<commit>/`. It runs

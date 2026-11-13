@@ -1948,7 +1948,9 @@ fn discovery_plans_paired_arms() {
     for case in &scored {
         for lane in &planned {
             assert!(
-                baselines.contains(&(case.target.clone(), *lane)),
+                baselines
+                    .iter()
+                    .any(|(other, at)| other.target == case.target && at == lane),
                 "{} has no original campaign on {lane:?}",
                 case.id
             );
@@ -1957,10 +1959,52 @@ fn discovery_plans_paired_arms() {
     // Eight cases on four targets: 60 campaigns of 600 s.
     assert_eq!((scored.len(), targets.len(), planned.len()), (8, 4, 5));
 
-    // An equivalent case needs no original campaign.
+    // An equivalent case needs no original campaign, and doesn't run one
+    // for the cases on its target.
     let mut equivalent = scored[0].clone();
     equivalent.equivalent = Some("review".to_owned());
     assert!(baseline_lanes(&[&equivalent], &planned).is_empty());
+    let mut sibling = scored[0].clone();
+    sibling.id = "sibling".to_owned();
+    let baselines = baseline_lanes(&[&equivalent, &sibling], &planned);
+    assert_eq!(baselines.len(), planned.len());
+    assert!(baselines.iter().all(|(case, _)| case.id == "sibling"));
+}
+
+/// Cases on one target share its original campaigns, and each reads the
+/// original's facts for its own property.
+#[test]
+fn each_case_reads_the_original_campaign_for_its_own_property() {
+    let (held, unapplied) = ("p/held", "p/unapplied");
+    let intended = "runs/r/workers/0/sim/inputs/active/p/held/aa.bin";
+    let campaign = Campaign {
+        records: CampaignRecords {
+            manifest: serde_json::json!({}),
+            initial_inputs: 0,
+            end: Some(serde_json::json!({
+                "failures": [{"path": intended, "sha256": "aa"}],
+                "workers": [{"index": 0, "millis": 1000}],
+            })),
+            attempts: Vec::new(),
+            evidence: serde_json::json!({
+                "status": "complete",
+                "unapplied": [unapplied],
+                "incomplete": [],
+                "complete_totals": {"properties": {held: {"held": 4, "violated": 1}}},
+            }),
+        },
+        unpaired: Some("why".to_owned()),
+    };
+    let facts = campaign.facts(held);
+    assert!(facts.applied);
+    assert_eq!(facts.applicable_runs, 5);
+    assert_eq!(facts.intended_input.as_deref(), Some(intended));
+    let facts = campaign.facts(unapplied);
+    assert!(!facts.applied);
+    assert_eq!(facts.applicable_runs, 0);
+    assert_eq!(facts.intended_input, None);
+    // The pairing verdict is the campaign's, whatever the property.
+    assert_eq!(facts.unpaired.as_deref(), Some("why"));
 }
 
 /// One seed's arms pass `campaign start` the same arguments but the
@@ -2102,7 +2146,7 @@ fn a_campaign_lane_reads_its_arm_and_attempts() {
         fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
             .expect("the script is executable");
         wait_until_executable(&sim);
-        let facts = campaign_lane(
+        let campaign = campaign_lane(
             &sim,
             &dir.path().join(format!("{name}-lane")),
             &dir.path().join("fuzz-target"),
@@ -2115,6 +2159,7 @@ fn a_campaign_lane_reads_its_arm_and_attempts() {
         )
         .expect("the lane runs")
         .unwrap_or_else(|error| panic!("{name}: the lane left no facts: {error}"));
+        let facts = campaign.facts(&case.property);
         // The stand-in's manifest records no build identity, so the build
         // never pairs; only the feedback mode differs between the lanes.
         let unpaired = facts.unpaired.expect("the stand-in names no build");

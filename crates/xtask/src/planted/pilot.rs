@@ -639,17 +639,33 @@ fn lanes(seeds: &[u32], arms: &[Arm]) -> Vec<Lane> {
 
 /// The original campaigns that `cases` need on `lanes`: one per target and
 /// lane, for each case that review didn't mark equivalent, in plan order.
-fn baseline_lanes(cases: &[&Case], lanes: &[Lane]) -> Vec<(String, Lane)> {
-    let mut planned: Vec<(String, Lane)> = Vec::new();
+/// Each runs with the first such case on its target, whose target and
+/// harness it shares with the target's other cases.
+fn baseline_lanes<'a>(cases: &[&'a Case], lanes: &[Lane]) -> Vec<(&'a Case, Lane)> {
+    let mut planned: Vec<(&Case, Lane)> = Vec::new();
     for case in cases.iter().filter(|case| case.equivalent.is_none()) {
         for lane in lanes {
-            let key = (case.target.clone(), *lane);
-            if !planned.contains(&key) {
-                planned.push(key);
+            if !planned
+                .iter()
+                .any(|(other, at)| other.target == case.target && at == lane)
+            {
+                planned.push((case, *lane));
             }
         }
     }
     planned
+}
+
+/// The original campaign's lane directory for `target` and `lane`, under
+/// `out`.
+fn baseline_dir(out: &Path, target: &str, lane: Lane) -> PathBuf {
+    out.join("baseline").join(target).join(lane.dir())
+}
+
+/// The mutant campaign's lane directory for case `id` and `lane`, under
+/// `out`.
+fn mutant_dir(out: &Path, id: &str, lane: Lane) -> PathBuf {
+    out.join("cases").join(id).join(lane.dir())
 }
 
 /// The sensitivity report over `cases`. Fails on zero cases.
@@ -946,13 +962,9 @@ fn discovery(
             &out.join("baseline-build.log"),
         )?;
         let mut baselines = BTreeMap::new();
-        for (target, lane) in baseline_lanes(cases, lanes) {
-            let case = cases
-                .iter()
-                .find(|case| case.target == target)
-                .expect("each planned target comes from a selected case");
-            let lane_dir = out.join("baseline").join(&target).join(lane.dir());
-            let facts = match &built {
+        for (case, lane) in baseline_lanes(cases, lanes) {
+            let lane_dir = baseline_dir(out, &case.target, lane);
+            let campaign = match &built {
                 Err(failure) => Err(LaneError::Build(failure.of("the original simulator"))),
                 Ok(sim) => campaign_lane(
                     sim,
@@ -972,7 +984,7 @@ fn discovery(
                     error => error,
                 }),
             };
-            baselines.insert((target, lane), facts);
+            baselines.insert((case.target.clone(), lane), campaign);
         }
         let mut rows = Vec::new();
         for case in cases {
@@ -998,7 +1010,8 @@ fn discovery(
 }
 
 /// Runs one case's mutant campaigns on `lanes`, beside the original's
-/// `baselines` by target and lane.
+/// campaigns `baselines` by target and lane. The original's facts are those
+/// of `case`'s property.
 #[allow(clippy::too_many_arguments)]
 fn discovery_case(
     repo_root: &Path,
@@ -1006,7 +1019,7 @@ fn discovery_case(
     pairing: &Pairing,
     case: &Case,
     lanes: &[Lane],
-    baselines: &BTreeMap<(String, Lane), Result<CampaignFacts, LaneError>>,
+    baselines: &BTreeMap<(String, Lane), Result<Campaign, LaneError>>,
     corpus: &Path,
     out: &Path,
     work: &Path,
@@ -1020,7 +1033,7 @@ fn discovery_case(
             };
             match baselines.get(&(case.target.clone(), *lane)) {
                 None => {}
-                Some(Ok(facts)) => run.baseline = Some(Ok(facts.clone())),
+                Some(Ok(campaign)) => run.baseline = Some(Ok(campaign.facts(&case.property))),
                 Some(Err(LaneError::Build(BuildFailure::Broken(why)))) => {
                     run.broken_build = Some(why.clone());
                 }
@@ -1071,7 +1084,7 @@ fn discovery_case(
                     }
                     Ok(sim) => sim.clone(),
                 };
-                let lane_dir = dir.join(lane.dir());
+                let lane_dir = mutant_dir(out, &case.id, *lane);
                 match campaign_lane(
                     &sim,
                     &lane_dir,
@@ -1094,7 +1107,8 @@ fn discovery_case(
                         run.patch = Some(Ok(()));
                         run.mutant = Some(Err(NoCampaign::Killed(why)));
                     }
-                    Ok(facts) => {
+                    Ok(campaign) => {
+                        let facts = campaign.facts(&case.property);
                         run.patch = Some(Ok(()));
                         if let Some(input) = &facts.intended_input {
                             run.confirmation = Some(confirm_and_replay(
@@ -1222,7 +1236,7 @@ impl std::fmt::Display for LaneError {
 
 /// Builds `case`'s fuzz target with `sim` in `fuzz_target`, and runs one
 /// campaign on it with `bounds` and `lane`'s seed and arm, from `corpus`,
-/// in a fresh store under `dir`. Reads what the store's records show, and
+/// in a fresh store under `dir`. Reads the store's records back, and
 /// whether the build pairs with `pairing`.
 #[allow(clippy::too_many_arguments)]
 fn campaign_lane(
@@ -1235,7 +1249,7 @@ fn campaign_lane(
     pairing: &Pairing,
     corpus: &Path,
     mutated: bool,
-) -> Result<Result<CampaignFacts, LaneError>, BoxError> {
+) -> Result<Result<Campaign, LaneError>, BoxError> {
     let store = dir.join("store");
     if store.exists() {
         return Err(format!("{} isn't a fresh store", store.display()).into());
@@ -1322,34 +1336,15 @@ fn campaign_lane(
         ))));
     };
     let run = manifest_file.trim_end_matches(".json").to_owned();
-    let manifest: Value =
-        serde_json::from_slice(&fs::read(store.join("manifests").join(&manifest_file))?)?;
-    let initial = manifest
-        .get("initial_snapshot")
-        .and_then(Value::as_str)
-        .ok_or("the manifest names no initial snapshot")?;
-    let snapshot: Value = serde_json::from_slice(&fs::read(
-        store.join("snapshots").join(initial).join("snapshot.json"),
-    )?)?;
-    let initial_inputs = snapshot
-        .get("inputs")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    let run_dir = store.join("runs").join(&run);
-    let end: Option<Value> = fs::read(run_dir.join("end.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let attempts = read_attempts(&run_dir, end.as_ref());
-    let evidence_file = dir.join("evidence.json");
     let mut evidence = Command::new(sim);
     evidence
         .args(["campaign", "evidence", "--store"])
         .arg(&store)
         .args(["--run", &run, "--out"])
-        .arg(&evidence_file);
+        .arg(dir.join(EVIDENCE_FILE));
     let log = dir.join("evidence.log");
-    let evidence = match run_pilot_child(&mut evidence, &log, None)? {
-        ChildEnd::Exited(0) => serde_json::from_slice::<Value>(&fs::read(&evidence_file)?)?,
+    match run_pilot_child(&mut evidence, &log, None)? {
+        ChildEnd::Exited(0) => {}
         end @ ChildEnd::Signaled(_) => {
             return Ok(Err(LaneError::Killed(format!(
                 "`zakura-sim campaign evidence` {end}; see {}",
@@ -1362,24 +1357,110 @@ fn campaign_lane(
                 log.display()
             ))))
         }
-    };
-    let mut facts = campaign_facts(
-        &case.property,
-        end.as_ref(),
-        &evidence,
-        initial_inputs,
-        &attempts,
-    );
-    let actual = manifest.pointer("/build/identity").unwrap_or(&Value::Null);
+    }
+    let records = CampaignRecords::read(dir)?;
+    let actual = records
+        .manifest
+        .pointer("/build/identity")
+        .unwrap_or(&Value::Null);
     let unpaired: Vec<String> = [
         paired_identity(&pairing.expected(case), actual, pairing.fields, mutated),
-        arm_mismatch(&manifest, lane.arm, bounds.feedback_arms.len() > 1),
+        arm_mismatch(&records.manifest, lane.arm, bounds.feedback_arms.len() > 1),
     ]
     .into_iter()
     .flatten()
     .collect();
-    facts.unpaired = (!unpaired.is_empty()).then(|| unpaired.join("; "));
-    Ok(Ok(facts))
+    Ok(Ok(Campaign {
+        records,
+        unpaired: (!unpaired.is_empty()).then(|| unpaired.join("; ")),
+    }))
+}
+
+/// The file `zakura-sim campaign evidence` writes in a lane directory.
+const EVIDENCE_FILE: &str = "evidence.json";
+
+/// A finished campaign's records, and whether its build and arm pair.
+#[derive(Debug)]
+struct Campaign {
+    records: CampaignRecords,
+    /// Why the run's fuzzer build doesn't pair with the expected identity,
+    /// or its fuzzer with its arm, if it doesn't.
+    unpaired: Option<String>,
+}
+
+impl Campaign {
+    /// What the campaign showed about `property`.
+    fn facts(&self, property: &str) -> CampaignFacts {
+        CampaignFacts {
+            unpaired: self.unpaired.clone(),
+            ..self.records.facts(property)
+        }
+    }
+}
+
+/// What a campaign left in its lane directory, as [`campaign_lane`] leaves
+/// it: the store's one run, and the evidence `campaign evidence` wrote. A
+/// report derives each case's facts from them.
+#[derive(Debug)]
+struct CampaignRecords {
+    /// The run's manifest.
+    manifest: Value,
+    /// Inputs in the run's initial snapshot.
+    initial_inputs: usize,
+    /// The run's end record, if it wrote one.
+    end: Option<Value>,
+    /// Each worker's attempts, in order ([`read_attempts`]).
+    attempts: Vec<Vec<Value>>,
+    /// The run's evidence.
+    evidence: Value,
+}
+
+impl CampaignRecords {
+    /// Reads the records of the lane directory `dir`, whose store must hold
+    /// exactly one run.
+    fn read(dir: &Path) -> Result<CampaignRecords, BoxError> {
+        let store = dir.join("store");
+        let manifest_file = only_entry(&store.join("manifests"))?
+            .ok_or_else(|| format!("{} holds no single run manifest", store.display()))?;
+        let run = manifest_file.trim_end_matches(".json");
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(store.join("manifests").join(&manifest_file))?)?;
+        let initial = manifest
+            .get("initial_snapshot")
+            .and_then(Value::as_str)
+            .ok_or("the manifest names no initial snapshot")?;
+        let snapshot: Value = serde_json::from_slice(&fs::read(
+            store.join("snapshots").join(initial).join("snapshot.json"),
+        )?)?;
+        let initial_inputs = snapshot
+            .get("inputs")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let run_dir = store.join("runs").join(run);
+        let end: Option<Value> = fs::read(run_dir.join("end.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let attempts = read_attempts(&run_dir, end.as_ref());
+        let evidence = serde_json::from_slice(&fs::read(dir.join(EVIDENCE_FILE))?)?;
+        Ok(CampaignRecords {
+            manifest,
+            initial_inputs,
+            end,
+            attempts,
+            evidence,
+        })
+    }
+
+    /// What the records show about `property`, with no pairing verdict.
+    fn facts(&self, property: &str) -> CampaignFacts {
+        campaign_facts(
+            property,
+            self.end.as_ref(),
+            &self.evidence,
+            self.initial_inputs,
+            &self.attempts,
+        )
+    }
 }
 
 /// Each worker's attempts, in order, from its `attempts.jsonl` in the run

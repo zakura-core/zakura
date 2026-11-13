@@ -371,6 +371,7 @@ class PropagationView:
         return report if isinstance(report, dict) else None
 
     def data(self) -> dict:
+        """The joined view, at most `PROPAGATION_CACHE_SECONDS` old."""
         with self._lock:
             if self._joined is None or time.monotonic() - self._fetched_at >= PROPAGATION_CACHE_SECONDS:
                 reports: dict[str, dict | None] = {}

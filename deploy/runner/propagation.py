@@ -298,15 +298,19 @@ def summarize(blocks, node_names):
 
 
 def summarize_downloads(blocks):
-    """`(outside peers, slowest downloads)` over `blocks`.
+    """`(outside peers, outside software, slowest downloads)` over `blocks`.
 
     An outside peer is one row per IP address: the software it last said it runs, which
     of our nodes downloaded from it, how many attempts there were and how many failed,
     and the median, 9-in-10 and slowest time of the ones that delivered the block. The
     slowest downloads are single attempts, whoever served them, each with the node that
     made it and the block's height, hash and size.
+
+    The outside software is the same downloads grouped by the software the peer named
+    when connecting (`None` when it named none): how many peers ran it, which of our
+    nodes used them, and the attempts, failures and times of all their downloads.
     """
-    peers, attempts = {}, []
+    peers, software, attempts = {}, {}, []
     for block in blocks:
         for node, view in block["nodes"].items():
             for download in view["downloads"]:
@@ -322,15 +326,22 @@ def summarize_downloads(blocks):
                     {"ip": download["ip"], "agent": None, "nodes": set(), "downloads": 0, "failed": 0,
                      "times": [], "last": 0.0},
                 )  # fmt: skip
-                peer["downloads"] += 1
-                peer["nodes"].add(node)
                 # Blocks come newest first, so the first software seen is the latest.
                 peer["agent"] = peer["agent"] or download["agent"]
-                peer["last"] = max(peer["last"], block["origin"])
-                if download["result"] != DOWNLOADED:
-                    peer["failed"] += 1
-                elif download["ms"] is not None:
-                    peer["times"].append(download["ms"])
+                group = software.setdefault(
+                    download["agent"],
+                    {"agent": download["agent"], "peers": set(), "nodes": set(), "downloads": 0, "failed": 0,
+                     "times": [], "last": 0.0},
+                )  # fmt: skip
+                group["peers"].add(download["ip"])
+                for tally in (peer, group):
+                    tally["downloads"] += 1
+                    tally["nodes"].add(node)
+                    tally["last"] = max(tally["last"], block["origin"])
+                    if download["result"] != DOWNLOADED:
+                        tally["failed"] += 1
+                    elif download["ms"] is not None:
+                        tally["times"].append(download["ms"])
     outside = [
         {
             "ip": peer["ip"], "agent": peer["agent"], "nodes": sorted(peer["nodes"]),
@@ -342,8 +353,19 @@ def summarize_downloads(blocks):
     ]  # fmt: skip
     # Slowest first; a peer that never delivered a block has no time and comes last.
     outside.sort(key=lambda peer: (peer["p90_ms"] is None, -(peer["p90_ms"] or 0), peer["ip"]))
+    versions = [
+        {
+            "agent": group["agent"], "peers": len(group["peers"]), "nodes": sorted(group["nodes"]),
+            "downloads": group["downloads"], "failed": group["failed"],
+            "median_ms": median(group["times"]), "p90_ms": ninth_decile(group["times"]),
+            "max_ms": max(group["times"], default=None), "last": group["last"],
+        }
+        for group in software.values()
+    ]  # fmt: skip
+    # The software most peers run first.
+    versions.sort(key=lambda group: (-group["peers"], -group["downloads"], group["agent"] or ""))
     attempts.sort(key=lambda attempt: (-attempt["ms"], attempt["node"]))
-    return outside[:MAX_OUTSIDE_PEERS], attempts[:SLOWEST_DOWNLOADS]
+    return outside[:MAX_OUTSIDE_PEERS], versions[:MAX_OUTSIDE_PEERS], attempts[:SLOWEST_DOWNLOADS]
 
 
 def join(reports, node_ids, limit=100, now=None, fleet_addresses=None, is_private=None):
@@ -371,7 +393,7 @@ def join(reports, node_ids, limit=100, now=None, fleet_addresses=None, is_privat
     blocks = [joined_block(block_hash, records) for block_hash, records in by_hash.items()]
     blocks.sort(key=lambda block: (block["height"] or 0, block["origin"]), reverse=True)
     blocks = blocks[:limit]
-    outside_peers, slowest_downloads = summarize_downloads(blocks)
+    outside_peers, outside_software, slowest_downloads = summarize_downloads(blocks)
     return {
         "generated_at": round(time.time() if now is None else now, 3),
         "nodes": list(node_ids),
@@ -384,5 +406,6 @@ def join(reports, node_ids, limit=100, now=None, fleet_addresses=None, is_privat
         "blocks": blocks,
         "summary": summarize(blocks, list(node_ids)),
         "outside_peers": outside_peers,
+        "outside_software": outside_software,
         "slowest_downloads": slowest_downloads,
     }

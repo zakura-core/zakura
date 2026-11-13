@@ -155,8 +155,9 @@ td.wrap { white-space: normal; min-width: 200px; max-width: 360px; }
 
   <section class="panel" id="outside-panel">
     <header><h2>Peers outside the fleet</h2>
-      <span class="note">One row per peer that is not ours and that one of our nodes downloaded a block from, slowest
-        first. The software is the peer's own, as it named it when connecting.</span></header>
+      <div class="legend"><span class="note" id="outside-intro"></span>
+        <button id="outside-by-peer" type="button" aria-pressed="true">By peer</button>
+        <button id="outside-by-software" type="button" aria-pressed="false">By software</button></div></header>
     <div class="scroll"><table id="outside"></table></div>
     <p class="note" id="outside-note"></p>
   </section>
@@ -191,7 +192,7 @@ const INTERVALS = [
 const POINT_LABELS = {
   heard: "Heard", asked: "Asked", body: "Had the block", queued: "Verified", tip: "Tip", told: "Told peers",
 };
-const state = { data: null, selected: null, followNewest: true, allHops: false };
+const state = { data: null, selected: null, followNewest: true, allHops: false, outsideBy: "peer" };
 
 // Every name on this page comes from node reports, so text is only ever set as text.
 function el(tag, attributes = {}, ...children) {
@@ -552,23 +553,42 @@ function renderDownloads(data) {
     ? "A time on the legacy stack is in whole milliseconds and includes any wait behind other requests on the same connection."
     : "No download has been recorded yet. A node records them once it runs a build that writes them.";
 
-  const peers = data.outside_peers || [];
-  const worst = Math.max(1, ...peers.map((peer) => peer.p90_ms || 0));
+  renderOutside(data);
+}
+
+// The outside peers' downloads, one row per peer or one per software version.
+function renderOutside(data) {
+  const bySoftware = state.outsideBy === "software";
+  document.getElementById("outside-by-peer").setAttribute("aria-pressed", String(!bySoftware));
+  document.getElementById("outside-by-software").setAttribute("aria-pressed", String(bySoftware));
+  document.getElementById("outside-intro").textContent = bySoftware
+    ? "One row per software version that outside peers named when connecting, most peers first."
+    : "One row per peer that is not ours and that one of our nodes downloaded a block from, slowest first. The software is the peer's own, as it named it when connecting.";
+  const rows = (bySoftware ? data.outside_software : data.outside_peers) || [];
+  const worst = Math.max(1, ...rows.map((row) => row.p90_ms || 0));
+  const first = bySoftware ? [["Software"], ["Peers", true]] : [["Peer address"], ["Peer runs"]];
   table(document.getElementById("outside"),
-    [["Peer address"], ["Peer runs"], ["Our nodes that downloaded from it"], ["Downloads", true], ["Legacy failures", true], ["Median", true],
-      ["9 in 10", true], [""], ["Slowest", true], ["Last used"]],
-    peers.map((peer) => {
+    [...first, [bySoftware ? "Our nodes that downloaded from them" : "Our nodes that downloaded from it"],
+      ["Downloads", true], ["Legacy failures", true], ["Median", true], ["9 in 10", true], [""], ["Slowest", true],
+      ["Last used"]],
+    rows.map((row) => {
       const users = el("td", { class: "wrap" });
-      peer.nodes.forEach((name, index) => users.append(index ? ", " : "", nodeLink(name)));
-      return el("tr", {}, el("td", { class: "mono", text: peer.ip }), cell(software(peer.agent)), users,
-        cell(String(peer.downloads), true), cell(String(peer.failed), true), cell(ms(peer.median_ms), true),
-        cell(ms(peer.p90_ms), true),
-        el("td", { style: "min-width:120px" }, peer.p90_ms === null ? "" :
-          el("div", { class: "bar", style: `width:${(peer.p90_ms / worst) * 100}%;background:var(--c-download)` })),
-        cell(ms(peer.max_ms), true), cell(clockTime(peer.last)));
+      row.nodes.forEach((name, index) => users.append(index ? ", " : "", nodeLink(name)));
+      const lead = bySoftware
+        ? [cell(software(row.agent)), cell(String(row.peers), true)]
+        : [el("td", { class: "mono", text: row.ip }), cell(software(row.agent))];
+      return el("tr", {}, ...lead, users,
+        cell(String(row.downloads), true), cell(String(row.failed), true), cell(ms(row.median_ms), true),
+        cell(ms(row.p90_ms), true),
+        el("td", { style: "min-width:120px" }, row.p90_ms === null ? "" :
+          el("div", { class: "bar", style: `width:${(row.p90_ms / worst) * 100}%;background:var(--c-download)` })),
+        cell(ms(row.max_ms), true), cell(clockTime(row.last)));
     }));
-  document.getElementById("outside-note").textContent = peers.length
-    ? "A peer is known by its IP address alone, so two nodes behind one address are one row. Times count only the downloads that delivered the block. \"Legacy failures\" counts only legacy attempts: a download over Zakura is recorded when its block arrives, so a Zakura peer never shows a failure here."
+  document.getElementById("outside-note").textContent = rows.length
+    ? (bySoftware
+      ? "A version is the exact name a peer sent, so each release is its own row. Times count every download from those peers that delivered the block. "
+      : "A peer is known by its IP address alone, so two nodes behind one address are one row. Times count only the downloads that delivered the block. ")
+      + "\"Legacy failures\" counts only legacy attempts: a download over Zakura is recorded when its block arrives, so a Zakura peer never shows a failure here."
     : "No outside peer is listed yet. A node records peer addresses only after it restarts with them switched on; until then its downloads show as \"address hidden\".";
 }
 
@@ -654,6 +674,12 @@ document.getElementById("all-hops").addEventListener("click", (event) => {
   render();
 });
 document.getElementById("follow").addEventListener("click", () => followNewest(!state.followNewest));
+for (const by of ["peer", "software"]) {
+  document.getElementById("outside-by-" + by).addEventListener("click", () => {
+    state.outsideBy = by;
+    if (state.data) renderOutside(state.data);
+  });
+}
 function readAddress() {
   const linked = linkedBlock();
   if (linked) { state.selected = linked; state.followNewest = false; }

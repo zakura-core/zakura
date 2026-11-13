@@ -272,6 +272,24 @@ class DownloadTests(unittest.TestCase):
             "kind": "private", "stack": "legacy", "ms": 40, "bytes": None, "result": "available", "route": "maybe",
         })  # fmt: skip
 
+    def test_outside_downloads_are_also_grouped_by_software_version(self):
+        zcashd = "/MagicBean:6.2.0/"
+        joined = self.join(
+            [download("203.0.113.5", ms=100, agent=zcashd), download("203.0.113.6", ms=300, agent=zcashd)],
+            [download("203.0.113.6", ms=50, agent=zcashd, result="notfound_response"),
+             download("203.0.113.9", ms=80, agent=None)],
+            # A private peer's software is never counted, and a fleet node is not outside.
+            [download(PRIVATE_IP, ms=900, agent="/Secret:1.0/"), download("192.0.2.10", ms=70)],
+        )  # fmt: skip
+        by_software = {group["agent"]: group for group in joined["outside_software"]}
+        self.assertEqual(list(by_software), [zcashd, None])
+        self.assertEqual(
+            {key: by_software[zcashd][key] for key in ("peers", "nodes", "downloads", "failed", "median_ms", "max_ms")},
+            {"peers": 2, "nodes": ["us-east-0"], "downloads": 3, "failed": 1, "median_ms": 300, "max_ms": 300},
+        )
+        self.assertEqual((by_software[None]["peers"], by_software[None]["median_ms"]), (1, 80))
+        self.assertNotIn("/Secret:1.0/", str(joined))
+
     def test_outside_peers_are_listed_by_address_slowest_first(self):
         slow, fast = "203.0.113.5", "203.0.113.6"
         joined = self.join(

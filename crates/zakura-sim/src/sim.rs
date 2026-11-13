@@ -113,6 +113,13 @@ pub trait TaskHold {
     /// True if `task`, which resumes at `at`, sits out the next pick. The
     /// run asks after each step's observations, once per ready task.
     fn holds(&self, task: TaskId, at: &At) -> bool;
+
+    /// False if the hold lets a task run while another task is parked on a
+    /// lock it holds, so the hold never blocks that task as well. The run
+    /// then doesn't ask [`TaskHold::holds`] about it.
+    fn holds_while_waited_on(&self) -> bool {
+        true
+    }
 }
 
 /// One step's pick, for tests and reports.
@@ -1110,10 +1117,14 @@ impl Sim {
     /// seen for the first time as spawned, and which ones the harness holds.
     fn ready(&self, st: &mut State) -> Result<Vec<(Identity, TaskId)>, HarnessFailure> {
         let ready = self.sched().ready();
+        let waited_on = self.sched().waited_on();
         let mut out = Vec::with_capacity(ready.len());
         st.held.clear();
         for r in ready {
-            if self.holds.iter().any(|hold| hold.holds(r.task, &r.at)) {
+            let waited_on = waited_on.contains(&r.task);
+            if self.holds.iter().any(|hold| {
+                (!waited_on || hold.holds_while_waited_on()) && hold.holds(r.task, &r.at)
+            }) {
                 st.held.insert(r.task);
             }
             let name = match st.names.get(&r.task) {

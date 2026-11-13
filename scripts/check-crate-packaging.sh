@@ -57,6 +57,7 @@ PUBLISH_ORDER=(
   zakura-chain
   zakura-header-chain
   zakura-node-services
+  zakura-mempool
   zakura-script
   zakura-state
   zakura-consensus

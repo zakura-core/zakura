@@ -2,7 +2,7 @@
 //! `zakura-rt`.
 //!
 //! The check parses every production module under `zakura-network`'s
-//! `zakura` module and in `zakura-quic`, and flags paths to tokio, the std mutex and atomics, std's
+//! `zakura` module, in `zakura-quic` and in `zakura-mempool`, and flags paths to tokio, the std mutex and atomics, std's
 //! hashed collections, and the thread RNG. It also flags the std blocking
 //! primitives and channels, `futures::select!` and `tokio_util::time`, which
 //! `zakura-rt` has no names for: under the simulator a blocking wait hangs the
@@ -74,12 +74,13 @@ use crate::BoxError;
 
 /// The root modules the check walks, each with the child modules under it
 /// that are not v2 production code.
-const ROOTS: [(&str, &[&str]); 2] = [
+const ROOTS: [(&str, &[&str]); 3] = [
     (
         "crates/zakura-network/src/zakura.rs",
         &["legacy_gossip", "testkit"],
     ),
     ("crates/zakura-quic/src/lib.rs", &[]),
+    ("crates/zakura-mempool/src/lib.rs", &[]),
 ];
 
 const RT_LIB: &str = "crates/zakura-rt/src/lib.rs";

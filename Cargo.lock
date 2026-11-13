@@ -3006,6 +3006,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-mempool"
+version = "0.1.0"
+dependencies = [
+ "zakura-chain",
+ "zakura-node-services",
+ "zakura-rt",
+]
+
+[[package]]
 name = "zakura-mmr-tree"
 version = "0.1.0"
 dependencies = [

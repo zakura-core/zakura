@@ -1,0 +1,27 @@
+[package]
+name = "zakura-mempool"
+version = "0.1.0"
+authors.workspace = true
+description = "Zakura's transaction pool: its storage, its rules and the pool core. Internal crate, published to support cargo install zakura"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+readme = "../../README.md"
+keywords.workspace = true
+categories = ["asynchronous", "cryptography::cryptocurrencies"]
+
+[features]
+default = []
+
+# Test generators and fixtures for this crate's users.
+test-support = []
+
+[dependencies]
+zakura-chain = { path = "../zakura-chain", version = "15.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "5.2.3" }
+zakura-rt = { path = "../zakura-rt", version = "0.4.0" }
+
+[lints]
+workspace = true

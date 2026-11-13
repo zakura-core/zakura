@@ -712,14 +712,19 @@ def process_rss_bytes(pid):
                 return int(line.split()[1]) * 1024
     return None
 
+# The kernel writes several lines for one OOM kill (the constraint, the kill itself,
+# the reaper); only the kill line, "Killed process <pid>", appears once per kill.
+OOM_KILL_LINE = re.compile(r"Killed process (\d+)")
+
+# Distinct processes the kernel killed for lack of memory in the last day.
 def oom_kill_count():
     proc = run([
         "journalctl", "-k", "--since", "-24 hours", "--no-pager",
-        "-o", "cat", "-n", "200", "-g", "Out of memory|oom-kill|oom_reaper",
+        "-o", "cat", "-n", "200", "-g", "Killed process",
     ], timeout=12)
-    lines = [line for line in proc.stdout.splitlines() if line.strip()]
-    if lines:
-        return len(lines)
+    killed = set(OOM_KILL_LINE.findall(proc.stdout))
+    if killed:
+        return len(killed)
     # journalctl exits 1 when nothing matched, which is exactly the zero case.
     # Only a real failure (missing journal, bad pattern) writes to stderr.
     if proc.returncode not in (0, 1) or proc.stderr.strip():

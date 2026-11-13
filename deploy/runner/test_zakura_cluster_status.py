@@ -508,12 +508,14 @@ zcash_net_in_bytes_total 12345
 
         self.assertEqual(probe["host"]["oom_kills_24h"], 0)
 
-    def test_oom_kills_are_counted_by_line(self):
+    def test_oom_kills_are_counted_once_per_killed_process(self):
+        # Two kills, each logged twice, as a cgroup kill and a repeated journal line.
+        kill = "Memory cgroup out of memory: Killed process {} (perf) total-vm:1kB\\n"
         with contextlib.ExitStack() as stack:
             env = self.stub_journalctl(
                 stack,
                 exit_code=0,
-                stdout="oom-kill: one\\noom-kill: two\\n",
+                stdout=(kill.format(4101) * 2) + (kill.format(4202) * 2),
             )
             probe = self.run_probe(env=env)
 

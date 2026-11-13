@@ -377,8 +377,7 @@ pub struct Config {
     /// Zakura ignores misbehavior reports for these peers, so their
     /// misbehavior score stays at zero and Zakura never bans their IP address. Tip lag,
     /// upgrade boundaries, or bugs cannot get them banned. This also exempts them from
-    /// mempool cooldowns and their disconnects, and from the wait that Zakura imposes
-    /// between inbound connections from one IP.
+    /// mempool cooldowns and their disconnects.
     ///
     /// Zakura also dials every entry that names one address, and dials it again whenever
     /// no connection to that peer is open, in either direction. An entry without a port
@@ -393,7 +392,10 @@ pub struct Config {
     /// full outbound peer set never blocks the dial. The inbound slots are a pool that
     /// only dialed addresses can use, so a node whose other inbound slots are full still
     /// accepts a listed peer that dials it, unless connections from listed peers already
-    /// fill the pool. A peer that is only in a range of several addresses adds no slots.
+    /// fill the pool. A
+    /// connection in the pool also skips the wait that Zakura imposes between inbound
+    /// connections from one IP, so a listed peer can reconnect at once. A peer that is
+    /// only in a range of several addresses gets none of this.
     /// Zakura still applies the per-IP connection limit to these peers, and still
     /// disconnects them on protocol errors or inbound overload.
     ///

@@ -944,13 +944,13 @@ where
                 && active_unconditional_inbound_connections
                     < config.unconditional_peer_connection_limit()
             {
-                // When these slots are all taken, the peer competes for a public slot.
+                // These slots skip the wait between inbound connections from one IP, so a
+                // dialed peer that lost its connection can reconnect at once. When they are
+                // all taken, the peer competes for a public slot, and waits like any other.
                 active_unconditional_connections.track_connection()
             } else if active_public_inbound_connections >= public_inbound_connection_limit
                 || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
-                // An unconditional peer that lost its connection may reconnect at once.
-                || (!config.unconditional_peers.contains(addr.ip())
-                    && recent_inbound_connections.is_past_limit_or_add(addr.ip()))
+                || recent_inbound_connections.is_past_limit_or_add(addr.ip())
             {
                 // Too many open inbound connections or pending handshakes already.
                 // Close the connection.

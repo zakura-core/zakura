@@ -2271,11 +2271,9 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
     std::mem::drop(second_connection);
 }
 
-/// The listener lets an unconditional peer reconnect at once, and makes any other peer
-/// wait before a second connection from its IP.
-///
-/// A peer in a listed range reconnects in a public slot, without the wait. A listed
-/// address reconnects in its own slot.
+/// The listener lets a dialed unconditional peer reconnect at once, in its own slot, and
+/// makes any other peer wait before a second connection from its IP, including a peer
+/// that is only in a listed range.
 #[tokio::test]
 async fn listener_unconditional_peer_reconnect_bypasses_recent_ip_limit() {
     let _init_guard = zakura_test::init();
@@ -2286,7 +2284,7 @@ async fn listener_unconditional_peer_reconnect_bypasses_recent_ip_limit() {
     }
 
     for (unconditional_peers, expected_connections) in
-        [("[]", 1), ("['127.0.0.0/30']", 2), ("['127.0.0.1']", 2)]
+        [("[]", 1), ("['127.0.0.0/30']", 1), ("['127.0.0.1']", 2)]
     {
         let success_disconnect_inbound_handshaker =
             service_fn(|req: HandshakeRequest<TcpStream>| async move {

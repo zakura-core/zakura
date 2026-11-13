@@ -280,7 +280,9 @@ fn sha256d_backends(c: &mut Criterion) {
     let mut group = c.benchmark_group("sha256d_backends");
     group.sample_size(20);
     for (length, chunk_size) in [
-        (64usize, 32usize),
+        (32usize, 16usize),
+        (32, 32),
+        (64, 32),
         (64, 64),
         (1487, 32),
         (1487, 1487),

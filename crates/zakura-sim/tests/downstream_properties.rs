@@ -366,6 +366,28 @@ fn the_frame_in_hand_at_a_close_may_finish() {
     assert_eq!(report.end.violation, None, "{:?}", report.end);
 }
 
+/// A frame whose work the node had already admitted before the close
+/// was no longer in hand, so more work from it after the close fails.
+#[test]
+fn more_work_from_a_handed_off_frame_after_close_fails() {
+    let report = run_script(vec![
+        vec![frame(TEST_STREAM, 0, "part", Label::Conformant, 7, 20)],
+        vec![judged(TEST_STREAM, 0)],
+        vec![part_work(0, 2)],
+        vec![closed("idle_timeout")],
+        vec![part_work(0, 2)],
+    ]);
+    let violation = report
+        .end
+        .violation
+        .expect("the frame was handed off before the close");
+    assert_eq!(violation.property, WORK);
+    assert!(
+        violation.actual.contains("after the close"),
+        "{violation:?}"
+    );
+}
+
 /// The work checks need storage observations. A harness that observes
 /// none can't register them.
 #[test]

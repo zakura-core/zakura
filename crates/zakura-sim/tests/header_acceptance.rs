@@ -7234,6 +7234,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "tests/header_node_reservations.rs",
         "a_prepare_joins_its_pick_and_completion_by_its_whole_operation",
     ),
+    (
+        "SessionRef",
+        "tests/header_mixed_resources.rs",
+        "admitted",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.

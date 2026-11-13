@@ -3304,22 +3304,215 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
             until: None,
         },
     },
+    // `outstanding-work-bounded`'s bound table, row by row.
+    bound_passes(
+        "gate-5/bound-table/work-slots/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/work-slots/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/reservation-maps/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/reservation-maps/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/request-deadlines/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/request-deadlines/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/locator-reads/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/locator-reads/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/locator-reads/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/node-execution-slots/at-limit",
+        obligation::BOUND_LIMIT_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/node-execution-slots/release-reuse",
+        obligation::BOUND_REUSE_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/publisher-capacity-waits/cleanup",
+        obligation::BOUND_WAITS_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/close-deadlines/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/storage-calls/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/port-futures/conservation",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/cached-offers/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/supplier-order/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/completed-targets/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/subscriber-cursors/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/subscriber-subscriptions/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/publisher-tasks/cleanup",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/sessions/membership",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_passes(
+        "gate-5/bound-table/serving-peer-budgets/cleanup",
+        obligation::BOUND_MEMBERSHIP_TEST,
+    ),
     GateRequirement {
-        name: "gate-5/bound-table",
+        name: "gate-5/bound-table/repair-reservation",
         gates: G5,
         expected: Expected::Open {
-            reason: obligation::GATE_5_BOUND_TABLE,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-9d.1"),
+            reason: obligation::BOUND_REPAIR_RESERVATION,
+            owner: obligation::BOUND_OWNER,
+            approval: PLAN,
+            until: None,
         },
     },
+    bound_open(
+        "gate-5/bound-table/reservation",
+        obligation::bound_unshown::RESERVATION,
+    ),
+    bound_open(
+        "gate-5/bound-table/locator-reads/per-peer",
+        obligation::bound_unshown::LOCATOR_PER_PEER,
+    ),
+    bound_open(
+        "gate-5/bound-table/calls-per-round",
+        obligation::bound_unshown::CALLS_PER_ROUND,
+    ),
+    bound_open(
+        "gate-5/bound-table/detached-headers",
+        obligation::bound_unshown::DETACHED,
+    ),
+    bound_open(
+        "gate-5/bound-table/departed-strikes",
+        obligation::bound_unshown::STRIKES,
+    ),
+    bound_open(
+        "gate-5/bound-table/pending-closes",
+        obligation::bound_unshown::PENDING_CLOSES,
+    ),
+    bound_open(
+        "gate-5/bound-table/status-cadences",
+        obligation::bound_unshown::CADENCES,
+    ),
+    bound_open(
+        "gate-5/bound-table/publisher-tombstones",
+        obligation::bound_unshown::TOMBSTONES,
+    ),
+    bound_open(
+        "gate-5/bound-table/publisher-jobs",
+        obligation::bound_unshown::JOBS,
+    ),
+    bound_open(
+        "gate-5/bound-table/subscription-slots",
+        obligation::bound_unshown::SUBSCRIPTION_SLOTS,
+    ),
+    bound_open(
+        "gate-5/bound-table/sent-cursor-ring",
+        obligation::bound_unshown::SENT_RING,
+    ),
+    bound_open(
+        "gate-5/bound-table/peer-execution-slots",
+        obligation::bound_unshown::PEER_EXECUTION,
+    ),
+    bound_open(
+        "gate-5/bound-table/node-output",
+        obligation::bound_unshown::NODE_OUTPUT,
+    ),
+    bound_open(
+        "gate-5/bound-table/peer-output",
+        obligation::bound_unshown::PEER_OUTPUT,
+    ),
+    bound_open(
+        "gate-5/bound-table/response-counts",
+        obligation::bound_unshown::RESPONSE_COUNTS,
+    ),
+    bound_open(
+        "gate-5/bound-table/retained-path-leases",
+        obligation::bound_unshown::LEASES,
+    ),
+    bound_open(
+        "gate-5/bound-table/readmission-cooldowns",
+        obligation::bound_unshown::COOLDOWNS,
+    ),
+    bound_open(
+        "gate-5/bound-table/pruned-peers",
+        obligation::bound_unshown::PRUNED_PEERS,
+    ),
+    bound_open(
+        "gate-5/bound-table/vct-repair",
+        obligation::bound_unshown::VCT_REPAIR,
+    ),
     GateRequirement {
         name: "gate-5/mixed-witness",
         gates: G5,
         expected: Expected::Passes { test: MIXED_TEST },
     },
 ];
+
+/// A bound-table row's requirement `name`, met by `test`'s pass.
+const fn bound_passes(name: &'static str, test: TestRef) -> GateRequirement {
+    GateRequirement {
+        name,
+        gates: G5,
+        expected: Expected::Passes { test },
+    }
+}
+
+/// A bound-table row's requirement `name` with no fixture evidence: the
+/// standing exclusion for `reason`, which blocks until Adam approves it.
+const fn bound_open(name: &'static str, reason: &'static str) -> GateRequirement {
+    GateRequirement {
+        name,
+        gates: G5,
+        expected: Expected::Open {
+            reason,
+            owner: obligation::BOUND_OWNER,
+            approval: Approval::Pending,
+            until: None,
+        },
+    }
+}
 
 /// The [`GATE_REQUIREMENTS`] as expected results.
 pub fn requirement_results() -> Vec<ExpectedResult> {
@@ -3745,6 +3938,7 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "each_node_harness_s_missing_sources_are_its_own_test_s",
     "delivered_obligations_verify_on_their_evidence",
     "every_node_history_lists_its_not_applicable_reports",
+    "a_missing_bound_row_blocks",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.

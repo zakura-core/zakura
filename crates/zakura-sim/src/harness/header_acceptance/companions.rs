@@ -365,17 +365,26 @@ fn attributed_page(record: &Value, rule: AuthorityRule) -> Option<PageRef> {
 }
 
 /// What the peer sent as `page`: its peer ([`page_peer`]) and the header
-/// hashes `sent` holds for its frame. An error says which is missing.
+/// hashes of the one page `sent` holds for its frame, joined on the
+/// frame's whole [`FrameRef`]. An error says which is missing.
 pub fn sent_page(
     page: &RejectedPage,
     peers: &[(String, String)],
     sent: &SentPages,
 ) -> Result<SentPage, String> {
     let peer = page_peer(page, peers)?;
-    let hashes = sent
-        .page(&page.frame)
-        .ok_or_else(|| format!("the peer sent no page as {page:?}"))?;
-    Ok(SentPage { peer, hashes })
+    let pages = sent.pages();
+    let found = FrameRef::joined(&page.frame, &pages, |(frame, _)| Some(frame.clone()));
+    let [(_, hashes)] = found[..] else {
+        return Err(format!(
+            "the peer sent {} pages as {page:?}, not one",
+            found.len()
+        ));
+    };
+    Ok(SentPage {
+        peer,
+        hashes: hashes.clone(),
+    })
 }
 
 /// [`FAULT_CLOSE`]: the node's first close of `page`'s connection comes
@@ -1117,8 +1126,9 @@ mod tests {
 
     /// The rejected page's peer and hashes come from its frame's evidence:
     /// the peer its `Session` row names, and the page the peer sent there,
-    /// joined on its frame's whole [`FrameRef`], so the same position on
-    /// another stream kind, version or direction holds no page.
+    /// joined on its frame's whole [`FrameRef`], so the same frame with
+    /// any one key moved, its connection, stream kind, version, QUIC
+    /// stream, direction or position, holds no page (Rule 25's template).
     #[test]
     fn the_sent_page_comes_from_the_frames_evidence() {
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
@@ -1128,13 +1138,14 @@ mod tests {
         pages.record(page.frame.clone(), sent().hashes);
         assert_eq!(sent_page(&page, &peers, &pages), Ok(sent()));
         assert!(sent_page(&page, &[], &pages).is_err());
-        assert_one_key_off(&page.frame, |frame| {
+        let keys = assert_one_key_off::<FrameRef>(&page.frame, |frame| {
             let page = RejectedPage {
                 frame: frame.clone(),
                 ..page.clone()
             };
             sent_page(&page, &peers, &pages).is_ok()
         });
+        assert_eq!(keys, 6);
     }
 
     /// The staging companion joins the page staged from the rejected frame:

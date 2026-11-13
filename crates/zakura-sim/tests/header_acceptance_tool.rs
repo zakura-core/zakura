@@ -22,7 +22,7 @@ use zakura_sim::{
         header_acceptance::{
             contracts::RunBy,
             evaluate::{Actual, End},
-            sim_test,
+            rows, sim_test,
             tool::{self, ReplayRun, TaskAt, Which, FULL_REPORT_FILE, REPLAY_DIR, REPLAY_FILE},
             HistoryRef, RunId,
         },
@@ -359,37 +359,121 @@ fn fixtures_of(harness: &str) -> Vec<PathBuf> {
 
 /// Records `input` on `harness` into `dir`, in this process.
 fn record_in_process(harness: &str, input: &[u8], dir: &Path) -> Result<(), String> {
+    record_input(harness, RecordInput::Input(input), dir)
+}
+
+/// Records `input` on `harness` into `dir`, in this process, for any input
+/// form the harness takes.
+fn record_input(harness: &str, input: RecordInput<'_>, dir: &Path) -> Result<(), String> {
     let entry = harness::find(harness).map_err(|error| error.to_string())?;
-    harness::record(entry, RecordInput::Input(input), dir)
+    harness::record(entry, input, dir)
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
-/// Gate 1's A/A and A/B/A comparison: for each header harness, its first
-/// committed history A runs twice and again after a distinct B in this one
-/// process, with the same trace, full report and store snapshot each time.
-/// A harness with one committed history takes the empty input as B. Its controls: a run with no full report is a missing
-/// comparison, an A result changed only after B fails, and a B that
-/// resolves to A's execution fails.
+/// One history gate 1 compares: a full fuzz input, or a committed typed
+/// scenario and its Plan bytes.
+enum History {
+    /// A full fuzz input.
+    Fuzz(Vec<u8>),
+    /// A typed scenario and its Plan bytes.
+    Typed {
+        /// The serialized scenario.
+        scenario: Value,
+        /// The Plan bytes.
+        plan: Vec<u8>,
+    },
+}
+
+impl History {
+    /// The committed typed fixture `stem`: its `.json` scenario and `.plan`
+    /// bytes.
+    fn typed(stem: &str) -> History {
+        let read = |ext: &str| {
+            std::fs::read(fixture(&format!("{stem}.{ext}"))).expect("the fixture is readable")
+        };
+        History::Typed {
+            scenario: serde_json::from_slice(&read("json")).expect("the scenario is JSON"),
+            plan: read("plan"),
+        }
+    }
+
+    /// This history as a record input.
+    fn input(&self) -> RecordInput<'_> {
+        match self {
+            History::Fuzz(input) => RecordInput::Input(input),
+            History::Typed { scenario, plan } => RecordInput::Plan { scenario, plan },
+        }
+    }
+}
+
+/// Each header harness's A and B histories for gate 1. A fuzz harness takes
+/// its first two committed fixtures, or the empty input as B when it has
+/// one. Smoke has no committed fixture, so A is its manifest history, the
+/// empty input, and B is other Plan bytes. Liveness's histories are typed,
+/// so A and B are two committed liveness fixtures.
+fn gate_1_histories() -> Vec<(&'static str, History, History)> {
+    let fuzz = |harness: &'static str| {
+        let fixtures = fixtures_of(harness);
+        let read = |path: &PathBuf| std::fs::read(path).expect("a fixture is readable");
+        let a = read(
+            fixtures
+                .first()
+                .expect("the harness has a committed fixture"),
+        );
+        let b = fixtures.get(1).map_or_else(Vec::new, read);
+        (harness, History::Fuzz(a), History::Fuzz(b))
+    };
+    vec![
+        (
+            "header-sync/smoke",
+            History::Fuzz(Vec::new()),
+            History::Fuzz(vec![0xa5; 64]),
+        ),
+        fuzz("header-sync/storage"),
+        fuzz("header-sync/release-wake"),
+        fuzz("header-sync/wire"),
+        fuzz("header-sync/flood"),
+        fuzz("header-sync/repair"),
+        (
+            "header-sync/liveness",
+            History::typed("header-hold-held-locator"),
+            History::typed("header-retire-timeout"),
+        ),
+        fuzz("header/reactor-policy"),
+        fuzz("header/publisher-policy"),
+    ]
+}
+
+/// Gate 1's A/A and A/B/A comparison: for each header harness
+/// ([`gate_1_histories`], which covers every one of
+/// [`rows::HEADER_HARNESSES`]), its history A runs twice and again after a
+/// distinct B in this one process, with the same trace, full report and
+/// store snapshot each time. Its controls: a run with no full report is a
+/// missing comparison, an A result changed only after B fails, and a B
+/// that resolves to A's execution fails.
 #[test]
 fn each_history_is_the_same_alone_and_after_another() {
-    for harness in [
-        "header-sync/storage",
-        "header-sync/wire",
-        "header-sync/release-wake",
-        "header-sync/repair",
-        "header/reactor-policy",
-        "header/publisher-policy",
-    ] {
-        let fixtures = fixtures_of(harness);
-        let a = std::fs::read(&fixtures[0]).expect("a fixture is readable");
-        let b = match fixtures.get(1) {
-            Some(path) => std::fs::read(path).expect("a fixture is readable"),
-            None => Vec::new(),
-        };
+    let histories = gate_1_histories();
+    let tested: std::collections::BTreeSet<&str> =
+        histories.iter().map(|(harness, ..)| *harness).collect();
+    assert_eq!(
+        tested,
+        rows::HEADER_HARNESSES.iter().copied().collect(),
+        "gate 1 compares every header harness"
+    );
+    for (harness, a, b) in &histories {
         let root = tempfile::tempdir().expect("a temp dir can be created");
         let compared = tool::a_a_and_a_b_a(root.path(), &mut |which, dir| {
-            record_in_process(harness, if which == Which::A { &a } else { &b }, dir)
+            record_input(
+                harness,
+                if which == Which::A {
+                    a.input()
+                } else {
+                    b.input()
+                },
+                dir,
+            )
         });
         assert_eq!(compared, Ok(()), "{harness}");
     }

@@ -244,11 +244,40 @@ pub fn judged_frame(obs: &Observation) -> Option<FrameRef> {
 }
 
 /// The rejected page in `observations`: the one `headers` frame the peer's
-/// models labelled `BadContent` and the node judged, with the session its
-/// connection and QUIC stream carry. An error says why there's no single
-/// one.
+/// models labelled `BadContent` and the node judged ([`rejected_frame`]),
+/// with the session its connection and QUIC stream carry. An error says
+/// why there's no single one.
 pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, String> {
-    let judged = |frame: &FrameRef| !FrameRef::joined(frame, observations, judged_frame).is_empty();
+    let judgments: Vec<FrameRef> = observations.iter().filter_map(judged_frame).collect();
+    let (frame, subscription) = rejected_frame(observations, &judgments)?;
+    // The session row names the stream its session reads.
+    let stream = StreamRef::from(&frame);
+    let sessions = StreamRef::joined(&stream, observations, session_stream);
+    let [Observation::Session {
+        session_id, peer, ..
+    }] = sessions[..]
+    else {
+        return Err(format!("{stream:?} carries sessions {sessions:?}, not one"));
+    };
+    Ok(RejectedPage {
+        frame,
+        session: *session_id,
+        subscription,
+        peer: peer.clone(),
+    })
+}
+
+/// The one `headers` frame in `observations` the peer's models labelled
+/// `BadContent` that `judgments`, the frames the node judged, hold, joined
+/// on its whole [`FrameRef`], with the subscription it names. An error
+/// says why there's no single one.
+fn rejected_frame(
+    observations: &[Observation],
+    judgments: &[FrameRef],
+) -> Result<(FrameRef, u64), String> {
+    let judged = |frame: &FrameRef| {
+        !FrameRef::joined(frame, judgments, |judged| Some(judged.clone())).is_empty()
+    };
     let frames: Vec<(FrameRef, Option<u64>)> = observations
         .iter()
         .filter_map(|obs| match obs {
@@ -284,21 +313,7 @@ pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, Strin
     };
     let subscription =
         exchange.ok_or_else(|| format!("the rejected page {} names no subscription", frame.seq))?;
-    // The session row names the stream its session reads.
-    let stream = StreamRef::from(frame);
-    let sessions = StreamRef::joined(&stream, observations, session_stream);
-    let [Observation::Session {
-        session_id, peer, ..
-    }] = sessions[..]
-    else {
-        return Err(format!("{stream:?} carries sessions {sessions:?}, not one"));
-    };
-    Ok(RejectedPage {
-        frame: frame.clone(),
-        session: *session_id,
-        subscription,
-        peer: peer.clone(),
-    })
+    Ok((frame.clone(), subscription))
 }
 
 /// The stream `obs` says its session reads, if it's a `Session` row.
@@ -365,17 +380,26 @@ fn attributed_page(record: &Value, rule: AuthorityRule) -> Option<PageRef> {
 }
 
 /// What the peer sent as `page`: its peer ([`page_peer`]) and the header
-/// hashes `sent` holds for its frame. An error says which is missing.
+/// hashes of the one page `sent` holds for its frame, joined on the
+/// frame's whole [`FrameRef`]. An error says which is missing.
 pub fn sent_page(
     page: &RejectedPage,
     peers: &[(String, String)],
     sent: &SentPages,
 ) -> Result<SentPage, String> {
     let peer = page_peer(page, peers)?;
-    let hashes = sent
-        .page(&page.frame)
-        .ok_or_else(|| format!("the peer sent no page as {page:?}"))?;
-    Ok(SentPage { peer, hashes })
+    let pages = sent.pages();
+    let found = FrameRef::joined(&page.frame, &pages, |(frame, _)| Some(frame.clone()));
+    let [(_, hashes)] = found[..] else {
+        return Err(format!(
+            "the peer sent {} pages as {page:?}, not one",
+            found.len()
+        ));
+    };
+    Ok(SentPage {
+        peer,
+        hashes: hashes.clone(),
+    })
 }
 
 /// [`FAULT_CLOSE`]: the node's first close of `page`'s connection comes
@@ -1064,26 +1088,22 @@ mod tests {
 
     /// The rejected page is the bad-content frame the node judged, joined
     /// on its judgment's whole [`FrameRef`]: a judgment with any one key of
-    /// the frame moved is another frame's, so there's no rejected page
-    /// (Rule 25's template). A judgment names no direction, since the node
-    /// judges only frames it reads, so an outbound frame is never judged.
+    /// the frame moved, its direction included, is another frame's, so
+    /// there's no rejected frame (Rule 25's template). A judgment
+    /// observation names no direction, since the node judges only frames it
+    /// reads, so the control hands [`rejected_frame`] the judged frames
+    /// directly, where an outbound one can stand.
     #[test]
     fn the_rejected_page_joins_its_judged_frame() {
-        let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
+        let closed = log(1, 1, "service_protocol_reject");
+        let page = rejected_page(&closed).unwrap();
         let keys = assert_one_key_off::<FrameRef>(&page.frame, |frame| {
-            let mut moved = log(1, 1, "service_protocol_reject");
-            moved[2] = Observation::FrameJudged {
-                connection: frame.connection,
-                stream: StreamId {
-                    kind: frame.kind,
-                    version: frame.version,
-                },
-                quic_stream: Some(frame.quic_stream),
-                seq: frame.seq,
-            };
-            frame.inbound && rejected_page(&moved).is_ok()
+            rejected_frame(&closed, std::slice::from_ref(frame)).is_ok()
         });
         assert_eq!(keys, 6);
+        let mut unjudged = closed.clone();
+        unjudged.remove(2);
+        assert!(rejected_page(&unjudged).is_err());
     }
 
     /// The rejected page's peer is the one scenario peer its `Session`
@@ -1117,8 +1137,9 @@ mod tests {
 
     /// The rejected page's peer and hashes come from its frame's evidence:
     /// the peer its `Session` row names, and the page the peer sent there,
-    /// joined on its frame's whole [`FrameRef`], so the same position on
-    /// another stream kind, version or direction holds no page.
+    /// joined on its frame's whole [`FrameRef`], so the same frame with
+    /// any one key moved, its connection, stream kind, version, QUIC
+    /// stream, direction or position, holds no page (Rule 25's template).
     #[test]
     fn the_sent_page_comes_from_the_frames_evidence() {
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
@@ -1128,13 +1149,14 @@ mod tests {
         pages.record(page.frame.clone(), sent().hashes);
         assert_eq!(sent_page(&page, &peers, &pages), Ok(sent()));
         assert!(sent_page(&page, &[], &pages).is_err());
-        assert_one_key_off(&page.frame, |frame| {
+        let keys = assert_one_key_off::<FrameRef>(&page.frame, |frame| {
             let page = RejectedPage {
                 frame: frame.clone(),
                 ..page.clone()
             };
             sent_page(&page, &peers, &pages).is_ok()
         });
+        assert_eq!(keys, 6);
     }
 
     /// The staging companion joins the page staged from the rejected frame:

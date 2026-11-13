@@ -394,6 +394,61 @@ pub struct ExchangeRef {
 }
 impl Ref for ExchangeRef {}
 
+/// One history a witness test declared: the test, as its task names it,
+/// and the harness and case its declaration names. Two declarations of
+/// one case on two harnesses are two histories.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclarationRef {
+    /// The test, as its task names it.
+    pub test: String,
+    /// The harness.
+    pub harness: String,
+    /// The case.
+    pub case: String,
+}
+impl Ref for DeclarationRef {}
+
+/// One planted case or native mutation: its property directory and its
+/// name. Cases under two properties can share a name, so a name alone
+/// names none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlantedRef {
+    /// The property directory, or `native-mutations/header-sync` for a
+    /// native mutation.
+    pub property: String,
+    /// The case's or mutation's name.
+    pub name: String,
+}
+impl Ref for PlantedRef {}
+
+/// One witness test's histories on one harness: the harness and the
+/// test's package, file and name, everything a counted history names but
+/// its case.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessRef {
+    /// The harness.
+    pub harness: String,
+    /// The test's package.
+    pub package: String,
+    /// The test's file, relative to its package.
+    pub file: String,
+    /// The test's name.
+    pub test: String,
+}
+impl Ref for WitnessRef {}
+
+impl WitnessRef {
+    /// `witness`'s histories on `harness`.
+    pub fn of(harness: &str, witness: super::TestRef) -> Self {
+        WitnessRef {
+            harness: harness.to_owned(),
+            package: witness.package.to_owned(),
+            file: witness.file.to_owned(),
+            test: witness.test.to_owned(),
+        }
+    }
+}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

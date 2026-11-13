@@ -93,7 +93,7 @@ const REGISTERED: &[Store] = &[
         &[TransportNode],
         (
             "header_despite_close",
-            "the_staging_companion_needs_the_rejected_page_staged",
+            "the_sent_pages_store_holds_what_the_peer_sent",
         ),
     ),
     store(

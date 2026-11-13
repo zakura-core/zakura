@@ -13,6 +13,7 @@ use support::{
     inputs,
     steer::{steer, Rule, Steer},
 };
+use zakura_network::zakura::observe::ReactorEvent;
 use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -276,19 +277,20 @@ fn each_membership_row_holds_keys_in_a_committed_witness() {
     assert_eq!(empty, Vec::<&str>::new(), "{peaks:?}");
 }
 
-/// One limit fixture's row as its log shows it: which entry opens a unit of
-/// the row, and for which party, and which entry releases one.
-struct RowUnits {
+/// One limit fixture's row as its log, or an evidence store's facts of
+/// type `T`, show it: which item opens a unit of the row, and for which
+/// party, and which item releases one.
+struct RowUnits<T = Entry> {
     /// The fixture's stem.
     stem: &'static str,
     /// The row's limit.
     limit: usize,
     /// The parties that want a unit, one more than the limit can hold.
     parties: usize,
-    /// The party an entry opens a unit for, if it opens one.
-    opens: fn(&Entry) -> Option<String>,
-    /// Whether an entry releases a unit.
-    releases: fn(&Entry) -> bool,
+    /// The party an item opens a unit for, if it opens one.
+    opens: fn(&T) -> Option<String>,
+    /// Whether an item releases a unit.
+    releases: fn(&T) -> bool,
 }
 
 /// What a limit fixture's log shows of its row.
@@ -305,8 +307,8 @@ struct RowUse {
     last_first_open: Option<(usize, usize)>,
 }
 
-/// Reads `row`'s units from `entries`, in log order.
-fn row_use(row: &RowUnits, entries: &[Entry]) -> RowUse {
+/// Reads `row`'s units from `entries`, in their order.
+fn row_use<T>(row: &RowUnits<T>, entries: &[T]) -> RowUse {
     let mut open = 0usize;
     let mut peak = 0;
     let mut seen = BTreeSet::new();
@@ -489,7 +491,7 @@ fn timeouts(entries: &[Entry]) -> Vec<(Duration, String)> {
 
 /// Whether `sizes`, a row's sizes in order, reach `limit`, then fall below
 /// it, a release, and later rise from below it, a reuse.
-fn released_and_reused(sizes: &[usize], limit: usize) -> bool {
+fn sizes_fall_and_rise(sizes: &[usize], limit: usize) -> bool {
     let Some(full) = sizes.iter().position(|size| *size == limit) else {
         return false;
     };
@@ -501,37 +503,81 @@ fn released_and_reused(sizes: &[usize], limit: usize) -> bool {
         .any(|pair| pair[0] < limit && pair[1] > pair[0])
 }
 
-/// Gate 5's bound-table rows for work slots, locator reads, and node and
-/// peer execution slots, by their limit fixtures' logs: each row reaches its
+/// The slot-limit fixture's reservation-map row, read from the work
+/// queue's reservation facts ([`ReservationEvidence`]): a reservation
+/// opens a unit for its peer and its end releases it. Those are the facts
+/// the outstanding rule joins the reactor's reservation map's keys to.
+///
+/// [`ReservationEvidence`]: zakura_sim::harness::header_node::reservation::ReservationEvidence
+fn reservation_row() -> RowUnits<ReactorEvent> {
+    RowUnits {
+        stem: "header-outstanding-slot-limit",
+        limit: 16,
+        parties: 17,
+        opens: |event| match event {
+            ReactorEvent::ReservationOpened { peer, .. } => Some(format!("{peer:?}")),
+            _ => None,
+        },
+        releases: |event| matches!(event, ReactorEvent::ReservationEnded { .. }),
+    }
+}
+
+/// Checks `used`, `row`'s units in its fixture's run: the row reaches its
 /// limit and no further while one more party waits, so the next is denied,
 /// and that party gets its first unit only after a release, with fewer than
-/// the limit open, so a released unit is reused. The departed strikes and
-/// cooldowns evict instead of making a party wait: more peers are dropped
-/// within one cooldown than the rows hold, so an entry was evicted, and
-/// each row then falls below its limit as entries end and rises again
-/// when returning peers are dropped once more.
+/// the limit open, so a released unit is reused.
+fn released_and_reused<T>(row: &RowUnits<T>, used: &RowUse) {
+    let stem = row.stem;
+    assert_eq!(
+        (used.peak, used.parties),
+        (row.limit, row.parties),
+        "{stem}: {used:?}"
+    );
+    let (Some(release), Some((reused, open))) = (used.first_release, used.last_first_open) else {
+        panic!("{stem}: the row released and reused a unit: {used:?}");
+    };
+    assert!(
+        release < reused && open < row.limit,
+        "{stem}: the waiting party's first unit came after a release: {used:?}"
+    );
+}
+
+/// Gate 5's bound-table rows for work slots, locator reads, and node and
+/// peer execution slots, by their limit fixtures' logs, and for the
+/// reservation maps, by the slot-limit fixture's reservation facts
+/// ([`reservation_row`]): each row is [`released_and_reused`]. The departed
+/// strikes and cooldowns evict instead of making a party wait: more peers
+/// are dropped within one cooldown than the rows hold, so an entry was
+/// evicted, and each row then falls below its limit as entries end and
+/// rises again when returning peers are dropped once more
+/// ([`sizes_fall_and_rise`]).
 #[test]
 fn the_limit_fixtures_release_and_reuse_their_bounds() {
-    for row in limit_rows() {
-        let stem = row.stem;
+    let run_fixture = |stem: &str| {
         let scenario = scenario(stem);
+        let prepared = Storage::prepare(&scenario);
+        let reservations = prepared.reservations.clone();
         let plan =
             fs::read(fixture(stem, "plan")).unwrap_or_else(|error| panic!("{stem}: {error}"));
-        let report = run(stem, &scenario, Plan::from_fuzz(&plan));
-        let used = row_use(&row, report.log.entries());
-        assert_eq!(
-            (used.peak, used.parties),
-            (row.limit, row.parties),
-            "{stem}: {used:?}"
-        );
-        let (Some(release), Some((reused, open))) = (used.first_release, used.last_first_open)
-        else {
-            panic!("{stem}: the row released and reused a unit: {used:?}");
-        };
-        assert!(
-            release < reused && open < row.limit,
-            "{stem}: the waiting party's first unit came after a release: {used:?}"
-        );
+        let report = run_prepared::<Storage>(
+            &scenario,
+            prepared,
+            Plan::from_fuzz(&plan),
+            &mut MemorySink::default(),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{stem}: {error}"));
+        assert_eq!(report.end.violation, None, "{stem}: {:?}", report.end);
+        assert_eq!(report.end.harness, None, "{stem}: {:?}", report.end);
+        (report, reservations.facts())
+    };
+    for row in limit_rows() {
+        let (report, facts) = run_fixture(row.stem);
+        released_and_reused(&row, &row_use(&row, report.log.entries()));
+        let reservations = reservation_row();
+        if reservations.stem == row.stem {
+            released_and_reused(&reservations, &row_use(&reservations, &facts));
+        }
     }
     let (stem, rows, limit, parties) = HELD_ROWS;
     let scenario = scenario(stem);
@@ -547,6 +593,7 @@ fn the_limit_fixtures_release_and_reuse_their_bounds() {
     )
     .unwrap_or_else(|error| panic!("{stem}: {error}"));
     assert_eq!(report.end.violation, None, "{stem}: {:?}", report.end);
+    assert_eq!(report.end.harness, None, "{stem}: {:?}", report.end);
     let config = scenario.node_settings.config();
     let per_direction = config
         .peer_limits
@@ -569,7 +616,7 @@ fn the_limit_fixtures_release_and_reuse_their_bounds() {
     for row in rows {
         let sizes = evidence.sizes(row);
         assert!(
-            released_and_reused(&sizes, limit),
+            sizes_fall_and_rise(&sizes, limit),
             "{stem}: {row} released and reused an entry: {sizes:?}"
         );
     }
@@ -579,10 +626,10 @@ fn the_limit_fixtures_release_and_reuse_their_bounds() {
 /// never rise again after falling fails the release-and-reuse read.
 #[test]
 fn the_held_row_read_needs_a_release_and_a_later_rise() {
-    assert!(released_and_reused(&[0, 8, 1, 0, 1, 0], 8));
-    assert!(!released_and_reused(&[0, 7, 6, 7], 8));
-    assert!(!released_and_reused(&[0, 8, 8], 8));
-    assert!(!released_and_reused(&[0, 8, 1, 0], 8));
+    assert!(sizes_fall_and_rise(&[0, 8, 1, 0, 1, 0], 8));
+    assert!(!sizes_fall_and_rise(&[0, 7, 6, 7], 8));
+    assert!(!sizes_fall_and_rise(&[0, 8, 8], 8));
+    assert!(!sizes_fall_and_rise(&[0, 8, 1, 0], 8));
 }
 
 /// A row read with no release, or whose waiting party got its unit before
@@ -590,7 +637,7 @@ fn the_held_row_read_needs_a_release_and_a_later_rise() {
 /// release it claims.
 #[test]
 fn the_reuse_check_needs_a_release_before_the_waiting_party() {
-    let row = RowUnits {
+    let row: RowUnits = RowUnits {
         stem: "control",
         limit: 1,
         parties: 2,

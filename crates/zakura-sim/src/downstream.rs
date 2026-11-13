@@ -122,10 +122,11 @@ impl Quantity {
 /// must come from a frame of `row` with the work's exchange key that the
 /// peer's models labelled `Conformant` and the node's reader judged, on a
 /// connection still open. After a close, only the frame the node was
-/// handling then, the newest it judged on that stream, may still finish:
-/// another task decides the close, so the receiver can't make it atomic
-/// with that frame's handoff. The work from each frame stays within that
-/// frame's bytes: one frame's unused bytes never cover another's work.
+/// handling then may still finish: the newest it judged on that stream,
+/// with none of its work admitted before the close. Another task decides
+/// the close, so the receiver can't make it atomic with that frame's
+/// handoff. The work from each frame stays within that frame's bytes: one
+/// frame's unused bytes never cover another's work.
 pub(crate) fn work_authorized(entries: &[Entry], at: usize, row: &RowAt) -> Found {
     let Observation::WorkAdmitted {
         connection,
@@ -143,7 +144,10 @@ pub(crate) fn work_authorized(entries: &[Entry], at: usize, row: &RowAt) -> Foun
     let before = &entries[..at];
     let what = format!("connection {connection}'s work from {row} frame {seq}");
     if let Some(close) = close_at(before, *connection) {
-        if newest_judged(&before[..close], *connection, row) != Some(*seq) {
+        let at_close = &before[..close];
+        let in_hand = newest_judged(at_close, *connection, row) == Some(*seq)
+            && !admitted_from(at_close, *connection, row, *seq);
+        if !in_hand {
             return Some(Err(Failure::new(
                 format!("{what} stops when the connection closes"),
                 "the node admitted it after the close",
@@ -476,6 +480,18 @@ fn newest_judged(entries: &[Entry], connection: u64, row: &RowAt) -> Option<u64>
             ..
         } if *c == connection && *stream == row.stream => Some(*seq),
         _ => None,
+    })
+}
+
+/// True if `entries` hold work admitted from `connection`'s frame `seq` of
+/// `row`.
+fn admitted_from(entries: &[Entry], connection: u64, row: &RowAt, seq: u64) -> bool {
+    entries.iter().any(|entry| {
+        matches!(
+            &entry.obs,
+            Observation::WorkAdmitted { connection: c, frame, seq: s, .. }
+                if *c == connection && frame == row && *s == seq
+        )
     })
 }
 

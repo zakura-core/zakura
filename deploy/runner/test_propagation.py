@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Tests for the cluster view: peer labels, one node's report, and the join across nodes."""
 
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -44,6 +47,31 @@ class LabelTests(unittest.TestCase):
         self.assertEqual(fleet[US_WEST_LABEL], "us-west-0")
         # A node without a node id has a name only.
         self.assertEqual(sorted(name for name in fleet if name.startswith("peer:")), [US_WEST_LABEL])
+
+    def test_the_installed_join_normalizes_addresses_without_the_checkout(self):
+        here = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ("propagation.py", "peer_addresses.py"):
+                shutil.copy2(here / name, directory)
+                self.assertFalse((Path(directory) / name).is_symlink())
+            done = subprocess.run(
+                [sys.executable, "-I", "-c",
+                 "import sys; sys.path.insert(0, sys.argv[1]); import propagation; "
+                 "print(propagation.canonical_ip('[::ffff:192.0.2.7]:8233'))", directory],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+        self.assertEqual(done.stdout.strip(), "192.0.2.7")
+
+    def test_peer_addresses_are_validated_in_every_supported_form(self):
+        for text, expected in (
+            ("192.0.2.7", "192.0.2.7"), ("192.0.2.7:8233", "192.0.2.7"),
+            ("2001:db8::7", "2001:db8::7"), ("[2001:db8::7]:8233", "2001:db8::7"),
+            ("::ffff:192.0.2.7", "192.0.2.7"), ("[::ffff:192.0.2.7]:8233", "192.0.2.7"),
+            (None, None), (42, None), ("", None), ("v4redacted:8233", None),
+            ("v6redacted:8233", None), ("not an address", None),
+        ):
+            with self.subTest(address=text):
+                self.assertEqual(propagation.canonical_ip(text), expected)
 
 
 class JoinTests(unittest.TestCase):

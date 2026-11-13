@@ -136,7 +136,7 @@ build that writes `legacy_gossip.jsonl` and know each other's names
 (`fleet.py peer-names`). Without those, a legacy node still appears with its
 own stage times, and its source shows as outside the fleet.
 
-`propagation.py` and `propagation.html` are installed beside
+`propagation.py`, `propagation.html`, and the shared `peer_addresses.py` are installed beside
 `zakura-cluster-status.py`; the dashboard loads them only when a node in its
 list has a `profiler_url`.
 

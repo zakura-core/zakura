@@ -55,7 +55,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PROFILER_FILES = ("zakura_profiler.py", "stacks.py", "blocks.py", "page.html")
+PROFILER_FILES = ("zakura_profiler.py", "stacks.py", "blocks.py", "peer_addresses.py", "page.html")
 PROFILER_UNIT = "zakura-profiler.service"
 TUNNEL_UNIT = "zakura-profiler-tunnel@.service"
 # The archive-vct-off tunnel from before every node had one; it holds a tunnel port.

@@ -1052,11 +1052,11 @@ class TraceFollowingTests(unittest.TestCase):
         self.assertEqual((download["peer"], download["addr"], download["agent"]), ("peer:aaaa", None, None))
 
     def test_a_peer_address_is_read_in_every_form_the_node_writes(self):
-        self.assertEqual(blocks.peer_ip("192.0.2.7:8233"), "192.0.2.7")
-        self.assertEqual(blocks.peer_ip("[2001:db8::7]:8233"), "2001:db8::7")
-        self.assertEqual(blocks.peer_ip("[::ffff:192.0.2.7]:8233"), "192.0.2.7")
+        self.assertEqual(blocks.canonical_ip("192.0.2.7:8233"), "192.0.2.7")
+        self.assertEqual(blocks.canonical_ip("[2001:db8::7]:8233"), "2001:db8::7")
+        self.assertEqual(blocks.canonical_ip("[::ffff:192.0.2.7]:8233"), "192.0.2.7")
         for hidden in ("v4redacted:8233", "v6redacted:8233", "isolated", "", None):
-            self.assertIsNone(blocks.peer_ip(hidden), hidden)
+            self.assertIsNone(blocks.canonical_ip(hidden), hidden)
 
     def test_a_run_whose_start_time_cannot_be_read_has_no_wall_clock_times(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)

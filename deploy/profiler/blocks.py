@@ -10,10 +10,11 @@ from its header arriving to its peers being told.
 
 import calendar
 import collections
-import ipaddress
 import json
 import os
 import re
+
+from peer_addresses import canonical_ip
 
 ANNOUNCEMENT_MARKER = b"sending block announcement"
 ANNOUNCEMENT = re.compile(
@@ -250,23 +251,6 @@ def peer_of(row):
     return peer if isinstance(peer, str) and peer.startswith("peer:") else None
 
 
-def peer_ip(text):
-    """The IP address in a peer column, or `None` when the node hid it.
-
-    A node writes a peer as `ip:port` (`[ip]:port` for IPv6) only when its
-    `expose_peer_addresses` setting is on, and as `v4redacted:port` otherwise. An IPv4
-    address written in IPv6 form comes back as IPv4, so one peer has one spelling.
-    """
-    if not isinstance(text, str):
-        return None
-    host = text.rsplit(":", 1)[0] if text.count(":") == 1 or text.startswith("[") else text
-    try:
-        address = ipaddress.ip_address(host.strip("[]"))
-    except ValueError:
-        return None
-    return str(getattr(address, "ipv4_mapped", None) or address)
-
-
 def note_download(seen, download):
     """Record in `seen`, one block's events, one attempt to download the block."""
     downloads = seen.setdefault("downloads", [])
@@ -457,13 +441,13 @@ class BlockStages:
         process = row.get("process_trace_id")
         if event == "peer_upgraded":
             if isinstance(row.get("peer"), str):
-                peer = {"addr": peer_ip(row.get("addr")), "agent": row.get("user_agent")}
+                peer = {"addr": canonical_ip(row.get("addr")), "agent": row.get("user_agent")}
                 remember(self._zakura_peers, (process, row["peer"]), peer)
             return
         if event in ("block_request_finish", "find_blocks_finish") and type(row.get("connection_id")) is int:
             # A request row is where a legacy connection's address and software are written;
             # its announcements carry only the connection's number.
-            peer = {"addr": peer_ip(row.get("peer")), "agent": row.get("user_agent")}
+            peer = {"addr": canonical_ip(row.get("peer")), "agent": row.get("user_agent")}
             remember(self._connections, (process, row["connection_id"]), peer)
         if event == "find_blocks_finish":
             return
@@ -472,7 +456,7 @@ class BlockStages:
             note_download(
                 self._by_hash.setdefault((process, row["requested_hash"]), {}),
                 {
-                    "when": when, "stack": PATH_LEGACY, "addr": peer_ip(row.get("peer")),
+                    "when": when, "stack": PATH_LEGACY, "addr": canonical_ip(row.get("peer")),
                     "agent": row.get("user_agent"), "ms": row.get("elapsed_ms"),
                     "result": row.get("result"), "route": row.get("route"),
                 },

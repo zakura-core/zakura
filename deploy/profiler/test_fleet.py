@@ -227,6 +227,18 @@ class InstalledFilesTests(unittest.TestCase):
         )
         self.assertEqual(archive.extractfile("node.conf").read(), b"[Service]\n")
 
+    def test_the_installed_profiler_normalizes_addresses_without_the_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with tarfile.open(fileobj=io.BytesIO(fleet.profiler_archive("[Service]\n"))) as archive:
+                archive.extractall(directory, filter="data")
+            done = subprocess.run(
+                [sys.executable, "-I", "-c",
+                 "import sys; sys.path.insert(0, sys.argv[1]); import blocks; "
+                 "print(blocks.canonical_ip('[::ffff:192.0.2.7]:8233'))", directory],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+        self.assertEqual(done.stdout.strip(), "192.0.2.7")
+
     def test_a_node_is_told_every_other_node_s_name_and_address(self):
         drop_in = fleet.peer_names_drop_in(fleet.named_peers(self.remote, [self.local, self.remote], frozenset()))
         self.assertEqual(drop_in.splitlines()[1:], ["[Service]", "Environment=ZAKURA_TRACE_PEER_NAMES=us-east-0=192.0.2.1"])

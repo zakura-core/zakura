@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from unittest.mock import patch
@@ -433,7 +434,8 @@ class TraceRetentionTests(unittest.TestCase):
                     follower.join(timeout=2)
         self.assertFalse(recorder.is_alive())
         self.assertFalse(follower.is_alive())
-        self.assertEqual(self.table.stat().st_size, 0)
+        self.assertFalse(self.table.exists())
+        self.assertGreater(self.table.with_suffix(".jsonl.1").stat().st_size, 1024 * 1024)
         self.assertEqual(len(self.profiler._jobs), 0)
         self.assertTrue(self.profiler.status()["trace_retention"]["ready"])
 
@@ -441,7 +443,7 @@ class TraceRetentionTests(unittest.TestCase):
         self.profiler._trace_checked_at = time.monotonic() - 31
         self.assertFalse(self.profiler.status()["trace_retention"]["ready"])
 
-    def test_a_failed_stage_write_is_reported_after_the_trace_file_is_capped(self):
+    def test_a_failed_stage_write_is_reported_after_the_trace_file_is_rotated(self):
         failed = threading.Event()
         with (
             patch.object(self.profiler.store, "add_block_stages", side_effect=OSError("disk write failed")),
@@ -455,10 +457,11 @@ class TraceRetentionTests(unittest.TestCase):
                 self.profiler.stop()
                 follower.join(timeout=2)
         self.assertFalse(follower.is_alive())
-        self.assertEqual(self.table.stat().st_size, 0)
+        self.assertFalse(self.table.exists())
+        self.assertGreater(self.table.with_suffix(".jsonl.1").stat().st_size, 1024 * 1024)
         self.assertFalse(self.profiler.status()["trace_retention"]["ready"])
 
-    def test_a_table_that_cannot_be_emptied_is_reported_and_not_ready(self):
+    def test_a_table_that_cannot_be_rotated_is_reported_and_not_ready(self):
         failed = threading.Event()
         real_fail = self.profiler.fail
 
@@ -468,7 +471,7 @@ class TraceRetentionTests(unittest.TestCase):
 
         size = self.table.stat().st_size
         with (
-            patch.object(blocks.os, "truncate", side_effect=PermissionError("the table is read-only")),
+            patch.object(blocks.os, "replace", side_effect=PermissionError("the table is read-only")),
             patch.object(self.profiler, "fail", side_effect=report_failure),
         ):
             follower = threading.Thread(target=self.profiler.trace_loop)
@@ -530,6 +533,79 @@ class LogFollowingTests(unittest.TestCase):
         self.assertEqual(follower.read_new_lines(), [b"one", b"two"])
         self.path.write_bytes(b"new\n")
         self.assertEqual(follower.read_new_lines(), [b"new"])
+
+    def test_a_renamed_file_is_read_to_its_end_before_the_new_one(self):
+        moved = self.path.with_name("node.log.1")
+        follower = blocks.FileFollower(self.path, moved_path=moved)
+        self.path.write_bytes(b"one\n")
+        self.assertEqual(follower.read_new_lines(), [b"one"])
+        os.replace(self.path, moved)
+        # The writer has not started a new file yet and still appends to the renamed one.
+        with open(moved, "ab") as handle:
+            handle.write(b"two\n")
+        self.assertEqual(follower.read_new_lines(), [b"two"])
+        with open(moved, "ab") as handle:
+            handle.write(b"three\n")
+        self.path.write_bytes(b"four\n")
+        self.assertEqual(follower.read_new_lines(), [b"three", b"four"])
+        self.assertEqual(follower.read_new_lines(), [])
+
+    def test_a_follower_that_starts_with_only_the_renamed_file_follows_it(self):
+        moved = self.path.with_name("node.log.1")
+        moved.write_bytes(b"x" * 100 + b"\nrecent\n")
+        follower = blocks.FileFollower(self.path, lookback_bytes=20, moved_path=moved)
+        self.assertEqual(follower.read_new_lines(), [b"recent"])
+        with open(moved, "ab") as handle:
+            handle.write(b"later\n")
+        self.assertEqual(follower.read_new_lines(), [b"later"])
+        with open(moved, "ab") as handle:
+            handle.write(b"last\n")
+        self.path.write_bytes(b"new\n")
+        self.assertEqual(follower.read_new_lines(), [b"last", b"new"])
+
+    def test_a_renamed_tail_is_drained_across_bounded_reads_before_the_new_file(self):
+        for tail in (b"a" * 15 + b"\n", b"old0001\nold0002\n" + b"split" * 5 + b"\nlast\n"):
+            with self.subTest(tail=tail), mock.patch.object(blocks, "MAX_READ_BYTES", 16):
+                moved = self.path.with_name("node.log.1")
+                self.path.write_bytes(b"initial\n")
+                follower = blocks.FileFollower(self.path, moved_path=moved)
+                self.assertEqual(follower.read_new_lines(), [b"initial"])
+                with open(self.path, "ab") as handle:
+                    handle.write(tail)
+                os.replace(self.path, moved)
+                self.path.write_bytes(b"new\n")
+
+                returned = []
+                for _ in range(10):
+                    returned.extend(follower.read_new_lines())
+                self.assertEqual(returned, tail.splitlines() + [b"new"])
+                self.assertEqual(follower.read_new_lines(), [])
+
+    def test_a_missing_renamed_file_does_not_block_switching_to_the_new_file(self):
+        with mock.patch.object(blocks, "MAX_READ_BYTES", 8):
+            moved = self.path.with_name("node.log.1")
+            self.path.write_bytes(b"initial\n")
+            follower = blocks.FileFollower(self.path, moved_path=moved)
+            self.assertEqual(follower.read_new_lines(), [b"initial"])
+            with open(self.path, "ab") as handle:
+                handle.write(b"old0001\nold0002\n")
+            os.replace(self.path, moved)
+            self.path.write_bytes(b"new\n")
+            self.assertEqual(follower.read_new_lines(), [b"old0001"])
+            moved.unlink()
+            self.assertEqual(follower.read_new_lines(), [b"new"])
+
+    def test_a_renamed_file_that_is_not_the_one_being_followed_is_skipped(self):
+        moved = self.path.with_name("node.log.1")
+        follower = blocks.FileFollower(self.path, moved_path=moved)
+        self.path.write_bytes(b"one\n")
+        self.assertEqual(follower.read_new_lines(), [b"one"])
+        # The followed file went somewhere else, and an unrelated file has the renamed name.
+        os.replace(self.path, self.path.with_name("node.log.elsewhere"))
+        moved.write_bytes(b"unrelated\n")
+        self.assertEqual(follower.read_new_lines(), [])
+        self.path.write_bytes(b"two\n")
+        self.assertEqual(follower.read_new_lines(), [b"two"])
 
 
 NODE_RUN = "100-1794528928000000000"
@@ -666,10 +742,15 @@ class TraceFollowingTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
 
-    def append(self, table, *rows):
-        with open(self.directory / f"{table}.jsonl", "a") as handle:
+    def append(self, table, *rows, renamed=False):
+        """Append rows to a table, or to the file it was renamed to when it passed the cap."""
+        name = f"{table}.jsonl.1" if renamed else f"{table}.jsonl"
+        with open(self.directory / name, "a") as handle:
             for row in rows:
                 handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+    def size(self, name):
+        return (self.directory / name).stat().st_size
 
     def test_blocks_are_joined_across_tables_and_other_rows_are_skipped(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
@@ -687,17 +768,112 @@ class TraceFollowingTests(unittest.TestCase):
         (record,) = follower.poll()
         self.assertEqual((record["height"], record["path"], record["ms"]["verify"]), (10, "legacy", 5.5))
 
-    def test_a_table_over_the_cap_is_emptied_and_followed_from_its_new_start(self):
+    def twelve_tips(self):
+        """Enough `chain_tip` rows, for heights 0 to 11, to pass a 2000-byte cap."""
+        return [tip_row(1_000_000 + index, height=index, block_hash=f"{index:064x}") for index in range(12)]
+
+    def heights(self, records):
+        return [record["height"] for record in records]
+
+    def test_a_table_over_the_cap_is_renamed_and_no_row_is_lost(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
-        self.append("discovery", *[trace_row("peer_seen", index, peer="p" * 40) for index in range(40)])
-        self.append("chain_tip", *[tip_row(1_000_000 + index, height=index, block_hash=f"{index:064x}") for index in range(12)])
+        # A table the profiler does not read is kept under the cap too.
+        self.append("discovery", *[trace_row("peer_seen", index, peer="p" * 40) for index in range(20)])
+        self.append("chain_tip", *self.twelve_tips())
+        written = {name: self.size(name) for name in ("discovery.jsonl", "chain_tip.jsonl")}
         follower.poll()
-        self.assertEqual((self.directory / "discovery.jsonl").stat().st_size, 0)
-        self.assertEqual((self.directory / "chain_tip.jsonl").stat().st_size, 0)
-        # The node keeps appending to the emptied file.
-        self.append("chain_tip", tip_row(1_100_000, height=50))
+        for name, size in written.items():
+            self.assertFalse((self.directory / name).exists())
+            self.assertEqual(self.size(name + ".1"), size)
+        # The node appends to the renamed file until its next sync, then starts a new one.
+        self.append("chain_tip", tip_row(1_100_000, height=50), renamed=True)
         self.append("chain_tip", tip_row(9_000_000, height=51, block_hash="cd" * 32))
-        self.assertEqual([record["height"] for record in follower.poll()], list(range(12)) + [50])
+        self.assertEqual(self.heights(follower.poll()), list(range(12)) + [50])
+
+    def test_a_renamed_table_is_followed_until_the_node_starts_a_new_one(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
+        self.append("chain_tip", *self.twelve_tips())
+        follower.poll()
+        self.append(
+            "chain_tip", tip_row(1_100_000, height=50), tip_row(9_000_000, height=51, block_hash="cd" * 32),
+            renamed=True,
+        )  # fmt: skip
+        self.assertEqual(self.heights(follower.poll()), list(range(12)) + [50])
+        self.assertFalse((self.directory / "chain_tip.jsonl").exists())
+        self.append("chain_tip", tip_row(20_000_000, height=52, block_hash="ef" * 32))
+        self.assertEqual(self.heights(follower.poll()), [51])
+
+    def test_a_restarted_profiler_follows_a_table_the_node_still_writes_under_its_renamed_name(self):
+        self.append("chain_tip", *self.twelve_tips())
+        blocks.TraceFollower(str(self.directory), table_cap_bytes=2000).poll()
+        self.assertFalse((self.directory / "chain_tip.jsonl").exists())
+        # A node build that never starts a new file, and a profiler started after the rename.
+        restarted = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
+        self.append(
+            "chain_tip", tip_row(1_100_000, height=50), tip_row(9_000_000, height=51, block_hash="cd" * 32),
+            renamed=True,
+        )  # fmt: skip
+        self.assertEqual(self.heights(restarted.poll()), list(range(12)) + [50])
+
+    def test_rotation_keeps_both_files_until_the_renamed_backlog_is_read(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=20)
+        current = self.directory / "block_sync.jsonl"
+        moved = self.directory / "block_sync.jsonl.1"
+        current.write_bytes(b"initial\n")
+        follower.poll()
+        with open(current, "ab") as handle:
+            handle.write(b"old\n" * 30)
+        with mock.patch.object(blocks, "MAX_READ_BYTES", 16):
+            follower.poll()
+            original = moved.read_bytes()
+            self.assertGreater(len(original), 2 * follower.table_cap_bytes)
+            current.write_bytes(b"new\n" * 10)
+            follower.poll()
+            # Neither the twice-cap fallback nor the next rotation may destroy the tail.
+            self.assertEqual(moved.read_bytes(), original)
+            self.assertEqual(current.read_bytes(), b"new\n" * 10)
+            for _ in range(20):
+                follower.poll()
+            self.assertEqual(moved.read_bytes(), b"new\n" * 10)
+            self.assertFalse(current.exists())
+
+    def test_rotation_keeps_the_unread_tail_while_the_writer_has_not_reopened(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=20)
+        current = self.directory / "block_sync.jsonl"
+        moved = self.directory / "block_sync.jsonl.1"
+        current.write_bytes(b"initial\n")
+        follower.poll()
+        with open(current, "ab") as handle:
+            handle.write(b"old\n" * 30)
+        with mock.patch.object(blocks, "MAX_READ_BYTES", 16):
+            follower.poll()
+            original = moved.read_bytes()
+            self.assertGreater(len(original), 2 * follower.table_cap_bytes)
+            # An updated writer can be delayed before its next sync creates the replacement.
+            follower.poll()
+            self.assertFalse(current.exists())
+            self.assertEqual(moved.read_bytes(), original)
+            current.write_bytes(b"new\n" * 10)
+            for _ in range(20):
+                follower.poll()
+            self.assertEqual(moved.read_bytes(), b"new\n" * 10)
+            self.assertFalse(current.exists())
+
+    def test_a_renamed_table_that_keeps_growing_is_emptied_at_twice_the_cap(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
+        self.append("chain_tip", *self.twelve_tips())
+        follower.poll()
+        self.assertLess(self.size("chain_tip.jsonl.1"), 4000)
+        # A node build that never starts a new file keeps appending to the renamed one.
+        self.append("chain_tip", *self.twelve_tips(), renamed=True)
+        self.assertGreater(self.size("chain_tip.jsonl.1"), 4000)
+        follower.poll()
+        self.assertEqual(self.size("chain_tip.jsonl.1"), 0)
+        self.append(
+            "chain_tip", tip_row(30_000_000, height=60), tip_row(40_000_000, height=61, block_hash="cd" * 32),
+            renamed=True,
+        )  # fmt: skip
+        self.assertIn(60, self.heights(follower.poll()))
 
     def test_a_cap_of_zero_never_empties_a_table(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=0)
@@ -711,29 +887,31 @@ class TraceFollowingTests(unittest.TestCase):
         self.assertEqual(follower.poll(), [])
         self.assertIsNone(follower.trim_failure)
 
-    def test_a_table_that_cannot_be_emptied_is_a_failure_until_it_is_emptied(self):
+    def test_a_table_that_cannot_be_rotated_is_a_failure_until_it_is_rotated(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
         rows = [trace_row("peer_seen", index, peer="p" * 40) for index in range(40)]
         self.append("discovery", *rows)
         self.append("block_sync", *rows)
         stuck = str(self.directory / "discovery.jsonl")
-        real_truncate = os.truncate
+        real_replace = os.replace
 
-        def refuse_one_table(path, length):
+        def refuse_one_table(path, destination):
             if path == stuck:
                 raise PermissionError("the table is read-only")
-            real_truncate(path, length)
+            real_replace(path, destination)
 
-        with patch.object(blocks.os, "truncate", side_effect=refuse_one_table):
+        with patch.object(blocks.os, "replace", side_effect=refuse_one_table):
             follower.poll()
         self.assertIsInstance(follower.trim_failure, PermissionError)
         self.assertGreater(os.path.getsize(stuck), 2000)
-        # The table that could be emptied was, despite the one that could not.
-        self.assertEqual((self.directory / "block_sync.jsonl").stat().st_size, 0)
+        # The other table was rotated despite the failure.
+        self.assertFalse((self.directory / "block_sync.jsonl").exists())
+        self.assertGreater((self.directory / "block_sync.jsonl.1").stat().st_size, 2000)
 
         follower.poll()
         self.assertIsNone(follower.trim_failure)
-        self.assertEqual(os.path.getsize(stuck), 0)
+        self.assertFalse(os.path.exists(stuck))
+        self.assertGreater(os.path.getsize(stuck + ".1"), 2000)
 
 
 class ApiTests(unittest.TestCase):

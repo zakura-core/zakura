@@ -885,7 +885,7 @@ def parse_args(argv):
     )
     parser.add_argument(
         "--trace-table-cap-mb", type=int, default=DEFAULT_TRACE_TABLE_CAP_MB,
-        help="empty any trace table in --trace-dir that grows past this size; 0 never empties one",
+        help="rename any trace table in --trace-dir that grows past this size to <table>.jsonl.1; 0 disables rotation",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8097)

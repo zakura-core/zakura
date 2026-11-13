@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::OnceLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -561,17 +561,68 @@ impl std::fmt::Debug for JsonlTracer {
     }
 }
 
+/// What tells the file a table writer has open from another file at the same path.
+///
+/// This is the device and inode on Unix. `std` has no stable equivalent elsewhere,
+/// so on other platforms every file compares equal and only a missing file is noticed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            Self {}
+        }
+    }
+}
+
+/// Opens the trace table file at `path` for appending, creating it if it is missing.
+async fn open_table_file(path: &Path) -> std::io::Result<(tokio::fs::File, FileIdentity)> {
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    let identity = FileIdentity::of(&file.metadata().await?);
+
+    Ok((file, identity))
+}
+
 struct TableWriter {
+    path: PathBuf,
     file: tokio::fs::File,
+    identity: FileIdentity,
     encode_buf: Vec<u8>,
 }
 
 impl TableWriter {
-    fn new(file: tokio::fs::File, buffer_flush_bytes: usize) -> Self {
-        Self {
+    /// Opens the table file at `path` and returns a writer with an empty buffer.
+    async fn open(path: PathBuf, buffer_flush_bytes: usize) -> std::io::Result<Self> {
+        let (file, identity) = open_table_file(&path).await?;
+
+        Ok(Self {
+            path,
             file,
+            identity,
             encode_buf: Vec::with_capacity(buffer_flush_bytes),
-        }
+        })
     }
 
     fn append_line(&mut self, line: &[u8]) {
@@ -588,6 +639,28 @@ impl TableWriter {
 
         if sync_file {
             self.file.sync_data().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Starts a new file at the table's path if the open file is no longer the one there.
+    ///
+    /// A tool that bounds the size of the trace directory renames, deletes or
+    /// replaces a table file while the writer has it open. Rows written so far stay
+    /// in the old file, and later rows go to the file at the path, so no row is
+    /// lost or split.
+    async fn reopen_if_moved(&mut self) -> std::io::Result<()> {
+        let at_path = match tokio::fs::metadata(&self.path).await {
+            Ok(metadata) => Some(FileIdentity::of(&metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            // The path cannot be examined right now. Keep the open file, which still
+            // takes rows, and look again at the next sync.
+            Err(_) => return Ok(()),
+        };
+
+        if at_path != Some(self.identity) {
+            (self.file, self.identity) = open_table_file(&self.path).await?;
         }
 
         Ok(())
@@ -650,12 +723,20 @@ impl TraceWriter {
                 continue;
             }
 
-            if let Err(error) = table_writer.flush_buffer(flush_file || force_flush).await {
+            // Each sync also checks that the open file is still the one at its path, so
+            // a table whose file was moved away is back there within a flush interval.
+            let sync_file = flush_file || force_flush;
+            let mut result = table_writer.flush_buffer(sync_file).await;
+            if result.is_ok() && sync_file {
+                result = table_writer.reopen_if_moved().await;
+            }
+
+            if let Err(error) = result {
                 tracing::warn!(
                     ?error,
                     table = table_name,
                     trace_dir = ?self.trace_dir,
-                    "disabling trace table after write failure"
+                    "disabling trace table after a failed write or reopen"
                 );
                 failed_tables.push(table_name);
             }
@@ -702,13 +783,13 @@ impl TraceWriter {
                 self.trace_dir_created = true;
             }
 
-            let file = match tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(self.trace_dir.join(file_name))
-                .await
+            let table_writer = match TableWriter::open(
+                self.trace_dir.join(file_name),
+                self.config.buffer_flush_bytes,
+            )
+            .await
             {
-                Ok(file) => file,
+                Ok(table_writer) => table_writer,
                 Err(error) => {
                     tracing::warn!(
                         ?error,
@@ -721,10 +802,7 @@ impl TraceWriter {
                 }
             };
 
-            self.tables.insert(
-                table,
-                TableWriter::new(file, self.config.buffer_flush_bytes),
-            );
+            self.tables.insert(table, table_writer);
         }
 
         self.tables.get_mut(table)
@@ -1066,6 +1144,174 @@ mod tests {
 
         drop(tx);
         handle.await.expect("writer task should complete");
+    }
+
+    /// A writer that syncs every 25 ms, so a test sees a moved file replaced quickly.
+    fn spawn_fast_syncing_writer(
+        trace_dir: PathBuf,
+    ) -> (mpsc::Sender<JsonlWriteEvent>, JoinHandle<()>) {
+        let config = JsonlTraceConfig {
+            batch_linger: Duration::from_millis(1),
+            file_flush_interval: Duration::from_millis(25),
+            ..JsonlTraceConfig::default()
+        };
+        let (tx, rx) = mpsc::channel(16);
+        let writer = TraceWriter::new(trace_dir, config);
+        let handle = tokio::spawn(run_trace_writer(rx, writer, CancellationToken::new()));
+
+        (tx, handle)
+    }
+
+    async fn send_alpha_row(tx: &mpsc::Sender<JsonlWriteEvent>, value: u64) {
+        tx.send(JsonlWriteEvent {
+            table: "alpha",
+            file_name: "alpha.jsonl",
+            line: format!(r#"{{"value":{value}}}"#).into_bytes(),
+        })
+        .await
+        .expect("send should succeed");
+    }
+
+    /// The rows in the file at `path`, or none while the file does not exist.
+    async fn rows(path: &Path) -> Vec<String> {
+        match tokio::fs::read_to_string(path).await {
+            Ok(contents) => contents.lines().map(str::to_owned).collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("trace file should be readable: {error}"),
+        }
+    }
+
+    /// Waits for the writer to bring the file at `path` to `expected` rows.
+    async fn wait_for_row_count(path: &Path, expected: usize) {
+        let reached = async {
+            while rows(path).await.len() != expected {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+
+        time::timeout(Duration::from_secs(10), reached)
+            .await
+            .expect("the writer should sync its rows well within ten seconds");
+    }
+
+    /// Waits for the writer to create a file at `path`.
+    async fn wait_for_file(path: &Path) {
+        let created = async {
+            while !tokio::fs::try_exists(path)
+                .await
+                .expect("trace directory should be readable")
+            {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+
+        time::timeout(Duration::from_secs(10), created)
+            .await
+            .expect("the writer should create the file well within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn writer_starts_a_new_file_when_the_table_file_is_moved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace_dir = dir.path().join("traces");
+        let table_path = trace_dir.join("alpha.jsonl");
+        let moved_path = trace_dir.join("alpha.jsonl.1");
+        let (tx, handle) = spawn_fast_syncing_writer(trace_dir.clone());
+
+        send_alpha_row(&tx, 1).await;
+        wait_for_row_count(&table_path, 1).await;
+
+        tokio::fs::rename(&table_path, &moved_path)
+            .await
+            .expect("an open trace file can be renamed");
+        // Sent before the writer has noticed the move: it may land in either file.
+        send_alpha_row(&tx, 2).await;
+        wait_for_file(&table_path).await;
+        send_alpha_row(&tx, 3).await;
+
+        drop(tx);
+        handle.await.expect("writer task should complete");
+
+        let moved = rows(&moved_path).await;
+        let current = rows(&table_path).await;
+
+        assert_eq!(moved.first().map(String::as_str), Some(r#"{"value":1}"#));
+        assert_eq!(current.last().map(String::as_str), Some(r#"{"value":3}"#));
+        assert_eq!(
+            [moved, current].concat(),
+            [r#"{"value":1}"#, r#"{"value":2}"#, r#"{"value":3}"#],
+            "every row is in exactly one file, in the order it was sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_starts_a_new_file_when_the_table_file_is_deleted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace_dir = dir.path().join("traces");
+        let table_path = trace_dir.join("alpha.jsonl");
+        let (tx, handle) = spawn_fast_syncing_writer(trace_dir.clone());
+
+        send_alpha_row(&tx, 1).await;
+        wait_for_row_count(&table_path, 1).await;
+
+        tokio::fs::remove_file(&table_path)
+            .await
+            .expect("an open trace file can be deleted");
+        wait_for_file(&table_path).await;
+        send_alpha_row(&tx, 2).await;
+
+        drop(tx);
+        handle.await.expect("writer task should complete");
+
+        assert_eq!(rows(&table_path).await, [r#"{"value":2}"#]);
+    }
+
+    // File identity is only known on Unix. Elsewhere a file that took the place of
+    // the table file is not noticed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writer_moves_to_a_file_that_took_the_place_of_the_table_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace_dir = dir.path().join("traces");
+        let table_path = trace_dir.join("alpha.jsonl");
+        let moved_path = trace_dir.join("alpha.jsonl.1");
+        let (tx, handle) = spawn_fast_syncing_writer(trace_dir.clone());
+
+        send_alpha_row(&tx, 1).await;
+        wait_for_row_count(&table_path, 1).await;
+
+        // A rotation tool that renames the file and creates an empty one in its place.
+        tokio::fs::rename(&table_path, &moved_path)
+            .await
+            .expect("an open trace file can be renamed");
+        tokio::fs::write(&table_path, b"")
+            .await
+            .expect("the trace directory is writable");
+
+        // Keep sending rows until one reaches the new file.
+        let mut last_sent = 1;
+        let reached_new_file = async {
+            while rows(&table_path).await.is_empty() {
+                last_sent += 1;
+                send_alpha_row(&tx, last_sent).await;
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        time::timeout(Duration::from_secs(10), reached_new_file)
+            .await
+            .expect("the writer should move to the new file well within ten seconds");
+
+        drop(tx);
+        handle.await.expect("writer task should complete");
+
+        let sent: Vec<String> = (1..=last_sent)
+            .map(|value| format!(r#"{{"value":{value}}}"#))
+            .collect();
+        assert_eq!(
+            [rows(&moved_path).await, rows(&table_path).await].concat(),
+            sent,
+            "every row is in exactly one file, in the order it was sent"
+        );
     }
 
     #[test]

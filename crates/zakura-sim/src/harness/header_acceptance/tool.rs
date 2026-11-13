@@ -139,7 +139,7 @@ use super::{
         ObligationState, Report, ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
     history::{Declaration, DeclaredHistory, Ran, PLAN_FILE, RAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
-    refs::{DeclarationRef, HistoryRunRef, PlantedRef, Ref, TestIdRef, TriggerRef},
+    refs::{DeclarationRef, HistoryRunRef, PlantedRef, PropertyRef, Ref, TestIdRef, TriggerRef},
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
     rows::HEADER_HARNESSES,
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
@@ -3256,7 +3256,8 @@ pub struct DraftExport {
 
 /// Every header ID a harness in `registered` registers as `Draft`, once,
 /// with its row's promotion, and an error for each such ID whose row in
-/// `rows` is missing, isn't `Draft`, or names no promotion (item 9).
+/// `rows`, joined on its whole [`PropertyRef`], is missing, isn't `Draft`,
+/// or names no promotion (item 9).
 pub fn draft_list(
     registered: &[super::Registered],
     rows: &[super::Row],
@@ -3269,7 +3270,16 @@ pub fn draft_list(
     let mut listed = Vec::new();
     let mut errors = Vec::new();
     for property in drafts {
-        let row = rows.iter().find(|row| row.property == property);
+        let want = PropertyRef {
+            property: property.to_owned(),
+        };
+        let row = PropertyRef::joined(&want, rows, |row| {
+            Some(PropertyRef {
+                property: row.property.to_owned(),
+            })
+        })
+        .first()
+        .copied();
         match row.and_then(|row| {
             (row.status == crate::property::Status::Draft)
                 .then_some(row.promotion)
@@ -3763,6 +3773,30 @@ mod tests {
             assert!(drafts.is_empty(), "{drafts:?}");
             assert_eq!(errors.len(), 1, "{errors:?}");
         }
+    }
+
+    /// A registered `Draft` ID takes the promotion of only its own row,
+    /// joined on its whole [`PropertyRef`] (Rule 25's template):
+    /// `honest-progress` is listed with its row's promotion, and with its
+    /// row's property moved it has no row, so it isn't listed.
+    #[test]
+    fn a_draft_s_row_joins_its_whole_property() {
+        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        let registered = super::super::registered();
+        let rows = super::super::rows();
+        let at = rows
+            .iter()
+            .position(|row| row.property == "header-sync/honest-progress")
+            .expect("honest-progress has a row");
+        let own = PropertyRef {
+            property: rows[at].property.to_owned(),
+        };
+        let keys = assert_one_key_off::<PropertyRef>(&own, |want| {
+            let mut moved = rows.clone();
+            moved[at].property = leaked(&want.property);
+            !draft_list(&registered, &moved).0.is_empty()
+        });
+        assert_eq!(keys, 1);
     }
 
     /// A history identity for the fixtures.

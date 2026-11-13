@@ -22,7 +22,9 @@ use serde_json::Value;
 
 use super::{
     evaluate::{Actions, End},
-    refs::{ActNameRef, ControlRef, LinkRef, PeerNameRef, PickRef, Ref, SessionRef, StampRef},
+    refs::{
+        ActNameRef, ControlRef, LinkRef, PeerNameRef, PickRef, Ref, ScriptRef, SessionRef, StampRef,
+    },
 };
 use crate::{
     harness::{
@@ -706,6 +708,23 @@ fn next_declared(declared: &[Declared], picked: &[bool], pick: &PickRef) -> Opti
         .map(|(at, _)| *at)
 }
 
+/// Whether an action of `declared` before the one at `at`, in its script,
+/// joined on its whole [`ScriptRef`], is still undone by `picked`: a
+/// script's actions are picked in order.
+fn earlier_undone(declared: &[Declared], picked: &[bool], at: usize) -> bool {
+    let script = ScriptRef {
+        script: declared[at].script.clone(),
+    };
+    let before: Vec<(usize, &Declared)> = declared[..at].iter().enumerate().collect();
+    ScriptRef::joined(&script, &before, |(_, other)| {
+        Some(ScriptRef {
+            script: other.script.clone(),
+        })
+    })
+    .iter()
+    .any(|(before, _)| !picked[*before])
+}
+
 /// Whether `run`, a node history's recording that ended `end`, carried
 /// out `declared`: [`Actions::Complete`] for a completed run whose every
 /// declared action was picked, each script's in order, and shown by its
@@ -744,12 +763,7 @@ pub fn judge(
         let Some(at) = next_declared(declared, &picked, pick) else {
             return Actions::Incomplete;
         };
-        let action = &declared[at];
-        let earlier_undone = declared[..at]
-            .iter()
-            .enumerate()
-            .any(|(before, other)| other.script == action.script && !picked[before]);
-        if earlier_undone {
+        if earlier_undone(declared, &picked, at) {
             return Actions::Incomplete;
         }
         picked[at] = true;
@@ -1082,6 +1096,33 @@ mod tests {
             })
         );
         assert_eq!(pick_ref("peer:node"), None);
+    }
+
+    /// The scripted `redial` of `peer-0` after its `close` can't be taken
+    /// before it: an earlier action is undone only in its own script,
+    /// joined on its whole [`ScriptRef`] (Rule 25's template), so with the
+    /// `close`'s script moved, the `redial` has nothing undone before it.
+    #[test]
+    fn an_earlier_action_joins_its_whole_script() {
+        let action = |script: &str, action: &str| Declared {
+            pick: PickRef {
+                peer: "peer-0".into(),
+                action: action.into(),
+            },
+            script: script.into(),
+            control: None,
+            effect: Effect::AtPick,
+        };
+        let keys = assert_one_key_off::<ScriptRef>(
+            &ScriptRef {
+                script: "peer-0".into(),
+            },
+            |want| {
+                let declared = [action(&want.script, "close"), action("peer-0", "redial")];
+                earlier_undone(&declared, &[false, false], 1)
+            },
+        );
+        assert_eq!(keys, 1);
     }
 
     /// A harness-driven pick is ignored only by its whole [`PickRef`]

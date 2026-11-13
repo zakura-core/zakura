@@ -1301,3 +1301,128 @@ both_pools!(
     one_peer_holds_at_most_five_fetches,
     output_waits_are_limited_to_distinct_outpoints,
 );
+
+/// One step of a replayed trace, and what each pool answered.
+#[derive(Debug, Eq, PartialEq)]
+enum Answered {
+    /// A submission: its first-stage answer, then its second if it passed
+    /// the first. Errors are compared by their text, which RPC returns.
+    Submitted(Result<Result<(), String>, String>),
+    /// A block was committed.
+    Committed,
+}
+
+/// A small deterministic generator for the replay traces.
+struct Trace(u64);
+
+impl Trace {
+    /// A number below `n`.
+    fn pick(&mut self, n: usize) -> usize {
+        // xorshift64, enough to vary a trace.
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        usize::try_from(self.0 % u64::try_from(n).expect("a small bound")).expect("a small pick")
+    }
+}
+
+impl Harness {
+    /// Submits `tx` and answers its verification with `pass`, if the pool
+    /// asks for one. Returns both stages' answers.
+    async fn replay_submit(&mut self, tx: &VerifiedUnminedTx, pass: bool) -> Answered {
+        let receiver = match self.queue_one(tx.transaction.clone()).await {
+            Ok(receiver) => receiver,
+            Err(error) => return Answered::Submitted(Err(error.to_string())),
+        };
+        let answer = if pass {
+            Ok(passed(tx, Vec::new()))
+        } else {
+            Err(TransactionError::BadBalance)
+        };
+        self.verify(answer).await;
+        Answered::Submitted(Ok(self
+            .outcome(receiver)
+            .await
+            .map_err(|error| error.to_string())))
+    }
+}
+
+/// The replay test from the M1 plan: today's pool and the pool core are
+/// driven with one generated trace, step by step, and compared after each
+/// step settles. The trace leaves out the differences the plan makes on
+/// purpose: a second submission of an id that is being verified, a parent
+/// missing from the pool, and gossip draining.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_pools_answer_a_replayed_trace_alike() {
+    let samples = || -> Vec<VerifiedUnminedTx> {
+        Network::Mainnet
+            .unmined_transactions_in_blocks(2..=10)
+            .collect()
+    };
+    let all: Vec<UnminedTxId> = samples().iter().map(|tx| tx.transaction.id()).collect();
+    // What the traces reached: admissions, refusals after verification,
+    // first-stage refusals, and blocks that emptied part of the pool.
+    let (mut admitted, mut refused, mut first_stage, mut mined) = (0, 0, 0, 0);
+    for seed in 1..=8u64 {
+        let mut trace = Trace(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut classic = pool(Config::default(), Peers::Silent, Mode::Classic).await;
+        let mut core = pool(Config::default(), Peers::Silent, Mode::Core).await;
+        for harness in [&mut classic, &mut core] {
+            harness.activate().await;
+            // Block 1 starts an upgrade, which resets today's pool.
+            harness
+                .commit(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice())
+                .await;
+        }
+        let txs = samples();
+        let mut next_block = 2u32;
+        for step in 0..30 {
+            let commit = next_block <= 10 && trace.pick(5) == 0;
+            let (tx, pass) = (txs[trace.pick(txs.len())].clone(), trace.pick(4) != 0);
+            let mut answers = Vec::new();
+            for harness in [&mut classic, &mut core] {
+                let answer = if commit {
+                    let bytes = zakura_test::vectors::MAINNET_BLOCKS
+                        .get(&next_block)
+                        .expect("the vectors hold the first ten blocks");
+                    harness.commit(bytes).await;
+                    Answered::Committed
+                } else {
+                    harness.replay_submit(&tx, pass).await
+                };
+                let (transactions, tip) = harness.full().await;
+                let mut ids: Vec<_> = transactions
+                    .iter()
+                    .map(|tx| tx.transaction.id().mined_id().0)
+                    .collect();
+                ids.sort_unstable();
+                let mut rejected: Vec<_> = harness
+                    .rejected(all.clone())
+                    .await
+                    .into_iter()
+                    .map(|id| id.mined_id().0)
+                    .collect();
+                rejected.sort_unstable();
+                answers.push((answer, ids, rejected, tip));
+            }
+            if commit {
+                next_block += 1;
+            }
+            match &answers[0].0 {
+                Answered::Submitted(Ok(Ok(()))) => admitted += 1,
+                Answered::Submitted(Ok(Err(_))) => refused += 1,
+                Answered::Submitted(Err(_)) => first_stage += 1,
+                Answered::Committed => mined += 1,
+            }
+            assert_eq!(
+                answers[0], answers[1],
+                "seed {seed}, step {step}: today's pool, then the core"
+            );
+        }
+    }
+    assert!(
+        admitted > 0 && refused > 0 && first_stage > 0 && mined > 0,
+        "the traces reach each kind of step: {admitted} admitted, {refused} refused, \
+         {first_stage} refused at the first stage, {mined} blocks"
+    );
+}

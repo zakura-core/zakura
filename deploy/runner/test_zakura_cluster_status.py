@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import http.client
 import importlib.util
 import json
 import io
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -1824,14 +1824,39 @@ class ProfilerRouteTests(unittest.TestCase):
                 return error.code, error.read(), error.headers
 
     def test_the_old_profile_page_address_opens_the_node_pages_profile(self):
-        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
-        self.addCleanup(connection.close)
-        connection.request("GET", "/profile/profiled")
-        response = connection.getresponse()
-        response.read()
-        self.assertEqual(response.status, 302)
-        self.assertEqual(response.headers["Location"], "/node/profiled#profile")
+        code, body, headers = self.fetch("/profile/profiled")
+        self.assertEqual(code, 200)
+        self.assertIn("no-store", headers["Cache-Control"])
+        self.assertIn(b'href="/node/profiled#profile"', body)
         self.assertEqual(StubProfiler.requests, [])
+
+    @unittest.skipUnless(shutil.which("node"), "needs node to run the page's JavaScript")
+    def test_a_saved_profile_link_keeps_its_view_on_the_node_page(self):
+        # A link saved from the old page carries its view in the fragment, which only
+        # the browser sees: the redirect page moves it, and the profile reads it back.
+        old_view = "#from=1700000000&to=1700000600&view=verification&lens=block&focus=zakura%3A%3Averify"
+        redirect = re.search(r"<script>(.*?)</script>", status.profile_redirect_page("profiled").decode()).group(1)
+        read_hash = re.search(r"function readHash\(\) \{.*?\n\}", status.PAGE, re.S).group(0)
+        script = f"""
+            const location = {{ hash: {json.dumps(old_view)}, replace(url) {{ this.next = url; }} }};
+            {redirect}
+            location.hash = location.next.slice(location.next.indexOf("#"));
+            const state = {{}};
+            {read_hash}
+            readHash();
+            console.log(JSON.stringify({{ url: location.next, state }}));
+        """
+        result = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout)
+        self.assertTrue(result["url"].startswith("/node/profiled#profile&"))
+        self.assertEqual(result["state"], {
+            "from": 1700000000, "to": 1700000600, "view": "verification", "lens": "block", "focus": "zakura::verify",
+        })
+
+    def test_every_profile_button_the_click_handler_names_is_on_the_page(self):
+        names = set(re.findall(r'button\.id === "([^"]+)"', status.PAGE))
+        self.assertEqual(names, {"pf-live", "pf-focus-fn", "pf-zoom-out", "pf-stage-median"})
+        for name in names:
+            self.assertIn(f'<button id="{name}"', status.PAGE)
 
     def test_the_node_page_holds_the_cpu_profile_and_a_jump_bar(self):
         code, body, _ = self.fetch("/node/profiled")

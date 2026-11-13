@@ -4807,11 +4807,11 @@ document.getElementById("profile").addEventListener("click", event => {
   if (button.dataset.pfRange) { state.range = button.dataset.pfRange; state.from = state.to = null; reload(); }
   else if (button.dataset.pfView !== undefined) { state.view = button.dataset.pfView || state.view; state.focus = ""; state.zoom = []; reload(); }
   else if (button.dataset.pfLens) { state.lens = button.dataset.pfLens; reload(); }
-  else if (button.id === "live") { state.from = state.to = null; reload(); }
-  else if (button.id === "focus-fn" && selected) { state.focus = selected.name.slice(0, 300); state.zoom = []; reload(); }
-  else if (button.id === "zoom-out") { state.zoom.pop(); selected = null; drawFlame(); }
+  else if (button.id === "pf-live") { state.from = state.to = null; reload(); }
+  else if (button.id === "pf-focus-fn" && selected) { state.focus = selected.name.slice(0, 300); state.zoom = []; reload(); }
+  else if (button.id === "pf-zoom-out") { state.zoom.pop(); selected = null; drawFlame(); }
   else if (button.dataset.pfScale) { state.scale = button.dataset.pfScale; drawStages(); }
-  else if (button.id === "stage-median") { state.block = null; drawStages(); }
+  else if (button.id === "pf-stage-median") { state.block = null; drawStages(); }
   else if (button.dataset.pfPath) { state.path = button.dataset.pfPath; state.block = null; drawStages(); }
   else if (button.dataset.pfBlock) { state.block = state.block === button.dataset.pfBlock ? null : button.dataset.pfBlock; drawStages(); }
   else if (button.dataset.pfCpu) {
@@ -5382,6 +5382,24 @@ class BoundedHTTPServer(ThreadingHTTPServer):
             self.slots.release()
 
 
+def profile_redirect_page(node_name: str) -> bytes:
+    """The page at the profile's former address, `/profile/<node>`.
+
+    It sends the browser to the node page's profile section and keeps the view a
+    saved link chose. That view (`#range=...&view=...`) is in the URL fragment,
+    which never reaches the server, so the browser moves it: to `#profile&range=...`.
+    """
+    target = "/node/" + urllib.parse.quote(node_name, safe="") + "#profile"
+    # json.dumps makes a JS string; escaping "<" keeps it from closing the script.
+    script_target = json.dumps(target).replace("<", "\\u003c")
+    return (
+        "<!doctype html><meta charset=\"utf-8\"><title>CPU profile</title>"
+        f"<script>location.replace({script_target}"
+        " + (location.hash.length > 1 ? \"&\" + location.hash.slice(1) : \"\"));</script>"
+        f"<p>The CPU profile is now on the <a href=\"{html.escape(target)}\">node page</a>.</p>"
+    ).encode()
+
+
 class Handler(BaseHTTPRequestHandler):
     # Socket timeout, so a client that stalls mid-request frees its slot.
     timeout = REQUEST_TIMEOUT_SECONDS
@@ -5484,12 +5502,7 @@ class Handler(BaseHTTPRequestHandler):
                 {**NO_STORE, "Retry-After": str(int(PUBLIC_RATE_WINDOW))},
             )
         if request is None:
-            self.send_response(302)
-            self.send_header("Location", "/node/" + urllib.parse.quote(node.name, safe="") + "#profile")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return None
+            return self.send_body(200, profile_redirect_page(node.name), "text/html; charset=utf-8", NO_STORE)
         params = [
             (key, value)
             for key, value in urllib.parse.parse_qsl(parsed.query)

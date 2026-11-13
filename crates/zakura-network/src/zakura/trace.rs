@@ -496,14 +496,16 @@ impl ZakuraTrace {
         });
     }
 
-    /// Emit one `handshake` row naming the software a peer runs, once its legacy
-    /// connection has been upgraded to Zakura.
+    /// Emit one `handshake` row tying a peer's trace label to where it connected from
+    /// and the software it runs, once its legacy connection has been upgraded to Zakura.
     ///
-    /// `user_agent` is the peer's sanitized handshake user agent. The other tables
-    /// name the peer by the same label.
+    /// `addr` is the address of the upgraded connection as the node's
+    /// `expose_peer_addresses` setting allows it to be written, and `user_agent` the
+    /// peer's sanitized handshake user agent.
     pub(crate) fn emit_peer_upgraded(
         &self,
         peer_id: &ZakuraPeerId,
+        addr: &str,
         user_agent: &str,
         inbound: bool,
     ) {
@@ -515,6 +517,7 @@ impl ZakuraTrace {
             let direction = if inbound { "inbound" } else { "outbound" };
             insert_optional_str(row, "direction", Some(direction));
             insert_optional_str(row, "peer", Some(&peer_label(peer_id)));
+            insert_optional_str(row, "addr", Some(addr));
             insert_optional_str(row, "user_agent", Some(user_agent));
         });
     }
@@ -833,7 +836,7 @@ mod tests {
         let trace = ZakuraTrace::new(JsonlTracer::new(tx), "node");
         let peer_id = ZakuraPeerId::new(vec![7; 32]).expect("32 bytes is a valid peer id");
 
-        trace.emit_peer_upgraded(&peer_id, "/Zakura:1.8.7/", true);
+        trace.emit_peer_upgraded(&peer_id, "192.0.2.7:8233", "/Zakura:1.8.7/", true);
 
         let written = rx.try_recv().expect("one row is written");
         assert_eq!(written.file_name, "handshake.jsonl");
@@ -841,6 +844,7 @@ mod tests {
         assert_eq!(row["event"], "peer_upgraded");
         assert_eq!(row["direction"], "inbound");
         assert_eq!(row["peer"], peer_label(&peer_id));
+        assert_eq!(row["addr"], "192.0.2.7:8233");
         assert_eq!(row["user_agent"], "/Zakura:1.8.7/");
     }
 

@@ -136,14 +136,24 @@ fn the_staging_companion_needs_the_rejected_page_staged() {
     });
 }
 
+/// The headers the linkage act sends in its page
+/// (`ContentRule::Linkage` in `peer/adversary.rs` takes `page_at(id, 2)`).
+const LINKAGE_HEADERS: usize = 2;
+
 /// The chain peer `peer` (its harness name) serves in the input's
 /// scenario, built from the scenario rather than from the run: each
 /// header's hash in hex, and the hash in hex the same header gets with its
 /// previous-block hash's first byte flipped, as the linkage fault sends it.
-fn served_chain(peer: &str) -> Vec<(String, String)> {
+/// With it, the page the linkage act sends, derived from the scenario
+/// alone: the peer's script is that one act and it serves no page of its
+/// own, so the act's page is the subscription's first, starting at the
+/// node's tip, its common ancestor with the peer's chain. It's the chain's
+/// next [`LINKAGE_HEADERS`] headers there, the first unlinked.
+fn served_chain(peer: &str) -> (Vec<(String, String)>, Vec<String>) {
     let entry = harness::find(HeaderWire::NAME).expect("the wire harness is registered");
+    let drawn = entry.scenario(&input());
     let scenario: WireScenario =
-        serde_json::from_value(entry.scenario(&input())).expect("the input draws a scenario");
+        serde_json::from_value(drawn.clone()).expect("the input draws a scenario");
     let index: usize = peer
         .strip_prefix("peer-")
         .and_then(|index| index.parse().ok())
@@ -153,11 +163,23 @@ fn served_chain(peer: &str) -> Vec<(String, String)> {
         .as_ref()
         .expect("the faulting peer serves an honest chain")
         .chain;
+    let spec = &drawn["peers"][index];
+    assert_eq!(
+        spec["script"],
+        serde_json::json!([{"action": "act", "act": {"act": "bad-content", "rule": "linkage"}}]),
+        "the peer's one action is the linkage act"
+    );
+    assert_eq!(spec["adversary"]["serve"], false, "the peer serves no page");
+    assert_eq!(drawn["node"]["fork"], serde_json::Value::Null, "{drawn}");
+    let tip: usize = drawn["node"]["main"]
+        .as_u64()
+        .and_then(|tip| tip.try_into().ok())
+        .expect("the node's chain has a length");
     let hex = |hash: zakura_chain::block::Hash| -> String {
         hash.0.iter().map(|byte| format!("{byte:02x}")).collect()
     };
     let fixture = HeaderFixture::regtest();
-    fixture
+    let chain: Vec<(String, String)> = fixture
         .extend(fixture.anchor(), length, 0)
         .iter()
         .map(|header| {
@@ -165,7 +187,20 @@ fn served_chain(peer: &str) -> Vec<(String, String)> {
             unlinked.previous_block_hash.0[0] ^= 1;
             (hex(header.hash()), hex(unlinked.hash()))
         })
-        .collect()
+        .collect();
+    // `chain[i]` is height `i + 1`, so the page's first header, at the
+    // tip's next height, is `chain[tip]`.
+    let sent = &chain[tip..tip + LINKAGE_HEADERS];
+    let page = std::iter::once(sent[0].1.clone())
+        .chain(sent[1..].iter().map(|(hash, _)| hash.clone()))
+        .collect();
+    (chain, page)
+}
+
+/// Whether `pages` hold exactly `expected` at `frame` ([`sent_at`]).
+fn holds_page(pages: &[(FrameRef, Vec<String>)], frame: &FrameRef, expected: &[String]) -> bool {
+    let kept = sent_at(pages, frame);
+    kept.as_deref() == Some(expected)
 }
 
 /// The hashes of the one page in `pages` sent as `frame`, joined on its
@@ -192,32 +227,31 @@ fn a_stored_page_joins_its_whole_frame() {
 }
 
 /// The producer of `SentPages`: what it keeps for the rejected frame is
-/// the page the peer sent there, as the scenario's chain and the linkage
-/// fault give it: its first header unlinked, then the chain's next
-/// headers. Every page it keeps sits at a headers frame the peer logged,
-/// and is that page or a run of the chain's headers.
+/// the page the peer sent there, as the scenario alone gives it
+/// ([`served_chain`]): its length, its place on the chain, its first
+/// header unlinked and the chain's next one. The same store with that
+/// page's second header dropped doesn't hold it. Every page it keeps sits
+/// at a headers frame the peer logged, and is that page or a run of the
+/// chain's headers.
 #[test]
 fn the_sent_pages_store_holds_what_the_peer_sent() {
     let evidence = evidence();
     let page = rejected_page(&evidence.observations).expect("one page was rejected");
-    let chain = served_chain(&page.peer);
+    let (chain, expected) = served_chain(&page.peer);
+    assert_eq!(expected.len(), LINKAGE_HEADERS);
     let pages = evidence.sent.pages();
-    let stored = sent_at(&pages, &page.frame).expect("the store holds the rejected frame's page");
-    let start = chain
-        .iter()
-        .position(|(_, unlinked)| *unlinked == stored[0])
-        .unwrap_or_else(|| {
-            panic!("the page's first header is a chain header unlinked: {stored:?}")
-        });
-    let expected: Vec<String> = std::iter::once(chain[start].1.clone())
-        .chain(
-            chain[start + 1..]
-                .iter()
-                .take(stored.len() - 1)
-                .map(|(hash, _)| hash.clone()),
-        )
-        .collect();
-    assert_eq!(stored, expected, "{page:?}");
+    assert!(
+        holds_page(&pages, &page.frame, &expected),
+        "{page:?}: {:?} isn't {expected:?}",
+        sent_at(&pages, &page.frame)
+    );
+    let mut truncated = sent_at(&pages, &page.frame).expect("the store holds the page");
+    truncated.remove(1);
+    assert!(!holds_page(
+        &[(page.frame.clone(), truncated)],
+        &page.frame,
+        &expected
+    ));
 
     let hashes: Vec<String> = chain.iter().map(|(hash, _)| hash.clone()).collect();
     let mut logged = 0;

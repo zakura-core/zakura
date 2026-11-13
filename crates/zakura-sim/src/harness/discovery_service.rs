@@ -250,8 +250,8 @@ fn spawn_with(
     let stream = discovery_stream();
     let failure = PeerFailure::default();
     let records = PeerRecords::default();
-    let mut control =
-        PeerControl::new(failure.clone(), records.clone(), shared_ids).with_discovery(&stream);
+    let mut control = PeerControl::new(sim, "node", failure.clone(), records.clone(), shared_ids)
+        .with_discovery(&stream);
     for ((index, peer), name) in peers.iter().enumerate().zip(names) {
         assert!(
             peer.honest.is_none(),
@@ -279,6 +279,7 @@ fn spawn_with(
             listening,
             chain: None,
             records: records.clone(),
+            order: net.order(),
             closed: PeerCloses::default(),
             taken: 0,
         };

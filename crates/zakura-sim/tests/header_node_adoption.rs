@@ -27,11 +27,12 @@ use zakura_sim::{
             storage_config, storage_properties, storage_sources, Dialer, MirrorSpec, Ports,
             Storage, StorageScenario, StorageView,
         },
-        run_prepared, Subsystem,
+        run_prepared, HarnessError, Subsystem,
     },
     observe::{StorageFact, StorageRequest},
     property::{EndViolation, HasView, Property, Sources},
-    MemorySink, Observation, ObservationLog, PlanInput, RunConfig, RunEnd, RunReport, Sim,
+    HarnessFailure, MemorySink, Observation, ObservationLog, PlanInput, RunConfig, RunEnd,
+    RunReport, Sim,
 };
 
 /// The last view a run's checks read, with how many adoption facts it held
@@ -78,6 +79,11 @@ impl HasView for Adopting {
     /// The storage harness's end-of-run violations.
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         self.storage.end_violations(log)
+    }
+
+    /// The inner harness's stop.
+    fn stopping(&self) -> bool {
+        self.storage.stopping()
     }
 }
 
@@ -147,8 +153,7 @@ impl Run {
 
     /// hdr-4's status and tip rules, which
     /// `header-sync/state-publication-consistent` owns now, as its outcome
-    /// in the run's report: held, broken, or, with nothing judged,
-    /// inconclusive.
+    /// in the run's report: held, broken, or, with nothing judged, open.
     fn publication(&self) -> Acceptance {
         let outcome = &self
             .report
@@ -162,7 +167,7 @@ impl Run {
             PropertyOutcome::Violated { .. } => {
                 Acceptance::Violated(format!("{:?}", self.report.end.violation))
             }
-            other => Acceptance::Inconclusive(format!("{other:?}")),
+            other => Acceptance::Open(format!("{other:?}")),
         }
     }
 }
@@ -178,7 +183,9 @@ fn run_for(scenario: &StorageScenario, budget: Option<u64>, input: PlanInput) ->
     run_limited(scenario, budget, None, input)
 }
 
-/// [`run_for`], with a drain of at most `drain_bound` steps, if set.
+/// [`run_for`], with a drain of at most `drain_bound` steps, if set. A run
+/// whose drain that bound cuts off ends at a `DrainBound` harness failure,
+/// which these tests read as a cut-off run's report.
 fn run_limited(
     scenario: &StorageScenario,
     budget: Option<u64>,
@@ -191,14 +198,20 @@ fn run_limited(
         drain_bound,
     };
     let ready = Adopting::prepare(&scenario);
-    let report = run_prepared::<Adopting>(
+    let report = match run_prepared::<Adopting>(
         &scenario,
         ready.clone(),
         input,
         &mut MemorySink::default(),
         None,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    ) {
+        Ok(report) => report,
+        Err(HarnessError::Run {
+            failure: HarnessFailure::DrainBound { .. },
+            report,
+        }) if scenario.drain_bound.is_some() => *report,
+        Err(error) => panic!("{error}"),
+    };
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     let (view, seen) = ready
         .last
@@ -294,7 +307,7 @@ fn nth(
 #[derive(Debug, Default)]
 struct Tally {
     held: usize,
-    inconclusive: usize,
+    open: usize,
 }
 
 impl Tally {
@@ -302,7 +315,7 @@ impl Tally {
     fn count(&mut self, rule: &str, outcome: Acceptance) {
         match outcome {
             Acceptance::Holds => self.held += 1,
-            Acceptance::Inconclusive(_) => self.inconclusive += 1,
+            Acceptance::Open(_) => self.open += 1,
             Acceptance::Violated(why) => panic!("the {rule} rule broke: {why}"),
         }
     }
@@ -463,8 +476,8 @@ fn a_single_tip_change_is_published_by_a_settled_end() {
 }
 
 /// Runs cut off early break no rule: whatever they owe when the budget ends
-/// is inconclusive, not a violation. The checks' own tests cover which
-/// endings are inconclusive.
+/// stays open, not a violation. The checks' own tests cover which
+/// endings are open.
 #[test]
 fn a_run_that_ends_early_breaks_no_rule() {
     let scenario = grow_witness();

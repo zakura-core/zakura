@@ -813,6 +813,15 @@ impl Storage {
         self.verified.transactions()
     }
 
+    /// Returns transactions by descending ancestor-package fee per cost, with
+    /// older insertion times and then TXIDs breaking ties.
+    ///
+    /// Scores include all unconfirmed ancestors. Template selection must account
+    /// for parents it has already selected and emit them before their children.
+    pub(super) fn mining_transactions(&self) -> impl Iterator<Item = &VerifiedUnminedTx> {
+        self.verified.mining_transactions()
+    }
+
     /// Returns a reference to the [`TransactionDependencies`] in the verified set.
     pub fn transaction_dependencies(&self) -> &TransactionDependencies {
         self.verified.transaction_dependencies()
@@ -835,7 +844,7 @@ impl Storage {
     }
 
     /// Returns the cost of the transactions in the mempool, according to ZIP-401.
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "mempool-bench"))]
     pub fn total_cost(&self) -> u64 {
         self.verified.total_cost()
     }
@@ -908,7 +917,6 @@ impl Storage {
     /// Returns the number of rejected [`UnminedTxId`]s or [`transaction::Hash`]es.
     ///
     /// Transactions on multiple rejected lists are counted multiple times.
-    #[allow(dead_code)]
     pub fn rejected_transaction_count(&mut self) -> usize {
         self.tip_rejected_exact.len()
             + self.tip_rejected_same_effects.len()
@@ -1087,12 +1095,12 @@ impl Storage {
     ///
     /// Must be called every time the rejected lists change.
     fn update_rejected_metrics(&mut self) {
-        metrics::gauge!("mempool.rejected.transaction.ids",)
-            .set(self.rejected_transaction_count() as f64);
+        let rejected_count = self.rejected_transaction_count();
+        metrics::gauge!("mempool.rejected.transaction.ids",).set(rejected_count as f64);
         // This is just an approximation.
         // TODO: make it more accurate #2869
         let item_size = size_of::<(transaction::Hash, SameEffectsTipRejectionError)>();
         metrics::gauge!("mempool.rejected.transaction.ids.bytes",)
-            .set((self.rejected_transaction_count() * item_size) as f64);
+            .set((rejected_count * item_size) as f64);
     }
 }

@@ -115,6 +115,7 @@ fn any() -> Policy {
         bound_ms: None,
         holds: Vec::new(),
         reply_holds: Vec::new(),
+        disruptions: Vec::new(),
     }
 }
 
@@ -925,9 +926,9 @@ fn ended_handle_reads_unavailable() {
     }
 }
 
-/// A run that stops at its step budget with a locator pending and a lease
-/// live, both witnessed at its last step, shuts down cleanly: nothing
-/// leaks, the port then has nothing pending and no live lease, and the
+/// A run that a violation stops at its last live step, before the drain
+/// could finish its work, with a locator pending and a lease live, both
+/// witnessed at that step, shuts down cleanly: nothing leaks, the port then has nothing pending and no live lease, and the
 /// frozen log has no shutdown entry. The node at A3 holds its locator toward
 /// `mirror-0`'s A5 forever, and the probe holds a path to A3, which nothing
 /// sweeps since nobody else acquires.
@@ -957,13 +958,20 @@ fn run_end_returns_every_permit_and_lease() {
         let last = std::cell::Cell::new((false, 0));
         let ready = Probing::prepare(&scenario);
         let port = ready.ports.node.clone();
-        let mut witness = after_step(|_| {
+        let budget = Probing::config(&scenario).budget;
+        let mut witness = after_step(|cx| {
             let locator = port
                 .pending()
                 .iter()
                 .any(|op| op.op == zakura_storage::header::HeaderOp::ContinuationLocator);
             last.set((locator, port.engine().live_leases()));
-            None
+            (cx.step == budget).then(|| zakura_sim::Violation {
+                property: "test/stop".to_owned(),
+                step: cx.step,
+                witness: vec![cx.step],
+                expected: "a stop before the drain".to_owned(),
+                actual: format!("step {budget}"),
+            })
         });
         let report = run_prepared::<Probing>(
             &scenario,
@@ -976,7 +984,7 @@ fn run_end_returns_every_permit_and_lease() {
         drop(witness);
         assert_eq!(
             report.end.outcome,
-            zakura_sim::Outcome::Budget,
+            zakura_sim::Outcome::Violation,
             "{:?}",
             report.end
         );
@@ -1236,6 +1244,7 @@ fn a_deferring_clock_keeps_the_fork_fixture_unsettled() {
                 bound_ms: Some(10),
                 holds: Vec::new(),
                 reply_holds: Vec::new(),
+                disruptions: Vec::new(),
             },
             controls: Vec::new(),
         },

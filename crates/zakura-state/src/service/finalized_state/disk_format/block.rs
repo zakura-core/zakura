@@ -103,12 +103,6 @@ impl TransactionIndex {
         )
     }
 
-    /// Returns this index as a `u64`.
-    #[allow(dead_code)]
-    pub fn as_u64(&self) -> u64 {
-        self.0.into()
-    }
-
     /// The minimum value of a transaction index.
     ///
     /// This value corresponds to the coinbase transaction.

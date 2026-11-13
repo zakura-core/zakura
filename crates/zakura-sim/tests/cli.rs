@@ -78,6 +78,92 @@ fn record_a_plan_against_a_scenario() {
     assert!(!out.join(INPUT_FILE).exists());
 }
 
+/// C18: `record --script` runs a scripted Plan against a scenario, its
+/// trace names the script by digest, and `replay` reruns it Exact.
+#[test]
+fn record_a_script_against_a_scenario() {
+    let dir = TempDir::new().unwrap();
+    let script = dir.path().join("plan.json");
+    std::fs::write(&script, "{\n  \"choices\": [\"default\"]\n}\n").unwrap();
+    let out = dir.path().join("trace");
+    let output = zakura_sim(&[
+        "record",
+        "--sim",
+        "discovery/wait-complete",
+        "--scenario",
+        "{}",
+        "--script",
+        script.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let trace = TraceReader::open(&out).unwrap();
+    assert_eq!(trace.meta.input, None);
+    let plan = trace.meta.plan.expect("a script names its Plan");
+    // The digest is of the Plan, whatever the file's formatting.
+    assert_eq!(
+        plan.sha256,
+        format!("{:x}", Sha256::digest(br#"{"choices":["default"]}"#))
+    );
+    let replay = zakura_sim(&["replay", out.to_str().unwrap()]);
+    assert!(replay.status.success(), "{replay:?}");
+
+    let both = zakura_sim(&[
+        "record",
+        "--sim",
+        "discovery/wait-complete",
+        "--scenario",
+        "{}",
+        "--script",
+        script.to_str().unwrap(),
+        "--plan",
+        script.to_str().unwrap(),
+        "--out",
+        dir.path().join("both").to_str().unwrap(),
+    ]);
+    assert_eq!(both.status.code(), Some(2), "{both:?}");
+}
+
+/// `replay --report` writes a new file only: pointed at the trace's own
+/// `trace.jsonl`, it fails and leaves the trace as it was.
+#[test]
+fn replay_report_never_overwrites() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input");
+    std::fs::write(&input, [0, 1, 7, 3, 9, 1, 4, 2]).unwrap();
+    let out = dir.path().join("trace");
+    let recorded = zakura_sim(&[
+        "record",
+        "--sim",
+        "discovery/wait-complete",
+        "--input",
+        input.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(recorded.status.success(), "{recorded:?}");
+    let trace = out.join(TRACE_FILE);
+    let before = std::fs::read(&trace).unwrap();
+    let replay = zakura_sim(&[
+        "replay",
+        out.to_str().unwrap(),
+        "--report",
+        trace.to_str().unwrap(),
+    ]);
+    assert!(!replay.status.success(), "{replay:?}");
+    assert_eq!(std::fs::read(&trace).unwrap(), before);
+    let report = dir.path().join("replayed.json");
+    let replay = zakura_sim(&[
+        "replay",
+        out.to_str().unwrap(),
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    assert!(replay.status.success(), "{replay:?}");
+    assert!(report.exists());
+}
+
 #[test]
 fn usage_errors_exit_2() {
     let dir = TempDir::new().unwrap();

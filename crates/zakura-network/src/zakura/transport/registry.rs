@@ -387,6 +387,7 @@ impl ServiceRegistry {
     }
 
     /// Return true when the service owning `kind` still wants this peer.
+    #[cfg(test)]
     pub fn wants_session(
         &self,
         kind: u16,
@@ -650,7 +651,7 @@ fn selected_streams(service: &dyn Service, negotiated: u64, mode: StreamMode) ->
     selected
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests {
     use std::sync::Mutex;
 

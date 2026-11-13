@@ -34,7 +34,7 @@ use crate::{
         Cardinality, CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId,
         Source, Status, Subject, Verdict,
     },
-    sender, Observation,
+    sender, Observation, ObservationLog,
 };
 
 /// What a generated property claims.
@@ -578,6 +578,200 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     }
 }
 
+/// True if `log` reaches the trigger history of the generated property
+/// `id` over the streams of `layout`, the layout its harness registered the
+/// property from (C7). A harness attaches it as
+/// [`TriggerHistory::LogOf`](crate::property::TriggerHistory::LogOf), through
+/// a function that names its layout. An ID that isn't generated, or whose
+/// stream isn't in `layout`, never reaches it.
+///
+/// A receiver template's trigger is the node judging a frame its row's rule
+/// covers, with the template's label: a `<label>-closes` ID's label on its
+/// row (any row for `undeclared-type`), a conformant frame on the stream for
+/// `conformant-never-closes`, a frame into an empty cadence bucket on the row
+/// for `cadence-never-closes`, any frame on the row for
+/// `receiver-work-authorized` and `receiver-serving-bounded`, and a page of
+/// the subscription on a connection the node granted it credit on for
+/// `receiver-credit-conserved`, where the grant's key is the page's. A
+/// sender template's is in [`sender::trigger`].
+pub fn generated_trigger(layout: &[Stream], id: &PropertyId, log: &ObservationLog) -> bool {
+    let Some(id) = GeneratedId::parse(id.as_str()) else {
+        return false;
+    };
+    if stream_of(layout, id.stream).is_none() {
+        return false;
+    }
+    let entries = log.entries();
+    match id.template {
+        Template::SenderWithinResponseQuantity
+        | Template::SenderWithinLimit
+        | Template::SenderAnswersOpen
+        | Template::SenderEndsOnce
+        | Template::SenderWithinOwed
+        | Template::SenderWithinLive
+        | Template::SenderWithinCredit
+        | Template::SenderCadence => sender::trigger(layout, &id, entries),
+        Template::ConformantNeverCloses
+        | Template::Closes(_)
+        | Template::CadenceNeverCloses
+        | Template::WorkAuthorized
+        | Template::CreditConserved
+        | Template::ServingBounded => entries.iter().enumerate().any(|(at, entry)| {
+            let Observation::FrameJudged {
+                connection,
+                stream,
+                quic_stream,
+                seq,
+            } = entry.obs
+            else {
+                return false;
+            };
+            let before = &entries[..at];
+            // What came before the peer sent the frame, which `sent`
+            // checked appears exactly once.
+            let sent_before = before
+                .iter()
+                .rposition(|entry| {
+                    matches!(&entry.obs, Observation::PeerFrame {
+                        connection: c,
+                        stream: s,
+                        quic_stream: q,
+                        seq: n,
+                        ..
+                    } if (*c, *s, *q, *n) == (connection, stream, quic_stream, seq))
+                })
+                .map_or(before, |sent_at| &before[..sent_at]);
+            sent(before, connection, stream, quic_stream, seq)
+                .is_ok_and(|frame| receiver_reached(layout, &id, sent_before, connection, &frame))
+        }),
+    }
+}
+
+/// True if `frame`, which the node judged on `connection` and the peer sent
+/// after `before`, reaches receiver template `id`'s trigger, as
+/// [`generated_trigger`] says. A credit grant must come before the page.
+fn receiver_reached(
+    layout: &[Stream],
+    id: &GeneratedId<'_>,
+    before: &[Entry],
+    connection: u64,
+    frame: &Sent<'_>,
+) -> bool {
+    let on_row = frame.rule_stream == id.stream && frame.row == id.row;
+    match id.template {
+        Template::Closes(label) => {
+            frame.label == label
+                && frame.rule_stream == id.stream
+                && (label == Label::UndeclaredType || frame.row == id.row)
+        }
+        Template::ConformantNeverCloses => {
+            frame.stream == id.stream && frame.label == Label::Conformant
+        }
+        Template::CadenceNeverCloses => {
+            frame.stream == id.stream && frame.row == id.row && frame.exhausted
+        }
+        Template::WorkAuthorized | Template::ServingBounded => on_row,
+        Template::CreditConserved => {
+            let Some(subscription) = id.row else {
+                return false;
+            };
+            is_page_of(
+                layout,
+                (frame.rule_stream, frame.row, frame.label),
+                (id.stream, subscription),
+            ) && before.iter().any(|entry| {
+                matches!(&entry.obs, Observation::CreditGranted {
+                    connection: c,
+                    subscription: granted,
+                    exchange,
+                    ..
+                } if *c == connection
+                    && Some(*exchange) == frame.exchange
+                    && granted.stream == id.stream
+                    && granted.row == subscription)
+            })
+        }
+        _ => false,
+    }
+}
+
+/// The stream of `layout` with ID `id`.
+fn stream_of(layout: &[Stream], id: StreamId) -> Option<&Stream> {
+    layout
+        .iter()
+        .find(|stream| stream.kind == id.kind && stream.version == id.version)
+}
+
+/// True if a frame whose rule is `row` on `rule_stream`, labelled `label`,
+/// is a page of the subscription row `subscription` of `layout`: a response
+/// row that doesn't end the exchange, whose request is that subscription as
+/// [`rule_row`] resolves it, or the subscription row itself for a page past
+/// its credit, which that row enforces. An ending, such as header sync's
+/// `headers-outcome`, spends no credit, so it's no page.
+pub(crate) fn is_page_of(
+    layout: &[Stream],
+    (rule_stream, row, label): (StreamId, Option<&str>, Label),
+    (stream, subscription): (StreamId, &str),
+) -> bool {
+    let Some(row) = row else {
+        return false;
+    };
+    if (rule_stream, row) == (stream, subscription) {
+        return label == Label::OverCredit;
+    }
+    let Some(frame_stream) = stream_of(layout, rule_stream) else {
+        return false;
+    };
+    let Some(rule) = frame_stream
+        .messages
+        .and_then(|rules| rules.iter().find(|rule| rule.name == row))
+    else {
+        return false;
+    };
+    if !matches!(
+        rule.role,
+        MessageRole::Response {
+            ends_exchange: false,
+            ..
+        }
+    ) {
+        return false;
+    }
+    let (enforced_on, enforced) = rule_row(layout, frame_stream, rule, Label::OverCredit);
+    (enforced_on.kind, enforced_on.version) == (stream.kind, stream.version)
+        && enforced.name == subscription
+}
+
+/// The request row of `layout` that the response row `row` on `stream`
+/// answers, as [`rule_row`] finds it: on `stream` first, then on the rest of
+/// the layout. `None` for a row that isn't a response.
+pub(crate) fn request_of(
+    layout: &[Stream],
+    stream: StreamId,
+    row: &str,
+) -> Option<(StreamId, &'static str)> {
+    let frame_stream = stream_of(layout, stream)?;
+    let rule = frame_stream
+        .messages?
+        .iter()
+        .find(|rule| rule.name == row)?;
+    let MessageRole::Response { request, .. } = rule.role else {
+        return None;
+    };
+    std::iter::once(frame_stream)
+        .chain(layout)
+        .find_map(|stream| {
+            let found = MessageRule::find(stream.messages?, request)?;
+            Some((
+                StreamId {
+                    kind: stream.kind,
+                    version: stream.version,
+                },
+                found.name,
+            ))
+        })
+}
+
 /// One frame a peer sent.
 #[derive(Clone, Copy, Debug)]
 struct Sent<'a> {
@@ -586,6 +780,8 @@ struct Sent<'a> {
     rule_stream: StreamId,
     label: Label,
     exhausted: bool,
+    /// The exchange or subscription it names, if any.
+    exchange: Option<u64>,
 }
 
 /// The frame `seq` the peer sent on `connection`, `stream` and
@@ -609,6 +805,7 @@ fn sent(
             rule_stream,
             label,
             exhausted,
+            exchange,
             ..
         } if (*c, *s, *quic, *q) == (connection, stream, quic_stream, seq) => Some(Sent {
             stream,
@@ -616,6 +813,7 @@ fn sent(
             rule_stream: *rule_stream,
             label: *label,
             exhausted: *exhausted,
+            exchange: *exchange,
         }),
         _ => None,
     });

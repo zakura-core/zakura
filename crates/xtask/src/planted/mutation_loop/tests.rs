@@ -12,21 +12,24 @@ use super::{run_measured, Built, Runnable};
 use serde_json::json;
 
 use super::{
+    super::outcome::EndOutcome,
     build_failure,
     classify::{self, read_record, Class, Ended, Observed, Reason, Record, Trigger},
-    parse_flags, selects, summarize, test_executables, BaselineReport, BuildIdentity, CaseReport,
-    LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
+    parse_flags, planted_cases, selects, summarize, test_executables, BaselineReport,
+    BuildIdentity, CaseReport, LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
 };
 
 const NAMED: &str = "block-sync/retained-byte-bound";
 const OTHER: &str = "block-sync/reserved-byte-bound";
 
 /// An end record on thread `t1` whose run `stopped_by` stopped, with each
-/// of `outcomes` as `(id, outcome, applicable)`.
+/// of `outcomes` as `(id, outcome, applicable)`. An outcome is `held`,
+/// `violated`, or `not-applicable/<reason>`, as [`outcome`] reads it.
 fn end(stopped_by: Option<&str>, outcomes: &[(&str, &str, u64)]) -> Record {
     end_on("t1", stopped_by, outcomes)
 }
 
+/// [`end`] on `thread`.
 fn end_on(thread: &str, stopped_by: Option<&str>, outcomes: &[(&str, &str, u64)]) -> Record {
     Record::End {
         thread: thread.to_owned(),
@@ -39,9 +42,20 @@ fn end_on(thread: &str, stopped_by: Option<&str>, outcomes: &[(&str, &str, u64)]
         harness: None,
         outcomes: outcomes
             .iter()
-            .map(|(id, outcome, n)| ((*id).to_owned(), ((*outcome).to_owned(), *n)))
+            .map(|(id, name, n)| ((*id).to_owned(), outcome(name, *n)))
             .collect(),
     }
+}
+
+/// The outcome `name` names, with `applicable` evaluations for `held`, read
+/// from its serialized form the way an end record's is.
+fn outcome(name: &str, applicable: u64) -> EndOutcome {
+    let value = match name.split_once('/') {
+        Some(("not-applicable", reason)) => json!({"not-applicable": {"reason": reason}}),
+        _ if name == "held" => json!({"held": {"applicable": applicable}}),
+        _ => json!({ name: {} }),
+    };
+    EndOutcome::parse(&value).unwrap_or_else(|error| panic!("{name}: {error}"))
 }
 
 fn judged(error: Option<&str>, trigger: Trigger) -> Record {
@@ -124,7 +138,7 @@ fn a_passing_witness_survives_held() {
 fn not_applicable_and_a_lost_trigger_survive_with_their_reasons() {
     let never = observed(
         Ended::Exited(0),
-        vec![end(None, &[(NAMED, "not-applicable", 0)])],
+        vec![end(None, &[(NAMED, "not-applicable/never-applied", 0)])],
     );
     assert_eq!(
         classified(&never),
@@ -133,7 +147,7 @@ fn not_applicable_and_a_lost_trigger_survive_with_their_reasons() {
     let judged_not_applicable = observed(
         Ended::Exited(1),
         vec![
-            end(None, &[(NAMED, "not-applicable", 0)]),
+            end(None, &[(NAMED, "not-applicable/never-applied", 0)]),
             judged(Some("not-applicable"), Trigger::Lost),
         ],
     );
@@ -269,34 +283,81 @@ fn a_violation_that_stopped_no_run_decides_nothing() {
     assert_eq!(result.other.as_deref(), Some(OTHER));
 }
 
+/// Each `not-applicable` reason, read from its serialized end record: a
+/// benign one survives `not-applicable`, and every other `incomplete`.
 #[test]
-fn an_inconclusive_named_id_survives_inconclusive_not_held() {
-    let inconclusive = observed(
+fn each_not_applicable_reason_survives_by_its_class() {
+    for (reason, expected) in [
+        (json!("never-applied"), Reason::NotApplicable),
+        (json!("undeclared"), Reason::NotApplicable),
+        (json!("excluded"), Reason::NotApplicable),
+        (json!("assumptions-never-held"), Reason::Incomplete),
+        (json!("assumption-lost"), Reason::Incomplete),
+        (json!("stopped-by-violation"), Reason::Incomplete),
+        (json!("harness-failed"), Reason::Incomplete),
+        (json!("node-stopped"), Reason::Incomplete),
+        (
+            json!({"unsettled": {"site": "teardown-open"}}),
+            Reason::Incomplete,
+        ),
+    ] {
+        let end_file = json!({
+            "seq": 0, "thread": "t1", "source": "abc",
+            "end": {
+                "outcome": "budget", "steps": 9, "drain": null, "cleanup": {},
+                "properties": [
+                    {"property": NAMED, "outcome": {"not-applicable": {"reason": reason}}},
+                ],
+            },
+        });
+        let record = read_record(&end_file.to_string(), "abc")
+            .unwrap()
+            .expect("the record is the build's");
+        let run = observed(Ended::Exited(0), vec![record]);
+        assert_eq!(
+            classified(&run),
+            (Class::Survived, Some(expected)),
+            "{reason}"
+        );
+    }
+    // An unknown reason fails the read.
+    let unknown = json!({
+        "seq": 0, "thread": "t1", "source": "abc",
+        "end": {"properties": [
+            {"property": NAMED, "outcome": {"not-applicable": {"reason": "lost"}}},
+        ]},
+    });
+    assert!(read_record(&unknown.to_string(), "abc").is_err());
+}
+
+#[test]
+fn an_incomplete_named_id_survives_incomplete_not_held() {
+    let incomplete = observed(
         Ended::Exited(0),
-        vec![end(None, &[(NAMED, "inconclusive", 0)])],
+        vec![end(None, &[(NAMED, "not-applicable/assumption-lost", 0)])],
     );
     assert_eq!(
-        classified(&inconclusive),
-        (Class::Survived, Some(Reason::Inconclusive))
+        classified(&incomplete),
+        (Class::Survived, Some(Reason::Incomplete))
     );
-    // A failed judgement of an inconclusive outcome gives the same reason.
-    let judged_inconclusive = observed(
+    // A failed judgement of an incomplete outcome gives the same reason.
+    let judged_incomplete = observed(
         Ended::Exited(1),
         vec![
-            end(None, &[(NAMED, "inconclusive", 0)]),
-            judged(Some("inconclusive"), Trigger::None),
+            end(None, &[(NAMED, "not-applicable/assumption-lost", 0)]),
+            judged(Some("incomplete"), Trigger::None),
         ],
     );
     assert_eq!(
-        classified(&judged_inconclusive),
-        (Class::Survived, Some(Reason::Inconclusive))
+        classified(&judged_incomplete),
+        (Class::Survived, Some(Reason::Incomplete))
     );
     // Some run that held the named ID with nonzero applicability is `held`,
     // as a baseline requires.
     let one_held = observed(
         Ended::Exited(0),
         vec![
-            end(None, &[(NAMED, "inconclusive", 0)]),
+            end(None, &[(NAMED, "not-applicable/assumption-lost", 0)]),
             end(None, &[(NAMED, "held", 3)]),
         ],
     );
@@ -390,7 +451,7 @@ fn a_baseline_must_hold_the_property_cleanly() {
         observed(Ended::Exited(0), vec![end(None, &[(NAMED, "held", 0)])]),
         observed(
             Ended::Exited(0),
-            vec![end(None, &[(NAMED, "not-applicable", 0)])],
+            vec![end(None, &[(NAMED, "not-applicable/never-applied", 0)])],
         ),
         observed(Ended::Exited(101), vec![end(None, &[(NAMED, "held", 2)])]),
         observed(
@@ -461,7 +522,7 @@ fn records_are_read_from_the_hooks_files_and_paired_by_source() {
             "properties": [
                 {"property": NAMED, "outcome": {"violated": {"witness": [9]}}},
                 {"property": OTHER, "outcome": {"held": {"applicable": 4}}},
-                {"property": "sim/no-livelock", "outcome": "not-applicable"},
+                {"property": "sim/no-livelock", "outcome": {"not-applicable": {"reason": "never-applied"}}},
             ],
         },
     });
@@ -474,11 +535,11 @@ fn records_are_read_from_the_hooks_files_and_paired_by_source() {
             violated: vec![NAMED.to_owned()],
             harness: None,
             outcomes: [
-                (NAMED.to_owned(), ("violated".to_owned(), 0)),
-                (OTHER.to_owned(), ("held".to_owned(), 4)),
+                (NAMED.to_owned(), outcome("violated", 0)),
+                (OTHER.to_owned(), outcome("held", 4)),
                 (
                     "sim/no-livelock".to_owned(),
-                    ("not-applicable".to_owned(), 0)
+                    outcome("not-applicable/never-applied", 0)
                 ),
             ]
             .into_iter()
@@ -708,7 +769,7 @@ fn the_report_round_trips_and_counts_by_property() {
         case(Class::KilledByOtherRule, None, NAMED),
         case(Class::Survived, Some(Reason::Held), NAMED),
         case(Class::Survived, Some(Reason::TriggerLost), NAMED),
-        case(Class::Survived, Some(Reason::Inconclusive), NAMED),
+        case(Class::Survived, Some(Reason::Incomplete), NAMED),
         case(Class::DidNotCompile, None, OTHER),
         case(Class::PatchDoesNotApply, None, OTHER),
         case(Class::BaselineFails, None, OTHER),
@@ -767,12 +828,12 @@ fn the_report_round_trips_and_counts_by_property() {
     assert!(value["cases"][1].get("trigger").is_none());
     assert_eq!(value["cases"][3]["result"]["reason"], "trigger-lost");
     assert_eq!(value["cases"][3]["trigger"], "lost");
-    assert_eq!(value["cases"][4]["result"]["reason"], "inconclusive");
+    assert_eq!(value["cases"][4]["result"]["reason"], "incomplete");
     assert_eq!(value["cases"][7]["baseline"]["rerun_alone"], true);
     assert!(first["baseline"].get("rerun_alone").is_none());
     assert_eq!(
         value["summary"][NAMED]["results"],
-        json!({"killed-by-named-rule": 1, "killed-by-other-rule": 1, "survived/held": 1, "survived/trigger-lost": 1, "survived/inconclusive": 1})
+        json!({"killed-by-named-rule": 1, "killed-by-other-rule": 1, "survived/held": 1, "survived/trigger-lost": 1, "survived/incomplete": 1})
     );
     assert_eq!(
         value["summary"][OTHER]["run_failures"],
@@ -843,6 +904,30 @@ fn a_child_reports_its_exit_or_its_deadline() {
     )
     .unwrap();
     assert_eq!(ended, Ended::TimedOut);
+}
+
+/// `--planted` refuses a nested case rather than drop its `set`: the loop
+/// would count a catch of the case's property alone, with a member held, as
+/// killed by the named rule.
+#[test]
+fn planted_cases_refuse_a_nested_set() {
+    let repo = tempfile::tempdir().unwrap();
+    let case = repo.path().join("qa/planted/race/lost-update");
+    fs::create_dir_all(&case).unwrap();
+    fs::write(case.join("nested.patch"), "").unwrap();
+    fs::write(
+        case.join("nested.toml"),
+        "input = \"in.bin\"\nset = [\"race/other\"]\n",
+    )
+    .unwrap();
+    let error =
+        planted_cases(repo.path(), &["race".to_owned()]).expect_err("a nested case is refused");
+    assert!(error.to_string().contains("`set`"), "{error}");
+
+    fs::write(case.join("nested.toml"), "input = \"in.bin\"\n").unwrap();
+    let cases = planted_cases(repo.path(), &["race".to_owned()]).unwrap();
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0].property, "race/lost-update");
 }
 
 /// `--planted` selects whole path components or one case, so a prefix that

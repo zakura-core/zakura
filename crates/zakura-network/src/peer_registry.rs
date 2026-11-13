@@ -90,6 +90,18 @@ impl PeerRegistry {
         connected_peers
     }
 
+    /// Return the remote address of every active connection, and whether the remote
+    /// peer initiated it.
+    pub(crate) fn connection_addrs(&self) -> Vec<(PeerSocketAddr, bool)> {
+        self.inner
+            .lock()
+            .expect("peer registry mutex is never poisoned")
+            .active_connections
+            .values()
+            .map(|peer| (peer.addr, peer.is_inbound))
+            .collect()
+    }
+
     /// Register one legacy connection until the returned guard drops.
     pub(crate) fn register_legacy(
         &self,

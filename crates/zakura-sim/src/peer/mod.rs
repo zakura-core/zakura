@@ -75,6 +75,7 @@ use zakura_rt::{
 };
 use zakura_scheduler::SimInstant;
 
+use self::evidence::PeerFeed;
 pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody, Remote, SharedIds};
 use self::{
     adversary::{Act, Adversary, AdversarySpec},
@@ -86,12 +87,14 @@ use self::{
     limit::{RateLimit, ADVERSARY_RATE},
 };
 use crate::{
+    evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     model::{
         CadenceModel, Charge, FrameHeader, FrameModel, Label, Labels, ReaderEnd, SubscriptionModel,
     },
+    net::WireOrder,
     observe::{PeerCredit, StreamId},
     table::rule_row,
-    ActionSource, Boundary, Identity, ObservationLog,
+    ActionSource, Boundary, Identity, ObservationLog, Sim,
 };
 
 /// The node's address on the run's network.
@@ -398,6 +401,11 @@ impl Slot {
 
 /// Offers each peer's next scripted action, as `peer:<name>:<action>`,
 /// while that peer is ready for it.
+///
+/// It's the peers' evidence source too (C11): what [`WireEvidence`] logs
+/// from their records is checked through a checkpoint, as the taps' events
+/// are, so a record the run never placed, or a placed observation that
+/// didn't reach the run's log, fails the run.
 pub struct PeerControl {
     slots: Vec<Slot>,
     /// Whether it logged the scripts' acts yet.
@@ -406,32 +414,64 @@ pub struct PeerControl {
     /// What the peers' tasks recorded, until the identity map places it.
     records: PeerRecords,
     evidence: WireEvidence,
+    /// The peers' records as the checkpoint reads them live.
+    feed: Arc<PeerFeed>,
+    /// Where it records what it delivered at each observation.
+    checkpoint: Checkpoint,
+    /// Binds it to the run that holds its checkpoint.
+    id: EvidenceId,
 }
 
 impl PeerControl {
-    /// No peers yet. Failures land in `failure`, the peers' tasks record
-    /// into `records`, and the transport tap hands over each connection's
-    /// shared ID in `shared_ids`.
-    pub(crate) fn new(failure: PeerFailure, records: PeerRecords, shared_ids: SharedIds) -> Self {
+    /// No peers yet, for the node named `node` on `sim`, which holds its
+    /// checkpoint from now on. Failures land in `failure`, the peers' tasks
+    /// record into `records`, and the transport tap hands over each
+    /// connection's shared ID in `shared_ids`.
+    ///
+    /// # Panics
+    ///
+    /// If `sim` already holds a peer checkpoint: a run's peers share one.
+    pub(crate) fn new(
+        sim: &mut Sim,
+        node: &str,
+        failure: PeerFailure,
+        records: PeerRecords,
+        shared_ids: SharedIds,
+    ) -> Self {
+        // `Checkpoint` reads every publisher through an `Arc`'s `Weak`, and
+        // the run holds this one on its own thread.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let feed = Arc::new(PeerFeed::new(records.clone()));
+        let live: std::sync::Weak<dyn LiveEvidence> = Arc::<PeerFeed>::downgrade(&feed);
+        let checkpoint = Checkpoint::new(
+            EvidenceKind::Peer {
+                node: node.to_owned(),
+            },
+            live,
+        );
+        let id = sim.register(checkpoint.clone());
+        assert_eq!(id.index, 0, "a run's peers share one evidence source");
         PeerControl {
             slots: Vec::new(),
             acts_logged: false,
             failure,
             records,
             evidence: WireEvidence::new(shared_ids),
+            feed,
+            checkpoint,
+            id,
         }
     }
 
     /// Also logs the peers' frames on `stream`, discovery's, which the
     /// evidence judges none of.
-    pub(crate) fn with_discovery(self, stream: &Stream) -> Self {
-        PeerControl {
-            evidence: self.evidence.with_discovery(StreamId {
-                kind: stream.kind,
-                version: stream.version,
-            }),
-            ..self
-        }
+    pub(crate) fn with_discovery(mut self, stream: &Stream) -> Self {
+        let evidence = std::mem::take(&mut self.evidence);
+        self.evidence = evidence.with_discovery(StreamId {
+            kind: stream.kind,
+            version: stream.version,
+        });
+        self
     }
 
     /// Adds peer `name`'s script, limited to [`ADVERSARY_RATE`] actions
@@ -501,7 +541,14 @@ impl ActionSource for PeerControl {
     /// that stopped its peer is logged with its `NodeFrame` first. This
     /// source is added after the transport tap, so the identity rows it
     /// reads are logged first.
+    ///
+    /// What it logged and every record seen so far go to its checkpoint,
+    /// which the run checks against its own log.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        // Only the run holding the checkpoint checks what this delivers.
+        if log.run() != self.id.run {
+            return Err("ForeignRun: peer evidence registered with another run".to_owned());
+        }
         if !std::mem::replace(&mut self.acts_logged, true) {
             let acts: Vec<String> = self
                 .slots
@@ -516,11 +563,40 @@ impl ActionSource for PeerControl {
                 log.push(crate::Observation::ActsScripted { acts });
             }
         }
+        let queued = self.records.borrow().len();
         let observed = self.evidence.observe(&self.records, log);
+        // `WireEvidence::observe` only takes records off the queue, and a
+        // usize always fits in a u64 on supported targets.
+        let taken = queued.saturating_sub(self.records.borrow().len()) as u64;
+        self.feed.took(taken, self.evidence.withheld());
+        // The run checks its own log against what the evidence says it
+        // logged, as it does a tap's.
+        if let Ok(delivered) = &observed {
+            self.checkpoint
+                .record(log.step(), delivered, self.feed.last_seq());
+        }
         if let Some(failure) = self.failure.get() {
             return Err(format!("PeerActionFailed: {failure}"));
         }
-        observed
+        observed.map(drop)
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
+}
+
+impl Drop for PeerControl {
+    /// Fails a run that's still live, since later records go unplaced.
+    fn drop(&mut self) {
+        self.checkpoint.dropped();
     }
 }
 
@@ -545,6 +621,9 @@ pub(crate) struct PeerTask {
     pub(crate) chain: Option<Arc<HonestChain>>,
     /// Where it records its frames.
     pub(crate) records: PeerRecords,
+    /// The run's wire-event stamps, which its readers take as each read
+    /// finishes and it takes as each write does.
+    pub(crate) order: WireOrder,
     /// The peers that closed their own connection, by index, which this one
     /// joins when it takes a scripted close.
     pub(crate) closed: PeerCloses,
@@ -574,8 +653,14 @@ enum StreamEvent {
     /// The node opened a discovery stream: the peer's half to write on.
     Discovery { id: u64, send: SendStream },
     /// A whole frame from the node arrived on header or discovery stream
-    /// `id`, read at `at` since the run's start.
-    Frame { id: u64, frame: Frame, at: Duration },
+    /// `id`, read at `at` since the run's start, with the [`WireOrder`]
+    /// stamp its read took.
+    Frame {
+        id: u64,
+        frame: Frame,
+        at: Duration,
+        order: u64,
+    },
 }
 
 /// The bytes of a plain `Headers` page's fixed fields: the subscription ID,
@@ -1089,13 +1174,15 @@ impl Acceptor for Forward {
 }
 
 /// Reads frames of at most `cap` bytes from the node on stream `id` until
-/// it ends, and forwards each whole one. Every read is drained, so the
-/// node's writer never stalls on this peer.
+/// it ends, and forwards each whole one with the `order` stamp its read
+/// took. Every read is drained, so the node's writer never stalls on this
+/// peer.
 async fn read_frames(
     id: u64,
     mut recv: RecvStream,
     cap: u32,
     events: mpsc::UnboundedSender<StreamEvent>,
+    order: WireOrder,
 ) {
     let cap = usize::try_from(cap).unwrap_or(usize::MAX);
     loop {
@@ -1124,7 +1211,16 @@ async fn read_frames(
         let at = zakura_scheduler::hooks::now()
             .expect("a peer reads inside a run")
             .since_start();
-        if events.send(StreamEvent::Frame { id, frame, at }).is_err() {
+        let order = order.next();
+        if events
+            .send(StreamEvent::Frame {
+                id,
+                frame,
+                at,
+                order,
+            })
+            .is_err()
+        {
             return;
         }
     }
@@ -1143,6 +1239,7 @@ async fn serve_stream(
     discovery: Option<Stream>,
     name: String,
     failure: PeerFailure,
+    order: WireOrder,
 ) {
     let Ok(prelude) = handshake::read_prelude(&mut recv).await else {
         return;
@@ -1157,7 +1254,7 @@ async fn serve_stream(
             return;
         }
         if events.send(StreamEvent::Discovery { id, send }).is_ok() {
-            read_frames(id, recv, stream.frame_cap, events).await;
+            read_frames(id, recv, stream.frame_cap, events, order).await;
         }
     } else if prelude.stream_kind == ZAKURA_STREAM_HEADER_SYNC {
         let id = recv.id();
@@ -1170,7 +1267,7 @@ async fn serve_stream(
             return;
         }
         if events.send(StreamEvent::Header { id, send }).is_ok() {
-            read_frames(id, recv, RegtestMessage::LAYOUT[0].frame_cap, events).await;
+            read_frames(id, recv, RegtestMessage::LAYOUT[0].frame_cap, events, order).await;
         }
     } else {
         let _held = send;
@@ -1187,6 +1284,7 @@ async fn accept_streams(
     discovery: Option<Stream>,
     name: String,
     failure: PeerFailure,
+    order: WireOrder,
 ) {
     while let Ok((send, recv)) = conn.accept_bi().await {
         let stream = serve_stream(
@@ -1196,6 +1294,7 @@ async fn accept_streams(
             discovery,
             name.clone(),
             failure.clone(),
+            order.clone(),
         );
         zakura_rt::task::spawn_named("peer_stream", stream);
     }
@@ -1417,8 +1516,9 @@ impl PeerTask {
             if stream.send.write_all(&frame.bytes).await.is_err() {
                 return false;
             }
+            let order = self.order.next();
             for seq in written {
-                self.record(remote, stream.id, RecordBody::Written { seq });
+                self.record(remote, stream.id, RecordBody::Written { seq, order });
             }
         }
         true
@@ -1447,6 +1547,7 @@ impl PeerTask {
             scripts.discovery.as_ref().map(DiscoveryPeer::stream),
             self.name.clone(),
             self.failure.clone(),
+            self.order.clone(),
         );
         zakura_rt::task::spawn_named("peer_accept", accept);
         // The header stream the peer writes on, and whether it's settled.
@@ -1469,7 +1570,10 @@ impl PeerTask {
             }
             let id = send.id();
             let cap = RegtestMessage::LAYOUT[0].frame_cap;
-            zakura_rt::task::spawn_named("peer_header", read_frames(id, recv, cap, events.clone()));
+            zakura_rt::task::spawn_named(
+                "peer_header",
+                read_frames(id, recv, cap, events.clone(), self.order.clone()),
+            );
             reads.insert(id, 0);
             let mut stream = HeaderStream { id, send };
             if let Some(honest) = scripts.honest.as_mut() {
@@ -1501,7 +1605,13 @@ impl PeerTask {
             let id = send.id();
             zakura_rt::task::spawn_named(
                 "peer_discovery",
-                read_frames(id, recv, layout.frame_cap, events.clone()),
+                read_frames(
+                    id,
+                    recv,
+                    layout.frame_cap,
+                    events.clone(),
+                    self.order.clone(),
+                ),
             );
             reads.insert(id, 0);
             let mut stream = HeaderStream { id, send };
@@ -1565,7 +1675,7 @@ impl PeerTask {
                             answers = script.start();
                         }
                     }
-                    StreamEvent::Frame { id, frame, at } if discovery_ids.contains(&id) => {
+                    StreamEvent::Frame { id, frame, at, order } if discovery_ids.contains(&id) => {
                         let read = reads.get_mut(&id).expect("a discovery stream's reader is known");
                         let seq = *read;
                         *read += 1;
@@ -1579,6 +1689,7 @@ impl PeerTask {
                             credit: None,
                             frame: frame.clone(),
                             at,
+                            order,
                         });
                         let Ok(message) = decode_frame::<DiscoveryMessage>(&frame) else {
                             return self.fail(format!(
@@ -1589,7 +1700,7 @@ impl PeerTask {
                             answers = script.receive(&message);
                         }
                     }
-                    StreamEvent::Frame { id, frame, at } => {
+                    StreamEvent::Frame { id, frame, at, order } => {
                         // Every header stream's reads are recorded, a
                         // finished or replaced one's included, since the
                         // node can still write on it.
@@ -1609,6 +1720,7 @@ impl PeerTask {
                             credit: decoded.as_ref().ok().and_then(credit),
                             frame: frame.clone(),
                             at,
+                            order,
                         });
                         let Ok(message) = decoded else {
                             return self.fail(format!(
@@ -1765,6 +1877,203 @@ async fn open(conn: &Conn, kind: u16, version: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        check::{Checker, NoChecks, PropertyReport, StepCtx},
+        HarnessFailure, MemorySink, Plan, RunConfig, RunEnd, Violation,
+    };
+
+    /// A record of the peer's write `seq` on a connection no registration
+    /// names yet, so it waits on the queue.
+    fn written(seq: u64) -> PeerRecord {
+        PeerRecord {
+            remote: Remote {
+                addr: NODE_ADDR,
+                shared_id: [0; 16],
+            },
+            quic_stream: 0,
+            body: RecordBody::Written {
+                seq,
+                order: seq + 1,
+            },
+        }
+    }
+
+    /// Pushes a record when the run ends, after its last observation.
+    struct LateRecord(PeerRecords);
+
+    impl Checker for LateRecord {
+        /// Nothing.
+        fn after_step(&mut self, _: &StepCtx<'_>) -> Option<Violation> {
+            None
+        }
+
+        /// Pushes the late record.
+        fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+            self.0.borrow_mut().push_back(written(1));
+            Vec::new()
+        }
+
+        /// Nothing: it keeps no obligations.
+        fn unfinished(&self) -> crate::Unfinished {
+            crate::Unfinished::default()
+        }
+    }
+
+    /// C11: the peers' evidence sits behind a checkpoint. A run whose peers
+    /// recorded nothing ends cleanly. A record still waiting for its
+    /// connection's registration when the run ends idle can never be placed,
+    /// so it fails the run as `UnplacedRecords`. A record pushed after the
+    /// last observation is one the run never saw, and it fails the run as
+    /// `Unobserved`. Both name the peers' checkpoint.
+    #[test]
+    fn peer_records_the_run_never_logs_fail_it() {
+        let run = |queued: bool, late: bool| {
+            let mut sim = Sim::new(RunConfig::default(), Plan::from_fuzz(&[]));
+            let records = PeerRecords::default();
+            let control = PeerControl::new(
+                &mut sim,
+                "node",
+                PeerFailure::default(),
+                records.clone(),
+                SharedIds::default(),
+            );
+            sim.add_source(Box::new(control));
+            if queued {
+                records.borrow_mut().push_back(written(0));
+            }
+            let mut sink = MemorySink::default();
+            if late {
+                sim.run(&mut LateRecord(records), &mut sink).end
+            } else {
+                sim.run(&mut NoChecks, &mut sink).end
+            }
+        };
+        let failed = |end: RunEnd| match end.harness {
+            Some(HarnessFailure::SourceEvidence { source, detail }) => {
+                assert_eq!(source, "peer:node#0");
+                detail
+            }
+            other => panic!("expected the peers' evidence to fail, got {other:?}"),
+        };
+        assert_eq!(run(false, false).harness, None);
+        let detail = failed(run(true, false));
+        assert!(detail.starts_with("UnplacedRecords: "), "{detail}");
+        let detail = failed(run(false, true));
+        assert!(
+            detail.starts_with("Unobserved: the peers published records 1..=1"),
+            "{detail}"
+        );
+    }
+
+    /// A record still queued when the run ends after its budget and a dry
+    /// drain fails it too: the log freezes before the record can be placed.
+    /// So does a placed frame the evidence still holds back, such as a
+    /// discovery request waiting for the node's count.
+    #[test]
+    fn evidence_still_unlogged_at_the_budget_fails_the_run() {
+        let mut sim = Sim::new(
+            RunConfig {
+                budget: 3,
+                ..RunConfig::default()
+            },
+            Plan::from_fuzz(&[]),
+        );
+        let records = PeerRecords::default();
+        let control = PeerControl::new(
+            &mut sim,
+            "node",
+            PeerFailure::default(),
+            records.clone(),
+            SharedIds::default(),
+        );
+        sim.add_source(Box::new(control));
+        // Busy past the budget, then done, so the drain runs dry.
+        sim.scheduler().spawn_root("spin", async {
+            for _ in 0..20 {
+                zakura_rt::task::yield_now().await;
+            }
+        });
+        records.borrow_mut().push_back(written(0));
+        let end = sim.run(&mut NoChecks, &mut MemorySink::default()).end;
+        assert!(
+            matches!(
+                &end.harness,
+                Some(HarnessFailure::SourceEvidence { detail, .. })
+                    if detail.starts_with("UnplacedRecords: ")
+            ),
+            "{end:?}"
+        );
+
+        let feed = PeerFeed::new(PeerRecords::default());
+        assert_eq!(feed.unfinished(&end), None);
+        feed.took(1, 1);
+        assert!(feed
+            .unfinished(&end)
+            .is_some_and(|why| why.starts_with("WithheldFrames: ")));
+    }
+
+    /// A violation stops the run early, but a record the peers had already
+    /// produced and that is still queued then fails the run as
+    /// `UnplacedRecords`, since the run's whole report never judged it.
+    #[test]
+    fn evidence_still_unlogged_at_a_violation_fails_the_run() {
+        let mut sim = Sim::new(RunConfig::default(), Plan::from_fuzz(&[]));
+        let records = PeerRecords::default();
+        let control = PeerControl::new(
+            &mut sim,
+            "node",
+            PeerFailure::default(),
+            records.clone(),
+            SharedIds::default(),
+        );
+        sim.add_source(Box::new(control));
+        sim.scheduler().spawn_root("spin", async {
+            loop {
+                zakura_rt::task::yield_now().await;
+            }
+        });
+        records.borrow_mut().push_back(written(0));
+        let mut stops = crate::check::after_step(|cx: &StepCtx<'_>| {
+            Some(Violation {
+                property: "test/stops".to_owned(),
+                step: cx.step,
+                witness: vec![cx.step],
+                expected: "no step".to_owned(),
+                actual: "a step".to_owned(),
+            })
+        });
+        let end = sim.run(&mut stops, &mut MemorySink::default()).end;
+        assert!(
+            matches!(
+                &end.harness,
+                Some(HarnessFailure::SourceEvidence { detail, .. })
+                    if detail.starts_with("UnplacedRecords: ")
+            ),
+            "{end:?}"
+        );
+    }
+
+    /// A run's peers share one checkpoint, so a second is refused.
+    #[test]
+    #[should_panic(expected = "a run's peers share one evidence source")]
+    fn a_run_holds_one_peer_checkpoint() {
+        let mut sim = Sim::new(RunConfig::default(), Plan::from_fuzz(&[]));
+        let first = PeerControl::new(
+            &mut sim,
+            "node",
+            PeerFailure::default(),
+            PeerRecords::default(),
+            SharedIds::default(),
+        );
+        let _second = PeerControl::new(
+            &mut sim,
+            "node",
+            PeerFailure::default(),
+            PeerRecords::default(),
+            SharedIds::default(),
+        );
+        drop(first);
+    }
 
     /// A listening peer's acceptor admits an attempt only while no other is
     /// in its QUIC handshake or live, so the node's connections reach the

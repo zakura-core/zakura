@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-index c353aa0405..9b4a4e07a3 100644
+index 15b6d86dee..e037380dc7 100644
 --- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-@@ -2316,16 +2316,6 @@ impl HeaderSyncReactor {
+@@ -2739,16 +2739,6 @@ impl HeaderSyncReactor {
              }
          }
          if old_tip != Some(new_tip) {

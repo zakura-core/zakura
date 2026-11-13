@@ -312,11 +312,12 @@ impl Ledger {
         };
         let envelope = self.frames.labels(&header);
         let row = self.frames.row(header.message_type);
-        let label = match row {
-            Some(_) if envelope.is_conformant() => match decode_frame::<RegtestMessage>(frame) {
-                Ok(message) => self.role(&message, header.payload_len),
-                Err(_) => Label::BadContent,
-            },
+        let decoded = decode_frame::<RegtestMessage>(frame).ok();
+        let label = match (row, &decoded) {
+            (Some(_), Some(message)) if envelope.is_conformant() => {
+                self.role(message, header.payload_len)
+            }
+            (Some(_), None) if envelope.is_conformant() => Label::BadContent,
             _ => envelope.first(),
         };
         let stream = &RegtestMessage::LAYOUT[0];
@@ -340,6 +341,7 @@ impl Ledger {
             rule_stream,
             label,
             exhausted,
+            exchange: decoded.as_ref().and_then(super::exchange),
         }
     }
 

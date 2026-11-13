@@ -391,6 +391,11 @@ pub struct ZakuraConfig {
     /// [`Config::expose_peer_addresses`](crate::config::Config::expose_peer_addresses).
     /// The state, mempool, and `getblocktemplate` write `chain_tip.jsonl`, `mempool.jsonl`, and
     /// `mining_template.jsonl`, which trace the path from a new tip to a mining template.
+    /// Legacy peer connections write `legacy_gossip.jsonl`: each block announcement sent to
+    /// a peer, the peer's request for that block and the block being sent, and a bounded
+    /// number of the announcements each peer sends. Its rows never hold a peer's address; the
+    /// `ZAKURA_TRACE_PEER_NAMES` environment variable names the peers an operator wants to
+    /// tell apart.
     pub trace_dir: Option<PathBuf>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
@@ -1500,7 +1505,7 @@ impl IpSlots {
         registered.saturating_add(handshaking)
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, all(debug_assertions, not(zakura_sim))))]
     fn registered_total(&self) -> usize {
         self.counts().registered.values().sum()
     }
@@ -1651,7 +1656,13 @@ impl ZakuraSupervisorState {
         }
     }
 
-    #[cfg(debug_assertions)]
+    /// Checks that the per-IP registered totals match the active peer
+    /// registrations with known IPs, in debug builds.
+    ///
+    /// Simulator builds skip it. Its `IpSlots` lock is a scheduler point
+    /// there, so a debug-only lock would give debug and release builds
+    /// different schedules for the same seed.
+    #[cfg(all(debug_assertions, not(zakura_sim)))]
     fn debug_assert_accounting(&self) {
         debug_assert_eq!(
             self.ip_slots.registered_total(),
@@ -1663,7 +1674,7 @@ impl ZakuraSupervisorState {
         );
     }
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(any(not(debug_assertions), zakura_sim))]
     fn debug_assert_accounting(&self) {}
 }
 
@@ -4821,6 +4832,7 @@ fn sought_services_with_custom(custom_services: &[CustomService]) -> Vec<ZakuraS
 }
 
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
+#[cfg(test)]
 pub async fn spawn_zakura_endpoint(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
@@ -7943,7 +7955,7 @@ impl ZakuraHandlerError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests {
     mod bounded_decoding;
     pub(super) mod connection;

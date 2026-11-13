@@ -223,18 +223,15 @@ pub enum Report {
         /// Its applicability count.
         applicable: u64,
     },
-    /// It never applied, for this reason, if the run gave one.
+    /// It ended `NotApplicable`, for this reason, as
+    /// [`NaReason::name`](crate::NaReason::name) writes it, such as
+    /// `never-applied`.
     NotApplicable {
-        /// The reason.
-        reason: Option<String>,
-    },
-    /// It was violated.
-    Violated,
-    /// It ended open, for this reason.
-    Inconclusive {
         /// The reason.
         reason: String,
     },
+    /// It was violated.
+    Violated,
 }
 
 /// Whether a run's declared actions were each picked and reached their
@@ -1080,9 +1077,7 @@ fn judge(
                 return Err("its history lost its trigger history".into());
             }
             match run.reports.get(property) {
-                Some(Report::NotApplicable {
-                    reason: Some(given),
-                }) if given == reason => Ok(()),
+                Some(Report::NotApplicable { reason: given }) if given == reason => Ok(()),
                 other => Err(format!(
                     "{property} is {other:?}, not NotApplicable({reason})"
                 )),
@@ -1461,8 +1456,8 @@ fn whole_report(
 
 /// Checks every property of `run` outside `skip` held, or stayed
 /// `NotApplicable` with the reason `not_applicable` lists for it. A listed
-/// property that held, an unlisted one that didn't apply, a wrong reason, a
-/// violation and an `Inconclusive` each fail.
+/// property that held, an unlisted one that didn't apply, a wrong reason and
+/// a violation each fail.
 fn others_pass(
     run: &Execution,
     skip: &[&str],
@@ -1485,12 +1480,7 @@ fn others_pass(
             .find(|na| na.property == property.as_str());
         match (report, listed) {
             (Report::Held { .. }, None) => {}
-            (
-                Report::NotApplicable {
-                    reason: Some(given),
-                },
-                Some(na),
-            ) if given == na.reason => {}
+            (Report::NotApplicable { reason: given }, Some(na)) if given == na.reason => {}
             (report, listed) => {
                 return Err(format!(
                     "{property} is {report:?}, where its row expects {}",

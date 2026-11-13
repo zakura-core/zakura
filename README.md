@@ -108,7 +108,7 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.8.6 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.8.7 zakura
 ```
 
 Standard x86-64 builds enable Pasta field assembly through the default

@@ -2890,6 +2890,9 @@ mod locator_capacity_tests {
         });
     }
 
+    // `LocatorReadPermit` takes `zakura_rt`'s permit, which isn't tokio's in
+    // the simulator build.
+    #[cfg(not(zakura_sim))]
     #[tokio::test]
     async fn accepted_locator_keeps_permit_after_caller_drop_until_exit_or_panic() {
         for panic in [false, true] {

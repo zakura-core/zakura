@@ -1636,11 +1636,7 @@ impl FinalizedState {
             None => return false,
         };
 
-        if block_height < debug_stop_at_height {
-            return false;
-        }
-
-        true
+        block_height >= debug_stop_at_height
     }
 
     /// Exit the host process.

@@ -27,7 +27,7 @@ use zakura_network::zakura::{
 };
 
 use super::stamp::Stamps;
-use crate::{IdleStatus, Outcome, RunEnd};
+use crate::RunEnd;
 
 /// How long after an adoption that changes a session's status the
 /// reactor's status publisher may wait before it queues that status:
@@ -246,20 +246,11 @@ impl AdoptionFact {
     }
 }
 
-/// Whether a run that ended as `end` settled: it ended with no task ready,
-/// idle with every task finished or waiting outside the scheduler, or after
-/// a drain that ran out of ready tasks. Any other end, such as a drain cut
-/// off at its bound, a violation or a harness failure, can stop a task
-/// partway through a synchronous call.
+/// Whether a run that ended as `end` settled: it ran dry at rest
+/// ([`RunEnd::at_rest`]). Any other end can stop a task partway through a
+/// synchronous call.
 pub fn settled(end: &RunEnd) -> bool {
-    match end.outcome {
-        Outcome::Idle { status } => matches!(
-            status,
-            IdleStatus::Quiescent | IdleStatus::WaitingOnExternal
-        ),
-        Outcome::Budget => end.drain.is_some_and(|drain| !drain.exhausted),
-        Outcome::Violation | Outcome::Harness => false,
-    }
+    end.at_rest()
 }
 
 /// An [`AdoptionFact`] and the virtual time since the run's start that the
@@ -298,7 +289,7 @@ pub enum Acceptance {
     /// The rule held over the whole run.
     Holds,
     /// The run ended before a fact the rule owes was due.
-    Inconclusive(String),
+    Open(String),
     /// The rule broke.
     Violated(String),
 }
@@ -499,7 +490,7 @@ impl AdoptionEvidence {
 
     /// The generation rule: every `Started` and locator `Dispatched` after an
     /// adoption carries that adoption's header generation. A safety rule, so
-    /// it's never inconclusive.
+    /// it's never open.
     pub fn generation(&self) -> Acceptance {
         let store = self.store();
         let mut latest = None;
@@ -548,7 +539,9 @@ mod tests {
     use crate::{
         domain::header_sync::{watch_end_violations, WATCH_OBSERVED_UNDER_FLOOD},
         end::Drain,
+        Outcome,
     };
+    use zakura_scheduler::Status as SchedulerStatus;
 
     /// An adoption at generation `generation` whose tip is at `height`.
     fn adoption(generation: u64, height: u32) -> Adoption {
@@ -627,12 +620,19 @@ mod tests {
                 exhausted: false,
             }),
             harness: None,
+            rest: Some(SchedulerStatus::Quiescent),
         };
+        // A drain cut off at its bound is a harness failure.
         let cut = RunEnd {
+            outcome: Outcome::Harness,
             drain: Some(Drain {
                 steps: 10,
                 exhausted: true,
             }),
+            harness: Some(crate::HarnessFailure::DrainBound {
+                open: "task:reactor.1:poll#1".to_owned(),
+            }),
+            rest: None,
             ..settled.clone()
         };
         let wedged = evidence(vec![(0, commit(2))], 0);

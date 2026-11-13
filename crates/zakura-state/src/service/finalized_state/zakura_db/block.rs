@@ -70,6 +70,12 @@ pub(in crate::service::finalized_state) const ZAKURA_HEADER_BY_HEIGHT: &str =
 /// hash-keyed auxiliary deliveries and committed `BlockInfo`. Nothing reads or writes it.
 pub const ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT: &str = "zakura_header_body_size_by_height";
 
+/// How much of a block's transactions one disk read fetches when the whole block is read.
+///
+/// This is the largest read-ahead RocksDB reaches on its own after several sequential
+/// reads. Asking for it up front fetches most old blocks in one read instead of two or three.
+const BLOCK_TRANSACTIONS_READ_AHEAD_BYTES: usize = 256 * 1024;
+
 impl IntoDisk for BlockCommitmentRoots {
     type Bytes = Vec<u8>;
 
@@ -542,7 +548,6 @@ impl ZakuraDb {
     }
 
     /// Returns the height for a canonical full-state or header-only hash.
-    #[allow(dead_code)]
     pub(crate) fn header_height(&self, hash: block::Hash) -> Option<block::Height> {
         self.height(hash).or_else(|| {
             let height_by_hash = self.db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
@@ -713,6 +718,9 @@ impl ZakuraDb {
 
     /// Returns the raw transactions of block `height` in finalized state, from
     /// static files or `tx_by_loc`. Returns no transactions if the body is missing.
+    ///
+    /// The `tx_by_loc` scan reads [`BLOCK_TRANSACTIONS_READ_AHEAD_BYTES`] at a time,
+    /// because the caller reads the whole block.
     #[allow(clippy::unwrap_in_result)]
     fn raw_block_transactions(&self, height: Height) -> Vec<RawBytes> {
         // Moved heights only read static files, see `Self::raw_transaction_at`.
@@ -725,10 +733,11 @@ impl ZakuraDb {
         let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
         let transactions: Vec<RawBytes> = self
             .db
-            .zs_forward_range_iter(
+            .zs_forward_range_iter_with_read_ahead(
                 tx_by_loc,
                 TransactionLocation::min_for_height(height)
                     ..=TransactionLocation::max_for_height(height),
+                BLOCK_TRANSACTIONS_READ_AHEAD_BYTES,
             )
             .map(|(_, raw): (TransactionLocation, RawBytes)| raw)
             .collect();

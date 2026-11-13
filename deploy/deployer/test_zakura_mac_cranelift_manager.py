@@ -252,6 +252,11 @@ class DashboardTests(unittest.TestCase):
 
 
 class PublicAuditTests(unittest.TestCase):
+    def setUp(self):
+        session = patch.object(deploy, 'dashboard_session', return_value='zakura_status_session=token')
+        session.start()
+        self.addCleanup(session.stop)
+
     def test_private_address_leak_fails_without_echoing_address(self):
         for private, leaked in [('198.51.100.42', '198.51.100.42'),
                                 ('198.51.100.42', '::ffff:c633:642a'),
@@ -264,7 +269,9 @@ class PublicAuditTests(unittest.TestCase):
                 self.assertNotIn(leaked, str(caught.exception))
 
     def test_audit_visits_linux_detail_pages_and_detects_peer_detail_leaks(self):
-        def response(url, **kwargs):
+        def response(request, **kwargs):
+            self.assertEqual(request.get_header('Cookie'), 'zakura_status_session=token')
+            url = request.full_url
             if url.endswith('/data'):
                 body = {'rows': [{'name': 'linux-reference'}, {'name': 'mac-os-cranelift'}]}
             elif url.endswith('/data/node/linux-reference'):
@@ -278,12 +285,57 @@ class PublicAuditTests(unittest.TestCase):
                 deploy.audit_public_privacy()
             self.assertNotIn('198.51.100.42', str(raised.exception))
             self.assertIn('https://status.mainnet.zakura.valargroup.dev/node/linux-reference',
-                          [call.args[0] for call in request.call_args_list])
+                          [call.args[0].full_url for call in request.call_args_list])
 
     def test_linux_addresses_are_allowed_by_private_audit(self):
         with patch.dict(os.environ, {'ZAKURA_MAC_CRANELIFT_HOST': '198.51.100.42'}), \
                 patch('urllib.request.urlopen', side_effect=lambda *a, **k: io.BytesIO(b'{"linux":"192.0.2.17"}')):
             deploy.audit_public_privacy()
+
+
+class DashboardSessionTests(unittest.TestCase):
+    def connection(self, responses):
+        """A stand-in HTTPSConnection that answers each request with the next (status, Set-Cookie)."""
+        sent = []
+        class Response:
+            def __init__(self, status, cookie):
+                self.status, self.cookie = status, cookie
+            def read(self, *args):
+                return b''
+            def getheader(self, name):
+                return self.cookie if name == 'Set-Cookie' else None
+        class Connection:
+            def __init__(self, host, timeout):
+                self.host = host
+            def request(self, method, path, body=None, headers=None):
+                sent.append((method, path, body))
+            def getresponse(self):
+                return Response(*responses.pop(0))
+            def close(self):
+                pass
+        return Connection, sent
+
+    def test_logs_in_after_checking_data_is_gated(self):
+        connection, sent = self.connection([(401, None), (303, 'zakura_status_session=abc; Max-Age=60; Secure')])
+        with patch.dict(os.environ, {'ZAKURA_STATUS_DASHBOARD_PASSWORD': 'pw'}), \
+                patch('http.client.HTTPSConnection', connection):
+            self.assertEqual(deploy.dashboard_session(), 'zakura_status_session=abc')
+        self.assertEqual([(method, path) for method, path, _ in sent], [('GET', '/data'), ('POST', '/login')])
+        self.assertEqual(sent[1][2], 'password=pw')
+
+    def test_open_data_fails_the_audit(self):
+        connection, _ = self.connection([(200, None)])
+        with patch.dict(os.environ, {'ZAKURA_STATUS_DASHBOARD_PASSWORD': 'pw'}), \
+                patch('http.client.HTTPSConnection', connection):
+            with self.assertRaisesRegex(ValueError, 'without a login'):
+                deploy.dashboard_session()
+
+    def test_wrong_password_fails_the_audit(self):
+        connection, _ = self.connection([(401, None), (401, None)])
+        with patch.dict(os.environ, {'ZAKURA_STATUS_DASHBOARD_PASSWORD': 'pw'}), \
+                patch('http.client.HTTPSConnection', connection):
+            with self.assertRaisesRegex(ValueError, 'login failed'):
+                deploy.dashboard_session()
 
 
 class RemoteProgramTests(unittest.TestCase):

@@ -12,11 +12,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use zakura_network::zakura::{ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC};
 
 use super::{
-    Acknowledgement, Baseline, BlockStage, BudgetChange, Call, CallEnd, CapacityClass,
-    CapacityEvent, Direction, Disposition, Dropped, Epoch, EpochWork, Fork, FrameLabel, FrameStage,
-    HeldPart, HoldStage, Level, Namespace, ObligationPoint, Operation, Purpose, ReorgStage,
-    ReplacementEvent, ReplacementKind, RequestEvent, RequestProgress, RetireReason, RetiredPhase,
-    Retirement, Row, Service, StateFeature, StreamService, Timing, Transition,
+    crossing::CrossingJoin, Acknowledgement, Baseline, BlockStage, BudgetChange, Call, CallEnd,
+    CapacityClass, CapacityEvent, Direction, Disposition, Dropped, Epoch, EpochWork, Fork,
+    FrameLabel, FrameStage, HeldPart, HoldStage, Level, Namespace, ObligationPoint, Operation,
+    Purpose, ReorgStage, ReplacementEvent, ReplacementKind, RequestEvent, RequestProgress,
+    RetireReason, RetiredPhase, Retirement, Row, Service, StateFeature, StreamService, Timing,
+    Transition,
 };
 use zakura_chain::work::difficulty::U256;
 
@@ -24,7 +25,7 @@ use crate::{
     check::{Phase, StepCtx},
     end::RunEnd,
     explore::feedback::{Collect, FeatureMap},
-    model::is_fault_cause,
+    model::{is_fault_cause, Label},
     observe::{
         BlockSyncFact, HeaderCheckFact, ReactorCall, ReactorFact, ReactorPurpose, StorageFact,
         StoragePoint, StorageRequest, StorageResult, StreamId, TransitionFact, TransportFact,
@@ -206,6 +207,8 @@ struct StateCollector {
     /// the peer class counts each peer's leases on one port against its
     /// limit of one.
     leases: BTreeMap<(u64, String), BTreeSet<u64>>,
+    /// The crossing join, fed every observation.
+    crossing: CrossingJoin,
 }
 
 impl Collect for StateCollector {
@@ -230,7 +233,9 @@ impl Collect for StateCollector {
                 continue;
             };
             let point = match to {
-                Lifecycle::Applicable => continue,
+                // An assumption loss ends obligations without the node
+                // doing anything, so it's no point of the node's.
+                Lifecycle::Applicable | Lifecycle::AssumptionLost => continue,
                 Lifecycle::Obliged => ObligationPoint::Opened,
                 Lifecycle::Discharged => ObligationPoint::Discharged,
                 Lifecycle::Expired => ObligationPoint::Expired,
@@ -393,6 +398,11 @@ impl StateCollector {
 
     /// Reads one observation, passing each feature it reaches to `hit`.
     fn observe(&mut self, observation: &Observation, hit: &mut dyn FnMut(StateFeature)) {
+        for crossed in self.crossing.observe(observation) {
+            if crossed.label == Label::Conformant {
+                hit(StateFeature::ConformantCrossing);
+            }
+        }
         match observation {
             Observation::Storage {
                 service,

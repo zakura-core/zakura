@@ -3219,8 +3219,17 @@ impl ZakuraProtocolHandler {
         self
     }
 
+    /// Reports a handshake cadence decision for `remote`. The caller reads
+    /// `hosts` under the `ip_slots` guard it already holds, so a tap adds no
+    /// lock and no scheduling point.
     #[cfg(any(test, zakura_sim))]
-    fn observe_handshake_cadence(&self, remote: SocketAddr, action: &'static str, fresh: bool) {
+    fn observe_handshake_cadence(
+        &self,
+        remote: SocketAddr,
+        action: &'static str,
+        fresh: bool,
+        hosts: usize,
+    ) {
         let cadence = super::handshake_cadence(self.supervisor.max_connections_per_ip);
         transport_observe!(
             self.transport_observer,
@@ -3230,7 +3239,7 @@ impl ZakuraProtocolHandler {
                 fresh,
                 capacity: cadence.capacity,
                 refill_interval: cadence.refill_interval,
-                hosts: self.supervisor.ip_slots.counts().cadence_hosts(),
+                hosts,
                 host_limit: self
                     .limits
                     .max_connections
@@ -4808,12 +4817,13 @@ impl ZakuraProtocolHandler {
         if matches!(registration, ZakuraRegistration::Registered { .. })
             && context.direction == ServicePeerDirection::Inbound
         {
-            self.supervisor
-                .ip_slots
-                .counts()
-                .refund_cadence(connection.admitted_ip(), Instant::now());
+            let mut counts = self.supervisor.ip_slots.counts();
+            counts.refund_cadence(connection.admitted_ip(), Instant::now());
             #[cfg(any(test, zakura_sim))]
-            self.observe_handshake_cadence(connection.admitted_addr(), "registered", false);
+            let hosts = counts.cadence_hosts();
+            drop(counts);
+            #[cfg(any(test, zakura_sim))]
+            self.observe_handshake_cadence(connection.admitted_addr(), "registered", false, hosts);
         }
         if let ZakuraRegistration::Registered {
             conn_id,
@@ -5036,6 +5046,8 @@ impl Acceptor for ZakuraProtocolHandler {
         if cadence != super::HandshakeCadenceAdmission::Admit {
             counts.release_transport();
         }
+        #[cfg(any(test, zakura_sim))]
+        let hosts = counts.cadence_hosts();
         drop(counts);
         #[cfg(any(test, zakura_sim))]
         self.observe_handshake_cadence(
@@ -5046,6 +5058,7 @@ impl Acceptor for ZakuraProtocolHandler {
                 super::HandshakeCadenceAdmission::Capacity => "capacity",
             },
             fresh && cadence == super::HandshakeCadenceAdmission::Admit,
+            hosts,
         );
         match cadence {
             super::HandshakeCadenceAdmission::Admit => Admit::Accept,
@@ -5060,12 +5073,13 @@ impl Acceptor for ZakuraProtocolHandler {
 
     fn cancel_admission(&self, incoming: &IncomingInfo) {
         self.finish_admission(false);
-        self.supervisor
-            .ip_slots
-            .counts()
-            .refund_cadence(incoming.remote.ip(), Instant::now());
+        let mut counts = self.supervisor.ip_slots.counts();
+        counts.refund_cadence(incoming.remote.ip(), Instant::now());
         #[cfg(any(test, zakura_sim))]
-        self.observe_handshake_cadence(incoming.remote, "cancelled", false);
+        let hosts = counts.cadence_hosts();
+        drop(counts);
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handshake_cadence(incoming.remote, "cancelled", false, hosts);
     }
 
     fn finish_admission(&self, handed_off: bool) {

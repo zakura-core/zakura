@@ -42,7 +42,11 @@ mod tests;
 
 /// The internal watch channel data type for [`ChainTipSender`], [`LatestChainTip`],
 /// and [`ChainTipChange`].
-type ChainTipData = Option<ChainTipBlock>;
+///
+/// The block is shared, because each tip read clones the channel value to release the
+/// channel's read lock early. Without the `Arc`, every read of a tip height or hash would
+/// copy the tip block's transaction list.
+type ChainTipData = Option<Arc<ChainTipBlock>>;
 
 /// A chain tip block, with precalculated block data.
 ///
@@ -199,7 +203,7 @@ impl ChainTipSender {
         committed: CommittedBlockAnnouncement,
     ) {
         self.use_non_finalized_tip = true;
-        self.update_with_commit(Some(tip), Some(committed));
+        self.update_with_commit(Some(Arc::new(tip)), Some(committed));
     }
 
     /// Publish a successful checkpoint commit after the database write is visible.
@@ -211,7 +215,7 @@ impl ChainTipSender {
         let selected_tip = if self.use_non_finalized_tip {
             self.sender.borrow().clone()
         } else {
-            Some(tip)
+            Some(Arc::new(tip))
         };
         self.update_with_commit(selected_tip, Some(committed));
     }
@@ -310,12 +314,12 @@ impl ChainTipSender {
     /// An update is only sent if the current best tip is different from the last best tip
     /// that was sent.
     fn update(&mut self, new_tip: Option<ChainTipBlock>) {
-        self.update_with_commit(new_tip, None);
+        self.update_with_commit(new_tip.map(Arc::new), None);
     }
 
     fn update_with_commit(
         &mut self,
-        new_tip: Option<ChainTipBlock>,
+        new_tip: ChainTipData,
         committed: Option<CommittedBlockAnnouncement>,
     ) {
         // Correctness: the `self.sender.borrow()` must not be placed in a `let` binding to prevent
@@ -349,7 +353,7 @@ impl ChainTipSender {
     ///
     /// Callers should create a new span with empty `new_height` and `new_hash` fields.
     fn record_new_tip(new_tip: &Option<ChainTipBlock>) {
-        Self::record_tip(&tracing::Span::current(), "new", new_tip);
+        Self::record_tip(&tracing::Span::current(), "new", new_tip.as_ref());
     }
 
     /// Record `new_tip` and the fields from `self` in the current span.
@@ -368,8 +372,8 @@ impl ChainTipSender {
 
         let old_tip = &*self.sender.borrow();
 
-        Self::record_tip(&span, "new", new_tip);
-        Self::record_tip(&span, "old", old_tip);
+        Self::record_tip(&span, "new", new_tip.as_ref());
+        Self::record_tip(&span, "old", old_tip.as_deref());
 
         span.record(
             "old_use_non_finalized_tip",
@@ -380,9 +384,9 @@ impl ChainTipSender {
     /// Record `tip` into `span` using the `prefix` to name the fields.
     ///
     /// Callers should create a new span with empty `{prefix}_height` and `{prefix}_hash` fields.
-    fn record_tip(span: &tracing::Span, prefix: &str, tip: &Option<ChainTipBlock>) {
-        let height = tip.as_ref().map(|block| block.height);
-        let hash = tip.as_ref().map(|block| block.hash);
+    fn record_tip(span: &tracing::Span, prefix: &str, tip: Option<&ChainTipBlock>) {
+        let height = tip.map(|block| block.height);
+        let hash = tip.map(|block| block.hash);
 
         span.record(format!("{prefix}_height").as_str(), field::debug(height));
         span.record(format!("{prefix}_hash").as_str(), field::debug(hash));
@@ -438,7 +442,7 @@ impl LatestChainTip {
         F: FnOnce(&ChainTipBlock) -> U,
     {
         self.receiver
-            .with_watch_data(|chain_tip_block| chain_tip_block.as_ref().map(f))
+            .with_watch_data(|chain_tip_block| chain_tip_block.as_deref().map(f))
     }
 }
 

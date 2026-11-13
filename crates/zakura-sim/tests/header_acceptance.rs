@@ -7677,6 +7677,62 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/tool.rs",
         "a_declared_history_joins_its_whole_declaration",
     ),
+    (
+        "HistoryRunRef",
+        "src/harness/header_acceptance.rs",
+        "history_key_history",
+        "src/harness/header_acceptance.rs",
+        "a_history_key_joins_its_whole_history",
+    ),
+    (
+        "HistoryRunRef",
+        "src/harness/header_acceptance.rs",
+        "list_key_history",
+        "src/harness/header_acceptance.rs",
+        "a_list_key_joins_its_whole_history",
+    ),
+    (
+        "TestIdRef",
+        "src/harness/header_acceptance.rs",
+        "witness_key_test",
+        "src/harness/header_acceptance.rs",
+        "a_witness_key_joins_its_whole_test",
+    ),
+    (
+        "TestIdRef",
+        "src/harness/header_acceptance.rs",
+        "contract_key_test",
+        "src/harness/header_acceptance.rs",
+        "a_contract_test_key_joins_its_whole_test",
+    ),
+    (
+        "TestIdRef",
+        "src/harness/header_acceptance.rs",
+        "composition_key_test",
+        "src/harness/header_acceptance.rs",
+        "a_composition_key_joins_its_whole_test",
+    ),
+    (
+        "TestIdRef",
+        "src/harness/header_acceptance.rs",
+        "narrowing_key_test",
+        "src/harness/header_acceptance.rs",
+        "a_narrowing_key_joins_its_whole_test",
+    ),
+    (
+        "TestIdRef",
+        "src/harness/header_acceptance.rs",
+        "missing_source_key_test",
+        "src/harness/header_acceptance.rs",
+        "a_missing_source_key_joins_its_whole_test",
+    ),
+    (
+        "TestIdRef",
+        "src/harness/header_acceptance/required.rs",
+        "permitted_test",
+        "src/harness/header_acceptance/required.rs",
+        "a_permitted_test_joins_its_whole_test",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.

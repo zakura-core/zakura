@@ -59,7 +59,7 @@ pub use rows::{
 };
 
 use crate::property::{Source, Status};
-use refs::{PlantedRef, PropertyRef, Ref, TestIdRef};
+use refs::{HistoryRunRef, PlantedRef, PropertyRef, Ref, TestIdRef};
 
 /// One of sim-6.2's six gates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -778,6 +778,70 @@ fn duplicate_of(class: &NativeClass, case: &CaseRef) -> bool {
     PlantedRef::joins(&want, case, |case| Some(case.planted()))
 }
 
+/// Whether `history` is the one a [`Key::History`]'s `run` names, joined on
+/// its whole [`HistoryRunRef`].
+fn history_key_history(run: &RunId, history: &HistoryRef) -> bool {
+    HistoryRunRef::of_run(run).is_some_and(|want| {
+        HistoryRunRef::joins(&want, history, |history| Some(HistoryRunRef::of(*history)))
+    })
+}
+
+/// Whether `history` is the one a [`Key::NaList`]'s `run` names, joined on
+/// its whole [`HistoryRunRef`].
+fn list_key_history(run: &RunId, history: &HistoryRef) -> bool {
+    HistoryRunRef::of_run(run).is_some_and(|want| {
+        HistoryRunRef::joins(&want, history, |history| Some(HistoryRunRef::of(*history)))
+    })
+}
+
+/// The test a key names by `package`, `file` and `test`, as joins name it.
+fn key_test(package: &str, file: &str, test: &str) -> TestIdRef {
+    TestIdRef {
+        package: package.to_owned(),
+        file: file.to_owned(),
+        test: test.to_owned(),
+    }
+}
+
+/// Whether `t` is the test a [`Key::Witness`] names, joined on its whole
+/// [`TestIdRef`].
+fn witness_key_test(package: &str, file: &str, test: &str, t: &TestRef) -> bool {
+    TestIdRef::joins(&key_test(package, file, test), t, |t| {
+        Some(TestIdRef::of(*t))
+    })
+}
+
+/// Whether `t` is the test a [`Key::ContractTest`] names, joined on its
+/// whole [`TestIdRef`].
+fn contract_key_test(package: &str, file: &str, test: &str, t: &TestRef) -> bool {
+    TestIdRef::joins(&key_test(package, file, test), t, |t| {
+        Some(TestIdRef::of(*t))
+    })
+}
+
+/// Whether `t` is the acceptance test a [`Key::Composition`] names by
+/// `test`, joined on its whole [`TestIdRef`].
+fn composition_key_test(test: &str, t: &TestRef) -> bool {
+    let want = key_test("zakura-sim", rows::ACCEPTANCE_TESTS, test);
+    TestIdRef::joins(&want, t, |t| Some(TestIdRef::of(*t)))
+}
+
+/// Whether `t` is the test a narrowing entry's `test` names, joined on its
+/// whole [`TestIdRef`]. A pending entry names none.
+fn narrowing_key_test(test: contracts::NarrowingTest, t: &TestRef) -> bool {
+    let contracts::NarrowingTest::Test(want) = test else {
+        return false;
+    };
+    TestIdRef::joins(&TestIdRef::of(want), t, |t| Some(TestIdRef::of(*t)))
+}
+
+/// Whether `t` is `harness`'s missing-source test
+/// ([`rows::missing_source_test`]), joined on its whole [`TestIdRef`].
+fn missing_source_key_test(harness: &str, t: &TestRef) -> bool {
+    rows::missing_source_test(harness)
+        .is_some_and(|want| TestIdRef::joins(&TestIdRef::of(want), t, |t| Some(TestIdRef::of(*t))))
+}
+
 /// Whether `test` is the one [`rows::reason_test`] names to show `reason`,
 /// joined on its whole [`TestIdRef`].
 fn reason_shown_by(reason: crate::NaReason, test: &TestRef) -> bool {
@@ -809,9 +873,6 @@ impl Key {
     /// narrowing test key is matched against `narrowing`, the manifest's
     /// entries.
     pub fn covers(&self, expected: &Expected, narrowing: &[contracts::Narrowing]) -> bool {
-        let test_is = |package: &str, file: &str, name: &str, test: &TestRef| {
-            test.package == package && test.file == file && test.test == name
-        };
         match (self, expected) {
             (Key::Passing { property }, Expected::Holds { property: p, .. })
             | (Key::Passing { property }, Expected::StaysNotApplicable { property: p, .. }) => {
@@ -844,7 +905,7 @@ impl Key {
                 | Expected::StaysNotApplicable {
                     history, property, ..
                 },
-            ) => RunId::from(*history) == *run && property == target,
+            ) => history_key_history(run, history) && property == target,
             (
                 Key::Native { patch },
                 Expected::IntegrityCaught {
@@ -895,7 +956,7 @@ impl Key {
             (
                 Key::NaList { run },
                 Expected::Holds { history, .. } | Expected::StaysNotApplicable { history, .. },
-            ) => RunId::from(*history) == *run,
+            ) => list_key_history(run, history),
             // A reason's key takes the pass of exactly the test that shows
             // it, or, for a reason with none, the Open that blocks.
             (Key::NaReason { reason }, Expected::Passes { test }) => reason_shown_by(*reason, test),
@@ -931,7 +992,7 @@ impl Key {
                     test,
                 },
                 Expected::Passes { test: t },
-            ) => test_is(package, file, test, t),
+            ) => witness_key_test(package, file, test, t),
             (
                 Key::ContractTest {
                     package,
@@ -940,16 +1001,13 @@ impl Key {
                     ..
                 },
                 Expected::Passes { test: t },
-            ) => test_is(package, file, test, t),
+            ) => contract_key_test(package, file, test, t),
             (Key::Composition { test }, Expected::Passes { test: t }) => {
-                test_is("zakura-sim", rows::ACCEPTANCE_TESTS, test, t)
+                composition_key_test(test, t)
             }
-            (Key::NarrowingTest { entry }, Expected::Passes { test: t }) => {
-                narrowing.iter().any(|narrowing| {
-                    narrowing.entry == entry
-                        && matches!(narrowing.test, contracts::NarrowingTest::Test(n) if n == *t)
-                })
-            }
+            (Key::NarrowingTest { entry }, Expected::Passes { test: t }) => narrowing
+                .iter()
+                .any(|narrowing| narrowing.entry == entry && narrowing_key_test(narrowing.test, t)),
             // A native mutation's or a narrowing entry's transitional Open
             // must be exactly the one its classification or entry writes:
             // reason, owner, approval and PR.
@@ -972,7 +1030,7 @@ impl Key {
                 })
             }
             (Key::MissingSource { harness, .. }, Expected::Passes { test: t }) => {
-                rows::missing_source_test(harness) == Some(*t)
+                missing_source_key_test(harness, t)
             }
             (
                 Key::Case { .. } | Key::Replay { .. } | Key::Witness { .. } | Key::History { .. },
@@ -1383,6 +1441,180 @@ mod tests {
                 test: leaked(&want.test),
             };
             key.covers(&Expected::Passes { test }, &[])
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// The run of the history `want` names.
+    fn history_run(want: &HistoryRunRef) -> RunId {
+        RunId::History {
+            harness: want.harness.clone(),
+            package: want.package.clone(),
+            file: want.file.clone(),
+            test: want.test.clone(),
+            case: want.case.clone(),
+        }
+    }
+
+    /// The first counted history, its target and its `Holds`.
+    fn a_history_s_holds() -> (HistoryRef, &'static str, Expected) {
+        let (history, target) = rows::history_targets()[0];
+        let holds = Expected::Holds {
+            property: target,
+            history,
+            not_applicable: &[],
+        };
+        (history, target, holds)
+    }
+
+    /// A history key takes the pass of only its own history, joined on its
+    /// whole [`HistoryRunRef`] (Rule 25's template): the key of a counted
+    /// history and its target covers that history's `Holds`, and the key
+    /// with the history's harness, its witness's package, file or name, or
+    /// its case moved doesn't.
+    #[test]
+    fn a_history_key_joins_its_whole_history() {
+        let (history, target, holds) = a_history_s_holds();
+        let keys = assert_one_key_off::<HistoryRunRef>(&HistoryRunRef::of(history), |want| {
+            let key = Key::History {
+                run: history_run(want),
+                target: target.to_owned(),
+            };
+            key.covers(&holds, &[])
+        });
+        assert_eq!(keys, 5);
+    }
+
+    /// A node history's list key takes the whole-report pass of only its
+    /// own history, joined on its whole [`HistoryRunRef`] (Rule 25's
+    /// template): the list key of a counted history covers that history's
+    /// `Holds`, and the key with the history's harness, its witness's
+    /// package, file or name, or its case moved doesn't.
+    #[test]
+    fn a_list_key_joins_its_whole_history() {
+        let (history, _, holds) = a_history_s_holds();
+        let keys = assert_one_key_off::<HistoryRunRef>(&HistoryRunRef::of(history), |want| {
+            let key = Key::NaList {
+                run: history_run(want),
+            };
+            key.covers(&holds, &[])
+        });
+        assert_eq!(keys, 5);
+    }
+
+    /// `want`'s test, its fields leaked for the life of the test.
+    fn test_of(want: &TestIdRef) -> TestRef {
+        TestRef {
+            package: leaked(&want.package),
+            file: leaked(&want.file),
+            test: leaked(&want.test),
+        }
+    }
+
+    /// A witness key takes the pass of only its own test, joined on its
+    /// whole [`TestIdRef`]: two files can hold a test of one name.
+    #[test]
+    fn a_witness_key_joins_its_whole_test() {
+        let own = super::sim_test("tests/a_witness.rs", "a_test");
+        let key = Key::Witness {
+            package: own.package.to_owned(),
+            file: own.file.to_owned(),
+            test: own.test.to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(own), |want| {
+            key.covers(
+                &Expected::Passes {
+                    test: test_of(want),
+                },
+                &[],
+            )
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// A contract's test key takes the pass of only its own test, joined on
+    /// its whole [`TestIdRef`].
+    #[test]
+    fn a_contract_test_key_joins_its_whole_test() {
+        let own = super::sim_test("tests/a_witness.rs", "a_test");
+        let key = Key::ContractTest {
+            contract: "C2".to_owned(),
+            package: own.package.to_owned(),
+            file: own.file.to_owned(),
+            test: own.test.to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(own), |want| {
+            key.covers(
+                &Expected::Passes {
+                    test: test_of(want),
+                },
+                &[],
+            )
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// A composition key takes the pass of only its own acceptance test,
+    /// joined on its whole [`TestIdRef`].
+    #[test]
+    fn a_composition_key_joins_its_whole_test() {
+        let own = super::sim_test(rows::ACCEPTANCE_TESTS, "a_check");
+        let key = Key::Composition {
+            test: own.test.to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(own), |want| {
+            key.covers(
+                &Expected::Passes {
+                    test: test_of(want),
+                },
+                &[],
+            )
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// A narrowing entry's test key takes the pass of only the entry's own
+    /// test, joined on its whole [`TestIdRef`].
+    #[test]
+    fn a_narrowing_key_joins_its_whole_test() {
+        let (entry, own) = contracts::NARROWING
+            .iter()
+            .find_map(|narrowing| match narrowing.test {
+                contracts::NarrowingTest::Test(test) => Some((narrowing.entry, test)),
+                contracts::NarrowingTest::Pending { .. } => None,
+            })
+            .expect("a narrowing entry has its test");
+        let key = Key::NarrowingTest {
+            entry: entry.to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(own), |want| {
+            key.covers(
+                &Expected::Passes {
+                    test: test_of(want),
+                },
+                contracts::NARROWING,
+            )
+        });
+        assert_eq!(keys, 3);
+    }
+
+    /// A missing-source key takes the pass of only its harness's own
+    /// missing-source test, joined on its whole [`TestIdRef`].
+    #[test]
+    fn a_missing_source_key_joins_its_whole_test() {
+        let harness = "header-sync/smoke";
+        let own = rows::missing_source_test(harness).expect("smoke has its missing-source test");
+        let key = Key::MissingSource {
+            harness: harness.to_owned(),
+            source: "a source".to_owned(),
+        };
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(own), |want| {
+            key.covers(
+                &Expected::Passes {
+                    test: test_of(want),
+                },
+                &[],
+            )
         });
         assert_eq!(keys, 3);
     }

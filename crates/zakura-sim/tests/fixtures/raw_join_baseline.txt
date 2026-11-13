@@ -189,18 +189,13 @@ src/harness/discovery_service.rs	planted_trigger	id.stream!=stream_id()
 src/harness/discovery_service.rs	sent_row	*s==stream
 src/harness/discovery_service.rs	wire_properties	SCRIPTED.contains(&property.id.as_str()
 src/harness/fixtures.rs	no_race_in	view.fixture().property()!=F::NAME
-src/harness/header_acceptance.rs	covers	RunId::from(*history)==*run
 src/harness/header_acceptance.rs	covers	covering==test
 src/harness/header_acceptance.rs	covers	mutation.class==NativeClass::Integrity{history:*history,diagnostic,not_applicable}
 src/harness/header_acceptance.rs	covers	p==property
 src/harness/header_acceptance.rs	covers	property==p
 src/harness/header_acceptance.rs	covers	property==target
-src/harness/header_acceptance.rs	covers	rows::missing_source_test(harness)==Some(*t)
 src/harness/header_acceptance.rs	covers	run==replayed
 src/harness/header_acceptance.rs	covers	set.contains(&property.as_str()
-src/harness/header_acceptance.rs	covers	test.file==file
-src/harness/header_acceptance.rs	covers	test.package==package
-src/harness/header_acceptance.rs	covers	test.test==name
 src/harness/header_acceptance.rs	needs_of	harness==Flood::NAME
 src/harness/header_acceptance.rs	needs_of	harness==HeaderWire::NAME
 src/harness/header_acceptance.rs	needs_of	harness==Liveness::NAME
@@ -245,7 +240,6 @@ src/harness/header_acceptance/evaluate.rs	same_run	property==super::NATIVE_DIR
 src/harness/header_acceptance/evaluate.rs	same_run	run.meta.harness!=harness
 src/harness/header_acceptance/inventory.rs	each_inventory_change_is_an_inventory_error	contract.id!=ContractId::C22
 src/harness/header_acceptance/inventory.rs	each_inventory_change_is_an_inventory_error	id!=ContractId::C22
-src/harness/header_acceptance/required.rs	allows	test==*t
 src/harness/header_acceptance/required.rs	required_keys	contract.id==id
 src/harness/header_acceptance/rows.rs	attach_history_passes	property==target
 src/harness/header_acceptance/rows.rs	machine_row	property==REACTOR

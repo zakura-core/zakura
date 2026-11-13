@@ -13,7 +13,7 @@ use super::{
         contract_catch_key, contract_test_key, Contract, ContractId, ContractState, Narrowing,
     },
     reasons::NaEntry,
-    refs::{PlantedRef, Ref},
+    refs::{PlantedRef, Ref, TestIdRef},
     sim_test, Approval, CaseRef, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, RunId,
     TestRef, Tier, PLAN, TIERS,
 };
@@ -130,7 +130,7 @@ impl Permit {
     /// Whether `expected` is what this permits.
     pub fn allows(self, expected: &Expected) -> bool {
         match (self, expected) {
-            (Permit::Test(test), Expected::Passes { test: t }) => test == *t,
+            (Permit::Test(test), Expected::Passes { test: t }) => permitted_test(test, t),
             (Permit::Caught(want), Expected::Caught { case, .. }) => permitted_catch(&want, case),
             (
                 Permit::Until { owner, pr, reason },
@@ -826,6 +826,12 @@ pub fn counted_runs(expected: &Expected) -> (Vec<RunId>, Vec<RunId>) {
     }
 }
 
+/// Whether `t` is the test a [`Permit::Test`] names, `want`, joined on its
+/// whole [`TestIdRef`].
+fn permitted_test(want: TestRef, t: &TestRef) -> bool {
+    TestIdRef::joins(&TestIdRef::of(want), t, |t| Some(TestIdRef::of(*t)))
+}
+
 /// `case`'s harness among `harnesses`, joined on its whole [`PlantedRef`],
 /// if it has one.
 fn harness_of<'a>(harnesses: &'a [(PlantedRef, String)], case: &PlantedRef) -> Option<&'a str> {
@@ -1138,6 +1144,26 @@ mod tests {
                 .contains_key(&draft_replay(&case))
         });
         assert_eq!(keys, 2);
+    }
+
+    /// A [`Permit::Test`] takes the pass of only its own test, joined on its
+    /// whole [`TestIdRef`] (Rule 25's template): the permit of a test allows
+    /// its `Passes`, and not the `Passes` of the test with its package,
+    /// file or name moved.
+    #[test]
+    fn a_permitted_test_joins_its_whole_test() {
+        let own = sim_test("tests/a_witness.rs", "a_test");
+        let permit = Permit::Test(own);
+        let keys = assert_one_key_off::<TestIdRef>(&TestIdRef::of(own), |want| {
+            let leak = |text: &str| -> &'static str { Box::leak(text.to_owned().into_boxed_str()) };
+            let test = TestRef {
+                package: leak(&want.package),
+                file: leak(&want.file),
+                test: leak(&want.test),
+            };
+            permit.allows(&Expected::Passes { test })
+        });
+        assert_eq!(keys, 3);
     }
 
     /// A [`Permit::Caught`] takes the `Caught` of its case only on the

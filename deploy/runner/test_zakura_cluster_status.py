@@ -1468,9 +1468,16 @@ class DashboardLoginConfigTests(unittest.TestCase):
     def test_env_without_hash_disables_the_gate(self):
         self.assertIsNone(status.dashboard_login_from_env({}))
 
-    def test_env_hash_without_secret_refuses_to_start(self):
+    def test_env_hash_gets_a_fresh_signing_key_per_start(self):
+        env = {"ZAKURA_DASHBOARD_PASSWORD_HASH": status.hash_password("pw", iterations=1000)}
+        first = status.dashboard_login_from_env(env)
+        second = status.dashboard_login_from_env(env)
+        self.assertNotEqual(first.session_secret, second.session_secret)
+        self.assertFalse(second.token_valid(first.issue_token(time.time()), time.time()))
+
+    def test_env_with_a_non_hash_refuses_to_start(self):
         with self.assertRaises(ValueError):
-            status.dashboard_login_from_env({"ZAKURA_DASHBOARD_PASSWORD_HASH": status.hash_password("pw", iterations=1000)})
+            status.dashboard_login_from_env({"ZAKURA_DASHBOARD_PASSWORD_HASH": "plaintext"})
 
     def test_print_password_hash_reads_stdin(self):
         result = subprocess.run([sys.executable, str(SCRIPT_PATH), "--print-password-hash"],

@@ -832,22 +832,15 @@ jobs:
           set -euo pipefail
 
           # The fleet pages need a shared password. Refuse to install without
-          # it rather than serve them publicly. The host keeps only its hash;
-          # the cookie secret survives deploys so logins do too (delete its
-          # line from the env file to sign everyone out).
+          # it rather than serve them publicly. The host keeps only its hash.
           if [ -z "${DASHBOARD_PASSWORD:-}" ]; then
             echo "secret ZAKURA_STATUS_DASHBOARD_PASSWORD is not set; not serving the dashboard without a password" >&2
             exit 1
           fi
-          dashboard_env="/etc/zakura-mainnet-dashboard/dashboard.env"
           sudo mkdir -p /etc/zakura-mainnet-dashboard
-          session_secret="$(sudo sed -n 's/^ZAKURA_DASHBOARD_SESSION_SECRET=//p' "$dashboard_env" 2>/dev/null || true)"
-          if [ -z "$session_secret" ]; then
-            session_secret="$(openssl rand -hex 32)"
-          fi
           password_hash="$(printf '%s\n' "$DASHBOARD_PASSWORD" | python3 deploy/runner/zakura-cluster-status.py --print-password-hash)"
-          printf 'ZAKURA_DASHBOARD_PASSWORD_HASH=%s\nZAKURA_DASHBOARD_SESSION_SECRET=%s\n' "$password_hash" "$session_secret" \
-            | sudo install -m 600 -o root -g root /dev/stdin "$dashboard_env"
+          printf 'ZAKURA_DASHBOARD_PASSWORD_HASH=%s\n' "$password_hash" \
+            | sudo install -m 600 -o root -g root /dev/stdin /etc/zakura-mainnet-dashboard/dashboard.env
 
           dashboard_dir="/opt/zakura-mainnet-dashboard"
           sudo install -d -m 755 "$dashboard_dir"

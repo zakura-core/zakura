@@ -4408,9 +4408,9 @@ setInterval(renderFreshness, 1000);
 
 # -- the shared dashboard password --------------------------------------------
 # One password gates the fleet pages and their data. Only its salted PBKDF2
-# hash and a random cookie secret reach this process, through the environment.
-# A login sets a cookie holding an expiry and an HMAC of it under the secret,
-# so rotating the secret signs everyone out.
+# hash reaches this process, through the environment. A login sets a cookie
+# holding an expiry and an HMAC of it under a random key made at startup and
+# never stored, so every restart signs everyone out.
 SESSION_COOKIE = "zakura_status_session"
 SESSION_SECONDS = 7 * 86400
 PASSWORD_HASH_ALGORITHM = "pbkdf2_sha256"
@@ -4451,7 +4451,7 @@ def parse_cookies(header: str | None) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class DashboardLogin:
-    """The password hash and the secret that signs login cookies."""
+    """The password hash and the in-memory key that signs login cookies."""
 
     password_hash: str
     session_secret: str
@@ -4474,16 +4474,16 @@ class DashboardLogin:
 
 
 def dashboard_login_from_env(environ) -> DashboardLogin | None:
-    """The login gate configured by `ZAKURA_DASHBOARD_PASSWORD_HASH`, or None when no password is set."""
+    """The login gate configured by `ZAKURA_DASHBOARD_PASSWORD_HASH`, or None when no password is set.
+
+    The cookie-signing key is fresh for this process and kept only in memory.
+    """
     password_hash = environ.get("ZAKURA_DASHBOARD_PASSWORD_HASH", "").strip()
-    session_secret = environ.get("ZAKURA_DASHBOARD_SESSION_SECRET", "").strip()
     if not password_hash:
         return None
-    if not session_secret:
-        raise ValueError("ZAKURA_DASHBOARD_PASSWORD_HASH needs ZAKURA_DASHBOARD_SESSION_SECRET to sign login cookies")
     if not password_hash.startswith(PASSWORD_HASH_ALGORITHM + "$"):
         raise ValueError("ZAKURA_DASHBOARD_PASSWORD_HASH is not a pbkdf2_sha256 hash")
-    return DashboardLogin(password_hash, session_secret)
+    return DashboardLogin(password_hash, secrets.token_hex(32))
 
 
 LOGIN_PAGE = """<!doctype html>

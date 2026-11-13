@@ -7154,6 +7154,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/actions.rs",
         "a_fact_joins_its_cause_by_its_whole_stamp",
     ),
+    (
+        "PickRef",
+        "src/harness/header_acceptance/actions.rs",
+        "next_declared",
+        "src/harness/header_acceptance/actions.rs",
+        "a_pick_joins_its_declared_action_whole",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.
@@ -7906,7 +7913,7 @@ const RULE_25_WITNESSES: &[&str] = &[
 /// parts: a peer, connection, session, subscription, stream, frame or
 /// page, an operation, call or sequence number, a storage instance, a
 /// peer's incarnation, a link, a version, an ID, a serialized attribution,
-/// or a store's stamp for a fact.
+/// a store's stamp for a fact, or a trace's pick.
 const IDENTITY_WORDS: &[&str] = &[
     "peer",
     "conn",
@@ -7926,6 +7933,7 @@ const IDENTITY_WORDS: &[&str] = &[
     "id",
     "attribution",
     "stamp",
+    "pick",
 ];
 
 /// The comparisons [`raw_joins`] finds that aren't identity joins, as
@@ -8068,6 +8076,12 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "tests/header_wire_witness.rs",
         "act_frame",
         "connection",
+        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "act_frame",
+        "pick",
         "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
     ),
     (
@@ -8365,6 +8379,10 @@ fn identity_joins_go_through_refs() {
         (
             "fn p(causes: &[(u64, usize)], stamp: u64) -> bool { causes.iter().any(|(at, _)| *at == stamp) }",
             Some("stamp"),
+        ),
+        (
+            "fn p(declared: &[String], pick: &str) -> bool { declared.iter().any(|action| action == pick) }",
+            Some("pick"),
         ),
         (
             "fn p(peer: &PeerNameRef) { assert_one_key_off::<PeerNameRef>(peer, |p| p.peer == peer.peer); }",

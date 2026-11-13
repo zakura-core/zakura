@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use super::{
     evaluate::{Actions, End},
-    refs::{ControlRef, LinkRef, Ref, SessionRef, StampRef},
+    refs::{ControlRef, LinkRef, PickRef, Ref, SessionRef, StampRef},
 };
 use crate::{
     harness::{
@@ -136,11 +136,21 @@ const PEER_CLOSED: &str = "accept_failed";
 /// peer finished its header stream.
 const STREAM_FINISHED: &str = "stream_closed";
 
+/// The `peer:<peer>:<action>` pick `pick` names, or `None` for one that
+/// isn't a `peer:` pick of that shape. A peer's name holds no `:`.
+fn pick_ref(pick: &str) -> Option<PickRef> {
+    let (peer, action) = pick.strip_prefix("peer:")?.split_once(':')?;
+    Some(PickRef {
+        peer: peer.to_owned(),
+        action: action.to_owned(),
+    })
+}
+
 /// One action a history's bound scenario declares.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Declared {
-    /// The pick that takes it: `peer:<peer>:<action>`.
-    pub pick: String,
+    /// The pick that takes it.
+    pub pick: PickRef,
     /// Which script it belongs to, whose actions are picked in order: the
     /// control script, or one peer's.
     pub script: String,
@@ -211,7 +221,10 @@ fn controls(scenario: &StorageScenario) -> Vec<Declared> {
                 | ControlAction::RepairStatus { .. } => Effect::AtPick,
             };
             Declared {
-                pick: format!("peer:{}:{}", step.peer, step.action.name()),
+                pick: PickRef {
+                    peer: step.peer.clone(),
+                    action: step.action.name().to_owned(),
+                },
                 script: "control".to_owned(),
                 control: Some(position),
                 effect,
@@ -248,7 +261,10 @@ fn peers(scenario: &WireScenario) -> Vec<Declared> {
                 | PeerAction::Discover { .. } => Effect::Unshown,
             };
             declared.push(Declared {
-                pick: format!("peer:{name}:{}", action.name()),
+                pick: PickRef {
+                    peer: name.clone(),
+                    action: action.name().to_owned(),
+                },
                 script: name.clone(),
                 control: None,
                 effect,
@@ -587,6 +603,20 @@ fn own_effect<'a>(facts: &'a [Fact], named: &[bool], cause: &ControlRef) -> Opti
         .copied()
 }
 
+/// The first of `declared` not yet `picked` that `pick` takes, joined by
+/// its whole [`PickRef`], so a pick never takes another peer's action or
+/// another action of its peer.
+fn next_declared(declared: &[Declared], picked: &[bool], pick: &PickRef) -> Option<usize> {
+    let undone: Vec<(usize, &Declared)> = declared
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| !picked[*at])
+        .collect();
+    PickRef::joined(pick, &undone, |(_, action)| Some(action.pick.clone()))
+        .first()
+        .map(|(at, _)| *at)
+}
+
 /// Whether `run`, a node history's recording that ended `end`, carried
 /// out `declared`: [`Actions::Complete`] for a completed run whose every
 /// declared action was picked, each script's in order, and shown by its
@@ -613,13 +643,11 @@ pub fn judge(
     // next undone declared action of its script with that identity.
     let mut picked = vec![false; declared.len()];
     for pick in &picks {
-        let next = declared
-            .iter()
-            .enumerate()
-            .find(|(at, action)| !picked[*at] && action.pick == *pick);
-        let Some((at, action)) = next else {
+        let Some(at) = pick_ref(pick).and_then(|pick| next_declared(declared, &picked, &pick))
+        else {
             return Actions::Incomplete;
         };
+        let action = &declared[at];
         let earlier_undone = declared[..at]
             .iter()
             .enumerate()
@@ -834,6 +862,32 @@ mod tests {
             joined += 1;
         }
         assert_eq!(joined, 3);
+    }
+
+    /// Each pick takes its declared action by its whole [`PickRef`] (Rule
+    /// 25's template): in the close-relink-close history every declared
+    /// action's pick finds the first undone one of its peer and action, and
+    /// the same pick with only its peer, `mirror-1`, which declares
+    /// nothing, or only its action moved finds none.
+    #[test]
+    fn a_pick_joins_its_declared_action_whole() {
+        let (_, _, declared) = close_relink_close();
+        let mut picked = vec![false; declared.len()];
+        for (at, action) in declared.iter().enumerate() {
+            assert_one_key_off::<PickRef>(&action.pick, |pick| {
+                next_declared(&declared, &picked, pick) == Some(at)
+            });
+            picked[at] = true;
+        }
+        assert_eq!(declared.len(), 3);
+        assert_eq!(
+            pick_ref("peer:mirror-0:recovery-relink"),
+            Some(PickRef {
+                peer: "mirror-0".into(),
+                action: "recovery-relink".into(),
+            })
+        );
+        assert_eq!(pick_ref("peer:node"), None);
     }
 
     /// Each fact takes its cause by its whole stamp (Rule 25's template):

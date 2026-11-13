@@ -296,6 +296,17 @@ pub struct StampRef {
 }
 impl Ref for StampRef {}
 
+/// One `peer:` pick of a trace, or the declared action it takes: the
+/// peer it acts on and the action, as `peer:<peer>:<action>` spells them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickRef {
+    /// The peer, by harness name, or `node`.
+    pub peer: String,
+    /// The action's name.
+    pub action: String,
+}
+impl Ref for PickRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

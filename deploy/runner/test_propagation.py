@@ -125,6 +125,12 @@ class JoinTests(unittest.TestCase):
         self.assertEqual([block["height"] for block in joined["blocks"]], [10, 9])
         self.assertEqual(len(propagation.join(reports, NODE_IDS, limit=1)["blocks"]), 1)
 
+    def test_a_node_that_recorded_no_announcement_has_an_unknown_source(self):
+        unheard = record(wall={"asked": 0.010, "body": 0.050, "tip": 0.060}, heard_from=None)
+        heard = record(wall={"heard": 0.0, "tip": 0.060}, heard_from=None)
+        self.assertEqual(self.join(**{"us-0": report(unheard)})["blocks"][0]["nodes"]["us-0"]["from"], "unknown")
+        self.assertEqual(self.join(**{"us-0": report(heard)})["blocks"][0]["nodes"]["us-0"]["from"], "outside")
+
     def test_a_malformed_record_costs_only_that_block_on_that_node(self):
         good = self.reports["us-0"]["blocks"][0]
         malformed = [

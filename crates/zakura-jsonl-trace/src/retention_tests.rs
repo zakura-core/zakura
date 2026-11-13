@@ -135,6 +135,24 @@ fn other_table() -> JsonlWriteEvent {
 }
 
 #[tokio::test]
+async fn startup_truncation_failure_is_propagated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(CURRENT);
+    std::fs::write(&path, "12345\n").unwrap();
+    let readonly = tokio::fs::File::open(&path).await.unwrap();
+    assert!(TableWriter::limit_existing_file(&readonly, 4)
+        .await
+        .is_err());
+    assert_eq!(contents(dir.path(), CURRENT).await, "12345\n");
+}
+
+#[test]
+fn default_budget_is_two_files_of_512_mib() {
+    let writer = TraceWriter::new(PathBuf::new(), JsonlTraceConfig::default());
+    assert_eq!(writer.legacy_gossip_file_limit, 512 * 1024 * 1024);
+}
+
+#[tokio::test]
 async fn failed_rotation_disables_only_gossip_and_discards_later_rows() {
     let dir = tempfile::tempdir().unwrap();
     let mut writer = writer(dir.path(), 2);

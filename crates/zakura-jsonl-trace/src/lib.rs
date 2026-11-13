@@ -612,13 +612,7 @@ impl TableWriter {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            let bytes = file.metadata().await?.len();
-            let bytes = if bytes > file_limit {
-                file.set_len(0).await?;
-                0
-            } else {
-                bytes
-            };
+            let bytes = Self::limit_existing_file(&file, file_limit).await?;
             Some(TraceRetention {
                 current: path,
                 previous,
@@ -633,6 +627,17 @@ impl TableWriter {
             encode_buf: Vec::with_capacity(buffer_flush_bytes),
             retention,
         })
+    }
+
+    /// Reconcile an existing current file before any new rows are accepted.
+    async fn limit_existing_file(file: &tokio::fs::File, limit: u64) -> std::io::Result<u64> {
+        let bytes = file.metadata().await?.len();
+        if bytes > limit {
+            file.set_len(0).await?;
+            Ok(0)
+        } else {
+            Ok(bytes)
+        }
     }
 
     async fn append_line(&mut self, line: &[u8]) -> std::io::Result<()> {

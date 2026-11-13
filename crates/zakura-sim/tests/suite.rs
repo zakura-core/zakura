@@ -237,11 +237,11 @@ fn the_committed_suite_covers_the_registry() {
 fn a_harness_without_a_target_fails() {
     let mut suite = committed();
     remove(&mut suite.missing_target, |row| {
-        row.harness == "header-sync/wire"
+        row.harness == "header-sync/repair"
     });
     assert_problem(
         &problems(&suite),
-        "no target runs the harness `header-sync/wire`",
+        "no target runs the harness `header-sync/repair`",
     );
 }
 
@@ -259,9 +259,9 @@ fn a_harness_both_run_and_missing_fails() {
 #[test]
 fn a_target_covering_a_harness_its_harness_doesnt_compose_fails() {
     // `header-sync/smoke` reports no property, so no property check rejects
-    // it, and `fixtures/all` checks none of `header-sync/wire`'s.
+    // it, and `fixtures/all` checks none of `header-sync/repair`'s.
     let mut suite = committed();
-    for harness in ["header-sync/smoke", "header-sync/wire"] {
+    for harness in ["header-sync/smoke", "header-sync/repair"] {
         remove(&mut suite.missing_target, |row| row.harness == harness);
         for target in &mut suite.target {
             if target.name == "race_fixtures" {
@@ -270,7 +270,7 @@ fn a_target_covering_a_harness_its_harness_doesnt_compose_fails() {
         }
     }
     let problems = problems(&suite);
-    for harness in ["header-sync/smoke", "header-sync/wire"] {
+    for harness in ["header-sync/smoke", "header-sync/repair"] {
         assert_problem(
             &problems,
             &format!(
@@ -698,14 +698,14 @@ fn a_registered_pending_row_fails() {
 fn every_problem_is_reported_at_once() {
     let mut suite = committed();
     remove(&mut suite.missing_target, |row| {
-        row.harness == "block-sync/storage"
+        row.harness == "header-sync/flood"
     });
     remove(&mut suite.ignored, |row| {
         row.test == "regenerate_wait_complete_input"
     });
     remove(&mut suite.target, |row| row.name == "race_fixtures");
     let problems = problems(&suite);
-    assert_problem(&problems, "no target runs the harness `block-sync/storage`");
+    assert_problem(&problems, "no target runs the harness `header-sync/flood`");
     assert_problem(&problems, "regenerate_wait_complete_input is ignored");
     assert_problem(&problems, "defines the target `race_fixtures`");
     assert_problem(&problems, "no target runs the harness `race/ab-ba`");

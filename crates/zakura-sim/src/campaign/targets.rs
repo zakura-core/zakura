@@ -28,6 +28,9 @@
 //! Each row also lists the retained production bypasses under
 //! `qa/planted/` whose committed input runs on the target's harness. `cargo
 //! xtask planted --targets` runs each one through its target.
+//!
+//! The report also lists each harness no target runs, with its
+//! `[[missing-target]]` row, so it accounts for every harness.
 
 use std::{
     fs,
@@ -53,15 +56,15 @@ use crate::{
     planted::{self, PLANTED_DIR},
     seed::{self, sha256, Seed},
     sim::NO_LIVELOCK,
-    suite::{SuiteFile, SIM_FUZZ_PACKAGE, SUITE_FILE},
+    suite::{MissingTarget, SuiteFile, SIM_FUZZ_PACKAGE, SUITE_FILE},
     trace::ARTIFACTS_VAR,
 };
 
 /// The report's file in the output directory.
 pub const READINESS_FILE: &str = "readiness.json";
 
-/// The report's format version.
-pub const READINESS_VERSION: u32 = 1;
+/// The report's format version. Version 2 adds the missing targets.
+pub const READINESS_VERSION: u32 = 2;
 
 /// The properties every harness checks. A target whose seeds apply only
 /// these runs no property of its own harness.
@@ -211,6 +214,10 @@ pub struct Readiness {
     pub sanitizer: String,
     /// One row per target, in `qa/suite.toml`'s order.
     pub targets: Vec<TargetReadiness>,
+    /// Each harness no target runs, with its `[[missing-target]]` row, in
+    /// `qa/suite.toml`'s order. [`Readiness::not_ready`] doesn't count
+    /// them, since the suite accounts for each.
+    pub missing_targets: Vec<MissingTarget>,
 }
 
 impl Readiness {
@@ -473,9 +480,10 @@ pub fn bypasses(repo: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> 
 }
 
 /// Checks each target `options` names, calls `checked` with each row as
-/// it's done, writes the report into `options.out`, and returns it. Fails
-/// only if the checker itself can't go on, such as on an output directory
-/// that isn't empty.
+/// it's done, writes the report into `options.out`, and returns it. The
+/// report lists every missing target, whichever targets `options` names.
+/// Fails only if the checker itself can't go on, such as on an output
+/// directory that isn't empty.
 pub fn check_targets(
     options: &TargetsOptions,
     mut checked: impl FnMut(&TargetReadiness),
@@ -508,6 +516,7 @@ pub fn check_targets(
         version: READINESS_VERSION,
         sanitizer: options.sanitizer.clone(),
         targets: Vec::new(),
+        missing_targets: suite.missing_target.clone(),
     };
     for target in declared
         .iter()

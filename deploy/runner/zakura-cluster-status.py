@@ -11,6 +11,9 @@ With --nu7-config it also serves the NU7 fork's public `/v1/status` (schema
 version 1) for zakura.com/nu7/. A node's optional `monitor` table selects how it
 is reached: `local = true` probes it on this host without SSH, and `status_url`
 reads a remote node's deploy/nu7-fork/miner/remote-status.py report instead.
+`profiler_url` names the node's continuous CPU profiler (deploy/profiler/): the
+fleet table marks such a node as profiled and `/profile/<name>` shows its flame
+graphs, forwarded from that URL.
 
 Only the Python stdlib is used.
 """
@@ -60,6 +63,19 @@ PUBLIC_ERROR_MESSAGE = "A fresh Ironwood status is not available."
 # that stalls mid-request keeps one.
 MAX_CONCURRENT_REQUESTS = 16
 REQUEST_TIMEOUT_SECONDS = 10
+# A node's continuous profiler (deploy/profiler/) answers on loopback. Its status is
+# read on every poll; the rest is forwarded only when someone opens the profile page.
+PROFILER_STATUS_TIMEOUT_SECONDS = 2
+PROFILER_REQUEST_TIMEOUT_SECONDS = 8
+PROFILER_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+PROFILER_MAX_PARAM_LENGTH = 400
+# The profiler requests the profile page may make, and the parameters each accepts.
+PROFILER_API = {
+    "status": (),
+    "flame": ("range", "from", "to", "view", "lens", "focus"),
+    "timeline": ("range", "from", "to"),
+    "blocks": ("limit",),
+}
 PUBLIC_ORIGINS = {
     "mainnet": frozenset({"https://zakura.com"}),
     "testnet": frozenset({
@@ -173,7 +189,7 @@ DEFAULTS = {
     "monitor": None,
     "internal_miner": False,
 }
-MONITOR_KEYS = {"local", "status_url", "label", "id", "region"}
+MONITOR_KEYS = {"local", "status_url", "label", "id", "region", "profiler_url"}
 
 
 @dataclass
@@ -204,6 +220,8 @@ class Node:
     miner_id: str = ""
     region: str = ""
     internal_miner: bool = False
+    # Where this node's continuous CPU profiler answers, when it runs one.
+    profiler_url: str = ""
 
     def ssh_cmd(self, *remote: str) -> list[str]:
         if self.local:
@@ -243,6 +261,9 @@ def load_nodes(config_path: Path) -> list[Node]:
                            or not re.fullmatch(r"https?://[A-Za-z0-9.:\[\]-]+/[A-Za-z0-9/._-]*",
                                                status_url)):
             raise SystemExit(f"{name}: status_url must be an http(s) URL on a remote node")
+        profiler_url = monitor.get("profiler_url", "")
+        if profiler_url and not re.fullmatch(r"https?://[A-Za-z0-9.:\[\]-]+", profiler_url):
+            raise SystemExit(f"{name}: profiler_url must be an http(s) origin without a path")
         nodes.append(
             Node(
                 name=name,
@@ -269,12 +290,50 @@ def load_nodes(config_path: Path) -> list[Node]:
                 miner_id=str(monitor.get("id") or ""),
                 region=str(monitor.get("region") or ""),
                 internal_miner=merged["internal_miner"] is True,
+                profiler_url=profiler_url,
             )
         )
 
     if not nodes:
         raise SystemExit(f"no [[nodes]] defined in {config_path}")
     return nodes
+
+
+def fetch_profiler(profiler_url: str, path: str, timeout: float) -> tuple[int, bytes, str]:
+    """Ask a node's profiler for `path`; returns `(status, body, content_type)`.
+
+    A profiler that cannot be reached, or answers with more than the size cap, is
+    reported as a 502 so the page can say so instead of hanging.
+    """
+    try:
+        with urllib.request.urlopen(profiler_url + path, timeout=timeout) as response:
+            body = response.read(PROFILER_MAX_RESPONSE_BYTES + 1)
+            status, content_type = response.status, response.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as error:
+        with error:
+            return error.code, error.read(PROFILER_MAX_RESPONSE_BYTES), "application/json"
+    except (OSError, ValueError):
+        return 502, b'{"error":"profiler unreachable"}', "application/json"
+    if len(body) > PROFILER_MAX_RESPONSE_BYTES:
+        return 502, b'{"error":"profiler response too large"}', "application/json"
+    return status, body, content_type
+
+
+def profiler_summary(profiler_url: str) -> dict:
+    """The few facts about a node's profiler that the fleet table shows."""
+    status, body, _ = fetch_profiler(profiler_url, "/api/status", PROFILER_STATUS_TIMEOUT_SECONDS)
+    try:
+        report = json.loads(body) if status == 200 else {}
+    except ValueError:
+        report = {}
+    if not isinstance(report, dict) or not isinstance(report.get("state"), str):
+        return {"state": "unreachable"}
+    summary = {"state": report["state"][:40]}
+    for key in ("rate_hz", "overhead_pct_last_hour", "last_window_end"):
+        value = report.get(key)
+        if type(value) in (int, float) and math.isfinite(value):
+            summary[key] = value
+    return summary
 
 
 def ssh_host(ssh_string: str) -> str:
@@ -1416,13 +1475,21 @@ class ClusterCollector:
                 pool.submit(probe_node, node, self.should_scrape_metrics(node.name, started), ancestor_height): node
                 for node in self.nodes
             }
+            profilers = {
+                node.name: pool.submit(profiler_summary, node.profiler_url)
+                for node in self.nodes
+                if node.profiler_url
+            }
             for future in concurrent.futures.as_completed(futures):
                 node = futures[future]
                 try:
                     probe = future.result()
                 except Exception as error:
                     probe = {"error": str(error)}
-                rows.append(self.row_for(node, probe, time.time()))
+                row = self.row_for(node, probe, time.time())
+                if node.name in profilers:
+                    row["profiler"] = profilers[node.name].result()
+                rows.append(row)
 
         if private_enabled:
             self.last_height.setdefault("mac-os-cranelift", self.private_mac_progress.get("height"))
@@ -3453,6 +3520,20 @@ function badge(text, toneName) {
   const cls = toneName && toneName !== 'neutral' ? ' tone-' + toneName : '';
   return '<span class="badge' + cls + '">' + esc(text) + '</span>';
 }
+// A link to the node's CPU flame graphs, for nodes that run the continuous profiler.
+function profilerBadge(row) {
+  const profiler = row.profiler;
+  if (!profiler) return '';
+  const working = profiler.state === 'ok';
+  const title = working
+    ? 'Continuous CPU profile: sampling at ' + profiler.rate_hz + ' Hz, using '
+      + (profiler.overhead_pct_last_hour == null ? 'under 1' : profiler.overhead_pct_last_hour)
+      + '% of one core. Open the flame graph.'
+    : 'Continuous CPU profiler is ' + profiler.state + '. Open the profile page.';
+  return '<a class="node-link badge tone-' + (working ? 'info' : 'warn') + '" href="/profile/'
+    + encodeURIComponent(row.name) + '" title="' + esc(title) + '">'
+    + (working ? 'profiled' : 'profiler ' + esc(profiler.state)) + '</a>';
+}
 function tipEventLabel(event) {
   if (event === 'reorg_height_drop') return 'height drop';
   if (event === 'tip_switch') return 'tip switch';
@@ -3570,8 +3651,10 @@ function renderFleet(data) {
     const client = row.client_name || 'unknown';
     clients[client] = (clients[client] || 0) + 1;
   }
-  el('client-mix').textContent = Object.keys(clients).sort()
-    .map((client) => clients[client] + ' ' + client).join(' · ') || 'no clients';
+  const profiled = rows.filter((row) => row.profiler).length;
+  el('client-mix').textContent = (Object.keys(clients).sort()
+    .map((client) => clients[client] + ' ' + client).join(' · ') || 'no clients')
+    + (profiled ? ' · CPU profile on ' + profiled + ' of ' + rows.length : '');
 
   const heights = rows.map((row) => row.height).filter((height) => height != null);
   el('fleet-max-height').textContent = heights.length ? num(Math.max(...heights)) : '—';
@@ -3823,7 +3906,8 @@ function renderTable(data) {
       + '<div class="stack"><a class="node-link node-name" href="/node/'
       + encodeURIComponent(row.name) + '" title="Open node detail">' + esc(row.name) + '</a>'
       + '<span class="node-sub" title="' + esc(row.node_id || '') + '">'
-      + esc(row.node_id ? tinyHash(row.node_id) : 'node id unknown') + '</span></div></div></td>'
+      + esc(row.node_id ? tinyHash(row.node_id) : 'node id unknown') + '</span>'
+      + profilerBadge(row) + '</div></div></td>'
       + '<td class="col-health"><div class="stack">'
       + badge(HEALTH_LABEL[row.health] || row.health, healthTone) + vitalBadges(row) + '</div></td>'
       + '<td class="col-chain"><div class="stack">'
@@ -3929,7 +4013,8 @@ function renderNodeHeader(data) {
     + badge(row.chain_role || 'unknown', tone(CHAIN_TONE, row.chain_role))
     + badge('service ' + (row.active_state || 'unknown'),
       row.active_state === 'active' ? 'ok' : 'bad')
-    + (row.tip_event ? badge(tipEventLabel(row.tip_event) || row.tip_event, 'bad') : '');
+    + (row.tip_event ? badge(tipEventLabel(row.tip_event) || row.tip_event, 'bad') : '')
+    + profilerBadge(row);
 
   const pill = el('state-pill');
   pill.textContent = { healthy: 'Healthy', stale: 'Stale', verification_error: 'Verification error', rpc_error: 'RPC error', down: 'Down' }[row.health]
@@ -4439,8 +4524,44 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         return str(peer_address)
 
+    def serve_profile(self, parsed: urllib.parse.ParseResult) -> None:
+        """Forward the profile page and its data requests to the node's own profiler.
+
+        `/profile/<node>` is the page; `/profile/<node>/api/<request>` is one of the
+        requests in PROFILER_API, with only the parameters listed there.
+        """
+        assert COLLECTOR is not None
+        name, _, rest = parsed.path[len("/profile/"):].partition("/")
+        node = COLLECTOR.nodes_by_name.get(urllib.parse.unquote(name))
+        request = rest[len("api/"):] if rest.startswith("api/") else None
+        if node is None or not node.profiler_url or (rest and request not in PROFILER_API):
+            return self.send_body(
+                404, b"not found\n", "text/plain; charset=utf-8", {"X-Content-Type-Options": "nosniff"}
+            )
+        if not RATE_LIMITER.allow(self.rate_limit_client()):
+            return self.send_json(
+                429, {"error": "Request rate limit exceeded"},
+                {**NO_STORE, "Retry-After": str(int(PUBLIC_RATE_WINDOW))},
+            )
+        if request is None:
+            status, body, _ = fetch_profiler(node.profiler_url, "/", PROFILER_REQUEST_TIMEOUT_SECONDS)
+            if status != 200:
+                body = b"The profiler on this node is not answering.\n"
+            content_type = "text/html; charset=utf-8" if status == 200 else "text/plain; charset=utf-8"
+            return self.send_body(status, body, content_type, NO_STORE)
+        params = [
+            (key, value)
+            for key, value in urllib.parse.parse_qsl(parsed.query)
+            if key in PROFILER_API[request] and len(value) <= PROFILER_MAX_PARAM_LENGTH
+        ]
+        path = f"/api/{request}" + ("?" + urllib.parse.urlencode(params) if params else "")
+        status, body, _ = fetch_profiler(node.profiler_url, path, PROFILER_REQUEST_TIMEOUT_SECONDS)
+        return self.send_body(status, body, "application/json", NO_STORE)
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/profile/"):
+            return self.serve_profile(parsed)
         if parsed.path == "/data":
             assert COLLECTOR is not None
             body = json.dumps(COLLECTOR.snapshot()).encode()

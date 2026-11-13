@@ -73,7 +73,6 @@ pub struct OutputLocation {
 
 impl OutputLocation {
     /// Creates an output location from a block height, and `usize` transaction and output indexes.
-    #[allow(dead_code)]
     pub fn from_usize(
         height: Height,
         transaction_index: usize,
@@ -555,24 +554,6 @@ impl AddressTransaction {
         let addr_tx = |tx_loc| AddressTransaction::new(address_location, tx_loc);
 
         addr_tx(max(first_utxo_location, query_start_location))..=addr_tx(query_end_location)
-    }
-
-    /// Update the transaction location to the next possible transaction for the
-    /// supplied address. Used to look up the next output with
-    /// [`ReadDisk::zs_next_key_value_from`][1].
-    ///
-    /// The updated transaction location may be invalid, which is not an issue
-    /// since [`ReadDisk::zs_next_key_value_from`][1] will fetch the next
-    /// existing (valid) value.
-    ///
-    /// [1]: super::super::disk_db::ReadDisk::zs_next_key_value_from
-    #[allow(dead_code)]
-    pub fn address_iterator_next(&mut self) {
-        // Iterating from the next possible output location gets us the next output,
-        // even if it is in a later block or transaction.
-        //
-        // Consensus: the block size limit is 2MB, which is much lower than the index range.
-        self.transaction_location.index.0 += 1;
     }
 
     /// The location of the first [`transparent::Output`] sent to the address of this output.

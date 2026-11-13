@@ -66,6 +66,7 @@ impl ReactorBudget {
     }
 
     /// The sum of `budgets`, or `None` if either field overflows.
+    #[cfg(test)]
     pub const fn checked_sum(budgets: &[Self]) -> Option<Self> {
         let mut total = Self::ZERO;
         let mut index = 0;

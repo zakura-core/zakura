@@ -24,7 +24,7 @@ use tokio::{
     time::{error, timeout, Instant},
 };
 use tokio_stream::wrappers::IntervalStream;
-use tokio_util::codec::Framed;
+use tokio_util::{codec::Framed, task::AbortOnDropHandle};
 use tower::Service;
 use tracing::Instrument;
 use tracing::{span, Level, Span};
@@ -281,7 +281,7 @@ impl ConnectedAddr {
     /// Returns a new outbound connected addr via `proxy`.
     ///
     /// `local_addr` is the ephemeral local address of the connection.
-    #[allow(unused)]
+    #[cfg(test)]
     pub fn new_outbound_proxy(proxy: SocketAddr, local_addr: SocketAddr) -> ConnectedAddr {
         OutboundProxy {
             proxy_addr: proxy,
@@ -293,7 +293,7 @@ impl ConnectedAddr {
     //
     // TODO: distinguish between direct listeners and proxy listeners in the
     //       rest of zakura-network
-    #[allow(unused)]
+    #[cfg(test)]
     pub fn new_inbound_proxy(proxy: SocketAddr) -> ConnectedAddr {
         InboundProxy {
             transient_addr: proxy,
@@ -1825,7 +1825,7 @@ where
                             Err(err) => {
                                 metrics::counter!(
                                     "zakura.net.in.errors",
-                                    "error" => err.to_string(),
+                                    "error" => serialization_error_metric_label(err),
                                 )
                                 .increment(1);
 
@@ -1967,8 +1967,9 @@ where
         // Correctness: As a defence-in-depth against hangs, wrap the entire handshake in a timeout.
         let fut = timeout(constants::HANDSHAKE_TIMEOUT, fut);
 
-        // Spawn a new task to drive this handshake, forwarding panics to the calling task.
-        tokio::spawn(erased(fut.instrument(negotiator_span)))
+        // Keep the spawned handshake owned by its caller. Dropping a timed-out
+        // connector must also release the inner handshake's stream and tracker.
+        AbortOnDropHandle::new(tokio::spawn(erased(fut.instrument(negotiator_span))))
             .map(
                 |join_result: Result<
                     Result<Result<Client, HandshakeError>, error::Elapsed>,
@@ -1987,6 +1988,24 @@ where
                 },
             )
             .boxed()
+    }
+}
+
+/// Returns a bounded serialization error label without error details.
+fn serialization_error_metric_label(error: &SerializationError) -> &'static str {
+    match error {
+        SerializationError::Io(_) => "io",
+        SerializationError::Parse(_) => "parse",
+        SerializationError::NonCanonicalShieldedProofSize => "non_canonical_shielded_proof_size",
+        SerializationError::Utf8Error(_) => "utf8_error",
+        SerializationError::TryFromSliceError(_) => "try_from_slice_error",
+        SerializationError::TryFromIntError(_) => "try_from_int_error",
+        SerializationError::FromHexError(_) => "from_hex_error",
+        SerializationError::Amount { .. } => "amount",
+        SerializationError::BadTransactionBalance => "bad_transaction_balance",
+        SerializationError::Script(_) => "script",
+        SerializationError::Opcode(_) => "opcode",
+        SerializationError::Num(_) => "num",
     }
 }
 

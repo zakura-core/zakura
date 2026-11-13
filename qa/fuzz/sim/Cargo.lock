@@ -1671,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "14.0.0"
+version = "15.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "5.2.1"
+version = "5.3.1"
 dependencies = [
  "chrono",
  "rayon",
@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "16.0.0"
+version = "17.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -1846,7 +1846,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.2.1"
+version = "5.2.3"
 dependencies = [
  "serde",
  "tokio",
@@ -1974,7 +1974,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-quic"
-version = "0.5.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "curve25519-dalek",
@@ -2027,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "pin-project-lite",
  "rand 0.10.3",

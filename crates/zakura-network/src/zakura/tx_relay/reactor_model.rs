@@ -165,8 +165,11 @@ pub(crate) struct ReactorModel {
     effects: Vec<RelayEffect>,
     /// Every step the pool returned to a call this reactor made.
     pool_steps: Vec<Step>,
-    /// Steps taken from the pool after a call that returns only an answer,
-    /// waiting to be routed before this input ends.
+    /// Every step this input's calls into the pool produced, in the order
+    /// the pool produced them, waiting to be routed before the input ends.
+    /// One queue for all of them, whether the call returned the step or
+    /// only an answer, so a later step never reaches a consumer before an
+    /// earlier one.
     collected: Vec<Step>,
     /// Announced ids dropped at a full pending set.
     pub(crate) overflowed: u64,
@@ -303,7 +306,7 @@ impl ReactorModel {
                     let supplier = self.sessions[&session].peer.clone();
                     *self.verifying.entry(supplier.clone()).or_default() += 1;
                     self.wanted_at(key).fetch = Fetch::Submitted { waiter, supplier };
-                    self.route(step, now, pool);
+                    self.collected.push(step);
                 }
             }
         }
@@ -701,7 +704,7 @@ impl ReactorModel {
         // The next ask reserves again.
         if let Some(reservation) = self.wanted_at(key).reservation.take() {
             let step = pool.release(reservation, now);
-            self.route(step, now, pool);
+            self.collected.push(step);
         }
         // If the core refused every announcer that had room, try again
         // after a delay. Otherwise the id waits for a request slot, which an
@@ -753,7 +756,7 @@ impl ReactorModel {
             // Any call into the pool can return a verdict for an earlier
             // submission, because the pool applies the deadlines that are
             // due before it handles the call.
-            self.route(step, now, pool);
+            self.collected.push(step);
         }
         self.forget(key);
     }
@@ -815,11 +818,11 @@ impl ReactorModel {
         }
     }
 
-    /// The one way out of an input. What the pool's deadlines caused during
-    /// this input's calls is routed here, in the order it was collected,
-    /// and every idle id that has someone to ask is asked. Routing and
-    /// asking can each cause more of the other, so this runs until both are
-    /// done.
+    /// The one way out of an input. Every step the pool produced during
+    /// this input's calls is routed here, in the order the pool produced
+    /// them, and every idle id that has someone to ask is asked. Routing and
+    /// asking can each cause more pool calls, whose steps join the back of
+    /// the queue, so this runs until both are done.
     fn finish(&mut self, now: ModelTime, pool: &mut PoolModel) -> Vec<RelayEffect> {
         loop {
             if !self.collected.is_empty() {

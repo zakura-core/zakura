@@ -1188,6 +1188,20 @@ fn a_random_run_always_drains_once_the_sessions_end() {
             reactor.assert_invariants();
         }
 
+        // The outcomes of the jobs that were cancelled and not yet heard
+        // from arrive now, late. Each is ignored and leaves nothing behind.
+        for job in std::mem::take(&mut ledger.cancelled) {
+            let read = GenerationRead::Stable(Generation(generation));
+            let step = pool.outcome(job, Outcome::Pass, read, read, now);
+            ledger.absorb(&step);
+            let effects = reactor.pool_step(&step, now, &mut pool);
+            apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
+        }
+        ledger.absorb_all(reactor.take_pool_steps());
+        assert!(
+            ledger.jobs.is_empty() || !sessions_end,
+            "seed {seed}: a late outcome left a job behind"
+        );
         // The reactor holds no slot at the core, whether or not its peers
         // left, and no body counts against a peer any more.
         assert_eq!(pool.slots_in_use(), 0, "seed {seed}: a core slot is stuck");
@@ -1347,4 +1361,64 @@ fn an_announcement_that_finds_a_deadline_due_passes_on_what_it_caused() {
     assert_eq!(started, 1, "transaction 1's check is handed to the caller");
     pool.assert_invariants();
     reactor.assert_invariants();
+}
+
+// Cases from the thirteenth review.
+
+#[test]
+fn the_pools_steps_reach_their_consumers_in_the_order_the_pool_produced_them() {
+    use zakura_node_services::mempool::port::model::Effect;
+    // One slot at the core.
+    let mut pool = PoolModel::new(Height(100), Generation(0)).with_limits(1, 5, 1);
+    let mut reactor = ReactorModel::new(MAX_TX);
+    let first = reactor.connect(v2(1), false, MAX_REQUESTS_PER_PEER);
+    let second = reactor.connect(v2(2), false, MAX_REQUESTS_PER_PEER);
+
+    // The reactor asks for transaction 2, stops waiting, and gives up. The
+    // request stays out. Another peer announces it again, but the slot is
+    // taken by now, so it only waits.
+    reactor.announce(first, id(2), 300, secs(0), &mut pool);
+    reactor.tick(REQUEST_TIMEOUT, &mut pool);
+    assert!(!reactor.wants(id(2)));
+    let legacy = QueueSource::LegacySocket(([10, 0, 0, 9], 8233).into());
+    let reserved = pool
+        .reserve(
+            id(1),
+            Source::Peer(legacy.clone()),
+            Intent::Deliver,
+            REQUEST_TIMEOUT,
+        )
+        .expect("the slot is free");
+    let (legacy_waiter, step) =
+        pool.submit(reserved.id, tx(1), Supplier::Peer(legacy), REQUEST_TIMEOUT);
+    let legacy_job = step.started()[0];
+    reactor.announce(second, id(2), 300, REQUEST_TIMEOUT, &mut pool);
+    assert!(reactor.wants(id(2)));
+    reactor.take_pool_steps();
+
+    // The first peer's late body arrives just as the legacy caller's
+    // verification runs out of time. Reserving for the body is what finds
+    // that deadline due, and submitting the body starts its own check.
+    let late = REQUEST_TIMEOUT + T_VERIFY;
+    reactor.tx(first, tx(2), late, &mut pool);
+
+    let effects: Vec<Effect> = reactor
+        .take_pool_steps()
+        .into_iter()
+        .flat_map(|step| step.effects)
+        .collect();
+    let position = |wanted: &dyn Fn(&Effect) -> bool| {
+        effects
+            .iter()
+            .position(wanted)
+            .unwrap_or_else(|| panic!("the effect is there: {effects:?}"))
+    };
+    let cancelled = position(&|effect| *effect == Effect::Cancel(legacy_job));
+    let answered = position(
+        &|effect| matches!(effect, Effect::Verdict { waiter, .. } if *waiter == legacy_waiter),
+    );
+    let started = position(&|effect| matches!(effect, Effect::Start { tx, .. } if *tx == id(2)));
+    // The old job is cancelled and its caller answered before the new one
+    // is started, because that is the order the pool did them in.
+    assert!(cancelled < started && answered < started, "{effects:?}");
 }

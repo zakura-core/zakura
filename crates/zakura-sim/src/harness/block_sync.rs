@@ -827,6 +827,7 @@ impl Subsystem for Storage {
             ScenarioFamily::new("paused-handoffs", PAUSED_HANDOFFS_TAG),
             ScenarioFamily::new("above-window", ABOVE_WINDOW_TAG),
             ScenarioFamily::new("peers-leave", PEERS_LEAVE_TAG),
+            ScenarioFamily::new("peers-leave-served", PEERS_LEAVE_SERVED_TAG),
         ];
         families.extend(BlockScenario::semantic_families());
         families.extend(BlockScenario::hostile_families());
@@ -834,8 +835,8 @@ impl Subsystem for Storage {
     }
 
     /// The scenario the prefix's two bytes pick: [`STUCK_FLOOR_TAG`],
-    /// [`PAUSED_HANDOFFS_TAG`], [`ABOVE_WINDOW_TAG`] and [`PEERS_LEAVE_TAG`]
-    /// pick theirs, as do the semantic scenarios' tags
+    /// [`PAUSED_HANDOFFS_TAG`], [`ABOVE_WINDOW_TAG`], [`PEERS_LEAVE_TAG`]
+    /// and [`PEERS_LEAVE_SERVED_TAG`] pick theirs, as do the semantic scenarios' tags
     /// ([`BlockScenario::semantic_drawn`]) and the hostile scenarios' tags
     /// ([`BlockScenario::hostile_drawn`]). All of them start with `ff`, so
     /// they come before the odd-first-byte arm. Otherwise an odd first byte
@@ -860,6 +861,9 @@ impl Subsystem for Storage {
             [first, second, ..] if [*first, *second] == PEERS_LEAVE_TAG => {
                 BlockScenario::peers_leave()
             }
+            [first, second, ..] if [*first, *second] == PEERS_LEAVE_SERVED_TAG => {
+                BlockScenario::peers_leave_served()
+            }
             [first, ..] if first % 2 == 1 => BlockScenario::short_budget(),
             _ => BlockScenario::default(),
         }
@@ -877,6 +881,11 @@ pub const ABOVE_WINDOW_TAG: [u8; 2] = [0xFF, 0x04];
 
 /// The scenario prefix that picks [`BlockScenario::peers_leave`].
 pub const PEERS_LEAVE_TAG: [u8; 2] = [0xFF, 0x05];
+
+/// The scenario prefix that picks [`BlockScenario::peers_leave_served`], the
+/// only drawn scenario whose links reserve session slots. It drew the short
+/// budget before, and no committed input starts with it.
+pub const PEERS_LEAVE_SERVED_TAG: [u8; 2] = [0xFF, 0x07];
 
 /// [`HandoffPause`]'s hold: a routine task that recorded a handoff's start
 /// and not its end, stopped in the budget's code, which only its release

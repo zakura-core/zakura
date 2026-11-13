@@ -121,8 +121,9 @@ enum BodyDecodePanic {
 ///
 /// Every peer that requests a block is sent the same body, so the checksum in the message
 /// header is the same for all of them. Hashing a full block takes milliseconds, and many peers
-/// request a new block at the same moment. Connections that share one `BlockChecksums` hash each
-/// block once between them.
+/// request a new block at the same moment. Connections that share one `BlockChecksums` reuse a
+/// block's checksum after a send has calculated and stored it. Concurrent sends that miss the
+/// cache can each calculate the checksum before either stores it.
 ///
 /// A checksum is found by the block's hash. A node only sends blocks it holds, and it holds one
 /// body for each hash. The body length is checked as well, so a body of another length is hashed
@@ -228,8 +229,8 @@ impl Builder {
         self
     }
 
-    /// Share `block_checksums` with the other codecs that were given a clone of it, so a block
-    /// sent through several of them is hashed once.
+    /// Share `block_checksums` with the other codecs that were given a clone of it, so later
+    /// sends can reuse a block's remembered checksum.
     pub(crate) fn with_block_checksums(mut self, block_checksums: BlockChecksums) -> Self {
         self.block_checksums = block_checksums;
         self

@@ -2403,6 +2403,14 @@ static HISTORIES: &[HistoryNa] = &[
     },
     HistoryNa {
         harness: "header-sync/wire",
+        file: "tests/header_wire_prepare_fault.rs",
+        test: "the_late_fault_fixture_penalizes_after_the_session_ended",
+        cases: &["committed late-fault input"],
+        applies: &[PENALTY, &["header-sync/header-fault-penalized"]],
+        undeclared: PENALTY_UNDECLARED,
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
         file: "tests/header_wire_progress.rs",
         test: "the_progress_fixture_holds_honest_progress",
         cases: &[""],

@@ -847,6 +847,20 @@ const HONEST_PEER: HistoryRef = HistoryRef {
     case: "both ways",
 };
 
+/// The committed late-fault fixture on `header-sync/wire`: the node
+/// penalizes the session that sent an invalid page after that session
+/// ended. It's `header-fault-penalized`'s counted history, since that ID's
+/// `COVERAGE` test runs the test-only `test/header-wire-watched` harness
+/// ([`TEST_ONLY_WITNESSES`]).
+const LATE_FAULT: HistoryRef = HistoryRef {
+    harness: WIRE,
+    witness: sim_test(
+        "tests/header_wire_prepare_fault.rs",
+        "the_late_fault_fixture_penalizes_after_the_session_ended",
+    ),
+    case: "committed late-fault input",
+};
+
 /// The smoke harness's clean run.
 const SMOKE_RUN: HistoryRef = HistoryRef {
     harness: SMOKE,
@@ -1170,6 +1184,7 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
         (FLOOD_WIRE, WATCH_WIRE),
         (FLOOD_LIFECYCLE, WATCH_LIFECYCLE),
         (SMOKE_RUN, SIM_WIDE[0]),
+        (LATE_FAULT, PENALIZED),
         (REACTOR_RUN, REACTOR),
         (PUBLISHER_RUN, PUBLISHER),
     ]);
@@ -1380,12 +1395,10 @@ const OPERATION_IDS_UNREACHED: &str =
      storage operations and logs their submissions and completions, so only storage-fake code \
      can break the rule and no production patch can";
 
-/// Why `header-fault-penalized`'s counted history is still owed.
-const PENALIZED_PASSING: &str = "a header-sync/wire history for the penalty, since its \
-                                 COVERAGE test runs test/header-wire-watched";
 /// Why a sim-wide ID's catch is still owed.
 const SIM_WIDE_CATCH: &str = "the sim-wide IDs' bypasses run on test-only harnesses, so a \
                               header-harness catch or an approved Open is still owed";
+
 /// Why `sim/no-livelock`'s counted history is still owed.
 const LIVELOCK_PASSING: &str = "its witness runs the test-only test/probe harness, which the \
                                 executable can't replay, so a header-harness history or an \
@@ -1393,15 +1406,14 @@ const LIVELOCK_PASSING: &str = "its witness runs the test-only test/probe harnes
 
 /// The transitional `Open` each transitional passing or catch key owes,
 /// whole: its reason, owner and the PR it waits for, written from the
-/// plan's PR table. The sim-wide IDs' catches and the two test-only
-/// witnesses' passing histories are hdr-14.4's. [`Key::covers`] takes a
-/// transitional `Open` on such a key only if it's exactly this one.
+/// plan's PR table. The sim-wide IDs' catches and `sim/no-livelock`'s
+/// passing history are hdr-14.4's. [`Key::covers`] takes a transitional `Open` on such a key only if it's
+/// exactly this one.
 pub fn owed_open(key: &Key) -> Option<Expected> {
     let (reason, until) = match key {
         Key::Catch { property } if SIM_WIDE.contains(&property.as_str()) => {
             (SIM_WIDE_CATCH, "hdr-14.4")
         }
-        Key::Passing { property } if property == PENALIZED => (PENALIZED_PASSING, "hdr-14.4"),
         Key::Passing { property } if property == SIM_WIDE[1] => (LIVELOCK_PASSING, "hdr-14.4"),
         _ => return None,
     };
@@ -2748,9 +2760,9 @@ fn hand_written_rows() -> Vec<Row> {
 
     let penalized = PENALIZED;
     // Its COVERAGE test runs the test-only test/header-wire-watched
-    // harness (`TEST_ONLY_WITNESSES`), so its counted history waits for a
-    // registered one.
-    let mut fault = vec![owed(Key::passing(penalized), G2)];
+    // harness (`TEST_ONLY_WITNESSES`), so its counted history is the
+    // committed late fault on header-sync/wire.
+    let mut fault = holds(penalized, G2, LATE_FAULT);
     // hdr-14.4 moved its three native mutations here, each a typed case on
     // the scripted late-fault fixture, and each is found at a step.
     for name in [

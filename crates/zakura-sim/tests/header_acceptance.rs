@@ -1080,7 +1080,9 @@ fn the_rows_are_consistent_with_coverage() {
             .iter()
             .map(|&(id, test, why)| (id, changed(test), why))
             .collect();
-        assert_eq!(witness_association_errors(&excepted, &other).len(), 1);
+        // Both exempt rows judge a header history that isn't their COVERAGE
+        // test's, so each fails once its exemption names another test.
+        assert_eq!(witness_association_errors(&excepted, &other).len(), 2);
     }
 }
 
@@ -1475,6 +1477,13 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
             "publisher_machine_records_and_replays_without_transport",
             Some("header/publisher-policy"),
             owned(&["PUBLISHER_INPUT"]),
+        ),
+        (
+            "header-sync/wire",
+            "tests/header_wire_prepare_fault.rs",
+            "the_late_fault_fixture_penalizes_after_the_session_ended",
+            Some("header-sync/header-fault-penalized"),
+            owned(&["committed late-fault input"]),
         ),
     ]);
     // Built once per call for a fixed test table, so the leaks are bounded.

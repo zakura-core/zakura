@@ -1,12 +1,9 @@
 # A request that a reset retired returns the height its replacement took
-# and published, and releases that charge. mut-6's generator drew this
-# machine input (seed 11, run 54), and the shrinker reduced its Plan to the
-# defaults.
+# and published, and releases that charge. mut-6's generator killed it with
+# a machine input that has no charged work, so the unpatched tree can't hold
+# on that input. The committed fixture reaches charged work, holds on the
+# unpatched tree and catches the mutant.
 # Besides state.rs, which the patch changes, the rest of the work queue
 # decides when a stale owner returns its heights.
+input = "crates/zakura-sim/tests/fixtures/block-work-ownership.bin"
 checks = ["crates/zakura-network/src/zakura/block_sync/work_queue"]
-
-[typed]
-harness = "block/work-ownership"
-scenario = "qa/planted/block/work-ownership/stale-owner-returns-replacement.scenario.json"
-plan = "qa/planted/block/work-ownership/stale-owner-returns-replacement.plan.bin"

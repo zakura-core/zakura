@@ -14,7 +14,7 @@
 //! skip all the network tests by setting the `SKIP_NETWORK_TESTS` environmental variable.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -26,8 +26,8 @@ use chrono::Utc;
 use futures::{channel::mpsc, future, FutureExt, StreamExt};
 use indexmap::IndexSet;
 use tokio::{
-    io::AsyncWriteExt,
-    net::{TcpSocket, TcpStream},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpSocket, TcpStream},
     task::{JoinError, JoinHandle},
 };
 use tower::{service_fn, Layer, Service, ServiceExt};
@@ -2273,6 +2273,9 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
 
 /// The listener lets an unconditional peer reconnect at once, and makes any other peer
 /// wait before a second connection from its IP.
+///
+/// A peer in a listed range reconnects in a public slot, without the wait. A listed
+/// address reconnects in its own slot.
 #[tokio::test]
 async fn listener_unconditional_peer_reconnect_bypasses_recent_ip_limit() {
     let _init_guard = zakura_test::init();
@@ -2282,7 +2285,9 @@ async fn listener_unconditional_peer_reconnect_bypasses_recent_ip_limit() {
         return;
     }
 
-    for (unconditional_peers, expected_connections) in [("[]", 1), ("['127.0.0.1']", 2)] {
+    for (unconditional_peers, expected_connections) in
+        [("[]", 1), ("['127.0.0.0/30']", 2), ("['127.0.0.1']", 2)]
+    {
         let success_disconnect_inbound_handshaker =
             service_fn(|req: HandshakeRequest<TcpStream>| async move {
                 let HandshakeRequest {
@@ -2348,6 +2353,125 @@ async fn listener_unconditional_peer_reconnect_bypasses_recent_ip_limit() {
         std::mem::drop(first_connection);
         std::mem::drop(second_connection);
     }
+}
+
+/// A dialed unconditional peer has inbound slots of its own, on top of the inbound
+/// limit, so it can connect while ordinary peers fill every public slot. A peer that is
+/// only in a listed range has none.
+#[tokio::test]
+async fn listener_gives_dialed_unconditional_peers_inbound_slots_of_their_own() {
+    let _init_guard = zakura_test::init();
+
+    // Each case is a node's unconditional peers, its zcashd-compat peers, its peer set
+    // target size, and the connections it accepts from the ordinary peer, which connects
+    // first, and from the unconditional peer. The inbound limit is 3 times the target.
+    let cases: [(&str, &[&str], usize, [usize; 2]); 6] = [
+        // Not listed: the unconditional peer finds the public slots full.
+        ("[]", &[], 1, [3, 0]),
+        // One slot for a listed address, on top of the inbound limit.
+        ("['::1']", &[], 1, [3, 1]),
+        // A listed address still connects to a node with no inbound slots.
+        ("['::1']", &[], 0, [0, 1]),
+        // A peer in a listed range cannot take the slot of another listed address.
+        ("['192.0.2.1', '::/127']", &[], 1, [3, 0]),
+        // The slots are one pool for the listed addresses.
+        ("['::1', '192.0.2.1']", &[], 1, [3, 2]),
+        // A listed zcashd-compat peer only takes the zcashd-compat slot.
+        ("['::1']", &["::1"], 1, [2, 1]),
+    ];
+
+    for (listed, zcashd_compat, target_size, expected) in cases {
+        let Some(mut listener) =
+            UnconditionalPeerListener::spawn(listed, zcashd_compat, target_size).await
+        else {
+            return;
+        };
+
+        // Offer more connections of each kind than the listener has slots for them.
+        let mut open_connections = Vec::new();
+        let mut accepted = [0, 0];
+        for (kind, source_ip) in [LISTENER_PUBLIC_IP, LISTENER_UNCONDITIONAL_IP]
+            .into_iter()
+            .enumerate()
+        {
+            for _ in 0..listener.inbound_limit + 3 {
+                if let Some(connection) = listener.offer(source_ip).await {
+                    accepted[kind] += 1;
+                    open_connections.push(connection);
+                }
+            }
+        }
+
+        assert_eq!(
+            accepted, expected,
+            "unexpected ordinary and unconditional connections with unconditional_peers = \
+             {listed}, zcashd-compat peers {zcashd_compat:?}, target size {target_size}",
+        );
+
+        listener.stop().await;
+    }
+}
+
+/// A dialed unconditional peer also takes public slots while they are free, after it
+/// fills its own slots.
+#[tokio::test]
+async fn listener_lets_unconditional_peers_use_free_public_slots() {
+    let _init_guard = zakura_test::init();
+
+    let Some(mut listener) = UnconditionalPeerListener::spawn("['::1']", &[], 1).await else {
+        return;
+    };
+
+    let mut open_connections = Vec::new();
+    while let Some(connection) = listener.offer(LISTENER_UNCONDITIONAL_IP).await {
+        open_connections.push(connection);
+    }
+    assert_eq!(
+        open_connections.len(),
+        listener.inbound_limit + 1,
+        "the peer takes its own slot and every public slot",
+    );
+    assert!(
+        listener.offer(LISTENER_PUBLIC_IP).await.is_none(),
+        "every public slot is taken",
+    );
+
+    listener.stop().await;
+}
+
+/// A dialed unconditional peer's slot is free again when its connection closes, and no
+/// other peer can take it.
+#[tokio::test]
+async fn listener_keeps_an_unconditional_peer_slot_after_its_connection_closes() {
+    let _init_guard = zakura_test::init();
+
+    let Some(mut listener) = UnconditionalPeerListener::spawn("['::1']", &[], 1).await else {
+        return;
+    };
+
+    let mut public_connections = Vec::new();
+    while let Some(connection) = listener.offer(LISTENER_PUBLIC_IP).await {
+        public_connections.push(connection);
+    }
+    assert_eq!(public_connections.len(), listener.inbound_limit);
+
+    let own_slot_connection = listener
+        .offer(LISTENER_UNCONDITIONAL_IP)
+        .await
+        .expect("the unconditional peer takes its own slot");
+    assert!(listener.offer(LISTENER_UNCONDITIONAL_IP).await.is_none());
+
+    std::mem::drop(own_slot_connection);
+    assert!(
+        listener.offer(LISTENER_PUBLIC_IP).await.is_none(),
+        "an ordinary peer cannot take the unconditional peer's slot",
+    );
+    assert!(
+        listener.offer(LISTENER_UNCONDITIONAL_IP).await.is_some(),
+        "the unconditional peer takes its slot again",
+    );
+
+    listener.stop().await;
 }
 
 /// Test configured zcashd-compat reconnects bypass the normal
@@ -3714,6 +3838,206 @@ async fn spawn_boxed_crawler_with_peer_limit(
     );
 
     (config, discovered_peers)
+}
+
+/// An inbound connection that the listener accepted: the peer's side, the listener's
+/// side, and the tracker that the listener gave the handshake.
+type AcceptedInboundConnection = (TcpStream, TcpStream, ConnectionTracker);
+
+/// The address of the ordinary peer in [`UnconditionalPeerListener`] tests.
+const LISTENER_PUBLIC_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+/// The address of the unconditional peer in [`UnconditionalPeerListener`] tests.
+const LISTENER_UNCONDITIONAL_IP: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+/// A running inbound listener whose handshakes succeed and stay open, for tests of the
+/// inbound slots that unconditional peers have.
+///
+/// It listens on every IPv4 and IPv6 address, see [`open_dual_stack_listener`], so a test
+/// can connect from two addresses on any machine: [`LISTENER_PUBLIC_IP`] and
+/// [`LISTENER_UNCONDITIONAL_IP`]. Each address can open any number of connections.
+struct UnconditionalPeerListener {
+    /// The port that the listener accepts connections on.
+    listen_port: u16,
+
+    /// The listener's inbound connection limit.
+    inbound_limit: usize,
+
+    /// The listener's side of each accepted connection.
+    accepted_rx: mpsc::UnboundedReceiver<(TcpStream, ConnectionTracker)>,
+
+    /// The peer changes that the listener sends to the peer set.
+    _peerset_rx: mpsc::Receiver<DiscoveredPeer>,
+
+    /// The listener task.
+    listen_task_handle: JoinHandle<Result<(), BoxError>>,
+}
+
+impl UnconditionalPeerListener {
+    /// Starts a listener for a node with `peerset_initial_target_size`, which lists
+    /// `unconditional_peers`, written as a TOML array, and has `zcashd_compat_peer_ips`.
+    ///
+    /// Returns `None` when network or IPv6 tests are turned off, or when this machine has
+    /// no listener for both IPv4 and IPv6 connections.
+    async fn spawn(
+        unconditional_peers: &str,
+        zcashd_compat_peer_ips: &[&str],
+        peerset_initial_target_size: usize,
+    ) -> Option<Self> {
+        if zakura_test::net::zebra_skip_network_tests() || zakura_test::net::zebra_skip_ipv6_tests()
+        {
+            return None;
+        }
+
+        let tcp_listener = open_dual_stack_listener().await?;
+        let listen_addr = tcp_listener
+            .local_addr()
+            .expect("an open listener has a local address");
+        let config = Config {
+            listen_addr,
+            peerset_initial_target_size,
+            max_connections_per_ip: usize::MAX,
+            unconditional_peers: toml::from_str::<Config>(&format!(
+                "unconditional_peers = {unconditional_peers}"
+            ))
+            .unwrap()
+            .unconditional_peers,
+            ..test_defaults()
+        };
+        let inbound_limit = config.peerset_inbound_connection_limit();
+
+        let (accepted_tx, accepted_rx) = mpsc::unbounded();
+        let open_inbound_handshaker = service_fn(move |req: HandshakeRequest<TcpStream>| {
+            let accepted_tx = accepted_tx.clone();
+            async move {
+                let HandshakeRequest {
+                    data_stream: tcp_stream,
+                    connected_addr,
+                    connection_tracker,
+                } = req;
+
+                let (fake_client, _harness) = ClientTestHarness::build()
+                    .with_connected_addr(connected_addr)
+                    .finish();
+
+                accepted_tx
+                    .unbounded_send((tcp_stream, connection_tracker))
+                    .expect("unexpected error sending to unbounded channel");
+
+                Ok(fake_client)
+            }
+        });
+
+        // Room for every peer change that a test can cause.
+        let (peerset_tx, peerset_rx) =
+            mpsc::channel::<DiscoveredPeer>(config.peerset_total_connection_limit() * 4);
+        let listen_task_handle = tokio::spawn(accept_inbound_connections(
+            config,
+            tcp_listener,
+            MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
+            tower::util::BoxCloneService::new(open_inbound_handshaker),
+            peerset_tx,
+            BannedIps::default(),
+            zcashd_compat_peer_ips
+                .iter()
+                .map(|ip| ip.parse().expect("test address parses"))
+                .collect(),
+        ));
+
+        Some(Self {
+            listen_port: listen_addr.port(),
+            inbound_limit,
+            accepted_rx,
+            _peerset_rx: peerset_rx,
+            listen_task_handle,
+        })
+    }
+
+    /// Connects to the listener from `source_ip`, and waits until the listener either
+    /// hands the connection to its handshaker or closes it.
+    ///
+    /// Returns the connection if the listener accepted it. It keeps its slot until it
+    /// is dropped.
+    async fn offer(&mut self, source_ip: IpAddr) -> Option<AcceptedInboundConnection> {
+        let listen_port = self.listen_port;
+        let accepted_rx = &mut self.accepted_rx;
+
+        tokio::time::timeout(LISTENER_TEST_DURATION, async move {
+            let mut peer_stream = connect_from_loopback(source_ip, listen_port).await;
+
+            tokio::select! {
+                accepted = accepted_rx.next() => {
+                    let (listener_stream, connection_tracker) =
+                        accepted.expect("the handshaker holds the sender");
+                    Some((peer_stream, listener_stream, connection_tracker))
+                }
+                // The listener sends nothing on a connection it keeps, so the read
+                // only finishes when the listener closes the connection.
+                _closed = peer_stream.read_u8() => None,
+            }
+        })
+        .await
+        .expect("the listener accepts or closes every connection")
+    }
+
+    /// Stops the listener, and checks that it was still running without an error.
+    async fn stop(self) {
+        self.listen_task_handle.abort();
+        tokio::task::yield_now().await;
+        assert_listener_task_cancelled(self.listen_task_handle);
+    }
+}
+
+/// Opens a listener on every IPv4 and IPv6 address of this machine, and checks that an
+/// IPv4 connection reaches it.
+///
+/// Returns `None` when no IPv4 connection reaches it, as on a machine that keeps IPv4
+/// connections away from IPv6 listeners.
+async fn open_dual_stack_listener() -> Option<TcpListener> {
+    // macOS can give the listener a port that another process already listens on for
+    // one IPv4 address. IPv4 connections to that address reach the other process, so
+    // the check fails, and another port is tried.
+    for _ in 0..10 {
+        let listener = TcpListener::bind("[::]:0")
+            .await
+            .expect("test should open an IPv6 listener");
+        let port = listener
+            .local_addr()
+            .expect("an open listener has a local address")
+            .port();
+
+        let (connected, accepted) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+            ),
+            tokio::time::timeout(Duration::from_secs(1), listener.accept()),
+        );
+        if let (Ok(Ok(client)), Ok(Ok((_server, peer)))) = (connected, accepted) {
+            if client.local_addr().map(|addr| addr.port()).ok() == Some(peer.port()) {
+                return Some(listener);
+            }
+        }
+    }
+
+    warn!("skipping a listener test, because IPv4 connections do not reach an IPv6 listener");
+    None
+}
+
+/// Connects to the listener on `listen_port` from the loopback address `source_ip`.
+async fn connect_from_loopback(source_ip: IpAddr, listen_port: u16) -> TcpStream {
+    let socket = match source_ip {
+        IpAddr::V4(_) => TcpSocket::new_v4(),
+        IpAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .expect("test should create a TCP socket");
+    socket
+        .bind(SocketAddr::new(source_ip, 0))
+        .expect("test should bind to a loopback source address");
+    socket
+        .connect(SocketAddr::new(source_ip, listen_port))
+        .await
+        .expect("test should connect to the inbound listener")
 }
 
 async fn connect_from(source_ip: Ipv4Addr, listen_addr: SocketAddr) -> TcpStream {

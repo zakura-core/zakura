@@ -1902,10 +1902,35 @@ fn unconditional_peers_dial_single_addresses() {
     // The limit counts entries, so it also covers the repeated address.
     assert_eq!(peers.dial_limit(), 6);
     assert_eq!(peers.dial_addrs(18233).len(), 6);
+
+    // The dialed addresses, in their IPv4 and IPv4-mapped forms. An address that is
+    // only in a range is not one.
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+    for dialed in [
+        "192.0.2.1",
+        "::ffff:192.0.2.1",
+        "192.0.2.2",
+        "198.51.100.7",
+        "2001:db8::1",
+        "192.0.2.3",
+    ] {
+        assert!(peers.is_dial_address(ip(dialed)), "{dialed} is dialed");
+    }
+    for not_dialed in ["198.51.100.8", "::ffff:198.51.100.8", "192.0.2.4"] {
+        assert!(
+            !peers.is_dial_address(ip(not_dialed)),
+            "{not_dialed} is not dialed"
+        );
+    }
+    assert!(
+        peers.contains(ip("198.51.100.8")),
+        "the range still matches"
+    );
 }
 
-/// Each dialed unconditional peer gets a connection slot on top of the outbound and
-/// inbound limits, so the peer set's connection limit check allows it.
+/// Each dialed unconditional peer gets an outbound slot and an inbound slot on top of
+/// the outbound and inbound limits, so the peer set's connection limit check allows
+/// them.
 #[test]
 fn unconditional_peer_dials_raise_the_total_connection_limit() {
     let default_config: Config = toml::from_str("").unwrap();
@@ -1926,7 +1951,7 @@ fn unconditional_peer_dials_raise_the_total_connection_limit() {
     );
     assert_eq!(
         config.peerset_total_connection_limit(),
-        default_config.peerset_total_connection_limit() + 2,
+        default_config.peerset_total_connection_limit() + 2 * 2,
     );
 }
 

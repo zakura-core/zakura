@@ -51,16 +51,31 @@ impl Entry {
 impl UnconditionalPeers {
     /// Returns whether `ip` is in any configured address or range.
     pub fn contains(&self, ip: IpAddr) -> bool {
+        self.contains_in(ip, |_entry| true)
+    }
+
+    /// Returns whether `ip` is the address of an entry that names one address, which
+    /// Zakura dials. An address that is only in a configured range is not.
+    pub fn is_dial_address(&self, ip: IpAddr) -> bool {
+        self.contains_in(ip, Entry::is_single_address)
+    }
+
+    /// Returns whether `ip` is in a configured address or range whose entry
+    /// `is_included` accepts.
+    fn contains_in(&self, ip: IpAddr, is_included: impl Fn(&Entry) -> bool) -> bool {
         let ip = canonical_ip(ip);
         let mapped_ip = match ip {
             IpAddr::V4(ipv4) => Some(IpAddr::V6(ipv4.to_ipv6_mapped())),
             IpAddr::V6(_) => None,
         };
 
-        self.entries.iter().any(|entry| {
-            entry.net.contains(&ip)
-                || mapped_ip.is_some_and(|mapped_ip| entry.net.contains(&mapped_ip))
-        })
+        self.entries
+            .iter()
+            .filter(|entry| is_included(entry))
+            .any(|entry| {
+                entry.net.contains(&ip)
+                    || mapped_ip.is_some_and(|mapped_ip| entry.net.contains(&mapped_ip))
+            })
     }
 
     /// Returns the number of configured entries.

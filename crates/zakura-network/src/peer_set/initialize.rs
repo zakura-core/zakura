@@ -828,6 +828,9 @@ const MIN_INBOUND_ACCEPT_BURST_INTERVAL: Duration = Duration::from_millis(100);
 /// Limits the number of active inbound connections based on `config`,
 /// and waits `min_inbound_peer_connection_interval` between connections.
 ///
+/// The unconditional peers that Zakura dials also share slots of their own, outside
+/// that limit, see [`Config::unconditional_peer_connection_limit`].
+///
 /// A bounded accept burst drains connections that are already queued by the
 /// kernel. Without it, the normal one-second handshake pacing can keep a full
 /// listen backlog from ever reaching a configured local sidecar connection.
@@ -855,6 +858,10 @@ where
     );
     let mut active_zcashd_compat_connections =
         ActiveConnectionCounter::new_counter_with(1, "zcashd-compat Inbound Connection");
+    let mut active_unconditional_connections = ActiveConnectionCounter::new_counter_with(
+        config.unconditional_peer_connection_limit(),
+        "Unconditional Peer Inbound Connections",
+    );
     let zcashd_compat_peer_ips: HashSet<_> = zcashd_compat_peer_ips
         .into_iter()
         .map(|ip| canonical_socket_addr(SocketAddr::new(ip, 0)).ip())
@@ -912,6 +919,8 @@ where
             let active_public_inbound_connections = active_inbound_connections.update_count();
             let active_zcashd_compat_inbound_connections =
                 active_zcashd_compat_connections.update_count();
+            let active_unconditional_inbound_connections =
+                active_unconditional_connections.update_count();
             let active_total_inbound_connections =
                 active_public_inbound_connections + active_zcashd_compat_inbound_connections;
             let canonical_ip = canonical_socket_addr(addr.remove_socket_addr_privacy()).ip();
@@ -931,6 +940,12 @@ where
                 }
 
                 active_zcashd_compat_connections.track_connection()
+            } else if config.unconditional_peers.is_dial_address(addr.ip())
+                && active_unconditional_inbound_connections
+                    < config.unconditional_peer_connection_limit()
+            {
+                // When these slots are all taken, the peer competes for a public slot.
+                active_unconditional_connections.track_connection()
             } else if active_public_inbound_connections >= public_inbound_connection_limit
                 || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
                 // An unconditional peer that lost its connection may reconnect at once.

@@ -388,9 +388,13 @@ pub struct Config {
     /// most `max_connections_per_ip` connections to one IP, so it does not dial further
     /// entries on that IP.
     ///
-    /// Each dialed address gets its own connection slot, outside the outbound connection
-    /// limit. Zakura still applies the inbound and per-IP connection limits to these
-    /// peers, and still disconnects them on protocol errors or inbound overload.
+    /// Each dialed address gets two connection slots of its own: an outbound slot, outside
+    /// the outbound connection limit, and an inbound slot, outside the inbound connection
+    /// limit. So a node whose inbound slots are full still accepts a listed peer that
+    /// dials it, and its other peers keep every slot. The inbound slots are shared between
+    /// the dialed peers. A peer that is only in a range of several addresses gets no
+    /// slots of its own. Zakura still applies the per-IP connection limit to these peers,
+    /// and still disconnects them on protocol errors or inbound overload.
     ///
     /// Entries match legacy peer IP addresses, and only the legacy P2P stack dials them.
     /// An IPv4 entry also matches the IPv4-mapped IPv6 form of the same address. The
@@ -499,17 +503,22 @@ impl Config {
     ///
     /// These connections are counted separately from
     /// [`peerset_outbound_connection_limit`](Self::peerset_outbound_connection_limit), so
-    /// a full outbound peer set never blocks them.
+    /// a full outbound peer set never blocks them. The inbound listener keeps as many
+    /// slots for these peers, outside
+    /// [`peerset_inbound_connection_limit`](Self::peerset_inbound_connection_limit).
     pub fn unconditional_peer_connection_limit(&self) -> usize {
         self.unconditional_peers.dial_limit()
     }
 
     /// The maximum number of inbound and outbound connections that Zakura will have
     /// at the same time.
+    ///
+    /// Each dialed unconditional peer has two slots here, one outbound and one inbound,
+    /// although with the default `max_connections_per_ip` it uses one at a time.
     pub fn peerset_total_connection_limit(&self) -> usize {
         self.peerset_outbound_connection_limit()
             + self.peerset_inbound_connection_limit()
-            + self.unconditional_peer_connection_limit()
+            + 2 * self.unconditional_peer_connection_limit()
     }
 
     /// The most bytes that TCP decoders can hold for incomplete messages across every

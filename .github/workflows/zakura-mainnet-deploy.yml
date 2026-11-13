@@ -811,6 +811,15 @@ jobs:
               print "rpc_config_path = \"/root/.cache/zakura/.cookie\""
               in_compat = 0
             }
+            # The continuous profiler installed below samples the node on this host.
+            $0 ~ /^name[[:space:]]*=[[:space:]]*"us-east-0"/ {
+              print "monitor    = { profiler_url = \"http://127.0.0.1:8097\" }"
+            }
+            # The legacy-only node runs its own profiler, reached through the SSH
+            # tunnel installed below.
+            $0 ~ /^name[[:space:]]*=[[:space:]]*"archive-vct-off"/ {
+              print "monitor    = { profiler_url = \"http://127.0.0.1:8098\" }"
+            }
           ' "$RUNNER_TEMP/dashboard.nodes.toml" > "$RUNNER_TEMP/dashboard.nodes.toml.tmp"
           mv "$RUNNER_TEMP/dashboard.nodes.toml.tmp" "$RUNNER_TEMP/dashboard.nodes.toml"
           # The managed install caches each sidecar release under its tag.
@@ -856,6 +865,37 @@ jobs:
           sudo systemctl enable zakura-mainnet-dashboard.service
           sudo systemctl restart zakura-mainnet-dashboard.service
           sudo systemctl --no-pager --full status zakura-mainnet-dashboard.service || true
+
+      - name: Install continuous profiler
+        if: always()
+        run: |
+          set -euo pipefail
+
+          # Samples this host's zakurad from outside the process and serves the flame
+          # graphs the dashboard links to. See deploy/profiler/README.md.
+          if ! command -v perf >/dev/null || ! command -v c++filt >/dev/null; then
+            echo "perf or c++filt is missing on this host; the profiler was not installed." >&2
+            exit 0
+          fi
+          profiler_dir="/opt/zakura-profiler"
+          sudo install -d -m 755 "$profiler_dir"
+          sudo install -m 644 deploy/profiler/zakura_profiler.py deploy/profiler/stacks.py \
+            deploy/profiler/blocks.py deploy/profiler/page.html "$profiler_dir/"
+          sudo install -m 644 deploy/profiler/zakura-profiler.service \
+            /etc/systemd/system/zakura-profiler.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-profiler.service
+          sudo systemctl restart zakura-profiler.service
+          sudo systemctl --no-pager --full status zakura-profiler.service || true
+
+          # archive-vct-off runs the same profiler, installed by hand, listening on
+          # its own loopback. This forwards it to 127.0.0.1:8098 here over the SSH
+          # access the dashboard already uses for that node.
+          sudo install -m 644 deploy/profiler/zakura-profiler-tunnel-archive-vct-off.service \
+            /etc/systemd/system/zakura-profiler-tunnel-archive-vct-off.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-profiler-tunnel-archive-vct-off.service
+          sudo systemctl restart zakura-profiler-tunnel-archive-vct-off.service
 
       - name: Install public broadcast gateway
         if: always()

@@ -103,8 +103,8 @@ fn cacheable_peers(address_book: &Arc<Mutex<AddressBook>>) -> Vec<MetaAddr> {
 mod tests {
     use super::*;
     use crate::{
-        constants::MAX_PEER_MISBEHAVIOR_SCORE, meta_addr::MetaAddrChange,
-        protocol::types::PeerServices, CacheDir, PeerSocketAddr,
+        constants::MAX_PEER_MISBEHAVIOR_SCORE, protocol::types::PeerServices, CacheDir,
+        PeerSocketAddr,
     };
     use zakura_chain::serialization::DateTime32;
 
@@ -184,10 +184,8 @@ mod tests {
                 .new_gossiped_change()
                 .unwrap(),
             );
-            book.update(MetaAddrChange::UpdateMisbehavior {
-                addr: banned,
-                score_increment: MAX_PEER_MISBEHAVIOR_SCORE,
-            });
+            book.misbehavior_reporter()
+                .report(banned, MAX_PEER_MISBEHAVIOR_SCORE);
             assert!(book.bans().contains(banned.ip()));
             let inbound: PeerSocketAddr = "127.0.0.3:45678".parse().unwrap();
             book.update(MetaAddr::new_connected(

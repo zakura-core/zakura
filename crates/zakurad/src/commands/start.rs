@@ -591,7 +591,7 @@ impl StartCmd {
 
         let advertised_services = Self::advertised_services(&config);
 
-        let (peer_set, address_book, misbehavior_sender, zakura_endpoint, block_adverts) =
+        let (peer_set, address_book, misbehavior, zakura_endpoint, block_adverts) =
             zakura_network::init_with_zakura(
                 config.network.clone(),
                 inbound,
@@ -690,7 +690,7 @@ impl StartCmd {
             block_verifier_router.clone(),
             state.clone(),
             latest_chain_tip.clone(),
-            misbehavior_sender.clone(),
+            misbehavior.clone(),
         );
 
         // The mempool and `getblocktemplate` trace the path from a new tip to a mining template.
@@ -717,7 +717,7 @@ impl StartCmd {
             sync_status.clone(),
             latest_chain_tip.clone(),
             chain_tip_change.clone(),
-            misbehavior_sender.clone(),
+            misbehavior.clone(),
             zcashd_compat_block_gossip_peer_ips.clone(),
             config.network.unconditional_peers.clone(),
         );
@@ -742,7 +742,7 @@ impl StartCmd {
             state: state.clone(),
             latest_chain_tip: latest_chain_tip.clone(),
             network: config.network.network.clone(),
-            misbehavior_sender,
+            misbehavior,
         };
         setup_tx
             .send(setup_data)

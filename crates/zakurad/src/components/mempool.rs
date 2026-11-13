@@ -30,7 +30,7 @@ use std::{
 };
 
 use futures::{future::FutureExt, stream::Stream};
-use tokio::sync::{broadcast, mpsc, oneshot, Notify};
+use tokio::sync::{broadcast, oneshot, Notify};
 use tower::{
     buffer::Buffer,
     timeout::Timeout,
@@ -628,7 +628,7 @@ pub struct Mempool {
 
     /// Bans peers that relay transactions whose verification failures do not
     /// depend on this node's tip.
-    misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
+    misbehavior: zn::MisbehaviorReporter,
 
     /// The canonical IPs of zcashd-compat sidecars. The mempool never bans,
     /// cools down, or disconnects these peers.
@@ -656,7 +656,7 @@ impl Mempool {
         sync_status: SyncStatus,
         latest_chain_tip: zs::LatestChainTip,
         chain_tip_change: ChainTipChange,
-        misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
+        misbehavior: zn::MisbehaviorReporter,
         zcashd_compat_peer_ips: Vec<IpAddr>,
         unconditional_peers: zn::UnconditionalPeers,
     ) -> (Self, MempoolTxSubscriber) {
@@ -678,7 +678,7 @@ impl Mempool {
             tx_verifier,
             transaction_sender,
             peer_cooldowns: peer_cooldown::PeerCooldowns::default(),
-            misbehavior_sender,
+            misbehavior,
             unconditional_peers,
             zcashd_compat_peer_ips: zcashd_compat_peer_ips
                 .into_iter()
@@ -1032,9 +1032,8 @@ impl Service<Request> for Mempool {
                                 && !self.unconditional_peers.contains(peer.ip())
                         });
                         if let Some(peer) = ban_peer {
-                            let _ = self
-                                .misbehavior_sender
-                                .try_send((peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
+                            self.misbehavior
+                                .report(peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
                         }
 
                         // Only start cooldowns while this node's validation context is

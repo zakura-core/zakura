@@ -2,6 +2,7 @@
 """Tests for the fleet installer: the node list, the config edit and the files it writes."""
 
 import io
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -145,7 +146,7 @@ class InstalledFilesTests(unittest.TestCase):
         self.local, self.remote = load(NODE_LIST)
 
     def test_the_profiler_reads_the_node_s_own_log_and_trace_files(self):
-        command = fleet.profiler_command(self.remote, fleet.TRACE_DIR)
+        command = fleet.profiler_command(self.remote, fleet.TRACE_DIR, manage_traces=True)
         self.assertEqual(command[command.index("--node-name") + 1], "archive-vct-off")
         self.assertEqual(command[command.index("--log-file") + 1], "/var/log/zakura/zakura.log")
         self.assertEqual(command[command.index("--trace-dir") + 1], "/mnt/data/zakura-traces")
@@ -155,6 +156,33 @@ class InstalledFilesTests(unittest.TestCase):
         command = fleet.profiler_command(self.local, "/mnt/data/perftraces/raw")
         self.assertEqual(command[command.index("--trace-dir") + 1], "/mnt/data/perftraces/raw")
         self.assertEqual(command[command.index("--trace-table-cap-mb") + 1], "0")
+
+    def test_an_existing_directory_matching_the_default_is_also_preserved(self):
+        command = fleet.profiler_command(self.local, fleet.TRACE_DIR)
+        self.assertEqual(command[command.index("--trace-table-cap-mb") + 1], "0")
+
+    def test_only_a_new_directory_is_claimed_and_a_second_claim_is_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "traces"
+            command = ["bash", "-c", fleet.CLAIM_TRACE_SCRIPT, "fleet", str(path)]
+            subprocess.run(command, check=True, timeout=5)
+            capture = path / "capture.jsonl"
+            capture.write_text("keep me\n")
+            subprocess.run(command, check=True, timeout=5)
+            self.assertEqual(capture.read_text(), "keep me\n")
+            self.assertTrue((path / fleet.TRACE_MARKER).is_file())
+
+    def test_an_existing_unclaimed_directory_cannot_be_adopted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / "capture.jsonl"
+            capture.write_text("keep me\n")
+            done = subprocess.run(
+                ["bash", "-c", fleet.CLAIM_TRACE_SCRIPT, "fleet", directory],
+                capture_output=True, timeout=5,
+            )
+            self.assertNotEqual(done.returncode, 0)
+            self.assertFalse((Path(directory) / fleet.TRACE_MARKER).exists())
+            self.assertEqual(capture.read_text(), "keep me\n")
 
     def test_a_node_without_trace_files_gets_a_profiler_without_them(self):
         command = fleet.profiler_command(self.local, None)
@@ -194,6 +222,7 @@ class StepTests(unittest.TestCase):
         self.node = load(NODE_LIST)[1]
         self.config = DUAL_CONFIG
         self.archives = []
+        self.managed = False
         self.real_remote = fleet.remote
         fleet.remote = self.fake_remote
         self.addCleanup(lambda: setattr(fleet, "remote", self.real_remote))
@@ -207,6 +236,12 @@ class StepTests(unittest.TestCase):
             self.assertEqual(arguments, ("/etc/zakura/zakura.toml",))
             self.config = stdin.decode()
             return ""
+        if script == fleet.CLAIM_TRACE_SCRIPT:
+            self.assertEqual(arguments, (fleet.TRACE_DIR,))
+            self.managed = True
+            return ""
+        if script == fleet.READ_TRACE_MARKER_SCRIPT:
+            return "managed" if self.managed else ""
         if script == fleet.INSTALL_SCRIPT:
             self.archives.append(stdin)
             return ""
@@ -221,11 +256,20 @@ class StepTests(unittest.TestCase):
         self.assertEqual(self.config, written)
 
     def test_the_profiler_is_pointed_at_the_trace_directory_in_the_node_s_config(self):
-        self.config = fleet.with_trace_dir(DUAL_CONFIG)
+        fleet.ensure_trace_config(self.node)
         self.assertEqual(fleet.install_profiler(self.node), "profiler running, reading /mnt/data/zakura-traces")
         (sent,) = self.archives
         drop_in = tarfile.open(fileobj=io.BytesIO(sent)).extractfile("node.conf").read().decode()
         self.assertIn("--trace-dir /mnt/data/zakura-traces --trace-table-cap-mb 200", drop_in)
+
+    def test_a_preexisting_default_trace_setting_does_not_grant_rotation_permission(self):
+        self.config = fleet.with_trace_dir(DUAL_CONFIG)
+        fleet.ensure_trace_config(self.node)
+        self.assertFalse(self.managed)
+        fleet.install_profiler(self.node)
+        (sent,) = self.archives
+        drop_in = tarfile.open(fileobj=io.BytesIO(sent)).extractfile("node.conf").read().decode()
+        self.assertIn("--trace-dir /mnt/data/zakura-traces --trace-table-cap-mb 0", drop_in)
 
     def test_one_failing_node_does_not_stop_the_others(self):
         def step(node):

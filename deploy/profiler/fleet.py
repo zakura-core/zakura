@@ -51,6 +51,7 @@ TUNNEL_ENV_DIR = "/etc/zakura-profiler-tunnels"
 PROFILER_PORT = 8097
 # The trace directory this tool sets. The profiler keeps the files in it small.
 TRACE_DIR = "/mnt/data/zakura-traces"
+TRACE_MARKER = ".zakura-profiler-managed"
 TRACE_TABLE_CAP_MB = 200
 ZAKURA_SECTION = re.compile(r"^\s*\[network\.zakura\]\s*(#.*)?$")
 # `systemctl show -p ExecStart` prints the command line as `argv[]=... ;`.
@@ -175,11 +176,11 @@ def config_path_from_unit(exec_start):
 # ---- the profiler's files ----
 
 
-def profiler_command(node, trace_dir):
+def profiler_command(node, trace_dir, *, manage_traces=False):
     """The profiler's command line for `node`, whose config sets `trace_dir` (or none).
 
-    A trace directory this tool did not set is read but never emptied: someone chose
-    it, and may need its files whole.
+    Only a directory explicitly claimed by this installer may be emptied. An existing
+    setting, including one equal to TRACE_DIR, does not grant that permission.
     """
     command = [
         "/usr/bin/python3", "/opt/zakura-profiler/zakura_profiler.py",
@@ -191,19 +192,19 @@ def profiler_command(node, trace_dir):
     if node.log_file:
         command += ["--log-file", node.log_file]
     if trace_dir:
-        cap = TRACE_TABLE_CAP_MB if trace_dir == TRACE_DIR else 0
+        cap = TRACE_TABLE_CAP_MB if manage_traces else 0
         command += ["--trace-dir", trace_dir, "--trace-table-cap-mb", str(cap)]
     command += ["--host", "127.0.0.1", "--port", str(PROFILER_PORT)]
     return command
 
 
-def unit_drop_in(node, trace_dir):
+def unit_drop_in(node, trace_dir, *, manage_traces=False):
     """A systemd drop-in that starts the profiler with this node's own settings."""
     return (
         "# Written by deploy/profiler/fleet.py: this node's name, log and trace files.\n"
         "[Service]\n"
         "ExecStart=\n"
-        f"ExecStart={shlex.join(profiler_command(node, trace_dir))}\n"
+        f"ExecStart={shlex.join(profiler_command(node, trace_dir, manage_traces=manage_traces))}\n"
     )
 
 
@@ -263,6 +264,20 @@ cat > "$config.tmp-trace-dir"
 mv "$config.tmp-trace-dir" "$config"
 """
 
+# Claim only a new directory; never grant rotation permission over existing files.
+# The marker survives failed installs and later runs without relying on the path name.
+CLAIM_TRACE_SCRIPT = f"""
+set -euo pipefail
+marker="$1/{TRACE_MARKER}"
+if [ -f "$marker" ]; then
+    exit 0
+fi
+mkdir -- "$1"
+: > "$marker"
+"""
+
+READ_TRACE_MARKER_SCRIPT = f'if [ -f "$1/{TRACE_MARKER}" ]; then printf managed; fi'
+
 
 # ---- running things on a node ----
 
@@ -299,6 +314,7 @@ def ensure_trace_config(node):
     edited = with_trace_dir(text)
     if edited == text:
         return f"already writes trace files to {trace_dir_of(text)}"
+    remote(node, CLAIM_TRACE_SCRIPT, TRACE_DIR)
     remote(node, WRITE_CONFIG_SCRIPT, path, stdin=edited.encode())
     if remote(node, 'cat "$1"', path) != edited:
         raise FleetError(f"{path} does not hold what was written")
@@ -309,7 +325,8 @@ def install_profiler(node):
     """Install and start the profiler on the node; returns a line saying what was done."""
     _, text = read_node_config(node)
     trace_dir = trace_dir_of(text)
-    remote(node, INSTALL_SCRIPT, stdin=profiler_archive(unit_drop_in(node, trace_dir)))
+    managed = bool(trace_dir and remote(node, READ_TRACE_MARKER_SCRIPT, trace_dir) == "managed")
+    remote(node, INSTALL_SCRIPT, stdin=profiler_archive(unit_drop_in(node, trace_dir, manage_traces=managed)))
     return "profiler running" + (f", reading {trace_dir}" if trace_dir else ", no trace files")
 
 

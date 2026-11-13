@@ -100,12 +100,18 @@ keeps the first original as `<config>.before-trace-dir`, and does not restart
 the node: the setting takes effect when the node next starts. A config that
 already names a trace directory is left as it is.
 
+When adding the setting, the installer creates a new trace directory containing
+`.zakura-profiler-managed`, its explicit permission to rotate files there on later
+runs. An existing directory without that marker is refused rather than adopted.
+
 **`install`** needs `perf` on the node (the `linux-tools` package) and installs
 `binutils` when `c++filt` is missing. It writes the node's own name, log file
 and trace directory into a systemd drop-in
 (`zakura-profiler.service.d/node.conf`), so the unit file is the same on every
 node. A trace directory that `ensure-trace-config` did not set is read with a
-cap of 0, so the profiler never empties files someone else chose to keep.
+cap of 0, so the profiler never empties files someone else chose to keep, even if
+their directory is `/mnt/data/zakura-traces`. Only a directory carrying the
+installer's marker gets the 200 MB per-file cap.
 
 **`tunnels`** is for the dashboard host. A profiler listens only on its own
 host's loopback address, so the dashboard host keeps an SSH tunnel to each

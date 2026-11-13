@@ -14,6 +14,7 @@
 //! skip all the network tests by setting the `SKIP_NETWORK_TESTS` environmental variable.
 
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -2232,6 +2233,9 @@ struct RedialCrawler {
     /// The peers that the crawler sent to the peer set.
     peerset_rx: mpsc::Receiver<DiscoveredPeer>,
 
+    /// Demand for more peers, which makes the crawler dial a peer from its address book.
+    demand_tx: mpsc::Sender<MorePeers>,
+
     crawl_task_handle: JoinHandle<Result<(), BoxError>>,
 
     address_book_updater_task_handle: JoinHandle<()>,
@@ -2446,7 +2450,7 @@ async fn spawn_redial_crawler(
 
     let crawl_task_handle = tokio::spawn(crawl_and_dial(
         config,
-        demand_tx,
+        demand_tx.clone(),
         demand_rx,
         candidates,
         tower::util::BoxCloneService::new(outbound_connector),
@@ -2467,6 +2471,7 @@ async fn spawn_redial_crawler(
         opened_rx,
         address_book_updates_rx,
         peerset_rx,
+        demand_tx,
         crawl_task_handle,
         address_book_updater_task_handle,
     }
@@ -2597,8 +2602,8 @@ async fn crawler_stops_redialing_after_the_last_redial_time() {
     );
 }
 
-/// Test the crawler starts redials that are due together 100 ms apart, as `CandidateSet::next`
-/// spaces the crawler's dials.
+/// Test the crawler starts redials that are due together 100 ms apart, because they take turns
+/// on its rate limit for new connections.
 #[tokio::test(start_paused = true)]
 async fn crawler_spaces_out_redials_that_are_due_together() {
     let _init_guard = zakura_test::init();
@@ -2632,8 +2637,8 @@ async fn crawler_spaces_out_redials_that_are_due_together() {
     assert_eq!(dialed, peers, "each dropped peer is redialed once");
 }
 
-/// Test a redial checks its peer right before dialing, after its spacing delay, so a peer that
-/// is banned or connects again during the delay is not dialed.
+/// Test a redial checks its peer right before dialing, after it waits for its turn to dial, so
+/// a peer that is banned or connects again during the wait is not dialed.
 #[tokio::test(start_paused = true)]
 async fn crawler_checks_each_redial_right_before_dialing() {
     let _init_guard = zakura_test::init();
@@ -2647,7 +2652,7 @@ async fn crawler_checks_each_redial_right_before_dialing() {
     let due_together = latest_redial_time(closed_at, constants::DROPPED_PEER_REDIAL_DELAYS[0]);
     tokio::time::advance(due_together - closed_at).await;
 
-    // The first redial starts at once, and the other two wait for their spacing delays.
+    // The first redial starts at once, and the other two wait for their turns.
     let first_dial = crawler
         .dials_until(due_together, due_together + Duration::from_millis(50))
         .await;
@@ -2668,6 +2673,58 @@ async fn crawler_checks_each_redial_right_before_dialing() {
             .await,
         vec![],
         "a peer banned or connected during the delay is not dialed"
+    );
+}
+
+/// Test a redial and a demand dial that are due together start 100 ms apart, because they take
+/// turns on the crawler's rate limit for new connections.
+#[tokio::test(start_paused = true)]
+async fn crawler_redials_take_turns_with_its_other_dials() {
+    let _init_guard = zakura_test::init();
+
+    let mut crawler =
+        spawn_redial_crawler(&[redial_test_peer()], RedialCrawlerOptions::default()).await;
+    let closed_at = crawler
+        .close_after(constants::MIN_REDIALED_CONNECTION_AGE)
+        .await;
+
+    // A gossiped peer for a demand dial to pick.
+    let candidate: PeerSocketAddr = "127.0.2.1:8233"
+        .parse()
+        .expect("hard-coded test address is valid");
+    crawler.update_address_book(
+        MetaAddr::new_gossiped_meta_addr(candidate, PeerServices::NODE_NETWORK, DateTime32::now())
+            .new_gossiped_change()
+            .expect("a gossiped test peer has valid address fields"),
+    );
+
+    let due_together = latest_redial_time(closed_at, constants::DROPPED_PEER_REDIAL_DELAYS[0]);
+    tokio::time::advance(due_together - closed_at).await;
+    crawler
+        .demand_tx
+        .try_send(MorePeers)
+        .expect("the demand channel has room");
+
+    let mut dials = crawler
+        .dials_until(due_together, due_together + Duration::from_secs(1))
+        .await;
+    dials.sort_by_key(|(_, started_after)| *started_after);
+    let dialed: HashSet<_> = dials
+        .iter()
+        .map(|(addr, _)| addr.remove_socket_addr_privacy())
+        .collect();
+    assert_eq!(
+        dialed,
+        HashSet::from([
+            redial_test_peer().remove_socket_addr_privacy(),
+            candidate.remove_socket_addr_privacy(),
+        ]),
+        "the dropped peer is redialed and the candidate is dialed: {dials:?}"
+    );
+    assert_eq!(
+        dials[1].1 - dials[0].1,
+        constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL,
+        "the second dial waits for its turn: {dials:?}"
     );
 }
 

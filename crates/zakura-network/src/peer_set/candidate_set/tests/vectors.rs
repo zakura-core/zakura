@@ -15,12 +15,15 @@ use zakura_chain::{parameters::Network::*, serialization::DateTime32};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
-    constants::{DEFAULT_MAX_CONNS_PER_IP, GET_ADDR_FANOUT, MIN_PEER_GET_ADDR_INTERVAL},
+    constants::{
+        DEFAULT_MAX_CONNS_PER_IP, GET_ADDR_FANOUT, MIN_OUTBOUND_PEER_CONNECTION_INTERVAL,
+        MIN_PEER_GET_ADDR_INTERVAL,
+    },
     types::{MetaAddr, PeerServices},
     AddressBook, Request, Response,
 };
 
-use super::super::{validate_addrs, CandidateSet};
+use super::super::{validate_addrs, CandidateSet, OutboundDialPacer};
 
 /// Test that offset is applied when all addresses have `last_seen` times in the future.
 #[test]
@@ -271,4 +274,41 @@ async fn verify_fanned_out_requests(
     }
 
     peer_service.expect_no_requests().await;
+}
+
+/// Dialers that share a pacer start at least `MIN_OUTBOUND_PEER_CONNECTION_INTERVAL` apart, and a
+/// dialer that comes later than that starts at once.
+#[tokio::test(start_paused = true)]
+async fn dialers_that_share_a_pacer_take_turns() {
+    let _init_guard = zakura_test::init();
+
+    let pacer = OutboundDialPacer::new();
+    let other_dialer = pacer.clone();
+    let started_at = Instant::now();
+
+    let (first, second) = tokio::join!(
+        async {
+            pacer.wait_for_turn().await;
+            Instant::now()
+        },
+        async {
+            other_dialer.wait_for_turn().await;
+            Instant::now()
+        },
+    );
+    assert_eq!(first, started_at, "the first dialer starts at once");
+    assert_eq!(
+        second,
+        started_at + MIN_OUTBOUND_PEER_CONNECTION_INTERVAL,
+        "the second dialer waits for the interval"
+    );
+
+    time::advance(MIN_OUTBOUND_PEER_CONNECTION_INTERVAL * 2).await;
+    let came_at = Instant::now();
+    pacer.wait_for_turn().await;
+    assert_eq!(
+        Instant::now(),
+        came_at,
+        "a dialer that comes after the interval starts at once"
+    );
 }

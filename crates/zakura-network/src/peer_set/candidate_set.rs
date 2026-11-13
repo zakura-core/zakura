@@ -120,7 +120,8 @@ mod tests;
 //     except Failed -> Responded is invalid, must go through Attempt
 //
 // Note: the CandidateSet can't be cloned, because there needs to be a single
-// instance of its timers, so that rate limits are enforced correctly.
+// instance of its timers, so that rate limits are enforced correctly. Other dialers
+// share its rate limit on new connections through `CandidateSet::dial_pacer`.
 pub(crate) struct CandidateSet<S>
 where
     S: Service<Request, Response = Response, Error = BoxError> + Send,
@@ -137,8 +138,8 @@ where
     /// The peer set used to crawl the network for peers.
     peer_service: S,
 
-    /// A timer that enforces a rate-limit on new outbound connections.
-    min_next_handshake: Instant,
+    /// The rate limit on new outbound connections, which redials share.
+    dial_pacer: OutboundDialPacer,
 
     /// A timer that enforces a rate-limit on peer set requests for more peers.
     min_next_crawl: Instant,
@@ -153,7 +154,7 @@ where
         f.debug_struct("CandidateSet")
             .field("address_book", &self.address_book)
             .field("peer_service", &type_name::<S>())
-            .field("min_next_handshake", &self.min_next_handshake)
+            .field("dial_pacer", &self.dial_pacer)
             .field("min_next_crawl", &self.min_next_crawl)
             .finish()
     }
@@ -172,7 +173,7 @@ where
         CandidateSet {
             address_book,
             peer_service,
-            min_next_handshake: Instant::now(),
+            dial_pacer: OutboundDialPacer::new(),
             min_next_crawl: Instant::now(),
         }
     }
@@ -393,8 +394,8 @@ where
     /// Zebra resists distributed denial of service attacks by making sure that
     /// new peer connections are initiated at least
     /// [`MIN_OUTBOUND_PEER_CONNECTION_INTERVAL`][constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL]
-    /// apart. If `next()` has recently provided a peer, then its future will sleep
-    /// until the rate-limit has passed.
+    /// apart. If `next()` or another dialer that shares [`Self::dial_pacer`] has recently
+    /// started a connection, then its future will sleep until the rate-limit has passed.
     ///
     /// [`Responded`]: crate::PeerAddrState::Responded
     pub async fn next(&mut self) -> Option<MetaAddr> {
@@ -429,10 +430,15 @@ where
             .await?;
 
         // Security: rate-limit new outbound peer connections
-        sleep_until(self.min_next_handshake).await;
-        self.min_next_handshake = Instant::now() + constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL;
+        self.dial_pacer.wait_for_turn().await;
 
         Some(next_peer)
+    }
+
+    /// Returns the rate limit on this set's new outbound connections, for the dialers that do
+    /// not get their peers from [`Self::next`].
+    pub(crate) fn dial_pacer(&self) -> OutboundDialPacer {
+        self.dial_pacer.clone()
     }
 
     /// Returns the address book for this `CandidateSet`.
@@ -440,6 +446,40 @@ where
     #[allow(dead_code)]
     pub async fn address_book(&self) -> Arc<std::sync::Mutex<AddressBook>> {
         self.address_book.clone()
+    }
+}
+
+/// The rate limit on new outbound connections, which every dialer of a peer set shares, so that
+/// their connections start at least
+/// [`MIN_OUTBOUND_PEER_CONNECTION_INTERVAL`](constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL)
+/// apart.
+#[derive(Clone, Debug)]
+pub(crate) struct OutboundDialPacer {
+    /// The earliest time that the next connection may start.
+    next_dial: Arc<std::sync::Mutex<Instant>>,
+}
+
+impl OutboundDialPacer {
+    /// Returns a pacer whose first connection can start at once.
+    fn new() -> Self {
+        Self {
+            next_dial: Arc::new(std::sync::Mutex::new(Instant::now())),
+        }
+    }
+
+    /// Waits for this dialer's turn, and makes the next dialer wait the interval after it.
+    pub(crate) async fn wait_for_turn(&self) {
+        let turn = {
+            let mut next_dial = self
+                .next_dial
+                .lock()
+                .expect("the lock is only held to read and set an instant, which cannot panic");
+            let turn = (*next_dial).max(Instant::now());
+            *next_dial = turn + constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL;
+            turn
+        };
+
+        sleep_until(turn).await;
     }
 }
 

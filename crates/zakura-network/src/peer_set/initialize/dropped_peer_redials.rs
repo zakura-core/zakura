@@ -27,8 +27,8 @@
 //! - each address has at most one pending set of redials, and at most the outbound
 //!   connection limit are pending in total, and
 //! - the crawler stops at the first success, counts each redial against the outbound
-//!   connection limit, and right before each dial skips a banned or connected peer, and a
-//!   peer that another dial is attempting.
+//!   connection limit and its rate limit on new connections, and right before each dial skips
+//!   a banned or connected peer, and a peer that another dial is attempting.
 
 use std::{collections::HashMap, time::Duration};
 

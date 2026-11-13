@@ -23,7 +23,7 @@ use indexmap::IndexSet;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
-    time::{sleep, sleep_until, Instant},
+    time::{sleep_until, Instant},
 };
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::task::AbortOnDropHandle;
@@ -1298,6 +1298,10 @@ where
     // Allow tasks using the candidate set to be spawned, so they can run concurrently.
     // Previously, Zebra has had deadlocks and long hangs caused by running dependent
     // candidate set futures in the same async task.
+    // Redials wait for their turns on the candidate set's rate limit for new connections, so
+    // they start at least `MIN_OUTBOUND_PEER_CONNECTION_INTERVAL` apart from each other and
+    // from its dials.
+    let dial_pacer = candidates.dial_pacer();
     let candidates = Arc::new(futures::lock::Mutex::new(candidates));
 
     // This contains both crawl and handshake tasks.
@@ -1539,9 +1543,6 @@ where
                 // The next iteration schedules redials for the connections that closed.
             }
             Ok(RedialsDue) => {
-                // Space out redials that are due together, as `CandidateSet::next` spaces the
-                // crawler's dials.
-                let mut delay = Duration::ZERO;
                 for addr in dropped_peer_redials.take_due(Instant::now()) {
                     let outbound_connections = active_outbound_connections.update_count();
                     if outbound_connections >= config.peerset_outbound_connection_limit() {
@@ -1557,11 +1558,12 @@ where
                     let address_book = address_book.clone();
                     let bans = bans.clone();
                     let peer_registry = peer_registry.clone();
+                    let dial_pacer = dial_pacer.clone();
                     let expose_peer_addresses = config.expose_peer_addresses;
 
                     let redial_handle = tokio::spawn(erased(
                         async move {
-                            sleep(delay).await;
+                            dial_pacer.wait_for_turn().await;
 
                             let outcome = redial(
                                 addr,
@@ -1584,7 +1586,6 @@ where
                     .wait_for_panics();
 
                     handshakes.push(redial_handle);
-                    delay = delay.saturating_add(constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL);
                 }
             }
             Ok(RedialFinished { addr, outcome }) => match outcome {
@@ -1765,7 +1766,7 @@ enum RedialOutcome {
 /// Claims the attempt with [`AddressBook::claim_attempt`], under the lock that
 /// [`CandidateSet::next`] takes, so the crawler never dials the peer twice at once. Then, right
 /// before dialing, skips a peer that `bans` holds or that `peer_registry` shows connected,
-/// since either can change during the spacing delay or while the claim waits for the lock.
+/// since either can change while the redial waits for its turn to dial or for the lock.
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(peer = %addr.addr_label(expose_peer_addresses)))]
 async fn redial<C>(

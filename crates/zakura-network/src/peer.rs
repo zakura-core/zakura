@@ -6,6 +6,7 @@ mod client;
 mod connection;
 mod connector;
 mod error;
+mod gossip_trace;
 mod handshake;
 mod load_tracked_client;
 mod minimum_peer_version;

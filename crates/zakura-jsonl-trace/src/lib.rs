@@ -232,13 +232,34 @@ fn elapsed_micros(elapsed: Duration) -> u64 {
     saturating_micros(elapsed)
 }
 
-/// Returns the instant this process created its first emitter.
+/// The moment this process started tracing, read from both clocks at once.
+struct ProcessStart {
+    /// Where `ts` counts from.
+    instant: Instant,
+    /// The same moment as nanoseconds since the Unix epoch.
+    unix_nanos: u128,
+}
+
+/// Returns the moment this process first asked for its trace origin or its trace id.
 ///
-/// Every emitter measures `ts` from this origin, so rows from different tables in one process
-/// can be ordered and subtracted.
+/// Both come from this one reading, so the wall-clock time of a row is the time in the
+/// trace id plus the row's `ts`.
+fn process_start() -> &'static ProcessStart {
+    static START: OnceLock<ProcessStart> = OnceLock::new();
+    START.get_or_init(|| ProcessStart {
+        instant: Instant::now(),
+        unix_nanos: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    })
+}
+
+/// Returns the instant every emitter in this process measures `ts` from.
+///
+/// One shared origin lets rows from different tables in one process be ordered and subtracted.
 fn process_origin() -> Instant {
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
-    *ORIGIN.get_or_init(Instant::now)
+    process_start().instant
 }
 
 /// Returns the process-wide node identifier used to tag JSONL trace records.
@@ -266,18 +287,15 @@ pub fn node_id() -> &'static str {
 ///
 /// The identifier disambiguates appended trace rows across process restarts.
 /// Process-relative monotonic timestamps restart from zero after each restart.
-/// The identifier provides only a correlation label.
+///
+/// It is the process id, a dash, and the Unix time in nanoseconds at which `ts` started
+/// counting. Adding a row's `ts` to that time gives the row's wall-clock time, which lets
+/// rows from different nodes share one time axis.
 /// The identifier does not provide randomness or security identity.
 pub fn process_trace_id() -> &'static str {
     static PROCESS_TRACE_ID: OnceLock<String> = OnceLock::new();
     PROCESS_TRACE_ID
-        .get_or_init(|| {
-            let started = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            format!("{}-{started}", std::process::id())
-        })
+        .get_or_init(|| format!("{}-{}", std::process::id(), process_start().unix_nanos))
         .as_str()
 }
 
@@ -900,6 +918,27 @@ mod tests {
         // A per-emitter origin would start the second emitter's `ts` near zero.
         assert!(second_ts >= 20_000, "{second_ts} < 20000");
         assert!(second_ts <= first_ts, "{second_ts} > {first_ts}");
+    }
+
+    #[test]
+    fn the_trace_id_names_the_wall_clock_time_that_ts_counts_from() {
+        let (_, started) = process_trace_id()
+            .split_once('-')
+            .expect("trace id is `<pid>-<start time>`");
+        let started: u128 = started.parse().expect("start time is in nanoseconds");
+        assert_eq!(started, process_start().unix_nanos);
+
+        // The start time plus the time counted since must be now, on the wall clock.
+        let counted = process_origin().elapsed().as_nanos();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is past 1970")
+            .as_nanos();
+        let off = now.abs_diff(started.saturating_add(counted));
+        assert!(
+            off < 1_000_000_000,
+            "trace clock is {off} ns from wall clock"
+        );
     }
 
     #[test]

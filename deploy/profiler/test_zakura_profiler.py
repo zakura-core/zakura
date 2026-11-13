@@ -969,6 +969,37 @@ class TraceFollowingTests(unittest.TestCase):
         # The failed attempt does not move the block's own download time.
         self.assertEqual(record["ms"]["body_download"], 40)
 
+    def test_the_first_outside_announcer_is_named_from_its_connection_s_request_rows(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append(
+            "legacy_gossip",
+            trace_row("block_inv_received", 500_000, hash=BLOCK_HASH, connection_id=3),
+            trace_row("block_inv_received", 600_000, hash=BLOCK_HASH, connection_id=4),
+        )  # fmt: skip
+        self.append(
+            "legacy_peer_request",
+            # Connection 3 never served the block, but asking it for hashes wrote its address.
+            trace_row("find_blocks_finish", 100_000, result="block_hashes", connection_id=3,
+                      peer="203.0.113.5:8233", user_agent="/MagicBean:6.2.0/", elapsed_ms=30),
+            trace_row("block_request_finish", 1_000_000, result="available", requested_hash=BLOCK_HASH,
+                      returned_hash=BLOCK_HASH, returned_height=10, connection_id=4,
+                      peer="192.0.2.7:8233", user_agent="/Zakura:1.8.7/", elapsed_ms=40, route="advertised"),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(1_010_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+
+        self.assertIsNone(record["heard_from"])
+        self.assertEqual(record["heard_from_peer"], {"addr": "203.0.113.5", "agent": "/MagicBean:6.2.0/"})
+        # Asking for hashes is not a download of the block.
+        self.assertEqual([download["addr"] for download in record["downloads"]], ["192.0.2.7"])
+
+    def test_an_announcer_whose_connection_wrote_no_request_row_is_not_named(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append("legacy_gossip", trace_row("block_inv_received", 500_000, hash=BLOCK_HASH, connection_id=3))
+        self.append("chain_tip", tip_row(1_010_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+        self.assertNotIn("heard_from_peer", record)
+
     def test_a_zakura_download_names_the_peer_its_upgrade_row_described(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
         self.append(

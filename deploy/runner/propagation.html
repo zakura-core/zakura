@@ -291,6 +291,13 @@ function peerName(download) {
   if (download.kind === "outside") return el("span", { class: "mono", text: download.ip });
   return el("span", { class: "quiet", text: download.kind === "private" ? "private peer" : "address hidden" });
 }
+// Where a node first heard of a block: one of our nodes, or the outside peer that told it
+// when the node recorded that peer's address.
+function heardFrom(view) {
+  if (view.from !== "outside" || !view.from_peer) return el("td", {}, sourceLink(view.from, "outside"));
+  const agent = view.from_peer.agent ? " (" + software(view.from_peer.agent) + ")" : "";
+  return el("td", {}, peerName(view.from_peer), el("span", { class: "quiet", text: agent }));
+}
 function peerSoftware(download) {
   if (download.kind === "fleet") return "one of ours";
   if (download.kind === "private") return "–";
@@ -468,7 +475,7 @@ function renderBlock(data) {
       ...Object.values(POINT_LABELS).map((label) => [label, true]), ["Clock"]],
     names.map((name) => {
       const view = block.nodes[name];
-      return el("tr", {}, nodeCell(name), cell(view.path || "–"), el("td", {}, sourceLink(view.from, "outside")),
+      return el("tr", {}, nodeCell(name), cell(view.path || "–"), heardFrom(view),
         downloadedFrom(view),
         ...Object.keys(POINT_LABELS).map((point) => cell(ms(view.at[point]), true)),
         cell(view.clock === "log" ? "node log (trace clock was off)" : "trace"));

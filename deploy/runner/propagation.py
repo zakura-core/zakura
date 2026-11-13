@@ -127,6 +127,17 @@ def node_downloads(record, fleet, fleet_addresses, is_private):
     return downloads
 
 
+def outside_announcer(record, fleet, fleet_addresses, is_private):
+    """The legacy peer that first told a node of a block, filtered like a download's peer.
+
+    `None` when the node did not record which connection that was or its address.
+    """
+    peer = record.get("heard_from_peer")
+    if not isinstance(peer, dict):
+        return None
+    return download_peer({"addr": peer.get("addr"), "agent": peer.get("agent")}, fleet, fleet_addresses, is_private)
+
+
 def median(values):
     ordered = sorted(values)
     return ordered[len(ordered) // 2] if ordered else None
@@ -165,6 +176,7 @@ def node_blocks(report, node, fleet, fleet_addresses, is_private):
             "size": record.get("size") if isinstance(record.get("size"), int) else None,
             "clock": clock,
             "from": fleet.get(record.get("heard_from"), OUTSIDE),
+            "from_peer": outside_announcer(record, fleet, fleet_addresses, is_private),
             "wall": {point: wall[point] + shift for point in POINTS if point in wall},
             "peers": peers,
             "downloads": node_downloads(record, fleet, fleet_addresses, is_private),
@@ -188,6 +200,8 @@ def joined_block(block_hash, records):
             "from": record["from"],
             "at": {point: offset(when) for point, when in record["wall"].items()},
             "downloads": record["downloads"],
+            # Only when the node recorded who the outside peer that told it first was.
+            **({"from_peer": record["from_peer"]} if record["from_peer"] else {}),
         }
         for node, record in records.items()
     }

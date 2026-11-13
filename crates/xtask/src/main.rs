@@ -391,7 +391,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "  cargo xtask planted loop --out <dir> [--work <dir>] [--cases <dir>] [--planted <prefix>]..."
+        "  cargo xtask planted loop (--out <dir> | --list) [--work <dir>] [--cases <dir>] [--planted <prefix>]..."
     )?;
     writeln!(
         output,
@@ -537,7 +537,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "remote host: each mutant's named witness, classified from zakura-sim's end records,"
     )?;
-    writeln!(output, "into --out/report.json.")?;
+    writeln!(
+        output,
+        "into --out/report.json. With --list, it prints the cases it selects and runs nothing."
+    )?;
     writeln!(
         output,
         "`planted triage` applies qa/native-mutations/triage.toml afresh to a loop report,"

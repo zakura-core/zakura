@@ -27,7 +27,8 @@ use super::{
         PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck,
     },
     parse_flags, planted_cases, selects, summarize, test_executables, triage, BaselineReport,
-    BuildIdentity, CaseReport, GenerateFlags, LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
+    BuildIdentity, CaseReport, GenerateFlags, ListedCase, LoopCase, Mutant, Report, Runner, Slot,
+    WitnessSpec,
 };
 use crate::planted::lane::{campaign_facts, Campaign, CampaignFacts};
 
@@ -895,10 +896,62 @@ fn flags_parse_and_refuse_bad_values() {
         &["--memory-max", "lots", "--out", "o"],
         &["--work", "w"],
         &["--out", "o", "--out", "p"],
+        &["--list", "--list"],
     ] {
         assert!(
             parse_flags(bad.iter().map(|s| (*s).to_owned())).is_err(),
             "{bad:?}"
+        );
+    }
+    let listing = parse_flags(
+        ["--list", "--cases", "qa/native-mutations", "--jobs", "4"]
+            .map(str::to_owned)
+            .into_iter(),
+    )
+    .unwrap();
+    assert!(listing.list, "--list needs no --out and takes no value");
+    assert_eq!(listing.jobs, 4);
+}
+
+/// `--list` names each case by the fields that tell it apart in a report,
+/// as the report writes them, so the joint run can drop a removed case
+/// from its cumulative report.
+#[test]
+fn a_listed_case_has_its_reports_key_fields() {
+    let tree = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let (_, _, mut case, baseline) =
+        one_case(tree.path(), out.path(), &tree.path().join("p"), true);
+    let key = |value: &serde_json::Value| {
+        ["patch", "property", "table", "witness"].map(|field| value.get(field).cloned())
+    };
+    for table in [None, Some("s6v3".to_owned())] {
+        case.table = table;
+        let listed = serde_json::to_value(ListedCase::from(&case)).unwrap();
+        let report = serde_json::to_value(CaseReport {
+            patch: case.label.clone(),
+            patch_sha256: "digest".to_owned(),
+            property: case.property.clone(),
+            entry: case.entry.clone(),
+            table: case.table.clone(),
+            witness: case.witness.clone(),
+            also_violates: case.also_violates.clone(),
+            result: classify::Classified::new(Class::Survived, Some(Reason::Held), "why"),
+            trigger: None,
+            baseline: baseline.clone(),
+            millis: None,
+            peak_rss_kib: None,
+            log: None,
+            rerun_alone: false,
+            generator: Vec::new(),
+            no_generator: None,
+            triage: None,
+        })
+        .unwrap();
+        assert_eq!(key(&listed), key(&report));
+        assert_eq!(
+            listed.as_object().unwrap().len(),
+            3 + usize::from(case.table.is_some())
         );
     }
 }

@@ -14,7 +14,10 @@ The droplet timer for mutation plan mut-4.6. Once a day it runs
    and every property finding so far, and
    `<state>/cumulative-libfuzzer.json` holds the libFuzzer lane's. A
    `--changed-since` report holds only the cases it reran, so diffing it
-   against the last report alone would list every unchanged survivor again;
+   against the last report alone would list every unchanged survivor again.
+   Each cumulative report keeps only the cases that `cargo xtask planted
+   loop --list` names at the checkout, so a removed case, or one a witness
+   change re-keyed, leaves it, and the diff lists it under `removed_cases`;
 6. runs `cargo xtask planted triage` on each cumulative report, which
    applies the checkout's `qa/native-mutations/triage.toml` afresh. A
    triage-only commit selects no case, so this step is what records its

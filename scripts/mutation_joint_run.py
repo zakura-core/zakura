@@ -17,6 +17,8 @@ in the first three lists:
 - `untriaged`: every lane of the new report, or of the routine's cumulative
   report, that survived, or that another rule killed, and has no record in
   `qa/native-mutations/triage.toml`.
+- `removed_cases`: the cases the routine dropped from its cumulative report,
+  because the checkout no longer lists them.
 
 The new report holds only the cases a change since the previous pin
 affects, so a case missing from it is unchanged, not fixed. The loop runs
@@ -29,9 +31,11 @@ first run), and optionally runs the libFuzzer lane on the same cases. A
 `--changed-since` report holds only the cases it reran, so the routine
 merges each new report into a cumulative one, `<state>/cumulative.json`
 (`cumulative-libfuzzer.json` for the libFuzzer lane): every case's latest
-result and every property finding so far. `cargo xtask planted triage` then
-applies the checkout's triage records to the cumulative report afresh, so a
-triage-only commit, which selects no case, still updates it. The routine
+result and every property finding so far. It keeps only the cases that
+`cargo xtask planted loop --list` names at the checkout. `cargo xtask
+planted triage` then applies the checkout's triage records to the
+cumulative report afresh, so a triage-only commit, which selects no case,
+still updates it. The routine
 diffs the new report against the previous cumulative one, and lists the
 cumulative report's untriaged lanes. Each run writes under
 `<state>/runs/<UTC time>-<commit>/`, and `<state>/latest.json` names the
@@ -90,8 +94,8 @@ def finding_key(finding):
     return (finding.get("property"), finding["harness"], finding["seed"], finding.get("mode", "inproc"))
 
 
-def diff(previous, new, current=None):
-    """Return what `new` reports that `previous` doesn't, and what in `current`, or `new` without it, still needs triage."""
+def diff(previous, new, current=None, removed=()):
+    """Return what `new` reports that `previous` doesn't, what in `current`, or `new` without it, still needs triage, and the `removed` case keys."""
     before = lanes(previous)
     surviving = [
         {"lane": list(key), "was": before.get(key)}
@@ -113,6 +117,7 @@ def diff(previous, new, current=None):
         "newly_failing_baselines": failing,
         "new_property_findings": findings,
         "untriaged": untriaged(new if current is None else current),
+        "removed_cases": [list(key) for key in removed],
     }
 
 
@@ -135,6 +140,13 @@ def merge(cumulative, new):
         "cases": [cases[key] for key in sorted(cases, key=repr)],
         "property_findings": [findings[key] for key in sorted(findings, key=repr)],
     }
+
+
+def prune(report, current):
+    """Return `report` with only the cases whose key is in `current`, and the keys of the cases it dropped, sorted."""
+    kept = [case for case in report.get("cases", []) if case_key(case) in current]
+    removed = sorted((case_key(case) for case in report.get("cases", []) if case_key(case) not in current), key=repr)
+    return {**report, "cases": kept}, removed
 
 
 def read_json(path):
@@ -208,6 +220,35 @@ def routine_steps(checkout, run_dir, latest, args):
     return steps
 
 
+def cases_step(checkout, args):
+    """Return the step that prints the loop's current cases at the checkout, selected by the loop's own flags."""
+    extra = [arg for arg in args.loop_args if arg != "--"]
+    return {
+        "name": "cases",
+        "argv": ["cargo", "xtask", "planted", "loop", "--list", *extra],
+        "env": {},
+        "cwd": str(checkout),
+    }
+
+
+def current_cases(step, run_dir):
+    """Run `step`, which prints cases as JSON, and return their keys, or None if it fails.
+
+    Its standard error goes to `<run_dir>/<name>.log`.
+    """
+    with open(Path(run_dir) / f"{step['name']}.log", "w") as log:
+        ended = subprocess.run(
+            step["argv"], cwd=step["cwd"], env={**os.environ, **step["env"]},
+            stdout=subprocess.PIPE, stderr=log, text=True, check=False,
+        )
+    if ended.returncode != 0:
+        return None
+    try:
+        return {case_key(case) for case in json.loads(ended.stdout)}
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 def triage_step(checkout, lane, cumulative_path):
     """Return the step that applies the checkout's triage records afresh to a lane's cumulative report, in place."""
     return {
@@ -245,7 +286,10 @@ def routine(args):
         run_dir = state / "runs" / "<UTC time>-<commit>"
         steps = routine_steps(checkout, run_dir, latest, args)
         triage = [triage_step(checkout, lane, state / name) for lane, name in CUMULATIVE_FILES.items()]
-        plan = {"latest": latest, "pin": "origin/main", "steps": steps, "triage": triage}
+        plan = {
+            "latest": latest, "pin": "origin/main", "steps": steps,
+            "cases": cases_step(checkout, args), "triage": triage,
+        }
         sys.stdout.write(json.dumps(plan, indent=2) + "\n")
         return 0
     pinned = pin(checkout)
@@ -257,6 +301,13 @@ def routine(args):
         ended[step["name"]] = run_step(step, run_dir)
     record = {"pinned": pinned, "previous": latest, "steps": ended, "news": {}}
     status = 0 if all(code == 0 for code in ended.values()) else 1
+    # The cumulative reports keep only the checkout's current cases, so a
+    # removed case, or one a witness change re-keyed, leaves them.
+    current = current_cases(cases_step(checkout, args), run_dir)
+    ended["cases"] = 0 if current is not None else 1
+    if current is None:
+        print("the loop's case list failed; the cumulative reports keep every case")
+        status = 1
     for lane, cumulative_file in CUMULATIVE_FILES.items():
         report = run_dir / lane / REPORT_FILE
         cumulative_path = state / cumulative_file
@@ -267,12 +318,14 @@ def routine(args):
         # commit, writes no report, and the cumulative report still takes
         # the checkout's triage.
         new = read_json(report) if report.exists() else {"pinned": cumulative.get("pinned"), "cases": []}
-        merged = merge(cumulative, new)
+        merged, removed = merge(cumulative, new), []
+        if current is not None:
+            merged, removed = prune(merged, current)
         cumulative_path.write_text(json.dumps(merged, indent=2) + "\n")
         step = triage_step(checkout, lane, cumulative_path)
         ended[step["name"]] = run_step(step, run_dir)
         status = status or int(ended[step["name"]] != 0)
-        changes = diff(cumulative, new, read_json(cumulative_path))
+        changes = diff(cumulative, new, read_json(cumulative_path), removed)
         write_diff(changes, run_dir / lane)
         record["news"][lane] = has_news(changes)
         status = status or int(record["news"][lane])

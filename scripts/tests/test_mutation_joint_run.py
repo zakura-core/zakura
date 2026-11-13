@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -160,6 +161,18 @@ class RoutineTests(unittest.TestCase):
             self.assertEqual(step["argv"][-2:], ["--jobs", "4"])
             self.assertEqual(step["cwd"], "/c")
         self.assertIn("libfuzzer", plan["steps"][2]["argv"])
+        self.assertEqual(plan["cases"]["argv"], ["cargo", "xtask", "planted", "loop", "--list", "--jobs", "4"])
+
+    def test_the_case_list_is_keyed_as_the_report_is(self):
+        listed = [{"patch": "one.patch", "property": "p", "witness": {"test_target": "t", "test": "x"}}]
+        step = {"name": "cases", "argv": [sys.executable, "-c", f"print({json.dumps(json.dumps(listed))})"],
+                "env": {}, "cwd": "."}
+        failing = {**step, "argv": [sys.executable, "-c", "raise SystemExit(2)"]}
+        with tempfile.TemporaryDirectory() as run_dir:
+            self.assertEqual(joint.current_cases(step, run_dir), {joint.case_key(listed[0])})
+            self.assertIsNone(joint.current_cases(failing, run_dir))
+        reported = {**listed[0], "witness": {"test": "x", "test_target": "t"}, "result": {"class": "survived"}}
+        self.assertEqual(joint.case_key(reported), joint.case_key(listed[0]))
 
     def test_the_units_command_and_example_budget_parse(self):
         service = (UNIT / "zakura-mutation-joint.service").read_text()
@@ -200,10 +213,20 @@ class CumulativeTests(unittest.TestCase):
                 triage(step["argv"])
             return 0
 
+        # The checkout lists every case a report so far named, unless the
+        # test sets `self.current`.
+        self.seen = getattr(self, "seen", set())
+        self.seen |= {joint.case_key(entry) for report in reports.values() for entry in report["cases"]}
+
+        def current_cases(step, run_dir):
+            self.listed = step
+            return getattr(self, "current", None) or set(self.seen)
+
         # Each run pins a new commit, so its run directory is new.
         self.pins = getattr(self, "pins", 0) + 1
         with mock.patch.object(joint, "pin", return_value=f"{self.pins:x}" * 40), \
                 mock.patch.object(joint, "run_step", side_effect=run_step), \
+                mock.patch.object(joint, "current_cases", side_effect=current_cases), \
                 contextlib.redirect_stdout(io.StringIO()):
             return joint.main(["routine", "--checkout", "/c", "--state", str(state),
                                "--libfuzzer-seconds", libfuzzer_seconds])
@@ -259,6 +282,36 @@ class CumulativeTests(unittest.TestCase):
             changes = json.loads((second / "loop" / joint.DIFF_FILE).read_text())
             self.assertEqual(changes["untriaged"], [])
             self.assertEqual(json.loads(cumulative.read_text())["cases"][0]["triage"]["reason"], "why")
+
+    def test_the_cumulative_report_drops_cases_the_checkout_no_longer_lists(self):
+        one, two = case("one.patch", "survived"), case("two.patch", "survived")
+        with tempfile.TemporaryDirectory() as state:
+            self.routine(state, {"loop": {"cases": [one, two]}})
+            self.assertEqual(self.listed["argv"][:5], ["cargo", "xtask", "planted", "loop", "--list"])
+            # A witness change re-keys one.patch, and two.patch is gone.
+            moved = case("one.patch", "survived", test="b")
+            self.current = {joint.case_key(moved)}
+            self.assertEqual(self.routine(state, {"loop": {"cases": [moved]}}), 1, "the re-keyed lane is new")
+            merged = json.loads((Path(state) / "cumulative.json").read_text())
+            self.assertEqual([joint.case_key(entry) for entry in merged["cases"]], [joint.case_key(moved)])
+            second = sorted(Path(state, "runs").iterdir())[1]
+            changes = json.loads((second / "loop" / joint.DIFF_FILE).read_text())
+            self.assertEqual(
+                changes["removed_cases"],
+                [list(joint.case_key(one)), list(joint.case_key(two))],
+            )
+
+    def test_a_failed_case_list_keeps_every_case_and_fails_the_unit(self):
+        with tempfile.TemporaryDirectory() as state:
+            self.routine(state, {"loop": {"cases": [case("one.patch", "killed-by-named-rule")]}})
+            with mock.patch.object(joint, "current_cases", return_value=None):
+                with mock.patch.object(joint, "run_step", return_value=0), \
+                        mock.patch.object(joint, "pin", return_value="f" * 40), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    status = joint.main(["routine", "--checkout", "/c", "--state", state])
+            self.assertEqual(status, 1)
+            merged = json.loads((Path(state) / "cumulative.json").read_text())
+            self.assertEqual(len(merged["cases"]), 1)
 
     def test_merge_keeps_every_property_finding(self):
         merged = joint.merge(

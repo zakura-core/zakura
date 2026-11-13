@@ -50,6 +50,9 @@
 //! affect, by `cargo xtask planted`'s rule: the patch, the case file, the
 //! witness's files, the files the patch changes, and the shared machinery.
 //!
+//! `--list` prints the cases the other flags select, as JSON, by the fields
+//! that tell a case apart in a report ([`ListedCase`]), and runs nothing.
+//!
 //! The loop runs only on a remote host. No workflow runs it.
 
 use std::{
@@ -358,6 +361,9 @@ pub(super) fn summarize(cases: &[CaseReport]) -> BTreeMap<String, PropertySummar
 /// The flags after `planted loop`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Flags {
+    /// `--list`: print the selected cases and run nothing.
+    pub(super) list: bool,
+    /// Empty with `--list`, which takes no `--out`.
     pub(super) out: PathBuf,
     pub(super) work: Option<PathBuf>,
     pub(super) cases: Option<PathBuf>,
@@ -371,7 +377,8 @@ pub(super) struct Flags {
 }
 
 /// Reads the flags after `planted loop`. `--out` and `--work` become
-/// absolute, since cargo runs from each slot's worktree.
+/// absolute, since cargo runs from each slot's worktree. Every flag but
+/// `--list` takes a value.
 pub(super) fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flags, BoxError> {
     let mut flags = Flags {
         jobs: DEFAULT_JOBS,
@@ -379,6 +386,10 @@ pub(super) fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flag
     };
     let mut out = None;
     while let Some(flag) = args.next() {
+        if flag == "--list" && !flags.list {
+            flags.list = true;
+            continue;
+        }
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         if flags.generate.parse(&flag, &value)? {
             continue;
@@ -408,8 +419,34 @@ pub(super) fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flag
             _ => return Err(format!("unknown or repeated flag `{flag}`").into()),
         }
     }
-    flags.out = out.ok_or(UsageError("`planted loop` needs --out <dir>"))?;
+    flags.out = match out {
+        Some(out) => out,
+        None if flags.list => PathBuf::new(),
+        None => return Err(UsageError("`planted loop` needs --out <dir>").into()),
+    };
     Ok(flags)
+}
+
+/// A case as `--list` prints it: the fields that tell it apart in a report.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(super) struct ListedCase<'a> {
+    /// The patch, as the report names it.
+    patch: &'a str,
+    property: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    table: Option<&'a str>,
+    witness: &'a WitnessSpec,
+}
+
+impl<'a> From<&'a LoopCase> for ListedCase<'a> {
+    fn from(case: &'a LoopCase) -> Self {
+        ListedCase {
+            patch: &case.label,
+            property: &case.property,
+            table: case.table.as_deref(),
+            witness: &case.witness,
+        }
+    }
 }
 
 /// Runs `cargo xtask planted loop`.
@@ -434,6 +471,11 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         &flags.only,
         flags.changed_since.as_deref(),
     )?;
+    if flags.list {
+        let listed: Vec<ListedCase> = cases.iter().flatten().map(ListedCase::from).collect();
+        println!("{}", serde_json::to_string_pretty(&listed)?);
+        return Ok(());
+    }
     let Some(cases) = cases else {
         println!("no loop case is affected by the changes since the revision");
         return Ok(());

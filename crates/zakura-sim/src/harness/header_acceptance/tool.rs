@@ -2292,9 +2292,11 @@ fn committed_input(repo: &Path, input: &str) -> Result<CommittedInput, String> {
 
 /// [`case_refusal`] for case `case`, `(property, name)`, of `input` on
 /// `harness`, through the target `targets`, the committed mapping, gives
-/// its harness. A mapping that can't be read refuses every case, so a
-/// confirmation naming no target never stands in for one the mapping would
-/// require.
+/// its harness. A typed or scripted case has no fuzz input for a target to
+/// run, so, as the planted runner's `--targets` does, it's confirmed
+/// through none whatever its harness maps to. A mapping that can't be read
+/// refuses every case, so a confirmation naming no target never stands in
+/// for one the mapping would require.
 fn mapped_case_refusal(
     targets: &Result<BTreeMap<String, String>, String>,
     rebuild: &Rebuild<'_>,
@@ -2303,12 +2305,13 @@ fn mapped_case_refusal(
     input: &CaseInput,
 ) -> Option<String> {
     match targets {
-        Ok(targets) => case_refusal(
-            rebuild,
-            case,
-            (harness, target_of(targets, harness).as_deref()),
-            input,
-        ),
+        Ok(targets) => {
+            let target = match input {
+                CaseInput::Fuzz { .. } => target_of(targets, harness),
+                CaseInput::Typed { .. } | CaseInput::Scripted { .. } => None,
+            };
+            case_refusal(rebuild, case, (harness, target.as_deref()), input)
+        }
         Err(why) => Some(format!("the fuzz-target mapping can't be read: {why}")),
     }
 }
@@ -4865,6 +4868,33 @@ mod tests {
         let unreadable = fuzz_targets(Path::new("/no/such/repo"));
         assert!(refusal(&unreadable, storage).is_some());
         assert_eq!(refusal(&committed, "header-sync/wire"), None);
+
+        // A typed or scripted storage case has no fuzz input, so the
+        // runner confirms it through no target, and that's accepted under
+        // the committed mapping, though its harness has one. An unreadable
+        // mapping still refuses it.
+        for input in [
+            CaseInput::Typed {
+                scenario: "s.json".into(),
+                plan: "p.bin".into(),
+            },
+            CaseInput::Scripted {
+                scenario: "s.json".into(),
+                script: "p.json".into(),
+            },
+        ] {
+            let refusal = |targets: &Result<BTreeMap<String, String>, String>| {
+                mapped_case_refusal(
+                    targets,
+                    &rebuild_of(&repo, case.path()),
+                    ("p", "a"),
+                    storage,
+                    &input,
+                )
+            };
+            assert_eq!(refusal(&committed), None, "{input:?}");
+            assert!(refusal(&unreadable).is_some(), "{input:?}");
+        }
     }
 
     /// A machine trace counts for a case only if it ran the case's committed

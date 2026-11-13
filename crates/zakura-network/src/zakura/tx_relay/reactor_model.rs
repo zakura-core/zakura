@@ -338,12 +338,26 @@ impl ReactorModel {
 
     /// Something the pool did after another input: verdicts for bodies this
     /// reactor submitted.
+    ///
+    /// The caller is whoever consumes the pool's steps. It takes the steps
+    /// of the reactor's own calls with [`Self::take_pool_steps`] before it
+    /// makes a pool call of its own, so that every step reaches it in the
+    /// order the pool produced them.
     pub(crate) fn pool_step(
         &mut self,
         step: &Step,
         now: ModelTime,
         pool: &mut PoolModel,
     ) -> Vec<RelayEffect> {
+        // The pool produced this step after every step it gave the reactor
+        // before. Whoever consumes the pool's steps has to have taken those
+        // first, or it could be told to cancel a job before it was told to
+        // start it.
+        assert!(
+            self.pool_steps.is_empty(),
+            "a pool step from outside was delivered before the reactor's earlier steps were taken: {:?}",
+            self.pool_steps
+        );
         self.verdicts(step, now, pool);
         self.finish(now, pool)
     }

@@ -44,12 +44,10 @@ use crate::{
     peer_registry::{PeerRegistry, PeerRegistryGuard},
     peer_set::{
         initialize::{
-            accept_inbound_connections, add_initial_peers, batch_misbehavior_reports,
-            crawl_and_dial, keep_unconditional_peers_connected,
-            leave_out_undialable_unconditional_peers, open_listener,
-            outbound_peer_replenishment_demand, unconditional_peer_dial_addrs, DiscoveredPeer,
-            ReplenishmentBudget, MISBEHAVIOR_BATCH_INTERVAL,
-            OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR,
+            accept_inbound_connections, add_initial_peers, crawl_and_dial,
+            keep_unconditional_peers_connected, leave_out_undialable_unconditional_peers,
+            open_listener, outbound_peer_replenishment_demand, unconditional_peer_dial_addrs,
+            DiscoveredPeer, ReplenishmentBudget, OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR,
             OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR,
         },
         set::MorePeers,
@@ -426,56 +424,6 @@ const ZCASHD_COMPAT_LISTENER_TEST_DURATION: Duration = Duration::from_millis(500
 /// The amount of time to make the inbound connection acceptor wait between peer connections.
 const MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS: Duration = Duration::from_millis(25);
 
-/// Misbehavior reports are coalesced per peer and flushed after five seconds.
-#[tokio::test(start_paused = true)]
-async fn misbehavior_reports_are_batched_for_five_seconds() {
-    let peer_addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
-    let (misbehavior_tx, misbehavior_rx) = tokio::sync::mpsc::channel(1);
-    let (address_book_updater, mut address_book_updates) = tokio::sync::mpsc::channel(1);
-    let batcher = tokio::spawn(batch_misbehavior_reports(
-        misbehavior_rx,
-        address_book_updater,
-    ));
-
-    misbehavior_tx
-        .send((peer_addr, 40))
-        .await
-        .expect("misbehavior batcher is running");
-    misbehavior_tx
-        .send((peer_addr, 60))
-        .await
-        .expect("misbehavior batcher is running");
-    // The third send can complete only after the first two reports have been
-    // received from this capacity-one channel.
-    misbehavior_tx
-        .send((peer_addr, 0))
-        .await
-        .expect("misbehavior batcher is running");
-
-    tokio::time::advance(MISBEHAVIOR_BATCH_INTERVAL - Duration::from_millis(1)).await;
-    tokio::task::yield_now().await;
-    assert!(
-        address_book_updates.try_recv().is_err(),
-        "misbehavior reports must remain batched before the interval elapses"
-    );
-
-    tokio::time::advance(Duration::from_millis(1)).await;
-    let update = address_book_updates
-        .recv()
-        .await
-        .expect("misbehavior batcher should flush an address book update");
-    assert_eq!(update.addr(), peer_addr);
-    assert_eq!(
-        update.misbehavior_score(),
-        constants::MAX_PEER_MISBEHAVIOR_SCORE
-    );
-
-    drop(misbehavior_tx);
-    batcher
-        .await
-        .expect("misbehavior batcher task should not panic");
-}
-
 /// The address book updater drops misbehavior reports for configured
 /// unconditional peers, and still bans other peers.
 #[tokio::test]
@@ -487,31 +435,19 @@ async fn address_book_updater_ignores_unconditional_peer_misbehavior() {
 
     let config: Config = toml::from_str("unconditional_peers = ['127.0.0.1']")
         .expect("unconditional peer config parses");
-    let (_address_book, bans, address_book_updater, _address_metrics, _updater_guard) =
+    let (_address_book, misbehavior, _address_book_updater, _address_metrics, _updater_guard) =
         AddressBookUpdater::spawn(&config, config.listen_addr, PeerServices::NODE_NETWORK);
 
-    // The updater applies changes in order, so the unconditional peer's report
-    // has been handled once the other peer is banned.
     for addr in [unconditional_addr, other_addr] {
-        address_book_updater
-            .send(MetaAddr::new_misbehavior(
-                addr,
-                constants::MAX_PEER_MISBEHAVIOR_SCORE,
-            ))
-            .await
-            .expect("address book updater is running");
+        misbehavior.report(addr, constants::MAX_PEER_MISBEHAVIOR_SCORE);
     }
 
-    tokio::time::timeout(CRAWLER_TEST_TIMEOUT, async {
-        while !bans.contains(other_addr.ip()) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the address book updater should ban the other peer");
-
     assert!(
-        !bans.contains(unconditional_addr.ip()),
+        misbehavior.is_banned(other_addr.ip()),
+        "the other peer should be banned"
+    );
+    assert!(
+        !misbehavior.is_banned(unconditional_addr.ip()),
         "unconditional peers must never be banned"
     );
 }

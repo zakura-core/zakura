@@ -80,11 +80,11 @@ fn address_book(c: &mut Criterion) {
         let new_addr = unique_ip_addr(size);
         let batch_size = size.min(MAX_ADDRS_IN_MESSAGE);
         let batch_updates: Vec<_> = (0..batch_size)
-            .map(|index| MetaAddr::new_misbehavior(peer_addr(index), 1))
+            .map(|index| MetaAddr::new_reconnect(peer_addr(index)))
             .collect();
 
         let mut update_check = address_book.clone();
-        let update_change = MetaAddr::new_misbehavior(existing_addr, 1);
+        let update_change = MetaAddr::new_reconnect(existing_addr);
         assert!(update_check.update(update_change).is_some());
 
         let mut insert_check = address_book.clone();
@@ -96,8 +96,13 @@ fn address_book(c: &mut Criterion) {
         );
 
         let mut ban_check = address_book.clone_with_fresh_bans_for_benchmark();
-        let ban_change = MetaAddr::new_misbehavior(existing_addr, MAX_PEER_MISBEHAVIOR_SCORE);
-        assert!(ban_check.update(ban_change).is_none());
+        ban_check
+            .misbehavior_reporter()
+            .report(existing_addr, MAX_PEER_MISBEHAVIOR_SCORE);
+        // The next update removes the banned IP's addresses, then rejects the change.
+        assert!(ban_check
+            .update(MetaAddr::new_reconnect(existing_addr))
+            .is_none());
         assert_eq!(ban_check.len(), size - SAME_IP_ADDRESS_COUNT);
         assert!(ban_check.bans().contains(existing_addr.ip()));
 
@@ -137,7 +142,7 @@ fn address_book(c: &mut Criterion) {
                 b.iter_batched_ref(
                     || address_book.clone(),
                     |address_book| {
-                        let change = MetaAddr::new_misbehavior(black_box(existing_addr), 1);
+                        let change = MetaAddr::new_reconnect(black_box(existing_addr));
                         black_box(address_book.update(change))
                     },
                     BatchSize::PerIteration,
@@ -163,10 +168,11 @@ fn address_book(c: &mut Criterion) {
                 b.iter_batched_ref(
                     || address_book.clone_with_fresh_bans_for_benchmark(),
                     |address_book| {
-                        let change = MetaAddr::new_misbehavior(
-                            black_box(existing_addr),
-                            MAX_PEER_MISBEHAVIOR_SCORE,
-                        );
+                        // A report bans the IP, and the next update removes its addresses.
+                        address_book
+                            .misbehavior_reporter()
+                            .report(black_box(existing_addr), MAX_PEER_MISBEHAVIOR_SCORE);
+                        let change = MetaAddr::new_reconnect(black_box(existing_addr));
                         black_box(address_book.update(change))
                     },
                     BatchSize::PerIteration,

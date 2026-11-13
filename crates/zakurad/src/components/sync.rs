@@ -21,7 +21,7 @@ use futures::{
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{mpsc, watch},
+    sync::watch,
     task::JoinError,
     time::{sleep, sleep_until, timeout},
 };
@@ -36,7 +36,7 @@ use zakura_chain::{
     parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
 };
 use zakura_consensus::{error::TransactionError, RouterError, VerifyBlockError};
-use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_network as zn;
 use zakura_state as zs;
 
 use crate::{
@@ -1071,8 +1071,8 @@ where
     /// This is based on the downloaded block height and the state tip height.
     past_lookahead_limit_receiver: zs::WatchReceiver<bool>,
 
-    /// Sender for reporting peer addresses that advertised unexpectedly invalid transactions.
-    misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
+    /// Scores peers that served invalid blocks, and bans them at the ban threshold.
+    misbehavior: zn::MisbehaviorReporter,
 
     /// Structured diagnostics for the legacy sync pipeline.
     trace: LegacySyncTrace,
@@ -1121,7 +1121,7 @@ where
         verifier: ZV,
         state: ZS,
         latest_chain_tip: ZSTip,
-        misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
+        misbehavior: zn::MisbehaviorReporter,
     ) -> (Self, SyncStatus) {
         let mut download_concurrency_limit = config.sync.download_concurrency_limit;
         let mut checkpoint_verify_concurrency_limit =
@@ -1222,7 +1222,7 @@ where
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
             past_lookahead_limit_receiver,
-            misbehavior_sender,
+            misbehavior,
             trace,
         };
 
@@ -2606,9 +2606,8 @@ where
                 advertiser_addr: Some(advertiser_addr),
                 ..
             }) if error.misbehavior_score() != 0 => {
-                let _ = self
-                    .misbehavior_sender
-                    .try_send((advertiser_addr, error.misbehavior_score()));
+                self.misbehavior
+                    .report(advertiser_addr, error.misbehavior_score());
             }
 
             // Unlike `AboveLookaheadHeightLimit` below, this one *is* scored. The
@@ -2620,16 +2619,15 @@ where
                 advertiser_addr: Some(advertiser_addr),
                 ..
             }) => {
-                let _ = self
-                    .misbehavior_sender
-                    .try_send((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
+                self.misbehavior
+                    .report(advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
             }
 
             Err(BlockDownloadVerifyError::InvalidHeight {
                 advertiser_addr: Some(advertiser_addr),
                 ..
             }) => {
-                let _ = self.misbehavior_sender.try_send((advertiser_addr, 100));
+                self.misbehavior.report(advertiser_addr, 100);
             }
 
             // `AboveLookaheadHeightLimit` is deliberately unscored. Its
@@ -2823,12 +2821,12 @@ where
                 *retry_count += 1;
 
                 // Ban the supplier before requeueing, so the replacement request is less likely
-                // to route back to it. The peer set batches misbehavior updates, so the ban may
-                // not have landed yet; the retry budget bounds the loop if it hasn't.
+                // to route back to it. The report bans the IP at once, but the peer set drops its
+                // connection on its next maintenance pass, so the replacement can still reach it;
+                // the retry budget bounds the loop if it does.
                 if let Some(advertiser_addr) = advertiser_addr {
-                    let _ = self
-                        .misbehavior_sender
-                        .try_send((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
+                    self.misbehavior
+                        .report(advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
                 }
 
                 info!(

@@ -22,7 +22,7 @@ use futures::{
 use indexmap::IndexSet;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc},
+    sync::broadcast,
     time::Instant,
 };
 use tokio_stream::wrappers::IntervalStream;
@@ -42,7 +42,7 @@ use zakura_chain::{
 use zakura_node_services::task::{erased, spawn_buffer};
 
 use crate::{
-    address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
+    address_book_updater::AddressBookUpdater,
     constants,
     meta_addr::{MetaAddr, MetaAddrChange},
     peer::{
@@ -54,7 +54,8 @@ use crate::{
     peer_set::{set::MorePeers, ActiveConnectionCounter, CandidateSet, ConnectionTracker, PeerSet},
     protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
     zakura::{CustomService, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup},
-    AddressBook, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
+    AddressBook, BannedIps, BoxError, Config, MisbehaviorReporter, PeerSocketAddr, Request,
+    Response,
 };
 
 #[cfg(test)]
@@ -77,50 +78,6 @@ use unconditional_peers::{
 /// - The connection limits don't include failed connections
 /// - tower::Discover interprets an error as stream termination
 type DiscoveredPeer = (PeerSocketAddr, peer::Client);
-
-/// How often accumulated peer misbehavior reports are sent to the address book.
-///
-/// Batching caps address book queue and mutex pressure at one flush per
-/// interval, no matter how fast peers send invalid blocks or transactions.
-/// Five seconds keeps ban-threshold score application prompt; do not remove the
-/// batching to make bans immediate.
-const MISBEHAVIOR_BATCH_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Batches peer misbehavior reports before forwarding them to the address book updater.
-async fn batch_misbehavior_reports(
-    mut misbehavior_rx: mpsc::Receiver<(PeerSocketAddr, u32)>,
-    address_book_updater: mpsc::Sender<MetaAddrChange>,
-) {
-    let mut misbehaviors: HashMap<PeerSocketAddr, u32> = HashMap::new();
-    // Coalesce repeated reports so invalid blocks or transactions cannot turn
-    // every report into address book queue and mutex pressure.
-    let mut flush_timer = IntervalStream::new(tokio::time::interval_at(
-        Instant::now() + MISBEHAVIOR_BATCH_INTERVAL,
-        MISBEHAVIOR_BATCH_INTERVAL,
-    ));
-
-    loop {
-        tokio::select! {
-            msg = misbehavior_rx.recv() => match msg {
-                Some((peer_addr, score_increment)) => *misbehaviors
-                    .entry(peer_addr)
-                    .or_default()
-                    += score_increment,
-                None => break,
-            },
-
-            _ = flush_timer.next() => {
-                for (addr, score_increment) in misbehaviors.drain() {
-                    let _ = address_book_updater
-                        .send(MetaAddr::new_misbehavior(addr, score_increment))
-                        .await;
-                }
-            },
-        };
-    }
-
-    tracing::warn!("exiting misbehavior update batch task");
-}
 
 /// Initialize a peer set, using a network `config`, `inbound_service`,
 /// and `latest_chain_tip`.
@@ -164,14 +121,14 @@ pub async fn init<S, C>(
 ) -> (
     BoxCloneSyncService<Request, Response, BoxError>,
     Arc<std::sync::Mutex<AddressBook>>,
-    mpsc::Sender<(PeerSocketAddr, u32)>,
+    MisbehaviorReporter,
 )
 where
     S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + Sync + 'static,
     S::Future: Send + 'static,
     C: ChainTip + Clone + Send + Sync + 'static,
 {
-    let (peer_set, address_book, misbehavior_tx, _zakura_endpoint) = init_with_zakura_header_sync(
+    let (peer_set, address_book, misbehavior, _zakura_endpoint) = init_with_zakura_header_sync(
         config,
         inbound_service,
         latest_chain_tip,
@@ -182,7 +139,7 @@ where
     )
     .await;
 
-    (peer_set, address_book, misbehavior_tx)
+    (peer_set, address_book, misbehavior)
 }
 
 /// Initialize a peer set and optionally expose a real-driver Zakura header-sync endpoint.
@@ -198,7 +155,7 @@ pub async fn init_with_zakura_header_sync<S, C>(
 ) -> (
     BoxCloneSyncService<Request, Response, BoxError>,
     Arc<std::sync::Mutex<AddressBook>>,
-    mpsc::Sender<(PeerSocketAddr, u32)>,
+    MisbehaviorReporter,
     Option<ZakuraEndpoint>,
 )
 where
@@ -218,8 +175,8 @@ where
     )
     .await
     .map(
-        |(peer_set, address_book, misbehavior_tx, zakura_endpoint, _block_adverts)| {
-            (peer_set, address_book, misbehavior_tx, zakura_endpoint)
+        |(peer_set, address_book, misbehavior, zakura_endpoint, _block_adverts)| {
+            (peer_set, address_book, misbehavior, zakura_endpoint)
         },
     )
     .expect("Zakura endpoint should start when P2P v2 is enabled")
@@ -240,7 +197,7 @@ pub async fn init_with_zakura<S, C>(
     (
         BoxCloneSyncService<Request, Response, BoxError>,
         Arc<std::sync::Mutex<AddressBook>>,
-        mpsc::Sender<(PeerSocketAddr, u32)>,
+        MisbehaviorReporter,
         Option<ZakuraEndpoint>,
         BoxCloneService<Request, Response, BoxError>,
     ),
@@ -286,25 +243,19 @@ where
         .as_ref()
         .map(|endpoint| endpoint.background_shutdown_token().drop_guard());
 
-    let (address_book, bans, address_book_updater, address_metrics, address_book_updater_guard) =
-        AddressBookUpdater::spawn_with_peer_registry(
-            &config,
-            listen_addr,
-            advertised_services,
-            peer_registry.clone(),
-        );
-
-    let (misbehavior_tx, misbehavior_rx) = mpsc::channel(
-        // Leave enough room for a misbehaviour update on every peer connection
-        // before the channel is drained.
-        config
-            .peerset_total_connection_limit()
-            .max(MIN_CHANNEL_SIZE),
+    let (
+        address_book,
+        misbehavior,
+        address_book_updater,
+        address_metrics,
+        address_book_updater_guard,
+    ) = AddressBookUpdater::spawn_with_peer_registry(
+        &config,
+        listen_addr,
+        advertised_services,
+        peer_registry.clone(),
     );
-
-    tokio::spawn(erased(
-        batch_misbehavior_reports(misbehavior_rx, address_book_updater.clone()).in_current_span(),
-    ));
+    let bans = misbehavior.bans();
 
     // Create a broadcast channel for peer inventory advertisements.
     // If it reaches capacity, this channel drops older inventory advertisements.
@@ -348,7 +299,7 @@ where
             .with_latest_chain_tip(latest_chain_tip.clone())
             .with_peer_registry(peer_registry.clone())
             .with_protected_peer_ips(protected_peer_ips)
-            .with_bans(bans.clone())
+            .with_misbehavior(misbehavior.clone())
             .with_tcp_warmup(peer::TcpWarmup::spawn(
                 config.tcp_warmup.clone(),
                 latest_chain_tip.clone(),
@@ -589,7 +540,7 @@ where
     Ok((
         peer_set,
         address_book,
-        misbehavior_tx,
+        misbehavior,
         returned_zakura_endpoint,
         block_adverts,
     ))

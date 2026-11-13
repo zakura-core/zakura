@@ -1055,7 +1055,7 @@ async fn setup(
 
     // Mempool
     let mempool_config = MempoolConfig::default();
-    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let misbehavior = crate::components::test_misbehavior::reporter();
     let (mut mempool_service, transaction_subscriber) = Mempool::new(
         &mempool_config,
         false,
@@ -1066,7 +1066,7 @@ async fn setup(
         sync_status.clone(),
         latest_chain_tip.clone(),
         chain_tip_change.clone(),
-        misbehavior_sender.clone(),
+        misbehavior.clone(),
         Vec::new(),
         zakura_network::UnconditionalPeers::default(),
     );
@@ -1085,7 +1085,7 @@ async fn setup(
         state: state_service.clone(),
         latest_chain_tip: latest_chain_tip.clone(),
         network: network.clone(),
-        misbehavior_sender,
+        misbehavior,
     };
     let r = setup_tx.send(setup_data);
     // We can't expect or unwrap because the returned Result does not implement Debug
@@ -1227,7 +1227,7 @@ mod submitblock_test {
             .buffer(10)
             .service(BoxService::new(inbound_service));
 
-        let (peer_set, _address_book, _misbehavior_tx) = zakura_network::init(
+        let (peer_set, _address_book, _misbehavior) = zakura_network::init(
             network_config,
             inbound_service.clone(),
             latest_chain_tip.clone(),

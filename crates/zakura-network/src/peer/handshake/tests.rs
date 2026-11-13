@@ -83,25 +83,14 @@ fn diagnostic_remote_addr_excludes_proxy_connection_identifiers() {
 
 #[test]
 fn noncanonical_shielded_proof_size_gets_ban_score() {
-    let addr = peer_addr(8233);
-    let change = inbound_error_address_change(
-        addr,
-        PeerServices::NODE_NETWORK,
-        &SerializationError::NonCanonicalShieldedProofSize,
-    );
-
-    assert_eq!(change.addr(), addr);
     assert_eq!(
-        change.misbehavior_score(),
+        inbound_error_misbehavior_score(&SerializationError::NonCanonicalShieldedProofSize),
         constants::MAX_PEER_MISBEHAVIOR_SCORE
     );
-
-    let ordinary_parser_error = inbound_error_address_change(
-        addr,
-        PeerServices::NODE_NETWORK,
-        &SerializationError::Parse("test parser error"),
+    assert_eq!(
+        inbound_error_misbehavior_score(&SerializationError::Parse("test parser error")),
+        0
     );
-    assert_eq!(ordinary_parser_error.misbehavior_score(), 0);
 }
 
 fn test_config(p2p_stack: P2pStack) -> Config {

@@ -46,6 +46,7 @@ use crate::{
             UnboxMempoolError,
         },
         sync::{self, BlockGossipError, RecentSyncLengths, SyncStatus},
+        test_misbehavior::{self, reported_score},
     },
     BoxError,
 };
@@ -959,9 +960,9 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
         _chain_tip_change,
         _sync_gossip_task_handle,
         _tx_gossip_task_handle,
-        mut misbehavior_rx,
+        misbehavior,
         _syncer,
-    ) = setup_with_misbehavior_receiver(false).await;
+    ) = setup_with_misbehavior_reporter(false).await;
 
     // `setup` commits genesis and block 1, so block 2 is the tip child. Rewriting only its
     // coinbase height leaves the header, and therefore the block hash, untouched.
@@ -1008,16 +1009,16 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
             .oneshot(Request::MempoolTransactionIds)
             .await;
 
-        if let Ok(received) = timeout(Duration::from_millis(100), misbehavior_rx.recv()).await {
-            report = Some(received);
+        if reported_score(&misbehavior, advertiser_addr) != 0 {
+            report = Some(reported_score(&misbehavior, advertiser_addr));
             break;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let report = report.expect("a poisoned gossip block must score its advertiser");
 
     assert_eq!(
-        report,
-        Some((advertiser_addr, 100)),
+        report, 100,
         "the advertiser of a poisoned tip child must be scored for a ban"
     );
 
@@ -1066,9 +1067,9 @@ async fn inbound_poisoned_parent_recovery_scores_and_is_not_requeued() -> Result
         _chain_tip_change,
         _sync_gossip_task_handle,
         _tx_gossip_task_handle,
-        mut misbehavior_rx,
+        misbehavior,
         _syncer,
-    ) = setup_with_misbehavior_receiver(false).await;
+    ) = setup_with_misbehavior_reporter(false).await;
 
     // `setup` commits genesis and block 1, so block 3 is one hop from the tip, and its parent is
     // the tip child.
@@ -1120,14 +1121,15 @@ async fn inbound_poisoned_parent_recovery_scores_and_is_not_requeued() -> Result
             .oneshot(Request::MempoolTransactionIds)
             .await;
 
-        if let Ok(received) = timeout(Duration::from_millis(100), misbehavior_rx.recv()).await {
-            report = Some(received);
+        if reported_score(&misbehavior, advertiser_addr) != 0 {
+            report = Some(reported_score(&misbehavior, advertiser_addr));
             break;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(
         report.expect("a poisoned parent recovery must score its supplier"),
-        Some((advertiser_addr, 100)),
+        100,
     );
 
     peer_set.expect_no_requests().await;
@@ -1312,7 +1314,6 @@ async fn caches_getaddr_response() {
         ));
         let inbound_service = BoxService::new(inbound_service);
         let inbound_service = ServiceBuilder::new().buffer(1).service(inbound_service);
-        let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
 
         let setup_data = InboundSetupData {
             address_book: address_book.clone(),
@@ -1322,7 +1323,7 @@ async fn caches_getaddr_response() {
             state: state_service.clone(),
             latest_chain_tip,
             network: network.clone(),
-            misbehavior_sender,
+            misbehavior: test_misbehavior::reporter(),
         };
         let r = setup_tx.send(setup_data);
         // We can't expect or unwrap because the returned Result does not implement Debug
@@ -1474,7 +1475,6 @@ async fn refused_block_reads_send_notfound() {
             setup_rx,
         )),
     ));
-    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let setup_data = InboundSetupData {
         address_book: Arc::new(std::sync::Mutex::new(AddressBook::new(
             SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -1491,7 +1491,7 @@ async fn refused_block_reads_send_notfound() {
         state,
         latest_chain_tip,
         network: Mainnet,
-        misbehavior_sender,
+        misbehavior: test_misbehavior::reporter(),
     };
     assert!(setup_tx.send(setup_data).is_ok(), "inbound setup is sent");
 
@@ -1554,9 +1554,9 @@ async fn setup(
         chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
-        _misbehavior_rx,
+        _misbehavior,
         syncer,
-    ) = setup_with_misbehavior_receiver(add_transactions).await;
+    ) = setup_with_misbehavior_reporter(add_transactions).await;
 
     (
         inbound_service,
@@ -1573,10 +1573,10 @@ async fn setup(
     )
 }
 
-/// [`setup`], additionally returning the receiver for peer misbehavior reports.
+/// [`setup`], additionally returning the reporter that records peer misbehavior.
 ///
-/// Tests that assert on peer scoring need the receiver; everything else uses [`setup`].
-async fn setup_with_misbehavior_receiver(
+/// Tests that assert on peer scoring need the reporter; everything else uses [`setup`].
+async fn setup_with_misbehavior_reporter(
     add_transactions: bool,
 ) -> (
     Buffer<
@@ -1598,7 +1598,7 @@ async fn setup_with_misbehavior_receiver(
     ChainTipChange,
     JoinHandle<Result<(), BlockGossipError>>,
     JoinHandle<Result<(), BoxError>>,
-    tokio::sync::mpsc::Receiver<(PeerSocketAddr, u32)>,
+    zakura_network::MisbehaviorReporter,
     RecentSyncLengths,
 ) {
     let _init_guard = zakura_test::init();
@@ -1698,7 +1698,7 @@ async fn setup_with_misbehavior_receiver(
     // Don't wait for the chain tip update here, we wait for expect_request(AdvertiseBlock) below,
     // which is called by the gossip_best_tip_block_hashes task once the chain tip changes.
 
-    let (misbehavior_sender, misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let misbehavior = test_misbehavior::reporter();
     let (mut mempool_service, transaction_subscriber) = Mempool::new(
         &MempoolConfig::default(),
         false,
@@ -1709,7 +1709,7 @@ async fn setup_with_misbehavior_receiver(
         sync_status.clone(),
         latest_chain_tip.clone(),
         chain_tip_change.clone(),
-        misbehavior_sender.clone(),
+        misbehavior.clone(),
         Vec::new(),
         zakura_network::UnconditionalPeers::default(),
     );
@@ -1786,7 +1786,7 @@ async fn setup_with_misbehavior_receiver(
         state: state_service.clone(),
         latest_chain_tip,
         network: network.clone(),
-        misbehavior_sender,
+        misbehavior: misbehavior.clone(),
     };
     let r = setup_tx.send(setup_data);
     // We can't expect or unwrap because the returned Result does not implement Debug
@@ -1803,7 +1803,7 @@ async fn setup_with_misbehavior_receiver(
         chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
-        misbehavior_rx,
+        misbehavior,
         recent_syncs,
     )
 }

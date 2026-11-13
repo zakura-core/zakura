@@ -64,6 +64,11 @@ struct SnapshotVerifier {
     hooks: Arc<Mutex<HashMap<UnminedTxId, Box<dyn FnOnce() + Send>>>>,
     /// Transactions whose future the verifier panics while building.
     panic_building: Arc<Mutex<HashSet<UnminedTxId>>>,
+    /// How long every verification takes, if set.
+    delay: Arc<Mutex<Option<Duration>>>,
+    /// Verifications running now, and the most that ran at once.
+    running: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Verifier<TestVerifyError> for SnapshotVerifier {
@@ -119,9 +124,18 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
             .snapshot()
             .expect("the core publishes before it starts a job");
         let txs = self.txs.clone();
+        let delay = *self.delay.lock().expect("no test panics holding it");
+        let (running, peak) = (self.running.clone(), self.peak.clone());
         Box::pin(async move {
             if let Some(gate) = gate {
                 gate.notified().await;
+            }
+            if let Some(delay) = delay {
+                use std::sync::atomic::Ordering;
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                running.fetch_sub(1, Ordering::SeqCst);
             }
             if hold {
                 std::future::pending::<()>().await;
@@ -207,6 +221,9 @@ impl Harness {
             calls: Arc::default(),
             hooks: Arc::default(),
             panic_building: Arc::default(),
+            delay: Arc::default(),
+            running: Arc::default(),
+            peak: Arc::default(),
         };
         let core = PoolCore::with_limits(
             &Config {
@@ -277,6 +294,12 @@ impl Harness {
     /// that mines `txs`. The chain is marked as changing before anything else
     /// happens, as the state writer does.
     fn change(&mut self, disconnect: u32, fork: u8, txs: &[&Tx]) {
+        self.change_under(disconnect, fork, txs, false);
+    }
+
+    /// [`Harness::change`], where the new block's height activates new
+    /// rules if `rules_change`.
+    fn change_under(&mut self, disconnect: u32, fork: u8, txs: &[&Tx], rules_change: bool) {
         let mut chain = self.chain.lock().expect("no test panics holding it");
         chain.begin_change();
         {
@@ -314,7 +337,7 @@ impl Harness {
                 }],
                 after,
                 generation,
-                rules_change: false,
+                rules_change,
             })
         });
     }
@@ -913,5 +936,75 @@ async fn a_chain_change_before_the_worker_first_looks_runs_the_job_again() {
         harness.calls(&parent),
         2,
         "the job bound to the old tip ran again at the new one"
+    );
+}
+
+/// The reorg half of the recovery gate. After a reorg the core gets every
+/// pooled transaction back as it does after an upgrade: both hide the whole
+/// pool, both get it all back in about the same time, and neither runs more
+/// verifications at once than the revalidation share. Today's pool resets
+/// the same way after both, so the boundary test that compares the two pools
+/// after an upgrade covers a reorg as well.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reorg_recovers_the_pool_as_an_upgrade_does() {
+    use std::sync::atomic::Ordering;
+    use zakura_node_services::mempool::port::MAX_REVALIDATING;
+
+    const POOLED: usize = 1_500;
+    const DELAY: Duration = Duration::from_millis(40);
+    let mut runner = TestRunner::deterministic();
+    let txs: Vec<Tx> = (0..POOLED)
+        .map(|_| build(&mut runner, &[], 1, None))
+        .collect();
+
+    let mut recoveries = Vec::new();
+    for reorg in [false, true] {
+        let mut harness = Harness::start(&txs);
+        for tx in &txs {
+            assert!(matches!(harness.submit(tx).await, Verdict::Admitted));
+        }
+        *harness
+            .verifier
+            .delay
+            .lock()
+            .expect("no test panics holding it") = Some(DELAY);
+        let started = tokio::time::Instant::now();
+        if reorg {
+            harness.change(1, 1, &[]);
+        } else {
+            harness.change_under(0, 0, &[], true);
+        }
+        let applied = harness.next_tip().await;
+        assert!(
+            applied.reset,
+            "the change hides the pool to verify it again"
+        );
+        assert_eq!(applied.hidden, POOLED, "every pooled transaction is hidden");
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while harness
+                .handle
+                .snapshot()
+                .is_none_or(|snapshot| snapshot.transactions.len() < POOLED)
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the core gets every transaction back");
+        recoveries.push((
+            started.elapsed(),
+            harness.verifier.peak.load(Ordering::SeqCst),
+        ));
+    }
+    let [(upgrade, upgrade_peak), (reorg, reorg_peak)] = recoveries[..] else {
+        unreachable!("two runs");
+    };
+    for peak in [upgrade_peak, reorg_peak] {
+        assert!(peak <= MAX_REVALIDATING, "within the share: {recoveries:?}");
+    }
+    // Allow for scheduling noise: one verification's delay either way.
+    assert!(
+        reorg <= upgrade + DELAY && upgrade <= reorg + DELAY,
+        "a reorg recovers as an upgrade does: {recoveries:?}"
     );
 }

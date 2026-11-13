@@ -1463,12 +1463,14 @@ async fn fill(harness: &mut Harness, txs: &[VerifiedUnminedTx]) -> usize {
 }
 
 /// How a pool recovered from a reset: how long until it showed a
-/// transaction again, how long until it held every one, and the most
-/// verifications run at once while it recovered.
+/// transaction again, how long until it held every one, how long a new
+/// transaction submitted at the reset took to be admitted (`None` if it was
+/// refused), and the most verifications run at once while it recovered.
 #[derive(Debug)]
 struct Recovery {
     first: Option<Duration>,
     full: Option<Duration>,
+    fresh: Option<Duration>,
     peak: usize,
 }
 
@@ -1484,8 +1486,10 @@ async fn recover(mode: Mode, reannounce: bool) -> Recovery {
         generate_test_chain, nu_activation_test_network, NU5_ACTIVATION_TEST_HEIGHT,
     };
 
-    let txs = distinct(RECOVERY_POOL);
+    let mut txs = distinct(RECOVERY_POOL + 1);
     let (verifier, peak) = delayed_verifier(&txs);
+    // Submitted at the reset, to time an admission while the pool recovers.
+    let fresh = txs.pop().expect("one more than the pool");
     // A Testnet that activates NU5 low, so one block resets today's pool and
     // hides the core's, as an upgrade does.
     let network = nu_activation_test_network();
@@ -1522,6 +1526,16 @@ async fn recover(mode: Mode, reannounce: bool) -> Recovery {
     harness
         .commit_block(blocks.next().expect("the chain reaches the reset"))
         .await;
+    let submitted = harness
+        .start_call(Request::Queue(vec![fresh.transaction.clone().into()]))
+        .await;
+    let fresh = tokio::spawn(async move {
+        let Ok(Response::Queued(mut answers)) = submitted.await else {
+            return None;
+        };
+        let receiver = answers.pop()?.ok()?;
+        matches!(receiver.await, Ok(Ok(()))).then(|| reset.elapsed())
+    });
     let (mut first, mut full) = (None, None);
     let deadline = reset + Duration::from_secs(60);
     // One announcement round at a time, in the background, so a slow answer
@@ -1529,7 +1543,10 @@ async fn recover(mode: Mode, reannounce: bool) -> Recovery {
     let mut announcing: Option<tokio::task::JoinHandle<()>> = None;
     while full.is_none() && time::Instant::now() < deadline {
         let ids = harness.ids().await;
-        let held = ids.len();
+        let held = txs
+            .iter()
+            .filter(|tx| ids.contains(&tx.transaction.id()))
+            .count();
         if reannounce && announcing.as_ref().is_none_or(|round| round.is_finished()) {
             let missing: Vec<Gossip> = txs
                 .iter()
@@ -1543,8 +1560,6 @@ async fn recover(mode: Mode, reannounce: bool) -> Recovery {
                 }));
             }
         }
-        let polled = std::time::Instant::now();
-        let _ = polled;
         if held > 0 && first.is_none() {
             first = Some(reset.elapsed());
         }
@@ -1556,6 +1571,7 @@ async fn recover(mode: Mode, reannounce: bool) -> Recovery {
     Recovery {
         first,
         full,
+        fresh: fresh.await.expect("the submission task does not panic"),
         peak: peak.load(Ordering::SeqCst),
     }
 }
@@ -1563,7 +1579,11 @@ async fn recover(mode: Mode, reannounce: bool) -> Recovery {
 /// The recovery gate: after a reset with 1,500 pooled transactions, the core
 /// shows a transaction again and holds every one no later than today's pool
 /// does with every transaction announced again. Without the announcements,
-/// the core alone gets every still-valid transaction back.
+/// the core alone gets every still-valid transaction back as soon. A new
+/// transaction submitted at the reset is admitted within a few verifications,
+/// because revalidation leaves part of the core's slots free. The core's own
+/// tests show a reorg recovers as this upgrade does, and today's pool resets
+/// the same way on both.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_core_recovers_from_a_reset_no_later_than_todays_pool() {
     let classic = recover(Mode::Classic, true).await;
@@ -1588,9 +1608,21 @@ async fn the_core_recovers_from_a_reset_no_later_than_todays_pool() {
         alone_full <= classic_full + slack,
         "the core alone: {core_alone:?}, today's {classic:?}"
     );
+    assert!(
+        core_alone.first.expect("shown") <= classic.first.expect("shown") + slack,
+        "first transaction, the core alone: {core_alone:?}, today's {classic:?}"
+    );
     for run in [&core, &core_alone] {
         assert!(
-            run.peak <= zakura_node_services::mempool::port::MAX_REVALIDATING,
+            run.fresh
+                .is_some_and(|admitted| admitted <= RECOVERY_VERIFY_DELAY * 3),
+            "a new transaction is admitted while the core recovers: {run:?}, today's {classic:?}"
+        );
+    }
+    for run in [&core, &core_alone] {
+        assert!(
+            // The share, plus the new transaction's own verification.
+            run.peak <= zakura_node_services::mempool::port::MAX_REVALIDATING + 1,
             "the core verifies again within its share: {run:?}"
         );
     }

@@ -1730,7 +1730,7 @@ fn update_latest_chain_channels(
     let old_best = if changes {
         chain_transition::old_best_chain(
             chain_tip_sender.transition_sender().is_subscribed(),
-            &non_finalized_state_sender.borrow(),
+            non_finalized_state_sender,
         )
     } else {
         None
@@ -1786,7 +1786,7 @@ fn update_channels_after_operator_change(
         let old_best = new_tip.and_then(|_| {
             chain_transition::old_best_chain(
                 chain_tip_sender.transition_sender().is_subscribed(),
-                &non_finalized_state_sender.borrow(),
+                non_finalized_state_sender,
             )
         });
         if let Some(backup_dir_path) = backup_dir_path {

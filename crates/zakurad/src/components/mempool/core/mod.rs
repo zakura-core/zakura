@@ -16,11 +16,7 @@
 //! The mempool handle other components take keeps its type, so nothing
 //! outside `start.rs` knows which pool runs.
 
-use std::{
-    collections::HashSet,
-    net::IpAddr,
-    sync::{atomic::AtomicBool, Arc},
-};
+use std::{collections::HashSet, net::IpAddr, sync::Arc};
 
 use tokio::{
     sync::{mpsc, watch},
@@ -146,7 +142,10 @@ pub(crate) fn start(
         chain_transitions,
         tx_verifier,
         chain_tip_change.network().clone(),
-        activation.current_flag(),
+        {
+            let currentness = activation.currentness();
+            Arc::new(move || currentness.is_current())
+        },
         misbehavior_sender,
         exempt,
         active_rx,
@@ -186,8 +185,8 @@ pub(crate) struct Assembled {
 }
 
 /// Builds the pool core and its connections. The core is on while `active`
-/// holds `true`, and the verifier starts cooldowns only while `current`
-/// holds `true`. [`start`] decides both as today's pool does.
+/// holds `true`, and the adapter starts cooldowns only while `current`
+/// answers `true`. [`start`] decides both as today's pool does.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble(
     config: &Config,
@@ -197,7 +196,7 @@ pub(crate) fn assemble(
     chain_transitions: &ChainTransitions,
     tx_verifier: TxVerifier,
     network: Network,
-    current: Arc<AtomicBool>,
+    current: Arc<dyn Fn() -> bool + Send + Sync>,
     misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
     exempt: Exempt,
     active: watch::Receiver<bool>,
@@ -211,7 +210,6 @@ pub(crate) fn assemble(
         read_state,
         config.max_transaction_bytes,
         network,
-        current,
     );
     let core = PoolCore::new(
         &core_config(config),
@@ -236,6 +234,7 @@ pub(crate) fn assemble(
         handle.clone(),
         Timeout::new(outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
         outbound,
+        current,
         adapter_read_state,
         expose_peer_addresses,
         misbehavior_sender,

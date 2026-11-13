@@ -76,6 +76,9 @@ struct Shared {
     peers: Outbound,
     /// The legacy peers in a transaction cooldown, keyed by IP address.
     cooldowns: PeerCooldowns,
+    /// Whether the node is current now. Today's pool starts a cooldown only
+    /// then, and asks when it handles the failure.
+    current: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Undecided transactions from each peer, counted from the reservation to
     /// the verdict.
     per_peer: std::sync::Mutex<HashMap<QueueSource, usize>>,
@@ -95,11 +98,14 @@ pub(crate) struct CoreMempool {
 
 impl CoreMempool {
     /// A service on `handle` that fetches through `outbound` and bans through
-    /// `misbehavior_sender`. It never charges a peer in `exempt`.
+    /// `misbehavior_sender`. It never charges a peer in `exempt`, and starts
+    /// a cooldown only while `current` says the node is current.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         handle: PoolHandle,
         outbound: Timeout<Outbound>,
         peers: Outbound,
+        current: Arc<dyn Fn() -> bool + Send + Sync>,
         read_state: ReadState,
         expose_peer_addresses: bool,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
@@ -111,6 +117,7 @@ impl CoreMempool {
                 outbound,
                 peers,
                 cooldowns: PeerCooldowns::default(),
+                current,
                 per_peer: std::sync::Mutex::new(HashMap::new()),
                 read_state: std::sync::Mutex::new(read_state),
                 expose_peer_addresses,
@@ -331,21 +338,9 @@ async fn queue(
     tokio::spawn(async move {
         // Today's download task has one deadline, `RATE_LIMIT_DELAY`, for the
         // fetch and the verification together, and its peer's slot is free
-        // once it ends. So does this. A body the core already holds stays
-        // under the core's own deadlines and node-wide slot after it.
-        let result = match tokio::time::timeout(
-            RATE_LIMIT_DELAY,
-            bring_in(&shared, reservation, item, from),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                metrics::counter!("mempool.failed.verify.tasks.total", "reason" => "timeout")
-                    .increment(1);
-                Err("timeout waiting for verification result".into())
-            }
-        };
+        // once it ends. So does this.
+        let deadline = tokio::time::Instant::now() + RATE_LIMIT_DELAY;
+        let result = bring_in(&shared, reservation, item, from, deadline).await;
         drop(slot);
         let _ = answer.send(result);
     });
@@ -433,13 +428,24 @@ fn first_stage_refusal(refused: Unreserved) -> Result<Receiver, BoxError> {
 
 /// Brings `item`'s body in under `reservation`, submits it, applies its
 /// charge to the legacy peer that served it, and returns today's
-/// second-stage answer.
+/// second-stage answer, all by `deadline`.
+///
+/// A fetch still out at the deadline is reported as failed, which frees
+/// the slot and reaches the change stream, as today's timeout does. A body
+/// the core already holds when the deadline passes stays under the core's
+/// own deadlines and node-wide slot, and its outcome reaches the change
+/// stream when the core decides it.
 async fn bring_in(
     shared: &Shared,
     reservation: Reservation,
     item: Gossip,
     from: Option<QueueSource>,
+    deadline: tokio::time::Instant,
 ) -> Result<(), BoxError> {
+    let timed_out = || -> BoxError {
+        metrics::counter!("mempool.failed.verify.tasks.total", "reason" => "timeout").increment(1);
+        "timeout waiting for verification result".into()
+    };
     let tx_id = item.id();
     // The body, and the legacy peer whose bytes it is, if any.
     let (tx, sender) = match item {
@@ -466,7 +472,10 @@ async fn bring_in(
                 .clone();
             let cancel = reservation.cancellation();
             let fetched = tokio::select! {
-                fetched = fetch_unless_mined(read_state, shared.outbound.clone(), tx_id, source) => fetched,
+                fetched = tokio::time::timeout_at(
+                    deadline,
+                    fetch_unless_mined(read_state, shared.outbound.clone(), tx_id, source),
+                ) => fetched,
                 () = cancel.cancelled() => {
                     // A block mined it while it was fetched. Dropping the
                     // reservation frees its slot, as today's pool cancels
@@ -479,6 +488,10 @@ async fn bring_in(
                     )
                     .into());
                 }
+            };
+            let Ok(fetched) = fetched else {
+                shared.handle.fetch_failed(reservation).await;
+                return Err(timed_out());
             };
             match fetched {
                 Ok((tx, served_by)) => (tx, served_by),
@@ -513,17 +526,21 @@ async fn bring_in(
         Some(QueueSource::Zakura(_)) => None,
         _ => sender.and_then(|addr| shared.supplier(addr)),
     };
-    let verdict = shared.handle.submit(reservation, tx).await;
+    let Ok(verdict) =
+        tokio::time::timeout_at(deadline, shared.handle.submit(reservation, tx)).await
+    else {
+        return Err(timed_out());
+    };
     if let (Verdict::Rejected(rejection), Some(peer)) = (&verdict, supplier) {
         match rejection.charge {
-            Charge::None => {}
-            Charge::Cooldown => start_peer_cooldown(
+            Charge::Cooldown if (shared.current)() => start_peer_cooldown(
                 &shared.cooldowns,
                 &shared.peers,
                 peer,
                 tx_id,
                 shared.expose_peer_addresses,
             ),
+            Charge::None | Charge::Cooldown => {}
             Charge::Ban => {
                 let _ = shared
                     .misbehavior_sender
@@ -774,8 +791,13 @@ mod tests {
     }
 
     /// The adapter on `handle`, with a network that is never ready, an
-    /// empty chain and no exempt peers.
+    /// empty chain, no exempt peers, and a node that is current.
     fn adapter_on(handle: PoolHandle) -> CoreMempool {
+        adapter_when(handle, true)
+    }
+
+    /// [`adapter_on`], with a node whose currentness is `current`.
+    fn adapter_when(handle: PoolHandle, current: bool) -> CoreMempool {
         let outbound = Timeout::new(
             BoxCloneSyncService::new(NeverReady),
             TRANSACTION_DOWNLOAD_TIMEOUT,
@@ -784,6 +806,7 @@ mod tests {
             handle,
             outbound,
             BoxCloneSyncService::new(NeverReady),
+            Arc::new(move || current),
             chain_holding(None),
             false,
             mpsc::channel(1).0,
@@ -797,8 +820,9 @@ mod tests {
     }
 
     /// A fetch from a network that never becomes ready ends at today's
-    /// whole-task deadline: its reservation is dropped, which frees the
-    /// core's slot, and its peer's slot is free again.
+    /// whole-task deadline. It is reported as failed, which frees the core's
+    /// slot and reaches the change stream as today's timeout does, and its
+    /// peer's slot is free again.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_fetch_from_an_unready_network_ends_at_the_task_deadline() {
         use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
@@ -833,10 +857,10 @@ mod tests {
             RATE_LIMIT_DELAY,
             "today's whole-task deadline"
         );
-        assert!(matches!(
-            inbox.next().await,
-            Some(PoolCommand::Released(ReservationId(1)))
-        ));
+        let Some(PoolCommand::FetchFailed(reservation)) = inbox.next().await else {
+            panic!("the timed-out fetch is reported as failed");
+        };
+        assert_eq!(reservation.accept(), ReservationId(1));
         assert!(core.shared.per_peer.lock().expect("no panics").is_empty());
     }
 
@@ -915,6 +939,7 @@ mod tests {
             handle,
             outbound,
             BoxCloneSyncService::new(NeverReady),
+            Arc::new(|| true),
             chain_holding(None),
             false,
             mpsc::channel(1).0,
@@ -961,5 +986,64 @@ mod tests {
             .expect("the push is answered")
             .expect_err("a cooling peer's body is refused");
         assert!(error.to_string().contains("cooldown"), "{error}");
+    }
+
+    /// A cooldown charge cools the peer that pushed the body only while the
+    /// node is current, asked when the verdict arrives, as today's pool asks
+    /// when it handles the failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cooldown_charge_cools_its_peer_only_while_the_node_is_current() {
+        use zakura_node_services::mempool::port::{
+            pool_port, PoolCommand, Rejection, RejectionScope, ReservationId,
+        };
+
+        for current in [true, false] {
+            let (handle, mut inbox) = pool_port();
+            let core = adapter_when(handle, current);
+            let body = Network::Mainnet
+                .unmined_transactions_in_blocks(1..=1)
+                .next()
+                .expect("a vector transaction")
+                .transaction;
+            let queued = tokio::spawn(queue(core.shared.clone(), Gossip::Tx(body), Some(peer())));
+            let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+                panic!("the push reserves first");
+            };
+            let _ = reply.send(Ok(inbox.grant(
+                ReservationId(1),
+                tx_id,
+                false,
+                true,
+                Default::default(),
+            )));
+            let receiver = queued
+                .await
+                .expect("the task does not panic")
+                .expect("the push passes the first stage");
+            let Some(PoolCommand::Submit {
+                reservation, reply, ..
+            }) = inbox.next().await
+            else {
+                panic!("the body is submitted");
+            };
+            let _accepted = reservation.accept();
+            let _ = reply.send(Verdict::Rejected(Rejection {
+                scope: RejectionScope::ExactTip,
+                charge: Charge::Cooldown,
+                detail: Arc::new(std::io::Error::other("invalid")),
+            }));
+            let _ = receiver.await.expect("the push is answered");
+
+            let QueueSource::LegacySocket(addr) = peer() else {
+                unreachable!("the test peer is a legacy peer");
+            };
+            assert_eq!(
+                core.shared
+                    .cooldowns
+                    .is_cooling_down(addr.ip(), Instant::now()),
+                current,
+                "cooling down only while current"
+            );
+        }
     }
 }

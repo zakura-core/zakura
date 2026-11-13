@@ -6,34 +6,56 @@
 //! more than a reorg's depth behind. The gap between the two keeps it from
 //! flapping. Test networks never turn it off.
 
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::time::Duration;
 
 use tokio::sync::watch;
-use zakura_chain::{block::Height, chain_sync_status::ChainSyncStatus, chain_tip::ChainTip};
+use zakura_chain::{
+    block::Height, chain_sync_status::ChainSyncStatus, chain_tip::ChainTip, parameters::Network,
+};
 use zakura_state::{self as zs, ChainTipChange, LatestChainTip};
 
 use crate::{components::sync::SyncStatus, BoxError};
 
-use super::super::{is_estimated_close_to_network_tip, Config};
+use super::super::{Config, MAX_ESTIMATED_DISTANCE_TO_ENABLE};
+
+/// Whether the node's validation context is current: the syncer is close to
+/// the tip, and the tip's clock estimate puts it close to the network tip.
+/// Today's pool asks this to turn on and before it starts a cooldown. It is
+/// read fresh each time, and cheap to clone.
+#[derive(Clone)]
+pub(crate) struct Currentness {
+    sync_status: SyncStatus,
+    latest_chain_tip: LatestChainTip,
+    network: Network,
+}
+
+impl Currentness {
+    /// Whether the node is current now.
+    pub fn is_current(&self) -> bool {
+        self.sync_status.is_close_to_tip() && self.is_estimated_close_to_network_tip()
+    }
+
+    /// Today's `is_estimated_close_to_network_tip`, read from the latest
+    /// tip, which is what the chain tip change reads too.
+    fn is_estimated_close_to_network_tip(&self) -> bool {
+        if self.network.is_a_test_network() {
+            return self.latest_chain_tip.best_tip_height().is_some();
+        }
+        self.latest_chain_tip
+            .estimate_distance_to_network_chain_tip(&self.network)
+            .is_some_and(|(distance, _height)| distance <= MAX_ESTIMATED_DISTANCE_TO_ENABLE)
+    }
+}
 
 /// How often the decision is checked when the tip does not change.
 const CHECK_INTERVAL: Duration = Duration::from_millis(200);
 
 /// What the decision reads.
 pub(super) struct Activation {
-    sync_status: SyncStatus,
     latest_chain_tip: LatestChainTip,
     chain_tip_change: ChainTipChange,
     debug_enable_at_height: Option<Height>,
-    /// Whether the node's validation context is current enough to start
-    /// cooldowns, which the verifier reads.
-    current: Arc<AtomicBool>,
+    currentness: Currentness,
 }
 
 impl Activation {
@@ -44,27 +66,30 @@ impl Activation {
         latest_chain_tip: LatestChainTip,
         chain_tip_change: ChainTipChange,
     ) -> Self {
-        Self {
+        let currentness = Currentness {
             sync_status,
+            latest_chain_tip: latest_chain_tip.clone(),
+            network: chain_tip_change.network().clone(),
+        };
+        Self {
             latest_chain_tip,
             chain_tip_change,
             debug_enable_at_height: config.debug_enable_at_height.map(Height),
-            current: Arc::default(),
+            currentness,
         }
     }
 
-    /// The flag that says whether the node is current enough to start
-    /// cooldowns. Today's pool starts them only then.
-    pub fn current_flag(&self) -> Arc<AtomicBool> {
-        self.current.clone()
+    /// What the adapter asks before it starts a cooldown, as today's pool
+    /// does when it handles a failure.
+    pub fn currentness(&self) -> Currentness {
+        self.currentness.clone()
     }
 
     /// Sends the decision to `active` whenever it changes, until the core is
     /// gone.
     pub async fn run(mut self, active: watch::Sender<bool>) -> Result<(), BoxError> {
         loop {
-            let current = self.is_current_enough();
-            self.current.store(current, Ordering::Relaxed);
+            let current = self.currentness.is_current();
             let on = *active.borrow();
             let next = self.next(on, current);
             if next != on {
@@ -98,12 +123,6 @@ impl Activation {
                 .best_tip_height()
                 .is_some_and(|height| height >= enable_at)
         })
-    }
-
-    /// Whether sync throughput and the tip estimate permit the pool.
-    fn is_current_enough(&self) -> bool {
-        self.sync_status.is_close_to_tip()
-            && is_estimated_close_to_network_tip(&self.chain_tip_change)
     }
 
     /// Whether the node has fallen far enough behind to turn the pool off.

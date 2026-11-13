@@ -15,10 +15,7 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -59,9 +56,6 @@ pub(crate) struct ConsensusVerifier {
     read_state: Arc<Mutex<ReadState>>,
     max_transaction_bytes: u64,
     network: Network,
-    /// Whether the node is current enough to start cooldowns. Today's pool
-    /// starts them only then.
-    current: Arc<AtomicBool>,
 }
 
 impl ConsensusVerifier {
@@ -72,14 +66,12 @@ impl ConsensusVerifier {
         read_state: ReadState,
         max_transaction_bytes: u64,
         network: Network,
-        current: Arc<AtomicBool>,
     ) -> Self {
         Self {
             tx_verifier,
             read_state: Arc::new(Mutex::new(read_state)),
             max_transaction_bytes,
             network,
-            current,
         }
     }
 
@@ -182,7 +174,6 @@ impl ConsensusVerifier {
                 } else if failure_bans(&error, transaction_version) {
                     Charge::Ban
                 } else if !after_reset
-                    && self.current.load(Ordering::Relaxed)
                     && failure_cools_down(
                         &error,
                         transaction_version,

@@ -146,10 +146,11 @@ pub(super) fn checkpoint_transition(
 }
 
 /// The old best chain to diff against, taken only when a consumer will need
-/// the transition. Taking it is an `Arc` clone.
+/// the transition. Without one, the published state is not even borrowed.
+/// Taking it is an `Arc` clone.
 pub(super) fn old_best_chain(
     subscribed: bool,
-    published: &crate::service::non_finalized_state::NonFinalizedState,
+    published: &tokio::sync::watch::Sender<crate::service::non_finalized_state::NonFinalizedState>,
 ) -> Option<Option<Arc<Chain>>> {
-    subscribed.then(|| published.best_chain().cloned())
+    subscribed.then(|| published.borrow().best_chain().cloned())
 }

@@ -12,11 +12,7 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::{
-    collections::HashSet,
-    sync::{atomic::AtomicBool, Arc},
-    time::Duration,
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
 use tokio::{
@@ -230,7 +226,7 @@ async fn pool(config: Config, peers: Peers, mode: Mode) -> Harness {
                 &transitions,
                 tx_verifier,
                 network.clone(),
-                Arc::new(AtomicBool::new(true)),
+                Arc::new(|| true),
                 tokio::sync::mpsc::channel(1).0,
                 Exempt::default(),
                 active_rx,
@@ -1139,7 +1135,7 @@ async fn one_peer_holds_at_most_five_fetches(mode: Mode) {
 /// (`sprout_deposits_start_cooldowns` and the peer cooldown tests). This
 /// harness cannot show it for today's pool: that pool starts cooldowns only
 /// while its tip is recent, and the harness's tip is the genesis block. The
-/// core's verifier is told it is current here.
+/// core's adapter is told it is current here.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cooldown_failure_silences_the_peer_that_sent_it() {
     let mut harness = active_pool(Mode::Core).await;

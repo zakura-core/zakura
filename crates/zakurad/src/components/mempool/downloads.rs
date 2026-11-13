@@ -877,7 +877,9 @@ where
         state: &mut ZS,
         txid: UnminedTxId,
     ) -> Result<(), TransactionDownloadVerifyError> {
-        transaction_in_best_chain(state.clone(), txid).await
+        // A `&mut` service is a service, so today's pool keeps its borrow and
+        // clones nothing.
+        transaction_in_best_chain(&mut *state, txid).await
     }
 }
 

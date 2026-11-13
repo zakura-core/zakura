@@ -297,12 +297,18 @@ class TraceFollower:
 
     The node never rotates its trace files, so this also empties any table that has
     grown past `table_cap_bytes`. That is safe while the node runs: it opens the files
-    for append, so its next row lands at the start of the emptied file.
+    for append, so its next row lands at the start of the emptied file. A cap of zero
+    leaves every table alone, for a directory whose files something else needs whole.
+
+    `trim_failure` is the error that kept the last `poll` from emptying a table past
+    the cap, or `None` when every table is under it. While it is set the tables are
+    not bounded, whatever was read.
     """
 
     def __init__(self, trace_dir, table_cap_bytes):
         self.trace_dir = trace_dir
         self.table_cap_bytes = table_cap_bytes
+        self.trim_failure = None
         self._followers = {
             table: FileFollower(os.path.join(trace_dir, table + ".jsonl"), lookback_bytes=2 * 1024 * 1024)
             for table in TRACE_TABLES
@@ -331,14 +337,28 @@ class TraceFollower:
         return self._stages.finished()
 
     def _cap_tables(self):
+        """Empty every table past the cap, and record in `trim_failure` the first that could not be."""
+        self.trim_failure = None
+        if not self.table_cap_bytes:
+            return
         try:
             names = os.listdir(self.trace_dir)
-        except OSError:
+        except FileNotFoundError:
+            # The node has not written a trace file yet: there is nothing to empty.
+            return
+        except OSError as error:
+            self.trim_failure = error
             return
         for name in names:
+            if not name.endswith(".jsonl"):
+                continue
             path = os.path.join(self.trace_dir, name)
             try:
-                if name.endswith(".jsonl") and os.path.getsize(path) > self.table_cap_bytes:
+                if os.path.getsize(path) > self.table_cap_bytes:
                     os.truncate(path, 0)
-            except OSError:
+            except FileNotFoundError:
+                # Removed since the directory was listed.
                 continue
+            except OSError as error:
+                # Keep going: one table that cannot be emptied must not stop the others.
+                self.trim_failure = self.trim_failure or error

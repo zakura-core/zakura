@@ -427,6 +427,7 @@ class Profiler:
         self._jobs = collections.deque()
         self._job_ready = threading.Condition()
         self._cpu_mark = sum(os.times()[:4])
+        self._trace_checked_at = None
 
     def fail(self, summary, detail=""):
         """Record a failure: `summary` is shown on the public page, `detail` goes only to the journal."""
@@ -552,14 +553,31 @@ class Profiler:
             except OSError as error:
                 self.fail(f"storing the profile failed ({type(error).__name__})", str(error))
 
+    def trace_loop(self):
+        """Read and cap trace files even when CPU sampling cannot produce a window."""
+        if self.traces is None:
+            return
+        while not self._stop.is_set():
+            try:
+                self.store.add_block_stages(self.traces.poll())
+                untrimmed = self.traces.trim_failure
+                if untrimmed is None:
+                    self._trace_checked_at = time.monotonic()
+                else:
+                    # The poll read the files but left one over the cap: not ready.
+                    self._trace_checked_at = None
+                    self.fail(f"trimming trace files failed ({type(untrimmed).__name__})", str(untrimmed))
+            except Exception as error:  # noqa: BLE001 - keep retention alive after a bad row or failed write
+                self._trace_checked_at = None
+                self.fail(f"following trace files failed ({type(error).__name__})", str(error))
+            self._stop.wait(5)
+
     def process_window(self, job):
         # The block announced at the very end of the window reaches the log a moment
         # later; wait for it so its samples are tagged.
         self._stop.wait(max(0.0, job["end"] + BLOCK_TAIL_SECONDS + 0.5 - time.time()))
         if self.log is not None:
             self.store.add_blocks(blocks.announcements(self.log.read_new_lines()))
-        if self.traces is not None:
-            self.store.add_block_stages(self.traces.poll())
         block_times = self.store.block_times(
             job["start"] - BLOCK_TAIL_SECONDS, job["end"] + BLOCK_LEAD_SECONDS
         )
@@ -653,6 +671,14 @@ class Profiler:
             "retention_days": HOUR_RETENTION_SECONDS // 86400,
             "block_window_ms": [round(BLOCK_LEAD_SECONDS * 1000), round(BLOCK_TAIL_SECONDS * 1000)],
             "stage_timeline": self.traces is not None,
+            "trace_retention": (
+                {
+                    "directory": self.args.trace_dir,
+                    "cap_mb": self.args.trace_table_cap_mb,
+                    "ready": self._trace_checked_at is not None and time.monotonic() - self._trace_checked_at < 30,
+                }
+                if self.traces is not None else None
+            ),
         }
 
 
@@ -859,7 +885,7 @@ def parse_args(argv):
     )
     parser.add_argument(
         "--trace-table-cap-mb", type=int, default=DEFAULT_TRACE_TABLE_CAP_MB,
-        help="empty any trace table in --trace-dir that grows past this size",
+        help="empty any trace table in --trace-dir that grows past this size; 0 never empties one",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8097)
@@ -886,6 +912,7 @@ def main(argv=None):
     workers = [
         threading.Thread(target=profiler.record_loop, name="record", daemon=True),
         threading.Thread(target=profiler.process_loop, name="process", daemon=True),
+        threading.Thread(target=profiler.trace_loop, name="traces", daemon=True),
     ]
     for worker in workers:
         worker.start()

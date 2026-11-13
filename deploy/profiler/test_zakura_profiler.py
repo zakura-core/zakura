@@ -11,6 +11,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -381,6 +382,114 @@ class PerfScriptTests(unittest.TestCase):
         self.assertEqual((status["state"], status["error"]), ("error", "perf record could not start"))
 
 
+class TraceRetentionTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        args = argparse.Namespace(
+            node_name="n", service="zakurad", window=60, log_file="", perf="perf",
+            scratch_dir=str(self.directory / "scratch"), trace_dir=str(self.directory / "traces"),
+            trace_table_cap_mb=1,
+        )
+        Path(args.trace_dir).mkdir()
+        self.profiler = profiler_module.Profiler(args, profiler_module.Store(self.directory / "store"))
+        self.table = Path(args.trace_dir) / "discovery.jsonl"
+        self.table.write_bytes(b"x" * (1024 * 1024 + 1))
+
+    def test_retention_keeps_running_when_perf_cannot_start(self):
+        failed = threading.Event()
+        followed = threading.Event()
+        real_fail = self.profiler.fail
+        real_add = self.profiler.store.add_block_stages
+
+        def report_failure(*arguments):
+            real_fail(*arguments)
+            failed.set()
+
+        def remember_stages(records):
+            real_add(records)
+            followed.set()
+
+        with (
+            patch.object(self.profiler, "main_pid", return_value=123),
+            patch.object(self.profiler, "node_build", return_value="test"),
+            patch.object(profiler_module.subprocess, "Popen", side_effect=OSError("perf is unavailable")),
+            patch.object(self.profiler, "fail", side_effect=report_failure),
+            patch.object(self.profiler.store, "add_block_stages", side_effect=remember_stages),
+        ):
+            recorder = threading.Thread(target=self.profiler.record_loop)
+            follower = threading.Thread(target=self.profiler.trace_loop)
+            recorder.start()
+            try:
+                self.assertTrue(failed.wait(2), "CPU sampling must fail before retention starts")
+                self.assertFalse(self.profiler.status()["trace_retention"]["ready"])
+                follower.start()
+                self.assertTrue(followed.wait(2), "trace following must run without a CPU window")
+            finally:
+                self.profiler.stop()
+                recorder.join(timeout=2)
+                if follower.ident is not None:
+                    follower.join(timeout=2)
+        self.assertFalse(recorder.is_alive())
+        self.assertFalse(follower.is_alive())
+        self.assertEqual(self.table.stat().st_size, 0)
+        self.assertEqual(len(self.profiler._jobs), 0)
+        self.assertTrue(self.profiler.status()["trace_retention"]["ready"])
+
+    def test_a_stale_retention_worker_is_not_ready(self):
+        self.profiler._trace_checked_at = time.monotonic() - 31
+        self.assertFalse(self.profiler.status()["trace_retention"]["ready"])
+
+    def test_a_failed_stage_write_is_reported_after_the_trace_file_is_capped(self):
+        failed = threading.Event()
+        with (
+            patch.object(self.profiler.store, "add_block_stages", side_effect=OSError("disk write failed")),
+            patch.object(self.profiler, "fail", side_effect=lambda *_: failed.set()),
+        ):
+            follower = threading.Thread(target=self.profiler.trace_loop)
+            follower.start()
+            try:
+                self.assertTrue(failed.wait(2))
+            finally:
+                self.profiler.stop()
+                follower.join(timeout=2)
+        self.assertFalse(follower.is_alive())
+        self.assertEqual(self.table.stat().st_size, 0)
+        self.assertFalse(self.profiler.status()["trace_retention"]["ready"])
+
+    def test_a_table_that_cannot_be_emptied_is_reported_and_not_ready(self):
+        failed = threading.Event()
+        real_fail = self.profiler.fail
+
+        def report_failure(*arguments):
+            real_fail(*arguments)
+            failed.set()
+
+        size = self.table.stat().st_size
+        with (
+            patch.object(blocks.os, "truncate", side_effect=PermissionError("the table is read-only")),
+            patch.object(self.profiler, "fail", side_effect=report_failure),
+        ):
+            follower = threading.Thread(target=self.profiler.trace_loop)
+            follower.start()
+            try:
+                self.assertTrue(failed.wait(2), "a table left over the cap must be reported")
+            finally:
+                self.profiler.stop()
+                follower.join(timeout=2)
+        self.assertFalse(follower.is_alive())
+        self.assertEqual(self.table.stat().st_size, size)
+        status = self.profiler.status()
+        self.assertFalse(status["trace_retention"]["ready"])
+        self.assertEqual(status["error"], "trimming trace files failed (PermissionError)")
+
+    def test_an_unconfigured_trace_reader_exits_without_claiming_readiness(self):
+        self.profiler.traces = None
+        self.profiler.trace_loop()
+        self.assertIsNone(self.profiler.status()["trace_retention"])
+
+
 class LogFollowingTests(unittest.TestCase):
     LINE = (
         b'2026-11-12T23:00:06.158820Z  INFO zakurad::components::sync::gossip: sending block announcement '
@@ -590,9 +699,41 @@ class TraceFollowingTests(unittest.TestCase):
         self.append("chain_tip", tip_row(9_000_000, height=51, block_hash="cd" * 32))
         self.assertEqual([record["height"] for record in follower.poll()], list(range(12)) + [50])
 
+    def test_a_cap_of_zero_never_empties_a_table(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=0)
+        self.append("discovery", *[trace_row("peer_seen", index, peer="p" * 40) for index in range(40)])
+        size = (self.directory / "discovery.jsonl").stat().st_size
+        follower.poll()
+        self.assertEqual((self.directory / "discovery.jsonl").stat().st_size, size)
+
     def test_a_missing_trace_directory_yields_nothing(self):
         follower = blocks.TraceFollower(str(self.directory / "absent"), table_cap_bytes=2000)
         self.assertEqual(follower.poll(), [])
+        self.assertIsNone(follower.trim_failure)
+
+    def test_a_table_that_cannot_be_emptied_is_a_failure_until_it_is_emptied(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
+        rows = [trace_row("peer_seen", index, peer="p" * 40) for index in range(40)]
+        self.append("discovery", *rows)
+        self.append("block_sync", *rows)
+        stuck = str(self.directory / "discovery.jsonl")
+        real_truncate = os.truncate
+
+        def refuse_one_table(path, length):
+            if path == stuck:
+                raise PermissionError("the table is read-only")
+            real_truncate(path, length)
+
+        with patch.object(blocks.os, "truncate", side_effect=refuse_one_table):
+            follower.poll()
+        self.assertIsInstance(follower.trim_failure, PermissionError)
+        self.assertGreater(os.path.getsize(stuck), 2000)
+        # The table that could be emptied was, despite the one that could not.
+        self.assertEqual((self.directory / "block_sync.jsonl").stat().st_size, 0)
+
+        follower.poll()
+        self.assertIsNone(follower.trim_failure)
+        self.assertEqual(os.path.getsize(stuck), 0)
 
 
 class ApiTests(unittest.TestCase):

@@ -567,7 +567,7 @@ async fn unconditional_peer_is_redialed_when_its_connection_closes() {
         PeerRegistry::default(),
         UnconditionalPeerDial::Fail,
     );
-    tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+    tokio::time::sleep(constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY * 3).await;
     let failed_dials = dialer.dial_times().len();
 
     // It comes back, and its connection stays open long enough to be healthy.
@@ -704,11 +704,12 @@ async fn unconditional_peer_redials_back_off() {
         let config: Config = toml::from_str("unconditional_peers = ['192.0.2.1']").unwrap();
         let dialer = spawn_unconditional_peer_dialer(config, PeerRegistry::default(), dial);
 
-        tokio::time::sleep(Duration::from_secs(10 * 60)).await;
+        // Long enough for the delay to reach the maximum, and for two dials at it.
+        tokio::time::sleep(constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY * 3).await;
 
         let dial_times = dialer.dial_times();
         assert!(
-            dial_times.len() >= 10,
+            dial_times.len() >= 12,
             "{dial:?}: the peer is still dialed at the maximum delay: {dial_times:?}",
         );
 

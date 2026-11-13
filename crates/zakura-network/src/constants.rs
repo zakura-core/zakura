@@ -278,7 +278,7 @@ pub const UNCONDITIONAL_PEER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 pub const MIN_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(1);
 
 /// The longest delay between two dials to the same unconditional peer, before jitter.
-pub const MAX_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(60);
+pub const MAX_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(10 * 60);
 
 /// The longest random delay that Zakura adds before it dials an unconditional peer
 /// again.

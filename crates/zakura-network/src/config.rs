@@ -383,9 +383,9 @@ pub struct Config {
     /// no connection to that peer is open, in either direction. An entry without a port
     /// is dialed on the network's default port. A CIDR range is only dialed when it
     /// covers a single address, such as `"192.0.2.1/32"`. A dial to a peer that accepts
-    /// no connections fails quietly and is retried about once a minute. Zakura keeps at
-    /// most `max_connections_per_ip` connections to one IP, so it does not dial further
-    /// entries on that IP.
+    /// no connections fails quietly, and each failure doubles the delay before the next
+    /// dial, up to ten minutes. Zakura keeps at most `max_connections_per_ip` connections
+    /// to one IP, so it does not dial further entries on that IP.
     ///
     /// Each dialed address adds one outbound and one inbound connection slot on top of the
     /// connection limits. Zakura dials each address on an outbound slot of its own, so a

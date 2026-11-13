@@ -1,3 +1,6 @@
 #![no_main]
 
-zakura_sim_fuzz::sim_target!(zakura_sim::harness::header_sync::HeaderWire);
+zakura_sim_fuzz::sim_target!(
+    zakura_sim::harness::header_sync::HeaderWire,
+    zakura_sim::explore::state::collector
+);

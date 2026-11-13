@@ -135,6 +135,13 @@ the section before each input and reads each nonzero counter as a feature,
 so an input that reaches a new state through covered code still joins the
 corpus. The section works on Linux only.
 
+`header_sync_storage`, `header_sync_wire`, `sync_storage`, `sync_wire` and
+`discovery_wire` pass `zakura_sim::explore::state::collector`, which reads
+the observations, obligations and run end that their harnesses log. The
+feedback comparison (fuzz-14, `qa/mutation-pilot/README.md`) runs planted
+cases on them with feedback on and off. Unset, `ZAKURA_SIM_FEEDBACK` means
+`on`, so their other campaigns read the collector's features too.
+
 `ZAKURA_SIM_FEEDBACK=off` moves the collector's writes to counters libFuzzer
 doesn't read. The collector still runs, so `on` and `off` runs take the same
 code path and differ only in what libFuzzer reads. Each target with a

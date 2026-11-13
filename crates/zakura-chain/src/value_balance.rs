@@ -7,10 +7,8 @@ use core::fmt;
 #[cfg(any(test, feature = "proptest-impl"))]
 use std::{borrow::Borrow, collections::HashMap};
 
-use crate::amount::MAX_MONEY;
-
 #[cfg(any(test, feature = "proptest-impl"))]
-use crate::{transaction::Transaction, transparent};
+use crate::{amount::MAX_MONEY, transaction::Transaction, transparent};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;

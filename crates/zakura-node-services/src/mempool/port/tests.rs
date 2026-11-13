@@ -2759,6 +2759,8 @@ struct Run {
     /// Output waits that have had no answer and were not cancelled, with
     /// the outpoint each one asked for.
     output_waits: Vec<(WaiterId, OutPoint)>,
+    /// Jobs the model cancelled. Their outcomes still arrive, late.
+    cancelled: Vec<JobId>,
 }
 
 impl Run {
@@ -2766,7 +2768,10 @@ impl Run {
         for effect in step.effects {
             match effect {
                 Effect::Start { job, .. } => self.jobs.push(job),
-                Effect::Cancel(job) => self.jobs.retain(|running| *running != job),
+                Effect::Cancel(job) => {
+                    self.jobs.retain(|running| *running != job);
+                    self.cancelled.push(job);
+                }
                 Effect::Verdict { waiter, .. } => self.verdicts.push(waiter),
                 // An output wait ends once: with its output, or because the
                 // pool turned off. An answer for a wait that is not out is
@@ -3008,6 +3013,17 @@ fn a_random_run_with_small_limits_always_drains() {
             "seed {seed}: a reservation is remembered"
         );
         assert!(run.jobs.is_empty(), "seed {seed}: a job never finished");
+        // The outcomes of the jobs that were cancelled along the way arrive
+        // now, late, with no tick after them. Each is ignored, and none may
+        // leave anything waiting to be started.
+        for job in std::mem::take(&mut run.cancelled) {
+            let read = stable(generation);
+            run.record(model.outcome(job, Outcome::Pass, read, read, now));
+        }
+        assert!(
+            run.jobs.is_empty() && model.hidden().is_empty() && model.slots_in_use() == 0,
+            "seed {seed}: a late outcome left work behind"
+        );
         // Settling is not allowed to mean throwing things away.
         if nothing_should_leave {
             let visible = model.visible();
@@ -3734,4 +3750,135 @@ fn after_a_reorg_a_passing_verifier_brings_the_whole_pool_back() {
     assert_eq!(model.visible(), before);
     assert!(model.hidden().is_empty());
     model.assert_invariants();
+}
+
+// Cases from the tenth review.
+
+#[test]
+fn a_late_outcome_still_starts_the_revalidation_its_timeout_made_room_for() {
+    // One slot.
+    let mut model = new_model().with_limits(1, 5, 1);
+    admit(&mut model, tx(1), 1, 0);
+    // A new transaction takes the slot, and then a reorg hides the pooled
+    // one. Its check has to wait for the slot.
+    let (waiter, job) = bring_in(&mut model, tx(2), legacy(2));
+    let step = model.transition(reorg(1, 100), secs(1));
+    assert!(step.started().is_empty());
+
+    // The new transaction's outcome arrives after its deadline. Nothing
+    // else is coming: no tick, no other input.
+    let step = model.outcome(job, Outcome::Pass, stable(1), stable(1), T_VERIFY + secs(5));
+    assert_eq!(
+        step.verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
+    );
+    // The slot it freed goes to the hidden transaction at once.
+    assert_eq!(step.started().len(), 1);
+}
+
+#[test]
+fn a_reservation_sees_the_deadlines_that_are_due_whether_or_not_a_tick_came_first() {
+    let late = T_VERIFY + secs(1);
+    // With a tick first.
+    let mut ticked = new_model();
+    let (waiter, _) = bring_in(&mut ticked, tx(1), legacy(1));
+    assert!(ticked.tick(late).verdict(waiter).is_some());
+    let with_tick = ticked.reserve(id(1), peer(2), Intent::Fetch, late).is_ok();
+
+    // Without one. The reservation is the first input to see the time.
+    let mut direct = new_model();
+    let (waiter, _) = bring_in(&mut direct, tx(1), legacy(1));
+    let without_tick = direct.reserve(id(1), peer(2), Intent::Fetch, late).is_ok();
+    assert!(with_tick && without_tick);
+    // The earlier submission's verdict is not lost. It comes with the next
+    // step.
+    assert_eq!(
+        direct.tick(late).verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
+    );
+}
+
+#[test]
+fn the_deadline_that_was_due_first_decides_however_late_the_core_gets_to_it() {
+    let parked_at_zero = |model: &mut PoolModel| {
+        let (waiter, job) = bring_in(model, child_of(2, 1), legacy(1));
+        model.outcome(job, missing(1), stable(0), stable(0), secs(0));
+        waiter
+    };
+    let unresolved_parent = Some(rejected(RejectionScope::ExactTip, Charge::None));
+
+    // A tick when the wait for the parent ends.
+    let mut prompt = new_model();
+    let waiter = parked_at_zero(&mut prompt);
+    assert_eq!(prompt.tick(T_PARK).verdict(waiter), unresolved_parent);
+
+    // One tick, after the slot's limit has passed as well. The wait for the
+    // parent ended first, so it still decides, and the answer is the same.
+    let mut late = new_model();
+    let waiter = parked_at_zero(&mut late);
+    let after_both = MAX_UNDECIDED + secs(1);
+    assert_eq!(late.tick(after_both).verdict(waiter), unresolved_parent);
+    assert_eq!(
+        late.reserve(id(2), peer(3), Intent::Fetch, after_both),
+        Err(ModelUnreserved::Rejected(RejectionScope::ExactTip))
+    );
+}
+
+#[test]
+fn a_second_failure_while_a_peer_is_cooling_down_does_not_extend_the_cooldown() {
+    let mut model = new_model();
+    let (_, first) = bring_in(&mut model, tx(1), legacy(1));
+    let (_, second) = bring_in(&mut model, tx(2), legacy(1));
+    let cooldown = Outcome::Fail {
+        scope: RejectionScope::ExactTip,
+        charge: Charge::Cooldown,
+    };
+    model.outcome(first, cooldown.clone(), stable(0), stable(0), secs(1));
+    model.outcome(second, cooldown, stable(0), stable(0), secs(59));
+
+    // The cooldown ends when the first one said, as today.
+    let ends = secs(1) + COOLDOWN;
+    assert!(model.cooling(&legacy(1), ends - secs(1)));
+    assert!(!model.cooling(&legacy(1), ends));
+}
+
+#[test]
+fn a_late_outcome_that_brings_a_retry_due_starts_it() {
+    let mut model = new_model();
+    admit(&mut model, tx(1), 1, 0);
+    let step = model.transition(reorg(1, 100), secs(0));
+    let job = the_job(&step);
+    // The check runs past its deadline. It is cancelled and a retry is set.
+    let step = model.tick(T_VERIFY);
+    assert!(step.effects.contains(&Effect::Cancel(job)));
+
+    // The cancelled job's outcome arrives just as the retry falls due, and
+    // it is the last input. It is ignored, and the retry starts with it.
+    let step = model.outcome(
+        job,
+        Outcome::Pass,
+        stable(1),
+        stable(1),
+        T_VERIFY + REVALIDATE_RETRY,
+    );
+    assert!(step.changes.is_empty());
+    assert_eq!(step.started().len(), 1);
+}
+
+#[test]
+fn an_older_time_from_a_caller_does_not_turn_the_models_clock_back() {
+    let mut model = new_model();
+    let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
+    // Another input moves time far past this job's deadline.
+    let late = MAX_UNDECIDED + secs(1);
+    assert!(model.reserve(id(2), peer(2), Intent::Fetch, late).is_ok());
+
+    // The job's outcome is delivered by a caller whose time is stale. The
+    // deadlines are judged on the model's clock, and the pass is too late.
+    let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(1));
+    assert_eq!(
+        step.verdict(waiter),
+        Some(ModelVerdict::LocalFault(LocalFault::VerifyTimeout))
+    );
+    assert!(model.visible().is_empty());
 }

@@ -647,6 +647,12 @@ impl PoolModel {
     // Inputs.
 
     /// [`super::PoolHandle::reserve`].
+    ///
+    /// Like every input, this first applies the deadlines that are due, so
+    /// its answer does not depend on whether a tick came just before it.
+    /// It returns no step. What those deadlines caused is returned with the
+    /// next step. The same holds for [`Self::await_output`],
+    /// [`Self::violation`] and [`Self::activate`].
     pub fn reserve(
         &mut self,
         tx_id: UnminedTxId,
@@ -654,10 +660,14 @@ impl PoolModel {
         intent: Intent,
         now: ModelTime,
     ) -> Result<ModelReservation, ModelUnreserved> {
-        self.advance(now);
+        self.enter(now);
+        let now = self.now;
         if !self.active {
             return Err(ModelUnreserved::Inactive);
         }
+        // A slot a deadline just freed goes to a revalidation that was
+        // already waiting for one, before this reservation counts slots.
+        self.start_revalidations();
         if let Source::Peer(peer) = &source {
             if self.cooling(peer, now) {
                 return Err(ModelUnreserved::CoolingDown);
@@ -764,6 +774,7 @@ impl PoolModel {
         now: ModelTime,
     ) -> (WaiterId, Step) {
         self.enter(now);
+        let now = self.now;
         let waiter = WaiterId(self.fresh());
         // The handle checks the body against the reservation before it
         // sends anything. A wrong body drops the reservation.
@@ -845,6 +856,7 @@ impl PoolModel {
         } else {
             self.settle_bodyless(key);
         }
+        self.start_revalidations();
         (waiter, self.take_step())
     }
 
@@ -860,7 +872,9 @@ impl PoolModel {
     ) -> Step {
         self.enter(now);
         let Some((target, started_at)) = self.jobs.remove(&job) else {
-            // Cancelled, or timed out.
+            // Cancelled, or timed out. A deadline applied on the way in may
+            // have freed a slot that a queued revalidation is waiting for.
+            self.start_revalidations();
             return self.take_step();
         };
         let fresh = before.brackets(after, self.applied);
@@ -1014,27 +1028,43 @@ impl PoolModel {
     /// happens to handle first.
     fn enter(&mut self, now: ModelTime) {
         self.advance(now);
+        // The model's own clock from here on. It never goes back, so a
+        // caller that passes an older time cannot make a deadline that has
+        // passed look as if it had not.
+        let now = self.now;
+        // Each admission can have a deadline for its stage and one for its
+        // slot. Whichever was due first decides it, however late the core
+        // gets to them. When both were due at the same moment, the stage's
+        // own deadline decides, because it says more about the transaction.
         let mut timed_out = Vec::new();
         let mut unparked = Vec::new();
         for (key, admission) in &self.admissions {
-            // The slot's own deadline comes first, whatever the stage.
-            if admission
-                .body_at
-                .is_some_and(|at| at.saturating_add(MAX_UNDECIDED) <= now)
-            {
-                timed_out.push(*key);
-                continue;
-            }
-            match &admission.stage {
-                Stage::Verifying { deadline, .. } if *deadline <= now => timed_out.push(*key),
-                Stage::Parked { .. }
-                    if admission
+            let slot_due = admission.body_at.map(|at| at.saturating_add(MAX_UNDECIDED));
+            let (stage_due, parked) = match &admission.stage {
+                Stage::Verifying { deadline, .. } => (Some(*deadline), false),
+                Stage::Parked { .. } => (
+                    admission
                         .missing_since
-                        .is_some_and(|since| since.saturating_add(T_PARK) <= now) =>
-                {
-                    unparked.push(*key)
+                        .map(|since| since.saturating_add(T_PARK)),
+                    true,
+                ),
+                _ => (None, false),
+            };
+            let stage_is_due = stage_due.is_some_and(|due| due <= now);
+            let slot_is_due = slot_due.is_some_and(|due| due <= now);
+            let stage_first = match (stage_due, slot_due) {
+                (Some(stage), Some(slot)) => stage <= slot,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if stage_is_due && (stage_first || !slot_is_due) {
+                if parked {
+                    unparked.push(*key);
+                } else {
+                    timed_out.push(*key);
                 }
-                _ => {}
+            } else if slot_is_due {
+                timed_out.push(*key);
             }
         }
         for key in timed_out {
@@ -1084,7 +1114,9 @@ impl PoolModel {
     /// [`super::PoolHandle::await_output`]. The lookup and the registration
     /// are one input, so no admission can fall between them.
     pub fn await_output(&mut self, outpoint: OutPoint, now: ModelTime) -> OutputAnswer {
-        self.advance(now);
+        self.enter(now);
+        // A retry or a slot that the time brought due is used at once.
+        self.start_revalidations();
         if !self.active {
             return OutputAnswer::Inactive;
         }
@@ -1128,7 +1160,9 @@ impl PoolModel {
 
     /// [`super::PoolHandle::report_violation`].
     pub fn violation(&mut self, peer: QueueSource, now: ModelTime) {
-        self.advance(now);
+        self.enter(now);
+        // A retry or a slot that the time brought due is used at once.
+        self.start_revalidations();
         self.cool(&peer);
     }
 
@@ -1164,10 +1198,11 @@ impl PoolModel {
 
     /// The node is near the tip again. The pool starts empty.
     pub fn activate(&mut self, tip: Height, generation: Generation, now: ModelTime) {
-        self.advance(now);
+        self.enter(now);
         self.active = true;
         self.tip = tip;
         self.applied = generation;
+        self.start_revalidations();
     }
 
     // Observations.
@@ -1301,6 +1336,49 @@ impl PoolModel {
             "the rejection lists' limits"
         );
         assert!(self.cooldowns.len() <= MAX_COOLDOWNS, "the cooldown limit");
+        // Nothing that can start is left waiting. A queued revalidation
+        // with room and no hidden parent would have been started by the
+        // input that made it startable, and a retry or deadline that is due
+        // would have been applied by the first input to see the time.
+        if self.active {
+            let room = self.revalidating() < self.max_revalidating
+                && self.slots_in_use() < self.max_pending;
+            for pooled in self.pool.values() {
+                let parent_hidden = pooled.tx.parents().any(|parent| {
+                    self.pooled
+                        .get(&parent)
+                        .is_some_and(|parent| self.pool[parent].hidden.is_some())
+                });
+                match &pooled.hidden {
+                    Some(Hidden::Queued) => assert!(
+                        !room || parent_hidden,
+                        "a revalidation that could start was left queued"
+                    ),
+                    Some(Hidden::Retry { at }) => {
+                        assert!(*at > self.now, "a retry that is due was left waiting")
+                    }
+                    Some(Hidden::Running { deadline, .. }) => assert!(
+                        *deadline > self.now,
+                        "a revalidation past its deadline was left running"
+                    ),
+                    _ => {}
+                }
+            }
+            for admission in self.admissions.values() {
+                if let Stage::Verifying { deadline, .. } = admission.stage {
+                    assert!(
+                        deadline > self.now,
+                        "a verification past its deadline was left running"
+                    );
+                }
+                assert!(
+                    admission
+                        .body_at
+                        .is_none_or(|at| at.saturating_add(MAX_UNDECIDED) > self.now),
+                    "an admission was left holding its slot past the limit"
+                );
+            }
+        }
         for pooled in self.pool.values().filter(|pooled| pooled.hidden.is_none()) {
             let seed: HashSet<transaction::Hash> = [pooled.tx.id.mined_id()].into();
             assert!(
@@ -2143,7 +2221,13 @@ impl PoolModel {
     /// whose cooldown ends first.
     fn cool(&mut self, peer: &QueueSource) {
         let key = CooldownKey::from(peer);
-        if !self.cooldowns.contains_key(&key) && self.cooldowns.len() >= MAX_COOLDOWNS {
+        // A failure while the peer is already cooling down changes nothing,
+        // as today. Two transactions of one peer that were being verified
+        // together do not make the cooldown longer.
+        if self.cooldowns.contains_key(&key) {
+            return;
+        }
+        if self.cooldowns.len() >= MAX_COOLDOWNS {
             let earliest = self
                 .cooldowns
                 .iter()
@@ -2256,7 +2340,14 @@ impl PoolModel {
         self.next_id
     }
 
+    /// The one way out of an input that returns a step. Queued
+    /// revalidations that can start are started first, so no input can free
+    /// a slot, or bring a retry due, and leave it unused until something
+    /// else happens.
     fn take_step(&mut self) -> Step {
+        if self.active {
+            self.start_revalidations();
+        }
         let step = std::mem::take(&mut self.step);
         let changes = u64::try_from(step.changes.len()).expect("a batch fits in u64");
         self.logged = self.logged.saturating_add(changes);

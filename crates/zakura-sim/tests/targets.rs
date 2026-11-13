@@ -459,3 +459,38 @@ fn quarantined_seeds_stay_in_the_report() {
         serde_json::from_slice(&fs::read(options.out.join(READINESS_FILE)).unwrap()).unwrap();
     assert_eq!(written, report);
 }
+
+/// The report lists each harness no target runs with its
+/// `[[missing-target]]` row, so it accounts for every harness, even when
+/// it checks only some targets. No missing target counts as not ready.
+#[test]
+fn the_report_lists_every_missing_target() {
+    use zakura_sim::campaign::{check_targets, Readiness, TargetsOptions, READINESS_FILE};
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, fixtures) = checkout(dir.path());
+    let options = TargetsOptions {
+        repo,
+        out: dir.path().join("out"),
+        targets: vec!["discovery_wait_complete".to_owned()],
+        sanitizer: "none".to_owned(),
+        target_dir: dir.path().join("target"),
+        fixtures: vec![fixtures],
+        child: std::time::Duration::from_secs(1),
+    };
+    let report = check_targets(&options, |_| {}).unwrap();
+    let missing = suite().missing_target;
+    assert!(!missing.is_empty(), "{SUITE_FILE} lists missing targets");
+    assert_eq!(report.missing_targets, missing);
+    // The one checked target has no seed, so it's the only row not ready.
+    let not_ready: Vec<&str> = report.not_ready().map(|row| row.target.as_str()).collect();
+    assert_eq!(not_ready, ["discovery_wait_complete"]);
+    let written: Readiness =
+        serde_json::from_slice(&fs::read(options.out.join(READINESS_FILE)).unwrap()).unwrap();
+    assert_eq!(written, report);
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(options.out.join(READINESS_FILE)).unwrap()).unwrap();
+    assert_eq!(
+        json["missing_targets"][0]["harness"],
+        missing[0].harness.as_str()
+    );
+}

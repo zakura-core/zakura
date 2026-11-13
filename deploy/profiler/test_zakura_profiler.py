@@ -547,6 +547,19 @@ class LogFollowingTests(unittest.TestCase):
         self.assertEqual(follower.read_new_lines(), [b"three", b"four"])
         self.assertEqual(follower.read_new_lines(), [])
 
+    def test_a_follower_that_starts_with_only_the_renamed_file_follows_it(self):
+        moved = self.path.with_name("node.log.1")
+        moved.write_bytes(b"x" * 100 + b"\nrecent\n")
+        follower = blocks.FileFollower(self.path, lookback_bytes=20, moved_path=moved)
+        self.assertEqual(follower.read_new_lines(), [b"recent"])
+        with open(moved, "ab") as handle:
+            handle.write(b"later\n")
+        self.assertEqual(follower.read_new_lines(), [b"later"])
+        with open(moved, "ab") as handle:
+            handle.write(b"last\n")
+        self.path.write_bytes(b"new\n")
+        self.assertEqual(follower.read_new_lines(), [b"last", b"new"])
+
     def test_a_renamed_file_that_is_not_the_one_being_followed_is_skipped(self):
         moved = self.path.with_name("node.log.1")
         follower = blocks.FileFollower(self.path, moved_path=moved)
@@ -754,6 +767,18 @@ class TraceFollowingTests(unittest.TestCase):
         self.assertFalse((self.directory / "chain_tip.jsonl").exists())
         self.append("chain_tip", tip_row(20_000_000, height=52, block_hash="ef" * 32))
         self.assertEqual(self.heights(follower.poll()), [51])
+
+    def test_a_restarted_profiler_follows_a_table_the_node_still_writes_under_its_renamed_name(self):
+        self.append("chain_tip", *self.twelve_tips())
+        blocks.TraceFollower(str(self.directory), table_cap_bytes=2000).poll()
+        self.assertFalse((self.directory / "chain_tip.jsonl").exists())
+        # A node build that never starts a new file, and a profiler started after the rename.
+        restarted = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
+        self.append(
+            "chain_tip", tip_row(1_100_000, height=50), tip_row(9_000_000, height=51, block_hash="cd" * 32),
+            renamed=True,
+        )  # fmt: skip
+        self.assertEqual(self.heights(restarted.poll()), list(range(12)) + [50])
 
     def test_a_renamed_table_that_keeps_growing_is_emptied_at_twice_the_cap(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)

@@ -561,29 +561,66 @@ impl std::fmt::Debug for JsonlTracer {
     }
 }
 
+/// What tells the file a table writer has open from another file at the same path.
+///
+/// This is the device and inode on Unix. `std` has no stable equivalent elsewhere,
+/// so on other platforms every file compares equal and only a missing file is noticed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            Self {}
+        }
+    }
+}
+
 /// Opens the trace table file at `path` for appending, creating it if it is missing.
-async fn open_table_file(path: &Path) -> std::io::Result<tokio::fs::File> {
-    tokio::fs::OpenOptions::new()
+async fn open_table_file(path: &Path) -> std::io::Result<(tokio::fs::File, FileIdentity)> {
+    let file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .await
+        .await?;
+    let identity = FileIdentity::of(&file.metadata().await?);
+
+    Ok((file, identity))
 }
 
 struct TableWriter {
     path: PathBuf,
     file: tokio::fs::File,
+    identity: FileIdentity,
     encode_buf: Vec<u8>,
 }
 
 impl TableWriter {
     /// Opens the table file at `path` and returns a writer with an empty buffer.
     async fn open(path: PathBuf, buffer_flush_bytes: usize) -> std::io::Result<Self> {
-        let file = open_table_file(&path).await?;
+        let (file, identity) = open_table_file(&path).await?;
 
         Ok(Self {
             path,
             file,
+            identity,
             encode_buf: Vec::with_capacity(buffer_flush_bytes),
         })
     }
@@ -607,14 +644,23 @@ impl TableWriter {
         Ok(())
     }
 
-    /// Starts a new file at the table's path if the open file is no longer there.
+    /// Starts a new file at the table's path if the open file is no longer the one there.
     ///
-    /// A tool that bounds the size of the trace directory renames or deletes a
-    /// table file while the writer has it open. Rows written so far stay in the
-    /// moved file, and later rows go to the new one, so no row is lost or split.
+    /// A tool that bounds the size of the trace directory renames, deletes or
+    /// replaces a table file while the writer has it open. Rows written so far stay
+    /// in the old file, and later rows go to the file at the path, so no row is
+    /// lost or split.
     async fn reopen_if_moved(&mut self) -> std::io::Result<()> {
-        if !tokio::fs::try_exists(&self.path).await? {
-            self.file = open_table_file(&self.path).await?;
+        let at_path = match tokio::fs::metadata(&self.path).await {
+            Ok(metadata) => Some(FileIdentity::of(&metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            // The path cannot be examined right now. Keep the open file, which still
+            // takes rows, and look again at the next sync.
+            Err(_) => return Ok(()),
+        };
+
+        if at_path != Some(self.identity) {
+            (self.file, self.identity) = open_table_file(&self.path).await?;
         }
 
         Ok(())
@@ -677,8 +723,8 @@ impl TraceWriter {
                 continue;
             }
 
-            // Each sync also checks that the file is still at its path, so a table
-            // whose file was moved away gets a new one within a flush interval.
+            // Each sync also checks that the open file is still the one at its path, so
+            // a table whose file was moved away is back there within a flush interval.
             let sync_file = flush_file || force_flush;
             let mut result = table_writer.flush_buffer(sync_file).await;
             if result.is_ok() && sync_file {
@@ -1218,6 +1264,54 @@ mod tests {
         handle.await.expect("writer task should complete");
 
         assert_eq!(rows(&table_path).await, [r#"{"value":2}"#]);
+    }
+
+    // File identity is only known on Unix. Elsewhere a file that took the place of
+    // the table file is not noticed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writer_moves_to_a_file_that_took_the_place_of_the_table_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace_dir = dir.path().join("traces");
+        let table_path = trace_dir.join("alpha.jsonl");
+        let moved_path = trace_dir.join("alpha.jsonl.1");
+        let (tx, handle) = spawn_fast_syncing_writer(trace_dir.clone());
+
+        send_alpha_row(&tx, 1).await;
+        wait_for_row_count(&table_path, 1).await;
+
+        // A rotation tool that renames the file and creates an empty one in its place.
+        tokio::fs::rename(&table_path, &moved_path)
+            .await
+            .expect("an open trace file can be renamed");
+        tokio::fs::write(&table_path, b"")
+            .await
+            .expect("the trace directory is writable");
+
+        // Keep sending rows until one reaches the new file.
+        let mut last_sent = 1;
+        let reached_new_file = async {
+            while rows(&table_path).await.is_empty() {
+                last_sent += 1;
+                send_alpha_row(&tx, last_sent).await;
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        time::timeout(Duration::from_secs(10), reached_new_file)
+            .await
+            .expect("the writer should move to the new file well within ten seconds");
+
+        drop(tx);
+        handle.await.expect("writer task should complete");
+
+        let sent: Vec<String> = (1..=last_sent)
+            .map(|value| format!(r#"{{"value":{value}}}"#))
+            .collect();
+        assert_eq!(
+            [rows(&moved_path).await, rows(&table_path).await].concat(),
+            sent,
+            "every row is in exactly one file, in the order it was sent"
+        );
     }
 
     #[test]

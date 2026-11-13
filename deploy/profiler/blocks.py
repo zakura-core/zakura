@@ -47,9 +47,10 @@ class FileFollower:
     def read_new_lines(self):
         """The lines completed since the last call, without their newlines.
 
-        A file that was replaced or truncated is read again from its start. A missing
-        file yields nothing and is retried on the next call, unless the file being
-        followed is now at `moved_path`, which is then followed there.
+        A file that was replaced or truncated is read again from its start. With
+        nothing at `path`, the file at `moved_path` is followed if it is the one being
+        followed, or if nothing has been followed yet; otherwise nothing is returned
+        and `path` is retried on the next call.
         """
         try:
             with open(self.path, "rb") as handle:
@@ -62,12 +63,10 @@ class FileFollower:
     def _read_current(self, handle):
         """The new lines of the file open at `path`, after any left in the file it replaced."""
         stat = os.fstat(handle.fileno())
-        earlier, skip_first = [], False
         if self._offset is None:
-            self._offset = max(0, stat.st_size - self._lookback_bytes)
-            # Start mid-file on a line boundary: drop the first, partial line.
-            skip_first = self._offset > 0
-        elif stat.st_ino != self._inode:
+            return self._start_following(handle, stat)
+        earlier = []
+        if stat.st_ino != self._inode:
             # A new file has the name. Its writer stopped writing the old file before
             # creating this one, so what the old file holds now is all it will hold.
             earlier = self._read_moved()
@@ -75,18 +74,19 @@ class FileFollower:
         elif stat.st_size < self._offset:
             self._offset, self._partial = 0, b""
         self._inode = stat.st_ino
-        lines = self._read_appended(handle, stat.st_size)
-        if skip_first and lines:
-            lines.pop(0)
-        return earlier + lines
+        return earlier + self._read_appended(handle, stat.st_size)
 
     def _read_moved(self):
-        """The new lines of the followed file, if it is the file now at `moved_path`."""
-        if self.moved_path is None or self._inode is None:
+        """The new lines of the file at `moved_path`, if that is the file to follow."""
+        if self.moved_path is None:
             return []
         try:
             with open(self.moved_path, "rb") as handle:
                 stat = os.fstat(handle.fileno())
+                if self._offset is None:
+                    # Nothing is at `path` and nothing has been followed yet, so this
+                    # is the file the writer still has open.
+                    return self._start_following(handle, stat)
                 if stat.st_ino != self._inode:
                     return []
                 if stat.st_size < self._offset:
@@ -94,6 +94,17 @@ class FileFollower:
                 return self._read_appended(handle, stat.st_size)
         except OSError:
             return []
+
+    def _start_following(self, handle, stat):
+        """Follow the open file from `lookback_bytes` before its end; return the lines there."""
+        self._inode = stat.st_ino
+        self._offset = max(0, stat.st_size - self._lookback_bytes)
+        starts_mid_file = self._offset > 0
+        lines = self._read_appended(handle, stat.st_size)
+        if starts_mid_file and lines:
+            # The first line read began before the starting point: drop it.
+            lines.pop(0)
+        return lines
 
     def _read_appended(self, handle, size):
         handle.seek(self._offset)

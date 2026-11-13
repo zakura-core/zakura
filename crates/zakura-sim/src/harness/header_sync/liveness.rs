@@ -53,7 +53,7 @@ use crate::{
             hold_wake::{HoldWakeEvidence, HoldWakeFact},
             policy::{Allow, Hold, OpKind, ReplyHold, Select, Trigger},
             publication::{Arming, PublicationEvidence, PublicationFact, STATUS_DEADLINE},
-            recovery::{RecoveryEvidence, RecoveryProgress},
+            recovery::{PrefixCutoff, RecoveryEvidence, RecoveryProgress},
             retirement::{RetirementEvidence, Roles},
             Chain, ControlAction, ControlStep, DelayedPage, Fork, Policy, Reset, Topology,
         },
@@ -1054,13 +1054,16 @@ fn held(kind: OpKind) -> StorageScenario {
 /// clock past its horizon ([`LivenessScenario::horizon`]), and a recovery
 /// fixture's `header-sync/bounded-adversary-progress` concluding or the
 /// clock passing its deadline ([`RecoveryEvidence::progress`]). A hold
-/// fixture whose held reply never reached the reactor, a departure fixture
-/// whose departure never came, and a recovery fixture whose recover never
-/// came also end at the horizon, so a node that never gets that far, such
-/// as a planted one that never prepares, still ends idle. So does a fixture
-/// whose own `Shutdown` step was never offered. A recovery that started
-/// always ends recovered or unreached, so the horizon never cuts its
-/// relinks short. A `BeforeQuiescence` obligation concludes
+/// fixture whose held reply never reached the reactor and a departure
+/// fixture whose departure never came also end at the horizon, so a node
+/// that never gets that far still ends idle. So does a fixture whose own
+/// `Shutdown` step was never offered. A recovery fixture's hostile prefix
+/// ends at the horizon instead ([`PrefixCutoff`]): its `Recover` comes there
+/// whatever its trigger, so a node that never gets as far as the trigger,
+/// such as a planted one that never prepares, is judged (#2355). This never
+/// ends a recovery that hasn't started, so it can't race that `Recover`, and
+/// a started one always ends recovered or unreached, so the horizon never
+/// cuts its relinks short. A `BeforeQuiescence` obligation concludes
 /// by the first quiescence after its trigger, and the clock moves only then.
 /// The fixture's own `Shutdown` step, if it has one, must be picked first,
 /// unless the horizon has passed.
@@ -1133,9 +1136,9 @@ impl Finish {
             FixtureKind::Departure => self.departed_at.is_some_and(|at| now > at) || horizon,
             FixtureKind::Timeout => horizon,
             FixtureKind::Recovery => match self.recovery.progress(&self.ends) {
-                // A started recovery always ends recovered or unreached,
-                // so only one whose recover never came ends at the horizon.
-                RecoveryProgress::Pending => horizon && self.recovery.recovery.started().is_none(),
+                // The `Recover` comes by the horizon, and a started recovery
+                // always ends recovered or unreached.
+                RecoveryProgress::Pending => false,
                 RecoveryProgress::Concluded => true,
                 RecoveryProgress::Owed { since } => now > recovery_deadline(since),
             },
@@ -1498,8 +1501,10 @@ impl Subsystem for Liveness {
     /// evidence armed, the publication evidence armed as the fixture says
     /// ([`LivenessScenario::arming`]), a departure or timeout fixture's
     /// hand-off rule for its mirrors ([`LivenessScenario::roles`]), the
-    /// late-page fixture's page delay on [`OWNER`], and the storage
-    /// harness's recovery finish off, since [`Finish`] ends every fixture.
+    /// late-page fixture's page delay on [`OWNER`], a recovery fixture's
+    /// prefix cut off at its horizon ([`PrefixCutoff::At`]) rather than the
+    /// storage harness's step budget, and the storage harness's recovery
+    /// finish off, since [`Finish`] ends every fixture.
     fn prepare(scenario: &LivenessScenario) -> Ports {
         let delayed_page = (*scenario == LivenessScenario::LatePage).then(|| DelayedPage {
             mirror: OWNER.to_owned(),
@@ -1515,6 +1520,9 @@ impl Subsystem for Liveness {
         }
         ports.hold_wake.arm();
         ports.publication.arm(scenario.arming());
+        ports
+            .recovery
+            .cut_off_at(PrefixCutoff::At(SimInstant::from_start(scenario.horizon())));
         ports
     }
 

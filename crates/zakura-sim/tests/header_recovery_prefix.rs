@@ -15,17 +15,18 @@ use support::{
     storage_witnesses::{hold, recover, recovering, reset, SOURCE},
 };
 use zakura_sim::{
+    domain::header_sync_progress::BOUNDED_ADVERSARY_PROGRESS,
     harness::{
         header_node::{
             policy::{Allow, OpKind, ReplyHold, Select, Trigger},
             recovery::{Hostile, HostileEvent, PREFIX_BOUND},
             Base, ControlAction, ControlStep, Reset,
         },
-        header_sync::{grammar, Storage, StorageScenario},
+        header_sync::{grammar, storage_config, Storage, StorageScenario},
         run_prepared, Subsystem,
     },
     observe::{StorageFact, StorageRequest},
-    MemorySink, Observation, Plan, PlanInput, RunReport,
+    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
 /// The bound, as a count.
@@ -293,6 +294,62 @@ fn a_full_prefix_recovers_even_when_its_trigger_was_skipped() {
                 "the growth was skipped: {prefix:?}"
             );
         }
+    }
+}
+
+/// A `Recover` whose trigger waits on node work that a stall keeps from
+/// coming still comes, at the step cutoff, and its recovery is judged
+/// (#2355). The first prepare is held with no release, and the recover waits
+/// for it to complete, so only the cutoff, `storage_config()`'s budget, can
+/// start recovery. One catch is the whole prefix, far from the bound, so
+/// it's the cutoff and not a full prefix that ends it. The `Recover` pick
+/// retires the hold, the node syncs to its source, and the property holds.
+/// Before the cutoff offered the `Recover`, the run finished at that step
+/// with nothing picked, and the property never applied.
+#[test]
+fn a_stalled_trigger_recovers_at_the_step_cutoff() {
+    let mut scenario = recovering(vec![recover(Some(Trigger::Completed(Select::nth(
+        OpKind::Prepare,
+        1,
+    ))))]);
+    scenario.policy.holds.push(hold(
+        Select {
+            kind: Some(OpKind::Prepare),
+            ..Select::default()
+        },
+        Trigger::Released,
+        Allow::Engine,
+    ));
+    for input in inputs(8, 256) {
+        let ports = Storage::prepare(&scenario);
+        let recovery = ports.recovery.clone();
+        let report =
+            run_prepared::<Storage>(&scenario, ports, input, &mut MemorySink::default(), None)
+                .unwrap_or_else(|error| panic!("{error}"));
+        let end = &report.end;
+        assert_eq!((&end.violation, &end.harness), (&None, &None), "{end:?}");
+        let recovered = report
+            .picks
+            .iter()
+            .find(|pick| pick.identity == format!("peer:{SOURCE}:recover"))
+            .map(|pick| pick.step)
+            .expect("the cutoff offers the recover");
+        assert!(
+            recovered >= storage_config().budget,
+            "the recover came at step {recovered}, before the cutoff"
+        );
+        let spent = recovery.prefix().spent().expect("the prefix is bounded");
+        assert!(spent < PREFIX_BOUND, "the prefix filled: {spent}");
+        let outcome = &report
+            .properties
+            .iter()
+            .find(|reported| reported.property == BOUNDED_ADVERSARY_PROGRESS)
+            .expect("the property reports")
+            .outcome;
+        assert!(
+            matches!(outcome, PropertyOutcome::Held { applicable } if *applicable > 0),
+            "{outcome:?}"
+        );
     }
 }
 

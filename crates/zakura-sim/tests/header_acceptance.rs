@@ -9928,6 +9928,24 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "finds the fixture's one fixed release pick by its literal, to count it and read its step",
     ),
     (
+        "tests/header_recovery_prefix.rs",
+        "a_stalled_trigger_recovers_at_the_step_cutoff",
+        "(&end.violation,&end.harness),(&None,&None)",
+        "asserts the run ended with no violation and no harness failure, the check `run` makes, not a join",
+    ),
+    (
+        "tests/header_recovery_prefix.rs",
+        "a_stalled_trigger_recovers_at_the_step_cutoff",
+        "pick.identity==format!(\"peer:{SOURCE}:recover\")",
+        "finds the source's `Recover` pick by its fixed name, the lookup `run` makes, not a join of two records",
+    ),
+    (
+        "tests/header_recovery_prefix.rs",
+        "a_stalled_trigger_recovers_at_the_step_cutoff",
+        "reported.property==BOUNDED_ADVERSARY_PROGRESS",
+        "picks the property's own report by its static ID, not run evidence",
+    ),
+    (
         "tests/header_wire_crossing.rs",
         "conformant_controls",
         "unpunished(&with(fault(update.connection+1)),update),Ok(())",

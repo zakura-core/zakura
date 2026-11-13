@@ -40,9 +40,10 @@
 //! breaks none, so a node that drops its honest source still owes progress.
 //!
 //! A scenario with a `Recover` step runs at most [`PREFIX_BOUND`] hostile
-//! events before its pick ([`Prefix`]).
+//! events before its pick ([`Prefix`]), and its prefix ends at its
+//! harness's cutoff at the latest ([`PrefixCutoff`]).
 
-use std::{rc::Rc, sync::Arc, time::Duration};
+use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use zakura_header_chain::{Frontier, SuffixWork};
@@ -83,6 +84,28 @@ pub(super) const UNREACHED: u64 = u64::MAX - 2;
 /// its pick (hdr-13).
 pub const PREFIX_BOUND: u32 = 32;
 
+/// Where a recovering scenario's hostile prefix ends if its `Recover` hasn't
+/// come by then, as a full prefix does ([`RecoveryEvidence::prefix_ended`]).
+/// Its harness sets it where it used to end such a run instead (#2355).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefixCutoff {
+    /// Once the last step taken is at least this one.
+    Steps(u64),
+    /// Once the clock is at or past this instant.
+    At(SimInstant),
+}
+
+impl PrefixCutoff {
+    /// Whether the cutoff is reached at `now`, with `step` the last step
+    /// taken.
+    pub fn reached(self, now: SimInstant, step: u64) -> bool {
+        match self {
+            PrefixCutoff::Steps(steps) => step >= steps,
+            PrefixCutoff::At(at) => now >= at,
+        }
+    }
+}
+
 /// One hostile event of a prefix ([`Prefix`]), as the harness counted it,
 /// with the step it executed at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,9 +135,11 @@ pub enum Hostile {
 /// each where it executes. Once [`PREFIX_BOUND`] have executed, it offers no
 /// more until the `Recover` pick: the control source offers only the
 /// `Recover` step, holds catch nothing new, and completions offer only what
-/// the success-only base would. Below the bound the record changes nothing
-/// a run offers. A scenario without a `Recover` step is unbounded and keeps
-/// nothing. Cloning shares it.
+/// the success-only base would. Past its cutoff ([`PrefixCutoff`]) the
+/// control source offers only the `Recover` step too, but holds and faults
+/// go on until its pick, within the bound. Below the bound the record
+/// changes nothing a run offers. A scenario without a `Recover` step is
+/// unbounded and keeps nothing. Cloning shares it.
 #[derive(Clone)]
 pub struct Prefix(Registered<Option<Vec<HostileEvent>>>);
 
@@ -337,13 +362,16 @@ pub enum Disruption {
 
 /// A run's recovery, shared by the control source, the storage source and
 /// the harness's view: the recovery, empty until a `Recover` step is
-/// picked, the hostile prefix before it, and the disruptions the scenario
-/// declares. Cloning shares them.
+/// picked, the hostile prefix before it and its cutoff, and the disruptions
+/// the scenario declares. Cloning shares them.
 #[derive(Clone)]
 pub struct RecoveryEvidence {
     recovery: Registered<Option<Recovery>>,
     prefix: Prefix,
     disruptions: Rc<[Disruption]>,
+    /// Set for a scenario with a `Recover` step. The harness's own setting,
+    /// fixed before the run, so it isn't an evidence store.
+    cutoff: Rc<Cell<Option<PrefixCutoff>>>,
 }
 
 /// One recovery: its source, when it started, and where it is.
@@ -368,28 +396,63 @@ impl Snapshot for Option<Recovery> {
 
 impl RecoveryEvidence {
     /// The evidence in `stores`, the node's, for a scenario with no
-    /// `Recover` step, whose prefix is unbounded.
+    /// `Recover` step, whose prefix is unbounded and has no cutoff.
     pub fn new(stores: &EvidenceStores) -> Self {
         RecoveryEvidence {
             recovery: stores.register("recovery", None),
             prefix: Prefix::unbounded(stores),
             disruptions: Rc::default(),
+            cutoff: Rc::default(),
         }
     }
 
     /// The evidence in `stores` for a scenario with a `Recover` step, whose
-    /// prefix is bounded, with the `disruptions` it declares.
-    pub fn bounded(stores: &EvidenceStores, disruptions: &[Disruption]) -> Self {
+    /// prefix is bounded and ends at `cutoff` at the latest, with the
+    /// `disruptions` it declares.
+    pub fn bounded(
+        stores: &EvidenceStores,
+        disruptions: &[Disruption],
+        cutoff: PrefixCutoff,
+    ) -> Self {
         RecoveryEvidence {
             recovery: stores.register("recovery", None),
             prefix: Prefix::bounded(stores),
             disruptions: disruptions.into(),
+            cutoff: Rc::new(Cell::new(Some(cutoff))),
+        }
+    }
+
+    /// Ends a bounded prefix at `cutoff` instead, for every clone. Does
+    /// nothing for a scenario with no `Recover` step. A harness calls it
+    /// while it prepares the run, before any source reads the cutoff.
+    pub fn cut_off_at(&self, cutoff: PrefixCutoff) {
+        if self.cutoff.get().is_some() {
+            self.cutoff.set(Some(cutoff));
         }
     }
 
     /// The run's hostile prefix.
     pub fn prefix(&self) -> &Prefix {
         &self.prefix
+    }
+
+    /// The prefix's cutoff, for a scenario with a `Recover` step.
+    pub fn cutoff(&self) -> Option<PrefixCutoff> {
+        self.cutoff.get()
+    }
+
+    /// Whether the prefix is open but has ended, at `now` with `step` the
+    /// last step taken: it's full ([`Prefix::full`]) or past its cutoff. A
+    /// shorter prefix is still a valid hostile prefix, so the control source
+    /// then offers the `Recover` at once, whatever its trigger, and a node
+    /// that stalled before the trigger is judged rather than the run ending
+    /// with nothing owed (#2355).
+    pub fn prefix_ended(&self, now: SimInstant, step: u64) -> bool {
+        self.in_prefix()
+            && (self.prefix.full()
+                || self
+                    .cutoff()
+                    .is_some_and(|cutoff| cutoff.reached(now, step)))
     }
 
     /// Whether the scenario declares `disruption`.
@@ -1124,7 +1187,11 @@ pub(crate) mod tests {
         ends: &EndEvidence,
         disruptions: &[Disruption],
     ) -> RecoveryEvidence {
-        let recovery = RecoveryEvidence::bounded(&EvidenceStores::default(), disruptions);
+        let recovery = RecoveryEvidence::bounded(
+            &EvidenceStores::default(),
+            disruptions,
+            PrefixCutoff::Steps(u64::MAX),
+        );
         recovery.start("mirror-0".into(), at(0), empty());
         let source = Member {
             peer: "mirror-0".into(),

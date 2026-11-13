@@ -2843,15 +2843,17 @@ fn hand_written_rows() -> Vec<Row> {
 
     let recovery = RECOVERY_ID;
     let mut recovering = holds(recovery, NONE, RECOVERY_WITNESS);
-    // hdr-11's control bypass, then hdr-13's: each violates only this ID
-    // on its committed fixture (a case's `also_violates` covers only its
-    // campaign's departure inputs).
+    // hdr-11's control bypass, then hdr-13's, then #2355's stall on the
+    // fault fixture, caught only once its prefix is cut off at the
+    // horizon: each violates only this ID on its committed fixture (a
+    // case's `also_violates` covers only its campaign's departure inputs).
     for name in [
         "skipped-apply",
         "stalled-successor",
         "faulted-target-remembered",
         "refusal-never-lifts",
         "pause-outlasts-cooldown",
+        "stalled-successor-on-faults",
     ] {
         recovering.extend(caught(
             LIVENESS,

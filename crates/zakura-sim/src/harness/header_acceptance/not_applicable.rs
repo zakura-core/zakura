@@ -1186,10 +1186,16 @@ const SHARED: &[Shared] = &[
             "header-sync/stale-completion-inert",
         ],
         undeclared: &[],
-        cases: &[(
-            "header-sync/bounded-adversary-progress",
-            "faulted-target-remembered",
-        )],
+        cases: &[
+            (
+                "header-sync/bounded-adversary-progress",
+                "faulted-target-remembered",
+            ),
+            (
+                "header-sync/bounded-adversary-progress",
+                "stalled-successor-on-faults",
+            ),
+        ],
     },
     Shared {
         harness: LIVENESS,
@@ -1413,6 +1419,19 @@ const PATCHED: &[PatchedNa] = &[
         applies: &["header-sync/peer-retirement-progress"],
         never: &[
             "header-sync/stale-completion-inert",
+            "header-sync/stale-chain-effect-inert",
+        ],
+        other: &[],
+    },
+    // Its Draft run, which ends at the recovery's deadline: the stalled
+    // round dispatches no prepare, so no held prepare reply wakes the
+    // reactor, and no chain effect goes stale.
+    PatchedNa {
+        property: "header-sync/bounded-adversary-progress",
+        name: "stalled-successor-on-faults",
+        applies: &[],
+        never: &[
+            "header-sync/hold-release-wakes",
             "header-sync/stale-chain-effect-inert",
         ],
         other: &[],

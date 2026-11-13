@@ -13,7 +13,11 @@
 // Disabled due to warnings in criterion macros
 #![allow(missing_docs)]
 
-use std::{hint::black_box, io::Cursor, sync::Arc};
+use std::{
+    hint::black_box,
+    io::{Cursor, Write},
+    sync::Arc,
+};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
@@ -269,5 +273,46 @@ fn block_encoding(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, block_encoding);
+/// Compare the production writer with its previous backend, including small writes.
+fn sha256d_backends(c: &mut Criterion) {
+    use sha2::{Digest, Sha256};
+
+    let mut group = c.benchmark_group("sha256d_backends");
+    group.sample_size(20);
+    for (length, chunk_size) in [
+        (64usize, 32usize),
+        (64, 64),
+        (1487, 32),
+        (1487, 1487),
+        (50_000, 32),
+        (50_000, 4096),
+        (2_000_000, 4096),
+    ] {
+        let bytes: Vec<_> = (0..=255u8).cycle().take(length).collect();
+        let label = format!("{length}bytes/{chunk_size}byte-writes");
+        group.throughput(Throughput::Bytes(u64::try_from(length).unwrap()));
+        group.bench_with_input(BenchmarkId::new("sha2", &label), &bytes, |b, bytes| {
+            b.iter(|| {
+                let mut hasher = Sha256::new();
+                for chunk in black_box(bytes).chunks(chunk_size) {
+                    hasher.update(chunk);
+                }
+                let digest: [u8; 32] = Sha256::digest(hasher.finalize()).into();
+                black_box(digest)
+            })
+        });
+        group.bench_with_input(BenchmarkId::new("ring", &label), &bytes, |b, bytes| {
+            b.iter(|| {
+                let mut writer = sha256d::Writer::default();
+                for chunk in black_box(bytes).chunks(chunk_size) {
+                    writer.write_all(chunk).unwrap();
+                }
+                black_box(writer.finish())
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, sha256d_backends, block_encoding);
 criterion_main!(benches);

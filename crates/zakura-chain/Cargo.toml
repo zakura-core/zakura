@@ -64,6 +64,7 @@ rand_core = { workspace = true, features = ["getrandom"] }
 rand_chacha_10 = { workspace = true, optional = true }
 rand_core_10 = { workspace = true, optional = true }
 ripemd = { workspace = true }
+ring = { workspace = true }
 # Matches version used by hdwallet
 secp256k1 = { workspace = true, features = ["serde"] }
 sha2 = { workspace = true, features = ["compress"] }

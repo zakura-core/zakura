@@ -1,0 +1,37 @@
+[Unit]
+Description=Zakura continuous CPU profiler
+Documentation=https://github.com/zakura-core/zakura/tree/main/deploy/profiler
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/data
+
+[Service]
+Type=simple
+# %H is the host name, which is the node's name in the fleet.
+ExecStart=/usr/bin/python3 /opt/zakura-profiler/zakura_profiler.py \
+    --node-name %H \
+    --service zakurad \
+    --data-dir /mnt/data/zakura-profiler \
+    --scratch-dir /run/zakura-profiler \
+    --log-file /root/logs/zakura-tracing.log \
+    --host 127.0.0.1 --port 8097
+# A tmpfs scratch directory: each sampling window is written and read once.
+RuntimeDirectory=zakura-profiler
+Restart=always
+RestartSec=10
+
+# The profiler must never compete with the node. Everything here runs only when a
+# CPU would otherwise be idle; the sampler child alone resets itself to normal
+# priority (see use_normal_scheduling in zakura_profiler.py).
+CPUSchedulingPolicy=idle
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=1
+# Hard ceilings for the whole unit, the sampler included: under a third of one core,
+# and memory that also covers the scratch files.
+CPUQuota=30%
+MemoryMax=1G
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

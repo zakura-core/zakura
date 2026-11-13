@@ -216,6 +216,28 @@ pub const MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER: usize = 5;
 /// queued rather than applied immediately, so a replacement request can still route back to it.
 pub const POISONED_GOSSIP_BLOCK_RETRY_LIMIT: usize = 3;
 
+/// Returns the lowest gossiped block height accepted with `tip_height`: blocks below it are
+/// behind the finalized tip, so they can never be committed.
+fn min_accepted_height(tip_height: Option<block::Height>) -> block::Height {
+    tip_height
+        .map(|tip_height| block::Height(tip_height.0.saturating_sub(zs::MAX_BLOCK_REORG_HEIGHT)))
+        .unwrap_or(block::Height(0))
+}
+
+/// Returns `hash`'s height if it is a verified block in the best chain, even if its body was
+/// pruned.
+///
+/// Lookup errors return `None`, so an unknown block, or a failed lookup, is still downloaded.
+async fn best_chain_height<S>(state: S, hash: block::Hash) -> Option<block::Height>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError>,
+{
+    match state.oneshot(zs::Request::BlockHeader(hash.into())).await {
+        Ok(zs::Response::BlockHeader { height, .. }) => Some(height),
+        _ => None,
+    }
+}
+
 /// Returns the highest gossiped block height accepted above `tip_height`.
 ///
 /// The configured limit counts blocks, so this height window scales with the
@@ -913,17 +935,45 @@ where
             // Check if the full block body is already in the state. `KnownBlock`
             // can be true for header-only Zakura sync state, but inbound gossip
             // still needs to fetch and verify the block body in that case.
-            match state
-                .clone()
-                .oneshot(zs::Request::AnyChainBlock(hash.into()))
-                .await
-            {
+            //
+            // A pruned state deletes old bodies but keeps their headers and hash index, so the
+            // body lookup misses blocks that we verified long ago. Look up the verified
+            // height concurrently with the body; both reads must finish before requesting a block.
+            let (body, verified_height) = futures::join!(
+                state
+                    .clone()
+                    .oneshot(zs::Request::AnyChainBlock(hash.into())),
+                best_chain_height(state.clone(), hash),
+            );
+            match body {
                 Ok(zs::Response::Block(None)) => Ok(()),
                 Ok(zs::Response::Block(Some(_))) => Err("already present".into()),
                 Ok(_) => unreachable!("wrong response"),
                 Err(e) => Err(e),
             }
             .map_err(|e| (e, None))?;
+
+            // Those old blocks would be dropped by the behind-tip check after the download, so
+            // don't request them.
+            if let Some(block_height) = verified_height {
+                let min_accepted_height = min_accepted_height(latest_chain_tip.best_tip_height());
+                if block_height < min_accepted_height {
+                    debug!(
+                        ?hash,
+                        ?block_height,
+                        ?min_accepted_height,
+                        "gossiped block is already in the best chain behind the finalized tip: \
+                         skipped download",
+                    );
+                    metrics::counter!("gossip.behind.finalized.skipped.block.count").increment(1);
+
+                    return Err((
+                        "gossiped block is already in the best chain behind the finalized tip"
+                            .into(),
+                        None,
+                    ));
+                }
+            }
 
             let request_hashes = std::iter::once(hash).collect();
             let request = match download_source.clone() {
@@ -1010,11 +1060,7 @@ where
             // the finalized tip anyway.
             //
             // TODO: get the actual finalized tip height
-            let min_accepted_height = tip_height
-                .map(|tip_height| {
-                    block::Height(tip_height.0.saturating_sub(zs::MAX_BLOCK_REORG_HEIGHT))
-                })
-                .unwrap_or(block::Height(0));
+            let min_accepted_height = min_accepted_height(tip_height);
 
             let block_height = block
                 .coinbase_height()
@@ -1904,6 +1950,111 @@ mod tests {
                 assert!(crate::components::inbound::block_misbehavior(error, addr).is_none());
             }
         }
+    }
+
+    /// Mocks a pruned state reporting `stored_height`, with the tip at `tip_height`, and returns
+    /// the download's result and the block requests sent to peers. The peer always returns
+    /// Mainnet block 1, so these tests check request dispatch, not successful verification.
+    async fn download_known_block(
+        stored_height: block::Height,
+        tip_height: block::Height,
+    ) -> (Option<Result<block::Hash, BoxError>>, Vec<zn::Request>) {
+        let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .expect("test vector deserializes");
+        let block1_hash = block1.hash();
+        let header = block1.header.clone();
+        let advertiser_addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+        let (_tip_sender, latest_chain_tip) = chain_tip_at(tip_height, hash(0x11));
+
+        let (network_tx, mut network_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            BoxCloneService::new(service_fn(move |request| {
+                let network_tx = network_tx.clone();
+                let block = block1.clone();
+                async move {
+                    network_tx.send(request)?;
+                    Ok(zn::Response::Blocks(vec![Available((
+                        block.into(),
+                        Some(advertiser_addr),
+                    ))]))
+                }
+            })),
+            BoxCloneService::new(service_fn(|_request| {
+                future::pending::<Result<block::Hash, BoxError>>()
+            })),
+            // A pruned state: the body is gone, but the header and its height remain.
+            BoxCloneService::new(service_fn(move |request| {
+                let header = header.clone();
+                async move {
+                    match request {
+                        zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                        zs::Request::BlockHeader(_) => Ok(zs::Response::BlockHeader {
+                            header: zakura_node_services::block_memory::HeaderHandle::Shared(
+                                header,
+                            ),
+                            hash: block1_hash,
+                            height: stored_height,
+                            next_block_hash: None,
+                        }),
+                        request => Err(format!("unexpected state request: {request:?}").into()),
+                    }
+                }
+            })),
+            latest_chain_tip,
+            Network::Mainnet,
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(
+                block1_hash,
+                Some(zn::PeerSource::LegacySocket(advertiser_addr)),
+            ),
+            DownloadAction::AddedToQueue
+        );
+        // Bound the wait if the downloaded block passes the height checks and reaches the
+        // verifier, which never answers. The post-download checks can also reject block 1.
+        let result = tokio::time::timeout(Duration::from_millis(500), downloads.next())
+            .await
+            .ok()
+            .flatten()
+            .map(|result| result.map_err(|(error, _addr)| error));
+
+        let mut requests = Vec::new();
+        while let Ok(request) = network_rx.try_recv() {
+            requests.push(request);
+        }
+        (result, requests)
+    }
+
+    /// A pruned node keeps the headers of blocks whose bodies it deleted. A gossiped hash for
+    /// one of those blocks, behind the finalized tip, is dropped without requesting the block.
+    #[tokio::test]
+    async fn pruned_block_behind_the_finalized_tip_is_not_requested() {
+        let (result, requests) =
+            download_known_block(block::Height(1), block::Height(1_000_000)).await;
+
+        let error = result
+            .expect("the download ends without waiting for a peer")
+            .expect_err("the block is not downloaded");
+        assert!(
+            error.to_string().contains("behind the finalized tip"),
+            "{error}"
+        );
+        assert!(requests.is_empty(), "requested {requests:?}");
+    }
+
+    /// The pre-download check uses the same cutoff as the check after download: a block at the
+    /// lowest accepted height is still requested.
+    #[tokio::test]
+    async fn known_block_at_the_lowest_accepted_height_is_still_requested() {
+        let tip_height = block::Height(1_000_000);
+        let (_result, requests) =
+            download_known_block(min_accepted_height(Some(tip_height)), tip_height).await;
+
+        assert_eq!(requests.len(), 1, "requested {requests:?}");
     }
 
     /// A gossiped block that is not a tip child keeps the existing behind-tip policy, and stays

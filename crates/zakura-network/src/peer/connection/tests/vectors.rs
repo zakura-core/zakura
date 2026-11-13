@@ -11,16 +11,21 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::{BufMut, BytesMut};
 use futures::{
     channel::{mpsc, oneshot},
     sink::SinkMapErr,
     FutureExt, SinkExt, StreamExt,
 };
 use indexmap::IndexSet;
+use tokio_util::codec::{Decoder, Encoder};
 use tower::load_shed::error::Overloaded;
 use tracing::Span;
 
-use zakura_chain::{block, serialization::SerializationError};
+use zakura_chain::{
+    block,
+    serialization::{sha256d, SerializationError},
+};
 use zakura_node_services::block_memory::BlockHandle;
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -31,7 +36,7 @@ use crate::{
         ClientRequest, ErrorSlot,
     },
     peer_set::ActiveConnectionCounter,
-    protocol::external::{InventoryHash, Message},
+    protocol::external::{Codec, InventoryHash, Message},
     types::Nonce,
     PeerError, PeerSource, Request, Response,
 };
@@ -163,29 +168,54 @@ async fn connection_shutdown_times_out_stalled_peer_tx_close() {
 }
 
 /// A connection marks its tracker closed by the peer only when the peer ended it, so a
-/// connection that this node closes is not reported.
+/// connection that this node closes, because its client was dropped or because the peer sent
+/// a malformed message, is not reported.
 #[tokio::test(start_paused = true)]
 async fn only_a_connection_that_its_peer_ended_is_reported() {
     let _init_guard = zakura_test::init();
 
-    for peer_ends_it in [true, false] {
+    /// How the test ends the connection.
+    enum Ending {
+        /// The peer closes its side.
+        PeerCloses,
+        /// This node drops the connection's client.
+        ClientDropped,
+        /// The peer sends a `ping` without its nonce, and keeps its side open.
+        TruncatedPing,
+    }
+
+    for (ending, expected_error) in [
+        (Ending::PeerCloses, "ConnectionClosed"),
+        (Ending::ClientDropped, "ClientDropped"),
+        (Ending::TruncatedPing, "UnexpectedEof"),
+    ] {
+        let peer_ends_it = matches!(ending, Ending::PeerCloses);
         let mut active_connections = ActiveConnectionCounter::new_counter();
         let mut connection_tracker =
             active_connections.track_connection_from(std::net::Ipv4Addr::LOCALHOST.into());
         connection_tracker.mark_open();
         let (connection, client_tx, shared_error_slot) =
             super::new_never_closing_test_connection::<crate::BoxError>(connection_tracker);
-        let (peer_tx, peer_rx) = mpsc::channel(1);
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
         let connection_task = tokio::spawn(connection.run(peer_rx));
         tokio::task::yield_now().await;
 
-        // The peer closes its side, or this node drops the connection's client.
-        let (_peer_tx, _client_tx) = if peer_ends_it {
-            drop(peer_tx);
-            (None, Some(client_tx))
-        } else {
-            drop(client_tx);
-            (Some(peer_tx), None)
+        // End the connection, and keep the sides that do not end it open.
+        let (_peer_tx, _client_tx) = match ending {
+            Ending::PeerCloses => {
+                drop(peer_tx);
+                (None, Some(client_tx))
+            }
+            Ending::ClientDropped => {
+                drop(client_tx);
+                (Some(peer_tx), None)
+            }
+            Ending::TruncatedPing => {
+                peer_tx
+                    .try_send(Err(truncated_ping_error()))
+                    .expect("the peer channel has room for one message");
+                (Some(peer_tx), Some(client_tx))
+            }
         };
 
         tokio::time::advance(REQUEST_TIMEOUT).await;
@@ -193,18 +223,11 @@ async fn only_a_connection_that_its_peer_ended_is_reported() {
             .await
             .expect("connection task should not panic");
 
-        let expected_error = if peer_ends_it {
-            "ConnectionClosed"
-        } else {
-            "ClientDropped"
-        };
-        assert_eq!(
-            shared_error_slot
-                .try_get_error()
-                .expect("a closed connection has an error")
-                .inner_debug(),
-            expected_error,
-        );
+        let error = shared_error_slot
+            .try_get_error()
+            .expect("a closed connection has an error")
+            .inner_debug();
+        assert!(error.contains(expected_error), "{error}");
         assert_eq!(active_connections.update_count(), 0);
         assert_eq!(
             active_connections.take_closed_connections().len(),
@@ -212,6 +235,25 @@ async fn only_a_connection_that_its_peer_ended_is_reported() {
             "only a connection that its peer ended is reported"
         );
     }
+}
+
+/// Returns the error that the legacy codec returns for a `ping` with an empty body, which a
+/// peer can send without closing its side of the connection.
+fn truncated_ping_error() -> SerializationError {
+    let mut codec = Codec::builder().finish();
+    let mut frame = BytesMut::new();
+    codec
+        .encode(Message::Ping(Nonce::default()), &mut frame)
+        .expect("a ping always encodes");
+
+    // Keep the header's magic and command, and declare an empty body with its checksum.
+    frame.truncate(16);
+    frame.put_u32_le(0);
+    frame.put_slice(&sha256d::Checksum::from(&b""[..]).0);
+
+    codec
+        .decode(&mut frame)
+        .expect_err("the codec rejects a ping without its nonce")
 }
 
 /// A stalled writer close cannot turn a failed connection into a successful advertisement.

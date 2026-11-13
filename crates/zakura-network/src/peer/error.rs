@@ -78,7 +78,8 @@ impl SharedPeerError {
     /// does when it restarts.
     ///
     /// Returns `false` for the errors that this node acts on, such as overloads, timeouts,
-    /// stalls, bans, and protocol violations.
+    /// stalls, bans, and protocol violations. That includes `UnexpectedEof`, which the codec
+    /// returns for a message body that is too short, while a closed stream is `ConnectionClosed`.
     pub(crate) fn is_peer_disconnect(&self) -> bool {
         match self.0.as_ref() {
             PeerError::ConnectionClosed => true,
@@ -87,7 +88,6 @@ impl SharedPeerError {
                 io::ErrorKind::ConnectionReset
                     | io::ErrorKind::ConnectionAborted
                     | io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::UnexpectedEof
             ),
             _ => false,
         }
@@ -413,13 +413,17 @@ mod tests {
             io::ErrorKind::ConnectionReset,
             io::ErrorKind::ConnectionAborted,
             io::ErrorKind::BrokenPipe,
-            io::ErrorKind::UnexpectedEof,
         ] {
             assert!(io_error(kind).is_peer_disconnect(), "{kind:?}");
         }
 
-        assert!(!io_error(io::ErrorKind::TimedOut).is_peer_disconnect());
-        assert!(!io_error(io::ErrorKind::InvalidData).is_peer_disconnect());
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(!io_error(kind).is_peer_disconnect(), "{kind:?}");
+        }
         for error in [
             PeerError::ClientDropped,
             PeerError::ConnectionDropped,

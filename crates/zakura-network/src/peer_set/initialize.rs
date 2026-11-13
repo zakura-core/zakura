@@ -912,7 +912,9 @@ where
             }
             // A new peer must leave the seats that are held for other peers empty.
             let seats_held_for_others = held_seats.held_for_others(addr.ip(), now);
-            // Held seats never exceed a tenth of the inbound limit, so the cast is exact.
+            // Updated at each inbound attempt and take-back, so an expired hold shows until the
+            // next attempt. Held seats never exceed a tenth of the inbound limit, so the cast is
+            // exact.
             metrics::gauge!("peer.inbound.held_seats").set(held_seats.len() as f64);
 
             let is_full = active_public_inbound_connections >= public_inbound_connection_limit
@@ -956,6 +958,8 @@ where
             } else {
                 if held_seats.take_back(addr.ip(), now) {
                     metrics::counter!("peer.inbound.held_seats.taken_back").increment(1);
+                    // The cast is exact, see the gauge update above.
+                    metrics::gauge!("peer.inbound.held_seats").set(held_seats.len() as f64);
                     info!(
                         peer = %addr_label,
                         "an inbound peer took back the seat that was held for it"

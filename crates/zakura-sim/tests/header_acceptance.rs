@@ -7192,6 +7192,27 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_sync.rs",
         "only_a_reactor_dispatch_meets_the_direct_dispatch_trigger",
     ),
+    (
+        "PeerFrameRef",
+        "src/table.rs",
+        "sent",
+        "tests/generated_triggers.rs",
+        "a_judged_frame_joins_its_whole_sent_frame",
+    ),
+    (
+        "ConnectionRef",
+        "src/table.rs",
+        "judged_reaches",
+        "tests/generated_triggers.rs",
+        "an_effect_joins_a_frame_judged_on_its_own_connection",
+    ),
+    (
+        "ConnectionRef",
+        "src/check.rs",
+        "punishment",
+        "src/check.rs",
+        "a_punishment_names_the_frame_judged_on_its_own_connection",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.

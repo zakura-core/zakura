@@ -28,6 +28,7 @@ use zakura_network::zakura::{MessageRole, MessageRule, Stream};
 
 use crate::{
     downstream,
+    harness::header_acceptance::refs::{ConnectionRef, PeerFrameRef, Ref},
     model::{consequence, is_fault_cause, is_rate_limit_cause, Consequence, Label},
     observe::{Entry, RowAt, StreamId},
     property::{
@@ -650,25 +651,20 @@ fn judged_reaches(
         else {
             return false;
         };
-        if on.is_some_and(|on| on != connection) {
+        let elsewhere = on.is_some_and(|on| {
+            !ConnectionRef::joins(&ConnectionRef { connection: on }, &connection, |judged| {
+                Some(ConnectionRef {
+                    connection: *judged,
+                })
+            })
+        });
+        if elsewhere {
             return false;
         }
         let before = &entries[..at];
-        // What came before the peer sent the frame, which `sent` checked
-        // appears exactly once.
-        let sent_before = before
-            .iter()
-            .rposition(|entry| {
-                matches!(&entry.obs, Observation::PeerFrame {
-                    connection: c,
-                    stream: s,
-                    quic_stream: q,
-                    seq: n,
-                    ..
-                } if (*c, *s, *q, *n) == (connection, stream, quic_stream, seq))
-            })
-            .map_or(before, |sent_at| &before[..sent_at]);
         sent(before, connection, stream, quic_stream, seq).is_ok_and(|frame| {
+            // What came before the peer sent the frame.
+            let sent_before = &before[..frame.at];
             key(seq, &frame) && receiver_reached(layout, id, sent_before, connection, &frame)
         })
     })
@@ -894,6 +890,8 @@ pub(crate) fn request_of(
 /// One frame a peer sent.
 #[derive(Clone, Copy, Debug)]
 struct Sent<'a> {
+    /// Its `PeerFrame`'s position in the entries [`sent`] read.
+    at: usize,
     stream: StreamId,
     row: Option<&'a str>,
     rule_stream: StreamId,
@@ -904,9 +902,9 @@ struct Sent<'a> {
 }
 
 /// The frame `seq` the peer sent on `connection`, `stream` and
-/// `quic_stream`, from `entries`. Every judged frame needs exactly one label
-/// there, so a missing or repeated `PeerFrame` is missing evidence,
-/// described in the error.
+/// `quic_stream`, from `entries`, joined by its whole [`PeerFrameRef`].
+/// Every judged frame needs exactly one label there, so a missing or
+/// repeated `PeerFrame` is missing evidence, described in the error.
 fn sent(
     entries: &[Entry],
     connection: u64,
@@ -914,27 +912,36 @@ fn sent(
     quic_stream: Option<u64>,
     seq: u64,
 ) -> Result<Sent<'_>, String> {
-    let mut labels = entries.iter().filter_map(|entry| match &entry.obs {
-        Observation::PeerFrame {
-            connection: c,
-            stream: s,
-            quic_stream: quic,
-            seq: q,
-            row,
-            rule_stream,
-            label,
-            exhausted,
-            exchange,
-            ..
-        } if (*c, *s, *quic, *q) == (connection, stream, quic_stream, seq) => Some(Sent {
-            stream,
-            row: row.as_deref(),
-            rule_stream: *rule_stream,
-            label: *label,
-            exhausted: *exhausted,
-            exchange: *exchange,
-        }),
-        _ => None,
+    let want = PeerFrameRef {
+        connection,
+        kind: stream.kind,
+        version: stream.version,
+        quic_stream,
+        seq,
+    };
+    let mut labels = entries.iter().enumerate().filter_map(|(at, entry)| {
+        if !PeerFrameRef::joins(&want, entry, |entry| peer_frame(&entry.obs)) {
+            return None;
+        }
+        match &entry.obs {
+            Observation::PeerFrame {
+                row,
+                rule_stream,
+                label,
+                exhausted,
+                exchange,
+                ..
+            } => Some(Sent {
+                at,
+                stream,
+                row: row.as_deref(),
+                rule_stream: *rule_stream,
+                label: *label,
+                exhausted: *exhausted,
+                exchange: *exchange,
+            }),
+            _ => None,
+        }
     });
     let on = quic_stream.map_or(String::new(), |quic| format!(" (QUIC stream {quic})"));
     let frame = format!("connection {connection} judged frame {seq} on {stream}{on}");
@@ -942,6 +949,26 @@ fn sent(
         (Some(sent), None) => Ok(sent),
         (None, _) => Err(format!("{frame} has no PeerFrame label before it")),
         (Some(_), Some(_)) => Err(format!("{frame} has more than one PeerFrame label")),
+    }
+}
+
+/// The frame a peer's `PeerFrame` names, if `obs` is one.
+fn peer_frame(obs: &Observation) -> Option<PeerFrameRef> {
+    match obs {
+        Observation::PeerFrame {
+            connection,
+            stream,
+            quic_stream,
+            seq,
+            ..
+        } => Some(PeerFrameRef {
+            connection: *connection,
+            kind: stream.kind,
+            version: stream.version,
+            quic_stream: *quic_stream,
+            seq: *seq,
+        }),
+        _ => None,
     }
 }
 

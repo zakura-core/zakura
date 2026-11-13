@@ -10,6 +10,7 @@ use zakura_scheduler::{SimInstant, Status};
 
 use crate::{
     end::{HarnessFailure, RunEnd},
+    harness::header_acceptance::refs::{ConnectionRef, Ref},
     observe::Observation,
     property::{CheckEvent, Pending},
     Enabled, Identity, ObservationLog,
@@ -66,17 +67,26 @@ impl FindingSubject {
     /// a run's log, makes, with the frame the node last judged on that
     /// connection before it.
     pub fn punishment(entries: &[crate::observe::Entry], at: usize, connection: u64) -> Self {
+        let punished = ConnectionRef { connection };
         let frame = entries[..at]
             .iter()
             .rev()
+            .filter(|entry| {
+                ConnectionRef::joins(&punished, *entry, |entry| match &entry.obs {
+                    Observation::FrameJudged { connection, .. } => Some(ConnectionRef {
+                        connection: *connection,
+                    }),
+                    _ => None,
+                })
+            })
             .find_map(|entry| match &entry.obs {
                 Observation::FrameJudged {
-                    connection: judged,
+                    connection,
                     stream,
                     quic_stream: Some(quic_stream),
                     seq,
-                } if *judged == connection => Some(FrameRef {
-                    connection,
+                } => Some(FrameRef {
+                    connection: *connection,
                     kind: stream.kind,
                     version: stream.version,
                     quic_stream: *quic_stream,
@@ -625,5 +635,56 @@ impl<C: Checker + ?Sized> Checker for Box<C> {
     /// Forwards to the checker.
     fn unfinished(&self) -> Unfinished {
         (**self).unfinished()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FindingSubject, FrameRef};
+    use crate::{
+        harness::header_acceptance::refs::{one_key_off::assert_one_key_off, ConnectionRef},
+        observe::StreamId,
+        Observation, ObservationLog,
+    };
+
+    /// A punishment names the frame the node last judged on the punished
+    /// connection: connection 1's close, after a frame judged on
+    /// connection 1, names that frame, and the same close after a frame
+    /// judged only on another connection names none.
+    #[test]
+    fn a_punishment_names_the_frame_judged_on_its_own_connection() {
+        let punished = ConnectionRef { connection: 1 };
+        let frame_on = |judged: &ConnectionRef| {
+            let mut log = ObservationLog::default();
+            log.push(Observation::FrameJudged {
+                connection: judged.connection,
+                stream: StreamId {
+                    kind: 64,
+                    version: 1,
+                },
+                quic_stream: Some(4),
+                seq: 2,
+            });
+            log.push(Observation::ConnectionClosed {
+                connection: 1,
+                cause: "service_protocol_reject".to_owned(),
+            });
+            match FindingSubject::punishment(log.entries(), 1, punished.connection) {
+                FindingSubject::Punishment { frame, .. } => frame,
+                FindingSubject::Publication { .. } => unreachable!("a punishment's subject"),
+            }
+        };
+        assert_eq!(
+            frame_on(&punished),
+            Some(FrameRef {
+                connection: 1,
+                kind: 64,
+                version: 1,
+                quic_stream: 4,
+                inbound: true,
+                seq: 2,
+            })
+        );
+        assert_one_key_off::<ConnectionRef>(&punished, |judged| frame_on(judged).is_some());
     }
 }

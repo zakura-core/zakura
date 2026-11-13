@@ -316,6 +316,26 @@ pub struct CallRef {
 }
 impl Ref for CallRef {}
 
+/// One frame a peer sent the node, as its `PeerFrame` and the node's
+/// `FrameJudged` of it name it: its connection, its stream's kind and
+/// version, its QUIC stream, if its harness has one, and its sequence. A
+/// [`FrameRef`] without the direction, which both name inbound, and whose
+/// QUIC stream may be absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerFrameRef {
+    /// The connection.
+    pub connection: u64,
+    /// The stream's kind.
+    pub kind: u16,
+    /// The stream's version.
+    pub version: u16,
+    /// The QUIC stream, or `None` for a harness with none.
+    pub quic_stream: Option<u64>,
+    /// The frame's position among the peer's frames on the stream.
+    pub seq: u64,
+}
+impl Ref for PeerFrameRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

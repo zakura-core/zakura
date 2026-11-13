@@ -6,9 +6,13 @@
 
 mod support;
 
-use support::feed::{FEED, ITEM};
+use support::{
+    feed::{FEED, ITEM},
+    one_key_off::assert_one_key_off,
+};
 use zakura_network::zakura::Stream;
 use zakura_sim::{
+    harness::header_acceptance::refs::{ConnectionRef, PeerFrameRef},
     model::Label,
     observe::{RowAt, StreamId, TransitionFact, TransportFact},
     property::PropertyId,
@@ -451,6 +455,79 @@ fn work_authorized_joins_the_work_to_its_own_frame() {
         &work_id,
         [first, own, vec![work(2, 0, 7)]].concat()
     ));
+}
+
+/// The peer's frame `frame`, on `row` and labelled `label`, as its whole
+/// ref names it.
+fn peer_as(frame: &PeerFrameRef, row: &str, label: Label) -> Observation {
+    Observation::PeerFrame {
+        connection: frame.connection,
+        stream: StreamId {
+            kind: frame.kind,
+            version: frame.version,
+        },
+        quic_stream: frame.quic_stream,
+        seq: frame.seq,
+        row: Some(row.to_owned()),
+        rule_stream: stream(),
+        label,
+        exhausted: false,
+        exchange: Some(7),
+        payload: 8,
+    }
+}
+
+/// The node judging the peer's frame `frame`.
+fn judged_as(frame: &PeerFrameRef) -> Observation {
+    Observation::FrameJudged {
+        connection: frame.connection,
+        stream: StreamId {
+            kind: frame.kind,
+            version: frame.version,
+        },
+        quic_stream: frame.quic_stream,
+        seq: frame.seq,
+    }
+}
+
+/// A receiver trigger joins the frame the node judged to the frame the
+/// peer sent by its whole ref: connection 1's long `item` frame 2 on QUIC
+/// stream 3 reaches its `long-payload-closes` trigger only when the peer
+/// sent that same frame, and a label sent with any one key moved, the
+/// QUIC stream's included, labels another frame and reaches nothing.
+#[test]
+fn a_judged_frame_joins_its_whole_sent_frame() {
+    let item = id(Some("item"), Template::Closes(Label::LongPayload));
+    let frame = PeerFrameRef {
+        connection: 1,
+        kind: FEED_STREAM.kind,
+        version: FEED_STREAM.version,
+        quic_stream: Some(3),
+        seq: 2,
+    };
+    let moved = assert_one_key_off::<PeerFrameRef>(&frame, |sent| {
+        reaches(
+            &item,
+            vec![peer_as(sent, "item", Label::LongPayload), judged_as(&frame)],
+        )
+    });
+    assert_eq!(moved, 5);
+}
+
+/// A downstream trigger joins each effect to a frame the node judged on
+/// the effect's own connection: connection 1's work from its judged
+/// `item` frame reaches `receiver-work-authorized`'s trigger, and the same
+/// work admitted on another connection doesn't.
+#[test]
+fn an_effect_joins_a_frame_judged_on_its_own_connection() {
+    let work_id = id(Some("item"), Template::WorkAuthorized);
+    let first = vec![peer(0, "item", Label::Conformant), judged(0)];
+    assert_one_key_off::<ConnectionRef>(&ConnectionRef { connection: 1 }, |on| {
+        reaches(
+            &work_id,
+            [first.clone(), vec![work(on.connection, 0, 7)]].concat(),
+        )
+    });
 }
 
 /// `receiver-credit-conserved`'s trigger joins each page's work the node

@@ -42,6 +42,7 @@ use crate::{
     inbound_resources::{InboundBudget, TCP_INBOUND_RETAINED_BYTES},
     meta_addr::MetaAddrChange,
     peer::{
+        gossip_trace::{LegacyGossipTrace, PeerGossipTrace},
         AnnouncedBlocks, CancelHeartbeatTask, Client, ClientRequest, Connection,
         ConnectionRequests, ErrorSlot, HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
     },
@@ -105,6 +106,10 @@ where
     /// Warms each new connection's send direction, if warm-up is enabled.
     tcp_warmup: Option<TcpWarmup>,
 
+    /// Records block announcements and block serving on each connection, when the node
+    /// writes trace files.
+    gossip_trace: LegacyGossipTrace,
+
     parent_span: Span,
 }
 
@@ -154,6 +159,7 @@ where
             inbound_budget: self.inbound_budget.clone(),
             bans: self.bans.clone(),
             tcp_warmup: self.tcp_warmup.clone(),
+            gossip_trace: self.gossip_trace.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -679,6 +685,7 @@ where
         let relay = self.relay.unwrap_or(false);
         let network = config.network.clone();
         let minimum_peer_version = MinimumPeerVersion::new(self.latest_chain_tip, &network);
+        let gossip_trace = LegacyGossipTrace::new(&config);
 
         Ok(Handshake {
             config,
@@ -696,6 +703,7 @@ where
             inbound_budget: InboundBudget::new(TCP_INBOUND_RETAINED_BYTES),
             bans: self.bans.unwrap_or_default(),
             tcp_warmup: self.tcp_warmup,
+            gossip_trace,
             parent_span: Span::current(),
         })
     }
@@ -1586,6 +1594,7 @@ where
         let inbound_service = self.inbound_service.clone();
         let address_book_updater = self.address_book_updater.clone();
         let inv_collector = self.inv_collector.clone();
+        let gossip_trace = self.gossip_trace.clone();
         let config = self.config.clone();
         let user_agent = self.user_agent.clone();
         let our_services = self.our_services;
@@ -1798,6 +1807,8 @@ where
             // Block gossip skips this peer for the blocks it announces to us.
             let announced_blocks = AnnouncedBlocks::default();
             let inbound_announced_blocks = announced_blocks.clone();
+            let gossip_trace = gossip_trace.for_peer(&connected_addr);
+            let inbound_gossip_trace = gossip_trace.clone();
             let ts_inner_conn_span = connection_span.clone();
             let inv_inner_conn_span = connection_span.clone();
             let peer_rx = peer_rx
@@ -1852,12 +1863,14 @@ where
                 .then(move |msg| {
                     let inbound_inv_collector = inbound_inv_collector.clone();
                     let inbound_announced_blocks = inbound_announced_blocks.clone();
+                    let inbound_gossip_trace = inbound_gossip_trace.clone();
                     let span = debug_span!(parent: inv_inner_conn_span.clone(), "inventory_filter");
                     register_inventory_status(
                         msg,
                         connected_addr,
                         inbound_inv_collector,
                         inbound_announced_blocks,
+                        inbound_gossip_trace,
                     )
                     .instrument(span)
                 })
@@ -1906,7 +1919,8 @@ where
                 addr_label,
                 alternate_addrs.collect(),
                 inbound_budget,
-            );
+            )
+            .with_gossip_trace(gossip_trace);
 
             let block_uploads = server.block_uploads.clone();
             let request_slot = server.request_slot.clone();
@@ -2015,15 +2029,22 @@ fn serialization_error_metric_label(error: &SerializationError) -> &'static str 
 /// a peer that already has the block. Unlike the inventory registry, this covers every block
 /// `inv`, solicited or not, and connections without a transient address. Requests for block
 /// bodies withdraw the peer's earlier claim to have those blocks.
+///
+/// An `inv` that names exactly one block is a new block announcement, and is written to
+/// `gossip_trace`. One that names several is the answer to a query.
 pub(crate) async fn register_inventory_status(
     msg: Result<Message, SerializationError>,
     connected_addr: ConnectedAddr,
     inv_collector: broadcast::Sender<InventoryChange>,
     announced_blocks: AnnouncedBlocks,
+    gossip_trace: PeerGossipTrace,
 ) -> Result<Message, SerializationError> {
     match &msg {
         Ok(Message::Inv(items)) => {
             announced_blocks.record(items.iter().filter_map(InventoryHash::block_hash));
+            if let [InventoryHash::Block(hash)] = items[..] {
+                gossip_trace.block_inv_received(hash);
+            }
         }
         // A request for the body or a missing response contradicts an earlier announcement.
         Ok(Message::GetData(items) | Message::NotFound(items)) => {

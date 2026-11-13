@@ -1124,6 +1124,48 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
     assert_eq!(remote_counter.update_count(), 0);
 }
 
+/// A peer's announcement of one block is traced under the peer's name. An `inv` that names
+/// several blocks answers a query, and one that names only transactions is not about a block,
+/// so neither is traced.
+#[tokio::test]
+async fn only_a_single_block_inv_is_traced_as_an_announcement() {
+    use crate::peer::gossip_trace::tests::test_trace;
+
+    let blocks: Vec<_> = (1..=3).map(|byte| block::Hash([byte; 32])).collect();
+    let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
+    let (trace, mut written) = test_trace(&[("127.0.0.1", "us-0")]);
+    let connected_addr = ConnectedAddr::new_inbound_direct(peer_addr(38233));
+
+    for message in [
+        Message::Inv(vec![InventoryHash::Block(blocks[0])]),
+        Message::Inv(
+            blocks[1..]
+                .iter()
+                .copied()
+                .map(InventoryHash::Block)
+                .collect(),
+        ),
+        Message::Inv(vec![transaction]),
+        Message::GetData(vec![InventoryHash::Block(blocks[0])]),
+    ] {
+        register_inventory_status(
+            Ok(message),
+            connected_addr,
+            broadcast::channel(16).0,
+            AnnouncedBlocks::default(),
+            trace.for_peer(&connected_addr),
+        )
+        .await
+        .expect("the filter passes the message through");
+    }
+
+    let rows = written.take();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["event"], "block_inv_received");
+    assert_eq!(rows[0]["hash"], blocks[0].to_string());
+    assert_eq!(rows[0]["peer_name"], "us-0");
+}
+
 /// Every inbound block `inv` records an announcement, whatever its shape, and `notfound`
 /// withdraws one. Unlike the inventory registry, this covers solicited multi-block `inv`s and
 /// connections without a transient address.
@@ -1173,6 +1215,7 @@ async fn inbound_invs_record_announced_blocks() {
             connected_addr,
             broadcast::channel(16).0,
             announced.clone(),
+            Default::default(),
         )
         .await
         .expect("the filter passes the message through");
@@ -1197,6 +1240,7 @@ async fn inbound_invs_record_announced_blocks() {
         ConnectedAddr::new_inbound_direct(peer_addr(38233)),
         broadcast::channel(16).0,
         announced.clone(),
+        Default::default(),
     )
     .await
     .expect("the filter passes the message through");
@@ -1228,6 +1272,7 @@ async fn body_requests_withdraw_only_requested_block_announcements() {
                 connected_addr,
                 broadcast::channel(16).0,
                 announced.clone(),
+                Default::default(),
             )
             .await
             .expect("the filter passes the request through");

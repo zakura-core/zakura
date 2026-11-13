@@ -1411,6 +1411,109 @@ fn new_protected_test_connection() -> (
     super::new_protected_test_connection()
 }
 
+/// A block we announce, the peer's request for it and the block write (or the block being
+/// missing) are each traced under the peer's name, in the order they happen. A block the peer
+/// asks for without our having announced it to the peer is not traced.
+#[tokio::test(start_paused = true)]
+async fn announcing_and_serving_a_block_is_traced() {
+    use crate::{
+        peer::{block_gossip::BlockGossipPeer, gossip_trace::tests::test_trace, ConnectedAddr},
+        InventoryResponse,
+    };
+    use std::sync::Arc;
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, _client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let (trace, mut written) = test_trace(&[("203.0.113.7", "us-0")]);
+    let peer = ConnectedAddr::new_inbound_direct("203.0.113.7:50123".parse().unwrap());
+    let mut connection = connection.with_gossip_trace(trace.for_peer(&peer));
+    let (block_advert_tx, block_advert_rx) =
+        tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+    connection.block_advert_rx = block_advert_rx;
+    let gossip = BlockGossipPeer {
+        sender: block_advert_tx,
+        address: None,
+        uploads: connection.block_uploads.clone(),
+        announced: Default::default(),
+        registry: None,
+        version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        sidecar: false,
+    };
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    // Announced to the peer, then gone by the time the peer asks for it.
+    let missing = block::Hash([7; 32]);
+    // Never announced to the peer.
+    let unannounced = block::Hash([8; 32]);
+
+    let advertisement = tokio::spawn(gossip.clone().advertise(hash));
+    assert_eq!(
+        outbound.next().await.unwrap(),
+        Message::Inv(vec![hash.into()])
+    );
+    let missing_advertisement = tokio::spawn(gossip.advertise(missing));
+    assert_eq!(
+        outbound.next().await.unwrap(),
+        Message::Inv(vec![missing.into()])
+    );
+    peer_tx
+        .send(Ok(Message::GetData(vec![
+            hash.into(),
+            missing.into(),
+            unannounced.into(),
+        ])))
+        .await
+        .unwrap();
+    inbound
+        .expect_request(Request::BlocksByHash(IndexSet::from([
+            hash,
+            missing,
+            unannounced,
+        ])))
+        .await
+        .respond(Response::Blocks(vec![
+            InventoryResponse::Available((block.clone().into(), None)),
+            InventoryResponse::Missing(missing),
+            InventoryResponse::Missing(unannounced),
+        ]));
+    assert_eq!(outbound.next().await.unwrap(), Message::Block(block.into()));
+    assert_eq!(
+        outbound.next().await.unwrap(),
+        Message::NotFound(vec![missing.into(), unannounced.into()])
+    );
+    advertisement.abort();
+    missing_advertisement.abort();
+    connection_task.abort();
+
+    let rows: Vec<_> = written
+        .take()
+        .into_iter()
+        .map(|row| {
+            assert_eq!(row["peer_name"], "us-0");
+            (
+                row["event"].as_str().unwrap().to_owned(),
+                row["hash"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("block_inv_sent".to_owned(), hash.to_string()),
+            ("block_inv_sent".to_owned(), missing.to_string()),
+            ("block_getdata_received".to_owned(), hash.to_string()),
+            ("block_getdata_received".to_owned(), missing.to_string()),
+            ("block_sent".to_owned(), hash.to_string()),
+            ("block_unavailable".to_owned(), missing.to_string()),
+        ]
+    );
+}
+
 /// Delivery tracking waits for the actual block write and its drain allowance.
 #[tokio::test(start_paused = true)]
 async fn block_gossip_tracks_connection_write() {

@@ -391,6 +391,11 @@ pub struct ZakuraConfig {
     /// [`Config::expose_peer_addresses`](crate::config::Config::expose_peer_addresses).
     /// The state, mempool, and `getblocktemplate` write `chain_tip.jsonl`, `mempool.jsonl`, and
     /// `mining_template.jsonl`, which trace the path from a new tip to a mining template.
+    /// Legacy peer connections write `legacy_gossip.jsonl`: each block announcement sent to
+    /// a peer, the peer's request for that block and the block being sent, and a bounded
+    /// number of the announcements each peer sends. Its rows never hold a peer's address; the
+    /// `ZAKURA_TRACE_PEER_NAMES` environment variable names the peers an operator wants to
+    /// tell apart.
     pub trace_dir: Option<PathBuf>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,

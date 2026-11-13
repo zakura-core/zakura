@@ -336,6 +336,51 @@ async fn startup_dials_leave_out_dialed_unconditional_peers() {
     assert_eq!(discovered.len(), 3, "discovery still learns every address");
 }
 
+/// Each dialed unconditional peer counts against the connection limit of its IP in the
+/// startup dials, so they dial another address on that IP only when the limit leaves
+/// room for it.
+#[tokio::test]
+async fn startup_dials_leave_room_for_dialed_unconditional_peers_on_their_ip() {
+    let _init_guard = zakura_test::init();
+
+    // Each case is the per-IP limit, and the number of other addresses on the listed
+    // peer's IP that the startup dials take. The seeds come in a random order.
+    for (max_connections_per_ip, expected_dials) in [(1, 0), (2, 1), (3, 2), (4, 2)] {
+        let config = Config {
+            cache_dir: CacheDir::disabled(),
+            initial_mainnet_peers: ["127.0.0.2:9000", "127.0.0.2:8233", "127.0.0.2:18233"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            unconditional_peers: toml::from_str::<Config>(
+                "unconditional_peers = ['127.0.0.2:9000']",
+            )
+            .unwrap()
+            .unconditional_peers,
+            max_connections_per_ip,
+            ..test_defaults()
+        };
+
+        let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
+        let selected = tokio::time::timeout(
+            PEER_CACHE_TEST_TIMEOUT,
+            super::super::limit_initial_peers(&config, book_tx),
+        )
+        .await
+        .expect("startup peer selection finishes within the test deadline");
+
+        assert!(
+            !selected.contains(&peer_addr("127.0.0.2:9000")),
+            "the listed address has a slot of its own",
+        );
+        assert_eq!(
+            selected.len(),
+            expected_dials,
+            "unexpected startup dials with {max_connections_per_ip} connections per IP",
+        );
+    }
+}
+
 /// A crawler peer limit large enough to exercise multi-peer behavior without
 /// flooding the test runtime with hundreds of immediate fake handshakes.
 const CRAWLER_MANY_PEER_LIMIT_FOR_TESTS: usize = 15;

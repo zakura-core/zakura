@@ -737,9 +737,10 @@ where
 /// `peerset_initial_target_size`.
 ///
 /// Returns the first candidates in the order provided by [`Config::initial_peers`],
-/// skipping addresses that exceed the per-IP connection limit, and the addresses of
-/// dialed unconditional peers, which have slots of their own. Skipped addresses
-/// do not consume a startup slot; later candidates can fill it.
+/// skipping the addresses of dialed unconditional peers, which have slots of their own,
+/// and addresses that exceed the per-IP connection limit. Each dialed unconditional peer
+/// counts against the limit of its IP, so a startup dial never takes the room it needs.
+/// Skipped addresses do not consume a startup slot; later candidates can fill it.
 ///
 /// Also sends every initial peer to the `address_book_updater`.
 async fn limit_initial_peers(
@@ -748,7 +749,13 @@ async fn limit_initial_peers(
 ) -> IndexSet<PeerSocketAddr> {
     let all_peers = config.initial_peers().await;
     let mut initial_peers = IndexSet::new();
+    let unconditional_dial_addrs = config
+        .unconditional_peers
+        .dial_addrs(config.network.default_port());
     let mut selected_per_ip = HashMap::new();
+    for addr in &unconditional_dial_addrs {
+        *selected_per_ip.entry(addr.ip()).or_insert(0) += 1;
+    }
 
     // Config has validated and interleaved cached peers with shuffled seeds.
     // Feed every candidate to discovery, even beyond the startup dial limit.
@@ -756,11 +763,12 @@ async fn limit_initial_peers(
         let _ = address_book_updater
             .send(MetaAddr::new_initial_peer(peer))
             .await;
-        if config.unconditional_peers.is_dial_address(peer.ip()) {
+        let canonical_peer = canonical_peer_addr(peer);
+        if unconditional_dial_addrs.contains(&canonical_peer) {
             continue;
         }
         if initial_peers.len() < config.peerset_initial_target_size {
-            let count = selected_per_ip.entry(peer.ip()).or_insert(0);
+            let count = selected_per_ip.entry(canonical_peer.ip()).or_insert(0);
             if *count < config.max_connections_per_ip {
                 initial_peers.insert(peer);
                 *count += 1;

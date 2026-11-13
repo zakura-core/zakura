@@ -34,8 +34,10 @@ within ten of the harness's runs, and at least two minutes. The unpatched
 build then reruns the confirmed trace's input with `zakura-sim record`, and
 replays the shrunk trace if the shrink finished. If the unpatched build
 violates the same ID on the confirmed trace, the lane is `baseline-fails`,
-because the bug is in the pinned revision. A violation on either trace is
-a property finding in the report. The shrink keeps the ID's violation but
+because the bug is in the pinned revision. If the unpatched build can't
+judge the confirmed trace's input, because its run passes its deadline or
+writes no report, the lane is a harness failure (`unconfirmed`). A
+violation on either trace is a property finding in the report. The shrink keeps the ID's violation but
 not the mutant's part in it, so a violation on the shrunk trace alone leaves
 the kill. One search per harness and seed runs on the unpatched build
 first, and one that a run failure ended reruns alone. A confirmed violation there is a property

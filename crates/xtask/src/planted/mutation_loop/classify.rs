@@ -85,7 +85,8 @@ pub(in crate::planted) enum Reason {
     /// whose shutdown abandoned tasks.
     Abandoned,
     /// Harness failure: a generator's kill didn't confirm, or didn't replay
-    /// Exact, in a fresh process.
+    /// Exact, in a fresh process, or the unpatched build couldn't judge its
+    /// input.
     Unconfirmed,
     /// Harness failure: a campaign didn't complete from an empty corpus, or
     /// its evidence falls short.

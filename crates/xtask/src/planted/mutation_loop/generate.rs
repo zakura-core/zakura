@@ -52,7 +52,9 @@
 //!   only the ID, not the mutant's effect, so a violation on the shrunk
 //!   trace alone leaves the kill. A run that passes its deadline, that the
 //!   memory cap kills, or that writes no report judging the ID is
-//!   `undecided`.
+//!   `undecided`. A kill whose confirmed trace is undecided there is a
+//!   harness failure (`unconfirmed`): only a hold on the unpatched build
+//!   shows the mutant caused the violation.
 //!
 //! A mutant's search runs once per harness and seed, and the loop
 //! classifies each of the mutant's cases from it. A search, or each
@@ -497,21 +499,46 @@ pub(in crate::planted) fn judge_unpatched(
     }
 }
 
-/// A confirmed kill's class once the unpatched build replayed its traces:
-/// `baseline-fails` if the unpatched build violates the ID on the confirmed
-/// trace too, else `result`. The shrunk trace's replay doesn't count: the
-/// shrink kept the ID's violation, not the mutant's part in it.
+/// A kill's class once the unpatched build ran its traces. A kill keeps
+/// `result` only if the killing ID holds when the unpatched build reruns the
+/// confirmed trace's input. If the unpatched build violates the ID there
+/// too, the lane is `baseline-fails`: the defect is the pinned revision's.
+/// If that run is undecided, or never ran, the lane is a harness failure
+/// (`unconfirmed`): the unpatched build couldn't judge the kill's input, so
+/// nothing shows the mutant caused the violation. The shrunk trace's run
+/// doesn't count: the shrink kept the ID's violation, not the mutant's part
+/// in it. A `result` that isn't a kill, such as an unconfirmed one, stays.
 pub(super) fn unpatched_class(result: Classified, checks: &[UnpatchedCheck]) -> Classified {
-    let confirmed = checks.iter().find(|check| {
-        check.trace == KillTrace::Confirmed && check.outcome == OnUnpatched::Violated
-    });
+    if !matches!(
+        result.class,
+        Class::KilledByNamedRule | Class::KilledByOtherRule
+    ) {
+        return result;
+    }
+    let unconfirmed = |why: &str| {
+        Classified::new(
+            Class::HarnessFailure,
+            Some(Reason::Unconfirmed),
+            format!(
+                "{}, but the unpatched build couldn't judge the kill's input: {why}",
+                result.detail
+            ),
+        )
+    };
+    let confirmed = checks
+        .iter()
+        .find(|check| check.trace == KillTrace::Confirmed);
     match confirmed {
-        Some(check) => Classified::new(
-            Class::BaselineFails,
-            None,
-            format!("{}, but {}", result.detail, check.detail),
-        ),
-        _ => result,
+        Some(check) => match check.outcome {
+            OnUnpatched::Holds => result,
+            OnUnpatched::Violated => Classified::new(
+                Class::BaselineFails,
+                None,
+                format!("{}, but {}", result.detail, check.detail),
+            ),
+            OnUnpatched::Undecided => unconfirmed(&check.detail),
+        },
+        None => unconfirmed("the confirmed trace never ran there"),
     }
 }
 

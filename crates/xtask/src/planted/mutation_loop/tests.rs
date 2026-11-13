@@ -1250,11 +1250,11 @@ fn a_kill_names_its_id_and_input_and_needs_its_confirmation() {
     assert_eq!(confirmed(result.clone(), &kept), result);
 }
 
-/// The unpatched build's replays of a kill decide whether the kill stands
-/// (mut-5): a violation on the confirmed trace too makes the lane
-/// `baseline-fails`; a violation on either trace is a property finding;
-/// a violation on the shrunk trace alone, a hold, or a replay that judged
-/// nothing leaves the kill.
+/// The unpatched build's runs of a kill decide whether the kill stands
+/// (mut-5): only a hold on the confirmed trace keeps it. A violation there
+/// too makes the lane `baseline-fails`; an undecided or missing run makes it
+/// a harness failure (`unconfirmed`). A violation on either trace is a
+/// property finding, and the shrunk trace's run alone never decides.
 #[test]
 fn a_kill_that_fails_unpatched_is_a_property_finding() {
     let report = |violations: &str| {
@@ -1292,19 +1292,52 @@ fn a_kill_that_fails_unpatched_is_a_property_finding() {
         detail: "the trace violates it on the unpatched build too".to_owned(),
         log: format!("mutants/x/unpatched-{trace:?}-replay.log").into(),
     };
-    for kept in [OnUnpatched::Holds, OnUnpatched::Undecided] {
-        assert_eq!(
-            unpatched_class(
-                killed.clone(),
-                &[
-                    check(KillTrace::Confirmed, kept),
-                    check(KillTrace::Shrunk, kept)
-                ]
-            ),
-            killed
-        );
+    assert_eq!(
+        unpatched_class(
+            killed.clone(),
+            &[
+                check(KillTrace::Confirmed, OnUnpatched::Holds),
+                check(KillTrace::Shrunk, OnUnpatched::Undecided)
+            ]
+        ),
+        killed
+    );
+    let other = classify::Classified {
+        other: Some(OTHER.to_owned()),
+        ..classify::Classified::new(Class::KilledByOtherRule, None, "the kill")
+    };
+    for result in [killed.clone(), other] {
+        for checks in [
+            vec![
+                check(KillTrace::Confirmed, OnUnpatched::Undecided),
+                check(KillTrace::Shrunk, OnUnpatched::Holds),
+            ],
+            vec![check(KillTrace::Shrunk, OnUnpatched::Holds)],
+            Vec::new(),
+        ] {
+            let judged = unpatched_class(result.clone(), &checks);
+            assert_eq!(
+                (judged.class, judged.reason, judged.other),
+                (Class::HarnessFailure, Some(Reason::Unconfirmed), None),
+                "{checks:?}"
+            );
+            assert!(
+                judged.detail.contains("couldn't judge the kill's input"),
+                "{}",
+                judged.detail
+            );
+        }
     }
-    assert_eq!(unpatched_class(killed.clone(), &[]), killed);
+    let unconfirmed = classify::Classified::new(
+        Class::HarnessFailure,
+        Some(Reason::Unconfirmed),
+        "the kill doesn't confirm",
+    );
+    assert_eq!(
+        unpatched_class(unconfirmed.clone(), &[]),
+        unconfirmed,
+        "a kill that didn't confirm keeps its reason"
+    );
     let shrunk_only = [
         check(KillTrace::Confirmed, OnUnpatched::Holds),
         check(KillTrace::Shrunk, OnUnpatched::Violated),
@@ -1342,6 +1375,193 @@ fn a_kill_that_fails_unpatched_is_a_property_finding() {
         lane.finding().unwrap().log,
         std::path::PathBuf::from("mutants/x/unpatched-Confirmed-replay.log"),
         "an unshrunk violation is a finding too"
+    );
+}
+
+/// A full report in which each of `violated` is violated and each of
+/// `held` holds.
+fn full_report(violated: &[&str], held: &[&str]) -> String {
+    let entry = |id: &&str, violations| json!({"property": id, "violations": violations});
+    let properties: Vec<_> = violated
+        .iter()
+        .map(|id| entry(id, json!([{"step": 3}])))
+        .chain(held.iter().map(|id| entry(id, json!([]))))
+        .collect();
+    json!({ "properties": properties }).to_string()
+}
+
+/// Writes an executable `zakura-sim` at `path` that sets `$cmd` to its
+/// subcommand and `$out` to its `--out` value, then runs `body`.
+#[cfg(unix)]
+fn fake_sim(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let prelude = "#!/bin/sh\ncmd=$1\nout=\nprev=\n\
+                   for arg in \"$@\"; do [ \"$prev\" = --out ] && out=$arg; prev=$arg; done\n";
+    fs::write(path, format!("{prelude}{body}")).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A case of `property`, allowing `also_violates`, for a generator lane.
+fn generator_case(property: &str, also_violates: &[&str]) -> LoopCase {
+    LoopCase {
+        label: format!("bounds/{property}.patch"),
+        patch: "p".into(),
+        listed_in: "cases.json".into(),
+        property: property.to_owned(),
+        witness: WitnessSpec::Test {
+            test: "t".to_owned(),
+            test_target: "block_table".to_owned(),
+        },
+        entry: Some("bounds".to_owned()),
+        table: None,
+        also_violates: also_violates.iter().map(|id| (*id).to_owned()).collect(),
+    }
+}
+
+/// One inproc search on a mutant that stops at a violation of `stop`, whose
+/// end record shows each of `violated` violated, run through
+/// [`Runner::generator_lanes`] for each of `cases`. The fresh confirmation
+/// writes `confirmed` as its trace's full report, the shrink fails, and the
+/// unpatched build's rerun of the confirmed trace's input writes
+/// `unpatched`, or no report. Returns each case's one lane.
+#[cfg(unix)]
+fn fake_kill(
+    stop: &str,
+    violated: &[&str],
+    confirmed: &str,
+    unpatched: Option<&str>,
+    cases: &[LoopCase],
+) -> Vec<GeneratorReport> {
+    let tree = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let (runner, slot, _, _) = one_case(tree.path(), out.path(), &tree.path().join("p"), true);
+    fs::create_dir_all(tree.path().join("crates/zakura-sim")).unwrap();
+    let generate = json!({
+        "stop": {"kind": "violation", "property": stop},
+        "kill_run": 0,
+        "executed": 1,
+        "millis": 5,
+        "input": "@OUT@/kill.bin",
+    });
+    let outcomes: Vec<_> = violated
+        .iter()
+        .map(|id| json!({"property": id, "outcome": {"violated": {}}}))
+        .collect();
+    let record = json!({
+        "source": "source",
+        "thread": "t1",
+        "end": {"violation": {"property": stop}, "properties": outcomes},
+    });
+    let patched = out.path().join("patched-sim");
+    fake_sim(
+        &patched,
+        &[
+            "case $cmd in\n",
+            "generate)\n",
+            "  mkdir -p \"$out\"; printf x > \"$out/kill.bin\"\n",
+            "  printf '%s' '@GENERATE@' | sed \"s|@OUT@|$out|\" > \"$out/generate.json\"\n",
+            "  printf '%s' '@RECORD@' > \"$ZAKURA_SIM_END_RECORDS/0.json\";;\n",
+            "confirm)\n",
+            "  mkdir -p \"$out/trace\"; printf x > \"$out/trace/input.bin\"\n",
+            "  printf '%s' '@CONFIRMED@' > \"$out/trace/full-report.json\"\n",
+            "  printf '%s' '{\"status\":\"confirmed\",\"trace\":\"trace\"}' > \"$out/confirmation.json\";;\n",
+            "replay) ;;\n",
+            "*) exit 1;;\n",
+            "esac\n",
+        ]
+        .concat()
+        .replace("@GENERATE@", &generate.to_string())
+        .replace("@RECORD@", &record.to_string())
+        .replace("@CONFIRMED@", confirmed),
+    );
+    let unpatched_sim = out.path().join("unpatched-sim");
+    let write = unpatched.map_or_else(String::new, |report| {
+        format!("printf '%s' '{report}' > \"$out/full-report.json\"\n")
+    });
+    fake_sim(
+        &unpatched_sim,
+        &format!("[ \"$cmd\" = record ] || exit 1\nmkdir -p \"$out\"\n{write}"),
+    );
+    let harness = "block-sync/storage";
+    let lanes = Lanes {
+        flags: GenerateFlags {
+            runs: 1,
+            seeds: vec![11],
+            ..GenerateFlags::default()
+        },
+        plans: vec![Ok(harness.to_owned()); cases.len()],
+        baselines: BTreeMap::from([(
+            (harness.to_owned(), 11),
+            GenBaseline {
+                failure: None,
+                millis: 10,
+            },
+        )]),
+        exclude: out.path().join("exclude.txt"),
+        corpus: out.path().join("corpus"),
+        targets: BTreeMap::new(),
+        unpatched_sim,
+    };
+    let built = Built {
+        sim: Some(patched),
+        tests: BTreeMap::new(),
+    };
+    let indexed: Vec<(usize, &LoopCase)> = cases.iter().enumerate().collect();
+    let mut reports = runner
+        .generator_lanes(
+            &slot,
+            &built,
+            &lanes,
+            &indexed,
+            &out.path().join("mutant"),
+            "source",
+            None,
+        )
+        .unwrap();
+    (0..cases.len())
+        .map(|index| {
+            let mut lanes = reports.remove(&index).unwrap();
+            assert_eq!(lanes.len(), 1);
+            lanes.remove(0)
+        })
+        .collect()
+}
+
+/// A confirmed kill stands only if the unpatched build's rerun of its input
+/// holds the killing ID. A rerun that judges nothing, as an `inproc` or a
+/// `libfuzzer` lane's kill alike goes through, is a harness failure.
+#[cfg(unix)]
+#[test]
+fn a_kill_the_unpatched_build_cannot_judge_is_unconfirmed() {
+    let case = generator_case(NAMED, &[]);
+    let confirmed = full_report(&[NAMED], &[]);
+    let holds = full_report(&[], &[NAMED]);
+    let kept = fake_kill(
+        NAMED,
+        &[NAMED],
+        &confirmed,
+        Some(&holds),
+        std::slice::from_ref(&case),
+    );
+    assert_eq!(kept[0].result.class, Class::KilledByNamedRule, "{kept:?}");
+    assert_eq!(kept[0].unpatched[0].outcome, OnUnpatched::Holds);
+
+    let silent = fake_kill(NAMED, &[NAMED], &confirmed, None, &[case]);
+    let lane = &silent[0];
+    assert_eq!(
+        (lane.result.class, lane.result.reason),
+        (Class::HarnessFailure, Some(Reason::Unconfirmed)),
+        "{lane:?}"
+    );
+    assert_eq!(lane.unpatched[0].outcome, OnUnpatched::Undecided);
+    assert!(lane.confirmation.as_ref().unwrap().ok);
+    assert!(
+        lane.result
+            .detail
+            .contains("couldn't judge the kill's input"),
+        "{}",
+        lane.result.detail
     );
 }
 

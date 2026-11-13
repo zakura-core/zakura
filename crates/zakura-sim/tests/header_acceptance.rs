@@ -7733,6 +7733,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/required.rs",
         "a_permitted_test_joins_its_whole_test",
     ),
+    (
+        "PlantedRef",
+        "tests/header_acceptance_narrowing.rs",
+        "case_task",
+        "tests/header_acceptance_narrowing.rs",
+        "a_released_case_s_task_joins_its_whole_case",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.
@@ -9576,12 +9583,6 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "released_inputs",
         "(input.harness.clone(),input.name.clone())",
         "lists the committed inputs by harness and name, and classifies a harness name, a static check",
-    ),
-    (
-        "tests/header_acceptance_narrowing.rs",
-        "released_inputs",
-        "(p,n)==(property,name)",
-        "skips native mutations by their directory, a kind, and picks the test's case, a test building its input",
     ),
     (
         "tests/header_acceptance_narrowing.rs",

@@ -22,12 +22,14 @@ use std::{fs, path::PathBuf, process::Command};
 
 use support::{
     inputs,
+    one_key_off::assert_one_key_off,
     prepare_fault::{disconnect_mid_prepare, scenario, LastView, Uncooled, Watched, CHAIN},
     steer::steer,
 };
 use zakura_sim::{
     domain::header_sync::STALE_COMPLETION_INERT,
     harness::{
+        header_acceptance::refs::{ConnectionRef, Ref},
         header_node::{
             fault::FaultEnd,
             stale::{StaleWindow, Staleness},
@@ -36,11 +38,12 @@ use zakura_sim::{
         run_prepared, HarnessError, Subsystem, WITNESS_FILE,
     },
     model::{is_fault_cause, Label},
-    observe::{ReactorFact, StorageFact, StorageRequest, StorageResult},
+    observe::{Entry, ReactorFact, StorageFact, StorageRequest, StorageResult, StreamId},
     peer::{honest::HonestChain, PeerAction},
     property::HasView,
     witness::{check_witness, Expect, WitnessScenario},
-    Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
+    Checker, MemorySink, NoChecks, Observation, ObservationLog, Plan, PlanInput, PropertyOutcome,
+    RunReport,
 };
 use zakura_storage::header::fixture::HeaderFixture;
 
@@ -209,9 +212,9 @@ fn assert_penalized(label: &str, report: &RunReport, view: &StorageView) -> Shap
 }
 
 /// The causes the node closed each connection that carried a `BadContent`
-/// page with, in log order, by that connection.
-fn bad_page_closes(report: &RunReport) -> Vec<(u64, Vec<String>)> {
-    let entries = report.log.entries();
+/// page in `entries` with, in log order, by that connection, each close
+/// joined to its page by its [`ConnectionRef`].
+fn bad_page_closes(entries: &[Entry]) -> Vec<(u64, Vec<String>)> {
     let mut connections: Vec<u64> = entries
         .iter()
         .filter_map(|entry| match &entry.obs {
@@ -225,19 +228,66 @@ fn bad_page_closes(report: &RunReport) -> Vec<(u64, Vec<String>)> {
     connections
         .into_iter()
         .map(|connection| {
+            let page = ConnectionRef { connection };
             let causes = entries
                 .iter()
+                .filter(|entry| {
+                    ConnectionRef::joins(&page, *entry, |entry| match &entry.obs {
+                        Observation::ConnectionClosed { connection, .. } => Some(ConnectionRef {
+                            connection: *connection,
+                        }),
+                        _ => None,
+                    })
+                })
                 .filter_map(|entry| match &entry.obs {
-                    Observation::ConnectionClosed {
-                        connection: closed,
-                        cause,
-                    } if *closed == connection => Some(cause.clone()),
+                    Observation::ConnectionClosed { cause, .. } => Some(cause.clone()),
                     _ => None,
                 })
                 .collect();
             (connection, causes)
         })
         .collect()
+}
+
+/// A bad page's close joins it by its connection: connection 1's
+/// `BadContent` page and a fault close of connection 1 are a close of the
+/// page's connection, and the same close of another connection isn't.
+#[test]
+fn a_bad_page_joins_the_close_of_its_own_connection() {
+    let page = ConnectionRef { connection: 1 };
+    let closes = |closed: &ConnectionRef| {
+        let mut log = ObservationLog::default();
+        log.push(Observation::PeerFrame {
+            connection: page.connection,
+            stream: StreamId {
+                kind: 64,
+                version: 1,
+            },
+            quic_stream: None,
+            seq: 0,
+            row: Some("headers".to_owned()),
+            rule_stream: StreamId {
+                kind: 64,
+                version: 1,
+            },
+            label: Label::BadContent,
+            exhausted: false,
+            exchange: None,
+            payload: 8,
+        });
+        log.push(Observation::ConnectionClosed {
+            connection: closed.connection,
+            cause: "service_protocol_reject".to_owned(),
+        });
+        bad_page_closes(log.entries())
+    };
+    assert_eq!(
+        closes(&page),
+        [(1, vec!["service_protocol_reject".to_owned()])]
+    );
+    assert_one_key_off::<ConnectionRef>(&page, |closed| {
+        closes(closed).iter().any(|(_, causes)| !causes.is_empty())
+    });
 }
 
 /// The node prepares the invalid tip, penalizes the peer and closes it. The
@@ -257,7 +307,7 @@ fn an_invalid_page_is_judged_at_prepare_and_penalized() {
                 .all(|(origin, current)| origin == current),
             "plan {index}: the session that sent the page was still current: {shape:?}"
         );
-        let closes = bad_page_closes(&report);
+        let closes = bad_page_closes(report.log.entries());
         assert!(
             !closes.is_empty()
                 && closes

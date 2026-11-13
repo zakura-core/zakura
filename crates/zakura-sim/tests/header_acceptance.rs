@@ -7213,6 +7213,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/check.rs",
         "a_punishment_names_the_frame_judged_on_its_own_connection",
     ),
+    (
+        "ConnectionRef",
+        "tests/header_wire_prepare_fault.rs",
+        "bad_page_closes",
+        "tests/header_wire_prepare_fault.rs",
+        "a_bad_page_joins_the_close_of_its_own_connection",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.

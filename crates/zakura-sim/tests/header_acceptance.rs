@@ -4200,6 +4200,7 @@ fn manifest() -> Manifest {
             Expected::StaysNotApplicable {
                 property: "t/b",
                 history: STAYS_HISTORY,
+                na_reason: zakura_sim::NaReason::NeverApplied,
                 reason: NEVER,
                 approval: Approval::Adam { record: "test" },
                 not_applicable: &[],
@@ -4507,7 +4508,7 @@ fn results() -> ResultFile {
                 Actual::Run(execution(
                     STAYS_HISTORY.into(),
                     NODE,
-                    &[("t/a", held()), ("t/b", na(NEVER))],
+                    &[("t/a", held()), ("t/b", na(UNREACHED))],
                 )),
             ),
             record(
@@ -4746,9 +4747,23 @@ fn replay_actual(results: &mut ResultFile) -> &mut Actual {
     &mut record_mut(results, &ExpectedId::Replays(HISTORY.into())).actual
 }
 
+/// Every genuine result verifies its keys. The approved `StaysNotApplicable`
+/// among them verifies against the report a real run gives it, its target
+/// `NotApplicable(never-applied)`, the typed reason its row names, while
+/// the row's approved prose says why; another reason blocks it.
 #[test]
 fn the_evaluator_accepts_genuine_results() {
     let manifest = manifest();
+    assert_ne!(NEVER, zakura_sim::NaReason::NeverApplied.name());
+    let mut undeclared = results();
+    run_of(&mut undeclared, &stays_id())
+        .reports
+        .insert("t/b".into(), na("undeclared"));
+    assert!(blocked(&state(
+        &manifest,
+        &undeclared,
+        &Key::passing("t/b")
+    )));
     let evaluation =
         header_acceptance::evaluate(&manifest, &required(&manifest), &results(), SUBJECT);
     assert!(evaluation.stray.is_empty(), "{:?}", evaluation.stray);
@@ -5088,7 +5103,7 @@ fn the_evaluator_refuses_each_single_defect() {
     // missing report.
     let stays_defects: [fn(&mut Execution); 3] = [
         |run| {
-            run.reports.insert("t/b".into(), na(UNREACHED));
+            run.reports.insert("t/b".into(), na("undeclared"));
         },
         |run| {
             run.reports.insert("t/a".into(), Report::Violated);
@@ -6507,11 +6522,11 @@ fn the_evaluator_binds_runners_and_traces() {
     }
 
     // An approved StaysNotApplicable reason with an empty approval record,
-    // or an empty reason its report repeats.
+    // or an empty reason.
     let stays = Key::passing("t/b");
     for (empty_reason, empty_record) in [(false, true), (true, false)] {
         let mut m = manifest();
-        let mut r = results();
+        let r = results();
         for result in &mut m.expected {
             if let Expected::StaysNotApplicable {
                 reason, approval, ..
@@ -6523,13 +6538,6 @@ fn the_evaluator_binds_runners_and_traces() {
                 if empty_record {
                     *approval = Approval::Adam { record: "" };
                 }
-            }
-        }
-        if empty_reason {
-            if let Some(Report::NotApplicable { reason }) =
-                run_of(&mut r, &stays_id()).reports.get_mut("t/b")
-            {
-                *reason = String::new();
             }
         }
         assert!(

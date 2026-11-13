@@ -1485,6 +1485,7 @@ fn generated_row(generated: &Generated, property: &'static str) -> Row {
             Expected::StaysNotApplicable {
                 property,
                 history,
+                na_reason: crate::NaReason::NeverApplied,
                 reason: NOT_OWED,
                 approval: Approval::Pending,
                 not_applicable: super::not_applicable::history_expected(history),

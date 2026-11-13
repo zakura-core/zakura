@@ -139,7 +139,7 @@ use super::{
         ObligationState, Report, ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
     history::{Declaration, DeclaredHistory, Ran, PLAN_FILE, RAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
-    refs::TriggerRef,
+    refs::{Ref, TriggerRef},
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
     rows::HEADER_HARNESSES,
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
@@ -278,6 +278,50 @@ impl std::str::FromStr for Containment {
 pub const REPLAY_DIR: &str = "replay";
 /// A fresh replay's own artifact: how its child ended ([`ReplayRun`]).
 pub const REPLAY_FILE: &str = "replay.json";
+/// A tool recording's own artifact: how its `zakura-sim record` child
+/// ended ([`RecordingRun`]).
+pub const RECORDING_FILE: &str = "recorded.json";
+
+/// What a tool recording's [`RECORDING_FILE`] holds, as the runner writes
+/// it from its child.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingRun {
+    /// The ID of the run whose runner made the recording.
+    pub run_id: String,
+    /// The index of its task.
+    pub index: usize,
+    /// The recording's role in the task's directory.
+    pub role: String,
+    /// The SHA-256 of the trace it left, or `None` if it left none.
+    pub trace: Option<String>,
+    /// Whether the child exited 0, which `zakura-sim record` does only if
+    /// it recorded and any witness it judged passed.
+    pub exited_ok: bool,
+    /// Whether it ended at its deadline.
+    pub killed: bool,
+}
+
+/// Why the recording in `dir`, task `at`'s run at `role`, doesn't count,
+/// or `None` if it does: its [`RECORDING_FILE`] must name that task's run
+/// at that role and `dir`'s trace ([`binding::RECORDING`]), and its child
+/// must have exited 0, so a recorder that wrote passing artifacts and then
+/// failed gets no credit for them.
+fn recorder_refusal(dir: &Path, (at, role): (&TaskAt<'_>, &str)) -> Option<String> {
+    let expect = Expect::new().with_read(
+        Field::Trace,
+        file_digest(&dir.join("trace.jsonl")),
+        "the recorded trace can't be read",
+    );
+    let path = dir.join(RECORDING_FILE);
+    match at.read::<RecordingRun>(&binding::RECORDING, &path, role, expect) {
+        Err(why) => Some(format!("its recorder's status isn't this run's: {why}")),
+        Ok(ran) if ran.killed => Some("its recorder hit its deadline".to_owned()),
+        Ok(ran) if !ran.exited_ok => Some("its recorder exited nonzero".to_owned()),
+        Ok(_) => None,
+    }
+}
+
 /// A node case's `Draft` run's companions, judged by the case's own build
 /// ([`CompanionsRun`]).
 pub const COMPANIONS_FILE: &str = "companions.json";
@@ -515,11 +559,10 @@ pub struct PatchedWitness {
 /// so they expect `violated` beside nothing: its set is judged on its
 /// `Draft` run ([`super::Found::AtStepSetOnDraft`]).
 fn patched_witness(repo: &Path, case: CaseRef) -> Result<PatchedWitness, String> {
-    let file = repo
-        .join("qa/planted")
+    let file = Path::new("qa/planted")
         .join(case.property)
         .join(format!("{}.toml", case.name));
-    let text = fs::read_to_string(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+    let text = binding::committed_text(repo, &file)?;
     let table: toml::Table =
         toml::from_str(&text).map_err(|error| format!("{}: {error}", file.display()))?;
     let ids = |key: &str| -> Result<Vec<String>, String> {
@@ -574,11 +617,10 @@ impl CaseInput {
 /// table's scenario and Plan, its `plan` bytes or its `script`. A case
 /// names exactly one input, and a typed one exactly one Plan.
 fn case_input(repo: &Path, case: CaseRef) -> Result<CaseInput, String> {
-    let file = repo
-        .join("qa/planted")
+    let file = Path::new("qa/planted")
         .join(case.property)
         .join(format!("{}.toml", case.name));
-    let text = fs::read_to_string(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+    let text = binding::committed_text(repo, &file)?;
     let table: toml::Table =
         toml::from_str(&text).map_err(|error| format!("{}: {error}", file.display()))?;
     let path = |table: &toml::Table, key: &str| {
@@ -825,10 +867,9 @@ fn draft_witness(property: &str, set: &[&str]) -> PatchedWitness {
 /// the repository root.
 fn native_patch(repo: &Path, patch: &str) -> Result<String, String> {
     let dir = format!("qa/native-mutations/header-sync/{patch}");
-    let patches: Vec<String> = fs::read_dir(repo.join(&dir))
-        .map_err(|error| format!("{dir}: {error}"))?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
+    let patches: Vec<String> = binding::committed_entries(repo, &dir)?
+        .into_iter()
+        .filter_map(|(path, _)| path.file_name()?.to_str().map(str::to_owned))
         .filter(|name| name.ends_with(".patch"))
         .collect();
     match patches.as_slice() {
@@ -1531,6 +1572,7 @@ pub fn assemble(repo: &Path, run_plan: &RunPlan, artifacts: &Path, run: &RunBind
                 };
                 let checks = CaseChecks {
                     repo,
+                    at,
                     dir: &dir,
                     property,
                     harness,
@@ -1700,6 +1742,8 @@ fn task_expected(task: &Task) -> &ExpectedId {
 struct CaseChecks<'a> {
     /// The repository at S.
     repo: &'a Path,
+    /// The case's task.
+    at: TaskAt<'a>,
     /// The case task's directory.
     dir: &'a Path,
     /// The case's property directory.
@@ -1763,6 +1807,9 @@ impl CaseChecks<'_> {
     fn draft(&self, run: RunId) -> Execution {
         let dir = self.dir.join("draft");
         let mut execution = execution(&dir, run, self.harness, RunBy::Tool);
+        if let Some(why) = recorder_refusal(&dir, (&self.at, "draft")) {
+            fail(&mut execution, why);
+        }
         if let Some(why) = case_input_refusal(self.repo, self.harness, self.input, &dir) {
             fail(&mut execution, why);
         }
@@ -1913,6 +1960,9 @@ fn history_execution(
     let (package, file, name, case) = test;
     let recording = dir.join("run");
     let mut execution = execution(&recording, run, harness, RunBy::Tool);
+    if let Some(why) = recorder_refusal(&recording, (at, "run")) {
+        fail(&mut execution, why);
+    }
     match witness {
         (property, Some(expect)) if !witness_judges(&recording, property, expect, &[]) => {
             execution.trigger = false;
@@ -2192,7 +2242,7 @@ impl CommittedInput {
 /// can't be read.
 fn committed_input(repo: &Path, input: &str) -> Result<CommittedInput, String> {
     use sha2::{Digest, Sha256};
-    let bytes = fs::read(repo.join(input))
+    let bytes = binding::committed_bytes(repo, input)
         .map_err(|_| format!("the committed input {input} can't be read"))?;
     Ok(CommittedInput {
         sha256: Sha256::digest(&bytes)
@@ -2235,7 +2285,7 @@ fn mapped_case_refusal(
 /// which no case's target can be confirmed.
 fn fuzz_targets(repo: &Path) -> Result<BTreeMap<String, String>, String> {
     let path = repo.join("qa/fuzz/sim/Cargo.toml");
-    let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text = binding::committed_text(repo, "qa/fuzz/sim/Cargo.toml")?;
     let manifest = toml::from_str::<toml::Table>(&text)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let targets = manifest
@@ -2739,7 +2789,7 @@ fn witness_judges(dir: &Path, property: &str, expect: &str, beside: &[String]) -
         expect: expect.to_owned(),
         also_violates: beside.to_vec(),
     };
-    bound_witness(dir).is_ok_and(|witness| trigger_of(&witness).as_ref() == Some(&want))
+    bound_witness(dir).is_ok_and(|witness| TriggerRef::joins(&want, &witness, trigger_of))
 }
 
 /// The trigger `witness`, a witness file, judged: its property, its
@@ -2777,7 +2827,7 @@ pub fn planted_cases(repo: &Path) -> Vec<(String, String)> {
         .iter()
         .map(|registration| registration.property.as_ref())
         .collect();
-    planted_cases_in(&repo.join("qa/planted"), &|property, name| {
+    planted_cases_in(repo, Path::new("qa/planted"), &|property, name| {
         is_header_case(repo, &ids, property, name)
     })
 }
@@ -2806,18 +2856,22 @@ fn is_header_case(repo: &Path, ids: &BTreeSet<&str>, property: &str, name: &str)
     })
 }
 
-/// Every planted case under `root` that `header` keeps, given its property
-/// and name, as `(property, name)`, sorted. An unreadable directory holds
-/// none.
-fn planted_cases_in(root: &Path, header: &dyn Fn(&str, &str) -> bool) -> Vec<(String, String)> {
+/// Every planted case under `root`, a committed directory of `repo`, that
+/// `header` keeps, given its property and name, as `(property, name)`,
+/// sorted. An unreadable directory holds none.
+fn planted_cases_in(
+    repo: &Path,
+    root: &Path,
+    header: &dyn Fn(&str, &str) -> bool,
+) -> Vec<(String, String)> {
     /// Collects every `.patch` under `dir`.
-    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
-        let Ok(entries) = fs::read_dir(dir) else {
+    fn walk(repo: &Path, root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = binding::committed_entries(repo, dir) else {
             return;
         };
-        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
-            if path.is_dir() {
-                walk(root, &path, out);
+        for (path, is_dir) in entries {
+            if is_dir {
+                walk(repo, root, &path, out);
             } else if path.extension().is_some_and(|ext| ext == "patch") {
                 let property = path
                     .parent()
@@ -2831,7 +2885,7 @@ fn planted_cases_in(root: &Path, header: &dyn Fn(&str, &str) -> bool) -> Vec<(St
         }
     }
     let mut cases = Vec::new();
-    walk(root, root, &mut cases);
+    walk(repo, root, root, &mut cases);
     cases.retain(|(property, name)| header(property, name));
     cases.sort();
     cases
@@ -2840,13 +2894,11 @@ fn planted_cases_in(root: &Path, header: &dyn Fn(&str, &str) -> bool) -> Vec<(St
 /// Every native-mutation directory under `repo`'s
 /// `qa/native-mutations/header-sync/`.
 pub fn native_dirs(repo: &Path) -> Vec<String> {
-    let mut dirs: Vec<String> = fs::read_dir(repo.join("qa/native-mutations/header-sync"))
+    let mut dirs: Vec<String> = binding::committed_entries(repo, "qa/native-mutations/header-sync")
         .into_iter()
         .flatten()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+        .filter(|(_, is_dir)| *is_dir)
+        .filter_map(|(path, _)| path.file_name()?.to_str().map(str::to_owned))
         .collect();
     dirs.sort();
     dirs
@@ -3578,6 +3630,25 @@ mod tests {
     /// A machine harness, and a node one.
     const MACHINE: &str = "header/reactor-policy";
     const NODE: &str = "header-sync/storage";
+
+    /// Writes the [`RECORDING_FILE`] the runner leaves beside the tool
+    /// recording in `dir`, [`AT`]'s run at `role`, naming its trace, for a
+    /// recorder that exited 0 if `exited_ok`.
+    fn recorder_exited(dir: &Path, role: &str, exited_ok: bool) {
+        let ran = RecordingRun {
+            run_id: AT.run_id.into(),
+            index: AT.index,
+            role: role.into(),
+            trace: file_digest(&dir.join("trace.jsonl")),
+            exited_ok,
+            killed: false,
+        };
+        fs::write(
+            dir.join(RECORDING_FILE),
+            serde_json::to_string(&ran).expect("a recording run serializes"),
+        )
+        .expect("the temp dir is writable");
+    }
 
     /// Records a real trace of the machine harness on its committed input
     /// into `dir`, its meta's build source set to `source`, with a witness
@@ -4817,6 +4888,7 @@ mod tests {
             .expect("the case's harness records its committed input");
         let checks = CaseChecks {
             repo: &repo,
+            at: AT,
             dir: case.path(),
             property,
             harness,
@@ -4840,6 +4912,7 @@ mod tests {
             &draft_dir,
         )
         .expect("the case's harness records its committed input");
+        recorder_exited(&draft_dir, "draft", true);
         let draft_run = |expect: &str, beside: &[String]| {
             write_witness(
                 &draft_dir,
@@ -5037,6 +5110,7 @@ mod tests {
         let case = case_dir("s", "patched");
         let draft_dir = case.path().join("draft");
         record_into(&draft_dir, "patched");
+        recorder_exited(&draft_dir, "draft", true);
         let input = CaseInput::Fuzz {
             input: MACHINE_INPUT.into(),
         };
@@ -5046,6 +5120,7 @@ mod tests {
         };
         let checks = CaseChecks {
             repo: &repo,
+            at: AT,
             dir: case.path(),
             property: MACHINE,
             harness: MACHINE,
@@ -5083,6 +5158,106 @@ mod tests {
             "{:?}",
             failed.end
         );
+    }
+
+    /// A tool recording counts only if its recorder exited 0. A history
+    /// run and a `Draft` run whose recorder wrote every artifact, all
+    /// passing, and then exited 1 each fail, and so does one whose status
+    /// names another role, another trace, or is missing.
+    #[test]
+    fn a_recorder_s_nonzero_exit_fails_its_run() {
+        let status = |dir: &Path, role: &str, trace: Option<String>, exited_ok: bool| {
+            let ran = serde_json::json!({
+                "run_id": "r",
+                "index": 0,
+                "role": role,
+                "trace": trace,
+                "exited_ok": exited_ok,
+                "killed": false,
+            });
+            fs::write(dir.join("recorded.json"), ran.to_string())
+                .expect("the temp dir is writable");
+        };
+        let refused = |run: &Execution, why: &str| matches!(&run.end, End::Failed { why: found } if found.contains(why));
+
+        let history = tempfile::tempdir().expect("a temp dir can be created");
+        history_task_dir(
+            history.path(),
+            Some(serde_json::json!({ "property": "p/a", "expect": "holds", "passed": true })),
+        );
+        let run = history.path().join("run");
+        let trace = file_digest(&run.join("trace.jsonl"));
+        let read = || {
+            history_execution(
+                (history.path(), &AT),
+                history_run(),
+                NODE,
+                ("p/a", Some("holds")),
+                ("zakura-sim", "tests/header_node.rs", "test", "plan 0"),
+                "s",
+            )
+        };
+        status(&run, "run", trace.clone(), true);
+        let ok = read();
+        assert!(
+            ok.trigger && !matches!(ok.end, End::Failed { .. }),
+            "{:?}",
+            ok.end
+        );
+        status(&run, "run", trace.clone(), false);
+        assert!(refused(&read(), "nonzero"), "{:?}", read().end);
+        status(&run, "draft", trace.clone(), true);
+        assert!(refused(&read(), "recorder"), "{:?}", read().end);
+        status(&run, "run", Some("0".repeat(64)), true);
+        assert!(refused(&read(), "recorder"), "{:?}", read().end);
+        fs::remove_file(run.join("recorded.json")).expect("it exists");
+        assert!(refused(&read(), "recorder"), "{:?}", read().end);
+
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let case = case_dir("s", "patched");
+        let draft_dir = case.path().join("draft");
+        record_into(&draft_dir, "patched");
+        let input = CaseInput::Fuzz {
+            input: MACHINE_INPUT.into(),
+        };
+        let expected = PatchedWitness {
+            expect: "violated".into(),
+            beside: Vec::new(),
+        };
+        write_witness(
+            &draft_dir,
+            serde_json::json!({
+                "property": MACHINE,
+                "expect": "violated",
+                "also_violates": [],
+                "passed": true,
+                "error": null,
+            }),
+        );
+        let checks = CaseChecks {
+            repo: &repo,
+            at: AT,
+            dir: case.path(),
+            property: MACHINE,
+            harness: MACHINE,
+            input: &input,
+            subject_source: "s",
+            draft_witness: Some(&expected),
+            subject: "s",
+            patch: TEST_PATCH,
+        };
+        let draft = || {
+            checks.draft(RunId::Case {
+                property: MACHINE.into(),
+                name: "a".into(),
+                run: CaseRun::Draft,
+            })
+        };
+        let trace = file_digest(&draft_dir.join("trace.jsonl"));
+        status(&draft_dir, "draft", trace.clone(), true);
+        assert_eq!(draft().end, End::Completed);
+        status(&draft_dir, "draft", trace, false);
+        assert!(refused(&draft(), "nonzero"), "{:?}", draft().end);
     }
 
     /// A typed planted case plans beside a fuzz-input one: each gets a task
@@ -5470,7 +5645,7 @@ mod tests {
             fs::write(root.path().join(dir).join(format!("{name}.patch")), "")
                 .expect("the temp dir is writable");
         }
-        let cases = planted_cases_in(root.path(), &|property, _| {
+        let cases = planted_cases_in(root.path(), Path::new(""), &|property, _| {
             property.starts_with("header-sync/") || property == "session/honest-never-punished"
         });
         let owned = |property: &str, name: &str| (property.to_owned(), name.to_owned());
@@ -6185,6 +6360,53 @@ mod tests {
         );
     }
 
+    /// A declaration records and reconciles only with the scenario and
+    /// Plan its test wrote: another attempt's Plan, one unused trailing
+    /// byte longer, or its scenario, left beside an otherwise valid
+    /// declaration, is refused before the runner gets arguments to record
+    /// it, and so is a declaration naming both Plan forms.
+    #[test]
+    fn another_attempt_s_plan_beside_a_declaration_is_refused() {
+        use super::super::history::declare_into;
+        let (scenario, plan) = storage_history();
+        let test = "another_attempt_s_plan_beside_a_declaration_is_refused";
+        let declare = |plan: Vec<u8>, scenario: &Value| {
+            let root = tempfile::tempdir().expect("a temp dir can be created");
+            declare_into(
+                root.path(),
+                &at_for(),
+                NODE,
+                "plan 0",
+                scenario,
+                &crate::PlanInput::Bytes(plan),
+            )
+            .expect("the declaration writes");
+            root
+        };
+        let args = |root: &Path| declared_record_args(root, (AT, ""), NODE, test, "plan 0");
+        let own = declare(plan.clone(), &scenario);
+        assert!(args(own.path()).is_ok(), "{:?}", args(own.path()));
+        let mut longer = plan.clone();
+        longer.push(0);
+        let mut moved = scenario.clone();
+        moved["policy"] = Value::Null;
+        for (file, other) in [
+            (PLAN_FILE, declare(longer, &scenario)),
+            (SCENARIO_FILE, declare(plan.clone(), &moved)),
+        ] {
+            let own = declare(plan.clone(), &scenario);
+            fs::copy(
+                other.path().join("0").join(file),
+                own.path().join("0").join(file),
+            )
+            .expect("the temp dir is writable");
+            assert!(args(own.path()).is_err(), "{file}");
+        }
+        let both = declare(plan.clone(), &scenario);
+        fs::write(both.path().join("0").join(SCRIPT_FILE), "{}").expect("writable");
+        assert!(args(both.path()).is_err());
+    }
+
     /// Writes into `dir` what the runner leaves for a history task whose
     /// test `test` declared [`storage_history`] as `plan 0`: the test's
     /// passing artifact from a binary embedding `s`, its declaration, and
@@ -6214,6 +6436,7 @@ mod tests {
         if let Some(witness) = witness {
             write_witness(&dir.join("run"), witness);
         }
+        recorder_exited(&dir.join("run"), "run", true);
     }
 
     /// A witness test's declaration counts only for the run, task and role
@@ -6428,6 +6651,8 @@ mod tests {
                     test: format!("a::{by}"),
                     harness: NODE.to_owned(),
                     case: (*case).to_owned(),
+                    scenario_sha256: String::new(),
+                    plan_sha256: String::new(),
                 })
                 .collect()
         };

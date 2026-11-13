@@ -541,12 +541,6 @@ const ALLOWED: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "src/harness/header_node.rs",
-        "Topology",
-        "acting",
-        "the control step being carried out, which its environment facts name",
-    ),
-    (
-        "src/harness/header_node.rs",
         "Control",
         "predicates",
         "the policy's trigger state, shared with the policy source",

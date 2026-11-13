@@ -1022,8 +1022,9 @@ const C15_PROVING: &[TestRef] = &[
 /// distinct ones there surviving into the run's report and the full report
 /// recorded beside its trace, which a fresh replay sends again. The watch
 /// rules find theirs both at the boundary of a third event and at a
-/// settled end, so each path has its test, and the settled end's
-/// store-level regression stays beside them. The
+/// settled end, so each path has its test. The settled end's also has one
+/// through the flood harness's own end path, and its store-level
+/// regression stays beside them. The
 /// claim-reading checks share one test, and `commit-only-authorized` and
 /// `header-fault-penalized` are C22's and C13's. `honest-progress` and
 /// `bounded-adversary-progress` find at most one failure in a run, as their
@@ -1071,6 +1072,10 @@ const C21_PROVING: &[TestRef] = &[
     sim_test(
         "src/harness/header_node/adoption.rs",
         "harness::header_node::adoption::tests::every_unread_publication_at_a_settled_end_reaches_the_sidecar",
+    ),
+    sim_test(
+        "src/harness/header_sync/flood.rs",
+        "harness::header_sync::flood::tests::the_flood_end_path_reports_every_unread_publication",
     ),
     sim_test(
         "src/harness/header_sync.rs",
@@ -1393,11 +1398,12 @@ pub fn contract_table() -> Vec<Contract> {
                  benign, except StoppedByViolation under the expected stop, or a missing \
                  report, and judges a nested case's exact set. A set the patched run breaks is \
                  judged in both runs, each nested finding joined to the case's own break by \
-                 subject: the same peer and the same punished event or frame. A set that \
-                 breaks only after the case's own break is judged on its Draft run as a \
-                 counterfactual of its baseline: every member breaks there and none in the \
-                 baseline, which proves each member depends on the patch, not that it shares \
-                 the case's peer or punished event or frame.",
+                 the same subject: for a finding at a step, the same punishment, its peer and \
+                 punished event or frame, and for one the run's end found, the same \
+                 publication, its state version. A set that breaks only after the case's own \
+                 break is judged on its Draft run as a counterfactual of its baseline: every \
+                 member breaks there and none in the baseline, which proves each member \
+                 depends on the patch, not that it shares the case's subject.",
                 C6_PROVING,
                 "E2, with Rule 25's subject joins",
             )

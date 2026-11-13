@@ -6931,100 +6931,303 @@ fn identity_refs_are_defined_only_in_refs() {
     );
 }
 
-/// Rule 25's registered one-key-off controls, one per type `refs.rs`
-/// implements `Ref` for: the type, and the test, by its file relative to
-/// the crate and its name, whose `assert_one_key_off::<type>` runs that
-/// type's control on a real join.
-const REF_CONTROLS: &[(&str, &str, &str)] = &[
+/// Rule 25's registered one-key-off controls, one per join site: the ref,
+/// the function that joins it (`<ref>::joined` or `<ref>::joins`), by its
+/// file relative to the crate and its name, and the test, by file and name,
+/// whose typed `assert_one_key_off::<ref>` control reaches that function
+/// ([`every_ref_has_a_one_key_off_control`]).
+const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
     (
         "FrameRef",
-        "src/harness/header_acceptance/refs.rs",
-        "the_template_moves_every_key",
-    ),
-    (
-        "PageRef",
-        "src/harness/header_acceptance/refs.rs",
-        "the_template_moves_every_key",
+        "src/harness/header_acceptance/companions.rs",
+        "rejected_page",
+        "src/harness/header_acceptance/companions.rs",
+        "the_rejected_page_joins_its_judged_frame",
     ),
     (
         "StreamRef",
         "src/harness/header_acceptance/companions.rs",
+        "rejected_page",
+        "src/harness/header_acceptance/companions.rs",
         "the_rejected_page_s_session_joins_its_stream",
+    ),
+    (
+        "FrameRef",
+        "src/harness/header_acceptance/companions.rs",
+        "fault_close",
+        "src/harness/header_acceptance/companions.rs",
+        "the_fault_close_joins_the_rejected_frames_connection",
+    ),
+    (
+        "SessionRef",
+        "src/harness/header_acceptance/companions.rs",
+        "fault_close",
+        "src/harness/header_acceptance/companions.rs",
+        "the_fault_close_joins_the_rejected_frames_connection",
     ),
     (
         "ReadRef",
         "src/harness/header_acceptance/companions.rs",
+        "staged_page",
+        "src/harness/header_acceptance/companions.rs",
         "the_staged_page_joins_the_rejected_frame",
     ),
     (
-        "SubscriptionRef",
+        "PageRef",
+        "src/harness/header_acceptance/companions.rs",
+        "staged_page",
         "src/harness/header_acceptance/companions.rs",
         "the_staged_page_joins_the_rejected_frame",
     ),
     (
         "FindingRef",
         "src/harness/header_acceptance/companions.rs",
+        "path_break",
+        "src/harness/header_acceptance/companions.rs",
         "the_path_break_names_the_sent_page",
+    ),
+    (
+        "PageRef",
+        "src/harness/header_acceptance/companions.rs",
+        "path_break",
+        "src/harness/header_acceptance/companions.rs",
+        "the_path_break_names_the_sent_page",
+    ),
+    (
+        "PeerNameRef",
+        "src/harness/header_acceptance/companions.rs",
+        "page_peer",
+        "src/harness/header_acceptance/companions.rs",
+        "the_page_s_peer_joins_its_harness_name",
     ),
     (
         "SessionRef",
         "src/harness/header_acceptance/actions.rs",
-        "a_session_end_joins_its_admission_by_its_whole_ref",
-    ),
-    (
-        "ControlRef",
+        "admitted_on",
         "src/harness/header_acceptance/actions.rs",
-        "a_control_effect_joins_its_whole_cause",
+        "a_session_end_joins_its_admission_by_its_whole_ref",
     ),
     (
         "LinkRef",
         "src/harness/header_acceptance/actions.rs",
+        "ends",
+        "src/harness/header_acceptance/actions.rs",
         "a_link_act_joins_its_whole_link",
     ),
     (
+        "LinkRef",
+        "src/harness/header_acceptance/actions.rs",
+        "show",
+        "src/harness/header_acceptance/actions.rs",
+        "a_link_act_joins_its_whole_link",
+    ),
+    (
+        "LinkRef",
+        "src/harness/header_acceptance/actions.rs",
+        "names_its_link",
+        "src/harness/header_acceptance/actions.rs",
+        "a_relink_fact_names_its_whole_link",
+    ),
+    (
+        "ControlRef",
+        "src/harness/header_acceptance/actions.rs",
+        "own_effect",
+        "src/harness/header_acceptance/actions.rs",
+        "a_control_effect_joins_its_whole_cause",
+    ),
+    (
         "TriggerRef",
+        "src/harness/header_acceptance/tool.rs",
+        "witness_judges",
         "src/harness/header_acceptance/tool.rs",
         "a_witness_judges_its_whole_trigger",
     ),
     (
         "FindingSubject",
         "src/witness.rs",
+        "joined",
+        "src/witness.rs",
         "a_member_at_the_break_s_step_joins_by_its_punishment",
     ),
     (
-        "WorkRef",
-        "tests/header_mixed_resources.rs",
-        "the_mixed_joins_fail_one_identity_off",
-    ),
-    (
         "DispatchRef",
+        "tests/header_mixed_resources.rs",
+        "dispatched",
         "tests/header_mixed_resources.rs",
         "the_mixed_joins_fail_one_identity_off",
     ),
     (
         "CallOpRef",
         "tests/header_mixed_resources.rs",
+        "ended",
+        "tests/header_mixed_resources.rs",
         "the_mixed_joins_fail_one_identity_off",
     ),
     (
         "StaleCallRef",
+        "tests/header_mixed_resources.rs",
+        "ended_stale",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
+    (
+        "WorkRef",
+        "tests/header_mixed_resources.rs",
+        "retired_before",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
+    (
+        "WorkRef",
+        "tests/header_mixed_resources.rs",
+        "reserved",
         "tests/header_mixed_resources.rs",
         "the_mixed_joins_fail_one_identity_off",
     ),
     (
         "ReleaseRef",
         "tests/header_mixed_resources.rs",
+        "released",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
+    (
+        "PeerNameRef",
+        "tests/header_mixed_resources.rs",
+        "links_of",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
+    (
+        "ConnectionRef",
+        "src/harness/header_acceptance/companions.rs",
+        "fault_close",
+        "src/harness/header_acceptance/companions.rs",
+        "the_fault_close_joins_the_rejected_frames_connection",
+    ),
+    (
+        "FrameRef",
+        "tests/header_wire_crossing.rs",
+        "judged_at",
+        "tests/header_wire_crossing.rs",
+        "an_over_window_crossing_grant_is_bad_cursor_and_closed",
+    ),
+    (
+        "ConnectionRef",
+        "tests/header_wire_crossing.rs",
+        "closed_on_its_judgment",
+        "tests/header_wire_crossing.rs",
+        "an_over_window_crossing_grant_is_bad_cursor_and_closed",
+    ),
+    (
+        "ConnectionRef",
+        "tests/header_wire_crossing.rs",
+        "unpunished",
+        "tests/header_wire_crossing.rs",
+        "a_crossing_close_is_conformant_and_unpunished",
+    ),
+    (
+        "QuicStreamRef",
+        "tests/header_wire_crossing.rs",
+        "act_frame",
+        "tests/header_wire_crossing.rs",
+        "an_act_s_frame_joins_its_quic_stream",
+    ),
+    (
+        "StorageOpRef",
+        "tests/header_mixed_resources.rs",
+        "reply_crosses_reset",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
+    (
+        "StorageRef",
+        "tests/header_mixed_resources.rs",
+        "reply_crosses_reset",
+        "tests/header_mixed_resources.rs",
         "the_mixed_joins_fail_one_identity_off",
     ),
 ];
 
-/// Every typed one-key-off control in the Rust source `text`, the file
-/// `file`, that a test run executes, as `(test, type)`: each call of
-/// `assert_one_key_off::<type>`, outside any macro, which `syn` doesn't
-/// parse, inside a `#[test]` function that isn't
-/// `#[ignore]`d, with no enclosing item compiled out by a `cfg` other than
-/// `test` or `zakura_sim`, by the type's last path segment.
-fn typed_controls(text: &str, file: &str) -> BTreeSet<(String, String)> {
+/// What [`join_scan`] finds in one Rust source file.
+#[derive(Default, Debug, Clone)]
+struct JoinScan {
+    /// Each function's name, with every name its body calls or names: a
+    /// call's or path's last segment and a method's name, at any depth,
+    /// macro arguments included. A `let` closure counts as a function of
+    /// its own, named `<function>::<binding>` after the function it's in.
+    names: BTreeMap<String, BTreeSet<String>>,
+    /// Each typed join, as `(ref, function)`: a call of `<ref>::joined` or
+    /// `<ref>::joins` inside that named function.
+    joins: BTreeSet<(String, String)>,
+    /// The function of each untyped join: a method call of `.joined` or
+    /// `.joins`, whose ref the scan can't see.
+    untyped: BTreeSet<String>,
+    /// Each typed control, as `(test, ref, names)`: a call of
+    /// `assert_one_key_off::<ref>` in a running test, with the names its
+    /// closure argument calls or names.
+    controls: Vec<(String, String, BTreeSet<String>)>,
+}
+
+/// The expressions a macro call's arguments hold, if `syn` parses them: a
+/// comma-separated list, or `matches!`'s expression, pattern and guard.
+fn macro_exprs(mac: &syn::Macro) -> Vec<syn::Expr> {
+    use syn::parse::Parser;
+    if mac.path.is_ident("matches") {
+        let parse = |input: syn::parse::ParseStream<'_>| {
+            let scrutinee: syn::Expr = input.parse()?;
+            input.parse::<syn::Token![,]>()?;
+            syn::Pat::parse_multi_with_leading_vert(input)?;
+            let mut exprs = vec![scrutinee];
+            if input.parse::<Option<syn::Token![if]>>()?.is_some() {
+                exprs.push(input.parse()?);
+            }
+            input.parse::<Option<syn::Token![,]>>()?;
+            Ok(exprs)
+        };
+        return parse.parse2(mac.tokens.clone()).unwrap_or_default();
+    }
+    syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
+        .parse2(mac.tokens.clone())
+        .map(|exprs| exprs.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Every name `expr` calls or names ([`JoinScan::names`]).
+fn names_in(expr: &syn::Expr) -> BTreeSet<String> {
+    use syn::visit::Visit;
+    /// Collects the names.
+    #[derive(Default)]
+    struct Names(BTreeSet<String>);
+    impl<'ast> Visit<'ast> for Names {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            if let Some(last) = path.segments.last() {
+                self.0.insert(last.ident.to_string());
+            }
+            syn::visit::visit_path(self, path);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            self.0.insert(call.method.to_string());
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            for expr in macro_exprs(mac) {
+                self.visit_expr(&expr);
+            }
+        }
+    }
+    let mut names = Names::default();
+    names.visit_expr(expr);
+    names.0
+}
+
+/// What the Rust source `text`, the file `file`, holds of Rule 25's joins
+/// and controls ([`JoinScan`]). Code compiled out by a `cfg` other than
+/// `test` or `zakura_sim` is skipped, and a control counts only inside a
+/// `#[test]` function that isn't `#[ignore]`d.
+fn join_scan(text: &str, file: &str) -> JoinScan {
     use syn::visit::Visit;
     /// Whether `attrs` compile their item out of a test run: a `cfg` that
     /// isn't `test` or `zakura_sim`.
@@ -7037,13 +7240,52 @@ fn typed_controls(text: &str, file: &str) -> BTreeSet<(String, String)> {
                 })
         })
     }
-    /// Collects the controls, by enclosing running test.
+    /// Walks the file, by enclosing function and running test.
     #[derive(Default)]
-    struct Controls {
+    struct Walk {
+        functions: Vec<String>,
+        scopes: Vec<String>,
         test: Option<String>,
-        found: BTreeSet<(String, String)>,
+        scan: JoinScan,
     }
-    impl<'ast> Visit<'ast> for Controls {
+    impl Walk {
+        /// Notes `name` as named by every enclosing scope.
+        fn name(&mut self, name: String) {
+            for scope in &self.scopes {
+                self.scan
+                    .names
+                    .entry(scope.clone())
+                    .or_default()
+                    .insert(name.clone());
+            }
+        }
+
+        /// Walks a function named `name` with `attrs`, by `walk`.
+        fn function(
+            &mut self,
+            name: String,
+            attrs: &[syn::Attribute],
+            walk: impl FnOnce(&mut Self),
+        ) {
+            if compiled_out(attrs) {
+                return;
+            }
+            let runs = attrs.iter().any(|attr| attr.path().is_ident("test"))
+                && !attrs.iter().any(|attr| attr.path().is_ident("ignore"));
+            let outer = self.test.clone();
+            if runs && outer.is_none() {
+                self.test = Some(name.clone());
+            }
+            self.scan.names.entry(name.clone()).or_default();
+            self.functions.push(name.clone());
+            self.scopes.push(name);
+            walk(self);
+            self.scopes.pop();
+            self.functions.pop();
+            self.test = outer;
+        }
+    }
+    impl<'ast> Visit<'ast> for Walk {
         fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
             if !compiled_out(&item.attrs) {
                 syn::visit::visit_item_mod(self, item);
@@ -7051,23 +7293,62 @@ fn typed_controls(text: &str, file: &str) -> BTreeSet<(String, String)> {
         }
 
         fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-            if compiled_out(&item.attrs) {
-                return;
+            self.function(item.sig.ident.to_string(), &item.attrs, |walk| {
+                syn::visit::visit_item_fn(walk, item)
+            });
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            self.function(item.sig.ident.to_string(), &item.attrs, |walk| {
+                syn::visit::visit_impl_item_fn(walk, item)
+            });
+        }
+
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            let closure = local
+                .init
+                .as_ref()
+                .is_some_and(|init| matches!(*init.expr, syn::Expr::Closure(_)));
+            match &local.pat {
+                syn::Pat::Ident(binding) if closure => {
+                    let within = self.functions.last().cloned().unwrap_or_default();
+                    let name = format!("{within}::{}", binding.ident);
+                    self.scan.names.entry(name.clone()).or_default();
+                    self.scopes.push(name);
+                    syn::visit::visit_local(self, local);
+                    self.scopes.pop();
+                }
+                _ => syn::visit::visit_local(self, local),
             }
-            let runs = item.attrs.iter().any(|attr| attr.path().is_ident("test"))
-                && !item.attrs.iter().any(|attr| attr.path().is_ident("ignore"));
-            let outer = self.test.take();
-            if runs && outer.is_none() {
-                self.test = Some(item.sig.ident.to_string());
+        }
+
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            if let Some(last) = path.segments.last() {
+                self.name(last.ident.to_string());
             }
-            syn::visit::visit_item_fn(self, item);
-            self.test = outer;
+            syn::visit::visit_path(self, path);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            self.name(call.method.to_string());
+            if call.method == "joined" || call.method == "joins" {
+                let within = self.functions.last().cloned().unwrap_or_default();
+                self.scan.untyped.insert(within);
+            }
+            syn::visit::visit_expr_method_call(self, call);
         }
 
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-            if let (Some(test), syn::Expr::Path(path)) = (&self.test, &*call.func) {
-                let last = path.path.segments.last();
-                let typed = last
+            if let syn::Expr::Path(path) = &*call.func {
+                let segments: Vec<&syn::PathSegment> = path.path.segments.iter().collect();
+                if let [.., owner, last] = segments[..] {
+                    if last.ident == "joined" || last.ident == "joins" {
+                        let within = self.functions.last().cloned().unwrap_or_default();
+                        self.scan.joins.insert((owner.ident.to_string(), within));
+                    }
+                }
+                let typed = segments
+                    .last()
                     .filter(|last| last.ident == "assert_one_key_off")
                     .and_then(|last| match &last.arguments {
                         syn::PathArguments::AngleBracketed(args) => args.args.first(),
@@ -7077,17 +7358,77 @@ fn typed_controls(text: &str, file: &str) -> BTreeSet<(String, String)> {
                         syn::GenericArgument::Type(syn::Type::Path(ty)) => ty.path.segments.last(),
                         _ => None,
                     });
-                if let Some(ty) = typed {
-                    self.found.insert((test.clone(), ty.ident.to_string()));
+                if let (Some(test), Some(ty), Some(closure)) =
+                    (&self.test, typed, call.args.iter().nth(1))
+                {
+                    self.scan.controls.push((
+                        test.clone(),
+                        ty.ident.to_string(),
+                        names_in(closure),
+                    ));
                 }
             }
             syn::visit::visit_expr_call(self, call);
         }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            for expr in macro_exprs(mac) {
+                self.visit_expr(&expr);
+            }
+        }
     }
     let parsed = syn::parse_file(text).unwrap_or_else(|error| panic!("{file} parses: {error}"));
-    let mut controls = Controls::default();
-    controls.visit_file(&parsed);
-    controls.found
+    let mut walk = Walk::default();
+    walk.visit_file(&parsed);
+    walk.scan
+}
+
+/// Whether some name in `from`, named inside the function `within`,
+/// reaches the function `to` through `names`, each function's names
+/// ([`JoinScan::names`]): by naming it, or by naming a function that does.
+/// A name resolves to a `let` closure of the function it's named in, if it
+/// has one, but inside that closure itself, and otherwise to every
+/// function of that name, so two functions
+/// of one name are one and this over-approximates. A call through a trait
+/// object or a function the scan can't see doesn't reach.
+fn reaches(
+    names: &BTreeMap<String, BTreeSet<String>>,
+    (within, from): (&str, &BTreeSet<String>),
+    to: &str,
+) -> bool {
+    let resolve = |owner: &str, name: &str| {
+        let local = format!("{owner}::{name}");
+        if names.contains_key(&local) {
+            local
+        } else {
+            name.to_owned()
+        }
+    };
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut next: Vec<String> = from.iter().map(|name| resolve(within, name)).collect();
+    while let Some(node) = next.pop() {
+        if node == to {
+            return true;
+        }
+        if seen.insert(node.clone()) {
+            // A closure can't name itself, so its own binding inside it is
+            // the item the binding shadows.
+            let (owner, own) = node.split_once("::").unwrap_or((&node, ""));
+            let owner = owner.to_owned();
+            let own = own.to_owned();
+            next.extend(
+                names
+                    .get(&node)
+                    .into_iter()
+                    .flatten()
+                    .map(|name| match name == &own {
+                        true => name.clone(),
+                        false => resolve(&owner, name),
+                    }),
+            );
+        }
+    }
+    false
 }
 
 /// The types `refs.rs`, as `text`, implements `Ref` for ([`defined_refs`]).
@@ -7098,128 +7439,236 @@ fn ref_impls(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Rule 25's completeness check: every type `refs.rs` implements `Ref`
-/// for is registered once in [`REF_CONTROLS`], and nothing else is, and
-/// each registered test runs that type's typed one-key-off control
-/// ([`typed_controls`]), so a new `Ref` without a control fails. The
-/// controls show a planted `Ref` with no registration, a registered test
-/// whose control isn't typed, that's `#[ignore]`d, that isn't a test or
-/// that's compiled out, and a registration naming a test that's gone, each
-/// fail it.
+/// Every Rust source file of the crate's `src` and `tests`, relative to the
+/// crate, with its text, but `refs.rs`, which defines the join, and the
+/// one-key-off template.
+fn crate_sources() -> BTreeMap<String, String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("the directory reads") {
+            let path = entry.expect("an entry reads").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk(&krate.join("src"), &mut files);
+    walk(&krate.join("tests"), &mut files);
+    files
+        .into_iter()
+        .map(|file| {
+            let relative = file
+                .strip_prefix(krate)
+                .expect("under the crate")
+                .display()
+                .to_string();
+            let text = std::fs::read_to_string(&file).expect("a source file reads");
+            (relative, text)
+        })
+        .filter(|(file, _)| {
+            file != "src/harness/header_acceptance/refs.rs"
+                && file != "tests/support/one_key_off.rs"
+        })
+        .collect()
+}
+
+/// Why Rule 25's controls don't cover the joins `scans` found, file by
+/// file ([`join_scan`]), each finding one
+/// line: a typed join no [`REF_CONTROLS`] entry registers, an entry naming
+/// a join that isn't there, an untyped join, a `Ref` type with no
+/// registered join, and an entry whose test has no typed control of its
+/// ref whose closure reaches its join function ([`reaches`], through the
+/// join's and the test's files).
+fn control_gaps(
+    scans: &BTreeMap<String, JoinScan>,
+    refs: &str,
+    registry: &[(&str, &str, &str, &str, &str)],
+) -> Vec<String> {
+    let mut gaps = Vec::new();
+    let found: BTreeSet<(String, String, String)> = scans
+        .iter()
+        .flat_map(|(file, scan)| {
+            scan.joins
+                .iter()
+                .map(|(ty, within)| (ty.clone(), file.clone(), within.clone()))
+        })
+        .collect();
+    let registered: BTreeSet<(String, String, String)> = registry
+        .iter()
+        .map(|(ty, file, within, ..)| ((*ty).to_owned(), (*file).to_owned(), (*within).to_owned()))
+        .collect();
+    if registered.len() != registry.len() {
+        gaps.push("a join is registered twice".to_owned());
+    }
+    for (ty, file, within) in found.difference(&registered) {
+        gaps.push(format!(
+            "{file} {within} joins {ty} with no registered control"
+        ));
+    }
+    for (ty, file, within) in registered.difference(&found) {
+        gaps.push(format!(
+            "{file} {within} doesn't join {ty}, as it's registered to"
+        ));
+    }
+    for (file, scan) in scans {
+        for within in &scan.untyped {
+            gaps.push(format!(
+                "{file} {within} joins by a method call, not by its ref's type"
+            ));
+        }
+    }
+    let joined: BTreeSet<String> = registered.iter().map(|(ty, ..)| ty.clone()).collect();
+    for ty in ref_impls(refs).difference(&joined) {
+        gaps.push(format!("{ty} implements Ref but nothing joins it"));
+    }
+    for (ty, file, within, test_file, test) in registry {
+        let (Some(at), Some(tested)) = (scans.get(*file), scans.get(*test_file)) else {
+            gaps.push(format!("{file} or {test_file} isn't a source"));
+            continue;
+        };
+        let mut names = at.names.clone();
+        for (name, called) in &tested.names {
+            names
+                .entry(name.clone())
+                .or_default()
+                .extend(called.iter().cloned());
+        }
+        let covered = tested.controls.iter().any(|(control, of, closure)| {
+            control == test && of == ty && reaches(&names, (test, closure), within)
+        });
+        if !covered {
+            gaps.push(format!(
+                "{test_file} {test} has no typed {ty} control reaching {file} {within}"
+            ));
+        }
+    }
+    gaps
+}
+
+/// Rule 25's control check: every typed join in the crate's `src` and
+/// `tests` (`<ref>::joined` or `<ref>::joins`) is registered in
+/// [`REF_CONTROLS`] by its function, nothing else is, no join is untyped,
+/// every `Ref` has a join, and each registered test runs a typed
+/// one-key-off control of its ref whose closure reaches the join's
+/// function ([`control_gaps`]). The controls show each fails it: the real
+/// trigger control untyped, renamed, `#[ignore]`d, not a test or compiled
+/// out; its closure no longer reaching the join; a template test that
+/// joins nothing registered in place of the real one; an unregistered and
+/// an untyped planted join; and a planted `Ref` nothing joins.
 #[test]
 fn every_ref_has_a_one_key_off_control() {
+    let sources = crate_sources();
+    let scans: BTreeMap<String, JoinScan> = sources
+        .iter()
+        .map(|(file, text)| (file.clone(), join_scan(text, file)))
+        .collect();
     let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let read = |file: &str| std::fs::read_to_string(krate.join(file)).expect("a source file reads");
-    let refs = read("src/harness/header_acceptance/refs.rs");
-    let registered: BTreeSet<String> = REF_CONTROLS
-        .iter()
-        .map(|(name, ..)| (*name).to_owned())
-        .collect();
+    let refs = std::fs::read_to_string(krate.join("src/harness/header_acceptance/refs.rs"))
+        .expect("refs.rs reads");
     assert_eq!(
-        registered.len(),
-        REF_CONTROLS.len(),
-        "a type is listed twice"
+        control_gaps(&scans, &refs, REF_CONTROLS),
+        Vec::<String>::new()
     );
-    assert_eq!(ref_impls(&refs), registered);
-    let missing = |sources: &BTreeMap<&str, String>| -> Vec<&str> {
-        REF_CONTROLS
-            .iter()
-            .filter(|(name, file, test)| {
-                !typed_controls(&sources[file], file)
-                    .contains(&((*test).to_owned(), (*name).to_owned()))
-            })
-            .map(|(name, ..)| *name)
-            .collect()
-    };
-    let sources: BTreeMap<&str, String> = REF_CONTROLS
-        .iter()
-        .map(|(_, file, _)| (*file, read(file)))
-        .collect();
-    assert_eq!(missing(&sources), Vec::<&str>::new());
 
-    let planted = format!(
-        "{refs}
-pub struct NewRef;
-impl Ref for NewRef {{}}
-"
-    );
-    assert!(ref_impls(&planted).contains("NewRef"));
-    assert_ne!(ref_impls(&planted), registered);
     let tool = "src/harness/header_acceptance/tool.rs";
-    let typed = "assert_one_key_off::<TriggerRef>(";
+    let gap = "src/harness/header_acceptance/tool.rs a_witness_judges_its_whole_trigger has no \
+               typed TriggerRef control reaching src/harness/header_acceptance/tool.rs \
+               witness_judges";
+    let typed = "assert_one_key_off::<TriggerRef>(&trigger, |want| {\n            witness_judges(";
     assert_eq!(sources[tool].matches(typed).count(), 1);
+    let test = "    #[test]\n    fn a_witness_judges_its_whole_trigger";
     for broken in [
-        sources[tool].replace(typed, "assert_one_key_off("),
+        sources[tool].replace(
+            typed,
+            "assert_one_key_off(&trigger, |want| {\n            witness_judges(",
+        ),
+        sources[tool].replace(
+            typed,
+            "assert_one_key_off::<TriggerRef>(&trigger, |want| {\n            bound_witness(",
+        ),
+        sources[tool].replace(
+            test,
+            "    #[test]\n    #[ignore]\n    fn a_witness_judges_its_whole_trigger",
+        ),
+        sources[tool].replace(test, "    fn a_witness_judges_its_whole_trigger"),
+        sources[tool].replace(
+            test,
+            "    #[test]\n    #[cfg(any())]\n    fn a_witness_judges_its_whole_trigger",
+        ),
         sources[tool].replace(
             "fn a_witness_judges_its_whole_trigger",
             "fn a_witness_judges_its_whole_trigger_gone",
         ),
-        sources[tool].replace(
-            "    #[test]\n    fn a_witness_judges_its_whole_trigger",
-            "    #[test]\n    #[ignore]\n    fn a_witness_judges_its_whole_trigger",
-        ),
-        sources[tool].replace(
-            "    #[test]\n    fn a_witness_judges_its_whole_trigger",
-            "    fn a_witness_judges_its_whole_trigger",
-        ),
-        sources[tool].replace(
-            "    #[test]\n    fn a_witness_judges_its_whole_trigger",
-            "    #[test]\n    #[cfg(any())]\n    fn a_witness_judges_its_whole_trigger",
-        ),
     ] {
         assert_ne!(broken, sources[tool]);
-        let mut sources = sources.clone();
-        sources.insert(tool, broken);
-        assert_eq!(missing(&sources), ["TriggerRef"]);
+        let mut scans = scans.clone();
+        scans.insert(tool.to_owned(), join_scan(&broken, tool));
+        assert_eq!(control_gaps(&scans, &refs, REF_CONTROLS), [gap]);
     }
+
+    // A template control, typed but comparing a frame with itself, in
+    // place of the rejected page's real frame control (round 8's gap).
+    let companions = "src/harness/header_acceptance/companions.rs";
+    let templated: Vec<_> = REF_CONTROLS
+        .iter()
+        .map(|entry| match entry {
+            ("FrameRef", file, "rejected_page", ..) => (
+                "FrameRef",
+                *file,
+                "rejected_page",
+                companions,
+                "a_template_control",
+            ),
+            other => *other,
+        })
+        .collect();
+    let mut planted = scans.clone();
+    planted.insert(
+        companions.to_owned(),
+        join_scan(
+            &format!(
+                "{}\n#[test]\nfn a_template_control() {{ let frame = frame(); \
+             assert_one_key_off::<FrameRef>(&frame, |want| *want == frame); }}\n",
+                sources[companions]
+            ),
+            companions,
+        ),
+    );
+    assert_eq!(
+        control_gaps(&planted, &refs, &templated),
+        [format!(
+            "{companions} a_template_control has no typed FrameRef control reaching \
+             {companions} rejected_page"
+        )]
+    );
+
+    for (planted, gap) in [
+        (
+            "fn planted(frames: &[FrameRef], want: &FrameRef) -> usize { FrameRef::joined(want, frames, |f| Some(f.clone())).len() }",
+            "src/harness/header_acceptance/tool.rs planted joins FrameRef with no registered control",
+        ),
+        (
+            "fn planted(frames: &[FrameRef], want: &FrameRef) -> usize { want.joined(frames, |f| Some(f.clone())).len() }",
+            "src/harness/header_acceptance/tool.rs planted joins by a method call, not by its ref's type",
+        ),
+    ] {
+        let mut scans = scans.clone();
+        let text = format!("{}\n{planted}\n", sources[tool]);
+        scans.insert(tool.to_owned(), join_scan(&text, tool));
+        assert_eq!(control_gaps(&scans, &refs, REF_CONTROLS), [gap]);
+    }
+    let unjoined = format!("{refs}\npub struct NewRef;\nimpl Ref for NewRef {{}}\n");
+    assert_eq!(
+        control_gaps(&scans, &unjoined, REF_CONTROLS),
+        ["NewRef implements Ref but nothing joins it"]
+    );
 }
 
 /// The acceptance tool's source directory, relative to the crate.
 const ACCEPTANCE_SRC: &str = "src/harness/header_acceptance";
-
-/// The reads under [`ACCEPTANCE_SRC`] outside `binding.rs` that read no
-/// run artifact, as `(file, function, why)`. Every other read there must
-/// go through `binding.rs`, the one place an artifact is bound to what its
-/// reader expects (Rule 25).
-const NON_ARTIFACT_READS: &[(&str, &str, &str)] = &[
-    (
-        "tool.rs",
-        "patched_witness",
-        "a planted case's committed `.toml` at S",
-    ),
-    (
-        "tool.rs",
-        "case_input",
-        "a planted case's committed `.toml` at S",
-    ),
-    (
-        "tool.rs",
-        "native_patch",
-        "the committed native mutation's directory at S",
-    ),
-    (
-        "tool.rs",
-        "fuzz_targets",
-        "the committed fuzz-target mapping at S",
-    ),
-    ("tool.rs", "committed_input", "a committed fuzz input at S"),
-    (
-        "tool.rs",
-        "walk",
-        "the committed planted-case tree at S, which `planted_cases_in` walks",
-    ),
-    (
-        "tool.rs",
-        "native_dirs",
-        "the committed native-mutation tree at S",
-    ),
-    (
-        "companions.rs",
-        "judge_trace",
-        "the companions judge, run by the case's own build on the Draft run it's handed: it \
-         writes `companions.json`, which the reader binds (`binding::COMPANIONS`)",
-    ),
-];
 
 /// Every read in the Rust source `text` outside test code, as the name of
 /// the function it's in, in order: a call of `fs::read`,
@@ -7372,12 +7821,11 @@ fn artifact_reads(text: &str, file: &str) -> Vec<String> {
     reads.found
 }
 
-/// Rule 25's enforcement: under [`ACCEPTANCE_SRC`], every read of a run
-/// artifact goes through `binding.rs`, so no reader binds an artifact
-/// itself or reads one unbound. Each read anywhere else in the directory
-/// is one [`NON_ARTIFACT_READS`] lists, with why it reads no artifact, and
-/// each listed read is still there. A planted bypass, however its read is
-/// spelled, fails the scan.
+/// Rule 25's enforcement: under [`ACCEPTANCE_SRC`], every read goes
+/// through `binding.rs`, a run artifact by its kind and S's committed files
+/// by `binding::committed_text` and its siblings, so no reader binds an
+/// artifact itself or reads one unbound, and there's no exemption to keep
+/// honest. A planted bypass, however its read is spelled, fails the scan.
 #[test]
 fn every_artifact_read_goes_through_binding() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(ACCEPTANCE_SRC);
@@ -7399,17 +7847,10 @@ fn every_artifact_read_goes_through_binding() {
         }
         texts.insert(file, text);
     }
-    let allowed: BTreeSet<(String, String)> = NON_ARTIFACT_READS
-        .iter()
-        .map(|(file, within, _)| ((*file).to_owned(), (*within).to_owned()))
-        .collect();
-    let unbound: Vec<&(String, String)> = found.difference(&allowed).collect();
     assert!(
-        unbound.is_empty(),
-        "reads outside binding.rs that NON_ARTIFACT_READS doesn't list: {unbound:?}"
+        found.is_empty(),
+        "reads outside binding.rs, which must read through it: {found:?}"
     );
-    let stale: Vec<&(String, String)> = allowed.difference(&found).collect();
-    assert!(stale.is_empty(), "listed reads that are gone: {stale:?}");
 
     let tool = &texts["tool.rs"];
     for bypass in [
@@ -7439,5 +7880,494 @@ fn every_artifact_read_goes_through_binding() {
             std::panic::catch_unwind(|| artifact_reads(&planted, "tool.rs")).is_err(),
             "{hidden}"
         );
+    }
+}
+/// hdr-14's own witness tests, whose identity assertions Rule 25 covers
+/// beside the acceptance layer's ([`raw_join_scope`]). Older witnesses
+/// assert hdr-3 to hdr-13's properties and predate the rule.
+const RULE_25_WITNESSES: &[&str] = &[
+    "tests/header_catch_not_applicable.rs",
+    "tests/header_cleanup.rs",
+    "tests/header_despite_close.rs",
+    "tests/header_mixed_resources.rs",
+    "tests/header_node_session_ends.rs",
+    "tests/header_wire_crossing.rs",
+    "tests/header_wire_witness.rs",
+];
+
+/// The words a name of an identity holds, as one of its `_`-separated
+/// parts: a peer, connection, session, subscription, stream, frame or
+/// page, an operation, call or sequence number, a storage instance, a
+/// peer's incarnation, a link, a version, an ID, or a serialized
+/// attribution.
+const IDENTITY_WORDS: &[&str] = &[
+    "peer",
+    "conn",
+    "connection",
+    "session",
+    "subscription",
+    "stream",
+    "frame",
+    "page",
+    "op",
+    "call",
+    "seq",
+    "instance",
+    "incarnation",
+    "link",
+    "version",
+    "id",
+    "attribution",
+];
+
+/// The comparisons [`raw_joins`] finds that aren't identity joins, as
+/// `(file, function, names, why)`: the comparison's identity names, sorted
+/// and space-separated, and why it compares no identity.
+const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
+    (
+        "src/harness/header_acceptance/actions.rs",
+        "of",
+        "link",
+        "builds each peer's link list, skipping a link it already holds; `show` joins it by `LinkRef`",
+    ),
+    (
+        "src/harness/header_acceptance/companions.rs",
+        "attributed_page",
+        "attribution",
+        "filters a record's rule and subject kind; the page it names joins by `PageRef`",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "caught_draft",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "contract_standing",
+        "id",
+        "contract IDs, the manifest's names for contracts",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "evaluate",
+        "id",
+        "contract and expected-result IDs, the manifest's keys, whose joins the evaluator's full-identity tests cover",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "key_state",
+        "id",
+        "contract IDs, the manifest's names for contracts",
+    ),
+    (
+        "src/harness/header_acceptance/evaluate.rs",
+        "same_run",
+        "id",
+        "a whole `RunId`, the manifest's typed run identity, compared whole",
+    ),
+    (
+        "src/harness/header_acceptance/not_applicable.rs",
+        "lists",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/required.rs",
+        "required_keys",
+        "id",
+        "contract IDs, the manifest's names for contracts",
+    ),
+    (
+        "src/harness/header_acceptance/rows.rs",
+        "hand_written_rows",
+        "id",
+        "a property ID choosing its row's watched set",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "a_a_and_a_b_a",
+        "id",
+        "trace digests, compared to show two recordings are one run, not joined",
+    ),
+    (
+        "src/harness/header_acceptance/tool.rs",
+        "draft_witness",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/witness.rs",
+        "judge",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/witness.rs",
+        "of",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "each_declared_list_matches_its_baseline",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "every_node_catch_declares_its_not_applicable",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "no_list_accepts_an_incomplete_reason",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "the_patched_list_judges_the_draft_run",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_catch_not_applicable.rs",
+        "violating",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_mixed_resources.rs",
+        "witnessed",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_node_session_ends.rs",
+        "a_link_the_harness_closes_shows_in_the_next_view",
+        "session_id",
+        "the storage view keys its lives by session ID alone, one per link in a run, so it's the view's whole identity; a view freshness test, not a history judgment",
+    ),
+    (
+        "tests/header_wire_crossing.rs",
+        "held_applied",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "act_frame",
+        "connection",
+        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "each_invalid_label_witness_has_a_conformant_control",
+        "connection",
+        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "each_invalid_label_witness_has_a_conformant_control",
+        "connection quic_stream seq",
+        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "honest_peer_never_punished",
+        "connection",
+        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "joins_the_frames",
+        "PEER_TO_NODE link",
+        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "joins_the_frames",
+        "first_frame seq",
+        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "joins_the_frames",
+        "id",
+        "steers the picks the reserved-flags script takes; the witness judges the recorded run, not this",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "outcome",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "peer_connections",
+        "peer",
+        "predates hdr-14 (the honest-peer witness at the PR base), so outside Rule 25",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "the_harness_registers_the_generated_header_ids",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary",
+        "ID",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+];
+
+/// The files [`raw_joins`] reads, relative to the crate: every acceptance
+/// source but `refs.rs`, where the join is defined, the witness judge, and
+/// [`RULE_25_WITNESSES`].
+fn raw_join_scope() -> Vec<String> {
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<String> = std::fs::read_dir(krate.join(ACCEPTANCE_SRC))
+        .expect("the acceptance source reads")
+        .map(|entry| entry.expect("an entry reads").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .map(|path| {
+            path.strip_prefix(krate)
+                .expect("under the crate")
+                .display()
+                .to_string()
+        })
+        .filter(|file| !file.ends_with("/refs.rs"))
+        .collect();
+    files.push("src/harness/header_acceptance.rs".to_owned());
+    files.push("src/witness.rs".to_owned());
+    files.extend(RULE_25_WITNESSES.iter().map(|file| (*file).to_owned()));
+    files.sort();
+    files
+}
+
+/// Each raw identity comparison in the Rust source `text`, the file
+/// `file`, as `(function, names)`: an `==` or `!=`, or a `contains` call,
+/// either side of which names an identity, by a path, field, method or
+/// JSON key one of whose `_`-separated parts is an [`IDENTITY_WORDS`] word,
+/// with those names, sorted and space-separated. Macro arguments and match
+/// guards count, and a one-key-off control's closure doesn't, since it
+/// judges a join's result. Test code under `src` is skipped, since it tests the
+/// code rather than judging a history; a witness test's file is all read.
+/// It can't see a comparison through a helper whose name holds no such
+/// word, `assert_eq!`'s equality, or a join the types make, such as a map
+/// keyed by an identity.
+fn raw_joins(text: &str, file: &str) -> BTreeSet<(String, String)> {
+    use syn::visit::Visit;
+    /// Whether `name` holds an identity word as one of its parts.
+    fn identity(name: &str) -> bool {
+        name.split('_')
+            .any(|part| IDENTITY_WORDS.contains(&part.to_ascii_lowercase().as_str()))
+    }
+    /// Every identity name `expr` holds.
+    fn identities(expr: &syn::Expr) -> BTreeSet<String> {
+        /// Collects them.
+        #[derive(Default)]
+        struct Names(BTreeSet<String>);
+        impl<'ast> Visit<'ast> for Names {
+            fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
+                let name = ident.to_string();
+                if identity(&name) {
+                    self.0.insert(name);
+                }
+            }
+
+            fn visit_expr_index(&mut self, index: &'ast syn::ExprIndex) {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(key),
+                    ..
+                }) = &*index.index
+                {
+                    if identity(&key.value()) {
+                        self.0.insert(key.value());
+                    }
+                }
+                syn::visit::visit_expr_index(self, index);
+            }
+
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                for expr in macro_exprs(mac) {
+                    self.visit_expr(&expr);
+                }
+            }
+        }
+        let mut names = Names::default();
+        names.visit_expr(expr);
+        names.0
+    }
+    /// Whether `attrs` mark test-only code: `#[test]`, or `#[cfg(test)]`.
+    fn test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("test")
+                || (attr.path().is_ident("cfg")
+                    && attr
+                        .meta
+                        .require_list()
+                        .is_ok_and(|list| list.tokens.to_string() == "test"))
+        })
+    }
+    /// Collects the comparisons, by enclosing function.
+    struct Raw {
+        skip_tests: bool,
+        within: Vec<String>,
+        found: BTreeSet<(String, String)>,
+    }
+    impl Raw {
+        /// Notes a comparison of `sides`, if one names an identity.
+        fn compare(&mut self, sides: &[&syn::Expr]) {
+            let names: BTreeSet<String> = sides.iter().flat_map(|side| identities(side)).collect();
+            if !names.is_empty() {
+                let within = self.within.last().cloned().unwrap_or_default();
+                let names: Vec<String> = names.into_iter().collect();
+                self.found.insert((within, names.join(" ")));
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Raw {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !(self.skip_tests && test_only(&item.attrs)) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !(self.skip_tests && test_only(&item.attrs)) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !(self.skip_tests && test_only(&item.attrs)) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_expr_binary(&mut self, binary: &'ast syn::ExprBinary) {
+            if matches!(binary.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) {
+                self.compare(&[&binary.left, &binary.right]);
+            }
+            syn::visit::visit_expr_binary(self, binary);
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            let control = matches!(&*call.func, syn::Expr::Path(path)
+                if path.path.segments.last().is_some_and(|last| last.ident == "assert_one_key_off"));
+            if control {
+                // A control's closure judges a join's result, as `==` of
+                // what the join found; the join itself is elsewhere.
+                if let Some(positive) = call.args.first() {
+                    self.visit_expr(positive);
+                }
+            } else {
+                syn::visit::visit_expr_call(self, call);
+            }
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "contains" {
+                let mut sides: Vec<&syn::Expr> = vec![&call.receiver];
+                sides.extend(call.args.iter());
+                self.compare(&sides);
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            for expr in macro_exprs(mac) {
+                self.visit_expr(&expr);
+            }
+        }
+    }
+    let parsed = syn::parse_file(text).unwrap_or_else(|error| panic!("{file} parses: {error}"));
+    let mut raw = Raw {
+        skip_tests: file.starts_with("src/"),
+        within: Vec::new(),
+        found: BTreeSet::new(),
+    };
+    raw.visit_file(&parsed);
+    raw.found
+}
+
+/// Rule 25's raw-join scan: in [`raw_join_scope`], every comparison that
+/// names an identity ([`raw_joins`]) is one [`NOT_RAW_JOINS`] lists, with
+/// why it joins no identity, and each listed one is still there; any
+/// other identity join goes through a typed ref. A planted raw join on a
+/// peer, an operation, a JSON attribution or by `contains` fails the scan,
+/// and a comparison of a kind or a count, or a control's closure judging
+/// a join's result, doesn't.
+#[test]
+fn identity_joins_go_through_refs() {
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found = BTreeSet::new();
+    for file in raw_join_scope() {
+        let text = std::fs::read_to_string(krate.join(&file)).expect("a source file reads");
+        for (within, names) in raw_joins(&text, &file) {
+            found.insert((file.clone(), within, names));
+        }
+    }
+    let allowed: BTreeSet<(String, String, String)> = NOT_RAW_JOINS
+        .iter()
+        .map(|(file, within, names, why)| {
+            assert!(!why.is_empty(), "{file} {within} has no reason");
+            (
+                (*file).to_owned(),
+                (*within).to_owned(),
+                (*names).to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        allowed.len(),
+        NOT_RAW_JOINS.len(),
+        "an entry is listed twice"
+    );
+    let raw: Vec<_> = found.difference(&allowed).collect();
+    assert!(
+        raw.is_empty(),
+        "raw identity joins outside refs.rs: {raw:#?}"
+    );
+    let stale: Vec<_> = allowed.difference(&found).collect();
+    assert!(
+        stale.is_empty(),
+        "listed comparisons that are gone: {stale:?}"
+    );
+
+    for (planted, names) in [
+        ("fn p(a: &str, b: &str) -> bool { a == b }", None),
+        ("fn p(kind: &str) -> bool { kind == \"invalidate\" }", None),
+        ("fn p(frames: &[u64]) -> bool { frames.len() == 1 }", None),
+        ("fn p(peer: &str, name: &str) -> bool { name == peer }", Some("peer")),
+        ("fn p(id: u64, op: u64) -> bool { matches!(id, x if x == op) }", Some("op")),
+        (
+            "fn p(record: &Value, want: &Value) -> bool { record[\"attribution\"] == *want }",
+            Some("attribution"),
+        ),
+        ("fn p(links: &[u64], conn: u64) -> bool { links.contains(&conn) }", Some("conn")),
+        (
+            "fn p(peer: &PeerNameRef) { assert_one_key_off::<PeerNameRef>(peer, |p| p.peer == peer.peer); }",
+            None,
+        ),
+        (
+            "fn p(o: &Obs, c: u64) -> bool { match o { Obs::Closed { connection } if *connection == c => true, _ => false } }",
+            Some("connection"),
+        ),
+    ] {
+        let found = raw_joins(planted, "tests/t.rs");
+        let want: BTreeSet<(String, String)> = names
+            .map(|names| ("p".to_owned(), names.to_owned()))
+            .into_iter()
+            .collect();
+        assert_eq!(found, want, "{planted}");
     }
 }

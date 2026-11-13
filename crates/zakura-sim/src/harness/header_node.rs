@@ -966,9 +966,6 @@ pub struct Topology {
     sessions: Option<SessionEvidence>,
     /// Set once a `Shutdown` step was picked, which stops any churn.
     stopping: Cell<bool>,
-    /// The position in the control script of the step being carried out,
-    /// while one is, which each environment fact it records names.
-    acting: Cell<Option<usize>>,
     /// The mirror whose pages the harness holds back, if any.
     delayed_page: Option<DelayedPage>,
 }
@@ -1124,11 +1121,8 @@ async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<(usize, usize)>
             return;
         }
         // Each relink and close is the churn step's own.
-        let _far = topology.acting_as(Some(position), || {
-            let (link, far) = topology.open(index, 0, true);
-            topology.close(&link);
-            far
-        });
+        let (link, _far) = topology.open(index, 0, true, Some(position));
+        topology.close(&link, Some(position));
         if topology.stopping() {
             return;
         }
@@ -1152,7 +1146,6 @@ impl Topology {
             tap: None,
             sessions: None,
             stopping: Cell::new(false),
-            acting: Cell::new(None),
             delayed_page: None,
         }
     }
@@ -1212,39 +1205,46 @@ impl Topology {
 
     /// Tells the node under test's tap that a `Shutdown` step was picked, so
     /// a run that ends before the step takes effect fails as an unfinished
-    /// stop.
-    fn expect_shutdown(&self) {
+    /// stop. `cause` is as [`Topology::environment`] takes it.
+    fn expect_shutdown(&self, cause: Option<usize>) {
         self.stopping.set(true);
         if let Some(tap) = &self.tap {
             tap.begin();
         }
-        self.environment(&self.nodes[0].name, None, EnvironmentAction::Shutdown);
+        self.environment(
+            &self.nodes[0].name,
+            None,
+            EnvironmentAction::Shutdown,
+            cause,
+        );
     }
 
     /// Records in the node under test's tap that the harness's `action` on
-    /// `peer` ends `connection`, as [`ends`] describes, naming the control
-    /// step being carried out, if one is ([`Topology::acting_as`]).
-    fn environment(&self, peer: &str, connection: Option<u64>, action: EnvironmentAction) {
+    /// `peer` ends `connection`, as [`ends`] describes, naming `cause`, the
+    /// position in the control script of the step carrying it out, if one
+    /// is. The cause is passed, not held by the topology: steps run in
+    /// their own tasks and overlap at scheduling points.
+    fn environment(
+        &self,
+        peer: &str,
+        connection: Option<u64>,
+        action: EnvironmentAction,
+        cause: Option<usize>,
+    ) {
         if let Some(tap) = &self.tap {
-            tap.environment(peer, connection, action, self.acting.get());
+            tap.environment(peer, connection, action, cause);
         }
     }
 
-    /// Runs `act` as the execution of the control script's step at
-    /// `position`, so every environment fact it records names that step,
-    /// or none for `None`. `act` must not wait, or another task's facts
-    /// could take its step.
-    fn acting_as<R>(&self, position: Option<usize>, act: impl FnOnce() -> R) -> R {
-        let outer = self.acting.replace(position);
-        let done = act();
-        self.acting.set(outer);
-        done
-    }
-
     /// Closes `link` as the harness's own action, which the node under
-    /// test's tap records first.
-    fn close(&self, link: &Link) {
-        self.environment(&link.peer, Some(link.conn_id), EnvironmentAction::Close);
+    /// test's tap records first, naming `cause` ([`Topology::environment`]).
+    fn close(&self, link: &Link, cause: Option<usize>) {
+        self.environment(
+            &link.peer,
+            Some(link.conn_id),
+            EnvironmentAction::Close,
+            cause,
+        );
         link.close();
     }
 
@@ -1326,24 +1326,36 @@ impl Topology {
     /// Each side's peer carries the link's counter as its origin's
     /// connection and generation. The session view hears of the link first.
     pub fn link(&self, dialer: usize, listener: usize) -> Link {
-        self.open(dialer, listener, false).0
+        self.open(dialer, listener, false, None).0
     }
 
     /// [`Topology::link`], with the dialer's side handed back as its
     /// streams, from the node and to it, instead of joining the dialer's
-    /// service, when `far_end` is set.
+    /// service, when `far_end` is set. A relink's record names `cause`
+    /// ([`Topology::environment`]).
     ///
     /// A link to a peer that was linked before is a relink, which the node
     /// under test's tap records ([`ends`]) before the link exists, naming
     /// the new connection. Two relinks of one peer can overlap at the
     /// service's scheduling points, so the earlier session the node replaces
     /// is the admission's to say, not this record's.
-    fn open(&self, dialer: usize, listener: usize, far_end: bool) -> (Link, Option<FarEnd>) {
+    fn open(
+        &self,
+        dialer: usize,
+        listener: usize,
+        far_end: bool,
+        cause: Option<usize>,
+    ) -> (Link, Option<FarEnd>) {
         let peer = if dialer == 0 { listener } else { dialer };
         let id = self.last_id.get() + 1;
         self.last_id.set(id);
         if self.link_to(&self.nodes[peer].name).is_some() {
-            self.environment(&self.nodes[peer].name, Some(id), EnvironmentAction::Relink);
+            self.environment(
+                &self.nodes[peer].name,
+                Some(id),
+                EnvironmentAction::Relink,
+                cause,
+            );
         }
         let (to_listener, from_dialer) = framed_channel(LINK_DEPTH);
         let (to_dialer, from_listener) = framed_channel(LINK_DEPTH);
@@ -1473,14 +1485,15 @@ impl Topology {
     /// Links the mirror named `peer` to the node under test again, as its
     /// dialer, with a flooding task at the mirror's end in place of its
     /// service ([`flood`]), registered with `generators`. The node replaces
-    /// the mirror's earlier session.
+    /// the mirror's earlier session. The relink's record names `cause`
+    /// ([`Topology::environment`]).
     ///
     /// The task's token is a child of the far end's connection token: the
     /// connection's close still stops it, and its retirement cancels only
     /// the child, so the connection stays open. One token keeps the loop's
     /// preemption points as they were.
-    fn flood(&self, peer: &str, generators: &Generators) {
-        let (_, far) = self.open(self.index(peer), 0, true);
+    fn flood(&self, peer: &str, generators: &Generators, cause: Option<usize>) {
+        let (_, far) = self.open(self.index(peer), 0, true, cause);
         let far = far.expect("an open with a far end hands it back");
         let link = far.cancel.clone();
         let stop = link.child_token();
@@ -1503,7 +1516,7 @@ impl Topology {
     /// out.
     pub(crate) fn begin_finish(&self) {
         if !self.shutdown_picked() {
-            self.expect_shutdown();
+            self.expect_shutdown(None);
         }
     }
 
@@ -1803,18 +1816,14 @@ impl Control {
                         .unwrap_or_else(|| panic!("the scenario links `{}`", step.peer))
                 };
                 match step.action {
-                    ControlAction::Close => {
-                        topology.acting_as(position, || topology.close(&link()))
-                    }
-                    ControlAction::Relink => topology.acting_as(position, || {
+                    ControlAction::Close => topology.close(&link(), position),
+                    ControlAction::Relink => {
                         let link = link();
-                        topology.link(link.dialer, link.listener);
-                    }),
+                        topology.open(link.dialer, link.listener, false, position);
+                    }
                     ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
                     ControlAction::Shutdown => topology.shutdown(),
-                    ControlAction::Flood => {
-                        topology.acting_as(position, || topology.flood(&step.peer, &generators))
-                    }
+                    ControlAction::Flood => topology.flood(&step.peer, &generators, position),
                     ControlAction::Churn => {
                         let index = topology.index(&step.peer);
                         let start = to_churn
@@ -2351,8 +2360,7 @@ impl ActionSource for Control {
         }
         if step.action == ControlAction::Shutdown {
             self.shut_down = true;
-            self.topology
-                .acting_as(Some(index), || self.topology.expect_shutdown());
+            self.topology.expect_shutdown(Some(index));
         }
         self.queued.set(self.queued.get() + 1);
         self.to_task

@@ -39,12 +39,13 @@ use zakura_network::zakura::observe::ReactorEvent;
 use super::{
     binding::{self, Expect, Field},
     refs::{
-        joined, FindingRef, FrameRef, PageRef, ReadRef, SessionRef, StreamRef, SubscriptionRef,
+        ConnectionRef, FindingRef, FrameRef, PageRef, PeerNameRef, ReadRef, Ref, SessionRef,
+        StreamRef, SubscriptionRef,
     },
     CaseRef,
 };
 use crate::{
-    harness::header_node::authority::{Attribution, AuthorityRule, AuthoritySubject},
+    harness::header_node::authority::AuthorityRule,
     model::{is_fault_cause, Label},
     peer::SentPages,
     Observation, PropertyOutcome, PropertyReport,
@@ -247,7 +248,7 @@ pub fn judged_frame(obs: &Observation) -> Option<FrameRef> {
 /// connection and QUIC stream carry. An error says why there's no single
 /// one.
 pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, String> {
-    let judged = |frame: &FrameRef| !joined(observations, judged_frame, frame).is_empty();
+    let judged = |frame: &FrameRef| !FrameRef::joined(frame, observations, judged_frame).is_empty();
     let frames: Vec<(FrameRef, Option<u64>)> = observations
         .iter()
         .filter_map(|obs| match obs {
@@ -285,7 +286,7 @@ pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, Strin
         exchange.ok_or_else(|| format!("the rejected page {} names no subscription", frame.seq))?;
     // The session row names the stream its session reads.
     let stream = StreamRef::from(frame);
-    let sessions = joined(observations, session_stream, &stream);
+    let sessions = StreamRef::joined(&stream, observations, session_stream);
     let [Observation::Session {
         session_id, peer, ..
     }] = sessions[..]
@@ -320,13 +321,47 @@ fn session_stream(obs: &Observation) -> Option<StreamRef> {
 }
 
 /// The peer `page` came from, as `peers` names it for its harness name, by
-/// `(name, peer)`, in hex as findings spell it.
+/// `(name, peer)`, in hex as findings spell it: the one peer joined on that
+/// name ([`PeerNameRef`]).
 fn page_peer(page: &RejectedPage, peers: &[(String, String)]) -> Result<String, String> {
-    peers
-        .iter()
-        .find(|(name, _)| *name == page.peer)
-        .map(|(_, peer)| peer.clone())
-        .ok_or_else(|| format!("no peer is named {}", page.peer))
+    let want = PeerNameRef {
+        peer: page.peer.clone(),
+    };
+    let named = PeerNameRef::joined(&want, peers, |(name, _)| {
+        Some(PeerNameRef { peer: name.clone() })
+    });
+    match named[..] {
+        [(_, peer)] => Ok(peer.clone()),
+        _ => Err(format!(
+            "{} peers are named {}, not one",
+            named.len(),
+            page.peer
+        )),
+    }
+}
+
+/// The page `record`, a claim store record, attributes a `rule` break to,
+/// if its subject is a page a reader tagged: its subscription, its frame
+/// and its headers, as [`PageRef`] names them.
+fn attributed_page(record: &Value, rule: AuthorityRule) -> Option<PageRef> {
+    let attribution = &record["attribution"];
+    if attribution["rule"] != serde_json::to_value(rule).ok()? {
+        return None;
+    }
+    let subject = &attribution["subject"];
+    if subject["subject"] != "page" {
+        return None;
+    }
+    serde_json::from_value(serde_json::json!({
+        "subscription": {
+            "peer": subject["peer"],
+            "session": subject["session"],
+            "subscription": subject["subscription"],
+        },
+        "frame": subject["frame"],
+        "headers": subject["headers"],
+    }))
+    .ok()
 }
 
 /// What the peer sent as `page`: its peer ([`page_peer`]) and the header
@@ -360,21 +395,22 @@ pub fn fault_close(
     };
     let judged = observations
         .iter()
-        .position(|obs| judged_frame(obs).as_ref() == Some(&page.frame))
+        .position(|obs| FrameRef::joins(&page.frame, obs, judged_frame))
         .ok_or_else(|| format!("the node never judged {page:?}"))?;
-    // A close names only its connection, which is the whole of its
-    // identity.
+    // A close names only its connection ([`ConnectionRef`]).
     let connection = page.frame.connection;
-    let close = observations
-        .iter()
-        .enumerate()
-        .find_map(|(at, obs)| match obs {
-            Observation::ConnectionClosed {
-                connection: c,
-                cause,
-            } if *c == connection => Some((at, cause)),
-            _ => None,
-        });
+    let closed = |obs: &Observation| match obs {
+        Observation::ConnectionClosed { connection, .. } => Some(ConnectionRef {
+            connection: *connection,
+        }),
+        _ => None,
+    };
+    let close = observations.iter().enumerate().find_map(|(at, obs)| {
+        let Observation::ConnectionClosed { cause, .. } = obs else {
+            return None;
+        };
+        ConnectionRef::joins(&ConnectionRef { connection }, obs, closed).then_some((at, cause))
+    });
     match close {
         None => Err(format!("connection {connection} never closed")),
         Some((at, cause)) if at < judged => Err(format!(
@@ -385,7 +421,8 @@ pub fn fault_close(
             "connection {connection} closed with {cause}, not a fault cause"
         )),
         Some(_) => {
-            let of_session = joined(refusals, |refusal| Some(refusal.session()), &session);
+            let of_session =
+                SessionRef::joined(&session, refusals, |refusal| Some(refusal.session()));
             match of_session[..] {
                 [refusal] if refusal.reason == CONTENT_FAULT => Ok(()),
                 _ => Err(format!(
@@ -406,12 +443,12 @@ pub fn staged_page(
     sent: &SentPage,
 ) -> Result<(), String> {
     let want = page.page(sent);
-    let from = joined(staged, StagedPage::read, &page.read());
+    let from = ReadRef::joined(&page.read(), staged, StagedPage::read);
     match from[..] {
         [fact] if fact.hashes.is_empty() => {
             Err(format!("the rejected page staged no header: {fact:?}"))
         }
-        [fact] if fact.page().as_ref() != Some(&want) => Err(format!(
+        [fact] if !PageRef::joins(&want, fact, StagedPage::page) => Err(format!(
             "the page staged from the rejected frame is {fact:?}, not the peer's {want:?}"
         )),
         [_] => Ok(()),
@@ -444,43 +481,34 @@ pub fn path_break(
         return Err(format!("{COMMIT} is {:?}", report.outcome));
     }
     let subject = page.page(sent);
-    let expected = serde_json::to_value(Attribution {
-        rule: AuthorityRule::Path,
-        subject: AuthoritySubject::Page {
-            peer: subject.subscription.peer,
-            session: subject.subscription.session,
-            subscription: subject.subscription.subscription,
-            headers: subject.headers,
-            frame: Some(subject.frame),
-        },
-    })
-    .map_err(|error| format!("the expected attribution doesn't serialize: {error}"))?;
     let records = claims
         .as_array()
         .ok_or("the claim store's snapshot isn't a list")?;
+    let breaks = PageRef::joined(&subject, records, |record| {
+        attributed_page(record, AuthorityRule::Path)
+    });
     let reported = |violation: &crate::Violation| {
         Some(FindingRef {
             step: violation.step,
             detail: violation.actual.clone(),
         })
     };
-    let found = records.iter().any(|record| {
+    let found = breaks.iter().any(|record| {
         let finding = record["step"].as_u64().zip(record["detail"].as_str());
         record["claim"] == "CommitOnlyAuthorized"
-            && record["attribution"] == expected
             && finding.is_some_and(|(step, detail)| {
                 let finding = FindingRef {
                     step,
                     detail: detail.to_owned(),
                 };
-                !joined(&report.violations, reported, &finding).is_empty()
+                !FindingRef::joined(&finding, &report.violations, reported).is_empty()
             })
     });
     if found {
         Ok(())
     } else {
         Err(format!(
-            "no retained {COMMIT} violation is the path break {expected}"
+            "no retained {COMMIT} violation is the path break of {subject:?}"
         ))
     }
 }
@@ -573,13 +601,14 @@ pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
 /// with `commit-only-authorized` as its whole `Draft` override. It's rerun
 /// here following the trace's own picks and draws ([`binding::TRACE_META`]),
 /// and the rerun's full report, every violation and the stores' snapshot,
-/// must equal the one
-/// recorded beside the trace, so what's judged is that run. So this must
+/// must equal the one recorded beside the trace, which must report that
+/// trace by its recording build ([`binding::FULL_REPORT`]), so what's
+/// judged is that run. So this must
 /// run in the build that recorded the trace, the case's own patched one,
 /// where a patched behavior replays. An error says why there's no verdict.
 pub fn judge_trace(dir: &std::path::Path) -> Result<Verdicts, String> {
     use crate::harness::{header_sync::HeaderWire, Subsystem};
-    let trace = crate::trace::TraceReader::open(dir).map_err(|error| error.to_string())?;
+    let trace = binding::open_trace(dir)?;
     let expect = Expect::new()
         .with(Field::Harness, HeaderWire::NAME)
         .with(Field::Draft, [COMMIT]);
@@ -590,12 +619,20 @@ pub fn judge_trace(dir: &std::path::Path) -> Result<Verdicts, String> {
     // Bound as `record` bound the recorded one, so it's equal only to a
     // report of this trace by this build.
     let rerun = rerun.map(|report| report.of_trace(&trace.id));
-    let recorded = std::fs::read_to_string(dir.join(crate::record::FULL_REPORT_FILE))
-        .map_err(|error| format!("its full report: {error}"))
-        .and_then(|text| {
-            serde_json::from_str::<crate::record::FullReport>(&text)
-                .map_err(|error| format!("its full report: {error}"))
-        })?;
+    let reported = Expect::new()
+        .with(Field::Trace, &trace.id)
+        .with(Field::Source, &trace.meta.build.source);
+    let recorded = binding::read_bounded(
+        &binding::FULL_REPORT,
+        &dir.join(crate::record::FULL_REPORT_FILE),
+        crate::trace::MAX_REPORT_BYTES,
+        &reported,
+    )
+    .and_then(|report| {
+        serde_json::from_value::<crate::record::FullReport>(report)
+            .map_err(|error| format!("its full report: {error}"))
+    })
+    .map_err(|why| format!("its full report: {why}"))?;
     if rerun.as_ref() != Some(&recorded) {
         return Err("the rerun's full report isn't the recorded one".to_owned());
     }
@@ -844,6 +881,38 @@ mod tests {
         assert!(judge_trace(plain.path()).is_err());
     }
 
+    /// The trace judge reads the recorded full report only as a report of
+    /// that trace by the build that recorded it ([`binding::FULL_REPORT`]):
+    /// a trace whose meta names another build, beside a report renamed to
+    /// that trace, which the rerun by this build would equal, is refused.
+    #[test]
+    fn the_trace_judge_binds_the_recorded_report() {
+        let dir = draft_recording();
+        assert!(judge_trace(dir.path()).is_ok());
+        let path = dir.path().join("trace.jsonl");
+        let text = std::fs::read_to_string(&path).expect("the trace is readable");
+        let (first, rest) = text.split_once('\n').expect("the trace has lines");
+        let mut meta: Value = serde_json::from_str(first).expect("its meta is JSON");
+        meta["meta"]["build"]["source"] = json!("another build");
+        std::fs::write(&path, format!("{meta}\n{rest}")).expect("the temp dir is writable");
+        let id = crate::trace::TraceReader::open(dir.path())
+            .expect("the trace reads")
+            .id;
+        let report = dir.path().join(crate::record::FULL_REPORT_FILE);
+        let mut renamed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&report).expect("it exists"))
+                .expect("it reads");
+        renamed["trace"] = json!(id);
+        std::fs::write(&report, renamed.to_string()).expect("the temp dir is writable");
+        let refused = judge_trace(dir.path());
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains("was built from")),
+            "{refused:?}"
+        );
+    }
+
     /// The fault-close companion joins the rejected frame and its content
     /// refusal: a fault close there after the session's reader refused a
     /// frame for linkage holds. Each key of the frame or of the refusing
@@ -876,20 +945,26 @@ mod tests {
         );
         let closed = log(1, 1, "service_protocol_reject");
         assert_eq!(fault_close(&closed, &linkage, &page), Ok(()));
-        assert_one_key_off(&page.frame, |frame| {
+        assert_one_key_off::<FrameRef>(&page.frame, |frame| {
             let page = RejectedPage {
                 frame: frame.clone(),
                 ..page.clone()
             };
             fault_close(&closed, &linkage, &page).is_ok()
         });
-        assert_one_key_off(&linkage[0].session(), |session| {
+        assert_one_key_off::<SessionRef>(&linkage[0].session(), |session| {
             let refusals = [Refusal {
                 peer: session.peer.clone(),
                 session: session.session,
                 reason: CONTENT_FAULT.into(),
             }];
             fault_close(&closed, &refusals, &page).is_ok()
+        });
+        // The close joins on its whole connection.
+        let own = ConnectionRef { connection: 1 };
+        assert_one_key_off::<ConnectionRef>(&own, |close| {
+            let log = log(1, close.connection, "service_protocol_reject");
+            fault_close(&log, &linkage, &page).is_ok()
         });
         assert!(fault_close(&log(1, 2, "service_protocol_reject"), &linkage, &page).is_err());
         assert!(fault_close(&log(1, 1, "service_local_shutdown"), &linkage, &page).is_err());
@@ -956,6 +1031,59 @@ mod tests {
         assert_eq!(keys, 4);
     }
 
+    /// The rejected page is the bad-content frame the node judged, joined
+    /// on its judgment's whole [`FrameRef`]: a judgment with any one key of
+    /// the frame moved is another frame's, so there's no rejected page
+    /// (Rule 25's template). A judgment names no direction, since the node
+    /// judges only frames it reads, so an outbound frame is never judged.
+    #[test]
+    fn the_rejected_page_joins_its_judged_frame() {
+        let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
+        let keys = assert_one_key_off::<FrameRef>(&page.frame, |frame| {
+            let mut moved = log(1, 1, "service_protocol_reject");
+            moved[2] = Observation::FrameJudged {
+                connection: frame.connection,
+                stream: StreamId {
+                    kind: frame.kind,
+                    version: frame.version,
+                },
+                quic_stream: Some(frame.quic_stream),
+                seq: frame.seq,
+            };
+            frame.inbound && rejected_page(&moved).is_ok()
+        });
+        assert_eq!(keys, 6);
+    }
+
+    /// The rejected page's peer is the one scenario peer its `Session`
+    /// row's harness name joins, on its whole [`PeerNameRef`]: the same
+    /// page with its peer's name moved names another peer or none (Rule
+    /// 25's template), and a name two peers share names none.
+    #[test]
+    fn the_page_s_peer_joins_its_harness_name() {
+        let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
+        let peers = vec![
+            ("peer-0".to_owned(), "ab".to_owned()),
+            ("peer-1".to_owned(), "cd".to_owned()),
+        ];
+        let own = PeerNameRef {
+            peer: page.peer.clone(),
+        };
+        let keys = assert_one_key_off::<PeerNameRef>(&own, |name| {
+            let moved = RejectedPage {
+                peer: name.peer.clone(),
+                ..page.clone()
+            };
+            page_peer(&moved, &peers) == Ok("ab".to_owned())
+        });
+        assert_eq!(keys, 1);
+        let shared = vec![
+            ("peer-0".to_owned(), "ab".to_owned()),
+            ("peer-0".to_owned(), "cd".to_owned()),
+        ];
+        assert!(page_peer(&page, &shared).is_err());
+    }
+
     /// The rejected page's peer and hashes come from its frame's evidence:
     /// the peer its `Session` row names, and the page the peer sent there,
     /// joined on its frame's whole [`FrameRef`], so the same position on
@@ -992,9 +1120,10 @@ mod tests {
             staged_page(std::slice::from_ref(&own), &page, &sent()),
             Ok(())
         );
-        let keys = assert_one_key_off(&own.page().expect("it names its frame"), |staged| {
-            staged_page(&[staged_from(staged)], &page, &sent()).is_ok()
-        });
+        let keys =
+            assert_one_key_off::<PageRef>(&own.page().expect("it names its frame"), |staged| {
+                staged_page(&[staged_from(staged)], &page, &sent()).is_ok()
+            });
         assert_eq!(keys, 6);
         // The frame's read, and the page's subscription, each on its own.
         let read = own.read().expect("it names its frame");
@@ -1029,7 +1158,7 @@ mod tests {
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
         let (store, properties) = claims("path", 3);
         assert_eq!(path_break(&properties, &store, &page, &sent()), Ok(()));
-        assert_one_key_off(&page.page(&sent()), |subject| {
+        assert_one_key_off::<PageRef>(&page.page(&sent()), |subject| {
             let (page, sent) = page_of(subject);
             path_break(&properties, &store, &page, &sent).is_ok()
         });

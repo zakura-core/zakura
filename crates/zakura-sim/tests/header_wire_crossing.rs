@@ -35,7 +35,10 @@ use zakura_network::zakura::{v9::RegtestMessage, Credit, MessageRole};
 use zakura_sim::{
     explore::state::crossing::{crossings, Crossed},
     harness::{
-        header_acceptance::{companions::judged_frame, refs::FrameRef},
+        header_acceptance::{
+            companions::judged_frame,
+            refs::{ConnectionRef, FrameRef, QuicStreamRef, Ref},
+        },
         header_sync::{HeaderWire, WireScenario},
         run_prepared,
         wire_plans::{act_scenario, SavedPlan},
@@ -121,38 +124,52 @@ fn observations(report: &RunReport) -> Vec<Observation> {
 /// `ActRan` names, before that `ActRan`, which the peer logs once it has
 /// written the act's frames, as its `PeerFrame` names it.
 fn act_frame(observations: &[Observation], act: Act) -> Option<FrameRef> {
-    let (ran, connection, quic_stream) =
-        observations
-            .iter()
-            .enumerate()
-            .find_map(|(at, observation)| match observation {
-                Observation::ActRan {
-                    connection,
-                    quic_stream,
-                    act: name,
-                } if name == act.name() => Some((at, *connection, *quic_stream)),
-                _ => None,
-            })?;
-    observations[..ran]
+    let (ran, stream) = observations
         .iter()
-        .rev()
-        .find_map(|observation| match *observation {
-            Observation::PeerFrame {
-                connection: c,
-                stream,
-                quic_stream: Some(q),
-                seq,
-                ..
-            } if (c, q) == (connection, quic_stream) => Some(FrameRef {
+        .enumerate()
+        .find_map(|(at, observation)| match observation {
+            Observation::ActRan {
                 connection,
-                kind: stream.kind,
-                version: stream.version,
                 quic_stream,
-                inbound: true,
-                seq,
-            }),
+                act: name,
+            } if name == act.name() => Some((
+                at,
+                QuicStreamRef {
+                    connection: *connection,
+                    quic_stream: *quic_stream,
+                },
+            )),
             _ => None,
-        })
+        })?;
+    let on = |observation: &Observation| match *observation {
+        Observation::PeerFrame {
+            connection,
+            quic_stream: Some(quic_stream),
+            ..
+        } => Some(QuicStreamRef {
+            connection,
+            quic_stream,
+        }),
+        _ => None,
+    };
+    let written = QuicStreamRef::joined(&stream, &observations[..ran], on);
+    written.last().and_then(|observation| match **observation {
+        Observation::PeerFrame {
+            connection,
+            stream,
+            quic_stream: Some(quic_stream),
+            seq,
+            ..
+        } => Some(FrameRef {
+            connection,
+            kind: stream.kind,
+            version: stream.version,
+            quic_stream,
+            inbound: true,
+            seq,
+        }),
+        _ => None,
+    })
 }
 
 /// The one crossed update in `observations`, which must carry `label`.
@@ -174,22 +191,51 @@ fn crossed(observations: &[Observation], label: Label) -> Result<Crossed, String
 fn judged_at(observations: &[Observation], update: &FrameRef) -> Result<usize, String> {
     observations
         .iter()
-        .position(|observation| judged_frame(observation).as_ref() == Some(update))
+        .position(|observation| FrameRef::joins(update, observation, judged_frame))
         .ok_or_else(|| format!("{update:?} was never judged"))
 }
 
+/// What `observation` punishes, if it's a connection's close with a fault
+/// cause or a `Misbehavior`: that connection.
+fn punished(observation: &Observation) -> Option<ConnectionRef> {
+    match observation {
+        Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+            Some(ConnectionRef {
+                connection: *connection,
+            })
+        }
+        Observation::Misbehavior { connection } => Some(ConnectionRef {
+            connection: *connection,
+        }),
+        _ => None,
+    }
+}
+
 /// Requires that the node closed `update`'s connection on its judgment:
-/// the connection's first close comes after the update's `FrameJudged`,
-/// with a fault cause. A close of another connection, or one the node
-/// decided before it judged the update, is an unrelated fault's.
-fn closed_on_its_judgment(observations: &[Observation], update: &FrameRef) -> Result<(), String> {
+/// the connection's first close, joined on its [`ConnectionRef`], comes
+/// after the update's `FrameJudged`, with a fault cause. A close of another
+/// connection, or one the node decided before it judged the update, is an
+/// unrelated fault's. Returns the close's position.
+fn closed_on_its_judgment(
+    observations: &[Observation],
+    update: &FrameRef,
+) -> Result<usize, String> {
     let judged = judged_at(observations, update)?;
+    let own = ConnectionRef {
+        connection: update.connection,
+    };
+    let closed = |observation: &Observation| match observation {
+        Observation::ConnectionClosed { connection, .. } => Some(ConnectionRef {
+            connection: *connection,
+        }),
+        _ => None,
+    };
     let (at, cause) = observations
         .iter()
         .enumerate()
         .find_map(|(at, observation)| match observation {
-            Observation::ConnectionClosed { connection, cause }
-                if *connection == update.connection =>
+            Observation::ConnectionClosed { cause, .. }
+                if ConnectionRef::joins(&own, observation, closed) =>
             {
                 Some((at, cause))
             }
@@ -208,28 +254,21 @@ fn closed_on_its_judgment(observations: &[Observation], update: &FrameRef) -> Re
             update.connection
         ));
     }
-    Ok(())
+    Ok(at)
 }
 
 /// Requires that the node judged `update` and drew no punishment for it:
-/// no fault close and no `Misbehavior` on its connection after its
-/// judgment.
+/// no fault close and no `Misbehavior` after its judgment joined on its
+/// connection's [`ConnectionRef`] ([`punished`]).
 fn unpunished(observations: &[Observation], update: &FrameRef) -> Result<(), String> {
     let judged = judged_at(observations, update)?;
-    for observation in &observations[judged..] {
-        match observation {
-            Observation::ConnectionClosed { connection, cause }
-                if *connection == update.connection && is_fault_cause(cause) =>
-            {
-                return Err(format!("connection {connection} closed with {cause}"));
-            }
-            Observation::Misbehavior { connection } if *connection == update.connection => {
-                return Err(format!("connection {connection} was punished"));
-            }
-            _ => {}
-        }
+    let own = ConnectionRef {
+        connection: update.connection,
+    };
+    match ConnectionRef::joined(&own, &observations[judged..], punished)[..] {
+        [] => Ok(()),
+        [first, ..] => Err(format!("{own:?} was punished by {first:?}")),
     }
-    Ok(())
 }
 
 /// Requires `id` held in `report`, applied at least once.
@@ -343,6 +382,63 @@ fn a_crossing_close_is_conformant_and_unpunished() {
     let report = crossing_history(Act::CrossingClose);
     let (observations, update) = conformant_crossing(&report, Act::CrossingClose);
     conformant_controls(&observations, &update);
+    // A fault close after the judgment punishes the update only on its
+    // own connection's whole ref.
+    let judged = judged_at(&observations, &update).expect("the update was judged");
+    let own = ConnectionRef {
+        connection: update.connection,
+    };
+    assert_one_key_off::<ConnectionRef>(&own, |closed| {
+        let mut changed = observations.clone();
+        let close = Observation::ConnectionClosed {
+            connection: closed.connection,
+            cause: "service_protocol_reject".to_owned(),
+        };
+        changed.insert(judged + 1, close);
+        unpunished(&changed, &update).is_err()
+    });
+}
+
+/// The frame an act wrote is the peer's last on the QUIC stream its
+/// `ActRan` names, joined on that whole [`QuicStreamRef`]: an `ActRan` with
+/// its connection or QUIC stream moved names another stream, and so
+/// another frame or none (Rule 25's template).
+#[test]
+fn an_act_s_frame_joins_its_quic_stream() {
+    let report = saved_outcome_crossing();
+    let observations = observations(&report);
+    let act = Act::OutcomeCrossing;
+    let written = act_frame(&observations, act).expect("the act wrote a frame");
+    let ran = observations
+        .iter()
+        .position(|observation| matches!(observation, Observation::ActRan { act: name, .. } if name == act.name()))
+        .expect("the act ran");
+    let Observation::ActRan {
+        connection,
+        quic_stream,
+        ..
+    } = observations[ran]
+    else {
+        unreachable!("the position is the act's ActRan");
+    };
+    let own = QuicStreamRef {
+        connection,
+        quic_stream,
+    };
+    let keys = assert_one_key_off::<QuicStreamRef>(&own, |stream| {
+        let mut moved = observations.clone();
+        if let Observation::ActRan {
+            connection,
+            quic_stream,
+            ..
+        } = &mut moved[ran]
+        {
+            *connection = stream.connection;
+            *quic_stream = stream.quic_stream;
+        }
+        act_frame(&moved, act) == Some(written.clone())
+    });
+    assert_eq!(keys, 2);
 }
 
 /// A `Grant` above the window crosses the node's ending, labelled
@@ -359,11 +455,21 @@ fn an_over_window_crossing_grant_is_bad_cursor_and_closed() {
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     let observations = observations(&report);
     let update = crossed_act(&observations, over_window(), Label::BadCursor);
-    assert_eq!(closed_on_its_judgment(&observations, &update), Ok(()));
+    let close = closed_on_its_judgment(&observations, &update).expect("it closed on judgment");
     held_applied(&report, BAD_CURSOR_CLOSES);
 
-    assert_one_key_off(&update, |update| {
+    assert_one_key_off::<FrameRef>(&update, |update| {
         closed_on_its_judgment(&observations, update).is_ok()
+    });
+    let own = ConnectionRef {
+        connection: update.connection,
+    };
+    assert_one_key_off::<ConnectionRef>(&own, |moved| {
+        let mut elsewhere = observations.clone();
+        if let Observation::ConnectionClosed { connection, .. } = &mut elsewhere[close] {
+            *connection = moved.connection;
+        }
+        closed_on_its_judgment(&elsewhere, &update).is_ok()
     });
 
     for moved in restreamed(&observations, &update) {
@@ -376,18 +482,6 @@ fn an_over_window_crossing_grant_is_bad_cursor_and_closed() {
     assert!(crossed(&unjudged, Label::BadCursor).is_err());
     assert!(closed_on_its_judgment(&unjudged, &update).is_err());
 
-    let close = observations
-        .iter()
-        .position(|observation| {
-            matches!(observation, Observation::ConnectionClosed { connection, .. }
-                if *connection == update.connection)
-        })
-        .expect("the connection closed");
-    let mut elsewhere = observations.clone();
-    if let Observation::ConnectionClosed { connection, .. } = &mut elsewhere[close] {
-        *connection += 1;
-    }
-    assert!(closed_on_its_judgment(&elsewhere, &update).is_err());
     let mut early = observations.clone();
     let moved = early.remove(close);
     early.insert(judged, moved);

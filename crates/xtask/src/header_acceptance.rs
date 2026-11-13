@@ -131,6 +131,9 @@ const COMPANIONS_FILE: &str = "companions.json";
 const FULL_REPORT_FILE: &str = "full-report.json";
 /// How a fresh replay's child ended, as the reader's `REPLAY_FILE` names it.
 const REPLAY_FILE: &str = "replay.json";
+/// How a tool recording's child ended, as the reader's `RECORDING_FILE`
+/// names it.
+const RECORDING_FILE: &str = "recorded.json";
 
 /// The default deadline for each child, in seconds.
 const DEFAULT_DEADLINE_SECS: u64 = 3600;
@@ -1490,22 +1493,34 @@ struct Checkouts<'a> {
 }
 
 /// Runs a `zakura-sim record` child, `sim` with `args` and `--out <out>`,
-/// under the deadline, its output in `<out>.log`. A child killed at its
-/// deadline leaves [`KILLED`] in `out`. Returns whether it exited 0.
+/// under the deadline, its output in `<out>.log`, for task `id`'s run at
+/// `role`. A child killed at its deadline leaves [`KILLED`] in `out`. How
+/// it ended goes to `out`'s [`RECORDING_FILE`], named as that run with the
+/// SHA-256 of the trace it left, so the reader refuses a recording whose
+/// child failed whatever artifacts it wrote. Returns whether it exited 0.
 fn record_run(
     options: &Options,
     sim: &Path,
     args: &[OsString],
-    out: &Path,
+    (out, id, role): (&Path, TaskId<'_>, &str),
 ) -> Result<bool, BoxError> {
     let mut record = Command::new(sim);
     record.arg("record").args(args).arg("--out").arg(out);
     let ended = child(&mut record, &out.with_extension("log"), options.deadline);
     stop_if_interrupted()?;
+    fs::create_dir_all(out)?;
     if ended.killed() {
-        fs::create_dir_all(out)?;
         fs::write(out.join(KILLED), "")?;
     }
+    let status = json!({
+        "trace": sha256_file(&out.join("trace.jsonl")),
+        "exited_ok": ended.exited(),
+        "killed": ended.killed(),
+    });
+    fs::write(
+        out.join(RECORDING_FILE),
+        serde_json::to_string_pretty(&id.name(role, status))?,
+    )?;
     Ok(ended.exited())
 }
 
@@ -1573,7 +1588,8 @@ fn name_replay(run: &Path, id: TaskId<'_>, role: &str) -> Result<(), BoxError> {
 /// declared under `declared` as `case` on `harness`, run for task `id` at
 /// `role`, with the arguments S's `tool` gives it (`header-acceptance
 /// record-args`, the reader's `record_args`), and `witness`, a property and
-/// its `--expect`, if any.
+/// its `--expect`, if any. The recording is that task's run at
+/// `recorded_as` ([`record_run`]).
 /// A declaration the reader wouldn't take leaves `out` missing, with why in
 /// `<out>.log`. Returns whether it recorded.
 fn record_declared(
@@ -1581,7 +1597,7 @@ fn record_declared(
     (tool, sim): (&Path, &Path),
     (declared, harness, test, case): (&Path, &str, &str, &str),
     (id, role): (TaskId<'_>, &str),
-    out: &Path,
+    (out, recorded_as): (&Path, &str),
     witness: Option<(&str, &str)>,
 ) -> Result<bool, BoxError> {
     let file = out.with_extension("args.json");
@@ -1617,7 +1633,7 @@ fn record_declared(
     if let Some((property, expect)) = witness {
         args.extend(["--witness", property, "--expect", expect].map(OsString::from));
     }
-    record_run(options, sim, &args, out)?;
+    record_run(options, sim, &args, (out, id, recorded_as))?;
     Ok(true)
 }
 
@@ -1659,7 +1675,7 @@ fn run_history(
         (&tools.tool, &tools.sim),
         named,
         (id, ""),
-        &run,
+        (&run, "run"),
         expect.map(|expect| (property.as_str(), expect)),
     )? {
         fresh_replay(options, &tools.sim, (&run, id, "run"))?;
@@ -1817,7 +1833,7 @@ fn rebuild_case(
         args.extend(["--draft".into(), set.join(",").into()]);
         args.extend(draft_witness_args(case)?);
         let draft = dir.join("draft");
-        record_run(options, sim, &args, &draft)?;
+        record_run(options, sim, &args, (&draft, id, "draft"))?;
         fresh_replay(options, sim, (&draft, id, "draft"))?;
         let named = case
             .get("companions")
@@ -1964,7 +1980,7 @@ fn run_integrity(
                 (&tools.tool, &sim),
                 (&declared, &harness, &test, &case),
                 (id, run),
-                &out.join("history"),
+                (&out.join("history"), &format!("{run}/history")),
                 None,
             )?;
         }
@@ -2555,15 +2571,21 @@ mod tests {
             deadline: Duration::from_secs(60),
         };
         let run = dir.path().join("run");
-        assert!(record_run(&options, &sim, &["--sim".into(), "h".into()], &run).unwrap());
-        assert_eq!(
-            fs::read_to_string(run.join("args")).unwrap(),
-            format!("record\n--sim\nh\n--out\n{}\n", run.display())
-        );
         let id = TaskId {
             run_id: "r",
             index: 3,
         };
+        assert!(record_run(
+            &options,
+            &sim,
+            &["--sim".into(), "h".into()],
+            (&run, id, "run")
+        )
+        .unwrap());
+        assert_eq!(
+            fs::read_to_string(run.join("args")).unwrap(),
+            format!("record\n--sim\nh\n--out\n{}\n", run.display())
+        );
         fresh_replay(&options, &sim, (&run, id, "run")).unwrap();
         let replay = run.join("replay");
         assert_eq!(
@@ -2589,10 +2611,58 @@ mod tests {
         };
         let killed = dir.path().join("killed");
         let slow = fake(dir.path(), "slow", "sleep 30");
-        assert!(!record_run(&short, &slow, &[], &killed).unwrap());
+        assert!(!record_run(&short, &slow, &[], (&killed, id, "run")).unwrap());
         assert!(killed.join(KILLED).exists());
         fresh_replay(&short, &sim, (&killed, id, "run")).unwrap();
         assert!(!killed.join("replay").exists());
+    }
+
+    /// A recording's child's exit is kept beside its artifacts as the
+    /// reader reads it: a recorder that writes a complete run and then
+    /// exits 1 leaves `recorded.json` saying so, named as this task's run
+    /// at its role with the trace it left, and one that exits 0 says that.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorder_s_exit_is_kept_beside_its_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options {
+            out: dir.path().to_owned(),
+            deadline: Duration::from_secs(60),
+        };
+        let id = TaskId {
+            run_id: "r",
+            index: 3,
+        };
+        let failing = fake(
+            dir.path(),
+            "failing-sim",
+            "out=; prev=\n\
+             for arg in \"$@\"; do [ \"$prev\" = --out ] && out=$arg; prev=$arg; done\n\
+             mkdir -p \"$out\"; printf 'trace\\n' > \"$out/trace.jsonl\"\n\
+             printf '{\"passed\":true}' > \"$out/witness.json\"; exit 1",
+        );
+        let status = |run: &Path| -> Value {
+            serde_json::from_str(&fs::read_to_string(run.join("recorded.json")).unwrap()).unwrap()
+        };
+        let run = dir.path().join("draft");
+        assert!(!record_run(&options, &failing, &[], (&run, id, "draft")).unwrap());
+        assert!(run.join("witness.json").is_file());
+        assert_eq!(
+            status(&run),
+            json!({
+                "run_id": "r",
+                "index": 3,
+                "role": "draft",
+                "trace": sha256_file(&run.join("trace.jsonl")),
+                "exited_ok": false,
+                "killed": false,
+            })
+        );
+        let passing = dir.path().join("run");
+        let sim = fake_sim(dir.path());
+        assert!(record_run(&options, &sim, &[], (&passing, id, "run")).unwrap());
+        assert_eq!(status(&passing)["exited_ok"], true);
+        assert_eq!(status(&passing)["role"], "run");
     }
 
     /// A copied planted replay is named as this run's task's at its run's
@@ -2681,7 +2751,7 @@ mod tests {
             (&tool, &sim),
             named,
             (id, "patched"),
-            &run,
+            (&run, "patched/history"),
             Some(("p/x", "holds"))
         )
         .unwrap());
@@ -2700,7 +2770,7 @@ mod tests {
             (&tool, &sim),
             refused,
             (id, "patched"),
-            &other,
+            (&other, "patched/history"),
             None
         )
         .unwrap());

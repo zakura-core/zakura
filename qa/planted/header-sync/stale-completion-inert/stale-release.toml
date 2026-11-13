@@ -2,8 +2,11 @@
 # The input's prepare ends after its round retired, while the same peer's
 # next round holds a reservation, so the handler returns that round's
 # headers.
-input = "crates/zakura-sim/tests/fixtures/header-storage-stale-prepare.bin"
 # Besides reactor.rs, which the patch changes, the queue and the subscriber
 # decide when a round retires mid-prepare and whether a grant is due. A
 # change there can move the input off its stale prepare.
+# The input is the stale-prepare seed less its last control step, a close
+# on a dropped read that never runs: the same run, with every step it
+# declares carried out.
+input = "crates/zakura-sim/tests/fixtures/header-storage-stale-prepare-steps.bin"
 checks = ["crates/zakura-network/src/zakura/header_sync"]

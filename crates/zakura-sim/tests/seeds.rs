@@ -187,6 +187,13 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-storage-triggers" | "header-storage-stale-prepare" => {
             value(StorageScenario::triggers())
         }
+        // The stale-prepare seed less its last control step, which never
+        // runs (`tests/header_storage_seeds.rs`).
+        "header-storage-stale-prepare-steps" => {
+            let mut scenario = StorageScenario::triggers();
+            scenario.controls.pop();
+            value(scenario)
+        }
         "header-storage-locator-dropped" => value(storage_witnesses::dropped_locator()),
         "header-storage-apply-at-close" => value(storage_witnesses::apply_at_close()),
         "header-storage-competing-mirrors" => value(storage_witnesses::competing_mirrors()),

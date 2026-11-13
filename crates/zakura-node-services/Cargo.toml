@@ -1,6 +1,6 @@
 [package]
 name = "zakura-node-services"
-version = "5.2.2"
+version = "5.2.3"
 authors.workspace = true
 description = "The interfaces of some Zakura node services. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -43,8 +43,8 @@ rpc-client = [
 reqwest = []
 
 [dependencies]
-zakura-chain = { path = "../zakura-chain" , version = "14.0.0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.2" }
+zakura-chain = { path = "../zakura-chain" , version = "15.0.0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.1" }
 zakura-rt = { path = "../zakura-rt", version = "0.4.0" }
 tower = { workspace = true, features = ["buffer"] }
 

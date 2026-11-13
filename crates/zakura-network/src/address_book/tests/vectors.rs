@@ -11,8 +11,12 @@ use zakura_chain::{
 };
 
 use crate::{
+    address_book_peers::AddressBookPeers,
     config::UnconditionalPeers,
-    constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE},
+    constants::{
+        DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE,
+        MIN_PEER_RECONNECTION_DELAY,
+    },
     meta_addr::{MetaAddr, MetaAddrChange},
     protocol::external::types::PeerServices,
     AddressBook,
@@ -290,6 +294,84 @@ fn misbehavior_ban_removes_all_addresses_for_ip() {
         1,
         "published metrics should exclude all addresses on the banned IP"
     );
+}
+
+/// The published metrics count the peers in each connection state, and split
+/// responded peers by how recently they answered, as peers change state and
+/// leave the address book.
+#[test]
+fn address_metrics_count_peers_by_state() {
+    let _init_guard = zakura_test::init();
+
+    let addr = |last_octet: u8| -> crate::PeerSocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, last_octet], 8233)).into()
+    };
+    let [pending, responded_a, responded_b, failed, gossiped] = [1, 2, 3, 4, 5].map(addr);
+
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let address_metrics = address_book.address_metrics_watcher();
+
+    for (seconds, peer) in (0..).zip([pending, responded_a, responded_b, failed, gossiped]) {
+        address_book.update(gossiped_change(
+            peer,
+            PeerServices::NODE_NETWORK,
+            DateTime32::MIN.saturating_add(Duration32::from_seconds(seconds)),
+        ));
+    }
+    address_book.update(MetaAddr::new_reconnect(pending));
+    for peer in [responded_a, responded_b] {
+        address_book.update(MetaAddr::new_reconnect(peer));
+        address_book.update(MetaAddr::new_responded(peer, None));
+    }
+    address_book.update(MetaAddr::new_reconnect(failed));
+    address_book.update(MetaAddr::new_errored(failed, PeerServices::NODE_NETWORK));
+    address_book.peers.assert_consistent();
+
+    let now = Utc::now();
+    let metrics = address_book.address_metrics(now);
+    assert_eq!(metrics, *address_metrics.borrow());
+    assert_eq!(metrics.responded, 2);
+    assert_eq!(metrics.never_attempted_gossiped, 1);
+    assert_eq!(metrics.failed, 1);
+    assert_eq!(metrics.attempt_pending, 1);
+    assert_eq!(metrics.recently_live, 2);
+    assert_eq!(metrics.recently_stopped_responding, 0);
+    assert_eq!(metrics.num_addresses, 5);
+    assert_eq!(
+        address_book.recently_live_peers(now).len(),
+        metrics.recently_live
+    );
+
+    // Responded peers stay in that state after they go quiet, but stop
+    // counting as live.
+    let after_peers_went_quiet = now
+        + chrono::Duration::from_std(MIN_PEER_RECONNECTION_DELAY * 2)
+            .expect("reconnection delay fits in a chrono duration");
+    let metrics = address_book.address_metrics(after_peers_went_quiet);
+    assert_eq!(metrics.responded, 2);
+    assert_eq!(metrics.recently_live, 0);
+    assert_eq!(metrics.recently_stopped_responding, 2);
+    assert!(address_book
+        .recently_live_peers(after_peers_went_quiet)
+        .is_empty());
+
+    // A banned peer leaves the address book and its state's count.
+    address_book.update(MetaAddrChange::UpdateMisbehavior {
+        addr: responded_a,
+        score_increment: MAX_PEER_MISBEHAVIOR_SCORE,
+    });
+    address_book.peers.assert_consistent();
+
+    let metrics = address_book.address_metrics(Utc::now());
+    assert_eq!(metrics, *address_metrics.borrow());
+    assert_eq!(metrics.responded, 1);
+    assert_eq!(metrics.recently_live, 1);
+    assert_eq!(metrics.num_addresses, 4);
 }
 
 /// Make sure peers are attempted in priority order.

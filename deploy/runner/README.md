@@ -65,7 +65,8 @@ dashboard also serves `/propagation`: for each recent block, when each node
 first heard of it and from which of our nodes or from outside, how long it
 then waited to ask, downloaded, verified, committed and told its peers, and
 every announcement between two of our nodes. Below that are medians per node
-and per pair of nodes over the blocks shown. The fleet page links to it.
+and per pair of nodes over the blocks shown. The fleet page links to it, and
+every node name on it links to that node's own page (`/node/<name>`).
 
 `/propagation/data` is the same as JSON. The dashboard asks each node's
 profiler for its recent blocks (`/api/propagation`) at most once every 10

@@ -34,6 +34,9 @@ h1 { font-size: 24px; line-height: 1.2; margin: 0; letter-spacing: -0.01em; }
 h2 { font-size: 16px; margin: 0; }
 p { margin: 0; }
 .mono { font-family: var(--mono); }
+a.node-link { color: inherit; border-radius: 4px; }
+a.node-link:hover { color: var(--pink-hi); text-decoration: underline; }
+a.node-link:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
 .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
 .note { color: var(--muted); font-size: 13px; max-width: 96ch; }
 header.top { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: flex-end; justify-content: space-between; }
@@ -63,6 +66,8 @@ svg { display: block; }
 svg text { font-family: var(--mono); font-size: 11px; fill: var(--muted); }
 svg text.node { fill: var(--ink-2); font-family: inherit; font-size: 13px; }
 svg text.value { fill: var(--ink); }
+svg a:hover text.node, svg a:focus text.node { fill: var(--pink-hi); text-decoration: underline; }
+svg a:focus { outline: none; }
 svg .grid { stroke: var(--line); stroke-width: 1; }
 svg .track { stroke: var(--line-hi); stroke-width: 1; }
 svg .hop { stroke: var(--ink-2); stroke-width: 1.5; fill: none; opacity: 0.75; }
@@ -222,6 +227,12 @@ function table(target, columns, rows) {
   target.replaceChildren(el("thead", {}, head), el("tbody", {}, ...rows));
 }
 function cell(text, numeric) { return el("td", { text, class: numeric ? "num" : null }); }
+// Every node has a page of its own on the status dashboard; a node's name links to it.
+function nodeHref(name) { return "/node/" + encodeURIComponent(name); }
+function nodeLink(name) { return el("a", { class: "node-link", href: nodeHref(name), text: name }); }
+// A block's source is one of our nodes or somewhere outside the fleet.
+function sourceLink(name, outside) { return name === "outside" ? outside : nodeLink(name); }
+function nodeCell(name) { return el("td", {}, nodeLink(name)); }
 
 function renderTiles(data) {
   const spreads = data.blocks.filter((block) => Object.keys(block.nodes).length > 1).map((block) => block.spread_ms).sort((a, b) => a - b);
@@ -243,8 +254,9 @@ function renderBlocks(data) {
     const slow = slowest(block);
     const pick = el("button", { type: "button", text: String(block.height ?? "?") });
     pick.addEventListener("click", () => { state.selected = block.hash; state.followNewest = false; render(); });
-    const first = el("td", {}, block.first_node, el("span", { class: "quiet", text: " ← " + (block.first_from === "outside" ? "outside" : block.first_from) }));
-    const slowCell = el("td", {}, slow.name,
+    const first = el("td", {}, nodeLink(block.first_node),
+      el("span", { class: "quiet" }, " ← ", sourceLink(block.first_from, "outside")));
+    const slowCell = el("td", {}, nodeLink(slow.name),
       el("span", { class: "quiet", text: slow.longest ? ` · ${slow.longest.label.toLowerCase()} ${ms(slow.longest.end - slow.longest.start)}` : "" }));
     return el("tr", { "aria-selected": block.hash === state.selected ? "true" : "false" },
       el("td", {}, pick), el("td", { class: "mono", text: shortHash(block.hash) + (block.reorg ? " (reorg)" : "") }),
@@ -298,7 +310,9 @@ function renderWaterfall(block) {
   }
   for (const name of names) {
     const view = block.nodes[name], y = rowY(name);
-    root.append(svg("text", { class: "node", x: 0, y: y + 4 }, name));
+    const link = svg("a", { href: nodeHref(name) });
+    link.append(svg("text", { class: "node", x: 0, y: y + 4 }, name));
+    root.append(link);
     const first = Math.min(...Object.values(view.at));
     root.append(svg("line", { class: "track", x1: x(first), x2: x(Math.max(...Object.values(view.at))), y1: y, y2: y }));
     for (const span of spans(view)) {
@@ -334,7 +348,7 @@ function renderWaterfall(block) {
   // One readout per node, on hover and on keyboard focus.
   for (const name of names) {
     const view = block.nodes[name];
-    const hit = svg("rect", { class: "hit", x: 0, y: rowY(name) - rowHeight / 2, width, height: rowHeight, tabindex: 0, "aria-label": name });
+    const hit = svg("rect", { class: "hit", x: left - 8, y: rowY(name) - rowHeight / 2, width: width - left + 8, height: rowHeight, tabindex: 0, "aria-label": name + ", times" });
     const rows = [[null, `first heard from ${source(view)}`, "heard " + ms(view.at.heard)]]
       .concat(spans(view).map((span) => [color(span.key), span.label.toLowerCase(), ms(span.end - span.start)]))
       .concat([[null, "after the first sighting in the fleet", "tip " + ms(view.at.tip)]]);
@@ -357,15 +371,16 @@ function renderBlock(data) {
   title.textContent = `Block ${block.height ?? "?"}`;
   const slow = slowest(block);
   note.replaceChildren(el("span", { class: "mono", text: block.hash }),
-    ` · first heard at ${clockTime(block.origin)} by ${block.first_node}, from ${block.first_from === "outside" ? "a peer outside the fleet" : block.first_from}`
-    + ` · every node had it as tip after ${ms(block.spread_ms)}, ${slow.name} last`);
+    ` · first heard at ${clockTime(block.origin)} by `, nodeLink(block.first_node), ", from ",
+    sourceLink(block.first_from, "a peer outside the fleet"),
+    ` · every node had it as tip after ${ms(block.spread_ms)}, `, nodeLink(slow.name), " last");
   renderWaterfall(block);
   const names = Object.keys(block.nodes).sort((a, b) => block.nodes[a].at.tip - block.nodes[b].at.tip);
   table(document.getElementById("block-nodes"),
     [["Node"], ["Stack"], ["First heard from"], ...Object.values(POINT_LABELS).map((label) => [label, true]), ["Clock"]],
     names.map((name) => {
       const view = block.nodes[name];
-      return el("tr", {}, cell(name), cell(view.path || "–"), cell(view.from),
+      return el("tr", {}, nodeCell(name), cell(view.path || "–"), el("td", {}, sourceLink(view.from, "outside")),
         ...Object.keys(POINT_LABELS).map((point) => cell(ms(view.at[point]), true)),
         cell(view.clock === "log" ? "node log (trace clock was off)" : "trace"));
     }));
@@ -377,7 +392,7 @@ function renderBlock(data) {
       const gap = hop.heard - hop.told;
       const transit = el("td", { class: "num" }, ms(gap),
         el("span", { class: "quiet", text: withinClockError(hop.from, hop.to, gap) ? " (within clock error)" : "" }));
-      return el("tr", {}, cell(hop.from), cell(hop.to), cell(ms(hop.told), true), cell(ms(hop.heard), true), transit,
+      return el("tr", {}, nodeCell(hop.from), nodeCell(hop.to), cell(ms(hop.told), true), cell(ms(hop.heard), true), transit,
         cell(ms(hop.asked), true), cell(ms(hop.sent), true));
     }));
 }
@@ -390,7 +405,7 @@ function renderSummary(data) {
       ...INTERVALS.map(({ label }) => [label, true]), ["Clock error", true]],
     entries.map(([name, node]) => {
       const error = clockError(name);
-      return el("tr", {}, cell(name), cell(String(node.blocks), true), cell(String(node.first), true),
+      return el("tr", {}, nodeCell(name), cell(String(node.blocks), true), cell(String(node.first), true),
         cell(ms(node.tip_median_ms), true),
         el("td", { style: "min-width:120px" }, el("div", { class: "bar", style: `width:${(node.tip_median_ms / worst) * 100}%` })),
         cell(ms(node.tip_p90_ms), true),
@@ -399,7 +414,7 @@ function renderSummary(data) {
     }));
   const pairs = [...data.summary.pairs].sort((a, b) => b.median_ms - a.median_ms);
   table(document.getElementById("pair-summary"), [["From"], ["To"], ["Blocks", true], ["Median in transit", true]],
-    pairs.map((pair) => el("tr", {}, cell(pair.from), cell(pair.to), cell(String(pair.hops), true),
+    pairs.map((pair) => el("tr", {}, nodeCell(pair.from), nodeCell(pair.to), cell(String(pair.hops), true),
       el("td", { class: "num" }, ms(pair.median_ms),
         el("span", { class: "quiet", text: withinClockError(pair.from, pair.to, pair.median_ms) ? " (within clock error)" : "" })))));
   document.getElementById("clock-note").textContent = pairs.length

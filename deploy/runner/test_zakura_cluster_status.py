@@ -1858,6 +1858,8 @@ class PropagationRouteTests(unittest.TestCase):
         code, body, headers = self.fetch("/propagation")
         self.assertEqual((code, headers["Content-Type"]), (200, "text/html; charset=utf-8"))
         self.assertIn(b'fetch("/propagation/data"', body)
+        # A node's name on the page leads to that node's own page.
+        self.assertIn(b'"/node/" + encodeURIComponent(name)', body)
 
     def test_other_paths_and_a_dashboard_without_profilers_have_no_cluster_view(self):
         self.assertEqual(self.fetch("/propagation/other")[0], 404)

@@ -865,7 +865,8 @@ async fn unconditional_peer_dials_respect_the_per_ip_connection_limit() {
 }
 
 /// Zakura does not dial its own listener, or an address that is invalid for outbound
-/// connections.
+/// connections. A wildcard listener is only reached by loopback addresses of its own
+/// address family.
 #[test]
 fn unconditional_peer_dial_addrs_skip_own_listener_and_invalid_addresses() {
     let _init_guard = zakura_test::init();
@@ -879,6 +880,7 @@ fn unconditional_peer_dial_addrs_skip_own_listener_and_invalid_addresses() {
                 '192.0.2.2:8033',
                 '203.0.113.9',
                 '192.0.2.3:18233',
+                '::1',
             ]",
         )
         .unwrap()
@@ -886,8 +888,23 @@ fn unconditional_peer_dial_addrs_skip_own_listener_and_invalid_addresses() {
 
     assert_eq!(
         unconditional_peer_dial_addrs(&config, "0.0.0.0:8233".parse().unwrap()),
-        vec![peer_addr("192.0.2.1:8233"), peer_addr("192.0.2.3:18233")],
-        "the loopback listener, a non-Zcash port and the external address are skipped",
+        vec![
+            peer_addr("192.0.2.1:8233"),
+            peer_addr("192.0.2.3:18233"),
+            peer_addr("[::1]:8233"),
+        ],
+        "the loopback listener, a non-Zcash port and the external address are skipped, \
+         and an IPv4 wildcard listener cannot be reached over IPv6",
+    );
+
+    assert_eq!(
+        unconditional_peer_dial_addrs(&config, "[::]:8233".parse().unwrap()),
+        vec![
+            peer_addr("127.0.0.1:8233"),
+            peer_addr("192.0.2.1:8233"),
+            peer_addr("192.0.2.3:18233"),
+        ],
+        "an IPv6 wildcard listener is reached over IPv6 loopback, and maybe not over IPv4",
     );
 
     assert_eq!(

@@ -139,7 +139,9 @@ fn connections_with_dials_in_flight(
 /// Returns whether `addr` is a listener address of this node that can be recognized
 /// without connecting.
 ///
-/// The handshake rejects every other self-connection by its nonce.
+/// A wildcard listener only counts loopback addresses of its own address family: an
+/// IPv4 wildcard cannot accept IPv6, and whether an IPv6 wildcard accepts IPv4 depends
+/// on the platform. The handshake rejects every other self-connection by its nonce.
 fn is_own_listener(
     addr: PeerSocketAddr,
     listen_addr: SocketAddr,
@@ -153,7 +155,9 @@ fn is_own_listener(
 
     addr.port() == listen_addr.port()
         && (addr.ip() == listen_addr.ip()
-            || (listen_addr.ip().is_unspecified() && addr.ip().is_loopback()))
+            || (listen_addr.ip().is_unspecified()
+                && addr.ip().is_loopback()
+                && addr.is_ipv4() == listen_addr.is_ipv4()))
 }
 
 /// Returns whether a dial to `addr` would add nothing to `connections`.

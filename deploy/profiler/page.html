@@ -225,6 +225,7 @@ function rangeParams() {
 async function api(path, params) {
   const query = params ? "?" + new URLSearchParams(params) : "";
   const response = await fetch(`${BASE}/api/${path}${query}`, { cache: "no-store" });
+  if (response.status === 503) throw new Error("the profiler is busy; try again in a minute");
   if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
   return response.json();
 }

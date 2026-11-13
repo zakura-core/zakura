@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -276,6 +277,15 @@ class StoreTests(unittest.TestCase):
         merged = self.store.merged_tree(self.hour, self.hour + 2 * 3600)
         self.assertEqual(stacks.total_us(merged), 3000)
 
+    def test_a_window_stored_after_its_hour_was_merged_still_counts(self):
+        for offset in range(0, 3540, 60):
+            self.store.add_window(summary(self.hour + offset), tree_of("f", 1000))
+        self.store.roll_up_hours(self.hour + 3600 + 130)
+        # Processing was behind: the hour's last window is stored after the roll-up.
+        self.store.add_window(summary(self.hour + 3590), tree_of("late", 1_000_000))
+        merged = self.store.merged_tree(self.hour, self.hour + 3600 + 300)
+        self.assertEqual(stacks.total_us(merged), 59 * 1000 + 1_000_000)
+
     def test_an_unfinished_hour_is_not_rolled_up(self):
         self.store.add_window(summary(self.hour), tree_of("f", 1000))
         self.store.roll_up_hours(self.hour + 1800)
@@ -304,6 +314,71 @@ class StoreTests(unittest.TestCase):
         self.store.add_block_stages([stage_record()])
         (record,) = profiler_module.Store(self.directory.name).recent_block_stages(5)
         self.assertEqual((record["height"], record["t"], record["ms"]["verify"]), (10, self.hour + 5.5, 2.0))
+
+
+# Stands in for `perf script`: prints the sample text, optional warnings, then sleeps.
+FAKE_PERF = """\
+#!/usr/bin/env python3
+import os, sys, time
+sys.stderr.write("w" * int(os.environ.get("FAKE_PERF_WARNING_BYTES", "0")))
+sys.stderr.write(os.environ.get("FAKE_PERF_ERRORS", ""))
+sys.stderr.flush()
+sys.stdout.write(open(os.environ["FAKE_PERF_SAMPLES"]).read())
+sys.stdout.flush()
+time.sleep(float(os.environ.get("FAKE_PERF_SLEEP", "0")))
+"""
+
+
+class PerfScriptTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        perf = self.directory / "perf"
+        perf.write_text(FAKE_PERF)
+        perf.chmod(0o755)
+        (self.directory / "samples.txt").write_text(PERF_SCRIPT)
+        args = argparse.Namespace(
+            node_name="n", service="zakurad", window=60, log_file="", perf=str(perf),
+            scratch_dir=str(self.directory), trace_dir="", trace_table_cap_mb=200,
+        )  # fmt: skip
+        self.profiler = profiler_module.Profiler(args, profiler_module.Store(self.directory / "store"))
+        self.profiler.symbols = stacks.SymbolNames(fake_demangle)
+        self.job = {"path": self.directory / "window.data", "rate": 100}
+        self.environment = {"FAKE_PERF_SAMPLES": str(self.directory / "samples.txt")}
+
+    def run_script(self, **environment):
+        saved = {key: os.environ.get(key) for key in {**self.environment, **environment}}
+        os.environ.update(self.environment, **environment)
+        try:
+            return self.profiler.run_perf_script(self.job, [])
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_many_warnings_do_not_stall_reading_the_samples(self):
+        _, totals, errors = self.run_script(
+            FAKE_PERF_WARNING_BYTES="300000", FAKE_PERF_ERRORS="lost 3 chunks"
+        )
+        self.assertEqual(totals["samples"], 3)
+        self.assertTrue(errors.endswith("lost 3 chunks"))
+
+    def test_a_hung_run_is_stopped(self):
+        original = profiler_module.PERF_SCRIPT_TIMEOUT_SECONDS
+        profiler_module.PERF_SCRIPT_TIMEOUT_SECONDS = 1
+        self.addCleanup(setattr, profiler_module, "PERF_SCRIPT_TIMEOUT_SECONDS", original)
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            self.run_script(FAKE_PERF_SLEEP="30")
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_failure_shows_only_its_summary_on_the_page(self):
+        self.profiler.fail("perf record could not start", "Permission denied: /root/secret")
+        status = self.profiler.status()
+        self.assertEqual((status["state"], status["error"]), ("error", "perf record could not start"))
 
 
 class LogFollowingTests(unittest.TestCase):
@@ -618,6 +693,16 @@ class ApiTests(unittest.TestCase):
         self.assertEqual([block["t"] for block in answer["blocks"]], [None, self.end - 100.0, None])
         self.assertEqual(answer["blocks"][1]["ms"]["writer_commit"], 4.0)
         self.assertEqual(len(json.loads(self.get("/api/blocks?limit=1")[1])["blocks"]), 1)
+
+    def test_uncached_flame_graphs_are_refused_once_their_cpu_budget_is_spent(self):
+        self.assertEqual(self.get("/api/flame?range=15m")[0], 200)
+        original = profiler_module.QUERY_CPU_BUDGET_SECONDS
+        profiler_module.QUERY_CPU_BUDGET_SECONDS = 0
+        self.addCleanup(setattr, profiler_module, "QUERY_CPU_BUDGET_SECONDS", original)
+        # A graph already computed is still served; a new one waits for the budget.
+        self.assertEqual(self.get("/api/flame?range=15m")[0], 200)
+        code, body = self.get("/api/flame?range=1h")
+        self.assertEqual((code, json.loads(body)), (503, {"error": "busy, try again"}))
 
     def test_bad_requests_are_refused(self):
         for path in (

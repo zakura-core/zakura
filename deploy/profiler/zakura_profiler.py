@@ -25,6 +25,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -66,6 +67,14 @@ DEFAULT_TRACE_TABLE_CAP_MB = 200
 # What the page gets of each block's stage record.
 BLOCK_FIELDS = ("height", "hash", "t", "path", "size", "status_peers", "status_slowest_ms", "reorg", "ms")
 COMPUTE_WAIT_SECONDS = 20
+# Flame graphs that are not cached may use this much CPU time between them in any
+# minute. Past it the API answers "busy", so requests for many different ranges cannot
+# take the CPU that processing new windows needs.
+QUERY_CPU_BUDGET_SECONDS = 10
+QUERY_BUDGET_PERIOD_SECONDS = 60
+# A `perf script` run normally takes a few seconds; one still running after this is
+# stopped so the next windows are processed.
+PERF_SCRIPT_TIMEOUT_SECONDS = 120
 # A window is late when no new one has been stored for this many window lengths.
 STALE_WINDOWS = 4
 PERF_SCRIPT_FIELDS = "comm,tid,time,ip,sym,dso"
@@ -243,6 +252,14 @@ class Store:
             self.minutes / f"{int(summary['start'])}.json.gz",
             {"summary": summary, "tree": stacks.encode_tree(tree)},
         )
+        hour_path = self.hours / f"{int(summary['start']) // 3600 * 3600}.json.gz"
+        if hour_path.exists():
+            # Processing fell behind and the window's hour was merged before it was
+            # stored. Ranges read whole hours from the hourly file, so add it there too.
+            document = read_json_gz(hour_path)
+            hour_tree = stacks.decode_tree(document["tree"])
+            stacks.merge_into(hour_tree, tree)
+            write_json_gz(hour_path, {**document, "tree": stacks.encode_tree(hour_tree)})
         self.index_log.append([summary])
         with self._lock:
             self.windows.append(summary)
@@ -411,6 +428,12 @@ class Profiler:
         self._job_ready = threading.Condition()
         self._cpu_mark = sum(os.times()[:4])
 
+    def fail(self, summary, detail=""):
+        """Record a failure: `summary` is shown on the public page, `detail` goes only to the journal."""
+        self.state = "error"
+        self.last_error = summary
+        print(f"{summary}: {detail}" if detail else summary, file=sys.stderr, flush=True)
+
     def stop(self):
         self._stop.set()
         perf = self._perf
@@ -481,8 +504,7 @@ class Profiler:
                 self._perf.kill()
                 _, errors = self._perf.communicate()
             except OSError as error:
-                self.last_error = f"perf record: {error}"
-                self.state = "error"
+                self.fail("perf record could not start", str(error))
                 self._stop.wait(30)
                 continue
             ended = time.time()
@@ -490,8 +512,7 @@ class Profiler:
                 data_path.unlink(missing_ok=True)
                 break
             if not data_path.exists() or data_path.stat().st_size == 0:
-                self.last_error = "perf record: " + errors.decode(errors="replace")[-300:]
-                self.state = "error"
+                self.fail("perf record wrote no data", errors.decode(errors="replace")[-300:])
                 data_path.unlink(missing_ok=True)
                 self._stop.wait(10)
                 continue
@@ -522,15 +543,14 @@ class Profiler:
                 self.state = "ok"
                 self.last_error = ""
             except Exception as error:  # noqa: BLE001 - one bad window must not end profiling
-                self.last_error = f"{type(error).__name__}: {error}"
-                self.state = "error"
+                self.fail(f"processing a window failed ({type(error).__name__})", str(error))
             finally:
                 job["path"].unlink(missing_ok=True)
             try:
                 self.store.roll_up_hours(time.time())
                 self.store.prune(time.time())
             except OSError as error:
-                self.last_error = f"store: {error}"
+                self.fail(f"storing the profile failed ({type(error).__name__})", str(error))
 
     def process_window(self, job):
         # The block announced at the very end of the window reaches the log a moment
@@ -543,27 +563,7 @@ class Profiler:
         block_times = self.store.block_times(
             job["start"] - BLOCK_TAIL_SECONDS, job["end"] + BLOCK_LEAD_SECONDS
         )
-        script = subprocess.Popen(
-            [self.args.perf, "script", "-i", str(job["path"]), "--no-inline",
-             "-F", PERF_SCRIPT_FIELDS],  # fmt: skip
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-        )
-        try:
-            tree, totals = build_window(
-                stacks.parse_perf_script(script.stdout),
-                self.symbols,
-                self.categorizer,
-                job["rate"],
-                block_times,
-            )
-            errors = script.stderr.read()
-        finally:
-            script.stdout.close()
-            script.stderr.close()
-            script.wait()
+        tree, totals, errors = self.run_perf_script(job, block_times)
         cpu_now = sum(os.times()[:4])
         summary = {
             "start": round(job["start"], 3),
@@ -579,6 +579,46 @@ class Profiler:
         self._cpu_mark = cpu_now
         self.store.add_window(summary, tree)
         self.rate = next_rate(job["rate"], totals["samples"])
+
+    def run_perf_script(self, job, block_times):
+        """Read one recorded window through `perf script`; returns `(tree, totals, stderr text)`.
+
+        The error output goes to a file, so a run that writes many warnings cannot stall
+        on a full pipe, and a run that hangs is stopped after PERF_SCRIPT_TIMEOUT_SECONDS.
+        """
+        timed_out = threading.Event()
+        with tempfile.TemporaryFile(dir=self.args.scratch_dir) as errors_file:
+            script = subprocess.Popen(
+                [self.args.perf, "script", "-i", str(job["path"]), "--no-inline",
+                 "-F", PERF_SCRIPT_FIELDS],  # fmt: skip
+                stdout=subprocess.PIPE,
+                stderr=errors_file,
+                text=True,
+                errors="replace",
+            )
+
+            def stop_script():
+                timed_out.set()
+                script.kill()
+
+            watchdog = threading.Timer(PERF_SCRIPT_TIMEOUT_SECONDS, stop_script)
+            watchdog.start()
+            try:
+                tree, totals = build_window(
+                    stacks.parse_perf_script(script.stdout),
+                    self.symbols,
+                    self.categorizer,
+                    job["rate"],
+                    block_times,
+                )
+            finally:
+                watchdog.cancel()
+                script.stdout.close()
+                script.wait()
+            if timed_out.is_set():
+                raise TimeoutError(f"perf script ran longer than {PERF_SCRIPT_TIMEOUT_SECONDS} s")
+            errors_file.seek(0)
+            return tree, totals, errors_file.read().decode(errors="replace")
 
     def status(self):
         now = time.time()
@@ -625,6 +665,14 @@ class Queries:
         self._compute = threading.Lock()
         self._trees = BoundedCache(3)
         self._flames = BoundedCache(48)
+        # `(finished_at, cpu_seconds)` of recent uncached flame graphs, oldest first.
+        self._spent = collections.deque()
+
+    def _over_budget(self, now):
+        """Whether uncached flame graphs used up QUERY_CPU_BUDGET_SECONDS in the last period."""
+        while self._spent and self._spent[0][0] < now - QUERY_BUDGET_PERIOD_SECONDS:
+            self._spent.popleft()
+        return sum(seconds for _, seconds in self._spent) >= QUERY_CPU_BUDGET_SECONDS
 
     def resolve_range(self, params):
         """`(start, end)` for a request's `range` or `from`/`to` parameters."""
@@ -645,7 +693,10 @@ class Queries:
             return cached
         if not self._compute.acquire(timeout=COMPUTE_WAIT_SECONDS):
             raise TimeoutError("profile is busy")
+        cpu_started = time.thread_time()
         try:
+            if self._over_budget(time.monotonic()):
+                raise TimeoutError("flame graph CPU budget used up")
             tree = self._trees.get(key[:2])
             if tree is None:
                 tree = self._trees.put(key[:2], self.store.merged_tree(start, end))
@@ -673,6 +724,7 @@ class Queries:
             )
             return self._flames.put(key, json.dumps(document, separators=(",", ":")).encode())
         finally:
+            self._spent.append((time.monotonic(), time.thread_time() - cpu_started))
             self._compute.release()
 
     def timeline(self, start, end):

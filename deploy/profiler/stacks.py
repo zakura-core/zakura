@@ -52,8 +52,10 @@ THREAD_GROUPS = {
 }
 
 # What part of the node a frame belongs to. A frame's category colours it, names the
-# one-click view it appears in, and (for the innermost such frame of a sample) decides
-# which band of the CPU timeline the sample counts toward, so the three cannot disagree.
+# one-click view it appears in, and decides which band of the CPU timeline a sample
+# counts toward. The two count differently: a view keeps everything under the
+# outermost frame of its category, while a sample's band is the category of its
+# innermost categorized frame, so a view's total can exceed its band's.
 # Where two patterns start at the same place in a name, the earlier entry wins, so
 # narrower patterns come first.
 CATEGORIES = (

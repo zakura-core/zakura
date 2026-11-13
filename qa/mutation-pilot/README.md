@@ -146,6 +146,7 @@ replaces an earlier result.
 cargo xtask planted pilot sensitivity --out "$OUT" [--only <case-id>]...
 cargo xtask planted pilot discovery --out "$OUT" [--only <case-id>]... [--seed <n>]...
 cargo xtask planted pilot feedback --out "$OUT" [--only <case-id>]... [--seed <n>]... [--arm on|off]...
+cargo xtask planted pilot rescore --from "$RUN_OUT" --out "$OUT"
 ```
 
 `sensitivity` builds the witness revision with Rust 1.99.0 and the dev
@@ -266,6 +267,27 @@ cases, keeps every case's seeds and arms in one report, and runs each
 original campaign once. Each invocation needs its own `--out` and `--work`.
 Five invocations run in parallel, one core per campaign. The longest, a
 target with three cases, runs 80 campaigns, about 13 hours.
+
+### Re-deriving a report
+
+`rescore` re-derives a finished `discovery` or `feedback` run's report from
+the records under the run's `--out`, without building or running anything:
+
+```sh
+cargo xtask planted pilot rescore --from "$RUN_OUT" --out "$NEW_OUT"
+```
+
+Each campaign's lane directory under `--out` keeps its store, with the
+run's manifest, initial snapshot, end record and each worker's attempts,
+and the evidence `campaign evidence` wrote. The run's report keeps each
+seed's class and reason, which the build, patch and confirmation steps
+decided, and each campaign's pairing verdict. `rescore` keeps those, reads
+each campaign's facts again for its case's own property, requires every
+paired fuzz build to share one toolchain, and compares the arms and counts
+the results again. It writes the report to `$NEW_OUT`, which must be
+missing or empty, records the commit that re-derived it as `rescored_by`,
+and leaves the run's own report alone. A change to how the report derives
+its facts or comparison from the records then needs no new campaign.
 
 The catalogue first pinned production at `870678be1` and the fuzz inputs
 at `b2e0456474`, which existed only on the stack branches that merged as

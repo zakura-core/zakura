@@ -391,6 +391,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
+        "  cargo xtask planted pilot rescore --from <run's --out> --out <dir>"
+    )?;
+    writeln!(
+        output,
         "  cargo xtask planted loop --out <dir> [--work <dir>] [--cases <dir>] [--planted <prefix>]..."
     )?;
     writeln!(
@@ -531,7 +535,14 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "semantic feedback on and off, and writes feedback.json. Discovery and feedback run"
     )?;
-    writeln!(output, "only on a remote campaign host.")?;
+    writeln!(
+        output,
+        "only on a remote campaign host. `rescore` re-derives a finished"
+    )?;
+    writeln!(
+        output,
+        "discovery or feedback run's report from the records under its --out, running nothing."
+    )?;
     writeln!(
         output,
         "`planted loop` runs the mutation loop's cases (qa/native-mutations/PROMPT.md) on a"

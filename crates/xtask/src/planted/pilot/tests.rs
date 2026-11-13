@@ -974,6 +974,7 @@ fn meta() -> Meta {
         reviewed_cases: 10,
         sim_rustc: None,
         fuzz_toolchain: None,
+        rescored_by: None,
     }
 }
 
@@ -1307,6 +1308,25 @@ fn relative_flags_become_absolute() {
     assert_eq!(absolute.out, Path::new("/a/b"));
     assert_eq!(absolute.work, None);
     assert!(parse_flags(["--work", "w"].into_iter().map(str::to_owned)).is_err());
+    let rescore = parse_flags(
+        ["--from", "run", "--out", "o"]
+            .into_iter()
+            .map(str::to_owned),
+    )
+    .expect("the flags parse");
+    assert_eq!(rescore.from, Some(cwd.join("run")));
+    // `--from` is `rescore`'s alone, which takes no other run flag.
+    let root = crate::repo_root().expect("xtask lives in the workspace");
+    let pilot = |args: &[&str]| super::run(&root, args.iter().map(|arg| (*arg).to_owned()));
+    for args in [
+        &["discovery", "--from", "/r", "--out", "/o"][..],
+        &["rescore", "--out", "/o"],
+        &["rescore", "--from", "/r", "--out", "/o", "--seed", "11"],
+        &["rescore", "--from", "/r", "--out", "/o", "--work", "/w"],
+    ] {
+        let error = pilot(args).expect_err("a usage error");
+        assert!(error.is::<UsageError>(), "{args:?}: {error}");
+    }
 }
 
 /// A campaign that left a libFuzzer timeout beside a confirmed finding of
@@ -2578,4 +2598,152 @@ fn confirmation_allows_the_cases_listed_violations() {
             None => assert!(!passed.contains("--also-violates"), "{passed}"),
         }
     }
+}
+
+/// Writes a finished campaign's records into the lane directory `dir`, as
+/// `campaign_lane` leaves them: one run whose saved violations are
+/// `violated`, whose evidence lists `unapplied`, and whose build ran
+/// `rustc`.
+fn write_lane(dir: &Path, violated: &[&str], unapplied: &[&str], rustc: &str) {
+    let store = dir.join("store");
+    let write = |path: PathBuf, value: Value| {
+        fs::create_dir_all(path.parent().expect("a file has a parent")).expect("the directory");
+        fs::write(path, value.to_string()).expect("the record is written");
+    };
+    write(
+        store.join("manifests/r.json"),
+        serde_json::json!({
+            "initial_snapshot": "s",
+            "build": {"identity": {"rustc": rustc, "cargo_fuzz": "cargo-fuzz 0.13.2"}},
+        }),
+    );
+    write(
+        store.join("snapshots/s/snapshot.json"),
+        serde_json::json!({"inputs": []}),
+    );
+    let failures: Vec<Value> = violated
+        .iter()
+        .map(|property| {
+            serde_json::json!({
+                "path": format!("runs/r/workers/0/sim/inputs/active/{property}/aa.bin"),
+                "sha256": "aa",
+            })
+        })
+        .collect();
+    write(
+        store.join("runs/r/end.json"),
+        serde_json::json!({"workers": [{"index": 0, "millis": 600_000}], "failures": failures}),
+    );
+    write(
+        dir.join(EVIDENCE_FILE),
+        serde_json::json!({
+            "status": "complete",
+            "unapplied": unapplied,
+            "incomplete": [],
+            "totals": {"runs": 10, "features": {}},
+        }),
+    );
+}
+
+/// `rescore` re-derives a finished run's report from the records under its
+/// `--out`: each case's original-campaign facts are its own property's,
+/// each seed keeps its class, and the report names the fuzz toolchain and
+/// the commit that re-derived it. It never overwrites a report, and it
+/// refuses fuzz builds with different toolchains.
+#[test]
+fn rescore_rederives_a_run_from_its_records() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let from = dir.path().join("run");
+    let (first, second) = ("p/first", "p/second");
+    let lane = Lane {
+        seed: 11,
+        arm: Arm::On,
+    };
+    // The original campaign applied only `second`. Each mutant found its
+    // case's property.
+    write_lane(&baseline_dir(&from, "t", lane), &[], &[first], "rustc 1");
+    write_lane(
+        &mutant_dir(&from, "p/first/a", lane),
+        &[first],
+        &[],
+        "rustc 1",
+    );
+    write_lane(
+        &mutant_dir(&from, "p/second/b", lane),
+        &[second],
+        &[],
+        "rustc 1",
+    );
+    // The report as the run at 5076fa41c wrote it, with both cases' original
+    // facts read for `first`, a `censored` field, and no toolchain.
+    let stale = serde_json::json!({"applied": false, "censored": true, "unpaired": null});
+    let case = |id: &str, property: &str| {
+        serde_json::json!({
+            "id": id,
+            "fault_class": "stale",
+            "property": property,
+            "target": "t",
+            "seeds": [{
+                "seed": 11,
+                "arm": "on",
+                "result": {"class": "intended-violation", "reason": "found"},
+                "baseline": stale,
+                "mutant": stale,
+                "store": format!("cases/{id}/on/seed-11/store"),
+            }],
+            "arms": [],
+            "cleanup": null,
+        })
+    };
+    let saved = serde_json::json!({
+        "experiment": "feedback",
+        "catalogue_sha256": "00",
+        "built_revision": "b",
+        "runner_revision": "b",
+        "reviewed_cases": 2,
+        "cases": [case("p/first/a", first), case("p/second/b", second)],
+        "summary": {},
+    });
+    fs::write(from.join("feedback.json"), saved.to_string()).expect("the report is written");
+
+    let root = crate::repo_root().expect("xtask lives in the workspace");
+    let out = dir.path().join("rescored");
+    let written = rescore::rescore(&root, &from, &out).expect("the run rescores");
+    assert_eq!(written.path, out.join("feedback.json"));
+    assert_eq!(written.by_arm[&Arm::On].intended, 2);
+    let report: Value =
+        serde_json::from_slice(&fs::read(&written.path).expect("the report is written"))
+            .expect("the report parses");
+    let seed = |case: usize| &report["cases"][case]["seeds"][0];
+    assert_eq!(seed(0)["baseline"]["applied"], false);
+    assert_eq!(seed(1)["baseline"]["applied"], true);
+    assert_eq!(seed(1)["result"]["class"], "intended-violation");
+    assert!(seed(1)["mutant"].get("censored").is_none());
+    assert_eq!(
+        seed(1)["mutant"]["intended_input"],
+        "runs/r/workers/0/sim/inputs/active/p/second/aa.bin"
+    );
+    assert_eq!(report["cases"][1]["arms"][0]["detected"], 1);
+    assert_eq!(report["fuzz_toolchain"]["rustc"], "rustc 1");
+    assert_eq!(report["runner_revision"], "b");
+    assert_eq!(
+        report["rescored_by"],
+        head(&root).expect("the workspace has a commit").as_str()
+    );
+
+    // A second rescore into the same --out would overwrite it.
+    assert!(rescore::rescore(&root, &from, &out).is_err());
+    // A mutant built by another compiler fails the run's rescore.
+    write_lane(
+        &mutant_dir(&from, "p/second/b", lane),
+        &[second],
+        &[],
+        "rustc 2",
+    );
+    let why = rescore::rescore(&root, &from, &dir.path().join("again"))
+        .expect_err("the toolchains differ")
+        .to_string();
+    assert!(why.contains("don't share one toolchain"), "{why}");
+    // A directory without a report has nothing to rescore.
+    assert!(rescore::rescore(&root, &out.join("none"), &dir.path().join("x")).is_err());
 }

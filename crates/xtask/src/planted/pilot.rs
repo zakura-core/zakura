@@ -1,6 +1,6 @@
-//! `cargo xtask planted pilot (sensitivity|discovery|feedback)`: the
-//! mutation pilot's paired runner (mutation plan, mut-3), and the feedback
-//! comparison (fuzz-14).
+//! `cargo xtask planted pilot (sensitivity|discovery|feedback|rescore)`:
+//! the mutation pilot's paired runner (mutation plan, mut-3), and the
+//! feedback comparison (fuzz-14).
 //!
 //! The pilot's experiments read the reviewed catalogue,
 //! `qa/mutation-pilot/catalogue.json`, and check its pins before anything
@@ -53,6 +53,10 @@
 //! It writes `feedback.json`, with `discovery.json`'s rows and each case's
 //! comparison of its arms ([`compare::compare`]).
 //!
+//! `rescore` re-derives a finished `discovery` or `feedback` run's report
+//! from the records its campaigns left under its `--out` ([`rescore`]). It
+//! runs nothing.
+//!
 //! Each result is exactly one class of the plan's table ([`Class`]). Each
 //! report counts its results by class and fault class, and the
 //! intended-detection rate's numerator and denominator.
@@ -86,6 +90,7 @@ use crate::{
 mod classify;
 mod compare;
 mod feedback;
+mod rescore;
 #[cfg(test)]
 mod tests;
 
@@ -250,7 +255,7 @@ struct Case {
 }
 
 /// What every report records about its run.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Meta {
     /// `sensitivity`, `discovery` or `feedback`.
     experiment: String,
@@ -272,6 +277,10 @@ struct Meta {
     /// finishes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fuzz_toolchain: Option<Value>,
+    /// The commit whose runner re-derived the report from the run's
+    /// records ([`rescore`]), if one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rescored_by: Option<String>,
 }
 
 /// A report: the run, its results, and their counts.
@@ -293,7 +302,7 @@ struct Report<T> {
 }
 
 /// A selected case that discovery left out, and the review's reason.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Excluded {
     id: String,
     fault_class: String,
@@ -345,17 +354,42 @@ struct SeedResult {
 }
 
 /// The experiments `planted pilot` runs.
-const EXPERIMENTS: &str = "expected `sensitivity`, `discovery` or `feedback` after `planted pilot`";
+const EXPERIMENTS: &str =
+    "expected `sensitivity`, `discovery`, `feedback` or `rescore` after `planted pilot`";
 
 /// Runs `cargo xtask planted pilot <experiment> --out <dir> [--work <dir>]
-/// [--only <case-id>]... [--seed <n>]... [--arm on|off]...`.
+/// [--only <case-id>]... [--seed <n>]... [--arm on|off]...`, or
+/// `cargo xtask planted pilot rescore --from <dir> --out <dir>`.
 pub(crate) fn run(
     repo_root: &Path,
     mut args: impl Iterator<Item = String>,
 ) -> Result<(), BoxError> {
     let experiment = args.next().ok_or(UsageError(EXPERIMENTS))?;
     let flags = parse_flags(args)?;
-    let out = flags.out.clone();
+    if experiment == "rescore" {
+        let from = match &flags {
+            Flags {
+                from: Some(from),
+                work: None,
+                only,
+                seeds,
+                arms,
+                ..
+            } if only.is_empty() && seeds.is_empty() && arms.is_empty() => from,
+            _ => {
+                return Err(UsageError(
+                    "`planted pilot rescore` takes --from <dir> and --out <dir> only",
+                )
+                .into())
+            }
+        };
+        let written = rescore::rescore(repo_root, from, &flags.out)?;
+        written.print(&experiment);
+        return Ok(());
+    }
+    if flags.from.is_some() {
+        return Err(UsageError("--from applies only to `planted pilot rescore`").into());
+    }
     let work = flags.work.clone().unwrap_or_else(|| {
         repo_root
             .join("target")
@@ -365,32 +399,45 @@ pub(crate) fn run(
     // Each child runs in its own process group, which a terminal's signal
     // doesn't reach. The handler lets the running child's group be killed.
     install_interrupt_handler();
-    let (summary, by_arm) = match experiment.as_str() {
+    let written = match experiment.as_str() {
         "sensitivity" | "discovery" => pilot(repo_root, &experiment, flags, &work)?,
         "feedback" => feedback_comparison(repo_root, flags, &work)?,
         _ => return Err(UsageError(EXPERIMENTS).into()),
     };
-    let report = out.join(format!("{experiment}.json"));
-    let print = |label: String, summary: &Summary| {
-        println!(
-            "{label}: {} of {} counted results are intended violations, over {} results; report in {}",
-            summary.intended,
-            summary.denominator,
-            summary.results,
-            report.display()
-        );
-    };
-    if by_arm.is_empty() {
-        print(experiment.clone(), &summary);
-    }
-    for (arm, summary) in &by_arm {
-        print(format!("{experiment}, feedback {arm}"), summary);
-    }
+    written.print(&experiment);
     Ok(())
 }
 
-/// A written report's counts: all results, and those of each arm.
-type Counts = (Summary, BTreeMap<Arm, Summary>);
+/// A written report: its path, and its counts in all and in each arm.
+#[derive(Debug)]
+struct Written {
+    path: PathBuf,
+    summary: Summary,
+    by_arm: BTreeMap<Arm, Summary>,
+}
+
+impl Written {
+    /// Prints the report's detection rates, labelled `label`: one line for
+    /// a report without arms, and one per arm for a discovery report.
+    fn print(&self, label: &str) {
+        let print = |label: String, summary: &Summary| {
+            println!(
+                "{label}: {} of {} counted results are intended violations, over {} results; \
+                 report in {}",
+                summary.intended,
+                summary.denominator,
+                summary.results,
+                self.path.display()
+            );
+        };
+        if self.by_arm.is_empty() {
+            print(label.to_owned(), &self.summary);
+        }
+        for (arm, summary) in &self.by_arm {
+            print(format!("{label}, feedback {arm}"), summary);
+        }
+    }
+}
 
 /// Runs the pilot's `sensitivity` or `discovery` `experiment` over the
 /// catalogue's cases, building under `work`, and writes its report.
@@ -399,7 +446,7 @@ fn pilot(
     experiment: &str,
     flags: Flags,
     work: &Path,
-) -> Result<Counts, BoxError> {
+) -> Result<Written, BoxError> {
     let Flags {
         out,
         only,
@@ -421,6 +468,7 @@ fn pilot(
         reviewed_cases: catalogue.cases.len(),
         sim_rustc: None,
         fuzz_toolchain: None,
+        rescored_by: None,
     };
     if experiment == "sensitivity" {
         if !seeds.is_empty() || !arms.is_empty() {
@@ -462,7 +510,7 @@ fn pilot(
 
 /// Runs the feedback comparison over the case list's cases on the runner's
 /// own `HEAD`, building under `work`, and writes its report.
-fn feedback_comparison(repo_root: &Path, flags: Flags, work: &Path) -> Result<Counts, BoxError> {
+fn feedback_comparison(repo_root: &Path, flags: Flags, work: &Path) -> Result<Written, BoxError> {
     let Flags {
         out,
         only,
@@ -494,6 +542,7 @@ fn feedback_comparison(repo_root: &Path, flags: Flags, work: &Path) -> Result<Co
         reviewed_cases: list.cases.len(),
         sim_rustc: None,
         fuzz_toolchain: None,
+        rescored_by: None,
     };
     let plan = Experiment {
         revision: &revision,
@@ -564,6 +613,9 @@ struct Flags {
     out: PathBuf,
     /// `--work`, absolute, if given.
     work: Option<PathBuf>,
+    /// `--from`, absolute, if given: the `--out` of the run that `rescore`
+    /// re-derives.
+    from: Option<PathBuf>,
     /// Each `--only` case ID.
     only: Vec<String>,
     /// Each `--seed`.
@@ -576,13 +628,14 @@ struct Flags {
 /// against the current directory, since the builds run cargo from their
 /// worktree, and cargo would read a relative `CARGO_TARGET_DIR` there.
 fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flags, BoxError> {
-    let (mut out, mut work, mut only, mut seeds, mut arms) =
-        (None, None, Vec::new(), Vec::new(), Vec::new());
+    let (mut out, mut work, mut from, mut only, mut seeds, mut arms) =
+        (None, None, None, Vec::new(), Vec::new(), Vec::new());
     while let Some(flag) = args.next() {
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--out" if out.is_none() => out = Some(std::path::absolute(value)?),
             "--work" if work.is_none() => work = Some(std::path::absolute(value)?),
+            "--from" if from.is_none() => from = Some(std::path::absolute(value)?),
             "--only" => only.push(value),
             "--seed" => seeds.push(value.parse::<u32>().map_err(|e| format!("--seed: {e}"))?),
             "--arm" => arms.push(Arm::parse(&value).map_err(|e| format!("--arm: {e}"))?),
@@ -592,6 +645,7 @@ fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flags, BoxError
     Ok(Flags {
         out: out.ok_or(UsageError("`planted pilot` needs --out <dir>"))?,
         work,
+        from,
         only,
         seeds,
         arms,
@@ -807,10 +861,19 @@ fn discovery_report(
 }
 
 /// Writes `report` to `<out>/<experiment>.json`, and returns its counts.
-fn write_report<T: Serialize>(out: &Path, report: Report<T>) -> Result<Counts, BoxError> {
-    let path = out.join(format!("{}.json", report.meta.experiment));
+fn write_report<T: Serialize>(out: &Path, report: Report<T>) -> Result<Written, BoxError> {
+    let path = out.join(report_file(&report.meta.experiment));
     fs::write(&path, serde_json::to_string_pretty(&report)? + "\n")?;
-    Ok((report.summary, report.by_arm))
+    Ok(Written {
+        path,
+        summary: report.summary,
+        by_arm: report.by_arm,
+    })
+}
+
+/// The report file of `experiment`, relative to `--out`.
+fn report_file(experiment: &str) -> String {
+    format!("{experiment}.json")
 }
 
 /// Runs each case's sensitivity experiment, writing its artifacts under

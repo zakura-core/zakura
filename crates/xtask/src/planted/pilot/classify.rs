@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::super::{
@@ -25,7 +25,7 @@ fn killed(why: impl Into<String>) -> Classified {
 }
 
 /// One result, as the plan's table defines it. There is no other class.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(super) enum Class {
     /// The target reports the declared property ID with a valid witness and
@@ -62,7 +62,7 @@ impl Class {
 }
 
 /// A result and why.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Classified {
     /// The class.
     pub(super) class: Class,

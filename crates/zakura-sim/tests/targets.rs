@@ -9,14 +9,15 @@
 #![cfg(zakura_sim)]
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
 
 use zakura_sim::{
     campaign::{
-        bypasses, declared_targets, judge_run, max_len, own_applicability, resolve, run_seed,
-        SeedRun, TargetStatus, FUZZ_PACKAGE, SHARED_PROPERTIES,
+        applied_properties, bypasses, declared_targets, judge_run, max_len, own_applicability,
+        resolve, run_seed, TargetStatus, FUZZ_PACKAGE, SHARED_PROPERTIES,
     },
     explore::{
         stats::{Counts, ProcessStats, STATS_VERSION},
@@ -211,21 +212,16 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
             }
         }
         let mut worker = Worker::new();
-        let seeds: Vec<SeedRun> = loaded
+        let reached: BTreeSet<String> = loaded
             .admitted
             .iter()
-            .map(|seed| {
+            .flat_map(|seed| {
                 let (outcome, applied) = run_seed(&mut worker, entry, &seed.input);
                 assert_eq!(outcome, "clean", "{}", seed.path.display());
-                SeedRun {
-                    file: seed.path.clone(),
-                    sha256: seed::sha256(&seed.input),
-                    outcome,
-                    applied,
-                }
+                applied
             })
             .collect();
-        let (applied, mut unapplied) = own_applicability(entry, &seeds);
+        let (applied, mut unapplied) = own_applicability(entry, &reached);
         assert!(!applied.is_empty(), "{}", target.name);
         unapplied.sort();
         if unapplied != unapplied_allowed(&target.name) {
@@ -241,7 +237,7 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
                 .iter()
                 .find(|entry| entry.name == covered)
                 .unwrap();
-            let (_, unapplied) = own_applicability(covered, &seeds);
+            let (_, unapplied) = own_applicability(covered, &reached);
             assert!(
                 unapplied.is_empty(),
                 "{} covers {}, and no seed applies {unapplied:?}",
@@ -339,18 +335,52 @@ fn shared_properties_never_count_as_applied() {
         .iter()
         .find(|entry| entry.name == "discovery/wait-complete")
         .unwrap();
-    let seeds = [SeedRun {
-        file: PathBuf::from("seed.bin"),
-        sha256: String::new(),
-        outcome: "clean".to_owned(),
-        applied: SHARED_PROPERTIES
-            .iter()
-            .map(|id| (*id).to_owned())
-            .collect(),
-    }];
-    let (applied, unapplied) = own_applicability(entry, &seeds);
+    let reached = SHARED_PROPERTIES
+        .iter()
+        .map(|id| (*id).to_owned())
+        .collect();
+    let (applied, unapplied) = own_applicability(entry, &reached);
     assert_eq!(applied, Vec::<String>::new());
     assert_eq!(unapplied, ["discovery/wait-complete-wakes"]);
+}
+
+/// A target's stats file counts a property as applied when it held with an
+/// applicable evaluation or was violated, not when it only ended not
+/// applicable.
+#[test]
+fn applied_properties_come_from_the_targets_counts() {
+    let entry = HARNESSES
+        .iter()
+        .find(|entry| entry.name == "discovery/wait-complete")
+        .unwrap();
+    let mut counts = Counts::for_harness(entry);
+    let held = counts
+        .properties
+        .get_mut("discovery/wait-complete-wakes")
+        .unwrap();
+    held.held = 1;
+    held.evaluations = 2;
+    let ids: Vec<String> = counts.properties.keys().cloned().collect();
+    let violated = ids
+        .iter()
+        .find(|id| id.as_str() != "discovery/wait-complete-wakes")
+        .unwrap()
+        .clone();
+    counts.properties.get_mut(&violated).unwrap().violated = 1;
+    let not_applicable = ids
+        .iter()
+        .find(|id| ![violated.as_str(), "discovery/wait-complete-wakes"].contains(&id.as_str()))
+        .unwrap();
+    counts
+        .properties
+        .get_mut(not_applicable)
+        .unwrap()
+        .not_applicable
+        .insert("never-applied".to_owned(), 1);
+    assert_eq!(
+        applied_properties(&counts),
+        BTreeSet::from(["discovery/wait-complete-wakes".to_owned(), violated])
+    );
 }
 
 /// A stats file of `harness` with `runs`, complete or not.

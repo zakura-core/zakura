@@ -353,16 +353,17 @@ pub(in crate::planted) struct GeneratorReport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(in crate::planted) enum OnUnpatched {
-    /// The replay ran to its end, and the killing ID isn't violated.
+    /// The run ended, and the killing ID isn't violated.
     Holds,
-    /// The replay violates the killing ID: a property finding.
+    /// The run violates the killing ID: a property finding.
     Violated,
-    /// The replay wrote no report that judges the killing ID, such as when
-    /// the unpatched build left the trace's picks.
+    /// The run wrote no report that judges the killing ID, such as when a
+    /// replay left the trace's picks.
     Undecided,
 }
 
-/// Which of a kill's traces the unpatched build replayed.
+/// Which of a kill's traces the unpatched build ran: the confirmed trace's
+/// input reruns from scratch, and the shrunk trace replays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(in crate::planted) enum KillTrace {
@@ -381,14 +382,14 @@ impl KillTrace {
     }
 }
 
-/// A kill's trace replayed on the unpatched build.
+/// A kill's trace run on the unpatched build.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::planted) struct UnpatchedCheck {
     pub(in crate::planted) trace: KillTrace,
     pub(in crate::planted) outcome: OnUnpatched,
     /// What showed it, in words.
     pub(in crate::planted) detail: String,
-    /// The replay's log, relative to `--out`.
+    /// The run's log, relative to `--out`.
     pub(in crate::planted) log: PathBuf,
 }
 
@@ -1321,13 +1322,15 @@ impl Runner {
         Ok((confirmation, Some(shrunk)))
     }
 
-    /// Replays the kill's `which` trace, at `trace`, on the unpatched
+    /// Runs the kill's `which` trace, at `trace`, on `harness`'s unpatched
     /// build, under the memory `cap` and within `child`, and judges whether
-    /// it violates `id` there. Writes under `dir`.
+    /// it violates `id` there. A trace with its `input.bin` reruns that
+    /// input, and any other trace replays. Writes under `dir`.
     #[allow(clippy::too_many_arguments)]
-    fn replay_unpatched(
+    pub(super) fn replay_unpatched(
         &self,
         lanes: &Lanes,
+        harness: &str,
         which: KillTrace,
         trace: &Path,
         id: &str,
@@ -1335,20 +1338,38 @@ impl Runner {
         cap: Option<u64>,
         child: Duration,
     ) -> Result<UnpatchedCheck, BoxError> {
-        let report = dir.join(format!("unpatched-{}-report.json", which.name()));
         let log = dir.join(format!("unpatched-{}-replay.log", which.name()));
-        if report.exists() {
-            fs::remove_file(&report)?;
-        }
-        let mut replay = scoped(cap, &lanes.unpatched_sim);
-        replay
-            .arg("replay")
-            .arg(trace)
-            .arg("--allow-build-mismatch")
-            .arg("--report")
-            .arg(&report);
-        // `--allow-build-mismatch` always exits 1, so only the report counts.
-        let ended = run_lane_child(&mut replay, &log, Some(child))?;
+        let input = trace.join("input.bin");
+        let mut run = scoped(cap, &lanes.unpatched_sim);
+        // A mutant's trace holds the mutant's picks, so the unpatched build
+        // leaves them on most replays. A trace with its input reruns that
+        // input from scratch instead. A shrunk trace has no input, so it
+        // replays, and a replay that leaves the picks stays undecided.
+        let report = if input.is_file() {
+            let out = dir.join(format!("unpatched-{}", which.name()));
+            if out.exists() {
+                fs::remove_dir_all(&out)?;
+            }
+            run.args(["record", "--sim", harness, "--input"])
+                .arg(&input)
+                .arg("--out")
+                .arg(&out);
+            out.join("full-report.json")
+        } else {
+            let report = dir.join(format!("unpatched-{}-report.json", which.name()));
+            if report.exists() {
+                fs::remove_file(&report)?;
+            }
+            // `--allow-build-mismatch` always exits 1, so only the report
+            // counts.
+            run.arg("replay")
+                .arg(trace)
+                .arg("--allow-build-mismatch")
+                .arg("--report")
+                .arg(&report);
+            report
+        };
+        let ended = run_lane_child(&mut run, &log, Some(child))?;
         let written = fs::read_to_string(&report).ok();
         let (outcome, detail) = judge_unpatched(id, which, written.as_deref(), &ended.to_string());
         Ok(UnpatchedCheck {
@@ -1609,6 +1630,7 @@ impl Runner {
                                 {
                                     checks.push(self.replay_unpatched(
                                         lanes,
+                                        harness,
                                         which,
                                         &self.out.join(trace),
                                         &kill.id,

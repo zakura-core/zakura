@@ -1068,7 +1068,7 @@ async fn setup(
         chain_tip_change.clone(),
         misbehavior_sender.clone(),
         Vec::new(),
-        zakura_network::UnconditionalPeers::default(),
+        zakura_network::UnconditionalPeerSet::default(),
     );
 
     // Enable the mempool

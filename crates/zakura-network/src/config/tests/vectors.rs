@@ -26,7 +26,7 @@ use crate::{
         DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
         DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
-    CacheDir, Config, P2pStack, UnconditionalPeers,
+    CacheDir, Config, P2pStack, PeerSocketAddr, UnconditionalPeers,
 };
 
 /// Cache line order survives parsing, deduplication, and fallback peer discovery.
@@ -1867,12 +1867,286 @@ fn unconditional_peers_parse_ips_and_cidr_ranges_and_roundtrip() {
     assert_eq!(roundtrip.unconditional_peers, config.unconditional_peers);
 }
 
+/// An entry can give the port to dial, and keeps it across a config round trip.
+#[test]
+fn unconditional_peers_parse_ports_and_roundtrip() {
+    let config: Config = toml::from_str(
+        "unconditional_peers = ['192.0.2.1:8233', '[2001:db8::1]:18233', '192.0.2.1']",
+    )
+    .expect("IP addresses with ports parse");
+
+    assert_eq!(config.unconditional_peers.len(), 3);
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    assert!(
+        serialized.contains(
+            r#"unconditional_peers = ["192.0.2.1:8233", "[2001:db8::1]:18233", "192.0.2.1"]"#
+        ),
+        "entries keep their ports and their order:\n{serialized}"
+    );
+
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip.unconditional_peers, config.unconditional_peers);
+
+    // A port only chooses where to dial. The exemption still covers the whole IP.
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+    assert!(config.unconditional_peers.contains(ip("192.0.2.1")));
+    assert!(config.unconditional_peers.contains(ip("2001:db8::1")));
+    assert!(!config.unconditional_peers.contains(ip("192.0.2.2")));
+}
+
+/// An entry can be a DNS name with a port. Names load in lower case, are dialed, and
+/// match no address until they are resolved.
+#[test]
+fn unconditional_peers_parse_dns_names_and_roundtrip() {
+    let config: Config = toml::from_str(
+        "unconditional_peers = [
+            'Peer.Example.com:8233',
+            'zakura-peer-1:18233',
+            '192.0.2.1',
+            'peer.example.com:8233',
+            'peer.example.com:8234',
+        ]",
+    )
+    .expect("DNS names with ports parse");
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    assert!(
+        serialized.contains(
+            r#"unconditional_peers = ["peer.example.com:8233", "zakura-peer-1:18233", "192.0.2.1", "peer.example.com:8233", "peer.example.com:8234"]"#
+        ),
+        "names serialize in lower case with their ports:\n{serialized}"
+    );
+
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip.unconditional_peers, config.unconditional_peers);
+
+    let peers = config.unconditional_peers;
+    assert_eq!(
+        peers.dial_hosts(),
+        vec![
+            ("peer.example.com".into(), 8233),
+            ("zakura-peer-1".into(), 18233),
+            // The same name on another port is another peer.
+            ("peer.example.com".into(), 8234),
+        ],
+        "names are dialed once each, in config order",
+    );
+    assert_eq!(peers.dial_addrs(8233).len(), 1, "a name is not an address");
+
+    // The limit counts entries, so it also covers the repeated name.
+    assert_eq!(peers.dial_limit(), 5);
+    assert_eq!(peers.len(), 5);
+    assert_eq!(peers.iter().count(), 1, "a name is not a range");
+
+    // The longest label and name that DNS allows load, and longer ones do not.
+    let label = "a".repeat(63);
+    let name = [label.as_str(); 3].join(".") + "." + &"a".repeat(61);
+    assert_eq!(name.len(), 253);
+    for (entry, is_valid) in [
+        (format!("{label}.example.com:8233"), true),
+        (format!("{label}a.example.com:8233"), false),
+        (format!("{name}:8233"), true),
+        (format!("{name}a:8233"), false),
+    ] {
+        assert_eq!(
+            toml::from_str::<Config>(&format!("unconditional_peers = ['{entry}']")).is_ok(),
+            is_valid,
+            "unexpected result for {entry:?}",
+        );
+    }
+}
+
+/// A DNS name can end with the dot of an absolute name. It loads, is looked up and
+/// serializes with that dot, which does not count toward the longest name.
+#[test]
+fn unconditional_peers_accept_an_absolute_dns_name() {
+    let config: Config = toml::from_str("unconditional_peers = ['Pool-Peer.Example.:8233']")
+        .expect("an absolute DNS name with a port parses");
+    assert_eq!(
+        config.unconditional_peers.dial_hosts(),
+        vec![("pool-peer.example.".into(), 8233)],
+    );
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    assert!(
+        serialized.contains(r#"unconditional_peers = ["pool-peer.example.:8233"]"#),
+        "an absolute name serializes with its dot:\n{serialized}"
+    );
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip.unconditional_peers, config.unconditional_peers);
+
+    let label = "a".repeat(63);
+    let name = [label.as_str(); 3].join(".") + "." + &"a".repeat(61);
+    assert_eq!(name.len(), 253);
+    for (entry, is_valid) in [
+        (format!("{name}.:8233"), true),
+        (format!("{name}a.:8233"), false),
+    ] {
+        assert_eq!(
+            toml::from_str::<Config>(&format!("unconditional_peers = ['{entry}']")).is_ok(),
+            is_valid,
+            "unexpected result for {entry:?}",
+        );
+    }
+}
+
+/// An entry that this node cannot dial stays exempt, but is no longer a dial address,
+/// is not dialed and adds no slots. The config still serializes as written.
+#[test]
+fn unconditional_peers_leave_out_undialable_entries() {
+    let config: Config =
+        toml::from_str("unconditional_peers = ['192.0.2.1', '192.0.2.2:9000', '192.0.2.4/30']")
+            .expect("unconditional peers parse");
+    let undialable: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+    let dialed: std::net::IpAddr = "192.0.2.2".parse().unwrap();
+
+    let peers = config
+        .unconditional_peers
+        .leave_out_undialable(8233, |addr| addr.ip() != undialable);
+
+    assert!(peers.contains(undialable), "the entry stays exempt");
+    assert!(!peers.is_dial_address(undialable));
+    assert!(peers.is_dial_address(dialed));
+    assert_eq!(
+        peers.dial_addrs(8233),
+        vec!["192.0.2.2:9000".parse::<PeerSocketAddr>().unwrap()],
+    );
+    assert_eq!(peers.dial_limit(), 1);
+
+    let serialized = toml::to_string(&Config {
+        unconditional_peers: peers,
+        ..config
+    })
+    .expect("config serializes");
+    assert!(
+        serialized
+            .contains(r#"unconditional_peers = ["192.0.2.1", "192.0.2.2:9000", "192.0.2.4/30"]"#),
+        "the config serializes as written:\n{serialized}"
+    );
+}
+
+/// Every entry that names one address is dialed, on the default port unless it gives
+/// one. Ranges are never dialed.
+#[test]
+fn unconditional_peers_dial_single_addresses() {
+    let peers = toml::from_str::<Config>(
+        "unconditional_peers = [
+            '192.0.2.1',
+            '192.0.2.2:18233',
+            '198.51.100.0/24',
+            '198.51.100.7/32',
+            '[2001:db8::1]:8233',
+            '::ffff:192.0.2.3',
+            '192.0.2.1:8233',
+        ]",
+    )
+    .unwrap()
+    .unconditional_peers;
+
+    let addr = |addr: &str| PeerSocketAddr::from(addr.parse::<SocketAddr>().unwrap());
+
+    assert_eq!(
+        peers.dial_addrs(8233),
+        vec![
+            addr("192.0.2.1:8233"),
+            addr("192.0.2.2:18233"),
+            // A full-length range is one address.
+            addr("198.51.100.7:8233"),
+            addr("[2001:db8::1]:8233"),
+            // An IPv4-mapped entry is dialed over IPv4.
+            addr("192.0.2.3:8233"),
+            // `192.0.2.1:8233` repeats the first entry on this default port.
+        ],
+    );
+
+    // The limit counts entries, so it also covers the repeated address.
+    assert_eq!(peers.dial_limit(), 6);
+    assert_eq!(peers.dial_addrs(18233).len(), 6);
+
+    // The dialed addresses, in their IPv4 and IPv4-mapped forms. An address that is
+    // only in a range is not one.
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+    for dialed in [
+        "192.0.2.1",
+        "::ffff:192.0.2.1",
+        "192.0.2.2",
+        "198.51.100.7",
+        "2001:db8::1",
+        "192.0.2.3",
+    ] {
+        assert!(peers.is_dial_address(ip(dialed)), "{dialed} is dialed");
+    }
+    for not_dialed in ["198.51.100.8", "::ffff:198.51.100.8", "192.0.2.4"] {
+        assert!(
+            !peers.is_dial_address(ip(not_dialed)),
+            "{not_dialed} is not dialed"
+        );
+    }
+    assert!(
+        peers.contains(ip("198.51.100.8")),
+        "the range still matches"
+    );
+}
+
+/// Each dialed unconditional peer gets an outbound slot and an inbound slot on top of
+/// the outbound and inbound limits, so the peer set's connection limit check allows
+/// them.
+#[test]
+fn unconditional_peer_dials_raise_the_total_connection_limit() {
+    let default_config: Config = toml::from_str("").unwrap();
+    let config: Config = toml::from_str(
+        "unconditional_peers = [
+            '192.0.2.1',
+            '192.0.2.2:8233',
+            '198.51.100.0/24',
+            'peer.example.com:8233',
+        ]",
+    )
+    .unwrap();
+
+    assert_eq!(default_config.unconditional_peer_connection_limit(), 0);
+    assert_eq!(config.unconditional_peer_connection_limit(), 3);
+
+    assert_eq!(
+        config.peerset_outbound_connection_limit(),
+        default_config.peerset_outbound_connection_limit(),
+    );
+    assert_eq!(
+        config.peerset_inbound_connection_limit(),
+        default_config.peerset_inbound_connection_limit(),
+    );
+    assert_eq!(
+        config.peerset_total_connection_limit(),
+        default_config.peerset_total_connection_limit() + 2 * 3,
+    );
+}
+
 #[test]
 fn unconditional_peers_reject_invalid_entries() {
     for entry in [
         "not an ip",
+        // A DNS name needs a port.
         "zakura.example.com",
-        "192.0.2.1:8233",
+        "zakura.example.com:0",
+        "zakura.example.com:65536",
+        // These are not DNS names.
+        "zakura..example.com:8233",
+        ".example.com:8233",
+        "zakura.example.com..:8233",
+        ".:8233",
+        "-zakura.example.com:8233",
+        "zakura-.example.com:8233",
+        "zakura_peer.example.com:8233",
+        "zakura peer.example.com:8233",
+        // A mistyped IPv4 address is not a DNS name either.
+        "192.0.2.300:8233",
+        "192.0.2.300.:8233",
+        "zakura.example.123:8233",
+        "192.0.2.1:0",
+        "192.0.2.1:65536",
+        "192.0.2.0/24:8233",
+        "[2001:db8::1]",
         "192.0.2.0/33",
         "192.0.2.5/24",
         "2001:db8::1/32",

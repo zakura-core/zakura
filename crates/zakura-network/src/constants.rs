@@ -265,6 +265,48 @@ pub const MIN_OUTBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_milli
 /// number of startup attempts.
 pub const INITIAL_PEER_DIAL_CONCURRENCY: usize = 50;
 
+/// How often Zakura checks whether each dialed unconditional peer is still connected.
+///
+/// A peer that is no longer connected is dialed again within this interval, unless it
+/// is waiting out a redial delay.
+pub const UNCONDITIONAL_PEER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The shortest delay between two dials to the same unconditional peer.
+///
+/// Each further dial that does not lead to a lasting connection doubles the delay, up to
+/// [`MAX_UNCONDITIONAL_PEER_REDIAL_DELAY`].
+pub const MIN_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(1);
+
+/// The longest delay between two dials to the same unconditional peer, before jitter.
+pub const MAX_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(10 * 60);
+
+/// The longest random delay that Zakura adds before it dials an unconditional peer
+/// again.
+///
+/// Two nodes that list each other would otherwise redial at the same moment after
+/// their connection drops, and each could keep the dial that the other one drops.
+/// The delay must be much longer than a round trip between two such nodes.
+pub const MAX_UNCONDITIONAL_PEER_REDIAL_JITTER: Duration = Duration::from_secs(2);
+
+/// The longest time that the startup dials wait for the first lookups of the DNS names
+/// in `network.unconditional_peers`, so that they leave the names' addresses the room
+/// they need. Each lookup gives up after [`DNS_LOOKUP_TIMEOUT`].
+pub const UNCONDITIONAL_PEER_STARTUP_LOOKUP_WAIT: Duration =
+    Duration::from_secs(DNS_LOOKUP_TIMEOUT.as_secs() + 1);
+
+/// The most addresses that Zakura takes from one lookup of an unconditional peer's DNS
+/// name.
+///
+/// These addresses are exempt from scoring and bans, and dialed in turn. A node has a
+/// few addresses at most, so a longer answer is not one node.
+pub const MAX_UNCONDITIONAL_PEER_RESOLVED_ADDRS: usize = 16;
+
+/// How long a connection to an unconditional peer must last to reset its redial delay.
+///
+/// A peer that keeps dropping new connections is dialed at the maximum delay, instead of
+/// in a tight loop.
+pub const UNCONDITIONAL_PEER_HEALTHY_CONNECTION: Duration = Duration::from_secs(60);
+
 /// The minimum time between _successful_ inbound peer connections, implemented by
 /// `peer_set::initialize::accept_inbound_connections`.
 ///
@@ -445,9 +487,10 @@ pub const MIN_PEER_SET_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// disconnected and banned.
 pub const MAX_PEER_MISBEHAVIOR_SCORE: u32 = 100;
 
-/// The most block hashes a Zakura native `FindBlocks` response may carry.
+/// The most block hashes a `FindBlocks` response may carry.
 ///
-/// A zakurad responder sends at most `MAX_FIND_BLOCK_HASHES_RESULTS` from
+/// Zakura native requesters reject longer responses, and legacy `inv` responses
+/// are truncated to this length. A zakurad responder sends at most `MAX_FIND_BLOCK_HASHES_RESULTS` from
 /// `zakura-state`; zakurad checks at compile time that the two match.
 pub const MAX_FIND_BLOCKS_RESPONSE_HASHES: usize = 500;
 

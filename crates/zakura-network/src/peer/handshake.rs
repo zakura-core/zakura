@@ -42,13 +42,16 @@ use crate::{
     inbound_resources::{InboundBudget, TCP_INBOUND_RETAINED_BYTES},
     meta_addr::MetaAddrChange,
     peer::{
+        gossip_trace::{LegacyGossipTrace, PeerGossipTrace},
         AnnouncedBlocks, CancelHeartbeatTask, Client, ClientRequest, Connection,
         ConnectionRequests, ErrorSlot, HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
     },
     peer_registry::PeerRegistry,
     peer_set::{ConnectionTracker, InventoryChange},
     protocol::{
-        external::{canonical_ip, types::*, AddrInVersion, Codec, InventoryHash, Message},
+        external::{
+            canonical_ip, types::*, AddrInVersion, BlockChecksums, Codec, InventoryHash, Message,
+        },
         internal::{Request, Response},
     },
     types::MetaAddr,
@@ -99,11 +102,18 @@ where
     /// Funds decoded TCP payloads across this node's connections.
     inbound_budget: InboundBudget,
 
+    /// Lets this node's connections reuse checksums of blocks they send.
+    block_checksums: BlockChecksums,
+
     /// The live ban list, rechecked by each connection before it writes a block advert.
     bans: BannedIps,
 
     /// Warms each new connection's send direction, if warm-up is enabled.
     tcp_warmup: Option<TcpWarmup>,
+
+    /// Records block announcements and block serving on each connection, when the node
+    /// writes trace files.
+    gossip_trace: LegacyGossipTrace,
 
     parent_span: Span,
 }
@@ -152,8 +162,10 @@ where
             peer_registry: self.peer_registry.clone(),
             protected_peer_ips: self.protected_peer_ips.clone(),
             inbound_budget: self.inbound_budget.clone(),
+            block_checksums: self.block_checksums.clone(),
             bans: self.bans.clone(),
             tcp_warmup: self.tcp_warmup.clone(),
+            gossip_trace: self.gossip_trace.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -281,7 +293,7 @@ impl ConnectedAddr {
     /// Returns a new outbound connected addr via `proxy`.
     ///
     /// `local_addr` is the ephemeral local address of the connection.
-    #[allow(unused)]
+    #[cfg(test)]
     pub fn new_outbound_proxy(proxy: SocketAddr, local_addr: SocketAddr) -> ConnectedAddr {
         OutboundProxy {
             proxy_addr: proxy,
@@ -293,7 +305,7 @@ impl ConnectedAddr {
     //
     // TODO: distinguish between direct listeners and proxy listeners in the
     //       rest of zakura-network
-    #[allow(unused)]
+    #[cfg(test)]
     pub fn new_inbound_proxy(proxy: SocketAddr) -> ConnectedAddr {
         InboundProxy {
             transient_addr: proxy,
@@ -679,6 +691,7 @@ where
         let relay = self.relay.unwrap_or(false);
         let network = config.network.clone();
         let minimum_peer_version = MinimumPeerVersion::new(self.latest_chain_tip, &network);
+        let gossip_trace = LegacyGossipTrace::new(&config);
 
         Ok(Handshake {
             config,
@@ -694,8 +707,10 @@ where
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
             inbound_budget: InboundBudget::new(TCP_INBOUND_RETAINED_BYTES),
+            block_checksums: BlockChecksums::default(),
             bans: self.bans.unwrap_or_default(),
             tcp_warmup: self.tcp_warmup,
+            gossip_trace,
             parent_span: Span::current(),
         })
     }
@@ -1563,6 +1578,7 @@ where
             connection_tracker,
         } = req;
         let inbound_budget = self.inbound_budget.clone();
+        let block_checksums = self.block_checksums.clone();
 
         let addr_label = connected_addr.addr_label(self.config.expose_peer_addresses);
         let negotiator_span = debug_span!(
@@ -1586,6 +1602,7 @@ where
         let inbound_service = self.inbound_service.clone();
         let address_book_updater = self.address_book_updater.clone();
         let inv_collector = self.inv_collector.clone();
+        let gossip_trace = self.gossip_trace.clone();
         let config = self.config.clone();
         let user_agent = self.user_agent.clone();
         let our_services = self.our_services;
@@ -1617,7 +1634,10 @@ where
 
             let mut peer_conn = Framed::new(
                 data_stream,
-                Codec::builder().for_network(&config.network).finish(),
+                Codec::builder()
+                    .for_network(&config.network)
+                    .with_block_checksums(block_checksums)
+                    .finish(),
             );
             let mut connection_tracker = connection_tracker;
 
@@ -1798,6 +1818,8 @@ where
             // Block gossip skips this peer for the blocks it announces to us.
             let announced_blocks = AnnouncedBlocks::default();
             let inbound_announced_blocks = announced_blocks.clone();
+            let gossip_trace = gossip_trace.for_peer(&connected_addr);
+            let inbound_gossip_trace = gossip_trace.clone();
             let ts_inner_conn_span = connection_span.clone();
             let inv_inner_conn_span = connection_span.clone();
             let peer_rx = peer_rx
@@ -1825,7 +1847,7 @@ where
                             Err(err) => {
                                 metrics::counter!(
                                     "zakura.net.in.errors",
-                                    "error" => err.to_string(),
+                                    "error" => serialization_error_metric_label(err),
                                 )
                                 .increment(1);
 
@@ -1852,12 +1874,14 @@ where
                 .then(move |msg| {
                     let inbound_inv_collector = inbound_inv_collector.clone();
                     let inbound_announced_blocks = inbound_announced_blocks.clone();
+                    let inbound_gossip_trace = inbound_gossip_trace.clone();
                     let span = debug_span!(parent: inv_inner_conn_span.clone(), "inventory_filter");
                     register_inventory_status(
                         msg,
                         connected_addr,
                         inbound_inv_collector,
                         inbound_announced_blocks,
+                        inbound_gossip_trace,
                     )
                     .instrument(span)
                 })
@@ -1906,7 +1930,8 @@ where
                 addr_label,
                 alternate_addrs.collect(),
                 inbound_budget,
-            );
+            )
+            .with_gossip_trace(gossip_trace);
 
             let block_uploads = server.block_uploads.clone();
             let request_slot = server.request_slot.clone();
@@ -1991,21 +2016,46 @@ where
     }
 }
 
+/// Returns a bounded serialization error label without error details.
+fn serialization_error_metric_label(error: &SerializationError) -> &'static str {
+    match error {
+        SerializationError::Io(_) => "io",
+        SerializationError::Parse(_) => "parse",
+        SerializationError::NonCanonicalShieldedProofSize => "non_canonical_shielded_proof_size",
+        SerializationError::Utf8Error(_) => "utf8_error",
+        SerializationError::TryFromSliceError(_) => "try_from_slice_error",
+        SerializationError::TryFromIntError(_) => "try_from_int_error",
+        SerializationError::FromHexError(_) => "from_hex_error",
+        SerializationError::Amount { .. } => "amount",
+        SerializationError::BadTransactionBalance => "bad_transaction_balance",
+        SerializationError::Script(_) => "script",
+        SerializationError::Opcode(_) => "opcode",
+        SerializationError::Num(_) => "num",
+    }
+}
+
 /// Register any advertised or missing inventory in `msg` for `connected_addr`.
 ///
 /// Also records the blocks this peer announces in `announced_blocks`, so block gossip can skip
 /// a peer that already has the block. Unlike the inventory registry, this covers every block
 /// `inv`, solicited or not, and connections without a transient address. Requests for block
 /// bodies withdraw the peer's earlier claim to have those blocks.
+///
+/// An `inv` that names exactly one block is a new block announcement, and is written to
+/// `gossip_trace`. One that names several is the answer to a query.
 pub(crate) async fn register_inventory_status(
     msg: Result<Message, SerializationError>,
     connected_addr: ConnectedAddr,
     inv_collector: broadcast::Sender<InventoryChange>,
     announced_blocks: AnnouncedBlocks,
+    gossip_trace: PeerGossipTrace,
 ) -> Result<Message, SerializationError> {
     match &msg {
         Ok(Message::Inv(items)) => {
             announced_blocks.record(items.iter().filter_map(InventoryHash::block_hash));
+            if let [InventoryHash::Block(hash)] = items[..] {
+                gossip_trace.block_inv_received(hash);
+            }
         }
         // A request for the body or a missing response contradicts an earlier announcement.
         Ok(Message::GetData(items) | Message::NotFound(items)) => {

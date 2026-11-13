@@ -70,6 +70,7 @@ itertools = { workspace = true }
 pin-project = { workspace = true }
 rand_10 = { workspace = true }
 rayon = { workspace = true }
+ring = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

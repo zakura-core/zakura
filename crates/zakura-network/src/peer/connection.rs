@@ -433,7 +433,13 @@ impl Handler {
                         .iter()
                         .all(|item| matches!(item, InventoryHash::Block(_))) =>
             {
-                let response = Response::BlockHashes(block_hashes(&items[..]).collect());
+                // Truncate rather than reject: zcashd can add one extra hash to a full
+                // response, and a peer can always send the maximum number of junk hashes.
+                let response = Response::BlockHashes(
+                    block_hashes(&items[..])
+                        .take(constants::MAX_FIND_BLOCKS_RESPONSE_HASHES)
+                        .collect(),
+                );
                 if let [InventoryHash::Block(_)] = items[..] {
                     ignored_msg = Some(Message::Inv(items));
                 }
@@ -685,6 +691,10 @@ where
     /// Reports requested blocks and completed framed writes to gossip schedulers.
     pub(super) block_uploads: super::block_gossip::BlockUploads,
 
+    /// Records the block announcements this connection writes, and the blocks the peer
+    /// asks for and is sent, when the node writes trace files.
+    gossip_trace: super::gossip_trace::PeerGossipTrace,
+
     /// Tells the client and peer set whether this connection is free to write a new request.
     pub(super) request_slot: super::client::RequestSlot,
 
@@ -821,6 +831,7 @@ where
             error_slot,
             peer_tx: peer_tx.into(),
             block_uploads: Default::default(),
+            gossip_trace: Default::default(),
             request_slot: Default::default(),
             connection_tracker,
             addr_label,
@@ -829,6 +840,15 @@ where
             inbound_budget,
             response_charge: None,
         }
+    }
+
+    /// Makes this connection write its block gossip to `gossip_trace`.
+    pub(super) fn with_gossip_trace(
+        mut self,
+        gossip_trace: super::gossip_trace::PeerGossipTrace,
+    ) -> Self {
+        self.gossip_trace = gossip_trace;
+        self
     }
 }
 
@@ -1258,6 +1278,7 @@ where
             Ok(true) => {
                 // Mark the write before reading the peer's next message, which can be its getdata.
                 self.block_uploads.advertised(advert.hash);
+                self.gossip_trace.block_inv_sent(advert.hash);
                 let _ = advert.result.send(Ok(()));
             }
             Ok(false) => {
@@ -1667,7 +1688,10 @@ where
                         .any(|item| matches!(item, InventoryHash::Block(_))) =>
                 {
                     let hashes = block_hashes(items)
-                        .inspect(|hash| self.block_uploads.requested(*hash))
+                        .inspect(|hash| {
+                            self.block_uploads.requested(*hash);
+                            self.gossip_trace.block_getdata_received(*hash);
+                        })
                         .collect();
 
                     if self.connection_info.is_protected_peer {
@@ -1975,9 +1999,11 @@ where
                                 return;
                             }
                             self.block_uploads.written(hash);
+                            self.gossip_trace.block_sent(hash);
                         }
                         Missing(hash) => {
                             self.block_uploads.unavailable(hash);
+                            self.gossip_trace.block_unavailable(hash);
                             missing_hashes.push(hash.into());
                         }
                     }

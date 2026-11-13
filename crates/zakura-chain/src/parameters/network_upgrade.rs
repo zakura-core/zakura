@@ -128,7 +128,6 @@ impl fmt::Display for NetworkUpgrade {
 ///
 /// Don't use this directly; use NetworkUpgrade::activation_list() so that
 /// we can switch to fake activation heights for some tests.
-#[allow(unused)]
 pub(super) const MAINNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = {
     use super::constants::activation_heights::mainnet::*;
     &[
@@ -156,7 +155,6 @@ pub(super) const MAINNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
 ///
 /// Don't use this directly; use NetworkUpgrade::activation_list() so that
 /// we can switch to fake activation heights for some tests.
-#[allow(unused)]
 pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = {
     use super::constants::activation_heights::testnet::*;
     &[

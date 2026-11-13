@@ -7262,6 +7262,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "tests/header_node_session_ends.rs",
         "an_end_joins_its_cancellation_by_its_connection",
     ),
+    (
+        "FrameRef",
+        "tests/header_wire_crossing.rs",
+        "act_wrote",
+        "tests/header_wire_crossing.rs",
+        "a_crossed_update_joins_the_act_s_frame",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.

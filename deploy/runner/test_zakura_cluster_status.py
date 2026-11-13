@@ -2061,6 +2061,36 @@ class PropagationRouteTests(unittest.TestCase):
         self.assertNotIn(private_agent.encode(), body)
         self.assertEqual(json.loads(body)["outside_peers"], [])
 
+    def test_a_queued_request_reads_the_private_list_after_acquiring_the_cache(self):
+        private_agent = "/Zakura:9.9.9-private/"
+        self.downloads = {"first": [self.download(self.PRIVATE, agent=private_agent)]}
+        view = status.PROPAGATION
+        queued = threading.Event()
+        lock = threading.Lock()
+
+        class QueuedLock:
+            def __enter__(self):
+                queued.set()
+                lock.acquire()
+
+            def __exit__(self, *args):
+                lock.release()
+
+        view._lock = QueuedLock()
+        protected = frozenset()
+        result = []
+        with mock.patch.object(status, "private_addresses", side_effect=lambda: protected):
+            with lock:
+                worker = threading.Thread(target=lambda: result.append(view.data()), daemon=True)
+                worker.start()
+                self.assertTrue(queued.wait(2), "the request must reach the busy cache")
+                protected = frozenset({status.address_key(self.PRIVATE)})
+            worker.join(2)
+        self.assertFalse(worker.is_alive(), "the queued request must finish")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["outside_peers"], [])
+        self.assertNotIn(private_agent, json.dumps(result[0]))
+
     def test_a_private_peer_s_address_and_software_are_never_served(self):
         private_agent = "/Zakura:9.9.9-private/"
         self.downloads = {

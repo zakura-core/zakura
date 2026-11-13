@@ -744,6 +744,36 @@ async fn unconditional_peer_redials_back_off() {
     }
 }
 
+/// A dial in flight counts against the per-IP limit, so listed addresses on one IP never
+/// have more dials in flight than `max_connections_per_ip`.
+#[tokio::test(start_paused = true)]
+async fn unconditional_peer_dials_in_flight_count_against_the_per_ip_limit() {
+    let _init_guard = zakura_test::init();
+
+    // Each case is the per-IP limit, and the dials that start while every dial hangs.
+    for (max_connections_per_ip, expected_dials) in [(1, 1), (2, 2)] {
+        let config = Config {
+            max_connections_per_ip,
+            ..toml::from_str(
+                "unconditional_peers = ['192.0.2.1:8233', '192.0.2.1:9000', '192.0.2.1:18233']",
+            )
+            .unwrap()
+        };
+        let dialer = spawn_unconditional_peer_dialer(
+            config,
+            PeerRegistry::default(),
+            UnconditionalPeerDial::Hang,
+        );
+        tokio::time::sleep(constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY).await;
+
+        assert_eq!(
+            dialer.dial_times().len(),
+            expected_dials,
+            "unexpected dials with {max_connections_per_ip} connections per IP",
+        );
+    }
+}
+
 /// Zakura does not start a second dial to a peer while the first one is in flight.
 #[tokio::test(start_paused = true)]
 async fn unconditional_peer_is_not_dialed_again_while_a_dial_is_in_flight() {

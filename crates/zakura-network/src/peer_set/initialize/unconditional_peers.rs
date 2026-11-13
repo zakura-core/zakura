@@ -43,6 +43,10 @@ struct RedialState {
 
     /// When this peer was first seen connected, if it still is.
     connected_since: Option<Instant>,
+
+    /// The address of this peer's dial in flight, if any. It counts against the per-IP
+    /// limit before it finishes, see [`connections_with_dials_in_flight`].
+    dialing: Option<PeerSocketAddr>,
 }
 
 /// A finished step of an attempt to connect to the peer at `index`.
@@ -113,6 +117,23 @@ fn is_dialable(addr: PeerSocketAddr, config: &Config, listen_addr: SocketAddr) -
     }
 
     true
+}
+
+/// Returns the connections in `peer_registry`, and an outbound connection for each dial
+/// in flight in `peers`, so a dial counts against `max_connections_per_ip` before it
+/// finishes and listed addresses on one IP cannot start more dials than the limit.
+fn connections_with_dials_in_flight(
+    peer_registry: &PeerRegistry,
+    peers: &[RedialState],
+) -> Vec<(PeerSocketAddr, bool)> {
+    let mut connections = peer_registry.connection_addrs();
+    connections.extend(
+        peers
+            .iter()
+            .filter_map(|peer| peer.dialing)
+            .map(|addr| (addr, false)),
+    );
+    connections
 }
 
 /// Returns whether `addr` is a listener address of this node that can be recognized
@@ -280,6 +301,7 @@ where
             is_attempting: false,
             has_attempted: false,
             connected_since: None,
+            dialing: None,
         })
         .collect();
 
@@ -298,16 +320,14 @@ where
             // attempt.
             Some(event) = events.next() => match event {
                 AttemptEvent::Delayed { index } => {
+                    let connections = connections_with_dials_in_flight(&peer_registry, &peers);
                     let peer: &mut RedialState = peers
                         .get_mut(index)
                         .expect("event indexes come from the peer list, which never shrinks");
 
-                    // The peer may have dialed in while this attempt waited.
-                    if is_connected(
-                        peer.addr,
-                        &peer_registry.connection_addrs(),
-                        config.max_connections_per_ip,
-                    ) {
+                    // The peer may have dialed in while this attempt waited, or a dial to
+                    // another listed address may have filled its IP.
+                    if is_connected(peer.addr, &connections, config.max_connections_per_ip) {
                         peer.is_attempting = false;
                         continue;
                     }
@@ -321,6 +341,7 @@ where
                         addr: peer.addr,
                         connection_tracker: active_connections.track_connection(),
                     };
+                    peer.dialing = Some(peer.addr);
                     let outbound_connector = outbound_connector.clone();
 
                     events.push(
@@ -346,6 +367,7 @@ where
                         .get_mut(index)
                         .expect("event indexes come from the peer list, which never shrinks");
                     peer.is_attempting = false;
+                    peer.dialing = None;
 
                     match result {
                         Ok((addr, client)) => {
@@ -401,7 +423,7 @@ where
             },
 
             _ = check_timer.tick() => {
-                let connections = peer_registry.connection_addrs();
+                let connections = connections_with_dials_in_flight(&peer_registry, &peers);
 
                 for (index, peer) in peers.iter_mut().enumerate() {
                     if peer.is_attempting {

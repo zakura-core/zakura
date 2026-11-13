@@ -162,6 +162,28 @@ impl Spend<SharedAnchor> {
 
         (prefix, self.zkproof, self.spend_auth_sig)
     }
+
+    /// Writes this spend's V5 prefix, the same bytes as
+    /// [`SpendPrefixInTransactionV5`], without copying the spend.
+    pub(crate) fn zcash_serialize_v5_prefix<W: io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), io::Error> {
+        write_v5_prefix(&self.cv, self.nullifier, &self.rk, writer)
+    }
+}
+
+/// Writes the V5 spend prefix fields: `cv`, `nullifier` and `rk`.
+fn write_v5_prefix<W: io::Write + ?Sized>(
+    cv: &commitment::ValueCommitment,
+    nullifier: note::Nullifier,
+    rk: &ValidatingKey,
+    writer: &mut W,
+) -> Result<(), io::Error> {
+    writer.write_all(&cv.0)?;
+    writer.write_32_bytes(&nullifier.into())?;
+    writer.write_all(&<[u8; 32]>::from(rk.clone())[..])?;
+    Ok(())
 }
 
 impl ZcashSerialize for Spend<PerSpendAnchor> {
@@ -249,10 +271,7 @@ impl ZcashDeserialize for Spend<PerSpendAnchor> {
 
 impl ZcashSerialize for SpendPrefixInTransactionV5 {
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
-        writer.write_all(&self.cv.0)?;
-        writer.write_32_bytes(&self.nullifier.into())?;
-        writer.write_all(&<[u8; 32]>::from(self.rk.clone())[..])?;
-        Ok(())
+        write_v5_prefix(&self.cv, self.nullifier, &self.rk, writer)
     }
 }
 

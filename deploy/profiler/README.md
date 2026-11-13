@@ -2,8 +2,8 @@
 
 `zakura_profiler.py` runs beside a `zakurad` node, samples where the node spends
 its CPU time all day, and serves flame graphs of it. The cluster status
-dashboard links to it: a node with a profiler shows a "profiled" badge that
-opens `/profile/<node>`.
+dashboard shows them in the "CPU profile" section of the node's page,
+`/node/<node>#profile`; the fleet table marks such a node "profiled".
 
 It runs on every mainnet node that has a `profiler_url` in the deploy workflow's
 node list: the regional nodes and `archive-vct-off`.
@@ -76,15 +76,15 @@ or arrange separate retention: stopping the profiler does not stop trace writes.
 
 | Path on the node | Contents |
 | --- | --- |
-| `/opt/zakura-profiler/` | `zakura_profiler.py`, `stacks.py`, `blocks.py`, `peer_addresses.py`, `page.html` |
+| `/opt/zakura-profiler/` | `zakura_profiler.py`, `stacks.py`, `blocks.py`, `peer_addresses.py` |
 | `/etc/systemd/system/zakura-profiler.service` | the unit, with the resource limits |
 | `/etc/systemd/system/zakura-profiler.service.d/node.conf` | this node's name, log file and trace directory |
 | `/mnt/data/zakura-profiler/` | one file per minute for 48 hours, one per hour for 14 days, capped at 2 GiB |
 | `/run/zakura-profiler/` | scratch space in memory for sampled windows, 512 MiB at most in all |
 
 The service listens on `127.0.0.1:8097`. The dashboard reaches it through the
-node's `monitor.profiler_url` setting and serves it publicly, rate limited, at
-`/profile/<node>`.
+node's `monitor.profiler_url` setting and forwards the node page's requests to it,
+rate limited, under `/profile/<node>/api/`. The profiler serves no page of its own.
 
 The node never rotates its trace tables. Given `--trace-dir`, the profiler
 renames any table in that directory that grows past `--trace-table-cap-mb`
@@ -204,7 +204,7 @@ To install by hand on one host instead:
 
 ```bash
 install -d /opt/zakura-profiler
-install -m 644 zakura_profiler.py stacks.py blocks.py peer_addresses.py page.html /opt/zakura-profiler/
+install -m 644 zakura_profiler.py stacks.py blocks.py peer_addresses.py /opt/zakura-profiler/
 install -m 644 zakura-profiler.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now zakura-profiler

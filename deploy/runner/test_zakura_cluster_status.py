@@ -9,6 +9,7 @@ import json
 import io
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -1824,12 +1825,48 @@ class ProfilerRouteTests(unittest.TestCase):
             with error:
                 return error.code, error.read(), error.headers
 
-    def test_profile_page_comes_from_the_nodes_profiler_and_is_never_cached(self):
+    def test_the_old_profile_page_address_opens_the_node_pages_profile(self):
         code, body, headers = self.fetch("/profile/profiled")
         self.assertEqual(code, 200)
-        self.assertIn(b"<title>profile</title>", body)
         self.assertIn("no-store", headers["Cache-Control"])
-        self.assertEqual(StubProfiler.requests, ["/"])
+        self.assertIn(b'href="/node/profiled#profile"', body)
+        self.assertEqual(StubProfiler.requests, [])
+
+    @unittest.skipUnless(shutil.which("node"), "needs node to run the page's JavaScript")
+    def test_a_saved_profile_link_keeps_its_view_on_the_node_page(self):
+        # A link saved from the old page carries its view in the fragment, which only
+        # the browser sees: the redirect page moves it, and the profile reads it back.
+        old_view = "#from=1700000000&to=1700000600&view=verification&lens=block&focus=zakura%3A%3Averify"
+        redirect = re.search(r"<script>(.*?)</script>", status.profile_redirect_page("profiled").decode()).group(1)
+        read_hash = re.search(r"function readHash\(\) \{.*?\n\}", status.PAGE, re.S).group(0)
+        script = f"""
+            const location = {{ hash: {json.dumps(old_view)}, replace(url) {{ this.next = url; }} }};
+            {redirect}
+            location.hash = location.next.slice(location.next.indexOf("#"));
+            const state = {{}};
+            {read_hash}
+            readHash();
+            console.log(JSON.stringify({{ url: location.next, state }}));
+        """
+        result = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout)
+        self.assertTrue(result["url"].startswith("/node/profiled#profile&"))
+        self.assertEqual(result["state"], {
+            "from": 1700000000, "to": 1700000600, "view": "verification", "lens": "block", "focus": "zakura::verify",
+        })
+
+    def test_every_profile_button_the_click_handler_names_is_on_the_page(self):
+        names = set(re.findall(r'button\.id === "([^"]+)"', status.PAGE))
+        self.assertEqual(names, {"pf-live", "pf-focus-fn", "pf-zoom-out", "pf-stage-median"})
+        for name in names:
+            self.assertIn(f'<button id="{name}"', status.PAGE)
+
+    def test_the_node_page_holds_the_cpu_profile_and_a_jump_bar(self):
+        code, body, _ = self.fetch("/node/profiled")
+        self.assertEqual(code, 200)
+        self.assertIn(b'id="node-nav"', body)
+        self.assertIn(b'<section class="pf" id="profile"', body)
+        # The profile reads the forwarder, never a page of the profiler's own.
+        self.assertIn(b'const BASE = "/profile/" + encodeURIComponent(node);', body)
 
     def test_profile_data_forwards_only_the_parameters_each_request_accepts(self):
         code, body, _ = self.fetch(
@@ -1860,9 +1897,6 @@ class ProfilerRouteTests(unittest.TestCase):
         self.profiler.shutdown()
         self.profiler.server_close()
         self.assertEqual(self.fetch("/profile/profiled/api/status")[0], 502)
-        code, body, _ = self.fetch("/profile/profiled")
-        self.assertEqual(code, 502)
-        self.assertIn(b"not answering", body)
         self.assertEqual(status.profiler_summary(self.profiler_url), {"state": "unreachable"})
         # Reopen so tearDown can close it like any other test.
         self.profiler = status.ThreadingHTTPServer(("127.0.0.1", 0), StubProfiler)
@@ -1885,10 +1919,11 @@ class ProfilerRouteTests(unittest.TestCase):
         )
         self.assertNotIn("profiler", rows["plain"])
 
-    def test_page_links_a_profiled_node_to_its_flame_graph(self):
+    def test_page_links_a_profiled_node_to_its_cpu_profile_section(self):
         self.assertIn("function profilerBadge(row)", status.PAGE)
         self.assertIn('<a class="node-link badge tone-', status.PAGE)
-        self.assertIn("href=\"/profile/'", status.PAGE)
+        self.assertIn("href=\"/node/'", status.PAGE)
+        self.assertIn("'#profile\" title=\"'", status.PAGE)
 
     def test_profiler_url_is_read_from_the_monitor_table(self):
         template = (

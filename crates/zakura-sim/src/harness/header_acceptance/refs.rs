@@ -187,6 +187,28 @@ pub struct DispatchRef {
 }
 impl Ref for DispatchRef {}
 
+/// One storage instance: its service and its registration index in its
+/// run, as an `Observation::Storage` names them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageRef {
+    /// The service, such as `header`.
+    pub service: String,
+    /// The instance's registration index.
+    pub instance: u64,
+}
+impl Ref for StorageRef {}
+
+/// One storage operation: its storage instance and its ID there, which is
+/// per service.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageOpRef {
+    /// The storage instance.
+    pub storage: StorageRef,
+    /// The operation's ID.
+    pub op: u64,
+}
+impl Ref for StorageOpRef {}
+
 /// A reactor call paired with the storage operation it submitted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallOpRef {

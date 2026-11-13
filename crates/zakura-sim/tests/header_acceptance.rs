@@ -7091,6 +7091,20 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "tests/header_mixed_resources.rs",
         "the_mixed_joins_fail_one_identity_off",
     ),
+    (
+        "StorageOpRef",
+        "tests/header_mixed_resources.rs",
+        "reply_crosses_reset",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
+    (
+        "StorageRef",
+        "tests/header_mixed_resources.rs",
+        "reply_crosses_reset",
+        "tests/header_mixed_resources.rs",
+        "the_mixed_joins_fail_one_identity_off",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.

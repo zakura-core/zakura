@@ -27,7 +27,9 @@ use support::{
 use zakura_network::zakura::observe::ReactorEvent;
 use zakura_sim::harness::header_acceptance::{
     history::run_declared,
-    refs::{CallOpRef, DispatchRef, Ref, ReleaseRef, StaleCallRef, WorkRef},
+    refs::{
+        CallOpRef, DispatchRef, Ref, ReleaseRef, StaleCallRef, StorageOpRef, StorageRef, WorkRef,
+    },
 };
 use zakura_sim::{
     check::{after_step, PropertyOutcome},
@@ -258,19 +260,28 @@ impl Selected {
     }
 
     /// The first storage operation `is` matches, as its submission gives
-    /// it: its ID, the reactor call that submitted it and its owner.
+    /// it: the operation, the reactor call that submitted it and its owner.
     fn first_submitted(
         &self,
         is: impl Fn(&StorageRequest) -> Option<&WorkOwner>,
-    ) -> Option<(u64, Option<u64>, WorkOwner)> {
+    ) -> Option<(StorageOpRef, Option<u64>, WorkOwner)> {
         self.obs.iter().find_map(|obs| match obs {
             Observation::Storage {
+                service,
+                instance,
                 fact:
                     StorageFact::Submitted {
                         id, request, call, ..
                     },
                 ..
-            } => is(request).map(|owner| (*id, *call, owner.clone())),
+            } => is(request).map(|owner| {
+                let storage = StorageRef {
+                    service: service.clone(),
+                    instance: *instance,
+                };
+                let op = StorageOpRef { storage, op: *id };
+                (op, *call, owner.clone())
+            }),
             _ => None,
         })
     }
@@ -278,6 +289,17 @@ impl Selected {
     /// The index of the first observation `is` matches.
     fn position(&self, is: impl Fn(&Observation) -> bool) -> Option<usize> {
         self.obs.iter().position(is)
+    }
+
+    /// The first apply's operation, or why there's none.
+    fn first_apply(&self) -> Result<StorageOpRef, String> {
+        let (op, ..) = self
+            .first_submitted(|request| match request {
+                StorageRequest::ApplyHeaderTarget { owner, .. } => Some(owner),
+                _ => None,
+            })
+            .ok_or("no apply was submitted")?;
+        Ok(op)
     }
 
     /// The first prepare's operation, the reactor call that submitted it
@@ -289,8 +311,8 @@ impl Selected {
                 _ => None,
             })
             .ok_or("no prepare was submitted")?;
-        let call = call.ok_or(format!("prepare {op} names no reactor call"))?;
-        Ok((op, call, owner))
+        let call = call.ok_or(format!("prepare {op:?} names no reactor call"))?;
+        Ok((op.op, call, owner))
     }
 
     /// Whether a reactor call dispatched `want`.
@@ -436,45 +458,76 @@ impl Selected {
     }
 
     /// Checks the scenario's selected apply, the first, kept its reply
-    /// across the reset: storage committed it, the node then invalidated
-    /// its tip, and only then delivered the apply's reply.
+    /// across the reset ([`Selected::reply_crosses_reset`]).
     fn apply_reply_crosses_reset(&self) -> Result<(), String> {
-        let (op, ..) = self
-            .first_submitted(|request| match request {
-                StorageRequest::ApplyHeaderTarget { owner, .. } => Some(owner),
-                _ => None,
-            })
-            .ok_or("no apply was submitted")?;
+        self.reply_crosses_reset(&self.first_apply()?).map(|_| ())
+    }
+
+    /// Checks `op` kept its reply across the reset: its storage committed
+    /// it, that same storage instance's node then invalidated its tip, and
+    /// only then delivered its reply, each joined on its whole ref, the
+    /// operation's [`StorageOpRef`] and the reset's [`StorageRef`]. Returns
+    /// the three facts' positions.
+    fn reply_crosses_reset(&self, op: &StorageOpRef) -> Result<(usize, usize, usize), String> {
+        let storage = |service: &String, instance: &u64| StorageRef {
+            service: service.clone(),
+            instance: *instance,
+        };
+        let committed = |obs: &Observation| match obs {
+            Observation::Storage {
+                service,
+                instance,
+                fact: StorageFact::Committed { id, .. },
+                ..
+            } => Some(StorageOpRef {
+                storage: storage(service, instance),
+                op: *id,
+            }),
+            _ => None,
+        };
+        let invalidated = |obs: &Observation| match obs {
+            Observation::Storage {
+                service,
+                instance,
+                fact: StorageFact::Reset { kind, .. },
+                ..
+            } if kind == "invalidate" => Some(storage(service, instance)),
+            _ => None,
+        };
+        let delivered = |obs: &Observation| match obs {
+            Observation::Storage {
+                service,
+                instance,
+                fact:
+                    StorageFact::Completed {
+                        id,
+                        delivered: true,
+                        ..
+                    },
+                ..
+            } => Some(StorageOpRef {
+                storage: storage(service, instance),
+                op: *id,
+            }),
+            _ => None,
+        };
         let committed = self
-            .position(|obs| {
-                matches!(obs, Observation::Storage {
-                    fact: StorageFact::Committed { id, .. },
-                    ..
-                } if *id == op)
-            })
-            .ok_or(format!("apply {op} never committed"))?;
+            .position(|obs| StorageOpRef::joins(op, obs, committed))
+            .ok_or(format!("{op:?} never committed"))?;
         let reset = self.obs[committed..]
             .iter()
-            .position(|obs| {
-                matches!(obs, Observation::Storage {
-                    fact: StorageFact::Reset { kind, .. },
-                    ..
-                } if kind == "invalidate")
-            })
-            .ok_or(format!("no invalidation followed apply {op}'s commit"))?
+            .position(|obs| StorageRef::joins(&op.storage, obs, invalidated))
+            .ok_or(format!(
+                "no invalidation of {:?} followed {op:?}'s commit",
+                op.storage
+            ))?
             + committed;
-        let delivered = |obs: &Observation| {
-            matches!(obs, Observation::Storage {
-                fact: StorageFact::Completed { id, delivered: true, .. },
-                ..
-            } if *id == op)
-        };
-        match self.position(delivered) {
-            Some(at) if at > reset => Ok(()),
+        match self.position(|obs| StorageOpRef::joins(op, obs, delivered)) {
+            Some(at) if at > reset => Ok((committed, reset, at)),
             Some(at) => Err(format!(
-                "apply {op}'s reply was delivered at {at}, before the reset at {reset}"
+                "{op:?}'s reply was delivered at {at}, before the reset at {reset}"
             )),
-            None => Err(format!("apply {op}'s reply was never delivered")),
+            None => Err(format!("{op:?}'s reply was never delivered")),
         }
     }
 }
@@ -627,8 +680,11 @@ fn the_mixed_scenario_holds_under_generated_plans() {
 /// one key of its ref moves on its own (Rule 25's template): the call's
 /// dispatch of the prepare's owner, every field of it, the call paired
 /// with the operation, the prepare's stale window, the round retired and
-/// reserved for the owner in full, and the round's release. The apply
-/// reply's crossing fails for a reply delivered before the reset.
+/// reserved for the owner in full, and the round's release. So do the
+/// apply's commit and reply joined on its storage operation, every key of
+/// it including its storage instance, and the reset joined on that same
+/// storage instance ([`Selected::reply_crosses_reset`]). The apply reply's
+/// crossing fails for a reply delivered before the reset.
 #[test]
 fn the_mixed_joins_fail_one_identity_off() {
     let committed: StorageScenario = serde_json::from_str(
@@ -666,31 +722,50 @@ fn the_mixed_joins_fail_one_identity_off() {
     assert_one_key_off::<WorkRef>(&round, |round| selected.reserved(round).is_some());
     assert_one_key_off::<ReleaseRef>(&release, |release| selected.released(release));
 
-    let (apply, ..) = selected
-        .first_submitted(|request| match request {
-            StorageRequest::ApplyHeaderTarget { owner, .. } => Some(owner),
-            _ => None,
-        })
-        .expect("an apply was submitted");
-    let reset = selected
-        .position(|obs| {
-            matches!(obs, Observation::Storage {
-                fact: StorageFact::Reset { kind, .. },
-                ..
-            } if kind == "invalidate")
-        })
-        .expect("the node invalidated");
+    // The apply's commit, the reset and its reply, each fact with one key
+    // of its ref moved on its own: the operation's storage service,
+    // instance or ID, and the reset's service or instance.
+    let apply = selected.first_apply().expect("an apply was submitted");
+    let (committed, reset, reply) = selected
+        .reply_crosses_reset(&apply)
+        .expect("the committed reply crosses");
+    let moved = |at: usize, to: &StorageOpRef| {
+        let mut moved = selected.clone();
+        let Observation::Storage {
+            service,
+            instance,
+            fact,
+            ..
+        } = &mut moved.obs[at]
+        else {
+            panic!("the fact at {at} is a storage fact");
+        };
+        *service = to.storage.service.clone();
+        *instance = to.storage.instance;
+        if let StorageFact::Committed { id, .. } | StorageFact::Completed { id, .. } = fact {
+            *id = to.op;
+        }
+        moved
+    };
+    for at in [committed, reply] {
+        let keys = assert_one_key_off::<StorageOpRef>(&apply, |op| {
+            moved(at, op).reply_crosses_reset(&apply).is_ok()
+        });
+        assert_eq!(keys, 3);
+    }
+    let keys = assert_one_key_off::<StorageRef>(&apply.storage, |storage| {
+        let to = StorageOpRef {
+            storage: storage.clone(),
+            op: apply.op,
+        };
+        moved(reset, &to).reply_crosses_reset(&apply).is_ok()
+    });
+    assert_eq!(keys, 2);
+
+    // The reply delivered before the reset.
     let mut early = selected.clone();
-    let reply = early
-        .position(|obs| {
-            matches!(obs, Observation::Storage {
-                fact: StorageFact::Completed { id, delivered: true, .. },
-                ..
-            } if *id == apply)
-        })
-        .expect("the reply was delivered");
-    let moved = early.obs.remove(reply);
-    early.obs.insert(reset, moved);
+    let delivered = early.obs.remove(reply);
+    early.obs.insert(reset, delivered);
     assert!(early.apply_reply_crosses_reset().is_err());
     assert!(early.held_prepare_joined().is_ok());
 }

@@ -616,7 +616,6 @@ fn quarantined_seeds_stay_in_the_report() {
         repo,
         out: dir.path().join("out"),
         targets: vec!["discovery_wait_complete".to_owned()],
-        skip: Vec::new(),
         sanitizer: "none".to_owned(),
         target_dir: dir.path().join("target"),
         fixtures: vec![fixtures.clone()],
@@ -639,56 +638,6 @@ fn quarantined_seeds_stay_in_the_report() {
     assert_eq!(written, report);
 }
 
-/// `--skip` leaves its targets out of the check and the report. A skipped
-/// target that the suite doesn't declare is refused, and so are names that
-/// leave no target to check.
-#[test]
-fn skipped_targets_stay_out_of_the_report() {
-    use zakura_sim::campaign::{check_targets, TargetsOptions};
-    let dir = tempfile::tempdir().unwrap();
-    let (repo, fixtures) = checkout(dir.path());
-    let skip: Vec<String> = declared_targets(&suite())
-        .into_iter()
-        .map(|target| target.name)
-        .filter(|name| name != "discovery_wait_complete")
-        .collect();
-    assert!(!skip.is_empty());
-    let options = TargetsOptions {
-        repo,
-        out: dir.path().join("out"),
-        targets: Vec::new(),
-        skip,
-        sanitizer: "none".to_owned(),
-        target_dir: dir.path().join("target"),
-        fixtures: vec![fixtures],
-        child: std::time::Duration::from_secs(1),
-    };
-    let report = check_targets(&options, |_| {}).unwrap();
-    let rows: Vec<&str> = report
-        .targets
-        .iter()
-        .map(|row| row.target.as_str())
-        .collect();
-    assert_eq!(rows, ["discovery_wait_complete"]);
-
-    let none_left = TargetsOptions {
-        out: dir.path().join("out-none"),
-        targets: vec!["discovery_wait_complete".to_owned()],
-        skip: vec!["discovery_wait_complete".to_owned()],
-        ..options.clone()
-    };
-    let error = check_targets(&none_left, |_| {}).unwrap_err().to_string();
-    assert!(error.contains("no target to check"), "{error}");
-
-    let unknown = TargetsOptions {
-        out: dir.path().join("out-unknown"),
-        skip: vec!["no_such_target".to_owned()],
-        ..options
-    };
-    let error = check_targets(&unknown, |_| {}).unwrap_err().to_string();
-    assert!(error.contains("no_such_target"), "{error}");
-}
-
 /// The report lists each harness no target runs with its
 /// `[[missing-target]]` row, so it accounts for every harness, even when
 /// it checks only some targets. No missing target counts as not ready.
@@ -701,7 +650,6 @@ fn the_report_lists_every_missing_target() {
         repo,
         out: dir.path().join("out"),
         targets: vec!["discovery_wait_complete".to_owned()],
-        skip: Vec::new(),
         sanitizer: "none".to_owned(),
         target_dir: dir.path().join("target"),
         fixtures: vec![fixtures],

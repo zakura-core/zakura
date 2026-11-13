@@ -36,9 +36,8 @@ pub const USAGE: &str = "\
   zakura-sim campaign status --store <dir>
   zakura-sim campaign evidence --store <dir> [--run <sha256>] [--out <file>]
   zakura-sim campaign verify --store <dir>
-  zakura-sim targets --out <dir> [--target <name>]... [--skip <name>]...
-      [--sanitizer address|none] [--target-dir <dir>] [--fixtures <dir>]...
-      [--child-secs <s>]
+  zakura-sim targets --out <dir> [--target <name>]... [--sanitizer address|none]
+      [--target-dir <dir>] [--fixtures <dir>]... [--child-secs <s>]
 ";
 
 /// What each subcommand does.
@@ -66,7 +65,7 @@ complete process saw apply, and every worker, process and stats file whose
 counts fall short. --out also writes it as JSON.
 `start` and `resume` exit 0 for a complete run and 1 otherwise.
 `targets` checks each simulator fuzz target qa/suite.toml declares, or each
---target, leaving out each --skip: it resolves the target's harness, loads the harness's admitted seeds,
+--target: it resolves the target's harness, loads the harness's admitted seeds,
 builds the target with the pinned nightly, and runs the target once on the
 seeds with --child-secs per input (default 60). The target's run counts which
 of the harness's properties applied. It prints each target's status
@@ -112,7 +111,6 @@ pub fn targets(args: Vec<String>) -> Result<(), Error> {
     flags.only(&[
         "--out",
         "--target",
-        "--skip",
         "--sanitizer",
         "--target-dir",
         "--fixtures",
@@ -141,11 +139,6 @@ pub fn targets(args: Vec<String>) -> Result<(), Error> {
         out: PathBuf::from(flags.required("--out")?),
         targets: flags
             .many("--target")
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        skip: flags
-            .many("--skip")
             .into_iter()
             .map(str::to_owned)
             .collect(),

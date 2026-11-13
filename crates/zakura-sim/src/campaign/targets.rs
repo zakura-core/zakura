@@ -94,9 +94,6 @@ pub struct TargetsOptions {
     pub out: PathBuf,
     /// The targets to check, by name. Empty checks every target.
     pub targets: Vec<String>,
-    /// The targets to leave out, by name, such as one that a separate run
-    /// checks with a longer budget.
-    pub skip: Vec<String>,
     /// cargo-fuzz's `--sanitizer`.
     pub sanitizer: String,
     /// cargo-fuzz's target directory.
@@ -499,7 +496,7 @@ pub fn check_targets(
         .map_err(|error| CampaignError::corrupt(&suite_path, error.to_string()))?;
     let manifest = read(&options.repo.join(FUZZ_PACKAGE).join("Cargo.toml"))?;
     let declared = declared_targets(&suite);
-    for name in options.targets.iter().chain(&options.skip) {
+    for name in &options.targets {
         if !declared.iter().any(|target| &target.name == name) {
             return Err(CampaignError::Refused(format!(
                 "{SUITE_FILE} declares no simulator fuzz target `{name}`"
@@ -508,15 +505,12 @@ pub fn check_targets(
     }
     let selected: Vec<&DeclaredTarget> = declared
         .iter()
-        .filter(|target| {
-            (options.targets.is_empty() || options.targets.contains(&target.name))
-                && !options.skip.contains(&target.name)
-        })
+        .filter(|target| options.targets.is_empty() || options.targets.contains(&target.name))
         .collect();
     if selected.is_empty() {
-        return Err(CampaignError::Refused(
-            "the --target and --skip names leave no target to check".to_owned(),
-        ));
+        return Err(CampaignError::Refused(format!(
+            "{SUITE_FILE} declares no target to check"
+        )));
     }
     let mut report = Readiness {
         version: READINESS_VERSION,

@@ -6,7 +6,7 @@
 revision, and diffs the new report against the previous one. `diff` diffs
 two reports without running anything. Both print the diff as JSON, write it
 beside the new report as `joint-diff.json`, and exit 1 if it lists anything
-in the first three lists:
+in the first four lists:
 
 - `newly_surviving`: lanes, witness or generator, that survived in the new
   report but not in the previous one, or that are new.
@@ -14,6 +14,10 @@ in the first three lists:
   report but not in the previous one, or that are new.
 - `new_property_findings`: what a generator's search on the unpatched build
   stopped at, if the previous report didn't list it.
+- `new_generator_baseline_failures`: generator searches on the unpatched
+  build that didn't end clean, other than property findings, if the previous
+  report didn't list them. Each blocks its harness and seed's lanes, as a
+  failing witness baseline blocks its case.
 - `untriaged`: every lane of the new report, or of the routine's cumulative
   report, that survived, or that another rule killed, and has no record in
   `qa/native-mutations/triage.toml`.
@@ -31,7 +35,8 @@ first run), and optionally runs the libFuzzer lane on the same cases. A
 `--changed-since` report holds only the cases it reran, so the routine
 merges each new report into a cumulative one, `<state>/cumulative.json`
 (`cumulative-libfuzzer.json` for the libFuzzer lane): every case's latest
-result and every property finding so far. It keeps only the cases that
+result, every property finding so far, and each generator search's latest
+baseline failure. It keeps only the cases that
 `cargo xtask planted loop --list` names at the checkout. `cargo xtask
 planted triage` then applies the checkout's triage records to the
 cumulative report afresh, so a triage-only commit, which selects no case,
@@ -94,6 +99,20 @@ def finding_key(finding):
     return (finding.get("property"), finding["harness"], finding["seed"], finding.get("mode", "inproc"))
 
 
+def baseline_failure_key(failure):
+    """Return one generator baseline failure's identity: its harness, seed and mode."""
+    return (failure["harness"], failure["seed"], failure.get("mode", "inproc"))
+
+
+def searched_pairs(report):
+    """Return the identity of every generator search whose lanes `report` holds: its harness, seed and mode."""
+    return {
+        (lane["harness"], lane["seed"], lane.get("mode", "inproc"))
+        for case in report.get("cases", [])
+        for lane in case.get("generator", [])
+    }
+
+
 def diff(previous, new, current=None, removed=()):
     """Return what `new` reports that `previous` doesn't, what in `current`, or `new` without it, still needs triage, and the `removed` case keys."""
     before = lanes(previous)
@@ -110,35 +129,54 @@ def diff(previous, new, current=None, removed=()):
     ]
     known = {finding_key(finding) for finding in previous.get("property_findings", [])}
     findings = [finding for finding in new.get("property_findings", []) if finding_key(finding) not in known]
+    blocked = {baseline_failure_key(failure) for failure in previous.get("generator_baseline_failures", [])}
+    baseline_failures = [
+        failure for failure in new.get("generator_baseline_failures", [])
+        if baseline_failure_key(failure) not in blocked
+    ]
     return {
         "previous_pinned": previous.get("pinned"),
         "pinned": new.get("pinned"),
         "newly_surviving": surviving,
         "newly_failing_baselines": failing,
         "new_property_findings": findings,
+        "new_generator_baseline_failures": baseline_failures,
         "untriaged": untriaged(new if current is None else current),
         "removed_cases": [list(key) for key in removed],
     }
 
 
 def has_news(changes):
-    return any(changes[key] for key in ("newly_surviving", "newly_failing_baselines", "new_property_findings"))
+    news = ("newly_surviving", "newly_failing_baselines", "new_property_findings", "new_generator_baseline_failures")
+    return any(changes[key] for key in news)
 
 
 def merge(cumulative, new):
-    """Return `cumulative` with `new`'s cases in place of their earlier results, and every property finding of both.
+    """Return `cumulative` with `new`'s cases and generator baselines in place of their earlier results, and every property finding of both.
 
     A `--changed-since` report holds only the cases it reran, so a case
-    missing from `new` keeps its last result.
+    missing from `new` keeps its last result. Likewise a generator search
+    `new` didn't run keeps its baseline failure, and one it ran keeps only
+    `new`'s.
     """
     cases = {case_key(case): case for case in cumulative.get("cases", [])}
     cases.update((case_key(case), case) for case in new.get("cases", []))
     findings = {finding_key(finding): finding for finding in cumulative.get("property_findings", [])}
     findings.update((finding_key(finding), finding) for finding in new.get("property_findings", []))
+    searched = searched_pairs(new)
+    failures = {
+        baseline_failure_key(failure): failure
+        for failure in cumulative.get("generator_baseline_failures", [])
+        if baseline_failure_key(failure) not in searched
+    }
+    failures.update(
+        (baseline_failure_key(failure), failure) for failure in new.get("generator_baseline_failures", [])
+    )
     return {
         "pinned": new.get("pinned"),
         "cases": [cases[key] for key in sorted(cases, key=repr)],
         "property_findings": [findings[key] for key in sorted(findings, key=repr)],
+        "generator_baseline_failures": [failures[key] for key in sorted(failures, key=repr)],
     }
 
 

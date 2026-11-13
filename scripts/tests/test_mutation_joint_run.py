@@ -34,6 +34,13 @@ def finding(seed, prop, detail="stopped", mode="inproc"):
     return {"harness": "discovery/wire", "seed": seed, "mode": mode, "property": prop, "detail": detail}
 
 
+def baseline_failure(seed, reason="timeout", mode="inproc"):
+    return {
+        "harness": "block-sync/storage", "seed": seed, "mode": mode,
+        "result": {"class": "harness-failure", "reason": reason}, "log": f"baseline/{seed}",
+    }
+
+
 class DiffTests(unittest.TestCase):
     def test_only_changes_toward_survival_or_failure_are_listed(self):
         previous = {
@@ -100,6 +107,20 @@ class DiffTests(unittest.TestCase):
         ]}
         found = joint.diff(previous, new)["new_property_findings"]
         self.assertEqual([entry["mode"] for entry in found], ["libfuzzer"])
+
+    def test_a_new_generator_baseline_failure_is_news(self):
+        previous = {"cases": [], "generator_baseline_failures": [baseline_failure(11)]}
+        new = {"cases": [], "generator_baseline_failures": [
+            baseline_failure(11, "oom"), baseline_failure(23), baseline_failure(11, mode="libfuzzer"),
+        ]}
+        changes = joint.diff(previous, new)
+        self.assertEqual(
+            [(entry["seed"], entry["mode"]) for entry in changes["new_generator_baseline_failures"]],
+            [(23, "inproc"), (11, "libfuzzer")],
+            "seed 11's inproc search was already blocked",
+        )
+        self.assertTrue(joint.has_news(changes))
+        self.assertFalse(joint.has_news(joint.diff(previous, previous)))
 
     def test_the_loop_runs_on_what_changed_since_the_previous_pin(self):
         command = joint.loop_command({"pinned": "a" * 40}, Path("out"), 500, ["--jobs", "8"])
@@ -312,6 +333,24 @@ class CumulativeTests(unittest.TestCase):
             self.assertEqual(status, 1)
             merged = json.loads((Path(state) / "cumulative.json").read_text())
             self.assertEqual(len(merged["cases"]), 1)
+
+    def test_a_blocked_generator_search_fails_the_unit_until_it_clears(self):
+        blocked = {"cases": [case("one.patch", "killed-by-named-rule", [(11, "baseline-fails")])],
+                   "generator_baseline_failures": [baseline_failure(11)]}
+        cleared = {"cases": [case("one.patch", "killed-by-named-rule", [(11, "killed-by-named-rule")])]}
+        other = {"cases": [case("two.patch", "killed-by-named-rule")]}
+        with tempfile.TemporaryDirectory() as state:
+            cumulative = Path(state) / "cumulative.json"
+            self.assertEqual(self.routine(state, {"loop": blocked}), 1)
+            # A run that didn't search seed 11 keeps its failure, so it's no
+            # news again.
+            self.assertEqual(self.routine(state, {"loop": other}), 0)
+            self.assertEqual(len(json.loads(cumulative.read_text())["generator_baseline_failures"]), 1)
+            # A run whose search of seed 11 ended clean clears it, so a new
+            # failure there is news again.
+            self.assertEqual(self.routine(state, {"loop": cleared}), 0)
+            self.assertEqual(json.loads(cumulative.read_text())["generator_baseline_failures"], [])
+            self.assertEqual(self.routine(state, {"loop": blocked}), 1)
 
     def test_merge_keeps_every_property_finding(self):
         merged = joint.merge(

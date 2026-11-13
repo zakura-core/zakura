@@ -65,8 +65,8 @@ cumulative one.
 
 `python3 scripts/mutation_joint_run.py run --previous <report.json> --out
 <dir>` runs the loop with generator lanes on the cases changed since the
-previous report's pin, and lists new survivors, new baseline failures and
-new property findings. `diff <old> <new>` lists them for two reports.
+previous report's pin, and lists new survivors, new baseline failures, new
+property findings and new generator baseline failures. `diff <old> <new>` lists them for two reports.
 
 Run `python3 scripts/mutation_inventory.py --output "${TMPDIR:-/tmp}/mutations.json"`
 from the repository root to check patch application and binding metadata.

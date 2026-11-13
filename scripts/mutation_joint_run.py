@@ -21,15 +21,22 @@ The new report holds only the cases a change since the previous pin
 affects, so a case missing from it is unchanged, not fixed. The loop runs
 only on the remote host.
 
-`routine` is the droplet timer's run (mutation plan, mut-4.6). It pins the
-checkout to `origin/main`, runs the full planted sim suite, runs the loop
-with generator lanes on what changed since the last pin (every case on its
-first run), and optionally runs the libFuzzer lane on the same cases. A
-`--changed-since` report holds only the cases it reran, so the routine
-diffs each new report against a cumulative one, `<state>/cumulative.json`
-(`cumulative-libfuzzer.json` for the libFuzzer lane): every case's latest
-result and every property finding so far. It then merges the new report
-into it. Each run writes under `<state>/runs/<UTC time>-<commit>/`, and
+`routine` is the droplet timer's run (mutation plan, mut-4.6 and run-2 to
+run-4). It pins the checkout to `origin/main`, writes the frozen suite
+manifest with `cargo xtask sim-suite --frozen`, runs the full planted sim
+suite, runs the loop with generator lanes on what changed since the last pin
+(every case on its first run), and optionally runs the libFuzzer lane on the
+same cases. A `--changed-since` report holds only the cases it reran, so the
+routine diffs each new report against a cumulative one,
+`<state>/cumulative.json` (`cumulative-libfuzzer.json` for the libFuzzer
+lane): every case's latest result and every property finding so far. It then
+merges the new report into it, and writes every diff to `findings.json`.
+With `--suite-fuzz` or `--fuzz-seconds`, it then fuzzes each manifest target
+in its own campaign store under `<state>/campaigns/`, and triages the
+campaigns' failure inputs into `<state>/archive/`, with
+`scripts/suite_fuzz_run.py`. Last, it writes `completeness.json`: which
+manifest rows it ran, which it didn't and why, and which are unimplemented.
+Each run writes under `<state>/runs/<UTC time>-<commit>/`, and
 `<state>/latest.json` names the last pin. `--dry-run` prints the steps
 without running any.
 """
@@ -47,6 +54,9 @@ REPORT_FILE = "report.json"
 LATEST_FILE = "latest.json"
 CUMULATIVE_FILES = {"loop": "cumulative.json", "libfuzzer": "cumulative-libfuzzer.json"}
 ROUTINE_FILE = "routine.json"
+FINDINGS_FILE = "findings.json"
+SUITE_MANIFEST_FILE = "suite-manifest.json"
+SUITE_FUZZ_SCRIPT = Path(__file__).resolve().parent / "suite_fuzz_run.py"
 NEEDS_TRIAGE = ("survived", "killed-by-other-rule")
 SIM_RUSTFLAGS = "--cfg zakura_sim"
 
@@ -172,12 +182,21 @@ def read_latest(state):
     return json.loads(path.read_text()) if path.exists() else None
 
 
-def routine_steps(checkout, run_dir, latest, args):
-    """Return the routine's steps after the checkout is pinned, as {name, argv, env, cwd} dicts."""
+def routine_steps(checkout, state, run_dir, latest, args):
+    """Return the routine's steps after the checkout is pinned, as {name, argv, env, cwd} dicts.
+
+    The diffs and `completeness_step` follow them.
+    """
     checkout = str(checkout)
     previous = {"pinned": latest["pinned"]} if latest else None
     sim_env = {"RUSTFLAGS": SIM_RUSTFLAGS}
+    manifest = Path(run_dir) / SUITE_MANIFEST_FILE
     steps = [{
+        "name": "suite-manifest",
+        "argv": ["cargo", "xtask", "sim-suite", "--out", str(manifest), "--frozen"],
+        "env": {},
+        "cwd": checkout,
+    }, {
         "name": "suite",
         "argv": ["cargo", "test", "-p", "zakura-sim", "--profile", "planted", "--locked", "--no-fail-fast"],
         "env": sim_env,
@@ -201,7 +220,44 @@ def routine_steps(checkout, run_dir, latest, args):
             "env": {},
             "cwd": checkout,
         })
+    # The suite fuzz is opt-in. Its archive step reads what it ran.
+    if args.suite_fuzz or args.fuzz_seconds:
+        budget = ["--seconds", str(args.fuzz_seconds)] if args.fuzz_seconds else []
+        steps.append({
+            "name": "suite-fuzz",
+            "argv": [sys.executable, str(SUITE_FUZZ_SCRIPT), "run", "--manifest", str(manifest),
+                     "--checkout", checkout, "--state", str(state), "--out", str(run_dir), *budget,
+                     "--workers", str(args.fuzz_workers), "--jobs", str(args.fuzz_jobs)],
+            "env": {},
+            "cwd": checkout,
+        })
+        steps.append({
+            "name": "archive",
+            "argv": [sys.executable, str(SUITE_FUZZ_SCRIPT), "archive",
+                     "--suite-fuzz", str(Path(run_dir) / "suite-fuzz.json"), "--checkout", checkout,
+                     "--archive", str(Path(state) / "archive"), "--out", str(run_dir)],
+            "env": {},
+            "cwd": checkout,
+        })
     return steps
+
+
+def completeness_step(checkout, run_dir, steps):
+    """Return the step that writes `completeness.json` from what `steps` wrote and `routine.json` records."""
+    run_dir = Path(run_dir)
+    names = {step["name"] for step in steps}
+    inputs = ["--routine", str(run_dir / ROUTINE_FILE)]
+    if "suite-fuzz" in names:
+        inputs += ["--suite-fuzz", str(run_dir / "suite-fuzz.json")]
+    if "loop" in names:
+        inputs += ["--loop-report", str(run_dir / "loop" / REPORT_FILE)]
+    return {
+        "name": "completeness",
+        "argv": [sys.executable, str(SUITE_FUZZ_SCRIPT), "completeness",
+                 "--manifest", str(run_dir / SUITE_MANIFEST_FILE), *inputs, "--out", str(run_dir)],
+        "env": {},
+        "cwd": str(checkout),
+    }
 
 
 def pin(checkout):
@@ -229,7 +285,8 @@ def routine(args):
     latest = read_latest(state)
     if args.dry_run:
         run_dir = state / "runs" / "<UTC time>-<commit>"
-        steps = routine_steps(checkout, run_dir, latest, args)
+        steps = routine_steps(checkout, state, run_dir, latest, args)
+        steps.append(completeness_step(checkout, run_dir, steps))
         sys.stdout.write(json.dumps({"latest": latest, "pin": "origin/main", "steps": steps}, indent=2) + "\n")
         return 0
     pinned = pin(checkout)
@@ -237,27 +294,32 @@ def routine(args):
     run_dir = state / "runs" / f"{stamp}-{pinned[:12]}"
     run_dir.mkdir(parents=True)
     ended = {}
-    for step in routine_steps(checkout, run_dir, latest, args):
+    steps = routine_steps(checkout, state, run_dir, latest, args)
+    for step in steps:
         ended[step["name"]] = run_step(step, run_dir)
     record = {"pinned": pinned, "previous": latest, "steps": ended, "news": {}}
-    status = 0 if all(code == 0 for code in ended.values()) else 1
+    findings = {}
     for lane, cumulative_file in CUMULATIVE_FILES.items():
         report = run_dir / lane / REPORT_FILE
         if not report.exists():
             continue
         cumulative_path = state / cumulative_file
         cumulative = read_json(cumulative_path)
-        changes = write_diff(cumulative, report)
-        record["news"][lane] = has_news(changes)
-        status = status or int(record["news"][lane])
+        findings[lane] = write_diff(cumulative, report)
+        record["news"][lane] = has_news(findings[lane])
         merged = merge(cumulative, json.loads(report.read_text()))
         cumulative_path.write_text(json.dumps(merged, indent=2) + "\n")
+    (run_dir / FINDINGS_FILE).write_text(json.dumps(findings, indent=2) + "\n")
     if ended.get("loop") == 0 or (run_dir / "loop" / REPORT_FILE).exists():
         (state / LATEST_FILE).write_text(json.dumps({"pinned": pinned, "run": str(run_dir)}, indent=2) + "\n")
     else:
         print(f"the loop failed without a report; {LATEST_FILE} stays")
+    # The completeness step reads the steps that ran from routine.json.
     (run_dir / ROUTINE_FILE).write_text(json.dumps(record, indent=2) + "\n")
-    return status
+    ended["completeness"] = run_step(completeness_step(checkout, run_dir, steps), run_dir)
+    (run_dir / ROUTINE_FILE).write_text(json.dumps(record, indent=2) + "\n")
+    failed = any(code != 0 for code in ended.values())
+    return 1 if failed or any(record["news"].values()) else 0
 
 
 def main(argv=None):
@@ -279,6 +341,12 @@ def main(argv=None):
                        help="a harness's own inproc runs, repeatable")
     timer.add_argument("--libfuzzer-seconds", type=int, default=0,
                        help="also run the libFuzzer lane on changed cases for this long per seed; 0 turns it off")
+    timer.add_argument("--suite-fuzz", action="store_true",
+                       help="also fuzz each suite manifest target for its suite budget, then archive its failures")
+    timer.add_argument("--fuzz-seconds", type=int, default=0,
+                       help="fuzz each target for this long per worker instead; nonzero also turns the suite fuzz on")
+    timer.add_argument("--fuzz-workers", type=int, default=1, help="each suite-fuzz campaign run's workers")
+    timer.add_argument("--fuzz-jobs", type=int, default=1, help="how many suite-fuzz campaigns run at once")
     timer.add_argument("--dry-run", action="store_true", help="print the steps without running any")
     timer.add_argument("loop_args", nargs=argparse.REMAINDER, help="more `planted loop` flags, after `--`")
     args = parser.parse_args(argv)

@@ -2835,16 +2835,22 @@ pub(crate) fn admit_tabled_message(
 }
 
 impl InboundMessageAdmission {
+    /// The error an ordered stream's worker closes with for this result, or
+    /// `None` if it admits the frame.
+    pub(crate) fn ordered_error(self) -> Option<ZakuraHandlerError> {
+        match self {
+            InboundMessageAdmission::Admit => None,
+            InboundMessageAdmission::Oversize => Some(ZakuraHandlerError::Oversize),
+            InboundMessageAdmission::Throttled => Some(ZakuraHandlerError::RateLimited),
+        }
+    }
+
     /// The close cause the ordered stream reader records for this result,
     /// or `None` if it admits the frame.
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn ordered_close_cause(self) -> Option<&'static str> {
-        let error = match self {
-            InboundMessageAdmission::Admit => return None,
-            InboundMessageAdmission::Oversize => ZakuraHandlerError::Oversize,
-            InboundMessageAdmission::Throttled => ZakuraHandlerError::RateLimited,
-        };
-        Some(read_close_cause(ReadPath::Ordered, &error))
+        self.ordered_error()
+            .map(|error| read_close_cause(ReadPath::Ordered, &error))
     }
 }
 
@@ -5801,8 +5807,10 @@ async fn persistent_stream_worker_with_policy(
                     // While the reader waited for raw capacity, the peer kept
                     // sending into transport buffers, as during a queue wait below.
                     reader_context.credit_read_pause(admitted.grant.waited());
-                    match admit_inbound_message(&admitted.frame, &reader_context, stream_kind) {
-                        InboundMessageAdmission::Admit => {
+                    match admit_inbound_message(&admitted.frame, &reader_context, stream_kind)
+                        .ordered_error()
+                    {
+                        None => {
                             #[cfg(any(test, zakura_sim))]
                             if let Some(tap) = reader_context.precheck.tap() {
                                 tap.queue_tag();
@@ -5837,8 +5845,7 @@ async fn persistent_stream_worker_with_policy(
                             .set(queue_depth_limit.saturating_sub(inbound_tx.capacity()) as f64);
                             continue;
                         }
-                        InboundMessageAdmission::Oversize => ZakuraHandlerError::Oversize,
-                        InboundMessageAdmission::Throttled => ZakuraHandlerError::RateLimited,
+                        Some(error) => error,
                     }
                 }
                 Err(error) => {

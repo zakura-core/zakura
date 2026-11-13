@@ -121,7 +121,10 @@ impl Quantity {
 /// `receiver-work-authorized`: work the node admits from a frame of `row`
 /// must come from a frame of `row` with the work's exchange key that the
 /// peer's models labelled `Conformant` and the node's reader judged, on a
-/// connection still open. The work from each frame stays within that
+/// connection still open. After a close, only the frame the node was
+/// handling then, the newest it judged on that stream, may still finish:
+/// another task decides the close, so the receiver can't make it atomic
+/// with that frame's handoff. The work from each frame stays within that
 /// frame's bytes: one frame's unused bytes never cover another's work.
 pub(crate) fn work_authorized(entries: &[Entry], at: usize, row: &RowAt) -> Found {
     let Observation::WorkAdmitted {
@@ -139,11 +142,13 @@ pub(crate) fn work_authorized(entries: &[Entry], at: usize, row: &RowAt) -> Foun
     }
     let before = &entries[..at];
     let what = format!("connection {connection}'s work from {row} frame {seq}");
-    if closed(before, *connection) {
-        return Some(Err(Failure::new(
-            format!("{what} stops when the connection closes"),
-            "the node admitted it after the close",
-        )));
+    if let Some(close) = close_at(before, *connection) {
+        if newest_judged(&before[..close], *connection, row) != Some(*seq) {
+            return Some(Err(Failure::new(
+                format!("{what} stops when the connection closes"),
+                "the node admitted it after the close",
+            )));
+        }
     }
     let delivered = match source_frame(before, *connection, row, *seq) {
         Some(Source {
@@ -450,8 +455,27 @@ pub(crate) fn within_response_quantity(entries: &[Entry], at: usize, row: &RowAt
 
 /// True if `entries` hold a close of `connection`.
 fn closed(entries: &[Entry], connection: u64) -> bool {
-    entries.iter().any(|entry| {
+    close_at(entries, connection).is_some()
+}
+
+/// The index of `connection`'s close in `entries`, if it closed.
+fn close_at(entries: &[Entry], connection: u64) -> Option<usize> {
+    entries.iter().position(|entry| {
         matches!(entry.obs, Observation::ConnectionClosed { connection: c, .. } if c == connection)
+    })
+}
+
+/// The newest frame of `row`'s stream that the node judged on `connection`
+/// in `entries`.
+fn newest_judged(entries: &[Entry], connection: u64, row: &RowAt) -> Option<u64> {
+    entries.iter().rev().find_map(|entry| match &entry.obs {
+        Observation::FrameJudged {
+            connection: c,
+            stream,
+            seq,
+            ..
+        } if *c == connection && *stream == row.stream => Some(*seq),
+        _ => None,
     })
 }
 

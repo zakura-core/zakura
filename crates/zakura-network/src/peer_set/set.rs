@@ -1101,7 +1101,7 @@ where
         svc: &D::Service,
     ) -> PeerTraceContext {
         PeerTraceContext {
-            peer_id: svc.trace_id(),
+            connection_id: svc.connection_id(),
             peer,
             peer_start_height: svc.remote_start_height(),
             local_tip_height: self.minimum_peer_version.chain_tip().best_tip_height(),

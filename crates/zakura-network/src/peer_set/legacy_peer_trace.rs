@@ -4,7 +4,8 @@
 //! downloads across the peer set. A download routed to `maybe` has no exact inventory claim from
 //! that peer; `advertised` means the selected peer recently sent an `inv` for that exact hash.
 //! `peer_start_height` is the peer's untrusted, point-in-time handshake claim and is not used as an
-//! inventory guarantee. Process-local `peer_id` values correlate events without recording peer IPs.
+//! inventory guarantee. A connection's process-local
+//! `connection_id` is the same number its `legacy_gossip` rows carry, so the two tables join.
 
 use std::{
     path::PathBuf,
@@ -37,7 +38,7 @@ pub(super) struct LegacyPeerTrace {
 
 #[derive(Copy, Clone, Debug)]
 pub(super) struct PeerTraceContext {
-    pub(super) peer_id: u64,
+    pub(super) connection_id: u64,
     pub(super) peer: PeerSocketAddr,
     pub(super) peer_start_height: Height,
     pub(super) local_tip_height: Option<Height>,
@@ -49,7 +50,7 @@ enum LegacyPeerEvent<'a> {
     #[serde(rename = "find_blocks_finish")]
     FindBlocksFinish {
         request_id: u64,
-        peer_id: u64,
+        connection_id: u64,
         peer: JsonlDisplay<'a, PeerSocketAddr>,
         peer_start_height: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,7 +66,7 @@ enum LegacyPeerEvent<'a> {
     #[serde(rename = "block_request_finish")]
     BlockRequestFinish {
         request_id: u64,
-        peer_id: u64,
+        connection_id: u64,
         peer: JsonlDisplay<'a, PeerSocketAddr>,
         peer_start_height: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,7 +180,7 @@ impl LegacyPeerTrace {
 
             LegacyPeerEvent::FindBlocksFinish {
                 request_id,
-                peer_id: peer.peer_id,
+                connection_id: peer.connection_id,
                 peer: JsonlDisplay(&peer.peer),
                 peer_start_height: peer.peer_start_height.0,
                 local_tip_height: peer.local_tip_height.map(|height| height.0),
@@ -240,7 +241,7 @@ impl LegacyPeerTrace {
 
             LegacyPeerEvent::BlockRequestFinish {
                 request_id,
-                peer_id: peer.peer_id,
+                connection_id: peer.connection_id,
                 peer: JsonlDisplay(&peer.peer),
                 peer_start_height: peer.peer_start_height.0,
                 local_tip_height: peer.local_tip_height.map(|height| height.0),
@@ -316,7 +317,7 @@ mod tests {
             next_request_id: Arc::new(AtomicU64::new(1)),
         };
         let peer = PeerTraceContext {
-            peer_id: 7,
+            connection_id: 7,
             peer: "127.0.0.1:8233".parse().expect("valid peer address"),
             peer_start_height: Height(100),
             local_tip_height: Some(Height(90)),
@@ -361,7 +362,7 @@ mod tests {
                 "node",
                 "event",
                 "request_id",
-                "peer_id",
+                "connection_id",
                 "peer",
                 "peer_start_height",
                 "local_tip_height",
@@ -380,7 +381,7 @@ mod tests {
                 "node",
                 "event",
                 "request_id",
-                "peer_id",
+                "connection_id",
                 "peer",
                 "peer_start_height",
                 "local_tip_height",
@@ -392,7 +393,7 @@ mod tests {
             ],
         );
         assert_eq!(events[0]["event"], "find_blocks_finish");
-        assert_eq!(events[0]["peer_id"], 7);
+        assert_eq!(events[0]["connection_id"], 7);
         assert_eq!(events[0]["peer_start_height"], 100);
         assert_eq!(events[0]["hash_count"], 2);
         assert_eq!(events[0]["inferred_start_height"], 91);
@@ -412,7 +413,7 @@ mod tests {
             next_request_id: Arc::new(AtomicU64::new(1)),
         };
         let peer = PeerTraceContext {
-            peer_id: 7,
+            connection_id: 7,
             peer: "127.0.0.1:8233".parse().expect("valid peer address"),
             peer_start_height: Height(100),
             local_tip_height: Some(Height(90)),

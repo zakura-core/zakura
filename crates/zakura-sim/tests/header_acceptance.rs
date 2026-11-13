@@ -7213,12 +7213,6 @@ const NON_ARTIFACT_READS: &[(&str, &str, &str)] = &[
         "native_dirs",
         "the committed native-mutation tree at S",
     ),
-    (
-        "companions.rs",
-        "judge_trace",
-        "the companions judge, run by the case's own build on the Draft run it's handed: it \
-         writes `companions.json`, which the reader binds (`binding::COMPANIONS`)",
-    ),
 ];
 
 /// Every read in the Rust source `text` outside test code, as the name of

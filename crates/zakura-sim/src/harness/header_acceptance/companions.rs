@@ -573,13 +573,14 @@ pub fn run_draft(input: &[u8]) -> Result<DraftEvidence, String> {
 /// with `commit-only-authorized` as its whole `Draft` override. It's rerun
 /// here following the trace's own picks and draws ([`binding::TRACE_META`]),
 /// and the rerun's full report, every violation and the stores' snapshot,
-/// must equal the one
-/// recorded beside the trace, so what's judged is that run. So this must
+/// must equal the one recorded beside the trace, which must report that
+/// trace by its recording build ([`binding::FULL_REPORT`]), so what's
+/// judged is that run. So this must
 /// run in the build that recorded the trace, the case's own patched one,
 /// where a patched behavior replays. An error says why there's no verdict.
 pub fn judge_trace(dir: &std::path::Path) -> Result<Verdicts, String> {
     use crate::harness::{header_sync::HeaderWire, Subsystem};
-    let trace = crate::trace::TraceReader::open(dir).map_err(|error| error.to_string())?;
+    let trace = binding::open_trace(dir)?;
     let expect = Expect::new()
         .with(Field::Harness, HeaderWire::NAME)
         .with(Field::Draft, [COMMIT]);
@@ -590,12 +591,20 @@ pub fn judge_trace(dir: &std::path::Path) -> Result<Verdicts, String> {
     // Bound as `record` bound the recorded one, so it's equal only to a
     // report of this trace by this build.
     let rerun = rerun.map(|report| report.of_trace(&trace.id));
-    let recorded = std::fs::read_to_string(dir.join(crate::record::FULL_REPORT_FILE))
-        .map_err(|error| format!("its full report: {error}"))
-        .and_then(|text| {
-            serde_json::from_str::<crate::record::FullReport>(&text)
-                .map_err(|error| format!("its full report: {error}"))
-        })?;
+    let reported = Expect::new()
+        .with(Field::Trace, &trace.id)
+        .with(Field::Source, &trace.meta.build.source);
+    let recorded = binding::read_bounded(
+        &binding::FULL_REPORT,
+        &dir.join(crate::record::FULL_REPORT_FILE),
+        crate::trace::MAX_REPORT_BYTES,
+        &reported,
+    )
+    .and_then(|report| {
+        serde_json::from_value::<crate::record::FullReport>(report)
+            .map_err(|error| format!("its full report: {error}"))
+    })
+    .map_err(|why| format!("its full report: {why}"))?;
     if rerun.as_ref() != Some(&recorded) {
         return Err("the rerun's full report isn't the recorded one".to_owned());
     }
@@ -842,6 +851,38 @@ mod tests {
         )
         .expect("the run records");
         assert!(judge_trace(plain.path()).is_err());
+    }
+
+    /// The trace judge reads the recorded full report only as a report of
+    /// that trace by the build that recorded it ([`binding::FULL_REPORT`]):
+    /// a trace whose meta names another build, beside a report renamed to
+    /// that trace, which the rerun by this build would equal, is refused.
+    #[test]
+    fn the_trace_judge_binds_the_recorded_report() {
+        let dir = draft_recording();
+        assert!(judge_trace(dir.path()).is_ok());
+        let path = dir.path().join("trace.jsonl");
+        let text = std::fs::read_to_string(&path).expect("the trace is readable");
+        let (first, rest) = text.split_once('\n').expect("the trace has lines");
+        let mut meta: Value = serde_json::from_str(first).expect("its meta is JSON");
+        meta["meta"]["build"]["source"] = json!("another build");
+        std::fs::write(&path, format!("{meta}\n{rest}")).expect("the temp dir is writable");
+        let id = crate::trace::TraceReader::open(dir.path())
+            .expect("the trace reads")
+            .id;
+        let report = dir.path().join(crate::record::FULL_REPORT_FILE);
+        let mut renamed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&report).expect("it exists"))
+                .expect("it reads");
+        renamed["trace"] = json!(id);
+        std::fs::write(&report, renamed.to_string()).expect("the temp dir is writable");
+        let refused = judge_trace(dir.path());
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains("was built from")),
+            "{refused:?}"
+        );
     }
 
     /// The fault-close companion joins the rejected frame and its content

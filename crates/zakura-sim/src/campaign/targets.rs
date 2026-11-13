@@ -20,8 +20,7 @@
 //! The checker runs no seed itself. libFuzzer's `-rss_limit_mb` reads the
 //! process's peak resident size, and Linux carries a process's peak across
 //! `exec`, so a target spawned from a checker that grew past the limit
-//! fails its first input out of memory. The seed-coverage test in
-//! `tests/targets.rs` runs each seed in a test process instead.
+//! fails its first input out of memory.
 //!
 //! Each target gets one [`TargetStatus`], and each status means one thing.
 //! A target is ready only if every step passed and at least one of its
@@ -56,7 +55,7 @@ use super::{
 use crate::{
     explore::{
         stats::{Counts, ProcessStats, STATS_VAR},
-        ProcessExit, ProcessFailure, Worker, ABANDON_LIMIT_VAR, EXPECT_VAR,
+        ProcessExit, ProcessFailure, ABANDON_LIMIT_VAR, EXPECT_VAR,
     },
     harness::{HarnessEntry, HARNESSES, NO_TASK_PANIC},
     planted::{self, PLANTED_DIR},
@@ -276,33 +275,6 @@ pub fn resolve(manifest: &str, target: &str) -> Result<&'static HarnessEntry, St
         .iter()
         .find(|entry| entry.name == name)
         .ok_or_else(|| format!("`{target}` maps to `{name}`, which no harness registers"))
-}
-
-/// Runs `input` on `entry`'s harness on `worker`, and returns what the
-/// explorer did with it and the properties whose evaluation applied. The
-/// seed-coverage test runs each seed this way.
-pub fn run_seed(
-    worker: &mut Worker,
-    entry: &'static HarnessEntry,
-    input: &[u8],
-) -> (String, Vec<String>) {
-    worker.explore(entry, input, move |_, run, classified| {
-        let mut counts = Counts::for_harness(entry);
-        counts.record(run, classified, &[]);
-        let outcome = counts
-            .outcomes
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "none".to_owned());
-        let applied = counts
-            .properties
-            .into_iter()
-            .filter(|(_, counts)| counts.applied())
-            .map(|(id, _)| id)
-            .collect();
-        (outcome, applied)
-    })
 }
 
 /// The harness's own properties, other than [`SHARED_PROPERTIES`], split
@@ -534,16 +506,25 @@ pub fn check_targets(
             )));
         }
     }
+    let selected: Vec<&DeclaredTarget> = declared
+        .iter()
+        .filter(|target| {
+            (options.targets.is_empty() || options.targets.contains(&target.name))
+                && !options.skip.contains(&target.name)
+        })
+        .collect();
+    if selected.is_empty() {
+        return Err(CampaignError::Refused(
+            "the --target and --skip names leave no target to check".to_owned(),
+        ));
+    }
     let mut report = Readiness {
         version: READINESS_VERSION,
         sanitizer: options.sanitizer.clone(),
         targets: Vec::new(),
         missing_targets: suite.missing_target.clone(),
     };
-    for target in declared.iter().filter(|target| {
-        (options.targets.is_empty() || options.targets.contains(&target.name))
-            && !options.skip.contains(&target.name)
-    }) {
+    for target in selected {
         let row = check_target(options, &manifest, target)?;
         checked(&row);
         report.targets.push(row);

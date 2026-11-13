@@ -17,13 +17,13 @@ use std::{
 use zakura_sim::{
     campaign::{
         applied_properties, bypasses, declared_targets, judge_run, max_len, own_applicability,
-        resolve, run_seed, TargetStatus, FUZZ_PACKAGE, SHARED_PROPERTIES,
+        resolve, TargetStatus, FUZZ_PACKAGE, SHARED_PROPERTIES,
     },
     explore::{
         stats::{Counts, ProcessStats, STATS_VERSION},
         ProcessExit, Worker,
     },
-    harness::HARNESSES,
+    harness::{HarnessEntry, HARNESSES},
     seed,
     suite::{SuiteFile, SUITE_FILE},
 };
@@ -31,6 +31,27 @@ use zakura_sim::{
 /// The repository's root.
 fn root() -> PathBuf {
     seed::repo_root()
+}
+
+/// Runs `input` on `entry`'s harness on `worker`, and returns the
+/// explorer's outcome and the properties whose evaluation applied, as the
+/// fuzz target's stats count them.
+fn run_seed(
+    worker: &mut Worker,
+    entry: &'static HarnessEntry,
+    input: &[u8],
+) -> (String, BTreeSet<String>) {
+    worker.explore(entry, input, move |_, run, classified| {
+        let mut counts = Counts::for_harness(entry);
+        counts.record(run, classified, &[]);
+        let outcome = counts
+            .outcomes
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "none".to_owned());
+        (outcome, applied_properties(&counts))
+    })
 }
 
 /// `qa/suite.toml`.
@@ -612,8 +633,9 @@ fn quarantined_seeds_stay_in_the_report() {
     assert_eq!(written, report);
 }
 
-/// `--skip` leaves its targets out of the check and the report, and a
-/// skipped target that the suite doesn't declare is refused.
+/// `--skip` leaves its targets out of the check and the report. A skipped
+/// target that the suite doesn't declare is refused, and so are names that
+/// leave no target to check.
 #[test]
 fn skipped_targets_stay_out_of_the_report() {
     use zakura_sim::campaign::{check_targets, TargetsOptions};
@@ -642,6 +664,15 @@ fn skipped_targets_stay_out_of_the_report() {
         .map(|row| row.target.as_str())
         .collect();
     assert_eq!(rows, ["discovery_wait_complete"]);
+
+    let none_left = TargetsOptions {
+        out: dir.path().join("out-none"),
+        targets: vec!["discovery_wait_complete".to_owned()],
+        skip: vec!["discovery_wait_complete".to_owned()],
+        ..options.clone()
+    };
+    let error = check_targets(&none_left, |_| {}).unwrap_err().to_string();
+    assert!(error.contains("no target to check"), "{error}");
 
     let unknown = TargetsOptions {
         out: dir.path().join("out-unknown"),

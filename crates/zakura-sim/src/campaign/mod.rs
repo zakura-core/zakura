@@ -89,8 +89,8 @@ pub use snapshot::{Snapshot, SnapshotEntry, SnapshotIndex, Source};
 pub use store::{CampaignError, Digest, RunState, Store, STORE_VERSION};
 pub use targets::{
     applied_properties, bypasses, check_targets, declared_targets, judge_run, max_len,
-    own_applicability, resolve, run_seed, smoke_command, BypassCase, DeclaredTarget, Readiness,
-    SeedFile, TargetReadiness, TargetStatus, TargetsOptions, READINESS_FILE, READINESS_VERSION,
+    own_applicability, resolve, smoke_command, BypassCase, DeclaredTarget, Readiness, SeedFile,
+    TargetReadiness, TargetStatus, TargetsOptions, READINESS_FILE, READINESS_VERSION,
     SHARED_PROPERTIES,
 };
 pub use verify::{verify, Verified};

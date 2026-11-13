@@ -10,9 +10,11 @@ Four steps, each safe to repeat:
 
     fleet.py ensure-trace-config --config nodes.toml [--node NAME]
         Install the profiler and verify trace retention before adding `trace_dir`
-        under `[network.zakura]` in a node config that has none. Nothing else in the
-        file changes, and the node is not restarted: the setting takes effect the
-        next time it starts. An existing trace directory is preserved.
+        under `[network.zakura]` in a node config that has none, and
+        `expose_peer_addresses = true` under `[network]` when the config does not set
+        it, so those files say which peer served each block. Nothing else in the file
+        changes, and the node is not restarted: the settings take effect the next
+        time it starts. An existing trace directory is preserved.
 
     fleet.py peer-names --config nodes.toml [--node NAME]
         Tell the node the names of the other nodes in the list, by address, so its
@@ -38,6 +40,7 @@ import copy
 import hashlib
 import io
 import ipaddress
+import json
 import os
 import re
 import shlex
@@ -65,7 +68,6 @@ TRACE_TABLE_CAP_MB = 200
 # The node reads the names of its fleet peers from this variable, as `name=ip,name=ip`.
 PEER_NAMES_VARIABLE = "ZAKURA_TRACE_PEER_NAMES"
 PEER_NAMES_DROP_IN = "trace-peer-names.conf"
-ZAKURA_SECTION = re.compile(r"^\s*\[network\.zakura\]\s*(#.*)?$")
 # `systemctl show -p ExecStart` prints the command line as `argv[]=... ;`.
 CONFIG_ARGUMENT = re.compile(r"argv\[\]=[^;]*?\s(?:-c|--config)[ =](\S+)")
 SSH_OPTIONS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-o", "StrictHostKeyChecking=yes")
@@ -142,24 +144,31 @@ def trace_dir_of(config_text):
     return zakura.get("trace_dir") if isinstance(zakura, dict) else None
 
 
-def with_trace_dir(config_text, trace_dir=TRACE_DIR):
-    """`config_text` with `trace_dir` added under `[network.zakura]`.
+def with_setting(config_text, section, key, value):
+    """`config_text` with `key = value` added under the table named by `section`.
 
-    A config that already sets `trace_dir` is returned as it is, whatever its value.
-    Otherwise one line is added below the section's heading, or the section is added
-    at the end of the file. Every other byte stays, and the result is parsed to
-    confirm that the new setting is the only difference; a layout this cannot edit
-    safely (the section written as an inline table, say) raises `FleetError`.
+    `section` is the table's path, such as `("network", "zakura")`. A config that
+    already sets `key` there is returned as it is, whatever its value. Otherwise one
+    line is added below the section's heading, or the section is added at the end of
+    the file. Every other byte stays, and the result is parsed to confirm that the new
+    setting is the only difference; a layout this cannot edit safely (the section
+    written as an inline table, say) raises `FleetError`.
     """
-    if trace_dir_of(config_text) is not None:
+    table = parse_config(config_text)
+    for name in section:
+        table = table.get(name, {}) if isinstance(table, dict) else {}
+    if isinstance(table, dict) and key in table:
         return config_text
-    setting = f'trace_dir = "{trace_dir}"\n'
+    # TOML writes a boolean bare and a string the way JSON does.
+    setting = f"{key} = {json.dumps(value)}\n"
+    heading_text = "[" + ".".join(section) + "]"
+    is_heading = re.compile(r"^\s*" + re.escape(heading_text) + r"\s*(#.*)?$")
     lines = config_text.splitlines(keepends=True)
-    heading = next((i for i, line in enumerate(lines) if ZAKURA_SECTION.match(line)), None)
+    heading = next((i for i, line in enumerate(lines) if is_heading.match(line)), None)
     if heading is None:
         if lines and not lines[-1].endswith("\n"):
             lines[-1] += "\n"
-        lines += ["\n", "[network.zakura]\n", setting]
+        lines += ["\n", heading_text + "\n", setting]
     else:
         if not lines[heading].endswith("\n"):
             lines[heading] += "\n"
@@ -167,14 +176,38 @@ def with_trace_dir(config_text, trace_dir=TRACE_DIR):
     edited = "".join(lines)
 
     expected = copy.deepcopy(parse_config(config_text))
-    expected.setdefault("network", {}).setdefault("zakura", {})["trace_dir"] = trace_dir
+    target = expected
+    for name in section:
+        target = target.setdefault(name, {})
+    target[key] = value
     try:
         after = tomllib.loads(edited)
     except tomllib.TOMLDecodeError as error:
-        raise FleetError(f"adding trace_dir would break the config ({error}); add it by hand") from error
+        raise FleetError(f"adding {key} would break the config ({error}); add it by hand") from error
     if after != expected:
-        raise FleetError("adding trace_dir would change another setting; add it by hand")
+        raise FleetError(f"adding {key} would change another setting; add it by hand")
     return edited
+
+
+def with_trace_dir(config_text, trace_dir=TRACE_DIR):
+    """`config_text` with `trace_dir` under `[network.zakura]`, unless it already names one."""
+    return with_setting(config_text, ("network", "zakura"), "trace_dir", trace_dir)
+
+
+def with_peer_addresses(config_text):
+    """`config_text` with `expose_peer_addresses = true` under `[network]`, unless it sets it.
+
+    With it the node writes its peers' addresses, not `v4redacted`, in its log and in
+    the trace rows of each block download, which is what lets the cluster view say
+    which outside peer served a block. A config that sets it to `false` is left alone.
+    """
+    return with_setting(config_text, ("network",), "expose_peer_addresses", True)
+
+
+def exposes_peer_addresses(config_text):
+    """Whether a node config lets the node write its peers' addresses."""
+    network = parse_config(config_text).get("network", {})
+    return isinstance(network, dict) and network.get("expose_peer_addresses") is True
 
 
 def config_path_from_unit(exec_start):
@@ -357,16 +390,31 @@ def write_node_config(node, path, text):
 
 
 def ensure_trace_config(node):
-    """Start verified retention before enabling new trace writes; never restart the node."""
+    """Start verified retention before enabling new trace writes; never restart the node.
+
+    Also lets the node write its peers' addresses, unless its config says not to.
+    """
     path, text = read_node_config(node)
-    edited = with_trace_dir(text)
-    if edited == text:
+    with_traces = with_trace_dir(text)
+    edited = with_peer_addresses(with_traces)
+    added = [
+        key
+        for key, before, after in (
+            ("trace_dir", text, with_traces),
+            ("expose_peer_addresses", with_traces, edited),
+        )
+        if before != after
+    ]
+    hidden = "" if exposes_peer_addresses(edited) else "; its config keeps peer addresses hidden"
+    if with_traces == text:
         install_profiler(node)
-        return f"already writes trace files to {trace_dir_of(text)}"
-    remote(node, CLAIM_TRACE_SCRIPT, TRACE_DIR)
-    start_profiler(node, TRACE_DIR, manage_traces=True)
+        if edited == text:
+            return f"already writes trace files to {trace_dir_of(text)}{hidden}"
+    else:
+        remote(node, CLAIM_TRACE_SCRIPT, TRACE_DIR)
+        start_profiler(node, TRACE_DIR, manage_traces=True)
     write_node_config(node, path, edited)
-    return f"added trace_dir to {path}; it takes effect when the node next starts"
+    return f"added {' and '.join(added)} to {path}; it takes effect when the node next starts{hidden}"
 
 
 def peer_address(node):

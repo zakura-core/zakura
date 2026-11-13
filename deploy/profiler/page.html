@@ -88,6 +88,16 @@ td.fn { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
 td.fn button { all: unset; cursor: pointer; color: var(--ink); }
 td.fn button:hover { color: var(--pink-hi); }
 .bar { height: 6px; border-radius: 3px; min-width: 2px; }
+#stages text.label { fill: var(--ink-2); font-family: inherit; font-size: 13px; }
+#stages text.value { fill: var(--ink); }
+#stages rect.hit { fill: transparent; }
+#stages rect.hit:hover { fill: var(--pink-soft); }
+#block-table td button { all: unset; cursor: pointer; color: var(--pink-hi); font-family: var(--mono); }
+#block-table td button:hover { text-decoration: underline; }
+#block-table td button:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
+#block-table tr[aria-selected="true"] td { background: var(--pink-soft); }
+.mini { display: flex; height: 8px; min-width: 120px; gap: 1px; }
+.mini i { display: block; height: 100%; min-width: 1px; border-radius: 1px; }
 .tip { position: fixed; pointer-events: none; z-index: 5; max-width: min(560px, 92vw); background: var(--raised); border: 1px solid var(--line-hi); border-radius: var(--r-sm); padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45); }
 .tip .name { font-family: var(--mono); overflow-wrap: anywhere; color: var(--ink); display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden; }
 .tip .row { display: flex; gap: 8px; align-items: center; color: var(--ink-2); }
@@ -147,6 +157,21 @@ ul.notes { margin: 0; padding-left: 18px; display: grid; gap: 4px; color: var(--
     </div>
   </section>
 
+  <section class="panel" aria-labelledby="st-h" id="stages-panel" hidden>
+    <div class="controls">
+      <h2 id="st-h">A block's path through the node</h2>
+      <div class="group" id="paths" role="group" aria-label="How the blocks arrived"></div>
+      <div class="group" role="group" aria-label="Stages to show">
+        <button data-scale="all">Whole path</button>
+        <button data-scale="inside">After the download</button>
+      </div>
+      <button id="stage-median" hidden>Back to the typical block</button>
+    </div>
+    <p class="note" id="st-note"></p>
+    <div class="chart"><svg id="stages" role="img" aria-label="Time a block spends in each stage"></svg></div>
+    <div class="chart"><table id="block-table"></table></div>
+  </section>
+
   <section class="panel" aria-labelledby="top-h">
     <h2 id="top-h">Functions with the most time of their own</h2>
     <p class="note">Time sampled in the function itself, not in what it calls, added up over every place it appears in this view. Click one to see everything under it.</p>
@@ -170,8 +195,17 @@ const el = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const color = cat => `var(--c-${cat})`;
 
-const state = { range: "1h", from: null, to: null, view: "all", lens: "all", focus: "", zoom: [], search: "" };
-let meta = null, status = null, flame = null, timeline = null, selected = null, labels = {};
+const state = { range: "1h", from: null, to: null, view: "all", lens: "all", focus: "", zoom: [], search: "", scale: "all", block: null, path: null };
+let meta = null, status = null, flame = null, timeline = null, selected = null, labels = {}, blockStages = null;
+// The colour of each stage is the colour of the subsystem that does the work.
+const STAGE_CATEGORY = {
+  header_fetch: "arrival", header_check: "arrival", body_request: "arrival", body_download: "arrival", submit: "arrival",
+  verify: "verification", writer_wait: "commit", writer_commit: "commit", status_fanout: "propagation",
+};
+const DOWNLOAD_STAGES = ["header_fetch", "header_check", "body_request", "body_download"];
+const PATH_LABEL = { legacy: "legacy network", zakura: "Zakura block sync", unknown: "not recorded" };
+const PATH_PHRASE = { legacy: "the legacy Zcash network", zakura: "Zakura's own block sync", unknown: "a path the trace did not record" };
+const BLOCK_ROWS = 12;
 
 function readHash() {
   const params = new URLSearchParams(location.hash.slice(1));
@@ -202,8 +236,16 @@ function cpu(us) {
   if (us >= 1e3) return (us / 1e3).toFixed(us >= 1e5 ? 0 : 1) + " ms";
   return Math.round(us) + " µs";
 }
+function ms(value) {
+  if (value == null) return "–";
+  if (value >= 1000) return (value / 1000).toFixed(2) + " s";
+  if (value >= 100) return Math.round(value) + " ms";
+  if (value >= 1) return value.toFixed(value >= 10 ? 1 : 2) + " ms";
+  return Math.round(value * 1000) + " µs";
+}
 const pct = (part, whole) => whole > 0 ? (100 * part / whole).toFixed(part / whole < 0.01 ? 2 : 1) + "%" : "–";
 const cores = value => value >= 1 ? value.toFixed(2) : value.toFixed(3);
+const clockSeconds = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 function clock(t, withDate) {
   const d = new Date(t * 1000);
   const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -290,6 +332,16 @@ document.addEventListener("click", event => {
   else if (button.id === "live") { state.from = state.to = null; reload(); }
   else if (button.id === "focus-fn" && selected) { state.focus = selected.name.slice(0, 300); state.zoom = []; reload(); }
   else if (button.id === "zoom-out") { state.zoom.pop(); selected = null; drawFlame(); }
+  else if (button.dataset.scale) { state.scale = button.dataset.scale; drawStages(); }
+  else if (button.id === "stage-median") { state.block = null; drawStages(); }
+  else if (button.dataset.path) { state.path = button.dataset.path; state.block = null; drawStages(); }
+  else if (button.dataset.block) { state.block = state.block === button.dataset.block ? null : button.dataset.block; drawStages(); }
+  else if (button.dataset.cpu) {
+    // The minute of samples that contains this block, narrowed to the moments around blocks.
+    const when = +button.dataset.cpu;
+    state.from = Math.floor(when - 65); state.to = Math.ceil(when + 1); state.lens = "block"; state.zoom = [];
+    reload().then(() => el("fl-h").scrollIntoView({ behavior: "smooth", block: "start" }));
+  }
   else if (button.dataset.fn !== undefined) { state.focus = flame.top[+button.dataset.fn][0].slice(0, 300); state.zoom = []; reload(); }
 });
 el("search").addEventListener("input", event => { state.search = event.target.value.trim().toLowerCase(); drawFlame(); });
@@ -486,6 +538,91 @@ function renderDetail(node) {
   svg.addEventListener("pointerleave", hideTip);
 })();
 
+// ---- a block's path: wall-clock time per stage, from the node's trace points ----
+function drawStages() {
+  const panel = el("stages-panel"), data = blockStages;
+  panel.hidden = !data;
+  if (!data) return;
+  document.querySelectorAll("[data-scale]").forEach(b => b.setAttribute("aria-pressed", b.dataset.scale === state.scale));
+  const svg = el("stages"), table = el("block-table");
+  const total = data.blocks.length;
+  // Most common arrival path first; the typical block is shown for one path at a time.
+  const paths = Object.keys(data.paths).sort((a, b) => data.paths[b].blocks - data.paths[a].blocks);
+  if (!paths.includes(state.path)) state.path = paths[0];
+  el("paths").innerHTML = paths.length < 2 ? "" : "<span>Arrived over</span>" + paths.map(path =>
+    `<button data-path="${esc(path)}" aria-pressed="${path === state.path}">${esc(PATH_LABEL[path] || path)} (${data.paths[path].blocks})</button>`).join("");
+  if (!total) {
+    svg.innerHTML = ""; svg.setAttribute("height", 0); table.innerHTML = ""; el("stage-median").hidden = true;
+    el("st-note").textContent = "No block has been recorded yet. This needs the node's trace files switched on (trace_dir under [network.zakura] in its config) and fills in with the next block.";
+    return;
+  }
+  const block = data.blocks.find(b => b.hash === state.block) || null;
+  el("stage-median").hidden = !block;
+  const typical = data.paths[block ? block.path : state.path];
+  const value = stage => block ? block.ms[stage] : typical.median_ms[stage];
+  const stages = data.stages.filter(s => value(s.id) != null && (state.scale === "all" || !DOWNLOAD_STAGES.includes(s.id)));
+  const span = stages.reduce((sum, s) => sum + value(s.id), 0) || 1;
+  const W = Math.max(560, svg.parentElement.clientWidth), ROWH = 26, left = 168, right = 236, top = 4, bottom = 22;
+  const H = top + stages.length * ROWH + bottom, plot = W - left - right;
+  let out = "", at = 0;
+  for (const fraction of [0, 0.5, 1]) {
+    const x = left + plot * fraction;
+    out += `<line x1="${x}" x2="${x}" y1="${top}" y2="${H - bottom + 4}" stroke="var(--line)"/><text x="${x}" y="${H - 5}" text-anchor="${fraction ? fraction === 1 ? "end" : "middle" : "start"}">${fraction ? ms(span * fraction) : "0"}</text>`;
+  }
+  stages.forEach((stage, i) => {
+    const v = value(stage.id), y = top + i * ROWH, w = Math.max(2, plot * v / span);
+    const x = Math.min(left + plot * at / span, left + plot - w);
+    const other = block ? `typical ${ms(typical.median_ms[stage.id])}` : `slowest tenth ${ms(typical.p90_ms[stage.id])}`;
+    out += `<text class="label" x="0" y="${y + 17}">${esc(stage.label)}</text>`
+      + `<rect x="${x.toFixed(1)}" y="${y + 5}" width="${w.toFixed(1)}" height="${ROWH - 10}" rx="3" fill="${color(STAGE_CATEGORY[stage.id])}"/>`
+      + `<text class="value" x="${left + plot + 10}" y="${y + 17}">${ms(v)}</text><text x="${left + plot + 82}" y="${y + 17}">${other}</text>`
+      + `<rect class="hit" data-stage="${esc(stage.id)}" x="0" y="${y}" width="${W}" height="${ROWH}"/>`;
+    at += v;
+  });
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", W); svg.setAttribute("height", H);
+  svg.innerHTML = out;
+  const mix = paths.map(path => `${data.paths[path].blocks} over ${PATH_PHRASE[path] || path}`).join(", ");
+  el("st-note").textContent = (block
+    ? `Block ${block.height.toLocaleString()}, which arrived over ${PATH_PHRASE[block.path] || block.path}. `
+    : `Of the last ${total} blocks, ${mix}. Bars are the typical (median) time in each stage for the ${typical.blocks} that arrived over ${PATH_PHRASE[state.path] || state.path}. `)
+    + "This is time on the clock, waiting included, from the node's own trace points; each bar starts where the one above it ends. "
+    + ((block ? block.path : state.path) === "legacy" ? "For a block from the legacy network the record starts when its download finishes, so it has no header stages. " : "")
+    + (block ? "" : "Pick a block below to see its own path.");
+  const rows = data.blocks.slice(-BLOCK_ROWS).reverse();
+  const widest = Math.max(...rows.map(insideMs), 0.001);
+  table.innerHTML = "<tr><th>Block</th><th>Announced</th><th>Came over</th><th>Download</th><th>Verify</th><th>Writer</th><th>Peers told</th><th>After the download</th><th></th></tr>"
+    + rows.map(b => {
+      const writer = b.ms.writer_wait == null ? null : b.ms.writer_wait + b.ms.writer_commit;
+      const told = b.status_peers ? `${b.status_peers} · typical ${ms(b.ms.status_fanout)} · last ${ms(b.status_slowest_ms)}` : "–";
+      const mini = data.stages.filter(s => !DOWNLOAD_STAGES.includes(s.id) && b.ms[s.id] != null)
+        .map(s => `<i style="width:${(100 * b.ms[s.id] / widest).toFixed(2)}%;background:${color(STAGE_CATEGORY[s.id])}"></i>`).join("");
+      return `<tr aria-selected="${b.hash === state.block}"><td><button data-block="${esc(b.hash)}" title="${esc(b.hash)}">${b.height.toLocaleString()}${b.reorg ? " (reorg)" : ""}</button></td>`
+        + `<td class="num">${b.t ? clockSeconds(b.t) : "–"}</td><td>${esc(PATH_LABEL[b.path] || b.path)}</td>`
+        + `<td class="num">${ms(b.ms.body_download)}</td><td class="num">${ms(b.ms.verify)}</td><td class="num">${ms(writer)}</td><td class="num">${told}</td>`
+        + `<td style="width:18%"><div class="mini" title="${ms(insideMs(b))} from download to peers told">${mini}</div></td>`
+        + `<td>${b.t ? `<button data-cpu="${b.t}">CPU around it</button>` : ""}</td></tr>`;
+    }).join("");
+}
+// Time from the block being in hand to its peers being told.
+function insideMs(block) {
+  return Object.entries(block.ms).reduce((sum, [stage, value]) => sum + (DOWNLOAD_STAGES.includes(stage) || value == null ? 0 : value), 0);
+}
+(function stageInteraction() {
+  const svg = el("stages");
+  svg.addEventListener("pointermove", event => {
+    const hit = event.target.closest("rect.hit");
+    const stage = hit && blockStages && blockStages.stages.find(s => s.id === hit.dataset.stage);
+    if (!stage) return hideTip();
+    const shown = blockStages.blocks.find(b => b.hash === state.block);
+    const typical = blockStages.paths[shown ? shown.path : state.path];
+    showTip(event, `<div class="row"><i class="swatch" style="background:${color(STAGE_CATEGORY[stage.id])}"></i><span>${esc(stage.label)}</span></div>`
+      + `<div class="row"><span>${esc(stage.where)}</span></div>`
+      + `<div class="row"><span>typical block</span><b>${ms(typical.median_ms[stage.id])}</b></div>`
+      + `<div class="row"><span>slowest tenth of blocks</span><b>${ms(typical.p90_ms[stage.id])}</b></div>`);
+  });
+  svg.addEventListener("pointerleave", hideTip);
+})();
+
 function renderTop() {
   const rows = flame ? flame.top.slice(0, 20) : [];
   const peak = rows.length ? rows[0][1] : 1;
@@ -503,6 +640,7 @@ function renderNotes() {
     `"While a block lands" keeps the samples from ${lead} ms before to ${tail} ms after each block announcement in the node log: the end of the download, verification, the commit and the hand-off to gossip.`,
     "Functions the compiler inlined are counted in the function they were inlined into. A tower that starts at “[stack truncated]” is a stack the unwinder could not follow to its thread's start.",
     `Per-minute detail is kept for 48 hours and hourly detail for ${status.retention_days} days.`,
+    ...(status.stage_timeline ? ["“A block's path through the node” is a different measurement: time on the clock between the node's own trace points for each block, so it includes waiting. It has no trace point between the new tip and the hand-off to legacy gossip, or per legacy peer; “Tell peers” covers Zakura peers only, counting status messages queued within a second of the new tip."] : []),
   ].map(text => `<li>${text}</li>`).join("");
 }
 
@@ -512,12 +650,16 @@ async function reload() {
     const params = rangeParams();
     const flameParams = { ...params, view: state.view, lens: state.lens };
     if (state.focus) flameParams.focus = state.focus;
-    [status, timeline, flame] = await Promise.all([api("status"), api("timeline", params), api("flame", flameParams)]);
+    [status, timeline, flame, blockStages] = await Promise.all([
+      api("status"), api("timeline", params), api("flame", flameParams),
+      // The stage timeline is extra: the profile still shows when it cannot be read.
+      status && status.stage_timeline ? api("blocks", { limit: 200 }).catch(() => blockStages) : null,
+    ]);
   } catch (error) {
     el("freshness").textContent = "Could not load the profile: " + error.message;
     return;
   }
-  renderStatus(); renderTiles(); drawTimeline(); buildTree(); drawFlame(); renderTop(); renderNotes();
+  renderStatus(); renderTiles(); drawTimeline(); buildTree(); drawFlame(); drawStages(); renderTop(); renderNotes();
 }
 async function start() {
   readHash();
@@ -528,7 +670,7 @@ async function start() {
   if (!meta.ranges.includes(state.range)) state.range = "1h";
   await reload();
   setInterval(() => { if (!state.from && !document.hidden) reload(); }, REFRESH_MS);
-  let resize; addEventListener("resize", () => { clearTimeout(resize); resize = setTimeout(() => { drawTimeline(); drawFlame(); }, 150); });
+  let resize; addEventListener("resize", () => { clearTimeout(resize); resize = setTimeout(() => { drawTimeline(); drawFlame(); drawStages(); }, 150); });
 }
 start();
 </script>

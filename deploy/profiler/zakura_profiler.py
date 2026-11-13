@@ -59,6 +59,11 @@ LENSES = ("all", "block")
 TIMELINE_BUCKETS = 240
 MAX_TIMELINE_BLOCKS = 2000
 MAX_FOCUS_LENGTH = 300
+# Per-block stage records kept, about a week of blocks.
+MAX_STAGE_RECORDS = 10_000
+DEFAULT_TRACE_TABLE_CAP_MB = 200
+# What the page gets of each block's stage record.
+BLOCK_FIELDS = ("height", "hash", "t", "path", "size", "status_peers", "status_slowest_ms", "reorg", "ms")
 COMPUTE_WAIT_SECONDS = 20
 # A window is late when no new one has been stored for this many window lengths.
 STALE_WINDOWS = 4
@@ -154,11 +159,13 @@ class Store:
         self.hours = self.root / "hour"
         self.index_path = self.root / "index.jsonl"
         self.blocks_path = self.root / "blocks.jsonl"
+        self.stages_path = self.root / "block_stages.jsonl"
         for directory in (self.minutes, self.hours):
             directory.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self.windows = []
         self.blocks = []
+        self.block_stages = []
         self._load()
 
     def _load(self):
@@ -168,9 +175,11 @@ class Store:
         self.blocks = sorted(
             tuple(b) for b in self._read_lines(self.blocks_path) if b[0] >= horizon
         )
-        # Rewrite both files without the rows that aged out.
+        self.block_stages = self._read_lines(self.stages_path)[-MAX_STAGE_RECORDS:]
+        # Rewrite the files without the rows that aged out.
         self._rewrite(self.index_path, self.windows)
         self._rewrite(self.blocks_path, self.blocks)
+        self._rewrite(self.stages_path, self.block_stages)
 
     @staticmethod
     def _read_lines(path):
@@ -217,14 +226,27 @@ class Store:
                 for block in new:
                     handle.write(json.dumps(block, separators=(",", ":")) + "\n")
 
+    def add_block_stages(self, records):
+        """Remember the per-stage timings of blocks that just finished."""
+        if not records:
+            return
+        with open(self.stages_path, "a") as handle:
+            for record in records:
+                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        with self._lock:
+            self.block_stages = (self.block_stages + records)[-MAX_STAGE_RECORDS:]
+
+    def recent_block_stages(self, limit):
+        """The newest stage records, oldest first, each with its announcement time."""
+        with self._lock:
+            records = self.block_stages[-limit:]
+            announced = {block[2]: block[0] for block in self.blocks[-(limit + 500) :]}
+        return [{**record, "t": announced.get(record["hash"])} for record in records]
+
     def block_times(self, start, end):
         with self._lock:
             times = [b[0] for b in self.blocks]
         return times[bisect.bisect_left(times, start) : bisect.bisect_right(times, end)]
-
-    def recent_blocks(self, limit):
-        with self._lock:
-            return list(self.blocks[-limit:])
 
     def windows_between(self, start, end):
         """Summaries of the windows that started in `[start, end)`, oldest first."""
@@ -342,6 +364,11 @@ class Profiler:
         self.symbols = stacks.SymbolNames()
         self.categorizer = stacks.Categorizer()
         self.log = blocks.FileFollower(args.log_file) if args.log_file else None
+        self.traces = (
+            blocks.TraceFollower(args.trace_dir, args.trace_table_cap_mb * 1024 * 1024)
+            if args.trace_dir
+            else None
+        )
         self.rate = RATE_LADDER[0]
         self.state = "starting"
         self.build = ""
@@ -482,6 +509,8 @@ class Profiler:
         self._stop.wait(max(0.0, job["end"] + BLOCK_TAIL_SECONDS + 0.5 - time.time()))
         if self.log is not None:
             self.store.add_blocks(blocks.announcements(self.log.read_new_lines()))
+        if self.traces is not None:
+            self.store.add_block_stages(self.traces.poll())
         block_times = self.store.block_times(
             job["start"] - BLOCK_TAIL_SECONDS, job["end"] + BLOCK_LEAD_SECONDS
         )
@@ -528,7 +557,11 @@ class Profiler:
         hour = self.store.windows_between(now - 3600, now)
         covered = sum(sampled_seconds(w) for w in hour)
         state = self.state
-        if state == "ok" and latest is not None and now - latest > STALE_WINDOWS * self.args.window:
+        fresh = latest is not None and now - latest <= STALE_WINDOWS * self.args.window
+        if state == "starting" and fresh:
+            # Restarted with recent data on disk: nothing is missing yet.
+            state = "ok"
+        elif state == "ok" and not fresh:
             state = "stale"
         return {
             "node": self.args.node_name,
@@ -550,6 +583,7 @@ class Profiler:
             "dropped_windows": self.dropped_windows,
             "retention_days": HOUR_RETENTION_SECONDS // 86400,
             "block_window_ms": [round(BLOCK_LEAD_SECONDS * 1000), round(BLOCK_TAIL_SECONDS * 1000)],
+            "stage_timeline": self.traces is not None,
         }
 
 
@@ -648,6 +682,31 @@ class Queries:
             "builds": builds,
         }
 
+    def block_stages(self, limit):
+        """How long recent blocks spent in each stage, and the median per stage.
+
+        Medians are kept apart by how the block arrived: the two networks record
+        different stages, so one median across both would describe neither.
+        """
+        records = self.store.recent_block_stages(limit)
+        paths = {}
+        for record in records:
+            paths.setdefault(record["path"], []).append(record["ms"])
+        for path, timings in paths.items():
+            medians, slowest = {}, {}
+            for stage, _, _ in blocks.STAGES:
+                values = sorted(ms[stage] for ms in timings if ms.get(stage) is not None)
+                if values:
+                    medians[stage] = values[len(values) // 2]
+                    slowest[stage] = values[min(len(values) - 1, len(values) * 9 // 10)]
+            paths[path] = {"blocks": len(timings), "median_ms": medians, "p90_ms": slowest}
+        return {
+            "stages": [{"id": s, "label": label, "where": where} for s, label, where in blocks.STAGES],
+            "paths": paths,
+            "fanout_window_ms": blocks.FANOUT_MICROSECONDS // 1000,
+            "blocks": [{key: record[key] for key in BLOCK_FIELDS} for record in records],
+        }
+
     def meta(self):
         """What the page needs before its first query: views, colours, ranges."""
         labels = {c["id"]: c["label"] for c in stacks.CATEGORIES}
@@ -703,11 +762,7 @@ def make_handler(queries, profiler, page_path):
                     return self.reply_json(200, queries.timeline(*queries.resolve_range(params)))
                 if parsed.path == "/api/blocks":
                     limit = max(1, min(int(params.get("limit", "200")), 1000))
-                    rows = [
-                        {"t": t, "height": height, "hash": block_hash}
-                        for t, height, block_hash in profiler.store.recent_blocks(limit)
-                    ]
-                    return self.reply_json(200, {"blocks": rows})
+                    return self.reply_json(200, queries.block_stages(limit))
             except (KeyError, ValueError):
                 return self.reply_json(400, {"error": "bad request"})
             except TimeoutError:
@@ -724,6 +779,14 @@ def parse_args(argv):
     parser.add_argument("--data-dir", required=True, help="where profiles are stored")
     parser.add_argument("--scratch-dir", required=True, help="where perf writes each window; use a tmpfs")
     parser.add_argument("--log-file", default="", help="node log, read for block announcement times")
+    parser.add_argument(
+        "--trace-dir", default="",
+        help="the node's [network.zakura] trace_dir, read for per-block stage timings",
+    )
+    parser.add_argument(
+        "--trace-table-cap-mb", type=int, default=DEFAULT_TRACE_TABLE_CAP_MB,
+        help="empty any trace table in --trace-dir that grows past this size",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8097)
     parser.add_argument("--window", type=int, default=WINDOW_SECONDS, help="seconds per sampling window")

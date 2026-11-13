@@ -293,6 +293,12 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([w["start"] for w in reopened.windows], [self.hour])
         self.assertEqual(reopened.block_times(self.hour, self.hour + 60), [self.hour + 5.5])
 
+    def test_block_stage_records_survive_a_restart_with_their_announcement_time(self):
+        self.store.add_blocks([(self.hour + 5.5, 10, BLOCK_HASH)])
+        self.store.add_block_stages([stage_record()])
+        (record,) = profiler_module.Store(self.directory.name).recent_block_stages(5)
+        self.assertEqual((record["height"], record["t"], record["ms"]["verify"]), (10, self.hour + 5.5, 2.0))
+
 
 class LogFollowingTests(unittest.TestCase):
     LINE = (
@@ -336,6 +342,166 @@ class LogFollowingTests(unittest.TestCase):
         self.assertEqual(follower.read_new_lines(), [b"new"])
 
 
+NODE_RUN = "100-1794528928000000000"
+BLOCK_HASH = "ab" * 32
+
+
+def trace_row(event, ts, process=NODE_RUN, **fields):
+    """One row of a node trace table; `ts` is microseconds since the node started."""
+    return {"ts": ts, "event": event, "process_trace_id": process, **fields}
+
+
+def tip_row(ts, height=10, block_hash=BLOCK_HASH, process=NODE_RUN, queue_us=500, commit_us=4000):
+    return trace_row(
+        "tip_published", ts, process, tip_height=height, tip_hash=block_hash, kind="extend",
+        queue_us=queue_us, commit_us=commit_us,
+    )  # fmt: skip
+
+
+def stage_record(height=10, block_hash=BLOCK_HASH, verify=2.0):
+    stages = dict.fromkeys(stage for stage, _, _ in blocks.STAGES)
+    stages.update(body_download=12, verify=verify, writer_wait=0.5, writer_commit=4.0, status_fanout=0.6)
+    return {
+        "height": height, "hash": block_hash, "process": NODE_RUN, "tip_us": 1_010_000, "reorg": False,
+        "path": "legacy", "size": None, "status_peers": 3, "status_slowest_ms": 0.8, "ms": stages,
+    }  # fmt: skip
+
+
+class BlockStageTests(unittest.TestCase):
+    def finished_after(self, rows, settle_at=10_000_000, process=NODE_RUN):
+        stages = blocks.BlockStages()
+        for row in rows:
+            stages.feed(row)
+        # Any later row moves the node's clock past the block's settling time.
+        stages.feed(trace_row("block_status_sent", settle_at, process, height=999))
+        return stages.finished()
+
+    def test_a_block_from_the_legacy_network_starts_when_its_download_finishes(self):
+        (record,) = self.finished_after(
+            [
+                trace_row(
+                    "block_request_finish", 1_000_000, result="available", elapsed_ms=12,
+                    returned_hash=BLOCK_HASH, returned_height=10,
+                ),
+                tip_row(1_010_000),
+                trace_row("block_status_sent", 1_010_400, height=10),
+                trace_row("block_status_sent", 1_010_600, height=10),
+                trace_row("block_status_sent", 1_010_800, height=10),
+                # A peer that connected two seconds later is not part of the fan-out.
+                trace_row("block_status_sent", 3_010_000, height=10),
+            ]
+        )  # fmt: skip
+        self.assertEqual((record["height"], record["hash"], record["path"]), (10, BLOCK_HASH, "legacy"))
+        self.assertEqual((record["status_peers"], record["status_slowest_ms"]), (3, 0.8))
+        self.assertEqual(
+            {stage: ms for stage, ms in record["ms"].items() if ms is not None},
+            # Verify ends where the writer's queue begins: tip - wait - commit.
+            {"body_download": 12, "verify": 5.5, "writer_wait": 0.5, "writer_commit": 4.0, "status_fanout": 0.6},
+        )
+
+    def test_a_block_from_zakura_block_sync_has_every_stage(self):
+        (record,) = self.finished_after(
+            [
+                trace_row("header_request_sent", 0, branch_target=BLOCK_HASH),
+                trace_row("header_response_received", 80_000, branch_target=BLOCK_HASH),
+                trace_row("header_target_admitted", 86_000, branch_target=BLOCK_HASH),
+                trace_row("block_get_blocks_sent", 90_000, request_owner=f"tip({BLOCK_HASH})"),
+                trace_row("block_body_received", 92_500, height=10, serialized_bytes=1500),
+                trace_row("commit_start", 93_000, height=10, hash=BLOCK_HASH),
+                tip_row(100_000, queue_us=1000, commit_us=5000),
+            ]
+        )
+        self.assertEqual((record["path"], record["size"], record["status_peers"]), ("zakura", 1500, 0))
+        self.assertEqual(
+            record["ms"],
+            {
+                "header_fetch": 80.0, "header_check": 6.0, "body_request": 4.0, "body_download": 2.5,
+                "submit": 0.5, "verify": 1.0, "writer_wait": 1.0, "writer_commit": 5.0, "status_fanout": None,
+            },
+        )  # fmt: skip
+
+    def test_a_block_is_held_until_its_fan_out_had_time_to_be_recorded(self):
+        stages = blocks.BlockStages()
+        stages.feed(tip_row(1_010_000))
+        stages.feed(trace_row("block_status_sent", 1_500_000, height=10))
+        self.assertEqual(stages.finished(), [])
+        stages.feed(trace_row("block_status_sent", 4_100_000, height=11))
+        self.assertEqual([record["height"] for record in stages.finished()], [10])
+        self.assertEqual(stages.finished(), [])
+
+    def test_rows_from_before_a_node_restart_are_not_joined(self):
+        earlier_run = "99-1794520000000000000"
+        (record,) = self.finished_after(
+            [
+                trace_row(
+                    "block_request_finish", 9_000_000, earlier_run, result="available", elapsed_ms=12,
+                    returned_hash=BLOCK_HASH, returned_height=10,
+                ),
+                tip_row(2_000_000),
+            ]
+        )  # fmt: skip
+        self.assertEqual(record["path"], "unknown")
+        self.assertIsNone(record["ms"]["verify"])
+        self.assertEqual(record["ms"]["writer_commit"], 4.0)
+
+    def test_a_block_request_that_returned_nothing_is_not_a_download(self):
+        (record,) = self.finished_after(
+            [
+                trace_row(
+                    "block_request_finish", 1_000_000, result="missing", elapsed_ms=900,
+                    returned_hash=BLOCK_HASH, returned_height=10,
+                ),
+                tip_row(1_010_000),
+            ]
+        )  # fmt: skip
+        self.assertEqual(record["path"], "unknown")
+        self.assertIsNone(record["ms"]["body_download"])
+
+
+class TraceFollowingTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+
+    def append(self, table, *rows):
+        with open(self.directory / f"{table}.jsonl", "a") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+    def test_blocks_are_joined_across_tables_and_other_rows_are_skipped(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append(
+            "legacy_peer_request",
+            trace_row(
+                "block_request_finish", 1_000_000, result="available", elapsed_ms=12,
+                returned_hash=BLOCK_HASH, returned_height=10,
+            ),
+        )  # fmt: skip
+        self.append("block_sync", trace_row("block_peer_wake", 1_005_000, height=10))
+        self.append("chain_tip", tip_row(1_010_000))
+        self.assertEqual(follower.poll(), [])
+        self.append("block_sync", trace_row("block_status_sent", 4_100_000, height=11))
+        (record,) = follower.poll()
+        self.assertEqual((record["height"], record["path"], record["ms"]["verify"]), (10, "legacy", 5.5))
+
+    def test_a_table_over_the_cap_is_emptied_and_followed_from_its_new_start(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=2000)
+        self.append("discovery", *[trace_row("peer_seen", index, peer="p" * 40) for index in range(40)])
+        self.append("chain_tip", *[tip_row(1_000_000 + index, height=index, block_hash=f"{index:064x}") for index in range(12)])
+        follower.poll()
+        self.assertEqual((self.directory / "discovery.jsonl").stat().st_size, 0)
+        self.assertEqual((self.directory / "chain_tip.jsonl").stat().st_size, 0)
+        # The node keeps appending to the emptied file.
+        self.append("chain_tip", tip_row(1_100_000, height=50))
+        self.append("chain_tip", tip_row(9_000_000, height=51, block_hash="cd" * 32))
+        self.assertEqual([record["height"] for record in follower.poll()], list(range(12)) + [50])
+
+    def test_a_missing_trace_directory_yields_nothing(self):
+        follower = blocks.TraceFollower(str(self.directory / "absent"), table_cap_bytes=2000)
+        self.assertEqual(follower.poll(), [])
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -347,9 +513,12 @@ class ApiTests(unittest.TestCase):
             build = "1.0" if index < 2 else "1.1"
             store.add_window(summary(start, cpu_us=6_000_000, build=build), self.sample_tree())
         store.add_blocks([(self.end - 100.0, 7, "cd" * 32)])
+        store.add_block_stages(
+            [stage_record(6, "ef" * 32, verify=1.0), stage_record(7, "cd" * 32, verify=3.0), stage_record(8, verify=9.0)]
+        )
         args = argparse.Namespace(
             node_name="test-node", service="zakurad", window=60, log_file="", perf="perf",
-            scratch_dir=self.directory.name,
+            scratch_dir=self.directory.name, trace_dir="", trace_table_cap_mb=200,
         )  # fmt: skip
         profiler = profiler_module.Profiler(args, store)
         profiler.state = "ok"
@@ -418,6 +587,20 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(timeline["blocks"], [self.end - 100.0])
         self.assertEqual([build for _, build in timeline["builds"]], ["1.0", "1.1"])
 
+    def test_blocks_report_each_stage_with_medians_and_announcement_times(self):
+        code, body = self.get("/api/blocks?limit=50")
+        answer = json.loads(body)
+        self.assertEqual(code, 200)
+        self.assertEqual([stage["id"] for stage in answer["stages"]], [stage for stage, _, _ in blocks.STAGES])
+        self.assertEqual(list(answer["paths"]), ["legacy"])
+        legacy = answer["paths"]["legacy"]
+        self.assertEqual((legacy["blocks"], legacy["median_ms"]["verify"], legacy["p90_ms"]["verify"]), (3, 3.0, 9.0))
+        self.assertNotIn("header_fetch", legacy["median_ms"])
+        # Only the block whose announcement was seen in the log has a wall-clock time.
+        self.assertEqual([block["t"] for block in answer["blocks"]], [None, self.end - 100.0, None])
+        self.assertEqual(answer["blocks"][1]["ms"]["writer_commit"], 4.0)
+        self.assertEqual(len(json.loads(self.get("/api/blocks?limit=1")[1])["blocks"]), 1)
+
     def test_bad_requests_are_refused(self):
         for path in (
             "/api/flame?view=everything",
@@ -426,6 +609,7 @@ class ApiTests(unittest.TestCase):
             "/api/flame?from=10&to=5",
             "/api/flame?focus=" + "x" * 400,
             "/api/timeline?from=abc&to=5",
+            "/api/blocks?limit=many",
         ):
             self.assertEqual(self.get(path)[0], 400, path)
         self.assertEqual(self.get("/api/nothing")[0], 404)

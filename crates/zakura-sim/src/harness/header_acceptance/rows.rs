@@ -1653,8 +1653,18 @@ fn hand_written_rows() -> Vec<Row> {
 
     let mut stale = holds(STALE, G5, STALE_CLOSE_RELINK);
     stale.push(mixed(STALE));
-    for (index, name) in [
-        "stale-charge",
+    // `stale-charge` charges the peer's current round as owned capacity,
+    // which also breaks the capacity bound, but only after its own break
+    // ([`NESTS`]), so its set is judged on its Draft run.
+    stale.extend(caught(
+        STORAGE,
+        case(STALE, "stale-charge"),
+        &[STALE, OUTSTANDING],
+        Found::AtStepSetOnDraft,
+        G5,
+        true,
+    ));
+    for name in [
         "stale-credit",
         "stale-release",
         "stale-retirement",
@@ -1662,17 +1672,14 @@ fn hand_written_rows() -> Vec<Row> {
         "stale-close",
         // hdr-14.4 moved this native mutation here, on the churn witness.
         "dropped-owner-check",
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ] {
         stale.extend(caught(
             STORAGE,
             case(STALE, name),
             &[STALE],
             Found::AtStep,
             G5,
-            index == 0,
+            false,
         ));
     }
     rows.push(sim_row(STALE, storage_harnesses, stale));
@@ -3006,7 +3013,7 @@ pub static NESTS: &[Nest] = &[
         ],
         when: "the punished peer is marked honest",
     },
-    // The four below break only after the case's own break, so their cases
+    // The five below break only after the case's own break, so their cases
     // judge the set on the Draft run (`Found::AtStepSetOnDraft`).
     Nest {
         broader: "sim/no-livelock",
@@ -3027,6 +3034,11 @@ pub static NESTS: &[Nest] = &[
         broader: "session/honest-never-punished",
         over: &["header-sync/s5v9/subscribe-headers/sender-within-live"],
         when: OPEN_REPEATED_PUNISHED,
+    },
+    Nest {
+        broader: OUTSTANDING,
+        over: &[STALE],
+        when: STALE_CHARGE_OUTSTANDING,
     },
     // A wedged run loop leaves its publication unread under both queues'
     // rules at once, so each watch rule nests over the other.
@@ -3054,6 +3066,10 @@ const OUTCOME_UNSOLICITED: &str = "the subscription ended on the early outcome, 
 const OPEN_REPEATED_PUNISHED: &str = "the node goes on to close the honest peer's connection \
                                       with a protocol reject over the subscription its repeated \
                                       Open doubled";
+/// When `outstanding-work-bounded` breaks beside a stale charge.
+const STALE_CHARGE_OUTSTANDING: &str = "a stale handler charges its peer's current round's \
+                                        reservation as owned capacity, so the peer's work \
+                                        outgrows its bound";
 /// When a wedged loop breaks both watch rules.
 const WEDGED_LOOP: &str = "the run loop stops reading its committed watch, so the run settles \
                            with the same publication unread under both queues' rules";

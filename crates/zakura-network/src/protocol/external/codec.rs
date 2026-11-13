@@ -119,15 +119,22 @@ enum BodyDecodePanic {
 
 /// Checksums of the large `block` messages this node sent most recently.
 ///
-/// Every peer that requests a block is sent the same body, so the checksum in the message
-/// header is the same for all of them. Hashing a full block takes milliseconds, and many peers
-/// request a new block at the same moment. Connections that share one `BlockChecksums` reuse a
+/// Sending the same block body to multiple peers uses the same message checksum.
+/// Hashing a full block takes milliseconds, and many peers request a new block at the same
+/// moment. Connections that share one `BlockChecksums` reuse a
 /// block's checksum after a send has calculated and stored it. Concurrent sends that miss the
 /// cache can each calculate the checksum before either stores it.
 ///
-/// A checksum is found by the block's hash. A node only sends blocks it holds, and it holds one
-/// body for each hash. The body length is checked as well, so a body of another length is hashed
-/// again rather than sent with a remembered checksum.
+/// A checksum is found by the block's hash. Bodies using this cache must come from committed
+/// state, or from trusted `submitblock` callers after semantic verification. Before contextual
+/// verification checks `hashBlockCommitments`, different v5 authorization data can produce
+/// bodies with the same block hash and length, even when their proofs and signatures verify.
+/// Untrusted bodies served before that check must not use this cache: they could leave a
+/// checksum that is later reused for a different body. Cache hits refresh the entry's recency,
+/// so repeated requests can keep such an entry present.
+///
+/// The body length is checked as well, so a body of another length is hashed again. This check
+/// does not distinguish different bodies of the same length or replace commitment validation.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BlockChecksums(Arc<Mutex<IndexMap<block::Hash, (usize, sha256d::Checksum)>>>);
 

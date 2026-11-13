@@ -13,7 +13,7 @@ use support::{
     inputs,
     steer::{steer, Rule, Steer},
 };
-use zakura_network::zakura::observe::ReactorEvent;
+use zakura_network::zakura::observe::{ReactorEvent, ServeInUse};
 use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -426,7 +426,7 @@ fn limit_rows() -> [RowUnits; 4] {
             },
         },
         RowUnits {
-            stem: "header-outstanding-peer-execution",
+            stem: EXECUTION_WAIT_FIXTURE,
             limit: 2,
             parties: 3,
             opens: |entry| match &entry.obs {
@@ -487,6 +487,44 @@ fn timeouts(entries: &[Entry]) -> Vec<(Duration, String)> {
         }
     }
     found
+}
+
+/// The peer-execution limit fixture's stem.
+const EXECUTION_WAIT_FIXTURE: &str = "header-outstanding-peer-execution";
+
+/// The virtual time of `row`'s first release in `entries`, its fixture's
+/// log.
+fn first_release_at(row: &RowUnits, entries: &[Entry]) -> Option<Duration> {
+    let mut now = Duration::ZERO;
+    for entry in entries {
+        if let Observation::TimeAdvanced { to_ns, .. } = &entry.obs {
+            now = Duration::from_nanos(*to_ns);
+        }
+        if (row.releases)(entry) {
+            return Some(now);
+        }
+    }
+    None
+}
+
+/// Whether `acquisitions`, a run's serving acquisitions with their virtual
+/// times, show a push holding a peer's output while the other pushes held
+/// all `limit` of its execution slots, before `released`. With no page job
+/// done before then, no push has given its slots back, so that push waits
+/// at the peer's execution reserve.
+fn waited_at_full_execution(
+    acquisitions: &[(Option<Duration>, ServeInUse)],
+    released: Duration,
+    limit: usize,
+) -> bool {
+    acquisitions.iter().any(|(at, in_use)| {
+        let ServeInUse {
+            peer_execution: executing,
+            peer_responses: responding,
+            ..
+        } = in_use;
+        at.is_some_and(|at| at < released) && *executing == limit && *responding > limit
+    })
 }
 
 /// Whether `history`, a row's member sets in order, takes `newcomer` in
@@ -581,6 +619,7 @@ fn the_limit_fixtures_release_and_reuse_their_bounds() {
         let scenario = scenario(stem);
         let prepared = Storage::prepare(&scenario);
         let reservations = prepared.reservations.clone();
+        let outstanding = prepared.outstanding.clone();
         let plan =
             fs::read(fixture(stem, "plan")).unwrap_or_else(|error| panic!("{stem}: {error}"));
         let report = run_prepared::<Storage>(
@@ -593,31 +632,30 @@ fn the_limit_fixtures_release_and_reuse_their_bounds() {
         .unwrap_or_else(|error| panic!("{stem}: {error}"));
         assert_eq!(report.end.violation, None, "{stem}: {:?}", report.end);
         assert_eq!(report.end.harness, None, "{stem}: {:?}", report.end);
-        (report, reservations.facts())
+        (report, reservations.facts(), outstanding)
     };
     for row in limit_rows() {
-        let (report, facts) = run_fixture(row.stem);
+        let stem = row.stem;
+        let (report, facts, outstanding) = run_fixture(stem);
         released_and_reused(&row, &row_use(&row, report.log.entries()));
         let reservations = reservation_row();
-        if reservations.stem == row.stem {
+        if reservations.stem == stem {
             released_and_reused(&reservations, &row_use(&reservations, &facts));
+        }
+        if stem == EXECUTION_WAIT_FIXTURE {
+            let released = first_release_at(&row, report.log.entries())
+                .unwrap_or_else(|| panic!("{stem}: the row released a unit"));
+            let acquisitions = outstanding.acquisitions();
+            assert!(
+                waited_at_full_execution(&acquisitions, released, row.limit),
+                "{stem}: a push held output with every execution slot taken before \
+                 {released:?}: {acquisitions:?}"
+            );
         }
     }
     let (stem, rows, limit, parties) = HELD_ROWS;
     let scenario = scenario(stem);
-    let prepared = Storage::prepare(&scenario);
-    let evidence = prepared.outstanding.clone();
-    let plan = fs::read(fixture(stem, "plan")).unwrap_or_else(|error| panic!("{stem}: {error}"));
-    let report = run_prepared::<Storage>(
-        &scenario,
-        prepared,
-        Plan::from_fuzz(&plan),
-        &mut MemorySink::default(),
-        None,
-    )
-    .unwrap_or_else(|error| panic!("{stem}: {error}"));
-    assert_eq!(report.end.violation, None, "{stem}: {:?}", report.end);
-    assert_eq!(report.end.harness, None, "{stem}: {:?}", report.end);
+    let (report, _, evidence) = run_fixture(stem);
     let config = scenario.node_settings.config();
     let per_direction = config
         .peer_limits
@@ -669,6 +707,28 @@ fn the_held_row_read_needs_a_release_and_a_later_rise() {
     assert!(!sizes_fall_and_rise(&[0, 7, 6, 7], 8));
     assert!(!sizes_fall_and_rise(&[0, 8, 8], 8));
     assert!(!sizes_fall_and_rise(&[0, 8, 1, 0], 8));
+}
+
+/// The acquisition read fails with no push holding output past the full
+/// execution slots, with one only once the slots aren't full, or with one
+/// only at or after the release.
+#[test]
+fn the_execution_wait_read_needs_output_held_past_full_slots_before_the_release() {
+    let at = |ms: u64| Some(Duration::from_millis(ms));
+    let in_use = |peer_execution, peer_responses| ServeInUse {
+        peer_execution,
+        peer_responses,
+        ..ServeInUse::default()
+    };
+    let released = Duration::from_millis(1_000);
+    let read = |acquisitions: &[(Option<Duration>, ServeInUse)]| {
+        waited_at_full_execution(acquisitions, released, 2)
+    };
+    assert!(read(&[(at(0), in_use(2, 2)), (at(0), in_use(2, 3))]));
+    assert!(!read(&[(at(0), in_use(2, 2))]));
+    assert!(!read(&[(at(0), in_use(1, 3))]));
+    assert!(!read(&[(at(1_000), in_use(2, 3))]));
+    assert!(!read(&[(None, in_use(2, 3))]));
 }
 
 /// A full row that never takes the newcomer in, grows past its limit to

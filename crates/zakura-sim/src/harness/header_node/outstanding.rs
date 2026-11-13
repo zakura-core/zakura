@@ -251,6 +251,9 @@ struct Store {
     /// The departed strikes' and cooldowns' peers in report order, by row,
     /// with a repeated set kept once.
     members: BTreeMap<&'static str, Vec<BTreeSet<String>>>,
+    /// Each serving acquisition's budgets in use, with the virtual time it
+    /// came at, in report order.
+    acquisitions: Vec<(Option<Duration>, ServeInUse)>,
     /// The first step whose drain judged a `Sizes`.
     applicable: Option<u64>,
     /// Whether a `Sizes` was judged since the last drain.
@@ -279,6 +282,7 @@ impl Snapshot for Store {
             peaks,
             sizes,
             members,
+            acquisitions,
             applicable,
             pending,
             running,
@@ -295,6 +299,7 @@ impl Snapshot for Store {
             "fields": debug_snapshot(&(peaks, applicable, pending, shut_down, at_rest, reported)),
             "sizes": debug_snapshot(sizes),
             "members": debug_snapshot(members),
+            "acquisitions": debug_snapshot(acquisitions),
             "running": running,
         })
     }
@@ -336,6 +341,16 @@ impl OutstandingEvidence {
     /// log names them. Empty for any other row.
     pub fn members(&self, row: &str) -> Vec<BTreeSet<String>> {
         self.with(|store| store.members.get(row).cloned().unwrap_or_default())
+    }
+
+    /// Each serving acquisition's budgets in use, the node's and its peer's,
+    /// with the virtual time since the run's start it came at, in report
+    /// order. A push takes its output before its execution slots, so an
+    /// acquisition that shows more of a peer's response slots than its
+    /// execution slots, with those full, shows a push holding output that
+    /// has yet to take an execution slot or already gave its slots back.
+    pub fn acquisitions(&self) -> Vec<(Option<Duration>, ServeInUse)> {
+        self.with(|store| store.acquisitions.clone())
     }
 
     /// Whether a drain up to and including `step`'s judged a `Sizes`.
@@ -762,6 +777,9 @@ impl Outstanding {
                 }
             }
             ReactorEvent::ServingAcquired { peer, in_use } => {
+                let now = self.now;
+                self.evidence
+                    .change(|store| store.acquisitions.push((now, *in_use)));
                 let peer_output = usize::try_from(in_use.peer_output).unwrap_or(usize::MAX);
                 for (row, size, bound) in [
                     (

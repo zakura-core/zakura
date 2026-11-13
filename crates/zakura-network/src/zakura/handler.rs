@@ -3272,15 +3272,18 @@ impl ZakuraProtocolHandler {
     }
 
     fn set_header_sync_enabled(&self, enabled: bool) {
-        let _supported = if enabled {
+        let previous = if enabled {
             self.supported_capabilities
                 .fetch_or(ZAKURA_CAP_HEADER_SYNC, Ordering::SeqCst)
-                | ZAKURA_CAP_HEADER_SYNC
         } else {
             self.supported_capabilities
                 .fetch_and(!ZAKURA_CAP_HEADER_SYNC, Ordering::SeqCst)
-                & !ZAKURA_CAP_HEADER_SYNC
         };
+        // A call that leaves the mask unchanged leaves in-flight negotiations
+        // current, so it keeps their generation.
+        if (previous & ZAKURA_CAP_HEADER_SYNC != 0) == enabled {
+            return;
+        }
         // Publish the generation before the caller snapshots registered peers.
         // Registrations before this change enter that snapshot; later ones reject
         // the old generation before installing services.
@@ -3288,7 +3291,7 @@ impl ZakuraProtocolHandler {
         transport_observe!(
             self.transport_observer,
             super::TransportEvent::CapabilitiesChanged {
-                supported: _supported,
+                supported: previous ^ ZAKURA_CAP_HEADER_SYNC,
             }
         );
     }
@@ -8659,6 +8662,14 @@ mod tests {
             handler.current_handshake_config().supported_capabilities,
             ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC
         );
+        assert_eq!(handler.handshake_snapshot().1, 2, "each change bumps once");
+
+        // Repeating the current setting keeps in-flight negotiations current.
+        handler.set_header_sync_enabled(true);
+        assert_eq!(handler.handshake_snapshot().1, 2);
+        handler.set_header_sync_enabled(false);
+        handler.set_header_sync_enabled(false);
+        assert_eq!(handler.handshake_snapshot().1, 3);
     }
 
     #[test]

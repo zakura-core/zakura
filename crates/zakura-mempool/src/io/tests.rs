@@ -73,6 +73,7 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
         tx: UnminedTx,
         _tip: ChainTip,
         _revalidation: bool,
+        _after_reset: bool,
     ) -> Pin<Box<dyn Future<Output = Outcome<TestVerifyError>> + Send>> {
         let id = tx.id();
         let hook = self

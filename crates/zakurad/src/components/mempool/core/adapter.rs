@@ -38,11 +38,10 @@ use crate::BoxError;
 
 use super::{
     super::{
-        downloads::{
-            fetch_transaction, peer_source_from_queue_source, TRANSACTION_DOWNLOAD_TIMEOUT,
-        },
+        crawler::RATE_LIMIT_DELAY,
+        downloads::{fetch_transaction, peer_source_from_queue_source, transaction_in_best_chain},
         pending_outputs::PendingOutputsFull,
-        queue_source_log_label, ExactTipRejectionError, MempoolError, Outbound,
+        queue_source_log_label, ExactTipRejectionError, MempoolError, Outbound, ReadState,
     },
     Exempt,
 };
@@ -55,6 +54,9 @@ type Receiver = oneshot::Receiver<Result<(), BoxError>>;
 struct Shared {
     handle: PoolHandle,
     outbound: Timeout<Outbound>,
+    /// For the already-mined check before a fetch. The read state service
+    /// is not `Sync`, so each fetch clones it under this lock.
+    read_state: std::sync::Mutex<ReadState>,
     expose_peer_addresses: bool,
     misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
     exempt: Arc<Exempt>,
@@ -72,6 +74,7 @@ impl CoreMempool {
     pub fn new(
         handle: PoolHandle,
         outbound: Timeout<Outbound>,
+        read_state: ReadState,
         expose_peer_addresses: bool,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
         exempt: Arc<Exempt>,
@@ -80,6 +83,7 @@ impl CoreMempool {
             shared: Arc::new(Shared {
                 handle,
                 outbound,
+                read_state: std::sync::Mutex::new(read_state),
                 expose_peer_addresses,
                 misbehavior_sender,
                 exempt,
@@ -351,7 +355,12 @@ async fn bring_in(
             let source = from.as_ref().and_then(peer_source_from_queue_source);
             // Boxing works around a compiler limitation: without it, the
             // spawned task cannot be proven `Send`.
-            match fetch_within(shared.outbound.clone(), tx_id, source).await {
+            let read_state = shared
+                .read_state
+                .lock()
+                .expect("no code panics while holding the read state lock")
+                .clone();
+            match fetch_within(read_state, shared.outbound.clone(), tx_id, source).await {
                 Ok((tx, served_by)) => {
                     // A v2 peer's body is not charged, as today.
                     let supplier = match (&from, served_by) {
@@ -463,23 +472,33 @@ fn second_stage(tx_id: UnminedTxId, verdict: Verdict) -> Result<(), BoxError> {
     }
 }
 
-/// Fetches `tx_id` within [`TRANSACTION_DOWNLOAD_TIMEOUT`], the wait for the
-/// network included.
+/// Fetches `tx_id`, unless the best chain already holds it, within today's
+/// whole-task deadline, [`RATE_LIMIT_DELAY`].
 ///
-/// The service's own timeout starts only once the network is ready, and the
-/// caller's reservation holds a core slot the whole time. So the whole fetch
-/// has a deadline, as today's download task does, and a fetch that misses it
+/// Today's downloader checks the chain before it asks the network, so an id
+/// that is already mined is answered `InState` without a download. The
+/// service's own timeout starts only once the network is ready, and the
+/// caller's reservation holds a core slot the whole time, so the whole fetch
+/// has the deadline today's download task has, and a fetch that misses it
 /// fails, which frees its slot.
 async fn fetch_within(
+    read_state: ReadState,
     outbound: Timeout<Outbound>,
     tx_id: UnminedTxId,
     source: Option<zn::PeerSource>,
 ) -> Result<(zakura_chain::transaction::UnminedTx, Option<PeerSocketAddr>), BoxError> {
     // Boxing works around a compiler limitation: without it, the spawned
     // task cannot be proven `Send`.
-    let fetch: futures::future::BoxFuture<'static, _> =
+    let lookup: futures::future::BoxFuture<'static, _> =
+        transaction_in_best_chain(read_state, tx_id).boxed();
+    let download: futures::future::BoxFuture<'static, _> =
         fetch_transaction(outbound, tx_id, source).boxed();
-    match tokio::time::timeout(TRANSACTION_DOWNLOAD_TIMEOUT, fetch).await {
+    let fetch: futures::future::BoxFuture<'static, _> = async move {
+        lookup.await?;
+        download.await
+    }
+    .boxed();
+    match tokio::time::timeout(RATE_LIMIT_DELAY, fetch).await {
         Ok(fetched) => fetched.map_err(BoxError::from),
         Err(elapsed) => Err(BoxError::from(elapsed)),
     }
@@ -487,9 +506,19 @@ async fn fetch_within(
 
 #[cfg(test)]
 mod tests {
-    use std::task::{Context, Poll};
+    use std::{
+        task::{Context, Poll},
+        time::Duration,
+    };
 
     use tower::util::BoxCloneSyncService;
+    use zakura_chain::{block::Height, parameters::Network};
+    use zakura_state as zs;
+
+    use super::super::super::{
+        downloads::{TransactionDownloadVerifyError, TRANSACTION_DOWNLOAD_TIMEOUT},
+        ReadState,
+    };
 
     use super::*;
 
@@ -511,6 +540,50 @@ mod tests {
         }
     }
 
+    /// A read state that finds `mined` in the best chain and nothing else.
+    fn chain_holding(mined: Option<UnminedTxId>) -> ReadState {
+        tower::util::BoxCloneService::new(tower::service_fn(move |request| async move {
+            match request {
+                zs::ReadRequest::Transaction(hash) => Ok(zs::ReadResponse::Transaction(
+                    mined
+                        .filter(|mined| mined.mined_id() == hash)
+                        .map(|_| Network::Mainnet.unmined_transactions_in_blocks(1..=1))
+                        .and_then(|mut txs| txs.next())
+                        .map(|tx| {
+                            zs::MinedTx::new(
+                                zakura_node_services::block_memory::TransactionHandle::Shared(
+                                    tx.transaction.transaction().clone(),
+                                ),
+                                Height(1),
+                                1,
+                                chrono::Utc::now(),
+                            )
+                        }),
+                )),
+                _ => unreachable!("the fetch asks only for a transaction"),
+            }
+        }))
+    }
+
+    /// An id the chain already mined is answered at once, without asking a
+    /// network that would never answer.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_already_mined_id_is_not_fetched() {
+        let mined = UnminedTxId::Legacy(zakura_chain::transaction::Hash([7; 32]));
+        let outbound = Timeout::new(
+            BoxCloneSyncService::new(NeverReady),
+            TRANSACTION_DOWNLOAD_TIMEOUT,
+        );
+        let started = tokio::time::Instant::now();
+        let fetched = fetch_within(chain_holding(Some(mined)), outbound, mined, None).await;
+        let error = fetched.expect_err("a mined id is not fetched");
+        assert!(matches!(
+            error.downcast_ref::<TransactionDownloadVerifyError>(),
+            Some(TransactionDownloadVerifyError::InState)
+        ));
+        assert_eq!(started.elapsed(), Duration::ZERO, "no wait for the network");
+    }
+
     /// A fetch from a network that never becomes ready fails at its
     /// deadline, so the reservation it holds is freed.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -521,12 +594,17 @@ mod tests {
         );
         let started = tokio::time::Instant::now();
         let fetched = fetch_within(
+            chain_holding(None),
             outbound,
             UnminedTxId::Legacy(zakura_chain::transaction::Hash([7; 32])),
             None,
         )
         .await;
         assert!(fetched.is_err(), "the fetch fails");
-        assert_eq!(started.elapsed(), TRANSACTION_DOWNLOAD_TIMEOUT);
+        assert_eq!(
+            started.elapsed(),
+            RATE_LIMIT_DELAY,
+            "today's whole-task deadline"
+        );
     }
 }

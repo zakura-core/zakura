@@ -78,10 +78,12 @@ impl Follower {
     /// events.
     pub async fn run(mut self) -> Result<(), BoxError> {
         let mut next_announcement = Instant::now();
-        let mut announcing: Option<BoxFuture<'static, Option<HashSet<UnminedTxId>>>> = None;
+        // The network, once it is ready. The ids are picked only then, so
+        // none removed during the wait is advertised.
+        let mut readying: Option<BoxFuture<'static, Option<Timeout<Outbound>>>> = None;
         loop {
             self.read();
-            let due = announcing.is_none() && !self.pending.is_empty();
+            let due = readying.is_none() && !self.pending.is_empty();
             tokio::select! {
                 changed = self.pool.snapshot_changed() => {
                     if !changed {
@@ -89,22 +91,40 @@ impl Follower {
                     }
                 }
                 () = tokio::time::sleep_until(next_announcement), if due => {
-                    let ids: HashSet<UnminedTxId> =
-                        self.pending.iter().copied().take(MAX_ANNOUNCED).collect();
-                    announcing = Some(announce(self.outbound.clone(), ids).boxed());
+                    readying = Some(ready(self.outbound.clone()).boxed());
                 }
-                announced = async { announcing.as_mut().expect("guarded").await },
-                    if announcing.is_some() =>
+                network = async { readying.as_mut().expect("guarded").await },
+                    if readying.is_some() =>
                 {
-                    announcing = None;
+                    readying = None;
                     next_announcement = Instant::now() + TRANSACTION_GOSSIP_DELAY;
-                    // Only ids a broadcast started for leave `pending`.
-                    for id in announced.into_iter().flatten() {
-                        self.pending.remove(&id);
+                    if let Some(network) = network {
+                        self.announce(network);
                     }
                 }
             }
         }
+    }
+
+    /// Advertises up to one message of the pending ids through `network`,
+    /// which is ready. The ids are taken only now, so the advertisement
+    /// holds only transactions that are still pooled.
+    fn announce(&mut self, mut network: Timeout<Outbound>) {
+        let ids: HashSet<UnminedTxId> = self.pending.iter().copied().take(MAX_ANNOUNCED).collect();
+        if ids.is_empty() {
+            return;
+        }
+        for id in &ids {
+            self.pending.remove(id);
+        }
+        let count = u64::try_from(ids.len()).expect("one advertisement fits in u64");
+        let response = network.call(zn::Request::AdvertiseTransactionIds(ids, None));
+        tokio::spawn(async move {
+            if let Err(error) = response.await {
+                tracing::debug!(%error, "transaction broadcast did not finish");
+            }
+        });
+        metrics::counter!("mempool.gossiped.transactions.total").increment(count);
     }
 
     /// Reads the log from the cursor to the latest snapshot.
@@ -160,33 +180,16 @@ impl Follower {
     }
 }
 
-/// Advertises `ids` to the peer set, and returns them once the broadcast has
-/// started, or `None` if the network was not ready in time.
-///
-/// The wait for the network is bounded, as today's gossip bounds it. Ids
-/// that were not sent stay pending for a later try.
-async fn announce(
-    outbound: Timeout<Outbound>,
-    ids: HashSet<UnminedTxId>,
-) -> Option<HashSet<UnminedTxId>> {
-    let network =
-        match tokio::time::timeout(BROADCAST_READY_TIMEOUT, outbound.ready_oneshot()).await {
-            Ok(Ok(network)) => network,
-            Ok(Err(_)) | Err(_) => {
-                metrics::counter!("mempool.gossip.network.unready.total").increment(1);
-                return None;
-            }
-        };
-    let count = u64::try_from(ids.len()).expect("one advertisement fits in u64");
-    let mut network = network;
-    let response = network.call(zn::Request::AdvertiseTransactionIds(ids.clone(), None));
-    tokio::spawn(async move {
-        if let Err(error) = response.await {
-            tracing::debug!(%error, "transaction broadcast did not finish");
+/// The peer set once it is ready, or `None` if it was not ready within
+/// [`BROADCAST_READY_TIMEOUT`], as today's gossip bounds the wait.
+async fn ready(outbound: Timeout<Outbound>) -> Option<Timeout<Outbound>> {
+    match tokio::time::timeout(BROADCAST_READY_TIMEOUT, outbound.ready_oneshot()).await {
+        Ok(Ok(network)) => Some(network),
+        Ok(Err(_)) | Err(_) => {
+            metrics::counter!("mempool.gossip.network.unready.total").increment(1);
+            None
         }
-    });
-    metrics::counter!("mempool.gossiped.transactions.total").increment(count);
-    Some(ids)
+    }
 }
 
 /// One batch of the change log, as today's change stream events.
@@ -347,5 +350,47 @@ mod tests {
         tokio::time::sleep(BROADCAST_READY_TIMEOUT + TRANSACTION_GOSSIP_DELAY * 2).await;
         let advertised = gate.advertised.lock().expect("no panics").clone();
         assert_eq!(advertised, vec![[pooled.transaction.id()].into()]);
+    }
+
+    /// A transaction mined while an announcement waits for the network is
+    /// not advertised once the network is ready.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_id_removed_while_the_network_was_unready_is_not_advertised() {
+        let pooled = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=10)
+            .next()
+            .expect("a vector transaction");
+        let (handle, inbox) = pool_port();
+        let gate = Gate::default();
+        let (changes, _events) = broadcast::channel(16);
+        tokio::spawn(
+            Follower::new(
+                handle.reader(),
+                BoxCloneSyncService::new(gate.clone()),
+                changes,
+            )
+            .run(),
+        );
+
+        inbox.publish([Change::Added(pooled.transaction.id())], |last| {
+            snapshot(vec![pooled.clone()], last)
+        });
+        // The announcement starts waiting on the closed network, and the
+        // transaction is mined meanwhile.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        inbox.publish(
+            [Change::Removed {
+                id: pooled.transaction.id(),
+                reason: RemovalReason::Mined,
+            }],
+            |last| snapshot(Vec::new(), last),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        gate.open.store(true, Ordering::SeqCst);
+        tokio::time::sleep(BROADCAST_READY_TIMEOUT + TRANSACTION_GOSSIP_DELAY * 2).await;
+        assert!(
+            gate.advertised.lock().expect("no panics").is_empty(),
+            "nothing still pooled was left to advertise"
+        );
     }
 }

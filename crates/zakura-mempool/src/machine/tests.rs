@@ -336,6 +336,7 @@ fn seen_real(step: &Step) -> Vec<Seen> {
                 job,
                 tx,
                 revalidation,
+                ..
             } => Seen::Start {
                 job: job.0,
                 tx: tx.id(),
@@ -1842,4 +1843,80 @@ fn a_refused_reveal_takes_its_cost_off_once() {
     }
     assert_eq!(machine.hidden(), vec![other.id()]);
     assert_eq!(machine.visible().len(), 3, "the parent and two children");
+}
+
+/// Sol's case from M1 review round 4: a job that runs again after a reset is
+/// marked, so the verifier charges no cooldown for it, as today's retry after
+/// a tip reset is not charged. A job for a body that arrives after the reset
+/// is not marked.
+#[test]
+fn a_job_run_again_after_a_reset_is_marked() {
+    let mut runner = TestRunner::deterministic();
+    let before_reset = build(&mut runner, &[], 1, None);
+    let after_reset = build(&mut runner, &[], 1, None);
+    let base = Instant::now();
+    let mut machine = Machine::new(&Config::default(), tip(START, 0), Generation(0), base);
+    let start = |machine: &mut Machine, tx: &Tx| -> Step {
+        let grant = machine
+            .reserve(tx.id(), Source::Node, Intent::Deliver, base)
+            .expect("room for a reservation");
+        assert!(machine.effects().is_empty());
+        machine
+            .submit(
+                grant.id,
+                tx.real.transaction.clone(),
+                Supplier::Nobody,
+                base,
+            )
+            .1
+    };
+    let marked = |step: &Step| -> Vec<bool> {
+        step.effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Start { after_reset, .. } => Some(*after_reset),
+                _ => None,
+            })
+            .collect()
+    };
+    let first = start(&mut machine, &before_reset);
+    assert_eq!(marked(&first), vec![false]);
+    let Some(Effect::Start { job, .. }) = first.effects.first().cloned() else {
+        panic!("a body starts a job");
+    };
+
+    // A reorg lands while the job runs, so its outcome is stale and it runs
+    // again, marked.
+    let old = tip(START, 0);
+    let new = tip(START, 1);
+    let step = machine.transition(
+        ChainTransition {
+            before: Some(old),
+            disconnected: vec![old],
+            connected: vec![ConnectedBlock {
+                hash: new.hash,
+                height: new.height,
+                transactions: Vec::new(),
+                transaction_hashes: Arc::new([]),
+            }],
+            after: new,
+            generation: Generation(1),
+            rules_change: false,
+        },
+        base,
+    );
+    assert!(marked(&step).is_empty());
+    let stale = GenerationRead::Stable(Generation(0));
+    let step = machine.outcome(
+        job,
+        Outcome::LocalFault(LocalFault::StateUnavailable),
+        stale,
+        stale,
+        base,
+        chrono::Utc::now(),
+    );
+    assert_eq!(marked(&step), vec![true], "the rerun is marked");
+
+    assert_eq!(marked(&start(&mut machine, &after_reset)), vec![false]);
+    machine.assert_invariants();
 }

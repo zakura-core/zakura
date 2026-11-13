@@ -193,6 +193,7 @@ pub(crate) fn assemble(
     let (start, events) = chain_transitions.subscribe()?;
     let (handle, inbox) = pool_port();
 
+    let adapter_read_state = read_state.clone();
     let verifier = verifier::ConsensusVerifier::new(
         Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
         read_state,
@@ -217,6 +218,7 @@ pub(crate) fn assemble(
     let adapter = adapter::CoreMempool::new(
         handle.clone(),
         Timeout::new(outbound, TRANSACTION_DOWNLOAD_TIMEOUT),
+        adapter_read_state,
         expose_peer_addresses,
         misbehavior_sender,
         Arc::new(exempt),

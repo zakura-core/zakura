@@ -135,6 +135,11 @@ pub enum Effect {
         tx: UnminedTx,
         /// Whether it is a pooled transaction being verified again.
         revalidation: bool,
+        /// Whether the chain was reset since its body arrived, by a reorg, a
+        /// rules change or a missed event. Today's pool charges no cooldown
+        /// for a transaction it retries after a tip reset, and neither does
+        /// the core's verifier. Bans still apply.
+        after_reset: bool,
     },
     /// Cancel a verification. Its outcome is ignored.
     Cancel(JobId),
@@ -262,6 +267,9 @@ struct Admission<E> {
     /// When its body arrived. Its slot is held at most [`MAX_UNDECIDED`] from
     /// here.
     body_at: Option<Instant>,
+    /// Whether the chain was reset since it was reserved. See
+    /// [`Effect::Start`].
+    after_reset: bool,
 }
 
 /// Where a hidden pooled transaction is.
@@ -535,6 +543,7 @@ impl<E: VerifyError> MempoolState<E> {
                 missing_error: None,
                 last_check_used: false,
                 body_at: None,
+                after_reset: false,
             },
         );
         self.admission_of.insert(tx_id, key);
@@ -663,6 +672,7 @@ impl<E: VerifyError> MempoolState<E> {
         // nothing. Today's reset drops every list too.
         let verify_again = transition.is_reorg() || transition.rules_change;
         if verify_again {
+            self.mark_reset();
             self.storage.clear_rejections(now);
         } else {
             self.storage.clear_tip_rejections(now);
@@ -741,6 +751,7 @@ impl<E: VerifyError> MempoolState<E> {
         }
         self.applied = generation;
         self.tip = tip;
+        self.mark_reset();
         self.storage.clear_rejections(self.now);
         // Expiry needs no verifier, only the new tip. Only the expired
         // transaction goes. A block the core missed may have mined it first,
@@ -1295,9 +1306,15 @@ impl<E: VerifyError> MempoolState<E> {
             });
             return (waiter, self.take_step());
         }
-        let (key, ticket_source) = match self.tickets.remove(&reservation) {
-            Some(ticket) => (Some(ticket.admission), Some(ticket.source)),
-            None => (self.owners.remove(&reservation), None),
+        let (key, ticket_source, body) = match self.tickets.remove(&reservation) {
+            // A joined caller that was not asked for the body sends none, as
+            // the handle drops it.
+            Some(ticket) => (
+                Some(ticket.admission),
+                Some(ticket.source),
+                body.filter(|_| ticket.brings),
+            ),
+            None => (self.owners.remove(&reservation), None, body),
         };
         // The admission the reservation was granted for, if it is still
         // undecided. A later admission of the same id has another key.
@@ -1438,9 +1455,16 @@ impl<E: VerifyError> MempoolState<E> {
         if waiting >= MAX_WAITERS || already_on_it {
             return Err(Unreserved::Pending);
         }
-        // One joined caller is asked for the body, and only while the core has
-        // none. Every other one waits for that body's verdict.
-        let brings = admission.body.is_none() && !tickets.iter().any(|ticket| ticket.brings);
+        // A joined caller is asked for the body only when nobody else can
+        // bring it: the core has none, the reserving caller is not still
+        // fetching or delivering it, and no other joined caller was asked.
+        // Otherwise a second decoded body would wait under the same slot,
+        // with nothing counted against the joining source. So a delivery
+        // that joins while the fetch is out waits for the fetch's verdict,
+        // and its own copy is dropped, as today drops it.
+        let brings = admission.body.is_none()
+            && !admission.owner_waiting
+            && !tickets.iter().any(|ticket| ticket.brings);
         let id = ReservationId(self.fresh());
         self.tickets.insert(
             id,
@@ -1883,6 +1907,7 @@ impl<E: VerifyError> MempoolState<E> {
         let admission = self.admission_at(key);
         admission.stage = Stage::Verifying { job, deadline };
         let tx_id = admission.tx_id;
+        let after_reset = admission.after_reset;
         let tx = admission
             .body
             .clone()
@@ -1892,6 +1917,7 @@ impl<E: VerifyError> MempoolState<E> {
             job,
             tx,
             revalidation: false,
+            after_reset,
         });
     }
 
@@ -1982,6 +2008,13 @@ impl<E: VerifyError> MempoolState<E> {
                 SameEffectsChainRejectionError::Expired.into(),
                 self.now,
             );
+        }
+    }
+
+    /// Marks every undecided transaction as reset. See [`Effect::Start`].
+    fn mark_reset(&mut self) {
+        for admission in self.admissions.values_mut() {
+            admission.after_reset = true;
         }
     }
 
@@ -2120,6 +2153,8 @@ impl<E: VerifyError> MempoolState<E> {
                 job,
                 tx,
                 revalidation: true,
+                // A revalidation is never charged.
+                after_reset: false,
             });
         }
     }

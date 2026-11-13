@@ -763,9 +763,15 @@ impl PoolModel {
             self.start_revalidations();
             return (waiter, self.take_step());
         }
-        let (key, ticket_source) = match self.tickets.remove(&reservation) {
-            Some(ticket) => (Some(ticket.admission), Some(ticket.source)),
-            None => (self.owners.remove(&reservation), None),
+        let (key, ticket_source, body) = match self.tickets.remove(&reservation) {
+            // A joined caller that was not asked for the body sends none, as
+            // the handle drops it.
+            Some(ticket) => (
+                Some(ticket.admission),
+                Some(ticket.source),
+                body.filter(|_| ticket.brings),
+            ),
+            None => (self.owners.remove(&reservation), None, body),
         };
         // The admission the reservation was granted for, if it is still
         // undecided. A later admission of the same id has another key.
@@ -1520,9 +1526,16 @@ impl PoolModel {
         if waiting >= MAX_WAITERS || already_on_it {
             return Err(ModelUnreserved::Pending);
         }
-        // One joined caller is asked for the body, and only while the core
-        // has none. Every other one waits for that body's verdict.
-        let brings = admission.body.is_none() && !tickets.iter().any(|ticket| ticket.brings);
+        // A joined caller is asked for the body only when nobody else can
+        // bring it: the core has none, the reserving caller is not still
+        // fetching or delivering it, and no other joined caller was asked.
+        // Otherwise a second decoded body would wait under the same slot,
+        // with nothing counted against the joining source. So a delivery
+        // that joins while the fetch is out waits for the fetch's verdict,
+        // and its own copy is dropped, as today drops it.
+        let brings = admission.body.is_none()
+            && !admission.owner_waiting
+            && !tickets.iter().any(|ticket| ticket.brings);
         let id = ReservationId(self.fresh());
         self.tickets.insert(
             id,

@@ -89,6 +89,7 @@ impl ConsensusVerifier {
         tx: UnminedTx,
         tip: ChainTip,
         revalidation: bool,
+        after_reset: bool,
     ) -> Outcome<TransactionError> {
         if usize::try_from(self.max_transaction_bytes)
             .is_ok_and(|max_transaction_bytes| tx.size() > max_transaction_bytes)
@@ -180,7 +181,8 @@ impl ConsensusVerifier {
                     Charge::None
                 } else if failure_bans(&error, transaction_version) {
                     Charge::Ban
-                } else if self.current.load(Ordering::Relaxed)
+                } else if !after_reset
+                    && self.current.load(Ordering::Relaxed)
                     && failure_cools_down(
                         &error,
                         transaction_version,
@@ -210,8 +212,9 @@ impl Verifier<TransactionError> for ConsensusVerifier {
         tx: UnminedTx,
         tip: ChainTip,
         revalidation: bool,
+        after_reset: bool,
     ) -> Pin<Box<dyn Future<Output = Outcome<TransactionError>> + Send>> {
-        Box::pin(self.clone().check(tx, tip, revalidation))
+        Box::pin(self.clone().check(tx, tip, revalidation, after_reset))
     }
 }
 

@@ -80,11 +80,15 @@ pub trait Verifier<E>: Clone + Send + Sync + 'static {
     /// step's snapshot is published. The returned future must not read the
     /// state until it is polled: the core reads the generation before it
     /// polls it. A panic here, or in the future, is a local fault.
+    ///
+    /// `after_reset` says the chain was reset since the transaction's body
+    /// arrived. See `Effect::Start`.
     fn verify(
         &self,
         tx: UnminedTx,
         tip: ChainTip,
         revalidation: bool,
+        after_reset: bool,
     ) -> Pin<Box<dyn Future<Output = Outcome<E>> + Send>>;
 }
 
@@ -455,7 +459,8 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                     job,
                     tx,
                     revalidation,
-                } => self.start(job, tx, revalidation),
+                    after_reset,
+                } => self.start(job, tx, revalidation, after_reset),
                 Effect::Cancel(job) => {
                     self.jobs.remove(&job);
                 }
@@ -501,7 +506,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
     }
 
     /// Starts a verification task for `job`.
-    fn start(&mut self, job: JobId, tx: UnminedTx, revalidation: bool) {
+    fn start(&mut self, job: JobId, tx: UnminedTx, revalidation: bool, after_reset: bool) {
         // The job verifies for the machine's tip, which belongs to the
         // generation the machine has applied. A worker that first reads any
         // other generation would report a result for one tip as fresh at
@@ -510,7 +515,8 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
         // A panic while the verifier builds its future is a local fault too,
         // not the end of the core.
         let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.verifier.verify(tx, self.machine.tip(), revalidation)
+            self.verifier
+                .verify(tx, self.machine.tip(), revalidation, after_reset)
         }))
         .unwrap_or_else(|_| {
             Box::pin(std::future::ready(Outcome::LocalFault(

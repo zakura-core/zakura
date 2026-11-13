@@ -877,23 +877,28 @@ where
         state: &mut ZS,
         txid: UnminedTxId,
     ) -> Result<(), TransactionDownloadVerifyError> {
-        match state
-            .ready()
-            .await
-            .map_err(CloneError::from)
-            .map_err(TransactionDownloadVerifyError::StateError)?
-            .call(zs::ReadRequest::Transaction(txid.mined_id()))
-            .await
-        {
-            Ok(zs::ReadResponse::Transaction(None)) => Ok(()),
-            Ok(zs::ReadResponse::Transaction(Some(_))) => {
-                Err(TransactionDownloadVerifyError::InState)
-            }
-            Ok(_) => unreachable!("wrong response"),
-            Err(e) => Err(TransactionDownloadVerifyError::StateError(e.into())),
-        }?;
+        transaction_in_best_chain(state.clone(), txid).await
+    }
+}
 
-        Ok(())
+/// Fails with [`TransactionDownloadVerifyError::InState`] if the best chain
+/// already holds a transaction with `txid`'s effects. Both pools check this
+/// before they fetch a body.
+pub(crate) async fn transaction_in_best_chain<ZS>(
+    state: ZS,
+    txid: UnminedTxId,
+) -> Result<(), TransactionDownloadVerifyError>
+where
+    ZS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>,
+{
+    match state
+        .oneshot(zs::ReadRequest::Transaction(txid.mined_id()))
+        .await
+    {
+        Ok(zs::ReadResponse::Transaction(None)) => Ok(()),
+        Ok(zs::ReadResponse::Transaction(Some(_))) => Err(TransactionDownloadVerifyError::InState),
+        Ok(_) => unreachable!("wrong response"),
+        Err(e) => Err(TransactionDownloadVerifyError::StateError(e.into())),
     }
 }
 

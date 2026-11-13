@@ -377,36 +377,6 @@ fn a_second_peer_can_answer_without_moving_the_reservation() {
 }
 
 #[test]
-fn a_body_that_arrives_after_the_verdict_is_answered_and_not_charged() {
-    let mut model = new_model();
-    // tx-relay reserved id 1 and is still waiting for its body.
-    let relay = model
-        .reserve(id(1), Source::Peer(v2(1)), Intent::Fetch, secs(0))
-        .expect("room");
-    // A legacy peer pushes the same transaction.
-    let pushed = model
-        .reserve(id(1), peer(2), Intent::Deliver, secs(1))
-        .expect("a delivery joins an undecided id");
-    assert!(pushed.joined);
-    let (pusher, step) = model.submit(pushed.id, tx(1), Supplier::Peer(legacy(2)), secs(1));
-    let job = the_job(&step);
-    // The pushed body verifies under the relay's slot. No second slot.
-    assert_eq!(model.slots_in_use(), 1);
-
-    let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(2));
-    assert_eq!(step.verdict(pusher), Some(ModelVerdict::Admitted));
-    // The relay's fetch is still out, so its slot is still taken.
-    assert_eq!(model.slots_in_use(), 1);
-
-    // The relay's own answer arrives late. It gets the admission's verdict,
-    // as if it had come in time.
-    let (late, step) = model.submit(relay.id, tx(1), Supplier::Peer(v2(1)), secs(3));
-    assert_eq!(step.verdict(late), Some(ModelVerdict::Admitted));
-    assert!(step.started().is_empty());
-    assert_eq!(model.slots_in_use(), 0);
-}
-
-#[test]
 fn a_joiner_that_comes_back_after_a_local_fault_gets_that_fault() {
     let mut model = new_model();
     let (waiter, job) = bring_in(&mut model, tx(1), legacy(1));
@@ -1410,37 +1380,38 @@ fn a_cooldown_follows_a_legacy_peer_to_a_new_port() {
 }
 
 #[test]
-fn only_one_joined_caller_is_asked_for_the_body() {
+fn a_delivery_that_joins_while_the_fetch_is_out_waits_for_it() {
     let mut model = new_model();
     // tx-relay reserved the id and is fetching it.
-    model
+    let fetch = model
         .reserve(id(1), Source::Peer(v2(1)), Intent::Fetch, secs(0))
         .expect("room");
+    // Two legacy peers push it meanwhile. Neither is asked for its copy,
+    // so no second body waits under the one slot, as today drops a pushed
+    // copy of an id that is already queued.
     let first = model
         .reserve(id(1), peer(2), Intent::Deliver, secs(0))
         .expect("joins");
     let second = model
         .reserve(id(1), peer(3), Intent::Deliver, secs(0))
         .expect("joins");
-    // Both hold the body. The core takes it from one of them.
-    assert!(first.wants_body);
+    assert!(!first.wants_body);
     assert!(!second.wants_body);
-
+    let (first_waiter, step) = model.wait(first.id, id(1), Supplier::Peer(legacy(2)), secs(0));
+    assert!(step.started().is_empty());
     let (second_waiter, step) = model.wait(second.id, id(1), Supplier::Peer(legacy(3)), secs(0));
     assert!(step.started().is_empty());
-    let (first_waiter, step) = model.submit(first.id, tx(1), Supplier::Peer(legacy(2)), secs(0));
-    let job = the_job(&step);
-
-    // A caller that joins once the core holds the body is not asked either.
-    let third = model
-        .reserve(id(1), peer(4), Intent::Deliver, secs(0))
-        .expect("joins");
-    assert!(!third.wants_body);
-
-    let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(1));
-    assert_eq!(step.verdict(first_waiter), Some(ModelVerdict::Admitted));
-    assert_eq!(step.verdict(second_waiter), Some(ModelVerdict::Admitted));
     assert_eq!(model.bodies_held(), 0);
+    assert_eq!(model.slots_in_use(), 1, "the joiners hold no slot");
+
+    // The fetch brings the body, and every waiter gets its verdict.
+    let (fetcher, step) = model.submit(fetch.id, tx(1), Supplier::Peer(v2(1)), secs(1));
+    let step = model.outcome(the_job(&step), Outcome::Pass, stable(0), stable(0), secs(2));
+    for waiter in [fetcher, first_waiter, second_waiter] {
+        assert_eq!(step.verdict(waiter), Some(ModelVerdict::Admitted));
+    }
+    assert_eq!(model.bodies_held(), 0);
+    model.assert_invariants();
 }
 
 #[test]
@@ -1449,18 +1420,13 @@ fn waiters_get_a_local_fault_when_nobody_brings_the_body() {
     let owner = model
         .reserve(id(1), Source::Peer(v2(1)), Intent::Fetch, secs(0))
         .expect("room");
-    let bringer = model
-        .reserve(id(1), peer(2), Intent::Deliver, secs(0))
-        .expect("joins");
     let waiting = model
         .reserve(id(1), peer(3), Intent::Deliver, secs(0))
         .expect("joins");
     let (waiter, _) = model.wait(waiting.id, id(1), Supplier::Peer(legacy(3)), secs(0));
 
-    // The fetch fails, and the caller that was asked for the body is
-    // cancelled.
-    assert_eq!(model.release(owner.id, secs(1)), Step::default());
-    let step = model.release(bringer.id, secs(1));
+    // The fetch fails, and nobody else was asked for the body.
+    let step = model.release(owner.id, secs(1));
     assert_eq!(
         step.verdict(waiter),
         Some(ModelVerdict::LocalFault(LocalFault::NoBody))
@@ -2087,7 +2053,7 @@ async fn a_dropped_reservation_wakes_an_idle_core() {
 // Cases from Sol's second review.
 
 #[test]
-fn a_fetch_that_is_still_out_keeps_its_slot_after_someone_else_decides_the_id() {
+fn a_fetch_that_is_still_out_keeps_its_slot_after_its_admission_ends() {
     let mut model = new_model();
     let alice = peer(1);
     // Alice's five fetches are out.
@@ -2098,29 +2064,26 @@ fn a_fetch_that_is_still_out_keeps_its_slot_after_someone_else_decides_the_id() 
                 .expect("five fit")
         })
         .collect();
-    // Bob delivers all five, and they are verified before Alice's fetches
-    // come back.
-    for n in 0..5 {
-        let joined = model
-            .reserve(id(n), peer(2), Intent::Deliver, secs(0))
-            .expect("joins");
-        let (_, step) = model.submit(joined.id, tx(n), Supplier::Peer(legacy(2)), secs(0));
-        model.outcome(the_job(&step), Outcome::Pass, stable(0), stable(0), secs(0));
-    }
-    assert_eq!(model.visible().len(), 5);
-
-    // Five decoded bodies are still on their way from Alice's peers. She
-    // cannot start a sixth fetch.
+    // The pool turns off and on again before her fetches come back. Their
+    // admissions end, but five decoded bodies are still on their way, so
+    // she cannot start a sixth fetch.
+    model.deactivate(secs(0));
+    model.activate(Height(100), Generation(0), secs(0));
+    assert!(model.effects().is_empty());
     assert_eq!(model.counted_against(&alice), 5);
     assert_eq!(
         model.reserve(id(9), alice.clone(), Intent::Fetch, secs(1)),
         Err(ModelUnreserved::NoRoom(NoRoom::Source))
     );
+    assert!(model.effects().is_empty());
 
     // One fetch comes back, and one fails. Each frees its slot. The one
-    // that came back gets the admission's verdict.
+    // that came back gets its admission's verdict.
     let (late, step) = model.submit(fetching[0].id, tx(0), Supplier::Peer(legacy(1)), secs(2));
-    assert_eq!(step.verdict(late), Some(ModelVerdict::Admitted));
+    assert_eq!(
+        step.verdict(late),
+        Some(ModelVerdict::LocalFault(LocalFault::Deactivated))
+    );
     model.release(fetching[1].id, secs(2));
     assert_eq!(model.counted_against(&alice), 3);
     assert!(model.reserve(id(9), alice, Intent::Fetch, secs(2)).is_ok());
@@ -2675,14 +2638,10 @@ fn a_fetch_that_outlived_its_admission_still_knows_its_id() {
                 .expect("room")
         })
         .collect();
-    // Another caller's bodies decide both ids while the fetches are out.
-    for n in 0..2 {
-        let joined = model
-            .reserve(id(n), peer(2), Intent::Deliver, secs(0))
-            .expect("joins");
-        let (_, step) = model.submit(joined.id, tx(n), Supplier::Peer(legacy(2)), secs(0));
-        model.outcome(the_job(&step), Outcome::Pass, stable(0), stable(0), secs(0));
-    }
+    // The admissions end while the fetches are out.
+    model.deactivate(secs(0));
+    model.activate(Height(100), Generation(0), secs(0));
+    assert!(model.effects().is_empty());
     assert_eq!(model.slots_in_use(), 2);
 
     // A wrong body is still a wrong body, as the handle would say.
@@ -2691,8 +2650,8 @@ fn a_fetch_that_outlived_its_admission_still_knows_its_id() {
         step.verdict(waiter),
         Some(ModelVerdict::LocalFault(LocalFault::WrongTransaction))
     );
-    // A fetch that fails now adds nothing to the log. The id's outcome is
-    // already there.
+    // A fetch that fails now adds nothing to the log. Its admission's
+    // outcome is already there.
     assert_eq!(model.fetch_failed(fetching[1].id, secs(1)), Step::default());
     assert_eq!(model.slots_in_use(), 0);
 }
@@ -3118,24 +3077,24 @@ fn a_joined_reservation_keeps_its_id_after_its_admission_ends() {
         Some(ModelVerdict::LocalFault(LocalFault::WrongTransaction))
     );
 
-    // The same for a joined caller that was asked for the body.
+    // The same for a caller that joined while the fetch was out.
     let owner = model
         .reserve(id(3), peer(1), Intent::Fetch, secs(2))
         .expect("room");
-    let brings = model
+    let joined = model
         .reserve(id(3), peer(2), Intent::Deliver, secs(2))
         .expect("joins");
-    assert!(brings.wants_body);
+    assert!(!joined.wants_body, "the fetch will bring the body");
     let (_, step) = model.submit(owner.id, tx(3), Supplier::Peer(legacy(1)), secs(2));
     model.outcome(the_job(&step), Outcome::Pass, stable(0), stable(0), secs(3));
-    let (waiter, step) = model.submit(brings.id, tx(9), Supplier::Peer(legacy(2)), secs(4));
+    let (waiter, step) = model.submit(joined.id, tx(9), Supplier::Peer(legacy(2)), secs(4));
     assert_eq!(
         step.verdict(waiter),
         Some(ModelVerdict::LocalFault(LocalFault::WrongTransaction))
     );
-    // With the right body it is a duplicate of what the pool holds.
-    let brings = model.reserve(id(3), peer(2), Intent::Deliver, secs(4));
-    assert_eq!(brings, Err(ModelUnreserved::Pooled));
+    // Once it is pooled, a new reservation finds it there.
+    let again = model.reserve(id(3), peer(2), Intent::Deliver, secs(4));
+    assert_eq!(again, Err(ModelUnreserved::Pooled));
 }
 
 #[test]

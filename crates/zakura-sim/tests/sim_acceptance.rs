@@ -865,7 +865,8 @@ mod manifest {
     #[test]
     fn every_named_result_exists() {
         let suite: SuiteFile = toml::from_str(&read(SUITE_FILE)).unwrap();
-        let required = committed_required(&seed::repo_root(), &Manifest::committed());
+        let required = committed_required(&seed::repo_root(), &Manifest::committed())
+            .expect("the committed inventories read, as hdr-14's own inventory test checks");
         let adapter = read("qa/fuzz/sim/src/fuzz/adapter.rs");
         for row in rows(derived()) {
             for expected in &row.expected {

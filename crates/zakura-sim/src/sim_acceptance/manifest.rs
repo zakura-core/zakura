@@ -698,7 +698,7 @@ pub fn derive(repo: &Path) -> Result<Derived, Vec<String>> {
             (path.extension()? == "bin").then(|| path.file_stem()?.to_str().map(str::to_owned))?
         })
         .collect();
-    let required = committed_required(repo, &Manifest::committed());
+    let required = committed_required(repo, &Manifest::committed()).map_err(|why| vec![why])?;
     let replay_keys: Vec<Key> = required
         .keys()
         .filter(|key| matches!(key, Key::Replay { .. }))

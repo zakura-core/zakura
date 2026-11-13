@@ -181,7 +181,7 @@ mod cli {
                     ],
                 )?;
                 use zakura_sim::sim_acceptance::header::read_bounded_json;
-                let plan: RunPlan = read_bounded_json(Path::new(&flags["--plan"]))?;
+                let plan = binding::read_plan(Path::new(&flags["--plan"]))?;
                 let record: tool::Record = read_bounded_json(Path::new(&flags["--record"]))?;
                 let (artifacts, out) = (
                     PathBuf::from(&flags["--artifacts"]),

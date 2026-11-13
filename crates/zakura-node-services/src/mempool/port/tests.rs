@@ -19,8 +19,8 @@ use zakura_chain::{
 use super::{
     model::{
         Effect, JobId, ModelBlock, ModelReader, ModelTransition, ModelTx, ModelUnreserved,
-        ModelVerdict, Outcome, OutputAnswer, PoolModel, Step, WaiterId, COOLDOWN, REJECTION_MEMORY,
-        REVALIDATE_RETRY, T_PARK, T_VERIFY,
+        ModelVerdict, Outcome, OutputAnswer, PoolModel, Step, WaiterId, COOLDOWN, MAX_PARKED,
+        REJECTION_MEMORY, REVALIDATE_RETRY, T_PARK, T_VERIFY,
     },
     pool_port, ChainReason, ChainTip, Change, ChangeLog, ChangeSeq, ChangesSince, Charge,
     CooldownKey, Generation, GenerationCell, GenerationRead, Intent, LocalFault, NoRoom,
@@ -2211,6 +2211,17 @@ fn a_reveal_cannot_grow_a_dependency_group_past_its_limit() {
     }
     assert_eq!(model.visible(), vec![id(2), id(3), id(1)]);
     assert!(model.hidden().is_empty());
+
+    // The child that did not fit is remembered until the tip changes, so
+    // it is not fetched again at once.
+    assert_eq!(
+        model.reserve(id(4), peer(9), Intent::Fetch, secs(2)),
+        Err(ModelUnreserved::Rejected(RejectionScope::EffectsTip))
+    );
+    model.transition(transition(2, 100, vec![vec![]]), secs(3));
+    assert!(model
+        .reserve(id(4), peer(9), Intent::Fetch, secs(3))
+        .is_ok());
 }
 
 #[test]
@@ -2752,8 +2763,9 @@ struct Run {
     jobs: Vec<JobId>,
     waiters: Vec<WaiterId>,
     verdicts: Vec<WaiterId>,
-    /// Output waits that have had no answer and were not cancelled.
-    output_waits: Vec<WaiterId>,
+    /// Output waits that have had no answer and were not cancelled, with
+    /// the outpoint each one asked for.
+    output_waits: Vec<(WaiterId, OutPoint)>,
 }
 
 impl Run {
@@ -2766,12 +2778,21 @@ impl Run {
                 // An output wait ends once: with its output, or because the
                 // pool turned off. An answer for a wait that is not out is
                 // a duplicate, or one for a caller that already left.
-                Effect::OutputReady { waiter, .. } | Effect::OutputWaitEnded(waiter) => {
+                Effect::OutputReady { waiter, outpoint } => {
                     let index = self
                         .output_waits
                         .iter()
-                        .position(|waiting| *waiting == waiter)
+                        .position(|(waiting, _)| *waiting == waiter)
                         .expect("an output answer names a wait that is still out");
+                    let (_, asked) = self.output_waits.swap_remove(index);
+                    assert_eq!(asked, outpoint, "the answer is the output asked for");
+                }
+                Effect::OutputWaitEnded(waiter) => {
+                    let index = self
+                        .output_waits
+                        .iter()
+                        .position(|(waiting, _)| *waiting == waiter)
+                        .expect("an ended output wait was still out");
                     self.output_waits.swap_remove(index);
                 }
                 Effect::Outputs { .. } => {}
@@ -2783,11 +2804,16 @@ impl Run {
 /// The body of transaction `n` in the random runs. Every third one spends
 /// the one before it.
 fn random_body(n: u16) -> ModelTx {
-    if n.is_multiple_of(3) && n > 0 {
+    let mut body = if n.is_multiple_of(3) && n > 0 {
         child_of(n, n - 1)
     } else {
         tx(n)
+    };
+    // Every fourth one expires a few blocks into the run.
+    if n.is_multiple_of(4) {
+        body.expiry = Some(Height(104 + u32::from(n)));
     }
+    body
 }
 
 #[test]
@@ -2900,12 +2926,12 @@ fn a_random_run_with_small_limits_always_drains() {
                 }
                 12 => {
                     if let OutputAnswer::Waiting(waiter) = model.await_output(output(n, 0), now) {
-                        run.output_waits.push(waiter);
+                        run.output_waits.push((waiter, output(n, 0)));
                     }
                 }
                 13 if !run.output_waits.is_empty() => {
                     let pick = rng.pick(run.output_waits.len());
-                    let waiter = run.output_waits.swap_remove(pick);
+                    let (waiter, _) = run.output_waits.swap_remove(pick);
                     model.cancel_output_wait(waiter);
                 }
                 _ => run.record(model.tick(now)),
@@ -2923,16 +2949,6 @@ fn a_random_run_with_small_limits_always_drains() {
         for (reservation, ..) in granted.drain(..) {
             run.record(model.release(reservation, now));
         }
-        // Callers still waiting for an output give up too. The model must
-        // be holding exactly the waits the run thinks are out.
-        for waiter in std::mem::take(&mut run.output_waits) {
-            model.cancel_output_wait(waiter);
-        }
-        assert_eq!(
-            model.output_waits(),
-            0,
-            "seed {seed}: an output wait is stuck"
-        );
         for round in 0..400 {
             if model.slots_in_use() == 0 && model.hidden().is_empty() && run.jobs.is_empty() {
                 break;
@@ -2955,6 +2971,34 @@ fn a_random_run_with_small_limits_always_drains() {
             model.assert_invariants();
         }
 
+        // Only now do callers still waiting for an output give up. Their
+        // waits stayed out through the drain, so an admission or reveal
+        // that should have answered one did, and was checked. An output
+        // that is visible now cannot still have a caller waiting for it.
+        for (waiter, outpoint) in std::mem::take(&mut run.output_waits) {
+            // Every random body creates output 0, so a visible transaction
+            // with this hash offers the output.
+            assert!(
+                !model
+                    .visible()
+                    .iter()
+                    .any(|visible| visible.mined_id() == outpoint.hash),
+                "seed {seed}: a wait was left out though its output is visible"
+            );
+            model.cancel_output_wait(waiter);
+        }
+        assert_eq!(
+            model.output_waits(),
+            0,
+            "seed {seed}: an output wait is stuck"
+        );
+        // Every caller has submitted or dropped what it was granted, so the
+        // model remembers no reservation.
+        assert_eq!(
+            model.caller_held(),
+            0,
+            "seed {seed}: a reservation is remembered"
+        );
         // Nothing is stuck: no slot is held, nothing is hidden, and every
         // submission was answered exactly once, with the pool still on.
         assert_eq!(model.slots_in_use(), 0, "seed {seed}: a slot is stuck");
@@ -3033,4 +3077,108 @@ fn a_pooled_transaction_that_fails_its_check_is_remembered_and_charges_nobody() 
         model.reserve(id(1), peer(2), Intent::Fetch, secs(2)),
         Err(ModelUnreserved::Rejected(RejectionScope::ExactTip))
     );
+}
+
+// Cases from the sixth review.
+
+#[test]
+fn a_parent_that_is_verified_again_and_again_cannot_hold_its_child_for_ever() {
+    let mut model = new_model();
+    let (child, job) = bring_in(&mut model, child_of(2, 1), legacy(1));
+    model.outcome(job, missing(1), stable(0), stable(0), secs(0));
+
+    // The parent is submitted, its verification never finishes, it times
+    // out, and it is submitted again at once. Each attempt stops the
+    // child's own wait.
+    let mut now = secs(0);
+    let mut answered = None;
+    for attempt in 0..4 {
+        let reservation = model
+            .reserve(id(1), peer(10 + attempt), Intent::Fetch, now)
+            .expect("room");
+        model.submit(
+            reservation.id,
+            tx(1),
+            Supplier::Peer(legacy(10 + attempt)),
+            now,
+        );
+        now += T_VERIFY;
+        let step = model.tick(now);
+        if let Some(verdict) = step.verdict(child) {
+            answered = Some((now, verdict));
+            break;
+        }
+    }
+    // The child still gets its answer, and its slot comes back.
+    assert_eq!(
+        answered,
+        Some((MAX_PARKED, rejected(RejectionScope::Uncached, Charge::None)))
+    );
+    model.assert_invariants();
+}
+
+#[test]
+fn a_missed_chain_event_past_an_expiry_height_expires_the_transaction() {
+    let mut model = new_model();
+    let mut expiring = tx(1);
+    expiring.expiry = Some(Height(101));
+    admit(&mut model, expiring, 1, 0);
+    admit(&mut model, tx(2), 2, 0);
+
+    // The core missed the blocks, so no transition told it the height.
+    let step = model.resync(Height(101), Generation(3), secs(1));
+    assert_eq!(
+        step.changes,
+        vec![
+            Change::Removed {
+                id: id(1),
+                reason: RemovalReason::Expired
+            },
+            Change::Hidden(id(2)),
+        ]
+    );
+    model.assert_invariants();
+    assert_eq!(
+        model.reserve(id(1), peer(3), Intent::Fetch, secs(1)),
+        Err(ModelUnreserved::Rejected(RejectionScope::EffectsChain(
+            ChainReason::Expired
+        )))
+    );
+}
+
+#[tokio::test]
+async fn a_caller_that_stops_waiting_for_an_output_closes_its_reply() {
+    let (handle, mut inbox) = pool_port();
+    let caller = tokio::spawn(async move { handle.await_output(output(1, 0)).await });
+    let Some(PoolCommand::AwaitOutput { reply, .. }) = inbox.next().await else {
+        panic!("the wait reaches the core");
+    };
+    assert!(!reply.is_closed());
+
+    // The caller is cancelled. The core can see that on the reply it
+    // holds, which is how it drops the waiter before the limit refuses
+    // someone who is still there.
+    caller.abort();
+    assert!(caller.await.expect_err("aborted").is_cancelled());
+    assert!(reply.is_closed());
+}
+
+#[test]
+fn nothing_expired_gets_in_even_if_a_verification_passes_it() {
+    let mut model = new_model();
+    let mut expired = tx(1);
+    expired.expiry = Some(Height(100));
+    let (waiter, job) = bring_in(&mut model, expired, legacy(1));
+    // The tip is at the expiry height. A verifier that passed it is wrong,
+    // and the pool does not depend on it being right.
+    let step = model.outcome(job, Outcome::Pass, stable(0), stable(0), secs(0));
+    assert_eq!(
+        step.verdict(waiter),
+        Some(rejected(
+            RejectionScope::EffectsChain(ChainReason::Expired),
+            Charge::None
+        ))
+    );
+    assert!(model.visible().is_empty());
+    model.assert_invariants();
 }

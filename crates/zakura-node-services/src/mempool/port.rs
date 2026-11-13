@@ -831,6 +831,10 @@ pub enum PoolCommand {
     /// [`PoolHandle::await_output`]. The core looks the output up and, if it
     /// is missing, registers the waiter, in one step of its task. So an
     /// admission cannot fall between the lookup and the registration.
+    ///
+    /// A caller that stops waiting drops its end, which closes `reply`. The
+    /// core drops closed waiters before it refuses a new outpoint for the
+    /// limit, as today, so callers that left cannot fill it.
     AwaitOutput {
         /// The outpoint.
         outpoint: transparent::OutPoint,

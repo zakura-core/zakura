@@ -62,6 +62,13 @@ pub const T_VERIFY: Duration = Duration::from_secs(60);
 /// wait for a pool parent.
 pub const T_PARK: Duration = Duration::from_secs(60);
 
+/// The longest a transaction stays parked, whatever its parents are doing:
+/// its own wait, plus one full verification of a parent. The wait in
+/// [`T_PARK`] stops while a parent is being verified, and without this a
+/// parent that is verified again and again could hold its children, and
+/// their slots, for ever.
+pub const MAX_PARKED: Duration = Duration::from_secs(120);
+
 /// How long the core refuses a peer after a cooldown charge or a violation.
 /// Today's base cooldown.
 pub const COOLDOWN: Duration = Duration::from_secs(10 * 60);
@@ -440,6 +447,8 @@ struct Admission {
     /// time it was parked. It never resets, so waking and parking again
     /// cannot keep a transaction past [`T_PARK`].
     parked_for: Duration,
+    /// All the time spent parked, bounded by [`MAX_PARKED`].
+    parked_total: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -474,6 +483,9 @@ struct Pooled {
     /// since it was last visible. Waking and parking again does not reset
     /// it.
     parked_for: Duration,
+    /// All the time spent hidden and parked since it was last visible,
+    /// bounded by [`MAX_PARKED`].
+    parked_total: Duration,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -527,6 +539,11 @@ pub struct PoolModel {
     /// Joined reservations whose admission ended before their caller came
     /// back. Each keeps its id, so a wrong body under it is still told
     /// apart, as the handle would.
+    ///
+    /// This is the model's stand-in for the id the caller's reservation
+    /// carries. The core keeps nothing for it: the handle makes that check
+    /// before it sends anything. An entry lasts as long as its caller holds
+    /// the reservation.
     ended_joins: HashMap<ReservationId, UnminedTxId>,
     /// The pool, oldest first.
     pool: BTreeMap<u64, Pooled>,
@@ -647,6 +664,7 @@ impl PoolModel {
                 waiters: Vec::new(),
                 stage: Stage::Reserved,
                 parked_for: Duration::ZERO,
+                parked_total: Duration::ZERO,
             },
         );
         self.admission_of.insert(tx_id, key);
@@ -907,16 +925,7 @@ impl PoolModel {
                 RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
             );
         }
-        let expired: Vec<UnminedTxId> = self
-            .pool
-            .values()
-            .filter(|pooled| pooled.tx.expiry.is_some_and(|expiry| self.tip >= expiry))
-            .map(|pooled| pooled.tx.id)
-            .collect();
-        for tx_id in expired {
-            self.remove_with_dependents(tx_id.mined_id(), RemovalReason::Expired);
-            self.cache(tx_id, RejectionScope::EffectsChain(ChainReason::Expired));
-        }
+        self.remove_expired();
         if verify_again {
             self.hide_all();
             // A block that left the chain may have spent an output a parked
@@ -942,6 +951,8 @@ impl PoolModel {
         self.applied = generation;
         self.tip = tip;
         self.clear_all_rejections();
+        // Expiry needs no verifier, only the new tip.
+        self.remove_expired();
         self.hide_all();
         self.rerun_parked();
         self.chain_applied();
@@ -956,7 +967,11 @@ impl PoolModel {
         for (key, admission) in &self.admissions {
             match &admission.stage {
                 Stage::Verifying { deadline, .. } if *deadline <= now => timed_out.push(*key),
-                Stage::Parked { .. } if admission.parked_for >= T_PARK => unparked.push(*key),
+                Stage::Parked { .. }
+                    if admission.parked_for >= T_PARK || admission.parked_total >= MAX_PARKED =>
+                {
+                    unparked.push(*key)
+                }
                 _ => {}
             }
         }
@@ -979,11 +994,12 @@ impl PoolModel {
         for key in keys {
             // An earlier removal in this loop can have taken this one with
             // it, as a dependent.
-            let Some((hidden, parked_for)) = self
-                .pool
-                .get(&key)
-                .map(|pooled| (pooled.hidden.clone(), pooled.parked_for))
-            else {
+            let Some((hidden, parked_out)) = self.pool.get(&key).map(|pooled| {
+                (
+                    pooled.hidden.clone(),
+                    pooled.parked_for >= T_PARK || pooled.parked_total >= MAX_PARKED,
+                )
+            }) else {
                 continue;
             };
             match hidden {
@@ -996,7 +1012,7 @@ impl PoolModel {
                     self.pooled_at(key).hidden = Some(Hidden::Queued);
                 }
                 // Its parent never came back.
-                Some(Hidden::Parked { .. }) if parked_for >= T_PARK => {
+                Some(Hidden::Parked { .. }) if parked_out => {
                     let hash = self.pooled_at(key).tx.id.mined_id();
                     self.remove_with_dependents(hash, RemovalReason::Invalidated);
                 }
@@ -1109,6 +1125,16 @@ impl PoolModel {
             .chain(self.leases.values().map(|lease| &lease.source))
             .filter(|counted| *counted == source)
             .count()
+    }
+
+    /// Reservations callers still hold, of every kind. Zero once every
+    /// caller has submitted or dropped what it was granted.
+    pub fn caller_held(&self) -> usize {
+        self.owners
+            .len()
+            .saturating_add(self.tickets.len())
+            .saturating_add(self.leases.len())
+            .saturating_add(self.ended_joins.len())
     }
 
     /// Undecided transactions that hold a body.
@@ -1342,6 +1368,17 @@ impl PoolModel {
                     Outcome::PassUsing(inputs) => inputs,
                     _ => Vec::new(),
                 };
+                // The tip has reached its expiry height. The verifier should
+                // have said so. The pool does not rely on that: nothing
+                // expired gets in.
+                if tx.expiry.is_some_and(|expiry| self.tip >= expiry) {
+                    self.reject(
+                        key,
+                        RejectionScope::EffectsChain(ChainReason::Expired),
+                        Charge::None,
+                    );
+                    return;
+                }
                 // Today's insertion checks, in today's order. First, another
                 // set of authorizing data for the same effects got in while
                 // this one was verified. That is a duplicate, not a
@@ -1401,6 +1438,7 @@ impl PoolModel {
                         visible_at: pool_key,
                         hidden_at: ChangeSeq(0),
                         parked_for: Duration::ZERO,
+                        parked_total: Duration::ZERO,
                     },
                 );
                 self.pooled.insert(hash, pool_key);
@@ -1461,6 +1499,18 @@ impl PoolModel {
                     self.pooled_at(key).hidden = Some(Hidden::Queued);
                     return;
                 }
+                // Nothing expired becomes visible either.
+                let expired = self.pool[&key]
+                    .tx
+                    .expiry
+                    .is_some_and(|expiry| self.tip >= expiry);
+                if expired {
+                    let tx_id = self.pool[&key].tx.id;
+                    self.pooled_at(key).hidden = Some(Hidden::Queued);
+                    self.remove_with_dependents(hash, RemovalReason::Expired);
+                    self.cache(tx_id, RejectionScope::EffectsChain(ChainReason::Expired));
+                    return;
+                }
                 // Today's insertion limits, as for a new transaction. A
                 // parent that was mined, then put back by a reorg, can have
                 // gained more pooled children than one group holds.
@@ -1470,8 +1520,12 @@ impl PoolModel {
                 if ancestors.len() > MAX_ANCESTORS
                     || self.dependency_group(&ancestors).len() >= MAX_PACKAGE
                 {
+                    let tx_id = self.pool[&key].tx.id;
                     self.pooled_at(key).hidden = Some(Hidden::Queued);
                     self.remove_with_dependents(hash, RemovalReason::Invalidated);
+                    // Remembered until the tip changes, as an insertion the
+                    // pool refuses for this reason is today.
+                    self.cache(tx_id, RejectionScope::EffectsTip);
                     return;
                 }
                 let visible_at = self.fresh();
@@ -1480,6 +1534,7 @@ impl PoolModel {
                 pooled.backoff = REVALIDATE_RETRY;
                 pooled.visible_at = visible_at;
                 pooled.parked_for = Duration::ZERO;
+                pooled.parked_total = Duration::ZERO;
                 let (id, hidden_at, count) = (pooled.tx.id, pooled.hidden_at, pooled.tx.outputs);
                 self.step.changes.push(Change::Revealed { id, hidden_at });
                 // Its outputs are available again, to waiters as well.
@@ -1670,6 +1725,21 @@ impl PoolModel {
                     .effects
                     .push(Effect::OutputReady { waiter, outpoint });
             }
+        }
+    }
+
+    /// Removes every pooled transaction whose expiry height the tip has
+    /// reached, with what depends on it, and remembers each as expired.
+    fn remove_expired(&mut self) {
+        let expired: Vec<UnminedTxId> = self
+            .pool
+            .values()
+            .filter(|pooled| pooled.tx.expiry.is_some_and(|expiry| self.tip >= expiry))
+            .map(|pooled| pooled.tx.id)
+            .collect();
+        for tx_id in expired {
+            self.remove_with_dependents(tx_id.mined_id(), RemovalReason::Expired);
+            self.cache(tx_id, RejectionScope::EffectsChain(ChainReason::Expired));
         }
     }
 
@@ -1883,6 +1953,7 @@ impl PoolModel {
             .collect();
         for admission in self.admissions.values_mut() {
             if let Stage::Parked { on } = &admission.stage {
+                admission.parked_total = admission.parked_total.saturating_add(elapsed);
                 if !on.iter().any(|parent| arriving.contains(parent)) {
                     admission.parked_for = admission.parked_for.saturating_add(elapsed);
                 }
@@ -1890,6 +1961,7 @@ impl PoolModel {
         }
         for pooled in self.pool.values_mut() {
             if let Some(Hidden::Parked { on }) = &pooled.hidden {
+                pooled.parked_total = pooled.parked_total.saturating_add(elapsed);
                 if !on.iter().any(|parent| arriving.contains(parent)) {
                     pooled.parked_for = pooled.parked_for.saturating_add(elapsed);
                 }

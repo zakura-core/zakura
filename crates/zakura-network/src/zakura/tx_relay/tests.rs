@@ -903,18 +903,50 @@ impl Lcg {
     }
 }
 
+/// What a reactor run has seen come out of the pool.
+#[derive(Default)]
+struct Ledger {
+    /// Verifications that have started and not been answered.
+    jobs: Vec<zakura_node_services::mempool::port::model::JobId>,
+    /// Submissions by the legacy caller that competes with the reactor.
+    legacy_waiters: Vec<zakura_node_services::mempool::port::model::WaiterId>,
+    /// Every verdict any step carried.
+    verdicts: Vec<zakura_node_services::mempool::port::model::WaiterId>,
+}
+
+impl Ledger {
+    fn absorb(&mut self, step: &Step) {
+        use zakura_node_services::mempool::port::model::Effect;
+        for effect in &step.effects {
+            match effect {
+                Effect::Start { job, .. } => self.jobs.push(*job),
+                Effect::Cancel(job) => self.jobs.retain(|running| running != job),
+                Effect::Verdict { waiter, .. } => self.verdicts.push(*waiter),
+                _ => {}
+            }
+        }
+    }
+
+    fn absorb_all(&mut self, steps: Vec<Step>) {
+        for step in &steps {
+            self.absorb(step);
+        }
+    }
+}
+
 #[test]
 fn a_random_run_always_drains_once_the_sessions_end() {
     for seed in 0..300 {
         let mut rng = Lcg(seed);
-        // A small core, so the run reaches a full one.
-        let mut pool = PoolModel::new(Height(100), Generation(0)).with_limits(6, 2, 3);
+        // A small core, so the run reaches a full one. One source's limit
+        // stays at five, so a peer's five request positions can all be used.
+        let mut pool = PoolModel::new(Height(100), Generation(0)).with_limits(6, 5, 3);
         let mut reactor = ReactorModel::new(MAX_TX);
         let mut now = secs(0);
         let mut live: Vec<SessionId> = Vec::new();
         // Requests on the wire: the session and the id.
         let mut asked: Vec<(SessionId, u16)> = Vec::new();
-        let mut jobs = Vec::new();
+        let mut ledger = Ledger::default();
         // What a legacy caller, competing for the same ids, still holds.
         let mut legacy_held = Vec::new();
         let mut generation = 0;
@@ -971,11 +1003,17 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                     let step = match rng.next(4) {
                         0 => pool.release(reserved.id, now),
                         _ if reserved.wants_body => {
-                            pool.submit(reserved.id, tx(n), supplier, now).1
+                            let (waiter, step) = pool.submit(reserved.id, tx(n), supplier, now);
+                            ledger.legacy_waiters.push(waiter);
+                            step
                         }
-                        _ => pool.wait(reserved.id, id(n), supplier, now).1,
+                        _ => {
+                            let (waiter, step) = pool.wait(reserved.id, id(n), supplier, now);
+                            ledger.legacy_waiters.push(waiter);
+                            step
+                        }
                     };
-                    jobs.extend(step.started());
+                    ledger.absorb(&step);
                     reactor.pool_step(&step, now, &mut pool)
                 }
                 // A block connects, sometimes after a reorg.
@@ -993,7 +1031,7 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                         },
                         now,
                     );
-                    jobs.extend(step.started());
+                    ledger.absorb(&step);
                     reactor.pool_step(&step, now, &mut pool)
                 }
                 0 => {
@@ -1028,11 +1066,11 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                     }
                 }
                 9..=10 => {
-                    jobs.extend(reactor.take_started());
-                    if jobs.is_empty() {
+                    ledger.absorb_all(reactor.take_pool_steps());
+                    if ledger.jobs.is_empty() {
                         Vec::new()
                     } else {
-                        let job = jobs.swap_remove(rng.pick(jobs.len()));
+                        let job = ledger.jobs.swap_remove(rng.pick(ledger.jobs.len()));
                         let outcome = match rng.next(5) {
                             0 => Outcome::Fail {
                                 scope: RejectionScope::ExactTip,
@@ -1047,13 +1085,13 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                         };
                         let read = GenerationRead::Stable(Generation(generation));
                         let step = pool.outcome(job, outcome, read, read, now);
-                        jobs.extend(step.started());
+                        ledger.absorb(&step);
                         reactor.pool_step(&step, now, &mut pool)
                     }
                 }
                 _ => {
                     let step = pool.tick(now);
-                    jobs.extend(step.started());
+                    ledger.absorb(&step);
                     let mut effects = reactor.pool_step(&step, now, &mut pool);
                     effects.extend(reactor.tick(now, &mut pool));
                     effects
@@ -1071,7 +1109,7 @@ fn a_random_run_always_drains_once_the_sessions_end() {
         // a local fault on some runs and pass on the others.
         for (reserved, ..) in legacy_held.drain(..) {
             let step = pool.release(reserved.id, now);
-            jobs.extend(step.started());
+            ledger.absorb(&step);
             reactor.pool_step(&step, now, &mut pool);
         }
         let sessions_end = seed % 3 != 2;
@@ -1081,12 +1119,13 @@ fn a_random_run_always_drains_once_the_sessions_end() {
             }
         }
         for round in 0..200 {
-            jobs.extend(reactor.take_started());
-            let settled = pool.slots_in_use() == 0 && pool.hidden().is_empty() && jobs.is_empty();
+            ledger.absorb_all(reactor.take_pool_steps());
+            let settled =
+                pool.slots_in_use() == 0 && pool.hidden().is_empty() && ledger.jobs.is_empty();
             if settled && (reactor.wanted_count() == 0 || !sessions_end) {
                 break;
             }
-            for job in std::mem::take(&mut jobs) {
+            for job in std::mem::take(&mut ledger.jobs) {
                 let outcome = if seed % 2 == 0 {
                     Outcome::LocalFault(LocalFault::StateUnavailable)
                 } else {
@@ -1097,12 +1136,12 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                 let outcome = if round < 20 { outcome } else { Outcome::Pass };
                 let read = GenerationRead::Stable(Generation(generation));
                 let step = pool.outcome(job, outcome, read, read, now);
-                jobs.extend(step.started());
+                ledger.absorb(&step);
                 reactor.pool_step(&step, now, &mut pool);
             }
             now += RETRY_MAX + T_VERIFY;
             let step = pool.tick(now);
-            jobs.extend(step.started());
+            ledger.absorb(&step);
             reactor.pool_step(&step, now, &mut pool);
             reactor.tick(now, &mut pool);
             reactor.assert_invariants();
@@ -1118,15 +1157,47 @@ fn a_random_run_always_drains_once_the_sessions_end() {
                 "seed {seed}: a peer's quota is stuck"
             );
         }
-        if sessions_end {
-            // Nothing is left wanted with nobody to ask.
-            assert_eq!(reactor.wanted_count(), 0, "seed {seed}: an id is stuck");
-            // A peer that comes back starts with its full allowance.
-            let back = reactor.connect(v2(1), false, MAX_REQUESTS_PER_PEER);
-            let effects = reactor.announce(back, id(15), 300, now, &mut pool);
-            let asked_or_known = effects == vec![ask(back, 15)] || !reactor.wants(id(15));
-            assert!(asked_or_known || pool.cooling(&v2(1), now), "seed {seed}");
+        if !sessions_end {
+            // The silent peers answer at last: none of them has anything.
+            // Every id they were holding up is asked for or given up, until
+            // nothing is wanted.
+            for _ in 0..200 {
+                let Some((session, n)) = asked.pop() else {
+                    break;
+                };
+                let effects = reactor.not_found(session, id(n), now, &mut pool);
+                apply(effects, &mut reactor, &mut pool, &mut live, &mut asked, now);
+            }
+            assert!(asked.is_empty(), "seed {seed}: requests never settle");
+            assert_eq!(pool.slots_in_use(), 0, "seed {seed}: a core slot is stuck");
+            for session in live.drain(..) {
+                reactor.end(session, now, &mut pool);
+            }
         }
+        // Nothing is left wanted with nobody to ask, nothing is hidden, and
+        // no verification is still running.
+        ledger.absorb_all(reactor.take_pool_steps());
+        assert_eq!(reactor.wanted_count(), 0, "seed {seed}: an id is stuck");
+        assert!(
+            pool.hidden().is_empty(),
+            "seed {seed}: a transaction is stuck hidden"
+        );
+        assert!(ledger.jobs.is_empty(), "seed {seed}: a job never finished");
+        // The legacy caller got each of its verdicts, once. Some of them
+        // come out of the reactor's own calls into the pool.
+        for waiter in &ledger.legacy_waiters {
+            let answers = ledger.verdicts.iter().filter(|w| *w == waiter).count();
+            assert_eq!(answers, 1, "seed {seed}: a legacy caller's verdict");
+        }
+        // A peer that comes back has its full allowance: all five request
+        // positions, for ids nobody has seen.
+        now += secs(3_600);
+        let back = reactor.connect(v2(1), false, MAX_REQUESTS_PER_PEER);
+        let mut asked_again = 0;
+        for n in 100..105 {
+            asked_again += reactor.announce(back, id(n), 300, now, &mut pool).len();
+        }
+        assert_eq!(asked_again, MAX_REQUESTS_PER_PEER, "seed {seed}");
         reactor.assert_invariants();
     }
 }

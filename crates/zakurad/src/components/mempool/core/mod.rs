@@ -237,6 +237,7 @@ pub(crate) fn assemble(
         outbound,
         may_cool,
         adapter_read_state,
+        config.max_transaction_bytes,
         expose_peer_addresses,
         misbehavior_sender,
         Arc::new(exempt),

@@ -81,6 +81,9 @@ struct Shared {
     /// tip is still the one the failure was verified at, and asks when it
     /// handles the failure.
     may_cool: Arc<dyn Fn(Height) -> bool + Send + Sync>,
+    /// The largest body the pool takes, which today's downloader checks
+    /// before a cooldown.
+    max_transaction_bytes: u64,
     /// Undecided transactions from each peer, counted from the reservation to
     /// the verdict.
     per_peer: std::sync::Mutex<HashMap<QueueSource, usize>>,
@@ -109,6 +112,7 @@ impl CoreMempool {
         peers: Outbound,
         may_cool: Arc<dyn Fn(Height) -> bool + Send + Sync>,
         read_state: ReadState,
+        max_transaction_bytes: u64,
         expose_peer_addresses: bool,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
         exempt: Arc<Exempt>,
@@ -120,6 +124,7 @@ impl CoreMempool {
                 peers,
                 cooldowns: PeerCooldowns::default(),
                 may_cool,
+                max_transaction_bytes,
                 per_peer: std::sync::Mutex::new(HashMap::new()),
                 read_state: std::sync::Mutex::new(read_state),
                 expose_peer_addresses,
@@ -514,7 +519,16 @@ async fn bring_in(
     // any wait for the reservation or the fetch, so a cooldown that started
     // meanwhile still applies. The failure reaches the change stream, and
     // the slot is freed.
-    if sender.is_some_and(|addr| shared.cooldowns.is_cooling_down(addr.ip(), Instant::now())) {
+    //
+    // Today's downloader checks the size first, so an oversized body is
+    // refused and remembered as too large whoever sent it. Such a body goes
+    // on to the core, whose verifier refuses it for its size before any
+    // other check, caches that for its exact id and charges nobody.
+    let oversized = usize::try_from(shared.max_transaction_bytes)
+        .is_ok_and(|max_transaction_bytes| tx.size() > max_transaction_bytes);
+    if !oversized
+        && sender.is_some_and(|addr| shared.cooldowns.is_cooling_down(addr.ip(), Instant::now()))
+    {
         metrics::counter!("mempool.peer_cooldown.ignored.transactions.total").increment(1);
         shared.handle.fetch_failed(reservation).await;
         return Err(format!(
@@ -807,6 +821,19 @@ mod tests {
         handle: PoolHandle,
         may_cool: impl Fn(Height) -> bool + Send + Sync + 'static,
     ) -> CoreMempool {
+        adapter_with(
+            handle,
+            may_cool,
+            super::super::super::Config::default().max_transaction_bytes,
+        )
+    }
+
+    /// [`adapter_when`], taking bodies of at most `max_transaction_bytes`.
+    fn adapter_with(
+        handle: PoolHandle,
+        may_cool: impl Fn(Height) -> bool + Send + Sync + 'static,
+        max_transaction_bytes: u64,
+    ) -> CoreMempool {
         let outbound = Timeout::new(
             BoxCloneSyncService::new(NeverReady),
             TRANSACTION_DOWNLOAD_TIMEOUT,
@@ -817,6 +844,7 @@ mod tests {
             BoxCloneSyncService::new(NeverReady),
             Arc::new(may_cool),
             chain_holding(None),
+            max_transaction_bytes,
             false,
             mpsc::channel(1).0,
             Arc::new(Exempt::default()),
@@ -940,20 +968,7 @@ mod tests {
         use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
 
         let (handle, mut inbox) = pool_port();
-        let outbound = Timeout::new(
-            BoxCloneSyncService::new(NeverReady),
-            TRANSACTION_DOWNLOAD_TIMEOUT,
-        );
-        let core = CoreMempool::new(
-            handle,
-            outbound,
-            BoxCloneSyncService::new(NeverReady),
-            Arc::new(|_| true),
-            chain_holding(None),
-            false,
-            mpsc::channel(1).0,
-            Arc::new(Exempt::default()),
-        );
+        let core = adapter_on(handle);
         let body = Network::Mainnet
             .unmined_transactions_in_blocks(1..=1)
             .next()
@@ -1081,5 +1096,46 @@ mod tests {
     async fn a_joined_push_is_charged_only_for_its_own_body() {
         assert!(!cooled_by_one_push(true, false, Height(100), |_| true).await);
         assert!(cooled_by_one_push(true, true, Height(100), |_| true).await);
+    }
+
+    /// An oversized body from a cooling peer still reaches the core, which
+    /// refuses it for its size and remembers that for its exact id, as
+    /// today's downloader checks the size before the cooldown.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_oversized_body_from_a_cooling_peer_is_still_refused_for_its_size() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
+
+        let (handle, mut inbox) = pool_port();
+        let core = adapter_with(handle, |_| true, 1);
+        let QueueSource::LegacySocket(addr) = peer() else {
+            unreachable!("the test peer is a legacy peer");
+        };
+        core.shared
+            .cooldowns
+            .record_invalid_transaction(addr.ip(), Instant::now());
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let queued = tokio::spawn(queue(core.shared.clone(), Gossip::Tx(body), Some(peer())));
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the push reserves first");
+        };
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            tx_id,
+            false,
+            true,
+            Default::default(),
+        )));
+        let _receiver = queued
+            .await
+            .expect("the task does not panic")
+            .expect("the push passes the first stage");
+        let Some(PoolCommand::Submit { reservation, .. }) = inbox.next().await else {
+            panic!("the oversized body goes on to the core, which checks its size");
+        };
+        let _accepted = reservation.accept();
     }
 }

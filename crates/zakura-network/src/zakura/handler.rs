@@ -1896,26 +1896,6 @@ impl ZakuraSupervisorHandle {
         }
     }
 
-    /// Returns whether `remote_ip` has reached the per-IP cap once `pending`
-    /// QUIC handshakes and its control handshakes are counted. Never awaits.
-    /// Decides whether `remote_ip` may start another handshake (zakura-quic
-    /// ADM-3 rule 2), given the transport's `pending` handshakes from it.
-    fn ip_admission(
-        &self,
-        remote_ip: IpAddr,
-        pending: usize,
-        max_handshakes_per_ip: usize,
-        validated: bool,
-    ) -> IpAdmission {
-        self.ip_slots.counts().ip_admission(
-            remote_ip,
-            pending,
-            max_handshakes_per_ip,
-            self.max_connections_per_ip,
-            validated,
-        )
-    }
-
     /// Counts an inbound control handshake against `remote_ip` until the guard
     /// drops at registration (zakura-quic ADM-3 rule 2).
     fn enter_control_handshake(&self, remote_ip: IpAddr) -> ControlHandshakeGuard {
@@ -4971,6 +4951,22 @@ impl ZakuraProtocolHandler {
 /// budget of 32, an IP gets 4 handshakes at a time.
 const PENDING_HANDSHAKE_SHARES_PER_IP: usize = 8;
 
+/// Retries an unvalidated source, so spoofed Initials cannot fill a budget,
+/// and refuses a validated one. Counts the decision under its metric.
+fn retry_or_refuse(
+    incoming: &IncomingInfo,
+    retried: &'static str,
+    rejected: &'static str,
+) -> Admit {
+    if incoming.validated {
+        metrics::counter!(rejected).increment(1);
+        Admit::Refuse
+    } else {
+        metrics::counter!(retried).increment(1);
+        Admit::Retry
+    }
+}
+
 impl Acceptor for ZakuraProtocolHandler {
     /// Applies zakura-quic ADM-3 rules 2 and 4 plus the connection cap, each
     /// within inbound's share, before any handshake work. The endpoint applies
@@ -4981,57 +4977,51 @@ impl Acceptor for ZakuraProtocolHandler {
         }
         let max_handshakes_per_ip =
             (self.limits.max_pending_handshakes / PENDING_HANDSHAKE_SHARES_PER_IP).max(1);
-        if self.supervisor.ip_admission(
+        // One lock section decides every count, so no check sees another's
+        // stale value.
+        let mut counts = self.supervisor.ip_slots.counts();
+        if counts.ip_admission(
             incoming.remote.ip(),
             incoming.pending_from_ip,
             max_handshakes_per_ip,
+            self.supervisor.max_connections_per_ip,
             incoming.validated,
         ) != IpAdmission::Open
         {
             // Require validation before consuming the last slot, including
             // the redial slot, so spoofed Initials cannot fill an IP's budget.
-            if !incoming.validated {
-                metrics::counter!("zakura.p2p.conn.retried.per_ip").increment(1);
-                return Admit::Retry;
-            }
-            metrics::counter!("zakura.p2p.conn.rejected.per_ip").increment(1);
-            return Admit::Refuse;
+            return retry_or_refuse(
+                incoming,
+                "zakura.p2p.conn.retried.per_ip",
+                "zakura.p2p.conn.rejected.per_ip",
+            );
         }
         // Every pending transport handshake is inbound, so it counts against
         // both the inbound share and the whole handshake budget.
-        if self
-            .supervisor
-            .ip_slots
-            .counts()
-            .pending_full(incoming.pending_total, self.limits.max_pending_handshakes)
-        {
+        if counts.pending_full(incoming.pending_total, self.limits.max_pending_handshakes) {
             // As above: spoofed Initials could fill the budget, so an
             // unvalidated source gets a Retry instead of a refusal.
-            if !incoming.validated {
-                metrics::counter!("zakura.p2p.conn.retried.pending_handshake").increment(1);
-                return Admit::Retry;
-            }
-            metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
-            return Admit::Refuse;
+            return retry_or_refuse(
+                incoming,
+                "zakura.p2p.conn.retried.pending_handshake",
+                "zakura.p2p.conn.rejected.pending_handshake",
+            );
         }
-        if self
-            .supervisor
-            .ip_slots
-            .counts()
-            .connections_full(true, self.limits.max_connections)
+        if counts.connections_full(true, self.limits.max_connections)
             || self.admission.available_permits() == 0
             || self.inbound_admission.available_permits() == 0
         {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
             return Admit::Refuse;
         }
-        let mut counts = self.supervisor.ip_slots.counts();
+        // The machine's transport reservations can exceed QUIC's pending
+        // count, so the claim checks the pending budget again.
         if !counts.claim_transport(self.limits.max_pending_handshakes) {
-            return if incoming.validated {
-                Admit::Refuse
-            } else {
-                Admit::Retry
-            };
+            return retry_or_refuse(
+                incoming,
+                "zakura.p2p.conn.retried.pending_handshake",
+                "zakura.p2p.conn.rejected.pending_handshake",
+            );
         }
         #[cfg(any(test, zakura_sim))]
         let fresh = !counts.has_cadence_host(incoming.remote.ip());
@@ -5060,13 +5050,11 @@ impl Acceptor for ZakuraProtocolHandler {
         match cadence {
             super::HandshakeCadenceAdmission::Admit => Admit::Accept,
             super::HandshakeCadenceAdmission::Exhausted
-            | super::HandshakeCadenceAdmission::Capacity => {
-                if incoming.validated {
-                    Admit::Refuse
-                } else {
-                    Admit::Retry
-                }
-            }
+            | super::HandshakeCadenceAdmission::Capacity => retry_or_refuse(
+                incoming,
+                "zakura.p2p.conn.retried.cadence",
+                "zakura.p2p.conn.rejected.cadence",
+            ),
         }
     }
 

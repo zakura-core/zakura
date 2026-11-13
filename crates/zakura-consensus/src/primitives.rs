@@ -3,8 +3,15 @@
 use std::sync::LazyLock;
 
 use tokio::sync::oneshot::error::RecvError;
+use zakura_chain::{
+    parameters::NetworkUpgrade,
+    transaction::{SigHash, UnminedTxId},
+};
 
 use crate::BoxError;
+
+pub(crate) use cache::ShieldedPool;
+use cache::{CacheKey, Cached};
 
 pub(crate) mod batch_control;
 mod cache;
@@ -53,6 +60,52 @@ pub fn clear_shielded_verification_caches() {
     if let Some(verifier) = LazyLock::get(&halo2::VERIFIER_NU6_3_ONWARD) {
         verifier.clear();
     }
+}
+
+/// Returns `true` if the transaction `tx_id` has a bundle in each of `pools`, and every one of
+/// them has already verified against `sighash`.
+///
+/// The transaction verifier asks this before it builds the bundles, because building them
+/// means reading the whole transaction a second time. Each pool is looked up in the cache of the
+/// verifier that checks it: the Sapling verifier, or the Halo2 verifier for the Orchard circuit
+/// in force at `network_upgrade`. A verifier that has not been built yet remembers nothing, and
+/// the lookup does not build it. An empty `pools` is never verified, because no cache entry
+/// stands for a transaction without shielded bundles.
+///
+/// A `true` counts one cache hit per pool, in place of the verifier calls the caller skips.
+/// A `false` counts nothing: the caller then calls the verifiers, which count for themselves.
+///
+/// # Correctness
+///
+/// The lookup uses the key the verifiers record a success under, so it accepts exactly the
+/// bundles their own cache would: see [`CacheKey`] for why the transaction ID, sighash and pool
+/// determine a bundle and its verification.
+pub(crate) fn shielded_bundles_are_verified(
+    network_upgrade: NetworkUpgrade,
+    tx_id: UnminedTxId,
+    sighash: &SigHash,
+    pools: impl Iterator<Item = ShieldedPool> + Clone,
+) -> bool {
+    let verified_keys_for = |pool: ShieldedPool| match pool {
+        ShieldedPool::Sapling => LazyLock::get(&sapling::VERIFIER).map(Cached::verified_keys),
+        ShieldedPool::Orchard | ShieldedPool::Ironwood => {
+            halo2::verified_keys_if_built(network_upgrade)
+        }
+    };
+    let is_verified = |pool: ShieldedPool| {
+        verified_keys_for(pool)
+            .is_some_and(|keys| keys.contains(&CacheKey::new(tx_id, sighash.0, pool)))
+    };
+
+    if pools.clone().next().is_none() || !pools.clone().all(is_verified) {
+        return false;
+    }
+
+    pools
+        .filter_map(verified_keys_for)
+        .for_each(|keys| keys.count_hit());
+
+    true
 }
 
 /// Fires off a task into the Rayon threadpool, awaits the result through a oneshot channel,

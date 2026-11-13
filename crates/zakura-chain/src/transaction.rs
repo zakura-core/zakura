@@ -37,6 +37,7 @@ pub use unmined::{
 use zcash_protocol::consensus;
 
 use crate::parameters::TX_V6_VERSION_GROUP_ID;
+pub use crate::primitives::zcash_primitives::ShieldedBundles;
 use crate::{
     amount::{Amount, Error as AmountError, NegativeAllowed, NonNegative},
     block, ironwood,
@@ -1903,6 +1904,22 @@ impl Transaction {
             &self.zcash_serialize_to_vec()?[..],
             branch_id,
         )?)
+    }
+
+    /// Reads this transaction with `librustzcash` and returns its shielded bundles, which is the
+    /// form the proof and signature verifiers take.
+    ///
+    /// This serializes the transaction and parses it again, which costs more than parsing it
+    /// the first time, so call it only for a transaction whose bundles are about to be verified.
+    ///
+    /// # Errors
+    ///
+    /// - If `nu` is not this transaction's network upgrade, as [`Self::to_librustzcash`] checks.
+    /// - If `librustzcash` rejects the serialized transaction.
+    pub fn shielded_bundles(&self, nu: NetworkUpgrade) -> Result<ShieldedBundles, crate::Error> {
+        Ok(ShieldedBundles::from_librustzcash(
+            &self.to_librustzcash_data(nu)?,
+        ))
     }
 
     /// Returns `nu`'s consensus branch ID, if this transaction can belong to `nu`.

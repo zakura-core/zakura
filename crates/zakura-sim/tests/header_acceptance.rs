@@ -4261,7 +4261,7 @@ fn manifest() -> Manifest {
                 patch: NATIVE,
                 history: NATIVE_HISTORY,
                 diagnostic: DIAGNOSTIC,
-                not_applicable: &[],
+                not_applicable: native_na(),
             },
         ),
         er(
@@ -4300,8 +4300,29 @@ fn manifest() -> Manifest {
             (QUIET, "t/q", Status::Active),
             (MACHINE, MACHINE, Status::Active),
             (NATIVE_HARNESS, "t/s", Status::Active),
-        ],
+        ]
+        .into_iter()
+        .chain(
+            native_na()
+                .iter()
+                .map(|na| (NATIVE_HARNESS, na.property, Status::Active)),
+        )
+        .collect(),
     }
+}
+
+/// The `NotApplicable` reports the native mutation's committed
+/// classification expects on its clean runs.
+fn native_na() -> &'static [header_acceptance::ExpectedNa] {
+    NATIVE_MUTATIONS
+        .iter()
+        .find_map(|mutation| match mutation.class {
+            NativeClass::Integrity { not_applicable, .. } if mutation.patch == NATIVE => {
+                Some(not_applicable)
+            }
+            _ => None,
+        })
+        .expect("the native mutation is an integrity one")
 }
 
 /// The required keys: exactly what the test manifest covers, with its
@@ -4443,11 +4464,13 @@ fn results() -> ResultFile {
         actual,
     };
     let native = |run| {
-        let mut run = execution(
-            RunId::native(NATIVE, run),
-            NATIVE_HARNESS,
-            &[("t/s", held())],
+        let mut reports = vec![("t/s", held())];
+        reports.extend(
+            native_na()
+                .iter()
+                .map(|listed| (listed.property, na(listed.reason))),
         );
+        let mut run = execution(RunId::native(NATIVE, run), NATIVE_HARNESS, &reports);
         run.meta.input = Some(NATIVE_HISTORY.into());
         run
     };
@@ -8187,6 +8210,18 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "property IDs, the manifest's and harness's names for properties, not run evidence",
     ),
     (
+        "src/harness/header_acceptance/not_applicable.rs",
+        "history_expected",
+        "id",
+        "property IDs, the manifest's and harness's names for properties, not run evidence",
+    ),
+    (
+        "src/harness/header_acceptance/required.rs",
+        "required_keys",
+        "id",
+        "contract IDs, the manifest's names for contracts",
+    ),
+    (
         "src/harness/header_acceptance/rows.rs",
         "hand_written_rows",
         "id",
@@ -8860,4 +8895,64 @@ fn each_node_harness_s_missing_sources_are_its_own_test_s() {
             "{key:?} is covered by {expected:?}, not {test:?}"
         );
     }
+}
+
+/// Every node-harness history a `Holds` or `StaysNotApplicable` judges
+/// matches exactly one group of the recorded `NotApplicable` reports, so
+/// its whole-report pass expects what its run reports beside its target,
+/// and every node history's list key is judged by that pass. A history
+/// that matches none would expect every other ID to hold.
+#[test]
+fn every_node_history_lists_its_not_applicable_reports() {
+    use header_acceptance::not_applicable::{history_expected, history_groups_matched};
+    let manifest = Manifest::committed();
+    let mut histories = BTreeSet::new();
+    for result in &manifest.expected {
+        if let Expected::Holds {
+            history,
+            not_applicable,
+            ..
+        }
+        | Expected::StaysNotApplicable {
+            history,
+            not_applicable,
+            ..
+        } = result.expected
+        {
+            if rows::is_machine(history.harness) {
+                continue;
+            }
+            assert_eq!(
+                history_groups_matched(history),
+                1,
+                "{history:?} matches one group"
+            );
+            assert_eq!(
+                not_applicable,
+                history_expected(history),
+                "{history:?}'s row carries its recorded list"
+            );
+            histories.insert(RunId::from(history));
+        }
+    }
+    for history in rows::counted_histories() {
+        if !rows::is_machine(history.harness) {
+            assert!(histories.contains(&RunId::from(history)), "{history:?}");
+        }
+    }
+    let judged: Vec<HistoryRef> = manifest
+        .expected
+        .iter()
+        .filter_map(|result| match result.expected {
+            Expected::Holds { history, .. } | Expected::StaysNotApplicable { history, .. } => {
+                Some(history)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        header_acceptance::not_applicable::history_groups_unmatched(&judged),
+        Vec::<String>::new(),
+        "every group lists a judged history"
+    );
 }

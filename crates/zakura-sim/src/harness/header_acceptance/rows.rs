@@ -552,22 +552,11 @@ const MIXED_RESOURCES: HistoryRef = HistoryRef {
 /// The four `Sim` resource rules [`MIXED_RESOURCES`] judges.
 const MIXED_TARGETS: [&str; 4] = [CHUNK, TEARDOWN, STALE, OUTSTANDING];
 
-/// What stays `NotApplicable` on [`MIXED_RESOURCES`], each with the reason
-/// its report carries: no storage scenario declares a livelock assumption
-/// or a recovery. Every other ID the storage harness registers must hold.
-const MIXED_NA: &[ExpectedNa] = &[
-    ExpectedNa {
-        property: SIM_WIDE[1],
-        reason: "undeclared",
-    },
-    ExpectedNa {
-        property: RECOVERY_ID,
-        reason: "undeclared",
-    },
-];
-
 /// `property`'s `Holds` on [`MIXED_RESOURCES`]. It takes its key, the
-/// history's pass for `property`, from [`attach_history_passes`].
+/// history's pass for `property`, from [`attach_history_passes`]. No
+/// storage scenario declares a livelock assumption or a recovery, so those
+/// two stay `NotApplicable`, and every other ID the storage harness
+/// registers must hold ([`super::not_applicable::history_expected`]).
 fn mixed(property: &'static str) -> ExpectedResult {
     result(
         Vec::new(),
@@ -575,7 +564,7 @@ fn mixed(property: &'static str) -> ExpectedResult {
         Expected::Holds {
             property,
             history: MIXED_RESOURCES,
-            not_applicable: MIXED_NA,
+            not_applicable: super::not_applicable::history_expected(MIXED_RESOURCES),
         },
     )
 }
@@ -909,7 +898,9 @@ fn transitional(reason: &'static str, owner: &'static str, until: &'static str) 
     }
 }
 
-/// `Holds` on `history` for `property`'s passing key.
+/// `Holds` on `history` for `property`'s passing key, expecting the
+/// history's own `NotApplicable` reports
+/// ([`super::not_applicable::history_expected`]).
 fn holds(property: &'static str, gates: &[Gate], history: HistoryRef) -> Vec<ExpectedResult> {
     vec![result(
         vec![Key::passing(property)],
@@ -917,7 +908,7 @@ fn holds(property: &'static str, gates: &[Gate], history: HistoryRef) -> Vec<Exp
         Expected::Holds {
             property,
             history,
-            not_applicable: &[],
+            not_applicable: super::not_applicable::history_expected(history),
         },
     )]
 }
@@ -996,7 +987,7 @@ pub fn attach_history_passes(expected: &mut Vec<ExpectedResult>) {
                     Expected::Holds {
                         property: target,
                         history,
-                        not_applicable: &[],
+                        not_applicable: super::not_applicable::history_expected(history),
                     },
                 ));
             }
@@ -1469,19 +1460,20 @@ fn generated_ids() -> &'static [&'static str] {
 /// covers that case's key alone.
 fn generated_row(generated: &Generated, property: &'static str) -> Row {
     let mut expected = if generated.suffix.ends_with("over-owed-closes") {
+        let history = if generated.witness == HEADERS {
+            wire_history(HEADERS, "headers/unsolicited-closes")
+        } else {
+            wire_history(OUTCOME, "headers-outcome/unsolicited-closes")
+        };
         let results = vec![result(
             vec![Key::passing(property)],
             generated.gates,
             Expected::StaysNotApplicable {
                 property,
-                history: if generated.witness == HEADERS {
-                    wire_history(HEADERS, "headers/unsolicited-closes")
-                } else {
-                    wire_history(OUTCOME, "headers-outcome/unsolicited-closes")
-                },
+                history,
                 reason: NOT_OWED,
                 approval: Approval::Pending,
-                not_applicable: &[],
+                not_applicable: super::not_applicable::history_expected(history),
             },
         )];
         results
@@ -3384,6 +3376,32 @@ const PROBE_ACCOUNTING: HistoryRef = HistoryRef {
     case: "plan 0 of inputs(16, 256)",
 };
 
+/// What [`PROBE_ACCOUNTING`]'s clean runs report `NotApplicable`, as its
+/// witness test's run of it reports them (round 9): no livelock bound or
+/// adversary is declared, and nothing goes stale or departs.
+const PROBE_ACCOUNTING_NA: &[ExpectedNa] = &[
+    ExpectedNa {
+        property: SIM_WIDE[1],
+        reason: "undeclared",
+    },
+    ExpectedNa {
+        property: RECOVERY_ID,
+        reason: "undeclared",
+    },
+    ExpectedNa {
+        property: STALE,
+        reason: "never-applied",
+    },
+    ExpectedNa {
+        property: CHAIN,
+        reason: "never-applied",
+    },
+    ExpectedNa {
+        property: RETIREMENT,
+        reason: "never-applied",
+    },
+];
+
 /// Every native mutation on `main`, classified. The ledger rules each one
 /// breaks move to the ID and PR the hdr-9–13 plan's evidence-rule
 /// classification gives them.
@@ -3458,7 +3476,7 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
         class: NativeClass::Integrity {
             history: PROBE_ACCOUNTING,
             diagnostic: "OwnedMismatch",
-            not_applicable: &[],
+            not_applicable: PROBE_ACCOUNTING_NA,
         },
     },
     NativeMutation {
@@ -3466,7 +3484,7 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
         class: NativeClass::Integrity {
             history: PROBE_ACCOUNTING,
             diagnostic: "ReservedMismatch",
-            not_applicable: &[],
+            not_applicable: PROBE_ACCOUNTING_NA,
         },
     },
     NativeMutation {
@@ -3681,6 +3699,7 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "every_ref_has_a_one_key_off_control",
     "identity_joins_go_through_refs",
     "each_node_harness_s_missing_sources_are_its_own_test_s",
+    "every_node_history_lists_its_not_applicable_reports",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.

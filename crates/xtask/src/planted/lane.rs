@@ -268,7 +268,10 @@ pub(in crate::planted) fn campaign_lane(
         ])
         .arg(fuzz_target)
         // Uncolored diagnostics, which `fuzz_build_failure` reads.
-        .env("CARGO_TERM_COLOR", "never");
+        .env("CARGO_TERM_COLOR", "never")
+        // A bypass patch can leave code unused, so a mutant's fuzz build
+        // warns even where the environment denies warnings.
+        .env("CARGO_BUILD_WARNINGS", "warn");
     let log = dir.join("build.log");
     match run_lane_child(&mut build, &log, None)? {
         ChildEnd::Exited(0) => {}

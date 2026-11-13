@@ -2121,6 +2121,48 @@ fn libfuzzer_flags_name_fuzz_targets() {
     assert!(error.contains("no_such_target"), "{error}");
 }
 
+/// Each feedback case's target gets the length-control flags its
+/// `qa/suite.toml` row gives it, so a misspelled `[bounds.libfuzzer_args]`
+/// table, which serde can't refuse beside the flattened bounds, or a suite
+/// row that changes, fails here. The pilot sets `-max_len` and
+/// `-rss_limit_mb` from its own bounds.
+#[test]
+fn feedback_flags_follow_the_suite_rows() {
+    let root = crate::repo_root().expect("xtask lives in the workspace");
+    let suite: toml::Value = toml::from_str(
+        &fs::read_to_string(root.join("qa/suite.toml")).expect("qa/suite.toml reads"),
+    )
+    .expect("qa/suite.toml parses");
+    let suite_flags = |target: &str| -> Vec<String> {
+        suite["target"]
+            .as_array()
+            .expect("qa/suite.toml lists targets")
+            .iter()
+            .find(|row| row["name"].as_str() == Some(target))
+            .and_then(|row| row.get("args"))
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .filter(|arg| arg.starts_with("-len_control"))
+            .map(str::to_owned)
+            .collect()
+    };
+    let list = committed_list();
+    for case in &list.cases {
+        assert_eq!(
+            list.bounds
+                .libfuzzer_args
+                .get(&case.target)
+                .cloned()
+                .unwrap_or_default(),
+            suite_flags(&case.target),
+            "{}",
+            case.target
+        );
+    }
+}
+
 /// Cases on one target share its original campaigns, and each reads the
 /// original's facts for its own property.
 #[test]

@@ -125,6 +125,12 @@ pub(super) fn resolve(
             )
             .into());
         }
+        if let Some(why) = &found.no_target {
+            return Err(format!(
+                "{id}: `planted --targets` never confirms its input through a target: {why}"
+            )
+            .into());
+        }
         let Witness::Input(input) = &found.witness else {
             return Err(format!("{id}: a typed case has no fuzz input for a target to run").into());
         };

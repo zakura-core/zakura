@@ -1813,6 +1813,9 @@ fn build_sim(
         .env("CARGO_TARGET_DIR", target)
         .env("CARGO_PROFILE_DEV_DEBUG", "0")
         .env("CARGO_INCREMENTAL", "0")
+        // A bypass patch can leave code unused: warn, even where the
+        // environment denies warnings, as `planted::cargo_sim` does.
+        .env("CARGO_BUILD_WARNINGS", "warn")
         .env_remove("RUSTC")
         .current_dir(tree);
     println!(

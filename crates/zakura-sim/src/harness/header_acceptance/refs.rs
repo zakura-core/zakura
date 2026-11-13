@@ -547,6 +547,16 @@ pub struct PropertyRef {
 }
 impl Ref for PropertyRef {}
 
+/// One script of a history's declared actions, whose actions are picked
+/// in order: `control`, or one peer's, by its harness name. A script's
+/// name is its whole identity within a run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptRef {
+    /// The script.
+    pub script: String,
+}
+impl Ref for ScriptRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

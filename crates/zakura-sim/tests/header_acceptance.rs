@@ -7804,6 +7804,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "tests/header_acceptance.rs",
         "each_node_harness_s_missing_sources_are_its_own_test_s",
     ),
+    (
+        "ScriptRef",
+        "src/harness/header_acceptance/actions.rs",
+        "earlier_undone",
+        "src/harness/header_acceptance/actions.rs",
+        "an_earlier_action_joins_its_whole_script",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.
@@ -8600,9 +8607,10 @@ fn every_artifact_read_goes_through_binding() {
 /// peer's incarnation, a link, a version, an ID, a serialized attribution,
 /// a store's stamp for a fact, or a trace's pick; and the acceptance
 /// layer's own: a property, a planted case, a witness test's package, file
-/// and name, a harness, a history and a run. A case's `name` isn't one:
-/// every case join names its `case` or `property` too, and `name` alone is
-/// mostly a store's, a rule's or a file's.
+/// and name, a harness, a history, a run and a declared action's script.
+/// A case's `name` isn't one: every case join names its `case` or
+/// `property` too, and `name` alone is mostly a store's, a rule's or a
+/// file's.
 const IDENTITY_WORDS: &[&str] = &[
     "peer",
     "conn",
@@ -8631,6 +8639,7 @@ const IDENTITY_WORDS: &[&str] = &[
     "harness",
     "history",
     "run",
+    "script",
 ];
 
 /// The comparisons [`raw_joins`] finds that aren't identity joins, as
@@ -10045,16 +10054,58 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "a static check of the native classification against its pins, whole names of the committed tables",
     ),
     (
+        "src/harness/header_acceptance/binding.rs",
+        "read_declaration",
+        "bytes.exists()!=script.exists()",
+        "checks a declaration names exactly one Plan form, whether two files exist, not a join",
+    ),
+    (
+        "src/harness/header_acceptance/history.rs",
+        "declarations_read_back_in_order",
+        "second,script",
+        "checks a declaration reads back the script the test wrote, an output check",
+    ),
+    (
         "src/harness/header_acceptance/tool.rs",
         "a_draft_s_row_joins_its_whole_property",
         "row.property==\"header-sync/honest-progress\"",
         "picks the test's fixture row by a literal property, a test building its input",
     ),
     (
+        "src/harness/header_acceptance/tool.rs",
+        "a_typed_case_is_planned_beside_a_fuzz_case",
+        "inputs,[&CaseInput::Fuzz{input:\"fixtures/in.bin\".into()},&CaseInput::Typed{scenario:\"s.json\".into(),plan:\"p.bin\".into()},&CaseInput::Scripted{scenario:\"s.json\".into(),script:\"p.json\".into()}]",
+        "asserts the planned inputs against the fixture's, an output check",
+    ),
+    (
         "tests/header_acceptance.rs",
         "every_referenced_test_exists",
         "case.name==\"reserved-flags-skipped\"",
         "picks the test's fixture cases by a literal name, a test building its input",
+    ),
+    (
+        "tests/header_despite_close.rs",
+        "served_chain",
+        "spec[\"script\"],serde_json::json!([{\"action\":\"act\",\"act\":{\"act\":\"bad-content\",\"rule\":\"linkage\"}}])",
+        "checks the fixture's script is the one the test expects, an output check",
+    ),
+    (
+        "tests/header_node_reservations.rs",
+        "the_overlapping_forks_fixture_matches_its_builders",
+        "script,overlapping_forks_script()",
+        "compares a committed script with its builder's, not a join",
+    ),
+    (
+        "tests/header_wire_prepare_fault.rs",
+        "the_late_fault_fixture_matches_its_builders",
+        "script,late_fault_script()",
+        "compares a committed script with its builder's, not a join",
+    ),
+    (
+        "tests/header_wire_witness.rs",
+        "the_reserved_flags_twice_script_matches_its_builder",
+        "committed,reserved_flags_twice_script()",
+        "compares a committed script with its builder's, not a join",
     ),
 ];
 

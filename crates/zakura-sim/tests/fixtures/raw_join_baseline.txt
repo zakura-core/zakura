@@ -516,6 +516,7 @@ src/peer/adapter.rs	received	(connection,quic_stream)
 src/peer/adapter.rs	received	message_type!=frame.message_type
 src/peer/adapter.rs	received	started==seq
 src/peer/adapter.rs	role	self.subscriptions.contains(&id
+src/peer/adversary.rs	acts_round_trip_through_json	back,script
 src/peer/adversary.rs	an_act_is_labelled_by_the_first_of_its_set	long_page.label(),Label::LongPayload
 src/peer/adversary.rs	an_act_is_labelled_by_the_first_of_its_set	long_page.labels().contains(Label::OverCredit
 src/peer/adversary.rs	before_receive	crossing.key==outcome.subscription_id
@@ -583,6 +584,7 @@ src/peer/honest.rs	receive	sub.id==outcome.subscription_id
 src/peer/mod.rs	new	id.index,0
 src/peer/mod.rs	observe	log.run()!=self.id.run
 src/peer/mod.rs	page	(pages,page.subscription_id)
+src/peer/mod.rs	run_with	self.spec.script.contains(&PeerAction::Redial
 src/peer/mod.rs	send_crafted	self.cadence.charge(SESSION,stream.version,row,now)==Charge::Exhausted
 src/peer/mod.rs	serve	self.spec.dialer==Dialer::Peer
 src/peer/mod.rs	serve	self.spec.dialer==Dialer::Peer
@@ -1624,6 +1626,8 @@ tests/record.rs	record_refuses_to_overwrite	std::fs::read(dir.path().join(INPUT_
 tests/record.rs	record_refuses_to_overwrite	std::fs::read(dir.path().join(TRACE_FILE)).unwrap(),before
 tests/record.rs	record_writes_a_complete_trace	end.outcome,OutcomeKind::Harness
 tests/record.rs	record_writes_a_complete_trace	std::fs::read(dir.path().join(INPUT_FILE)).unwrap(),BYTES
+tests/record.rs	recording_a_script_names_it	named,PlanRef::script(&defaults)
+tests/record.rs	recording_a_script_names_it	named.kind,PlanKind::Script
 tests/record.rs	recording_replays_the_same_bytes	a.id,b.id
 tests/record_failure.rs	end_outcome	report.property==property
 tests/record_failure.rs	first_violation	report.property==property
@@ -1819,6 +1823,7 @@ tests/view_facts.rs	a_deferral_with_nothing_armed_violates_at_its_deadline_in_th
 tests/view_facts.rs	a_deferred_deadline_does_not_pass_while_a_task_is_starved	report.end.harness,Some(zakura_sim::HarnessFailure::StuckWithoutAction{status:"worker-starved"})
 tests/view_facts.rs	a_lost_deferred_timer_violates_at_the_next_timer	violation.property,SERVED
 tests/view_facts.rs	a_view_trigger_needs_the_view	Registry::new(vec![blind]).err(),Some(RegistryError::ViewTriggerWithoutView{id:PropertyId::new(SERVED)})
+tests/view_facts.rs	build	script.acts.contains(&Act::Starve
 tests/view_facts.rs	fact	*at==stamp
 tests/view_facts.rs	oblige_after	fact(&view,*stamp)==Some(name)
 tests/view_facts.rs	one_fact_discharges_the_oldest_only	p.property==SERVED

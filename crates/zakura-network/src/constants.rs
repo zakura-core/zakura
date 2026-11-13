@@ -323,8 +323,8 @@ pub const INBOUND_SEAT_HOLD_LIMIT_DIVISOR: usize = 10;
 /// that its peers hold seats for.
 pub const MIN_REDIALED_CONNECTION_AGE: Duration = MIN_HELD_SEAT_CONNECTION_AGE;
 
-/// After a long-lived outbound connection closes, Zakura dials its peer again this long after
-/// the close, at each time in turn until one dial succeeds. Implemented by
+/// After the peer of a long-lived outbound connection closes it, Zakura dials the peer again
+/// this long after the close, at each time in turn until one dial succeeds. Implemented by
 /// `peer_set::initialize::crawl_and_dial`.
 ///
 /// A peer that restarts reopens its listener with every inbound seat empty, and on Mainnet

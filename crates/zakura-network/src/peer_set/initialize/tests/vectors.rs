@@ -2238,6 +2238,16 @@ impl RedialCrawler {
         closed_at
     }
 
+    /// Like [`Self::close_after`], but this node closes the connections, for example to drop
+    /// a stalled peer.
+    async fn drop_after(&mut self, open_for: Duration) -> tokio::time::Instant {
+        tokio::time::advance(open_for).await;
+        let closed_at = tokio::time::Instant::now();
+        self.connections.clear();
+
+        closed_at
+    }
+
     /// Runs the crawler until `until`, and returns the address of each dial, and how long
     /// after `closed_at` it started.
     async fn dials_until(
@@ -2579,8 +2589,8 @@ async fn redials_after(options: RedialCrawlerOptions, open_for: Duration) -> Vec
         .await
 }
 
-/// Test the crawler does not redial a peer whose connection was short, a banned peer, or a
-/// peer that is connected again.
+/// Test the crawler does not redial a peer whose connection was short, a banned peer, a peer
+/// that is connected again, or a peer that this node disconnected.
 #[tokio::test(start_paused = true)]
 async fn crawler_does_not_redial_short_banned_or_connected_peers() {
     let _init_guard = zakura_test::init();
@@ -2622,6 +2632,19 @@ async fn crawler_does_not_redial_short_banned_or_connected_peers() {
         redials_after(options, constants::MIN_REDIALED_CONNECTION_AGE).await,
         vec![],
         "a peer that is connected again is not redialed"
+    );
+
+    let mut crawler =
+        spawn_redial_crawler(&[redial_test_peer()], RedialCrawlerOptions::default()).await;
+    let closed_at = crawler
+        .drop_after(constants::MIN_REDIALED_CONNECTION_AGE)
+        .await;
+    assert_eq!(
+        crawler
+            .redial_times_until(closed_at, closed_at + AFTER_EVERY_REDIAL)
+            .await,
+        vec![],
+        "a peer that this node disconnected is not redialed"
     );
 }
 

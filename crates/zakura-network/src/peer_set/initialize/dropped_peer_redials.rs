@@ -11,6 +11,9 @@
 //! # Security
 //!
 //! These redials skip the reconnection delay, but they stay bounded:
+//! - only a connection that its peer closed is redialed: one that this node closed, to shed
+//!   load or to drop a stalled or banned peer, is not, so a redial never undoes this node's
+//!   own decision to disconnect a peer,
 //! - only a connection that was open for
 //!   [`MIN_REDIALED_CONNECTION_AGE`](constants::MIN_REDIALED_CONNECTION_AGE) is redialed, so
 //!   a peer causes at most one dial per redial delay for each such connection,

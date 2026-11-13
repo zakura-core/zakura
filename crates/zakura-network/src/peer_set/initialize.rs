@@ -1199,8 +1199,8 @@ fn outbound_peer_replenishment_demand(
 /// Uses `active_outbound_connections` to limit the number of active outbound connections
 /// across both the initial peers and crawler. The limit is based on `config`.
 ///
-/// When an outbound connection that was open for [`constants::MIN_REDIALED_CONNECTION_AGE`]
-/// closes, dials its peer again at the times in [`constants::DROPPED_PEER_REDIAL_DELAYS`],
+/// When the peer of an outbound connection that was open for
+/// [`constants::MIN_REDIALED_CONNECTION_AGE`] closes it, dials the peer again at the times in [`constants::DROPPED_PEER_REDIAL_DELAYS`],
 /// until a dial succeeds, unless `bans` holds the peer or `peer_registry` shows it connected.
 /// See [`dropped_peer_redials`] for why.
 #[allow(clippy::too_many_arguments)]

@@ -408,6 +408,19 @@ pub struct DeclarationRef {
 }
 impl Ref for DeclarationRef {}
 
+/// One planted case or native mutation: its property directory and its
+/// name. Cases under two properties can share a name, so a name alone
+/// names none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlantedRef {
+    /// The property directory, or `native-mutations/header-sync` for a
+    /// native mutation.
+    pub property: String,
+    /// The case's or mutation's name.
+    pub name: String,
+}
+impl Ref for PlantedRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

@@ -161,8 +161,14 @@ class RoutineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as state:
             plan = self.dry_run(state, "--libfuzzer-seconds", "60", "--harness-runs", "block-sync/storage=20")
         self.assertIsNone(plan["latest"])
-        self.assertEqual([step["name"] for step in plan["steps"]], ["suite", "loop"])
-        suite, loop = plan["steps"]
+        self.assertEqual([step["name"] for step in plan["steps"]], ["suite-manifest", "suite", "loop"])
+        self.assertEqual(
+            plan["order"],
+            ["suite-manifest", "suite", "loop", "cases", "triage-loop", "triage-libfuzzer", "completeness"],
+        )
+        manifest, suite, loop = plan["steps"]
+        self.assertEqual(manifest["argv"][:3], ["cargo", "xtask", "sim-suite"])
+        self.assertIn("--frozen", manifest["argv"])
         self.assertEqual(suite["env"], {"RUSTFLAGS": "--cfg zakura_sim"})
         self.assertIn("planted", suite["argv"])
         self.assertNotIn("--changed-since", loop["argv"])
@@ -176,12 +182,12 @@ class RoutineTests(unittest.TestCase):
             (Path(state) / joint.LATEST_FILE).write_text(json.dumps({"pinned": "a" * 40}))
             plan = self.dry_run(state, "--libfuzzer-seconds", "60", "--", "--jobs", "4")
         names = [step["name"] for step in plan["steps"]]
-        self.assertEqual(names, ["suite", "loop", "libfuzzer"])
-        for step in plan["steps"][1:]:
+        self.assertEqual(names, ["suite-manifest", "suite", "loop", "libfuzzer"])
+        for step in plan["steps"][2:]:
             self.assertEqual(step["argv"][step["argv"].index("--changed-since") + 1], "a" * 40)
             self.assertEqual(step["argv"][-2:], ["--jobs", "4"])
             self.assertEqual(step["cwd"], "/c")
-        self.assertIn("libfuzzer", plan["steps"][2]["argv"])
+        self.assertIn("libfuzzer", plan["steps"][3]["argv"])
         self.assertEqual(plan["cases"]["argv"], ["cargo", "xtask", "planted", "loop", "--list", "--jobs", "4"])
 
     def test_the_libfuzzer_lane_runs_on_what_changed_since_its_own_pin(self):
@@ -189,8 +195,32 @@ class RoutineTests(unittest.TestCase):
             (Path(state) / joint.LATEST_FILE).write_text(json.dumps({"pinned": "a" * 40}))
             (Path(state) / joint.LIBFUZZER_LATEST_FILE).write_text(json.dumps({"pinned": "b" * 40}))
             plan = self.dry_run(state, "--libfuzzer-seconds", "60")
-        since = {step["name"]: step["argv"][step["argv"].index("--changed-since") + 1] for step in plan["steps"][1:]}
+        since = {step["name"]: step["argv"][step["argv"].index("--changed-since") + 1] for step in plan["steps"][2:]}
         self.assertEqual(since, {"loop": "a" * 40, "libfuzzer": "b" * 40})
+
+    def test_a_fuzz_budget_adds_the_suite_fuzz_and_its_archive_before_the_cases(self):
+        with tempfile.TemporaryDirectory() as state:
+            plan = self.dry_run(state, "--fuzz-seconds", "600", "--fuzz-jobs", "2")
+            suite_only = self.dry_run(state, "--suite-fuzz")
+        self.assertEqual(plan["order"], [
+            "suite-manifest", "suite", "loop", "suite-fuzz", "archive",
+            "cases", "triage-loop", "triage-libfuzzer", "completeness",
+        ])
+        steps = {step["name"]: step["argv"] for step in plan["steps"]}
+        manifest = steps["suite-manifest"][steps["suite-manifest"].index("--out") + 1]
+        fuzz, archive, completeness = steps["suite-fuzz"], steps["archive"], plan["completeness"]["argv"]
+        self.assertEqual(fuzz[2], "run")
+        self.assertEqual(fuzz[fuzz.index("--manifest") + 1], manifest)
+        self.assertEqual(fuzz[fuzz.index("--state") + 1], str(Path(state).resolve()))
+        self.assertEqual(fuzz[fuzz.index("--seconds") + 1], "600")
+        self.assertEqual(fuzz[fuzz.index("--jobs") + 1], "2")
+        out = fuzz[fuzz.index("--out") + 1]
+        self.assertEqual(archive[archive.index("--suite-fuzz") + 1], str(Path(out) / "suite-fuzz.json"))
+        self.assertEqual(archive[archive.index("--archive") + 1], str(Path(state).resolve() / "archive"))
+        self.assertEqual(completeness[completeness.index("--manifest") + 1], manifest)
+        self.assertEqual(completeness[completeness.index("--suite-fuzz") + 1], str(Path(out) / "suite-fuzz.json"))
+        fuzz = next(step["argv"] for step in suite_only["steps"] if step["name"] == "suite-fuzz")
+        self.assertNotIn("--seconds", fuzz, "--suite-fuzz alone keeps each target's suite budget")
 
     def test_the_case_list_is_keyed_as_the_report_is(self):
         listed = [{"patch": "one.patch", "property": "p", "witness": {"test_target": "t", "test": "x"}}]
@@ -217,7 +247,7 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(argv[-1], "$ZAKURA_MUTATION_ARGS")
         with tempfile.TemporaryDirectory() as state:
             plan = self.dry_run(state, *env["ZAKURA_MUTATION_ARGS"].split())
-        loop = plan["steps"][1]["argv"]
+        loop = next(step for step in plan["steps"] if step["name"] == "loop")["argv"]
         self.assertEqual(loop.count("--generate-harness-runs"), 4)
         self.assertEqual(loop[loop.index("--cases") + 1], "qa/native-mutations")
         self.assertEqual(loop[-2:], ["--jobs", "4"])
@@ -306,7 +336,9 @@ class CumulativeTests(unittest.TestCase):
                 path.write_text(json.dumps(merged))
 
             self.assertEqual(self.routine(state, {}, triage=record), 0)
-            self.assertEqual([step["name"] for step in self.ran], ["suite", "loop", "triage-loop"])
+            self.assertEqual(
+                [step["name"] for step in self.ran], ["suite-manifest", "suite", "loop", "triage-loop", "completeness"]
+            )
             second = sorted(Path(state, "runs").iterdir())[1]
             changes = json.loads((second / "loop" / joint.DIFF_FILE).read_text())
             self.assertEqual(changes["untriaged"], [])
@@ -391,6 +423,48 @@ class CumulativeTests(unittest.TestCase):
             self.assertEqual(pin_file(), "4" * 40)
             self.routine(state, {"loop": killed}, "60")
             self.assertEqual(since(steps()["libfuzzer"]), "4" * 40)
+
+    def test_completeness_runs_last_and_reads_the_steps_and_findings_written_before_it(self):
+        seen = {}
+        with tempfile.TemporaryDirectory() as state:
+            run_step = self.routine_with_completeness(seen)
+            with mock.patch.object(joint, "pin", return_value="a" * 40), \
+                    mock.patch.object(joint, "run_step", side_effect=run_step), \
+                    mock.patch.object(joint, "current_cases",
+                                      return_value={joint.case_key(case("one.patch", "survived"))}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                status = joint.main(["routine", "--checkout", "/c", "--state", state, "--suite-fuzz"])
+            run_dir = next((Path(state) / "runs").iterdir())
+            record = json.loads((run_dir / joint.ROUTINE_FILE).read_text())
+        self.assertEqual(status, 1, "the first survivor is news")
+        self.assertEqual(seen["order"], [
+            "suite-manifest", "suite", "loop", "suite-fuzz", "archive", "triage-loop", "completeness",
+        ])
+        self.assertEqual(
+            list(seen["routine"]["steps"]),
+            ["suite-manifest", "suite", "loop", "suite-fuzz", "archive", "cases", "triage-loop"],
+        )
+        self.assertEqual(len(seen["findings"]["loop"]["newly_surviving"]), 1)
+        self.assertEqual(set(seen["findings"]["loop"]), set(joint.diff({}, {})))
+        self.assertEqual(record["steps"]["completeness"], 0)
+        self.assertEqual(record["steps"]["cases"], 0)
+
+    @staticmethod
+    def routine_with_completeness(seen):
+        """Return a `run_step` that writes a loop report, and saves routine.json and findings.json at `completeness`."""
+        def run_step(step, run_dir):
+            if step["name"] == "loop":
+                (Path(run_dir) / "loop").mkdir()
+                (Path(run_dir) / "loop" / joint.REPORT_FILE).write_text(
+                    json.dumps({"cases": [case("one.patch", "survived")]})
+                )
+            if step["name"] == "completeness":
+                seen["routine"] = json.loads((Path(run_dir) / joint.ROUTINE_FILE).read_text())
+                seen["findings"] = json.loads((Path(run_dir) / joint.FINDINGS_FILE).read_text())
+            seen.setdefault("order", []).append(step["name"])
+            return 0
+
+        return run_step
 
     def test_merge_keeps_every_property_finding(self):
         merged = joint.merge(

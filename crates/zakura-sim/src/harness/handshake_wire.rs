@@ -264,7 +264,8 @@ impl Subsystem for Wire {
         );
         let failure = PeerFailure::default();
         let records = PeerRecords::default();
-        let mut control = PeerControl::new(failure.clone(), records.clone(), shared_ids);
+        let mut control =
+            PeerControl::new(sim, "node", failure.clone(), records.clone(), shared_ids);
         for ((index, spec), name) in scenario.peers.iter().enumerate().zip(names) {
             let (readiness, commands) = control.add(&name, spec.script.clone(), false);
             let (listening, listened) = zakura_rt::sync::watch::channel(false);
@@ -288,6 +289,7 @@ impl Subsystem for Wire {
                 listening,
                 chain: None,
                 records: records.clone(),
+                order: net.order(),
                 closed: PeerCloses::default(),
                 taken: 0,
             };

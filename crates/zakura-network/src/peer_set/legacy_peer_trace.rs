@@ -6,6 +6,8 @@
 //! `peer_start_height` is the peer's untrusted, point-in-time handshake claim and is not used as an
 //! inventory guarantee. A connection's process-local
 //! `connection_id` is the same number its `legacy_gossip` rows carry, so the two tables join.
+//! The `peer` column holds the peer's address only when the node's `expose_peer_addresses` setting
+//! is on, and is redacted otherwise. `user_agent` is the software the peer says it runs.
 
 use std::{
     path::PathBuf,
@@ -33,13 +35,16 @@ const TABLE: JsonlTraceTable =
 #[derive(Clone, Debug)]
 pub(super) struct LegacyPeerTrace {
     emitter: JsonlEventEmitter,
+    expose_peer_addresses: bool,
     next_request_id: Arc<AtomicU64>,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct PeerTraceContext {
     pub(super) connection_id: u64,
     pub(super) peer: PeerSocketAddr,
+    /// The sanitized user agent the peer advertised in its handshake.
+    pub(super) user_agent: Arc<str>,
     pub(super) peer_start_height: Height,
     pub(super) local_tip_height: Option<Height>,
 }
@@ -51,7 +56,8 @@ enum LegacyPeerEvent<'a> {
     FindBlocksFinish {
         request_id: u64,
         connection_id: u64,
-        peer: JsonlDisplay<'a, PeerSocketAddr>,
+        peer: String,
+        user_agent: &'a str,
         peer_start_height: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         local_tip_height: Option<u32>,
@@ -67,7 +73,8 @@ enum LegacyPeerEvent<'a> {
     BlockRequestFinish {
         request_id: u64,
         connection_id: u64,
-        peer: JsonlDisplay<'a, PeerSocketAddr>,
+        peer: String,
+        user_agent: &'a str,
         peer_start_height: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         local_tip_height: Option<u32>,
@@ -131,13 +138,17 @@ enum BlockRequestResult<'a> {
 }
 
 impl LegacyPeerTrace {
-    pub(super) fn new(trace_dir: Option<PathBuf>) -> Self {
+    /// Creates a trace that writes to `trace_dir`, or nowhere when it is `None`.
+    ///
+    /// Rows hold peer addresses only when `expose_peer_addresses` is set.
+    pub(super) fn new(trace_dir: Option<PathBuf>, expose_peer_addresses: bool) -> Self {
         let tracer = trace_dir
             .map(JsonlTracer::spawn)
             .unwrap_or_else(JsonlTracer::noop);
 
         Self {
             emitter: JsonlEventEmitter::new(tracer, zakura_jsonl_trace::node_id()),
+            expose_peer_addresses,
             next_request_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -181,7 +192,8 @@ impl LegacyPeerTrace {
             LegacyPeerEvent::FindBlocksFinish {
                 request_id,
                 connection_id: peer.connection_id,
-                peer: JsonlDisplay(&peer.peer),
+                peer: peer.peer.addr_label(self.expose_peer_addresses),
+                user_agent: &peer.user_agent,
                 peer_start_height: peer.peer_start_height.0,
                 local_tip_height: peer.local_tip_height.map(|height| height.0),
                 elapsed_ms: saturating_millis(elapsed),
@@ -242,7 +254,8 @@ impl LegacyPeerTrace {
             LegacyPeerEvent::BlockRequestFinish {
                 request_id,
                 connection_id: peer.connection_id,
-                peer: JsonlDisplay(&peer.peer),
+                peer: peer.peer.addr_label(self.expose_peer_addresses),
+                user_agent: &peer.user_agent,
                 peer_start_height: peer.peer_start_height.0,
                 local_tip_height: peer.local_tip_height.map(|height| height.0),
                 elapsed_ms: saturating_millis(elapsed),
@@ -297,6 +310,27 @@ mod tests {
         block::Hash([byte; 32])
     }
 
+    fn test_trace(
+        guard: &zakura_jsonl_trace::JsonlTraceGuard,
+        expose_peer_addresses: bool,
+    ) -> LegacyPeerTrace {
+        LegacyPeerTrace {
+            emitter: JsonlEventEmitter::new(guard.tracer(), "test-node"),
+            expose_peer_addresses,
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn test_peer() -> PeerTraceContext {
+        PeerTraceContext {
+            connection_id: 7,
+            peer: "192.0.2.7:8233".parse().expect("valid peer address"),
+            user_agent: Arc::from("/Zakura:1.8.7/"),
+            peer_start_height: Height(100),
+            local_tip_height: Some(Height(90)),
+        }
+    }
+
     fn assert_key_order(line: &str, keys: &[&str]) {
         let mut remainder = line;
         for key in keys {
@@ -312,20 +346,12 @@ mod tests {
     async fn writes_attributed_find_blocks_and_notfound_events() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
-        let trace = LegacyPeerTrace {
-            emitter: JsonlEventEmitter::new(guard.tracer(), "test-node"),
-            next_request_id: Arc::new(AtomicU64::new(1)),
-        };
-        let peer = PeerTraceContext {
-            connection_id: 7,
-            peer: "127.0.0.1:8233".parse().expect("valid peer address"),
-            peer_start_height: Height(100),
-            local_tip_height: Some(Height(90)),
-        };
+        let trace = test_trace(&guard, false);
+        let peer = test_peer();
 
         trace.find_blocks_finish(
             1,
-            peer,
+            peer.clone(),
             Some(hash(1)),
             None,
             Duration::from_millis(12),
@@ -364,6 +390,7 @@ mod tests {
                 "request_id",
                 "connection_id",
                 "peer",
+                "user_agent",
                 "peer_start_height",
                 "local_tip_height",
                 "elapsed_ms",
@@ -383,6 +410,7 @@ mod tests {
                 "request_id",
                 "connection_id",
                 "peer",
+                "user_agent",
                 "peer_start_height",
                 "local_tip_height",
                 "elapsed_ms",
@@ -394,6 +422,10 @@ mod tests {
         );
         assert_eq!(events[0]["event"], "find_blocks_finish");
         assert_eq!(events[0]["connection_id"], 7);
+        assert_eq!(events[0]["peer"], "v4redacted:8233");
+        assert_eq!(events[0]["user_agent"], "/Zakura:1.8.7/");
+        assert_eq!(events[1]["peer"], "v4redacted:8233");
+        assert_eq!(events[1]["user_agent"], "/Zakura:1.8.7/");
         assert_eq!(events[0]["peer_start_height"], 100);
         assert_eq!(events[0]["hash_count"], 2);
         assert_eq!(events[0]["inferred_start_height"], 91);
@@ -405,19 +437,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn names_the_peer_address_only_when_the_node_exposes_peer_addresses() {
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
+        let trace = test_trace(&guard, true);
+
+        trace.block_request_finish(
+            1,
+            test_peer(),
+            hash(2),
+            "maybe",
+            Duration::from_millis(4),
+            &Err(SharedPeerError::from(PeerError::NotFoundResponse(vec![
+                InventoryHash::Block(hash(2)),
+            ]))),
+        );
+
+        drop(trace);
+        guard.shutdown().await;
+
+        let event = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
+            .expect("legacy peer trace file is written");
+        let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
+
+        assert_eq!(event["peer"], "192.0.2.7:8233");
+        assert_eq!(event["user_agent"], "/Zakura:1.8.7/");
+    }
+
+    #[tokio::test]
     async fn omits_hashes_from_maximum_find_blocks_response() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
-        let trace = LegacyPeerTrace {
-            emitter: JsonlEventEmitter::new(guard.tracer(), "test-node"),
-            next_request_id: Arc::new(AtomicU64::new(1)),
-        };
-        let peer = PeerTraceContext {
-            connection_id: 7,
-            peer: "127.0.0.1:8233".parse().expect("valid peer address"),
-            peer_start_height: Height(100),
-            local_tip_height: Some(Height(90)),
-        };
+        let trace = test_trace(&guard, false);
+        let peer = test_peer();
         let hash_count = MAX_RECEIVED_BLOCK_HASHES;
         let hashes: Vec<_> = (0..hash_count)
             .map(|index| {

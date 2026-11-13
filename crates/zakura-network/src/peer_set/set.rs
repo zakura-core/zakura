@@ -382,7 +382,10 @@ where
             block_gossip_peers_changed: false,
             block_gossip_fanout: AdvertFanout::from_config(config),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
-            legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
+            legacy_peer_trace: LegacyPeerTrace::new(
+                config.zakura.trace_dir.clone(),
+                config.expose_peer_addresses,
+            ),
 
             // Busy peers
             unready_services: FuturesUnordered::new(),
@@ -1103,6 +1106,7 @@ where
         PeerTraceContext {
             connection_id: svc.connection_id(),
             peer,
+            user_agent: svc.remote_user_agent(),
             peer_start_height: svc.remote_start_height(),
             local_tip_height: self.minimum_peer_version.chain_tip().best_tip_height(),
         }

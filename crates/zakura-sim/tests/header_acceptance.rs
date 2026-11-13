@@ -653,19 +653,19 @@ fn every_required_key_is_covered_once_with_its_gates() {
     // A transitional row naming another listed PR than its key's owner, or
     // only another owner, or only another reason.
     refused(&|m| {
-        let at = covering(m, &Key::catch("sim/no-task-panic"));
+        let at = covering(m, &Key::catch("sim/no-livelock"));
         if let Expected::Open { until, .. } = &mut m.expected[at].expected {
             *until = Some("hdr-14.5");
         }
     });
     refused(&|m| {
-        let at = covering(m, &Key::catch("sim/no-task-panic"));
+        let at = covering(m, &Key::catch("sim/no-livelock"));
         if let Expected::Open { owner, .. } = &mut m.expected[at].expected {
             *owner = "Evan's side";
         }
     });
     refused(&|m| {
-        let at = covering(m, &Key::catch("sim/no-task-panic"));
+        let at = covering(m, &Key::catch("sim/no-livelock"));
         if let Expected::Open { reason, .. } = &mut m.expected[at].expected {
             *reason = "some other reason hdr-14.4 owns";
         }
@@ -1080,7 +1080,9 @@ fn the_rows_are_consistent_with_coverage() {
             .iter()
             .map(|&(id, test, why)| (id, changed(test), why))
             .collect();
-        assert_eq!(witness_association_errors(&excepted, &other).len(), 1);
+        // Both exempt rows judge a header history that isn't their COVERAGE
+        // test's, so each fails once its exemption names another test.
+        assert_eq!(witness_association_errors(&excepted, &other).len(), 2);
     }
 }
 
@@ -1475,6 +1477,13 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
             "publisher_machine_records_and_replays_without_transport",
             Some("header/publisher-policy"),
             owned(&["PUBLISHER_INPUT"]),
+        ),
+        (
+            "header-sync/wire",
+            "tests/header_wire_prepare_fault.rs",
+            "the_late_fault_fixture_penalizes_after_the_session_ended",
+            Some("header-sync/header-fault-penalized"),
+            owned(&["committed late-fault input"]),
         ),
     ]);
     // Built once per call for a fixed test table, so the leaks are bounded.
@@ -2990,9 +2999,8 @@ fn every_narrowing_entry_has_a_test_or_its_pr() {
 ///
 /// hdr-14.8's frozen-head run is still to come, and the node cleanup keys
 /// wait for its per-run cleanup record. hdr-14.4 and hdr-9d.1 merged
-/// without the evidence their rows wait for: the sim-wide IDs' and the
-/// penalty's header-harness histories and catches, and the bound table's
-/// per-row fixtures. They stay here, named, until those are built or Adam
+/// without the evidence their rows wait for: `sim/no-livelock`'s
+/// header-harness catch, and the bound table's per-row fixtures. They stay here, named, until those are built or Adam
 /// approves standing exclusions for them.
 const OPEN_PRS: &[&str] = &["hdr-14.4", "hdr-14.8", "hdr-9d.1"];
 
@@ -3011,7 +3019,7 @@ fn every_transitional_row_names_an_open_pr() {
         *owner = "";
     }
     assert!(!open_errors(&ownerless).is_empty());
-    let panic = "sim/no-task-panic";
+    let livelock = "sim/no-livelock";
     let mut replaced = manifest.expected.clone();
     let caught = replaced
         .iter()
@@ -3033,17 +3041,17 @@ fn every_transitional_row_names_an_open_pr() {
     };
     replaced.push(header_acceptance::ExpectedResult {
         keys: vec![Key::Case {
-            property: panic.into(),
-            name: "task-panic".into(),
+            property: livelock.into(),
+            name: "spin".into(),
         }],
         gates: vec![Gate::G2],
         expected: Expected::Caught {
             case: CaseRef {
-                property: panic,
-                name: "task-panic",
+                property: livelock,
+                name: "spin",
             },
             harness,
-            set: &["sim/no-task-panic"],
+            set: &["sim/no-livelock"],
             found,
             not_applicable,
             patched_not_applicable,
@@ -3281,8 +3289,9 @@ const MID_PREPARE: TestRef = sim_test(
 /// Each history a row judges for an ID other than the one it's run for, as
 /// `(history, ID)`: `both-ways`, run for `conformant-never-closes`,
 /// also judges each sender rule; each `over-owed-closes` stays
-/// `NotApplicable` in its row's `unsolicited` history; and the storage
-/// witness's first plan judges `harness/direct-dispatch`.
+/// `NotApplicable` in its row's `unsolicited` history; the storage
+/// witness's first plan judges `harness/direct-dispatch`; and the first
+/// hold-release fixture judges `sim/no-livelock`.
 const SHARED_HISTORIES: &[(HistoryRef, &str)] = &[
     (
         HistoryRef {
@@ -3368,6 +3377,19 @@ const SHARED_HISTORIES: &[(HistoryRef, &str)] = &[
             case: "plan 0 of inputs(32, 256)",
         },
         "harness/direct-dispatch",
+    ),
+    // `sim/no-livelock`'s COVERAGE witness runs test/probe, so its row
+    // judges the first hold-release fixture, run for hold-release-wakes.
+    (
+        HistoryRef {
+            harness: "header-sync/liveness",
+            witness: sim_test(
+                "tests/header_hold_release.rs",
+                "the_committed_fixtures_match_their_names",
+            ),
+            case: "header-hold-held-locator",
+        },
+        "sim/no-livelock",
     ),
 ];
 

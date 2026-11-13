@@ -1262,6 +1262,17 @@ const SHARED: &[Shared] = &[
             "departed-source-unpruned",
         )],
     },
+    // The serving-churn fixture: the node serves four mirrors that each
+    // leave mid-subscription, so nothing goes stale.
+    Shared {
+        harness: STORAGE,
+        never: &[
+            "header-sync/stale-chain-effect-inert",
+            "header-sync/stale-completion-inert",
+        ],
+        undeclared: STORAGE_UNDECLARED,
+        cases: &[("sim/no-task-panic", "stop-asserts-subscriptions-ended")],
+    },
 ];
 
 /// How a case's patched completed runs report otherwise than its baseline.
@@ -2400,6 +2411,14 @@ static HISTORIES: &[HistoryNa] = &[
             ],
         ],
         undeclared: &["header-sync/bounded-adversary-progress", "sim/no-livelock"],
+    },
+    HistoryNa {
+        harness: "header-sync/wire",
+        file: "tests/header_wire_prepare_fault.rs",
+        test: "the_late_fault_fixture_penalizes_after_the_session_ended",
+        cases: &["committed late-fault input"],
+        applies: &[PENALTY, &["header-sync/header-fault-penalized"]],
+        undeclared: PENALTY_UNDECLARED,
     },
     HistoryNa {
         harness: "header-sync/wire",

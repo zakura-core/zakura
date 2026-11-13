@@ -52,7 +52,7 @@ use crate::{
     observe::Exit,
     property::{
         Assume, Assumptions, CheckCtx, CheckEvent, HasView, Kind, Property, PropertyId, Registry,
-        RegistryChecker, Source, Sources, Status, Tee, Verdict,
+        RegistryChecker, Source, Sources, Status, Tee, TriggerHistory, Verdict,
     },
     record::{FullReport, CONTRACT_VERSION, FORMAT_VERSION},
     sim::NO_LIVELOCK,
@@ -352,7 +352,7 @@ pub(crate) fn registry<S: Subsystem>() -> Registry<S> {
             needs: &[Source::Schedule],
             status: Status::Active,
             check: no_task_panic::<S>,
-            witness: None,
+            witness: Some(TriggerHistory::Log(a_task_ran)),
         },
         Property {
             id: PropertyId::new(NO_LIVELOCK),
@@ -426,6 +426,21 @@ fn no_task_panic<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         ),
         None => Verdict::Holds,
     }
+}
+
+/// [`NO_TASK_PANIC`]'s trigger history: the step loop ran a task and
+/// logged how its poll ended, which a panic needs. A run that never polled
+/// a task has nothing a panic check could have seen.
+fn a_task_ran(log: &ObservationLog) -> bool {
+    log.entries().iter().any(|entry| {
+        matches!(
+            entry.obs,
+            Observation::TaskReached { .. }
+                | Observation::TaskWaiting { .. }
+                | Observation::TaskParked { .. }
+                | Observation::TaskExited { .. }
+        )
+    })
 }
 
 /// Applies [`NO_LIVELOCK`] at each live step. The step loop finds the

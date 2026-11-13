@@ -29,7 +29,10 @@ use support::{
 use zakura_sim::{
     domain::header_sync::STALE_COMPLETION_INERT,
     harness::{
-        header_acceptance::refs::{ConnectionRef, Ref, SessionIdRef},
+        header_acceptance::{
+            history::run_declared,
+            refs::{ConnectionRef, Ref, SessionIdRef},
+        },
         header_node::{
             fault::FaultEnd,
             stale::{StaleWindow, Staleness},
@@ -43,7 +46,7 @@ use zakura_sim::{
     property::HasView,
     witness::{check_witness, Expect, WitnessScenario},
     Checker, MemorySink, NoChecks, Observation, ObservationLog, Plan, PlanInput, PropertyOutcome,
-    RunReport,
+    RecordSink, RunReport,
 };
 use zakura_storage::header::fixture::HeaderFixture;
 
@@ -560,18 +563,22 @@ fn run_wire(
     extra: Option<&mut dyn Checker>,
 ) -> (RunReport, Vec<String>) {
     let mut sink = MemorySink::default();
-    let report = match run_prepared::<HeaderWire>(
-        scenario,
-        HeaderWire::prepare(scenario),
-        plan,
-        &mut sink,
-        extra,
-    ) {
+    let report = run_wire_into(scenario, plan, &mut sink, extra);
+    (report, sink.lines())
+}
+
+/// [`run_wire`], recording into `sink` and returning only the report.
+fn run_wire_into(
+    scenario: &WireScenario,
+    plan: PlanInput,
+    sink: &mut dyn RecordSink,
+    extra: Option<&mut dyn Checker>,
+) -> RunReport {
+    match run_prepared::<HeaderWire>(scenario, HeaderWire::prepare(scenario), plan, sink, extra) {
         Ok(report) => report,
         Err(HarnessError::Run { report, .. }) => *report,
         Err(error) => panic!("{error}"),
-    };
-    (report, sink.lines())
+    }
 }
 
 /// The default Plan on `header-sync/wire`, steered by
@@ -640,7 +647,9 @@ fn regenerate_late_fault_fixture() {
 /// On `header-sync/wire` itself, the committed late fault holds
 /// `header-sync/header-fault-penalized` with its trigger history and no
 /// violation, and the property applies. The fault is late: the node
-/// penalized the session that sent the invalid page after it ended.
+/// penalized the session that sent the invalid page after it ended. The
+/// run is the penalty's counted history, `committed late-fault input`,
+/// which the acceptance tool records from this declaration (C18).
 #[test]
 fn the_late_fault_fixture_penalizes_after_the_session_ended() {
     let (scenario, script) = committed_late_fault();
@@ -652,7 +661,13 @@ fn the_late_fault_fixture_penalizes_after_the_session_ended() {
         HEADER_FAULT_PENALIZED,
         Expect::Holds,
     );
-    let (report, _) = run_wire(&scenario, PlanInput::Script(script), None);
+    let report = run_declared(
+        HeaderWire::NAME,
+        "committed late-fault input",
+        &scenario,
+        PlanInput::Script(script),
+        |scenario, plan, sink| run_wire_into(scenario, plan, sink, None),
+    );
     assert!(
         report.end.violation.is_none() && report.end.harness.is_none(),
         "{:?}",

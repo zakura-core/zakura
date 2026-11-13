@@ -343,12 +343,13 @@ fn a_listed_co_violation_is_expected() {
     assert_eq!(violated, [A, B]);
 }
 
-/// `sim/no-task-panic` has no trigger-history check, so no input can show
-/// its causal witness, and one that violates nothing is no failure.
+/// `sim/no-task-panic`'s trigger history is a task having run, so the
+/// planted task panic confirms with its causal witness, and an input that
+/// violates nothing is no failure.
 #[test]
-fn unsupported_and_clean_runs_say_so() {
+fn panicking_and_clean_runs_say_so() {
     let (panic, _dir) = run(&[2, 7, 1], NO_TASK_PANIC);
-    assert_eq!(panic.status, ConfirmStatus::WitnessUnsupported, "{panic:?}");
+    assert_eq!(panic.status, ConfirmStatus::Confirmed, "{panic:?}");
     let (clean, _dir) = run(&[3, 7, 1], A);
     assert_eq!(clean.status, ConfirmStatus::NotViolated, "{clean:?}");
     assert_eq!(clean.detail.as_deref(), Some("the run is clean"));

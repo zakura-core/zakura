@@ -1332,8 +1332,10 @@ fn reports_diagnostic(log: &str, diagnostic: &str) -> bool {
 /// declaration recorded in `dir/history` by the same checkout (C18, C8),
 /// whose trace must bind to the declaration and end as the test did: a
 /// harness failure reporting `diagnostic` for a failing test, completed for
-/// a passing one. A test reports no property outcomes, so without that
-/// recording the run claims no history and its whole-report check fails.
+/// a passing one, and its recorder must have exited 0 as task `at`'s run at
+/// `<role>/history` ([`recorder_refusal`]). A test reports no property
+/// outcomes, so without that recording the run claims no history and its
+/// whole-report check fails.
 /// Its `Draft` override and declared actions are that recording's too, so
 /// a history recorded with an override, or whose actions didn't all run,
 /// is judged as it ran, and without the recording its actions are
@@ -1441,7 +1443,11 @@ fn integrity_execution(
         let from_checkout = binding::check_trace(&history, &expect).map_err(|why| {
             format!("its recorded history isn't from the checkout its test ran in: {why}")
         });
-        match bound.and(agrees).and(from_checkout) {
+        let recorder = match recorder_refusal(&history, (at, &format!("{role}/history"))) {
+            Some(why) => Err(format!("its recorded history doesn't count: {why}")),
+            None => Ok(()),
+        };
+        match bound.and(agrees).and(from_checkout).and(recorder) {
             Ok(()) => {
                 claimed = Some(input.clone());
                 reports = recorded.reports;
@@ -3635,9 +3641,19 @@ mod tests {
     /// recording in `dir`, [`AT`]'s run at `role`, naming its trace, for a
     /// recorder that exited 0 if `exited_ok`.
     fn recorder_exited(dir: &Path, role: &str, exited_ok: bool) {
+        recorder_exited_for(dir, (AT.run_id, AT.index, role), exited_ok);
+    }
+
+    /// [`recorder_exited`] for the run, task index and role `run_id`,
+    /// `index` and `role` name.
+    fn recorder_exited_for(
+        dir: &Path,
+        (run_id, index, role): (&str, usize, &str),
+        exited_ok: bool,
+    ) {
         let ran = RecordingRun {
-            run_id: AT.run_id.into(),
-            index: AT.index,
+            run_id: run_id.into(),
+            index,
             role: role.into(),
             trace: file_digest(&dir.join("trace.jsonl")),
             exited_ok,
@@ -3682,7 +3698,8 @@ mod tests {
     /// Rewrites `dir`'s trace through `edit` on its parsed lines, and
     /// rebinds its full report, if it has one, to the rewritten trace as
     /// `zakura-sim record` binds it: that trace's digest and the source its
-    /// meta records.
+    /// meta records. Its [`RECORDING_FILE`], if it has one, is rebound to
+    /// the rewritten trace's SHA-256 too, as the runner would have named it.
     fn rewrite(dir: &Path, edit: impl FnOnce(&mut Vec<Value>)) {
         let path = dir.join("trace.jsonl");
         let text = fs::read_to_string(&path).expect("the trace is readable");
@@ -3693,6 +3710,16 @@ mod tests {
         edit(&mut lines);
         let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
         fs::write(&path, text).expect("the temp dir is writable");
+        let status = dir.join(RECORDING_FILE);
+        if let Ok(text) = fs::read_to_string(&status) {
+            let mut ran: RecordingRun = serde_json::from_str(&text).expect("the status reads");
+            ran.trace = file_digest(&path);
+            fs::write(
+                &status,
+                serde_json::to_string(&ran).expect("a recording run serializes"),
+            )
+            .expect("the temp dir is writable");
+        }
         let report = dir.join(FULL_REPORT_FILE);
         let Ok(text) = fs::read_to_string(&report) else {
             return;
@@ -5260,6 +5287,116 @@ mod tests {
         assert!(refused(&draft(), "nonzero"), "{:?}", draft().end);
     }
 
+    /// An integrity run's history recording counts only if its recorder
+    /// exited 0. Each run whose test and recording are complete and would
+    /// count, but whose recorder then exited 1, claims no history and takes no
+    /// reports, and the patched one fails. So does one whose status names
+    /// another role or is missing.
+    #[test]
+    fn an_integrity_recorder_s_nonzero_exit_fails_its_run() {
+        let failure = "storage:header's evidence failed: OwnedMismatch: at a quiet boundary";
+        let read = |(name, run): (&str, CaseRun), edit: &dyn Fn(&Path, &str)| {
+            let dir = tempfile::tempdir().expect("a temp dir can be created");
+            let patched = run == CaseRun::Patched;
+            let source = if patched { "patched" } else { "subject" };
+            let declared_for = super::super::history::DeclaredFor {
+                run_id: AT.run_id.into(),
+                index: AT.index,
+                role: name.into(),
+            };
+            declare_and_record_for(
+                dir.path(),
+                &declared_for,
+                "a_test",
+                "plan 0",
+                source,
+                patched.then_some(failure),
+            );
+            let artifact = TestRun {
+                run_id: AT.run_id.into(),
+                index: AT.index,
+                role: name.into(),
+                executable_sha256: None,
+                package: "zakura-sim".into(),
+                file: "tests/header_node.rs".into(),
+                tests: vec![(
+                    "a_test".into(),
+                    if patched { "FAILED" } else { "ok" }.into(),
+                )],
+                killed: false,
+                exited_ok: !patched,
+                log: if patched {
+                    format!("the run hit a harness failure: {failure}\n")
+                } else {
+                    String::new()
+                },
+                binary_source: Some(source.into()),
+                checkout_source: Some(source.into()),
+            };
+            fs::write(
+                dir.path().join(TEST_FILE),
+                serde_json::to_string(&artifact).expect("a test run serializes"),
+            )
+            .expect("the temp dir is writable");
+            edit(&dir.path().join("history"), name);
+            integrity_execution(
+                (dir.path(), &AT, name),
+                RunId::native("raw-budget-lease", run),
+                &history_run(),
+                NODE,
+                "OwnedMismatch",
+                "subject",
+            )
+        };
+        type Defect<'a> = (&'a str, &'a dyn Fn(&Path, &str));
+        let defects: [Defect; 3] = [
+            ("nonzero", &|dir, name| {
+                recorder_exited_for(
+                    dir,
+                    (AT.run_id, AT.index, &format!("{name}/history")),
+                    false,
+                );
+            }),
+            ("another role", &|dir, _| {
+                recorder_exited_for(dir, (AT.run_id, AT.index, "run"), true);
+            }),
+            ("missing", &|dir, _| {
+                fs::remove_file(dir.join(RECORDING_FILE)).expect("it exists");
+            }),
+        ];
+        let runs = [
+            ("unpatched", CaseRun::Unpatched),
+            ("patched", CaseRun::Patched),
+            ("restored", CaseRun::Restored),
+        ];
+        for run in runs {
+            let own = read(run, &|_, _| {});
+            assert_eq!(own.meta.input, Some(history_run()), "{run:?}: {own:?}");
+            assert!(!own.reports.is_empty(), "{run:?}");
+            assert!(!matches!(own.end, End::Failed { .. }), "{run:?}: {own:?}");
+        }
+        for (defect, apply) in defects {
+            for run in runs {
+                let refused = read(run, apply);
+                assert_eq!(refused.meta.input, None, "{defect} {run:?}");
+                assert!(refused.reports.is_empty(), "{defect} {run:?}");
+                if run.1 == CaseRun::Patched {
+                    assert!(
+                        matches!(&refused.end, End::Failed { why } if why.contains("recorder")),
+                        "{defect}: {:?}",
+                        refused.end
+                    );
+                }
+            }
+        }
+        let nonzero = read(runs[1], defects[0].1);
+        assert!(
+            matches!(&nonzero.end, End::Failed { why } if why.contains("exited nonzero")),
+            "{:?}",
+            nonzero.end
+        );
+    }
+
     /// A typed planted case plans beside a fuzz-input one: each gets a task
     /// and a result, and its links name its scenario and Plan. A typed case's Plan is
     /// its bytes or its script. A case naming both forms, or neither, is
@@ -6175,7 +6312,8 @@ mod tests {
     /// test `test` declared [`storage_history`] as `case`, for the run,
     /// task and role `declared_for` names: the declaration, and that
     /// history recorded by the build with source `source`, ending in the
-    /// harness failure `failure` when one is given.
+    /// harness failure `failure` when one is given, by a recorder that
+    /// exited 0 as that run at `<role>/history`.
     fn declare_and_record_for(
         dir: &Path,
         declared_for: &super::super::history::DeclaredFor,
@@ -6226,6 +6364,15 @@ mod tests {
                 end["harness"] = Value::String(failure.to_owned());
             }
         });
+        recorder_exited_for(
+            &recording,
+            (
+                &declared_for.run_id,
+                declared_for.index,
+                &format!("{}/history", declared_for.role),
+            ),
+            true,
+        );
     }
 
     /// An integrity run's `Draft` override and declared actions are its

@@ -31,17 +31,45 @@ use zakura_sim::{
 /// next round is active.
 const STALE_PREPARE_INPUT: &[u8] = include_bytes!("fixtures/header-storage-stale-prepare.bin");
 
+/// The committed close-and-relink seed (`tests/header_storage_seeds.rs`),
+/// whose every control step runs.
+const CLOSE_RELINK_INPUT: &[u8] = include_bytes!("fixtures/header-storage-close-relink.bin");
+
 /// `header-sync/stale-completion-inert` holds on the committed stale-prepare
 /// seed, and the run reaches its trigger history: a call ends stale.
 /// `cargo xtask planted header-sync/stale-completion-inert` checks that the
-/// same input violates it under each planted patch.
+/// same input violates it under each planted patch. It isn't a counted
+/// history: its scenario's last control step, a close on a dropped read,
+/// never runs within the step budget under any plan searched, so the
+/// property's counted history is the close-and-relink seed's
+/// ([`the_close_relink_input_holds_stale_completion_inert`]).
 #[test]
 fn the_stale_prepare_input_holds_stale_completion_inert() {
     let entry = harness::find(Storage::NAME).expect("the storage harness is registered");
     let (prefix, plan) = STALE_PREPARE_INPUT.split_at(Storage::SCENARIO_BYTES);
+    let result = (entry.witness)(
+        &entry.scenario(prefix),
+        Plan::from_fuzz(plan),
+        STALE_COMPLETION_INERT,
+        Expect::Holds,
+        &[],
+        &mut MemorySink::default(),
+    );
+    assert_eq!(result, Ok(()));
+}
+
+/// `header-sync/stale-completion-inert` holds on the committed
+/// close-and-relink seed, whose every control step runs, and the run
+/// reaches its trigger history: a call ends stale. It's the property's
+/// counted history, which the acceptance tool records from this
+/// declaration (C18).
+#[test]
+fn the_close_relink_input_holds_stale_completion_inert() {
+    let entry = harness::find(Storage::NAME).expect("the storage harness is registered");
+    let (prefix, plan) = CLOSE_RELINK_INPUT.split_at(Storage::SCENARIO_BYTES);
     let result = run_declared(
         Storage::NAME,
-        "committed stale-prepare input",
+        "committed close-relink input",
         &entry.scenario(prefix),
         Plan::from_fuzz(plan),
         |scenario, plan, sink| {

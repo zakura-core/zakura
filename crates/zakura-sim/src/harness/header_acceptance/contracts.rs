@@ -698,6 +698,7 @@ const C14_PROVING: &[TestRef] = &[
         "tests/header_node_reservations.rs",
         "a_round_retires_with_headers_still_reserved",
     ),
+    sim_test("tests/header_node.rs", "grow_steps_record_their_growths"),
     sim_test(
         "tests/header_stale.rs",
         "the_stale_prepare_input_holds_stale_completion_inert",
@@ -1240,6 +1241,10 @@ const C17_PROVING: &[TestRef] = &[
     sim_test(
         "src/harness/header_node/wake.rs",
         "harness::header_node::wake::tests::a_frozen_wake_store_drops_a_fact",
+    ),
+    sim_test(
+        "src/harness/header_node/grown.rs",
+        "harness::header_node::grown::tests::a_frozen_grow_store_drops_a_growth",
     ),
     sim_test(
         "src/harness/header_node/recovery.rs",

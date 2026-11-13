@@ -1130,6 +1130,7 @@ fn judge(
             Expected::StaysNotApplicable {
                 property,
                 history,
+                na_reason,
                 reason,
                 approval,
                 not_applicable,
@@ -1154,9 +1155,12 @@ fn judge(
                 return Err("its history lost its trigger history".into());
             }
             match run.reports.get(property) {
-                Some(Report::NotApplicable { reason: given }) if given == reason => Ok(()),
+                Some(Report::NotApplicable { reason: given }) if *given == na_reason.name() => {
+                    Ok(())
+                }
                 other => Err(format!(
-                    "{property} is {other:?}, not NotApplicable({reason})"
+                    "{property} is {other:?}, not NotApplicable({})",
+                    na_reason.name()
                 )),
             }
         }

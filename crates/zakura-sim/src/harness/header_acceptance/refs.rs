@@ -191,7 +191,7 @@ pub struct ControlRef {
     pub control: usize,
     /// The peer.
     pub peer: String,
-    /// The action, as `Close`, `Relink` or `Shutdown`.
+    /// The action, as `Close`, `Relink` or `Shutdown`, or a growth's `grow`.
     pub action: String,
 }
 impl Ref for ControlRef {}

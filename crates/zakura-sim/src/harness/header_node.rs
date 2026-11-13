@@ -25,6 +25,7 @@ pub mod claim;
 pub mod ends;
 pub mod fault;
 pub mod fork_choice;
+pub mod grown;
 pub mod hold_wake;
 pub mod outstanding;
 mod pair;
@@ -964,6 +965,8 @@ pub struct Topology {
     tap: Option<TapShutdown>,
     /// The node under test's session view, told of each link.
     sessions: Option<SessionEvidence>,
+    /// Where each completed growth is recorded, with its control step.
+    grown: Option<grown::GrowEvidence>,
     /// Set once a `Shutdown` step was picked, which stops any churn.
     stopping: Cell<bool>,
     /// The mirror whose pages the harness holds back, if any.
@@ -1145,6 +1148,7 @@ impl Topology {
             last_id: Cell::new(0),
             tap: None,
             sessions: None,
+            grown: None,
             stopping: Cell::new(false),
             delayed_page: None,
         }
@@ -1193,6 +1197,15 @@ impl Topology {
         sessions.expect_links();
         Topology {
             sessions: Some(sessions),
+            ..self
+        }
+    }
+
+    /// This topology, recording each completed growth in `grown`, naming
+    /// the control step that made it.
+    pub fn with_grown(self, grown: grown::GrowEvidence) -> Self {
+        Topology {
+            grown: Some(grown),
             ..self
         }
     }
@@ -1277,7 +1290,9 @@ impl Topology {
     /// grows the new tip instead. Anything else, such as a resource stall
     /// that leaves the target unadmitted while the tip stays put, is
     /// recorded as a failure. The node must be a mirror, on an engine port.
-    async fn grow(&self, peer: &str, fixture: &HeaderFixture, len: u32) {
+    /// A completed growth is recorded in the topology's [`grown`] store,
+    /// naming `cause`, the control step's position, if a step made it.
+    async fn grow(&self, peer: &str, fixture: &HeaderFixture, len: u32, cause: Option<usize>) {
         let node = self
             .nodes
             .iter()
@@ -1307,6 +1322,9 @@ impl Topology {
             match (applied, now) {
                 (Ok(ApplyHeaderTargetOutcome::Applied), Some(now)) if now == target => {
                     self.effects.grown.borrow_mut().push(peer.to_owned());
+                    if let Some(grown) = &self.grown {
+                        grown.record(peer, cause);
+                    }
                     return;
                 }
                 // The mirror moved its tip during the growth.
@@ -1821,7 +1839,9 @@ impl Control {
                         let link = link();
                         topology.open(link.dialer, link.listener, false, position);
                     }
-                    ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
+                    ControlAction::Grow { len } => {
+                        topology.grow(&step.peer, &fixture, len, position).await
+                    }
                     ControlAction::Shutdown => topology.shutdown(),
                     ControlAction::Flood => topology.flood(&step.peer, &generators, position),
                     ControlAction::Churn => {

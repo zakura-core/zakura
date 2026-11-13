@@ -3,7 +3,7 @@
 # first two bytes pick the saved `honest-progress` scenario, and
 # `header-wire-honest-progress.end.json` is its pinned end record.
 harness = "header-sync/wire"
-generator = 3
+generator = 4
 sha256 = "74c5053016f3f964085db6458f208d0a70a2d551ab8db19e55966bd04f49ebf6"
 scenario_sha256 = "92776aa445e24008dcecaee451f693d47564a6e102c4cb5ad88984a4b5961798"
 source = "crates/zakura-sim/tests/header_wire_lifecycle.rs"

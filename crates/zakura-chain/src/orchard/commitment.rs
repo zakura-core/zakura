@@ -1,7 +1,7 @@
 //! Note and value commitments.
 
 use crate::serialization::ZcashReader;
-use std::{fmt, io, sync::LazyLock};
+use std::{fmt, io};
 
 use group::{ff::PrimeField, CurveAffine as _, GroupEncoding};
 use halo2::{
@@ -9,70 +9,9 @@ use halo2::{
     pasta::pallas,
 };
 
-use crate::{
-    amount::Amount,
-    serialization::{
-        serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
-    },
+use crate::serialization::{
+    serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
 };
-
-use super::sinsemilla::*;
-
-/// Note commitments for the output notes.
-#[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
-pub struct NoteCommitment(#[serde(with = "serde_helpers::Affine")] pub pallas::Affine);
-
-impl fmt::Debug for NoteCommitment {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut d = f.debug_struct("NoteCommitment");
-
-        let option: Option<Coordinates<pallas::Affine>> = self.0.coordinates().into();
-
-        match option {
-            Some(coordinates) => d
-                .field("x", &hex::encode(coordinates.x().to_repr()))
-                .field("y", &hex::encode(coordinates.y().to_repr()))
-                .finish(),
-            None => d
-                .field("x", &hex::encode(pallas::Base::zero().to_repr()))
-                .field("y", &hex::encode(pallas::Base::zero().to_repr()))
-                .finish(),
-        }
-    }
-}
-
-impl From<pallas::Point> for NoteCommitment {
-    fn from(projective_point: pallas::Point) -> Self {
-        Self(pallas::Affine::from(projective_point))
-    }
-}
-
-impl From<NoteCommitment> for [u8; 32] {
-    fn from(cm: NoteCommitment) -> [u8; 32] {
-        cm.0.to_bytes()
-    }
-}
-
-impl TryFrom<[u8; 32]> for NoteCommitment {
-    type Error = &'static str;
-
-    fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
-        let possible_point = pallas::Affine::from_bytes(&bytes);
-
-        if possible_point.is_some().into() {
-            Ok(Self(possible_point.unwrap()))
-        } else {
-            Err("Invalid pallas::Affine value")
-        }
-    }
-}
-
-impl NoteCommitment {
-    /// Extract the x coordinate of the note commitment.
-    pub fn extract_x(&self) -> pallas::Base {
-        extract_p(self.0.into())
-    }
-}
 
 /// A homomorphic Pedersen commitment to the net value of a _note_, used in
 /// Action descriptions.
@@ -207,22 +146,6 @@ impl ZcashDeserialize for ValueCommitment {
         Self::try_from(reader.read_32_bytes()?).map_err(SerializationError::Parse)
     }
 }
-
-impl ValueCommitment {
-    /// Generate a new `ValueCommitment` from an existing `rcv on a `value`.
-    ///
-    /// ValueCommit^Orchard(v) :=
-    ///
-    /// <https://zips.z.cash/protocol/nu5.pdf#concretehomomorphiccommit>
-    #[allow(non_snake_case)]
-    pub fn new(rcv: pallas::Scalar, value: Amount) -> Self {
-        let v = pallas::Scalar::from(value);
-        Self::from(*V * v + *R * rcv)
-    }
-}
-
-static V: LazyLock<pallas::Point> = LazyLock::new(|| pallas_group_hash(b"z.cash:Orchard-cv", b"v"));
-static R: LazyLock<pallas::Point> = LazyLock::new(|| pallas_group_hash(b"z.cash:Orchard-cv", b"r"));
 
 #[cfg(test)]
 mod tests {

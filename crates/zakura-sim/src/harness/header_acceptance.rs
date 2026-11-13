@@ -67,7 +67,7 @@ pub enum Gate {
     G4,
     /// Resources.
     G5,
-    /// Missing evidence, inconclusive ends and tiers.
+    /// Missing evidence, incomplete ends and tiers.
     G6,
 }
 
@@ -498,12 +498,8 @@ pub enum Key {
     /// One `NotApplicable` reason in [`reasons::NA_REASONS`], shown at its
     /// trigger.
     NaReason {
-        /// The producer's file.
-        file: String,
-        /// The producer's function.
-        function: String,
-        /// The construction's position in the function.
-        index: usize,
+        /// The reason.
+        reason: crate::NaReason,
     },
     /// A header ID's entry for a tier other than its own (item 6).
     Tier {

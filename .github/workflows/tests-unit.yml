@@ -250,12 +250,15 @@ jobs:
           # The archive stores compiled binaries, so it must be built in the same
           # mode the shards run. The run-time-only filters (`--profile`,
           # `--partition`, `--run-ignored`) are applied by the shard jobs, not here.
+          # `zakura-sim` is empty without `--cfg zakura_sim`, so its 120-odd test
+          # binaries hold no tests here. sim-build runs them, and lint.yml still
+          # checks that the crate compiles without the flag.
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            cargo nextest archive --locked --release --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --workspace --exclude zakura-sim --release --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           elif [[ "${FULL_COVERAGE}" == "true" ]]; then
-            cargo nextest archive --locked --cargo-profile ci-tests --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --workspace --exclude zakura-sim --cargo-profile ci-tests --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           else
-            cargo nextest archive --locked --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --workspace --exclude zakura-sim --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           fi
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
@@ -499,7 +502,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     env:
       CARGO_TARGET_DIR: target/sim
     steps:
@@ -551,7 +554,7 @@ jobs:
       contents: read
       issues: write
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -577,7 +580,7 @@ jobs:
       # The step's limit leaves the issue step time to run.
       - name: Check tonight's shard of the planted bypass patches
         id: planted
-        timeout-minutes: 40
+        timeout-minutes: 110
         run: cargo xtask planted --shard "${SHARD}/${SHARDS}"
         env:
           RUSTFLAGS: --cfg zakura_sim
@@ -708,10 +711,8 @@ jobs:
   # `cargo xtask sim-targets` reports one status per target. The ASan fuzz
   # builds take minutes, so the job runs nightly and on manual dispatch,
   # never on pull requests or pushes. It checks readiness, not how well a
-  # target searches. `cargo xtask planted --targets`, which confirms each
-  # retained bypass through its target, rebuilds the patched simulator and
-  # target for each of about 20 cases, so scripts/sim-long-runs.sh runs it
-  # on a remote host instead.
+  # target searches. sim-planted-targets confirms each retained bypass
+  # through its target.
   sim-targets:
     name: zakura_sim targets
     if: vars.TEMPORARY_PR_CI != 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
@@ -748,6 +749,84 @@ jobs:
           name: sim-targets-readiness
           path: ${{ runner.temp }}/sim-targets/readiness.json
           if-no-files-found: ignore
+
+  # `cargo xtask planted --targets` runs each retained bypass whose committed
+  # input runs on a simulator fuzz target's harness, and confirms the patched
+  # input through that target in fresh processes. It rebuilds the patched
+  # simulator and the target with AddressSanitizer for each case, so it
+  # shards the cases as sim-planted does: fourteen shards, and each night the
+  # job's two parts run the two shards the UTC weekday picks, so each case
+  # runs once a week. Each shard has its own failure issue, and only a
+  # passing run of that shard closes it, so the job stays out of
+  # test-success. It runs nightly and on manual dispatch, never on pull
+  # requests or pushes.
+  sim-planted-targets:
+    name: zakura_sim planted targets ${{ matrix.part }}
+    if: vars.TEMPORARY_PR_CI != 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: read
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    env:
+      # Seven weekdays times the matrix's two parts.
+      SHARDS: 14
+      CARGO_FUZZ_VERSION: 0.13.2
+      CXXFLAGS: -include cstdint
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          # The nightly `header-fuzz.yml` and the simulator fuzz package pin.
+          toolchain: nightly-2026-07-15
+          cache-shared-key: zakura-sim-planted-targets
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version "${CARGO_FUZZ_VERSION}" --locked
+      - name: Pick tonight's shard
+        id: shard
+        run: echo "index=$((2 * $(date -u +%w) + PART))" >> "$GITHUB_OUTPUT"
+        env:
+          PART: ${{ matrix.part }}
+      # The step's limit leaves the issue step time to run.
+      - name: Confirm tonight's shard of the planted bypasses through their targets
+        id: planted
+        timeout-minutes: 110
+        run: cargo +nightly-2026-07-15 xtask planted --targets --shard "${SHARD}/${SHARDS}"
+        env:
+          RUSTFLAGS: --cfg zakura_sim
+          SHARD: ${{ steps.shard.outputs.index }}
+      - name: Create, update, or close the shard's failure issue
+        if: always() && github.event_name == 'schedule' && steps.shard.outputs.index != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHARD: ${{ steps.shard.outputs.index }}
+          SHARD_RESULT: ${{ steps.planted.outcome }}
+        run: |
+          issue_title="[nightly] zakura_sim planted targets shard ${SHARD}/${SHARDS} failed"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          issue_number="$(gh issue list --state open --search "\"${issue_title}\" in:title" --json number,title --jq ".[] | select(.title == \"${issue_title}\") | .number" | head -n 1)"
+
+          if [[ "${SHARD_RESULT}" != "success" ]]; then
+            message="Planted targets shard ${SHARD}/${SHARDS} failed: ${run_url}"
+            if [[ -n "${issue_number}" ]]; then
+              gh issue comment "${issue_number}" --body "${message}"
+            else
+              gh issue create --title "${issue_title}" --body "${message}"
+            fi
+          elif [[ -n "${issue_number}" ]]; then
+            gh issue comment "${issue_number}" --body "Planted targets shard ${SHARD}/${SHARDS} recovered: ${run_url}"
+            gh issue close "${issue_number}" --reason completed
+          fi
 
   # Semver-checks compares rustdoc APIs and cannot see a dependency's major
   # bump underneath an unchanged type name. This job is the gate that can:
@@ -871,8 +950,8 @@ jobs:
           # skips on PRs that do not touch Cargo manifests or this check, and
           # sim-build, sim-sanitizers, sim-feedback and sim-targets run only on the nightly
           # schedule and manual dispatch, so a nightly failure still fails
-          # this status and reaches report-nightly-result. sim-planted
-          # reports to one failure issue per shard instead.
+          # this status and reaches report-nightly-result. sim-planted and
+          # sim-planted-targets report to one failure issue per shard instead.
           # Failed, non-skipped jobs still fail this aggregate status.
           allowed-skips: temporary-unit-tests, check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, sprout-disabled, network-dependent, publish-graph, sim-build, sim-sanitizers, sim-feedback, sim-targets, zakura-testkit
 

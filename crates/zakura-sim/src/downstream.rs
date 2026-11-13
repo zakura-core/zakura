@@ -22,8 +22,6 @@ use std::{
     fmt,
 };
 
-use zakura_scheduler::Status as SchedulerStatus;
-
 use crate::{
     model::Label,
     observe::{Entry, RowAt},
@@ -44,9 +42,10 @@ pub(crate) fn check<S: HasView>(
 }
 
 /// Checks `receiver-serving-bounded`: [`serving_bounded`] on each entry,
-/// and [`owners_retired`] at each step that leaves no task running.
+/// and [`owners_retired`] at each step that leaves the scheduler at rest
+/// ([`crate::at_rest`]).
 pub(crate) fn check_serving<S: HasView>(cx: &mut CheckCtx<'_, S>, id: &GeneratedId<'_>) -> Verdict {
-    let at_rest = cx.status != SchedulerStatus::Running;
+    let at_rest = crate::at_rest(cx.status);
     check_with(cx, id, serving_bounded, at_rest.then_some(owners_retired))
 }
 
@@ -327,7 +326,7 @@ fn answered(
     })
 }
 
-/// The rest of `receiver-serving-bounded`, checked when no task is running:
+/// The rest of `receiver-serving-bounded`, checked at rest ([`crate::at_rest`]):
 /// every owner for a request of `row` that has ended, by the node's ending
 /// or its connection's close, has retired. `None` if the node never served
 /// one.

@@ -691,13 +691,16 @@ impl Service<zn::Request> for Inbound {
                         )
                         .await
                         {
-                            Ok(block) => Some(block),
+                            // Measure each found block once; both size limits below use it.
+                            Ok(block) => Some(block.map(|block| {
+                                let size = block.zcash_serialized_size();
+                                (block, size)
+                            })),
                             Err(error) if is_read_capacity_refusal(&*error) => None,
                             Err(error) => return Err(error),
                         };
-                        if let Some(Some(block)) = &block {
-                            state_lookup_bytes = state_lookup_bytes
-                                .saturating_add(block.zcash_serialized_size());
+                        if let Some(Some((_, size))) = &block {
+                            state_lookup_bytes = state_lookup_bytes.saturating_add(*size);
                         }
                         lookup_results.push((index, hash, block));
                     }
@@ -718,10 +721,8 @@ impl Service<zn::Request> for Inbound {
                             continue;
                         };
                         match block {
-                            Some(block) => {
-                                // If checking the serialized size of the block performs badly,
-                                // return the size from the state using a wrapper type.
-                                total_size += block.zcash_serialized_size();
+                            Some((block, size)) => {
+                                total_size += size;
 
                                 blocks.push(Available((block, None)))
                             },

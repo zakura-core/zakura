@@ -58,13 +58,18 @@
 //! reset run with no `Reset` fact is missing evidence, which fails the run.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, PoisonError},
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{DurableState, EngineSnapshot};
+use zakura_network::zakura::{
+    observe::{HeaderSyncObserver, ReactorEvent},
+    ZakuraPeerId,
+};
 use zakura_storage::header::{
     controlled::{EngineRun, RunKind},
     fixture::HeaderFixture,
@@ -88,6 +93,21 @@ struct Store {
     settled: Option<(u64, Option<String>)>,
     /// How many settled points the drains judged.
     settled_points: u64,
+    /// The mirrors whose own reactors decided on a session with the node
+    /// ([`MirrorDecisions`]).
+    mirrors_decided: HashSet<String>,
+    /// Each mirror's links with the node, by connection ID, and when the
+    /// session on each ended, as the topology's cancellation hooks record
+    /// it ([`ForkChoiceEvidence::watch_link_ends`]).
+    link_ends: Option<LinkEnds>,
+}
+
+/// The topology's record of when each link's session ended, by connection
+/// ID, and which mirror each of the node's links joins.
+#[derive(Debug)]
+struct LinkEnds {
+    ended: Arc<Mutex<BTreeMap<u64, Duration>>>,
+    mirrors: Vec<(u64, String)>,
 }
 
 /// When the fork-choice check first applied, shared by the tap and whoever
@@ -136,6 +156,94 @@ impl ForkChoiceEvidence {
     /// whether or not a task could still run after their steps.
     pub fn settled_points(&self) -> u64 {
         self.with(|store| store.settled_points)
+    }
+
+    /// The observer for the mirror named `mirror`, which records its own
+    /// reactor admitting or refusing a session with `node`, the node under
+    /// test ([`MirrorDecisions`]).
+    pub fn mirror(&self, mirror: &str, node: ZakuraPeerId) -> Arc<dyn HeaderSyncObserver> {
+        Arc::new(MirrorDecisions {
+            mirror: mirror.to_owned(),
+            node,
+            evidence: self.clone(),
+        })
+    }
+
+    /// Counts a mirror whose link `connection` with the node ended, as
+    /// `ended` records it, as one that had its chance to connect, for each
+    /// of `mirrors`' links: a refusal before either reactor holds a session,
+    /// in a service or the transport, ends the link but reports no
+    /// decision.
+    pub fn watch_link_ends(
+        &self,
+        ended: Arc<Mutex<BTreeMap<u64, Duration>>>,
+        mirrors: Vec<(u64, String)>,
+    ) {
+        self.with(|store| store.link_ends = Some(LinkEnds { ended, mirrors }));
+    }
+
+    /// How many mirrors have had their chance to connect: their own
+    /// reactors admitted or refused a session with the node, or a link of
+    /// theirs with the node ended.
+    fn mirrors_resolved(&self) -> usize {
+        let link_ends = self.with(|store| {
+            store
+                .link_ends
+                .as_ref()
+                .map(|ends| (ends.ended.clone(), ends.mirrors.clone()))
+        });
+        // The topology's hooks take the ended map's lock inside a `cancel`,
+        // so it's read with the store's lock released.
+        let ended: Vec<String> = link_ends.map_or_else(Vec::new, |(ended, mirrors)| {
+            let ended = ended.lock().unwrap_or_else(PoisonError::into_inner);
+            mirrors
+                .into_iter()
+                .filter(|(connection, _)| ended.contains_key(connection))
+                .map(|(_, mirror)| mirror)
+                .collect()
+        });
+        self.with(|store| {
+            store
+                .mirrors_decided
+                .iter()
+                .chain(&ended)
+                .collect::<HashSet<_>>()
+                .len()
+        })
+    }
+}
+
+/// A mirror's observer, which records the mirror's reactor deciding on a
+/// session with the node under test: admitting it, or refusing it in its
+/// readmission cooldown or at capacity, the three ways its handling of a
+/// new session ends. So settled points count a mirror the node itself
+/// refused, even when the mirrors run the same refusing reactor
+/// ([`settled`]). It ignores every other event and
+/// adds no scheduling point, so the mirror runs as it would unobserved.
+#[derive(Debug)]
+struct MirrorDecisions {
+    /// The mirror's harness name.
+    mirror: String,
+    /// The node under test.
+    node: ZakuraPeerId,
+    evidence: ForkChoiceEvidence,
+}
+
+impl HeaderSyncObserver for MirrorDecisions {
+    /// Records the mirror if `event` admits or refuses a session with the
+    /// node.
+    fn observe(&self, event: ReactorEvent) {
+        let (ReactorEvent::SessionAdmitted { peer, .. }
+        | ReactorEvent::SessionRefused { peer, .. }
+        | ReactorEvent::SessionAtCapacity { peer, .. }) = event
+        else {
+            return;
+        };
+        if peer == self.node {
+            self.evidence.with(|store| {
+                store.mirrors_decided.insert(self.mirror.clone());
+            });
+        }
     }
 }
 
@@ -230,7 +338,7 @@ impl ForkChoice {
     /// `on_reactor`, at `now`, for settled points.
     pub(super) fn observe(
         &mut self,
-        event: &zakura_network::zakura::observe::ReactorEvent,
+        event: &ReactorEvent,
         on_reactor: bool,
         now: zakura_scheduler::SimInstant,
     ) {
@@ -247,7 +355,9 @@ impl ForkChoice {
         // No property checks step 0, the setup observation's, which may
         // also run before the run's clock does.
         let verdict = match (&mut self.settled, self.tainted) {
-            (Some(settled), false) if step > 0 => settled.judge(self.selected, outside),
+            (Some(settled), false) if step > 0 => {
+                settled.judge(self.selected, outside, self.evidence.mirrors_resolved())
+            }
             _ => None,
         };
         self.evidence.with(|store| {

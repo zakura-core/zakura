@@ -1,5 +1,6 @@
 //! Asynchronous verification of cryptographic primitives.
 
+#[cfg(any(test, feature = "internal-bench"))]
 use std::sync::LazyLock;
 
 use tokio::sync::oneshot::error::RecvError;
@@ -37,6 +38,7 @@ const MAX_BATCH_LATENCY: std::time::Duration = std::time::Duration::from_millis(
 /// It is always safe to call: forgetting a key costs a re-verification and can never accept a
 /// bundle that was not verified.
 #[doc(hidden)]
+#[cfg(any(test, feature = "internal-bench"))]
 pub fn clear_shielded_verification_caches() {
     if let Some(verifier) = LazyLock::get(&sapling::VERIFIER) {
         verifier.clear();

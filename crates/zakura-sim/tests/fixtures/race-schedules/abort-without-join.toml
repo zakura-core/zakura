@@ -1,0 +1,13 @@
+# The saved schedule `abort-without-join.bin` (sched-4 S4.4): the planted race on 2
+# workers, then Plan bytes that reach the race's trigger history.
+# `tests/race_fixtures.rs`'s witness tests read them. It sits outside the
+# seed corpus because it fails by design.
+harness = "race/abort-without-join"
+generator = 1
+sha256 = "3e6637944ec5b54c9f91f921070636fa9478cd474ba659a2cce3eab366a525f2"
+scenario_sha256 = "0e4fd8ccc2b76f011bae79384f3039e23f39ecfe9a446e2e887516eb827e62de"
+source = "crates/zakura-sim/tests/race_schedules.rs"
+
+[[witness]]
+property = "race/abort-without-join"
+expect = "violated"

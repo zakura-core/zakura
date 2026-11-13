@@ -51,11 +51,11 @@ mod fill;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use fill::{replay_block_fill_bytes, BlockFillReplaySummary};
 mod io;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod lifecycle_tests;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod requester_tests;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod scaling_tests;
 mod state;
 #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -1554,7 +1554,7 @@ impl Drop for PeerRoutine {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicU64;

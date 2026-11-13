@@ -7,7 +7,10 @@
 //! contract in [`REQUIRED_CONTRACTS`], unless a [`NARROWING`] entry whose
 //! own test passed releases it.
 
-use super::{sim_test, Approval, CaseRef, Expected, ExpectedResult, Key, ResultKind, TestRef};
+use super::{
+    refs::{PlantedRef, Ref},
+    sim_test, Approval, CaseRef, Expected, ExpectedResult, Key, ResultKind, TestRef,
+};
 
 /// A contract's ID, as the plan's table numbers them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1758,14 +1761,7 @@ pub fn contract_test_results(table: &[Contract], rows: &[ExpectedResult]) -> Vec
     });
     let catches = satisfied.flat_map(|contract| {
         contract.proving_catches.iter().filter_map(|&case| {
-            let caught = rows.iter().find_map(|result| match result.expected {
-                Expected::Caught { case: c, .. } | Expected::HarnessCaught { case: c, .. }
-                    if c == case =>
-                {
-                    Some(result.expected.clone())
-                }
-                _ => None,
-            })?;
+            let caught = caught_result(rows, &case.planted())?;
             Some(ExpectedResult {
                 keys: vec![contract_catch_key(contract.id, case)],
                 gates: Vec::new(),
@@ -1774,6 +1770,19 @@ pub fn contract_test_results(table: &[Contract], rows: &[ExpectedResult]) -> Vec
         })
     });
     tests.chain(catches).collect()
+}
+
+/// The `Caught` or `HarnessCaught` the first result of `rows` naming
+/// `case` expects, joined on the case's whole [`PlantedRef`], so a case
+/// under another property with the same name never stands in for it.
+fn caught_result(rows: &[ExpectedResult], case: &PlantedRef) -> Option<Expected> {
+    let caught = PlantedRef::joined(case, rows, |result| match result.expected {
+        Expected::Caught { case, .. } | Expected::HarnessCaught { case, .. } => {
+            Some(case.planted())
+        }
+        _ => None,
+    });
+    caught.first().map(|result| result.expected.clone())
 }
 
 /// The [`Key::ContractCatch`] for `contract`'s proving catch `case`.
@@ -1822,4 +1831,60 @@ pub fn narrowing_test_results(entries: &[Narrowing]) -> Vec<ExpectedResult> {
             },
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::header_acceptance::{
+        refs::one_key_off::assert_one_key_off, ExpectedNa, Found,
+    };
+
+    /// A contract's proving catch takes the result of its own case only
+    /// on the case's whole [`PlantedRef`] (Rule 25's template): among the
+    /// catches of `later-ancestor`, `overgrant` under the same property and
+    /// a `later-ancestor` under another, the key's case finds its own
+    /// result, and the case with its property or its name moved finds
+    /// none.
+    #[test]
+    fn a_contract_catch_joins_its_whole_case() {
+        const NONE: &[ExpectedNa] = &[];
+        let caught = |case: CaseRef, harness: &'static str| ExpectedResult {
+            keys: Vec::new(),
+            gates: Vec::new(),
+            expected: Expected::Caught {
+                case,
+                harness,
+                set: &[],
+                found: Found::AtStep,
+                companions: &[],
+                not_applicable: NONE,
+                patched_not_applicable: None,
+            },
+        };
+        let rows = [
+            caught(
+                CaseRef {
+                    property: "header-sync/another",
+                    name: LATER_ANCESTOR.name,
+                },
+                "same name",
+            ),
+            caught(
+                CaseRef {
+                    property: LATER_ANCESTOR.property,
+                    name: "overgrant",
+                },
+                "same property",
+            ),
+            caught(LATER_ANCESTOR, "own"),
+        ];
+        let keys = assert_one_key_off::<PlantedRef>(&LATER_ANCESTOR.planted(), |case| {
+            matches!(
+                caught_result(&rows, case),
+                Some(Expected::Caught { harness: "own", .. })
+            )
+        });
+        assert_eq!(keys, 2);
+    }
 }

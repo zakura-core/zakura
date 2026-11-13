@@ -7504,6 +7504,34 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/required.rs",
         "a_permitted_catch_joins_its_whole_case",
     ),
+    (
+        "PlantedRef",
+        "src/harness/header_acceptance/contracts.rs",
+        "caught_result",
+        "src/harness/header_acceptance/contracts.rs",
+        "a_contract_catch_joins_its_whole_case",
+    ),
+    (
+        "LinkRef",
+        "src/harness/header_acceptance/actions.rs",
+        "of",
+        "src/harness/header_acceptance/actions.rs",
+        "an_admission_joins_its_earlier_link_whole",
+    ),
+    (
+        "PeerNameRef",
+        "src/harness/header_acceptance/actions.rs",
+        "link",
+        "src/harness/header_acceptance/actions.rs",
+        "a_peer_s_links_join_its_whole_name",
+    ),
+    (
+        "ActNameRef",
+        "src/harness/header_acceptance/actions.rs",
+        "one_peer_declares",
+        "src/harness/header_acceptance/actions.rs",
+        "an_act_joins_its_declarers_by_its_whole_name",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.
@@ -8354,12 +8382,6 @@ const NOT_RAW_JOINS: &[(&str, &str, &str, &str)] = &[
         "harness_driven",
         "pick",
         "finds the `Recover` steps by their action's name, a kind; the driven picks it builds join by `PickRef`",
-    ),
-    (
-        "src/harness/header_acceptance/actions.rs",
-        "of",
-        "link",
-        "builds each peer's link list, skipping a link it already holds; `show` joins it by `LinkRef`",
     ),
     (
         "src/harness/header_acceptance/companions.rs",

@@ -16,10 +16,12 @@
 //! punished connection, event and frame. A
 //! finding is named by
 //! its step ([`FindingRef`]), within a run every artifact names by its
-//! trace's digest ([`super::binding`]). A join is [`joined`]:
-//! every item whose ref equals the one wanted. Each ref kind's negative
-//! controls come from one template, which moves each of its keys in turn
-//! (`tests/support/one_key_off.rs`).
+//! trace's digest ([`super::binding`]). A join is [`Ref::joined`]:
+//! every item whose ref equals the one wanted, called by the ref's type,
+//! as `FrameRef::joined(&want, items, of)`, so a source scan sees which
+//! ref each join site joins. Each join site has a registered negative
+//! control that reaches it, from one template, which moves each of the
+//! ref's keys in turn (`tests/support/one_key_off.rs`).
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -27,20 +29,26 @@ use crate::observe::WorkOwner;
 
 /// A full identity that joins compare whole. Its serialized form's leaves
 /// are its keys.
-pub trait Ref: Clone + std::fmt::Debug + PartialEq + Serialize + DeserializeOwned {}
+pub trait Ref: Clone + std::fmt::Debug + PartialEq + Serialize + DeserializeOwned {
+    /// Every item of `items` whose ref, by `of`, is this one, in order: the
+    /// one join, so no assertion matches on less than a whole ref. An item
+    /// `of` gives no ref is never joined.
+    fn joined<'a, T: 'a>(
+        &self,
+        items: impl IntoIterator<Item = &'a T>,
+        of: impl Fn(&T) -> Option<Self>,
+    ) -> Vec<&'a T> {
+        items
+            .into_iter()
+            .filter(|item| of(item).as_ref() == Some(self))
+            .collect()
+    }
 
-/// Every item of `items` whose ref, by `of`, is `want`, in order: the one
-/// join, so no assertion matches on less than a whole ref. An item `of`
-/// gives no ref is never joined.
-pub fn joined<'a, T: 'a, R: Ref>(
-    items: impl IntoIterator<Item = &'a T>,
-    of: impl Fn(&T) -> Option<R>,
-    want: &R,
-) -> Vec<&'a T> {
-    items
-        .into_iter()
-        .filter(|item| of(item).as_ref() == Some(want))
-        .collect()
+    /// Whether `item`'s ref, by `of`, is this one: [`Ref::joined`] of it
+    /// alone.
+    fn joins<T>(&self, item: &T, of: impl Fn(&T) -> Option<Self>) -> bool {
+        !self.joined([item], of).is_empty()
+    }
 }
 
 /// One transport frame, defined beside the findings that name it.
@@ -98,7 +106,8 @@ pub struct SessionRef {
 }
 impl Ref for SessionRef {}
 
-/// One subscription: its peer, session and ID, which is per session.
+/// One subscription: its peer, session and ID, which is per session. It's
+/// a part of [`PageRef`], which joins it whole, and joins nothing alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionRef {
     /// The peer, in hex as findings spell it.
@@ -108,7 +117,6 @@ pub struct SubscriptionRef {
     /// Its ID within that session.
     pub subscription: u64,
 }
-impl Ref for SubscriptionRef {}
 
 /// One page of headers on a subscription: the subscription, the frame's
 /// position among its stream's reads, and the headers in order.
@@ -235,11 +243,12 @@ pub(crate) mod one_key_off;
 
 #[cfg(test)]
 mod tests {
-    use super::{one_key_off::assert_one_key_off, *};
+    use super::*;
 
-    /// The template moves every key of a ref, at any depth, and each moved
-    /// copy fails a join the ref itself passes: a page's subscription's
-    /// peer, session and ID, its frame and each header.
+    /// The template moves every key of a ref, at any depth: a page's
+    /// subscription's peer, session and ID, its frame and each header. The
+    /// join holds for the ref and for no moved copy, and [`Ref::joins`] is
+    /// [`Ref::joined`] of one item.
     #[test]
     fn the_template_moves_every_key() {
         let page = PageRef {
@@ -251,19 +260,16 @@ mod tests {
             frame: 3,
             headers: vec!["01".into(), "02".into()],
         };
-        let staged = [page.clone()];
-        let joins = |want: &PageRef| joined(&staged, |page| Some(page.clone()), want).len() == 1;
-        let keys = assert_one_key_off::<PageRef>(&page, joins);
-        assert_eq!(keys, 6);
-        let frame = FrameRef {
-            connection: 1,
-            kind: 5,
-            version: 9,
-            quic_stream: 4,
-            inbound: true,
-            seq: 3,
-        };
-        let keys = assert_one_key_off::<FrameRef>(&frame, |want| *want == frame);
-        assert_eq!(keys, 6);
+        let keys = super::one_key_off::one_key_off(&page);
+        assert_eq!(keys.len(), 6);
+        assert!(PageRef::joins(&page, &page, |page| Some(page.clone())));
+        for (pointer, off) in keys {
+            let staged = [page.clone(), off];
+            let found = PageRef::joined(&page, &staged, |page| Some(page.clone()));
+            assert_eq!(found.len(), 1, "{pointer}");
+            assert!(!PageRef::joins(&page, &staged[1], |page| Some(
+                page.clone()
+            )));
+        }
     }
 }

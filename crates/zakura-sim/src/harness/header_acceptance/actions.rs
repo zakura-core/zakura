@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use super::{
     evaluate::{Actions, End},
-    refs::{joined, ControlRef, LinkRef, SessionRef},
+    refs::{ControlRef, LinkRef, Ref, SessionRef},
 };
 use crate::{
     harness::{
@@ -475,7 +475,7 @@ impl Sessions {
     /// ref, its peer and session ID, so an end never takes the link of
     /// another peer's session with the same ID.
     fn admitted_on(&self, session: &SessionRef) -> Option<u64> {
-        joined(&self.admitted, |(at, _)| Some(at.clone()), session)
+        SessionRef::joined(session, &self.admitted, |(at, _)| Some(at.clone()))
             .first()
             .map(|(_, link)| *link)
     }
@@ -491,7 +491,7 @@ impl Sessions {
     /// How many sessions on `link` the node ended for `reason`.
     fn ends(&self, link: &LinkRef, reason: &str) -> usize {
         let ended = self.ended.iter().filter(|(_, why)| why == reason);
-        joined(ended, |(at, _)| Some(at.clone()), link).len()
+        LinkRef::joined(link, ended, |(at, _)| Some(at.clone())).len()
     }
 
     /// Whether the node shows `shows` on `link` the `nth` time, from 0, a
@@ -500,10 +500,19 @@ impl Sessions {
     /// this one.
     fn show(&self, link: &LinkRef, shows: LinkShows, nth: usize) -> bool {
         match shows {
-            LinkShows::Opened => self
-                .links
-                .get(&link.peer)
-                .is_some_and(|links| links.contains(&link.connection)),
+            LinkShows::Opened => {
+                let opened: Vec<LinkRef> = self
+                    .links
+                    .iter()
+                    .flat_map(|(peer, links)| {
+                        links.iter().map(|&connection| LinkRef {
+                            peer: peer.clone(),
+                            connection,
+                        })
+                    })
+                    .collect();
+                !LinkRef::joined(link, &opened, |at| Some(at.clone())).is_empty()
+            }
             LinkShows::Ended => self.ends(link, PEER_CLOSED) > nth,
             LinkShows::Finished => self.ends(link, STREAM_FINISHED) > nth,
         }
@@ -519,7 +528,10 @@ impl Sessions {
 fn names_its_link(facts: &[Fact], report: &FullReport) -> Vec<bool> {
     let opened = session_links(report, "LinkOpened");
     let closed = session_links(report, "LinkClosed");
-    let relinked = |link: &LinkRef| !joined(facts, Fact::relink, link).is_empty();
+    let relinked = |link: &LinkRef| !LinkRef::joined(link, facts, Fact::relink).is_empty();
+    let among = |links: &[LinkRef], link: &LinkRef| {
+        !LinkRef::joined(link, links, |at| Some(at.clone())).is_empty()
+    };
     let mut current = std::collections::BTreeMap::new();
     for link in &opened {
         if !current.contains_key(&link.peer) && !relinked(link) {
@@ -533,11 +545,13 @@ fn names_its_link(facts: &[Fact], report: &FullReport) -> Vec<bool> {
                 ("Shutdown", ..) => fact.connection.is_none(),
                 (_, Some(link), _) => {
                     current.insert(link.peer.clone(), Some(link.clone()));
-                    opened.contains(&link)
+                    among(&opened, &link)
                 }
                 (_, _, Some(link)) => {
                     let was = current.insert(link.peer.clone(), None).flatten();
-                    was.as_ref() == Some(&link) && opened.contains(&link) && closed.contains(&link)
+                    LinkRef::joins(&link, &was, Clone::clone)
+                        && among(&opened, &link)
+                        && among(&closed, &link)
                 }
                 _ => false,
             },
@@ -550,7 +564,9 @@ fn names_its_link(facts: &[Fact], report: &FullReport) -> Vec<bool> {
 fn own_effect<'a>(facts: &'a [Fact], named: &[bool], cause: &ControlRef) -> Option<&'a Fact> {
     let named = facts.iter().zip(named).filter(|(_, named)| **named);
     let named: Vec<&Fact> = named.map(|(fact, _)| fact).collect();
-    joined(named, Fact::cause, cause).first().copied()
+    ControlRef::joined(cause, named, Fact::cause)
+        .first()
+        .copied()
 }
 
 /// Whether `run`, a node history's recording that ended `end`, carried
@@ -800,6 +816,32 @@ mod tests {
             joined += 1;
         }
         assert_eq!(joined, 3);
+    }
+
+    /// A control fact names its link only by its whole [`LinkRef`]: in the
+    /// close-relink-close history each relink names a link the store
+    /// opened, and the same fact with only its peer or connection moved
+    /// names none (Rule 25's template).
+    #[test]
+    fn a_relink_fact_names_its_whole_link() {
+        let (_, report, _) = close_relink_close();
+        let facts = environment_facts(&report);
+        let named = names_its_link(&facts, &report);
+        let mut relinks = 0;
+        for (at, fact) in facts.iter().enumerate() {
+            let Some(link) = fact.relink() else {
+                continue;
+            };
+            assert!(named[at], "{fact:?}");
+            assert_one_key_off::<LinkRef>(&link, |link| {
+                let mut moved = facts.clone();
+                moved[at].peer = link.peer.clone();
+                moved[at].connection = Some(link.connection);
+                names_its_link(&moved, &report)[at]
+            });
+            relinks += 1;
+        }
+        assert!(relinks > 0);
     }
 
     /// A committed fixture's path, from the repository root.

@@ -38,9 +38,7 @@ use zakura_network::zakura::observe::ReactorEvent;
 
 use super::{
     binding::{self, Expect, Field},
-    refs::{
-        joined, FindingRef, FrameRef, PageRef, ReadRef, SessionRef, StreamRef, SubscriptionRef,
-    },
+    refs::{FindingRef, FrameRef, PageRef, ReadRef, Ref, SessionRef, StreamRef, SubscriptionRef},
     CaseRef,
 };
 use crate::{
@@ -247,7 +245,7 @@ pub fn judged_frame(obs: &Observation) -> Option<FrameRef> {
 /// connection and QUIC stream carry. An error says why there's no single
 /// one.
 pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, String> {
-    let judged = |frame: &FrameRef| !joined(observations, judged_frame, frame).is_empty();
+    let judged = |frame: &FrameRef| !FrameRef::joined(frame, observations, judged_frame).is_empty();
     let frames: Vec<(FrameRef, Option<u64>)> = observations
         .iter()
         .filter_map(|obs| match obs {
@@ -285,7 +283,7 @@ pub fn rejected_page(observations: &[Observation]) -> Result<RejectedPage, Strin
         exchange.ok_or_else(|| format!("the rejected page {} names no subscription", frame.seq))?;
     // The session row names the stream its session reads.
     let stream = StreamRef::from(frame);
-    let sessions = joined(observations, session_stream, &stream);
+    let sessions = StreamRef::joined(&stream, observations, session_stream);
     let [Observation::Session {
         session_id, peer, ..
     }] = sessions[..]
@@ -360,7 +358,7 @@ pub fn fault_close(
     };
     let judged = observations
         .iter()
-        .position(|obs| judged_frame(obs).as_ref() == Some(&page.frame))
+        .position(|obs| FrameRef::joins(&page.frame, obs, judged_frame))
         .ok_or_else(|| format!("the node never judged {page:?}"))?;
     // A close names only its connection, which is the whole of its
     // identity.
@@ -385,7 +383,8 @@ pub fn fault_close(
             "connection {connection} closed with {cause}, not a fault cause"
         )),
         Some(_) => {
-            let of_session = joined(refusals, |refusal| Some(refusal.session()), &session);
+            let of_session =
+                SessionRef::joined(&session, refusals, |refusal| Some(refusal.session()));
             match of_session[..] {
                 [refusal] if refusal.reason == CONTENT_FAULT => Ok(()),
                 _ => Err(format!(
@@ -406,12 +405,12 @@ pub fn staged_page(
     sent: &SentPage,
 ) -> Result<(), String> {
     let want = page.page(sent);
-    let from = joined(staged, StagedPage::read, &page.read());
+    let from = ReadRef::joined(&page.read(), staged, StagedPage::read);
     match from[..] {
         [fact] if fact.hashes.is_empty() => {
             Err(format!("the rejected page staged no header: {fact:?}"))
         }
-        [fact] if fact.page().as_ref() != Some(&want) => Err(format!(
+        [fact] if !PageRef::joins(&want, fact, StagedPage::page) => Err(format!(
             "the page staged from the rejected frame is {fact:?}, not the peer's {want:?}"
         )),
         [_] => Ok(()),
@@ -473,7 +472,7 @@ pub fn path_break(
                     step,
                     detail: detail.to_owned(),
                 };
-                !joined(&report.violations, reported, &finding).is_empty()
+                !FindingRef::joined(&finding, &report.violations, reported).is_empty()
             })
     });
     if found {
@@ -917,14 +916,14 @@ mod tests {
         );
         let closed = log(1, 1, "service_protocol_reject");
         assert_eq!(fault_close(&closed, &linkage, &page), Ok(()));
-        assert_one_key_off(&page.frame, |frame| {
+        assert_one_key_off::<FrameRef>(&page.frame, |frame| {
             let page = RejectedPage {
                 frame: frame.clone(),
                 ..page.clone()
             };
             fault_close(&closed, &linkage, &page).is_ok()
         });
-        assert_one_key_off(&linkage[0].session(), |session| {
+        assert_one_key_off::<SessionRef>(&linkage[0].session(), |session| {
             let refusals = [Refusal {
                 peer: session.peer.clone(),
                 session: session.session,
@@ -997,6 +996,30 @@ mod tests {
         assert_eq!(keys, 4);
     }
 
+    /// The rejected page is the bad-content frame the node judged, joined
+    /// on its judgment's whole [`FrameRef`]: a judgment with any one key of
+    /// the frame moved is another frame's, so there's no rejected page
+    /// (Rule 25's template). A judgment names no direction, since the node
+    /// judges only frames it reads, so an outbound frame is never judged.
+    #[test]
+    fn the_rejected_page_joins_its_judged_frame() {
+        let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
+        let keys = assert_one_key_off::<FrameRef>(&page.frame, |frame| {
+            let mut moved = log(1, 1, "service_protocol_reject");
+            moved[2] = Observation::FrameJudged {
+                connection: frame.connection,
+                stream: StreamId {
+                    kind: frame.kind,
+                    version: frame.version,
+                },
+                quic_stream: Some(frame.quic_stream),
+                seq: frame.seq,
+            };
+            frame.inbound && rejected_page(&moved).is_ok()
+        });
+        assert_eq!(keys, 6);
+    }
+
     /// The rejected page's peer and hashes come from its frame's evidence:
     /// the peer its `Session` row names, and the page the peer sent there,
     /// joined on its frame's whole [`FrameRef`], so the same position on
@@ -1033,9 +1056,10 @@ mod tests {
             staged_page(std::slice::from_ref(&own), &page, &sent()),
             Ok(())
         );
-        let keys = assert_one_key_off(&own.page().expect("it names its frame"), |staged| {
-            staged_page(&[staged_from(staged)], &page, &sent()).is_ok()
-        });
+        let keys =
+            assert_one_key_off::<PageRef>(&own.page().expect("it names its frame"), |staged| {
+                staged_page(&[staged_from(staged)], &page, &sent()).is_ok()
+            });
         assert_eq!(keys, 6);
         // The frame's read, and the page's subscription, each on its own.
         let read = own.read().expect("it names its frame");
@@ -1070,7 +1094,7 @@ mod tests {
         let page = rejected_page(&log(1, 1, "service_protocol_reject")).unwrap();
         let (store, properties) = claims("path", 3);
         assert_eq!(path_break(&properties, &store, &page, &sent()), Ok(()));
-        assert_one_key_off(&page.page(&sent()), |subject| {
+        assert_one_key_off::<PageRef>(&page.page(&sent()), |subject| {
             let (page, sent) = page_of(subject);
             path_break(&properties, &store, &page, &sent).is_ok()
         });

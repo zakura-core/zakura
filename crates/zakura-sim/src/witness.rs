@@ -770,7 +770,7 @@ fn judge_end(
 /// `property`'s own break (C6): it names the same subject
 /// ([`FindingSubject`](crate::check::FindingSubject)) as one of
 /// `property`'s violations the same way found, compared whole
-/// ([`refs::joined`]), so a member's punishment joins only the case's
+/// ([`Ref::joined`](crate::harness::header_acceptance::refs::Ref::joined)), so a member's punishment joins only the case's
 /// punishment of the same connection, by the same event, answering the
 /// same frame. A step's finding must also be caused there: its cause, its
 /// witness's first step, is the step that break broke at. A step check's
@@ -784,7 +784,7 @@ fn judge_end(
 /// of its violations, or every member when the report kept none of
 /// `property`'s.
 fn joined(reports: &[PropertyReport], property: &str, set: &[String]) -> Result<(), WitnessError> {
-    use crate::{harness::header_acceptance::refs, Violation};
+    use crate::{check::FindingSubject, harness::header_acceptance::refs::Ref, Violation};
     let (own_steps, own_ends) = reports
         .iter()
         .find(|r| r.property == property)
@@ -805,7 +805,7 @@ fn joined(reports: &[PropertyReport], property: &str, set: &[String]) -> Result<
         for violation in steps {
             let cause = violation.witness.first().copied().unwrap_or(violation.step);
             let tied = violation.subject.as_ref().is_some_and(|named| {
-                refs::joined(own_steps, subject, named)
+                FindingSubject::joined(named, own_steps, subject)
                     .iter()
                     .any(|break_| break_.step == cause)
             });
@@ -820,7 +820,7 @@ fn joined(reports: &[PropertyReport], property: &str, set: &[String]) -> Result<
             let tied = violation
                 .subject
                 .as_ref()
-                .is_some_and(|named| !refs::joined(own_ends, subject, named).is_empty());
+                .is_some_and(|named| !FindingSubject::joined(named, own_ends, subject).is_empty());
             if !tied {
                 return Err(WitnessError::Unjoined {
                     property: member.clone(),
@@ -1355,7 +1355,7 @@ mod tests {
             )
         };
         assert_eq!(judged(Some(&unread), Some(&unread)), Ok(()));
-        assert_one_key_off(&unread, |member| {
+        assert_one_key_off::<FindingSubject>(&unread, |member| {
             judged(Some(&unread), Some(member)).is_ok()
         });
         let unjoined = Err(WitnessError::Unjoined {

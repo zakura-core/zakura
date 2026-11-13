@@ -27,7 +27,7 @@ use support::{
 use zakura_network::zakura::observe::ReactorEvent;
 use zakura_sim::harness::header_acceptance::{
     history::run_declared,
-    refs::{joined, CallOpRef, DispatchRef, ReleaseRef, StaleCallRef, WorkRef},
+    refs::{CallOpRef, DispatchRef, Ref, ReleaseRef, StaleCallRef, WorkRef},
 };
 use zakura_sim::{
     check::{after_step, PropertyOutcome},
@@ -309,19 +309,22 @@ impl Selected {
             }),
             _ => None,
         };
-        !joined(&self.obs, of, want).is_empty()
+        !DispatchRef::joined(want, &self.obs, of).is_empty()
     }
 
     /// The position of the first observation of a call ending paired with
     /// its operation, `want`.
     fn ended(&self, want: &CallOpRef) -> Option<usize> {
-        self.obs.iter().position(|obs| match obs {
+        let of = |obs: &Observation| match obs {
             Observation::Reactor {
                 event: ReactorFact::CallEnded { call, op, .. },
                 ..
-            } => op.map(|op| CallOpRef { call: *call, op }).as_ref() == Some(want),
-            _ => false,
-        })
+            } => op.map(|op| CallOpRef { call: *call, op }),
+            _ => None,
+        };
+        self.obs
+            .iter()
+            .position(|obs| CallOpRef::joins(want, obs, of))
     }
 
     /// Whether `want`'s stale window ended at a step's drain.
@@ -332,7 +335,7 @@ impl Selected {
                 apply: window.apply,
             })
         };
-        joined(&self.stale, of, want)
+        StaleCallRef::joined(want, &self.stale, of)
             .iter()
             .any(|window| window.step.is_some())
     }
@@ -350,7 +353,7 @@ impl Selected {
             }),
             _ => None,
         };
-        !joined(&self.obs[..ended], of, want).is_empty()
+        !WorkRef::joined(want, &self.obs[..ended], of).is_empty()
     }
 
     /// The round a reservation backs for `want`, by its peer and
@@ -364,7 +367,7 @@ impl Selected {
             }),
             _ => None,
         };
-        joined(&self.accounting, of, want)
+        WorkRef::joined(want, &self.accounting, of)
             .into_iter()
             .find_map(|event| match event {
                 ReactorEvent::ReservationBound { request, .. } => Some(ReleaseRef {
@@ -386,7 +389,7 @@ impl Selected {
             }),
             _ => None,
         };
-        !joined(&self.accounting, of, want).is_empty()
+        !ReleaseRef::joined(want, &self.accounting, of).is_empty()
     }
 
     /// Checks the scenario's held first prepare is the one that ended stale
@@ -660,7 +663,7 @@ fn the_mixed_joins_fail_one_identity_off() {
     };
     assert_one_key_off::<WorkRef>(&round, |round| selected.retired_before(round, ended));
     let release = selected.reserved(&round).expect("a reservation backs it");
-    assert_one_key_off(&round, |round| selected.reserved(round).is_some());
+    assert_one_key_off::<WorkRef>(&round, |round| selected.reserved(round).is_some());
     assert_one_key_off::<ReleaseRef>(&release, |release| selected.released(release));
 
     let (apply, ..) = selected

@@ -139,7 +139,7 @@ use super::{
         ObligationState, Report, ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
     history::{Declaration, DeclaredHistory, Ran, PLAN_FILE, RAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
-    refs::TriggerRef,
+    refs::{Ref, TriggerRef},
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
     rows::HEADER_HARNESSES,
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
@@ -2789,7 +2789,7 @@ fn witness_judges(dir: &Path, property: &str, expect: &str, beside: &[String]) -
         expect: expect.to_owned(),
         also_violates: beside.to_vec(),
     };
-    bound_witness(dir).is_ok_and(|witness| trigger_of(&witness).as_ref() == Some(&want))
+    bound_witness(dir).is_ok_and(|witness| TriggerRef::joins(&want, &witness, trigger_of))
 }
 
 /// The trigger `witness`, a witness file, judged: its property, its

@@ -115,6 +115,17 @@ When adding the setting, the installer creates a new trace directory containing
 `.zakura-profiler-managed`, its explicit permission to rotate files there on later
 runs. An existing directory without that marker is refused rather than adopted.
 
+`us-east-0` wrote trace files to the default directory before this installer
+existed, and its profiler kept them under the cap. To keep that, create the
+marker there once by hand, before the first deploy that runs this installer:
+
+```bash
+touch /mnt/data/zakura-traces/.zakura-profiler-managed
+```
+
+Without it the profiler on `us-east-0` reads that directory with a cap of 0 and
+its trace files grow without limit.
+
 **`install`** needs `perf` on the node (the `linux-tools` package) and installs
 `binutils` when `c++filt` is missing. It writes the node's own name, log file
 and trace directory into a systemd drop-in

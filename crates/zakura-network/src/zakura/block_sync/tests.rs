@@ -4749,6 +4749,126 @@ async fn check_cold_probe_deadline(expired: bool) {
 }
 
 #[tokio::test]
+async fn peer_answering_a_request_lost_to_another_source_is_not_parked() {
+    check_request_lost_to_another_source(true).await;
+}
+
+#[tokio::test]
+async fn silent_peer_whose_request_was_lost_to_another_source_is_still_dropped() {
+    check_request_lost_to_another_source(false).await;
+}
+
+/// We ask a peer for the new tip block, and the block is committed from
+/// another source (legacy gossip) before the peer answers. A peer that then
+/// sends the block it was asked for has served the request, so it keeps its
+/// session. A peer that never answers is still dropped at its liveness deadline.
+async fn check_request_lost_to_another_source(peer_answers: bool) {
+    let mut config = immediate_body_download_config();
+    // The liveness deadline is `request_timeout * 4` = 1.2 s.
+    config.request_timeout = Duration::from_millis(300);
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 64);
+
+    let blocks = mainnet_blocks_1_to_3();
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
+
+    let peer = peer(0x54);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    let connection_cancel = CancellationToken::new();
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        ServicePeerDirection::Outbound,
+        streams,
+        connection_cancel.clone(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: blocks[0].hash(),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    tip_tx
+        .send((block::Height(1), blocks[0].hash()))
+        .expect("tip watch is live");
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
+        .await
+        .expect("needed metadata queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 1)
+    );
+
+    // Another source delivers the block first, and state commits it.
+    handle
+        .send(BlockSyncEvent::ChainTipGrow(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        }))
+        .await
+        .expect("legacy commit grow event queues");
+
+    if peer_answers {
+        // The peer answers well within its request timeout.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for message in [
+            BlockSyncMessage::Block(blocks[0].clone()),
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(1),
+                returned: 1,
+            },
+        ] {
+            inbound_tx
+                .send(message.encode_frame().expect("frame encodes"))
+                .await
+                .expect("answer frame queues");
+        }
+    }
+
+    // Wait past the liveness deadline that the request armed.
+    tokio::time::sleep(Duration::from_millis(1_800)).await;
+    let session_ended = handle.peer_snapshot().outbound_peers == 0;
+    if peer_answers {
+        assert!(
+            !session_ended
+                && service.wants_peer(
+                    &peer,
+                    ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                    ServicePeerDirection::Outbound,
+                ),
+            "a peer that answered a request we no longer needed lost its session for no progress"
+        );
+        assert!(!connection_cancel.is_cancelled());
+    } else {
+        // The silent peer never ended the exchange, so the liveness deadline
+        // closes its connection.
+        assert!(
+            session_ended && connection_cancel.is_cancelled(),
+            "a peer that never answered must still be dropped at its liveness deadline"
+        );
+    }
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn peer_emits_periodic_bbr_heartbeat_while_idle() {
     // The per-peer `block_peer_bbr` heartbeat fires on a fixed cadence even while the
     // peer is idle (its interval's first tick is immediate), so the controller state is

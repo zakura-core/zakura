@@ -302,7 +302,9 @@ pub enum Expected {
         not_applicable: &'static [ExpectedNa],
     },
     /// The history's whole report passes and its target stays
-    /// `NotApplicable` with `reason`.
+    /// `NotApplicable` with `reason`, while the history reaches its own
+    /// target's trigger, which the tool records under that target's `holds`
+    /// witness.
     StaysNotApplicable {
         /// The target.
         property: &'static str,

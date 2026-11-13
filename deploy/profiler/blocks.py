@@ -274,7 +274,7 @@ def note_download(seen, download):
         downloads.append(download)
 
 
-def block_downloads(attempts, started, zakura_peers):
+def block_downloads(attempts, started, zakura_peers, process):
     """Every attempt to download one block, oldest first, as the cluster view reads them.
 
     Each says which network it used (`stack`), the peer's IP address (`addr`, `None`
@@ -283,13 +283,17 @@ def block_downloads(attempts, started, zakura_peers):
     arrived) and when it ended (`at`, unix seconds, when the run's start is known). A
     Zakura peer also has its trace label (`peer`) and the block's size (`bytes`); a
     legacy one says whether the peer had announced the block (`route`).
+
+    `zakura_peers` is keyed by `(process, label)`: a peer is named only from the upgrade
+    row of the node run that made the download, since a restart can change both the
+    peer behind a connection and whether the node writes addresses.
     """
     downloads = []
     for attempt in sorted(attempts, key=lambda attempt: attempt["when"]):
         download = {key: value for key, value in attempt.items() if key != "when"}
         if "peer" in download:
             # A Zakura row names the peer by label; its upgrade row said who that is.
-            download.update(zakura_peers.get(download["peer"], {"addr": None, "agent": None}))
+            download.update(zakura_peers.get((process, download["peer"]), {"addr": None, "agent": None}))
         if started is not None:
             download["at"] = round(started + attempt["when"] / 1e6, 6)
         downloads.append(download)
@@ -435,7 +439,8 @@ class BlockStages:
         self._open = []
         self._latest = 0
         self._process = None
-        # What each Zakura peer's upgrade row said about it: `{label: {"addr", "agent"}}`.
+        # What each Zakura peer's upgrade row said about it, per node run:
+        # `{(process, label): {"addr", "agent"}}`.
         self._zakura_peers = {}
         # `{(process, connection_id): {"addr", "agent"}}` of legacy connections.
         self._connections = {}
@@ -453,7 +458,7 @@ class BlockStages:
         if event == "peer_upgraded":
             if isinstance(row.get("peer"), str):
                 peer = {"addr": peer_ip(row.get("addr")), "agent": row.get("user_agent")}
-                remember(self._zakura_peers, row["peer"], peer)
+                remember(self._zakura_peers, (process, row["peer"]), peer)
             return
         if event in ("block_request_finish", "find_blocks_finish") and type(row.get("connection_id")) is int:
             # A request row is where a legacy connection's address and software are written;
@@ -572,7 +577,9 @@ class BlockStages:
                     "reorg": block["reorg"],
                     **cluster_times(events, block),
                     **self._outside_announcer(events, block["process"]),
-                    "downloads": block_downloads(attempts, process_started(block["process"]), self._zakura_peers),
+                    "downloads": block_downloads(
+                        attempts, process_started(block["process"]), self._zakura_peers, block["process"]
+                    ),
                     "path": block_path(events),
                     "size": events.get("size"),
                     "status_peers": len(told),

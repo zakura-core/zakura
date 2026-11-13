@@ -188,11 +188,137 @@ pub const END_BOUNDARY_FAULT_STORE_TEST: TestRef = sim_test(
     "harness::header_node::fault::tests::the_end_reports_every_open_fault",
 );
 
-/// Why `gate-5/bound-table` is open until hdr-9d.1.
-pub const GATE_5_BOUND_TABLE: &str =
-    "each row of outstanding-work-bounded's bound table: its at-limit, \
-                     one-over-denied and release-then-reuse fixture, its cleanup or \
-                     conservation witness, or its exclusion";
+/// Gate 5's bound-table limit fixtures (hdr-9d.1): work slots, locator
+/// reads and node execution slots each reach their limit and no further
+/// while one more party waits, and the slot fixture's per-round
+/// reservations, staged capacity and request deadlines reach 16 with them.
+pub const BOUND_LIMIT_TEST: TestRef = sim_test(
+    "tests/header_outstanding.rs",
+    "the_limit_fixtures_reach_and_hold_their_bounds",
+);
+
+/// Gate 5's bound-table release and reuse: in each limit fixture's log the
+/// waiting party gets its first unit only after a release, with fewer than
+/// the limit open.
+pub const BOUND_REUSE_TEST: TestRef = sim_test(
+    "tests/header_outstanding.rs",
+    "the_limit_fixtures_release_and_reuse_their_bounds",
+);
+
+/// Gate 5's bound-table membership and cleanup witness: every membership
+/// or cleanup row held keys while the rule judged it in a committed
+/// witness that holds the property.
+pub const BOUND_MEMBERSHIP_TEST: TestRef = sim_test(
+    "tests/header_outstanding.rs",
+    "each_membership_row_holds_keys_in_a_committed_witness",
+);
+
+/// Gate 5's capacity-wait cleanup witness: two refusals, and the publisher
+/// keeps one wait at a time, so the pruning drops the stale one.
+pub const BOUND_WAITS_TEST: TestRef = sim_test(
+    "tests/header_outstanding.rs",
+    "the_capacity_waits_fixture_refuses_twice_and_holds",
+);
+
+/// Who owns a bound-table row's missing evidence.
+pub const BOUND_OWNER: &str = "hdr-9d";
+
+/// A bound-table row's obligation `name`, met by `test`'s pass.
+const fn bound_test(name: &'static str, test: TestRef) -> GateObligation {
+    GateObligation {
+        name,
+        gates: &[Gate::G5],
+        permit: Permit::Test(test),
+    }
+}
+
+/// A bound-table row's obligation `name` with no fixture evidence, met
+/// only by a standing exclusion for `reason` once Adam approves it.
+const fn bound_unshown(name: &'static str, reason: &'static str) -> GateObligation {
+    GateObligation {
+        name,
+        gates: &[Gate::G5],
+        permit: Permit::Standing {
+            owner: BOUND_OWNER,
+            reason,
+            approval: Approval::Pending,
+        },
+    }
+}
+
+/// The bound-table rows with no fixture evidence, each with the reason its
+/// exclusion would carry. `pub` so the manifest's rows write the same
+/// standing `Open`s. Each awaits Adam's approval.
+pub mod bound_unshown {
+    /// The ordinary per-identity reservation.
+    pub const RESERVATION: &str = "no fixture reaches the 250-header per-identity \
+        reservation: the limit fixtures' mirrors advertise at most 235 headers per response";
+    /// The per-peer locator bound.
+    pub const LOCATOR_PER_PEER: &str = "no fixture asks for a second locator read for one \
+        peer while its first is in flight, so the one-per-peer bound is never at its limit";
+    /// One prepare and one apply per round.
+    pub const CALLS_PER_ROUND: &str = "no fixture offers a round a second prepare or apply \
+        while its first is pending, so the one-per-round bound is never at its limit";
+    /// Detached `RetainedHeaders`.
+    pub const DETACHED: &str = "detached RetainedHeaders count inside the chunk budget, which \
+        chunk-budget-bound judges, and no fixture holds one past its round";
+    /// Departed strikes.
+    pub const STRIKES: &str = "no committed storage fixture leaves a departed strike, so the \
+        map's limit and its maintenance expiry are never exercised";
+    /// Pending closes.
+    pub const PENDING_CLOSES: &str = "no committed storage fixture fills a session's queue so a \
+        Close is refused and waits to retry, so the map stays empty";
+    /// Status cadences.
+    pub const CADENCES: &str = "status cadences are listed, not checked: the storage harness \
+        has no transport, so no connection close removes an entry, and the removal is the \
+        transport cleanup's contract (RegisteredPeerCleanupGuard)";
+    /// Publisher tombstones.
+    pub const TOMBSTONES: &str = "no fixture keeps two ended subscriptions' tombstones on one \
+        session at once, so the 2-tombstone bound is never at its limit";
+    /// Publisher jobs.
+    pub const JOBS: &str = "no fixture asks a session's publisher for a second page job while \
+        one runs, so the one-job bound is never at its limit";
+    /// Publisher subscription slots.
+    pub const SUBSCRIPTION_SLOTS: &str = "no fixture opens a second subscription while the \
+        first's terminal write finishes, so the 2-slot margin is never used";
+    /// The sent-cursor ring.
+    pub const SENT_RING: &str = "no fixture sends a subscription anywhere near 4,096 pages, so \
+        its sent-cursor ring never nears its limit";
+    /// Peer execution slots.
+    pub const PEER_EXECUTION: &str = "the capacity-waits fixture holds a peer's 2 execution \
+        slots, but no fixture shows a third page job for that peer denied, released and reused";
+    /// Node serving output.
+    pub const NODE_OUTPUT: &str = "the node's output grants are listed, not checked: their \
+        limit follows the configured session count through the toolkit's sizing";
+    /// Per-peer serving output.
+    pub const PEER_OUTPUT: &str = "no fixture queues anywhere near 64 MiB of one peer's output, \
+        so the per-peer output bound never nears its limit";
+    /// Serving response counts.
+    pub const RESPONSE_COUNTS: &str = "response counts are listed, not checked: their limits \
+        follow the configured session count through the toolkit's sizing";
+    /// Retained-path leases.
+    pub const LEASES: &str = "the 8 node execution slots bound concurrent serving leases first, \
+        so no fixture reaches storage's 16 retained-path leases";
+    /// Readmission cooldowns.
+    pub const COOLDOWNS: &str = "readmission cooldowns are capped at the admitted peer limit \
+        (#2131), but no committed storage fixture installs one, so the cap and the \
+        maintenance expiry are never exercised";
+    /// Pruned peers.
+    pub const PRUNED_PEERS: &str = "pruned peers are capped at the admitted peer limit \
+        (#2209), but no committed storage fixture prunes a peer's history, so the cap is never \
+        exercised";
+    /// VCT repair rows.
+    pub const VCT_REPAIR: &str = "no committed storage fixture starts a VCT repair, so its \
+        sources, episodes and context reads stay empty; the repair harness's witnesses judge \
+        stale completion and outstanding work, not these rows' limits";
+}
+
+/// Why the repair reservation has no row result: the bound table marks it
+/// not judged, since the unclaimed chunk budget already bounds it, and no
+/// repair round is reachable in these fixtures.
+pub const BOUND_REPAIR_RESERVATION: &str = "the repair reservation is the unclaimed chunk \
+    budget, which chunk-budget-bound already bounds, so the bound table doesn't judge it, and \
+    no repair round is reachable in these fixtures";
 
 /// Every gate obligation no row owns, with its gates and what may satisfy
 /// it, written from the spec's gate table.
@@ -388,15 +514,170 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
             approval: Approval::Pending,
         },
     },
+    // `outstanding-work-bounded`'s bound table (hdr-9d.1), one obligation
+    // per row and kind of evidence: an admission row's at-limit and
+    // one-over-denied fixture and its release-then-reuse fixture, a
+    // membership, cleanup or conservation row's witness, or the exclusion
+    // a row with neither awaits.
+    bound_test("gate-5/bound-table/work-slots/at-limit", BOUND_LIMIT_TEST),
+    bound_test(
+        "gate-5/bound-table/work-slots/release-reuse",
+        BOUND_REUSE_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/reservation-maps/at-limit",
+        BOUND_LIMIT_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/reservation-maps/release-reuse",
+        BOUND_REUSE_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/request-deadlines/at-limit",
+        BOUND_LIMIT_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/request-deadlines/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/locator-reads/at-limit",
+        BOUND_LIMIT_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/locator-reads/release-reuse",
+        BOUND_REUSE_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/locator-reads/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/node-execution-slots/at-limit",
+        BOUND_LIMIT_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/node-execution-slots/release-reuse",
+        BOUND_REUSE_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/publisher-capacity-waits/cleanup",
+        BOUND_WAITS_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/close-deadlines/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/storage-calls/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/port-futures/conservation",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/cached-offers/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/supplier-order/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/completed-targets/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/subscriber-cursors/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/subscriber-subscriptions/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/publisher-tasks/cleanup",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/sessions/membership",
+        BOUND_MEMBERSHIP_TEST,
+    ),
+    bound_test(
+        "gate-5/bound-table/serving-peer-budgets/cleanup",
+        BOUND_MEMBERSHIP_TEST,
+    ),
     GateObligation {
-        name: "gate-5/bound-table",
+        name: "gate-5/bound-table/repair-reservation",
         gates: &[Gate::G5],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-9d.1",
-            reason: GATE_5_BOUND_TABLE,
+        permit: Permit::Standing {
+            owner: BOUND_OWNER,
+            reason: BOUND_REPAIR_RESERVATION,
+            approval: PLAN,
         },
     },
+    bound_unshown("gate-5/bound-table/reservation", bound_unshown::RESERVATION),
+    bound_unshown(
+        "gate-5/bound-table/locator-reads/per-peer",
+        bound_unshown::LOCATOR_PER_PEER,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/calls-per-round",
+        bound_unshown::CALLS_PER_ROUND,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/detached-headers",
+        bound_unshown::DETACHED,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/departed-strikes",
+        bound_unshown::STRIKES,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/pending-closes",
+        bound_unshown::PENDING_CLOSES,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/status-cadences",
+        bound_unshown::CADENCES,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/publisher-tombstones",
+        bound_unshown::TOMBSTONES,
+    ),
+    bound_unshown("gate-5/bound-table/publisher-jobs", bound_unshown::JOBS),
+    bound_unshown(
+        "gate-5/bound-table/subscription-slots",
+        bound_unshown::SUBSCRIPTION_SLOTS,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/sent-cursor-ring",
+        bound_unshown::SENT_RING,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/peer-execution-slots",
+        bound_unshown::PEER_EXECUTION,
+    ),
+    bound_unshown("gate-5/bound-table/node-output", bound_unshown::NODE_OUTPUT),
+    bound_unshown("gate-5/bound-table/peer-output", bound_unshown::PEER_OUTPUT),
+    bound_unshown(
+        "gate-5/bound-table/response-counts",
+        bound_unshown::RESPONSE_COUNTS,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/retained-path-leases",
+        bound_unshown::LEASES,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/readmission-cooldowns",
+        bound_unshown::COOLDOWNS,
+    ),
+    bound_unshown(
+        "gate-5/bound-table/pruned-peers",
+        bound_unshown::PRUNED_PEERS,
+    ),
+    bound_unshown("gate-5/bound-table/vct-repair", bound_unshown::VCT_REPAIR),
     // The one storage history running all four Sim resource IDs together,
     // with its Shutdown and StopStorage picked and the node settled at its
     // reactor's exit. Its four whole-report passes are history keys.

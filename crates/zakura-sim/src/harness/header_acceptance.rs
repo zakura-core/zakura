@@ -773,12 +773,6 @@ impl Key {
                     history, property, ..
                 },
             ) => RunId::from(*history) == *run && property == target,
-            // A transitional Open on a passing or catch key must be exactly
-            // the one `rows::owed_open` writes for that key: its reason,
-            // owner, approval and PR.
-            (Key::Passing { .. } | Key::Catch { .. }, Expected::Open { until: Some(_), .. }) => {
-                rows::owed_open(self).is_some_and(|open| same_open(expected, &open))
-            }
             (
                 Key::Native { patch },
                 Expected::IntegrityCaught {

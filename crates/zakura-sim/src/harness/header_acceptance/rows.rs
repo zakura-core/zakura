@@ -518,14 +518,16 @@ const CLOSE_RELINK_TEARDOWN: HistoryRef = HistoryRef {
     case: "committed close-relink input",
 };
 
-/// The committed stale-prepare input.
-const STALE_PREPARE: HistoryRef = HistoryRef {
+/// The committed close-relink input, under the stale witness. The
+/// committed stale-prepare input isn't counted: its scenario's last control
+/// step never runs within the step budget, so its actions never complete.
+const STALE_CLOSE_RELINK: HistoryRef = HistoryRef {
     harness: STORAGE,
     witness: sim_test(
         "tests/header_stale.rs",
-        "the_stale_prepare_input_holds_stale_completion_inert",
+        "the_close_relink_input_holds_stale_completion_inert",
     ),
-    case: "committed stale-prepare input",
+    case: "committed close-relink input",
 };
 
 /// The mixed resource witness's test (gate 5), which runs its committed
@@ -1179,7 +1181,7 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
     histories.extend([
         (CLOSE_RELINK_CAPACITY, CHUNK),
         (CLOSE_RELINK_TEARDOWN, TEARDOWN),
-        (STALE_PREPARE, STALE),
+        (STALE_CLOSE_RELINK, STALE),
         (RELEASE_INPUT, WAKES),
         (FLOOD_WIRE, WATCH_WIRE),
         (FLOOD_LIFECYCLE, WATCH_LIFECYCLE),
@@ -1286,7 +1288,7 @@ pub fn witness_tests() -> Vec<TestRef> {
         ),
         CLOSE_RELINK_CAPACITY.witness,
         CLOSE_RELINK_TEARDOWN.witness,
-        STALE_PREPARE.witness,
+        STALE_CLOSE_RELINK.witness,
         RESET_WITNESSES.witness,
         CHAIN_WITNESSES.witness,
         AUTHORITY_WITNESSES.witness,
@@ -1645,7 +1647,7 @@ fn hand_written_rows() -> Vec<Row> {
     }
     rows.push(sim_row(TEARDOWN, storage_harnesses, teardown));
 
-    let mut stale = holds(STALE, G5, STALE_PREPARE);
+    let mut stale = holds(STALE, G5, STALE_CLOSE_RELINK);
     stale.push(mixed(STALE));
     for (index, name) in [
         "stale-charge",

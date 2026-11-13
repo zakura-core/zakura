@@ -2344,7 +2344,7 @@ static HISTORIES: &[HistoryNa] = &[
     HistoryNa {
         harness: "header-sync/storage",
         file: "tests/header_stale.rs",
-        test: "the_stale_prepare_input_holds_stale_completion_inert",
+        test: "the_close_relink_input_holds_stale_completion_inert",
         cases: &[""],
         applies: &[
             STORAGE_HOLDS,

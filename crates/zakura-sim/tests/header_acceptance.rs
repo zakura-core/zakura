@@ -1413,9 +1413,9 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
         (
             STORAGE,
             "tests/header_stale.rs",
-            "the_stale_prepare_input_holds_stale_completion_inert",
+            "the_close_relink_input_holds_stale_completion_inert",
             Some("header-sync/stale-completion-inert"),
-            owned(&["committed stale-prepare input"]),
+            owned(&["committed close-relink input"]),
         ),
     ];
     // Gate 5's mixed resource witness, run for each of the four resource

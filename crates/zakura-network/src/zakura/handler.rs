@@ -11,7 +11,6 @@ use service_session::{
 pub use service_session::{replay_service_session_bytes, ServiceSessionReplaySummary};
 
 use std::{
-    collections::BTreeMap,
     future,
     io::{Cursor, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -393,16 +392,10 @@ pub struct ZakuraConfig {
     /// The state, mempool, and `getblocktemplate` write `chain_tip.jsonl`, `mempool.jsonl`, and
     /// `mining_template.jsonl`, which trace the path from a new tip to a mining template.
     /// Legacy peer connections write `legacy_gossip.jsonl`: each block announcement received
-    /// from or sent to a peer, and each block a peer asked for and was sent.
+    /// from or sent to a peer, and each block a peer asked for and was sent. Its rows never
+    /// hold a peer's address; the `ZAKURA_TRACE_PEER_NAMES` environment variable names the
+    /// peers an operator wants to tell apart.
     pub trace_dir: Option<PathBuf>,
-    /// Names for legacy peers in `legacy_gossip.jsonl`, as `name = "ip address"`.
-    ///
-    /// Trace rows never hold a peer's address. A peer whose IP address is listed here is
-    /// recorded under its name, so the rows of several nodes run by one operator can be joined
-    /// into the path a block took between them. Every other peer stays unnamed. List only
-    /// nodes you operate: the name tells a reader of the trace files which peer it was.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub trace_peer_names: BTreeMap<String, IpAddr>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
     /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
@@ -439,7 +432,6 @@ impl Default for ZakuraConfig {
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
             message_rate_per_second: DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND,
             trace_dir: None,
-            trace_peer_names: BTreeMap::new(),
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
             dev_network: None,

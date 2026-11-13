@@ -7,7 +7,12 @@
 //! from one node to the next.
 //!
 //! Rows never hold a peer's address. A connection has a process-local number, and a peer whose
-//! IP address the operator listed in `network.zakura.trace_peer_names` also has its name.
+//! IP address the operator listed in the `ZAKURA_TRACE_PEER_NAMES` environment variable also
+//! has its name.
+//!
+//! The list is an environment variable, like the node's own trace label, and not a config
+//! setting: a config rejects settings it does not know, so a list written there would stop an
+//! older build from starting after a rollback.
 
 use std::{
     collections::HashMap,
@@ -28,6 +33,12 @@ use super::ConnectedAddr;
 use crate::{protocol::external::canonical_ip, Config};
 
 const TABLE: JsonlTraceTable = JsonlTraceTable::new("legacy_gossip", "legacy_gossip.jsonl");
+
+/// Names for legacy peers in the gossip trace, as `name=ip` pairs separated by commas, for
+/// example `us-0=203.0.113.7,asia-0=198.51.100.9`.
+///
+/// List only nodes you operate: the name tells a reader of the trace files which peer it was.
+const PEER_NAMES_ENV: &str = "ZAKURA_TRACE_PEER_NAMES";
 
 #[derive(Serialize)]
 struct GossipEvent<'a> {
@@ -55,22 +66,24 @@ pub(crate) struct LegacyGossipTrace {
 
 impl LegacyGossipTrace {
     /// Returns the trace `config` asks for: rows go to `network.zakura.trace_dir`, and
-    /// nothing is written when that is unset.
+    /// nothing is written when that is unset. Peers are named from `ZAKURA_TRACE_PEER_NAMES`.
     pub(crate) fn new(config: &Config) -> Self {
-        let tracer = config
-            .zakura
-            .trace_dir
-            .clone()
-            .map(JsonlTracer::spawn)
-            .unwrap_or_else(JsonlTracer::noop);
+        let Some(trace_dir) = config.zakura.trace_dir.clone() else {
+            return Self::with_emitter(JsonlEventEmitter::noop(), []);
+        };
+
+        let listed = std::env::var(PEER_NAMES_ENV).unwrap_or_default();
+        let (peer_names, rejected) = parse_peer_names(&listed);
+        if !rejected.is_empty() {
+            tracing::warn!(
+                ?rejected,
+                "ignoring {PEER_NAMES_ENV} entries that are not `name=ip address`"
+            );
+        }
 
         Self::with_emitter(
-            JsonlEventEmitter::new(tracer, zakura_jsonl_trace::node_id()),
-            config
-                .zakura
-                .trace_peer_names
-                .iter()
-                .map(|(name, ip)| (*ip, name.as_str())),
+            JsonlEventEmitter::new(JsonlTracer::spawn(trace_dir), zakura_jsonl_trace::node_id()),
+            peer_names,
         )
     }
 
@@ -107,6 +120,29 @@ impl LegacyGossipTrace {
             peer_name,
         }
     }
+}
+
+/// Splits a `name=ip,name=ip` list into the pairs it names and the entries it cannot read.
+fn parse_peer_names(listed: &str) -> (Vec<(IpAddr, &str)>, Vec<&str>) {
+    let mut peer_names = Vec::new();
+    let mut rejected = Vec::new();
+
+    for entry in listed.split(',').map(str::trim) {
+        if entry.is_empty() {
+            continue;
+        }
+        let named = entry.split_once('=').and_then(|(name, ip)| {
+            let name = name.trim();
+            let ip = ip.trim().parse().ok()?;
+            (!name.is_empty()).then_some((ip, name))
+        });
+        match named {
+            Some(pair) => peer_names.push(pair),
+            None => rejected.push(entry),
+        }
+    }
+
+    (peer_names, rejected)
 }
 
 /// Writes the block gossip trace of one legacy connection.
@@ -246,6 +282,23 @@ pub(super) mod tests {
             assert!(!text.contains("203.0.113.7"), "{text}");
             assert!(!text.contains("198.51.100.9"), "{text}");
         }
+    }
+
+    #[test]
+    fn the_peer_list_is_read_as_name_and_address_pairs() {
+        let (peer_names, rejected) = parse_peer_names(
+            " us-0=203.0.113.7 , asia-0 = 2001:db8::9,,no-address,=198.51.100.1,x=not-an-ip",
+        );
+
+        assert_eq!(
+            peer_names,
+            [
+                ("203.0.113.7".parse().unwrap(), "us-0"),
+                ("2001:db8::9".parse().unwrap(), "asia-0"),
+            ]
+        );
+        assert_eq!(rejected, ["no-address", "=198.51.100.1", "x=not-an-ip"]);
+        assert_eq!(parse_peer_names(""), (Vec::new(), Vec::new()));
     }
 
     #[test]

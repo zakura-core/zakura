@@ -155,7 +155,8 @@ td.wrap { white-space: normal; min-width: 200px; max-width: 360px; }
 
   <section class="panel" id="outside-panel">
     <header><h2>Peers outside the fleet</h2>
-      <span class="note">Every outside peer one of our nodes downloaded a block from, slowest first.</span></header>
+      <span class="note">One row per peer that is not ours and that one of our nodes downloaded a block from, slowest
+        first. The software is the peer's own, as it named it when connecting.</span></header>
     <div class="scroll"><table id="outside"></table></div>
     <p class="note" id="outside-note"></p>
   </section>
@@ -506,7 +507,7 @@ function renderSummary(data) {
 function renderDownloads(data) {
   const slow = data.slowest_downloads || [];
   table(document.getElementById("slowest"),
-    [["Took", true], ["Node"], ["Downloaded from"], ["Software"], ["Block"], ["Size", true], ["Stack"], ["Outcome"]],
+    [["Took", true], ["Our node"], ["Downloaded from"], ["That peer runs"], ["Block"], ["Size", true], ["Stack"], ["Outcome"]],
     slow.map((download) => {
       const pick = el("button", { type: "button", text: String(download.height ?? shortHash(download.hash)) });
       pick.setAttribute("aria-label", `Show block ${download.height ?? shortHash(download.hash)}`);
@@ -524,7 +525,7 @@ function renderDownloads(data) {
   const peers = data.outside_peers || [];
   const worst = Math.max(1, ...peers.map((peer) => peer.p90_ms || 0));
   table(document.getElementById("outside"),
-    [["Address"], ["Software"], ["Used by"], ["Downloads", true], ["Failed", true], ["Median", true],
+    [["Peer address"], ["Peer runs"], ["Our nodes that downloaded from it"], ["Downloads", true], ["Failed", true], ["Median", true],
       ["9 in 10", true], [""], ["Slowest", true], ["Last used"]],
     peers.map((peer) => {
       const users = el("td", { class: "wrap" });

@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
+index 5965173..b1cfa56 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
+@@ -425,6 +425,12 @@ impl PublisherState {
+ 
+     /// Stop the publisher for `exit`, keeping the first reason.
+     fn stop(&mut self, exit: Exit) -> Exit {
++        // Mutation: a stop assumes every subscription already ended, which
++        // a subscriber that leaves mid-subscription breaks.
++        assert!(
++            self.subscriptions.is_empty(),
++            "a publisher stops only after its subscriptions end"
++        );
+         *self.exit.get_or_insert(exit)
+     }
+ 

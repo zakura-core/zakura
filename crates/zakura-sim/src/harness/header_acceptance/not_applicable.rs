@@ -1262,6 +1262,17 @@ const SHARED: &[Shared] = &[
             "departed-source-unpruned",
         )],
     },
+    // The serving-churn fixture: the node serves four mirrors that each
+    // leave mid-subscription, so nothing goes stale.
+    Shared {
+        harness: STORAGE,
+        never: &[
+            "header-sync/stale-chain-effect-inert",
+            "header-sync/stale-completion-inert",
+        ],
+        undeclared: STORAGE_UNDECLARED,
+        cases: &[("sim/no-task-panic", "stop-asserts-subscriptions-ended")],
+    },
 ];
 
 /// How a case's patched completed runs report otherwise than its baseline.

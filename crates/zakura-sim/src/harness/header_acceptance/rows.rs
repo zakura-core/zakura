@@ -1395,20 +1395,18 @@ const OPERATION_IDS_UNREACHED: &str =
      storage operations and logs their submissions and completions, so only storage-fake code \
      can break the rule and no production patch can";
 
-/// Why a sim-wide ID's catch is still owed.
+/// Why `sim/no-livelock`'s catch is still owed.
 const SIM_WIDE_CATCH: &str = "the sim-wide IDs' bypasses run on test-only harnesses, so a \
                               header-harness catch or an approved Open is still owed";
 
 /// The transitional `Open` each transitional passing or catch key owes,
 /// whole: its reason, owner and the PR it waits for, written from the
-/// plan's PR table. The sim-wide IDs' catches are hdr-14.4's.
+/// plan's PR table. `sim/no-livelock`'s catch is hdr-14.4's.
 /// [`Key::covers`] takes a transitional `Open` on such a key only if it's
 /// exactly this one.
 pub fn owed_open(key: &Key) -> Option<Expected> {
     let (reason, until) = match key {
-        Key::Catch { property } if SIM_WIDE.contains(&property.as_str()) => {
-            (SIM_WIDE_CATCH, "hdr-14.4")
-        }
+        Key::Catch { property } if property == SIM_WIDE[1] => (SIM_WIDE_CATCH, "hdr-14.4"),
         _ => return None,
     };
     Some(transitional(reason, "Adam's side", until))
@@ -2891,7 +2889,17 @@ fn hand_written_rows() -> Vec<Row> {
     let node_harnesses: &'static [&'static str] =
         &[SMOKE, STORAGE, RELEASE_WAKE, WIRE, FLOOD, REPAIR, LIVENESS];
     let mut panic = holds(SIM_WIDE[0], NONE, SMOKE_RUN);
-    panic.push(owed(Key::catch(SIM_WIDE[0]), NONE));
+    // A publisher stop that asserts every subscription already ended
+    // panics the session's publisher on the committed serving-churn
+    // fixture, whose subscribers each leave mid-subscription.
+    panic.extend(caught(
+        STORAGE,
+        case(SIM_WIDE[0], "stop-asserts-subscriptions-ended"),
+        &[SIM_WIDE[0]],
+        Found::AtStep,
+        NONE,
+        true,
+    ));
     rows.push(sim_row(SIM_WIDE[0], node_harnesses, panic));
 
     // Its COVERAGE witness runs the test-only test/probe harness

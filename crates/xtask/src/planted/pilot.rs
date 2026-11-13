@@ -71,8 +71,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    apply, classify as planted_verdict, git, provenance, record, remove_worktree, Expect, Located,
-    Run, Verdict,
+    apply, checkout::Checkout, classify as planted_verdict, git, provenance, record,
+    remove_worktree, Expect, Located, Run, Verdict,
 };
 use crate::{
     run_command,
@@ -149,10 +149,6 @@ const FUZZ_FIELDS: &[&str] = &[
 /// match: those the checkout fixes. Every build runs in one invocation
 /// with one toolchain, so the toolchain fields go unchecked.
 const CHECKOUT_FIELDS: &[&str] = &["target", "harness", "git", "lockfile", "fuzz_lockfile"];
-
-/// The fuzz package, whose files the fuzz build's source digest covers
-/// beside the source paths, as `zakura-sim campaign build` reads them.
-const FUZZ_PACKAGE: &str = "qa/fuzz/sim";
 
 /// The error that stops the pilot after SIGINT, SIGTERM or SIGHUP.
 pub(super) const INTERRUPTED_ERROR: &str =
@@ -1672,26 +1668,25 @@ impl Pairing {
 
 /// The fuzz build identity's fields that `tree`, a clean checkout, fixes:
 /// its commit, the source digest that `zakura-sim campaign build` takes
-/// over the source paths and the fuzz package, and both lockfiles' digests.
+/// over the source paths and the fuzz package, and both lockfiles' digests,
+/// read as that command reads them ([`Checkout::read`]).
 fn checkout_identity(tree: &Path) -> serde_json::Map<String, Value> {
-    let mut paths = provenance::SOURCE_PATHS.to_vec();
-    paths.push(FUZZ_PACKAGE);
-    let checkout = provenance::Provenance::read(tree, &paths);
-    let digest = |path: PathBuf| {
-        provenance::file_digest(&path).unwrap_or_else(|| provenance::UNKNOWN.to_owned())
-    };
-    let mut identity = serde_json::Map::new();
-    identity.insert("git".to_owned(), Value::from(checkout.git));
-    identity.insert("source".to_owned(), Value::from(checkout.source));
-    identity.insert(
-        "lockfile".to_owned(),
-        Value::from(digest(tree.join("Cargo.lock"))),
-    );
-    identity.insert(
-        "fuzz_lockfile".to_owned(),
-        Value::from(digest(tree.join(FUZZ_PACKAGE).join("Cargo.lock"))),
-    );
-    identity
+    let Checkout {
+        git,
+        source,
+        lockfile,
+        fuzz_lockfile,
+        dirty: _,
+    } = Checkout::read(tree);
+    [
+        ("git", git),
+        ("source", source),
+        ("lockfile", lockfile),
+        ("fuzz_lockfile", fuzz_lockfile),
+    ]
+    .into_iter()
+    .map(|(field, value)| (field.to_owned(), Value::from(value)))
+    .collect()
 }
 
 /// Why `actual`, a build identity, doesn't pair with `expected`, the

@@ -119,6 +119,11 @@ mod pilot;
 #[path = "../../zakura-sim/build/provenance.rs"]
 pub(super) mod provenance;
 
+/// The checkout state a fuzz build's identity records, as `zakura-sim
+/// campaign build` reads it.
+#[path = "../../zakura-sim/src/campaign/checkout.rs"]
+mod checkout;
+
 /// Where the cases live and the property each bypasses, shared with the
 /// simulator's checks of the catalogue.
 #[path = "../../zakura-sim/src/planted.rs"]

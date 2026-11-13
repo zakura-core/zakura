@@ -642,7 +642,8 @@ pub struct ZakuraLocalLimits {
     pub keep_alive_interval: Duration,
     /// Stream prelude read timeout.
     pub prelude_timeout: Duration,
-    /// Control handshake read/write timeout.
+    /// Control handshake deadline: it bounds each read and write, and the
+    /// whole exchange in both directions.
     pub control_timeout: Duration,
     /// Per-connection stream-open rate.
     pub stream_open_rate_per_second: u32,
@@ -6040,7 +6041,35 @@ pub(crate) async fn run_native_initiator_handshake_without_trace(
     .await
 }
 
+/// Runs the initiator's control exchange within one `control_timeout`.
+///
+/// The responder applies the same overall deadline. Without it, a responder
+/// that paces each step holds this dial's pending-handshake permit for one
+/// timeout per step.
 async fn run_native_initiator_handshake(
+    connection: &Connection,
+    limits: &ZakuraLocalLimits,
+    handshake_config: &ZakuraHandshakeConfig,
+    local_peer_id: &ZakuraPeerId,
+    trace: &ZakuraTrace,
+    conn: &ZakuraConnTrace,
+) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
+    timeout(
+        limits.control_timeout,
+        run_native_initiator_control_steps(
+            connection,
+            limits,
+            handshake_config,
+            local_peer_id,
+            trace,
+            conn,
+        ),
+    )
+    .await
+    .unwrap_or(Err(ZakuraHandlerError::Timeout("control handshake")))
+}
+
+async fn run_native_initiator_control_steps(
     connection: &Connection,
     limits: &ZakuraLocalLimits,
     handshake_config: &ZakuraHandshakeConfig,
@@ -11912,6 +11941,86 @@ mod tests {
                 );
             }
         }
+
+        client_conn.close(0u32.into(), b"done");
+        client.shutdown().await;
+        server.shutdown().await;
+        Ok(())
+    }
+
+    /// A responder that paces its ack's length and payload, each within the
+    /// per-step deadline, still fails the initiator at the overall deadline.
+    #[tokio::test]
+    async fn initiator_bounds_a_paced_ack_by_one_deadline() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(74).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        server.serve(CaptureConnection {
+            alpn: P2P_V2_ALPN,
+            connection_tx: conn_tx,
+            stream_tx,
+        })?;
+        let client = LocalEndpointFactory::new().endpoint(75).await?;
+        let server_addr = LocalEndpointFactory::node_addr(&server).await;
+        let client_conn = timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr, &[P2P_V2_ALPN]),
+        )
+        .await??;
+        let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+        limits.control_timeout = Duration::from_secs(1);
+        let config = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let local_peer = ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?;
+
+        let handshake = run_native_initiator_handshake_without_trace(
+            &client_conn,
+            &limits,
+            &config,
+            &local_peer,
+        );
+        let respond = async {
+            let (mut send, mut recv) = stream_rx.recv().await.ok_or("missing control stream")?;
+            let hello = ZakuraControlHello::decode(
+                &read_control_payload(
+                    &mut recv,
+                    LOCAL_MAX_CONTROL_FRAME_BYTES,
+                    Duration::from_secs(2),
+                )
+                .await?,
+            )?;
+            let ack = ZakuraControlAck {
+                magic: CONTROL_ACK_MAGIC,
+                control_version: CONTROL_VERSION,
+                selected_zakura_protocol: hello.selected_zakura_protocol,
+                peer_nonce: [9; 32],
+                remote_peer_nonce: hello.peer_nonce,
+                accepted_capabilities: hello.capabilities,
+                accepted_channels: 0,
+                accepted_limits: hello.initial_limits,
+            }
+            .encode()?;
+            let mut len = Vec::with_capacity(CONTROL_LENGTH_BYTES);
+            len.write_u32::<LittleEndian>(u32::try_from(ack.len())?)?;
+            zakura_rt::time::sleep(Duration::from_millis(600)).await;
+            send.write_all(&len).await?;
+            zakura_rt::time::sleep(Duration::from_millis(600)).await;
+            // The initiator may already have closed the stream.
+            let _ = send.write_all(&ack).await;
+            Ok::<_, BoxError>(send)
+        };
+        let (negotiated, responded) = timeout(Duration::from_secs(5), async {
+            tokio::join!(handshake, respond)
+        })
+        .await?;
+        responded?;
+        assert!(
+            matches!(
+                negotiated,
+                Err(ZakuraHandlerError::Timeout("control handshake"))
+            ),
+            "a paced ack must fail at the overall deadline; got {negotiated:?}"
+        );
 
         client_conn.close(0u32.into(), b"done");
         client.shutdown().await;

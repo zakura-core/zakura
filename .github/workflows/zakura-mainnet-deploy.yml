@@ -593,6 +593,12 @@ jobs:
           python3 deploy/profiler/fleet.py ensure-trace-config "${args[@]}" \
             || echo "::warning::trace files could not be switched on for every node; see the step log" >&2
 
+          # Each node is also told the names of the other nodes, by address, so its
+          # trace files say which of them a block was announced to or served to. The
+          # block propagation page joins the nodes on those names.
+          python3 deploy/profiler/fleet.py peer-names "${args[@]}" \
+            || echo "::warning::fleet peer names could not be set on every node; see the step log" >&2
+
       - name: Deploy fleet
         working-directory: deploy/deployer
         env:
@@ -833,6 +839,8 @@ jobs:
           dashboard_dir="/opt/zakura-mainnet-dashboard"
           sudo install -d -m 755 "$dashboard_dir"
           sudo install -m 755 deploy/runner/zakura-cluster-status.py "$dashboard_dir/zakura-cluster-status.py"
+          # The block propagation page and the module that joins the nodes' reports for it.
+          sudo install -m 644 deploy/runner/propagation.py deploy/runner/propagation.html "$dashboard_dir/"
           cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
           # Dashboard-only: deploy.py rejects these fields, so add cookie RPC
           # auth for the compatibility node into this copy (not the deploy config).

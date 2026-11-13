@@ -24,6 +24,8 @@ from unittest import mock
 
 
 SCRIPT_PATH = Path(__file__).with_name("zakura-cluster-status.py")
+# The dashboard imports its sibling modules, as it does when run as a script.
+sys.path.insert(0, str(SCRIPT_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("zakura_cluster_status", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 status = importlib.util.module_from_spec(SPEC)
@@ -1792,6 +1794,84 @@ def nu7_rows(**overrides):
     rows.update(overrides)
     return list(rows.values())
 
+
+
+class PropagationRouteTests(unittest.TestCase):
+    """The cluster view against stand-in profilers that each report one block."""
+
+    BLOCK = "ab" * 32
+
+    def setUp(self):
+        import propagation
+
+        self.asked = []
+        self.original = (status.PROPAGATION, status.RATE_LIMITER, status.fetch_profiler)
+        heard_first, heard_later = node("heard-first"), node("heard-later")
+        down, plain = node("down"), node("plain")
+        heard_first.profiler_url, heard_later.profiler_url, down.profiler_url = "first", "later", "down"
+        status.fetch_profiler = self.fake_profiler
+        status.PROPAGATION = status.PropagationView([heard_first, heard_later, down, plain], propagation.join)
+        status.RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), status.Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        status.PROPAGATION, status.RATE_LIMITER, status.fetch_profiler = self.original
+
+    def fake_profiler(self, profiler_url, path, timeout):
+        self.asked.append((profiler_url, path))
+        if profiler_url == "down":
+            return 502, b"", "text/plain"
+        tip = 1_794_000_000.0 + (0.05 if profiler_url == "first" else 0.25)
+        block = {"hash": self.BLOCK, "height": 7, "path": "legacy", "t": tip, "wall": {"tip": tip}, "peers": {}}
+        return 200, json.dumps({"node": profiler_url, "clock": None, "blocks": [block]}).encode(), "application/json"
+
+    def fetch(self, path):
+        try:
+            with urllib.request.urlopen(self.base_url + path) as response:
+                return response.status, response.read(), response.headers
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, error.read(), error.headers
+
+    def test_the_data_joins_every_profiled_node_s_report_of_a_block(self):
+        code, body, headers = self.fetch("/propagation/data")
+        self.assertEqual((code, headers["Cache-Control"]), (200, status.NO_STORE["Cache-Control"]))
+        joined = json.loads(body)
+        self.assertEqual(joined["nodes"], ["heard-first", "heard-later", "down"])
+        self.assertEqual(joined["unreachable"], ["down"])
+        (block,) = joined["blocks"]
+        self.assertEqual((block["hash"], block["first_node"], block["spread_ms"]), (self.BLOCK, "heard-first", 200.0))
+
+    def test_profilers_are_asked_once_for_requests_close_together(self):
+        self.fetch("/propagation/data")
+        self.fetch("/propagation/data")
+        self.assertEqual(
+            sorted(self.asked),
+            [(url, f"/api/propagation?limit={status.PROPAGATION_BLOCKS}") for url in ("down", "first", "later")],
+        )
+
+    def test_the_page_is_served_and_asks_for_that_data(self):
+        code, body, headers = self.fetch("/propagation")
+        self.assertEqual((code, headers["Content-Type"]), (200, "text/html; charset=utf-8"))
+        self.assertIn(b'fetch("/propagation/data"', body)
+
+    def test_other_paths_and_a_dashboard_without_profilers_have_no_cluster_view(self):
+        self.assertEqual(self.fetch("/propagation/other")[0], 404)
+        status.PROPAGATION = None
+        self.assertEqual(self.fetch("/propagation/data")[0], 404)
+
+    def test_the_cluster_view_shares_the_public_rate_limit(self):
+        status.RATE_LIMITER = status.RateLimiter(limit=1, window=60)
+        self.assertEqual(self.fetch("/propagation/data")[0], 200)
+        self.assertEqual(self.fetch("/propagation")[0], 429)
+
+    def test_the_fleet_page_links_to_the_cluster_view(self):
+        self.assertIn('id="propagation-link" href="/propagation" hidden', status.PAGE)
+        self.assertIn("el('propagation-link').hidden = !profiled;", status.PAGE)
 
 class Nu7StatusTests(unittest.TestCase):
     def setUp(self):

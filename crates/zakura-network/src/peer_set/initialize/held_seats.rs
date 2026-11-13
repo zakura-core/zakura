@@ -14,6 +14,7 @@
 //! - the peer must have closed the connection itself: one that this node closed, to shed load
 //!   or to drop a stalled or banned peer, holds no seat, so a hold never undoes this node's
 //!   own decision to disconnect a peer,
+//! - a ban releases the peer's held seat,
 //! - the connection must have been open for the minimum age, and the hold is no longer
 //!   than that age, so a peer holds a seat for at most as long as it used it,
 //! - each IP address has at most one held seat, and
@@ -43,26 +44,36 @@ pub struct HeldSeats {
 
     /// The most seats held at one time.
     max_held: usize,
+
+    /// The banned IP addresses, which hold no seats.
+    bans: BannedIps,
 }
 
 impl HeldSeats {
     /// Returns an empty set of held seats for a listener that accepts
-    /// `inbound_connection_limit` connections.
-    pub fn new(inbound_connection_limit: usize) -> Self {
+    /// `inbound_connection_limit` connections and refuses `bans`.
+    pub fn new(inbound_connection_limit: usize, bans: BannedIps) -> Self {
         Self::with_policy(
             constants::MIN_HELD_SEAT_CONNECTION_AGE,
             constants::INBOUND_SEAT_HOLD_DURATION,
             inbound_connection_limit / constants::INBOUND_SEAT_HOLD_LIMIT_DIVISOR,
+            bans,
         )
     }
 
     /// Returns an empty set of held seats with the given policy.
-    fn with_policy(min_connection_age: Duration, hold_duration: Duration, max_held: usize) -> Self {
+    fn with_policy(
+        min_connection_age: Duration,
+        hold_duration: Duration,
+        max_held: usize,
+        bans: BannedIps,
+    ) -> Self {
         Self {
             release_times: HashMap::new(),
             min_connection_age,
             hold_duration,
             max_held,
+            bans,
         }
     }
 
@@ -70,10 +81,9 @@ impl HeldSeats {
     ///
     /// Returns `true` if the seat is held at `now`. A seat is not held if the connection
     /// was too short, if the hold is already over, if its IP address already has a held
-    /// seat or is in `bans`, or if the cap is reached. The listener refuses a banned peer
-    /// before it can take a seat back.
-    pub fn hold(&mut self, closed: ClosedConnection, bans: &BannedIps, now: Instant) -> bool {
-        self.release_expired(now);
+    /// seat or is banned, or if the cap is reached.
+    pub fn hold(&mut self, closed: ClosedConnection, now: Instant) -> bool {
+        self.release(now);
 
         let release_time = closed.closed_at + self.hold_duration;
 
@@ -81,7 +91,7 @@ impl HeldSeats {
             || release_time <= now
             || self.release_times.len() >= self.max_held
             || self.release_times.contains_key(&closed.ip)
-            || bans.contains(closed.ip)
+            || self.bans.contains(closed.ip)
         {
             return false;
         }
@@ -95,7 +105,7 @@ impl HeldSeats {
     ///
     /// A new connection from `ip` must leave these seats empty.
     pub fn held_for_others(&mut self, ip: IpAddr, now: Instant) -> usize {
-        self.release_expired(now);
+        self.release(now);
 
         self.release_times.len() - usize::from(self.release_times.contains_key(&ip))
     }
@@ -104,20 +114,24 @@ impl HeldSeats {
     ///
     /// Returns `true` if a seat was held for `ip` at `now`.
     pub fn take_back(&mut self, ip: IpAddr, now: Instant) -> bool {
-        self.release_expired(now);
+        self.release(now);
 
         self.release_times.remove(&ip).is_some()
     }
 
-    /// Returns the number of seats held, including any whose hold has ended since the last
-    /// call that took the current time.
+    /// Returns the number of seats held, including any released since the last call that
+    /// took the current time.
     pub fn len(&self) -> usize {
         self.release_times.len()
     }
 
-    /// Releases every seat whose hold has ended by `now`.
-    fn release_expired(&mut self, now: Instant) {
+    /// Releases every seat whose hold has ended by `now`, or whose IP address is now banned.
+    ///
+    /// A ban can arrive after a seat is held, because misbehavior reports are applied in
+    /// batches. The banned peer is refused before it can take its seat back.
+    fn release(&mut self, now: Instant) {
+        let bans = &self.bans;
         self.release_times
-            .retain(|_ip, release_time| *release_time > now);
+            .retain(|ip, release_time| *release_time > now && !bans.contains(*ip));
     }
 }

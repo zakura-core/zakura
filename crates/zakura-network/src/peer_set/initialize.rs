@@ -865,7 +865,7 @@ where
     let public_inbound_connection_limit = config
         .peerset_inbound_connection_limit()
         .saturating_sub(zcashd_compat_reserved_slots);
-    let mut held_seats = held_seats::HeldSeats::new(public_inbound_connection_limit);
+    let mut held_seats = held_seats::HeldSeats::new(public_inbound_connection_limit, bans.clone());
 
     let mut handshakes: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send>>> =
         FuturesUnordered::new();
@@ -919,7 +919,7 @@ where
             // Hold the seats of the long-lived public peers that closed since the last accept.
             let now = Instant::now();
             for closed_connection in active_inbound_connections.take_closed_connections() {
-                if held_seats.hold(closed_connection, &bans, now) {
+                if held_seats.hold(closed_connection, now) {
                     metrics::counter!("peer.inbound.held_seats.held").increment(1);
                 }
             }

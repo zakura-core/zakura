@@ -2079,13 +2079,21 @@ async fn listener_holds_the_seat_of_a_long_lived_peer() {
     // Every seat taken in this test sends one peer change.
     let (peerset_tx, _peerset_rx) = mpsc::channel::<DiscoveredPeer>(inbound_limit * 4);
 
+    // The address book applies bans to the list that the listener reads.
+    let mut address_book = AddressBook::new(
+        config.listen_addr,
+        &config.network,
+        config.max_connections_per_ip,
+        tracing::Span::none(),
+    );
+
     let listen_fut = accept_inbound_connections(
         config.clone(),
         tcp_listener,
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
         tower::util::BoxCloneService::new(open_inbound_handshaker),
         peerset_tx,
-        BannedIps::default(),
+        address_book.bans(),
         Vec::new(),
     );
     let listen_task_handle = tokio::spawn(listen_fut);
@@ -2144,6 +2152,18 @@ async fn listener_holds_the_seat_of_a_long_lived_peer() {
     let evicted_seat = take_inbound_seat(returning_ip, listen_port, &mut accepted_rx).await;
     advance_listener_clock(constants::MIN_HELD_SEAT_CONNECTION_AGE).await;
     drop(evicted_seat);
+    other_seats.push(take_inbound_seat(other_ip, listen_port, &mut accepted_rx).await);
+
+    // A ban releases the seat held for the banned peer.
+    other_seats.pop();
+    let banned_seat = take_inbound_seat(returning_ip, listen_port, &mut accepted_rx).await;
+    advance_listener_clock(constants::MIN_HELD_SEAT_CONNECTION_AGE).await;
+    close_by_peer(banned_seat);
+    expect_no_inbound_seat(other_ip, listen_port, &mut accepted_rx).await;
+    address_book.update(MetaAddr::new_misbehavior(
+        SocketAddr::new(returning_ip, 8233).into(),
+        constants::MAX_PEER_MISBEHAVIOR_SCORE,
+    ));
     other_seats.push(take_inbound_seat(other_ip, listen_port, &mut accepted_rx).await);
 
     listen_task_handle.abort();

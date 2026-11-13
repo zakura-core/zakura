@@ -98,6 +98,9 @@ software (`/Zakura:1.8.7/` reads "Zakura 1.8.7", and zcashd's `/MagicBean:6.2.0/
 reads "zcashd 6.2.0"), which of our nodes
 downloaded from it, how many attempts were recorded and how many legacy attempts
 failed, and the median, 9-in-10 and slowest time of the ones that delivered a block.
+"By software" groups the same downloads by the exact software name each peer
+sent, most peers first, with each version's peer count and the times of all its
+downloads.
 
 A peer is one of four kinds. One of our nodes, recognised by its Zakura label
 or by the address the node list reaches it at, is shown by name. A peer whose

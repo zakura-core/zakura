@@ -720,7 +720,7 @@ fn write_block_without_validation(state: &ZakuraDb, original_block: &Arc<Block>)
             .map(|tx| tx.hash())
             .collect();
         let new_outputs =
-            new_ordered_outputs_with_height(&original_block, Height(0), &transaction_hashes);
+            new_ordered_outputs_with_height(original_block, Height(0), &transaction_hashes);
 
         CheckpointVerifiedBlock(SemanticallyVerifiedBlock {
             block: original_block.clone().into(),

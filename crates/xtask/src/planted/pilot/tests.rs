@@ -325,7 +325,7 @@ fn discovery_run(mutant: CampaignFacts, confirmation: Option<Result<(), String>>
 }
 
 fn discovered(run: &DiscoveryRun) -> Class {
-    classify::discovery(ID, run).class
+    classify::discovery(ID, &[], run).class
 }
 
 /// A confirmed finding of the intended ID is an intended violation, though
@@ -437,7 +437,7 @@ fn a_baseline_campaign_that_times_out_or_is_killed_is_a_harness_failure() {
     ] {
         let mut run = discovery_run(found(ID), Some(Ok(())));
         run.baseline = Some(baseline);
-        let result = classify::discovery(ID, &run);
+        let result = classify::discovery(ID, &[], &run);
         assert_eq!(result.class, Class::HarnessFailure, "{:?}", run.baseline);
         assert_eq!(
             classify::discovery_baseline(&run.baseline).map(|failed| failed.class),
@@ -539,7 +539,13 @@ fn campaign_facts_read_saved_failures() {
     let intended = format!("{worker}/sim/inputs/active/block/reactor-policy/aa.bin");
     let crash = format!("{worker}/artifacts/crash-bb");
     let trace = format!("{worker}/sim/traces/block/reactor-policy/cc/trace.jsonl");
-    let facts = campaign_facts(ID, Some(&end(&[&intended, &crash, &trace])), &evidence, 0);
+    let facts = campaign_facts(
+        ID,
+        Some(&end(&[&intended, &crash, &trace])),
+        &evidence,
+        0,
+        &[],
+    );
     assert_eq!(facts.violated, [ID]);
     assert!(facts.failures.is_empty(), "{:?}", facts.failures);
     assert_eq!(facts.intended_input.as_deref(), Some(intended.as_str()));
@@ -559,36 +565,50 @@ fn campaign_facts_read_saved_failures() {
         Some(&end(&[&crash, &timeout, &nondeterministic])),
         &evidence,
         0,
+        &[],
     );
     assert!(facts.violated.is_empty());
     assert_eq!(facts.failures, [nondeterministic]);
     assert_eq!(facts.killed, [timeout, crash]);
 
     let unapplied = serde_json::json!({"status": "complete", "unapplied": [ID], "incomplete": []});
-    assert!(!campaign_facts(ID, None, &unapplied, 0).applied);
+    assert!(!campaign_facts(ID, None, &unapplied, 0, &[]).applied);
     assert_eq!(
-        campaign_facts(ID, None, &serde_json::json!({}), 0).status,
+        campaign_facts(ID, None, &serde_json::json!({}), 0, &[]).status,
         "none"
     );
 }
 
-/// Paired campaigns get the catalogue's bounds and seed: their arguments
-/// differ only in the store, the name and the build.
+/// Paired campaigns get the catalogue's bounds, and their lane's seed and
+/// arm: their arguments differ only in the store, the name and the build.
 #[test]
 fn paired_campaigns_share_their_budget() {
     let catalogue = committed_catalogue();
     let bounds = &catalogue.discovery;
+    let case = &catalogue.cases[0];
     let corpus = Path::new("qa/mutation-pilot/discovery-empty");
+    let lane = Lane {
+        seed: 11,
+        arm: Arm::On,
+    };
     let baseline = start_args(
         bounds,
-        "t-11",
-        "h",
+        "t-on-11",
+        case,
         "aa",
-        11,
+        lane,
         corpus,
         Path::new("s/baseline"),
     );
-    let mutant = start_args(bounds, "c-11", "h", "bb", 11, corpus, Path::new("s/mutant"));
+    let mutant = start_args(
+        bounds,
+        "c-on-11",
+        case,
+        "bb",
+        lane,
+        corpus,
+        Path::new("s/mutant"),
+    );
     let differ: Vec<usize> = (0..baseline.len())
         .filter(|i| baseline[*i] != mutant[*i])
         .collect();
@@ -840,10 +860,17 @@ fn zero_selected_tests_fail() {
     assert!(select(&[], &[])
         .expect_err("no case")
         .contains("zero cases"));
-    assert_eq!(select_seeds(&[11, 23], &[]), Ok(vec![11, 23]));
-    assert_eq!(select_seeds(&[11, 23], &[23]), Ok(vec![23]));
-    assert!(select_seeds(&[11, 23], &[5]).is_err());
-    assert!(select_seeds(&[], &[]).is_err());
+    assert_eq!(select_allocated(&[11, 23], &[], "seed"), Ok(vec![11, 23]));
+    assert_eq!(select_allocated(&[11, 23], &[23], "seed"), Ok(vec![23]));
+    assert!(select_allocated(&[11, 23], &[5], "seed").is_err());
+    assert!(select_allocated::<u32>(&[], &[], "seed").is_err());
+    assert!(select_allocated(&[11, 23, 11], &[], "seed")
+        .expect_err("a seed allocated twice")
+        .contains("twice"));
+    assert_eq!(
+        select_allocated(&[Arm::On, Arm::Off], &[Arm::Off], "arm"),
+        Ok(vec![Arm::Off])
+    );
     assert!(classify::summarize(std::iter::empty()).is_err());
     assert!(sensitivity_report(meta(), Vec::new()).is_err());
     let unseeded = DiscoveryCase {
@@ -852,6 +879,7 @@ fn zero_selected_tests_fail() {
         property: ID.to_owned(),
         target: "t".to_owned(),
         seeds: Vec::new(),
+        arms: Vec::new(),
         cleanup: None,
     };
     assert!(discovery_report(meta(), vec![unseeded], Vec::new()).is_err());
@@ -930,6 +958,7 @@ fn reports_count_classes_and_rates() {
     // Discovery counts each seed of each case.
     let seed = |seed: u32, class: Class| SeedResult {
         seed,
+        arm: Arm::On,
         result: classified(class),
         baseline: None,
         mutant: None,
@@ -945,6 +974,7 @@ fn reports_count_classes_and_rates() {
             seed(23, Class::NotApplicable),
             seed(47, Class::BaselineFailure),
         ],
+        arms: Vec::new(),
         cleanup: None,
     };
     let excluded = Excluded {
@@ -1210,11 +1240,11 @@ fn a_timeout_beside_a_finding_is_a_harness_failure() {
         "unapplied": [],
         "incomplete": [{"reason": "restart-limit", "worker": 0}],
     });
-    let facts = campaign_facts(ID, Some(&end), &evidence, 0);
+    let facts = campaign_facts(ID, Some(&end), &evidence, 0, &[]);
     assert_eq!(facts.violated, [ID]);
     assert!(facts.failures.is_empty(), "{:?}", facts.failures);
     assert_eq!(facts.killed, std::slice::from_ref(&timeout));
-    let result = classify::discovery(ID, &discovery_run(facts, Some(Ok(()))));
+    let result = classify::discovery(ID, &[], &discovery_run(facts, Some(Ok(()))));
     assert_eq!(result.class, Class::HarnessFailure, "{}", result.reason);
     assert!(result.reason.contains(&timeout), "{}", result.reason);
     // Another ID's finding beside a timeout doesn't count either.
@@ -1558,8 +1588,12 @@ fn a_campaign_build_is_rejected_only_for_a_compile_error() {
             &dir.path().join(format!("{name}-lane")),
             &dir.path().join("fuzz-target"),
             case,
-            11,
-            &catalogue,
+            Lane {
+                seed: 11,
+                arm: Arm::On,
+            },
+            &catalogue.discovery,
+            &Pairing::of(&Pin::Catalogue(&catalogue), dir.path()),
             dir.path(),
             true,
         )
@@ -1636,8 +1670,12 @@ fn a_campaign_that_a_signal_killed_is_not_read() {
             &dir.path().join(format!("{name}-lane")),
             &dir.path().join("fuzz-target"),
             case,
-            11,
-            &catalogue,
+            Lane {
+                seed: 11,
+                arm: Arm::On,
+            },
+            &catalogue.discovery,
+            &Pairing::of(&Pin::Catalogue(&catalogue), dir.path()),
             dir.path(),
             false,
         )
@@ -1649,5 +1687,729 @@ fn a_campaign_that_a_signal_killed_is_not_read() {
         let baseline = classify::discovery_baseline(&Some(Err(NoCampaign::Killed(why))))
             .expect("the baseline fails");
         assert_eq!(baseline.class, Class::HarnessFailure, "{name}");
+    }
+}
+
+/// A campaign's facts time its first intended finding by the process that
+/// crashed on it, count its unique abstract states, and mark a run without
+/// an intended input censored.
+#[test]
+fn campaign_facts_time_the_intended_finding() {
+    let intended = "runs/m/workers/0/sim/inputs/active/block/reactor-policy/aa.bin";
+    let end = serde_json::json!({
+        "failures": [{"path": intended, "sha256": "aa"}],
+        "workers": [{"index": 0, "millis": 3500}, {"index": 1, "millis": 9000}],
+    });
+    let evidence = serde_json::json!({
+        "status": "worker-stopped",
+        "totals": {"runs": 42, "features": {"1": 3, "4097": 1}},
+        "unapplied": [],
+        "incomplete": [],
+    });
+    let attempt = |millis: u64, crash: &str, sha256: &str| {
+        serde_json::json!({
+            "millis": millis,
+            "artifacts": [{"path": format!("runs/m/workers/0/artifacts/{crash}"), "sha256": sha256}],
+        })
+    };
+    // Worker 0's second process crashed on the intended input after 3.5 s
+    // in all; worker 1's first process did after 5 s.
+    let attempts = vec![
+        vec![
+            attempt(1000, "crash-1", "ff"),
+            attempt(2500, "crash-2", "aa"),
+        ],
+        vec![attempt(5000, "crash-3", "aa")],
+    ];
+    let facts = campaign_facts(ID, Some(&end), &evidence, 0, &attempts);
+    assert_eq!(facts.intended_input.as_deref(), Some(intended));
+    assert_eq!(facts.first_intended_secs, Some(3.5));
+    assert!(!facts.censored);
+    assert_eq!(facts.features_reached, 2);
+    assert_eq!(facts.worker_secs, 9.0);
+
+    // A timeout or a crash on another input doesn't time the finding.
+    let unmatched = vec![vec![
+        attempt(1000, "timeout-1", "aa"),
+        attempt(1000, "crash-2", "ff"),
+    ]];
+    let facts = campaign_facts(ID, Some(&end), &evidence, 0, &unmatched);
+    assert_eq!(facts.first_intended_secs, None);
+    assert!(!facts.censored);
+
+    // Without an intended input, the run is censored.
+    let other = serde_json::json!({
+        "failures": [{"path": "runs/m/workers/0/sim/inputs/active/sim/no-task-panic/aa.bin", "sha256": "aa"}],
+        "workers": [{"index": 0, "millis": 600_000}],
+    });
+    let facts = campaign_facts(ID, Some(&other), &evidence, 0, &attempts);
+    assert!(facts.censored);
+    assert_eq!(facts.first_intended_secs, None);
+    assert_eq!(facts.worker_secs, 600.0);
+    assert_eq!(
+        campaign_facts(ID, None, &serde_json::json!({}), 0, &[]).features_reached,
+        0
+    );
+}
+
+/// The Kaplan-Meier median counts a censored run at risk until it stops,
+/// reaches one half exactly, and is missing when half the runs or more
+/// end censored.
+#[test]
+fn the_median_time_to_detection_counts_censored_runs() {
+    use compare::median_detection;
+    assert_eq!(median_detection(&[]), None);
+    let all: Vec<(f64, bool)> = (1..=10).map(|secs| (f64::from(secs), true)).collect();
+    assert_eq!(median_detection(&all), Some(5.0));
+    assert_eq!(
+        median_detection(&[(4.0, true), (1.0, true), (3.0, true), (2.0, true)]),
+        Some(2.0)
+    );
+    // The undetected share is 3/4 after 1 s, and 3/4 × 1/2 after 3 s.
+    assert_eq!(
+        median_detection(&[(1.0, true), (2.0, false), (3.0, true), (4.0, false)]),
+        Some(3.0)
+    );
+    // A run censored early leaves the risk set: 2/3 after 2 s, 1/3 after 3 s.
+    assert_eq!(
+        median_detection(&[(1.0, false), (2.0, true), (3.0, true), (600.0, false)]),
+        Some(3.0)
+    );
+    // A run censored at a detection time stays at risk through it.
+    assert_eq!(median_detection(&[(10.0, true), (10.0, false)]), Some(10.0));
+    // Three of four runs end censored at the budget.
+    let budget = (600.0, false);
+    assert_eq!(
+        median_detection(&[(5.0, true), budget, budget, budget]),
+        None
+    );
+    assert_eq!(compare::median(&mut []), None);
+    assert_eq!(compare::median(&mut [3]), Some(3.0));
+    assert_eq!(compare::median(&mut [4, 1]), Some(2.5));
+    assert_eq!(compare::median(&mut [5, 1, 3]), Some(3.0));
+}
+
+/// Each arm counts its seeds as detected, censored or unscored, times the
+/// detected and censored ones, and totals its original and mutant
+/// campaigns' applicable runs and unique abstract states.
+#[test]
+fn each_arm_summarizes_its_seeds() {
+    let facts =
+        |applied: bool, applicable_runs: u64, features: usize, secs: Option<f64>| CampaignFacts {
+            applied,
+            applicable_runs,
+            features_reached: features,
+            worker_secs: 600.0,
+            first_intended_secs: secs,
+            censored: secs.is_none(),
+            ..campaign()
+        };
+    let seed = |seed: u32, arm: Arm, class: Class, mutant: Option<CampaignFacts>| SeedResult {
+        seed,
+        arm,
+        result: classified(class),
+        baseline: Some(facts(
+            true,
+            100,
+            10 + usize::try_from(seed).expect("a small seed"),
+            None,
+        )),
+        mutant,
+        store: None,
+    };
+    let seeds = vec![
+        seed(
+            1,
+            Arm::On,
+            Class::IntendedViolation,
+            Some(facts(true, 5, 3, Some(30.0))),
+        ),
+        seed(
+            1,
+            Arm::Off,
+            Class::SurvivedBudget,
+            Some(facts(true, 50, 1, None)),
+        ),
+        seed(
+            2,
+            Arm::On,
+            Class::IntendedViolation,
+            Some(facts(true, 7, 5, Some(90.0))),
+        ),
+        seed(
+            2,
+            Arm::Off,
+            Class::NotApplicable,
+            Some(facts(false, 0, 1, None)),
+        ),
+        // A finding no crash timed counts at the campaign's end.
+        seed(
+            3,
+            Arm::On,
+            Class::IntendedViolation,
+            Some(facts(true, 9, 4, None)),
+        ),
+        seed(
+            3,
+            Arm::Off,
+            Class::HarnessFailure,
+            Some(facts(true, 2, 2, Some(10.0))),
+        ),
+        seed(
+            4,
+            Arm::On,
+            Class::OtherViolation,
+            Some(facts(true, 1, 2, None)),
+        ),
+        seed(4, Arm::Off, Class::BaselineFailure, None),
+    ];
+    let arms = compare::compare(&seeds);
+    assert_eq!(
+        arms.iter().map(|arm| arm.arm).collect::<Vec<_>>(),
+        [Arm::On, Arm::Off]
+    );
+    let on = &arms[0];
+    assert_eq!(
+        (on.seeds, on.detected, on.censored, on.unscored),
+        (4, 3, 1, 0)
+    );
+    // Undetected shares: 3/4 at 30 s, 1/2 at 90 s.
+    assert_eq!(on.median_detection_secs, Some(90.0));
+    assert_eq!(
+        (
+            on.mutant.campaigns,
+            on.mutant.applicable,
+            on.mutant.applicable_runs
+        ),
+        (4, 4, 22)
+    );
+    assert_eq!(on.mutant.features_reached, Some(3.5));
+    assert_eq!(
+        (on.baseline.campaigns, on.baseline.applicable_runs),
+        (4, 400)
+    );
+    assert_eq!(on.baseline.features_reached, Some(12.5));
+
+    let off = &arms[1];
+    assert_eq!(
+        (off.seeds, off.detected, off.censored, off.unscored),
+        (4, 0, 2, 2)
+    );
+    assert_eq!(off.median_detection_secs, None);
+    // The harness failure's campaign still left facts.
+    assert_eq!(
+        (
+            off.mutant.campaigns,
+            off.mutant.applicable,
+            off.mutant.applicable_runs
+        ),
+        (3, 2, 52)
+    );
+    assert_eq!(off.mutant.features_reached, Some(1.0));
+    let json = serde_json::to_value(&arms).expect("the comparison serializes");
+    assert_eq!(json[1]["arm"], "off");
+    assert_eq!(json[1]["median_detection_secs"], Value::Null);
+}
+
+/// The plan runs each seed's arms together, one original campaign per
+/// target, seed and arm, and one mutant campaign per case, seed and arm.
+/// The committed catalogue's discovery runs five seeds in one arm.
+#[test]
+fn discovery_plans_paired_arms() {
+    let planned = lanes(&[11, 23], &[Arm::On, Arm::Off]);
+    let pairs: Vec<(u32, Arm)> = planned.iter().map(|lane| (lane.seed, lane.arm)).collect();
+    assert_eq!(
+        pairs,
+        [(11, Arm::On), (11, Arm::Off), (23, Arm::On), (23, Arm::Off)]
+    );
+    assert_eq!(planned[1].dir(), Path::new("off/seed-11"));
+
+    let catalogue = committed_catalogue();
+    let bounds = &catalogue.discovery;
+    assert_eq!(bounds.seeds.len(), 5);
+    assert_eq!(bounds.feedback_arms, [Arm::On]);
+    let cases = select(&catalogue.cases, &[]).expect("every case");
+    let (scored, _) = discovery_cases(&cases).expect("some case is scored");
+    let planned = lanes(&bounds.seeds, &bounds.feedback_arms);
+    let baselines = baseline_lanes(&scored, &planned);
+    let targets: BTreeSet<&str> = scored.iter().map(|case| case.target.as_str()).collect();
+    assert_eq!(baselines.len(), targets.len() * planned.len());
+    for case in &scored {
+        for lane in &planned {
+            assert!(
+                baselines.contains(&(case.target.clone(), *lane)),
+                "{} has no original campaign on {lane:?}",
+                case.id
+            );
+        }
+    }
+    // Eight cases on four targets: 60 campaigns of 600 s.
+    assert_eq!((scored.len(), targets.len(), planned.len()), (8, 4, 5));
+
+    // An equivalent case needs no original campaign.
+    let mut equivalent = scored[0].clone();
+    equivalent.equivalent = Some("review".to_owned());
+    assert!(baseline_lanes(&[&equivalent], &planned).is_empty());
+}
+
+/// One seed's arms pass `campaign start` the same arguments but the
+/// store, the name and the feedback mode, which is `on` only in the on
+/// arm. The fuzz target's collector runs in both arms; the mode sets
+/// whether libFuzzer reads its features. A run whose fuzzer logged another
+/// mode, or none, doesn't pair.
+#[test]
+fn each_arm_runs_with_its_own_feedback_mode() {
+    let list = committed_list();
+    let case = &list.cases[0];
+    let corpus = Path::new("qa/mutation-pilot/discovery-empty");
+    let args = |arm: Arm| {
+        start_args(
+            &list.bounds,
+            &format!("c-{arm}-11"),
+            case,
+            "bb",
+            Lane { seed: 11, arm },
+            corpus,
+            &Path::new("s").join(arm.mode()),
+        )
+    };
+    let (on, off) = (args(Arm::On), args(Arm::Off));
+    assert_eq!(on.len(), off.len());
+    let flags: Vec<&OsString> = (0..on.len())
+        .filter(|i| on[*i] != off[*i])
+        .map(|i| &on[i - 1])
+        .collect();
+    assert_eq!(flags, ["--store", "--campaign", "--feedback"]);
+    let feedback = |args: &[OsString]| {
+        let at = args
+            .iter()
+            .position(|arg| arg == "--feedback")
+            .expect("the mode is passed");
+        args[at + 1].clone()
+    };
+    assert_eq!(feedback(&on), "on");
+    assert_eq!(feedback(&off), "off");
+    // The case's target gets the list's extra libFuzzer flags.
+    assert_eq!(case.target, "header_sync_storage");
+    let at = on
+        .iter()
+        .position(|arg| arg == "--libfuzzer-arg")
+        .expect("the target's flag is passed");
+    assert_eq!(on[at + 1], "-len_control=0");
+
+    let manifest = |mode: &str| serde_json::json!({"feedback": {"mode": mode}});
+    assert_eq!(arm_mismatch(&manifest("on"), Arm::On, true), None);
+    assert_eq!(arm_mismatch(&manifest("off"), Arm::Off, true), None);
+    assert!(arm_mismatch(&manifest("on"), Arm::Off, true)
+        .expect("the modes differ")
+        .contains("not the arm's off"));
+    assert!(arm_mismatch(&serde_json::json!({}), Arm::On, true)
+        .expect("no feedback was logged")
+        .contains("no semantic feedback"));
+    // A lone arm, as the pilot's discovery runs, pairs without a logged
+    // mode, since no other arm compares with it.
+    assert_eq!(arm_mismatch(&serde_json::json!({}), Arm::On, false), None);
+    assert_eq!(Arm::parse("off"), Ok(Arm::Off));
+    assert!(Arm::parse("both").is_err());
+    let flags = parse_flags(
+        ["--out", "/o", "--arm", "off"]
+            .into_iter()
+            .map(str::to_owned),
+    )
+    .expect("the flags parse");
+    assert_eq!(flags.arms, [Arm::Off]);
+    assert!(parse_flags(["--out", "/o", "--arm", "x"].into_iter().map(str::to_owned)).is_err());
+}
+
+/// `campaign_lane` passes its arm's mode to `campaign start`, rejects a run
+/// whose fuzzer logged another mode, and times the intended finding from
+/// the worker's attempts.
+#[cfg(unix)]
+#[test]
+fn a_campaign_lane_reads_its_arm_and_attempts() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // `campaign_lane` runs its children against the pilot's interrupt flag.
+    let _flag = crate::sim_minimize::tests::INTERRUPT_FLAG_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let catalogue = committed_catalogue();
+    let case = &catalogue.cases[0];
+    assert_eq!(case.property, ID);
+    // The records a run that found the intended property after 1.5 s
+    // leaves; the manifest names the mode the fuzzer logged.
+    let records = |mode: &str| {
+        format!(
+            "mkdir -p \"$store/manifests\" \"$store/snapshots/s\" \"$store/runs/r/workers/0\"\n\
+             echo \"{{\\\"initial_snapshot\\\":\\\"s\\\",\\\"feedback\\\":{{\\\"mode\\\":\\\"{mode}\\\"}}}}\" \
+             > \"$store/manifests/r.json\"\n\
+             echo '{{\"inputs\":[]}}' > \"$store/snapshots/s/snapshot.json\"\n\
+             echo '{{\"workers\":[{{\"index\":0,\"millis\":4000}}],\"failures\":[{{\"path\":\
+             \"runs/r/workers/0/sim/inputs/active/block/reactor-policy/aa.bin\",\"sha256\":\"aa\"}}]}}' \
+             > \"$store/runs/r/end.json\"\n\
+             echo '{{\"millis\":1500,\"artifacts\":[{{\"path\":\"runs/r/workers/0/artifacts/crash-1\",\
+             \"sha256\":\"aa\"}}]}}' > \"$store/runs/r/workers/0/attempts.jsonl\"\n\
+             exit 1"
+        )
+    };
+    let evidence = "echo '{\"status\":\"worker-stopped\",\"totals\":{\"runs\":9,\
+                    \"features\":{\"7\":2}},\"unapplied\":[],\"incomplete\":[]}' > \"$8\"";
+    // `$mode` is the value after `--feedback`.
+    let passed = "mode=none; prev=\n\
+                  for arg in \"$@\"; do [ \"$prev\" = --feedback ] && mode=$arg; prev=$arg; done\n";
+    for (name, start, arm, mismatch) in [
+        (
+            "passed-on",
+            format!("{passed}{}", records("$mode")),
+            Arm::On,
+            false,
+        ),
+        (
+            "passed-off",
+            format!("{passed}{}", records("$mode")),
+            Arm::Off,
+            false,
+        ),
+        ("always-on", records("on"), Arm::Off, true),
+    ] {
+        let sim = dir.path().join(name);
+        fs::write(
+            &sim,
+            format!(
+                "#!/bin/sh\n\
+                 store=$4\n\
+                 case \"$1 $2\" in\n\
+                 'campaign build') mkdir -p \"$store/builds/b\" ;;\n\
+                 'campaign start') {start} ;;\n\
+                 'campaign evidence') {evidence} ;;\n\
+                 esac\n"
+            ),
+        )
+        .expect("the script is written");
+        fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
+            .expect("the script is executable");
+        wait_until_executable(&sim);
+        let facts = campaign_lane(
+            &sim,
+            &dir.path().join(format!("{name}-lane")),
+            &dir.path().join("fuzz-target"),
+            case,
+            Lane { seed: 11, arm },
+            &catalogue.discovery,
+            &Pairing::of(&Pin::Catalogue(&catalogue), dir.path()),
+            dir.path(),
+            true,
+        )
+        .expect("the lane runs")
+        .unwrap_or_else(|error| panic!("{name}: the lane left no facts: {error}"));
+        // The stand-in's manifest records no build identity, so the build
+        // never pairs; only the feedback mode differs between the lanes.
+        let unpaired = facts.unpaired.expect("the stand-in names no build");
+        assert_eq!(
+            unpaired.contains("feedback"),
+            mismatch,
+            "{name}: {unpaired}"
+        );
+        assert_eq!(facts.first_intended_secs, Some(1.5), "{name}");
+        assert!(!facts.censored, "{name}");
+        assert_eq!(facts.features_reached, 1, "{name}");
+        assert_eq!(facts.worker_secs, 4.0, "{name}");
+    }
+}
+
+/// The committed feedback comparison's case list, checked.
+fn committed_list() -> feedback::List {
+    let root = crate::repo_root().expect("xtask lives in the workspace");
+    feedback::read(&root).expect("the committed list checks").1
+}
+
+/// The committed case list resolves each case to its planted patch, input
+/// and production files, and freezes ten seeds in both arms: twelve cases
+/// on five targets, 340 campaigns of 600 s.
+#[test]
+fn the_feedback_list_plans_paired_arms() {
+    let list = committed_list();
+    assert_eq!(list.bounds.seeds.len(), 10);
+    assert_eq!(list.bounds.feedback_arms, [Arm::On, Arm::Off]);
+    for case in &list.cases {
+        assert_eq!(
+            Path::new(&case.id).parent(),
+            Some(Path::new(&case.property)),
+            "{}: its property is its directory",
+            case.id
+        );
+        assert!(!case.production_files.is_empty(), "{}", case.id);
+        assert!(
+            case.production_files
+                .keys()
+                .all(|path| path.starts_with("crates/")),
+            "{}: {:?}",
+            case.id,
+            case.production_files
+        );
+    }
+    let cases: Vec<&Case> = list.cases.iter().collect();
+    let planned = lanes(&list.bounds.seeds, &list.bounds.feedback_arms);
+    let targets: BTreeSet<&str> = cases.iter().map(|case| case.target.as_str()).collect();
+    assert!(!targets.contains("block_sync_storage"));
+    let originals = baseline_lanes(&cases, &planned).len();
+    assert_eq!(originals, targets.len() * planned.len());
+    assert_eq!(
+        (
+            cases.len(),
+            targets.len(),
+            originals + cases.len() * planned.len()
+        ),
+        (12, 5, 340)
+    );
+}
+
+/// A synthetic repository for [`feedback::resolve`]: one planted input case,
+/// `p/q/name`, whose input runs `h/one` and whose patch changes
+/// `crates/a.rs`, and the fuzz targets `t_one` (`h/one`), `t_two` (`h/two`)
+/// and `t_none`, which runs no harness.
+fn planted_repo() -> (
+    tempfile::TempDir,
+    crate::planted::Case,
+    BTreeMap<String, Option<String>>,
+) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+    let write = |path: &str, text: &str| {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().expect("a file has a parent")).expect("the directory");
+        fs::write(path, text).expect("the file is written");
+    };
+    write("crates/a.rs", "fn a() {}\n");
+    write("in/x.bin", "x");
+    write(
+        "in/x.toml",
+        &format!(
+            "harness = \"h/one\"\nsha256 = \"{}\"\n",
+            hex(&Sha256::digest(b"x"))
+        ),
+    );
+    write(
+        "qa/planted/p/q/name.patch",
+        "--- a/crates/a.rs\n+++ b/crates/a.rs\n@@ -1 +1 @@\n-fn a() {}\n+fn a() { todo!() }\n",
+    );
+    let case = crate::planted::Case {
+        property: "p/q".to_owned(),
+        patch: root.join("qa/planted/p/q/name.patch"),
+        witness: crate::planted::Witness::Input(PathBuf::from("in/x.bin")),
+        checks: Vec::new(),
+        also_violates: vec!["p/also".to_owned()],
+        set: Vec::new(),
+        target: None,
+    };
+    let targets = BTreeMap::from([
+        ("t_one".to_owned(), Some("h/one".to_owned())),
+        ("t_two".to_owned(), Some("h/two".to_owned())),
+        ("t_none".to_owned(), None),
+    ]);
+    (dir, case, targets)
+}
+
+/// A listed case of `id` on `target`, violating `property`.
+fn entry(id: &str, property: &str, target: &str) -> feedback::Entry {
+    feedback::Entry {
+        case: id.to_owned(),
+        property: property.to_owned(),
+        target: target.to_owned(),
+        fault_class: "stale-result".to_owned(),
+    }
+}
+
+/// A listed case resolves to its planted patch, input, harness, allowed
+/// properties and patched production files, hashed in the tree.
+#[test]
+fn a_listed_case_resolves_to_its_planted_case() {
+    let (dir, planted, targets) = planted_repo();
+    let root = dir.path();
+    let cases = feedback::resolve(
+        root,
+        &[entry("p/q/name", "p/q", "t_one")],
+        &[planted],
+        &targets,
+    )
+    .expect("the case resolves");
+    let [case] = cases.as_slice() else {
+        panic!("one case: {cases:?}");
+    };
+    assert_eq!(case.id, "p/q/name");
+    assert_eq!(case.patch, Path::new("qa/planted/p/q/name.patch"));
+    assert_eq!(case.harness, "h/one");
+    assert_eq!(case.witness, Path::new("in/x.bin"));
+    assert_eq!(case.also_violates, ["p/also"]);
+    let file = |path: &str| file_sha256(&root.join(path)).expect("the file is hashed");
+    assert_eq!(
+        case.production_files,
+        BTreeMap::from([("crates/a.rs".to_owned(), file("crates/a.rs"))])
+    );
+    assert_eq!(case.patch_sha256, file("qa/planted/p/q/name.patch"));
+    assert_eq!(case.witness_sha256, file("in/x.bin"));
+    // The runner's pin check in a checkout with the same files passes.
+    check_pins(root, "HEAD", &[case]).expect("the tree holds the hashed files");
+}
+
+/// The list rejects a case with no planted patch, an unknown or
+/// harness-less target, a property that isn't the case's, a target that
+/// runs another harness, a case listed twice, a typed or nested case, and
+/// an empty list.
+#[test]
+fn the_feedback_list_rejects_bad_cases() {
+    let (dir, planted, targets) = planted_repo();
+    let root = dir.path();
+    let typed = crate::planted::Case {
+        witness: crate::planted::Witness::Typed {
+            harness: "h/one".to_owned(),
+            scenario: PathBuf::from("s.json"),
+            plan: PathBuf::from("s.plan"),
+        },
+        ..planted.clone()
+    };
+    let nested = crate::planted::Case {
+        also_violates: Vec::new(),
+        set: vec!["p/broader".to_owned()],
+        ..planted.clone()
+    };
+    let good = entry("p/q/name", "p/q", "t_one");
+    for (entries, planted, why) in [
+        (
+            vec![entry("p/q/missing", "p/q", "t_one")],
+            &planted,
+            "no planted case has the patch qa/planted/p/q/missing.patch",
+        ),
+        (
+            vec![entry("p/q/name", "p/q", "nope")],
+            &planted,
+            "nope isn't a simulator fuzz target",
+        ),
+        (
+            vec![entry("p/q/name", "p/q", "t_none")],
+            &planted,
+            "t_none runs no registered harness",
+        ),
+        (
+            vec![entry("p/q/name", "p/other", "t_one")],
+            &planted,
+            "lists property p/other, but the planted case violates p/q",
+        ),
+        (
+            vec![entry("p/q/name", "p/q", "t_two")],
+            &planted,
+            "t_two runs h/two, but the case's input runs h/one",
+        ),
+        (vec![good.clone(), good.clone()], &planted, "listed twice"),
+        (vec![good.clone()], &typed, "a typed case has no fuzz input"),
+        (vec![good.clone()], &nested, "nested case"),
+        (Vec::new(), &planted, "the list names no case"),
+    ] {
+        let error = feedback::resolve(root, &entries, std::slice::from_ref(planted), &targets)
+            .expect_err(why)
+            .to_string();
+        assert!(error.contains(why), "{why}: {error}");
+    }
+}
+
+/// A mutant campaign may violate a property its case lists in
+/// `also_violates` beside the intended one: a confirmed finding of both is
+/// still detection. The listed property alone misses the patch, and an
+/// unlisted one beside the intended finding is another violation, as the
+/// planted runner judges.
+#[test]
+fn discovery_allows_listed_violations_beside_the_intended_one() {
+    const ALSO: &str = "block/also";
+    let also = [ALSO.to_owned()];
+    let both = CampaignFacts {
+        violated: vec![ID.to_owned(), ALSO.to_owned()],
+        ..found(ID)
+    };
+    let judged = |facts: &CampaignFacts, also_violates: &[String]| {
+        classify::discovery(
+            ID,
+            also_violates,
+            &discovery_run(facts.clone(), Some(Ok(()))),
+        )
+    };
+    assert_eq!(judged(&both, &also).class, Class::IntendedViolation);
+    assert_eq!(judged(&both, &[]).class, Class::OtherViolation);
+    let alone = judged(&found(ALSO), &also);
+    assert_eq!(alone.class, Class::OtherViolation);
+    assert!(
+        alone.reason.contains("allows only beside"),
+        "{}",
+        alone.reason
+    );
+    let unlisted = CampaignFacts {
+        violated: vec![ID.to_owned(), OTHER.to_owned()],
+        ..found(ID)
+    };
+    assert_eq!(judged(&unlisted, &also).class, Class::OtherViolation);
+}
+
+/// A fresh confirmation lets the input violate the case's `also_violates`
+/// beside its property, as `cargo xtask planted` confirms a case, and a
+/// case without them passes no such flag.
+#[cfg(unix)]
+#[test]
+fn confirmation_allows_the_cases_listed_violations() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // `confirm_and_replay` runs its children against the pilot's interrupt
+    // flag.
+    let _flag = crate::sim_minimize::tests::INTERRUPT_FLAG_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let args = dir.path().join("args");
+    // A stand-in for `zakura-sim` whose `confirm` records its arguments and
+    // confirms, and whose `replay` matches.
+    let sim = dir.path().join("sim");
+    fs::write(
+        &sim,
+        format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             confirm) echo \"$@\" > '{}'; mkdir -p \"$9\"; \
+             echo '{{\"status\":\"confirmed\",\"trace\":\"t\"}}' > \"$9/confirmation.json\" ;;\n\
+             esac\n",
+            args.display()
+        ),
+    )
+    .expect("the script is written");
+    fs::set_permissions(&sim, fs::Permissions::from_mode(0o755)).expect("the script is executable");
+    wait_until_executable(&sim);
+    let mut case = committed_catalogue().cases[0].clone();
+    for (also_violates, flag) in [
+        (
+            vec!["p/a".to_owned(), "p/b".to_owned()],
+            Some("--also-violates p/a,p/b"),
+        ),
+        (Vec::new(), None),
+    ] {
+        case.also_violates = also_violates;
+        let out = dir.path().join(format!("out-{}", case.also_violates.len()));
+        let confirmed = confirm_and_replay(
+            &sim,
+            &case,
+            Path::new("in.bin"),
+            &out,
+            Duration::from_secs(60),
+        )
+        .expect("the children run");
+        assert_eq!(confirmed, Ok(()));
+        let passed = fs::read_to_string(&args).expect("confirm ran");
+        assert!(
+            passed.contains(&format!("--property {}", case.property)),
+            "{passed}"
+        );
+        match flag {
+            Some(flag) => assert!(passed.contains(flag), "{passed}"),
+            None => assert!(!passed.contains("--also-violates"), "{passed}"),
+        }
     }
 }

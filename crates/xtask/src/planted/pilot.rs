@@ -1,7 +1,8 @@
-//! `cargo xtask planted pilot (sensitivity|discovery)`: the mutation pilot's
-//! paired runner (mutation plan, mut-3).
+//! `cargo xtask planted pilot (sensitivity|discovery|feedback)`: the
+//! mutation pilot's paired runner (mutation plan, mut-3), and the feedback
+//! comparison (fuzz-14).
 //!
-//! Both experiments read the reviewed catalogue,
+//! The pilot's experiments read the reviewed catalogue,
 //! `qa/mutation-pilot/catalogue.json`, and check its pins before anything
 //! runs: each selected case's patch, witness input and production files
 //! must match the catalogue's hashes at the pinned revision. Every pilot
@@ -26,15 +27,28 @@
 //! must replay Exact in another. It writes `sensitivity.json`.
 //!
 //! `discovery` checks out the fuzz revision, whose production source must
-//! equal the witness revision's. For each target and seed it runs one
-//! campaign on the original build, and for each case and seed one on the
-//! mutant, with the catalogue's bounds, from the frozen empty corpus, each
-//! in a fresh store. Paired campaigns differ only in their store, name and
-//! build. A mutant finding of the intended property must confirm and replay
-//! Exact in fresh processes. It writes `discovery.json`. A scored campaign
-//! runs on a remote campaign host, never locally or in CI. A case whose
-//! catalogue entry sets `discovery_excluded` runs no campaign. The report
-//! lists it with that reason, outside its counts.
+//! equal the witness revision's. For each target, seed and feedback arm
+//! ([`Arm`]) it runs one campaign on the original build, and for each case,
+//! seed and arm one on the mutant, with the catalogue's bounds, from the
+//! frozen empty corpus, each in a fresh store. Paired campaigns differ only
+//! in their store, name and build. A mutant finding of the intended
+//! property must confirm and replay Exact in fresh processes. It writes
+//! `discovery.json`. A scored campaign runs on a remote campaign host,
+//! never locally or in CI. A case whose catalogue entry sets
+//! `discovery_excluded` runs no campaign. The report lists it with that
+//! reason, outside its counts.
+//!
+//! `feedback` runs `discovery`'s campaigns over the feedback comparison's
+//! case list, `qa/mutation-pilot/feedback.toml` ([`feedback`]), instead of
+//! the catalogue: planted cases on fuzz targets that pass the
+//! protocol-state collector. It builds the runner's own `HEAD`, as
+//! `planted --targets` does, and each case's mutant is `HEAD` with the
+//! case's patch. The list's cases are read from the tree the runner runs
+//! from, and the checkout of `HEAD` must hold the same files. Each seed
+//! runs in both arms, semantic feedback on and off, which differ only in
+//! their store, name and feedback mode. The fuzzer must log the arm's mode
+//! at startup. It writes `feedback.json`, with `discovery.json`'s rows and
+//! each case's comparison of its arms ([`compare::compare`]).
 //!
 //! Each result is exactly one class of the plan's table ([`Class`]). Each
 //! report counts its results by class and fault class, and the
@@ -66,6 +80,8 @@ use crate::{
 };
 
 mod classify;
+mod compare;
+mod feedback;
 #[cfg(test)]
 mod tests;
 
@@ -73,6 +89,7 @@ use classify::{
     CampaignFacts, Class, Classified, DiscoveryRun, NoCampaign, Recorded, SensitivityRun, Summary,
     TraceFacts,
 };
+use compare::{Arm, ArmSummary};
 
 /// The catalogue, relative to the repository root.
 const CATALOGUE: &str = "qa/mutation-pilot/catalogue.json";
@@ -126,6 +143,15 @@ const FUZZ_FIELDS: &[&str] = &[
     "cargo_args",
 ];
 
+/// The fuzz build identity's fields a build of `feedback`'s checkout must
+/// match: those the checkout fixes. Every build runs in one invocation
+/// with one toolchain, so the toolchain fields go unchecked.
+const CHECKOUT_FIELDS: &[&str] = &["target", "harness", "git", "lockfile", "fuzz_lockfile"];
+
+/// The fuzz package, whose files the fuzz build's source digest covers
+/// beside the source paths, as `zakura-sim campaign build` reads them.
+const FUZZ_PACKAGE: &str = "qa/fuzz/sim";
+
 /// The error that stops the pilot after SIGINT, SIGTERM or SIGHUP.
 pub(super) const INTERRUPTED_ERROR: &str =
     "interrupted: the running child's process group was killed";
@@ -172,8 +198,12 @@ struct Bounds {
     rss_limit_mb: u64,
     max_restarts: u64,
     abandon_limit: u64,
-    feedback: String,
+    /// The arms each seed runs in, in order.
+    feedback_arms: Vec<Arm>,
     sanitizer: String,
+    /// Each target's extra libFuzzer flags, such as `-len_control=0`.
+    #[serde(default)]
+    libfuzzer_args: BTreeMap<String, Vec<String>>,
 }
 
 /// The catalogue's confirmation bounds.
@@ -193,6 +223,10 @@ struct Case {
     /// Each production file the patch changes, with its hash before.
     production_files: BTreeMap<String, String>,
     property: String,
+    /// Other properties the patch's bug breaks, which a campaign may
+    /// violate beside `property` ([`classify::discovery`]).
+    #[serde(default)]
+    also_violates: Vec<String>,
     harness: String,
     target: String,
     witness: PathBuf,
@@ -211,15 +245,15 @@ struct Case {
 /// What every report records about its run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct Meta {
-    /// `sensitivity` or `discovery`.
+    /// `sensitivity`, `discovery` or `feedback`.
     experiment: String,
-    /// The catalogue's SHA-256.
+    /// The SHA-256 of the catalogue, or of `feedback`'s case list.
     catalogue_sha256: String,
     /// The revision the experiment built.
     built_revision: String,
     /// The runner's own commit.
     runner_revision: String,
-    /// Cases the catalogue holds.
+    /// Cases the catalogue, or `feedback`'s case list, holds.
     reviewed_cases: usize,
 }
 
@@ -262,22 +296,25 @@ struct SensitivityCase {
     cleanup: Option<String>,
 }
 
-/// One discovery case's results, one per seed.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// One discovery case's results, one per seed and arm.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct DiscoveryCase {
     id: String,
     fault_class: String,
     property: String,
     target: String,
     seeds: Vec<SeedResult>,
+    /// What the seeds came to in each arm.
+    arms: Vec<ArmSummary>,
     /// Why the case's worktree or builds couldn't be removed.
     cleanup: Option<String>,
 }
 
-/// One seed's paired campaigns.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// One seed's paired campaigns in one arm.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct SeedResult {
     seed: u32,
+    arm: Arm,
     result: Classified,
     baseline: Option<CampaignFacts>,
     mutant: Option<CampaignFacts>,
@@ -285,66 +322,31 @@ struct SeedResult {
     store: Option<PathBuf>,
 }
 
+/// The experiments `planted pilot` runs.
+const EXPERIMENTS: &str = "expected `sensitivity`, `discovery` or `feedback` after `planted pilot`";
+
 /// Runs `cargo xtask planted pilot <experiment> --out <dir> [--work <dir>]
-/// [--only <case-id>]... [--seed <n>]...`.
+/// [--only <case-id>]... [--seed <n>]... [--arm on|off]...`.
 pub(crate) fn run(
     repo_root: &Path,
     mut args: impl Iterator<Item = String>,
 ) -> Result<(), BoxError> {
-    let experiment = args.next().ok_or(UsageError(
-        "expected `sensitivity` or `discovery` after `planted pilot`",
-    ))?;
-    let Flags {
-        out,
-        work,
-        only,
-        seeds,
-    } = parse_flags(args)?;
-    // Each child runs in its own process group, which a terminal's signal
-    // doesn't reach. The handler lets the running child's group be killed.
-    install_interrupt_handler();
-    let bytes = fs::read(repo_root.join(CATALOGUE))?;
-    let catalogue: Catalogue = serde_json::from_slice(&bytes)?;
-    check_exclusions(&catalogue.cases)?;
-    let cases = select(&catalogue.cases, &only)?;
-    let work = work.unwrap_or_else(|| {
+    let experiment = args.next().ok_or(UsageError(EXPERIMENTS))?;
+    let flags = parse_flags(args)?;
+    let out = flags.out.clone();
+    let work = flags.work.clone().unwrap_or_else(|| {
         repo_root
             .join("target")
             .join("mutation-pilot")
             .join(&experiment)
     });
-    let mut meta = Meta {
-        experiment: experiment.clone(),
-        catalogue_sha256: hex(&Sha256::digest(&bytes)),
-        built_revision: String::new(),
-        runner_revision: head(repo_root)?,
-        reviewed_cases: catalogue.cases.len(),
-    };
+    // Each child runs in its own process group, which a terminal's signal
+    // doesn't reach. The handler lets the running child's group be killed.
+    install_interrupt_handler();
     let summary = match experiment.as_str() {
-        "sensitivity" => {
-            if !seeds.is_empty() {
-                return Err(UsageError("--seed applies only to `discovery`").into());
-            }
-            fresh_dir(&out)?;
-            meta.built_revision = catalogue.source_revision.clone();
-            let rows = sensitivity(repo_root, &catalogue, &cases, &out, &work)?;
-            check_interrupt(&INTERRUPTED)?;
-            write_report(&out, sensitivity_report(meta, rows)?)?
-        }
-        "discovery" => {
-            let seeds = select_seeds(&catalogue.discovery.seeds, &seeds)?;
-            let (scored, excluded) = discovery_cases(&cases)?;
-            fresh_dir(&out)?;
-            meta.built_revision = catalogue.fuzz_build_inputs.source_revision.clone();
-            let rows = discovery(repo_root, &catalogue, &scored, &seeds, &out, &work)?;
-            check_interrupt(&INTERRUPTED)?;
-            write_report(&out, discovery_report(meta, rows, excluded)?)?
-        }
-        _ => {
-            return Err(
-                UsageError("expected `sensitivity` or `discovery` after `planted pilot`").into(),
-            )
-        }
+        "sensitivity" | "discovery" => pilot(repo_root, &experiment, flags, &work)?,
+        "feedback" => feedback_comparison(repo_root, flags, &work)?,
+        _ => return Err(UsageError(EXPERIMENTS).into()),
     };
     println!(
         "{experiment}: {} of {} counted results are intended violations, over {} results; report in {}",
@@ -354,6 +356,138 @@ pub(crate) fn run(
         out.join(format!("{experiment}.json")).display()
     );
     Ok(())
+}
+
+/// Runs the pilot's `sensitivity` or `discovery` `experiment` over the
+/// catalogue's cases, building under `work`, and writes its report.
+fn pilot(
+    repo_root: &Path,
+    experiment: &str,
+    flags: Flags,
+    work: &Path,
+) -> Result<Summary, BoxError> {
+    let Flags {
+        out,
+        only,
+        seeds,
+        arms,
+        ..
+    } = flags;
+    let bytes = fs::read(repo_root.join(CATALOGUE))?;
+    let catalogue: Catalogue = serde_json::from_slice(&bytes)?;
+    check_exclusions(&catalogue.cases)?;
+    let cases = select(&catalogue.cases, &only)?;
+    let mut meta = Meta {
+        experiment: experiment.to_owned(),
+        catalogue_sha256: hex(&Sha256::digest(&bytes)),
+        built_revision: String::new(),
+        runner_revision: head(repo_root)?,
+        reviewed_cases: catalogue.cases.len(),
+    };
+    if experiment == "sensitivity" {
+        if !seeds.is_empty() || !arms.is_empty() {
+            return Err(UsageError("--seed and --arm don't apply to `sensitivity`").into());
+        }
+        fresh_dir(&out)?;
+        meta.built_revision = catalogue.source_revision.clone();
+        let rows = sensitivity(repo_root, &catalogue, &cases, &out, work)?;
+        check_interrupt(&INTERRUPTED)?;
+        return write_report(&out, sensitivity_report(meta, rows)?);
+    }
+    let bounds = &catalogue.discovery;
+    let seeds = select_allocated(&bounds.seeds, &seeds, "seed")?;
+    let arms = select_allocated(&bounds.feedback_arms, &arms, "arm")?;
+    let (scored, excluded) = discovery_cases(&cases)?;
+    let fuzz = &catalogue.fuzz_build_inputs;
+    check_same_source(repo_root, &catalogue.source_revision, &fuzz.source_revision)?;
+    fresh_dir(&out)?;
+    meta.built_revision = fuzz.source_revision.clone();
+    let plan = Experiment {
+        revision: &fuzz.source_revision,
+        toolchain: Some(toolchain(&catalogue.baseline_build)?),
+        bounds,
+        child: Duration::from_secs(catalogue.confirmation.child_seconds),
+        pin: Pin::Catalogue(&catalogue),
+    };
+    let rows = discovery(repo_root, &plan, &scored, &lanes(&seeds, &arms), &out, work)?;
+    check_interrupt(&INTERRUPTED)?;
+    write_report(&out, discovery_report(meta, rows, excluded)?)
+}
+
+/// Runs the feedback comparison over the case list's cases on the runner's
+/// own `HEAD`, building under `work`, and writes its report.
+fn feedback_comparison(repo_root: &Path, flags: Flags, work: &Path) -> Result<Summary, BoxError> {
+    let Flags {
+        out,
+        only,
+        seeds,
+        arms,
+        ..
+    } = flags;
+    let (bytes, list) = feedback::read(repo_root)?;
+    let cases = select(&list.cases, &only)?;
+    let seeds = select_allocated(&list.bounds.seeds, &seeds, "seed")?;
+    let arms = select_allocated(&list.bounds.feedback_arms, &arms, "arm")?;
+    fresh_dir(&out)?;
+    let revision = head(repo_root)?;
+    let meta = Meta {
+        experiment: "feedback".to_owned(),
+        catalogue_sha256: hex(&Sha256::digest(&bytes)),
+        built_revision: revision.clone(),
+        runner_revision: revision.clone(),
+        reviewed_cases: list.cases.len(),
+    };
+    let plan = Experiment {
+        revision: &revision,
+        toolchain: None,
+        bounds: &list.bounds,
+        child: Duration::from_secs(list.confirmation.child_seconds),
+        pin: Pin::Checkout,
+    };
+    let rows = discovery(repo_root, &plan, &cases, &lanes(&seeds, &arms), &out, work)?;
+    check_interrupt(&INTERRUPTED)?;
+    write_report(&out, discovery_report(meta, rows, Vec::new())?)
+}
+
+/// Fails if the fuzz revision `fuzz` changes production source of the
+/// witness revision `witness`.
+fn check_same_source(repo_root: &Path, witness: &str, fuzz: &str) -> Result<(), BoxError> {
+    let same_source = git(repo_root)
+        .args(["diff", "--quiet", witness, fuzz, "--"])
+        .args(provenance::SOURCE_PATHS)
+        .status()?;
+    if same_source.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the fuzz revision {fuzz} changes production source of the witness revision {witness}"
+        )
+        .into())
+    }
+}
+
+/// What a discovery experiment builds and runs.
+struct Experiment<'a> {
+    /// The revision every build checks out.
+    revision: &'a str,
+    /// The rustup toolchain that builds `zakura-sim`, or `None` for the
+    /// checkout's own `rust-toolchain.toml`.
+    toolchain: Option<&'a str>,
+    /// The campaigns' bounds.
+    bounds: &'a Bounds,
+    /// The longest one confirm or replay child may run.
+    child: Duration,
+    /// What each fuzz build must pair with.
+    pin: Pin<'a>,
+}
+
+/// The fuzz build identity an original campaign's build must have.
+enum Pin<'a> {
+    /// The catalogue's pinned fuzz build inputs ([`FUZZ_FIELDS`]).
+    Catalogue(&'a Catalogue),
+    /// The checked-out revision's commit, source and lockfiles, which the
+    /// runner reads from its checkout ([`CHECKOUT_FIELDS`]).
+    Checkout,
 }
 
 /// The flags after the experiment's name.
@@ -367,13 +501,16 @@ struct Flags {
     only: Vec<String>,
     /// Each `--seed`.
     seeds: Vec<u32>,
+    /// Each `--arm`.
+    arms: Vec<Arm>,
 }
 
 /// Reads the flags in `args`. It makes `--out` and `--work` absolute
 /// against the current directory, since the builds run cargo from their
 /// worktree, and cargo would read a relative `CARGO_TARGET_DIR` there.
 fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flags, BoxError> {
-    let (mut out, mut work, mut only, mut seeds) = (None, None, Vec::new(), Vec::new());
+    let (mut out, mut work, mut only, mut seeds, mut arms) =
+        (None, None, Vec::new(), Vec::new(), Vec::new());
     while let Some(flag) = args.next() {
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
@@ -381,6 +518,7 @@ fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flags, BoxError
             "--work" if work.is_none() => work = Some(std::path::absolute(value)?),
             "--only" => only.push(value),
             "--seed" => seeds.push(value.parse::<u32>().map_err(|e| format!("--seed: {e}"))?),
+            "--arm" => arms.push(Arm::parse(&value).map_err(|e| format!("--arm: {e}"))?),
             _ => return Err(format!("unknown or repeated flag `{flag}`").into()),
         }
     }
@@ -389,24 +527,25 @@ fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flags, BoxError
         work,
         only,
         seeds,
+        arms,
     })
 }
 
-/// The cases `only` names, or every case without `only`. Fails on an ID
-/// the catalogue doesn't hold, and on zero selected cases.
+/// The `cases` that `only` names, or every case without `only`. Fails on
+/// an ID `cases` doesn't hold, and on zero selected cases.
 fn select<'a>(cases: &'a [Case], only: &[String]) -> Result<Vec<&'a Case>, String> {
     if let Some(unknown) = only
         .iter()
         .find(|id| !cases.iter().any(|case| &case.id == *id))
     {
-        return Err(format!("--only {unknown} names no catalogue case"));
+        return Err(format!("--only {unknown} names no case"));
     }
     let selected: Vec<&Case> = cases
         .iter()
         .filter(|case| only.is_empty() || only.contains(&case.id))
         .collect();
     if selected.is_empty() {
-        return Err("zero cases selected: the catalogue holds none".to_owned());
+        return Err("zero cases selected: there are none".to_owned());
     }
     Ok(selected)
 }
@@ -444,21 +583,73 @@ fn discovery_cases<'a>(cases: &[&'a Case]) -> Result<(Vec<&'a Case>, Vec<Exclude
     Ok((scored, excluded))
 }
 
-/// The seeds `only` names, or every catalogue seed without it. Fails on a
-/// seed the catalogue doesn't allocate, and on zero seeds.
-fn select_seeds(seeds: &[u32], only: &[u32]) -> Result<Vec<u32>, String> {
-    if let Some(unknown) = only.iter().find(|seed| !seeds.contains(seed)) {
-        return Err(format!("--seed {unknown} isn't a catalogue seed"));
+/// The values of the `allocated` seeds or arms that `only` names, or every
+/// one without `only`, in allocation order. `flag` names them, as `seed` or
+/// `arm`. Fails on a value not allocated, on one allocated twice, and on
+/// zero values.
+fn select_allocated<T: Copy + PartialEq + std::fmt::Display>(
+    allocated: &[T],
+    only: &[T],
+    flag: &str,
+) -> Result<Vec<T>, String> {
+    if let Some(unknown) = only.iter().find(|value| !allocated.contains(value)) {
+        return Err(format!("--{flag} {unknown} isn't an allocated {flag}"));
     }
-    let selected: Vec<u32> = seeds
+    if let Some((_, twice)) = allocated
+        .iter()
+        .enumerate()
+        .find(|(at, value)| allocated[..*at].contains(value))
+    {
+        return Err(format!("{flag} {twice} is allocated twice"));
+    }
+    let selected: Vec<T> = allocated
         .iter()
         .copied()
-        .filter(|seed| only.is_empty() || only.contains(seed))
+        .filter(|value| only.is_empty() || only.contains(value))
         .collect();
     if selected.is_empty() {
-        return Err("zero seeds selected: the catalogue allocates none".to_owned());
+        return Err(format!("zero {flag}s selected: none is allocated"));
     }
     Ok(selected)
+}
+
+/// One paired campaign's place in the discovery plan: its seed and arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Lane {
+    seed: u32,
+    arm: Arm,
+}
+
+impl Lane {
+    /// The lane's directory, under its target's or case's: `<arm>/seed-<n>`.
+    fn dir(self) -> PathBuf {
+        Path::new(self.arm.mode()).join(format!("seed-{}", self.seed))
+    }
+}
+
+/// Every lane of `seeds` and `arms`, each seed's arms together. An
+/// interrupted run then leaves paired arms, and the arms share the host's
+/// drift over the run.
+fn lanes(seeds: &[u32], arms: &[Arm]) -> Vec<Lane> {
+    seeds
+        .iter()
+        .flat_map(|&seed| arms.iter().map(move |&arm| Lane { seed, arm }))
+        .collect()
+}
+
+/// The original campaigns that `cases` need on `lanes`: one per target and
+/// lane, for each case that review didn't mark equivalent, in plan order.
+fn baseline_lanes(cases: &[&Case], lanes: &[Lane]) -> Vec<(String, Lane)> {
+    let mut planned: Vec<(String, Lane)> = Vec::new();
+    for case in cases.iter().filter(|case| case.equivalent.is_none()) {
+        for lane in lanes {
+            let key = (case.target.clone(), *lane);
+            if !planned.contains(&key) {
+                planned.push(key);
+            }
+        }
+    }
+    planned
 }
 
 /// The sensitivity report over `cases`. Fails on zero cases.
@@ -524,7 +715,7 @@ fn sensitivity(
         let built = build_sim(
             &tree,
             &work.join("baseline").join("target"),
-            toolchain,
+            Some(toolchain),
             &out.join("baseline-build.log"),
         )?;
         let mut rows = Vec::new();
@@ -599,7 +790,7 @@ fn sensitivity_case(
                 let built = build_sim(
                     &tree,
                     &target,
-                    toolchain(&catalogue.baseline_build)?,
+                    Some(toolchain(&catalogue.baseline_build)?),
                     &dir.join("mutant-build.log"),
                 )?;
                 let sim = match built {
@@ -630,9 +821,8 @@ fn sensitivity_case(
                 ) {
                     run.confirmation = Some(confirm_and_replay(
                         &sim,
-                        &case.harness,
+                        case,
                         &tree.join(&case.witness),
-                        &case.property,
                         &dir.join("confirmation"),
                         child,
                     )?);
@@ -732,91 +922,69 @@ fn witness_run(
     })
 }
 
-/// Runs each case's discovery experiment on `seeds`, writing stores and
-/// reports under `out` and building under `work`.
+/// Runs `plan`'s discovery experiment for each case on `lanes`, writing
+/// stores and reports under `out` and building under `work`.
 fn discovery(
     repo_root: &Path,
-    catalogue: &Catalogue,
+    plan: &Experiment,
     cases: &[&Case],
-    seeds: &[u32],
+    lanes: &[Lane],
     out: &Path,
     work: &Path,
 ) -> Result<Vec<DiscoveryCase>, BoxError> {
-    let fuzz = &catalogue.fuzz_build_inputs;
-    let same_source = git(repo_root)
-        .args([
-            "diff",
-            "--quiet",
-            &catalogue.source_revision,
-            &fuzz.source_revision,
-            "--",
-        ])
-        .args(provenance::SOURCE_PATHS)
-        .status()?;
-    if !same_source.success() {
-        return Err(format!(
-            "the fuzz revision {} changes production source of the witness revision {}",
-            fuzz.source_revision, catalogue.source_revision
-        )
-        .into());
-    }
-    let toolchain = toolchain(&catalogue.baseline_build)?;
-    let child = Duration::from_secs(catalogue.confirmation.child_seconds);
     let tree = work.join("baseline").join("worktree");
-    add_worktree(repo_root, &tree, &fuzz.source_revision)?;
+    add_worktree(repo_root, &tree, plan.revision)?;
     let rows = (|| {
-        check_pins(&tree, &fuzz.source_revision, cases)?;
-        let corpus = tree.join(&catalogue.discovery.corpus);
+        check_pins(&tree, plan.revision, cases)?;
+        let pairing = Pairing::of(&plan.pin, &tree);
+        let corpus = tree.join(&plan.bounds.corpus);
         check_empty_corpus(&corpus)?;
         let built = build_sim(
             &tree,
             &work.join("baseline").join("sim-target"),
-            toolchain,
+            plan.toolchain,
             &out.join("baseline-build.log"),
         )?;
         let mut baselines = BTreeMap::new();
-        for case in cases.iter().filter(|case| case.equivalent.is_none()) {
-            for seed in seeds {
-                let key = (case.target.clone(), *seed);
-                if baselines.contains_key(&key) {
-                    continue;
-                }
-                let lane_dir = out
-                    .join("baseline")
-                    .join(&case.target)
-                    .join(format!("seed-{seed}"));
-                let facts = match &built {
-                    Err(failure) => Err(LaneError::Build(failure.of("the original simulator"))),
-                    Ok(sim) => campaign_lane(
-                        sim,
-                        &lane_dir,
-                        &work.join("baseline").join("fuzz-target"),
-                        case,
-                        *seed,
-                        catalogue,
-                        &corpus,
-                        false,
-                    )?
-                    .map_err(|error| match error {
-                        LaneError::Build(failure) => {
-                            LaneError::Build(failure.of("the original fuzz target"))
-                        }
-                        error => error,
-                    }),
-                };
-                baselines.insert(key, facts);
-            }
+        for (target, lane) in baseline_lanes(cases, lanes) {
+            let case = cases
+                .iter()
+                .find(|case| case.target == target)
+                .expect("each planned target comes from a selected case");
+            let lane_dir = out.join("baseline").join(&target).join(lane.dir());
+            let facts = match &built {
+                Err(failure) => Err(LaneError::Build(failure.of("the original simulator"))),
+                Ok(sim) => campaign_lane(
+                    sim,
+                    &lane_dir,
+                    &work.join("baseline").join("fuzz-target"),
+                    case,
+                    lane,
+                    plan.bounds,
+                    &pairing,
+                    &corpus,
+                    false,
+                )?
+                .map_err(|error| match error {
+                    LaneError::Build(failure) => {
+                        LaneError::Build(failure.of("the original fuzz target"))
+                    }
+                    error => error,
+                }),
+            };
+            baselines.insert((target, lane), facts);
         }
         let mut rows = Vec::new();
         for case in cases {
             let row = discovery_case(
-                repo_root, catalogue, case, seeds, &baselines, &corpus, out, work, child,
+                repo_root, plan, &pairing, case, lanes, &baselines, &corpus, out, work,
             )?;
             for seed in &row.seeds {
                 println!(
-                    "{} seed {}: {} — {}",
+                    "{} seed {} feedback {}: {} — {}",
                     row.id,
                     seed.seed,
+                    seed.arm,
                     class_name(seed.result.class),
                     seed.result.reason
                 );
@@ -829,28 +997,28 @@ fn discovery(
     rows
 }
 
-/// Runs one case's mutant campaigns on `seeds`, beside the original's
-/// `baselines` by target and seed.
+/// Runs one case's mutant campaigns on `lanes`, beside the original's
+/// `baselines` by target and lane.
 #[allow(clippy::too_many_arguments)]
 fn discovery_case(
     repo_root: &Path,
-    catalogue: &Catalogue,
+    plan: &Experiment,
+    pairing: &Pairing,
     case: &Case,
-    seeds: &[u32],
-    baselines: &BTreeMap<(String, u32), Result<CampaignFacts, LaneError>>,
+    lanes: &[Lane],
+    baselines: &BTreeMap<(String, Lane), Result<CampaignFacts, LaneError>>,
     corpus: &Path,
     out: &Path,
     work: &Path,
-    child: Duration,
 ) -> Result<DiscoveryCase, BoxError> {
-    let mut runs: Vec<(u32, DiscoveryRun, Option<PathBuf>)> = seeds
+    let mut runs: Vec<(Lane, DiscoveryRun, Option<PathBuf>)> = lanes
         .iter()
-        .map(|seed| {
+        .map(|lane| {
             let mut run = DiscoveryRun {
                 equivalent: case.equivalent.clone(),
                 ..DiscoveryRun::default()
             };
-            match baselines.get(&(case.target.clone(), *seed)) {
+            match baselines.get(&(case.target.clone(), *lane)) {
                 None => {}
                 Some(Ok(facts)) => run.baseline = Some(Ok(facts.clone())),
                 Some(Err(LaneError::Build(BuildFailure::Broken(why)))) => {
@@ -861,7 +1029,7 @@ fn discovery_case(
                 }
                 Some(Err(error)) => run.baseline = Some(Err(NoCampaign::Failed(error.to_string()))),
             }
-            (*seed, run, None)
+            (*lane, run, None)
         })
         .collect();
     let runnable = |run: &DiscoveryRun| {
@@ -875,11 +1043,7 @@ fn discovery_case(
             case_work.join("sim-target"),
             case_work.join("fuzz-target"),
         );
-        add_worktree(
-            repo_root,
-            &tree,
-            &catalogue.fuzz_build_inputs.source_revision,
-        )?;
+        add_worktree(repo_root, &tree, plan.revision)?;
         let ran = (|| {
             let dir = out.join("cases").join(&case.id);
             fs::create_dir_all(&dir)?;
@@ -890,12 +1054,12 @@ fn discovery_case(
                 Ok(()) => build_sim(
                     &tree,
                     &sim_target,
-                    toolchain(&catalogue.baseline_build)?,
+                    plan.toolchain,
                     &dir.join("mutant-build.log"),
                 )?
                 .map_err(|failure| failure.of("the mutant simulator")),
             };
-            for (seed, run, store) in runs.iter_mut().filter(|(_, run, _)| runnable(run)) {
+            for (lane, run, store) in runs.iter_mut().filter(|(_, run, _)| runnable(run)) {
                 let sim = match &mutant {
                     Err(BuildFailure::Rejected(why)) => {
                         run.patch = Some(Err(why.clone()));
@@ -907,14 +1071,15 @@ fn discovery_case(
                     }
                     Ok(sim) => sim.clone(),
                 };
-                let lane_dir = dir.join(format!("seed-{seed}"));
+                let lane_dir = dir.join(lane.dir());
                 match campaign_lane(
                     &sim,
                     &lane_dir,
                     &fuzz_target,
                     case,
-                    *seed,
-                    catalogue,
+                    *lane,
+                    plan.bounds,
+                    pairing,
                     corpus,
                     true,
                 )? {
@@ -934,11 +1099,10 @@ fn discovery_case(
                         if let Some(input) = &facts.intended_input {
                             run.confirmation = Some(confirm_and_replay(
                                 &sim,
-                                &case.harness,
+                                case,
                                 &lane_dir.join("store").join(input),
-                                &case.property,
                                 &lane_dir.join("confirmation"),
-                                child,
+                                plan.child,
                             )?);
                         }
                         run.mutant = Some(Ok(facts));
@@ -955,24 +1119,30 @@ fn discovery_case(
         cleanup = clean(repo_root, &tree, &[&sim_target, &fuzz_target]);
         ran?;
     }
-    let ok = |lane: &Option<Result<CampaignFacts, NoCampaign>>| {
-        lane.as_ref().and_then(|lane| lane.as_ref().ok()).cloned()
+    let ok = |campaign: &Option<Result<CampaignFacts, NoCampaign>>| {
+        campaign
+            .as_ref()
+            .and_then(|campaign| campaign.as_ref().ok())
+            .cloned()
     };
+    let seeds: Vec<SeedResult> = runs
+        .into_iter()
+        .map(|(lane, run, store)| SeedResult {
+            seed: lane.seed,
+            arm: lane.arm,
+            result: classify::discovery(&case.property, &case.also_violates, &run),
+            baseline: ok(&run.baseline),
+            mutant: ok(&run.mutant),
+            store,
+        })
+        .collect();
     Ok(DiscoveryCase {
         id: case.id.clone(),
         fault_class: case.fault_class.clone(),
         property: case.property.clone(),
         target: case.target.clone(),
-        seeds: runs
-            .into_iter()
-            .map(|(seed, run, store)| SeedResult {
-                seed,
-                result: classify::discovery(&case.property, &run),
-                baseline: ok(&run.baseline),
-                mutant: ok(&run.mutant),
-                store,
-            })
-            .collect(),
+        arms: compare::compare(&seeds),
+        seeds,
         cleanup,
     })
 }
@@ -1051,16 +1221,18 @@ impl std::fmt::Display for LaneError {
 }
 
 /// Builds `case`'s fuzz target with `sim` in `fuzz_target`, and runs one
-/// campaign on it with the catalogue's bounds and `seed`, from `corpus`, in
-/// a fresh store under `dir`. Reads what the store's records show.
+/// campaign on it with `bounds` and `lane`'s seed and arm, from `corpus`,
+/// in a fresh store under `dir`. Reads what the store's records show, and
+/// whether the build pairs with `pairing`.
 #[allow(clippy::too_many_arguments)]
 fn campaign_lane(
     sim: &Path,
     dir: &Path,
     fuzz_target: &Path,
     case: &Case,
-    seed: u32,
-    catalogue: &Catalogue,
+    lane: Lane,
+    bounds: &Bounds,
+    pairing: &Pairing,
     corpus: &Path,
     mutated: bool,
 ) -> Result<Result<CampaignFacts, LaneError>, BoxError> {
@@ -1069,7 +1241,6 @@ fn campaign_lane(
         return Err(format!("{} isn't a fresh store", store.display()).into());
     }
     fs::create_dir_all(dir)?;
-    let bounds = &catalogue.discovery;
     let mut build = Command::new(sim);
     build
         .args(["campaign", "build", "--store"])
@@ -1102,15 +1273,20 @@ fn campaign_lane(
             "the store holds no single build".to_owned(),
         )));
     };
-    let name =
-        format!("{}-{}", if mutated { &case.id } else { &case.target }, seed).replace('/', "-");
+    let name = format!(
+        "{}-{}-{}",
+        if mutated { &case.id } else { &case.target },
+        lane.arm,
+        lane.seed
+    )
+    .replace('/', "-");
     let mut start = Command::new(sim);
     start.args(start_args(
         bounds,
         &name,
-        &case.harness,
+        case,
         &build_digest,
-        seed,
+        lane,
         corpus,
         &store,
     ));
@@ -1159,9 +1335,11 @@ fn campaign_lane(
         .get("inputs")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
-    let end: Option<Value> = fs::read(store.join("runs").join(&run).join("end.json"))
+    let run_dir = store.join("runs").join(&run);
+    let end: Option<Value> = fs::read(run_dir.join("end.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let attempts = read_attempts(&run_dir, end.as_ref());
     let evidence_file = dir.join("evidence.json");
     let mut evidence = Command::new(sim);
     evidence
@@ -1185,22 +1363,77 @@ fn campaign_lane(
             ))))
         }
     };
-    let mut facts = campaign_facts(&case.property, end.as_ref(), &evidence, initial_inputs);
-    let expected = expected_fuzz_identity(catalogue, case);
+    let mut facts = campaign_facts(
+        &case.property,
+        end.as_ref(),
+        &evidence,
+        initial_inputs,
+        &attempts,
+    );
     let actual = manifest.pointer("/build/identity").unwrap_or(&Value::Null);
-    facts.unpaired = paired_identity(&expected, actual, FUZZ_FIELDS, mutated);
+    let unpaired: Vec<String> = [
+        paired_identity(&pairing.expected(case), actual, pairing.fields, mutated),
+        arm_mismatch(&manifest, lane.arm, bounds.feedback_arms.len() > 1),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    facts.unpaired = (!unpaired.is_empty()).then(|| unpaired.join("; "));
     Ok(Ok(facts))
 }
 
-/// `campaign start`'s arguments for one lane: every bound and the seed come
-/// from the catalogue, so paired campaigns differ only in `store`, `name`
-/// and `build`.
+/// Each worker's attempts, in order, from its `attempts.jsonl` in the run
+/// directory `run_dir`, for each worker the end record `end` lists. A
+/// missing file or line reads as no attempt.
+fn read_attempts(run_dir: &Path, end: Option<&Value>) -> Vec<Vec<Value>> {
+    end.and_then(|end| end.get("workers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|worker| worker.get("index").and_then(Value::as_u64))
+        .map(|index| {
+            let path = run_dir
+                .join("workers")
+                .join(index.to_string())
+                .join("attempts.jsonl");
+            fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        })
+        .collect()
+}
+
+/// Why the run whose manifest is `manifest` didn't run in `arm`, or `None`
+/// if it did. The fuzzer logs its feedback mode at startup, which the
+/// manifest records. A target without a collector logs none: that's no
+/// mismatch for a lone arm, but when `compared` with another arm, the two
+/// couldn't differ.
+fn arm_mismatch(manifest: &Value, arm: Arm, compared: bool) -> Option<String> {
+    match manifest.pointer("/feedback/mode").and_then(Value::as_str) {
+        Some(mode) if mode == arm.mode() => None,
+        Some(mode) => Some(format!(
+            "the fuzzer ran with feedback {mode}, not the arm's {arm}"
+        )),
+        None if compared => Some(format!(
+            "the fuzzer logged no semantic feedback, so its {arm} arm can't differ from another"
+        )),
+        None => None,
+    }
+}
+
+/// `campaign start`'s arguments for one lane of `case`: every bound comes
+/// from `bounds`, with the libFuzzer flags it gives `case`'s target, and
+/// the seed and feedback mode from `lane`. Paired campaigns differ only in
+/// `store`, `name` and `build`, and one seed's arms only in `store`, `name`
+/// and the feedback mode.
 fn start_args(
     bounds: &Bounds,
     name: &str,
-    harness: &str,
+    case: &Case,
     build: &str,
-    seed: u32,
+    lane: Lane,
     corpus: &Path,
     store: &Path,
 ) -> Vec<OsString> {
@@ -1211,43 +1444,109 @@ fn start_args(
     args.push(store.into());
     for (flag, value) in [
         ("--campaign", name.to_owned()),
-        ("--sim", harness.to_owned()),
+        ("--sim", case.harness.clone()),
         ("--build", build.to_owned()),
         ("--seconds", bounds.seconds_per_seed.to_string()),
         ("--workers", bounds.workers.to_string()),
-        ("--seed", seed.to_string()),
+        ("--seed", lane.seed.to_string()),
         ("--max-len", bounds.max_len.to_string()),
         ("--timeout", bounds.input_timeout_seconds.to_string()),
         ("--rss-limit-mb", bounds.rss_limit_mb.to_string()),
         ("--max-restarts", bounds.max_restarts.to_string()),
         ("--abandon-limit", bounds.abandon_limit.to_string()),
-        ("--feedback", bounds.feedback.clone()),
+        ("--feedback", lane.arm.mode().to_owned()),
     ] {
         args.push(flag.into());
         args.push(value.into());
+    }
+    for arg in bounds
+        .libfuzzer_args
+        .get(&case.target)
+        .into_iter()
+        .flatten()
+    {
+        args.push("--libfuzzer-arg".into());
+        args.push(arg.into());
     }
     args.push("--fixtures".into());
     args.push(corpus.into());
     args
 }
 
-/// The fuzz build identity the catalogue pins for `case`'s target, with
-/// the field names a manifest's build identity uses.
-fn expected_fuzz_identity(catalogue: &Catalogue, case: &Case) -> Value {
-    let fuzz = &catalogue.fuzz_build_inputs;
-    serde_json::json!({
-        "target": case.target,
-        "harness": case.harness,
-        "git": fuzz.source_revision,
-        "source": fuzz.source_sha256,
-        "lockfile": catalogue.baseline_build.get("lockfile"),
-        "fuzz_lockfile": fuzz.lockfile_sha256,
-        "rustc": fuzz.rustc,
-        "cargo_fuzz": fuzz.cargo_fuzz,
-        "libfuzzer_sys": fuzz.libfuzzer_sys,
-        "rustflags": fuzz.rustflags,
-        "cargo_args": fuzz.cargo_args,
-    })
+/// The fuzz build identity an original campaign's build must have, less
+/// its target and harness, and the fields a mutant's build shares with it.
+struct Pairing {
+    /// The identity's fields, with the names a manifest's build identity
+    /// uses.
+    identity: serde_json::Map<String, Value>,
+    /// The fields a build must match: all but `dirty` and `source`, which
+    /// [`paired_identity`] checks by whether the build is a mutant.
+    fields: &'static [&'static str],
+}
+
+impl Pairing {
+    /// The identity `pin` names, read from `tree`, the checkout every build
+    /// starts from, for [`Pin::Checkout`].
+    fn of(pin: &Pin, tree: &Path) -> Pairing {
+        match pin {
+            Pin::Catalogue(catalogue) => {
+                let fuzz = &catalogue.fuzz_build_inputs;
+                let Value::Object(identity) = serde_json::json!({
+                    "git": fuzz.source_revision,
+                    "source": fuzz.source_sha256,
+                    "lockfile": catalogue.baseline_build.get("lockfile"),
+                    "fuzz_lockfile": fuzz.lockfile_sha256,
+                    "rustc": fuzz.rustc,
+                    "cargo_fuzz": fuzz.cargo_fuzz,
+                    "libfuzzer_sys": fuzz.libfuzzer_sys,
+                    "rustflags": fuzz.rustflags,
+                    "cargo_args": fuzz.cargo_args,
+                }) else {
+                    unreachable!("a JSON object literal is an object")
+                };
+                Pairing {
+                    identity,
+                    fields: FUZZ_FIELDS,
+                }
+            }
+            Pin::Checkout => Pairing {
+                identity: checkout_identity(tree),
+                fields: CHECKOUT_FIELDS,
+            },
+        }
+    }
+
+    /// The identity `case`'s original build must have.
+    fn expected(&self, case: &Case) -> Value {
+        let mut identity = self.identity.clone();
+        identity.insert("target".to_owned(), Value::from(case.target.as_str()));
+        identity.insert("harness".to_owned(), Value::from(case.harness.as_str()));
+        Value::Object(identity)
+    }
+}
+
+/// The fuzz build identity's fields that `tree`, a clean checkout, fixes:
+/// its commit, the source digest that `zakura-sim campaign build` takes
+/// over the source paths and the fuzz package, and both lockfiles' digests.
+fn checkout_identity(tree: &Path) -> serde_json::Map<String, Value> {
+    let mut paths = provenance::SOURCE_PATHS.to_vec();
+    paths.push(FUZZ_PACKAGE);
+    let checkout = provenance::Provenance::read(tree, &paths);
+    let digest = |path: PathBuf| {
+        provenance::file_digest(&path).unwrap_or_else(|| provenance::UNKNOWN.to_owned())
+    };
+    let mut identity = serde_json::Map::new();
+    identity.insert("git".to_owned(), Value::from(checkout.git));
+    identity.insert("source".to_owned(), Value::from(checkout.source));
+    identity.insert(
+        "lockfile".to_owned(),
+        Value::from(digest(tree.join("Cargo.lock"))),
+    );
+    identity.insert(
+        "fuzz_lockfile".to_owned(),
+        Value::from(digest(tree.join(FUZZ_PACKAGE).join("Cargo.lock"))),
+    );
+    identity
 }
 
 /// Why `actual`, a build identity, doesn't pair with `expected`, the
@@ -1275,7 +1574,7 @@ fn paired_identity(
     }
     (!differ.is_empty()).then(|| {
         format!(
-            "the {} build doesn't pair with the catalogue's: {} differ",
+            "the {} build doesn't pair with the expected identity: {} differ",
             if mutated { "mutant" } else { "original" },
             differ.join(", ")
         )
@@ -1332,28 +1631,31 @@ fn failure_kind(path: &str) -> Failure {
 }
 
 /// What a campaign's end record `end` and `evidence` show about
-/// `property`, for a run whose initial snapshot held `initial_inputs`.
+/// `property`, for a run whose initial snapshot held `initial_inputs` and
+/// whose workers made `attempts`, each worker's in order.
 fn campaign_facts(
     property: &str,
     end: Option<&Value>,
     evidence: &Value,
     initial_inputs: usize,
+    attempts: &[Vec<Value>],
 ) -> CampaignFacts {
     let mut violated = BTreeSet::new();
     let (mut failures, mut killed, mut crashes, mut intended_input) =
         (Vec::new(), Vec::new(), Vec::new(), None);
+    let mut intended_digests = BTreeSet::new();
     let records = end
         .and_then(|end| end.get("failures"))
         .and_then(Value::as_array);
-    for path in records
-        .into_iter()
-        .flatten()
-        .filter_map(|record| record.get("path").and_then(Value::as_str))
-    {
+    for record in records.into_iter().flatten() {
+        let Some(path) = record.get("path").and_then(Value::as_str) else {
+            continue;
+        };
         match failure_kind(path) {
             Failure::Violation(violation) => {
-                if violation == property && intended_input.is_none() {
-                    intended_input = Some(path.to_owned());
+                if violation == property {
+                    intended_input.get_or_insert_with(|| path.to_owned());
+                    intended_digests.extend(record.get("sha256").and_then(Value::as_str));
                 }
                 violated.insert(violation);
             }
@@ -1374,6 +1676,12 @@ fn campaign_facts(
             .and_then(Value::as_u64)
             .unwrap_or(0)
     };
+    let worker_millis = end
+        .and_then(|end| end.get("workers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|worker| worker.get("millis").and_then(Value::as_u64));
     CampaignFacts {
         status: evidence
             .get("status")
@@ -1407,29 +1715,73 @@ fn campaign_facts(
             .flatten()
             .filter_map(|worker| worker.get("millis").and_then(Value::as_u64))
             .sum(),
+        worker_secs: Duration::from_millis(worker_millis.max().unwrap_or(0)).as_secs_f64(),
+        features_reached: evidence
+            .pointer("/totals/features")
+            .and_then(Value::as_object)
+            .map_or(0, serde_json::Map::len),
+        first_intended_secs: first_detection(attempts, &intended_digests),
+        censored: intended_input.is_none(),
         intended_input,
         unpaired: None,
     }
 }
 
-/// Confirms `input`'s violation of `property` on `harness` with `sim` in a
-/// fresh process, then replays the confirmed trace in another, writing
-/// under `dir`. Each child gets `child`.
+/// The seconds a worker had fuzzed when its first process that crashed on
+/// an input with one of `digests` ended, the earliest over the workers,
+/// each its `attempts` in order. A process stops at an `Active` violation
+/// once it records it, and libFuzzer saves the input as a crash, so the
+/// time bounds the detection from above. `None` if no crash matches.
+fn first_detection(attempts: &[Vec<Value>], digests: &BTreeSet<&str>) -> Option<f64> {
+    attempts
+        .iter()
+        .filter_map(|worker| {
+            let mut millis = 0u64;
+            for attempt in worker {
+                millis = millis
+                    .saturating_add(attempt.get("millis").and_then(Value::as_u64).unwrap_or(0));
+                let crashed = attempt
+                    .get("artifacts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|artifact| {
+                        let path = artifact.get("path").and_then(Value::as_str);
+                        let digest = artifact.get("sha256").and_then(Value::as_str);
+                        path.is_some_and(|path| failure_kind(path) == Failure::Crash)
+                            && digest.is_some_and(|digest| digests.contains(digest))
+                    });
+                if crashed {
+                    return Some(millis);
+                }
+            }
+            None
+        })
+        .min()
+        .map(|millis| Duration::from_millis(millis).as_secs_f64())
+}
+
+/// Confirms `input`'s violation of `case`'s property on its harness with
+/// `sim` in a fresh process, then replays the confirmed trace in another,
+/// writing under `dir`. Each child gets `child`. The input may violate the
+/// case's `also_violates` too, as `cargo xtask planted` confirms a case.
 fn confirm_and_replay(
     sim: &Path,
-    harness: &str,
+    case: &Case,
     input: &Path,
-    property: &str,
     dir: &Path,
     child: Duration,
 ) -> Result<Result<(), String>, BoxError> {
     let confirm_dir = dir.join("confirm");
     let mut confirm = Command::new(sim);
     confirm
-        .args(["confirm", "--sim", harness, "--input"])
+        .args(["confirm", "--sim", &case.harness, "--input"])
         .arg(input)
-        .args(["--property", property, "--out"])
+        .args(["--property", &case.property, "--out"])
         .arg(&confirm_dir);
+    if !case.also_violates.is_empty() {
+        confirm.args(["--also-violates", &case.also_violates.join(",")]);
+    }
     let ended = run_pilot_child(&mut confirm, &dir.join("confirm.log"), Some(child))?;
     let confirmation = fs::read(confirm_dir.join(CONFIRMATION_FILE))
         .ok()
@@ -1582,9 +1934,10 @@ fn undeclared(changed: &BTreeSet<String>, declared: &BTreeMap<String, String>) -
 
 /// Checks each case's frozen inputs, its patch, witness input and
 /// production files, in `tree`, a checkout of the pinned `revision`, before
-/// any patch, against the catalogue's hashes. The pilot reads every input
-/// at the pin, never from the tree it runs from, so a later change there
-/// leaves the run alone. A patch missing at the pin fails.
+/// any patch, against the case's hashes: the catalogue's, or for
+/// `feedback`, those of the runner's tree. Every input is read at the pin,
+/// never from the tree the runner runs from, so a later change there leaves
+/// the run alone. A patch missing at the pin fails.
 fn check_pins(tree: &Path, revision: &str, cases: &[&Case]) -> Result<(), BoxError> {
     let missing: Vec<String> = cases
         .iter()
@@ -1619,7 +1972,7 @@ fn check_pins(tree: &Path, revision: &str, cases: &[&Case]) -> Result<(), BoxErr
         Ok(())
     } else {
         Err(format!(
-            "frozen inputs differ from the catalogue: {}",
+            "frozen inputs differ from the cases' hashes: {}",
             differ.join(", ")
         )
         .into())
@@ -1653,20 +2006,33 @@ fn toolchain(build: &Value) -> Result<&str, String> {
         .ok_or_else(|| "the catalogue's witness build names no rustc version".to_owned())
 }
 
-/// Builds `tree`'s `zakura-sim` binary in `target` with `toolchain` and the
-/// catalogue's witness build flags: the dev profile without debug
-/// information or incremental compilation, and the simulator's flag. The
-/// binary's path, or why the build failed. Cargo writes its messages as
-/// JSON, which [`sim_build_failure`] reads.
+/// Builds `tree`'s `zakura-sim` binary in `target` with `toolchain`, or
+/// the checkout's own without one, and the catalogue's witness build flags:
+/// the dev profile without debug information or incremental compilation,
+/// and the simulator's flag. The binary's path, or why the build failed.
+/// Cargo writes its messages as JSON, which [`sim_build_failure`] reads.
 fn build_sim(
     tree: &Path,
     target: &Path,
-    toolchain: &str,
+    toolchain: Option<&str>,
     log: &Path,
 ) -> Result<Result<PathBuf, BuildFailure>, BoxError> {
-    let mut cargo = Command::new("rustup");
+    let mut cargo = match toolchain {
+        Some(toolchain) => {
+            let mut rustup = Command::new("rustup");
+            rustup.args(["run", toolchain, "cargo"]);
+            rustup
+        }
+        // The runner's own toolchain override would win over the
+        // checkout's `rust-toolchain.toml`.
+        None => {
+            let mut cargo = Command::new("cargo");
+            cargo.env_remove("RUSTUP_TOOLCHAIN");
+            cargo
+        }
+    };
     cargo
-        .args(["run", toolchain, "cargo", "build", "--locked"])
+        .args(["build", "--locked"])
         .arg("--message-format=json")
         .args(["-p", "zakura-sim", "--bin", "zakura-sim"])
         .env("RUSTFLAGS", SIM_RUSTFLAGS)

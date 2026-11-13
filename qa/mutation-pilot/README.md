@@ -7,6 +7,9 @@ discovery corpus. Each case names its causal trigger and the observations
 that expose the changed behavior. The catalogue changes no production code,
 property, generator, witness input or mutation patch.
 
+`feedback.toml` lists the planted cases that the feedback comparison
+(fuzz-14) runs with semantic feedback on and off, under Feedback comparison.
+
 This package prepares the pilot. No mutant and no scored discovery campaign
 has run. The full retained-suite readiness gate remains open.
 The [mutation plan](https://valargroup.getoutline.com/doc/6af54d3b-7ca5-4f05-975d-77893109e7ad)
@@ -92,6 +95,13 @@ in CI.
   --rss-limit-mb 2048 --max-restarts 0 --abandon-limit 1 --feedback on
 ```
 
+The pilot's targets run machine harnesses. A machine history logs no
+observation, and its safety property opens no obligation, so the
+protocol-state collector would reach no feature on them. At `debba4e31` they
+pass no collector either. So `--feedback on` adds nothing to libFuzzer's
+code edges here, and the pilot's discovery runs one arm. The feedback
+comparison (fuzz-14) runs on other targets, under Feedback comparison.
+
 ## Verify
 
 ```sh
@@ -135,6 +145,7 @@ replaces an earlier result.
 ```sh
 cargo xtask planted pilot sensitivity --out "$OUT" [--only <case-id>]...
 cargo xtask planted pilot discovery --out "$OUT" [--only <case-id>]... [--seed <n>]...
+cargo xtask planted pilot feedback --out "$OUT" [--only <case-id>]... [--seed <n>]... [--arm on|off]...
 ```
 
 `sensitivity` builds the witness revision with Rust 1.99.0 and the dev
@@ -160,6 +171,81 @@ failures, invalid mutants and equivalent mutants, and keeps not-applicable
 results. `discovery` skips each case whose catalogue entry sets
 `discovery_excluded`, and lists it with its reason outside the counts.
 `sensitivity` still runs it.
+
+## Feedback comparison
+
+`feedback.toml` is the feedback comparison's frozen case list (fuzz-14).
+Each case names a retained planted case by its path under `qa/planted/`,
+with its property, fuzz target and fault class. The list also freezes the
+bounds: ten seeds, two arms (semantic feedback `on` and `off`), 600 seconds
+per campaign, one worker, `campaign start`'s default input limits
+(4096-byte inputs, a 30-second input limit, 4096 MiB RSS), no restarts, no
+sanitizer, the empty corpus above, and each target's extra libFuzzer flags
+from `qa/suite.toml`. Confirmation gets 300 seconds per child. To extend the
+list, add a `[[case]]`.
+
+The cases run on `header_sync_storage`, `header_sync_wire`, `sync_storage`,
+`sync_wire` and `discovery_wire`. Each passes the protocol-state collector,
+and each harness logs the observations the collector reads. Nightly
+`cargo xtask planted --targets` confirms each case's committed input through
+its target. `discovery_wire` has one input case. `block_sync_storage` has
+none in the list: a generated run takes about 96 seconds, so a 600-second
+campaign runs a handful of inputs.
+
+`cargo xtask planted pilot feedback` reads the list and checks each case: its
+patch must exist, its property must be the case's directory, and its target
+must run its input's harness. A case listed twice, a typed case and a nested
+case fail. The runner then builds the runner tree's `HEAD`, as
+`planted --targets` does: each original campaign runs `HEAD`, and each
+mutant runs `HEAD` with the case's patch. The list's cases come from the
+runner's tree, and `HEAD`'s checkout must hold the same patches, inputs and
+production files, so commit any change to a case first. The simulator builds
+with the checkout's own toolchain. Each fuzz build must name the checkout's
+commit, lockfiles and the case's target and harness. An original's source
+digest must be the checkout's, and a mutant's must differ.
+
+Each seed's arms run one after the other, and differ only in their store,
+name and feedback mode. The collector runs in both arms; the arm sets only
+whether libFuzzer reads its features. The fuzzer logs its mode at startup,
+and the run's manifest records it. A run whose fuzzer logged another mode,
+or none, is a harness failure.
+
+Detection is discovery's: a saved input that violates the case's property,
+which a fresh `zakura-sim confirm --property` confirms and an Exact replay
+reproduces. As in `cargo xtask planted`, a campaign and its confirmation
+may violate the case's `also_violates` beside its property. One of them
+alone is another violation. A campaign stops at its first finding.
+
+`feedback.json` has `discovery.json`'s rows, by case, seed and arm, and an
+`arms` comparison per case. For each arm, it gives:
+
+- `detected`: seeds whose mutant campaign found the intended property;
+- `censored`: seeds whose valid mutant campaign ended without it, as a
+  survivor, a not-applicable run or another property's violation;
+- `unscored`: harness failures, baseline failures, invalid mutants and
+  equivalent mutants;
+- `median_detection_secs`: the Kaplan-Meier median of the time to
+  detection over the detected and censored seeds, or `null` when half the
+  seeds or more end censored;
+- `baseline` and `mutant`: the original's and the mutant's campaigns,
+  those where the property applied, their applicable runs, and the median
+  of the unique abstract states each campaign reached.
+
+A campaign's time to detection is the fuzzing time its worker had spent
+when the process that crashed on the intended input ended. A censored
+campaign's time is its longest worker's fuzzing time. A campaign's unique
+abstract states are the distinct protocol-state features its runs hit, in
+either arm. The report sets no discovery threshold.
+
+A full run takes 340 campaigns: per seed and arm, one original campaign for
+each of five targets and one mutant campaign for each of twelve cases. At
+600 seconds each, that's 57 hours of campaign time, less the time that
+mutant campaigns stop early at a finding. Run it only on a remote campaign
+host. One invocation per target, with `--only` naming each of the target's
+cases, keeps every case's seeds and arms in one report, and runs each
+original campaign once. Each invocation needs its own `--out` and `--work`.
+Five invocations run in parallel, one core per campaign. The longest, a
+target with three cases, runs 80 campaigns, about 13 hours.
 
 The catalogue first pinned production at `870678be1` and the fuzz inputs
 at `b2e0456474`, which existed only on the stack branches that merged as

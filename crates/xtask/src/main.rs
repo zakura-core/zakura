@@ -383,7 +383,11 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "  cargo xtask planted pilot (sensitivity|discovery) --out <dir> [--work <dir>]"
+        "  cargo xtask planted pilot (sensitivity|discovery|feedback) --out <dir> [--work <dir>]"
+    )?;
+    writeln!(
+        output,
+        "      [--only <case-id>]... [--seed <n>]... [--arm on|off]..."
     )?;
     writeln!(
         output,
@@ -397,7 +401,6 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "  cargo xtask header-acceptance [--out <dir>] [--deadline-secs <n>]"
     )?;
-    writeln!(output, "      [--only <case-id>]... [--seed <n>]...")?;
     writeln!(
         output,
         "  cargo xtask record --sim <name> (--input <file> | --scenario <json> --plan <file>) --out <dir>"
@@ -518,9 +521,17 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "writes sensitivity.json or discovery.json to --out. Discovery runs only on a"
+        "writes sensitivity.json or discovery.json to --out. `feedback` runs discovery's"
     )?;
-    writeln!(output, "remote campaign host.")?;
+    writeln!(
+        output,
+        "campaigns over qa/mutation-pilot/feedback.toml's planted cases on HEAD, each seed with"
+    )?;
+    writeln!(
+        output,
+        "semantic feedback on and off, and writes feedback.json. Discovery and feedback run"
+    )?;
+    writeln!(output, "only on a remote campaign host.")?;
     writeln!(
         output,
         "`planted loop` runs the mutation loop's cases (qa/native-mutations/PROMPT.md) on a"

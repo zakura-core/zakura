@@ -9,6 +9,7 @@
 
 pub mod config;
 pub mod error;
+pub mod io;
 pub mod machine;
 pub mod peer_cooldown;
 pub mod storage;

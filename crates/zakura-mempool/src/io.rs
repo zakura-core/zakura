@@ -1,0 +1,471 @@
+//! The pool core's task: [`PoolCore`] owns the machine and serves the port.
+//!
+//! The task takes one input at a time: a caller's command, a chain event, a
+//! verification's outcome, a change to whether the pool is on, or a deadline.
+//! It hands the input to [`MempoolState`] and then carries out the step, in
+//! this order:
+//!
+//! 1. It publishes the step's change batch and a snapshot of the pool after
+//!    it, so a verification that starts in this step reads a pool at least
+//!    as new as the one that started it.
+//! 2. It publishes the cooldowns, if one started.
+//! 3. It does each effect in order: starts and cancels verifications, sends
+//!    verdicts, and answers output waiters.
+//!
+//! A verification runs in a task of its own, outside the core's task. It
+//! reads the generation before its first state lookup and after its last,
+//! and comes back as an input with both readings. See
+//! [`MempoolState::outcome`] for how the machine uses them.
+//!
+//! Every name the task uses for time, tasks and channels comes from
+//! `zakura_rt`, so it builds and runs under the simulator.
+
+use std::{future::Future, pin::Pin};
+
+use chrono::{DateTime, Utc};
+use zakura_chain::{
+    block::{self, Height},
+    transaction::UnminedTx,
+    transparent,
+};
+use zakura_node_services::mempool::port::{
+    AwaitOutputError, ChainEvent, ChainEvents, ChainStart, ChainTip, Generation, GenerationCell,
+    GenerationRead, LocalFault, PoolCommand, PoolInbox, Verdict,
+};
+use zakura_rt::{
+    collections::HashMap,
+    sync::{mpsc, oneshot, watch},
+    task::{self, AbortOnDropHandle},
+    time,
+};
+
+use crate::{
+    config::Config,
+    machine::{
+        Effect, JobId, Limits, MempoolState, Outcome, OutputAnswer, Step, VerifyError, WaiterId,
+    },
+};
+
+#[cfg(test)]
+mod tests;
+
+/// The most times a verification yields while it waits for the state writer
+/// to finish a change before its first lookup. A change is short. A worker
+/// that waits this long goes ahead, and its outcome is then stale.
+const STABLE_WAIT_YIELDS: usize = 10_000;
+
+/// What the core asks of the node to verify one transaction: the
+/// already-mined lookup, the tip lookup, then the verifier, without the
+/// fetch. The core reads the generation around the whole call.
+pub trait Verifier<E>: Clone + Send + Sync + 'static {
+    /// Verifies `tx` for the block after `tip`. `revalidation` says it is a
+    /// pooled transaction being checked again.
+    ///
+    /// The core calls this in the step that starts the job, after that
+    /// step's snapshot is published. The returned future must not read the
+    /// state until it is polled: the core reads the generation before it
+    /// polls it.
+    fn verify(
+        &self,
+        tx: UnminedTx,
+        tip: ChainTip,
+        revalidation: bool,
+    ) -> Pin<Box<dyn Future<Output = Outcome<E>> + Send>>;
+}
+
+/// A verification's report to the core.
+struct Report<E> {
+    job: JobId,
+    outcome: Outcome<E>,
+    before: GenerationRead,
+    after: GenerationRead,
+}
+
+/// What the snapshot last published carried, beside the transactions.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct Published {
+    tip: ChainTip,
+    generation: Generation,
+    active: bool,
+}
+
+/// The pool core: the machine, the port's inbox, and the work in flight.
+pub struct PoolCore<E, V> {
+    machine: MempoolState<E>,
+    inbox: PoolInbox,
+    chain: ChainEvents,
+    generation: GenerationCell,
+    verifier: V,
+    /// Whether the node is near enough to the tip for the pool to be on.
+    active: watch::Receiver<bool>,
+    /// The latest tip and generation from the chain, which the machine
+    /// skips while it is off and takes when it turns on.
+    chain_tip: ChainTip,
+    chain_generation: Generation,
+    /// Every verification reports here. At most one report per running job
+    /// is in flight, and the machine bounds the jobs, so this is bounded.
+    reports_tx: mpsc::UnboundedSender<Report<E>>,
+    reports: mpsc::UnboundedReceiver<Report<E>>,
+    /// The running verifications. Dropping a handle cancels its task.
+    jobs: HashMap<JobId, AbortOnDropHandle<()>>,
+    /// Callers waiting for a verdict.
+    verdicts: HashMap<WaiterId, oneshot::Sender<Verdict>>,
+    /// Callers waiting for an output.
+    outputs: HashMap<WaiterId, oneshot::Sender<Result<transparent::Output, AwaitOutputError>>>,
+    published: Option<Published>,
+}
+
+impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
+    /// A core that starts at `start`, reads chain events from `chain`, and
+    /// serves `inbox`. It is on while `active` holds `true`.
+    pub fn new(
+        config: &Config,
+        start: ChainStart,
+        chain: ChainEvents,
+        generation: GenerationCell,
+        verifier: V,
+        inbox: PoolInbox,
+        active: watch::Receiver<bool>,
+    ) -> Self {
+        Self::with_limits(
+            config,
+            start,
+            chain,
+            generation,
+            verifier,
+            inbox,
+            active,
+            Limits::default(),
+        )
+    }
+
+    /// [`Self::new`] with other limits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_limits(
+        config: &Config,
+        start: ChainStart,
+        chain: ChainEvents,
+        generation: GenerationCell,
+        verifier: V,
+        inbox: PoolInbox,
+        active: watch::Receiver<bool>,
+        limits: Limits,
+    ) -> Self {
+        // Before the genesis block there is no tip, and the pool stays off
+        // until the first transition names one.
+        let chain_tip = start.tip.unwrap_or(ChainTip {
+            hash: block::Hash([0; 32]),
+            height: Height(0),
+        });
+        let machine = MempoolState::new(config, chain_tip, start.generation, time::Instant::now())
+            .with_limits(limits);
+        let (reports_tx, reports) = mpsc::unbounded_channel();
+        Self {
+            machine,
+            inbox,
+            chain,
+            generation,
+            verifier,
+            active,
+            chain_tip,
+            chain_generation: start.generation,
+            reports_tx,
+            reports,
+            jobs: HashMap::default(),
+            verdicts: HashMap::default(),
+            outputs: HashMap::default(),
+            published: None,
+        }
+    }
+
+    /// Runs the core until every port handle is gone or the chain's sender
+    /// is dropped.
+    pub async fn run(mut self) {
+        // The machine starts on. Until the node is near the tip it is off,
+        // and the first snapshot says so.
+        if !*self.active.borrow_and_update() {
+            let step = self.machine.deactivate(time::Instant::now());
+            self.finish(step);
+        }
+        self.publish(Vec::new());
+        loop {
+            let deadline = self.machine.next_deadline();
+            let sleep = async move {
+                match deadline {
+                    Some(deadline) => time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            zakura_rt::select! {
+                biased;
+                event = self.chain.next() => match event {
+                    Some(event) => self.chain_event(event),
+                    None => break,
+                },
+                Some(report) = self.reports.recv() => self.report(report),
+                changed = self.active.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    self.activity();
+                }
+                command = self.inbox.next() => match command {
+                    Some(command) => self.command(command),
+                    None => break,
+                },
+                () = sleep => {
+                    let step = self.machine.tick(time::Instant::now());
+                    self.finish(step);
+                }
+            }
+        }
+    }
+
+    /// One caller's command.
+    fn command(&mut self, command: PoolCommand) {
+        let now = time::Instant::now();
+        match command {
+            PoolCommand::Reserve {
+                tx_id,
+                source,
+                intent,
+                reply,
+            } => {
+                let answer = self
+                    .machine
+                    .reserve(tx_id, source, intent, now)
+                    .map(|grant| {
+                        self.inbox
+                            .grant(grant.id, tx_id, grant.joined, grant.wants_body)
+                    });
+                // A caller that left drops the reservation with the reply,
+                // which frees the slot.
+                let _ = reply.send(answer);
+                let step = self.machine.effects();
+                self.finish(step);
+            }
+            PoolCommand::Submit {
+                reservation,
+                transaction,
+                supplier,
+                reply,
+            } => {
+                let id = reservation.accept();
+                let (waiter, step) = self.machine.submit(id, transaction, supplier, now);
+                self.verdicts.insert(waiter, reply);
+                self.finish(step);
+            }
+            PoolCommand::Join {
+                reservation,
+                supplier,
+                reply,
+            } => {
+                let tx_id = reservation.tx_id();
+                let id = reservation.accept();
+                let (waiter, step) = self.machine.wait(id, tx_id, supplier, now);
+                self.verdicts.insert(waiter, reply);
+                self.finish(step);
+            }
+            PoolCommand::FetchFailed(reservation) => {
+                let step = self.machine.fetch_failed(reservation.accept(), now);
+                self.finish(step);
+            }
+            PoolCommand::Released(id) => {
+                let step = self.machine.release(id, now);
+                self.finish(step);
+            }
+            PoolCommand::ReportViolation(violation) => {
+                self.machine.violation(&violation.peer, now);
+                let step = self.machine.effects();
+                self.finish(step);
+            }
+            PoolCommand::AwaitOutput { outpoint, reply } => {
+                let outputs = &self.outputs;
+                let mut closed = Vec::new();
+                let answer = self.machine.await_output(outpoint, now, |waiter| {
+                    let gone = outputs.get(&waiter).is_none_or(oneshot::Sender::is_closed);
+                    if gone {
+                        closed.push(waiter);
+                    }
+                    gone
+                });
+                for waiter in closed {
+                    self.outputs.remove(&waiter);
+                }
+                match answer {
+                    OutputAnswer::Ready(output) => {
+                        let _ = reply.send(Ok(output));
+                    }
+                    OutputAnswer::Waiting(waiter) => {
+                        self.outputs.insert(waiter, reply);
+                    }
+                    OutputAnswer::TooManyWaiters => {
+                        let _ = reply.send(Err(AwaitOutputError::TooManyWaiters));
+                    }
+                    OutputAnswer::Inactive => {
+                        let _ = reply.send(Err(AwaitOutputError::Inactive));
+                    }
+                }
+                let step = self.machine.effects();
+                self.finish(step);
+            }
+            PoolCommand::RejectedIds { ids, reply } => {
+                let _ = reply.send(self.machine.rejected_ids(ids, now));
+                let step = self.machine.effects();
+                self.finish(step);
+            }
+        }
+    }
+
+    /// One chain event. The core remembers the tip even while it is off.
+    fn chain_event(&mut self, event: ChainEvent) {
+        let now = time::Instant::now();
+        let step = match event {
+            ChainEvent::Transition(transition) => {
+                self.chain_tip = transition.after;
+                self.chain_generation = transition.generation;
+                self.machine.transition(transition, now)
+            }
+            ChainEvent::Resync { tip, generation } => {
+                self.chain_tip = tip;
+                self.chain_generation = generation;
+                self.machine.resync(tip, generation, now)
+            }
+        };
+        self.finish(step);
+    }
+
+    /// One verification's report.
+    fn report(&mut self, report: Report<E>) {
+        self.jobs.remove(&report.job);
+        let step = self.machine.outcome(
+            report.job,
+            report.outcome,
+            report.before,
+            report.after,
+            time::Instant::now(),
+            wall_now(),
+        );
+        self.finish(step);
+    }
+
+    /// The node moved toward or away from the tip.
+    fn activity(&mut self) {
+        let active = *self.active.borrow_and_update();
+        if active == self.machine.is_active() {
+            return;
+        }
+        let now = time::Instant::now();
+        if active {
+            self.machine
+                .activate(self.chain_tip, self.chain_generation, now);
+            let step = self.machine.effects();
+            self.finish(step);
+        } else {
+            let step = self.machine.deactivate(now);
+            self.finish(step);
+        }
+    }
+
+    /// Carries out one step. See the module docs for the order.
+    fn finish(&mut self, step: Step) {
+        let Step { effects, changes } = step;
+        self.publish(changes);
+        if let Some(cooldowns) = self.machine.cooldowns_if_changed() {
+            self.inbox.publish_cooldowns(cooldowns);
+        }
+        for effect in effects {
+            match effect {
+                Effect::Start {
+                    job,
+                    tx,
+                    revalidation,
+                } => self.start(job, tx, revalidation),
+                Effect::Cancel(job) => {
+                    self.jobs.remove(&job);
+                }
+                Effect::Verdict { waiter, verdict } => {
+                    if let Some(reply) = self.verdicts.remove(&waiter) {
+                        let _ = reply.send(verdict);
+                    }
+                }
+                Effect::OutputReady { waiter, output, .. } => {
+                    if let Some(reply) = self.outputs.remove(&waiter) {
+                        let _ = reply.send(Ok(output));
+                    }
+                }
+                Effect::OutputWaitEnded(waiter) => {
+                    if let Some(reply) = self.outputs.remove(&waiter) {
+                        let _ = reply.send(Err(AwaitOutputError::Inactive));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Publishes a batch, and a snapshot for it, when the batch changed
+    /// anything or the snapshot's tip, generation or state would differ. A
+    /// snapshot copies the visible pool, so an input that changed nothing a
+    /// reader sees publishes nothing.
+    fn publish(&mut self, changes: Vec<zakura_node_services::mempool::port::Change>) {
+        let now = Published {
+            tip: self.machine.tip(),
+            generation: self.machine.generation(),
+            active: self.machine.is_active(),
+        };
+        if changes.is_empty() && self.published == Some(now) {
+            return;
+        }
+        self.published = Some(now);
+        let machine = &self.machine;
+        self.inbox
+            .publish(changes, |last_change| machine.snapshot(last_change));
+    }
+
+    /// Starts a verification task for `job`.
+    fn start(&mut self, job: JobId, tx: UnminedTx, revalidation: bool) {
+        let verification = self.verifier.verify(tx, self.machine.tip(), revalidation);
+        let generation = self.generation.clone();
+        let reports = self.reports_tx.clone();
+        let handle = task::spawn_named("mempool-verify", async move {
+            let before = stable_reading(&generation).await;
+            // The verifier runs in a task of its own, so a panic in it is
+            // a local fault and not the end of this one.
+            let inner =
+                AbortOnDropHandle::new(task::spawn_named("mempool-verify-call", verification));
+            let outcome = match inner.await {
+                Ok(outcome) => outcome,
+                Err(error) if error.is_panic() => Outcome::LocalFault(LocalFault::VerifyPanicked),
+                // Cancelled with this task.
+                Err(_) => return,
+            };
+            let after = generation.read();
+            // The core is gone if this fails.
+            let _ = reports.send(Report {
+                job,
+                outcome,
+                before,
+                after,
+            });
+        });
+        self.jobs.insert(job, AbortOnDropHandle::new(handle));
+    }
+}
+
+/// Reads the generation once the state writer is not in the middle of a
+/// change, or after [`STABLE_WAIT_YIELDS`] tries.
+async fn stable_reading(generation: &GenerationCell) -> GenerationRead {
+    for _ in 0..STABLE_WAIT_YIELDS {
+        let read = generation.read();
+        if matches!(read, GenerationRead::Stable(_)) {
+            return read;
+        }
+        task::yield_now().await;
+    }
+    generation.read()
+}
+
+/// The wall-clock time, from `zakura_rt` so the simulator can set it.
+fn wall_now() -> DateTime<Utc> {
+    zakura_rt::time::utc_now().into()
+}

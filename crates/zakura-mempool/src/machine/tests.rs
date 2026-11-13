@@ -63,7 +63,7 @@ use crate::{
 /// The verifier's error in these tests.
 #[derive(thiserror::Error, Clone, Debug, PartialEq, Eq)]
 #[error("the test verifier rejected the transaction")]
-struct TestVerifyError;
+pub(crate) struct TestVerifyError;
 
 /// The machine under test.
 type Machine = MempoolState<TestVerifyError>;
@@ -85,14 +85,14 @@ fn p2pkh() -> transparent::Script {
 
 /// One transaction of a run's universe, as each side sees it.
 #[derive(Clone)]
-struct Tx {
-    real: VerifiedUnminedTx,
-    model: ModelTx,
+pub(crate) struct Tx {
+    pub(crate) real: VerifiedUnminedTx,
+    pub(crate) model: ModelTx,
 }
 
 impl Tx {
     /// Its exact id.
-    fn id(&self) -> UnminedTxId {
+    pub(crate) fn id(&self) -> UnminedTxId {
         self.model.id
     }
 }
@@ -100,7 +100,12 @@ impl Tx {
 /// Builds a V6 transaction that spends `spends`, creates `outputs` P2PKH
 /// outputs and expires at `expiry`. Each one reveals a new Ironwood
 /// nullifier, so two never conflict through a nullifier.
-fn build(runner: &mut TestRunner, spends: &[OutPoint], outputs: u32, expiry: Option<Height>) -> Tx {
+pub(crate) fn build(
+    runner: &mut TestRunner,
+    spends: &[OutPoint],
+    outputs: u32,
+    expiry: Option<Height>,
+) -> Tx {
     let action = any::<ironwood::Action>()
         .new_tree(runner)
         .expect("the action strategy makes a value")
@@ -208,7 +213,7 @@ fn legacy(n: u8) -> QueueSource {
 }
 
 /// A tip at `height` on the fork numbered `fork`.
-fn tip(height: u32, fork: u8) -> ChainTip {
+pub(crate) fn tip(height: u32, fork: u8) -> ChainTip {
     let mut hash = [fork; 32];
     hash[..4].copy_from_slice(&height.to_be_bytes());
     ChainTip {

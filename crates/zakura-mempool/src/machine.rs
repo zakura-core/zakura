@@ -59,7 +59,7 @@ use crate::{
 };
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// What a verification error must be for the machine to cache it and hand it
 /// to callers.
@@ -755,7 +755,7 @@ impl<E: VerifyError> MempoolState<E> {
         &mut self,
         outpoint: OutPoint,
         now: Instant,
-        closed: impl Fn(WaiterId) -> bool,
+        mut closed: impl FnMut(WaiterId) -> bool,
     ) -> OutputAnswer {
         self.enter(now);
         self.start_revalidations();

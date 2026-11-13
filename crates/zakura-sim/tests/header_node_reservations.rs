@@ -30,6 +30,7 @@ use std::{
 use serde_json::Value;
 use support::{
     inputs,
+    one_key_off::assert_one_key_off,
     steer::{before, steer, Steer},
 };
 use tempfile::TempDir;
@@ -38,6 +39,7 @@ use zakura_sim::{
     domain::header_sync::COMMIT_ONLY_AUTHORIZED,
     harness::{
         self,
+        header_acceptance::refs::{Ref, StorageOpRef, StorageRef},
         header_node::Policy,
         header_node::{
             policy::Trigger, reservation::ReservationEvidence, session::SessionFact, Chain,
@@ -47,7 +49,7 @@ use zakura_sim::{
         record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem, WITNESS_FILE,
     },
     observe::{
-        ReactorCall, ReactorFact, StorageFact, StorageRequest, TransitionFact, TransportFact,
+        Entry, ReactorCall, ReactorFact, StorageFact, StorageRequest, TransitionFact, TransportFact,
     },
     peer::{honest::HonestSpec, PeerSpec},
     record::RecordSink,
@@ -539,24 +541,116 @@ fn fixture_file(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// The node's storage operations that are preparations before `cx`'s step,
-/// by operation ID, each with the supplier it prepares for.
-fn prepares_before(cx: &StepCtx<'_>) -> BTreeMap<u64, String> {
-    before(cx)
+/// What one storage fact says of the node's header preparations: a
+/// prepare's submission, with the supplier it prepares for, or an
+/// operation's completion, each by its operation's whole ref.
+#[derive(Clone, Debug)]
+enum PrepareEvent {
+    /// A `PrepareHeaderTarget` was submitted for the supplier.
+    Submitted(StorageOpRef, String),
+    /// An operation completed.
+    Completed(StorageOpRef),
+}
+
+/// The storage instance an `Observation::Storage` names.
+fn storage_of(service: &str, instance: u64) -> StorageRef {
+    StorageRef {
+        service: service.to_owned(),
+        instance,
+    }
+}
+
+/// Each storage fact in `entries` that [`PrepareEvent`] tracks, in order.
+fn prepare_events(entries: &[Entry]) -> Vec<PrepareEvent> {
+    entries
         .iter()
         .filter_map(|entry| match &entry.obs {
             Observation::Storage {
-                fact:
+                service,
+                instance,
+                fact,
+                ..
+            } => {
+                let op = |id: &u64| StorageOpRef {
+                    storage: storage_of(service, *instance),
+                    op: *id,
+                };
+                match fact {
                     StorageFact::Submitted {
                         id,
                         request: StorageRequest::PrepareHeaderTarget { source, .. },
                         ..
-                    },
-                ..
-            } => Some((*id, source.clone())),
+                    } => Some(PrepareEvent::Submitted(op(id), source.clone())),
+                    StorageFact::Completed { id, .. } => Some(PrepareEvent::Completed(op(id))),
+                    _ => None,
+                }
+            }
             _ => None,
         })
         .collect()
+}
+
+/// How many suppliers had a prepare submitted when the first of their
+/// first prepares completed, joined by its [`StorageOpRef`], or `None` if
+/// none did, with each supplier's first prepare.
+fn first_prepare_ran(events: &[PrepareEvent]) -> (Option<usize>, BTreeMap<String, StorageOpRef>) {
+    let mut prepares = BTreeMap::new();
+    let mut first_ran = None;
+    for event in events {
+        match event {
+            PrepareEvent::Submitted(op, source) => {
+                prepares.entry(source.clone()).or_insert_with(|| op.clone());
+            }
+            PrepareEvent::Completed(done)
+                if prepares
+                    .values()
+                    .any(|first| StorageOpRef::joins(first, done, |done| Some(done.clone()))) =>
+            {
+                first_ran.get_or_insert(prepares.len());
+            }
+            PrepareEvent::Completed(_) => {}
+        }
+    }
+    (first_ran, prepares)
+}
+
+/// Whether the storage action `identity` runs one of `prepares`, joined by
+/// its [`StorageOpRef`]. A storage action's identity is
+/// `storage:<service>:<id>:<outcome>`, which names no instance, so the
+/// action's is the one instance of its service among `storages`; two are an
+/// error, since the identity can't tell them apart.
+fn runs_prepare(
+    storages: &BTreeSet<(String, u64)>,
+    prepares: &[(StorageOpRef, String)],
+    identity: &str,
+) -> Result<bool, String> {
+    let Some((service, id)) = identity
+        .strip_prefix("storage:")
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(service, rest)| Some((service, rest.split(':').next()?.parse::<u64>().ok()?)))
+    else {
+        return Ok(false);
+    };
+    let mut instances = storages
+        .iter()
+        .filter(|(named, _)| named == service)
+        .map(|(_, instance)| *instance);
+    let instance = match (instances.next(), instances.next()) {
+        (Some(instance), None) => instance,
+        (None, _) => return Ok(false),
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{identity} names no instance, and two of {service} ran: {storages:?}"
+            ))
+        }
+    };
+    let picked = StorageOpRef {
+        storage: storage_of(service, instance),
+        op: id,
+    };
+    Ok(prepares
+        .iter()
+        .any(|(prepare, _)| StorageOpRef::joins(&picked, prepare, |prepare| Some(prepare.clone()))))
 }
 
 /// A steering rule: the node's storage runs no preparation until it has
@@ -565,19 +659,29 @@ fn prepares_before(cx: &StepCtx<'_>) -> BTreeMap<u64, String> {
 /// can. So each mirror's round stages its page and dispatches its prepare
 /// while the other's leases are still staged.
 fn both_prepares_before_either_runs(cx: &StepCtx<'_>) -> Result<Steer, String> {
-    let prepares = prepares_before(cx);
-    if prepares.values().collect::<BTreeSet<_>>().len() >= 2 {
+    let entries = before(cx);
+    let prepares: Vec<(StorageOpRef, String)> = prepare_events(entries)
+        .into_iter()
+        .filter_map(|event| match event {
+            PrepareEvent::Submitted(op, source) => Some((op, source)),
+            PrepareEvent::Completed(_) => None,
+        })
+        .collect();
+    let suppliers: BTreeSet<&String> = prepares.iter().map(|(_, source)| source).collect();
+    if suppliers.len() >= 2 {
         return Ok(Steer::Fine);
     }
-    // A storage operation's identity is `storage:header:<id>:<outcome>`.
-    let runs_prepare = |identity: &str| {
-        identity
-            .strip_prefix("storage:header:")
-            .and_then(|rest| rest.split(':').next())
-            .and_then(|id| id.parse::<u64>().ok())
-            .is_some_and(|id| prepares.contains_key(&id))
-    };
-    if !runs_prepare(&cx.pick.to_string()) {
+    let storages: BTreeSet<(String, u64)> = entries
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Storage {
+                service, instance, ..
+            } => Some((service.clone(), *instance)),
+            _ => None,
+        })
+        .collect();
+    let runs = |identity: &str| runs_prepare(&storages, &prepares, identity);
+    if !runs(&cx.pick.to_string())? {
         return Ok(Steer::Fine);
     }
     let names: Vec<String> = cx
@@ -585,13 +689,54 @@ fn both_prepares_before_either_runs(cx: &StepCtx<'_>) -> Result<Steer, String> {
         .iter()
         .map(|enabled| enabled.identity.to_string())
         .collect();
-    names
-        .iter()
-        .find(|name| !runs_prepare(name) && !name.starts_with("advance-time"))
-        .or_else(|| names.iter().find(|name| !runs_prepare(name)))
-        .cloned()
-        .map(Steer::Pick)
+    let mut held = Vec::new();
+    for name in &names {
+        if !runs(name)? {
+            held.push(name);
+        }
+    }
+    held.iter()
+        .find(|name| !name.starts_with("advance-time"))
+        .or_else(|| held.first())
+        .map(|name| Steer::Pick((*name).clone()))
         .ok_or_else(|| format!("only a held preparation can run: {names:?}"))
+}
+
+/// The steering rule's and the fixture witness's joins of a storage
+/// operation, by its whole [`StorageOpRef`]: a pick of header operation 5
+/// runs the prepare submitted as instance 0's operation 5, and the first
+/// of two suppliers' prepares ran when that operation completed. Moving
+/// the prepare's service, instance or operation, or the completion's,
+/// makes neither join.
+#[test]
+fn a_prepare_joins_its_pick_and_completion_by_its_whole_operation() {
+    let op = StorageOpRef {
+        storage: storage_of("header", 0),
+        op: 5,
+    };
+    let storages = BTreeSet::from([("header".to_owned(), 0)]);
+    assert_one_key_off::<StorageOpRef>(&op, |prepare| {
+        runs_prepare(
+            &storages,
+            &[(prepare.clone(), "m1".to_owned())],
+            "storage:header:5:success",
+        )
+        .expect("one header instance ran")
+    });
+    let other = StorageOpRef {
+        storage: storage_of("header", 0),
+        op: 6,
+    };
+    assert_one_key_off::<StorageOpRef>(&op, |done| {
+        let events = [
+            PrepareEvent::Submitted(op.clone(), "m1".to_owned()),
+            PrepareEvent::Submitted(other.clone(), "m2".to_owned()),
+            PrepareEvent::Completed(done.clone()),
+        ];
+        first_prepare_ran(&events).0 == Some(2)
+    });
+    let two = BTreeSet::from([("header".to_owned(), 0), ("header".to_owned(), 1)]);
+    assert!(runs_prepare(&two, &[(op, "m1".to_owned())], "storage:header:5:success").is_err());
 }
 
 /// Runs `scenario` under `plan` on `header-sync/storage` itself, with
@@ -706,26 +851,7 @@ fn the_overlapping_forks_fixture_prepares_both_while_both_are_staged() {
         matches!(outcome, Some(PropertyOutcome::Held { applicable }) if applicable > 0),
         "{outcome:?}"
     );
-    let mut prepares = BTreeMap::new();
-    let mut first_ran = None;
-    for entry in report.log.entries() {
-        let Observation::Storage { fact, .. } = &entry.obs else {
-            continue;
-        };
-        match fact {
-            StorageFact::Submitted {
-                id,
-                request: StorageRequest::PrepareHeaderTarget { source, .. },
-                ..
-            } => {
-                prepares.entry(source.clone()).or_insert(*id);
-            }
-            StorageFact::Completed { id, .. } if prepares.values().any(|first| first == id) => {
-                first_ran.get_or_insert(prepares.len());
-            }
-            _ => {}
-        }
-    }
+    let (first_ran, prepares) = first_prepare_ran(&prepare_events(report.log.entries()));
     assert_eq!(
         first_ran,
         Some(2),

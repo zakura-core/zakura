@@ -398,6 +398,17 @@ pub const TRACE_META: Kind = Kind {
     closed: false,
 };
 
+/// `header-acceptance plan`'s `plan.json`
+/// ([`RunPlan`](super::tool::RunPlan)). It names no execution, so it
+/// carries no field: the evaluator instead refuses any plan that isn't the
+/// one S's manifest gives (`tool::binding_refusal`).
+pub const PLAN: Kind = Kind {
+    name: "plan.json",
+    carries: &[],
+    required: &[],
+    closed: false,
+};
+
 /// What a reader expects an artifact to carry, by field. Expecting two
 /// values for one field, or one the reader couldn't read, refuses every
 /// artifact that carries it.
@@ -608,6 +619,13 @@ pub fn scenario_expect(
         .with(Field::Plan, &plan))
 }
 
+/// The run plan at `path` ([`PLAN`]), read as the trace reader reads its
+/// files, or why it can't be.
+pub fn read_plan(path: &Path) -> Result<super::tool::RunPlan, String> {
+    let plan = read_bounded(&PLAN, path, crate::trace::MAX_REPORT_BYTES, &Expect::new())?;
+    serde_json::from_value(plan).map_err(|error| format!("{}: {error}", path.display()))
+}
+
 /// The JSON artifact of `kind` at `path`, if it's readable and bound to
 /// what `expect` names ([`check`]), or why not.
 pub fn read(kind: &Kind, path: &Path, expect: &Expect) -> Result<Value, String> {
@@ -685,9 +703,26 @@ pub fn committed_bytes(repo: &Path, rel: impl AsRef<Path>) -> Result<Vec<u8>, St
     std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/// `rel` under S's checkout `repo`, if it names a committed regular file
+/// there ([`committed_path`]), for a reader that hands the path on rather
+/// than reading it here: a typed case's scenario and Plan, which
+/// [`scenario_expect`] judges a trace against and the runner records from.
+/// An absolute path, one with `..`, one under `target`, or a missing file is
+/// refused.
+pub fn committed_file(repo: &Path, rel: impl AsRef<Path>) -> Result<std::path::PathBuf, String> {
+    let rel = rel.as_ref();
+    let path = committed_path(repo, rel)?;
+    if !path.is_file() {
+        return Err(format!("{} isn't a committed file", rel.display()));
+    }
+    Ok(path)
+}
+
 /// Each entry of the committed directory `rel` of S's checkout `repo`
 /// ([`committed_path`]), as its path relative to `repo` and whether it's a
-/// directory, sorted, or why it can't be read.
+/// directory, sorted, or why it can't be read. An entry that can't be read
+/// fails the whole listing, so no reader takes a partial one for the
+/// directory.
 pub fn committed_entries(
     repo: &Path,
     rel: impl AsRef<Path>,
@@ -696,9 +731,11 @@ pub fn committed_entries(
     let path = committed_path(repo, rel)?;
     let mut entries: Vec<(std::path::PathBuf, bool)> = std::fs::read_dir(&path)
         .map_err(|error| format!("{}: {error}", path.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| (rel.join(entry.file_name()), entry.path().is_dir()))
-        .collect();
+        .map(|entry| {
+            let entry = entry.map_err(|error| format!("{}: {error}", path.display()))?;
+            Ok((rel.join(entry.file_name()), entry.path().is_dir()))
+        })
+        .collect::<Result<_, String>>()?;
     entries.sort();
     Ok(entries)
 }

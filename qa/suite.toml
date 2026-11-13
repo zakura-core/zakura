@@ -162,6 +162,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed reset witnesses from their builders"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_acceptance.rs"
+test = "regenerate_raw_join_baseline"
+run = false
+reason = "a tool, not a test: it rewrites the committed raw-join baseline from the PR base's sources, keeping only the hits the head still has"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_hold_release.rs"
 test = "regenerate_hold_fixtures"
 run = false

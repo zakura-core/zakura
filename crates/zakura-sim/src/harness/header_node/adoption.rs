@@ -25,6 +25,7 @@ use zakura_network::zakura::{
 
 use super::stamp::Stamps;
 use crate::{
+    harness::header_acceptance::refs::{Ref, StampRef},
     stores::{debug_snapshot, EvidenceStores, Guard, Registered, Snapshot},
     RunEnd,
 };
@@ -280,8 +281,8 @@ pub enum WatchRead {
     /// A publication is still waiting for its read or its third event.
     Open,
     /// The loop took too many events before reading a publication: each
-    /// publication it broke the rule for, in publication order, at least
-    /// one.
+    /// publication it broke the rule for with one of the new facts, in
+    /// publication order, at least one.
     Broken(Vec<String>),
 }
 
@@ -290,8 +291,9 @@ pub enum WatchRead {
 enum PublicationRead {
     /// A watch read at or past it.
     Read,
-    /// A third event from the queue, first: its break.
-    Broken,
+    /// A third event from the queue, first: its break, by that event's
+    /// stamp.
+    Broken(u64),
     /// Neither, yet.
     Open,
 }
@@ -439,13 +441,21 @@ impl AdoptionEvidence {
     ///
     /// A publication that neither a read nor a third event has answered yet
     /// is [`WatchRead::Open`]. Each publication whose third event came
-    /// first is its own break.
-    pub fn watch_read(&self, queue: EventQueue) -> WatchRead {
+    /// first is its own break, reported once: only while that event's stamp
+    /// is one of `new`, the facts the step added. One broken by an earlier
+    /// step's fact counts as answered, so a run that goes on past a break,
+    /// as a Draft run does, doesn't report it again at each later step.
+    pub fn watch_read(&self, queue: EventQueue, new: &[u64]) -> WatchRead {
         let mut found = WatchRead::Nothing;
         let mut breaks = Vec::new();
         for (state_version, read) in self.publication_reads(queue) {
             found = match (read, found) {
-                (PublicationRead::Broken, found) => {
+                (PublicationRead::Broken(stamp), found)
+                    if !StampRef::joined(&StampRef { stamp }, new, |at| {
+                        Some(StampRef { stamp: *at })
+                    })
+                    .is_empty() =>
+                {
                     breaks.push(format!(
                         "the reactor took {} {queue:?} events after state {state_version:?} \
                          was published, with no watch read of it",
@@ -454,7 +464,7 @@ impl AdoptionEvidence {
                     found
                 }
                 (PublicationRead::Open, _) | (_, WatchRead::Open) => WatchRead::Open,
-                (PublicationRead::Read, _) => WatchRead::Holds,
+                (PublicationRead::Read | PublicationRead::Broken(_), _) => WatchRead::Holds,
             };
         }
         if breaks.is_empty() {
@@ -498,7 +508,7 @@ impl AdoptionEvidence {
                     AdoptionFact::EventTaken { queue: from, .. } if *from == queue => {
                         taken += 1;
                         if taken == WATCH_READ_EVENTS + 1 {
-                            read = PublicationRead::Broken;
+                            read = PublicationRead::Broken(later.stamp);
                             break;
                         }
                     }
@@ -588,6 +598,7 @@ mod tests {
     use crate::{
         domain::header_sync::{watch_end_violations, WATCH_OBSERVED_UNDER_FLOOD},
         end::Drain,
+        harness::header_acceptance::refs::one_key_off::assert_one_key_off,
         Outcome,
     };
     use zakura_scheduler::Status as SchedulerStatus;
@@ -756,9 +767,11 @@ mod tests {
         );
     }
 
-    /// The watch rule over `facts`, all at time 0.
+    /// The watch rule over `facts`, all at time 0 and all new.
     fn watch(facts: Vec<AdoptionFact>) -> WatchRead {
-        evidence(facts.into_iter().map(|fact| (0, fact)).collect(), 0).watch_read(EventQueue::Wire)
+        let evidence = evidence(facts.into_iter().map(|fact| (0, fact)).collect(), 0);
+        let new: Vec<u64> = evidence.facts().iter().map(|fact| fact.stamp).collect();
+        evidence.watch_read(EventQueue::Wire, &new)
     }
 
     /// Two wire events and then a read of a later state answer a
@@ -809,6 +822,41 @@ mod tests {
             watch(vec![commit(2), read(2), commit(3), wire(TurnStart, 4)]),
             WatchRead::Open
         );
+    }
+
+    /// A broken publication is reported only at the step that added the
+    /// event that broke it, joined by that event's whole [`StampRef`]: the
+    /// third wire take after state 2's publication breaks the rule when
+    /// its stamp is new, and with only another stamp new the publication
+    /// counts as answered.
+    #[test]
+    fn a_break_joins_the_stamp_of_the_event_that_made_it() {
+        use TakePoint::{Select, TurnStart};
+        let evidence = evidence(
+            [
+                commit(2),
+                wire(TurnStart, 4),
+                wire(Select, 3),
+                wire(TurnStart, 2),
+            ]
+            .into_iter()
+            .map(|fact| (0, fact))
+            .collect(),
+            0,
+        );
+        let breaking = StampRef {
+            stamp: evidence
+                .facts()
+                .last()
+                .expect("the third take is recorded")
+                .stamp,
+        };
+        assert_one_key_off::<StampRef>(&breaking, |new| {
+            matches!(
+                evidence.watch_read(EventQueue::Wire, &[new.stamp]),
+                WatchRead::Broken(_)
+            )
+        });
     }
 
     /// A publication whose queue delivers an event before its watch read
@@ -917,6 +965,19 @@ mod tests {
         fn snapshot(&self) -> Option<serde_json::Value> {
             Some(self.0 .0.stores().report_snapshot())
         }
+
+        /// The store's own stamps after `after`, as a node harness reports
+        /// its tap's.
+        fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+            Some(
+                self.0
+                    .facts()
+                    .into_iter()
+                    .map(|stamped| stamped.stamp)
+                    .filter(|stamp| after.is_none_or(|after| *stamp > after))
+                    .collect(),
+            )
+        }
     }
 
     impl crate::harness::scripted::Script for Adoptions {
@@ -1018,6 +1079,94 @@ mod tests {
             );
             assert!(findings(&full, other).violations.is_empty(), "{other}");
         }
+    }
+
+    /// [`Adoptions`] over three steps, a Draft run's continuation: step 1
+    /// breaks the wire rule for states 2 and 3, as [`Adoptions`] scripts it,
+    /// and steps 2 and 3 add nothing.
+    #[derive(Clone, Default)]
+    struct LongAdoptions(Adoptions);
+
+    impl crate::domain::header_sync::AdoptionView for LongAdoptions {
+        fn adoption(&self) -> &AdoptionEvidence {
+            &self.0 .0
+        }
+    }
+
+    impl crate::property::HasView for LongAdoptions {
+        type View = LongAdoptions;
+
+        /// A copy sharing the store.
+        fn view(&self) -> LongAdoptions {
+            self.clone()
+        }
+
+        /// [`Adoptions`]'s.
+        fn snapshot(&self) -> Option<serde_json::Value> {
+            self.0.snapshot()
+        }
+
+        /// [`Adoptions`]'s.
+        fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+            self.0.stamps_after(after)
+        }
+    }
+
+    impl crate::harness::scripted::Script for LongAdoptions {
+        const NAME: &'static str = "test/two-unread-publications-then-two-steps";
+        type Case = ();
+
+        /// Both watch rules.
+        fn properties(
+        ) -> Vec<crate::property::Property<crate::harness::scripted::ScriptRun<LongAdoptions>>>
+        {
+            vec![
+                crate::domain::header_sync::watch_observed_under_flood(),
+                crate::domain::header_sync::watch_observed_under_lifecycle_flood(),
+            ]
+        }
+
+        /// The schedule and the view.
+        fn sources() -> crate::property::Sources {
+            use crate::property::Source;
+            crate::property::Sources::observed(&[Source::Schedule, Source::View])
+        }
+
+        /// [`Adoptions`]'s wire case at step 1, and nothing after.
+        fn observe(&self, (): &(), log: &mut crate::ObservationLog) {
+            crate::harness::scripted::Script::observe(&self.0, &false, log);
+        }
+
+        /// Three steps: the break's and two more.
+        fn steps((): &()) -> usize {
+            3
+        }
+    }
+
+    /// A Draft run goes on past a break, and each publication's break is
+    /// reported once, at the step its third event came: two findings at
+    /// step 1, not two more at each of steps 2 and 3.
+    #[test]
+    fn a_draft_run_reports_each_broken_publication_once() {
+        use crate::harness::scripted::{findings, sidecar};
+        let full = sidecar::<LongAdoptions>(&(), &[WATCH_OBSERVED_UNDER_FLOOD.to_owned()]);
+        let found = findings(&full, WATCH_OBSERVED_UNDER_FLOOD);
+        let reported: Vec<_> = found
+            .violations
+            .iter()
+            .map(|violation| (violation.step, violation.actual.clone()))
+            .collect();
+        let broke = |version: u64| {
+            (
+                1,
+                format!(
+                    "the reactor took 3 Wire events after state {:?} was published, with no \
+                     watch read of it",
+                    StateVersion::new(version)
+                ),
+            )
+        };
+        assert_eq!(reported, [broke(2), broke(3)]);
     }
 
     /// Adoption evidence whose run settles with what it published unread:

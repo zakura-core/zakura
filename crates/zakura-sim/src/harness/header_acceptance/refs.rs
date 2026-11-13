@@ -287,6 +287,113 @@ pub struct TriggerRef {
 }
 impl Ref for TriggerRef {}
 
+/// One fact of a node's stores, by the node stamp the store records it
+/// under: an `ends` fact as its `causes` name it, or an adoption fact as a
+/// check's new stamps name it. The stores share the node's one stamp
+/// counter, so a stamp names one fact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StampRef {
+    /// The stamp.
+    pub stamp: u64,
+}
+impl Ref for StampRef {}
+
+/// One `peer:` pick of a trace, or the declared action it takes: the
+/// peer it acts on and the action, as `peer:<peer>:<action>` spells them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickRef {
+    /// The peer, by harness name, or `node`.
+    pub peer: String,
+    /// The action's name.
+    pub action: String,
+}
+impl Ref for PickRef {}
+
+/// One reactor call, by the number its reactor gives it: the whole of what
+/// a storage submission names of the call that submitted it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRef {
+    /// The reactor call.
+    pub call: u64,
+}
+impl Ref for CallRef {}
+
+/// One frame a peer sent the node, as its `PeerFrame` and the node's
+/// `FrameJudged` of it name it: its connection, its stream's kind and
+/// version, its QUIC stream, if its harness has one, and its sequence. A
+/// [`FrameRef`] without the direction, which both name inbound, and whose
+/// QUIC stream may be absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerFrameRef {
+    /// The connection.
+    pub connection: u64,
+    /// The stream's kind.
+    pub kind: u16,
+    /// The stream's version.
+    pub version: u16,
+    /// The QUIC stream, or `None` for a harness with none.
+    pub quic_stream: Option<u64>,
+    /// The frame's position among the peer's frames on the stream.
+    pub seq: u64,
+}
+impl Ref for PeerFrameRef {}
+
+/// One session as evidence that names it by session ID alone names it:
+/// the topology's
+/// [`SessionLife`](crate::harness::header_node::adoption::SessionLife)s,
+/// which hold one session per link in a run, and a reactor
+/// `Misbehavior`'s origin, which the node numbers within its run. So the
+/// ID is the whole identity they carry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionIdRef {
+    /// The session.
+    pub session_id: u64,
+}
+impl Ref for SessionIdRef {}
+
+/// One frame a peer sent the node, as the work the node admitted from it
+/// names it: `WorkAdmitted`'s connection, its frame row's stream kind and
+/// version, and the frame's sequence. A [`PeerFrameRef`] without the QUIC
+/// stream, which `WorkAdmitted` doesn't carry, so a harness with two QUIC
+/// streams of one kind on a connection can't tell their frames apart here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFrameRef {
+    /// The connection.
+    pub connection: u64,
+    /// The stream's kind.
+    pub kind: u16,
+    /// The stream's version.
+    pub version: u16,
+    /// The frame's position among the peer's frames on the stream.
+    pub seq: u64,
+}
+impl Ref for SourceFrameRef {}
+
+impl From<&PeerFrameRef> for SourceFrameRef {
+    /// The source `frame` is to the work it admits: every key of its ref
+    /// but its QUIC stream.
+    fn from(frame: &PeerFrameRef) -> Self {
+        SourceFrameRef {
+            connection: frame.connection,
+            kind: frame.kind,
+            version: frame.version,
+            seq: frame.seq,
+        }
+    }
+}
+
+/// One exchange or subscription of one connection: the connection and the
+/// key a peer's `PeerFrame` and the node's effects (`WorkAdmitted`,
+/// `Serving`, `NodeOutput`) name it by, which is per connection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeRef {
+    /// The connection.
+    pub connection: u64,
+    /// The exchange's key.
+    pub exchange: u64,
+}
+impl Ref for ExchangeRef {}
+
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
 #[path = "../../../tests/support/one_key_off.rs"]

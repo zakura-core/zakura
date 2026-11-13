@@ -58,11 +58,11 @@ mod cli {
 
     use zakura_sim::{
         harness::header_acceptance::{
-            companions,
-            tool::{self, CompanionVerdict, CompanionsRun, RunPlan},
+            binding, companions,
+            tool::{self, CompanionVerdict, CompanionsRun},
             Manifest,
         },
-        trace::{BuildInfo, TraceReader},
+        trace::BuildInfo,
     };
 
     /// The usage text.
@@ -132,11 +132,7 @@ mod cli {
                         "--out",
                     ],
                 )?;
-                let plan: RunPlan = serde_json::from_str(
-                    &fs::read_to_string(&flags["--plan"])
-                        .map_err(|e| format!("{}: {e}", flags["--plan"]))?,
-                )
-                .map_err(|e| format!("{}: {e}", flags["--plan"]))?;
+                let plan = binding::read_plan(&PathBuf::from(&flags["--plan"]))?;
                 let artifacts = PathBuf::from(&flags["--artifacts"]);
                 let run = tool::RunBinding {
                     run_id: flags["--run-id"].clone(),
@@ -208,11 +204,11 @@ mod cli {
             "companions" => {
                 let flags = flags(rest, &["--trace", "--out"])?;
                 let dir = PathBuf::from(&flags["--trace"]);
-                let trace = TraceReader::open(&dir)
-                    .map_err(|e| format!("{}: {e}", dir.display()))?
-                    .id;
+                // The digest and the verdicts come from one read of the
+                // trace, so the file can't name a trace it didn't judge.
+                let judged = companions::judge_trace(&dir)?;
                 // A trace with no verdict fails every companion, with why.
-                let verdicts = match companions::judge_trace(&dir) {
+                let verdicts = match judged.verdicts {
                     Ok(verdicts) => verdicts,
                     Err(why) => companions::COMPANIONS
                         .iter()
@@ -220,7 +216,7 @@ mod cli {
                         .collect(),
                 };
                 let run = CompanionsRun {
-                    trace,
+                    trace: judged.trace,
                     source: BuildInfo::current().source,
                     companions: verdicts
                         .into_iter()

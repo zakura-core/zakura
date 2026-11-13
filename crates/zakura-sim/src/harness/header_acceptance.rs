@@ -218,25 +218,35 @@ pub struct ExpectedNa {
     pub reason: &'static str,
 }
 
+/// The committed `.toml` of planted case `name` of `property`, relative to
+/// the repository root.
+fn case_toml(property: &str, name: &str) -> std::path::PathBuf {
+    std::path::Path::new("qa/planted")
+        .join(property)
+        .join(format!("{name}.toml"))
+}
+
+/// The committed TOML file `rel` of the repository `repo`, read through
+/// [`binding::committed_text`], or why it can't be.
+fn committed_toml(repo: &std::path::Path, rel: &std::path::Path) -> Result<toml::Table, String> {
+    let text = binding::committed_text(repo, rel)?;
+    toml::from_str(&text).map_err(|e| format!("{}: {e}", rel.display()))
+}
+
 /// The harness planted case `name` of `property` runs on, under the
 /// repository `repo`, from its `.toml` as the planted runner reads it: a
 /// fuzz-input case's committed `input`, whose sidecar names its `harness`,
 /// or a typed case's `[typed]` table's `harness`. A case names exactly one
-/// of the two. An error says what can't be read.
+/// of the two. Both files are read as committed ones
+/// ([`binding::committed_text`]), so an input outside the checkout, or
+/// under `target`, is refused. An error says what can't be read.
 pub fn planted_harness(
     repo: &std::path::Path,
     property: &str,
     name: &str,
 ) -> Result<String, String> {
-    let read = |path: &std::path::Path| -> Result<toml::Table, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
-    };
-    let path = repo
-        .join("qa/planted")
-        .join(property)
-        .join(format!("{name}.toml"));
-    let case = read(&path)?;
+    let path = case_toml(property, name);
+    let case = committed_toml(repo, &path)?;
     let harness = |table: &toml::Table, what: &str| {
         table
             .get("harness")
@@ -249,7 +259,8 @@ pub fn planted_harness(
             let input = input
                 .as_str()
                 .ok_or_else(|| format!("{}: `input` isn't a path", path.display()))?;
-            let sidecar = read(&repo.join(input).with_extension("toml"))?;
+            let sidecar =
+                committed_toml(repo, &std::path::Path::new(input).with_extension("toml"))?;
             harness(&sidecar, &format!("{input}'s sidecar"))
         }
         (None, Some(typed)) => {
@@ -266,20 +277,15 @@ pub fn planted_harness(
 }
 
 /// Whether planted case `name` of `property`, under the repository `repo`,
-/// is harness-caught: its `.toml` names `missing_evidence`, as the planted
-/// runner reads it. An error says what can't be read.
+/// is harness-caught: its committed `.toml` ([`binding::committed_text`])
+/// names `missing_evidence`, as the planted runner reads it. An error says
+/// what can't be read.
 pub fn planted_harness_caught(
     repo: &std::path::Path,
     property: &str,
     name: &str,
 ) -> Result<bool, String> {
-    let path = repo
-        .join("qa/planted")
-        .join(property)
-        .join(format!("{name}.toml"));
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let case: toml::Table =
-        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let case = committed_toml(repo, &case_toml(property, name))?;
     Ok(case.contains_key("missing_evidence"))
 }
 
@@ -562,7 +568,8 @@ pub enum Key {
         /// [`history_targets`](rows::history_targets) names it.
         target: String,
     },
-    /// A node history's expected `NotApplicable` list (C1).
+    /// A node history's expected `NotApplicable` list (C1), which that
+    /// history's own whole-report pass judges.
     NaList {
         /// The history.
         run: RunId,
@@ -716,9 +723,12 @@ impl Key {
     /// key the catch of exactly that case, a duplicate native mutation's key
     /// the catch of the case its classification names, a replay key the
     /// replay of exactly that execution, a test key the `Passes` of exactly
-    /// that test, and a requirement key what its
-    /// [`GATE_OBLIGATIONS`](required::GATE_OBLIGATIONS) entry permits. Any
-    /// other key also takes an `Open`, which blocks until approved. A
+    /// that test, a requirement key what its
+    /// [`GATE_OBLIGATIONS`](required::GATE_OBLIGATIONS) entry permits, a
+    /// `NotApplicable` reason's key the pass of the test that shows it
+    /// ([`rows::REASON_TESTS`]), and a node history's list key that
+    /// history's whole-report pass. Any other key also takes an `Open`,
+    /// which blocks until approved. A
     /// narrowing test key is matched against `narrowing`, the manifest's
     /// entries.
     pub fn covers(&self, expected: &Expected, narrowing: &[contracts::Narrowing]) -> bool {
@@ -816,9 +826,19 @@ impl Key {
                 };
                 same_open(expected, &canonical)
             }
-            (Key::NaList { .. }, Expected::Open { .. }) => same_open(expected, &rows::NA_LIST),
-            (Key::NaReason { .. }, Expected::Open { .. }) => {
-                same_open(expected, &rows::REASON_TEST)
+            // A node history's list is judged by that history's own
+            // whole-report pass, which compares every report with it.
+            (
+                Key::NaList { run },
+                Expected::Holds { history, .. } | Expected::StaysNotApplicable { history, .. },
+            ) => RunId::from(*history) == *run,
+            // A reason's key takes the pass of exactly the test that shows
+            // it, or, for a reason with none, the Open that blocks.
+            (Key::NaReason { reason }, Expected::Passes { test }) => {
+                rows::reason_test(*reason) == Some(*test)
+            }
+            (Key::NaReason { reason }, Expected::Open { .. }) => {
+                rows::reason_test(*reason).is_none() && same_open(expected, &rows::REASON_UNSHOWN)
             }
             (Key::Tier { property, tier }, Expected::Open { .. }) => TIERS
                 .into_iter()

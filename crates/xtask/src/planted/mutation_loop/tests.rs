@@ -930,6 +930,26 @@ fn planted_cases_refuse_a_nested_set() {
     assert_eq!(cases[0].property, "race/lost-update");
 }
 
+/// `--planted` refuses a case with a `draft_set` too: the loop runs only the
+/// ordinary witness, so it would count the case's stopping break as a kill
+/// without the `Draft` run that must also break each member, as
+/// `page-past-credit`'s `sim/no-livelock` does.
+#[test]
+fn planted_cases_refuse_a_draft_set() {
+    let repo = tempfile::tempdir().unwrap();
+    let case = repo.path().join("qa/planted/race/lost-update");
+    fs::create_dir_all(&case).unwrap();
+    fs::write(case.join("drafted.patch"), "").unwrap();
+    fs::write(
+        case.join("drafted.toml"),
+        "input = \"in.bin\"\ndraft_set = [\"sim/no-livelock\"]\n",
+    )
+    .unwrap();
+    let error =
+        planted_cases(repo.path(), &["race".to_owned()]).expect_err("a Draft-set case is refused");
+    assert!(error.to_string().contains("`draft_set`"), "{error}");
+}
+
 /// `--planted` selects whole path components or one case, so a prefix that
 /// names a directory doesn't also select a sibling that starts the same way.
 #[test]

@@ -28,6 +28,9 @@ use zakura_network::zakura::{MessageRole, MessageRule, Stream};
 
 use crate::{
     downstream,
+    harness::header_acceptance::refs::{
+        ConnectionRef, ExchangeRef, PeerFrameRef, Ref, SourceFrameRef,
+    },
     model::{consequence, is_fault_cause, is_rate_limit_cause, Consequence, Label},
     observe::{Entry, RowAt, StreamId},
     property::{
@@ -630,15 +633,15 @@ pub fn generated_trigger(layout: &[Stream], id: &PropertyId, log: &ObservationLo
 }
 
 /// True if the node judged a frame in `entries`, on `connection` if it's
-/// given and with `key` true of its sequence number and the frame the peer
-/// sent, that reaches receiver template `id`'s trigger
+/// given and with `key` true of the judged frame's whole ref and the frame
+/// the peer sent, that reaches receiver template `id`'s trigger
 /// ([`receiver_reached`]).
 fn judged_reaches(
     layout: &[Stream],
     id: &GeneratedId<'_>,
     entries: &[Entry],
     on: Option<u64>,
-    key: impl Fn(u64, &Sent<'_>) -> bool,
+    key: impl Fn(&PeerFrameRef, &Sent<'_>) -> bool,
 ) -> bool {
     entries.iter().enumerate().any(|(at, entry)| {
         let Observation::FrameJudged {
@@ -650,26 +653,28 @@ fn judged_reaches(
         else {
             return false;
         };
-        if on.is_some_and(|on| on != connection) {
+        let elsewhere = on.is_some_and(|on| {
+            !ConnectionRef::joins(&ConnectionRef { connection: on }, &connection, |judged| {
+                Some(ConnectionRef {
+                    connection: *judged,
+                })
+            })
+        });
+        if elsewhere {
             return false;
         }
         let before = &entries[..at];
-        // What came before the peer sent the frame, which `sent` checked
-        // appears exactly once.
-        let sent_before = before
-            .iter()
-            .rposition(|entry| {
-                matches!(&entry.obs, Observation::PeerFrame {
-                    connection: c,
-                    stream: s,
-                    quic_stream: q,
-                    seq: n,
-                    ..
-                } if (*c, *s, *q, *n) == (connection, stream, quic_stream, seq))
-            })
-            .map_or(before, |sent_at| &before[..sent_at]);
+        let judged = PeerFrameRef {
+            connection,
+            kind: stream.kind,
+            version: stream.version,
+            quic_stream,
+            seq,
+        };
         sent(before, connection, stream, quic_stream, seq).is_ok_and(|frame| {
-            key(seq, &frame) && receiver_reached(layout, id, sent_before, connection, &frame)
+            // What came before the peer sent the frame.
+            let sent_before = &before[..frame.at];
+            key(&judged, &frame) && receiver_reached(layout, id, sent_before, connection, &frame)
         })
     })
 }
@@ -677,10 +682,11 @@ fn judged_reaches(
 /// True if each effect in `entries` that downstream template `id` checks
 /// ([`crate::downstream`]) came after a frame the node judged on the
 /// effect's connection that reaches `id`'s trigger on the effect's own
-/// identity: the work's source frame, by stream and sequence number, for
-/// `receiver-work-authorized`; a page with the work's subscription key for
-/// `receiver-credit-conserved`; and a request with the serving owner's or
-/// output's key for `receiver-serving-bounded`. So a violation's trigger
+/// identity: the work's source frame, by its [`SourceFrameRef`], for
+/// `receiver-work-authorized`; a page with the work's subscription, by its
+/// [`ExchangeRef`], for `receiver-credit-conserved`; and a request with the
+/// serving owner's or output's [`ExchangeRef`] for
+/// `receiver-serving-bounded`. So a violation's trigger
 /// history is its own, not another connection's, frame's or exchange's,
 /// and an effect with no such frame reaches nothing.
 fn effects_follow_trigger(layout: &[Stream], id: &GeneratedId<'_>, entries: &[Entry]) -> bool {
@@ -699,7 +705,15 @@ fn effects_follow_trigger(layout: &[Stream], id: &GeneratedId<'_>, entries: &[En
                     ..
                 },
                 Template::WorkAuthorized,
-            ) if on_row(frame) => (*connection, Some((frame.stream, *seq)), None),
+            ) if on_row(frame) => {
+                let source = SourceFrameRef {
+                    connection: *connection,
+                    kind: frame.stream.kind,
+                    version: frame.stream.version,
+                    seq: *seq,
+                };
+                (*connection, Some(source), None)
+            }
             (
                 Observation::WorkAdmitted {
                     connection,
@@ -709,7 +723,14 @@ fn effects_follow_trigger(layout: &[Stream], id: &GeneratedId<'_>, entries: &[En
                     ..
                 },
                 Template::CreditConserved,
-            ) if on_row(request) => (*connection, None, Some(*exchange)),
+            ) if on_row(request) => (
+                *connection,
+                None,
+                Some(ExchangeRef {
+                    connection: *connection,
+                    exchange: *exchange,
+                }),
+            ),
             (
                 Observation::Serving {
                     connection,
@@ -723,7 +744,14 @@ fn effects_follow_trigger(layout: &[Stream], id: &GeneratedId<'_>, entries: &[En
                     ..
                 },
                 Template::ServingBounded,
-            ) if on_row(request) => (*connection, None, Some(*exchange)),
+            ) if on_row(request) => (
+                *connection,
+                None,
+                Some(ExchangeRef {
+                    connection: *connection,
+                    exchange: *exchange,
+                }),
+            ),
             _ => return true,
         };
         judged_reaches(
@@ -731,9 +759,17 @@ fn effects_follow_trigger(layout: &[Stream], id: &GeneratedId<'_>, entries: &[En
             id,
             &entries[..at],
             Some(connection),
-            |seq, frame| {
-                source.is_none_or(|source| source == (frame.stream, seq))
-                    && exchange.is_none_or(|exchange| frame.exchange == Some(exchange))
+            |judged, frame| {
+                source.as_ref().is_none_or(|source| {
+                    SourceFrameRef::joins(source, judged, |judged| Some(judged.into()))
+                }) && exchange.as_ref().is_none_or(|exchange| {
+                    ExchangeRef::joins(exchange, frame, |frame| {
+                        frame.exchange.map(|key| ExchangeRef {
+                            connection: judged.connection,
+                            exchange: key,
+                        })
+                    })
+                })
             },
         )
     })
@@ -894,6 +930,8 @@ pub(crate) fn request_of(
 /// One frame a peer sent.
 #[derive(Clone, Copy, Debug)]
 struct Sent<'a> {
+    /// Its `PeerFrame`'s position in the entries [`sent`] read.
+    at: usize,
     stream: StreamId,
     row: Option<&'a str>,
     rule_stream: StreamId,
@@ -904,9 +942,9 @@ struct Sent<'a> {
 }
 
 /// The frame `seq` the peer sent on `connection`, `stream` and
-/// `quic_stream`, from `entries`. Every judged frame needs exactly one label
-/// there, so a missing or repeated `PeerFrame` is missing evidence,
-/// described in the error.
+/// `quic_stream`, from `entries`, joined by its whole [`PeerFrameRef`].
+/// Every judged frame needs exactly one label there, so a missing or
+/// repeated `PeerFrame` is missing evidence, described in the error.
 fn sent(
     entries: &[Entry],
     connection: u64,
@@ -914,27 +952,36 @@ fn sent(
     quic_stream: Option<u64>,
     seq: u64,
 ) -> Result<Sent<'_>, String> {
-    let mut labels = entries.iter().filter_map(|entry| match &entry.obs {
-        Observation::PeerFrame {
-            connection: c,
-            stream: s,
-            quic_stream: quic,
-            seq: q,
-            row,
-            rule_stream,
-            label,
-            exhausted,
-            exchange,
-            ..
-        } if (*c, *s, *quic, *q) == (connection, stream, quic_stream, seq) => Some(Sent {
-            stream,
-            row: row.as_deref(),
-            rule_stream: *rule_stream,
-            label: *label,
-            exhausted: *exhausted,
-            exchange: *exchange,
-        }),
-        _ => None,
+    let want = PeerFrameRef {
+        connection,
+        kind: stream.kind,
+        version: stream.version,
+        quic_stream,
+        seq,
+    };
+    let mut labels = entries.iter().enumerate().filter_map(|(at, entry)| {
+        if !PeerFrameRef::joins(&want, entry, |entry| peer_frame(&entry.obs)) {
+            return None;
+        }
+        match &entry.obs {
+            Observation::PeerFrame {
+                row,
+                rule_stream,
+                label,
+                exhausted,
+                exchange,
+                ..
+            } => Some(Sent {
+                at,
+                stream,
+                row: row.as_deref(),
+                rule_stream: *rule_stream,
+                label: *label,
+                exhausted: *exhausted,
+                exchange: *exchange,
+            }),
+            _ => None,
+        }
     });
     let on = quic_stream.map_or(String::new(), |quic| format!(" (QUIC stream {quic})"));
     let frame = format!("connection {connection} judged frame {seq} on {stream}{on}");
@@ -942,6 +989,26 @@ fn sent(
         (Some(sent), None) => Ok(sent),
         (None, _) => Err(format!("{frame} has no PeerFrame label before it")),
         (Some(_), Some(_)) => Err(format!("{frame} has more than one PeerFrame label")),
+    }
+}
+
+/// The frame a peer's `PeerFrame` names, if `obs` is one.
+fn peer_frame(obs: &Observation) -> Option<PeerFrameRef> {
+    match obs {
+        Observation::PeerFrame {
+            connection,
+            stream,
+            quic_stream,
+            seq,
+            ..
+        } => Some(PeerFrameRef {
+            connection: *connection,
+            kind: stream.kind,
+            version: stream.version,
+            quic_stream: *quic_stream,
+            seq: *seq,
+        }),
+        _ => None,
     }
 }
 
@@ -957,8 +1024,11 @@ fn judged(entries: &[Entry], connection: u64) -> Result<Vec<Sent<'_>>, String> {
                 stream,
                 quic_stream,
                 seq,
-            } if c == connection => {
-                Some(sent(&entries[..at], connection, stream, quic_stream, seq))
+            } if ConnectionRef::joins(&ConnectionRef { connection }, &c, |c| {
+                Some(ConnectionRef { connection: *c })
+            }) =>
+            {
+                Some(sent(&entries[..at], c, stream, quic_stream, seq))
             }
             _ => None,
         })
@@ -976,9 +1046,12 @@ pub(crate) fn judged_nonconformant(entries: &[Entry], connection: u64) -> Result
 
 /// True if `entries` hold a close of `connection`, with any cause.
 fn closed(entries: &[Entry], connection: u64) -> bool {
-    entries.iter().any(|entry| {
-        matches!(entry.obs, Observation::ConnectionClosed { connection: c, .. } if c == connection)
+    let closing = ConnectionRef { connection };
+    !ConnectionRef::joined(&closing, entries, |entry| match entry.obs {
+        Observation::ConnectionClosed { connection, .. } => Some(ConnectionRef { connection }),
+        _ => None,
     })
+    .is_empty()
 }
 
 /// The subject of an obligation on `connection`.

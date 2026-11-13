@@ -1669,7 +1669,9 @@ pub const WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD: &str =
     "header-sync/watch-observed-under-lifecycle-flood";
 
 /// What the flood checks read: one reactor's adoption evidence, which
-/// keeps publications, watch reads and taken events in order.
+/// keeps publications, watch reads and taken events in order. The
+/// harness's stamps ([`HasView::stamps_after`]) cover its facts, since a
+/// break is reported at the step that stamped its breaking event.
 pub trait AdoptionView {
     /// The reactor's adoption evidence.
     fn adoption(&self) -> &AdoptionEvidence;
@@ -1748,15 +1750,16 @@ where
 
 /// Checks the watch rule for `queue` over the view's adoption evidence
 /// ([`AdoptionEvidence::watch_read`]), each publication it broke its own
-/// violation. It applies once a state is published. A publication still waiting for its read or its third event
-/// stays pending ([`Pending::WatchOpen`]) if the run ends there, unless
-/// [`watch_end_violations`] breaks it at a settled end.
+/// violation, once, at the step that added the breaking event. It applies
+/// once a state is published. A publication still waiting for its read or
+/// its third event stays pending ([`Pending::WatchOpen`]) if the run ends
+/// there, unless [`watch_end_violations`] breaks it at a settled end.
 fn check_watch_read<S>(cx: &mut CheckCtx<'_, S>, queue: EventQueue) -> Verdict
 where
     S: HasView,
     S::View: AdoptionView,
 {
-    match cx.view().adoption().watch_read(queue) {
+    match cx.view().adoption().watch_read(queue, cx.new_stamps()) {
         WatchRead::Nothing => Verdict::NotApplicable,
         WatchRead::Holds => Verdict::Holds,
         WatchRead::Open => {

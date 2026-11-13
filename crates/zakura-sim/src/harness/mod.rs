@@ -357,7 +357,7 @@ pub(crate) fn registry<S: Subsystem>() -> Registry<S> {
             needs: &[Source::Schedule],
             status: Status::Active,
             check: live_step::<S>,
-            witness: None,
+            witness: Some(TriggerHistory::Log(a_task_ran)),
         },
     ];
     properties.extend(S::properties());
@@ -423,9 +423,10 @@ fn no_task_panic<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     }
 }
 
-/// [`NO_TASK_PANIC`]'s trigger history: the step loop ran a task and
-/// logged how its poll ended, which a panic needs. A run that never polled
-/// a task has nothing a panic check could have seen.
+/// [`NO_TASK_PANIC`]'s and [`NO_LIVELOCK`]'s trigger history: the step
+/// loop ran a task and logged how its poll ended, which a panic needs and
+/// so does a spin at one instant. A run that never polled a task has
+/// nothing either check could have seen.
 fn a_task_ran(log: &ObservationLog) -> bool {
     log.entries().iter().any(|entry| {
         matches!(

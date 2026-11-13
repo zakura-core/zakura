@@ -356,8 +356,9 @@ fn regenerate_hold_fixtures() {
 }
 
 /// `record --witness` judges each committed fixture as `cargo xtask
-/// planted` runs it, expecting a hold, and `replay` reruns the trace Exact
-/// in a fresh process.
+/// planted` and the acceptance runner run it, expecting a hold of both its
+/// hold-wake property and `sim/no-livelock`, whose counted history it is,
+/// and `replay` reruns the trace Exact in a fresh process.
 #[test]
 fn the_committed_fixtures_record_and_replay_in_a_fresh_process() {
     let zakura_sim = |args: &[&str]| {
@@ -367,52 +368,54 @@ fn the_committed_fixtures_record_and_replay_in_a_fresh_process() {
             .expect("the binary runs")
     };
     for (name, _) in committed_fixtures() {
-        let dir = tempfile::TempDir::new().expect("a temporary directory");
-        let trace = dir.path().join("trace");
-        let scenario =
-            fs::read_to_string(fixture_file(name, "json")).expect("the fixture is committed");
-        let recorded = zakura_sim(&[
-            "record",
-            "--sim",
-            Liveness::NAME,
-            "--scenario",
-            &scenario,
-            "--plan",
-            fixture_file(name, "plan")
-                .to_str()
-                .expect("the path is UTF-8"),
-            "--out",
-            trace.to_str().expect("the path is UTF-8"),
-            "--witness",
-            HOLD_RELEASE_WAKES,
-            "--expect",
-            "holds",
-        ]);
-        assert!(recorded.status.success(), "{name}: {recorded:?}");
-        let witness: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(trace.join(zakura_sim::harness::WITNESS_FILE))
-                .expect("witness.json"),
-        )
-        .expect("witness.json is JSON");
-        assert_eq!(
-            witness["passed"],
-            serde_json::Value::Bool(true),
-            "{name}: {witness}"
-        );
-        let end: serde_json::Value = fs::read_to_string(trace.join("trace.jsonl"))
-            .expect("the trace is written")
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .find_map(|line| line.get("end").cloned())
-            .expect("the trace ends");
-        assert_eq!(end["outcome"], "idle", "{name}: {end}");
-        let replayed = zakura_sim(&["replay", trace.to_str().expect("the path is UTF-8")]);
-        let stdout = String::from_utf8_lossy(&replayed.stdout);
-        assert!(
-            replayed.status.success()
-                && stdout.contains("every pick, draw and observation matched"),
-            "{name}: {replayed:?}"
-        );
+        for property in [HOLD_RELEASE_WAKES, NO_LIVELOCK] {
+            let dir = tempfile::TempDir::new().expect("a temporary directory");
+            let trace = dir.path().join("trace");
+            let scenario =
+                fs::read_to_string(fixture_file(name, "json")).expect("the fixture is committed");
+            let recorded = zakura_sim(&[
+                "record",
+                "--sim",
+                Liveness::NAME,
+                "--scenario",
+                &scenario,
+                "--plan",
+                fixture_file(name, "plan")
+                    .to_str()
+                    .expect("the path is UTF-8"),
+                "--out",
+                trace.to_str().expect("the path is UTF-8"),
+                "--witness",
+                property,
+                "--expect",
+                "holds",
+            ]);
+            assert!(recorded.status.success(), "{name} {property}: {recorded:?}");
+            let witness: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(trace.join(zakura_sim::harness::WITNESS_FILE))
+                    .expect("witness.json"),
+            )
+            .expect("witness.json is JSON");
+            assert_eq!(
+                witness["passed"],
+                serde_json::Value::Bool(true),
+                "{name} {property}: {witness}"
+            );
+            let end: serde_json::Value = fs::read_to_string(trace.join("trace.jsonl"))
+                .expect("the trace is written")
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find_map(|line| line.get("end").cloned())
+                .expect("the trace ends");
+            assert_eq!(end["outcome"], "idle", "{name} {property}: {end}");
+            let replayed = zakura_sim(&["replay", trace.to_str().expect("the path is UTF-8")]);
+            let stdout = String::from_utf8_lossy(&replayed.stdout);
+            assert!(
+                replayed.status.success()
+                    && stdout.contains("every pick, draw and observation matched"),
+                "{name} {property}: {replayed:?}"
+            );
+        }
     }
 }
 

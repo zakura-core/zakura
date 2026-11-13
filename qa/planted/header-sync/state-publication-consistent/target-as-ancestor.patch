@@ -1,0 +1,29 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
+index 23d8fafeec..495d0820e2 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
+@@ -543,15 +543,19 @@ impl PublisherState {
+                 }
+                 let target = subscription.fixed.target;
+                 let last = subscription.position.last();
++                let locators = match last {
++                    Some(last) => vec![last.hash],
++                    None => subscription.locators.clone(),
++                };
+                 Job {
+                     key,
+                     id,
+-                    initial_target: target,
++                    // Mutation: a path job copies its first locator, where
++                    // its page starts, into its target, while it still
++                    // leases toward the right one.
++                    initial_target: locators.first().copied().unwrap_or(target),
+                     lease_target: target,
+-                    locators: match last {
+-                        Some(last) => vec![last.hash],
+-                        None => subscription.locators.clone(),
+-                    },
++                    locators,
+                     parent: last,
+                     // Before the first page, check that the target is still
+                     // selected.

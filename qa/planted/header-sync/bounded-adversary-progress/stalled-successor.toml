@@ -1,0 +1,19 @@
+# hdr-13's stalled successor on the close class: a round never dispatches
+# its prepare once its last page is staged. In the departure fixture,
+# mirror A holds the target when the harness closes it, and the recover
+# names mirror B, the one member left. B takes A's target up and stages
+# its pages, so `peer-retirement-progress`'s hand-off still holds, but its
+# round never prepares, and the node stays at A3, its baseline at the
+# `Recover` pick. The `recovered` pick owes A4 to A6, and the obligation
+# runs to its 30-second deadline. The harness offers a time boundary just
+# past it, so the violation comes there, and the fixture's finish ends the
+# run idle after it.
+# Besides reactor.rs, which the patch changes, the rest of header sync
+# decides whether B is offered the target and stages its pages. A change
+# there can move the input off its staged page.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-recovery-departure.json"
+plan = "crates/zakura-sim/tests/fixtures/header-recovery-departure.plan"

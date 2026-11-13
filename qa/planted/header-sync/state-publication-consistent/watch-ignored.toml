@@ -1,0 +1,13 @@
+# The run loop drops its committed watch's arm and its top-of-turn check.
+# On the liveness quiet-reset witness the invalidation and reconsideration
+# commit after the mirror's session is admitted, so no new session reads
+# the watch, and the reactor never adopts them before quiescence. No
+# node-side commit happens, so hdr-7c's flood properties don't apply. The
+# run loop's watch handling decides when a commit is adopted, so a change
+# there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-live-quiet-reset.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-live-quiet-reset.plan"

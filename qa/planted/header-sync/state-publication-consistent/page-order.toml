@@ -1,0 +1,11 @@
+# The publisher swaps a page's first two headers. On the served-in-pages
+# witness the first page of 250 headers is queued out of its read's order,
+# while its declared ancestor and its last header stay right. The page
+# publisher decides what a page holds, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync/v9"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-served-in-pages.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-served-in-pages.plan"

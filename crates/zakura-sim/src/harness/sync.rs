@@ -788,6 +788,17 @@ impl ActionSource for Control {
                 .unwrap_or_else(|_| panic!("{full}")),
         }
     }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Watches the node's engine at each observation: hands the cross model the
@@ -844,6 +855,17 @@ impl ActionSource for EngineWatch {
             self.header_best = header_best;
         }
         Ok(())
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 
@@ -973,14 +995,17 @@ pub fn sync_config(scenario: &SyncScenario) -> RunConfig {
         budget: scenario.steps.unwrap_or(
             12_000 + STEPS_PER_BLOCK * (u64::from(scenario.blocks) + scenario.changed()),
         ),
-        drain_bound: 2_000,
+        // The longest drain measured on the saved scenarios is about 2,200
+        // steps here, and 18,600 over `sync/wire`'s QUIC, which shares this
+        // bound and runs the peers' timers to the harness timer cap.
+        drain_bound: 80_000,
         ..RunConfig::default()
     }
 }
 
 impl Subsystem for SyncStorage {
     const NAME: &'static str = "sync/storage";
-    const GENERATOR: u32 = 2;
+    const GENERATOR: u32 = 3;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = SyncScenario;
     type Prepared = SyncPorts;
@@ -1358,11 +1383,33 @@ pub enum SavedSync {
     /// [`REORG_NTH`]th admitted apply for [`REORG_HOLD_MS`] before committing
     /// it: the verdict stage.
     ReorgVerdict,
+    /// Header storage holds the node's first header prepare for the whole
+    /// run, since nothing in `sync/storage` releases a hold, and the node's
+    /// shutdown is first offered at [`TEARDOWN_HEADERS_MS`]. However long
+    /// the shutdown waits, the prepare can't finish first, so a Plan that
+    /// takes the shutdown has the stopped reactor drop its call unfinished.
+    /// The step has no deadline, so a Plan that keeps it waiting until the
+    /// step budget never stops the node. A shutdown taken soon after it's
+    /// offered leaves block sync nothing to download. A later one may let
+    /// the node sync from its other mirror first.
+    TeardownHeaders,
 }
 
 /// How long the teardown scenarios hold their operation past the node's
 /// shutdown, at least, in milliseconds of virtual time.
 const TEARDOWN_HOLD_MS: u64 = 2_000;
+
+/// When [`SavedSync::TeardownHeaders`]'s shutdown is first offered, in
+/// milliseconds of virtual time from the run's start. Time moves only once
+/// no task can run, and no further than the earliest pending operation's
+/// deadline. Before the first header prepare, only the node's locator read
+/// is a storage operation, which the converging policy completes within
+/// 5 s, so the prepare is submitted before this under any Plan. The
+/// shutdown step has no deadline, so a Plan may take it much later, after
+/// the round's 30 s request deadline has retired the round and the node
+/// has prepared again from its other mirror. The held prepare's call is
+/// still unfinished then, which is what the fixture needs.
+const TEARDOWN_HEADERS_MS: u64 = 20_000;
 
 /// How long [`SavedSync::RetiredQuery`] holds its query, at least, in
 /// milliseconds of virtual time.
@@ -1386,7 +1433,7 @@ const TAG: u8 = 0xFD;
 
 impl SavedSync {
     /// Every saved scenario.
-    pub const ALL: [SavedSync; 9] = [
+    pub const ALL: [SavedSync; 10] = [
         SavedSync::Honest,
         SavedSync::Reorg,
         SavedSync::RetiredQuery,
@@ -1396,6 +1443,7 @@ impl SavedSync {
         SavedSync::ReorgRequest,
         SavedSync::ReorgSubmit,
         SavedSync::ReorgVerdict,
+        SavedSync::TeardownHeaders,
     ];
 
     /// The fixture's name, `sync-storage-<name>.bin`.
@@ -1410,6 +1458,7 @@ impl SavedSync {
             SavedSync::ReorgRequest => "reorg-request",
             SavedSync::ReorgSubmit => "reorg-submit",
             SavedSync::ReorgVerdict => "reorg-verdict",
+            SavedSync::TeardownHeaders => "teardown-headers",
         }
     }
 
@@ -1448,6 +1497,7 @@ impl SavedSync {
                 (BLOCK_TEARDOWN_RETURNS_BASELINE, "holds"),
                 (cross::TEARDOWN_RETURNS_BASELINE, "holds"),
             ],
+            SavedSync::TeardownHeaders => &[(cross::TEARDOWN_RETURNS_BASELINE, "holds")],
         }
     }
 
@@ -1540,6 +1590,26 @@ impl SavedSync {
                 block_policy::Select::nth(block_policy::BlockKind::Apply, REORG_NTH),
                 vec![block_policy::BlockAllow::Committed],
             ),
+            SavedSync::TeardownHeaders => {
+                let mut header_policy = header_node::Policy::converging();
+                header_policy.holds.push(header_node::policy::Hold {
+                    select: header_node::policy::Select::nth(
+                        header_node::policy::OpKind::Prepare,
+                        1,
+                    ),
+                    until: header_node::policy::Trigger::Released,
+                    then: vec![header_node::policy::Allow::Engine],
+                    deadline_ms: None,
+                });
+                SyncScenario {
+                    header_policy,
+                    control: vec![SyncStep {
+                        action: SyncAction::Teardown,
+                        when: Some(Trigger::VirtualTime(TEARDOWN_HEADERS_MS)),
+                    }],
+                    ..two_mirrors
+                }
+            }
         }
     }
 }

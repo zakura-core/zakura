@@ -430,7 +430,8 @@ fn other_causes_tasks_and_dropped_calls_are_not_judged() {
 
 /// A stale fault's penalty isn't an effect on other work: a `Misbehavior`
 /// under a stale handler breaks nothing, so a stale prepare that fails with
-/// a peer fault may still penalize its peer.
+/// a peer fault may still penalize its peer. The wire harness's
+/// `a_disconnect_mid_prepare_is_still_penalized` runs one end to end.
 #[test]
 fn a_stale_faults_penalty_is_allowed() {
     let mut events = retired_window();

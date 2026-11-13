@@ -23,7 +23,7 @@ use crate::{
 use itertools::Itertools;
 
 use super::{
-    FieldNotPresent, JoinSplitData, JoinSplitPubKey, JoinSplitSig, LockTime, Memo, Transaction,
+    FieldNotPresent, JoinSplitData, JoinSplitPubKey, JoinSplitSig, LockTime, Transaction,
     UnminedTx, VerifiedUnminedTx,
 };
 
@@ -517,22 +517,6 @@ impl Transaction {
 
         Ok(remaining_transaction_value)
     }
-}
-
-impl Arbitrary for Memo {
-    type Parameters = ();
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        (vec(any::<u8>(), 512))
-            .prop_map(|v| {
-                let mut bytes = [0; 512];
-                bytes.copy_from_slice(v.as_slice());
-                Memo(Box::new(bytes))
-            })
-            .boxed()
-    }
-
-    type Strategy = BoxedStrategy<Self>;
 }
 
 /// Generates arbitrary [`LockTime`]s.

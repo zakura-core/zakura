@@ -103,6 +103,7 @@ fn peer_offers(report: &RunReport) -> BTreeMap<(u64, u64), Offers> {
                 connection,
                 quic_stream,
                 seq,
+                ..
             } => {
                 let next = offers
                     .get_mut(&(*connection, *quic_stream))
@@ -879,6 +880,7 @@ fn a_reopen_after_both_subscriptions_end_gets_a_new_identity() {
                     quic_stream,
                     seq,
                     message_type,
+                    ..
                 } if *quic_stream == first => Some((at.step, *seq, *message_type)),
                 _ => None,
             })

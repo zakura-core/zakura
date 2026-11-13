@@ -27,6 +27,11 @@
 //!   resets never verify bodies. Which tip is selected is
 //!   `expected-chain-selected`'s.
 //! - **Read.** A locator read leaves the durable state exactly as it was.
+//!
+//! A harness commit straight into the engine records an engine run too
+//! (`ControlledPort::harness_commit`), and is judged as an apply of its own
+//! headers that returned `Applied`, since its harness fails the run
+//! otherwise.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -82,16 +87,20 @@ impl Contents {
         }
     }
 
-    /// Judges one engine `run`.
-    pub(super) fn run(&mut self, run: &EngineRun) {
+    /// Judges one engine `run`, returning whether it found the run left the
+    /// engine's durable state other than its rules allow.
+    pub(super) fn run(&mut self, run: &EngineRun) -> bool {
         let EngineRun {
             kind,
             clock,
             before,
             after,
+            // The engine's own snapshot is `expected-chain-selected`'s.
+            snapshot: _,
         } = run;
         let what = match kind {
             RunKind::Apply(id, _) => format!("apply operation {}", id.0),
+            RunKind::HarnessCommit(_) => "a harness commit".to_owned(),
             RunKind::Reset => "a reset".to_owned(),
             RunKind::Locator(id, _) => {
                 // Its result is `reset-invalidates-work`'s locator-result
@@ -102,8 +111,9 @@ impl Contents {
                          state",
                         id.0
                     ));
+                    return true;
                 }
-                return;
+                return false;
             }
         };
         let mut found = Vec::new();
@@ -140,9 +150,20 @@ impl Contents {
             .map(|new| hash(*new))
             .collect();
         inserted.sort_unstable();
-        let success = match kind {
+        // A harness commit inserts its own headers and returned `Applied`,
+        // or its harness failed the run, so it's judged as such an apply.
+        let insertion = match kind {
             RunKind::Apply(id, result) => {
-                let payload = self.payloads.get(&id.0).cloned().flatten();
+                Some((self.payloads.get(&id.0).cloned().flatten(), result.clone()))
+            }
+            RunKind::HarnessCommit(hashes) => Some((
+                Some(hashes.iter().map(|header| hash(*header)).collect()),
+                ResultIdentity::Applied,
+            )),
+            _ => None,
+        };
+        let success = match insertion {
+            Some((payload, result)) => {
                 let stray: Vec<&String> = inserted
                     .iter()
                     .filter(|new| !payload.as_ref().is_some_and(|sent| sent.contains(new)))
@@ -201,10 +222,12 @@ impl Contents {
         if success {
             self.judge_state(*clock, before, after, reset.as_ref(), &mut found);
         }
+        let broke = !found.is_empty();
         for detail in found {
             self.breaks
                 .push(format!("CommitOnlyAuthorized: {what} {detail}"));
         }
+        broke
     }
 
     /// Judges the durable state `after` a successful run, field by field:

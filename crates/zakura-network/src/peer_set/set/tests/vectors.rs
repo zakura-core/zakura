@@ -411,6 +411,7 @@ fn block_gossip_skips_busy_outdated_peers() {
                 sender,
                 address: None,
                 uploads: Default::default(),
+                announced: Default::default(),
                 registry: None,
                 version: Version(1),
                 sidecar: false,

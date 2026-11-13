@@ -1484,7 +1484,7 @@ impl IpSlots {
         counts.registered(ip).saturating_add(counts.handshaking(ip))
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, all(debug_assertions, not(zakura_sim))))]
     fn registered_total(&self) -> usize {
         self.counts().registered_total()
     }
@@ -1702,7 +1702,13 @@ impl ZakuraSupervisorState {
         }
     }
 
-    #[cfg(debug_assertions)]
+    /// Checks that the per-IP registered totals match the active peer
+    /// registrations with known IPs, in debug builds.
+    ///
+    /// Simulator builds skip it. Its `IpSlots` lock is a scheduler point
+    /// there, so a debug-only lock would give debug and release builds
+    /// different schedules for the same seed.
+    #[cfg(all(debug_assertions, not(zakura_sim)))]
     fn debug_assert_accounting(&self) {
         debug_assert_eq!(
             self.ip_slots.registered_total(),
@@ -1714,7 +1720,7 @@ impl ZakuraSupervisorState {
         );
     }
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(any(not(debug_assertions), zakura_sim))]
     fn debug_assert_accounting(&self) {}
 }
 
@@ -2751,7 +2757,7 @@ struct SessionOpenContext<'a> {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum InboundMessageAdmission {
+pub(crate) enum InboundMessageAdmission {
     Admit,
     Oversize,
     Throttled,
@@ -2786,26 +2792,27 @@ fn admit_inbound_message(
     // A stream with a table charges only the rows that declare a cadence.
     // Commitments bound requests and reservations bound responses.
     if let (Some(cadence), Some(rules)) = (&context.cadence, context.messages) {
-        let rule = MessageRule::find(rules, frame.message_type)
-            .expect("the frame filter admits only rows of the stream's table");
-        let charge = cadence
-            .buckets
-            .lock()
-            .expect("Zakura cadence bucket mutex is never poisoned")
-            .charge(cadence.layout, rule);
-        // A sibling stream can keep the connection alive during an unbounded
-        // transport stall. Exhaustion cannot prove a sender violation.
-        if charge == CadenceCharge::Exhausted {
-            context.conn.trace_rate_limit(
-                "cadence.exhausted",
-                context.stream_id,
-                stream_kind,
-                None,
-                None,
-                None,
-            );
-        }
-        return InboundMessageAdmission::Admit;
+        return admit_tabled_message(
+            frame,
+            rules,
+            |rule| {
+                cadence
+                    .buckets
+                    .lock()
+                    .expect("Zakura cadence bucket mutex is never poisoned")
+                    .charge(cadence.layout, rule)
+            },
+            || {
+                context.conn.trace_rate_limit(
+                    "cadence.exhausted",
+                    context.stream_id,
+                    stream_kind,
+                    None,
+                    None,
+                    None,
+                );
+            },
+        );
     }
 
     let admitted = {
@@ -2833,6 +2840,45 @@ fn admit_inbound_message(
     }
 
     InboundMessageAdmission::Admit
+}
+
+/// Admits `frame` on a stream with the message table `rules`. It finds the
+/// frame's row, charges the row's cadence bucket through `charge`, and calls
+/// `exhausted` if the bucket was empty. An empty bucket doesn't refuse the
+/// frame.
+///
+/// # Panics
+///
+/// If no row of `rules` has the frame's type. The frame filter admits only
+/// rows of the stream's table.
+pub(crate) fn admit_tabled_message(
+    frame: &Frame,
+    rules: &[MessageRule],
+    charge: impl FnOnce(&MessageRule) -> CadenceCharge,
+    exhausted: impl FnOnce(),
+) -> InboundMessageAdmission {
+    let rule = MessageRule::find(rules, frame.message_type)
+        .expect("the frame filter admits only rows of the stream's table");
+    // A sibling stream can keep the connection alive during an unbounded
+    // transport stall. Exhaustion cannot prove a sender violation.
+    if charge(rule) == CadenceCharge::Exhausted {
+        exhausted();
+    }
+    InboundMessageAdmission::Admit
+}
+
+impl InboundMessageAdmission {
+    /// The close cause the ordered stream reader records for this result,
+    /// or `None` if it admits the frame.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn ordered_close_cause(self) -> Option<&'static str> {
+        let error = match self {
+            InboundMessageAdmission::Admit => return None,
+            InboundMessageAdmission::Oversize => ZakuraHandlerError::Oversize,
+            InboundMessageAdmission::Throttled => ZakuraHandlerError::RateLimited,
+        };
+        Some(read_close_cause(ReadPath::Ordered, &error))
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -8395,7 +8441,7 @@ impl ZakuraHandlerError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests {
     mod bounded_decoding;
     pub(super) mod connection;

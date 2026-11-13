@@ -1,5 +1,10 @@
+use std::sync::Mutex as StdMutex;
+
 use super::*;
-use crate::zakura::{CloseCause, FramedRecv, SinkReject};
+use crate::zakura::{
+    header_sync::observe::{HeaderSyncObserver, ReactorEvent},
+    CloseCause, FramedRecv, SinkReject,
+};
 
 #[test]
 fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
@@ -466,9 +471,25 @@ fn response_exceeding_its_owned_reservation_is_malformed_and_releases_capacity()
     );
 }
 
+/// Records every event its handle reports.
+#[derive(Debug, Default)]
+struct Reported(StdMutex<Vec<ReactorEvent>>);
+
+impl HeaderSyncObserver for Reported {
+    /// Keeps `event`.
+    fn observe(&self, event: ReactorEvent) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+}
+
 /// Run the session reader on one page from `parent`, then on the inbound
-/// stream's end, for a session subscribed to `target` from `locators`.
+/// stream's end, for a session subscribed to `target` from `locators`,
+/// whose handle reports to `reported`.
 async fn read_page(
+    reported: &Arc<Reported>,
     tree: &v9::test_support::HeaderTree,
     target: zakura_header_chain::Frontier,
     locators: &[zakura_header_chain::Frontier],
@@ -482,8 +503,10 @@ async fn read_page(
         v9::{LeaseOwner, Publisher},
     };
 
-    let (handle, _actions, _reactor) = build_header_sync_reactor(startup(CancellationToken::new()))
-        .expect("the session reader fixture starts");
+    let (mut handle, _actions, _reactor) =
+        build_header_sync_reactor(startup(CancellationToken::new()))
+            .expect("the session reader fixture starts");
+    handle.credit_observer = Some(reported.clone());
     let peer = peer();
     let cancel = CancellationToken::new();
     let (send, _outbound) = framed_channel(8);
@@ -539,7 +562,9 @@ async fn read_page(
 
 /// The session reader ends the session as a protocol violation when a page
 /// claims a sent locator but its headers do not link, before the reactor or
-/// preparation sees the page. The same subscription admits the linked page.
+/// preparation sees the page, and reports the refusal to its handle's
+/// observer. The same subscription admits the linked page, reporting no
+/// refusal.
 #[tokio::test]
 async fn unlinked_page_ends_the_session_in_the_reader() {
     let mut tree = v9::test_support::HeaderTree::new();
@@ -547,11 +572,37 @@ async fn unlinked_page_ends_the_session_in_the_reader() {
     chain.extend(tree.extend(tree.genesis, 7));
     let (target, locators) = (chain[7], [chain[5], chain[0]]);
 
-    read_page(&tree, target, &locators, chain[5], &chain[6..8], true)
-        .await
-        .expect("the reader admits a linked page and ends with the stream");
+    let reported = Arc::new(Reported::default());
+    read_page(
+        &reported,
+        &tree,
+        target,
+        &locators,
+        chain[5],
+        &chain[6..8],
+        true,
+    )
+    .await
+    .expect("the reader admits a linked page and ends with the stream");
+    let refused = |reported: &Reported| {
+        reported
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|event| matches!(event, ReactorEvent::FrameRefused { .. }))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        refused(&reported),
+        Vec::new(),
+        "a linked page is no refusal"
+    );
 
+    let reported = Arc::new(Reported::default());
     let rejected = read_page(
+        &reported,
         &tree,
         target,
         &locators,
@@ -568,6 +619,14 @@ async fn unlinked_page_ends_the_session_in_the_reader() {
         error.to_string(),
         "the headers do not link from the page parent",
         "the reader rejects the page for its linkage, not another rule"
+    );
+    let refused = refused(&reported);
+    assert!(
+        matches!(
+            refused.as_slice(),
+            [ReactorEvent::FrameRefused { peer: refused_peer, .. }] if *refused_peer == peer()
+        ),
+        "the refusal is reported once, naming the peer: {refused:?}"
     );
 }
 

@@ -228,6 +228,13 @@ pub enum Observation {
         /// frame to an empty bucket: its charge returned
         /// [`crate::model::Charge::Exhausted`].
         exhausted: bool,
+        /// The exchange or subscription the frame names, in the key space
+        /// of [`Observation::PeerFrame`]'s `exchange`: header sync's
+        /// subscription ID. `None` for a frame whose message names none,
+        /// such as a status or a discovery message, whose exchanges run in
+        /// order on their stream.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exchange: Option<u64>,
     },
     /// The node's reader reached the bytes it needs to judge the peer's
     /// frame `seq`. A frame the reader hasn't reached has no judgement.
@@ -434,6 +441,9 @@ pub enum Observation {
         /// The frame's position among the peer's writes on the stream, from
         /// 0.
         seq: u64,
+        /// The run's [`crate::net::WireOrder`] stamp, taken as `write_all`
+        /// returned.
+        order: u64,
     },
     /// A scripted peer closed its connection with `Conn::close`, so its
     /// close is on its way and nothing it sends on the connection follows
@@ -487,6 +497,10 @@ pub enum Observation {
         payload: u64,
         /// The credit an update adds, for an `Open` or `Grant`.
         credit: Option<PeerCredit>,
+        /// The run's [`crate::net::WireOrder`] stamp, taken as the peer's
+        /// reader finished reading the frame, which can be well before the
+        /// peer's main task records it.
+        order: u64,
     },
     /// An event from a test-only fake action source.
     Fake {
@@ -1462,6 +1476,19 @@ pub enum BlockSyncFact {
         /// Whether the write landed.
         landed: bool,
     },
+    /// A peer-registry call from one routine generation changed the peer's
+    /// entry while another generation owned it, as the registry's
+    /// fingerprints of the entry before and after the call show.
+    StaleRegistryChange {
+        /// The entry's peer.
+        peer: String,
+        /// The call, as the peer registry's method names it.
+        writer: String,
+        /// The generation the call came from.
+        generation: u64,
+        /// The generation that owned the entry.
+        entry_generation: u64,
+    },
     /// A routine took frame `seq` from its stream and is about to judge it.
     FrameJudged {
         /// The sending peer.
@@ -1866,6 +1893,32 @@ pub(crate) fn peer_transport_entries<'o>(
         .collect()
 }
 
+/// The entries the scripted peers' evidence logged in `observations`, in
+/// order: what [`crate::evidence::EvidenceKind::Peer`] covers. A run's peers
+/// share one checkpoint, so it names no instance.
+pub(crate) fn peer_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::PeerFrame { .. }
+                    | Observation::PeerWritten { .. }
+                    | Observation::PeerReceived { .. }
+                    | Observation::PeerClosed { .. }
+                    | Observation::NodeFrame { .. }
+                    | Observation::FrameJudged { .. }
+                    | Observation::ConnectionClosed { .. }
+                    | Observation::Misbehavior { .. }
+                    | Observation::ActRan { .. }
+                    | Observation::ActSkipped { .. }
+            )
+        })
+        .collect()
+}
+
 /// The events that reactor tap `instance` logged in `observations`, in
 /// order.
 pub(crate) fn reactor_entries<'o>(
@@ -2230,6 +2283,9 @@ pub enum TransportFact {
         seq: u64,
         /// The frame's message type.
         message_type: u16,
+        /// The run's [`crate::net::WireOrder`] stamp, taken when the tap's
+        /// observer heard of the write, before it buffered the event.
+        order: u64,
     },
     /// The node decided to close the connection: its first recorded close
     /// cause, or `None` for a cancellation with no cause recorded first.
@@ -2285,10 +2341,24 @@ pub struct KindLoad {
     pub raw_held: u64,
     /// The raw gate's capacity, as the gate reports it.
     pub raw_capacity: u64,
+    /// The raw gate's free bytes above its capacity: bytes released more
+    /// often than granted. The row omits it while it is 0.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub raw_excess: u64,
     /// Queued output frame bytes the kind's frames hold.
     pub output_held: u64,
     /// The output gate's capacity, as the gate reports it.
     pub output_capacity: u64,
+    /// The output gate's free bytes above its capacity. The row omits it
+    /// while it is 0.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub output_excess: u64,
+}
+
+/// Whether `bytes` is 0, so a row omits the field and an honest run's log
+/// keeps its form.
+fn is_zero(bytes: &u64) -> bool {
+    *bytes == 0
 }
 
 /// A service session's lifecycle step, in [`TransportFact::SessionLifecycle`].

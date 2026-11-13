@@ -19,7 +19,7 @@ use crate::{
 
 mod block_sync;
 mod discovery;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod example_reactor;
 mod handler;
 mod handshake;

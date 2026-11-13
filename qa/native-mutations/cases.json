@@ -588,6 +588,17 @@
   {
     "patch": "shared-wire-path/cadence-exhaustion-throttles/cadence-exhaustion-throttles.patch",
     "entry": "shared-wire-path",
+    "table": "block-sync/s6v3",
+    "property": "block-sync/s6v3/status/cadence-never-closes",
+    "witness": {
+      "test": "each_probe_fault_reaches_its_exact_id",
+      "test_target": "block_table"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "shared-wire-path/cadence-exhaustion-throttles/cadence-exhaustion-throttles.patch",
+    "entry": "shared-wire-path",
     "table": "discovery/s4v2",
     "property": "discovery/s4v2/hello/cadence-never-closes",
     "witness": {
@@ -595,6 +606,17 @@
       "test_target": "discovery_wire_witness"
     },
     "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch",
+    "entry": "shared-wire-path",
+    "table": "block-sync/s6v3",
+    "property": "block-sync/s6v3/undeclared-type-closes",
+    "witness": {
+      "test": "each_probe_fault_reaches_its_exact_id",
+      "test_target": "block_table"
+    },
+    "fault_class": "request-authorization"
   },
   {
     "patch": "shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch",

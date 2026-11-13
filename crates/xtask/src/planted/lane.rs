@@ -17,7 +17,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::pilot::INTERRUPTED_ERROR;
+use super::{outcome::NaReason, pilot::INTERRUPTED_ERROR};
 use crate::{
     sim_minimize::{run_child, ChildEnd, INTERRUPTED},
     BoxError,
@@ -370,6 +370,9 @@ pub(in crate::planted) struct CampaignFacts {
     pub(in crate::planted) runs: u64,
     /// Inputs where the intended property applied, in complete processes.
     pub(in crate::planted) applicable_runs: u64,
+    /// Inputs where the intended property ended `not-applicable` for an
+    /// incomplete reason, such as `assumption-lost`, in complete processes.
+    pub(in crate::planted) incomplete_runs: u64,
     /// How long the workers ran, in milliseconds.
     pub(in crate::planted) millis: u64,
     /// The first saved input that violates the intended property, relative
@@ -552,6 +555,16 @@ pub(in crate::planted) fn campaign_facts(
             .and_then(Value::as_u64)
             .unwrap_or(0),
         applicable_runs: counts("complete_totals", "held") + counts("complete_totals", "violated"),
+        incomplete_runs: evidence
+            .pointer("/complete_totals/properties")
+            .and_then(|properties| properties.get(property))
+            .and_then(|counts| counts.get("not_applicable"))
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(reason, _)| !NaReason::is_benign_name(reason))
+            .filter_map(|(_, runs)| runs.as_u64())
+            .sum(),
         millis: end
             .and_then(|end| end.get("workers"))
             .and_then(Value::as_array)
@@ -564,21 +577,46 @@ pub(in crate::planted) fn campaign_facts(
     }
 }
 
+/// What a confirmation must show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::planted) enum Confirm {
+    /// A witness: the run also reaches the property's trigger history. The
+    /// pilot confirms a case's witness so.
+    Witness,
+    /// A kill: the run violates the property alone and replays Exact. A
+    /// generator lane confirms a kill so, since a mutant can break the
+    /// property on a path that the trigger history, written for the
+    /// unpatched code, doesn't name.
+    Kill,
+}
+
+/// A confirmed trace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::planted) struct ConfirmedTrace {
+    /// The trace's directory.
+    pub(in crate::planted) dir: PathBuf,
+    /// For a [`Confirm::Kill`], why the trace can't serve as a witness, if
+    /// it can't.
+    pub(in crate::planted) missing_witness: Option<String>,
+}
+
 /// Confirms `input`'s violation of `property` on `harness` in a fresh
-/// process, beside `also_violates`, then replays the confirmed trace in
-/// another, writing under `dir`. `sim` makes each child's `zakura-sim`
-/// command, such as one under a memory cap. Each child gets `child`.
-/// Returns the confirmed trace's directory, or why the input didn't
+/// process, beside `also_violates`, as `need` asks, then replays the
+/// confirmed trace in another, writing under `dir`. `sim` makes each
+/// child's `zakura-sim` command, such as one under a memory cap. Each child
+/// gets `child`. Returns the confirmed trace, or why the input didn't
 /// confirm or replay.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::planted) fn confirm_and_replay(
     sim: &dyn Fn() -> Command,
     harness: &str,
     input: &Path,
     property: &str,
     also_violates: &[String],
+    need: Confirm,
     dir: &Path,
     child: Duration,
-) -> Result<Result<PathBuf, String>, BoxError> {
+) -> Result<Result<ConfirmedTrace, String>, BoxError> {
     let confirm_dir = dir.join("confirm");
     let mut confirm = sim();
     confirm
@@ -593,13 +631,16 @@ pub(in crate::planted) fn confirm_and_replay(
     let confirmation = fs::read(confirm_dir.join(CONFIRMATION_FILE))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-    let trace = match confirmed_trace(ended, confirmation.as_ref()) {
-        Ok(trace) => confirm_dir.join(trace),
+    let trace = match confirmed_trace(ended, confirmation.as_ref(), need) {
+        Ok(trace) => ConfirmedTrace {
+            dir: confirm_dir.join(trace.dir),
+            ..trace
+        },
         Err(why) => return Ok(Err(why)),
     };
     let log = dir.join("replay.log");
     let mut replay = sim();
-    replay.arg("replay").arg(&trace);
+    replay.arg("replay").arg(&trace.dir);
     Ok(match run_lane_child(&mut replay, &log, Some(child))? {
         ChildEnd::Exited(0) => Ok(trace),
         end => Err(format!(
@@ -609,13 +650,16 @@ pub(in crate::planted) fn confirm_and_replay(
     })
 }
 
-/// The confirmed trace's directory, relative to the confirmation's, from a
-/// `zakura-sim confirm` that ended `ended` and wrote `confirmation`, or why
-/// it didn't confirm.
+/// The confirmed trace, its directory relative to the confirmation's, from
+/// a `zakura-sim confirm` that ended `ended` and wrote `confirmation`, as
+/// `need` asks, or why it didn't confirm. For a [`Confirm::Kill`], a
+/// confirmation that shows the violation but no witness confirms: `confirm`
+/// still records its trace, and exits nonzero.
 pub(in crate::planted) fn confirmed_trace(
     ended: ChildEnd,
     confirmation: Option<&Value>,
-) -> Result<PathBuf, String> {
+    need: Confirm,
+) -> Result<ConfirmedTrace, String> {
     let Some(confirmation) = confirmation else {
         return Err(format!(
             "`zakura-sim confirm` {ended} without a confirmation"
@@ -629,8 +673,13 @@ pub(in crate::planted) fn confirmed_trace(
         .get("detail")
         .and_then(Value::as_str)
         .map_or_else(String::new, |detail| format!(": {detail}"));
-    match status {
-        "confirmed" if ended == ChildEnd::Exited(0) => {}
+    let missing_witness = match status {
+        "confirmed" if ended == ChildEnd::Exited(0) => None,
+        "witness-lost" | "witness-unsupported"
+            if need == Confirm::Kill && matches!(ended, ChildEnd::Exited(_)) =>
+        {
+            Some(format!("the kill is no witness: {status}{detail}"))
+        }
         "witness-lost" | "witness-unsupported" => {
             return Err(format!(
                 "missing witness: the fresh confirmation is {status}{detail}"
@@ -641,12 +690,16 @@ pub(in crate::planted) fn confirmed_trace(
                 "the fresh confirmation is {status}{detail}; `zakura-sim confirm` {ended}"
             ))
         }
-    }
-    confirmation
+    };
+    let dir = confirmation
         .get("trace")
         .and_then(Value::as_str)
         .map(PathBuf::from)
-        .ok_or_else(|| "the confirmation names no trace".to_owned())
+        .ok_or_else(|| "the confirmation names no trace".to_owned())?;
+    Ok(ConfirmedTrace {
+        dir,
+        missing_witness,
+    })
 }
 
 /// What a failed `cargo build --message-format=json` that ended `end` and

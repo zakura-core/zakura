@@ -8,7 +8,6 @@ mod auth_digest;
 mod hash;
 mod joinsplit;
 mod lock_time;
-mod memo;
 mod serialize;
 mod sighash;
 mod txid;
@@ -25,7 +24,6 @@ pub use auth_digest::AuthDigest;
 pub use hash::{Hash, WtxId};
 pub use joinsplit::{JoinSplitData, JoinSplitPubKey, JoinSplitSig};
 pub use lock_time::LockTime;
-pub use memo::Memo;
 use redjubjub::{Binding, Signature};
 pub use sapling::FieldNotPresent;
 pub use serialize::{

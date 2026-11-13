@@ -50,6 +50,9 @@
 //! affect, by `cargo xtask planted`'s rule: the patch, the case file, the
 //! witness's files, the files the patch changes, and the shared machinery.
 //!
+//! `--list` prints the cases the other flags select, as JSON, by the fields
+//! that tell a case apart in a report ([`ListedCase`]), and runs nothing.
+//!
 //! The loop runs only on a remote host. No workflow runs it.
 
 use std::{
@@ -87,6 +90,9 @@ mod classify;
 mod generate;
 #[cfg(test)]
 mod tests;
+mod triage;
+
+pub(crate) use triage::run as triage;
 
 use classify::{Class, Classified, Ended, GenerateFacts, Observed, Reason, Trigger};
 use generate::{
@@ -242,6 +248,9 @@ pub(super) struct CaseReport {
     /// Why the case has no generator lane, with the lanes on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) no_generator: Option<String>,
+    /// The witness lane's recorded triage ([`triage`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) triage: Option<triage::Triage>,
 }
 
 /// The unpatched witness's run for a case's property.
@@ -352,6 +361,9 @@ pub(super) fn summarize(cases: &[CaseReport]) -> BTreeMap<String, PropertySummar
 /// The flags after `planted loop`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Flags {
+    /// `--list`: print the selected cases and run nothing.
+    pub(super) list: bool,
+    /// Empty with `--list`, which takes no `--out`.
     pub(super) out: PathBuf,
     pub(super) work: Option<PathBuf>,
     pub(super) cases: Option<PathBuf>,
@@ -365,7 +377,8 @@ pub(super) struct Flags {
 }
 
 /// Reads the flags after `planted loop`. `--out` and `--work` become
-/// absolute, since cargo runs from each slot's worktree.
+/// absolute, since cargo runs from each slot's worktree. Every flag but
+/// `--list` takes a value.
 pub(super) fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flags, BoxError> {
     let mut flags = Flags {
         jobs: DEFAULT_JOBS,
@@ -373,6 +386,10 @@ pub(super) fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flag
     };
     let mut out = None;
     while let Some(flag) = args.next() {
+        if flag == "--list" && !flags.list {
+            flags.list = true;
+            continue;
+        }
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         if flags.generate.parse(&flag, &value)? {
             continue;
@@ -402,8 +419,34 @@ pub(super) fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flag
             _ => return Err(format!("unknown or repeated flag `{flag}`").into()),
         }
     }
-    flags.out = out.ok_or(UsageError("`planted loop` needs --out <dir>"))?;
+    flags.out = match out {
+        Some(out) => out,
+        None if flags.list => PathBuf::new(),
+        None => return Err(UsageError("`planted loop` needs --out <dir>").into()),
+    };
     Ok(flags)
+}
+
+/// A case as `--list` prints it: the fields that tell it apart in a report.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(super) struct ListedCase<'a> {
+    /// The patch, as the report names it.
+    patch: &'a str,
+    property: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    table: Option<&'a str>,
+    witness: &'a WitnessSpec,
+}
+
+impl<'a> From<&'a LoopCase> for ListedCase<'a> {
+    fn from(case: &'a LoopCase) -> Self {
+        ListedCase {
+            patch: &case.label,
+            property: &case.property,
+            table: case.table.as_deref(),
+            witness: &case.witness,
+        }
+    }
 }
 
 /// Runs `cargo xtask planted loop`.
@@ -428,6 +471,11 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         &flags.only,
         flags.changed_since.as_deref(),
     )?;
+    if flags.list {
+        let listed: Vec<ListedCase> = cases.iter().flatten().map(ListedCase::from).collect();
+        println!("{}", serde_json::to_string_pretty(&listed)?);
+        return Ok(());
+    }
     let Some(cases) = cases else {
         println!("no loop case is affected by the changes since the revision");
         return Ok(());
@@ -459,7 +507,11 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         let _ = remove_worktree(repo_root, &slot.tree);
         let _ = fs::remove_dir_all(&slot.target);
     }
-    let outcome = outcome?;
+    let mut outcome = outcome?;
+    let records = triage::read(repo_root)?;
+    for stale in triage::apply(&mut outcome.cases, &records) {
+        println!("stale triage: {}: it matches no lane", stale.describe());
+    }
     let report = Report {
         schema: SCHEMA,
         pinned,
@@ -511,8 +563,10 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         );
     }
     println!(
-        "{} cases; report in {}",
+        "{} cases, {} lanes untriaged ({}); report in {}",
         report.cases.len(),
+        triage::untriaged(&report.cases),
+        triage::TRIAGE_FILE,
         flags.out.join(REPORT_FILE).display()
     );
     Ok(())
@@ -547,8 +601,6 @@ pub(super) fn native_cases(repo_root: &Path, dir: &Path) -> Result<Vec<LoopCase>
     Ok(cases)
 }
 
-/// Every retained planted case whose property starts with one of
-/// `prefixes`, with its own committed witness.
 /// True if `--planted <prefix>` selects the planted case whose patch is at
 /// `path` under `qa/planted/`. The prefix ends at a path component or at the
 /// case's `.patch`, so `block` selects `block/…` and not `block-sync/…`.
@@ -557,7 +609,13 @@ pub(super) fn selects(prefix: &str, path: &str) -> bool {
         .is_some_and(|rest| prefix.ends_with('/') || rest.starts_with('/') || rest.starts_with('.'))
 }
 
-fn planted_cases(repo_root: &Path, prefixes: &[String]) -> Result<Vec<LoopCase>, BoxError> {
+/// Every retained planted case whose property starts with one of
+/// `prefixes`, with its own committed witness. Fails on a case that names
+/// a nested `set`, which the loop's classes don't judge.
+pub(super) fn planted_cases(
+    repo_root: &Path,
+    prefixes: &[String],
+) -> Result<Vec<LoopCase>, BoxError> {
     if prefixes.is_empty() {
         return Ok(Vec::new());
     }
@@ -574,8 +632,19 @@ fn planted_cases(repo_root: &Path, prefixes: &[String]) -> Result<Vec<LoopCase>,
         }
         matched.extend(prefixes.iter().filter(|prefix| selects(prefix, &path)));
         let case_file = patch.with_extension("toml");
-        let CaseFile { also_violates, .. } = toml::from_str(&fs::read_to_string(&case_file)?)
+        let CaseFile {
+            also_violates, set, ..
+        } = toml::from_str(&fs::read_to_string(&case_file)?)
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
+        // The loop's classes judge one property beside `also_violates`, so
+        // a nested case's exact set would be silently ignored.
+        if !set.is_empty() {
+            return Err(format!(
+                "{}: the loop doesn't judge a nested case's `set`; `cargo xtask planted` does",
+                case_file.display()
+            )
+            .into());
+        }
         cases.push(LoopCase {
             label: relative_label(repo_root, &patch),
             listed_in: case_file.clone(),
@@ -949,11 +1018,31 @@ impl Runner {
                 results.insert(index, report);
             }
         }
+        let cases: Vec<CaseReport> = results.into_values().collect();
+        let mut property_findings = found.findings;
+        for finding in cases
+            .iter()
+            .flat_map(|case| &case.generator)
+            .filter_map(generate::GeneratorReport::finding)
+        {
+            let same = |known: &generate::PropertyFinding| {
+                (&known.property, &known.harness, known.seed, known.mode)
+                    == (
+                        &finding.property,
+                        &finding.harness,
+                        finding.seed,
+                        finding.mode,
+                    )
+            };
+            if !property_findings.iter().any(same) {
+                property_findings.push(finding);
+            }
+        }
         Ok(Outcome {
             source,
-            cases: results.into_values().collect(),
+            cases,
             generate,
-            property_findings: found.findings,
+            property_findings,
             generator_baseline_failures: found.failures,
         })
     }
@@ -1110,6 +1199,7 @@ impl Runner {
                 rerun_alone: false,
                 generator: Vec::new(),
                 no_generator: lanes.and_then(|lanes| lanes.plans[index].clone().err()),
+                triage: None,
             }
         };
         // Gives each case's generator lanes, which didn't search, `result`.

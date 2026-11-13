@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use zakura_network::zakura::observe::ClaimRule;
 
-use crate::{Outcome, RunEnd};
+use crate::RunEnd;
 
 /// A claim rule the tap checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +60,14 @@ pub enum Claim {
     /// An apply changed the engine under an older generation or anchor, or
     /// the reactor's adoption moved back ([`super::chain_effect`]).
     StaleChainEffect,
+    /// The port didn't publish a committed engine state as it was, the
+    /// reactor adopted other than an engine record, or a queued `Status` or
+    /// tip publication named other than the latest adoption
+    /// ([`super::publication`]).
+    StatePublicationConsistent,
+    /// The engine selected other than a max-work eligible tip of what it
+    /// holds, or scored its tip wrongly ([`super::fork_choice`]).
+    ExpectedChainSelected,
     /// A round's owner isn't bound to its `Open`, a staged page isn't on
     /// its requested path ([`super::authority`]), or the node admitted a
     /// session under another identity than its link's.
@@ -178,14 +186,11 @@ impl SettlementEvidence {
         self.with(|store| store.rows.push((rounds, false)));
     }
 
-    /// Notes how the run ended: at rest when it went idle or its drain ran
-    /// dry, and not when its drain was cut off at its bound.
+    /// Notes how the run ended: at rest when it ran dry at rest
+    /// ([`RunEnd::at_rest`]), and not at a violation, a harness failure, a
+    /// drain cut off at its bound included, or a worker-starved dry end.
     pub(crate) fn end(&self, end: &RunEnd) {
-        let at_rest = match end.outcome {
-            Outcome::Idle { .. } => true,
-            Outcome::Budget => end.drain.is_some_and(|drain| !drain.exhausted),
-            _ => false,
-        };
+        let at_rest = end.at_rest();
         self.with(|store| store.at_rest = at_rest);
     }
 
@@ -202,18 +207,6 @@ impl SettlementEvidence {
                     *read = true;
                     *row
                 })
-        })
-    }
-
-    /// Whether a property read the drain of `step`'s settlement.
-    pub(super) fn read_at(&self, step: u64) -> bool {
-        self.with(|store| {
-            store
-                .rows
-                .iter()
-                .rev()
-                .find(|(row, _)| row.step == step)
-                .is_some_and(|(_, read)| *read)
         })
     }
 

@@ -40,7 +40,7 @@ mod getdata_routing;
 #[cfg(test)]
 mod prop;
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod vectors;
 
 /// The maximum number of arbitrary peers to generate in [`PeerVersions`].

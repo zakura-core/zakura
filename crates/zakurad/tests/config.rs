@@ -439,6 +439,27 @@ fn config_zakura_network_expose_peer_addresses_env() {
 }
 
 #[test]
+fn config_zakura_network_tcp_warmup_env() {
+    let env = EnvGuard::new();
+
+    env.set_var("ZAKURA_NETWORK__TCP_WARMUP__ENABLED", "true");
+    env.set_var("ZAKURA_NETWORK__TCP_WARMUP__PEER_COOLDOWN", "6h");
+    env.set_var("ZAKURA_NETWORK__TCP_WARMUP__MAX_CONCURRENT", "4");
+
+    let config = ZakuradConfig::load(None).expect("load config with TCP warm-up overrides");
+    let warmup = &config.network.tcp_warmup;
+    assert!(warmup.enabled);
+    assert_eq!(
+        warmup.peer_cooldown,
+        std::time::Duration::from_secs(6 * 60 * 60)
+    );
+    assert_eq!(warmup.max_concurrent, 4);
+
+    env.set_var("ZAKURA_NETWORK__TCP_WARMUP__MAX_CHUNK_BYTES", "2097145");
+    ZakuradConfig::load(None).expect_err("reject padding over the message limit");
+}
+
+#[test]
 fn config_zakura_tracing_log_file_env() {
     let env = EnvGuard::new();
 

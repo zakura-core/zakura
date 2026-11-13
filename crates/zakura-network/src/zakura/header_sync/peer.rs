@@ -157,6 +157,14 @@ fn violation(
         row.insert(hs_trace::BOUNDARY.into(), "pipe".into());
         row.insert(hs_trace::DISPOSITION.into(), "disconnect".into());
     });
+    #[cfg(any(test, zakura_sim))]
+    if let Some(observer) = &handle.credit_observer {
+        observer.observe(super::observe::ReactorEvent::FrameRefused {
+            peer: session.peer_id().clone(),
+            session_id: session.session_id(),
+            reason,
+        });
+    }
     SinkReject::protocol(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         error.to_string(),

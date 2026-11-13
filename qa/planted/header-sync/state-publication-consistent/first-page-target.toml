@@ -1,0 +1,12 @@
+# A path job miscopies its subscription's initial target, while it still
+# leases toward the right one, so the page is the read and its marker
+# matches the target it carries. Only the subscriber can tell, against its
+# own `Open`: it refuses the page and ends its session with the node.
+# The publisher's job state and page builder decide what a page carries,
+# so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync/v9"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-served-one-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-served-one-header.plan"

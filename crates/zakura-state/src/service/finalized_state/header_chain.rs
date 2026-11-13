@@ -3077,12 +3077,34 @@ impl HeaderChainRuntime {
         )
     }
 
+    /// Load the durable validation lease rooted at `parent`, unless planning cannot read it.
+    ///
+    /// A lease the planner cannot read is left on disk: `engine` already retains every header
+    /// the lease would supply. `engine` is the engine the transition will be planned on, and
+    /// `context` is the context it will be planned under.
+    fn validation_lease_if_needed(
+        &self,
+        engine: &HeaderChainEngine,
+        parent: block::Hash,
+        context: &TransitionContext<'_>,
+    ) -> Result<Option<ValidationLease>, StoreError> {
+        if !engine.needs_validation_lease(parent, context) {
+            return Ok(None);
+        }
+        self.store
+            .validation_context(parent, context.config.network())
+            .map(Some)
+    }
+
     /// Bind a state-service request to the exact durable facts its event may consume.
+    ///
+    /// `engine` and `context` are the ones the request will be planned with. The authority in
+    /// `context` need not authorize any lease yet: no lease decision depends on that.
     fn build_transition_input(
         &self,
         request: TransitionRequest,
         before: &EngineSnapshot,
-        network: &Network,
+        context: &TransitionContext<'_>,
         engine: &HeaderChainEngine,
     ) -> Result<TransitionInput, HeaderChainStoreError> {
         let retained_checkpoint = retained_checkpoint_headers(engine, &request.event);
@@ -3092,15 +3114,29 @@ impl HeaderChainRuntime {
                 let anchor_changed = event.owner.header_authority().branch.anchor_hash
                     != before.frontiers.finalized.hash;
                 let mut validation_leases = Vec::new();
-                if self.store.header_node(event.parent_hash)?.is_some() {
-                    validation_leases
-                        .push(self.store.validation_context(event.parent_hash, network)?);
-                }
-                if anchor_changed && event.parent_hash != before.frontiers.finalized.hash {
+                // A parent this store does not hold has no lease; the planner rejects its headers.
+                if engine.needs_validation_lease(event.parent_hash, context)
+                    && self.store.header_node(event.parent_hash)?.is_some()
+                {
                     validation_leases.push(
                         self.store
-                            .validation_context(before.frontiers.finalized.hash, network)?,
+                            .validation_context(event.parent_hash, context.config.network())?,
                     );
+                }
+                // Header admission walks only from the batch's parent, so it reads the finalized
+                // header's lease only when that walk runs out of retained headers.
+                if anchor_changed
+                    && event.parent_hash != before.frontiers.finalized.hash
+                    && engine.needs_validation_lease_for_walk(
+                        event.parent_hash,
+                        before.frontiers.finalized.hash,
+                        context,
+                    )
+                {
+                    validation_leases.push(self.store.validation_context(
+                        before.frontiers.finalized.hash,
+                        context.config.network(),
+                    )?);
                 }
                 validation_leases.dedup_by_key(|lease| lease.parent());
                 let finality_rebase_history = self.store.finality_rebase_history(
@@ -3133,7 +3169,9 @@ impl HeaderChainRuntime {
                         validation_leases: if retained_checkpoint {
                             Vec::new()
                         } else {
-                            vec![self.store.validation_context(parent.hash, network)?]
+                            self.validation_lease_if_needed(engine, parent.hash, context)?
+                                .into_iter()
+                                .collect()
                         },
                     },
                 }
@@ -3143,9 +3181,14 @@ impl HeaderChainRuntime {
                     expected_version,
                     event,
                     facts: HeaderValidationFacts {
-                        validation_leases: vec![self
-                            .store
-                            .validation_context(before.frontiers.finalized.hash, network)?],
+                        validation_leases: self
+                            .validation_lease_if_needed(
+                                engine,
+                                before.frontiers.finalized.hash,
+                                context,
+                            )?
+                            .into_iter()
+                            .collect(),
                     },
                 }
             }
@@ -3540,10 +3583,23 @@ impl HeaderChainRuntime {
                 }
             }
         }
+        // Which leases to load depends on the retention references this authority vouches for,
+        // never on the leases it authorizes, so the decision uses it before any lease is loaded.
+        let lease_free_authority = StateIssuedAuthority {
+            inner: base_context.full_state_authority,
+            validation_leases: &[],
+            active_retention_references: &active_retention_references,
+            full_state_authorization_version: Some(before.state_version),
+        };
         let input = self.build_transition_input(
             request,
             &before,
-            base_context.config.network(),
+            &TransitionContext {
+                config: base_context.config,
+                clock: base_context.clock,
+                full_state_authority: Some(&lease_free_authority),
+                retention_references: base_context.retention_references,
+            },
             &transition_engine,
         )?;
         let validation_leases = input
@@ -3551,10 +3607,8 @@ impl HeaderChainRuntime {
             .map(|facts| facts.validation_leases.clone())
             .unwrap_or_default();
         let state_authority = StateIssuedAuthority {
-            inner: base_context.full_state_authority,
             validation_leases: &validation_leases,
-            active_retention_references: &active_retention_references,
-            full_state_authorization_version: Some(before.state_version),
+            ..lease_free_authority
         };
         let transition_context = TransitionContext {
             config: base_context.config,

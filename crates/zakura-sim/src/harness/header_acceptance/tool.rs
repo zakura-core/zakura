@@ -519,21 +519,16 @@ fn report(outcome: &Value) -> Option<Report> {
         "held" => Report::Held {
             applicable: outcome.get("held")?.get("applicable")?.as_u64()?,
         },
+        // The trace's typed reason, so an unknown one is a malformed record.
         "not-applicable" => Report::NotApplicable {
-            reason: outcome
-                .get("not-applicable")
-                .and_then(|na| na.get("reason"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            reason: serde_json::from_value::<crate::NaReason>(
+                outcome.get("not-applicable")?.get("reason")?.clone(),
+            )
+            .ok()?
+            .name()
+            .into_owned(),
         },
         "violated" => Report::Violated,
-        "inconclusive" => Report::Inconclusive {
-            reason: outcome
-                .get("inconclusive")?
-                .get("reason")?
-                .as_str()?
-                .to_owned(),
-        },
         _ => return None,
     })
 }
@@ -2000,7 +1995,11 @@ mod tests {
             target_of(&targets, MACHINE).as_deref(),
             Some("header_reactor_policy")
         );
-        assert_eq!(target_of(&targets, "header-sync/wire"), None);
+        assert_eq!(
+            target_of(&targets, "header-sync/wire").as_deref(),
+            Some("header_sync_wire")
+        );
+        assert_eq!(target_of(&targets, "header-sync/repair"), None);
         assert!(fuzz_targets(Path::new("/no/such/repo")).is_empty());
     }
 

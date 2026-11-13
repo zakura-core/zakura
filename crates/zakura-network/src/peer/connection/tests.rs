@@ -29,6 +29,7 @@ use crate::{
 
 mod prop;
 mod vectors;
+mod warmup;
 
 /// Test that dropping a peer sender does not require a Tokio timer context.
 #[test]
@@ -191,9 +192,11 @@ fn test_connection_channels(
 ) -> super::ConnectionRequests<zakura_chain::chain_tip::NoChainTip> {
     let (_block_advert_tx, block_advert_rx) =
         tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+    let (_warmup_tx, warmup_rx) = tokio::sync::mpsc::channel(crate::peer::tcp_warmup::WARMUP_QUEUE);
     super::ConnectionRequests {
         client_rx,
         block_advert_rx,
+        warmup_rx,
         minimum_peer_version: crate::peer::MinimumPeerVersion::new(
             zakura_chain::chain_tip::NoChainTip,
             &zakura_chain::parameters::Network::Mainnet,

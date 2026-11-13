@@ -1,0 +1,30 @@
+[Unit]
+Description=Temporary isolated Zakura PR runner
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+ExecStart=/opt/zakura-ci/run-isolated-job.sh
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=5min
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/zakura-ci
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# RestrictSUIDSGID blocks tar/openat2 on Ubuntu 26.04 (systemd#44034).
+# NoNewPrivileges still prevents gaining privileges through setuid executables.
+TasksMax=8192
+MemoryMax=30G
+MemorySwapMax=8G
+
+[Install]
+WantedBy=multi-user.target

@@ -11,6 +11,130 @@ independently.
 
 ## [Unreleased]
 
+## [1.8.7] - 2026-11-12
+
+### Added
+
+- The indexer gRPC API has a `GetTransaction` method that returns a transaction's raw bytes
+  ([#2316](https://github.com/zakura-core/zakura/pull/2316)).
+- Added an opt-in warm-up for new legacy P2P connections. When
+  `network.tcp_warmup.enabled` is set, the node sends each new peer a few
+  padded `ping` messages so the connection's TCP send window reaches full
+  block size before a block needs it. Settings live in `[network.tcp_warmup]`
+  and in `ZAKURA_NETWORK__TCP_WARMUP__*` environment variables. Warm-up needs
+  `net.ipv4.tcp_slow_start_after_idle = 0`
+  ([#2371](https://github.com/zakura-core/zakura/pull/2371)).
+
+### Changed
+
+- Relayed blocks are now advertised in measured round-trip-time order, like
+  locally mined blocks, prioritizing peers with shorter measured round trips.
+  After excluding peers that already announced the block, every fourth selected
+  recipient goes to a random remaining peer
+  ([#2103](https://github.com/zakura-core/zakura/pull/2103)).
+- Peers that announced a block to us are no longer advertised that block unless
+  a broadcast still tracks their upload, or the connection already delivered that
+  advert. This avoids redundant inventory. The new
+  `peer.block_gossip.advert_skipped` counter reports the skips
+  ([#2103](https://github.com/zakura-core/zakura/pull/2103)).
+- A peer requesting a block withdraws its earlier announcement of that block.
+  Echoed announcements cannot hide an unfinished upload's failure from a
+  committed mined-block broadcast, preserving its fallback
+  ([#2103](https://github.com/zakura-core/zakura/pull/2103)).
+- Each legacy connection remembers recent block announcements in two generations
+  that rotate on a timer or when the newer one fills, holding at most 512 hashes
+  each. Recording an announcement costs the same whether the inventory message
+  carries one hash or the maximum 50,000, so a peer cannot make the connection
+  spend time proportional to both the message and the retained entries
+  ([#2103](https://github.com/zakura-core/zakura/pull/2103)).
+- Skipping peers that announced a block no longer hides failures or authorization
+  revocations from other recipients. A broadcast still succeeds without sending
+  inventory when every peer already announced the block
+  ([#2103](https://github.com/zakura-core/zakura/pull/2103)).
+- Large RPC responses, such as a full `getblocktemplate` answer or a raw block,
+  are encoded with less work: hex payloads are written without being searched
+  for characters to escape, and a successful response to a client that does not
+  use JSON-RPC 2.0 is no longer parsed and written a second time. The bytes
+  sent are unchanged
+  ([#2307](https://github.com/zakura-core/zakura/pull/2307)).
+- Block and mempool verification no longer computes unused librustzcash transaction ID digests for v5 and later transactions
+  ([#2310](https://github.com/zakura-core/zakura/pull/2310)).
+- Block and transaction decoding decompresses each Sapling spend's `rk` once instead of twice, cutting block decode time by about 38%
+  ([#2311](https://github.com/zakura-core/zakura/pull/2311)).
+- Orchard action points are decompressed in batches while decoding blocks and transactions, which is faster on x86-64
+  ([#2312](https://github.com/zakura-core/zakura/pull/2312)).
+- Sapling value commitment and ephemeral key checks batch their field inversions, speeding up block and mempool verification
+  ([#2313](https://github.com/zakura-core/zakura/pull/2313)).
+- Verbose `getblock` and `getrawtransaction` responses hex-encode shielded byte fields faster
+  ([#2315](https://github.com/zakura-core/zakura/pull/2315)).
+- Zakura block-sync peers announce a new chain tip within about a second instead of waiting up to 30 seconds for the next Status
+  ([#2321](https://github.com/zakura-core/zakura/pull/2321)).
+- Reduced the time and memory used to finalize non-finalized blocks and to index their
+  transparent addresses, especially for blocks with many transparent outputs or inputs
+  ([#2330](https://github.com/zakura-core/zakura/pull/2330)).
+- Run the database format check once when `zakurad` stops, instead of once per
+  database instance, and run it after the state's last block commit. On Mainnet,
+  the repeated checks made a stop hit the 20 s shutdown timeout, which cut the
+  shutdown off. A stop now takes about 10 s
+  ([#2331](https://github.com/zakura-core/zakura/pull/2331)).
+- Stopped re-reading recent headers from the database when `zakurad` inserts a
+  header or commits a block at the chain tip, where it already holds those
+  headers in memory. Each of the two steps read about 115 header rows on the
+  thread that saves blocks; each now reads one
+  ([#2350](https://github.com/zakura-core/zakura/pull/2350)).
+- `getblocktemplate` now selects mempool transactions deterministically by
+  ancestor-package fee per cost, rescoring descendants as parents are selected
+  and skipping any package that does not fit, giving up after 1,000 in a row,
+  instead of by weighted random draw
+  ([#2367](https://github.com/zakura-core/zakura/pull/2367)).
+
+### Fixed
+
+- Preserve legacy peers' RTT preference across restarts and alternate cached
+  listening addresses with shuffled seed peers during startup. Prefer a fresh
+  seed when only one startup slot is available, limit saved addresses and startup
+  attempts per IP, shuffle peers without measured RTT, and exclude known non-nodes
+  ([#2279](https://github.com/zakura-core/zakura/pull/2279)).
+- Stop using default Zcash ports to prioritize or reject peers; network identity
+  is checked by the P2P protocol
+  ([#2279](https://github.com/zakura-core/zakura/pull/2279)).
+- Preserved the internal duplicate-spend and duplicate-transaction assertions while
+  allowing finalized index entries to be replaced before cleanup.
+
+- Avoided repeatedly scanning block transactions when reconstructing transparent
+  outputs for address queries.
+
+- Prevented transparent balance queries from panicking when large transfers between
+  queried addresses temporarily exceed the money limit before canceling out.
+- Fixed the on-disk backup of recent blocks rewriting a block's file once for
+  every extra chain that holds the block. With side chains present, a node
+  rewrote hundreds of backup files each time a block arrived
+  ([#2344](https://github.com/zakura-core/zakura/pull/2344)).
+- Fixed misleading mempool reset logs: a reset no longer logs `activating mempool`
+  or `re-verifying mempool transactions after a chain fork`, and the single
+  `resetting mempool` line now reports `requeued_transactions`
+  ([#2374](https://github.com/zakura-core/zakura/pull/2374)).
+- Allowed patch release preparation for the current backwards-compatible node
+  additions and behavior changes
+  ([#2380](https://github.com/zakura-core/zakura/pull/2380)).
+
+<!-- release-readiness: allow-patch; reason: The release owner approved a patch node release for the current backwards-compatible additions and behavior changes. Library crates retain independent SemVer bumps. -->
+
+### Security
+
+- A v2 node's QUIC transport now caps inbound connections at their
+  connection and handshake shares (93 at the defaults) and counts each one
+  until it closes, so peers that the node closes right after their TLS
+  handshake can't hold extra slots. Discovery keeps its whole outbound
+  share when inbound is full, and the dial reserve fits one full 8-address
+  record. Startup now refuses a `zakura.bootstrap_peers` identity with
+  more dialable addresses than that reserve (8 at the defaults), since its
+  dial couldn't start while inbound peers fill the table
+  ([#2272](https://github.com/zakura-core/zakura/pull/2272)).
+- The indexer gRPC API refuses request messages over 4096 bytes before buffering them, where it
+  previously accepted up to 4 MiB
+  ([#2354](https://github.com/zakura-core/zakura/pull/2354)).
+
 ## [1.8.6] - 2026-11-10
 
 This node release uses an explicitly approved patch-version exception, including

@@ -185,7 +185,7 @@ pub fn run_config() -> RunConfig {
             ..SchedulerConfig::default()
         },
         budget: 3_000,
-        drain_bound: 1_000,
+        drain_bound: 5_000,
         ..RunConfig::default()
     }
 }

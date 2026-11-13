@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+index 132f2ca64b..44212f98a8 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+@@ -1091,6 +1091,12 @@ fn page_output<const HEADER_BYTES: usize>(
+     job: &Job,
+     page: RetainedHeaderPathPage,
+ ) -> Result<EncodedPage, Refusal> {
++    // Mutation: a subscription's first page declares its ancestor one
++    // height above the one storage read from.
++    let mut page = page;
++    if job.parent.is_none() {
++        page.common_ancestor.height.0 += 1;
++    }
+     let count = page.headers.len();
+     // Widening u32 to usize is lossless on supported targets.
+     if count == 0

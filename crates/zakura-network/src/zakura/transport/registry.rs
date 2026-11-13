@@ -650,7 +650,7 @@ fn selected_streams(service: &dyn Service, negotiated: u64, mode: StreamMode) ->
     selected
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests {
     use std::sync::Mutex;
 

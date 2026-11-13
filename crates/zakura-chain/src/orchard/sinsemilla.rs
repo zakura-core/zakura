@@ -1,33 +1,11 @@
 //! Sinsemilla hash functions and helpers.
+//!
+//! These rebuild their domains on every call, so only the test vectors use them.
+//! The production `MerkleCRH^Orchard` path in [`crate::orchard::tree`] hashes
+//! through a cached domain instead.
 
-use halo2::{
-    arithmetic::{Coordinates, CurveAffine, CurveExt},
-    pasta::pallas,
-};
-
-// Only the test-vector hash below rebuilds a `HashDomain` from raw message bits;
-// the production Merkle path uses a cached domain in `crate::orchard::tree`.
-#[cfg(test)]
+use halo2::{arithmetic::CurveExt, pasta::pallas};
 use sinsemilla::HashDomain;
-
-/// [Coordinate Extractor for Pallas][concreteextractorpallas]
-///
-/// ExtractP: P → P𝑥 such that ExtractP(𝑃) = 𝑥(𝑃) mod 𝑞P.
-///
-/// ExtractP returns the type P𝑥 which is precise for its range, unlike
-/// ExtractJ(𝑟) which returns a bit sequence.
-///
-/// [concreteextractorpallas]: https://zips.z.cash/protocol/nu5.pdf#concreteextractorpallas
-pub fn extract_p(point: pallas::Point) -> pallas::Base {
-    let option: Option<Coordinates<pallas::Affine>> =
-        pallas::Affine::from(point).coordinates().into();
-
-    match option {
-        // If Some, it's not the identity.
-        Some(coordinates) => *coordinates.x(),
-        _ => pallas::Base::zero(),
-    }
-}
 
 /// GroupHash into Pallas, aka _GroupHash^P_
 ///
@@ -55,11 +33,6 @@ pub fn pallas_group_hash(D: &[u8], M: &[u8]) -> pallas::Point {
 /// SinsemillaHash: B^Y^\[N\] × B[{0 .. 𝑘·𝑐}] → P_𝑥 ∪ {⊥}
 ///
 /// <https://zips.z.cash/protocol/nu5.pdf#concretesinsemillahash>
-///
-/// This rebuilds the [`HashDomain`] (and its `Q` generator) on every call, so it
-/// is only used by the test vectors. The production `MerkleCRH^Orchard` path in
-/// [`crate::orchard::tree`] hashes through a cached domain instead.
-#[cfg(test)]
 #[allow(non_snake_case)]
 pub fn sinsemilla_hash(D: &[u8], M: &[bool]) -> Option<pallas::Base> {
     let domain = std::str::from_utf8(D).expect("must be valid UTF-8");

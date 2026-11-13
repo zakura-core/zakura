@@ -97,6 +97,11 @@ pub struct EnginePort {
     /// The highest checkpoint's height, which no VCT repair passes, as
     /// zakura-state's `max_checkpoint_height`.
     checkpoint_ceiling: block::Height,
+    /// Each snapshot sent on the selected-chain watch since the last
+    /// [`Self::take_publications`], in order, for the simulator's
+    /// publication rule. A std lock, held only to push or take.
+    #[cfg(zakura_sim)]
+    publications: StdMutex<Vec<EngineSnapshot>>,
 }
 
 impl EnginePort {
@@ -167,6 +172,8 @@ impl EnginePort {
             block_service: AtomicBool::new(false),
             // `zakurad` sets it to 0 on Regtest, so no repair resolves.
             checkpoint_ceiling: block::Height(0),
+            #[cfg(zakura_sim)]
+            publications: StdMutex::default(),
         }
     }
 
@@ -1096,12 +1103,41 @@ impl EnginePort {
             )
         };
         if let Some(selected) = self.selected_sender() {
-            selected.send_replace(Some(snapshot));
+            selected.send_replace(Some(self.published(snapshot)));
         }
         if let Some(views) = views {
             views.send_replace(Some(view.clone()));
         }
         view
+    }
+
+    /// Hands back `snapshot`, which the caller sends on the selected-chain
+    /// watch, and in a simulator build records it for `take_publications`
+    /// first. The record is the sent value
+    /// itself, so a send that's skipped or sends something else can't leave
+    /// a record that says otherwise. Reading the watch back would add a
+    /// scheduling point.
+    fn published(&self, snapshot: EngineSnapshot) -> EngineSnapshot {
+        #[cfg(zakura_sim)]
+        self.publications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(snapshot.clone());
+        snapshot
+    }
+
+    /// Every snapshot this port sent on its selected-chain watch since the
+    /// last call, oldest first: what each committed transition published,
+    /// as the simulator's publication rule judges it. A shut-down watch
+    /// sends nothing, so it records nothing.
+    #[cfg(zakura_sim)]
+    pub fn take_publications(&self) -> Vec<EngineSnapshot> {
+        std::mem::take(
+            &mut *self
+                .publications
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// A clone of the selected-chain watch's sender, or `None` once

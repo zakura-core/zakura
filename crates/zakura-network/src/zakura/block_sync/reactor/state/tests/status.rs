@@ -53,7 +53,7 @@ fn a_ready_peer_with_the_latest_status_needs_no_send() {
     schedule
         .delivery_mut(&peer(0))
         .expect("the admitted peer has a delivery record")
-        .queued(status(5));
+        .queued(status(5), now);
     assert!(schedule
         .due(
             status(5),
@@ -84,7 +84,7 @@ fn a_replacement_session_starts_a_fresh_delivery() {
     schedule
         .delivery_mut(&peer(0))
         .expect("the admitted peer has a delivery record")
-        .queued(status(5));
+        .queued(status(5), now);
     schedule.admit(&peer(0), now);
     assert_eq!(
         schedule.due(status(5), [(&peer(0), true)], now),
@@ -117,18 +117,28 @@ fn input() -> impl Strategy<Value = Input> {
     ]
 }
 
-/// One admitted peer: the status index it last queued and its retry time in
-/// milliseconds after the test start.
+/// One admitted peer: the status index it last queued, its retry time in
+/// milliseconds after the test start, and the status index a cadence deferral
+/// held back with when it did.
 #[derive(Clone, Copy, Debug)]
 struct ModelDelivery {
     last_queued: Option<u32>,
     retry_ms: u64,
+    deferred: Option<(u32, u64)>,
 }
 
 impl ModelDelivery {
-    /// The retry time while the peer still needs `latest`.
+    /// The retry time while the peer still needs `latest`. Each status index
+    /// is a higher tip, so a status newer than a deferred one is due from the
+    /// deferral on.
     fn deadline(&self, latest: u32, ready: bool) -> Option<u64> {
-        (self.last_queued != Some(latest) || !ready).then_some(self.retry_ms)
+        if self.last_queued == Some(latest) && ready {
+            return None;
+        }
+        Some(match self.deferred {
+            Some((deferred, at_ms)) if latest > deferred => self.retry_ms.min(at_ms),
+            _ => self.retry_ms,
+        })
     }
 }
 
@@ -149,25 +159,30 @@ proptest! {
             match input {
                 Input::Admit(id) => {
                     schedule.admit(&peer(id), now);
-                    model[usize::from(id)] = Some(ModelDelivery { last_queued: None, retry_ms: now_ms });
+                    model[usize::from(id)] = Some(ModelDelivery { last_queued: None, retry_ms: now_ms, deferred: None });
                 }
                 Input::Remove(id) => {
                     schedule.remove(&peer(id));
                     model[usize::from(id)] = None;
                 }
                 Input::Queued(id) => {
-                    let actual = schedule.delivery_mut(&peer(id)).map(|delivery| delivery.queued(status(latest)));
+                    let actual = schedule.delivery_mut(&peer(id)).map(|delivery| delivery.queued(status(latest), now));
                     prop_assert_eq!(actual.is_some(), model[usize::from(id)].is_some());
                     if let Some(delivery) = model[usize::from(id)].as_mut() {
                         delivery.last_queued = Some(latest);
+                        delivery.retry_ms = now_ms;
+                        delivery.deferred = None;
                     }
                 }
                 Input::Deferred(id, ms) => {
                     let at = now + Duration::from_millis(ms);
-                    let actual = schedule.delivery_mut(&peer(id)).map(|delivery| delivery.deferred_until(at));
+                    let actual = schedule
+                        .delivery_mut(&peer(id))
+                        .map(|delivery| delivery.deferred_until(status(latest), now, at));
                     prop_assert_eq!(actual.is_some(), model[usize::from(id)].is_some());
                     if let Some(delivery) = model[usize::from(id)].as_mut() {
                         delivery.retry_ms = now_ms + ms;
+                        delivery.deferred = Some((latest, now_ms));
                     }
                 }
                 Input::QueueFull(id) => {
@@ -175,6 +190,7 @@ proptest! {
                     prop_assert_eq!(actual.is_some(), model[usize::from(id)].is_some());
                     if let Some(delivery) = model[usize::from(id)].as_mut() {
                         delivery.retry_ms = now_ms + 100;
+                        delivery.deferred = None;
                     }
                 }
                 Input::StatusChange => latest += 1,

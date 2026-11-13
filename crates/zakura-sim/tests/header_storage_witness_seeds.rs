@@ -12,6 +12,8 @@ use std::{fs, path::PathBuf};
 use support::{byte_inputs, storage_witnesses};
 use zakura_chain::work::difficulty::U256;
 use zakura_sim::{
+    check::PropertyOutcome,
+    domain::header_sync_progress::BOUNDED_ADVERSARY_PROGRESS,
     explore::{classify, ExploreOutcome},
     harness::{
         self,
@@ -66,6 +68,10 @@ enum Shows {
     },
     /// The node reached recovery's conditions after a prefix of this class.
     Recovered(&'static str),
+    /// [`Shows::Recovered`], and the recovery owed the node a successor,
+    /// which it met: `header-sync/bounded-adversary-progress` applied once
+    /// and held (hdr-13).
+    Owed(&'static str),
     /// The first read, held until two other reads completed, completed
     /// through the engine with a page after them. That's `holds()`'s first
     /// hold succeeding, which the migrated seed's slice doesn't show: its
@@ -286,6 +292,13 @@ impl Shows {
                 matches!(&prepares[..], [a, b]
                     if a.0 == b.0 && (a.2, b.2) == (earlier, later) && b.3.cmp(&a.3) == ordering)
             }
+            Shows::Owed(class) => {
+                Shows::Recovered(class).in_run(report)
+                    && report.properties.iter().any(|reported| {
+                        reported.property == BOUNDED_ADVERSARY_PROGRESS
+                            && reported.outcome == PropertyOutcome::Held { applicable: 1 }
+                    })
+            }
             Shows::Recovered(class) => {
                 let (Some(&recover), Some(&done)) = (
                     picked(report, "recover").first(),
@@ -318,6 +331,10 @@ impl Shows {
                         "reply-holds" => committed.iter().any(|(at, id)| {
                             before(at) && delivered(*id).is_some_and(|(done, _)| done > recover)
                         }),
+                        "departure" => {
+                            picked(report, "close").first().is_some_and(before)
+                                && picked(report, "recovery-relink").is_empty()
+                        }
                         _ => false,
                     }
             }
@@ -334,12 +351,24 @@ fn shows(stem: &str) -> (Shows, usize) {
     let witness = stem
         .strip_prefix("header-storage-w-")
         .expect("witness stems share a prefix");
-    if let Some(class) = witness.strip_prefix("recover-") {
-        let class = ["closes", "holds", "faults", "invalidations", "reply-holds"]
-            .into_iter()
-            .find(|known| *known == class)
-            .unwrap_or_else(|| panic!("{stem} names no prefix class"));
-        return (Shows::Recovered(class), 16);
+    let class = |class: &str| {
+        [
+            "closes",
+            "holds",
+            "faults",
+            "invalidations",
+            "reply-holds",
+            "departure",
+        ]
+        .into_iter()
+        .find(|known| *known == class)
+        .unwrap_or_else(|| panic!("{stem} names no prefix class"))
+    };
+    if let Some(named) = witness.strip_prefix("recover-") {
+        return (Shows::Recovered(class(named)), 16);
+    }
+    if let Some(named) = witness.strip_prefix("owed-") {
+        return (Shows::Owed(class(named)), 16);
     }
     if let Some((kind, allow, outcome, _)) = storage_witnesses::fault_witnesses()
         .into_iter()
@@ -424,8 +453,9 @@ fn input(index: usize, scenario: &StorageScenario) -> Vec<u8> {
 fn committed_witness_seeds_show_their_overlaps() {
     let entry = harness::find(Storage::NAME).unwrap();
     let seeds = storage_witnesses::witness_seeds();
-    // 15 named witnesses, 10 faults and 5 recovery classes.
-    assert_eq!(seeds.len(), 30);
+    // 15 named witnesses, 10 faults, 5 recovery classes and hdr-13's two
+    // owed recoveries.
+    assert_eq!(seeds.len(), 32);
     for (stem, scenario) in seeds {
         let (shows, slice) = shows(&stem);
         let committed = fs::read(fixtures().join(format!("{stem}.bin")))

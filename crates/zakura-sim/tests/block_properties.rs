@@ -81,6 +81,11 @@ impl<F: FnMut(u64, &BlockSyncView)> Checker for Sampler<F> {
     fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
         Vec::new()
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
 /// [`node_run`], handing `sample` the node's view after every step.

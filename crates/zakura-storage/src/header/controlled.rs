@@ -179,10 +179,15 @@ pub enum RunKind {
     Locator(OpId, Option<Vec<zakura_header_chain::Frontier>>),
     /// An operator reset.
     Reset,
+    /// A harness commit straight into the engine, outside any operation,
+    /// with the hashes of the headers it committed, in order. See
+    /// [`ControlledPort::harness_commit`].
+    HarnessCommit(Vec<block::Hash>),
 }
 
 /// An engine run's durable state just before and just after it, for the
-/// simulator's commit-contents, durable-state and locator-result checks.
+/// simulator's commit-contents, durable-state and locator-result checks,
+/// and the engine's own snapshot just after it, for its fork-choice check.
 #[cfg(zakura_sim)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineRun {
@@ -195,6 +200,10 @@ pub struct EngineRun {
     pub before: zakura_header_chain::DurableState,
     /// After the run.
     pub after: zakura_header_chain::DurableState,
+    /// The snapshot the engine itself gives after the run, read from it
+    /// whatever the run's result. It's the engine's own projection of
+    /// `after`'s metadata, the one a publication would carry.
+    pub snapshot: EngineSnapshot,
 }
 
 /// What [`ControlledPort::complete`] or [`ControlledPort::deliver`] did.
@@ -443,6 +452,9 @@ struct Ops {
     /// The run it's bound to.
     #[cfg(zakura_sim)]
     run: Option<zakura_rt::sim::RunId>,
+    /// The harness commits' engine runs not yet taken.
+    #[cfg(zakura_sim)]
+    harness_runs: Vec<std::sync::Arc<EngineRun>>,
     /// Set when something used the port outside that run.
     #[cfg(zakura_sim)]
     refused: bool,
@@ -1035,6 +1047,7 @@ impl ControlledPort {
                 clock,
                 before,
                 after: self.engine.durable_state(),
+                snapshot: self.engine.snapshot(),
             })
         });
         if before.is_some_and(|before| before != self.engine.snapshot()) {
@@ -1248,6 +1261,7 @@ impl ControlledPort {
                 clock,
                 before: durable_before,
                 after: self.engine.durable_state(),
+                snapshot: self.engine.snapshot(),
             }),
         };
         let mut ops = self.ops();
@@ -1288,6 +1302,39 @@ impl ControlledPort {
     /// The facts published since the last call, in order.
     pub fn take_facts(&self) -> Vec<Fact> {
         mem::take(&mut self.ops().facts)
+    }
+
+    /// Runs `commit`, a harness's commit of the headers `hashes` straight
+    /// into the engine, outside any operation, and, if it succeeds, records
+    /// its engine run, as every apply and reset records one, for
+    /// [`take_harness_runs`](Self::take_harness_runs). It publishes no fact,
+    /// since no operation ran. A commit that fails records nothing: its
+    /// harness fails the run.
+    #[cfg(zakura_sim)]
+    pub fn harness_commit<E>(
+        &self,
+        hashes: Vec<block::Hash>,
+        commit: impl FnOnce(&EnginePort) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let clock = zakura_rt::time::utc_now().into();
+        let before = self.engine.durable_state();
+        commit(&self.engine)?;
+        let run = EngineRun {
+            kind: RunKind::HarnessCommit(hashes),
+            clock,
+            before,
+            after: self.engine.durable_state(),
+            snapshot: self.engine.snapshot(),
+        };
+        self.ops().harness_runs.push(std::sync::Arc::new(run));
+        Ok(())
+    }
+
+    /// The engine runs of the harness commits since the last call, oldest
+    /// first.
+    #[cfg(zakura_sim)]
+    pub fn take_harness_runs(&self) -> Vec<std::sync::Arc<EngineRun>> {
+        mem::take(&mut self.ops().harness_runs)
     }
 
     /// Shuts the service down, as the end of a run does. Drops every pending

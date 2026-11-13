@@ -376,13 +376,9 @@ impl Drop for ReadStateService {
         // TODO: move this into a try_shutdown() method
         if let Some(block_write_task) = self.block_write_task.take() {
             if let Some(block_write_task_handle) = Arc::into_inner(block_write_task) {
-                // We're the last database user, so we can tell it to shut down (blocking):
-                // - flushes the database to disk, and
-                // - drops the database, which cleans up any database tasks correctly.
-                self.db.shutdown(true);
-
-                // This state owns the last reference to the thread.
-                // The state can wait for the block write task and then check for panics.
+                // This state owns the last reference to the thread, so it waits for the block
+                // write task before shutting the database down. The task's own shutdown then
+                // runs the format check after its last commit.
                 // (We'd also like to abort the thread, but std::thread::JoinHandle can't do that.)
 
                 // This log is verbose during tests.
@@ -390,9 +386,16 @@ impl Drop for ReadStateService {
                 info!("waiting for the block write task to finish");
                 #[cfg(test)]
                 debug!("waiting for the block write task to finish");
+                let block_write_task_result = block_write_task_handle.join();
+
+                // We're the last database user, so we can tell it to shut down (blocking):
+                // - flushes the database to disk, even if the block write task panicked or
+                //   returned early without shutting the database down, and
+                // - drops the database, which cleans up any database tasks correctly.
+                self.db.shutdown(true);
 
                 // TODO: move this into a check_for_panics() method
-                match block_write_task_handle.join() {
+                match block_write_task_result {
                     Err(thread_panic) => std::panic::resume_unwind(thread_panic),
                     Ok(write::BlockWriteTaskExit::HeaderChainAttachmentFailed(error)) => {
                         tracing::error!(?error, "block write task stopped during header attachment")

@@ -97,7 +97,7 @@ is in
 `Added` and `Changed` entries normally require a minor `zakura` release. A
 release may intentionally keep a patch version when every such entry is
 backwards compatible and the release team records one explanation in a
-fragment:
+fragment, inside a category section after its list item:
 
 ```markdown
 <!-- release-readiness: allow-patch; reason: All additions and behavior changes are backwards compatible. -->
@@ -106,6 +106,9 @@ fragment:
 The waiver applies to the node release level only; changed library crates still
 receive their independently required SemVer bumps. It cannot waive
 `Deprecated`, `Removed`, or Mainnet network-upgrade entries.
+Use this marker for future patch approvals rather than adding version-specific
+exceptions to the release scripts. It covers the current pending release and
+is assembled with its changelog entries; a later release needs its own approval.
 
 For the stable v1.8.6 release from v1.8.5 only, the release owner approved a
 node patch exception that includes the documented removal of historical

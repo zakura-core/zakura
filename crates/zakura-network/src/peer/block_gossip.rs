@@ -7,6 +7,10 @@
 //! Upload tracking deduplicates overlapping broadcasts and reports delivery failures. Its
 //! request expiry and write grace do not control announcement timing or limit body writes.
 //! A newer block does not cancel an older broadcast: peers can still need its parent.
+//!
+//! Peers that announced the block are skipped unless this connection's upload registry already
+//! determines the outcome: a broadcast still tracking the upload, or an advert already delivered.
+//! An announcement cannot replace either outcome.
 
 use std::{
     collections::HashMap,
@@ -23,7 +27,7 @@ use zakura_chain::{block, chain_tip::ChainTip};
 
 use crate::{
     constants::{BLOCK_GOSSIP_TIMEOUT, REQUEST_TIMEOUT},
-    peer::{MinimumPeerVersion, SharedPeerError},
+    peer::{AnnouncedBlocks, MinimumPeerVersion, SharedPeerError},
     peer_registry::PeerRegistryUpdater,
     protocol::external::types::Version,
     BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
@@ -120,10 +124,10 @@ impl AdvertFanout {
     }
 }
 
-/// Every this many mined-block advertisements, a random peer replaces the next-lowest RTT.
+/// Every this many selected recipients, a random peer replaces the next-lowest RTT.
 ///
 /// Random peers keep the initial group from depending entirely on the lowest RTTs.
-const MINED_RANDOM_INTERVAL: usize = 4;
+const ADVERT_RANDOM_INTERVAL: usize = 4;
 /// Allow the kernel send queue to drain after the framed block write completes.
 const BLOCK_WRITE_GRACE: Duration = Duration::from_millis(750);
 /// Expire request tracking for peers that already have the block. This does not pace gossip.
@@ -168,6 +172,24 @@ struct UploadRegistry {
 pub(crate) struct BlockUploads(Arc<Mutex<UploadRegistry>>);
 
 impl BlockUploads {
+    /// Whether this registry already determines the peer's outcome for `hash`.
+    ///
+    /// A broadcast that still owns the upload has to publish its own outcome, and an advert
+    /// this connection already delivered stays a success. An announcement can suppress a new
+    /// advert, but it cannot override either of those.
+    fn determines_outcome(&self, hash: block::Hash) -> bool {
+        let uploads = self.0.lock().expect("block upload mutex is never poisoned");
+        uploads
+            .active
+            .get(&hash)
+            .is_some_and(|upload| upload.strong_count() > 0)
+            || uploads
+                .successful
+                .get(&hash)
+                // `register` applies the same bound when it prunes the history.
+                .is_some_and(|completed| completed.elapsed() < SUCCESSFUL_ADVERT_RETENTION)
+    }
+
     fn register(&self, hash: block::Hash) -> (watch::Receiver<UploadState>, Option<UploadClaim>) {
         let mut uploads = self.0.lock().expect("block upload mutex is never poisoned");
         uploads.active.retain(|_, upload| upload.strong_count() > 0);
@@ -312,6 +334,8 @@ pub(crate) struct BlockGossipPeer {
     /// Address used for live authorization checks, absent for isolated connections.
     pub(crate) address: Option<PeerSocketAddr>,
     pub(crate) uploads: BlockUploads,
+    /// The blocks this peer announced to us, which it does not need advertised back.
+    pub(crate) announced: AnnouncedBlocks,
     pub(crate) registry: Option<PeerRegistryUpdater>,
     pub(crate) version: Version,
     /// Configured sidecars may wait for a busy connection to write inventory.
@@ -319,6 +343,11 @@ pub(crate) struct BlockGossipPeer {
 }
 
 impl BlockGossipPeer {
+    /// An announcement can suppress a new advert, but cannot replace an upload's outcome.
+    fn can_skip_advert(&self, hash: block::Hash) -> bool {
+        self.announced.announced(hash) && !self.uploads.determines_outcome(hash)
+    }
+
     pub(crate) fn rtt(&self) -> Option<Duration> {
         self.registry.as_ref().and_then(PeerRegistryUpdater::rtt)
     }
@@ -333,7 +362,15 @@ impl BlockGossipPeer {
     }
 
     /// Advertises the block and distinguishes authorization revocation from delivery failure.
+    ///
+    /// An announcement may suppress a new advert but cannot replace an active upload's outcome
+    /// or one this connection already delivered. A retry after a joined upload failed still
+    /// advertises: the peer's claim does not satisfy the delivery this broadcast owes.
     async fn advertise_outcome(self, hash: block::Hash) -> AdvertOutcome {
+        if self.can_skip_advert(hash) {
+            metrics::counter!("peer.block_gossip.advert_skipped", "when" => "fan_out").increment(1);
+            return AdvertOutcome::Skipped;
+        }
         let mut retried = false;
         let (mut progress, claim) = loop {
             let (mut progress, claim) = self.uploads.register(hash);
@@ -419,6 +456,8 @@ impl BlockGossipPeer {
 #[derive(Clone, Copy)]
 enum AdvertOutcome {
     Sent,
+    /// The peer announced the block to us, so it was not advertised to.
+    Skipped,
     Revoked,
     Failed,
 }
@@ -440,14 +479,20 @@ struct RevokedCandidates;
 
 /// Announces to sidecars and the initial group immediately, then all remaining peers at
 /// `delayed_at`. Delivery tracking never gates another peer's announcement.
+/// Succeeds if an attempted send succeeds, or every candidate is skipped. Skips cannot
+/// hide a failed send or authorization revocation.
 pub(crate) fn broadcast_block(
     peers: Vec<BlockGossipPeer>,
     hash: block::Hash,
     window: usize,
-    mined: bool,
     delayed_at: Instant,
 ) -> BoxFuture<'static, Result<Response, BoxError>> {
-    let mut initial = order_peers(peers, mined, &mut rand_10::rng());
+    let (mut initial, skipped) = select_peers(peers, hash, &mut rand_10::rng());
+    if skipped > 0 {
+        metrics::counter!("peer.block_gossip.advert_skipped", "when" => "selection")
+            // Skips are bounded by the connected peer count.
+            .increment(u64::try_from(skipped).unwrap_or(u64::MAX));
+    }
     let sidecars = initial.iter().take_while(|peer| peer.sidecar).count();
     let delayed = initial.split_off(sidecars.saturating_add(window).min(initial.len()));
     async move {
@@ -466,13 +511,19 @@ pub(crate) fn broadcast_block(
         // Poll the initial group first, including sidecars, without waiting for delivery.
         let sends = futures::stream::select(advertise(initial), delayed);
         futures::pin_mut!(sends);
+        let mut skipped = skipped > 0;
         let mut succeeded = false;
+        let mut failed = false;
         let mut revoked = false;
         while let Some(outcome) = sends.next().await {
-            succeeded |= matches!(outcome, AdvertOutcome::Sent);
-            revoked |= matches!(outcome, AdvertOutcome::Revoked);
+            match outcome {
+                AdvertOutcome::Sent => succeeded = true,
+                AdvertOutcome::Skipped => skipped = true,
+                AdvertOutcome::Revoked => revoked = true,
+                AdvertOutcome::Failed => failed = true,
+            }
         }
-        if succeeded {
+        if succeeded || (skipped && !failed && !revoked) {
             Ok(Response::Nil)
         } else if revoked {
             Err(Box::new(RevokedCandidates) as BoxError)
@@ -528,11 +579,10 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
         &mut self,
         request: Request,
     ) -> BoxFuture<'static, Result<Response, BoxError>> {
-        let (block, mined) = match request {
-            Request::AdvertiseBlock(block, _) | Request::AdvertiseBlockToAll(block) => {
-                (block, false)
-            }
-            Request::AdvertiseMinedBlock(block) => (block, true),
+        let block = match request {
+            Request::AdvertiseBlock(block, _)
+            | Request::AdvertiseBlockToAll(block)
+            | Request::AdvertiseMinedBlock(block) => block,
             other => {
                 return futures::future::ready(Err(format!(
                     "block advertiser cannot send {}",
@@ -567,7 +617,7 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
                     .cloned()
                     .collect();
                 if !candidates.is_empty() {
-                    match broadcast_block(candidates, block.hash, window, mined, delayed_at).await {
+                    match broadcast_block(candidates, block.hash, window, delayed_at).await {
                         Ok(response) => return Ok(response),
                         Err(error) => tracing::debug!(
                             hash = ?block.hash,
@@ -584,27 +634,27 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
     }
 }
 
-/// Randomize relays and equal RTTs; put configured sidecars first.
+/// Select peers that need the block and put configured sidecars first.
 ///
-/// Mined blocks follow RTT order, except that every [`MINED_RANDOM_INTERVAL`]th non-sidecar
-/// advertisement goes to a random remaining peer.
-pub(crate) fn order_peers(
-    peers: Vec<BlockGossipPeer>,
-    mined: bool,
+/// Low RTT is a heuristic for reaching peers sooner, whether the block was mined locally or
+/// relayed. Every [`ADVERT_RANDOM_INTERVAL`]th selected non-sidecar goes to a random remaining
+/// peer instead. Filter known announcers first so they cannot consume these random positions;
+/// later announcements can still remove a selected peer during fan-out. An unmeasured RTT
+/// sorts last: a connection younger than one heartbeat has no measurement, and the random slot is what
+/// reaches those peers. Equal RTTs are randomized.
+fn select_peers(
+    mut peers: Vec<BlockGossipPeer>,
+    hash: block::Hash,
     rng: &mut impl rand_10::Rng,
-) -> Vec<BlockGossipPeer> {
+) -> (Vec<BlockGossipPeer>, usize) {
     use rand_10::{seq::SliceRandom, RngExt};
+    let skipped = peers
+        .extract_if(.., |peer| peer.can_skip_advert(hash))
+        .count();
     // Snapshot RTT once: heartbeat updates must not change comparisons during sorting.
     let mut peers: Vec<_> = peers
         .into_iter()
-        .map(|peer| {
-            let rtt = if mined {
-                peer.rtt().unwrap_or(Duration::MAX)
-            } else {
-                Duration::ZERO
-            };
-            (peer.sidecar, rtt, peer)
-        })
+        .map(|peer| (peer.sidecar, peer.rtt().unwrap_or(Duration::MAX), peer))
         .collect();
     peers.shuffle(rng);
     peers.sort_unstable_by_key(|(sidecar, rtt, _)| (!sidecar, *rtt));
@@ -612,14 +662,14 @@ pub(crate) fn order_peers(
     let mut remaining = peers.split_off(sidecars);
     let mut ordered: Vec<_> = peers.into_iter().map(|(_, _, peer)| peer).collect();
     for position in 1..=remaining.len() {
-        let index = if mined && position % MINED_RANDOM_INTERVAL == 0 {
+        let index = if position % ADVERT_RANDOM_INTERVAL == 0 {
             rng.random_range(0..remaining.len())
         } else {
             0
         };
         ordered.push(remaining.remove(index).2);
     }
-    ordered
+    (ordered, skipped)
 }
 
 #[cfg(test)]
@@ -639,6 +689,7 @@ mod tests {
                 sender,
                 address: None,
                 uploads: BlockUploads::default(),
+                announced: AnnouncedBlocks::default(),
                 registry: None,
                 version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
                 sidecar: false,
@@ -751,7 +802,6 @@ mod tests {
             peers.clone(),
             parent,
             TEST_WINDOW,
-            true,
             Instant::now() + Duration::from_millis(500),
         ))];
         if early_and_committed {
@@ -759,7 +809,6 @@ mod tests {
                 peers.clone(),
                 parent,
                 TEST_WINDOW,
-                true,
                 Instant::now() + Duration::from_millis(500),
             )));
         }
@@ -783,7 +832,6 @@ mod tests {
             peers,
             child,
             TEST_WINDOW,
-            true,
             Instant::now() + Duration::from_millis(500),
         )));
         let wait = loop {
@@ -888,13 +936,7 @@ mod tests {
         let start = Instant::now();
         let first = tokio::spawn(timeout(
             BLOCK_GOSSIP_TIMEOUT,
-            broadcast_block(
-                peers.clone(),
-                hash,
-                2,
-                true,
-                start + Duration::from_secs(60),
-            ),
+            broadcast_block(peers.clone(), hash, 2, start + Duration::from_secs(60)),
         ));
         for _ in 0..2 {
             assert_eq!(writes.recv().await.unwrap().1, hash);
@@ -909,13 +951,7 @@ mod tests {
 
         let fallback = tokio::spawn(timeout(
             BLOCK_GOSSIP_TIMEOUT,
-            broadcast_block(
-                peers,
-                hash,
-                2,
-                true,
-                Instant::now() + Duration::from_secs(60),
-            ),
+            broadcast_block(peers, hash, 2, Instant::now() + Duration::from_secs(60)),
         ));
         let advert = receiver.recv().await.unwrap();
         assert_eq!(advert.hash, hash);
@@ -1033,6 +1069,70 @@ mod tests {
         assert!(!duplicate.await.unwrap());
     }
 
+    /// An echoed inventory cannot replace the outcome of an unfinished early upload,
+    /// whether it arrives before selection or before the selected peer is polled.
+    #[tokio::test(start_paused = true)]
+    async fn committed_broadcast_observes_upload_despite_echoed_inventory() {
+        for announce_after_selection in [false, true] {
+            for delivered in [false, true] {
+                let hash = block::Hash([39; 32]);
+
+                let (peer, mut receiver) = peer();
+                let mut early = broadcast_block(vec![peer.clone()], hash, 1, Instant::now());
+                assert!((&mut early).now_or_never().is_none());
+                accept(&mut receiver, hash).await;
+                assert!((&mut early).now_or_never().is_none());
+                peer.uploads.requested(hash);
+                if !announce_after_selection {
+                    peer.announced.record([hash]);
+                }
+                let mut committed = broadcast_block(vec![peer.clone()], hash, 1, Instant::now());
+                if announce_after_selection {
+                    peer.announced.record([hash]);
+                }
+                assert!(
+                    (&mut committed).now_or_never().is_none(),
+                    "the committed broadcast must await the early upload"
+                );
+                assert!(receiver.try_recv().is_err(), "joining writes no duplicate");
+                if delivered {
+                    peer.uploads.written(hash);
+                } else {
+                    drop(receiver);
+                    peer.uploads.disconnected();
+                }
+                let (early, committed) = tokio::join!(early, committed);
+                assert_eq!(early.is_ok(), delivered);
+                assert_eq!(committed.is_ok(), delivered);
+            }
+        }
+    }
+
+    /// A joined upload that fails without disconnecting is retried even after an echo.
+    #[tokio::test(start_paused = true)]
+    async fn echoed_inventory_does_not_prevent_retry_of_unavailable_upload() {
+        let hash = block::Hash([40; 32]);
+
+        let (peer, mut receiver) = peer();
+        let mut early = broadcast_block(vec![peer.clone()], hash, 1, Instant::now());
+        assert!((&mut early).now_or_never().is_none());
+        accept(&mut receiver, hash).await;
+        assert!((&mut early).now_or_never().is_none());
+        peer.uploads.requested(hash);
+        peer.announced.record([hash]);
+        let mut committed = broadcast_block(vec![peer.clone()], hash, 1, Instant::now());
+        assert!((&mut committed).now_or_never().is_none());
+        peer.uploads.unavailable(hash);
+        assert!(early.await.is_err());
+        assert!((&mut committed).now_or_never().is_none());
+        accept(&mut receiver, hash).await;
+        assert!((&mut committed).now_or_never().is_none());
+        peer.uploads.requested(hash);
+        peer.uploads.written(hash);
+        assert!(committed.await.is_ok());
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn upload_timeout_and_disconnect_fail_tracking() {
         for disconnect in [false, true] {
@@ -1088,7 +1188,6 @@ mod tests {
             peers.clone(),
             parent,
             TEST_WINDOW,
-            true,
             Instant::now() + Duration::from_millis(500),
         ));
         for _ in 0..TEST_WINDOW {
@@ -1100,7 +1199,6 @@ mod tests {
             peers.clone(),
             child,
             TEST_WINDOW,
-            true,
             Instant::now() + Duration::from_millis(500),
         ));
         for _ in 0..TEST_WINDOW {
@@ -1139,7 +1237,6 @@ mod tests {
             peers,
             block.hash,
             fanout.window(block.size),
-            false,
             Instant::now() + Duration::from_millis(500),
         ));
         let mut wave = Vec::new();
@@ -1249,54 +1346,51 @@ mod tests {
     /// peer count, or whether the block was mined locally.
     #[tokio::test(start_paused = true)]
     async fn all_peers_are_announced_by_one_deadline() {
-        for mined in [false, true] {
-            for count in [16, 100, 300, 1_001] {
-                for size in [
-                    Some(102_399),
-                    Some(102_400),
-                    Some(102_401),
-                    Some(837_632),
-                    Some(1_572_864),
-                    Some(u32::MAX),
-                    None,
-                ] {
-                    let fanout = AdvertFanout::from_config(&Config {
-                        advert_delay: Duration::from_millis(500),
-                        ..sized_window_config()
-                    });
-                    let (peers, mut writes) = connected_peers(count);
-                    let hash = block::Hash([0xd1; 32]);
-                    let start = Instant::now();
-                    let delay = fanout.delay();
-                    let task = tokio::spawn(broadcast_block(
-                        peers,
-                        hash,
-                        fanout.window(size),
-                        mined,
-                        start + delay,
-                    ));
-                    let mut seen = std::collections::HashSet::new();
-                    for position in 0..count {
-                        let (index, written) = writes.recv().await.unwrap();
-                        assert_eq!(written, hash);
-                        assert!(seen.insert(index), "peer {index} advertised twice");
-                        let elapsed = start.elapsed();
-                        if position < fanout.window(size) {
-                            assert_eq!(elapsed, Duration::ZERO);
-                        } else {
-                            // Tokio timers have millisecond resolution.
-                            assert!(
-                                elapsed >= delay && elapsed <= delay + Duration::from_millis(1),
-                                "{count} peers, {size:?}, mined={mined}: {elapsed:?} vs {delay:?}"
-                            );
-                        }
+        for count in [16, 100, 300, 1_001] {
+            for size in [
+                Some(102_399),
+                Some(102_400),
+                Some(102_401),
+                Some(837_632),
+                Some(1_572_864),
+                Some(u32::MAX),
+                None,
+            ] {
+                let fanout = AdvertFanout::from_config(&Config {
+                    advert_delay: Duration::from_millis(500),
+                    ..sized_window_config()
+                });
+                let (peers, mut writes) = connected_peers(count);
+                let hash = block::Hash([0xd1; 32]);
+                let start = Instant::now();
+                let delay = fanout.delay();
+                let task = tokio::spawn(broadcast_block(
+                    peers,
+                    hash,
+                    fanout.window(size),
+                    start + delay,
+                ));
+                let mut seen = std::collections::HashSet::new();
+                for position in 0..count {
+                    let (index, written) = writes.recv().await.unwrap();
+                    assert_eq!(written, hash);
+                    assert!(seen.insert(index), "peer {index} advertised twice");
+                    let elapsed = start.elapsed();
+                    if position < fanout.window(size) {
+                        assert_eq!(elapsed, Duration::ZERO);
+                    } else {
+                        // Tokio timers have millisecond resolution.
+                        assert!(
+                            elapsed >= delay && elapsed <= delay + Duration::from_millis(1),
+                            "{count} peers, {size:?}: {elapsed:?} vs {delay:?}"
+                        );
                     }
-                    assert!(task.await.unwrap().is_ok());
-                    assert!(
-                        writes.try_recv().is_err(),
-                        "tracking expiry started another wave"
-                    );
                 }
+                assert!(task.await.unwrap().is_ok());
+                assert!(
+                    writes.try_recv().is_err(),
+                    "tracking expiry started another wave"
+                );
             }
         }
     }
@@ -1314,7 +1408,6 @@ mod tests {
                 peers,
                 block::Hash([0xd2; 32]),
                 fanout.window(size),
-                false,
                 start + fanout.delay(),
             ));
             for _ in 0..300 {
@@ -1350,7 +1443,6 @@ mod tests {
                         peers,
                         block::Hash([0xd6; 32]),
                         initial,
-                        false,
                         start + delay,
                     ));
                     for _ in 0..count {
@@ -1388,7 +1480,6 @@ mod tests {
             peers,
             block::Hash([0xd3; 32]),
             32,
-            false,
             start + delay,
         ));
         for position in 0..300 {
@@ -1426,7 +1517,6 @@ mod tests {
             peers,
             block::Hash([0xd4; 32]),
             32,
-            false,
             start + delay,
         ));
         let mut seen = std::collections::HashSet::new();
@@ -1450,14 +1540,14 @@ mod tests {
         let hash = block::Hash([0xd5; 32]);
         let start = Instant::now();
         let deadline = start + Duration::from_millis(500);
-        let first = tokio::spawn(broadcast_block(peers.clone(), hash, 32, false, deadline));
+        let first = tokio::spawn(broadcast_block(peers.clone(), hash, 32, deadline));
         for _ in 0..32 {
             writes.recv().await.unwrap();
             assert_eq!(start.elapsed(), Duration::ZERO);
         }
         // All peers enter the joined broadcast immediately. Existing claims must not block
         // its attempts to announce to other peers.
-        let joined = tokio::spawn(broadcast_block(peers, hash, 32, false, start));
+        let joined = tokio::spawn(broadcast_block(peers, hash, 32, start));
         for _ in 32..300 {
             writes.recv().await.unwrap();
             assert_eq!(start.elapsed(), Duration::ZERO);
@@ -1474,6 +1564,49 @@ mod tests {
         );
         first.abort();
         joined.abort();
+    }
+
+    /// Even with one initial recipient, lower-RTT peers cannot hold back the rest.
+    #[tokio::test(start_paused = true)]
+    async fn low_rtt_peers_cannot_delay_a_single_peer_initial_group() {
+        let registry = PeerRegistry::default();
+        let mut guards = Vec::new();
+        let mut peers = measured_peers(&registry, &mut guards, (1..=60).map(Some));
+        let (sender, mut queued) = mpsc::unbounded_channel();
+        for (index, peer) in peers.iter_mut().enumerate() {
+            let (adverts, mut receiver) = mpsc::channel(BLOCK_ADVERT_QUEUE);
+            peer.sender = adverts;
+            let sender = sender.clone();
+            let uploads = peer.uploads.clone();
+            tokio::spawn(async move {
+                while let Some(advert) = receiver.recv().await {
+                    uploads.advertised(advert.hash);
+                    uploads.requested(advert.hash);
+                    advert.result.send(Ok(())).unwrap();
+                    sender.send(index).unwrap();
+                }
+            });
+        }
+        let start = Instant::now();
+        let delay = Duration::from_millis(500);
+        let broadcast = tokio::spawn(broadcast_block(
+            peers,
+            block::Hash([0xd7; 32]),
+            1,
+            start + delay,
+        ));
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(queued.recv().await.unwrap()));
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        for _ in 1..60 {
+            assert!(seen.insert(queued.recv().await.unwrap()));
+            assert_eq!(start.elapsed(), delay);
+        }
+        assert!(
+            seen.contains(&59),
+            "the slowest measured peer was announced to"
+        );
+        broadcast.abort();
     }
 
     /// A full connection queue holds only that peer's adverts. It can drain a burst before
@@ -1493,7 +1626,6 @@ mod tests {
                     peers.clone(),
                     *hash,
                     1,
-                    false,
                     start,
                 )));
             }
@@ -1627,7 +1759,6 @@ mod tests {
             vec![peer.clone()],
             hash,
             1,
-            true,
             Instant::now() + Duration::from_millis(500),
         ));
         accept(&mut receiver, hash).await;
@@ -1641,7 +1772,6 @@ mod tests {
             vec![peer.clone()],
             hash,
             1,
-            true,
             Instant::now() + Duration::from_millis(500),
         );
         assert!(delayed_early.await.is_ok());
@@ -1661,7 +1791,6 @@ mod tests {
             vec![peer.clone()],
             hash,
             TEST_WINDOW,
-            true,
             Instant::now() + Duration::from_millis(500),
         ));
         let advert = receiver.recv().await.unwrap();
@@ -1674,7 +1803,6 @@ mod tests {
             vec![peer],
             hash,
             TEST_WINDOW,
-            true,
             Instant::now() + Duration::from_millis(500),
         ));
         accept(&mut receiver, hash).await;
@@ -1698,7 +1826,6 @@ mod tests {
                 peers.clone(),
                 hash,
                 TEST_WINDOW,
-                false,
                 Instant::now() + Duration::from_millis(500),
             )));
             let next_block = mined + Duration::from_secs(1);
@@ -1824,8 +1951,9 @@ mod tests {
             .collect()
     }
 
+    /// Relayed and mined blocks share one order: lowest RTT first, unmeasured RTT last.
     #[test]
-    fn miners_use_rtt_and_relays_use_random_order() {
+    fn advertisements_follow_rtt_order() {
         let registry = PeerRegistry::default();
         let mut guards = Vec::new();
         let peers = measured_peers(
@@ -1833,8 +1961,10 @@ mod tests {
             &mut guards,
             [Some(80), Some(10), None, Some(30), Some(10)],
         );
-        let mined = order_peers(peers.clone(), true, &mut StdRng::seed_from_u64(9));
-        let measured: Vec<_> = mined.iter().map(BlockGossipPeer::rtt).collect();
+        let (ordered, skipped) =
+            select_peers(peers, block::Hash([0; 32]), &mut StdRng::seed_from_u64(9));
+        assert_eq!(skipped, 0);
+        let measured: Vec<_> = ordered.iter().map(BlockGossipPeer::rtt).collect();
         assert_eq!(
             measured[..3],
             [Some(10), Some(10), Some(30)].map(|value| value.map(Duration::from_millis))
@@ -1843,33 +1973,64 @@ mod tests {
         let mut rest = measured[3..].to_vec();
         rest.sort();
         assert_eq!(rest, [None, Some(Duration::from_millis(80))]);
-        let relay = order_peers(peers, false, &mut StdRng::seed_from_u64(9));
-        assert_ne!(
-            relay.iter().map(BlockGossipPeer::rtt).collect::<Vec<_>>(),
-            measured
-        );
     }
 
     #[test]
-    fn low_rtt_peers_cannot_fill_the_first_mined_wave() {
+    fn low_rtt_peers_cannot_fill_the_first_wave() {
         let registry = PeerRegistry::default();
         let mut guards = Vec::new();
         let peers = measured_peers(&registry, &mut guards, (1..=100).map(Some));
-        let mined: Vec<_> = order_peers(peers, true, &mut StdRng::seed_from_u64(3))
+        let (ordered, skipped) =
+            select_peers(peers, block::Hash([0; 32]), &mut StdRng::seed_from_u64(3));
+        assert_eq!(skipped, 0);
+        let ordered: Vec<_> = ordered
             .iter()
             .map(|peer| peer.rtt().unwrap().as_millis())
             .collect();
-        for (position, window) in mined.chunks(MINED_RANDOM_INTERVAL).enumerate() {
-            let rtt_ordered = &window[..window.len().min(MINED_RANDOM_INTERVAL - 1)];
+        for (position, window) in ordered.chunks(ADVERT_RANDOM_INTERVAL).enumerate() {
+            let rtt_ordered = &window[..window.len().min(ADVERT_RANDOM_INTERVAL - 1)];
             assert!(
                 rtt_ordered.is_sorted(),
                 "RTT order outside random slots in chunk {position}"
             );
         }
-        let first_wave = &mined[..TEST_WINDOW];
+        let first_wave = &ordered[..TEST_WINDOW];
         assert!(
             first_wave.iter().any(|rtt| *rtt > TEST_WINDOW as u128),
             "a random slot reaches beyond the lowest-RTT peers: {first_wave:?}"
+        );
+    }
+
+    /// Known announcers must not change the order, including random positions, of the
+    /// remaining recipients when given the same random choices.
+    #[test]
+    fn announcers_do_not_consume_random_positions() {
+        let registry = PeerRegistry::default();
+        let mut guards = Vec::new();
+        let hash = block::Hash([36; 32]);
+        let peers = measured_peers(&registry, &mut guards, (1..=100).map(Some));
+        for peer in peers.iter().step_by(4) {
+            peer.announced.record([hash]);
+        }
+        let remaining = peers
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 4 != 0)
+            .map(|(_, peer)| peer.clone())
+            .collect();
+        let (expected, _) = select_peers(remaining, hash, &mut StdRng::seed_from_u64(3));
+        let (selected, skipped) = select_peers(peers, hash, &mut StdRng::seed_from_u64(3));
+        assert_eq!(skipped, 25);
+        assert_eq!(selected.len(), 75);
+        assert_eq!(
+            selected
+                .iter()
+                .map(BlockGossipPeer::rtt)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(BlockGossipPeer::rtt)
+                .collect::<Vec<_>>()
         );
     }
     #[tokio::test(start_paused = true)]
@@ -2077,6 +2238,248 @@ mod tests {
         let (result, ()) = tokio::join!(deadline, reject);
         assert!(result.is_err());
         assert!(receiver.try_recv().is_err());
+    }
+
+    /// A peer that announced the block to us already has it, so it is not advertised to.
+    #[tokio::test(start_paused = true)]
+    async fn peers_that_announced_the_block_are_not_advertised() {
+        let hash = block::Hash([30; 32]);
+
+        let (peers, mut writes) = connected_peers(2);
+        peers[0].announced.record([hash]);
+        let broadcast = tokio::spawn(broadcast_block(peers, hash, TEST_WINDOW, Instant::now()));
+        assert_eq!(
+            writes
+                .recv()
+                .await
+                .expect("the other peer is advertised to"),
+            (1, hash)
+        );
+        tokio::time::advance(BLOCK_REQUEST_WAIT).await;
+        assert!(broadcast.await.unwrap().is_ok());
+        assert!(
+            writes.try_recv().is_err(),
+            "the peer that announced the block got an advert"
+        );
+    }
+
+    /// A broadcast whose every peer has the block writes nothing, and still succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn broadcast_succeeds_when_every_peer_announced_the_block() {
+        let hash = block::Hash([31; 32]);
+
+        let (peers, mut writes) = connected_peers(3);
+        for peer in &peers {
+            peer.announced.record([hash]);
+        }
+        assert!(broadcast_block(peers, hash, TEST_WINDOW, Instant::now())
+            .await
+            .is_ok());
+        assert!(writes.try_recv().is_err());
+    }
+
+    /// A broadcast with no peers at all still fails, so the advertiser waits for one.
+    #[tokio::test(start_paused = true)]
+    async fn broadcast_without_peers_fails() {
+        assert!(broadcast_block(
+            Vec::new(),
+            block::Hash([32; 32]),
+            TEST_WINDOW,
+            Instant::now()
+        )
+        .await
+        .is_err());
+    }
+
+    /// Skipped peers take no window entry, so the remaining peers are advertised to at once.
+    #[tokio::test(start_paused = true)]
+    async fn skipped_peers_do_not_consume_the_advert_window() {
+        let hash = block::Hash([33; 32]);
+
+        let (peers, mut writes) = connected_peers(3);
+        peers[0].announced.record([hash]);
+        peers[1].announced.record([hash]);
+        let started = Instant::now();
+        let broadcast = tokio::spawn(broadcast_block(peers, hash, 1, Instant::now()));
+        assert_eq!(
+            writes.recv().await.expect("the last peer needs it"),
+            (2, hash)
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "a skipped peer held the window"
+        );
+        tokio::time::advance(BLOCK_REQUEST_WAIT).await;
+        assert!(broadcast.await.unwrap().is_ok());
+    }
+
+    /// An announcement that arrives after selection still skips the advert write.
+    #[tokio::test(start_paused = true)]
+    async fn announcement_before_the_advert_write_skips_the_peer() {
+        let hash = block::Hash([34; 32]);
+
+        let (peer, mut receiver) = peer();
+        // The advert is selected before the announcement, and written after it.
+        let advert = peer.clone().advertise_outcome(hash);
+        peer.announced.record([hash]);
+        assert!(matches!(advert.await, AdvertOutcome::Skipped));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    /// Overlapping broadcasts of a skipped peer both succeed, instead of reporting failure.
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_broadcasts_report_a_skipped_peer_as_success() {
+        let hash = block::Hash([35; 32]);
+
+        let (peers, mut writes) = connected_peers(1);
+        peers[0].announced.record([hash]);
+        let (early, committed) = tokio::join!(
+            broadcast_block(peers.clone(), hash, TEST_WINDOW, Instant::now()),
+            broadcast_block(peers, hash, TEST_WINDOW, Instant::now()),
+        );
+        assert!(early.is_ok());
+        assert!(committed.is_ok());
+        assert!(writes.try_recv().is_err());
+    }
+
+    /// Both broadcasts are running when the second peer announces the block. At the delayed
+    /// group's absolute deadline, neither creates an upload claim or writes inventory to it.
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_broadcasts_skip_an_announcement_before_the_delayed_group() {
+        timeout(Duration::from_secs(10), async {
+            let registry = PeerRegistry::default();
+            let mut guards = Vec::new();
+            let mut peers = measured_peers(&registry, &mut guards, [Some(1), Some(2)]);
+            let (first_tx, mut first_rx) = mpsc::channel(BLOCK_ADVERT_QUEUE);
+            let (later_tx, mut later_rx) = mpsc::channel(BLOCK_ADVERT_QUEUE);
+            peers[0].sender = first_tx;
+            peers[1].sender = later_tx;
+            let later = peers[1].clone();
+            let hash = block::Hash([37; 32]);
+
+            let delayed_at = Instant::now() + Duration::from_millis(500);
+            let mut early = broadcast_block(peers.clone(), hash, 1, delayed_at);
+            let mut committed = broadcast_block(peers, hash, 1, delayed_at);
+            assert!((&mut early).now_or_never().is_none());
+            assert!((&mut committed).now_or_never().is_none());
+            let first = first_rx
+                .try_recv()
+                .expect("both broadcasts join the first peer's upload");
+            assert_eq!(first.hash, hash);
+            assert!(later_rx.try_recv().is_err());
+
+            later.announced.record([hash]);
+            first.result.send(Ok(())).unwrap();
+            assert!((&mut early).now_or_never().is_none());
+            assert!((&mut committed).now_or_never().is_none());
+            tokio::time::advance(BLOCK_REQUEST_WAIT).await;
+            let (early, committed) = tokio::join!(early, committed);
+            assert!(early.is_ok());
+            assert!(committed.is_ok());
+            assert!(
+                first_rx.try_recv().is_err(),
+                "the joined broadcast wrote a duplicate"
+            );
+            assert!(
+                later_rx.try_recv().is_err(),
+                "the late announcer received inventory"
+            );
+            assert!(
+                later
+                    .uploads
+                    .0
+                    .lock()
+                    .expect("block upload mutex is never poisoned")
+                    .active
+                    .is_empty(),
+                "skipping a peer must not create an upload claim"
+            );
+        })
+        .await
+        .expect("overlapping broadcasts finish within their request wait");
+    }
+
+    /// A delivered advert stays a success: a later announcement from the same peer must not
+    /// weaken it into a skip, or a broadcast that reached this peer reports failure when a
+    /// different peer's send fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_delivered_advert_outranks_a_later_announcement() {
+        let hash = block::Hash([42; 32]);
+
+        let (delivered, mut receiver) = peer();
+        let early = broadcast_block(vec![delivered.clone()], hash, 1, Instant::now());
+        let early = tokio::spawn(early);
+        accept(&mut receiver, hash).await;
+        tokio::time::advance(BLOCK_REQUEST_WAIT).await;
+        assert!(early.await.unwrap().is_ok(), "the advert was delivered");
+
+        // The peer now echoes the block it already received from us.
+        delivered.announced.record([hash]);
+        let (failed, failed_receiver) = peer();
+        drop(failed_receiver);
+        assert!(
+            broadcast_block(vec![delivered, failed], hash, 1, Instant::now())
+                .await
+                .is_ok(),
+            "an echo turned a delivered advert into a failed broadcast"
+        );
+        assert!(receiver.try_recv().is_err(), "no duplicate inventory");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_announcer_does_not_hide_other_send_failures() {
+        let hash = block::Hash([38; 32]);
+        let (announcer, mut receiver) = peer();
+        announcer.announced.record([hash]);
+        let (failed, failed_receiver) = peer();
+        drop(failed_receiver);
+        assert!(
+            broadcast_block(vec![announcer, failed], hash, 1, Instant::now())
+                .await
+                .is_err()
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skipped_announcers_preserve_failed_and_revoked_outcomes() {
+        for announce_before_selection in [false, true] {
+            for revoked in [false, true] {
+                let registry = PeerRegistry::default();
+                let mut guards = Vec::new();
+                let mut peers = measured_peers(&registry, &mut guards, [Some(1), Some(2)]);
+                let (first_tx, mut first_rx) = mpsc::channel(BLOCK_ADVERT_QUEUE);
+                let (later_tx, mut later_rx) = mpsc::channel(BLOCK_ADVERT_QUEUE);
+                peers[0].sender = first_tx;
+                peers[1].sender = later_tx;
+                let later = peers[1].clone();
+                let hash = block::Hash([41; 32]);
+                if announce_before_selection {
+                    later.announced.record([hash]);
+                }
+                let delayed_at = Instant::now() + Duration::from_millis(500);
+                let mut broadcast = broadcast_block(peers, hash, 1, delayed_at);
+                assert!((&mut broadcast).now_or_never().is_none());
+                let first = first_rx.try_recv().unwrap();
+                if !announce_before_selection {
+                    later.announced.record([hash]);
+                }
+                if revoked {
+                    first
+                        .result
+                        .send(Err(BlockAdvertError::AuthorizationRevoked))
+                        .unwrap();
+                } else {
+                    drop(first);
+                }
+                let error = broadcast
+                    .await
+                    .expect_err("a skipped peer cannot hide a failed send");
+                assert_eq!(error.is::<RevokedCandidates>(), revoked);
+                assert!(later_rx.try_recv().is_err());
+            }
+        }
     }
 
     #[test]

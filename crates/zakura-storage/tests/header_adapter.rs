@@ -392,3 +392,24 @@ fn a_shorter_weighted_fork_outweighs_a_longer_one() {
 fn branch_zero_takes_no_weight() {
     let _ = HeaderFixture::regtest().with_weight(0, 1);
 }
+
+/// In simulator builds the port records each snapshot it sends on its
+/// selected-chain watch: one per committed transition, equal to the engine's
+/// snapshot then, and taken once.
+#[cfg(zakura_sim)]
+#[test]
+fn each_publication_on_the_selected_watch_is_recorded() {
+    let fixture = HeaderFixture::regtest();
+    let port = EnginePort::new(&fixture);
+    assert_eq!(port.take_publications(), Vec::new());
+    let anchor = fixture.anchor();
+    let first = fixture.extend(anchor, 2, 0);
+    admit(&port, anchor, &first, 1);
+    let after_first = port.snapshot();
+    let tip = frontiers(anchor, &first)[1];
+    let second = fixture.extend(tip, 1, 0);
+    admit(&port, tip, &second, 2);
+    let after_second = port.snapshot();
+    assert_eq!(port.take_publications(), vec![after_first, after_second]);
+    assert_eq!(port.take_publications(), Vec::new());
+}

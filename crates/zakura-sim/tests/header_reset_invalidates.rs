@@ -9,6 +9,7 @@ mod support;
 use std::{fs, path::PathBuf, process::Command};
 
 use support::{byte_inputs, inputs};
+use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
     domain::header_sync::{
@@ -342,7 +343,10 @@ fn every_witness_holds_and_applies() {
                 assert!(
                     matches!(
                         outcome(&report, control),
-                        PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
+                        PropertyOutcome::Held { .. }
+                            | PropertyOutcome::NotApplicable {
+                                reason: NaReason::NeverApplied
+                            }
                     ),
                     "{name}: {control}: {:?}",
                     outcome(&report, control)

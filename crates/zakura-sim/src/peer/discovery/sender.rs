@@ -195,6 +195,7 @@ impl DiscoverySender {
             rule_stream: self.stream,
             label,
             exhausted,
+            exchange: None,
         })
     }
 }

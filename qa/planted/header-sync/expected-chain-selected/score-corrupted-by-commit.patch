@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-header-chain/src/transition/types/snapshot.rs b/crates/zakura-header-chain/src/transition/types/snapshot.rs
+index 9dd3892c5b..68528ed975 100644
+--- a/crates/zakura-header-chain/src/transition/types/snapshot.rs
++++ b/crates/zakura-header-chain/src/transition/types/snapshot.rs
+@@ -179,7 +179,10 @@ impl EngineMetadata {
+             header_generation: self.header_generation,
+             verified_generation: self.verified_generation,
+             frontiers: self.frontiers,
+-            header_best_score: self.header_best_score,
++            header_best_score: crate::ChainScore::new(
++                crate::SuffixWork::new(self.header_best_score.suffix_work.as_u256() / 2),
++                self.header_best_score.tip_hash,
++            ),
+             oldest_retained_height: self.oldest_retained_height,
+             alarms: self.alarms.clone(),
+         }

@@ -2,11 +2,15 @@
 //! the tests that read them build: each is a typed scenario generator 3 can
 //! encode, so the fuzzer can draw it from its seed.
 
+// Not every test that shares this module names them.
+#[allow(unused_imports)]
+pub use zakura_sim::harness::header_sync::liveness::{OWNER, TAKER};
 use zakura_sim::harness::{
     header_node::{
         policy::{Allow, Hold, OpKind, ReplyHold, Select, Trigger},
         Chain, ControlAction, ControlStep, Fork, Policy, Reset,
     },
+    header_sync::liveness::RecoveryFixture,
     header_sync::{Dialer, MirrorSpec, StorageScenario, Weights},
 };
 
@@ -521,6 +525,60 @@ pub fn recovery_witnesses() -> Vec<(&'static str, StorageScenario)> {
     ]
 }
 
+/// hdr-13's recovery witnesses for the classes whose fuzz-12 witness owes
+/// the node nothing at its `recovered` pick, so
+/// `header-sync/bounded-adversary-progress` doesn't apply there. Each owes a
+/// header past the node's baseline.
+///
+/// - **Reply holds.** fuzz-12's recovers once its held apply commits, which
+///   leaves the baseline at the source's tip. Here the source grows by two
+///   headers once the apply commits, and the recover comes once it has
+///   grown, with the reply still held. The grown tip reaches the node only
+///   behind the source's one-second status floor, so the node meets it
+///   after the `recovered` pick.
+/// - **Departure.** The close class as hdr-10's departure fixture
+///   completes it ([`departure_recovery`]).
+pub fn owed_recovery_witnesses() -> Vec<(&'static str, StorageScenario)> {
+    let mut reply_holds = recovering(vec![
+        step(
+            SOURCE,
+            ControlAction::Grow { len: 2 },
+            Some(Trigger::Committed(Select::nth(OpKind::Apply, 1))),
+        ),
+        recover(Some(Trigger::Grown(SOURCE.to_owned()))),
+    ]);
+    reply_holds.policy.reply_holds.push(ReplyHold {
+        select: Select::nth(OpKind::Apply, 1),
+        until: Trigger::VirtualTime(3_600_000),
+    });
+    vec![
+        ("reply holds", reply_holds),
+        ("departure", departure_recovery()),
+    ]
+}
+
+/// The node at A2 and the source at A8, which grows by two headers once the
+/// node's first apply completes, with the recover once it has grown. The
+/// grown tip reaches the node only behind the source's one-second status
+/// floor, so at the `recovered` pick the node still owes it: hdr-13's
+/// declared stall.
+pub fn grown_source() -> StorageScenario {
+    recovering(vec![
+        step(
+            SOURCE,
+            ControlAction::Grow { len: 2 },
+            Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
+        ),
+        recover(Some(Trigger::Grown(SOURCE.to_owned()))),
+    ])
+}
+
+/// hdr-13's close class as the departure's completion
+/// ([`RecoveryFixture::Departure`]).
+pub fn departure_recovery() -> StorageScenario {
+    RecoveryFixture::Departure.storage()
+}
+
 /// [`StorageScenario::holds`], the scenario whose node releases a header
 /// path, with its first release completing with `fault` once `after`
 /// milliseconds pass.
@@ -609,6 +667,12 @@ pub fn witness_seeds() -> Vec<(String, StorageScenario)> {
     for (class, scenario) in recovery_witnesses() {
         seeds.push((
             format!("header-storage-w-recover-{}", class.replace(' ', "-")),
+            scenario,
+        ));
+    }
+    for (class, scenario) in owed_recovery_witnesses() {
+        seeds.push((
+            format!("header-storage-w-owed-{}", class.replace(' ', "-")),
             scenario,
         ));
     }

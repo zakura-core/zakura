@@ -68,6 +68,10 @@ pub const MAX_BLOB_BYTES: u64 = 256 << 20;
 /// The largest `input.bin` the reader accepts.
 pub const MAX_INPUT_BYTES: u64 = 16 << 20;
 
+/// The largest full report ([`crate::record::FULL_REPORT_FILE`]) a replay
+/// or the shrinker reads.
+pub const MAX_REPORT_BYTES: u64 = 256 << 20;
+
 /// The deepest nesting of arrays and objects that `meta.scenario` and an
 /// assumption's `params` may hold. serde_json stops parsing at 128 levels,
 /// and the record around these values adds up to 4 (`{"meta":{"assumptions":

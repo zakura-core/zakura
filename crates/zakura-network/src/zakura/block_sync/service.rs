@@ -1167,7 +1167,7 @@ impl BlockSyncService {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod requester_session_tests {
     use super::*;
     use crate::zakura::{

@@ -246,16 +246,15 @@ impl Authority {
         }
     }
 
-    /// Judges each apply's and reset's engine run in `runs`, after the
-    /// drain's storage facts. Each makes the check applicable.
-    pub(super) fn engine_runs<'r>(
+    /// Judges one engine `run`, after the drain's storage facts, returning
+    /// whether the commit-contents rules found it left the engine's durable
+    /// state other than they allow. Each run makes the check applicable.
+    pub(super) fn engine_run(
         &mut self,
-        runs: impl IntoIterator<Item = &'r zakura_storage::header::controlled::EngineRun>,
-    ) {
-        for run in runs {
-            self.contents.run(run);
-            self.applies();
-        }
+        run: &zakura_storage::header::controlled::EngineRun,
+    ) -> bool {
+        self.applies();
+        self.contents.run(run)
     }
 
     /// Notes that storage gave `hash` at `height` as a locator's entry, as

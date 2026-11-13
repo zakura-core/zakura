@@ -1415,7 +1415,7 @@ fn send_reserved(
         .send(action);
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests {
     mod commit_metrics;
     mod ownership;

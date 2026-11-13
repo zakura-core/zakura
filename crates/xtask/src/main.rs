@@ -109,6 +109,10 @@ fn try_main() -> Result<(), BoxError> {
                 args.next();
                 return planted::mutation_loop(&repo_root()?, args);
             }
+            if args.peek().map(String::as_str) == Some("triage") {
+                args.next();
+                return planted::triage(&repo_root()?, args);
+            }
             let mut changed_since = None;
             let mut property = None;
             let mut shard = None;
@@ -387,11 +391,15 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "  cargo xtask planted loop --out <dir> [--work <dir>] [--cases <dir>] [--planted <prefix>]..."
+        "  cargo xtask planted loop (--out <dir> | --list) [--work <dir>] [--cases <dir>] [--planted <prefix>]..."
     )?;
     writeln!(
         output,
         "      [--only <property-id>]... [--changed-since <rev>] [--jobs <n>] [--memory-max <bytes>|off]"
+    )?;
+    writeln!(
+        output,
+        "  cargo xtask planted triage --report <file> [--out <file>]"
     )?;
     writeln!(
         output,
@@ -529,7 +537,18 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "remote host: each mutant's named witness, classified from zakura-sim's end records,"
     )?;
-    writeln!(output, "into --out/report.json.")?;
+    writeln!(
+        output,
+        "into --out/report.json. With --list, it prints the cases it selects and runs nothing."
+    )?;
+    writeln!(
+        output,
+        "`planted triage` applies qa/native-mutations/triage.toml afresh to a loop report,"
+    )?;
+    writeln!(
+        output,
+        "or to a merge of several, and writes it to --out or back in place."
+    )?;
     writeln!(output)?;
     writeln!(
         output,

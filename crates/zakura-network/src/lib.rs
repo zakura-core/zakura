@@ -130,6 +130,12 @@
 // Long Tower service and future types are routine in this crate, and factoring
 // them into type aliases would not make the code clearer.
 #![allow(clippy::type_complexity)]
+// Most unit tests and the testkit's test stack name tokio's types, so they
+// don't build under `zakura_sim`. The helpers they share go unused there.
+#![cfg_attr(
+    all(zakura_sim, any(test, feature = "zakura-testkit")),
+    allow(dead_code, unused_imports)
+)]
 
 #[macro_use]
 extern crate pin_project;

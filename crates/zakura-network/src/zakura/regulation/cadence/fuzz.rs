@@ -8,7 +8,7 @@ use std::{collections::VecDeque, time::Duration};
 
 use zakura_rt::time::Instant;
 
-use super::{send_slot, RowSend, Slot};
+use super::{cadence, send_slot, Bucket, RowSend, Slot};
 use crate::zakura::{
     framed_channel,
     regulation::test_family::{decode, Probe, PING, STATUS},
@@ -50,6 +50,10 @@ fn replay(data: &[u8], mut before_send: impl FnMut(&mut Slot<Probe>)) -> Cadence
         latest: None,
         last_sent: None,
         unwritten: zakura_rt::sync::Weak::new(),
+        mirror: Bucket::new(
+            cadence(&rule).expect("the replayed rows declare a cadence"),
+            origin,
+        ),
     });
     let (send, mut recv) = framed_channel(1);
     let mut pending = [None, None];

@@ -22,7 +22,7 @@ preparation uses semver and public-API checks to choose crate version bumps.
 
 An `Added` or `Changed` release may use a patch node version when every such
 entry is backwards compatible and the release team records one explicit
-release-level waiver in a fragment:
+release-level waiver in a fragment, inside a category section after its list item:
 
 ```markdown
 <!-- release-readiness: allow-patch; reason: All additions and behavior changes are backwards compatible. -->
@@ -30,6 +30,8 @@ release-level waiver in a fragment:
 
 This does not waive library crate version bumps and cannot cover `Deprecated`,
 `Removed`, or Mainnet network-upgrade entries.
+The marker covers the current pending release. Record a new approval for each
+later release rather than adding version-specific exceptions to the scripts.
 
 Write complete Keep a Changelog list items, including the PR link. Multiple
 changes and categories belong in the same fragment. Parameter changes still

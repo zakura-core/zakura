@@ -13,19 +13,22 @@ use super::{Built, Runnable};
 use serde_json::json;
 
 use super::{
+    super::outcome::EndOutcome,
     build_failure,
     classify::{
         self, read_record, Applicability, Class, Ended, GenerateFacts, GenerateStop, Observed,
         Reason, Record, Trigger,
     },
     generate::{
-        baseline_lane, campaign_class, co_violations, confirmed, no_generator as no_generator_of,
-        plan, write_exclusions, FollowUp, GenBaseline, GenerateConfig, GenerateMode,
-        GeneratorBaselineFailure, GeneratorReport, Kill, Lanes, PropertyFinding, Search, Searched,
-        Unpatched,
+        baseline_lane, campaign_class, co_violation_confirmed, co_violations, confirm_child,
+        confirmed, judge_unpatched, no_generator as no_generator_of, plan, shrink_wall,
+        unpatched_class, write_exclusions, FollowUp, GenBaseline, GenerateConfig, GenerateMode,
+        GeneratorBaselineFailure, GeneratorReport, Kill, KillTrace, Lanes, OnUnpatched,
+        PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck,
     },
-    parse_flags, selects, summarize, test_executables, BaselineReport, BuildIdentity, CaseReport,
-    GenerateFlags, LoopCase, Mutant, Report, Runner, Slot, WitnessSpec,
+    parse_flags, planted_cases, selects, summarize, test_executables, triage, BaselineReport,
+    BuildIdentity, CaseReport, GenerateFlags, ListedCase, LoopCase, Mutant, Report, Runner, Slot,
+    WitnessSpec,
 };
 use crate::planted::lane::{campaign_facts, Campaign, CampaignFacts};
 
@@ -33,11 +36,13 @@ const NAMED: &str = "block-sync/retained-byte-bound";
 const OTHER: &str = "block-sync/reserved-byte-bound";
 
 /// An end record on thread `t1` whose run `stopped_by` stopped, with each
-/// of `outcomes` as `(id, outcome, applicable)`.
+/// of `outcomes` as `(id, outcome, applicable)`. An outcome is `held`,
+/// `violated`, or `not-applicable/<reason>`, as [`outcome`] reads it.
 fn end(stopped_by: Option<&str>, outcomes: &[(&str, &str, u64)]) -> Record {
     end_on("t1", stopped_by, outcomes)
 }
 
+/// [`end`] on `thread`.
 fn end_on(thread: &str, stopped_by: Option<&str>, outcomes: &[(&str, &str, u64)]) -> Record {
     Record::End {
         thread: thread.to_owned(),
@@ -50,9 +55,20 @@ fn end_on(thread: &str, stopped_by: Option<&str>, outcomes: &[(&str, &str, u64)]
         harness: None,
         outcomes: outcomes
             .iter()
-            .map(|(id, outcome, n)| ((*id).to_owned(), ((*outcome).to_owned(), *n)))
+            .map(|(id, name, n)| ((*id).to_owned(), outcome(name, *n)))
             .collect(),
     }
+}
+
+/// The outcome `name` names, with `applicable` evaluations for `held`, read
+/// from its serialized form the way an end record's is.
+fn outcome(name: &str, applicable: u64) -> EndOutcome {
+    let value = match name.split_once('/') {
+        Some(("not-applicable", reason)) => json!({"not-applicable": {"reason": reason}}),
+        _ if name == "held" => json!({"held": {"applicable": applicable}}),
+        _ => json!({ name: {} }),
+    };
+    EndOutcome::parse(&value).unwrap_or_else(|error| panic!("{name}: {error}"))
 }
 
 fn judged(error: Option<&str>, trigger: Trigger) -> Record {
@@ -135,7 +151,7 @@ fn a_passing_witness_survives_held() {
 fn not_applicable_and_a_lost_trigger_survive_with_their_reasons() {
     let never = observed(
         Ended::Exited(0),
-        vec![end(None, &[(NAMED, "not-applicable", 0)])],
+        vec![end(None, &[(NAMED, "not-applicable/never-applied", 0)])],
     );
     assert_eq!(
         classified(&never),
@@ -144,7 +160,7 @@ fn not_applicable_and_a_lost_trigger_survive_with_their_reasons() {
     let judged_not_applicable = observed(
         Ended::Exited(1),
         vec![
-            end(None, &[(NAMED, "not-applicable", 0)]),
+            end(None, &[(NAMED, "not-applicable/never-applied", 0)]),
             judged(Some("not-applicable"), Trigger::Lost),
         ],
     );
@@ -280,34 +296,81 @@ fn a_violation_that_stopped_no_run_decides_nothing() {
     assert_eq!(result.other.as_deref(), Some(OTHER));
 }
 
+/// Each `not-applicable` reason, read from its serialized end record: a
+/// benign one survives `not-applicable`, and every other `incomplete`.
 #[test]
-fn an_inconclusive_named_id_survives_inconclusive_not_held() {
-    let inconclusive = observed(
+fn each_not_applicable_reason_survives_by_its_class() {
+    for (reason, expected) in [
+        (json!("never-applied"), Reason::NotApplicable),
+        (json!("undeclared"), Reason::NotApplicable),
+        (json!("excluded"), Reason::NotApplicable),
+        (json!("assumptions-never-held"), Reason::Incomplete),
+        (json!("assumption-lost"), Reason::Incomplete),
+        (json!("stopped-by-violation"), Reason::Incomplete),
+        (json!("harness-failed"), Reason::Incomplete),
+        (json!("node-stopped"), Reason::Incomplete),
+        (
+            json!({"unsettled": {"site": "teardown-open"}}),
+            Reason::Incomplete,
+        ),
+    ] {
+        let end_file = json!({
+            "seq": 0, "thread": "t1", "source": "abc",
+            "end": {
+                "outcome": "budget", "steps": 9, "drain": null, "cleanup": {},
+                "properties": [
+                    {"property": NAMED, "outcome": {"not-applicable": {"reason": reason}}},
+                ],
+            },
+        });
+        let record = read_record(&end_file.to_string(), "abc")
+            .unwrap()
+            .expect("the record is the build's");
+        let run = observed(Ended::Exited(0), vec![record]);
+        assert_eq!(
+            classified(&run),
+            (Class::Survived, Some(expected)),
+            "{reason}"
+        );
+    }
+    // An unknown reason fails the read.
+    let unknown = json!({
+        "seq": 0, "thread": "t1", "source": "abc",
+        "end": {"properties": [
+            {"property": NAMED, "outcome": {"not-applicable": {"reason": "lost"}}},
+        ]},
+    });
+    assert!(read_record(&unknown.to_string(), "abc").is_err());
+}
+
+#[test]
+fn an_incomplete_named_id_survives_incomplete_not_held() {
+    let incomplete = observed(
         Ended::Exited(0),
-        vec![end(None, &[(NAMED, "inconclusive", 0)])],
+        vec![end(None, &[(NAMED, "not-applicable/assumption-lost", 0)])],
     );
     assert_eq!(
-        classified(&inconclusive),
-        (Class::Survived, Some(Reason::Inconclusive))
+        classified(&incomplete),
+        (Class::Survived, Some(Reason::Incomplete))
     );
-    // A failed judgement of an inconclusive outcome gives the same reason.
-    let judged_inconclusive = observed(
+    // A failed judgement of an incomplete outcome gives the same reason.
+    let judged_incomplete = observed(
         Ended::Exited(1),
         vec![
-            end(None, &[(NAMED, "inconclusive", 0)]),
-            judged(Some("inconclusive"), Trigger::None),
+            end(None, &[(NAMED, "not-applicable/assumption-lost", 0)]),
+            judged(Some("incomplete"), Trigger::None),
         ],
     );
     assert_eq!(
-        classified(&judged_inconclusive),
-        (Class::Survived, Some(Reason::Inconclusive))
+        classified(&judged_incomplete),
+        (Class::Survived, Some(Reason::Incomplete))
     );
     // Some run that held the named ID with nonzero applicability is `held`,
     // as a baseline requires.
     let one_held = observed(
         Ended::Exited(0),
         vec![
-            end(None, &[(NAMED, "inconclusive", 0)]),
+            end(None, &[(NAMED, "not-applicable/assumption-lost", 0)]),
             end(None, &[(NAMED, "held", 3)]),
         ],
     );
@@ -401,7 +464,7 @@ fn a_baseline_must_hold_the_property_cleanly() {
         observed(Ended::Exited(0), vec![end(None, &[(NAMED, "held", 0)])]),
         observed(
             Ended::Exited(0),
-            vec![end(None, &[(NAMED, "not-applicable", 0)])],
+            vec![end(None, &[(NAMED, "not-applicable/never-applied", 0)])],
         ),
         observed(Ended::Exited(101), vec![end(None, &[(NAMED, "held", 2)])]),
         observed(
@@ -472,7 +535,7 @@ fn records_are_read_from_the_hooks_files_and_paired_by_source() {
             "properties": [
                 {"property": NAMED, "outcome": {"violated": {"witness": [9]}}},
                 {"property": OTHER, "outcome": {"held": {"applicable": 4}}},
-                {"property": "sim/no-livelock", "outcome": "not-applicable"},
+                {"property": "sim/no-livelock", "outcome": {"not-applicable": {"reason": "never-applied"}}},
             ],
         },
     });
@@ -485,11 +548,11 @@ fn records_are_read_from_the_hooks_files_and_paired_by_source() {
             violated: vec![NAMED.to_owned()],
             harness: None,
             outcomes: [
-                (NAMED.to_owned(), ("violated".to_owned(), 0)),
-                (OTHER.to_owned(), ("held".to_owned(), 4)),
+                (NAMED.to_owned(), outcome("violated", 0)),
+                (OTHER.to_owned(), outcome("held", 4)),
                 (
                     "sim/no-livelock".to_owned(),
-                    ("not-applicable".to_owned(), 0)
+                    outcome("not-applicable/never-applied", 0)
                 ),
             ]
             .into_iter()
@@ -716,13 +779,14 @@ fn the_report_round_trips_and_counts_by_property() {
         rerun_alone: reason == Some(Reason::Oom),
         generator: Vec::new(),
         no_generator: None,
+        triage: None,
     };
     let cases = vec![
         case(Class::KilledByNamedRule, None, NAMED),
         case(Class::KilledByOtherRule, None, NAMED),
         case(Class::Survived, Some(Reason::Held), NAMED),
         case(Class::Survived, Some(Reason::TriggerLost), NAMED),
-        case(Class::Survived, Some(Reason::Inconclusive), NAMED),
+        case(Class::Survived, Some(Reason::Incomplete), NAMED),
         case(Class::DidNotCompile, None, OTHER),
         case(Class::PatchDoesNotApply, None, OTHER),
         case(Class::BaselineFails, None, OTHER),
@@ -784,12 +848,12 @@ fn the_report_round_trips_and_counts_by_property() {
     assert!(value["cases"][1].get("trigger").is_none());
     assert_eq!(value["cases"][3]["result"]["reason"], "trigger-lost");
     assert_eq!(value["cases"][3]["trigger"], "lost");
-    assert_eq!(value["cases"][4]["result"]["reason"], "inconclusive");
+    assert_eq!(value["cases"][4]["result"]["reason"], "incomplete");
     assert_eq!(value["cases"][7]["baseline"]["rerun_alone"], true);
     assert!(first["baseline"].get("rerun_alone").is_none());
     assert_eq!(
         value["summary"][NAMED]["results"],
-        json!({"killed-by-named-rule": 1, "killed-by-other-rule": 1, "survived/held": 1, "survived/trigger-lost": 1, "survived/inconclusive": 1})
+        json!({"killed-by-named-rule": 1, "killed-by-other-rule": 1, "survived/held": 1, "survived/trigger-lost": 1, "survived/incomplete": 1})
     );
     assert_eq!(
         value["summary"][OTHER]["run_failures"],
@@ -832,10 +896,62 @@ fn flags_parse_and_refuse_bad_values() {
         &["--memory-max", "lots", "--out", "o"],
         &["--work", "w"],
         &["--out", "o", "--out", "p"],
+        &["--list", "--list"],
     ] {
         assert!(
             parse_flags(bad.iter().map(|s| (*s).to_owned())).is_err(),
             "{bad:?}"
+        );
+    }
+    let listing = parse_flags(
+        ["--list", "--cases", "qa/native-mutations", "--jobs", "4"]
+            .map(str::to_owned)
+            .into_iter(),
+    )
+    .unwrap();
+    assert!(listing.list, "--list needs no --out and takes no value");
+    assert_eq!(listing.jobs, 4);
+}
+
+/// `--list` names each case by the fields that tell it apart in a report,
+/// as the report writes them, so the joint run can drop a removed case
+/// from its cumulative report.
+#[test]
+fn a_listed_case_has_its_reports_key_fields() {
+    let tree = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let (_, _, mut case, baseline) =
+        one_case(tree.path(), out.path(), &tree.path().join("p"), true);
+    let key = |value: &serde_json::Value| {
+        ["patch", "property", "table", "witness"].map(|field| value.get(field).cloned())
+    };
+    for table in [None, Some("s6v3".to_owned())] {
+        case.table = table;
+        let listed = serde_json::to_value(ListedCase::from(&case)).unwrap();
+        let report = serde_json::to_value(CaseReport {
+            patch: case.label.clone(),
+            patch_sha256: "digest".to_owned(),
+            property: case.property.clone(),
+            entry: case.entry.clone(),
+            table: case.table.clone(),
+            witness: case.witness.clone(),
+            also_violates: case.also_violates.clone(),
+            result: classify::Classified::new(Class::Survived, Some(Reason::Held), "why"),
+            trigger: None,
+            baseline: baseline.clone(),
+            millis: None,
+            peak_rss_kib: None,
+            log: None,
+            rerun_alone: false,
+            generator: Vec::new(),
+            no_generator: None,
+            triage: None,
+        })
+        .unwrap();
+        assert_eq!(key(&listed), key(&report));
+        assert_eq!(
+            listed.as_object().unwrap().len(),
+            3 + usize::from(case.table.is_some())
         );
     }
 }
@@ -860,6 +976,30 @@ fn a_child_reports_its_exit_or_its_deadline() {
     )
     .unwrap();
     assert_eq!(ended, Ended::TimedOut);
+}
+
+/// `--planted` refuses a nested case rather than drop its `set`: the loop
+/// would count a catch of the case's property alone, with a member held, as
+/// killed by the named rule.
+#[test]
+fn planted_cases_refuse_a_nested_set() {
+    let repo = tempfile::tempdir().unwrap();
+    let case = repo.path().join("qa/planted/race/lost-update");
+    fs::create_dir_all(&case).unwrap();
+    fs::write(case.join("nested.patch"), "").unwrap();
+    fs::write(
+        case.join("nested.toml"),
+        "input = \"in.bin\"\nset = [\"race/other\"]\n",
+    )
+    .unwrap();
+    let error =
+        planted_cases(repo.path(), &["race".to_owned()]).expect_err("a nested case is refused");
+    assert!(error.to_string().contains("`set`"), "{error}");
+
+    fs::write(case.join("nested.toml"), "input = \"in.bin\"\n").unwrap();
+    let cases = planted_cases(repo.path(), &["race".to_owned()]).unwrap();
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0].property, "race/lost-update");
 }
 
 /// `--planted` selects whole path components or one case, so a prefix that
@@ -1042,17 +1182,17 @@ fn an_end_of_run_violation_kills_by_its_rule() {
 #[test]
 fn a_clean_search_survives_by_its_outcome_counts() {
     let clean = observed(Ended::Exited(0), Vec::new());
-    let counts = |held, inconclusive| Applicability {
+    let counts = |held, incomplete| Applicability {
         held,
         violated: 0,
-        inconclusive,
-        not_applicable: 40 - held - inconclusive,
+        incomplete,
+        not_applicable: 40 - held - incomplete,
     };
     for (named, expected) in [
         (Some(counts(3, 1)), (Class::Survived, Some(Reason::Held))),
         (
             Some(counts(0, 2)),
-            (Class::Survived, Some(Reason::Inconclusive)),
+            (Class::Survived, Some(Reason::Incomplete)),
         ),
         (
             Some(counts(0, 0)),
@@ -1163,6 +1303,411 @@ fn a_kill_names_its_id_and_input_and_needs_its_confirmation() {
     assert_eq!(confirmed(result.clone(), &kept), result);
 }
 
+/// The unpatched build's runs of a kill decide whether the kill stands
+/// (mut-5): only a hold on the confirmed trace keeps it. A violation there
+/// too makes the lane `baseline-fails`; an undecided or missing run makes it
+/// a harness failure (`unconfirmed`). A violation on either trace is a
+/// property finding, and the shrunk trace's run alone never decides.
+#[test]
+fn a_kill_that_fails_unpatched_is_a_property_finding() {
+    let report = |violations: &str| {
+        format!(
+            r#"{{"properties":[{{"property":"{NAMED}","outcome":"held","violations":{violations},"end_found":0}}],"snapshot":null}}"#
+        )
+    };
+    let judged = |line: Option<&str>| {
+        judge_unpatched(NAMED, KillTrace::Shrunk, "replay", line, "exited 1").0
+    };
+    assert_eq!(judged(Some(&report("[]"))), OnUnpatched::Holds);
+    assert_eq!(
+        judged(Some(&report(r#"[{"step":3}]"#))),
+        OnUnpatched::Violated
+    );
+    assert_eq!(judged(None), OnUnpatched::Undecided);
+    assert_eq!(judged(Some("not json")), OnUnpatched::Undecided);
+    assert_eq!(
+        judge_unpatched(
+            OTHER,
+            KillTrace::Shrunk,
+            "replay",
+            Some(&report("[]")),
+            "exited 1"
+        )
+        .0,
+        OnUnpatched::Undecided,
+        "a report without the ID judges nothing"
+    );
+
+    let killed = classify::Classified::new(Class::KilledByNamedRule, None, "the kill");
+    let check = |trace, outcome| UnpatchedCheck {
+        trace,
+        outcome,
+        detail: "the trace violates it on the unpatched build too".to_owned(),
+        log: format!("mutants/x/unpatched-{trace:?}-replay.log").into(),
+    };
+    assert_eq!(
+        unpatched_class(
+            killed.clone(),
+            &[
+                check(KillTrace::Confirmed, OnUnpatched::Holds),
+                check(KillTrace::Shrunk, OnUnpatched::Undecided)
+            ]
+        ),
+        killed
+    );
+    let other = classify::Classified {
+        other: Some(OTHER.to_owned()),
+        ..classify::Classified::new(Class::KilledByOtherRule, None, "the kill")
+    };
+    for result in [killed.clone(), other] {
+        for checks in [
+            vec![
+                check(KillTrace::Confirmed, OnUnpatched::Undecided),
+                check(KillTrace::Shrunk, OnUnpatched::Holds),
+            ],
+            vec![check(KillTrace::Shrunk, OnUnpatched::Holds)],
+            Vec::new(),
+        ] {
+            let judged = unpatched_class(result.clone(), &checks);
+            assert_eq!(
+                (judged.class, judged.reason, judged.other),
+                (Class::HarnessFailure, Some(Reason::Unconfirmed), None),
+                "{checks:?}"
+            );
+            assert!(
+                judged.detail.contains("couldn't judge the kill's input"),
+                "{}",
+                judged.detail
+            );
+        }
+    }
+    let unconfirmed = classify::Classified::new(
+        Class::HarnessFailure,
+        Some(Reason::Unconfirmed),
+        "the kill doesn't confirm",
+    );
+    assert_eq!(
+        unpatched_class(unconfirmed.clone(), &[]),
+        unconfirmed,
+        "a kill that didn't confirm keeps its reason"
+    );
+    let shrunk_only = [
+        check(KillTrace::Confirmed, OnUnpatched::Holds),
+        check(KillTrace::Shrunk, OnUnpatched::Violated),
+    ];
+    assert_eq!(
+        unpatched_class(killed.clone(), &shrunk_only),
+        killed,
+        "the shrink kept the ID, not the mutant's part in it"
+    );
+    let failed = unpatched_class(
+        killed.clone(),
+        &[check(KillTrace::Confirmed, OnUnpatched::Violated)],
+    );
+    assert_eq!((failed.class, failed.reason), (Class::BaselineFails, None));
+    assert!(failed.detail.contains("unpatched build too"));
+
+    let mut lane =
+        GeneratorReport::unsearched("block-sync/storage", 11, GenerateMode::Inproc, failed);
+    lane.violated = Some(NAMED.to_owned());
+    assert_eq!(lane.finding(), None, "no replay ran");
+    lane.unpatched = vec![check(KillTrace::Confirmed, OnUnpatched::Holds)];
+    assert_eq!(lane.finding(), None);
+    lane.unpatched = shrunk_only.to_vec();
+    let finding = lane.finding().unwrap();
+    assert_eq!(finding.property.as_deref(), Some(NAMED));
+    assert_eq!(
+        finding.log,
+        std::path::PathBuf::from("mutants/x/unpatched-Shrunk-replay.log")
+    );
+    lane.unpatched = vec![
+        check(KillTrace::Confirmed, OnUnpatched::Violated),
+        check(KillTrace::Shrunk, OnUnpatched::Undecided),
+    ];
+    assert_eq!(
+        lane.finding().unwrap().log,
+        std::path::PathBuf::from("mutants/x/unpatched-Confirmed-replay.log"),
+        "an unshrunk violation is a finding too"
+    );
+}
+
+/// A full report in which each of `violated` is violated and each of
+/// `held` holds.
+fn full_report(violated: &[&str], held: &[&str]) -> String {
+    let entry = |id: &&str, violations| json!({"property": id, "violations": violations});
+    let properties: Vec<_> = violated
+        .iter()
+        .map(|id| entry(id, json!([{"step": 3}])))
+        .chain(held.iter().map(|id| entry(id, json!([]))))
+        .collect();
+    json!({ "properties": properties }).to_string()
+}
+
+/// Writes an executable `zakura-sim` at `path` that sets `$cmd` to its
+/// subcommand and `$out` to its `--out` value, then runs `body`.
+#[cfg(unix)]
+fn fake_sim(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let prelude = "#!/bin/sh\ncmd=$1\nout=\nprev=\n\
+                   for arg in \"$@\"; do [ \"$prev\" = --out ] && out=$arg; prev=$arg; done\n";
+    fs::write(path, format!("{prelude}{body}")).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A case of `property`, allowing `also_violates`, for a generator lane.
+#[cfg(unix)]
+fn generator_case(property: &str, also_violates: &[&str]) -> LoopCase {
+    LoopCase {
+        label: format!("bounds/{property}.patch"),
+        patch: "p".into(),
+        listed_in: "cases.json".into(),
+        property: property.to_owned(),
+        witness: WitnessSpec::Test {
+            test: "t".to_owned(),
+            test_target: "block_table".to_owned(),
+        },
+        entry: Some("bounds".to_owned()),
+        table: None,
+        also_violates: also_violates.iter().map(|id| (*id).to_owned()).collect(),
+    }
+}
+
+/// One inproc search on a mutant that stops at a violation of `stop`, whose
+/// end record shows each of `violated` violated, run through
+/// [`Runner::generator_lanes`] for each of `cases`. The fresh confirmation
+/// writes `confirmed` as its trace's full report, the shrink fails, and the
+/// unpatched build's rerun of the confirmed trace's input writes
+/// `unpatched`, or no report. Returns each case's one lane.
+#[cfg(unix)]
+fn fake_kill(
+    stop: &str,
+    violated: &[&str],
+    confirmed: &str,
+    unpatched: Option<&str>,
+    cases: &[LoopCase],
+) -> Vec<GeneratorReport> {
+    let tree = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let (runner, slot, _, _) = one_case(tree.path(), out.path(), &tree.path().join("p"), true);
+    fs::create_dir_all(tree.path().join("crates/zakura-sim")).unwrap();
+    let generate = json!({
+        "stop": {"kind": "violation", "property": stop},
+        "kill_run": 0,
+        "executed": 1,
+        "millis": 5,
+        "input": "@OUT@/kill.bin",
+    });
+    let outcomes: Vec<_> = violated
+        .iter()
+        .map(|id| json!({"property": id, "outcome": {"violated": {}}}))
+        .collect();
+    let record = json!({
+        "source": "source",
+        "thread": "t1",
+        "end": {"violation": {"property": stop}, "properties": outcomes},
+    });
+    let patched = out.path().join("patched-sim");
+    fake_sim(
+        &patched,
+        &[
+            "case $cmd in\n",
+            "generate)\n",
+            "  mkdir -p \"$out\"; printf x > \"$out/kill.bin\"\n",
+            "  printf '%s' '@GENERATE@' | sed \"s|@OUT@|$out|\" > \"$out/generate.json\"\n",
+            "  printf '%s' '@RECORD@' > \"$ZAKURA_SIM_END_RECORDS/0.json\";;\n",
+            "confirm)\n",
+            "  mkdir -p \"$out/trace\"; printf x > \"$out/trace/input.bin\"\n",
+            "  printf '%s' '@CONFIRMED@' > \"$out/trace/full-report.json\"\n",
+            "  printf '%s' '{\"status\":\"confirmed\",\"trace\":\"trace\"}' > \"$out/confirmation.json\";;\n",
+            "replay) ;;\n",
+            "*) exit 1;;\n",
+            "esac\n",
+        ]
+        .concat()
+        .replace("@GENERATE@", &generate.to_string())
+        .replace("@RECORD@", &record.to_string())
+        .replace("@CONFIRMED@", confirmed),
+    );
+    let unpatched_sim = out.path().join("unpatched-sim");
+    let write = unpatched.map_or_else(String::new, |report| {
+        format!("printf '%s' '{report}' > \"$out/full-report.json\"\n")
+    });
+    fake_sim(
+        &unpatched_sim,
+        &format!("[ \"$cmd\" = record ] || exit 1\nmkdir -p \"$out\"\n{write}"),
+    );
+    let harness = "block-sync/storage";
+    let lanes = Lanes {
+        flags: GenerateFlags {
+            runs: 1,
+            seeds: vec![11],
+            ..GenerateFlags::default()
+        },
+        plans: vec![Ok(harness.to_owned()); cases.len()],
+        baselines: BTreeMap::from([(
+            (harness.to_owned(), 11),
+            GenBaseline {
+                failure: None,
+                millis: 10,
+            },
+        )]),
+        exclude: out.path().join("exclude.txt"),
+        corpus: out.path().join("corpus"),
+        targets: BTreeMap::new(),
+        unpatched_sim,
+    };
+    let built = Built {
+        sim: Some(patched),
+        tests: BTreeMap::new(),
+    };
+    let indexed: Vec<(usize, &LoopCase)> = cases.iter().enumerate().collect();
+    let mut reports = runner
+        .generator_lanes(
+            &slot,
+            &built,
+            &lanes,
+            &indexed,
+            &out.path().join("mutant"),
+            "source",
+            None,
+        )
+        .unwrap();
+    (0..cases.len())
+        .map(|index| {
+            let mut lanes = reports.remove(&index).unwrap();
+            assert_eq!(lanes.len(), 1);
+            lanes.remove(0)
+        })
+        .collect()
+}
+
+/// A confirmed kill stands only if the unpatched build's rerun of its input
+/// holds the killing ID. A rerun that judges nothing, as an `inproc` or a
+/// `libfuzzer` lane's kill alike goes through, is a harness failure.
+#[cfg(unix)]
+#[test]
+fn a_kill_the_unpatched_build_cannot_judge_is_unconfirmed() {
+    let case = generator_case(NAMED, &[]);
+    let confirmed = full_report(&[NAMED], &[]);
+    let holds = full_report(&[], &[NAMED]);
+    let kept = fake_kill(
+        NAMED,
+        &[NAMED],
+        &confirmed,
+        Some(&holds),
+        std::slice::from_ref(&case),
+    );
+    assert_eq!(kept[0].result.class, Class::KilledByNamedRule, "{kept:?}");
+    assert_eq!(kept[0].unpatched[0].outcome, OnUnpatched::Holds);
+
+    let silent = fake_kill(NAMED, &[NAMED], &confirmed, None, &[case]);
+    let lane = &silent[0];
+    assert_eq!(
+        (lane.result.class, lane.result.reason),
+        (Class::HarnessFailure, Some(Reason::Unconfirmed)),
+        "{lane:?}"
+    );
+    assert_eq!(lane.unpatched[0].outcome, OnUnpatched::Undecided);
+    assert!(lane.confirmation.as_ref().unwrap().ok);
+    assert!(
+        lane.result
+            .detail
+            .contains("couldn't judge the kill's input"),
+        "{}",
+        lane.result.detail
+    );
+}
+
+/// A search that stopped at a co-violation `Q` of the case's property `P`
+/// names `P`'s rule only because the run violated `P` too. The fresh
+/// confirmation requires `Q` alone, so the named kill stands only if the
+/// confirmed trace shows `P` violated as well.
+#[test]
+fn a_co_violation_kill_needs_its_property_in_the_confirmation() {
+    let named = classify::Classified::new(Class::KilledByNamedRule, None, "the kill");
+    let both = full_report(&[OTHER, NAMED], &[]);
+    let alone = full_report(&[OTHER], &[NAMED]);
+    let judged = |property, report: Option<&str>| {
+        let result = co_violation_confirmed(named.clone(), property, OTHER, report);
+        (result.class, result.reason)
+    };
+    let unconfirmed = (Class::HarnessFailure, Some(Reason::Unconfirmed));
+    assert_eq!(judged(NAMED, Some(&both)), (Class::KilledByNamedRule, None));
+    assert_eq!(judged(NAMED, Some(&alone)), unconfirmed);
+    assert_eq!(
+        judged(NAMED, Some(&full_report(&[OTHER], &[]))),
+        unconfirmed
+    );
+    assert_eq!(judged(NAMED, Some("not json")), unconfirmed);
+    assert_eq!(judged(NAMED, None), unconfirmed);
+    assert_eq!(
+        judged(OTHER, Some(&alone)),
+        (Class::KilledByNamedRule, None),
+        "the confirmation already requires the kill's own ID"
+    );
+    let detail = co_violation_confirmed(named.clone(), NAMED, OTHER, Some(&alone)).detail;
+    assert!(
+        detail.contains(&format!(
+            "confirmation of {OTHER} doesn't show {NAMED} violated"
+        )),
+        "{detail}"
+    );
+    let other = classify::Classified {
+        other: Some(OTHER.to_owned()),
+        ..classify::Classified::new(Class::KilledByOtherRule, None, "the kill")
+    };
+    assert_eq!(
+        co_violation_confirmed(other.clone(), NAMED, OTHER, None),
+        other
+    );
+
+    // Through the lane: one search stops at OTHER, which the NAMED case
+    // allows, and whose run violated NAMED too. A confirmation that shows
+    // NAMED keeps the named kill; one that doesn't leaves only the OTHER
+    // case's kill.
+    #[cfg(unix)]
+    {
+        let cases = [generator_case(NAMED, &[OTHER]), generator_case(OTHER, &[])];
+        let holds = full_report(&[], &[OTHER]);
+        let lanes = fake_kill(OTHER, &[OTHER, NAMED], &both, Some(&holds), &cases);
+        assert_eq!(lanes[0].result.class, Class::KilledByNamedRule, "{lanes:?}");
+        assert_eq!(lanes[0].violated.as_deref(), Some(OTHER));
+        let lanes = fake_kill(OTHER, &[OTHER, NAMED], &alone, Some(&holds), &cases);
+        assert_eq!(
+            (lanes[0].result.class, lanes[0].result.reason),
+            unconfirmed,
+            "{lanes:?}"
+        );
+        assert_eq!(lanes[1].result.class, Class::KilledByNamedRule, "{lanes:?}");
+    }
+}
+
+/// A kill's confirm or replay child gets ten of its search's runs, and at
+/// least five minutes.
+#[test]
+fn a_slow_harness_gets_a_longer_confirmation() {
+    assert_eq!(confirm_child(Duration::ZERO), Duration::from_secs(300));
+    assert_eq!(
+        confirm_child(Duration::from_secs(105)),
+        Duration::from_secs(1050)
+    );
+}
+
+/// A kill's shrink gets ten of its search's runs, and at least two minutes.
+#[test]
+fn a_slow_harness_gets_a_longer_shrink() {
+    assert_eq!(shrink_wall(Duration::ZERO), Duration::from_secs(120));
+    assert_eq!(
+        shrink_wall(Duration::from_millis(500)),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        shrink_wall(Duration::from_secs(96)),
+        Duration::from_secs(960)
+    );
+}
+
 /// A search that ended at a run failure on the unpatched build is a
 /// failure to rerun alone, never a property finding. Only a confirmed
 /// `Active` violation is a finding.
@@ -1267,6 +1812,7 @@ fn only_a_confirmed_unpatched_violation_is_a_property_finding() {
         exclude: out.path().join("exclude.txt"),
         corpus: out.path().join("corpus"),
         targets: BTreeMap::new(),
+        unpatched_sim: out.path().join("zakura-sim"),
     };
     let reports = runner
         .generator_lanes(
@@ -1298,6 +1844,7 @@ fn a_campaign_lane_gets_the_same_classes() {
         applied,
         runs: 1000,
         applicable_runs: if applied { 10 } else { 0 },
+        incomplete_runs: 0,
         ..CampaignFacts::default()
     };
     let class = |also: &[&str], facts: &CampaignFacts| {
@@ -1328,6 +1875,24 @@ fn a_campaign_lane_gets_the_same_classes() {
     assert_eq!(
         class(&[], &facts(&[], false)),
         (Class::Survived, Some(Reason::NotApplicable), None)
+    );
+    let lost = CampaignFacts {
+        incomplete_runs: 4,
+        ..facts(&[], false)
+    };
+    assert_eq!(
+        class(&[], &lost),
+        (Class::Survived, Some(Reason::Incomplete), None)
+    );
+    let evidence = serde_json::json!({
+        "complete_totals": {"properties": {NAMED: {"not_applicable": {
+            "never-applied": 7, "assumption-lost": 3, "unsettled:watch-open": 2
+        }}}},
+    });
+    assert_eq!(
+        campaign_facts(NAMED, None, &evidence, 0).incomplete_runs,
+        5,
+        "a benign reason isn't incomplete"
     );
     let timed_out = CampaignFacts {
         killed: vec!["artifacts/timeout-1".to_owned()],
@@ -1364,7 +1929,11 @@ fn a_campaign_lane_gets_the_same_classes() {
     ] {
         assert_eq!(
             class(&[], &short),
-            (Class::HarnessFailure, Some(Reason::Incomplete), None),
+            (
+                Class::HarnessFailure,
+                Some(Reason::CampaignIncomplete),
+                None
+            ),
             "{short:?}"
         );
     }
@@ -1415,7 +1984,7 @@ fn a_campaign_counts_only_active_violations() {
     let stopped = json!({"status": "worker-stopped", "unapplied": []});
     assert!(matches!(
         campaign(end, stopped).unpatched(),
-        Unpatched::Failed { result, rerun: false } if result.reason == Some(Reason::Incomplete)
+        Unpatched::Failed { result, rerun: false } if result.reason == Some(Reason::CampaignIncomplete)
     ));
 }
 
@@ -1566,6 +2135,10 @@ fn generate_flags_parse_and_refuse_bad_values() {
             "libfuzzer",
             "--generate-seconds",
             "30",
+            "--generate-harness-runs",
+            "block-sync/storage=20",
+            "--generate-harness-runs",
+            "discovery/wire=1000",
         ]
         .map(str::to_owned)
         .into_iter(),
@@ -1579,9 +2152,15 @@ fn generate_flags_parse_and_refuse_bad_values() {
             harness: Some("block-sync/storage".to_owned()),
             mode: GenerateMode::Libfuzzer,
             seconds: 30,
+            harness_runs: BTreeMap::from([
+                ("block-sync/storage".to_owned(), 20),
+                ("discovery/wire".to_owned(), 1000),
+            ]),
         }
     );
     assert!(flags.generate.on());
+    assert_eq!(flags.generate.runs_for("block-sync/storage"), 20);
+    assert_eq!(flags.generate.runs_for("block/work-funding"), 2000);
     let off = parse_flags(
         ["--out", "o", "--generate-harness", "auto"]
             .map(str::to_owned)
@@ -1596,6 +2175,26 @@ fn generate_flags_parse_and_refuse_bad_values() {
         &["--out", "o", "--generate-seeds", "1,,2"],
         &["--out", "o", "--generate-mode", "afl"],
         &["--out", "o", "--generate-seconds", "0"],
+        &[
+            "--out",
+            "o",
+            "--generate-harness-runs",
+            "block-sync/storage",
+        ],
+        &[
+            "--out",
+            "o",
+            "--generate-harness-runs",
+            "block-sync/storage=0",
+        ],
+        &[
+            "--out",
+            "o",
+            "--generate-harness-runs",
+            "x=1",
+            "--generate-harness-runs",
+            "x=2",
+        ],
     ] {
         assert!(
             parse_flags(bad.iter().map(|s| (*s).to_owned())).is_err(),
@@ -1651,6 +2250,7 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
         rerun_alone: false,
         generator,
         no_generator: no_generator.map(str::to_owned),
+        triage: None,
     };
     let cases = vec![
         case(
@@ -1680,6 +2280,7 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
         generate: Some(GenerateConfig {
             mode: GenerateMode::Inproc,
             runs: 2000,
+            harness_runs: BTreeMap::from([("block-sync/storage".to_owned(), 20)]),
             seeds: vec![11],
             harness: "auto".to_owned(),
             seconds: None,
@@ -1774,4 +2375,403 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
     .unwrap();
     assert!(plain.get("generate").is_none());
     assert!(plain.get("property_findings").is_none());
+}
+
+/// A triage record lands on each lane it names that needs triage, while the
+/// lane's class and other rule are the record's: the witness lane, or each
+/// seed of a generator harness. A record that matches no lane is stale, and
+/// every lane that needs triage without one counts as untriaged.
+#[test]
+fn triage_records_land_on_the_lanes_they_name() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join(triage::TRIAGE_FILE);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    assert!(
+        triage::read(root.path()).unwrap().is_empty(),
+        "no file, no records"
+    );
+    fs::write(
+        &file,
+        format!(
+            r##"
+[[triage]]
+patch = "p.patch"
+property = "{NAMED}"
+lane = "witness"
+class = "survived"
+stage = "observation"
+reason = "the harness never records the dropped frame"
+issue = "#2266"
+
+[[triage]]
+patch = "p.patch"
+property = "{NAMED}"
+lane = "block-sync/storage"
+class = "survived"
+stage = "generator"
+reason = "honest mirrors only"
+
+[[triage]]
+patch = "p.patch"
+property = "{NAMED}"
+lane = "block-sync/storage"
+class = "killed-by-other-rule"
+other = "{OTHER}"
+stage = "property"
+reason = "{OTHER} names the overdraft first"
+
+[[triage]]
+patch = "gone.patch"
+property = "{NAMED}"
+lane = "witness"
+class = "survived"
+stage = "property"
+reason = "stale"
+"##
+        ),
+    )
+    .unwrap();
+    let records = triage::read(root.path()).unwrap();
+    assert_eq!(records.len(), 4);
+
+    let result = |class, other: Option<&str>| classify::Classified {
+        other: other.map(str::to_owned),
+        ..classify::Classified::new(class, None, "why")
+    };
+    let lane = |harness: &str, seed, class, other| {
+        GeneratorReport::unsearched(harness, seed, GenerateMode::Inproc, result(class, other))
+    };
+    let witness = |class, other| CaseReport {
+        patch: "p.patch".to_owned(),
+        patch_sha256: String::new(),
+        property: NAMED.to_owned(),
+        entry: None,
+        table: None,
+        witness: WitnessSpec::Test {
+            test: "t".to_owned(),
+            test_target: "block_table".to_owned(),
+        },
+        also_violates: Vec::new(),
+        result: result(class, other),
+        trigger: None,
+        baseline: BaselineReport {
+            passed: true,
+            detail: None,
+            millis: 1,
+            rerun_alone: false,
+        },
+        millis: None,
+        peak_rss_kib: None,
+        log: None,
+        rerun_alone: false,
+        generator: vec![
+            lane("block-sync/storage", 11, Class::Survived, None),
+            lane(
+                "block-sync/storage",
+                23,
+                Class::KilledByOtherRule,
+                Some(OTHER),
+            ),
+            lane("block-sync/storage", 47, Class::KilledByNamedRule, None),
+            lane(
+                "block-sync/storage",
+                89,
+                Class::KilledByOtherRule,
+                Some("x/y"),
+            ),
+            lane("block-sync/wire", 11, Class::Survived, None),
+        ],
+        no_generator: None,
+        triage: None,
+    };
+    let mut cases = vec![witness(Class::Survived, None)];
+    assert_eq!(triage::untriaged(&cases), 5);
+    let stale = triage::apply(&mut cases, &records);
+    assert!(
+        stale.is_empty(),
+        "gone.patch didn't run, so it isn't judged"
+    );
+    let case = &cases[0];
+    assert_eq!(
+        case.triage.as_ref().unwrap().stage,
+        triage::Stage::Observation
+    );
+    assert_eq!(
+        case.triage.as_ref().unwrap().issue.as_deref(),
+        Some("#2266")
+    );
+    let stages: Vec<_> = case
+        .generator
+        .iter()
+        .map(|lane| lane.triage.as_ref().map(|triage| triage.stage))
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            Some(triage::Stage::Generator),
+            Some(triage::Stage::Property),
+            None,
+            None,
+            None
+        ],
+        "seed 89's kill names another rule than the record's"
+    );
+    assert_eq!(
+        triage::untriaged(&cases),
+        2,
+        "block-sync/storage seed 89 and block-sync/wire seed 11"
+    );
+
+    // A lane whose class changed stays untriaged, and its record is stale.
+    let mut changed = vec![witness(Class::KilledByOtherRule, Some(OTHER))];
+    changed[0].generator.clear();
+    assert_eq!(
+        triage::apply(&mut changed, &records),
+        vec![&records[0], &records[1], &records[2]]
+    );
+    assert_eq!(changed[0].triage, None);
+    assert_eq!(triage::untriaged(&changed), 1);
+
+    // A kill by the named rule needs no triage, so its records are stale.
+    let mut killed = vec![witness(Class::KilledByNamedRule, None)];
+    killed[0].generator.clear();
+    assert_eq!(
+        triage::apply(&mut killed, &records),
+        vec![&records[0], &records[1], &records[2]]
+    );
+    assert_eq!(killed[0].triage, None);
+}
+
+/// A record names its other rule exactly when it explains a kill by another
+/// rule; anything else is a read error.
+#[test]
+fn a_triage_record_names_its_other_rule_only_for_another_rules_kill() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join(triage::TRIAGE_FILE);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let record = |fields: &str| {
+        format!(
+            "[[triage]]\npatch = \"p.patch\"\nproperty = \"{NAMED}\"\nlane = \"witness\"\n\
+             stage = \"property\"\nreason = \"why\"\n{fields}"
+        )
+    };
+    for (fields, error) in [
+        (
+            "class = \"killed-by-other-rule\"\n",
+            "is `killed-by-other-rule` and names no `other` rule",
+        ),
+        (
+            &*format!("class = \"survived\"\nother = \"{OTHER}\"\n"),
+            "is `survived` and names an `other` rule",
+        ),
+        ("", "missing field `class`"),
+        ("class = \"killed-by-named-rule\"\n", "unknown variant"),
+    ] {
+        fs::write(&file, record(fields)).unwrap();
+        let read = triage::read(root.path()).unwrap_err().to_string();
+        assert!(read.contains(error), "{fields:?}: {read}");
+        assert!(read.contains(triage::TRIAGE_FILE), "{read}");
+    }
+    fs::write(
+        &file,
+        record(&format!(
+            "class = \"killed-by-other-rule\"\nother = \"{OTHER}\"\n"
+        )),
+    )
+    .unwrap();
+    assert_eq!(
+        triage::read(root.path()).unwrap()[0].other.as_deref(),
+        Some(OTHER)
+    );
+}
+
+/// `planted triage` applies the checkout's records to a report afresh: a
+/// lane that now matches a record gets it, a lane whose old triage no
+/// longer matches loses it, and nothing else in the report changes.
+#[test]
+fn triage_reapplies_to_a_merged_report() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join(triage::TRIAGE_FILE);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(
+        &file,
+        format!(
+            r##"
+[[triage]]
+patch = "a.patch"
+property = "{NAMED}"
+lane = "witness"
+class = "survived"
+stage = "observation"
+reason = "recorded after the run"
+
+[[triage]]
+patch = "b.patch"
+property = "{NAMED}"
+lane = "witness"
+class = "survived"
+stage = "generator"
+reason = "b.patch is killed now"
+"##
+        ),
+    )
+    .unwrap();
+    let records = triage::read(root.path()).unwrap();
+    let case = |patch: &str, class, triage: Option<triage::Triage>| {
+        let mut case = serde_json::to_value(CaseReport {
+            patch: patch.to_owned(),
+            patch_sha256: String::new(),
+            property: NAMED.to_owned(),
+            entry: None,
+            table: None,
+            witness: WitnessSpec::Test {
+                test: "t".to_owned(),
+                test_target: "block_table".to_owned(),
+            },
+            also_violates: Vec::new(),
+            result: classify::Classified::new(class, None, "why"),
+            trigger: None,
+            baseline: BaselineReport {
+                passed: true,
+                detail: None,
+                millis: 1,
+                rerun_alone: false,
+            },
+            millis: None,
+            peak_rss_kib: None,
+            log: None,
+            rerun_alone: false,
+            generator: vec![GeneratorReport::unsearched(
+                "block-sync/storage",
+                11,
+                GenerateMode::Inproc,
+                classify::Classified::new(Class::KilledByNamedRule, None, "why"),
+            )],
+            no_generator: None,
+            triage,
+        })
+        .unwrap();
+        case["later_field"] = json!("kept");
+        case
+    };
+    let old = triage::Triage {
+        stage: triage::Stage::Generator,
+        reason: "an old record".to_owned(),
+        issue: None,
+    };
+    let mut report = json!({
+        "pinned": "p",
+        "cases": [
+            case("a.patch", Class::Survived, None),
+            case("b.patch", Class::KilledByNamedRule, Some(old.clone())),
+            case("c.patch", Class::Survived, Some(old)),
+        ],
+        "property_findings": [{"harness": "h", "seed": 1}],
+    });
+    let stale = triage::reapply(&mut report, &records).unwrap();
+    assert_eq!(stale, vec![&records[1]], "b.patch is killed now");
+    let cases = report["cases"].as_array().unwrap();
+    assert_eq!(cases[0]["triage"]["reason"], "recorded after the run");
+    assert!(cases[1].get("triage").is_none(), "{}", cases[1]);
+    assert!(cases[2].get("triage").is_none(), "c.patch has no record");
+    assert!(cases[0]["generator"][0].get("triage").is_none());
+    assert_eq!(cases[0]["later_field"], "kept");
+    assert_eq!(report["property_findings"][0]["seed"], 1);
+    assert!(triage::reapply(&mut json!({"pinned": "p"}), &records).is_err());
+}
+
+/// The committed triage records read, each naming its class.
+#[test]
+fn the_committed_triage_records_read() {
+    let repo_root = crate::repo_root().expect("xtask lives in the workspace");
+    let records = triage::read(&repo_root).expect("the committed triage records read");
+    assert!(!records.is_empty());
+}
+
+/// A mutant's trace leaves its picks on the unpatched build, so a trace with
+/// its input reruns that input with `record`, and only a trace without one
+/// replays.
+#[cfg(unix)]
+#[test]
+fn the_unpatched_build_reruns_a_kills_input() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tree = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let (runner, _, _, _) = one_case(tree.path(), out.path(), &tree.path().join("p"), true);
+    // A `zakura-sim` that logs its arguments. `record` writes a report that
+    // violates the named ID; `replay` leaves the picks and writes none.
+    let calls = out.path().join("calls");
+    let report = json!({"properties": [{"property": NAMED, "violations": [{"step": 3}]}]});
+    let sim = out.path().join("zakura-sim");
+    fs::write(
+        &sim,
+        format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> '{calls}'\n\
+             if [ \"$1\" = record ]; then\n\
+             while [ \"$1\" != --out ]; do shift; done\n\
+             mkdir -p \"$2\"; printf '%s' '{report}' > \"$2/full-report.json\"; exit 0\n\
+             fi\n\
+             echo 'the run asked for a pick after the trace'\"'\"'s last one' >&2; exit 1\n",
+            calls = calls.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&sim, fs::Permissions::from_mode(0o755)).unwrap();
+    let lanes = Lanes {
+        flags: GenerateFlags::default(),
+        plans: Vec::new(),
+        baselines: BTreeMap::new(),
+        exclude: out.path().join("exclude.txt"),
+        corpus: out.path().join("corpus"),
+        targets: BTreeMap::new(),
+        unpatched_sim: sim,
+    };
+    let confirmed = out.path().join("confirmed");
+    let shrunk = out.path().join("shrunk");
+    fs::create_dir_all(&confirmed).unwrap();
+    fs::create_dir_all(&shrunk).unwrap();
+    fs::write(confirmed.join("input.bin"), b"\xff\x07").unwrap();
+    let dir = out.path().join("kill");
+    fs::create_dir_all(&dir).unwrap();
+    let check = |which, trace: &Path| {
+        runner
+            .run_unpatched(
+                &lanes,
+                "block-sync/storage",
+                which,
+                trace,
+                NAMED,
+                &dir,
+                None,
+                Duration::from_secs(30),
+            )
+            .unwrap()
+    };
+
+    let rerun = check(KillTrace::Confirmed, &confirmed);
+    assert_eq!(rerun.outcome, OnUnpatched::Violated, "{}", rerun.detail);
+    assert!(rerun.log.ends_with("unpatched-confirmed-record.log"));
+    let replayed = check(KillTrace::Shrunk, &shrunk);
+    assert_eq!(replayed.outcome, OnUnpatched::Undecided);
+    assert!(
+        replayed
+            .detail
+            .starts_with("the unpatched `zakura-sim replay` of the shrunk trace wrote no report"),
+        "{}",
+        replayed.detail
+    );
+    assert!(replayed.log.ends_with("unpatched-shrunk-replay.log"));
+    let calls = fs::read_to_string(&calls).unwrap();
+    let calls: Vec<&str> = calls.lines().collect();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls[0].starts_with("record --sim block-sync/storage --input ")
+            && calls[0].contains("confirmed/input.bin --out "),
+        "{}",
+        calls[0]
+    );
+    assert!(calls[1].starts_with("replay "), "{}", calls[1]);
+    assert!(calls[1].contains("--allow-build-mismatch"), "{}", calls[1]);
 }

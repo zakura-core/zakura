@@ -1503,6 +1503,7 @@ fn completions_carry_typed_identities() {
             last: chain[1],
             count: 2,
             complete: false,
+            links: vec![(chain[0].hash, anchor.hash), (chain[1].hash, chain[0].hash)],
         }
     );
     let mut continued = acquire(&port, peer(1), 5, chain[2]);
@@ -1519,6 +1520,7 @@ fn completions_carry_typed_identities() {
             last: chain[2],
             count: 1,
             complete: true,
+            links: vec![(chain[2].hash, chain[1].hash)],
         }
     );
     let (_, release) = run(&port, port.release_header_path(rest.clone()));

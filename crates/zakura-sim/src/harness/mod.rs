@@ -10,6 +10,7 @@
 //! loop's own: [`NO_TASK_PANIC`] always, and [`NO_LIVELOCK`] while the
 //! scenario's [`Assume::BoundedAdversary`] holds ([`run_config`]).
 
+pub mod block_hostile;
 pub mod block_node;
 pub mod block_semantic;
 pub mod block_sync;
@@ -44,7 +45,7 @@ pub(crate) use record::write_trace;
 pub use record::{record, record_witness, RecordError, RecordInput, WITNESS_FILE};
 
 use crate::{
-    check::{Checker, Phase, PropertyReport, StepCtx, Violation},
+    check::{Checker, Phase, PropertyReport, StepCtx, Unfinished, Violation},
     end::{HarnessFailure, Outcome, RunEnd},
     explore::{self, ExploreRun},
     net::Net,
@@ -53,7 +54,7 @@ use crate::{
         Assume, Assumptions, CheckCtx, CheckEvent, HasView, Kind, Property, PropertyId, Registry,
         RegistryChecker, Source, Sources, Status, Tee, Verdict,
     },
-    record::{CONTRACT_VERSION, FORMAT_VERSION},
+    record::{FullReport, CONTRACT_VERSION, FORMAT_VERSION},
     sim::NO_LIVELOCK,
     trace::{
         meta::{BudgetRecord, PropertyRef, SchedulerRecord, RNG},
@@ -270,17 +271,21 @@ pub(crate) fn run_reading<S: Subsystem, T: 'static>(
     sim.on_end({
         let this = Rc::clone(&this);
         let read_out = Rc::clone(&read_out);
-        move |end, properties, log| *read_out.borrow_mut() = Some(read(&this, end, properties, log))
+        move |end, properties, log| {
+            let snapshot = this.snapshot();
+            *read_out.borrow_mut() = Some((read(&this, end, properties, log), snapshot));
+        }
     });
     let mut checker = registry_checker(&this, assumptions);
     let report = match extra {
         Some(extra) => sim.run(&mut Tee(Dyn(&mut *checker), Dyn(extra)), sink),
         None => sim.run(&mut *checker, sink),
     };
-    let read = read_out
+    let (read, snapshot) = read_out
         .borrow_mut()
         .take()
         .expect("`Sim::run` runs its end hooks once");
+    sink.report(&FullReport::new(&report.properties, snapshot));
     // The harness outlives the run, so production tasks never see their
     // handles close mid-run.
     drop(checker);
@@ -312,7 +317,9 @@ pub fn meta<S: Subsystem>(scenario: &S::Scenario) -> Result<MetaRecord, HarnessE
         rng: RNG.to_owned(),
         fixtures: Vec::new(),
         properties: registered::<S>(),
+        draft: draft(),
         input: None,
+        plan: None,
         derived_from: None,
     })
 }
@@ -383,7 +390,48 @@ pub(crate) fn registry<S: Subsystem>() -> Registry<S> {
         },
     ];
     properties.extend(S::properties());
+    let draft = draft();
+    for property in &mut properties {
+        if draft.iter().any(|id| id == property.id.as_str()) {
+            property.status = Status::Draft;
+        }
+    }
     Registry::new(properties).unwrap_or_else(|error| panic!("{}: {error}", S::NAME))
+}
+
+thread_local! {
+    /// The run configuration [`with_draft`] sets.
+    static DRAFT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` with every property in `ids` checked as `Draft`, whatever its
+/// registered status (C9), as a planted case's `Draft` run needs: no
+/// member's `Active` violation stops the run, so it runs to its end and
+/// keeps every member's violations. Every registry `f` builds applies it,
+/// and every `meta` record it writes names it in `meta.draft`, so a replay
+/// of the trace, which applies `meta.draft` the same way, rebuilds the run.
+/// The setting ends with `f`, even if `f` panics.
+pub fn with_draft<T>(ids: &[String], f: impl FnOnce() -> T) -> T {
+    /// Puts the earlier setting back when dropped.
+    struct Restore(Vec<String>);
+
+    impl Drop for Restore {
+        /// Restores the setting `with_draft` replaced.
+        fn drop(&mut self) {
+            DRAFT.with(|draft| *draft.borrow_mut() = std::mem::take(&mut self.0));
+        }
+    }
+
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let _restore = Restore(DRAFT.with(|draft| draft.replace(sorted)));
+    f()
+}
+
+/// The IDs [`with_draft`] set, sorted, or none outside it.
+pub fn draft() -> Vec<String> {
+    DRAFT.with(|draft| draft.borrow().clone())
 }
 
 /// Checks [`NO_TASK_PANIC`]: violated at a step where a task panicked.
@@ -749,5 +797,15 @@ impl Checker for Dyn<'_> {
     /// Forwards to the checker.
     fn step_loop_violation(&mut self, violation: &Violation) {
         self.0.step_loop_violation(violation);
+    }
+
+    /// Forwards to the checker.
+    fn stops(&mut self, property: &str) -> bool {
+        self.0.stops(property)
+    }
+
+    /// Forwards to the checker.
+    fn unfinished(&self) -> Unfinished {
+        self.0.unfinished()
     }
 }

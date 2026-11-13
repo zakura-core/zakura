@@ -1,7 +1,7 @@
 //! Native Zakura discovery service and dial supervision.
 
 mod candidate_dialer;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod conformance_tests;
 mod dialer;
 mod peer;

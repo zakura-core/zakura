@@ -1,0 +1,9 @@
+# The committed fuzz input `header-wire-old-page-after-reopen.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `old-page-after-reopen` scenario, and
+# `header-wire-old-page-after-reopen.end.json` is its pinned end record.
+harness = "header-sync/wire"
+generator = 4
+sha256 = "e82fc976d6531c78191b25b44f5d6f56ccedf2fbd212b5a7704ac5b33bd624c6"
+scenario_sha256 = "574fe102c5bfc2cb4d8e1426ff7615b1782bf7f436fc256b2686ab593e164ed2"
+source = "crates/zakura-sim/tests/header_wire_lifecycle.rs"

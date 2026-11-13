@@ -27,6 +27,85 @@ use super::{super::MetaAddr, check};
 /// [`DateTime32`]s.
 const TEST_TIME_ERROR_MARGIN: Duration32 = Duration32::from_seconds(1);
 
+/// Default ports do not override the address tie-breaker for otherwise identical peers.
+#[test]
+fn peer_cache_port_does_not_override_book_order() {
+    let now = Instant::now();
+    let wall_now = Utc::now();
+    let peer = |addr| {
+        MetaAddr::new_responded(addr, Some(Duration::from_millis(20)))
+            .apply_to_meta_addr(None, now, wall_now)
+            .unwrap()
+    };
+    let custom = peer("127.0.0.1:9000".parse().unwrap());
+    for port in [8233, 18233] {
+        let default = peer(SocketAddr::from(([127, 0, 0, 2], port)).into());
+        assert_eq!(
+            custom.peer_preference().unwrap(),
+            default.peer_preference().unwrap()
+        );
+        assert!(custom < default);
+    }
+    assert!(peer("0.0.0.0:8233".parse().unwrap())
+        .peer_preference()
+        .is_err());
+}
+
+/// RTT survives same-connection updates but never carries into another connection.
+#[test]
+fn peer_cache_rtt_survives_only_same_connection_updates() {
+    let addr = "127.0.0.1:8233".parse().unwrap();
+    let now = Instant::now();
+    let wall_now = Utc::now();
+    let original = MetaAddr::new_responded(addr, Some(Duration::from_millis(20)))
+        .apply_to_meta_addr(None, now, wall_now)
+        .unwrap();
+    let later = CONCURRENT_ADDRESS_CHANGE_PERIOD + Duration::from_secs(1);
+    for (change, expected) in [
+        (
+            MetaAddrChange::UpdatePingSent {
+                addr,
+                ping_sent_at: now + later,
+            },
+            Some(20),
+        ),
+        (MetaAddr::new_responded(addr, None), Some(20)),
+        (
+            MetaAddr::new_responded(addr, Some(Duration::from_millis(10))),
+            Some(10),
+        ),
+        (
+            MetaAddrChange::UpdateMisbehavior {
+                addr,
+                score_increment: 1,
+            },
+            Some(20),
+        ),
+        (MetaAddr::new_reconnect(addr), None),
+        (
+            MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, false),
+            None,
+        ),
+        (
+            MetaAddr::new_errored(addr, PeerServices::NODE_NETWORK),
+            None,
+        ),
+    ] {
+        let updated = change
+            .apply_to_meta_addr(
+                Some(original),
+                now + later,
+                wall_now + chrono::Duration::from_std(later).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            updated.rtt(),
+            expected.map(Duration::from_millis),
+            "{change:?}"
+        );
+    }
+}
+
 #[test]
 fn peer_addr_labels_require_explicit_opt_in() {
     let ipv4 = PeerSocketAddr::from(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 8233));

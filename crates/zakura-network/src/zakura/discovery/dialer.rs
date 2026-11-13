@@ -186,7 +186,7 @@ pub(crate) fn parse_bootstrap_peer(entry: &str) -> Result<NodeAddr, ZakuraHandle
     Ok(NodeAddr::with_addrs(node_id, [direct_addr]))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests {
     use super::*;
     use std::time::Duration;

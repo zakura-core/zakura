@@ -331,6 +331,7 @@ where
         });
 
         let client = Client {
+            announced_blocks: Default::default(),
             block_uploads: Default::default(),
             request_slot: Default::default(),
             peer_registry_updater: None,

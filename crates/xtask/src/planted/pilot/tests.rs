@@ -13,6 +13,8 @@ const ID: &str = "block/reactor-policy";
 const OTHER: &str = "sim/no-task-panic";
 const HELD: &str = r#"{"held":{"applicable":4}}"#;
 const VIOLATED: &str = r#"{"violated":{"witness":[3]}}"#;
+/// A `not-applicable` outcome whose check never applied.
+const NEVER_APPLIED: &str = r#"{"not-applicable":{"reason":"never-applied"}}"#;
 
 /// The planted runner's reading of an `end` line with `violation`, and
 /// `reports` as (property, outcome JSON) pairs.
@@ -143,9 +145,10 @@ fn sensitivity_rejects_missing_witnesses() {
 
     let why = confirmed_trace(
         ChildEnd::Exited(1),
-        Some(&serde_json::json!({"status": "witness-lost", "detail": null})),
+        Some(&serde_json::json!({"status": "witness-lost", "detail": null, "trace": "t"})),
+        Confirm::Witness,
     )
-    .expect_err("a lost witness doesn't confirm");
+    .expect_err("a lost witness doesn't confirm a witness");
     assert!(why.starts_with("missing witness"), "{why}");
     let caught = run(Some(ID), &[(ID, VIOLATED)]);
     assert_eq!(
@@ -177,7 +180,7 @@ fn sensitivity_rejects_failed_baselines() {
             Some(trace(Some(4))),
         )),
         Ok(recorded(
-            run(None, &[(ID, r#""not-applicable""#)]),
+            run(None, &[(ID, NEVER_APPLIED)]),
             Some(trace(None)),
         )),
         Ok(recorded(run(None, &[(ID, HELD)]), Some(trace(Some(0))))),
@@ -205,9 +208,9 @@ fn sensitivity_rejects_broken_patches() {
     assert_eq!(class(&case), Class::InvalidMutant);
 }
 
-/// A run that reports nothing for the intended ID, ends inconclusive,
-/// leaks state, crashes, or doesn't pair with the original's build has
-/// incomplete observations: a harness failure.
+/// A run that reports nothing for the intended ID, ends at a harness
+/// failure, leaks state, crashes, or doesn't pair with the original's build
+/// has incomplete observations: a harness failure.
 #[test]
 fn sensitivity_rejects_incomplete_observations() {
     let leaky = TraceFacts {
@@ -227,7 +230,7 @@ fn sensitivity_rejects_incomplete_observations() {
         sensitivity_run(
             run(
                 None,
-                &[(ID, r#"{"inconclusive":{"reason":"harness-failed"}}"#)],
+                &[(ID, r#"{"not-applicable":{"reason":"harness-failed"}}"#)],
             ),
             None,
         ),
@@ -240,6 +243,34 @@ fn sensitivity_rejects_incomplete_observations() {
     }
 }
 
+/// Each `not-applicable` reason, read from its serialized end record: only
+/// `never-applied` is [`Class::NotApplicable`], and every other reason,
+/// benign or not, is incomplete observations.
+#[test]
+fn sensitivity_classifies_each_not_applicable_reason() {
+    for (reason, expected) in [
+        (r#""never-applied""#, Class::NotApplicable),
+        (r#""undeclared""#, Class::HarnessFailure),
+        (r#""excluded""#, Class::HarnessFailure),
+        (r#""assumptions-never-held""#, Class::HarnessFailure),
+        (r#""assumption-lost""#, Class::HarnessFailure),
+        (r#""stopped-by-violation""#, Class::HarnessFailure),
+        (r#""harness-failed""#, Class::HarnessFailure),
+        (r#""node-stopped""#, Class::HarnessFailure),
+        (
+            r#"{"unsettled":{"site":"watch-open"}}"#,
+            Class::HarnessFailure,
+        ),
+    ] {
+        let outcome = format!(r#"{{"not-applicable":{{"reason":{reason}}}}}"#);
+        assert_eq!(
+            class(&sensitivity_run(run(None, &[(ID, &outcome)]), None)),
+            expected,
+            "{reason}"
+        );
+    }
+}
+
 /// A held mutant run survives, a never-applying one is not applicable, and
 /// only review metadata makes a case equivalent.
 #[test]
@@ -249,10 +280,7 @@ fn sensitivity_names_survivors_and_equivalents() {
         Class::SurvivedBudget
     );
     assert_eq!(
-        class(&sensitivity_run(
-            run(None, &[(ID, r#""not-applicable""#)]),
-            None
-        )),
+        class(&sensitivity_run(run(None, &[(ID, NEVER_APPLIED)]), None)),
         Class::NotApplicable
     );
     let review = SensitivityRun {
@@ -271,6 +299,7 @@ fn campaign() -> CampaignFacts {
         applied: true,
         runs: 1000,
         applicable_runs: 600,
+        incomplete_runs: 0,
         millis: 600_000,
         ..CampaignFacts::default()
     }
@@ -468,6 +497,7 @@ fn discovery_rejects_incomplete_observations() {
             CampaignFacts {
                 applied: false,
                 applicable_runs: 0,
+                incomplete_runs: 0,
                 ..campaign()
             },
             None
@@ -644,22 +674,45 @@ fn traces_give_their_facts() {
     assert!(parse_trace(r#"{"step":1}"#, ID).is_err());
 }
 
-/// A confirmation must say `confirmed`, exit 0 and name its trace.
+/// A confirmation must say `confirmed`, exit 0 and name its trace. A kill
+/// also confirms on a trace that is no witness, and says so.
 #[test]
 fn confirmations_must_confirm() {
     let confirmed = serde_json::json!({"status": "confirmed", "trace": "traces/a/b"});
-    assert_eq!(
-        confirmed_trace(ChildEnd::Exited(0), Some(&confirmed)),
-        Ok(PathBuf::from("traces/a/b"))
-    );
-    assert!(confirmed_trace(ChildEnd::TimedOut, Some(&confirmed)).is_err());
-    assert!(confirmed_trace(ChildEnd::Exited(1), None).is_err());
-    let other = serde_json::json!({"status": "other-property", "detail": OTHER});
-    assert!(confirmed_trace(ChildEnd::Exited(1), Some(&other))
-        .expect_err("another property doesn't confirm")
-        .contains(OTHER));
-    let untraced = serde_json::json!({"status": "confirmed"});
-    assert!(confirmed_trace(ChildEnd::Exited(0), Some(&untraced)).is_err());
+    for need in [Confirm::Witness, Confirm::Kill] {
+        assert_eq!(
+            confirmed_trace(ChildEnd::Exited(0), Some(&confirmed), need),
+            Ok(ConfirmedTrace {
+                dir: PathBuf::from("traces/a/b"),
+                missing_witness: None,
+            })
+        );
+        assert!(confirmed_trace(ChildEnd::TimedOut, Some(&confirmed), need).is_err());
+        assert!(confirmed_trace(ChildEnd::Exited(1), None, need).is_err());
+        let other = serde_json::json!({"status": "other-property", "detail": OTHER});
+        assert!(confirmed_trace(ChildEnd::Exited(1), Some(&other), need)
+            .expect_err("another property doesn't confirm")
+            .contains(OTHER));
+        let untraced = serde_json::json!({"status": "confirmed"});
+        assert!(confirmed_trace(ChildEnd::Exited(0), Some(&untraced), need).is_err());
+    }
+
+    let lost = serde_json::json!({
+        "status": "witness-lost",
+        "detail": "lost its trigger history",
+        "trace": "traces/a/b",
+    });
+    let kill = confirmed_trace(ChildEnd::Exited(1), Some(&lost), Confirm::Kill)
+        .expect("a kill confirms without a witness");
+    assert_eq!(kill.dir, PathBuf::from("traces/a/b"));
+    assert!(kill
+        .missing_witness
+        .expect("the kill says it's no witness")
+        .contains("lost its trigger history"));
+    assert!(confirmed_trace(ChildEnd::Exited(1), Some(&lost), Confirm::Witness).is_err());
+    assert!(confirmed_trace(ChildEnd::TimedOut, Some(&lost), Confirm::Kill).is_err());
+    let untraced = serde_json::json!({"status": "witness-unsupported"});
+    assert!(confirmed_trace(ChildEnd::Exited(1), Some(&untraced), Confirm::Kill).is_err());
 }
 
 /// A patch must change exactly its declared production files.

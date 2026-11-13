@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/repair.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/repair.rs
+index 1e08c00704..20df46b4c0 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/repair.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/repair.rs
+@@ -328,9 +328,9 @@ impl RepairRequirement {
+             .filter(|source| !connected_sources.contains(*source))
+             .copied()
+             .collect();
+-        for source in departed {
+-            self.departed_sources.entry(source).or_insert(now + hold);
+-        }
++        // Mutation: a departed supplier's history gets no hold, so nothing
++        // ever prunes it.
++        let _ = (departed, hold);
+         let mut ended: Vec<SourceId> = self
+             .departed_sources
+             .iter()

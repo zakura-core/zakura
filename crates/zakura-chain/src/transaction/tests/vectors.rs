@@ -2418,7 +2418,7 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
         block::Height,
         orchard::{
             keys::EphemeralPublicKey, tree, Action, AuthorizedAction, EncryptedNote, Flags,
-            NoteCommitment, Nullifier, ShieldedData, ValueCommitment, WrappedNoteKey,
+            Nullifier, ShieldedData, ValueCommitment, WrappedNoteKey,
         },
         primitives::Halo2Proof,
         serialization::ZcashSerialize,
@@ -2436,7 +2436,7 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
         // rk = identity point — this is the vulnerability trigger.
         rk: [0u8; 32].into(),
         // cm_x is the x-coordinate of the note commitment.
-        cm_x: NoteCommitment(pallas::Affine::identity()).extract_x(),
+        cm_x: pallas::Base::zero(),
         // ephemeral_key must be non-identity; use the generator.
         ephemeral_key: EphemeralPublicKey(pallas::Affine::generator()),
         enc_ciphertext: EncryptedNote([0u8; 580]),

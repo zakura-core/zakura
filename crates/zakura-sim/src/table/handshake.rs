@@ -114,7 +114,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             needs: &[Source::Closes],
             status: Status::Active,
             check: check_quic_admission::<S>,
-            witness: Some(TriggerHistory::PropertyLog(quic_admission_reached)),
+            witness: Some(TriggerHistory::LogOf(quic_admission_reached)),
         });
     }
     properties.push(Property {
@@ -212,7 +212,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             needs: &[Source::Closes],
             status: Status::Active,
             check: check_counts::<S>,
-            witness: Some(TriggerHistory::PropertyLog(admission_reached)),
+            witness: Some(TriggerHistory::LogOf(admission_reached)),
         });
     }
     properties.push(Property {
@@ -223,7 +223,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         needs: &[Source::Closes],
         status: Status::Active,
         check: check_reserve::<S>,
-        witness: Some(TriggerHistory::PropertyLog(admission_reached)),
+        witness: Some(TriggerHistory::LogOf(admission_reached)),
     });
     properties.push(Property {
         id: PropertyId::new("handshake/finishes-in-time"),
@@ -250,7 +250,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
                 needs: &[Source::Closes],
                 status: Status::Active,
                 check: check_refused::<S>,
-                witness: Some(TriggerHistory::PropertyLog(handshake_label_reached)),
+                witness: Some(TriggerHistory::LogOf(handshake_label_reached)),
             });
         }
         properties.push(Property {
@@ -263,7 +263,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             needs: &[Source::Closes],
             status: Status::Active,
             check: check_conformant::<S>,
-            witness: Some(TriggerHistory::PropertyLog(handshake_label_reached)),
+            witness: Some(TriggerHistory::LogOf(handshake_label_reached)),
         });
     }
     for row in ["hello", "ack"] {
@@ -277,7 +277,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             needs: &[Source::Closes],
             status: Status::Active,
             check: check_released::<S>,
-            witness: Some(TriggerHistory::PropertyLog(handshake_refusal_reached)),
+            witness: Some(TriggerHistory::LogOf(handshake_refusal_reached)),
         });
     }
     properties.push(Property {
@@ -288,7 +288,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         needs: &[Source::Closes],
         status: Status::Active,
         check: check_conformant_prelude::<S>,
-        witness: Some(TriggerHistory::PropertyLog(handshake_label_reached)),
+        witness: Some(TriggerHistory::LogOf(handshake_label_reached)),
     });
     for &(label, consequence) in PRELUDE {
         properties.push(Property {
@@ -303,7 +303,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
             needs: &[Source::Closes],
             status: Status::Active,
             check: check_prelude::<S>,
-            witness: Some(TriggerHistory::PropertyLog(handshake_label_reached)),
+            witness: Some(TriggerHistory::LogOf(handshake_label_reached)),
         });
     }
     properties
@@ -451,7 +451,8 @@ fn quic_admission_applies(property: &str, event: &TransportFact) -> bool {
     }
 }
 
-fn quic_admission_reached(property: &str, log: &crate::ObservationLog) -> bool {
+fn quic_admission_reached(property: &PropertyId, log: &crate::ObservationLog) -> bool {
+    let property = property.as_str();
     log.entries().iter().any(|entry| {
         matches!(&entry.obs,
             Observation::Transport { event, .. } if quic_admission_applies(property, event)
@@ -839,7 +840,8 @@ fn capability_flip_reached(log: &crate::ObservationLog) -> bool {
     false
 }
 
-fn admission_reached(property: &str, log: &crate::ObservationLog) -> bool {
+fn admission_reached(property: &PropertyId, log: &crate::ObservationLog) -> bool {
+    let property = property.as_str();
     log.entries().iter().any(|entry| {
         let Observation::Transport {
             event:
@@ -1235,7 +1237,8 @@ fn paced_control_reached(log: &crate::ObservationLog) -> bool {
 }
 
 /// A generated rejection witness reaches the labelled exchange and its production judgement.
-fn handshake_label_reached(property: &str, log: &crate::ObservationLog) -> bool {
+fn handshake_label_reached(property: &PropertyId, log: &crate::ObservationLog) -> bool {
+    let property = property.as_str();
     let mut parts = property.split('/');
     let (Some("handshake"), Some(row), Some(claim)) = (parts.next(), parts.next(), parts.next())
     else {
@@ -1382,7 +1385,8 @@ fn resource_released(key: &ObligationKey, obs: &Observation) -> bool {
     } if key.subject == Subject::Owner(format!("{shared_id}/{stage}")))
 }
 
-fn handshake_refusal_reached(property: &str, log: &crate::ObservationLog) -> bool {
+fn handshake_refusal_reached(property: &PropertyId, log: &crate::ObservationLog) -> bool {
+    let property = property.as_str();
     let Some(row) = property.split('/').nth(1) else {
         return false;
     };

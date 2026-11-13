@@ -37,7 +37,8 @@
 //! The shrinker never changes the original trace. It writes into its output
 //! directory:
 //!
-//! - `original/`: a copy of the original trace;
+//! - `original/`: a copy of the original trace, with its full report if it
+//!   has one;
 //! - `best-plan.json`: the best candidate's choices as a scripted [`Plan`],
 //!   rewritten after each accepted candidate, so an interrupted or killed
 //!   shrink keeps it;
@@ -60,8 +61,8 @@ use serde_json::Value;
 use super::{
     failure::{on_new_thread, replay_on_new_thread},
     meta::{Derivation, DerivationTool},
-    read::refuse_symlinked_dir,
-    ReadError, ReplayError, Trace, BLOBS_DIR, INPUT_FILE, TRACE_FILE,
+    read::{read_bounded, refuse_symlinked_dir},
+    ReadError, ReplayError, Trace, BLOBS_DIR, INPUT_FILE, MAX_REPORT_BYTES, TRACE_FILE,
 };
 pub use crate::plan::Candidate;
 use crate::{
@@ -69,7 +70,7 @@ use crate::{
     plan::{By, SkipScript},
     record::{
         machine::{MachineFailure, MachineScenario, MachineStep},
-        DrawRecord, EndRecord, Record, StepRecord,
+        DrawRecord, EndRecord, Record, StepRecord, FULL_REPORT_FILE,
     },
     witness::{Expect, WitnessError},
     Category, MemorySink, Plan, PlanChoice, PlanInput,
@@ -296,8 +297,25 @@ pub fn shrink(
 
 /// [`shrink`] on `harness`, whatever `meta.sim` names. The passes stop
 /// before the next candidate once `interrupt` is set, and the shrink then
-/// re-records the best candidate so far.
+/// re-records the best candidate so far. Every run applies the trace's
+/// `meta.draft`.
 pub fn shrink_with(
+    trace: &Trace,
+    harness: &'static HarnessEntry,
+    budget: ShrinkBudget,
+    out: &Path,
+    interrupt: &AtomicBool,
+) -> Result<ShrinkReport, ShrinkError> {
+    // The trace's `Draft` override is run configuration: every candidate
+    // and the reduced recording run under it, as the trace's own replay
+    // does.
+    harness::with_draft(&trace.meta.draft, || {
+        shrink_under_draft(trace, harness, budget, out, interrupt)
+    })
+}
+
+/// [`shrink_with`], under the trace's `Draft` override.
+fn shrink_under_draft(
     trace: &Trace,
     harness: &'static HarnessEntry,
     budget: ShrinkBudget,
@@ -438,6 +456,20 @@ fn prepare_out(out: &Path, trace: &Trace) -> Result<(), ShrinkError> {
     fs::copy(trace.dir.join(TRACE_FILE), original.join(TRACE_FILE))?;
     if trace.meta.input.is_some() {
         fs::copy(trace.dir.join(INPUT_FILE), original.join(INPUT_FILE))?;
+    }
+    // The recording's full report, every violation and its stores, goes
+    // with it, so a replay of the original still compares them.
+    // Pass 1's replay already refused a report `read_bounded` refuses, so
+    // only a file changed since can fail here.
+    let report =
+        read_bounded(&trace.dir.join(FULL_REPORT_FILE), MAX_REPORT_BYTES).map_err(|error| {
+            match error {
+                ReadError::Io(error) => ShrinkError::Io(error),
+                other => ShrinkError::Io(io::Error::other(other.to_string())),
+            }
+        })?;
+    if let Some(report) = report {
+        fs::write(original.join(FULL_REPORT_FILE), report)?;
     }
     // Blobs found in the committed store instead stay there.
     for blob in &trace.meta.fixtures {

@@ -907,14 +907,29 @@ fn run_end(outcome: crate::Outcome, drain: Option<bool>) -> crate::RunEnd {
             exhausted,
         }),
         harness: None,
+        // A dry end is quiescent unless it is an idle one that says
+        // otherwise.
+        rest: match outcome {
+            crate::Outcome::Idle { status } => Some(match status {
+                crate::IdleStatus::Quiescent => zakura_scheduler::Status::Quiescent,
+                crate::IdleStatus::Deadlock => zakura_scheduler::Status::Deadlock,
+                crate::IdleStatus::WorkerStarved => zakura_scheduler::Status::WorkerStarved,
+                crate::IdleStatus::WaitingOnExternal => zakura_scheduler::Status::WaitingOnExternal,
+            }),
+            crate::Outcome::Budget if drain == Some(false) => {
+                Some(zakura_scheduler::Status::Quiescent)
+            }
+            _ => None,
+        },
     }
 }
 
 /// A departure whose unit never reached its boundary is judged when the
 /// run settles, as `adoption::settled` decides: a slot left with the
-/// departed session breaks at a quiescent end, or after a budget drain that
-/// ran dry. A deadlocked or worker-starved end, which can stop a task inside
-/// a unit, or a budget end whose drain hit its bound, leaves it unjudged.
+/// departed session breaks at a quiescent or deadlocked end, or after a
+/// budget drain that ran dry. A worker-starved end, which can stop a task
+/// inside a unit, or a budget end whose drain hit its bound, leaves it
+/// unjudged.
 #[test]
 fn a_settled_run_judges_an_unfinished_departure() {
     let left_with_slot = |end| {
@@ -942,7 +957,7 @@ fn a_settled_run_judges_an_unfinished_departure() {
         (run_end(idle(crate::IdleStatus::Quiescent), None), 1),
         (run_end(idle(crate::IdleStatus::WaitingOnExternal), None), 1),
         (run_end(crate::Outcome::Budget, Some(false)), 1),
-        (run_end(idle(crate::IdleStatus::Deadlock), None), 0),
+        (run_end(idle(crate::IdleStatus::Deadlock), None), 1),
         (run_end(idle(crate::IdleStatus::WorkerStarved), None), 0),
         (run_end(crate::Outcome::Budget, Some(true)), 0),
         (run_end(crate::Outcome::Budget, None), 0),

@@ -50,8 +50,21 @@ pub struct MetaRecord {
     pub fixtures: Vec<BlobRef>,
     /// Every property the run checks.
     pub properties: Vec<PropertyRef>,
+    /// The properties the run checks as `Draft` whatever their registered
+    /// status, sorted: the run configuration a planted case's `Draft` run
+    /// records ([`crate::harness::with_draft`]), so a replay applies it too.
+    /// Each one's status in `properties` reads `draft`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub draft: Vec<String>,
     /// `input.bin`, when input bytes produced the run.
     pub input: Option<InputRef>,
+    /// The Plan the run took its choices from when no `input.bin` did: Plan
+    /// bytes or a scripted [`crate::Plan`], by digest, so a tool can bind
+    /// the trace to the committed Plan it ran (C18). `None` for a run of a
+    /// full fuzz input, which `input` names, and for a trace no Plan
+    /// produced, such as a replay's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanRef>,
     /// The trace this one was derived from, if any.
     pub derived_from: Option<Derivation>,
 }
@@ -281,6 +294,53 @@ pub struct InputRef {
     pub sha256: String,
     /// Their length.
     pub len: u64,
+}
+
+/// The Plan a run took its choices from, other than a full fuzz input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanRef {
+    /// Which form it took.
+    pub kind: PlanKind,
+    /// The SHA-256, in lowercase hex, of its bytes: the Plan bytes, or the
+    /// scripted Plan's JSON as [`PlanRef::script`] writes it.
+    pub sha256: String,
+    /// The bytes' length.
+    pub len: u64,
+}
+
+impl PlanRef {
+    /// The reference to Plan bytes `plan`.
+    pub fn bytes(plan: &[u8]) -> Self {
+        PlanRef {
+            kind: PlanKind::Bytes,
+            sha256: hex(&Sha256::digest(plan)),
+            // A usize always fits in a u64 on supported targets.
+            len: plan.len() as u64,
+        }
+    }
+
+    /// The reference to the scripted `plan`, by its JSON as `serde_json`
+    /// writes it, with no whitespace. A committed script file may be
+    /// formatted any way, so a tool compares the Plan it parses, through
+    /// this.
+    pub fn script(plan: &crate::Plan) -> Self {
+        let json = serde_json::to_vec(plan).expect("a Plan always serializes");
+        PlanRef {
+            kind: PlanKind::Script,
+            ..PlanRef::bytes(&json)
+        }
+    }
+}
+
+/// A [`PlanRef`]'s form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanKind {
+    /// Plan bytes, decoded one choice at a time.
+    Bytes,
+    /// A scripted Plan, which follows picks by identity.
+    Script,
 }
 
 /// Where a derived trace came from.

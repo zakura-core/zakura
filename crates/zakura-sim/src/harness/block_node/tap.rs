@@ -508,6 +508,17 @@ impl BlockTap {
                 entry_generation: *entry_generation,
                 landed: *landed,
             },
+            BlockEvent::StaleRegistryChange {
+                peer: changed,
+                writer,
+                generation,
+                entry_generation,
+            } => BlockSyncFact::StaleRegistryChange {
+                peer: peer(changed),
+                writer: writer.name().to_owned(),
+                generation: *generation,
+                entry_generation: *entry_generation,
+            },
             BlockEvent::FrameJudged {
                 peer: sender,
                 conn_id,
@@ -955,6 +966,17 @@ impl ActionSource for BlockTap {
             Err(_) if self.state.health().is_some() => Ok(()),
             Err(detail) => Err(detail),
         }
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut crate::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 

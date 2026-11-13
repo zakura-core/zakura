@@ -15,6 +15,7 @@ use serde_json::Value;
 use super::super::{
     baseline_failure, classify as planted_verdict,
     lane::{campaign_failure, left_failures, CampaignFacts},
+    outcome::{EndOutcome, NaReason},
     Run, Verdict,
 };
 
@@ -242,19 +243,27 @@ pub(super) fn sensitivity(property: &str, run: &SensitivityRun) -> Classified {
             Class::OtherViolation,
             format!("the mutant violates {other}, not {property}"),
         ),
-        Verdict::NotCaught(outcome) => match outcome.as_str() {
-            "held" => result(
-                Class::SurvivedBudget,
-                format!("{property} held on the mutant's witness run"),
-            ),
-            "not-applicable" => result(
+        // Only a run that never applied is `NotApplicable`. Any other
+        // reason means the mutant's observations were incomplete.
+        Verdict::NotCaught(outcome) if outcome == "held" => result(
+            Class::SurvivedBudget,
+            format!("{property} held on the mutant's witness run"),
+        ),
+        Verdict::NotCaught(outcome)
+            if outcome
+                == EndOutcome::NotApplicable {
+                    reason: NaReason::NeverApplied,
+                }
+                .to_string() =>
+        {
+            result(
                 Class::NotApplicable,
                 format!("{property} never applied on the mutant's witness run"),
-            ),
-            outcome => harness(format!(
-                "incomplete observations: {property} is {outcome} on the mutant"
-            )),
-        },
+            )
+        }
+        Verdict::NotCaught(outcome) => harness(format!(
+            "incomplete observations: {property} is {outcome} on the mutant"
+        )),
         Verdict::Unreported => harness(format!(
             "incomplete observations: the mutant run doesn't report {property}"
         )),

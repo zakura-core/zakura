@@ -1,0 +1,21 @@
+{
+  "node": {
+    "main": 2,
+    "fork": null
+  },
+  "mirrors": [
+    {
+      "chain": {
+        "main": 1,
+        "fork": null
+      },
+      "dialer": "mirror"
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": []
+  },
+  "controls": []
+}

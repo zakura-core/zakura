@@ -82,6 +82,11 @@ impl Checker for StepTimes {
     fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
         Vec::new()
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
 /// Runs `scenario` under `plan` with `extra` beside the registered

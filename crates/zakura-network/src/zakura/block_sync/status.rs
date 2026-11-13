@@ -1,6 +1,6 @@
 //! Per-peer delivery of the latest local serving range.
 
-use super::{BlockSyncStatus, Duration, Instant};
+use super::{regulated::status_sender::announces_new_tip, BlockSyncStatus, Duration, Instant};
 
 const QUEUE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -12,6 +12,10 @@ const QUEUE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) struct StatusDelivery {
     last_queued: Option<BlockSyncStatus>,
     retry_at: Instant,
+    /// The Status a cadence deferral held back, and when. A Status with a
+    /// higher tip is due at once, since the connection's cadence may send a
+    /// new tip early.
+    deferred: Option<(BlockSyncStatus, Instant)>,
 }
 
 impl StatusDelivery {
@@ -19,6 +23,7 @@ impl StatusDelivery {
         Self {
             last_queued: None,
             retry_at: now,
+            deferred: None,
         }
     }
 
@@ -28,22 +33,43 @@ impl StatusDelivery {
         latest: BlockSyncStatus,
         received_status: bool,
     ) -> Option<Instant> {
-        (self.last_queued != Some(latest) || !received_status).then_some(self.retry_at)
+        if self.last_queued == Some(latest) && received_status {
+            return None;
+        }
+        match self.deferred {
+            Some((deferred, deferred_at)) if announces_new_tip(Some(&deferred), &latest) => {
+                Some(self.retry_at.min(deferred_at))
+            }
+            _ => Some(self.retry_at),
+        }
     }
 
-    pub(super) fn queued(&mut self, status: BlockSyncStatus) {
+    /// `status` entered the connection's queue at `now`.
+    ///
+    /// Any earlier deadline belonged to a Status this one supersedes, so the
+    /// next change is due at once and the connection's cadence decides when it
+    /// may go out. A held-over deadline would hold a later tip until a
+    /// correction's 30 s interval.
+    pub(super) fn queued(&mut self, status: BlockSyncStatus, now: Instant) {
         self.last_queued = Some(status);
+        self.retry_at = now;
+        self.deferred = None;
     }
 
-    /// The cadence allows the next send at `at`.
-    pub(super) fn deferred_until(&mut self, at: Instant) {
+    /// The cadence held back `status` at `now` and allows the next send at `at`.
+    pub(super) fn deferred_until(&mut self, status: BlockSyncStatus, now: Instant, at: Instant) {
         self.retry_at = at;
+        self.deferred = Some((status, now));
     }
 
     /// Back off a full queue or an unwritten previous Status without waiting
     /// for the next cadence interval.
+    ///
+    /// This drops any cadence deferral, whose time has passed, so a new tip
+    /// waits for the back-off instead of retrying at once.
     pub(super) fn queue_full(&mut self, now: Instant) {
         self.retry_at = now + QUEUE_RETRY_INTERVAL;
+        self.deferred = None;
     }
 }
 
@@ -69,14 +95,23 @@ mod tests {
         let mut delivery = StatusDelivery::new(now);
         let initial = status(1_000, 6_000);
         assert_eq!(delivery.next_deadline(initial, true), Some(now));
-        delivery.queued(initial);
+        delivery.queued(initial, now);
         assert_eq!(delivery.next_deadline(initial, true), None);
         let correction = status(1_000, 6_001);
         assert_eq!(delivery.next_deadline(correction, true), Some(now));
         let cadence = now + Duration::from_secs(30);
-        delivery.deferred_until(cadence);
+        delivery.deferred_until(correction, now, cadence);
         assert_eq!(delivery.next_deadline(correction, true), Some(cadence));
-        delivery.queued(correction);
+        // A pruning change or a lower tip keeps the deferral.
+        let pruned = status(1_000, 5_999);
+        assert_eq!(delivery.next_deadline(pruned, true), Some(cadence));
+        let pruned = status(1_001, 6_001);
+        assert_eq!(delivery.next_deadline(pruned, true), Some(cadence));
+        // A new tip is due at once; the connection's cadence decides whether
+        // it may go out early.
+        let new_tip = status(1_000, 6_002);
+        assert_eq!(delivery.next_deadline(new_tip, true), Some(now));
+        delivery.queued(correction, now);
         assert_eq!(delivery.next_deadline(correction, true), None);
     }
 
@@ -85,7 +120,7 @@ mod tests {
         let now = Instant::now();
         let mut delivery = StatusDelivery::new(now);
         let initial = status(1_000, 6_000);
-        delivery.queued(initial);
+        delivery.queued(initial, now);
         let full_at = now + Duration::from_secs(30);
         delivery.queue_full(full_at);
         let latest = status(1_002, 6_002);
@@ -98,8 +133,48 @@ mod tests {
             delivery.next_deadline(latest, true),
             Some(deadline + QUEUE_RETRY_INTERVAL)
         );
-        delivery.queued(latest);
+        delivery.queued(latest, now);
         assert_eq!(delivery.next_deadline(latest, true), None);
+    }
+
+    /// Queue pressure on a new tip backs off instead of reusing an older
+    /// cadence deferral, whose time is already past.
+    #[test]
+    fn queue_pressure_after_a_deferral_backs_off_a_new_tip() {
+        let now = Instant::now();
+        let mut delivery = StatusDelivery::new(now);
+        delivery.queued(status(1_000, 6_000), now);
+        let deferred = status(1_000, 6_001);
+        delivery.deferred_until(deferred, now, now + Duration::from_secs(1));
+        let new_tip = status(1_000, 6_002);
+        let pressure_at = now + Duration::from_secs(2);
+        assert_eq!(delivery.next_deadline(new_tip, true), Some(now));
+
+        delivery.queue_full(pressure_at);
+        assert_eq!(
+            delivery.next_deadline(new_tip, true),
+            Some(pressure_at + QUEUE_RETRY_INTERVAL)
+        );
+    }
+
+    /// A tip that goes out early past a deferred correction leaves no deadline
+    /// behind: the next tip is due at once, not at the correction's interval.
+    #[test]
+    fn an_early_tip_clears_a_superseded_correction_deadline() {
+        let now = Instant::now();
+        let mut delivery = StatusDelivery::new(now);
+        delivery.queued(status(1_000, 6_000), now);
+        let correction = status(1_001, 6_000);
+        let cadence = now + Duration::from_secs(30);
+        delivery.deferred_until(correction, now, cadence);
+
+        let tip_at = now + Duration::from_secs(2);
+        let tip = status(1_001, 6_001);
+        assert_eq!(delivery.next_deadline(tip, true), Some(now));
+        delivery.queued(tip, tip_at);
+
+        let next_tip = status(1_001, 6_002);
+        assert_eq!(delivery.next_deadline(next_tip, true), Some(tip_at));
     }
 
     #[test]
@@ -108,7 +183,7 @@ mod tests {
         let mut delivery = StatusDelivery::new(now);
         let latest = status(1_000, 6_000);
         assert_eq!(delivery.next_deadline(latest, false), Some(now));
-        delivery.queued(latest);
+        delivery.queued(latest, now);
         // The handshake keeps an unchanged Status due. The connection's cadence
         // paces the resend; see the reactor test for that deferral.
         assert_eq!(delivery.next_deadline(latest, false), Some(now));
@@ -120,7 +195,7 @@ mod tests {
         let now = Instant::now();
         let mut delivery = StatusDelivery::new(now);
         let initial = status(1_000, 6_000);
-        delivery.queued(initial);
+        delivery.queued(initial, now);
         delivery.queue_full(now);
         assert!(delivery.next_deadline(status(1_001, 6_001), true).is_some());
         assert_eq!(delivery.next_deadline(initial, true), None);

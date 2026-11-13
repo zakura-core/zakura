@@ -1,0 +1,14 @@
+# The reactor refuses an offer whose tip is lower than its local tip, even
+# with more work, in `AdvertisedHeaderTarget::is_discovery_eligible`. On the
+# stronger-last witness, under its committed plan, the node applies the
+# five lighter headers first, so the three heavier ones are lower and never
+# fetched. Selection holds over what the engine has, and the first settled
+# point, with every mirror admitted and the node idle, fails convergence.
+# The reactor, the queue and the scheduler decide which fork arrives first,
+# so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-selection-stronger-last.json"
+plan = "crates/zakura-sim/tests/fixtures/header-selection-stronger-last.plan"

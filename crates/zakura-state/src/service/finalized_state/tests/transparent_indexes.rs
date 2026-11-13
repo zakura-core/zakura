@@ -36,7 +36,6 @@ use crate::{
             CheckpointVerifiedBlock, FinalizedState, ZakuraDb, PRUNING_METADATA,
             STATE_COLUMN_FAMILIES_IN_CODE,
         },
-        non_finalized_state::SharedMap,
     },
     ContextuallyVerifiedBlock, ReadRequest, ReadResponse, RollbackFinalizedStateError,
     RollbackFinalizedStateOptions, SemanticallyVerifiedBlock, StateInitError,
@@ -187,13 +186,8 @@ fn commit_checkpoint(state: &mut FinalizedState, blocks: &[Arc<Block>]) {
 fn commit_contextual(state: &mut FinalizedState, block: Arc<Block>) {
     let network = state.network();
     let semantically_verified = SemanticallyVerifiedBlock::from(block);
-    let spent_utxos = check::utxo::transparent_spend(
-        &semantically_verified,
-        |_| None,
-        &SharedMap::default(),
-        &state.db,
-    )
-    .expect("the test block only spends valid finalized outputs");
+    let spent_utxos = check::utxo::transparent_spend(&semantically_verified, None, &state.db)
+        .expect("the test block only spends valid finalized outputs");
     let contextually_verified = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
         &network,
         semantically_verified,
@@ -240,8 +234,7 @@ fn check_spends(
     all_transactions.extend(transactions);
     let block = SemanticallyVerifiedBlock::from(child_block(parent, all_transactions));
 
-    check::utxo::transparent_spend(&block, |_| None, &SharedMap::default(), db)
-        .map(|spent| spent.into_keys().collect())
+    check::utxo::transparent_spend(&block, None, db).map(|spent| spent.into_keys().collect())
 }
 
 /// Runs every spend check this file cares about, returning a comparable summary.

@@ -1858,6 +1858,8 @@ class PropagationRouteTests(unittest.TestCase):
         code, body, headers = self.fetch("/propagation")
         self.assertEqual((code, headers["Content-Type"]), (200, "text/html; charset=utf-8"))
         self.assertIn(b'fetch("/propagation/data"', body)
+        # A selected block is named in the page address, so it can be linked to.
+        self.assertIn(b'"#block=" + hash', body)
         # A node's name on the page leads to that node's own page.
         self.assertIn(b'"/node/" + encodeURIComponent(name)', body)
 

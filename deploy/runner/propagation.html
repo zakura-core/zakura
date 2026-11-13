@@ -85,6 +85,8 @@ td .quiet { color: var(--muted); }
 #blocks td button { all: unset; cursor: pointer; color: var(--pink-hi); font-family: var(--mono); }
 #blocks td button:hover { text-decoration: underline; }
 #blocks td button:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
+#blocks tbody tr { cursor: pointer; }
+#blocks tbody tr:hover td { background: var(--raised); }
 #blocks tr[aria-selected="true"] td { background: var(--pink-soft); }
 .bar { height: 6px; border-radius: 3px; min-width: 2px; background: var(--c-wait_to_ask); }
 .tooltip {
@@ -117,7 +119,7 @@ td .quiet { color: var(--muted); }
 
   <section class="tiles" id="tiles" aria-label="Summary of the blocks shown"></section>
 
-  <section class="panel">
+  <section class="panel" id="block-panel">
     <header>
       <h2 id="block-title">Block</h2>
       <div class="legend" id="legend"></div>
@@ -135,7 +137,7 @@ td .quiet { color: var(--muted); }
 
   <section class="panel">
     <header><h2>Recent blocks</h2>
-      <div class="legend"><span class="note">Select a block to see its path.</span>
+      <div class="legend"><span class="note">Select a block to see its path. The address then leads to that block.</span>
         <button id="follow" type="button" aria-pressed="true">Follow the newest block</button></div></header>
     <div class="scroll"><table id="blocks"></table></div>
   </section>
@@ -222,6 +224,26 @@ function slowest(block) {
 }
 function source(view) { return view.from === "outside" ? "a peer outside the fleet" : view.from; }
 
+// The block the page address names, as `#block=<hash>`, if any.
+function linkedBlock() {
+  const linked = /^#block=([0-9a-f]{64})$/.exec(location.hash);
+  return linked ? linked[1] : null;
+}
+// Show one block and stop following the newest; the address then leads to that block.
+function selectBlock(hash) {
+  state.selected = hash;
+  state.followNewest = false;
+  history.replaceState(null, "", "#block=" + hash);
+  render();
+  document.getElementById("block-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+function followNewest(follow) {
+  state.followNewest = follow;
+  if (follow) history.replaceState(null, "", location.pathname);
+  else if (state.selected) history.replaceState(null, "", "#block=" + state.selected);
+  render();
+}
+
 function table(target, columns, rows) {
   const head = el("tr", {}, ...columns.map(([label, numeric]) => el("th", { text: label, class: numeric ? "num" : null })));
   target.replaceChildren(el("thead", {}, head), el("tbody", {}, ...rows));
@@ -253,15 +275,18 @@ function renderBlocks(data) {
   const rows = data.blocks.map((block) => {
     const slow = slowest(block);
     const pick = el("button", { type: "button", text: String(block.height ?? "?") });
-    pick.addEventListener("click", () => { state.selected = block.hash; state.followNewest = false; render(); });
+    pick.setAttribute("aria-label", `Show block ${block.height ?? shortHash(block.hash)}`);
     const first = el("td", {}, nodeLink(block.first_node),
       el("span", { class: "quiet" }, " ← ", sourceLink(block.first_from, "outside")));
     const slowCell = el("td", {}, nodeLink(slow.name),
       el("span", { class: "quiet", text: slow.longest ? ` · ${slow.longest.label.toLowerCase()} ${ms(slow.longest.end - slow.longest.start)}` : "" }));
-    return el("tr", { "aria-selected": block.hash === state.selected ? "true" : "false" },
+    const row = el("tr", { "aria-selected": block.hash === state.selected ? "true" : "false" },
       el("td", {}, pick), el("td", { class: "mono", text: shortHash(block.hash) + (block.reorg ? " (reorg)" : "") }),
       cell(clockTime(block.origin)), first, cell(ms(block.spread_ms), true), slowCell,
       cell(`${Object.keys(block.nodes).length} / ${data.nodes.length}`, true));
+    // Anywhere on the row selects the block, except a node name, which leads to that node.
+    row.addEventListener("click", (event) => { if (!event.target.closest("a")) selectBlock(block.hash); });
+    return row;
   });
   table(document.getElementById("blocks"), [["Height"], ["Hash"], ["First heard"], ["First node ← its source"],
     ["Every node at tip after", true], ["Last node · its longest step"], ["Nodes", true]], rows);
@@ -435,7 +460,12 @@ function renderLegend() {
 function render() {
   const data = state.data;
   if (!data) return;
-  if (state.followNewest || !data.blocks.some((block) => block.hash === state.selected)) {
+  if (!state.followNewest && !data.blocks.some((block) => block.hash === state.selected)) {
+    // The selected block is older than the blocks the nodes still report.
+    state.followNewest = true;
+    history.replaceState(null, "", location.pathname);
+  }
+  if (state.followNewest) {
     // The newest block is still arriving on some nodes: follow the newest one that the
     // most nodes have reported.
     const recent = data.blocks.slice(0, 10);
@@ -470,7 +500,13 @@ document.getElementById("all-hops").addEventListener("click", (event) => {
   event.currentTarget.setAttribute("aria-pressed", String(state.allHops));
   render();
 });
-document.getElementById("follow").addEventListener("click", () => { state.followNewest = !state.followNewest; render(); });
+document.getElementById("follow").addEventListener("click", () => followNewest(!state.followNewest));
+function readAddress() {
+  const linked = linkedBlock();
+  if (linked) { state.selected = linked; state.followNewest = false; }
+}
+window.addEventListener("hashchange", () => { readAddress(); render(); });
+readAddress();
 window.addEventListener("resize", () => render());
 renderLegend();
 refresh();

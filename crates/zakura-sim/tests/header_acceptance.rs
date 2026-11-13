@@ -8822,3 +8822,42 @@ fn regenerate_raw_join_baseline() {
     }
     std::fs::write(krate.join(RAW_JOIN_BASELINE), out).expect("the fixture directory exists");
 }
+
+/// Every node harness's missing-source keys are covered by that harness's
+/// own missing-source test, and only a machine's by the machine's standing
+/// `Open`. A node harness the mapping misses, as `header-sync/liveness`
+/// once was, would fall to the machine's `Open` and fail here.
+#[test]
+fn each_node_harness_s_missing_sources_are_its_own_test_s() {
+    let manifest = Manifest::committed();
+    let needs = header_acceptance::needs();
+    let harnesses: BTreeSet<&str> = needs.iter().map(|(harness, _)| harness.as_str()).collect();
+    assert!(harnesses.contains("header-sync/liveness"));
+    for (harness, source) in &needs {
+        let key = Key::MissingSource {
+            harness: harness.clone(),
+            source: source.clone(),
+        };
+        let covering: Vec<&Expected> = manifest
+            .expected
+            .iter()
+            .filter(|result| result.keys.contains(&key))
+            .map(|result| &result.expected)
+            .collect();
+        let [expected] = covering.as_slice() else {
+            panic!("{key:?} is covered {} times", covering.len());
+        };
+        if rows::is_machine(harness) {
+            assert_eq!(rows::missing_source_test(harness), None, "{harness}");
+            assert!(matches!(expected, Expected::Open { .. }), "{key:?}");
+            continue;
+        }
+        let test = rows::missing_source_test(harness)
+            .unwrap_or_else(|| panic!("{harness} is a node harness with no missing-source test"));
+        assert_eq!(test.file, "tests/header_acceptance_sources.rs", "{harness}");
+        assert!(
+            matches!(expected, Expected::Passes { test: t } if *t == test),
+            "{key:?} is covered by {expected:?}, not {test:?}"
+        );
+    }
+}

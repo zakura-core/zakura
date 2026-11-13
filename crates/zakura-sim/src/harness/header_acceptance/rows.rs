@@ -3680,6 +3680,7 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "every_artifact_read_goes_through_binding",
     "every_ref_has_a_one_key_off_control",
     "identity_joins_go_through_refs",
+    "each_node_harness_s_missing_sources_are_its_own_test_s",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.
@@ -3755,6 +3756,7 @@ pub fn missing_source_test(harness: &str) -> Option<TestRef> {
         WIRE => "wire_fails_without_each_source",
         FLOOD => "flood_fails_without_each_source",
         REPAIR => "repair_fails_without_each_source",
+        LIVENESS => "liveness_fails_without_each_source",
         _ => return None,
     };
     Some(sim_test(SOURCE_TESTS, test))

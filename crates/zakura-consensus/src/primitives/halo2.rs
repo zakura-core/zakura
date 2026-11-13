@@ -24,6 +24,7 @@ use zcash_protocol::value::ZatBalance;
 use super::batch_control::{Batch, BatchControl, RequestWeight};
 use super::fallback::Fallback;
 use crate::{error::TransactionError, BoxError};
+use thiserror::Error;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -284,6 +285,31 @@ impl QueueBatchVerify for BatchValidator<'_> {
         }: Item,
     ) -> Result<(), BatchError> {
         self.add_bundle(bundle.as_ref(), sighash.0)
+    }
+}
+
+/// An error that may occur when verifying [Halo2 proofs of Zcash Orchard Action
+/// descriptions][actions].
+///
+/// [actions]: https://zips.z.cash/protocol/protocol.pdf#actiondesc
+// TODO: if halo2::plonk::Error gets the std::error::Error trait derived on it,
+// remove this and just wrap `halo2::plonk::Error` as an enum variant of
+// `crate::transaction::Error`, which does the trait derivation via `thiserror`
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum Halo2Error {
+    #[error("the constraint system is not satisfied")]
+    ConstraintSystemFailure,
+    #[error("unknown Halo2 error")]
+    Other,
+}
+
+impl From<halo2::plonk::Error> for Halo2Error {
+    fn from(err: halo2::plonk::Error) -> Halo2Error {
+        match err {
+            halo2::plonk::Error::ConstraintSystemFailure => Halo2Error::ConstraintSystemFailure,
+            _ => Halo2Error::Other,
+        }
     }
 }
 

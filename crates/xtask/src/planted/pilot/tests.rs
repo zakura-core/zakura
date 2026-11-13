@@ -1691,8 +1691,8 @@ fn a_campaign_that_a_signal_killed_is_not_read() {
 }
 
 /// A campaign's facts time its first intended finding by the process that
-/// crashed on it, count its unique abstract states, and mark a run without
-/// an intended input censored.
+/// crashed on it, and count its unique abstract states and its longest
+/// worker's time.
 #[test]
 fn campaign_facts_time_the_intended_finding() {
     let intended = "runs/m/workers/0/sim/inputs/active/block/reactor-policy/aa.bin";
@@ -1724,7 +1724,6 @@ fn campaign_facts_time_the_intended_finding() {
     let facts = campaign_facts(ID, Some(&end), &evidence, 0, &attempts);
     assert_eq!(facts.intended_input.as_deref(), Some(intended));
     assert_eq!(facts.first_intended_secs, Some(3.5));
-    assert!(!facts.censored);
     assert_eq!(facts.features_reached, 2);
     assert_eq!(facts.worker_secs, 9.0);
 
@@ -1735,15 +1734,15 @@ fn campaign_facts_time_the_intended_finding() {
     ]];
     let facts = campaign_facts(ID, Some(&end), &evidence, 0, &unmatched);
     assert_eq!(facts.first_intended_secs, None);
-    assert!(!facts.censored);
+    assert!(facts.intended_input.is_some());
 
-    // Without an intended input, the run is censored.
+    // Without an intended input, nothing times a finding.
     let other = serde_json::json!({
         "failures": [{"path": "runs/m/workers/0/sim/inputs/active/sim/no-task-panic/aa.bin", "sha256": "aa"}],
         "workers": [{"index": 0, "millis": 600_000}],
     });
     let facts = campaign_facts(ID, Some(&other), &evidence, 0, &attempts);
-    assert!(facts.censored);
+    assert_eq!(facts.intended_input, None);
     assert_eq!(facts.first_intended_secs, None);
     assert_eq!(facts.worker_secs, 600.0);
     assert_eq!(
@@ -1801,7 +1800,7 @@ fn each_arm_summarizes_its_seeds() {
             features_reached: features,
             worker_secs: 600.0,
             first_intended_secs: secs,
-            censored: secs.is_none(),
+            intended_input: secs.map(|_| "i.bin".to_owned()),
             ..campaign()
         };
     let seed = |seed: u32, arm: Arm, class: Class, mutant: Option<CampaignFacts>| SeedResult {
@@ -1847,7 +1846,10 @@ fn each_arm_summarizes_its_seeds() {
             3,
             Arm::On,
             Class::IntendedViolation,
-            Some(facts(true, 9, 4, None)),
+            Some(CampaignFacts {
+                intended_input: Some("i.bin".to_owned()),
+                ..facts(true, 9, 4, None)
+            }),
         ),
         seed(
             3,
@@ -1855,11 +1857,13 @@ fn each_arm_summarizes_its_seeds() {
             Class::HarnessFailure,
             Some(facts(true, 2, 2, Some(10.0))),
         ),
+        // Another violation beside an intended input is censored at the
+        // campaign's end, not detected at 20 s.
         seed(
             4,
             Arm::On,
             Class::OtherViolation,
-            Some(facts(true, 1, 2, None)),
+            Some(facts(true, 1, 2, Some(20.0))),
         ),
         seed(4, Arm::Off, Class::BaselineFailure, None),
     ];
@@ -1873,7 +1877,8 @@ fn each_arm_summarizes_its_seeds() {
         (on.seeds, on.detected, on.censored, on.unscored),
         (4, 3, 1, 0)
     );
-    // Undetected shares: 3/4 at 30 s, 1/2 at 90 s.
+    // Undetected shares: 3/4 at 30 s, 1/2 at 90 s. Had seed 4 counted at
+    // 20 s, the median would be 30 s.
     assert_eq!(on.median_detection_secs, Some(90.0));
     assert_eq!(
         (
@@ -2113,7 +2118,7 @@ fn a_campaign_lane_reads_its_arm_and_attempts() {
             "{name}: {unpaired}"
         );
         assert_eq!(facts.first_intended_secs, Some(1.5), "{name}");
-        assert!(!facts.censored, "{name}");
+        assert!(facts.intended_input.is_some(), "{name}");
         assert_eq!(facts.features_reached, 1, "{name}");
         assert_eq!(facts.worker_secs, 4.0, "{name}");
     }

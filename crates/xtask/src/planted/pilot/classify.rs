@@ -312,9 +312,6 @@ pub(super) struct CampaignFacts {
     /// first intended input ended, the earliest over the workers. `None`
     /// without an intended input, or if no process's crash matches one.
     pub(super) first_intended_secs: Option<f64>,
-    /// True if the run saved no intended input: its time to detection is
-    /// only known to exceed `worker_secs`.
-    pub(super) censored: bool,
     /// Why the run's fuzzer build doesn't pair with the expected identity,
     /// or its fuzzer with its arm, if it doesn't.
     pub(super) unpaired: Option<String>,

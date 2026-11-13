@@ -220,8 +220,10 @@ alone is another violation. A campaign stops at its first finding.
 `arms` comparison per case. For each arm, it gives:
 
 - `detected`: seeds whose mutant campaign found the intended property;
-- `censored`: seeds whose valid mutant campaign ended without it, as a
-  survivor, a not-applicable run or another property's violation;
+- `censored`: seeds whose valid mutant campaign ended without a
+  detection: a survivor, a not-applicable run or another violation. A
+  campaign that saved an intended input beside another violation is
+  another violation, so it's censored too;
 - `unscored`: harness failures, baseline failures, invalid mutants and
   equivalent mutants;
 - `median_detection_secs`: the Kaplan-Meier median of the time to
@@ -231,9 +233,14 @@ alone is another violation. A campaign stops at its first finding.
   those where the property applied, their applicable runs, and the median
   of the unique abstract states each campaign reached.
 
-A campaign's time to detection is the fuzzing time its worker had spent
-when the process that crashed on the intended input ended. A censored
-campaign's time is its longest worker's fuzzing time. A campaign's unique
+Each seed's class decides its place: only an intended violation is a
+detection. A campaign's time to detection is the fuzzing time its worker
+had spent when the process that crashed on the intended input ended, or
+its longest worker's fuzzing time if no crash matches the input. A
+censored campaign's time is its longest worker's fuzzing time: the
+detection is only known to come later. A campaign's `intended_input`
+names the first input it saved that violates the case's property,
+whatever its class. A campaign's unique
 abstract states are the distinct protocol-state features its runs hit, in
 either arm. The report sets no discovery threshold.
 

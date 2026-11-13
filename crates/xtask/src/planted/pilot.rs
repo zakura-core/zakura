@@ -1676,12 +1676,13 @@ fn campaign_facts(
             .and_then(Value::as_u64)
             .unwrap_or(0)
     };
-    let worker_millis = end
+    let worker_millis: Vec<u64> = end
         .and_then(|end| end.get("workers"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|worker| worker.get("millis").and_then(Value::as_u64));
+        .filter_map(|worker| worker.get("millis").and_then(Value::as_u64))
+        .collect();
     CampaignFacts {
         status: evidence
             .get("status")
@@ -1708,20 +1709,14 @@ fn campaign_facts(
             .and_then(Value::as_u64)
             .unwrap_or(0),
         applicable_runs: counts("complete_totals", "held") + counts("complete_totals", "violated"),
-        millis: end
-            .and_then(|end| end.get("workers"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|worker| worker.get("millis").and_then(Value::as_u64))
-            .sum(),
-        worker_secs: Duration::from_millis(worker_millis.max().unwrap_or(0)).as_secs_f64(),
+        millis: worker_millis.iter().sum(),
+        worker_secs: Duration::from_millis(worker_millis.iter().copied().max().unwrap_or(0))
+            .as_secs_f64(),
         features_reached: evidence
             .pointer("/totals/features")
             .and_then(Value::as_object)
             .map_or(0, serde_json::Map::len),
         first_intended_secs: first_detection(attempts, &intended_digests),
-        censored: intended_input.is_none(),
         intended_input,
         unpaired: None,
     }

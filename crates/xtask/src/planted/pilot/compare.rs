@@ -104,8 +104,15 @@ enum Scored {
     Unscored,
 }
 
-/// Where `seed` falls. A detection without a crash the runner could match
-/// to the intended input counts at the campaign's end, an upper bound.
+/// Where `seed` falls, by its class. Only an intended violation is a
+/// detection. A detection without a crash the runner could match to the
+/// intended input counts at the campaign's end, an upper bound. Every other
+/// valid campaign is censored at its end: a survivor, a not-applicable run,
+/// and another violation. Another violation stays censored even when the
+/// campaign also saved an intended input, since the case's rules count that
+/// campaign as another violation, not as a detection ([`super::classify::discovery`]).
+/// The campaign stopped at that finding, so its time to detection is only
+/// known to exceed its end.
 fn score(seed: &SeedResult) -> Scored {
     let Some(mutant) = &seed.mutant else {
         return Scored::Unscored;

@@ -282,7 +282,8 @@ mod tests {
     fn committed() -> (Manifest, BTreeMap<Key, BTreeSet<Gate>>) {
         let manifest = Manifest::committed();
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let required = committed_required(&repo, &manifest);
+        let required =
+            committed_required(&repo, &manifest).expect("the committed inventories read");
         (manifest, required)
     }
 

@@ -234,7 +234,7 @@ fn the_matrix_check_refuses_one_id_moved_between_harnesses() {
 /// (shared IDs' cases only on a header harness, `tool.rs`'s
 /// `is_header_case`).
 fn planted_cases() -> Vec<(String, String)> {
-    header_acceptance::tool::planted_cases(&repo())
+    header_acceptance::tool::planted_cases(&repo()).expect("the planted directories read")
 }
 
 /// The planted inventory reads a property at any depth under
@@ -256,11 +256,11 @@ fn the_planted_scan_reads_nested_properties() {
     let owned = |property: &str, name: &str| (property.to_owned(), name.to_owned());
     assert_eq!(
         header_acceptance::tool::planted_cases(repo.path()),
-        vec![
+        Ok(vec![
             owned("header-sync/s5v9/headers/reserved-flags-closes", "flags"),
             owned("header-sync/s5v9/status/reserved-flags-closes", "flags"),
             owned("session/honest-never-punished", "punished"),
-        ]
+        ])
     );
 }
 

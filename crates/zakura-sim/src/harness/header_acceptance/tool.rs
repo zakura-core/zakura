@@ -2847,7 +2847,7 @@ fn fail(run: &mut Execution, why: String) {
 /// ([`is_header_case`]), as `(property, name)`. The property is the patch's
 /// directory relative to `qa/planted`, at any depth, as the planted runner
 /// reads it.
-pub fn planted_cases(repo: &Path) -> Vec<(String, String)> {
+pub fn planted_cases(repo: &Path) -> Result<Vec<(String, String)>, String> {
     let registered = super::registered();
     let ids: BTreeSet<&str> = registered
         .iter()
@@ -2884,20 +2884,25 @@ fn is_header_case(repo: &Path, ids: &BTreeSet<&str>, property: &str, name: &str)
 
 /// Every planted case under `root`, a committed directory of `repo`, that
 /// `header` keeps, given its property and name, as `(property, name)`,
-/// sorted. An unreadable directory holds none.
+/// sorted, or why the walk is incomplete: a directory or an entry under
+/// `root` that can't be read, so a case there can't go undiscovered.
 fn planted_cases_in(
     repo: &Path,
     root: &Path,
     header: &dyn Fn(&str, &str) -> bool,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, String> {
     /// Collects every `.patch` under `dir`.
-    fn walk(repo: &Path, root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
-        let Ok(entries) = binding::committed_entries(repo, dir) else {
-            return;
-        };
+    fn walk(
+        repo: &Path,
+        root: &Path,
+        dir: &Path,
+        out: &mut Vec<(String, String)>,
+    ) -> Result<(), String> {
+        let entries = binding::committed_entries(repo, dir)
+            .map_err(|why| format!("the planted inventory is incomplete: {why}"))?;
         for (path, is_dir) in entries {
             if is_dir {
-                walk(repo, root, &path, out);
+                walk(repo, root, &path, out)?;
             } else if path.extension().is_some_and(|ext| ext == "patch") {
                 let property = path
                     .parent()
@@ -2909,25 +2914,26 @@ fn planted_cases_in(
                 }
             }
         }
+        Ok(())
     }
     let mut cases = Vec::new();
-    walk(repo, root, root, &mut cases);
+    walk(repo, root, root, &mut cases)?;
     cases.retain(|(property, name)| header(property, name));
     cases.sort();
-    cases
+    Ok(cases)
 }
 
 /// Every native-mutation directory under `repo`'s
-/// `qa/native-mutations/header-sync/`.
-pub fn native_dirs(repo: &Path) -> Vec<String> {
+/// `qa/native-mutations/header-sync/`, or why it can't be listed.
+pub fn native_dirs(repo: &Path) -> Result<Vec<String>, String> {
     let mut dirs: Vec<String> = binding::committed_entries(repo, "qa/native-mutations/header-sync")
+        .map_err(|why| format!("the native-mutation inventory is incomplete: {why}"))?
         .into_iter()
-        .flatten()
         .filter(|(_, is_dir)| *is_dir)
         .filter_map(|(path, _)| path.file_name()?.to_str().map(str::to_owned))
         .collect();
     dirs.sort();
-    dirs
+    Ok(dirs)
 }
 
 /// Every `(file, test, property)` `COVERAGE` names for a header ID.
@@ -2956,12 +2962,15 @@ pub fn coverage_tests() -> Vec<(String, String, String)> {
 }
 
 /// The keys `manifest` must cover, from `repo`'s directories and the
-/// registry.
-pub fn committed_required(repo: &Path, manifest: &Manifest) -> BTreeMap<Key, BTreeSet<Gate>> {
+/// registry, or why the directories can't be read whole.
+pub fn committed_required(
+    repo: &Path,
+    manifest: &Manifest,
+) -> Result<BTreeMap<Key, BTreeSet<Gate>>, String> {
     let registered = super::registered();
     let needs = super::needs();
-    let planted = planted_cases(repo);
-    let native = native_dirs(repo);
+    let planted = planted_cases(repo)?;
+    let native = native_dirs(repo)?;
     let coverage = coverage_tests();
     let planted_harnesses: BTreeMap<(String, String), String> = planted
         .iter()
@@ -2977,7 +2986,7 @@ pub fn committed_required(repo: &Path, manifest: &Manifest) -> BTreeMap<Key, BTr
         })
         .cloned()
         .collect();
-    required_keys(&Inventories {
+    Ok(required_keys(&Inventories {
         registered: &registered,
         needs: &needs,
         planted: &planted,
@@ -2994,7 +3003,7 @@ pub fn committed_required(repo: &Path, manifest: &Manifest) -> BTreeMap<Key, BTr
         expected: &manifest.expected,
         histories: &super::rows::history_targets(),
         machine: super::rows::is_machine,
-    })
+    }))
 }
 
 /// Which history a run of [`a_a_and_a_b_a`] records.
@@ -3535,8 +3544,9 @@ pub fn evaluate_artifacts(
 }
 
 /// [`evaluate_artifacts`] with the inventories checked against `pin`
-/// ([`super::inventory`]): on a mismatch the evaluation is invalidated, so
-/// the record lists the mismatch as a stray and fails every gate. The
+/// ([`super::inventory`]): on a mismatch, or a committed directory the
+/// inventories can't read whole, the evaluation is invalidated, so the
+/// record lists why as a stray and fails every gate. The
 /// record's only path runs through here, so deleting a list entry or a
 /// static test can't remove the check.
 fn evaluate_against(
@@ -3548,7 +3558,10 @@ fn evaluate_against(
 ) -> (ResultFile, Record) {
     let (subject, subject_source) = (run.subject.as_str(), run.subject_source.as_str());
     let manifest = Manifest::committed();
-    let required = committed_required(repo, &manifest);
+    let (required, unread) = match committed_required(repo, &manifest) {
+        Ok(required) => (required, Vec::new()),
+        Err(why) => (BTreeMap::new(), vec![why]),
+    };
     let results = assemble(repo, plan, artifacts, run);
     let mut evaluation = evaluate(
         &manifest,
@@ -3559,6 +3572,7 @@ fn evaluate_against(
             source: subject_source,
         },
     );
+    evaluation.invalidate(unread);
     evaluation.invalidate(super::inventory::errors_against(
         &manifest,
         &required,
@@ -5894,7 +5908,8 @@ mod tests {
         }
         let cases = planted_cases_in(root.path(), Path::new(""), &|property, _| {
             property.starts_with("header-sync/") || property == "session/honest-never-punished"
-        });
+        })
+        .expect("every directory reads");
         let owned = |property: &str, name: &str| (property.to_owned(), name.to_owned());
         assert_eq!(
             cases,
@@ -5903,6 +5918,43 @@ mod tests {
                 owned("header-sync/s5v9/status/reserved-flags-closes", "flags"),
                 owned("session/honest-never-punished", "punished"),
             ]
+        );
+    }
+
+    /// A planted directory the inventory can't read fails discovery rather
+    /// than holding no cases: a new case under an unreadable property
+    /// directory is never silently left without its required key, and the
+    /// required keys can't be computed. With the directory readable again,
+    /// its case is found and the keys are computed.
+    #[test]
+    fn an_unreadable_planted_directory_fails_discovery() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempfile::tempdir().expect("a temp dir can be created");
+        let dir = repo.path().join("qa/planted/header-sync/new-property");
+        fs::create_dir_all(&dir).expect("the temp dir is writable");
+        fs::write(dir.join("new-case.patch"), "").expect("the temp dir is writable");
+        fs::create_dir_all(repo.path().join("qa/native-mutations/header-sync"))
+            .expect("the temp dir is writable");
+        let set = |mode: u32| {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode))
+                .expect("the temp dir's mode can change")
+        };
+        set(0o000);
+        let found = planted_cases(repo.path());
+        let required = committed_required(repo.path(), &Manifest::committed());
+        set(0o755);
+        assert!(
+            found.as_ref().is_err_and(|why| why.contains("incomplete")),
+            "{found:?}"
+        );
+        assert!(required.is_err());
+        assert!(committed_required(repo.path(), &Manifest::committed()).is_ok());
+        assert_eq!(
+            planted_cases(repo.path()),
+            Ok(vec![(
+                "header-sync/new-property".to_owned(),
+                "new-case".to_owned()
+            )])
         );
     }
 
@@ -6025,7 +6077,7 @@ mod tests {
             .map(|(property, name, ..)| ((*property).to_owned(), (*name).to_owned()))
             .collect();
         kept.sort();
-        assert_eq!(planted_cases(repo.path()), kept);
+        assert_eq!(planted_cases(repo.path()), Ok(kept));
     }
 
     /// A planted case's harness is read only from committed files: a fuzz

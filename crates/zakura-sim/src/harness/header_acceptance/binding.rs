@@ -720,7 +720,9 @@ pub fn committed_file(repo: &Path, rel: impl AsRef<Path>) -> Result<std::path::P
 
 /// Each entry of the committed directory `rel` of S's checkout `repo`
 /// ([`committed_path`]), as its path relative to `repo` and whether it's a
-/// directory, sorted, or why it can't be read.
+/// directory, sorted, or why it can't be read. An entry that can't be read
+/// fails the whole listing, so no reader takes a partial one for the
+/// directory.
 pub fn committed_entries(
     repo: &Path,
     rel: impl AsRef<Path>,
@@ -729,9 +731,11 @@ pub fn committed_entries(
     let path = committed_path(repo, rel)?;
     let mut entries: Vec<(std::path::PathBuf, bool)> = std::fs::read_dir(&path)
         .map_err(|error| format!("{}: {error}", path.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| (rel.join(entry.file_name()), entry.path().is_dir()))
-        .collect();
+        .map(|entry| {
+            let entry = entry.map_err(|error| format!("{}: {error}", path.display()))?;
+            Ok((rel.join(entry.file_name()), entry.path().is_dir()))
+        })
+        .collect::<Result<_, String>>()?;
     entries.sort();
     Ok(entries)
 }

@@ -25,7 +25,7 @@ use zakura_sim::{
                 DraftEvidence, Refusal, SentPage, StagedPage, CONTENT_FAULT, FAULT_CLOSE,
                 PATH_BREAK, STAGED,
             },
-            refs::PageRef,
+            refs::{PageRef, Ref},
         },
         header_sync::{HeaderWire, WireScenario},
         Subsystem,
@@ -168,6 +168,29 @@ fn served_chain(peer: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The hashes of the one page in `pages` sent as `frame`, joined on its
+/// whole ref, or `None` if none was. Two pages at one frame fail the test.
+fn sent_at(pages: &[(FrameRef, Vec<String>)], frame: &FrameRef) -> Option<Vec<String>> {
+    match FrameRef::joined(frame, pages, |(sent, _)| Some(sent.clone()))[..] {
+        [] => None,
+        [(_, hashes)] => Some(hashes.clone()),
+        ref many => panic!("{frame:?}: {} pages", many.len()),
+    }
+}
+
+/// [`sent_at`] finds a stored page at its whole frame, and not with any
+/// one key of that frame moved (Rule 25's template).
+#[test]
+fn a_stored_page_joins_its_whole_frame() {
+    let evidence = evidence();
+    let page = rejected_page(&evidence.observations).expect("one page was rejected");
+    let pages = vec![(page.frame.clone(), vec!["ab".to_owned()])];
+    assert!(sent_at(&pages, &page.frame).is_some());
+    let keys =
+        assert_one_key_off::<FrameRef>(&page.frame, |frame| sent_at(&pages, frame).is_some());
+    assert_eq!(keys, 6);
+}
+
 /// The producer of `SentPages`: what it keeps for the rejected frame is
 /// the page the peer sent there, as the scenario's chain and the linkage
 /// fault give it: its first header unlinked, then the chain's next
@@ -178,10 +201,8 @@ fn the_sent_pages_store_holds_what_the_peer_sent() {
     let evidence = evidence();
     let page = rejected_page(&evidence.observations).expect("one page was rejected");
     let chain = served_chain(&page.peer);
-    let stored = evidence
-        .sent
-        .page(&page.frame)
-        .expect("the store holds the rejected frame's page");
+    let pages = evidence.sent.pages();
+    let stored = sent_at(&pages, &page.frame).expect("the store holds the rejected frame's page");
     let start = chain
         .iter()
         .position(|(_, unlinked)| *unlinked == stored[0])
@@ -220,7 +241,7 @@ fn the_sent_pages_store_holds_what_the_peer_sent() {
             inbound: true,
             seq: *seq,
         };
-        let Some(kept) = evidence.sent.page(&frame) else {
+        let Some(kept) = sent_at(&pages, &frame) else {
             continue;
         };
         assert_eq!(row, "headers", "{frame:?}: {kept:?}");

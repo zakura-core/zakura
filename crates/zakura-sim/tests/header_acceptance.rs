@@ -7432,6 +7432,13 @@ const REF_CONTROLS: &[(&str, &str, &str, &str, &str)] = &[
         "src/harness/header_acceptance/not_applicable.rs",
         "a_history_s_group_joins_its_whole_witness",
     ),
+    (
+        "FrameRef",
+        "tests/header_despite_close.rs",
+        "sent_at",
+        "tests/header_despite_close.rs",
+        "a_stored_page_joins_its_whole_frame",
+    ),
 ];
 
 /// What [`join_scan`] finds in one Rust source file.

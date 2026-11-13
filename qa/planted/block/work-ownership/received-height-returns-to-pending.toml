@@ -1,0 +1,12 @@
+# A request that returns its heights after its body arrived puts the
+# received height back in `pending`, so another request downloads it again.
+# mut-6's generator drew this machine input (seed 11, run 2), and the
+# shrinker reduced its Plan to the defaults.
+# Besides state.rs, which the patch changes, the rest of the work queue
+# decides when a request returns its heights.
+checks = ["crates/zakura-network/src/zakura/block_sync/work_queue"]
+
+[typed]
+harness = "block/work-ownership"
+scenario = "qa/planted/block/work-ownership/received-height-returns-to-pending.scenario.json"
+plan = "qa/planted/block/work-ownership/received-height-returns-to-pending.plan.bin"

@@ -7,7 +7,7 @@
 
 mod support;
 
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{collections::BTreeSet, fs, path::PathBuf, time::Duration};
 
 use support::{
     inputs,
@@ -137,7 +137,13 @@ fn the_witnesses_hold_under_generated_plans() {
 /// fixture one mirror sits below the node and relinks twice. Storage holds
 /// its first session's page read and its second session's lease acquire,
 /// so those two page jobs hold the peer's 2 execution slots, and the third
-/// session's job waits for one. Each row reaches its limit and no further.
+/// session's job waits for one. In the departed-limit fixture the node
+/// admits 8 peers and drops a peer at its first request timeout, and every
+/// mirror's first page on a link arrives past that timeout. So the 8
+/// admitted mirrors' drops fill the departed strikes and cooldowns to 8,
+/// and the 9th mirror, linked once a slot frees, is dropped while they're
+/// held, so the earliest entry goes. Each row reaches its limit and no
+/// further.
 /// In the slot fixture the 16 rounds' reservations, staged capacity entries
 /// and request deadlines, one per round, reach 16 with them. Each run then
 /// releases and reuses its row, which
@@ -173,6 +179,13 @@ fn the_limit_fixtures_reach_and_hold_their_bounds() {
             2,
             1,
             &[][..],
+        ),
+        (
+            "header-outstanding-departed-limit",
+            "departed strikes",
+            8,
+            8,
+            &["cooldowns"][..],
         ),
     ] {
         let scenario = scenario(stem);
@@ -442,11 +455,60 @@ fn limit_rows() -> [RowUnits; 4] {
     ]
 }
 
+/// The departed-limit fixture's rows, which keep one entry per dropped
+/// peer until the node's cooldown ends and evict the earliest past their
+/// limit, with that limit and the peers dropped while the first is held.
+const HELD_ROWS: (&str, [&str; 2], usize, usize) = (
+    "header-outstanding-departed-limit",
+    ["departed strikes", "cooldowns"],
+    8,
+    9,
+);
+
+/// Each round the node retired for its request timeout, by its peer, with
+/// the virtual time then, in log order.
+fn timeouts(entries: &[Entry]) -> Vec<(Duration, String)> {
+    let mut now = Duration::ZERO;
+    let mut found = Vec::new();
+    for entry in entries {
+        match &entry.obs {
+            Observation::TimeAdvanced { to_ns, .. } => now = Duration::from_nanos(*to_ns),
+            Observation::Reactor {
+                event:
+                    ReactorFact::Retired {
+                        request, reason, ..
+                    },
+                ..
+            } if reason == "timed_out" => found.push((now, request.peer.clone())),
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Whether `sizes`, a row's sizes in order, reach `limit`, then fall below
+/// it, a release, and later rise from below it, a reuse.
+fn released_and_reused(sizes: &[usize], limit: usize) -> bool {
+    let Some(full) = sizes.iter().position(|size| *size == limit) else {
+        return false;
+    };
+    let Some(released) = sizes[full..].iter().position(|size| *size < limit) else {
+        return false;
+    };
+    sizes[full + released..]
+        .windows(2)
+        .any(|pair| pair[0] < limit && pair[1] > pair[0])
+}
+
 /// Gate 5's bound-table rows for work slots, locator reads, and node and
 /// peer execution slots, by their limit fixtures' logs: each row reaches its
 /// limit and no further while one more party waits, so the next is denied,
 /// and that party gets its first unit only after a release, with fewer than
-/// the limit open, so a released unit is reused.
+/// the limit open, so a released unit is reused. The departed strikes and
+/// cooldowns evict instead of making a party wait: more peers are dropped
+/// within one cooldown than the rows hold, so an entry was evicted, and
+/// each row then falls below its limit as entries end and rises again
+/// when a returning peer is dropped once more.
 #[test]
 fn the_limit_fixtures_release_and_reuse_their_bounds() {
     for row in limit_rows() {
@@ -470,6 +532,47 @@ fn the_limit_fixtures_release_and_reuse_their_bounds() {
             "{stem}: the waiting party's first unit came after a release: {used:?}"
         );
     }
+    let (stem, rows, limit, parties) = HELD_ROWS;
+    let scenario = scenario(stem);
+    let prepared = Storage::prepare(&scenario);
+    let evidence = prepared.outstanding.clone();
+    let plan = fs::read(fixture(stem, "plan")).unwrap_or_else(|error| panic!("{stem}: {error}"));
+    let report = run_prepared::<Storage>(
+        &scenario,
+        prepared,
+        Plan::from_fuzz(&plan),
+        &mut MemorySink::default(),
+        None,
+    )
+    .unwrap_or_else(|error| panic!("{stem}: {error}"));
+    assert_eq!(report.end.violation, None, "{stem}: {:?}", report.end);
+    let timeouts = timeouts(report.log.entries());
+    let hold = scenario.node_settings.config().unproductive_peer_cooldown;
+    let first = timeouts.first().map(|(at, _)| *at).unwrap_or_default();
+    let held: BTreeSet<&String> = timeouts
+        .iter()
+        .filter(|(at, _)| *at < first + hold)
+        .map(|(_, peer)| peer)
+        .collect();
+    assert_eq!(held.len(), parties, "{stem}: {timeouts:?}");
+    assert!(timeouts.len() > parties, "{stem}: {timeouts:?}");
+    for row in rows {
+        let sizes = evidence.sizes(row);
+        assert!(
+            released_and_reused(&sizes, limit),
+            "{stem}: {row} released and reused an entry: {sizes:?}"
+        );
+    }
+}
+
+/// A held row whose sizes never reach the limit, never fall below it, or
+/// never rise again after falling fails the release-and-reuse read.
+#[test]
+fn the_held_row_read_needs_a_release_and_a_later_rise() {
+    assert!(released_and_reused(&[0, 8, 1, 0, 1, 0], 8));
+    assert!(!released_and_reused(&[0, 7, 6, 7], 8));
+    assert!(!released_and_reused(&[0, 8, 8], 8));
+    assert!(!released_and_reused(&[0, 8, 1, 0], 8));
 }
 
 /// A row read with no release, or whose waiting party got its unit before

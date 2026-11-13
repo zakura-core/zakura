@@ -109,6 +109,8 @@ tracing-subscriber = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "15.0.0", features = ["proptest-impl"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.1", features = ["test-support"] }
+# The pool model that the tx-relay reactor model drives.
+zakura-node-services = { path = "../zakura-node-services", version = "5.2.3", features = ["test-support"] }
 zakura-test = { path = "../zakura-test/", version = "4.0.0" }
 # The transport observer's unit tests read `Conn::shared_id`. No version, so
 # publishing strips it: crates.io's zakura-quic 0.4.0 has no `test-support`.

@@ -30,12 +30,31 @@ struct TestAcceptor {
     seen: Arc<Mutex<Vec<IncomingInfo>>>,
     banned: Arc<Mutex<HashSet<IpAddr>>>,
     handled: mpsc::UnboundedSender<Conn>,
+    /// Counts `cancel_admission` and unhanded `finish_admission` calls.
+    returned: Arc<Returned>,
+}
+
+/// The admissions an acceptor got back without a connection.
+#[derive(Default)]
+struct Returned {
+    cancelled: AtomicUsize,
+    finished: AtomicUsize,
 }
 
 impl Acceptor for TestAcceptor {
     fn admit(&self, incoming: &IncomingInfo) -> Admit {
         self.seen.lock().unwrap().push(*incoming);
         (self.decide)(incoming)
+    }
+
+    fn cancel_admission(&self, _: &IncomingInfo) {
+        self.returned.cancelled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn finish_admission(&self, handed_off: bool) {
+        if !handed_off {
+            self.returned.finished.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn alpns(&self) -> Vec<Vec<u8>> {
@@ -69,6 +88,7 @@ struct Server {
     #[cfg(target_os = "linux")]
     banned: Arc<Mutex<HashSet<IpAddr>>>,
     handled: mpsc::UnboundedReceiver<Conn>,
+    returned: Arc<Returned>,
 }
 
 impl Server {
@@ -128,6 +148,7 @@ fn serve_test_acceptor(
     let seen = Arc::new(Mutex::new(Vec::new()));
     let banned = Arc::new(Mutex::new(HashSet::new()));
     let (handled_tx, handled) = mpsc::unbounded_channel();
+    let returned = Arc::new(Returned::default());
     endpoint
         .serve(TestAcceptor {
             decide: Box::new(decide),
@@ -135,6 +156,7 @@ fn serve_test_acceptor(
             seen: seen.clone(),
             banned: banned.clone(),
             handled: handled_tx,
+            returned: returned.clone(),
         })
         .unwrap();
     Server {
@@ -143,6 +165,7 @@ fn serve_test_acceptor(
         #[cfg(target_os = "linux")]
         banned,
         handled,
+        returned,
     }
 }
 
@@ -515,6 +538,8 @@ async fn wrong_identity_is_refused() {
     .unwrap();
 }
 
+/// The server rejects the first packet, so the acceptor gets its admission
+/// back through `cancel_admission` alone: a spoofed source pays no charge.
 #[tokio::test]
 async fn alpn_mismatch_is_classified() {
     tokio::time::timeout(TEST_TIMEOUT, async {
@@ -524,6 +549,8 @@ async fn alpn_mismatch_is_classified() {
             client.connect(server.addr(), &[b"p2p-v2/2"]).await,
             Err(ConnectError::AlpnMismatch)
         ));
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 1);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
     })
     .await
     .unwrap();

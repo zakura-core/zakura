@@ -508,13 +508,9 @@ impl<F: SocketFactory> EndpointTask<F> {
                     self.send_response(&transmit, io);
                     return;
                 };
-                // ADM-7: count the handshake from Accept until it finishes.
-                let pending = self.shared.pending.enter(pending_group, acceptor.clone());
                 let probe = Arc::new(CongestionProbe::default());
                 let mut server = (*server).clone();
                 server.transport_config(self.shared.connection_transport(probe.clone(), io.gso()));
-                #[cfg(zakura_sim)]
-                self.shared.observe_handshake_attempt(remote);
                 match self.endpoint.accept(
                     incoming,
                     now(),
@@ -522,6 +518,10 @@ impl<F: SocketFactory> EndpointTask<F> {
                     Some(Arc::new(server)),
                 ) {
                     Ok((handle, conn)) => {
+                        // ADM-7: count the handshake from Accept until it finishes.
+                        let pending = self.shared.pending.enter(pending_group, acceptor.clone());
+                        #[cfg(zakura_sim)]
+                        self.shared.observe_handshake_attempt(remote);
                         metrics::counter!("zakura.quic.incoming.accepted").increment(1);
                         let connecting =
                             self.spawn_connection(handle, conn, probe, raw_remote, slot);
@@ -541,6 +541,9 @@ impl<F: SocketFactory> EndpointTask<F> {
                         );
                     }
                     Err(error) => {
+                        // The first packet failed before a handshake started,
+                        // so a spoofed source pays no application charge.
+                        acceptor.cancel_admission(&info);
                         #[cfg(zakura_sim)]
                         self.shared.pending.record(crate::HandshakeEvent::Finished {
                             remote: raw_remote,

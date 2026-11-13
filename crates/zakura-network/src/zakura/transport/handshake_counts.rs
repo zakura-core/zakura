@@ -85,7 +85,8 @@ impl HandshakeCounts {
         }
     }
 
-    /// Refunds a registered connection or an attempt QUIC never started.
+    /// Refunds a registered connection, an attempt QUIC never started, or an
+    /// attempt the node refused for its own capacity after TLS.
     pub fn refund_cadence(&mut self, ip: IpAddr, now: Instant) {
         if let Some(bucket) = self.cadence.get_mut(&admission_host(ip)) {
             bucket.refill(now);
@@ -179,7 +180,9 @@ impl HandshakeCounts {
 
     /// Counts transport owners that have not transferred into control handshakes.
     pub fn transport_pending(&self) -> usize {
-        self.inbound_reservations - self.inbound_pending
+        self.inbound_reservations
+            .checked_sub(self.inbound_pending)
+            .expect("each transferred attempt keeps its reservation until it releases both")
     }
 
     /// Reserves the shared pending budget before an inbound TLS attempt starts.

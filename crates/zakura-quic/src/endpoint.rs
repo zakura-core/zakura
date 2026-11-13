@@ -81,8 +81,9 @@ pub trait Acceptor: Send + Sync + 'static {
     /// crypto work and must not block (ADM-4).
     fn admit(&self, incoming: &IncomingInfo) -> Admit;
 
-    /// Returns any application admission charge when a transport limit or
-    /// stateless Retry prevents an accepted attempt from starting TLS.
+    /// Returns any application admission charge when a transport limit, a
+    /// stateless Retry or a rejected first packet prevents an accepted attempt
+    /// from starting TLS.
     /// Runs synchronously on the endpoint task, after `admit` returned `Accept`.
     fn cancel_admission(&self, _incoming: &IncomingInfo) {}
 

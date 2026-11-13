@@ -3219,6 +3219,20 @@ impl ZakuraProtocolHandler {
         self
     }
 
+    /// Returns an inbound attempt's cadence token. `action` names the reason in
+    /// the sim's cadence observation.
+    fn refund_cadence(&self, remote: SocketAddr, action: &'static str) {
+        let mut counts = self.supervisor.ip_slots.counts();
+        counts.refund_cadence(remote.ip(), Instant::now());
+        #[cfg(any(test, zakura_sim))]
+        let hosts = counts.cadence_hosts();
+        drop(counts);
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handshake_cadence(remote, action, false, hosts);
+        #[cfg(not(any(test, zakura_sim)))]
+        let _ = action;
+    }
+
     /// Reports a handshake cadence decision for `remote`. The caller reads
     /// `hosts` under the `ip_slots` guard it already holds, so a tap adds no
     /// lock and no scheduling point.
@@ -4817,13 +4831,7 @@ impl ZakuraProtocolHandler {
         if matches!(registration, ZakuraRegistration::Registered { .. })
             && context.direction == ServicePeerDirection::Inbound
         {
-            let mut counts = self.supervisor.ip_slots.counts();
-            counts.refund_cadence(connection.admitted_ip(), Instant::now());
-            #[cfg(any(test, zakura_sim))]
-            let hosts = counts.cadence_hosts();
-            drop(counts);
-            #[cfg(any(test, zakura_sim))]
-            self.observe_handshake_cadence(connection.admitted_addr(), "registered", false, hosts);
+            self.refund_cadence(connection.admitted_addr(), "registered");
         }
         if let ZakuraRegistration::Registered {
             conn_id,
@@ -5073,13 +5081,7 @@ impl Acceptor for ZakuraProtocolHandler {
 
     fn cancel_admission(&self, incoming: &IncomingInfo) {
         self.finish_admission(false);
-        let mut counts = self.supervisor.ip_slots.counts();
-        counts.refund_cadence(incoming.remote.ip(), Instant::now());
-        #[cfg(any(test, zakura_sim))]
-        let hosts = counts.cadence_hosts();
-        drop(counts);
-        #[cfg(any(test, zakura_sim))]
-        self.observe_handshake_cadence(incoming.remote, "cancelled", false, hosts);
+        self.refund_cadence(incoming.remote, "cancelled");
     }
 
     fn finish_admission(&self, handed_off: bool) {
@@ -5103,6 +5105,8 @@ impl Acceptor for ZakuraProtocolHandler {
         let claim = handler.claim_inbound(&connection, true);
         if claim.is_err() {
             handler.finish_admission(false);
+            // Dials took the room during TLS, so the refusal is local.
+            handler.refund_cadence(connection.admitted_addr(), "refused");
         }
         Box::pin(async move { handler.serve_inbound(connection, claim).await })
     }
@@ -14991,6 +14995,87 @@ mod tests {
         assert_eq!(handler.pending_handshakes.available_permits(), 4);
         assert_eq!(handler.admission.available_permits(), 4);
         drop(full);
+        Ok(())
+    }
+
+    /// Dials can take the room an inbound attempt saw at admission while its
+    /// TLS runs. The node then refuses the attempt itself, so the attempt's
+    /// cadence token returns to its address.
+    #[tokio::test]
+    async fn a_local_refusal_after_tls_returns_the_cadence_token() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+        limits.max_connections = 4;
+        limits.max_pending_handshakes = 4;
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(1),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        );
+        let server = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(0x1367_0003)
+            .await?;
+        let (connection_tx, mut connection_rx) = mpsc::channel(1);
+        let (stream_tx, _stream_rx) = mpsc::channel(1);
+        server.serve(CaptureConnection {
+            alpn: P2P_V2_ALPN,
+            connection_tx,
+            stream_tx,
+        })?;
+        let client = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(0x1367_0004)
+            .await?;
+        let _client_connection = client
+            .connect(
+                LocalEndpointFactory::node_addr(&server).await,
+                &[P2P_V2_ALPN],
+            )
+            .await?;
+        let inbound = timeout(Duration::from_secs(10), connection_rx.recv())
+            .await?
+            .expect("the capture acceptor sends the accepted connection");
+        let ip = inbound.admitted_ip();
+        let max_hosts = limits
+            .max_connections
+            .saturating_add(limits.max_pending_handshakes);
+        let charge = |handler: &ZakuraProtocolHandler| {
+            handler.supervisor.ip_slots.counts().admit_cadence(
+                ip,
+                handler.supervisor.max_connections_per_ip,
+                max_hosts,
+                Instant::now(),
+            )
+        };
+
+        // `admit` reserved the transport and took the address's one token.
+        assert!(handler
+            .supervisor
+            .ip_slots
+            .counts()
+            .claim_transport(limits.max_pending_handshakes));
+        assert_eq!(
+            charge(&handler),
+            crate::zakura::HandshakeCadenceAdmission::Admit
+        );
+        // Dials then took the inbound share.
+        assert_eq!(limits.max_inbound_connections(), 3);
+        let dials = handler
+            .inbound_admission
+            .clone()
+            .try_acquire_many_owned(3)
+            .expect("the test holds free permits");
+
+        timeout(Duration::from_secs(10), handler.handle(inbound)).await?;
+        assert_eq!(
+            charge(&handler),
+            crate::zakura::HandshakeCadenceAdmission::Admit
+        );
+        assert_eq!(
+            charge(&handler),
+            crate::zakura::HandshakeCadenceAdmission::Exhausted
+        );
+        drop(dials);
         Ok(())
     }
 

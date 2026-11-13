@@ -734,7 +734,8 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                 *tokens = tokens.saturating_sub(1);
             }
             "admitted" if !rate => *tokens = tokens.saturating_sub(1),
-            "registered" => *tokens = tokens.saturating_add(1).min(cap),
+            // Registration and a local refusal after TLS refund the attempt.
+            "registered" | "refused" => *tokens = tokens.saturating_add(1).min(cap),
             "cancelled" if !rate => *tokens = tokens.saturating_add(1).min(cap),
             "exhausted" if !rate && *tokens != 0 => {
                 return cx.violated(

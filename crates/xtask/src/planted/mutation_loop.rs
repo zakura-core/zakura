@@ -50,6 +50,8 @@
 //! `--changed-since <rev>` keeps only the cases a change since `rev` can
 //! affect, by `cargo xtask planted`'s rule: the patch, the case file, the
 //! witness's files, the files the patch changes, and the shared machinery.
+//! With generator lanes on, a change to the work list, or to the inputs
+//! their searches read, affects every case ([`generate::watched`]).
 //!
 //! `--list` prints the cases the other flags select, as JSON, by the fields
 //! that tell a case apart in a report ([`ListedCase`]), and runs nothing.
@@ -471,6 +473,7 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         cases,
         &flags.only,
         flags.changed_since.as_deref(),
+        &flags.generate,
     )?;
     if flags.list {
         let listed: Vec<ListedCase> = cases.iter().flatten().map(ListedCase::from).collect();
@@ -674,13 +677,15 @@ fn relative_label(repo_root: &Path, path: &Path) -> String {
 }
 
 /// The cases `only` names by property, or all of them, then those a change
-/// since `changed_since` affects. `None` if the change affects none. Fails
-/// on zero cases before the change filter.
+/// since `changed_since` affects, with the generator lanes `generate`
+/// turns on. `None` if the change affects none. Fails on zero cases before
+/// the change filter.
 fn select(
     repo_root: &Path,
     cases: Vec<LoopCase>,
     only: &[String],
     changed_since: Option<&str>,
+    generate: &GenerateFlags,
 ) -> Result<Option<Vec<LoopCase>>, BoxError> {
     if let Some(unknown) = only
         .iter()
@@ -701,7 +706,9 @@ fn select(
     let changed = changed_since_rev(repo_root, rev)?;
     let mut affected = Vec::new();
     for case in cases {
-        if is_affected(&watched(repo_root, &case)?, &changed) {
+        let mut watched = watched(repo_root, &case)?;
+        watched.extend(generate::watched(generate));
+        if is_affected(&watched, &changed) {
             affected.push(case);
         }
     }

@@ -117,6 +117,28 @@ pub(super) const EXCLUDED_DIRS: &[&str] = &[
     "crates/zakura-sim/tests/fixtures",
 ];
 
+/// The fuzz package a `libfuzzer` lane builds its targets from, relative to
+/// the repository root.
+const FUZZ_DIR: &str = "qa/fuzz/sim";
+
+/// Every path, relative to the repository root, whose change can change
+/// any case's generator lanes under `flags`, beside the case's own paths:
+/// the work list, whose `[[no-generator]]` records decide which cases get
+/// a lane, then [`EXCLUDED_DIRS`], whose inputs an `inproc` search skips,
+/// or [`FUZZ_DIR`], whose targets a `libfuzzer` lane builds. None with the
+/// lanes off.
+pub(super) fn watched(flags: &GenerateFlags) -> Vec<PathBuf> {
+    if !flags.on() {
+        return Vec::new();
+    }
+    let mut paths = vec![PathBuf::from(WORK_LIST)];
+    match flags.mode {
+        GenerateMode::Inproc => paths.extend(EXCLUDED_DIRS.iter().map(PathBuf::from)),
+        GenerateMode::Libfuzzer => paths.push(PathBuf::from(FUZZ_DIR)),
+    }
+    paths
+}
+
 /// The file every `inproc` search reads its exclusions from, under
 /// `--out`.
 const EXCLUDE_FILE: &str = "generate/exclude.txt";

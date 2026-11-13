@@ -1054,6 +1054,48 @@ fn a_case_watches_its_work_list_entrys_paths() {
     ));
 }
 
+/// With generator lanes on, every case watches the inputs the lanes read:
+/// the work list, whose `[[no-generator]]` records apply to a planted case
+/// that names no entry, then the excluded inputs for an `inproc` search or
+/// the fuzz targets for a `libfuzzer` lane. With the lanes off, a planted
+/// case watches none of them.
+#[test]
+fn generator_lanes_watch_their_inputs() {
+    let repo_root = crate::repo_root().expect("xtask lives in the workspace");
+    let cases = planted_cases(&repo_root, &["session/connection-shares-bound".to_owned()])
+        .expect("the committed planted cases parse");
+    let case = cases
+        .first()
+        .expect("connection-shares-bound has planted cases");
+    assert_eq!(case.entry, None);
+    let own = super::watched(&repo_root, case).expect("the case's files read");
+    let watches = |flags: &GenerateFlags, path: &str| {
+        let mut watched = own.clone();
+        watched.extend(super::generate::watched(flags));
+        crate::planted::is_affected(&watched, &[path.into()])
+    };
+    let inproc = GenerateFlags {
+        runs: 10,
+        ..GenerateFlags::default()
+    };
+    let libfuzzer = GenerateFlags {
+        mode: GenerateMode::Libfuzzer,
+        ..inproc.clone()
+    };
+    let work_list = "qa/native-mutations/work-list.toml";
+    let excluded = "qa/planted/discovery/s4v2/hello/sender-cadence/repeat-hello.plan.bin";
+    let target = "qa/fuzz/sim/fuzz_targets/block_sync_storage.rs";
+    for path in [work_list, excluded, target] {
+        assert!(!watches(&GenerateFlags::default(), path), "off: {path}");
+    }
+    assert!(watches(&inproc, work_list));
+    assert!(watches(&inproc, excluded));
+    assert!(!watches(&inproc, target));
+    assert!(watches(&libfuzzer, work_list));
+    assert!(!watches(&libfuzzer, excluded));
+    assert!(watches(&libfuzzer, target));
+}
+
 // The generator lane (mut-4.3 and mut-4.4).
 
 /// A search's report that stopped at `stop`, with `NAMED`'s outcome

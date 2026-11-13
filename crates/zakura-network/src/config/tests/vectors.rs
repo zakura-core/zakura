@@ -1865,6 +1865,41 @@ fn unconditional_peers_parse_ports_and_roundtrip() {
     assert!(!config.unconditional_peers.contains(ip("192.0.2.2")));
 }
 
+/// An entry that this node cannot dial stays exempt, but is no longer a dial address,
+/// is not dialed and adds no slots. The config still serializes as written.
+#[test]
+fn unconditional_peers_leave_out_undialable_entries() {
+    let config: Config =
+        toml::from_str("unconditional_peers = ['192.0.2.1', '192.0.2.2:9000', '192.0.2.4/30']")
+            .expect("unconditional peers parse");
+    let undialable: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+    let dialed: std::net::IpAddr = "192.0.2.2".parse().unwrap();
+
+    let peers = config
+        .unconditional_peers
+        .leave_out_undialable(8233, |addr| addr.ip() != undialable);
+
+    assert!(peers.contains(undialable), "the entry stays exempt");
+    assert!(!peers.is_dial_address(undialable));
+    assert!(peers.is_dial_address(dialed));
+    assert_eq!(
+        peers.dial_addrs(8233),
+        vec!["192.0.2.2:9000".parse::<PeerSocketAddr>().unwrap()],
+    );
+    assert_eq!(peers.dial_limit(), 1);
+
+    let serialized = toml::to_string(&Config {
+        unconditional_peers: peers,
+        ..config
+    })
+    .expect("config serializes");
+    assert!(
+        serialized
+            .contains(r#"unconditional_peers = ["192.0.2.1", "192.0.2.2:9000", "192.0.2.4/30"]"#),
+        "the config serializes as written:\n{serialized}"
+    );
+}
+
 /// Every entry that names one address is dialed, on the default port unless it gives
 /// one. Ranges are never dialed.
 #[test]

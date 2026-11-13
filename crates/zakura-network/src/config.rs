@@ -398,7 +398,8 @@ pub struct Config {
     /// holds at most `max_connections_per_ip` of the pool's slots. A connection in the
     /// pool also skips the wait that Zakura imposes between inbound connections from one
     /// IP, so a listed peer can reconnect at once. A peer that is only in a range of
-    /// several addresses gets none of this.
+    /// several addresses gets none of this, and nor does an entry that Zakura cannot
+    /// dial, such as its own listener.
     /// Zakura still applies the per-IP connection limit to these peers, and still
     /// disconnects them on protocol errors or inbound overload.
     ///

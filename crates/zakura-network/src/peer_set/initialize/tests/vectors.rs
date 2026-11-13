@@ -45,7 +45,8 @@ use crate::{
     peer_set::{
         initialize::{
             accept_inbound_connections, add_initial_peers, batch_misbehavior_reports,
-            crawl_and_dial, keep_unconditional_peers_connected, open_listener,
+            crawl_and_dial, keep_unconditional_peers_connected,
+            leave_out_undialable_unconditional_peers, open_listener,
             outbound_peer_replenishment_demand, unconditional_peer_dial_addrs, DiscoveredPeer,
             ReplenishmentBudget, MISBEHAVIOR_BATCH_INTERVAL,
             OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR,
@@ -863,6 +864,64 @@ fn unconditional_peer_dial_addrs_skip_own_listener_and_invalid_addresses() {
         unconditional_peer_dial_addrs(&config, "0.0.0.0:18233".parse().unwrap())[0],
         peer_addr("127.0.0.1:8233"),
         "a loopback peer on another port is not this node",
+    );
+}
+
+/// An unconditional peer that this node cannot dial keeps no room. Here a shared list
+/// names the node's own external address: the startup dials and the crawler still reach
+/// another node on that IP, and the entry adds no slots. It stays exempt from bans.
+#[tokio::test]
+async fn undialable_unconditional_peers_keep_no_room() {
+    let _init_guard = zakura_test::init();
+
+    let listen_addr: SocketAddr = "0.0.0.0:8233".parse().unwrap();
+    let other_node = peer_addr("192.0.2.9:9000");
+    let mut config = Config {
+        cache_dir: CacheDir::disabled(),
+        listen_addr,
+        external_addr: Some("192.0.2.9:8233".parse().unwrap()),
+        initial_mainnet_peers: ["192.0.2.9:9000".to_string()].into_iter().collect(),
+        unconditional_peers: toml::from_str::<Config>("unconditional_peers = ['192.0.2.9']")
+            .unwrap()
+            .unconditional_peers,
+        ..test_defaults()
+    };
+    leave_out_undialable_unconditional_peers(&mut config, listen_addr);
+
+    assert!(config.unconditional_peers.contains(other_node.ip()));
+    assert!(!config.unconditional_peers.is_dial_address(other_node.ip()));
+    assert_eq!(config.unconditional_peer_connection_limit(), 0);
+
+    let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
+    let selected = tokio::time::timeout(
+        PEER_CACHE_TEST_TIMEOUT,
+        super::super::limit_initial_peers(&config, book_tx),
+    )
+    .await
+    .expect("startup peer selection finishes within the test deadline");
+    assert!(
+        selected.contains(&other_node),
+        "the startup dials reach the other node"
+    );
+
+    let address_book = AddressBook::new_with_addrs(
+        listen_addr,
+        &config.network,
+        config.max_connections_per_ip,
+        constants::MAX_ADDRS_IN_ADDRESS_BOOK,
+        tracing::Span::none(),
+        vec![MetaAddr::new_gossiped_meta_addr(
+            other_node,
+            PeerServices::NODE_NETWORK,
+            DateTime32::MIN,
+        )],
+    )
+    .with_unconditional_peers(config.unconditional_peers.clone());
+    assert!(
+        address_book
+            .reconnection_peers(Instant::now(), chrono::Utc::now())
+            .any(|peer| peer.addr == other_node),
+        "the crawler can reach the other node",
     );
 }
 

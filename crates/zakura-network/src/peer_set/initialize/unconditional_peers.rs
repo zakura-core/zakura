@@ -59,41 +59,60 @@ enum AttemptEvent {
 
 /// Returns the addresses that Zakura dials to stay connected to its unconditional peers.
 ///
-/// Leaves out this node's own listener, and addresses that are invalid for outbound
-/// connections on the configured network.
+/// Leaves out the addresses that [`is_dialable`] rejects.
 pub(super) fn unconditional_peer_dial_addrs(
     config: &Config,
     listen_addr: SocketAddr,
 ) -> Vec<PeerSocketAddr> {
-    let mut dial_addrs = config
+    config
         .unconditional_peers
-        .dial_addrs(config.network.default_port());
+        .dial_addrs(config.network.default_port())
+        .into_iter()
+        .filter(|&addr| is_dialable(addr, config, listen_addr))
+        .collect()
+}
 
-    dial_addrs.retain(|&addr| {
-        let addr_label = addr.addr_label(config.expose_peer_addresses);
+/// Leaves the unconditional peers that [`is_dialable`] rejects, such as this node's own
+/// listener, out of dialing, see [`UnconditionalPeers::leave_out_undialable`].
+///
+/// Zakura does this once its listener is bound, before anything uses the list, so the
+/// startup dials, the crawler and the inbound listener keep no room for these peers.
+///
+/// [`UnconditionalPeers::leave_out_undialable`]: crate::UnconditionalPeers::leave_out_undialable
+pub(super) fn leave_out_undialable_unconditional_peers(
+    config: &mut Config,
+    listen_addr: SocketAddr,
+) {
+    config.unconditional_peers = config
+        .unconditional_peers
+        .leave_out_undialable(config.network.default_port(), |addr| {
+            is_dialable(addr, config, listen_addr)
+        });
+}
 
-        if is_own_listener(addr, listen_addr, config.external_addr) {
-            debug!(
-                peer = %addr_label,
-                "not dialing an unconditional peer address that is this node's own listener"
-            );
-            return false;
-        }
+/// Returns whether Zakura can dial `addr`: it is not this node's own listener, and it is
+/// valid for outbound connections on the configured network.
+fn is_dialable(addr: PeerSocketAddr, config: &Config, listen_addr: SocketAddr) -> bool {
+    let addr_label = addr.addr_label(config.expose_peer_addresses);
 
-        if let Err(error) = address_is_valid_for_outbound_connections(addr, config.network.clone())
-        {
-            warn!(
-                peer = %addr_label,
-                ?error,
-                "not dialing an unconditional peer address that is invalid for outbound connections"
-            );
-            return false;
-        }
+    if is_own_listener(addr, listen_addr, config.external_addr) {
+        debug!(
+            peer = %addr_label,
+            "not dialing an unconditional peer address that is this node's own listener"
+        );
+        return false;
+    }
 
-        true
-    });
+    if let Err(error) = address_is_valid_for_outbound_connections(addr, config.network.clone()) {
+        warn!(
+            peer = %addr_label,
+            ?error,
+            "not dialing an unconditional peer address that is invalid for outbound connections"
+        );
+        return false;
+    }
 
-    dial_addrs
+    true
 }
 
 /// Returns whether `addr` is a listener address of this node that can be recognized

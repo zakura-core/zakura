@@ -63,7 +63,10 @@ mod tests;
 mod recent_by_ip;
 mod unconditional_peers;
 
-use unconditional_peers::{keep_unconditional_peers_connected, unconditional_peer_dial_addrs};
+use unconditional_peers::{
+    keep_unconditional_peers_connected, leave_out_undialable_unconditional_peers,
+    unconditional_peer_dial_addrs,
+};
 
 /// A successful outbound peer connection attempt or inbound connection handshake.
 ///
@@ -255,6 +258,8 @@ where
         info!("legacy P2P disabled; not opening Zcash protocol listener");
         (None, config.listen_addr)
     };
+    let mut config = config;
+    leave_out_undialable_unconditional_peers(&mut config, listen_addr);
     // Clone the inbound service for the Zakura legacy-gossip sink before the
     // handshake builder consumes the original below. The factory only runs when
     // `v2_p2p` is enabled; otherwise the endpoint is `None` and the clone drops.

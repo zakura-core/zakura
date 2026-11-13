@@ -3497,14 +3497,13 @@ pub(super) fn push_unique_service(services: &mut Vec<ZakuraServiceId>, service: 
     }
 }
 
+/// Returns the node IDs of the connected peers, skipping peer ids that aren't
+/// node IDs.
+///
+/// Runs on every discovery message, so it relies on the peer ids of
+/// authenticated connections carrying their already checked node IDs.
 fn connected_peer_node_ids(connected: &[ZakuraPeerId]) -> Vec<NodeId> {
-    connected
-        .iter()
-        .filter_map(|peer_id| {
-            let bytes: [u8; NODE_ID_BYTES] = peer_id.as_bytes().try_into().ok()?;
-            NodeId::from_bytes(&bytes).ok()
-        })
-        .collect()
+    connected.iter().filter_map(ZakuraPeerId::node_id).collect()
 }
 
 /// Returns how many discovery dials may start.
@@ -5739,6 +5738,47 @@ mod tests {
         })
         .encode()
         .expect("the local exclusion list encodes");
+    }
+
+    /// Only connected peers whose ids are valid node IDs join the exclusion
+    /// list, whether the id kept its node ID from the connection or is plain
+    /// bytes. Ids that aren't curve points and short legacy ids are skipped.
+    #[tokio::test]
+    async fn peer_sample_exclusions_skip_connected_ids_that_are_not_node_ids() {
+        let from_connection = secret_key().public();
+        let from_bytes = secret_key().public();
+        let not_a_point = (0..=u8::MAX)
+            .map(|byte| [byte; 32])
+            .find(|bytes| NodeId::from_bytes(bytes).is_err())
+            .expect("some repeated byte is not a curve point");
+        let connected = vec![
+            ZakuraPeerId::from_node_id(from_connection),
+            peer_id_for(from_bytes),
+            ZakuraPeerId::new(not_a_point.to_vec()).expect("32 bytes is a valid peer id"),
+            ZakuraPeerId::new(vec![1, 2, 3]).expect("a short legacy id is a valid peer id"),
+        ];
+        let local = secret_key();
+        let local_node_id = local.public();
+        let (_connected_tx, connected_rx) = watch::channel(connected);
+        let handle = discovery_handle_at(
+            local_config_with(
+                local,
+                vec![test_addr(200)],
+                vec![ZakuraServiceId::discovery()],
+            ),
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+            NOW,
+        );
+
+        // The local node always excludes itself as well.
+        let mut expected = vec![
+            *local_node_id.as_bytes(),
+            *from_connection.as_bytes(),
+            *from_bytes.as_bytes(),
+        ];
+        expected.sort_unstable();
+        assert_eq!(handle.peer_sample_exclusions().await, expected);
     }
 
     #[test]

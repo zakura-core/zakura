@@ -26,13 +26,13 @@ use zakura_sim::{
     harness::{
         discovery_service::{
             act_scenario, asking_scenario, wire_properties, DiscoveryWire, NodeHandle, SavedPlan,
-            WireScenario, FAMILY, SCRIPTED,
+            WireScenario, ASKED, CONFORMANT_ACTS, FAMILY, HOSTILE_ACTS, SCRIPTED,
         },
         run_prepared, HarnessError, Subsystem,
     },
     model::{is_fault_cause, Label},
     observe::{StreamId, TransportFact},
-    peer::discovery::{relayed_node, DiscoveryAct, DiscoveryRow, DiscoveryRule, Request},
+    peer::discovery::{relayed_node, DiscoveryAct, DiscoveryRow, Request},
     table::{GeneratedId, Template},
     witness::{judge_report, Expect},
     MemorySink, Observation, Plan, PropertyOutcome, RunReport,
@@ -50,97 +50,11 @@ fn id(suffix: &str) -> String {
 }
 
 /// One act per `<label>-closes` ID discovery can reach, and the two
-/// cadence runs. [`reached`] names each one's ID.
-const ACTS: [DiscoveryAct; 29] = [
-    DiscoveryAct::UndeclaredType { message_type: 0 },
-    DiscoveryAct::ReservedFlags {
-        row: DiscoveryRow::Hello,
-        bit: 0,
-    },
-    DiscoveryAct::ShortPayload {
-        row: DiscoveryRow::Hello,
-    },
-    DiscoveryAct::LongPayload {
-        row: DiscoveryRow::Hello,
-    },
-    DiscoveryAct::BadContent {
-        rule: DiscoveryRule::HelloSignature,
-    },
-    DiscoveryAct::HelloBurst,
-    DiscoveryAct::ReservedFlags {
-        row: DiscoveryRow::GetPeers,
-        bit: 0,
-    },
-    DiscoveryAct::ShortPayload {
-        row: DiscoveryRow::GetPeers,
-    },
-    DiscoveryAct::LongPayload {
-        row: DiscoveryRow::GetPeers,
-    },
-    DiscoveryAct::OverMargin {
-        row: DiscoveryRow::GetPeers,
-    },
-    DiscoveryAct::BadContent {
-        rule: DiscoveryRule::GetPeersLimit,
-    },
-    DiscoveryAct::RequestRun {
-        row: DiscoveryRow::GetPeers,
-    },
-    DiscoveryAct::ReservedFlags {
-        row: DiscoveryRow::Peers,
-        bit: 0,
-    },
-    DiscoveryAct::ShortPayload {
-        row: DiscoveryRow::Peers,
-    },
-    DiscoveryAct::LongPayload {
-        row: DiscoveryRow::Peers,
-    },
-    DiscoveryAct::Unsolicited {
-        row: DiscoveryRow::Peers,
-    },
-    DiscoveryAct::OverOwed {
-        row: DiscoveryRow::Peers,
-    },
-    DiscoveryAct::BadContent {
-        rule: DiscoveryRule::PeersSignature,
-    },
-    DiscoveryAct::ReservedFlags {
-        row: DiscoveryRow::GetServices,
-        bit: 0,
-    },
-    DiscoveryAct::ShortPayload {
-        row: DiscoveryRow::GetServices,
-    },
-    DiscoveryAct::LongPayload {
-        row: DiscoveryRow::GetServices,
-    },
-    DiscoveryAct::OverMargin {
-        row: DiscoveryRow::GetServices,
-    },
-    DiscoveryAct::BadContent {
-        rule: DiscoveryRule::GetServicesWanted,
-    },
-    DiscoveryAct::RequestRun {
-        row: DiscoveryRow::GetServices,
-    },
-    DiscoveryAct::ReservedFlags {
-        row: DiscoveryRow::Services,
-        bit: 0,
-    },
-    DiscoveryAct::ShortPayload {
-        row: DiscoveryRow::Services,
-    },
-    DiscoveryAct::LongPayload {
-        row: DiscoveryRow::Services,
-    },
-    DiscoveryAct::Unsolicited {
-        row: DiscoveryRow::Services,
-    },
-    DiscoveryAct::BadContent {
-        rule: DiscoveryRule::ServicesNodeId,
-    },
-];
+/// cadence runs: [`HOSTILE_ACTS`], which `discovery/wire` draws.
+/// [`reached`] names each one's ID.
+fn acts() -> [DiscoveryAct; HOSTILE_ACTS.len()] {
+    HOSTILE_ACTS.map(|(_, act)| act)
+}
 
 /// The IDs the honest exchange reaches: the receiver partner and the
 /// sender IDs of the node's own `Hello` and requests. The honest peer asks
@@ -292,10 +206,10 @@ const OVER_OWED: DiscoveryAct = DiscoveryAct::OverOwed {
 /// 32.
 const LIMIT: usize = 1;
 
-/// Runs the witness of each act in [`ACTS`] whose ID names `row`, and
+/// Runs the witness of each act in [`acts`] whose ID names `row`, and
 /// requires its ID to apply and hold there ([`witnessed`]).
 fn apply_on_row(row: DiscoveryRow) {
-    let acts: Vec<DiscoveryAct> = ACTS
+    let acts: Vec<DiscoveryAct> = acts()
         .into_iter()
         .filter(|act| reached(*act).split('/').nth(2) == Some(row.name()))
         .collect();
@@ -394,10 +308,10 @@ fn fault_closes(report: &RunReport) -> Vec<String> {
 /// honest peer.
 #[test]
 fn every_discovery_property_applies_in_its_witness() {
-    let listed: Vec<String> = ACTS
+    let listed: Vec<String> = acts()
         .into_iter()
         .map(reached)
-        .chain(ACTS.into_iter().flat_map(also))
+        .chain(acts().into_iter().flat_map(also))
         .chain(HONEST.iter().chain(&UNREACHED).map(|suffix| id(suffix)))
         .chain(OWED.iter().map(|(suffix, ..)| id(suffix)))
         .collect();
@@ -409,6 +323,48 @@ fn every_discovery_property_applies_in_its_witness() {
     witnessed(&report, "honest", &honest);
     assert_eq!(fault_closes(&report), Vec::<String>::new());
 }
+
+/// `discovery/wire` draws each act witness, each asking witness of
+/// [`OWED`], and each conformant control, from its family's tag, so the
+/// generator reaches stream 4's refusal, `sender-within-owed` and
+/// `conformant-never-closes` IDs (mutation plan, mut-6). Each family's name
+/// is its own. The drawn `expired-hello` is the scenario of
+/// `conformant-never-closes`' planted case.
+#[test]
+fn each_hostile_family_draws_its_witness() {
+    let families = DiscoveryWire::families();
+    let drawn = |name: &str| {
+        let family = families
+            .iter()
+            .find(|family| family.name == name)
+            .unwrap_or_else(|| panic!("{name} isn't a family"));
+        DiscoveryWire::draw(&family.tag)
+    };
+    for (name, act) in HOSTILE_ACTS {
+        assert_eq!(drawn(name), act_scenario(act), "{name}");
+    }
+    assert_eq!(ASKED, OWED.map(|(_, request)| request));
+    for request in ASKED {
+        assert_eq!(
+            drawn(request.name()),
+            asking_scenario(request),
+            "{request:?}"
+        );
+    }
+    for (name, act) in CONFORMANT_ACTS {
+        assert_eq!(act.label(), Label::Conformant, "{name}");
+        assert_eq!(drawn(name), act_scenario(act), "{name}");
+    }
+    let planted: WireScenario = serde_json::from_str(EXPIRED_HELLO_SCENARIO).unwrap();
+    assert_eq!(drawn("expired-hello"), planted);
+    let names: BTreeSet<&str> = families.iter().map(|family| family.name).collect();
+    assert_eq!(names.len(), families.len(), "{families:?}");
+}
+
+/// The committed scenario of `conformant-never-closes`' planted case.
+const EXPIRED_HELLO_SCENARIO: &str = include_str!(
+    "../../../qa/planted/discovery/s4v2/conformant-never-closes/close-on-expired-hello.scenario.json"
+);
 
 /// The node's answers carry only what their requests asked for:
 /// `sender-within-owed` applies and holds on a `Peers` that answers a
@@ -436,8 +392,8 @@ fn answers_within_their_requests_hold_sender_within_owed() {
 #[test]
 fn hello_acts_apply_in_their_witnesses() {
     witnessed(
-        &run(&act_scenario(ACTS[0])),
-        ACTS[0],
+        &run(&act_scenario(acts()[0])),
+        acts()[0],
         &[id("undeclared-type-closes")],
     );
     apply_on_row(DiscoveryRow::Hello);

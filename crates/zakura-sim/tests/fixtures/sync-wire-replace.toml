@@ -3,7 +3,7 @@
 # first two bytes pick the saved `replace` scenario, and
 # `sync-wire-replace.end.json` is its pinned end record.
 harness = "sync/wire"
-generator = 4
+generator = 5
 sha256 = "d38768d21fc6210c8c4b6c038171334f9a8e8b5de0df626e18b0dcc9e3596bea"
 scenario_sha256 = "8eb3163fd31c47760705c5ff95a5262855af108841be18a332be3d799f23bf9e"
 source = "crates/zakura-sim/tests/sync_wire.rs"

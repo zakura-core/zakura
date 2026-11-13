@@ -243,6 +243,91 @@ fn a_replaced_connection_reopens_every_service_under_fresh_ids() {
     }
 }
 
+/// For each routine that ended after block sync admitted a newer generation
+/// for its peer, the claims its peer's newest routine reported last before
+/// that end.
+fn replacement_claims_at_superseded_end(log: &ObservationLog) -> Vec<usize> {
+    let mut newest: BTreeMap<String, u64> = BTreeMap::new();
+    let mut claims: BTreeMap<(String, u64), usize> = BTreeMap::new();
+    let mut met = Vec::new();
+    for entry in log.entries() {
+        match &entry.obs {
+            Observation::BlockSync {
+                event:
+                    BlockSyncFact::SessionAdmitted {
+                        peer, generation, ..
+                    },
+                ..
+            } => {
+                newest.insert(peer.clone(), *generation);
+            }
+            Observation::BlockSync {
+                event:
+                    BlockSyncFact::Routine {
+                        peer,
+                        generation,
+                        claims: published,
+                        ended,
+                        ..
+                    },
+                ..
+            } => {
+                let replacement = newest
+                    .get(peer)
+                    .copied()
+                    .filter(|newest| newest > generation);
+                if let (true, Some(replacement)) = (*ended, replacement) {
+                    met.push(
+                        claims
+                            .get(&(peer.clone(), replacement))
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                }
+                claims.insert((peer.clone(), *generation), published.len());
+            }
+            _ => {}
+        }
+    }
+    met
+}
+
+/// The node's connection to its one mirror closes once it has asked
+/// storage to admit four bodies, and the node redials. The mirror's chain
+/// grows after the redial, so the replacement's routine requests the new
+/// bodies. The scenario holds the closed connection's block-sync routine
+/// until the replacement's routine reports a claim, so the superseded
+/// routine's drop meets an entry with claims. The gates refuse its writes,
+/// and the registry's fingerprints of the entry show no change. Both of the
+/// node's tips still reach the mirror's tip.
+#[test]
+fn a_superseded_routine_drops_beside_its_replacements_claims() {
+    let committed = Plan::from_fuzz(&[]);
+    for input in std::iter::once(committed).chain(inputs(2, 256)) {
+        let (report, _, ports) = run(SavedWire::ReplaceClaims, input);
+        let tip = ports.mirror_tip();
+        assert_eq!(ports.tips(), (tip, tip), "{:?}", report.end);
+        let met = replacement_claims_at_superseded_end(&report.log);
+        assert!(
+            met.len() == 1 && met[0] > 0,
+            "exactly one routine ended after its replacement's admission, beside \
+             the replacement's claims: {met:?}"
+        );
+        assert!(
+            !refused_stale_writes(&report.log).is_empty(),
+            "the superseded routine's gated writes met its replacement's entry"
+        );
+        assert!(
+            matches!(
+                outcome(&report, REPLACEMENT_PRESERVES_AUTHORIZATION),
+                PropertyOutcome::Held { applicable } if *applicable > 0
+            ),
+            "{:?}",
+            outcome(&report, REPLACEMENT_PRESERVES_AUTHORIZATION)
+        );
+    }
+}
+
 /// Round 8's tail: a budget that ends while `mirror-1`'s dialer sleeps out
 /// its redial settle leaves the redial to the drain. The drain's clock
 /// reaches that timer within the harness timer cap, though nothing is open,

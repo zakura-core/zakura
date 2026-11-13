@@ -1,0 +1,13 @@
+# The committed fuzz input `sync-wire-replace-claims.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `replace-claims` scenario, and
+# `sync-wire-replace-claims.end.json` is its pinned end record.
+harness = "sync/wire"
+generator = 5
+sha256 = "b662618d8c5c1c83c1196213a032799d7a0c4797bd6a76c11f5b9c517249e2d9"
+scenario_sha256 = "5c2f2156e233c79d51e1e603fa73fa05882b4654865ed2d52c3340fd7714f2c7"
+source = "crates/zakura-sim/tests/sync_wire.rs"
+
+[[witness]]
+property = "session/replacement-preserves-authorization"
+expect = "holds"

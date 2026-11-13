@@ -45,13 +45,18 @@ impl GateProbe {
         }
     }
 
-    /// The bytes granted now, 0 once the gate is gone.
-    fn granted(&self) -> u64 {
+    /// The bytes granted now and the free bytes above the capacity, both 0
+    /// once the gate is gone.
+    fn read(&self) -> (u64, u64) {
         // While a read runs no task does, so a handle upgraded here is never
         // the last one, and dropping it releases nothing.
-        self.bytes.upgrade().map_or(0, |bytes| {
+        self.bytes.upgrade().map_or((0, 0), |bytes| {
             // Widening usize to u64 is lossless on supported targets.
-            self.capacity.saturating_sub(bytes.peek_available() as u64)
+            let free = bytes.peek_available() as u64;
+            (
+                self.capacity.saturating_sub(free),
+                free.saturating_sub(self.capacity),
+            )
         })
     }
 }
@@ -78,10 +83,15 @@ pub struct KindSample {
     pub raw_held: u64,
     /// The raw gate's capacity.
     pub raw_capacity: u64,
+    /// The raw gate's free bytes above its capacity: bytes released more
+    /// often than granted.
+    pub raw_excess: u64,
     /// Queued output frame bytes the kind's frames hold now.
     pub output_held: u64,
     /// The output gate's capacity.
     pub output_capacity: u64,
+    /// The output gate's free bytes above its capacity.
+    pub output_excess: u64,
 }
 
 impl ConnectionProbe {
@@ -123,12 +133,18 @@ impl ConnectionProbe {
             kinds: self
                 .kinds
                 .iter()
-                .map(|kind| KindSample {
-                    kind: kind.kind,
-                    raw_held: kind.raw.granted(),
-                    raw_capacity: kind.raw.capacity,
-                    output_held: kind.output.granted(),
-                    output_capacity: kind.output.capacity,
+                .map(|kind| {
+                    let (raw_held, raw_excess) = kind.raw.read();
+                    let (output_held, output_excess) = kind.output.read();
+                    KindSample {
+                        kind: kind.kind,
+                        raw_held,
+                        raw_capacity: kind.raw.capacity,
+                        raw_excess,
+                        output_held,
+                        output_capacity: kind.output.capacity,
+                        output_excess,
+                    }
                 })
                 .collect(),
         }

@@ -1,0 +1,37 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/peer_registry.rs b/crates/zakura-network/src/zakura/block_sync/peer_registry.rs
+index 9357bdd3af..6d91fc2cfd 100644
+--- a/crates/zakura-network/src/zakura/block_sync/peer_registry.rs
++++ b/crates/zakura-network/src/zakura/block_sync/peer_registry.rs
+@@ -783,7 +783,9 @@ impl PeerRegistry {
+     /// as in [`insert_outstanding`](Self::insert_outstanding).
+     pub(super) fn clear_outstanding(&self, peer: &ZakuraPeerId, generation: u64) {
+         let detached = gated_write!(self, peer, TakeOutstanding, generation, |table| {
+-            table.take_outstanding(peer, generation)
++            // A routine with no live requests leaves its peer no claims, so
++            // match the entry by peer ID alone.
++            table.forget_outstanding(peer)
+         });
+         // Drop the detached claims after releasing the lock.
+         drop(detached);
+diff --git a/crates/zakura-network/src/zakura/block_sync/peer_registry/state.rs b/crates/zakura-network/src/zakura/block_sync/peer_registry/state.rs
+index 8476b5e974..832c7c4003 100644
+--- a/crates/zakura-network/src/zakura/block_sync/peer_registry/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/peer_registry/state.rs
+@@ -381,6 +381,17 @@ impl PeerTable {
+             })
+     }
+ 
++    /// Detach the peer's claims for the caller to drop after unlocking,
++    /// whichever routine generation owns its entry.
++    pub(super) fn forget_outstanding(
++        &mut self,
++        peer: &ZakuraPeerId,
++    ) -> Option<BTreeMap<block::Height, OutstandingMeta>> {
++        self.peers
++            .get_mut(peer)
++            .map(|entry| std::mem::take(&mut entry.outstanding))
++    }
++
+     /// Publish the owning generation's slot diagnostics. Returns whether the
+     /// change can alter floor preference.
+     #[must_use = "a ranking change must wake floor deferrers"]

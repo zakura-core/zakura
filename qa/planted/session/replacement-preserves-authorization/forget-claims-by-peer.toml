@@ -1,0 +1,11 @@
+# Routes a routine's claim clear through a new peer-registry writer that
+# detaches a peer's claims by peer ID alone and reports nothing. The input
+# closes the node's connection to its one mirror and grows the mirror's
+# chain after the redial. It holds that connection's block-sync routine
+# until the replacement's routine publishes a claim. The held routine's
+# drop then detaches its replacement's claims, which only the registry's
+# fingerprints of the entry show.
+input = "crates/zakura-sim/tests/fixtures/sync-wire-replace-claims.bin"
+# Besides peer_registry.rs and state.rs, which the patch changes, the
+# routine's drop decides which generation's writes reach an entry.
+checks = ["crates/zakura-network/src/zakura/block_sync/peer_routine.rs"]

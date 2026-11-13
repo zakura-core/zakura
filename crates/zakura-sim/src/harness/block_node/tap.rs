@@ -508,6 +508,17 @@ impl BlockTap {
                 entry_generation: *entry_generation,
                 landed: *landed,
             },
+            BlockEvent::StaleRegistryChange {
+                peer: changed,
+                writer,
+                generation,
+                entry_generation,
+            } => BlockSyncFact::StaleRegistryChange {
+                peer: peer(changed),
+                writer: writer.name().to_owned(),
+                generation: *generation,
+                entry_generation: *entry_generation,
+            },
             BlockEvent::FrameJudged {
                 peer: sender,
                 conn_id,

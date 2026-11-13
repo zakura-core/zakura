@@ -287,3 +287,12 @@ lane = "discovery/wire"
 class = "survived"
 stage = "generator"
 reason = """No drawn peer sends `GetServices`, so `services/sender-within-owed` never applies: discovery/wire's drawn peers never ask. #2364 draws a peer that asks for header sync's service alone."""
+
+[[triage]]
+patch = "qa/native-mutations/shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
+property = "block-sync/s6v3/undeclared-type-closes"
+lane = "witness"
+class = "killed-by-other-rule"
+other = "sim/no-task-panic"
+stage = "property"
+reason = "The mutant lets an undeclared type reach admission, whose row `expect` panics the relay task before any close. `sim/no-task-panic` is the rule that sees it: a reader panic is the production effect, so no close ID can apply."

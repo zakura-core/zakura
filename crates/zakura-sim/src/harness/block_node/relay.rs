@@ -19,8 +19,10 @@
 //! forwards the frame, and holds the precheck until the connection closes.
 //! A refused header closes the connection with `ordered_read_rejected`, as
 //! the QUIC reader does, and the relay records that the node judged the
-//! frame. Once a connection closes, its relays forward
-//! nothing more.
+//! frame. The relay then runs the QUIC worker's admission step on each
+//! admitted frame, which charges the connection's cadence buckets, and
+//! closes with the worker's cause for a frame that step refuses. Once a
+//! connection closes, its relays forward nothing more.
 //!
 //! Each record carries the number of block-sync events the node's tap had
 //! recorded by then, so [`super::identity`] can place it among those
@@ -63,6 +65,7 @@ use zakura_network::zakura::{
     CloseCauseReader, Frame, FramedRecv, FramedSend, MessageRole, MessageRule, StreamReader,
     MSG_BS_BLOCK, MSG_BS_GET_BLOCKS,
 };
+use zakura_rt::time::Instant;
 use zakura_scheduler::{hooks, SimInstant};
 
 use super::tap::TapClock;
@@ -1127,8 +1130,10 @@ fn node_output(
 
 /// Labels and forwards every frame from `from` to `to`, sent `way` on
 /// `connection`, until either end goes away or the connection closes.
-/// Into the node, `reader` admits each frame as a QUIC stream's reader
-/// would, from when the node's service chooses its precheck.
+/// Into the node, `reader` and its admission step admit each frame as a
+/// QUIC stream's reader and worker would, from when the node's service
+/// chooses its precheck. The admission step's cadence buckets gain the
+/// pauses in which the relay waited for the node, as the worker's do.
 async fn forward(
     wire: Wire,
     connection: u64,
@@ -1147,11 +1152,14 @@ async fn forward(
     };
     let closed = std::pin::pin!(reader.closed());
     let mut closed = closed;
+    let waiting_since = Instant::now();
     zakura_rt::select! {
         biased;
         _ = &mut closed => return,
         _ = reader.ready() => {}
     }
+    let mut admission = reader.admission();
+    admission.credit_pause(waiting_since.elapsed());
     loop {
         let frame = zakura_rt::select! {
             biased;
@@ -1171,11 +1179,18 @@ async fn forward(
             reader.refuse();
             return;
         }
+        if let Err(cause) = admission.admit(&frame) {
+            wire.refused(connection, seq);
+            reader.close(cause);
+            return;
+        }
+        let waiting_since = Instant::now();
         let sent = zakura_rt::select! {
             biased;
             _ = &mut closed => return,
             sent = to.send(frame) => sent,
         };
+        admission.credit_pause(waiting_since.elapsed());
         if sent.is_err() {
             return;
         }

@@ -21,6 +21,8 @@ use zakura_rt::{collections::HashMap, time::Instant};
 
 #[cfg(any(test, zakura_sim))]
 use super::super::block_sync_observe::{BlockEvent, ObserverSlot, RegistryWriter};
+#[cfg(any(test, zakura_sim))]
+use super::EntryFingerprint;
 use super::{
     super::{
         config::{
@@ -104,6 +106,44 @@ impl PeerTable {
                     }
                 );
             }
+        }
+    }
+
+    /// The fingerprint of the peer's entry, if it has one.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn fingerprint(&self, peer: &ZakuraPeerId) -> Option<EntryFingerprint> {
+        self.peers.get(peer).map(Entry::fingerprint)
+    }
+
+    /// Reports a change that `writer`'s call from `generation` made to the
+    /// peer's entry, if another generation owns the entry. `before` is the
+    /// entry's fingerprint before the call, taken under the same lock.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn report_stale_change(
+        &self,
+        peer: &ZakuraPeerId,
+        writer: RegistryWriter,
+        generation: u64,
+        before: Option<EntryFingerprint>,
+    ) {
+        let after = self.fingerprint(peer);
+        let Some(entry_generation) = before
+            .as_ref()
+            .or(after.as_ref())
+            .map(|entry| entry.generation)
+        else {
+            return;
+        };
+        if entry_generation != generation && before != after {
+            observe!(
+                self.observer,
+                BlockEvent::StaleRegistryChange {
+                    peer: peer.clone(),
+                    writer,
+                    generation,
+                    entry_generation,
+                }
+            );
         }
     }
 

@@ -294,6 +294,48 @@ async fn startup_dial_limit_counts_ip_diversity_before_truncation() {
     }
 }
 
+/// Startup dials leave out the addresses of dialed unconditional peers, which have
+/// outbound slots of their own. A peer that is only in a listed range is still dialed,
+/// and discovery still learns every address.
+#[tokio::test]
+async fn startup_dials_leave_out_dialed_unconditional_peers() {
+    let _init_guard = zakura_test::init();
+
+    let config = Config {
+        cache_dir: CacheDir::disabled(),
+        initial_mainnet_peers: ["127.0.0.1:8233", "127.0.0.2:8233", "127.0.0.3:8233"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        unconditional_peers: toml::from_str::<Config>(
+            "unconditional_peers = ['127.0.0.2', '127.0.0.0/30']",
+        )
+        .unwrap()
+        .unconditional_peers,
+        ..test_defaults()
+    };
+
+    let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
+    let selected = tokio::time::timeout(
+        PEER_CACHE_TEST_TIMEOUT,
+        super::super::limit_initial_peers(&config, book_tx),
+    )
+    .await
+    .expect("startup peer selection finishes within the test deadline");
+
+    let selected: IndexSet<PeerSocketAddr> = selected.into_iter().collect();
+    assert_eq!(
+        selected,
+        IndexSet::from([peer_addr("127.0.0.1:8233"), peer_addr("127.0.0.3:8233")]),
+    );
+
+    let mut discovered = IndexSet::new();
+    while let Some(change) = book_rx.recv().await {
+        discovered.insert(change.addr());
+    }
+    assert_eq!(discovered.len(), 3, "discovery still learns every address");
+}
+
 /// A crawler peer limit large enough to exercise multi-peer behavior without
 /// flooding the test runtime with hundreds of immediate fake handshakes.
 const CRAWLER_MANY_PEER_LIMIT_FOR_TESTS: usize = 15;

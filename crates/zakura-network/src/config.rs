@@ -389,10 +389,10 @@ pub struct Config {
     ///
     /// Each dialed address adds one outbound and one inbound connection slot on top of the
     /// connection limits. Zakura dials each address on an outbound slot of its own, so a
-    /// full outbound peer set never blocks the dial. The inbound slots are a pool that
-    /// only dialed addresses can use, so a node whose other inbound slots are full still
-    /// accepts a listed peer that dials it, unless connections from listed peers already
-    /// fill the pool. A
+    /// full outbound peer set never blocks the dial, and the startup dials to seed and
+    /// cached peers leave it out. The inbound slots are a pool that only dialed addresses
+    /// can use, so a node whose other inbound slots are full still accepts a listed peer
+    /// that dials it, unless connections from listed peers already fill the pool. A
     /// connection in the pool also skips the wait that Zakura imposes between inbound
     /// connections from one IP, so a listed peer can reconnect at once. A peer that is
     /// only in a range of several addresses gets none of this.

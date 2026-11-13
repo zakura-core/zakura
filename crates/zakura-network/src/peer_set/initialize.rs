@@ -737,7 +737,8 @@ where
 /// `peerset_initial_target_size`.
 ///
 /// Returns the first candidates in the order provided by [`Config::initial_peers`],
-/// skipping addresses that exceed the per-IP connection limit. Skipped addresses
+/// skipping addresses that exceed the per-IP connection limit, and the addresses of
+/// dialed unconditional peers, which have slots of their own. Skipped addresses
 /// do not consume a startup slot; later candidates can fill it.
 ///
 /// Also sends every initial peer to the `address_book_updater`.
@@ -755,6 +756,9 @@ async fn limit_initial_peers(
         let _ = address_book_updater
             .send(MetaAddr::new_initial_peer(peer))
             .await;
+        if config.unconditional_peers.is_dial_address(peer.ip()) {
+            continue;
+        }
         if initial_peers.len() < config.peerset_initial_target_size {
             let count = selected_per_ip.entry(peer.ip()).or_insert(0);
             if *count < config.max_connections_per_ip {

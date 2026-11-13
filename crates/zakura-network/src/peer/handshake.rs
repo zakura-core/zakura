@@ -1806,6 +1806,7 @@ where
             let announced_blocks = AnnouncedBlocks::default();
             let inbound_announced_blocks = announced_blocks.clone();
             let gossip_trace = gossip_trace.for_peer(&connected_addr);
+            let connection_id = gossip_trace.connection_id();
             let inbound_gossip_trace = gossip_trace.clone();
             let ts_inner_conn_span = connection_span.clone();
             let inv_inner_conn_span = connection_span.clone();
@@ -1964,6 +1965,7 @@ where
                 request_slot,
                 peer_registry_updater: client_peer_registry_updater,
                 connection_info,
+                connection_id,
                 shutdown_tx: Some(shutdown_tx),
                 server_tx,
                 block_advert_tx,

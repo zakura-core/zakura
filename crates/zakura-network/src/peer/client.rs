@@ -54,6 +54,10 @@ pub struct Client {
     /// The metadata for the connected peer `service`.
     pub connection_info: Arc<ConnectionInfo>,
 
+    /// This connection's process-local number in the trace files: the `connection_id`
+    /// of its block gossip rows and of the requests the peer set sends it.
+    pub(crate) connection_id: u64,
+
     /// Used to shut down the corresponding heartbeat.
     /// This is always Some except when we take it on drop.
     pub(crate) shutdown_tx: Option<oneshot::Sender<CancelHeartbeatTask>>,

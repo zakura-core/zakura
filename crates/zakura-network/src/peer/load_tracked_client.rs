@@ -3,10 +3,7 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -20,8 +17,6 @@ use crate::{
     peer::{Client, ConnectedAddr, ConnectionInfo},
     protocol::external::{canonical_socket_addr, types::PeerServices, types::Version},
 };
-
-static NEXT_PEER_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A client service wrapper that keeps track of its load.
 ///
@@ -42,8 +37,8 @@ pub struct LoadTrackedClient {
     /// The metadata for the connected peer `service`.
     connection_info: Arc<ConnectionInfo>,
 
-    /// A process-local identifier for correlating privacy-preserving peer traces.
-    trace_id: u64,
+    /// The connection's process-local number in the trace files.
+    connection_id: u64,
 }
 
 /// Create a new [`LoadTrackedClient`] wrapping the provided `client` service.
@@ -61,6 +56,7 @@ impl From<Client> for LoadTrackedClient {
         };
 
         let request_slot = client.request_slot.clone();
+        let connection_id = client.connection_id;
 
         let service = PeakEwma::new(
             client,
@@ -74,8 +70,7 @@ impl From<Client> for LoadTrackedClient {
             service,
             request_slot,
             connection_info,
-            // Wrap-around is unreachable for a process-local u64 counter.
-            trace_id: NEXT_PEER_TRACE_ID.fetch_add(1, Ordering::Relaxed),
+            connection_id,
         }
     }
 }
@@ -136,9 +131,9 @@ impl LoadTrackedClient {
         self.connection_info.remote.start_height
     }
 
-    /// Retrieve a process-local identifier used to correlate peer trace events.
-    pub(crate) fn trace_id(&self) -> u64 {
-        self.trace_id
+    /// Retrieve the connection's process-local number, shared by every trace row about it.
+    pub(crate) fn connection_id(&self) -> u64 {
+        self.connection_id
     }
 
     /// Returns true if this peer connected directly to us from `ip`.

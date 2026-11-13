@@ -7861,27 +7861,57 @@ fn artifact_reads(text: &str, file: &str) -> Vec<String> {
     reads.found
 }
 
-/// Rule 25's enforcement: under [`ACCEPTANCE_SRC`], every read goes
+/// The files [`every_artifact_read_goes_through_binding`] reads, relative
+/// to the crate: the acceptance tool's parent module and every Rust file
+/// under [`ACCEPTANCE_SRC`], at any depth, but `binding.rs`, which is the
+/// boundary.
+fn artifact_read_scope() -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("the acceptance source reads") {
+            let path = entry.expect("an entry reads").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut paths = vec![krate.join(format!("{ACCEPTANCE_SRC}.rs"))];
+    walk(&krate.join(ACCEPTANCE_SRC), &mut paths);
+    let mut files: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            path.strip_prefix(krate)
+                .expect("under the crate")
+                .display()
+                .to_string()
+        })
+        .filter(|file| *file != format!("{ACCEPTANCE_SRC}/binding.rs"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Rule 25's enforcement: in [`artifact_read_scope`], every read goes
 /// through `binding.rs`, a run artifact by its kind and S's committed files
 /// by `binding::committed_text` and its siblings, so no reader binds an
 /// artifact itself or reads one unbound, and there's no exemption to keep
 /// honest. A planted bypass, however its read is spelled, fails the scan.
 #[test]
 fn every_artifact_read_goes_through_binding() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(ACCEPTANCE_SRC);
+    let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let scope = artifact_read_scope();
+    for file in [
+        "src/harness/header_acceptance.rs",
+        "src/harness/header_acceptance/tool.rs",
+    ] {
+        assert!(scope.iter().any(|at| at == file), "{file} is scanned");
+    }
     let mut found: BTreeSet<(String, String)> = BTreeSet::new();
     let mut texts = BTreeMap::new();
-    for entry in std::fs::read_dir(&dir).expect("the acceptance source reads") {
-        let path = entry.expect("an entry reads").path();
-        let file = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("a UTF-8 file name")
-            .to_owned();
-        if path.extension().is_none_or(|ext| ext != "rs") || file == "binding.rs" {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).expect("a source file reads");
+    for file in scope {
+        let text = std::fs::read_to_string(krate.join(&file)).expect("a source file reads");
         for within in artifact_reads(&text, &file) {
             found.insert((file.clone(), within));
         }
@@ -7892,7 +7922,7 @@ fn every_artifact_read_goes_through_binding() {
         "reads outside binding.rs, which must read through it: {found:?}"
     );
 
-    let tool = &texts["tool.rs"];
+    let tool = &texts["src/harness/header_acceptance/tool.rs"];
     for bypass in [
         "fn planted(dir: &Path) { let _ = std::fs::read_to_string(dir.join(\"replay.json\")); }",
         "fn planted(dir: &Path) { let _ = fs::read(dir); }",

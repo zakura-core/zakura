@@ -5918,6 +5918,48 @@ mod tests {
         assert_eq!(planted_cases(repo.path()), kept);
     }
 
+    /// A planted case's harness is read only from committed files: a fuzz
+    /// case whose input, and so its sidecar, sits under `target` or outside
+    /// the checkout is refused, not read, and so is an absolute `.toml`
+    /// path. A committed input's sidecar names the harness.
+    #[test]
+    fn a_case_s_harness_is_read_from_committed_files_only() {
+        let repo = tempfile::tempdir().expect("a temp dir can be created");
+        let outside = tempfile::tempdir().expect("a temp dir can be created");
+        let write = |path: &Path, text: &str| {
+            fs::create_dir_all(path.parent().expect("the path has a parent"))
+                .expect("the temp dir is writable");
+            fs::write(path, text).expect("the temp dir is writable");
+        };
+        let sidecar = "harness = \"header-sync/storage\"\n";
+        write(&repo.path().join("fixtures/in.toml"), sidecar);
+        write(&repo.path().join("target/run/in.toml"), sidecar);
+        write(&outside.path().join("in.toml"), sidecar);
+        let absolute = outside.path().join("in.bin");
+        for (name, input, read) in [
+            ("committed", "fixtures/in.bin", true),
+            ("built", "target/run/in.bin", false),
+            ("outside", absolute.to_str().expect("a UTF-8 path"), false),
+            ("climbing", "fixtures/../target/run/in.bin", false),
+        ] {
+            write(
+                &repo.path().join(format!("qa/planted/p/{name}.toml")),
+                &format!("input = \"{input}\"\nmissing_evidence = \"x\"\n"),
+            );
+            let harness = super::super::planted_harness(repo.path(), "p", name);
+            assert_eq!(harness.is_ok(), read, "{name}: {harness:?}");
+            assert_eq!(
+                super::super::planted_harness_caught(repo.path(), "p", name),
+                Ok(true)
+            );
+        }
+        let property = outside.path().join("p");
+        write(&property.join("abs.toml"), "missing_evidence = \"x\"\n");
+        let property = property.to_str().expect("a UTF-8 path");
+        assert!(super::super::planted_harness_caught(repo.path(), property, "abs").is_err());
+        assert!(super::super::planted_harness(repo.path(), property, "abs").is_err());
+    }
+
     /// Every task's keys link its evidence and its result: a node case its
     /// `Draft` run and companions, a history its declarations and
     /// recording, and an integrity mutation the history it ran.

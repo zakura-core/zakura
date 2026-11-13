@@ -117,6 +117,22 @@ use crate::{
     config::ZakuradConfig,
 };
 
+/// The background work of whichever pool runs.
+enum MempoolTasks {
+    /// Today's pool, which needs its queue checker and its gossip task.
+    Classic {
+        /// The signal its queue checker waits on.
+        verification_finished: std::sync::Arc<tokio::sync::Notify>,
+    },
+    /// The pool core, already running.
+    Core {
+        /// The core's task.
+        core: tokio::task::JoinHandle<Result<(), crate::BoxError>>,
+        /// The tasks that turn it on and follow what it publishes.
+        follower: tokio::task::JoinHandle<Result<(), crate::BoxError>>,
+    },
+}
+
 struct BlockSyncDriverExitGuard {
     fatal_events: mpsc::UnboundedSender<()>,
     shutdown: CancellationToken,
@@ -703,29 +719,78 @@ impl StartCmd {
             zakura_jsonl_trace::node_id(),
         );
 
-        info!("initializing mempool");
-        let (mempool, mempool_transaction_subscriber) = Mempool::new(
-            &config.mempool,
-            config.network.expose_peer_addresses,
-            peer_set.clone(),
-            state.clone(),
-            tower::util::BoxCloneService::new(read_only_state_service.clone()),
-            tx_verifier,
-            sync_status.clone(),
-            latest_chain_tip.clone(),
-            chain_tip_change.clone(),
-            misbehavior_sender.clone(),
-            zcashd_compat_block_gossip_peer_ips.clone(),
-            config.network.unconditional_peers.clone(),
-        );
-        let mempool = mempool.with_trace(template_path_trace.clone());
-        let mempool_verification_finished = mempool.verification_finished();
-        let mempool = spawn_buffer(
-            BoxService::new(mempool),
-            mempool::downloads::MAX_INBOUND_CONCURRENCY,
-        );
+        // The pool is chosen once, at startup.
+        let pool_implementation = config.mempool.implementation.resolve();
+        info!(?pool_implementation, "initializing mempool");
+        let (mempool, mempool_transaction_subscriber, verifier_pool, mempool_tasks) =
+            if pool_implementation == mempool::config::Implementation::Core {
+                let chain_transitions = read_only_state_service
+                    .chain_transitions()
+                    .ok_or_else(|| {
+                        eyre!("the pool core needs the state writer's chain transitions")
+                    })?
+                    .clone();
+                let parts = mempool::core::start(
+                    &config.mempool,
+                    config.network.expose_peer_addresses,
+                    peer_set.clone(),
+                    tower::util::BoxCloneService::new(read_only_state_service.clone()),
+                    &chain_transitions,
+                    tx_verifier,
+                    sync_status.clone(),
+                    latest_chain_tip.clone(),
+                    chain_tip_change.clone(),
+                    misbehavior_sender.clone(),
+                    mempool::core::Exempt {
+                        zcashd_compat: zcashd_compat_block_gossip_peer_ips
+                            .iter()
+                            .map(|ip| ip.to_canonical())
+                            .collect(),
+                        unconditional: config.network.unconditional_peers.clone(),
+                    },
+                )
+                .map_err(|error| eyre!(error))?;
+                (
+                    parts.mempool,
+                    parts.subscriber,
+                    parts.verifier_pool,
+                    MempoolTasks::Core {
+                        core: parts.core_task,
+                        follower: parts.follower_task,
+                    },
+                )
+            } else {
+                let (mempool, mempool_transaction_subscriber) = Mempool::new(
+                    &config.mempool,
+                    config.network.expose_peer_addresses,
+                    peer_set.clone(),
+                    state.clone(),
+                    tower::util::BoxCloneService::new(read_only_state_service.clone()),
+                    tx_verifier,
+                    sync_status.clone(),
+                    latest_chain_tip.clone(),
+                    chain_tip_change.clone(),
+                    misbehavior_sender.clone(),
+                    zcashd_compat_block_gossip_peer_ips.clone(),
+                    config.network.unconditional_peers.clone(),
+                );
+                let mempool = mempool.with_trace(template_path_trace.clone());
+                let verification_finished = mempool.verification_finished();
+                let mempool = spawn_buffer(
+                    BoxService::new(mempool),
+                    mempool::downloads::MAX_INBOUND_CONCURRENCY,
+                );
+                (
+                    mempool.clone(),
+                    mempool_transaction_subscriber,
+                    mempool,
+                    MempoolTasks::Classic {
+                        verification_finished,
+                    },
+                )
+            };
 
-        if tx_verifier_setup_tx.send(mempool.clone()).is_err() {
+        if tx_verifier_setup_tx.send(verifier_pool).is_err() {
             warn!("error setting up the transaction verifier with a handle to the mempool service");
         };
 
@@ -882,20 +947,30 @@ impl StartCmd {
         );
         node_tasks.track(&block_gossip_task_handle);
 
-        info!("spawning mempool queue checker task");
-        let mempool_queue_checker_task_handle =
-            mempool::QueueChecker::spawn(mempool.clone(), mempool_verification_finished);
-        node_tasks.track(&mempool_queue_checker_task_handle);
+        // The pool core decides and announces in its own tasks, so it runs
+        // them in the queue checker's and the gossip task's places.
+        let (mempool_queue_checker_task_handle, tx_gossip_task_handle) = match mempool_tasks {
+            MempoolTasks::Classic {
+                verification_finished,
+            } => {
+                info!("spawning mempool queue checker task");
+                let queue_checker =
+                    mempool::QueueChecker::spawn(mempool.clone(), verification_finished);
 
-        info!("spawning mempool transaction gossip task");
-        let tx_gossip_task_handle = spawn_erased(
-            mempool::run_mempool_transaction_id_gossip(
-                mempool_transaction_subscriber.subscribe(),
-                peer_set.clone(),
-                mempool.clone(),
-            )
-            .in_current_span(),
-        );
+                info!("spawning mempool transaction gossip task");
+                let gossip = spawn_erased(
+                    mempool::run_mempool_transaction_id_gossip(
+                        mempool_transaction_subscriber.subscribe(),
+                        peer_set.clone(),
+                        mempool.clone(),
+                    )
+                    .in_current_span(),
+                );
+                (queue_checker, gossip)
+            }
+            MempoolTasks::Core { core, follower } => (core, follower),
+        };
+        node_tasks.track(&mempool_queue_checker_task_handle);
         node_tasks.track(&tx_gossip_task_handle);
 
         info!("spawning delete old databases task");

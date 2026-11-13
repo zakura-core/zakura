@@ -60,6 +60,7 @@ use crate::components::sync::SyncStatus;
 use trace::{MempoolTrace, TipProcessing};
 
 pub use zakura_mempool::config;
+pub(crate) mod core;
 mod crawler;
 pub mod downloads;
 mod error;
@@ -221,13 +222,61 @@ fn transaction_ban_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSo
         return None;
     };
 
-    let bans = match peer_action(error) {
-        PeerAction::Ban => true,
-        PeerAction::BanV5AndLater => *transaction_version >= 5,
-        PeerAction::Cooldown | PeerAction::Ignore => false,
-    };
+    failure_bans(error, *transaction_version).then_some(*advertiser_addr)
+}
 
-    bans.then_some(*advertiser_addr)
+/// Whether a verification failure with `error` bans the peer that relayed a
+/// transaction of `transaction_version`. Both pools use this. See
+/// [`peer_action`].
+pub(crate) fn failure_bans(error: &TransactionError, transaction_version: u32) -> bool {
+    match peer_action(error) {
+        PeerAction::Ban => true,
+        PeerAction::BanV5AndLater => transaction_version >= 5,
+        PeerAction::Cooldown | PeerAction::Ignore => false,
+    }
+}
+
+/// Whether a verification failure with `error` starts a cooldown for the
+/// peer that relayed a transaction of `transaction_version` declaring
+/// `transaction_network_upgrade`. The transaction was verified for the block
+/// whose upgrade is `tip_upgrade`, and `grace_period_upgrade` is the upgrade
+/// before it if that block is in the upgrade's grace period. Both pools use
+/// this. [`transaction_cooldown_peer`] adds today's pool's checks of the
+/// peer and the tip.
+pub(crate) fn failure_cools_down(
+    error: &TransactionError,
+    transaction_version: u32,
+    transaction_network_upgrade: Option<NetworkUpgrade>,
+    tip_upgrade: NetworkUpgrade,
+    grace_period_upgrade: Option<NetworkUpgrade>,
+) -> bool {
+    let cools_down = match peer_action(error) {
+        PeerAction::Cooldown => true,
+        PeerAction::BanV5AndLater => transaction_version < 5,
+        PeerAction::Ban | PeerAction::Ignore => false,
+    };
+    if !cools_down {
+        return false;
+    }
+
+    // Tip timestamps can be up to two hours in the future, so this node can
+    // pass the tip distance check while its tip is before an upgrade that the
+    // network has activated. A transaction that declares a later upgrade than
+    // the tip's shows that this node can be behind, so it starts no cooldown.
+    // Below NU5, the verifier does not check branch IDs, so such a transaction
+    // can fail with other errors.
+    if transaction_network_upgrade.is_some_and(|upgrade| upgrade > tip_upgrade) {
+        return false;
+    }
+
+    // A peer whose tip lags an upgrade activation relays transactions built
+    // for the previous upgrade. Those transactions can fail with signature or
+    // pool rule errors. So shortly after an activation,
+    // a transaction that declares the previous upgrade, or declares no
+    // upgrade, starts no cooldown.
+    !grace_period_upgrade.is_some_and(|previous_upgrade| {
+        transaction_network_upgrade.is_none_or(|upgrade| upgrade == previous_upgrade)
+    })
 }
 
 /// The number of blocks after a network upgrade activates during which a
@@ -286,34 +335,17 @@ fn transaction_cooldown_peer(
         return None;
     }
 
-    let cools_down = match peer_action(error) {
-        PeerAction::Cooldown => true,
-        PeerAction::BanV5AndLater => *transaction_version < 5,
-        PeerAction::Ban | PeerAction::Ignore => false,
-    };
-
-    if !cools_down || tip_height.is_none() || *tip_height != best_tip_height {
+    if tip_height.is_none() || *tip_height != best_tip_height {
         return None;
     }
 
-    // Tip timestamps can be up to two hours in the future, so this node can
-    // pass the tip distance check while its tip is before an upgrade that the
-    // network has activated. A transaction that declares a later upgrade than
-    // the tip's shows that this node can be behind, so it starts no cooldown.
-    // Below NU5, the verifier does not check branch IDs, so such a transaction
-    // can fail with other errors.
-    if transaction_network_upgrade.is_some_and(|upgrade| upgrade > tip_upgrade) {
-        return None;
-    }
-
-    // A peer whose tip lags an upgrade activation relays transactions built
-    // for the previous upgrade. Those transactions can fail with signature or
-    // pool rule errors. So shortly after an activation,
-    // a transaction that declares the previous upgrade, or declares no
-    // upgrade, starts no cooldown.
-    if grace_period_upgrade.is_some_and(|previous_upgrade| {
-        transaction_network_upgrade.is_none_or(|upgrade| upgrade == previous_upgrade)
-    }) {
+    if !failure_cools_down(
+        error,
+        *transaction_version,
+        *transaction_network_upgrade,
+        tip_upgrade,
+        grace_period_upgrade,
+    ) {
         return None;
     }
 

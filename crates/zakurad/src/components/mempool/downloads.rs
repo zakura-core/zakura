@@ -58,7 +58,7 @@ use tracing::Instrument;
 use zakura_chain::{
     block::Height,
     parameters::NetworkUpgrade,
-    transaction::{self, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
 use zakura_consensus::transaction as tx;
@@ -92,7 +92,71 @@ type TaskResult = Result<
     (UnminedTxId, tokio::time::error::Elapsed),
 >;
 
-fn peer_source_from_queue_source(source: &QueueSource) -> Option<zn::PeerSource> {
+/// Fetches the transaction `txid` through `network`, from `source` if one is
+/// named or from any peer that advertised it. Returns the body and the legacy
+/// address that served it, if the peer set knows one. Both pools fetch with
+/// this.
+///
+/// A response that is missing, empty, or holds another transaction is a
+/// failed download. The caller bounds the wait.
+pub(crate) async fn fetch_transaction<ZN>(
+    network: ZN,
+    txid: UnminedTxId,
+    source: Option<zn::PeerSource>,
+) -> Result<(UnminedTx, Option<PeerSocketAddr>), TransactionDownloadVerifyError>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
+{
+    let request_ids = std::iter::once(txid).collect();
+    let req = match source {
+        Some(source) => zn::Request::TransactionsByIdFrom {
+            ids: request_ids,
+            source,
+        },
+        None => zn::Request::TransactionsById(request_ids),
+    };
+
+    let tx = match network
+        .oneshot(req)
+        .await
+        .map_err(CloneError::from)
+        .map_err(TransactionDownloadVerifyError::DownloadFailed)?
+    {
+        zn::Response::Transactions(mut txs) => txs.pop().ok_or_else(|| {
+            TransactionDownloadVerifyError::DownloadFailed(
+                BoxError::from("no transactions returned").into(),
+            )
+        })?,
+        _ => unreachable!("wrong response to transaction request"),
+    };
+
+    let (tx, advertiser_addr) = match tx {
+        zn::InventoryResponse::Available(tx) => tx,
+        zn::InventoryResponse::Missing(_) => {
+            return Err(TransactionDownloadVerifyError::DownloadFailed(
+                BoxError::from("transaction was missing from peer response").into(),
+            ));
+        }
+    };
+
+    // The Zakura codec does not check that a response only holds requested
+    // transactions. A caller keys its bookkeeping by the requested ID, so a
+    // substituted transaction would leak it.
+    if tx.id() != txid {
+        return Err(TransactionDownloadVerifyError::DownloadFailed(
+            BoxError::from("peer responded with an unrequested transaction").into(),
+        ));
+    }
+
+    metrics::counter!(
+        "mempool.downloaded.transactions.total",
+        "version" => format!("{}", tx.transaction().version()),
+    )
+    .increment(1);
+    Ok((tx, advertiser_addr))
+}
+
+pub(crate) fn peer_source_from_queue_source(source: &QueueSource) -> Option<zn::PeerSource> {
     match source {
         QueueSource::LegacySocket(_) => None,
         QueueSource::Zakura(peer_id) => zn::zakura::ZakuraPeerId::new(peer_id.clone())
@@ -569,52 +633,8 @@ where
 
             let (tx, advertiser_addr) = match gossiped_tx {
                 Gossip::Id(txid) => {
-                    let request_ids = std::iter::once(txid).collect();
-                    let req = match download_source {
-                        Some(source) => zn::Request::TransactionsByIdFrom {
-                            ids: request_ids,
-                            source,
-                        },
-                        None => zn::Request::TransactionsById(request_ids),
-                    };
-
-                    let tx = match network
-                        .oneshot(req)
-                        .await
-                        .map_err(CloneError::from)
-                        .map_err(TransactionDownloadVerifyError::DownloadFailed)?
-                    {
-                        zn::Response::Transactions(mut txs) => txs.pop().ok_or_else(|| {
-                            TransactionDownloadVerifyError::DownloadFailed(
-                                BoxError::from("no transactions returned").into(),
-                            )
-                        })?,
-                        _ => unreachable!("wrong response to transaction request"),
-                    };
-
-                    let (tx, advertiser_addr) = match tx {
-                        zn::InventoryResponse::Available(tx) => tx,
-                        zn::InventoryResponse::Missing(_) => {
-                            return Err(TransactionDownloadVerifyError::DownloadFailed(
-                                BoxError::from("transaction was missing from peer response").into(),
-                            ));
-                        }
-                    };
-
-                    // The Zakura codec does not check that a response only holds
-                    // requested transactions. `poll_next` releases this task's
-                    // cancel handle and peer slot under the verified transaction's
-                    // ID, so a substituted transaction would leak them.
-                    if tx.id() != txid {
-                        return Err(TransactionDownloadVerifyError::DownloadFailed(
-                            BoxError::from("peer responded with an unrequested transaction").into(),
-                        ));
-                    }
-
-                    metrics::counter!(
-                        "mempool.downloaded.transactions.total",
-                        "version" => format!("{}",tx.transaction().version()),
-                    ).increment(1);
+                    let (tx, advertiser_addr) =
+                        fetch_transaction(network, txid, download_source).await?;
                     Self::check_transaction_size(&tx, max_transaction_bytes)?;
                     (tx, advertiser_addr)
                 }

@@ -52,6 +52,37 @@ pub struct Config {
     /// If unset, defaults to [`DEFAULT_MAX_DATACARRIER_BYTES`]. This size includes the OP_RETURN
     /// opcode and pushdata overhead. Matches zcashd's `-datacarriersize` default behavior.
     pub max_datacarrier_bytes: Option<u32>,
+
+    /// Which pool the node runs.
+    ///
+    /// `default` is the node's choice, which is `classic` in this release. What
+    /// `default` means can change in a later release. `classic` is the pool
+    /// nodes have run so far. `core` runs the pool core, which is new and off
+    /// unless chosen here.
+    pub implementation: Implementation,
+}
+
+/// Which pool a node runs. See [`Config::implementation`].
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Implementation {
+    /// The node's choice for this release.
+    #[default]
+    Default,
+    /// The pool nodes have run so far.
+    Classic,
+    /// The pool core.
+    Core,
+}
+
+impl Implementation {
+    /// The pool this setting runs: `Default` resolved for this release.
+    pub fn resolve(self) -> Self {
+        match self {
+            Self::Default | Self::Classic => Self::Classic,
+            Self::Core => Self::Core,
+        }
+    }
 }
 
 impl Default for Config {
@@ -73,6 +104,8 @@ impl Default for Config {
             debug_enable_at_height: None,
 
             max_datacarrier_bytes: Some(DEFAULT_MAX_DATACARRIER_BYTES),
+
+            implementation: Implementation::Default,
         }
     }
 }

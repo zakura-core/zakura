@@ -38,6 +38,24 @@ impl fmt::Display for MempoolDisabledError {
 
 impl std::error::Error for MempoolDisabledError {}
 
+/// The pool core does not hold the output asked for in
+/// [`Request::AwaitOutput`].
+///
+/// The pool core answers the transaction verifier's output requests at once,
+/// from the pool it published before it started the verification, instead
+/// of waiting. The verifier treats this error as it treats a timeout today:
+/// the input is missing.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct OutputNotInPool;
+
+impl fmt::Display for OutputNotInPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("no transaction in the mempool creates this output")
+    }
+}
+
+impl std::error::Error for OutputNotInPool {}
+
 #[cfg(test)]
 mod tests {
     use super::MempoolDisabledError;

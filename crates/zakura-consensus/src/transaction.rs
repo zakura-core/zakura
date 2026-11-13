@@ -958,6 +958,12 @@ where
                     Ok(mempool::Response::UnspentOutput(output)) => output,
                     Ok(_) => unreachable!("UnspentOutput always responds with UnspentOutput"),
                     Err(err) => {
+                        // The pool core answers at once that it holds no such
+                        // output, where today's pool waits until the timeout.
+                        // Both mean the input is missing.
+                        if err.is::<mempool::OutputNotInPool>() {
+                            return Err(TransactionError::TransparentInputNotFound);
+                        }
                         return match err.downcast::<Elapsed>() {
                             Ok(_) => Err(TransactionError::TransparentInputNotFound),
                             Err(err) => Err(err.into()),

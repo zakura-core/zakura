@@ -1,18 +1,26 @@
-//! Today's pool at its service boundary.
+//! Today's pool and the pool core at the service boundary.
 //!
 //! These tests drive the mempool only through `Service<Request>` and its
 //! collaborators: the verifier, the peer set, the state and the sync status.
-//! They pin what callers see today, so the pool core's adapter can be held to
-//! the same answers. [`pool`] is the one place that builds the service under
-//! test.
+//! They pin what callers see today, and hold the pool core's adapter to the
+//! same answers. [`pool`] is the one place that builds the service under
+//! test, for either [`Mode`].
+//!
+//! Each test runs against both pools, through [`both_pools!`]. Where the
+//! core answers differently on purpose, the test says so and checks the
+//! core's answer.
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{atomic::AtomicBool, Arc},
+    time::Duration,
+};
 
 use futures::future::BoxFuture;
 use tokio::{
-    sync::oneshot,
+    sync::{oneshot, watch},
     time::{self, timeout},
 };
 use tower::{
@@ -31,12 +39,14 @@ use zakura_chain::{
 use zakura_consensus::{error::TransactionError, transaction as tx};
 use zakura_network as zn;
 use zakura_node_services::mempool::{
-    CreatedOrSpent, Gossip, MempoolDisabledError, QueueSource, Request, Response,
+    CreatedOrSpent, Gossip, MempoolChange, MempoolChangeKind, MempoolDisabledError,
+    MempoolTxSubscriber, QueueSource, Request, Response,
 };
 use zakura_state::{self as zs, ChainTipChange, LatestChainTip};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use super::super::{
+    core::{self, Exempt, MempoolService},
     downloads::MAX_INBOUND_CONCURRENCY,
     downloads::MAX_INBOUND_CONCURRENCY_PER_PEER,
     pending_outputs::{PendingOutputsFull, MAX_PENDING_OUTPUTS},
@@ -77,10 +87,56 @@ enum Peers {
     Silent,
 }
 
+/// Which pool a test runs against.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Mode {
+    /// Today's pool.
+    Classic,
+    /// The pool core, behind its adapter.
+    Core,
+}
+
+/// The service under test.
+enum PoolUnderTest {
+    /// Today's pool, which the test drives directly.
+    Classic(Box<Mempool>),
+    /// The pool core's adapter, and the switch that turns the core on.
+    Core {
+        /// The adapter, buffered as `start.rs` buffers it.
+        service: MempoolService,
+        /// The transaction verifier's pool handle.
+        verifier_pool: MempoolService,
+        /// Whether the core is on. The test sets it, where the node would
+        /// decide it from its sync status.
+        active: watch::Sender<bool>,
+    },
+}
+
+/// Runs a test, an async function that takes a [`Mode`], against both pools.
+macro_rules! both_pools {
+    ($($test:ident),* $(,)?) => {
+        $(
+            mod $test {
+                use super::Mode;
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn classic() {
+                    super::$test(Mode::Classic).await;
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn core() {
+                    super::$test(Mode::Core).await;
+                }
+            }
+        )*
+    };
+}
+
 /// The pool under test and the controls a test drives it with.
 struct Harness {
     /// The service under test.
-    pool: Mempool,
+    pool: PoolUnderTest,
     /// The peer set, when it is [`Peers::Mock`].
     peers: MockPeerSet,
     /// The verifier.
@@ -93,11 +149,13 @@ struct Harness {
     latest_tip: LatestChainTip,
     /// The sync status the pool turns on from.
     syncs: RecentSyncLengths,
+    /// The indexer's change stream.
+    changes: MempoolTxSubscriber,
 }
 
 /// Build today's pool on Mainnet with the genesis block committed. The pool
 /// starts inactive.
-async fn pool(config: Config, peers: Peers) -> Harness {
+async fn pool(config: Config, peers: Peers, mode: Mode) -> Harness {
     let network = Network::Mainnet;
     let mock_peers: MockPeerSet = MockService::build()
         .with_max_request_delay(REQUEST_DELAY)
@@ -128,20 +186,68 @@ async fn pool(config: Config, peers: Peers) -> Harness {
     };
 
     let (sync_status, syncs) = crate::components::sync::SyncStatus::new();
-    let (pool, subscriber) = Mempool::new(
-        &config,
-        false,
-        outbound,
-        state.clone(),
-        BoxCloneService::new(read_state),
-        tower::buffer::Buffer::new(BoxService::new(verifier.clone()), 1),
-        sync_status,
-        latest_chain_tip.clone(),
-        chain_tip_change.clone(),
-        tokio::sync::mpsc::channel(1).0,
-        Vec::new(),
-        zn::UnconditionalPeers::default(),
-    );
+    let tx_verifier = tower::buffer::Buffer::new(BoxService::new(verifier.clone()), 1);
+    let (pool, subscriber) = match mode {
+        Mode::Classic => {
+            let (pool, subscriber) = Mempool::new(
+                &config,
+                false,
+                outbound,
+                state.clone(),
+                BoxCloneService::new(read_state),
+                tx_verifier,
+                sync_status,
+                latest_chain_tip.clone(),
+                chain_tip_change.clone(),
+                tokio::sync::mpsc::channel(1).0,
+                Vec::new(),
+                zn::UnconditionalPeers::default(),
+            );
+            (PoolUnderTest::Classic(Box::new(pool)), subscriber)
+        }
+        Mode::Core => {
+            let transitions = read_state
+                .chain_transitions()
+                .expect("a writable state publishes chain transitions")
+                .clone();
+            let (active, active_rx) = watch::channel(false);
+            // The announcer's advertisements are answered here, so the peer
+            // set only sees the requests these tests name.
+            let outbound = BoxCloneSyncService::new(tower::service_fn(move |request| {
+                let outbound = outbound.clone();
+                async move {
+                    match request {
+                        zn::Request::AdvertiseTransactionIds(..) => Ok(zn::Response::Nil),
+                        request => outbound.oneshot(request).await,
+                    }
+                }
+            }));
+            let assembled = core::assemble(
+                &config,
+                false,
+                outbound,
+                BoxCloneService::new(read_state),
+                &transitions,
+                tx_verifier,
+                network.clone(),
+                Arc::new(AtomicBool::new(true)),
+                tokio::sync::mpsc::channel(1).0,
+                Exempt::default(),
+                active_rx,
+            )
+            .expect("the test is the only consumer of the chain transitions");
+            tokio::spawn(assembled.core.run());
+            tokio::spawn(assembled.follower.run());
+            (
+                PoolUnderTest::Core {
+                    service: assembled.mempool,
+                    verifier_pool: assembled.verifier_pool,
+                    active,
+                },
+                assembled.subscriber,
+            )
+        }
+    };
     let mut changes = subscriber.subscribe();
     tokio::spawn(async move { while changes.recv().await.is_ok() {} });
 
@@ -153,6 +259,7 @@ async fn pool(config: Config, peers: Peers) -> Harness {
         tip_change: chain_tip_change,
         latest_tip: latest_chain_tip,
         syncs,
+        changes: subscriber,
     };
     harness
         .commit(zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice())
@@ -161,8 +268,8 @@ async fn pool(config: Config, peers: Peers) -> Harness {
 }
 
 /// [`pool`] with the default config and a [`Peers::Mock`] peer set, turned on.
-async fn active_pool() -> Harness {
-    let mut harness = pool(Config::default(), Peers::Mock).await;
+async fn active_pool(mode: Mode) -> Harness {
+    let mut harness = pool(Config::default(), Peers::Mock, mode).await;
     harness.activate().await;
     harness
 }
@@ -170,8 +277,65 @@ async fn active_pool() -> Harness {
 impl Harness {
     /// Turn the pool on, as a node close to the tip does.
     async fn activate(&mut self) {
-        self.pool.enable(&mut self.syncs).await;
-        assert!(self.pool.is_enabled(), "the pool turns on near the tip");
+        match &mut self.pool {
+            PoolUnderTest::Classic(pool) => pool.enable(&mut self.syncs).await,
+            PoolUnderTest::Core { active, .. } => {
+                active.send_replace(true);
+                self.caught_up().await;
+            }
+        }
+        assert!(self.is_enabled().await, "the pool turns on near the tip");
+    }
+
+    /// Whether the pool is on, as callers see it: an inactive pool refuses
+    /// `FullTransactions`.
+    async fn is_enabled(&mut self) -> bool {
+        match &self.pool {
+            PoolUnderTest::Classic(pool) => pool.is_enabled(),
+            PoolUnderTest::Core { .. } => self.call(Request::FullTransactions).await.is_ok(),
+        }
+    }
+
+    /// Waits until an active core has applied the state's tip. Today's pool
+    /// applies it on its next call instead.
+    async fn caught_up(&mut self) {
+        for _ in 0..(ANSWER_WAIT.as_millis() / 10) {
+            let tip = self.latest_tip.best_tip_hash();
+            if let Ok(Response::FullTransactions {
+                last_seen_tip_hash, ..
+            }) = self.call(Request::FullTransactions).await
+            {
+                if Some(last_seen_tip_hash) == tip {
+                    return;
+                }
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the pool core applies the state's tip within {ANSWER_WAIT:?}");
+    }
+
+    /// Starts `request` without awaiting it. Today's pool registers what the
+    /// request asks for when it is called. The core does when the returned
+    /// future is first polled.
+    async fn start_call(
+        &mut self,
+        request: Request,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, BoxError>> + Send>>
+    {
+        match &mut self.pool {
+            PoolUnderTest::Classic(pool) => pool
+                .ready()
+                .await
+                .expect("the pool is always ready")
+                .call(request),
+            PoolUnderTest::Core { service, .. } => Box::pin(
+                service
+                    .ready()
+                    .await
+                    .expect("the pool is always ready")
+                    .call(request),
+            ),
+        }
     }
 
     /// Commit the serialized block `bytes` and wait for the tip to change.
@@ -190,17 +354,19 @@ impl Harness {
             .await
             .expect("the tip changes after a commit")
             .expect("the tip channel stays open");
-        self.pool.dummy_call().await;
+        match &mut self.pool {
+            PoolUnderTest::Classic(pool) => pool.dummy_call().await,
+            PoolUnderTest::Core { .. } => {
+                if self.is_enabled().await {
+                    self.caught_up().await;
+                }
+            }
+        }
     }
 
     /// Send `request` and return its answer.
     async fn call(&mut self, request: Request) -> Result<Response, BoxError> {
-        self.pool
-            .ready()
-            .await
-            .expect("the pool is always ready")
-            .call(request)
-            .await
+        self.start_call(request).await.await
     }
 
     /// Send `request` and return its answer, which must be `Ok`.
@@ -223,11 +389,13 @@ impl Harness {
         answers.remove(0)
     }
 
-    /// Wait for a queued item's second answer, polling the pool meanwhile,
-    /// as the queue checker does.
+    /// Wait for a queued item's second answer, polling today's pool
+    /// meanwhile, as the queue checker does. The core needs no polling.
     async fn outcome(&mut self, mut receiver: Receiver) -> Result<(), BoxError> {
         for _ in 0..(ANSWER_WAIT.as_millis() / 50) {
-            self.pool.dummy_call().await;
+            if let PoolUnderTest::Classic(pool) = &mut self.pool {
+                pool.dummy_call().await;
+            }
             if let Ok(answer) = timeout(Duration::from_millis(50), &mut receiver).await {
                 return answer.expect("the pool answers each queued item");
             }
@@ -347,10 +515,9 @@ fn is_disabled(error: &BoxError) -> bool {
     error.downcast_ref::<MempoolDisabledError>().is_some()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn inactive_pool_answers_each_request_as_today() {
-    let mut harness = pool(Config::default(), Peers::Mock).await;
-    assert!(!harness.pool.is_enabled(), "a far-behind pool starts off");
+async fn inactive_pool_answers_each_request_as_today(mode: Mode) {
+    let mut harness = pool(Config::default(), Peers::Mock, mode).await;
+    assert!(!harness.is_enabled().await, "a far-behind pool starts off");
     let sample = samples(1).remove(0);
     let id = sample.transaction.id();
     let outpoint = first_output(&sample);
@@ -421,9 +588,8 @@ async fn inactive_pool_answers_each_request_as_today() {
     harness.verifier.expect_no_requests().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn empty_active_pool_answers_each_query_as_today() {
-    let mut harness = active_pool().await;
+async fn empty_active_pool_answers_each_query_as_today(mode: Mode) {
+    let mut harness = active_pool(mode).await;
     let sample = samples(1).remove(0);
     let id = sample.transaction.id();
     let outpoint = first_output(&sample);
@@ -471,32 +637,19 @@ async fn empty_active_pool_answers_each_query_as_today() {
     ));
 
     // A wait for an output nobody created stays open.
-    let wait = harness
-        .pool
-        .ready()
-        .await
-        .expect("the pool is always ready")
-        .call(Request::AwaitOutput(outpoint));
+    let wait = harness.start_call(Request::AwaitOutput(outpoint)).await;
     assert!(timeout(SILENCE, wait).await.is_err());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn admitted_body_is_served_by_every_query() {
-    let mut harness = active_pool().await;
+async fn admitted_body_is_served_by_every_query(mode: Mode) {
+    let mut harness = active_pool(mode).await;
     let sample = samples(1).remove(0);
     let id = sample.transaction.id();
     let outpoint = first_output(&sample);
     let output = sample.transaction.transaction().outputs()[0].clone();
 
     // A waiter registered before the admission is answered by it.
-    let waiter = tokio::spawn(
-        harness
-            .pool
-            .ready()
-            .await
-            .expect("the pool is always ready")
-            .call(Request::AwaitOutput(outpoint)),
-    );
+    let waiter = tokio::spawn(harness.start_call(Request::AwaitOutput(outpoint)).await);
     harness.admit(&sample).await;
     let answer = timeout(ANSWER_WAIT, waiter)
         .await
@@ -559,14 +712,20 @@ async fn admitted_body_is_served_by_every_query() {
                 && last_seen_hash == tip
     ));
 
-    // The admission waits for gossip until it is taken, a limit at a time.
+    // Today's admission waits for gossip until it is taken, a limit at a
+    // time. The core announces from its change log, so it has nothing to
+    // take here: a difference made on purpose.
+    let gossiped: HashSet<UnminedTxId> = match mode {
+        Mode::Classic => [id].into(),
+        Mode::Core => HashSet::new(),
+    };
     assert!(matches!(
         harness.ask(Request::TakePendingGossipTransactionIds { limit: 0 }).await,
         Response::TransactionIds(ids) if ids.is_empty()
     ));
     assert!(matches!(
         harness.ask(Request::TakePendingGossipTransactionIds { limit: 1 }).await,
-        Response::TransactionIds(ids) if ids == [id].into()
+        Response::TransactionIds(ids) if ids == gossiped
     ));
     assert!(matches!(
         harness.ask(Request::TakePendingGossipTransactionIds { limit: 1 }).await,
@@ -596,9 +755,8 @@ async fn admitted_body_is_served_by_every_query() {
     harness.verifier.expect_no_requests().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn queued_id_is_fetched_then_verified() {
-    let mut harness = active_pool().await;
+async fn queued_id_is_fetched_then_verified(mode: Mode) {
+    let mut harness = active_pool(mode).await;
     let sample = samples(1).remove(0);
     let id = sample.transaction.id();
 
@@ -621,9 +779,8 @@ async fn queued_id_is_fetched_then_verified() {
     assert_eq!(harness.ids().await, [id].into());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn failed_fetch_answers_the_receiver_and_caches_nothing() {
-    let mut harness = active_pool().await;
+async fn failed_fetch_answers_the_receiver_and_caches_nothing(mode: Mode) {
+    let mut harness = active_pool(mode).await;
     let id = samples(1).remove(0).transaction.id();
 
     let receiver = harness
@@ -651,9 +808,8 @@ async fn failed_fetch_answers_the_receiver_and_caches_nothing() {
         .expect("a failed fetch leaves the id free to queue again");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn failed_verification_is_answered_then_cached_for_the_tip() {
-    let mut harness = active_pool().await;
+async fn failed_verification_is_answered_then_cached_for_the_tip(mode: Mode) {
+    let mut harness = active_pool(mode).await;
     let sample = samples(1).remove(0);
     let id = sample.transaction.id();
 
@@ -683,13 +839,12 @@ async fn failed_verification_is_answered_then_cached_for_the_tip() {
     assert!(harness.ids().await.is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn too_large_rejection_is_answered_at_the_receiver_stage() {
+async fn too_large_rejection_is_answered_at_the_receiver_stage(mode: Mode) {
     let config = Config {
         max_transaction_bytes: 1,
         ..Config::default()
     };
-    let mut harness = pool(config, Peers::Mock).await;
+    let mut harness = pool(config, Peers::Mock, mode).await;
     harness.activate().await;
     let sample = samples(1).remove(0);
     let id = sample.transaction.id();
@@ -732,25 +887,29 @@ async fn too_large_rejection_is_answered_at_the_receiver_stage() {
     harness.verifier.expect_no_requests().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn pool_dependency_limits_are_answered_then_cached_for_the_tip() {
-    let mut harness = active_pool().await;
+async fn pool_dependency_limits_are_answered_then_cached_for_the_tip(mode: Mode) {
+    let mut harness = active_pool(mode).await;
     let [a, b, c, d, e, f]: [VerifiedUnminedTx; 6] = samples(6).try_into().expect("six samples");
 
-    // A parent the pool does not hold.
-    let error = harness
-        .submit(&a, vec![OutPoint::from_usize(unknown_id(0).mined_id(), 0)])
-        .await
-        .expect_err("a missing pool parent is refused");
-    let missing = MempoolError::StorageEffectsTip(SameEffectsTipRejectionError::MissingOutput);
-    assert_eq!(error.unbox_mempool_error(), missing);
-    assert_eq!(
-        harness
-            .queue_one(a.transaction.id())
+    // A parent the pool does not hold. Today's pool refuses it and caches
+    // the refusal. The core verifies it again instead, because the parent
+    // may have been mined since the verifier looked: a difference made on
+    // purpose, which the machine tests cover.
+    if mode == Mode::Classic {
+        let error = harness
+            .submit(&a, vec![OutPoint::from_usize(unknown_id(0).mined_id(), 0)])
             .await
-            .unbox_mempool_error(),
-        missing
-    );
+            .expect_err("a missing pool parent is refused");
+        let missing = MempoolError::StorageEffectsTip(SameEffectsTipRejectionError::MissingOutput);
+        assert_eq!(error.unbox_mempool_error(), missing);
+        assert_eq!(
+            harness
+                .queue_one(a.transaction.id())
+                .await
+                .unbox_mempool_error(),
+            missing
+        );
+    }
 
     // A chain of three: b, then c spending b, then d spending c.
     harness.admit(&b).await;
@@ -804,9 +963,8 @@ async fn pool_dependency_limits_are_answered_then_cached_for_the_tip() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn mined_transaction_is_rejected_for_the_chain_and_tip_rejections_end() {
-    let mut harness = pool(Config::default(), Peers::Silent).await;
+async fn mined_transaction_is_rejected_for_the_chain_and_tip_rejections_end(mode: Mode) {
+    let mut harness = pool(Config::default(), Peers::Silent, mode).await;
     harness.activate().await;
     // Block 1 starts an upgrade, which resets the pool, so the test starts
     // after it.
@@ -864,9 +1022,8 @@ async fn mined_transaction_is_rejected_for_the_chain_and_tip_rejections_end() {
     assert_eq!(tip_hash, harness.tip_hash(), "the new tip's hash");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn same_id_twice_is_already_queued_at_the_first_stage() {
-    let mut harness = pool(Config::default(), Peers::Silent).await;
+async fn same_id_twice_is_already_queued_at_the_first_stage(mode: Mode) {
+    let mut harness = pool(Config::default(), Peers::Silent, mode).await;
     harness.activate().await;
     let sample = samples(1).remove(0);
     let id = sample.transaction.id();
@@ -882,17 +1039,26 @@ async fn same_id_twice_is_already_queued_at_the_first_stage() {
         .expect("two answers")
         .expect("the first copy is queued");
 
-    for item in [Gossip::from(id), sample.transaction.clone().into()] {
-        assert_eq!(
-            harness.queue_one(item).await.unbox_mempool_error(),
-            MempoolError::AlreadyQueued
-        );
+    assert_eq!(
+        harness.queue_one(id).await.unbox_mempool_error(),
+        MempoolError::AlreadyQueued
+    );
+    // Today's pool refuses a body of an id it is fetching. The core joins the
+    // body to that id instead, and answers it with the same verdict at the
+    // second stage: the one difference the adapter makes on purpose.
+    let body = harness.queue_one(sample.transaction.clone()).await;
+    match mode {
+        Mode::Classic => {
+            assert_eq!(body.unbox_mempool_error(), MempoolError::AlreadyQueued)
+        }
+        Mode::Core => {
+            body.expect("a body of an undecided id joins it");
+        }
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn full_queue_is_refused_at_the_first_stage() {
-    let mut harness = pool(Config::default(), Peers::Silent).await;
+async fn full_queue_is_refused_at_the_first_stage(mode: Mode) {
+    let mut harness = pool(Config::default(), Peers::Silent, mode).await;
     harness.activate().await;
 
     let answers = harness
@@ -924,9 +1090,8 @@ async fn full_queue_is_refused_at_the_first_stage() {
     assert!(harness.ids().await.is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn one_peer_holds_at_most_five_fetches() {
-    let mut harness = pool(Config::default(), Peers::Silent).await;
+async fn one_peer_holds_at_most_five_fetches(mode: Mode) {
+    let mut harness = pool(Config::default(), Peers::Silent, mode).await;
     harness.activate().await;
     let offered: Vec<_> = (0..=MAX_INBOUND_CONCURRENCY_PER_PEER)
         .map(unknown_id)
@@ -966,9 +1131,16 @@ async fn one_peer_holds_at_most_five_fetches() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn output_waits_are_limited_to_distinct_outpoints() {
-    let mut harness = active_pool().await;
+/// Today's pool only. Its waits register when the request is called, so the
+/// test can hold 65,536 of them without polling. The core's register when
+/// the call is first polled, and the core drops abandoned waits before it
+/// refuses a new outpoint, which is a difference made on purpose: see the
+/// port's `PoolCommand::AwaitOutput`.
+async fn output_waits_are_limited_to_distinct_outpoints(mode: Mode) {
+    if mode == Mode::Core {
+        return;
+    }
+    let mut harness = active_pool(mode).await;
     let outpoint = |index: usize| OutPoint::from_usize(unknown_id(index).mined_id(), 0);
 
     // Each wait holds its place while its future is alive.
@@ -976,11 +1148,8 @@ async fn output_waits_are_limited_to_distinct_outpoints() {
     for index in 0..MAX_PENDING_OUTPUTS {
         waits.push(
             harness
-                .pool
-                .ready()
-                .await
-                .expect("the pool is always ready")
-                .call(Request::AwaitOutput(outpoint(index))),
+                .start_call(Request::AwaitOutput(outpoint(index)))
+                .await,
         );
     }
 
@@ -994,12 +1163,7 @@ async fn output_waits_are_limited_to_distinct_outpoints() {
     );
 
     // Another wait for an outpoint already waited on is accepted.
-    let again = harness
-        .pool
-        .ready()
-        .await
-        .expect("the pool is always ready")
-        .call(Request::AwaitOutput(outpoint(0)));
+    let again = harness.start_call(Request::AwaitOutput(outpoint(0))).await;
     assert!(timeout(SILENCE, again).await.is_err());
 
     // Abandoned waits keep their places until the next scheduled prune, so a
@@ -1015,3 +1179,125 @@ async fn output_waits_are_limited_to_distinct_outpoints() {
         "{error:?}"
     );
 }
+
+/// The indexer's change stream reports an admission as added and a refused
+/// verification as invalidated, one event each.
+async fn change_stream_reports_admissions_and_refusals(mode: Mode) {
+    let mut harness = active_pool(mode).await;
+    let mut changes = harness.changes.subscribe();
+    let [admitted, refused]: [VerifiedUnminedTx; 2] = samples(2).try_into().expect("two samples");
+
+    harness.admit(&admitted).await;
+    let receiver = harness
+        .queue_one(refused.transaction.clone())
+        .await
+        .expect("a new body passes the first stage");
+    harness.verify(Err(TransactionError::BadBalance)).await;
+    harness
+        .outcome(receiver)
+        .await
+        .expect_err("an invalid transaction is refused");
+
+    let mut events: Vec<(MempoolChangeKind, HashSet<UnminedTxId>)> = Vec::new();
+    while events.len() < 2 {
+        // Today's pool reports a refusal on its next poll, after it answered
+        // the receiver, so it is polled as the queue checker polls it.
+        harness.ask(Request::CheckForVerifiedTransactions).await;
+        let change: MempoolChange = timeout(ANSWER_WAIT, changes.recv())
+            .await
+            .expect("the change stream reports both")
+            .expect("the change stream stays open");
+        events.push((change.kind(), change.tx_ids().clone()));
+    }
+    assert_eq!(
+        events,
+        vec![
+            (MempoolChangeKind::Added, [admitted.transaction.id()].into()),
+            (
+                MempoolChangeKind::Invalidated,
+                [refused.transaction.id()].into()
+            ),
+        ]
+    );
+}
+
+/// The core only: a body whose id is already being verified joins that
+/// verification, and both submissions get its verdict at the second stage.
+/// Today's pool refuses the second one as already queued.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_joins_an_undecided_id_and_gets_its_verdict() {
+    let mut harness = active_pool(Mode::Core).await;
+    let sample = samples(1).remove(0);
+
+    let first = harness
+        .queue_one(sample.transaction.clone())
+        .await
+        .expect("a new body passes the first stage");
+    let second = harness
+        .queue_one(sample.transaction.clone())
+        .await
+        .expect("a second body joins the first");
+    harness.verify(Ok(passed(&sample, Vec::new()))).await;
+    harness
+        .outcome(first)
+        .await
+        .expect("the transaction is admitted");
+    harness
+        .outcome(second)
+        .await
+        .expect("the joined body gets the same verdict");
+    // One verification served both.
+    harness.verifier.expect_no_requests().await;
+}
+
+/// The core only: the transaction verifier's pool handle answers an output
+/// lookup at once, with the output or `OutputNotInPool`, where today's pool
+/// makes it wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_verifiers_pool_handle_answers_at_once() {
+    let mut harness = active_pool(Mode::Core).await;
+    let sample = samples(1).remove(0);
+    harness.admit(&sample).await;
+    let PoolUnderTest::Core { verifier_pool, .. } = &harness.pool else {
+        unreachable!("the harness runs the core");
+    };
+
+    let present = verifier_pool
+        .clone()
+        .oneshot(Request::AwaitOutput(first_output(&sample)))
+        .await
+        .expect("a pooled output is answered");
+    assert!(matches!(present, Response::UnspentOutput(_)));
+
+    let missing = OutPoint::from_usize(unknown_id(0).mined_id(), 0);
+    let error = timeout(
+        SILENCE,
+        verifier_pool.clone().oneshot(Request::AwaitOutput(missing)),
+    )
+    .await
+    .expect("a missing output is answered at once")
+    .expect_err("nothing creates it");
+    assert!(
+        error
+            .downcast_ref::<zakura_node_services::mempool::OutputNotInPool>()
+            .is_some(),
+        "{error:?}"
+    );
+}
+
+both_pools!(
+    change_stream_reports_admissions_and_refusals,
+    inactive_pool_answers_each_request_as_today,
+    empty_active_pool_answers_each_query_as_today,
+    admitted_body_is_served_by_every_query,
+    queued_id_is_fetched_then_verified,
+    failed_fetch_answers_the_receiver_and_caches_nothing,
+    failed_verification_is_answered_then_cached_for_the_tip,
+    too_large_rejection_is_answered_at_the_receiver_stage,
+    pool_dependency_limits_are_answered_then_cached_for_the_tip,
+    mined_transaction_is_rejected_for_the_chain_and_tip_rejections_end,
+    same_id_twice_is_already_queued_at_the_first_stage,
+    full_queue_is_refused_at_the_first_stage,
+    one_peer_holds_at_most_five_fetches,
+    output_waits_are_limited_to_distinct_outpoints,
+);

@@ -2980,7 +2980,8 @@ mod tests {
     /// A lane blocks on a failed command or listing, a required target
     /// that wasn't built or lists nothing, a listed test that didn't run and
     /// pass (a `--skip`), a nonempty expected-empty target, an unrun
-    /// `run = true` ignored test, or any failure.
+    /// `run = true` ignored test, or any failure. A test is matched within
+    /// its own target, never by its name alone.
     #[test]
     fn a_lane_needs_its_whole_inventory() {
         let required = ["zakura-sim/draws".to_owned()];
@@ -3055,6 +3056,29 @@ mod tests {
         let failed =
             lane(json!({ "targets": { "zakura-sim/draws": [["a", "ok"], ["c", "FAILED"]] } }));
         assert!(blocked(&judge(&failed, &none)));
+        // One key off: the listed test's name ran, but in another target.
+        let elsewhere = lane(json!({
+            "listed": { "zakura-sim/draws": ["a"], "zakura-sim/net": ["a"], "zakura-rt/lib": [] },
+            "targets": { "zakura-sim/draws": [], "zakura-sim/net": [["a", "ok"]] },
+        }));
+        assert!(
+            blocked(&judge(&elsewhere, &none)),
+            "a listed test that ran only under another target blocks"
+        );
+        let ignored_elsewhere = lane(json!({
+            "listed": { "zakura-sim/draws": ["a"], "zakura-sim/net": ["slow"], "zakura-rt/lib": [] },
+            "targets": {
+                "zakura-sim/draws": [["a", "ok"], ["slow", "ignored"]],
+                "zakura-sim/net": [["slow", "ok"]],
+            },
+        }));
+        assert!(
+            blocked(&judge(
+                &ignored_elsewhere,
+                &["zakura-sim/draws::slow".to_owned()]
+            )),
+            "a `run = true` test that ran only under another target blocks"
+        );
     }
 
     /// A lane binds to S only when every target it listed or ran names its

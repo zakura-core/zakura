@@ -891,7 +891,30 @@ impl DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
-        self.zs_range_iter_with_direction(cf, range, false)
+        self.zs_range_iter_with_direction(cf, range, false, None)
+    }
+
+    /// Returns a forward iterator over the items in `cf` in `range`, like
+    /// [`Self::zs_forward_range_iter`], that fetches up to `read_ahead_bytes` of the range
+    /// from disk at a time instead of one small block per read.
+    ///
+    /// Use this for a scan that reads a whole bounded range of large values. RocksDB does
+    /// not read past the end of `range`, so a short range costs no extra disk reads.
+    ///
+    /// Holding this iterator open might delay block commit transactions.
+    pub fn zs_forward_range_iter_with_read_ahead<C, K, V, R>(
+        &self,
+        cf: &C,
+        range: R,
+        read_ahead_bytes: usize,
+    ) -> impl Iterator<Item = (K, V)> + '_
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk,
+        R: RangeBounds<K>,
+    {
+        self.zs_range_iter_with_direction(cf, range, false, Some(read_ahead_bytes))
     }
 
     /// Returns a reverse iterator over the items in `cf` in `range`.
@@ -908,7 +931,7 @@ impl DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
-        self.zs_range_iter_with_direction(cf, range, true)
+        self.zs_range_iter_with_direction(cf, range, true, None)
     }
 
     /// Returns an iterator over the items in `cf` in `range`.
@@ -916,12 +939,17 @@ impl DiskDb {
     /// RocksDB iterators are ordered by increasing key bytes by default.
     /// Otherwise, if `reverse` is `true`, the iterator is ordered by decreasing key bytes.
     ///
+    /// With `read_ahead_bytes`, the scan fetches that much of the range from disk at a time.
+    /// Without it, RocksDB starts with single blocks and reads ahead only after two
+    /// sequential reads.
+    ///
     /// Holding this iterator open might delay block commit transactions.
     fn zs_range_iter_with_direction<C, K, V, R>(
         &self,
         cf: &C,
         range: R,
         reverse: bool,
+        read_ahead_bytes: Option<usize>,
     ) -> impl Iterator<Item = (K, V)> + '_
     where
         C: rocksdb::AsColumnFamilyRef,
@@ -946,7 +974,10 @@ impl DiskDb {
         let range = (start_bound, end_bound);
 
         let mode = Self::zs_iter_mode(&range, reverse);
-        let opts = Self::zs_iter_opts(&range);
+        let mut opts = Self::zs_iter_opts(&range);
+        if let Some(read_ahead_bytes) = read_ahead_bytes {
+            opts.set_readahead_size(read_ahead_bytes);
+        }
 
         // Reading multiple items from iterators has caused database hangs,
         // in previous RocksDB versions

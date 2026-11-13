@@ -165,6 +165,36 @@ async fn single_startup_slot_prefers_seed_over_cached_peer() {
     );
 }
 
+/// A restart with cached peers dials them even when every seed lookup fails,
+/// instead of retrying DNS until a seed resolves.
+#[tokio::test]
+async fn cached_peers_are_returned_when_seed_dns_fails() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cached: crate::PeerSocketAddr = "127.0.0.9:9000".parse().unwrap();
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        // The reserved `.invalid` TLD never resolves (RFC 6761).
+        initial_mainnet_peers: ["seed.zakura-test.invalid:8233".to_string()]
+            .into_iter()
+            .collect(),
+        ..Config::default()
+    };
+    config
+        .update_peer_cache([cached].into_iter().collect())
+        .await
+        .unwrap();
+
+    // One failed lookup round takes at most one DNS timeout.
+    let initial_peers = tokio::time::timeout(
+        crate::constants::DNS_LOOKUP_TIMEOUT * 3,
+        config.initial_peers(),
+    )
+    .await
+    .expect("cached peers are returned after one failed seed lookup round");
+    assert_eq!(initial_peers.into_iter().collect::<Vec<_>>(), vec![cached]);
+}
+
 /// Cached peers retain their turns, and seed membership does not depend on the port.
 #[tokio::test]
 async fn peer_cache_alternates_with_seeds_on_any_network_port() {

@@ -831,11 +831,12 @@ mod manifest {
     }
 
     /// The rows' fixed content is pinned: unchanged, it matches the pin,
-    /// and changing one field of one row moves it.
+    /// and changing one field of one row moves it. A test's file is named
+    /// whole, so `tests/draws.rs` and a file `draws` are two results.
     #[test]
     fn a_changed_row_field_fails_the_pin() {
         use zakura_sim::sim_acceptance::manifest::{
-            rows, rows_digest, rows_digest_of, Derived, ROWS_SHA256,
+            rows, rows_digest, rows_digest_of, test_target, Derived, Expected, ROWS_SHA256,
         };
         assert_eq!(rows_digest(), ROWS_SHA256);
         let mut changed = rows(&Derived::default());
@@ -845,6 +846,19 @@ mod manifest {
         let row = fewer.iter_mut().find(|row| row.expected.len() > 1).unwrap();
         row.expected.pop();
         assert_ne!(rows_digest_of(&fewer), ROWS_SHA256);
+        let mut moved = rows(&Derived::default());
+        let test = moved
+            .iter_mut()
+            .flat_map(|row| &mut row.expected)
+            .find_map(|expected| match expected {
+                Expected::Test(test) => Some(test),
+                _ => None,
+            })
+            .unwrap();
+        let original = Expected::Test(*test).to_string();
+        test.file = test_target(test);
+        assert_ne!(Expected::Test(*test).to_string(), original);
+        assert_ne!(rows_digest_of(&moved), ROWS_SHA256);
     }
 
     #[test]

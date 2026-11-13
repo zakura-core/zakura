@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::super::{
@@ -25,7 +25,7 @@ fn killed(why: impl Into<String>) -> Classified {
 }
 
 /// One result, as the plan's table defines it. There is no other class.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(super) enum Class {
     /// The target reports the declared property ID with a valid witness and
@@ -62,7 +62,7 @@ impl Class {
 }
 
 /// A result and why.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Classified {
     /// The class.
     pub(super) class: Class,
@@ -272,7 +272,7 @@ pub(super) fn sensitivity(property: &str, run: &SensitivityRun) -> Classified {
 }
 
 /// What one discovery campaign showed, from its store's records.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub(super) struct CampaignFacts {
     /// How the run ended: `complete`, `worker-stopped` or `interrupted`, or
     /// `none` without an end record.
@@ -300,17 +300,26 @@ pub(super) struct CampaignFacts {
     pub(super) applicable_runs: u64,
     /// How long the workers ran, in milliseconds.
     pub(super) millis: u64,
+    /// How long the longest worker ran, in seconds.
+    pub(super) worker_secs: f64,
+    /// The unique abstract states the run reached: the distinct
+    /// protocol-state features its processes' runs hit.
+    pub(super) features_reached: usize,
     /// The first saved input that violates the intended property, relative
     /// to the store.
     pub(super) intended_input: Option<String>,
-    /// Why the run's fuzzer build doesn't pair with the catalogue's, if it
-    /// doesn't.
+    /// The seconds a worker had fuzzed when the process that saved the
+    /// first intended input ended, the earliest over the workers. `None`
+    /// without an intended input, or if no process's crash matches one.
+    pub(super) first_intended_secs: Option<f64>,
+    /// Why the run's fuzzer build doesn't pair with the expected identity,
+    /// or its fuzzer with its arm, if it doesn't.
     pub(super) unpaired: Option<String>,
 }
 
 /// What one seed's paired discovery campaigns observed. A step that didn't
 /// run is `None`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct DiscoveryRun {
     /// The review's argument that the mutation can't change behavior.
     pub(super) equivalent: Option<String>,
@@ -351,10 +360,20 @@ impl std::fmt::Display for NoCampaign {
 
 /// What a seed's paired campaigns show about `property`: the original's
 /// campaign must complete from an empty corpus with no failure, and the
-/// mutant's equal-budget campaign must find exactly `property`, with no
-/// other failure, and a fresh process must confirm it. A completed campaign that never applies the
-/// property is [`Class::NotApplicable`], never a survivor.
-pub(super) fn discovery(property: &str, run: &DiscoveryRun) -> Classified {
+/// mutant's equal-budget campaign must find `property`, with no other
+/// failure, and a fresh process must confirm it. A completed campaign that
+/// never applies the property is [`Class::NotApplicable`], never a
+/// survivor.
+///
+/// `also_violates` lists properties the patch's bug breaks too. As in the
+/// planted runner's judge ([`planted_verdict`]), a mutant campaign may
+/// violate them beside `property`, but one of them alone misses the patch,
+/// so it stays [`Class::OtherViolation`].
+pub(super) fn discovery(
+    property: &str,
+    also_violates: &[String],
+    run: &DiscoveryRun,
+) -> Classified {
     let harness = |why: String| result(Class::HarnessFailure, why);
     if let Some(argument) = &run.equivalent {
         return result(Class::Equivalent, argument.clone());
@@ -389,14 +408,24 @@ pub(super) fn discovery(property: &str, run: &DiscoveryRun) -> Classified {
     if let Some(why) = left_failures(mutant) {
         return harness(format!("the mutant campaign {why}"));
     }
-    let others: Vec<&String> = mutant.violated.iter().filter(|p| *p != property).collect();
+    let found = mutant.violated.iter().any(|p| p == property);
+    let others: Vec<&String> = mutant
+        .violated
+        .iter()
+        .filter(|p| *p != property && !(found && also_violates.contains(p)))
+        .collect();
     if let Some(other) = others.first() {
+        let alone = if also_violates.contains(other) {
+            format!(", which the case allows only beside {property}")
+        } else {
+            String::new()
+        };
         return result(
             Class::OtherViolation,
-            format!("the mutant campaign violates {other}"),
+            format!("the mutant campaign violates {other}{alone}"),
         );
     }
-    if mutant.violated.iter().any(|p| p == property) {
+    if found {
         return match &run.confirmation {
             None => harness("no fresh process confirmed the campaign's finding".to_owned()),
             Some(Err(why)) => harness(why.clone()),
@@ -512,8 +541,8 @@ fn left_failures(campaign: &CampaignFacts) -> Option<String> {
 /// numerator and denominator.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct Summary {
-    /// Results counted: cases for sensitivity, case-seed pairs for
-    /// discovery.
+    /// Results counted: cases for sensitivity, and for discovery one per
+    /// case, seed and arm.
     pub(super) results: usize,
     /// Results by class. Every class appears, with zero if none.
     pub(super) classes: BTreeMap<Class, usize>,

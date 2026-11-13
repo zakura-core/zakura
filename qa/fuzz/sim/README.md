@@ -31,6 +31,12 @@ whose target has no harness or no campaign.
 
 ## Targets
 
+The storage and wire targets (`header_sync_storage`, `header_sync_wire`,
+`sync_storage`, `sync_wire`, `discovery_wire` and `block_sync_storage`) run
+about one input a second or slower. libFuzzer's default length control would
+hold their inputs at 4 bytes for a whole campaign, so their `qa/suite.toml`
+rows pass `-len_control=0`.
+
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
 - `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
   encodes the scenario in the action grammar of
@@ -134,6 +140,13 @@ per feature into the `__libfuzzer_extra_counters` section. libFuzzer clears
 the section before each input and reads each nonzero counter as a feature,
 so an input that reaches a new state through covered code still joins the
 corpus. The section works on Linux only.
+
+`header_sync_storage`, `header_sync_wire`, `sync_storage`, `sync_wire` and
+`discovery_wire` pass `zakura_sim::explore::state::collector`, which reads
+the observations, obligations and run end that their harnesses log. The
+feedback comparison (fuzz-14, `qa/mutation-pilot/README.md`) runs planted
+cases on them with feedback on and off. Unset, `ZAKURA_SIM_FEEDBACK` means
+`on`, so their other campaigns read the collector's features too.
 
 `ZAKURA_SIM_FEEDBACK=off` moves the collector's writes to counters libFuzzer
 doesn't read. The collector still runs, so `on` and `off` runs take the same
@@ -423,6 +436,15 @@ must give the seed's input. The `header-sync/storage` seeds were migrated
 from generator 2 this way, by `grammar::migrate`. A seed whose prefix is for
 another generator than its harness's is rejected, even when the harness
 would draw a fallback scenario for it.
+
+The seed corpus is the fixture directory's own seeds. Campaigns, `cargo
+xtask sim-targets` and `--out` run each one as an input that passes, so no
+corpus seed carries a witness with `expect = "violated"` or
+`"violated-set"`. A seed that fails by design, such as a pinned repro of an
+open bug, sits in a subdirectory with that witness, and only its own test
+loads it: `known-failures/` holds open-bug repros, and `race-schedules/`
+holds the planted races' violating schedules. The seed tests fail on a
+corpus seed that expects a violation and on a known failure that doesn't.
 
 `cargo xtask sim-seeds` validates every seed against the current generators.
 A required seed that fails, such as one built for an older generator or one

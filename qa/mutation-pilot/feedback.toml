@@ -1,0 +1,132 @@
+# The feedback comparison's frozen case list (fuzz-14). `cargo xtask planted
+# pilot feedback` reads it. See README.md, Feedback comparison.
+#
+# Each case names a retained planted case by its path under qa/planted/,
+# without the `.patch`, and repeats the case's property, the directory it
+# lies in. Its target must be a simulator fuzz target that runs the harness
+# of the case's committed input, and its harness must log the observations
+# that `zakura_sim::explore::state::collector` reads. Nightly
+# `cargo xtask planted --targets` confirms each committed input through that
+# target. A nested case, one with a `set`, isn't allowed: a campaign stops at
+# its first finding, which needn't show the whole set.
+#
+# To extend the list, add a `[[case]]`. Every case runs the same seeds, arms
+# and bounds, so a case added later compares with the earlier ones.
+
+[bounds]
+# Deliberate cold start, as the pilot's discovery: no seed, witness or
+# carried input.
+corpus = "qa/mutation-pilot/discovery-empty"
+seeds = [11, 23, 47, 89, 179, 359, 719, 1439, 2879, 5759]
+feedback_arms = ["on", "off"]
+seconds_per_seed = 600
+workers = 1
+# `campaign start`'s defaults, which the suite's rows for these targets use.
+max_len = 4096
+input_timeout_seconds = 30
+rss_limit_mb = 4096
+max_restarts = 0
+abandon_limit = 1
+sanitizer = "none"
+
+# Each target's extra libFuzzer flags, from its qa/suite.toml row. These
+# harnesses run about one input a second, so libFuzzer's default length
+# control would hold every input at 4 bytes for the whole campaign.
+[bounds.libfuzzer_args]
+header_sync_storage = ["-len_control=0"]
+header_sync_wire = ["-len_control=0"]
+sync_storage = ["-len_control=0"]
+sync_wire = ["-len_control=0"]
+discovery_wire = ["-len_control=0"]
+
+[confirmation]
+# The wire harnesses run to their step budget, so a confirmation child gets
+# more time than the pilot's machine harnesses need.
+child_seconds = 300
+
+# header_sync_storage
+
+[[case]]
+case = "header-sync/chunk-budget-bound/uncapped-secondary-reservation"
+property = "header-sync/chunk-budget-bound"
+target = "header_sync_storage"
+fault_class = "boundary-accounting"
+
+[[case]]
+case = "header-sync/stale-completion-inert/stale-credit"
+property = "header-sync/stale-completion-inert"
+target = "header_sync_storage"
+fault_class = "stale-result"
+
+[[case]]
+case = "header-sync/teardown-returns-baseline/leaked-reservation-entry"
+property = "header-sync/teardown-returns-baseline"
+target = "header_sync_storage"
+fault_class = "resource-lifetime"
+
+# header_sync_wire
+
+[[case]]
+case = "header-sync/commit-only-authorized/off-path-page"
+property = "header-sync/commit-only-authorized"
+target = "header_sync_wire"
+fault_class = "authorization"
+
+[[case]]
+case = "header-sync/honest-progress/skipped-apply"
+property = "header-sync/honest-progress"
+target = "header_sync_wire"
+fault_class = "liveness"
+
+# sync_storage
+
+[[case]]
+case = "block-sync/query-work-authorized/ignore-view-during-query"
+property = "block-sync/query-work-authorized"
+target = "sync_storage"
+fault_class = "authorization"
+
+[[case]]
+case = "sync/header-reorg-retires-block-work/accept-stale-scope-bodies"
+property = "sync/header-reorg-retires-block-work"
+target = "sync_storage"
+fault_class = "stale-result"
+
+[[case]]
+case = "sync/tips-consistent/keep-epoch-on-replaced-selection"
+property = "sync/tips-consistent"
+target = "sync_storage"
+fault_class = "stale-result"
+
+# sync_wire
+
+[[case]]
+case = "session/credit-isolated/handshake-window-only"
+property = "session/credit-isolated"
+target = "sync_wire"
+fault_class = "boundary-accounting"
+
+[[case]]
+case = "session/replacement-preserves-authorization/take-claims-by-peer"
+property = "session/replacement-preserves-authorization"
+target = "sync_wire"
+fault_class = "ownership"
+
+[[case]]
+case = "session/stalled-service-isolated/close-on-block-stall"
+property = "session/stalled-service-isolated"
+target = "sync_wire"
+fault_class = "liveness"
+
+# discovery_wire: its only planted case with a fuzz input. Its other cases
+# are typed scenarios.
+
+[[case]]
+case = "discovery/late-response-admitted/revoke-on-timeout"
+property = "discovery/late-response-admitted"
+target = "discovery_wire"
+fault_class = "stale-result"
+
+# block_sync_storage has twelve input cases but none here: a generated run
+# takes about 96 s and 7 GB (qa/suite.toml), so a 600-second campaign runs
+# a handful of inputs, and a cold start finds nothing to compare.

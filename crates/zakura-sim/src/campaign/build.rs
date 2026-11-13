@@ -19,10 +19,13 @@ use super::store::{
 #[path = "../../build/provenance.rs"]
 mod provenance;
 
-pub use crate::suite::NIGHTLY;
+/// Shared with `cargo xtask planted pilot`, which includes the file.
+#[path = "checkout.rs"]
+mod checkout;
 
-/// The simulator fuzz package, relative to the repository's root.
-pub const FUZZ_PACKAGE: &str = "qa/fuzz/sim";
+pub use crate::suite::NIGHTLY;
+use checkout::Checkout;
+pub use checkout::FUZZ_PACKAGE;
 
 /// The simulator build's flag, which the fuzz package needs.
 const SIM_RUSTFLAGS: &str = "--cfg zakura_sim";
@@ -278,41 +281,6 @@ pub fn build_fuzzer(
         cargo_args,
     };
     Ok((bytes, identity))
-}
-
-/// The state of a checkout that a build record names.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Checkout {
-    /// `HEAD`'s commit.
-    git: String,
-    /// True if the tree had changes under the source paths or the fuzz
-    /// package, or if git couldn't say.
-    dirty: bool,
-    /// The digest of the source paths and the fuzz package.
-    source: String,
-    /// The digest of the workspace's `Cargo.lock`.
-    lockfile: String,
-    /// The digest of the fuzz package's `Cargo.lock`.
-    fuzz_lockfile: String,
-}
-
-impl Checkout {
-    /// The checkout at `repo` as it is now.
-    fn read(repo: &Path) -> Checkout {
-        let mut paths = provenance::SOURCE_PATHS.to_vec();
-        paths.push(FUZZ_PACKAGE);
-        let provenance = provenance::Provenance::read(repo, &paths);
-        let digest = |path: PathBuf| {
-            provenance::file_digest(&path).unwrap_or_else(|| provenance::UNKNOWN.to_owned())
-        };
-        Checkout {
-            git: provenance.git,
-            dirty: provenance.dirty,
-            source: provenance.source,
-            lockfile: digest(repo.join("Cargo.lock")),
-            fuzz_lockfile: digest(repo.join(FUZZ_PACKAGE).join("Cargo.lock")),
-        }
-    }
 }
 
 /// Runs `build` in the checkout at `repo`, and returns its result with the

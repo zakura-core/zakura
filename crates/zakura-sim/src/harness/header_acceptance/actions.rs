@@ -633,14 +633,25 @@ fn names_its_link(facts: &[Fact], report: &FullReport) -> Vec<bool> {
                 }
                 (_, _, Some(link)) => {
                     let was = current.insert(link.peer.clone(), None).flatten();
-                    LinkRef::joins(&link, &was, Clone::clone)
-                        && among(&opened, &link)
-                        && among(&closed, &link)
+                    closes_current(&link, was.as_ref(), &opened, &closed)
                 }
                 _ => false,
             },
         )
         .collect()
+}
+
+/// Whether a close naming `link` names the link it acted on: `was`, its
+/// peer's current link before it, which `opened` shows opened and
+/// `closed` shows closed, each joined on its whole [`LinkRef`].
+fn closes_current(
+    link: &LinkRef,
+    was: Option<&LinkRef>,
+    opened: &[LinkRef],
+    closed: &[LinkRef],
+) -> bool {
+    let among = |links: &[LinkRef]| !LinkRef::joined(link, links, |at| Some(at.clone())).is_empty();
+    LinkRef::joins(link, &was, |was| was.cloned()) && among(opened) && among(closed)
 }
 
 /// The first of `facts` that `cause`'s own execution recorded and that
@@ -1127,6 +1138,43 @@ mod tests {
             relinks += 1;
         }
         assert!(relinks > 0);
+    }
+
+    /// A close names the link it acted on only by its whole [`LinkRef`]
+    /// (Rule 25's template): in the close-relink-close history each close
+    /// names its peer's current link, which the store opened and closed.
+    /// The same close with only its peer or connection moved names none,
+    /// and so does each close against a current link with only its peer
+    /// or connection moved, though the store opened and closed the close's
+    /// own link, so the current-link join alone refuses it.
+    #[test]
+    fn a_close_fact_names_its_peer_s_current_link() {
+        let (_, report, _) = close_relink_close();
+        let facts = environment_facts(&report);
+        let named = names_its_link(&facts, &report);
+        let (opened, closed) = (
+            session_links(&report, "LinkOpened"),
+            session_links(&report, "LinkClosed"),
+        );
+        let mut closes = 0;
+        for (at, fact) in facts.iter().enumerate() {
+            let Some(link) = fact.closes() else {
+                continue;
+            };
+            assert!(named[at], "{fact:?}");
+            assert_one_key_off::<LinkRef>(&link, |link| {
+                let mut moved = facts.clone();
+                moved[at].peer = link.peer.clone();
+                moved[at].connection = Some(link.connection);
+                names_its_link(&moved, &report)[at]
+            });
+            assert_one_key_off::<LinkRef>(&link, |was| {
+                closes_current(&link, Some(was), &opened, &closed)
+            });
+            assert!(!closes_current(&link, None, &opened, &closed));
+            closes += 1;
+        }
+        assert_eq!(closes, 2);
     }
 
     /// A committed fixture's path, from the repository root.

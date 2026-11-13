@@ -13,6 +13,7 @@ use support::{
     inputs,
     steer::{steer, Rule, Steer},
 };
+use zakura_network::zakura::observe::ReactorEvent;
 use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -251,19 +252,20 @@ fn each_membership_row_holds_keys_in_a_committed_witness() {
     assert_eq!(empty, Vec::<&str>::new(), "{peaks:?}");
 }
 
-/// One limit fixture's row as its log shows it: which entry opens a unit of
-/// the row, and for which party, and which entry releases one.
-struct RowUnits {
+/// One limit fixture's row as its log, or an evidence store's facts of
+/// type `T`, show it: which item opens a unit of the row, and for which
+/// party, and which item releases one.
+struct RowUnits<T = Entry> {
     /// The fixture's stem.
     stem: &'static str,
     /// The row's limit.
     limit: usize,
     /// The parties that want a unit, one more than the limit can hold.
     parties: usize,
-    /// The party an entry opens a unit for, if it opens one.
-    opens: fn(&Entry) -> Option<String>,
-    /// Whether an entry releases a unit.
-    releases: fn(&Entry) -> bool,
+    /// The party an item opens a unit for, if it opens one.
+    opens: fn(&T) -> Option<String>,
+    /// Whether an item releases a unit.
+    releases: fn(&T) -> bool,
 }
 
 /// What a limit fixture's log shows of its row.
@@ -280,8 +282,8 @@ struct RowUse {
     last_first_open: Option<(usize, usize)>,
 }
 
-/// Reads `row`'s units from `entries`, in log order.
-fn row_use(row: &RowUnits, entries: &[Entry]) -> RowUse {
+/// Reads `row`'s units from `entries`, in their order.
+fn row_use<T>(row: &RowUnits<T>, entries: &[T]) -> RowUse {
     let mut open = 0usize;
     let mut peak = 0;
     let mut seen = BTreeSet::new();
@@ -399,33 +401,76 @@ fn limit_rows() -> [RowUnits; 3] {
     ]
 }
 
-/// Gate 5's bound-table rows for work slots, locator reads and node
-/// execution slots, by their limit fixtures' logs: each row reaches its
+/// The slot-limit fixture's reservation-map row, read from the work
+/// queue's reservation facts ([`ReservationEvidence`]): a reservation
+/// opens a unit for its peer and its end releases it. Those are the facts
+/// the outstanding rule joins the reactor's reservation map's keys to.
+///
+/// [`ReservationEvidence`]: zakura_sim::harness::header_node::reservation::ReservationEvidence
+fn reservation_row() -> RowUnits<ReactorEvent> {
+    RowUnits {
+        stem: "header-outstanding-slot-limit",
+        limit: 16,
+        parties: 17,
+        opens: |event| match event {
+            ReactorEvent::ReservationOpened { peer, .. } => Some(format!("{peer:?}")),
+            _ => None,
+        },
+        releases: |event| matches!(event, ReactorEvent::ReservationEnded { .. }),
+    }
+}
+
+/// Checks `used`, `row`'s units in its fixture's run: the row reaches its
 /// limit and no further while one more party waits, so the next is denied,
 /// and that party gets its first unit only after a release, with fewer than
 /// the limit open, so a released unit is reused.
+fn released_and_reused<T>(row: &RowUnits<T>, used: &RowUse) {
+    let stem = row.stem;
+    assert_eq!(
+        (used.peak, used.parties),
+        (row.limit, row.parties),
+        "{stem}: {used:?}"
+    );
+    let (Some(release), Some((reused, open))) = (used.first_release, used.last_first_open) else {
+        panic!("{stem}: the row released and reused a unit: {used:?}");
+    };
+    assert!(
+        release < reused && open < row.limit,
+        "{stem}: the waiting party's first unit came after a release: {used:?}"
+    );
+}
+
+/// Gate 5's bound-table rows for work slots, locator reads and node
+/// execution slots, by their limit fixtures' logs, and for the reservation
+/// maps, by the slot-limit fixture's reservation facts
+/// ([`reservation_row`]): each row is [`released_and_reused`].
 #[test]
 fn the_limit_fixtures_release_and_reuse_their_bounds() {
-    for row in limit_rows() {
-        let stem = row.stem;
+    let run_fixture = |stem: &str| {
         let scenario = scenario(stem);
+        let prepared = Storage::prepare(&scenario);
+        let reservations = prepared.reservations.clone();
         let plan =
             fs::read(fixture(stem, "plan")).unwrap_or_else(|error| panic!("{stem}: {error}"));
-        let report = run(stem, &scenario, Plan::from_fuzz(&plan));
-        let used = row_use(&row, report.log.entries());
-        assert_eq!(
-            (used.peak, used.parties),
-            (row.limit, row.parties),
-            "{stem}: {used:?}"
-        );
-        let (Some(release), Some((reused, open))) = (used.first_release, used.last_first_open)
-        else {
-            panic!("{stem}: the row released and reused a unit: {used:?}");
-        };
-        assert!(
-            release < reused && open < row.limit,
-            "{stem}: the waiting party's first unit came after a release: {used:?}"
-        );
+        let report = run_prepared::<Storage>(
+            &scenario,
+            prepared,
+            Plan::from_fuzz(&plan),
+            &mut MemorySink::default(),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{stem}: {error}"));
+        assert_eq!(report.end.violation, None, "{stem}: {:?}", report.end);
+        assert_eq!(report.end.harness, None, "{stem}: {:?}", report.end);
+        (report, reservations.facts())
+    };
+    for row in limit_rows() {
+        let (report, facts) = run_fixture(row.stem);
+        released_and_reused(&row, &row_use(&row, report.log.entries()));
+        let reservations = reservation_row();
+        if reservations.stem == row.stem {
+            released_and_reused(&reservations, &row_use(&reservations, &facts));
+        }
     }
 }
 
@@ -434,7 +479,7 @@ fn the_limit_fixtures_release_and_reuse_their_bounds() {
 /// release it claims.
 #[test]
 fn the_reuse_check_needs_a_release_before_the_waiting_party() {
-    let row = RowUnits {
+    let row: RowUnits = RowUnits {
         stem: "control",
         limit: 1,
         parties: 2,

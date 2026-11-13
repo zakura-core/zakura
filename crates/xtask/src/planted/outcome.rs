@@ -84,6 +84,13 @@ impl NaReason {
             NaReason::NeverApplied | NaReason::Undeclared | NaReason::Excluded
         )
     }
+
+    /// Whether the reason that `zakura-sim` names `name`, as [`fmt::Display`]
+    /// writes it, is benign. An `Unsettled` name, or one this build doesn't
+    /// know, is incomplete.
+    pub(super) fn is_benign_name(name: &str) -> bool {
+        serde_json::from_value::<NaReason>(name.into()).is_ok_and(NaReason::is_benign)
+    }
 }
 
 impl fmt::Display for NaReason {

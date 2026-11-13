@@ -5,7 +5,7 @@
 //! A run keeps each campaign's lane directory under its `--out`: the
 //! store, with the run's manifest, initial snapshot, end record and each
 //! worker's attempts, and the evidence `campaign evidence` wrote
-//! ([`CampaignRecords`]). Its report keeps each seed's class and reason,
+//! ([`lane::Campaign`]). Its report keeps each seed's class and reason,
 //! which the build, patch and confirmation steps decided, and each
 //! campaign's pairing verdict. `rescore` keeps those, reads each
 //! campaign's facts again for its case's own property, checks that every
@@ -28,8 +28,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    baseline_dir, classify::Classified, compare, discovery_report, fresh_dir, head, mutant_dir,
-    report_file, toolchain_of, write_report, Arm, Campaign, CampaignFacts, CampaignRecords,
+    baseline_dir, classify::Classified, compare, discovery_report, fresh_dir, head, lane,
+    mutant_dir, report_file, toolchain_of, write_report, Arm, Campaign, CampaignFacts,
     DiscoveryCase, Excluded, Lane, Meta, SeedResult, Written,
 };
 use crate::BoxError;
@@ -172,13 +172,9 @@ fn reread(
     toolchains: &mut BTreeSet<String>,
 ) -> Result<CampaignFacts, BoxError> {
     let records =
-        CampaignRecords::read(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-    let identity = records
-        .manifest
-        .pointer("/build/identity")
-        .unwrap_or(&Value::Null);
+        lane::Campaign::read(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     if saved.unpaired.is_none() {
-        toolchains.insert(Value::Object(toolchain_of(identity)).to_string());
+        toolchains.insert(Value::Object(toolchain_of(records.identity())).to_string());
     }
     Ok(Campaign {
         records,

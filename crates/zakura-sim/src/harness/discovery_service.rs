@@ -46,7 +46,7 @@ use zakura_quic::sim::{SeededInputs, SimNet};
 use super::{
     header_sync::wire_config,
     wire_node::{DialReporter, TransportTap, WireEndpoint},
-    NetScenario, Subsystem,
+    NetScenario, ScenarioFamily, Subsystem,
 };
 use crate::{
     domain::discovery::late_response_admitted,
@@ -54,7 +54,8 @@ use crate::{
     observe::StreamId,
     peer::{
         discovery::{
-            discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryScript, Hold, Request,
+            discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryRule, DiscoveryScript,
+            Hold, Request,
         },
         key_index,
         limit::ADVERSARY_RATE,
@@ -504,6 +505,250 @@ pub fn act_scenario(act: DiscoveryAct) -> WireScenario {
     }
 }
 
+/// The second tag byte of the first [`HOSTILE_ACTS`] family. The saved
+/// Plans take `1` to `0x1f`.
+pub const HOSTILE_TAG_BASE: u8 = 0x20;
+
+/// One act per `<label>-closes` ID a discovery scenario reaches, and the
+/// two cadence runs, each with its family's name (mutation plan, mut-6).
+/// [`DiscoveryWire`]'s `draw` runs [`act_scenario`] of the act at index
+/// `i` for the tag `[TAG, HOSTILE_TAG_BASE + i]`, so the generator reaches
+/// stream 4's refusal IDs. Inserting an act moves [`ASKED`]'s tags, so a
+/// new act goes in with a bump of [`DiscoveryWire`]'s `GENERATOR`.
+pub const HOSTILE_ACTS: [(&str, DiscoveryAct); 29] = [
+    (
+        "undeclared-type",
+        DiscoveryAct::UndeclaredType { message_type: 0 },
+    ),
+    (
+        "hello-reserved-flags",
+        DiscoveryAct::ReservedFlags {
+            row: DiscoveryRow::Hello,
+            bit: 0,
+        },
+    ),
+    (
+        "hello-short-payload",
+        DiscoveryAct::ShortPayload {
+            row: DiscoveryRow::Hello,
+        },
+    ),
+    (
+        "hello-long-payload",
+        DiscoveryAct::LongPayload {
+            row: DiscoveryRow::Hello,
+        },
+    ),
+    (
+        "hello-bad-content",
+        DiscoveryAct::BadContent {
+            rule: DiscoveryRule::HelloSignature,
+        },
+    ),
+    ("hello-burst", DiscoveryAct::HelloBurst),
+    (
+        "get-peers-reserved-flags",
+        DiscoveryAct::ReservedFlags {
+            row: DiscoveryRow::GetPeers,
+            bit: 0,
+        },
+    ),
+    (
+        "get-peers-short-payload",
+        DiscoveryAct::ShortPayload {
+            row: DiscoveryRow::GetPeers,
+        },
+    ),
+    (
+        "get-peers-long-payload",
+        DiscoveryAct::LongPayload {
+            row: DiscoveryRow::GetPeers,
+        },
+    ),
+    (
+        "get-peers-over-margin",
+        DiscoveryAct::OverMargin {
+            row: DiscoveryRow::GetPeers,
+        },
+    ),
+    (
+        "get-peers-bad-content",
+        DiscoveryAct::BadContent {
+            rule: DiscoveryRule::GetPeersLimit,
+        },
+    ),
+    (
+        "get-peers-request-run",
+        DiscoveryAct::RequestRun {
+            row: DiscoveryRow::GetPeers,
+        },
+    ),
+    (
+        "peers-reserved-flags",
+        DiscoveryAct::ReservedFlags {
+            row: DiscoveryRow::Peers,
+            bit: 0,
+        },
+    ),
+    (
+        "peers-short-payload",
+        DiscoveryAct::ShortPayload {
+            row: DiscoveryRow::Peers,
+        },
+    ),
+    (
+        "peers-long-payload",
+        DiscoveryAct::LongPayload {
+            row: DiscoveryRow::Peers,
+        },
+    ),
+    (
+        "peers-unsolicited",
+        DiscoveryAct::Unsolicited {
+            row: DiscoveryRow::Peers,
+        },
+    ),
+    (
+        "peers-over-owed",
+        DiscoveryAct::OverOwed {
+            row: DiscoveryRow::Peers,
+        },
+    ),
+    (
+        "peers-bad-content",
+        DiscoveryAct::BadContent {
+            rule: DiscoveryRule::PeersSignature,
+        },
+    ),
+    (
+        "get-services-reserved-flags",
+        DiscoveryAct::ReservedFlags {
+            row: DiscoveryRow::GetServices,
+            bit: 0,
+        },
+    ),
+    (
+        "get-services-short-payload",
+        DiscoveryAct::ShortPayload {
+            row: DiscoveryRow::GetServices,
+        },
+    ),
+    (
+        "get-services-long-payload",
+        DiscoveryAct::LongPayload {
+            row: DiscoveryRow::GetServices,
+        },
+    ),
+    (
+        "get-services-over-margin",
+        DiscoveryAct::OverMargin {
+            row: DiscoveryRow::GetServices,
+        },
+    ),
+    (
+        "get-services-bad-content",
+        DiscoveryAct::BadContent {
+            rule: DiscoveryRule::GetServicesWanted,
+        },
+    ),
+    (
+        "get-services-request-run",
+        DiscoveryAct::RequestRun {
+            row: DiscoveryRow::GetServices,
+        },
+    ),
+    (
+        "services-reserved-flags",
+        DiscoveryAct::ReservedFlags {
+            row: DiscoveryRow::Services,
+            bit: 0,
+        },
+    ),
+    (
+        "services-short-payload",
+        DiscoveryAct::ShortPayload {
+            row: DiscoveryRow::Services,
+        },
+    ),
+    (
+        "services-long-payload",
+        DiscoveryAct::LongPayload {
+            row: DiscoveryRow::Services,
+        },
+    ),
+    (
+        "services-unsolicited",
+        DiscoveryAct::Unsolicited {
+            row: DiscoveryRow::Services,
+        },
+    ),
+    (
+        "services-bad-content",
+        DiscoveryAct::BadContent {
+            rule: DiscoveryRule::ServicesNodeId,
+        },
+    ),
+];
+
+/// The requests that ask for less than everything, whose answers reach
+/// the `sender-within-owed` IDs in [`asking_scenario`]. Their tags follow
+/// [`HOSTILE_ACTS`]'.
+pub const ASKED: [Request; 2] = [Request::GetOnePeer, Request::GetHeaderSyncService];
+
+/// The conformant frames that local policy, not the specification, refuses,
+/// each with its family's name. A node that closes on one breaks
+/// `conformant-never-closes`. Their tags follow [`ASKED`]'.
+pub const CONFORMANT_ACTS: [(&str, DiscoveryAct); 2] = [
+    ("expired-hello", DiscoveryAct::ExpiredHello),
+    ("expired-relay", DiscoveryAct::ExpiredRelay),
+];
+
+/// What a drawn family runs: a peer's discovery act ([`act_scenario`]), or
+/// an asking request ([`asking_scenario`]).
+#[derive(Clone, Copy)]
+enum Drawn {
+    Act(DiscoveryAct),
+    Asked(Request),
+}
+
+impl Drawn {
+    /// The family's scenario.
+    fn scenario(self) -> WireScenario {
+        match self {
+            Drawn::Act(act) => act_scenario(act),
+            Drawn::Asked(request) => asking_scenario(request),
+        }
+    }
+}
+
+/// The families after the saved Plans: each of [`HOSTILE_ACTS`], then
+/// each of [`ASKED`], then each of [`CONFORMANT_ACTS`], by name, tag and
+/// what it runs. Only [`Drawn::scenario`] builds a scenario, so a draw
+/// builds just the family it picks.
+fn drawn_families() -> impl Iterator<Item = (&'static str, [u8; 2], Drawn)> {
+    let acts = HOSTILE_ACTS
+        .iter()
+        .map(|(name, act)| (*name, Drawn::Act(*act)));
+    let asked = ASKED
+        .iter()
+        .map(|request| (request.name(), Drawn::Asked(*request)));
+    let conformant = CONFORMANT_ACTS
+        .iter()
+        .map(|(name, act)| (*name, Drawn::Act(*act)));
+    acts.chain(asked)
+        .chain(conformant)
+        .zip(HOSTILE_TAG_BASE..)
+        .map(|((name, drawn), tag)| (name, [TAG, tag], drawn))
+}
+
+/// The scenario `prefix` tags, if it starts with one of
+/// [`drawn_families`]' tags.
+fn drawn_scenario(prefix: &[u8]) -> Option<WireScenario> {
+    drawn_families()
+        .find(|(_, tag, _)| prefix.get(..2) == Some(&tag[..]))
+        .map(|(_, _, drawn)| drawn.scenario())
+}
+
 /// The honest exchange, with the peer sending `request` once.
 pub fn asking_scenario(request: Request) -> WireScenario {
     let mut scenario = WireScenario::default();
@@ -816,7 +1061,7 @@ impl HasView for DiscoveryWire {
 
 impl Subsystem for DiscoveryWire {
     const NAME: &'static str = "discovery/wire";
-    const GENERATOR: u32 = 1;
+    const GENERATOR: u32 = 2;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = WireScenario;
     type Prepared = NodeHandle;
@@ -871,9 +1116,23 @@ impl Subsystem for DiscoveryWire {
         ])
     }
 
-    /// The saved Plan's scenario `prefix` tags ([`SavedPlan::tag`]), or
-    /// the default scenario.
+    /// Each saved Plan's tag ([`SavedPlan::tag`]), then each hostile
+    /// act's and asking request's ([`drawn_families`]).
+    fn families() -> Vec<ScenarioFamily> {
+        SavedPlan::ALL
+            .into_iter()
+            .map(|plan| ScenarioFamily::new(plan.name(), plan.tag()))
+            .chain(drawn_families().map(|(name, tag, _)| ScenarioFamily::new(name, tag)))
+            .collect()
+    }
+
+    /// The saved Plan's scenario `prefix` tags ([`SavedPlan::tag`]), the
+    /// hostile act's or asking request's ([`drawn_families`]), or the
+    /// default scenario.
     fn draw(prefix: &[u8]) -> WireScenario {
-        SavedPlan::from_tag(prefix).map_or_else(WireScenario::default, SavedPlan::scenario)
+        if let Some(plan) = SavedPlan::from_tag(prefix) {
+            return plan.scenario();
+        }
+        drawn_scenario(prefix).unwrap_or_default()
     }
 }

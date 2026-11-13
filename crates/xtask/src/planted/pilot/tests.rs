@@ -2,6 +2,8 @@
 //! observations. None builds or runs a simulator; one runs a shell script
 //! in its place.
 
+use std::ffi::OsString;
+
 use super::*;
 #[cfg(unix)]
 use crate::planted::wait_until_executable;
@@ -143,9 +145,10 @@ fn sensitivity_rejects_missing_witnesses() {
 
     let why = confirmed_trace(
         ChildEnd::Exited(1),
-        Some(&serde_json::json!({"status": "witness-lost", "detail": null})),
+        Some(&serde_json::json!({"status": "witness-lost", "detail": null, "trace": "t"})),
+        Confirm::Witness,
     )
-    .expect_err("a lost witness doesn't confirm");
+    .expect_err("a lost witness doesn't confirm a witness");
     assert!(why.starts_with("missing witness"), "{why}");
     let caught = run(Some(ID), &[(ID, VIOLATED)]);
     assert_eq!(
@@ -296,6 +299,7 @@ fn campaign() -> CampaignFacts {
         applied: true,
         runs: 1000,
         applicable_runs: 600,
+        incomplete_runs: 0,
         millis: 600_000,
         ..CampaignFacts::default()
     }
@@ -493,6 +497,7 @@ fn discovery_rejects_incomplete_observations() {
             CampaignFacts {
                 applied: false,
                 applicable_runs: 0,
+                incomplete_runs: 0,
                 ..campaign()
             },
             None
@@ -591,24 +596,16 @@ fn paired_campaigns_share_their_budget() {
         seed: 11,
         arm: Arm::On,
     };
-    let baseline = start_args(
-        bounds,
-        "t-on-11",
-        case,
-        "aa",
-        lane,
-        corpus,
-        Path::new("s/baseline"),
-    );
-    let mutant = start_args(
-        bounds,
-        "c-on-11",
-        case,
-        "bb",
-        lane,
-        corpus,
-        Path::new("s/mutant"),
-    );
+    let args = |name: &str, build: &str, store: &str| {
+        start_args(
+            &bounds.campaign,
+            &lane_spec(case, lane, bounds, name, corpus),
+            build,
+            Path::new(store),
+        )
+    };
+    let baseline = args("t-on-11", "aa", "s/baseline");
+    let mutant = args("c-on-11", "bb", "s/mutant");
     let differ: Vec<usize> = (0..baseline.len())
         .filter(|i| baseline[*i] != mutant[*i])
         .collect();
@@ -689,22 +686,45 @@ fn traces_give_their_facts() {
     assert!(parse_trace(r#"{"step":1}"#, ID).is_err());
 }
 
-/// A confirmation must say `confirmed`, exit 0 and name its trace.
+/// A confirmation must say `confirmed`, exit 0 and name its trace. A kill
+/// also confirms on a trace that is no witness, and says so.
 #[test]
 fn confirmations_must_confirm() {
     let confirmed = serde_json::json!({"status": "confirmed", "trace": "traces/a/b"});
-    assert_eq!(
-        confirmed_trace(ChildEnd::Exited(0), Some(&confirmed)),
-        Ok(PathBuf::from("traces/a/b"))
-    );
-    assert!(confirmed_trace(ChildEnd::TimedOut, Some(&confirmed)).is_err());
-    assert!(confirmed_trace(ChildEnd::Exited(1), None).is_err());
-    let other = serde_json::json!({"status": "other-property", "detail": OTHER});
-    assert!(confirmed_trace(ChildEnd::Exited(1), Some(&other))
-        .expect_err("another property doesn't confirm")
-        .contains(OTHER));
-    let untraced = serde_json::json!({"status": "confirmed"});
-    assert!(confirmed_trace(ChildEnd::Exited(0), Some(&untraced)).is_err());
+    for need in [Confirm::Witness, Confirm::Kill] {
+        assert_eq!(
+            confirmed_trace(ChildEnd::Exited(0), Some(&confirmed), need),
+            Ok(ConfirmedTrace {
+                dir: PathBuf::from("traces/a/b"),
+                missing_witness: None,
+            })
+        );
+        assert!(confirmed_trace(ChildEnd::TimedOut, Some(&confirmed), need).is_err());
+        assert!(confirmed_trace(ChildEnd::Exited(1), None, need).is_err());
+        let other = serde_json::json!({"status": "other-property", "detail": OTHER});
+        assert!(confirmed_trace(ChildEnd::Exited(1), Some(&other), need)
+            .expect_err("another property doesn't confirm")
+            .contains(OTHER));
+        let untraced = serde_json::json!({"status": "confirmed"});
+        assert!(confirmed_trace(ChildEnd::Exited(0), Some(&untraced), need).is_err());
+    }
+
+    let lost = serde_json::json!({
+        "status": "witness-lost",
+        "detail": "lost its trigger history",
+        "trace": "traces/a/b",
+    });
+    let kill = confirmed_trace(ChildEnd::Exited(1), Some(&lost), Confirm::Kill)
+        .expect("a kill confirms without a witness");
+    assert_eq!(kill.dir, PathBuf::from("traces/a/b"));
+    assert!(kill
+        .missing_witness
+        .expect("the kill says it's no witness")
+        .contains("lost its trigger history"));
+    assert!(confirmed_trace(ChildEnd::Exited(1), Some(&lost), Confirm::Witness).is_err());
+    assert!(confirmed_trace(ChildEnd::TimedOut, Some(&lost), Confirm::Kill).is_err());
+    let untraced = serde_json::json!({"status": "witness-unsupported"});
+    assert!(confirmed_trace(ChildEnd::Exited(1), Some(&untraced), Confirm::Kill).is_err());
 }
 
 /// A patch must change exactly its declared production files.
@@ -2108,7 +2128,7 @@ fn each_case_reads_the_original_campaign_for_its_own_property() {
     let (held, unapplied) = ("p/held", "p/unapplied");
     let intended = "runs/r/workers/0/sim/inputs/active/p/held/aa.bin";
     let campaign = Campaign {
-        records: CampaignRecords {
+        records: lane::Campaign {
             manifest: serde_json::json!({}),
             initial_inputs: 0,
             end: Some(serde_json::json!({
@@ -2148,13 +2168,11 @@ fn each_arm_runs_with_its_own_feedback_mode() {
     let case = &list.cases[0];
     let corpus = Path::new("qa/mutation-pilot/discovery-empty");
     let args = |arm: Arm| {
+        let name = format!("c-{arm}-11");
         start_args(
-            &list.bounds,
-            &format!("c-{arm}-11"),
-            case,
+            &list.bounds.campaign,
+            &lane_spec(case, Lane { seed: 11, arm }, &list.bounds, &name, corpus),
             "bb",
-            Lane { seed: 11, arm },
-            corpus,
             &Path::new("s").join(arm.mode()),
         )
     };
@@ -2580,14 +2598,17 @@ fn confirmation_allows_the_cases_listed_violations() {
         case.also_violates = also_violates;
         let out = dir.path().join(format!("out-{}", case.also_violates.len()));
         let confirmed = confirm_and_replay(
-            &sim,
-            &case,
+            &|| Command::new(&sim),
+            &case.harness,
             Path::new("in.bin"),
+            &case.property,
+            &case.also_violates,
+            Confirm::Witness,
             &out,
             Duration::from_secs(60),
         )
         .expect("the children run");
-        assert_eq!(confirmed, Ok(()));
+        assert_eq!(confirmed.map(drop), Ok(()));
         let passed = fs::read_to_string(&args).expect("confirm ran");
         assert!(
             passed.contains(&format!("--property {}", case.property)),
@@ -2635,7 +2656,7 @@ fn write_lane(dir: &Path, violated: &[&str], unapplied: &[&str], rustc: &str) {
         serde_json::json!({"workers": [{"index": 0, "millis": 600_000}], "failures": failures}),
     );
     write(
-        dir.join(EVIDENCE_FILE),
+        dir.join(lane::EVIDENCE_FILE),
         serde_json::json!({
             "status": "complete",
             "unapplied": unapplied,
@@ -2746,4 +2767,83 @@ fn rescore_rederives_a_run_from_its_records() {
     assert!(why.contains("don't share one toolchain"), "{why}");
     // A directory without a report has nothing to rescore.
     assert!(rescore::rescore(&root, &out.join("none"), &dir.path().join("x")).is_err());
+}
+
+/// `lane::campaign_lane` runs `campaign build` with its `build` command and
+/// `campaign start` and `campaign evidence` with its `sim` command, so a
+/// memory cap on the runs never reaches the cargo build.
+#[cfg(unix)]
+#[test]
+fn a_campaign_builds_with_its_own_command() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // `campaign_lane` runs its children against the pilot's interrupt flag.
+    let _flag = crate::sim_minimize::tests::INTERRUPT_FLAG_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let catalogue = committed_catalogue();
+    let case = &catalogue.cases[0];
+    let log = dir.path().join("children.log");
+    // Stand-ins for `zakura-sim` that log which command ran which child.
+    // `build` makes one build; `sim` refuses a build and leaves a run's
+    // records for `start` and an evidence file for `evidence`.
+    let script = |name: &str, body: &str| {
+        let path = dir.path().join(name);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"{name} $1 $2\" >> '{}'\n\
+                 store=$4\n\
+                 {body}\n",
+                log.display()
+            ),
+        )
+        .expect("the script is written");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("the script is executable");
+        wait_until_executable(&path);
+        path
+    };
+    let build = script("build", "mkdir -p \"$store/builds/b\"");
+    let sim = script(
+        "sim",
+        "case \"$1 $2\" in\n\
+         'campaign build') exit 1 ;;\n\
+         'campaign start') mkdir -p \"$store/manifests\" \"$store/snapshots/s\"\n\
+           echo '{\"initial_snapshot\":\"s\"}' > \"$store/manifests/r.json\"\n\
+           echo '{\"inputs\":[]}' > \"$store/snapshots/s/snapshot.json\" ;;\n\
+         'campaign evidence') echo '{}' > \"$8\" ;;\n\
+         esac",
+    );
+    // `wait_until_executable` ran each script once.
+    fs::remove_file(&log).expect("the scripts logged their trial runs");
+    let spec = lane::LaneSpec {
+        target: &case.target,
+        harness: &case.harness,
+        name: "split",
+        seed: 11,
+        feedback: "on",
+        libfuzzer_args: &[],
+        corpus: dir.path(),
+    };
+    let bounds = &catalogue.discovery.campaign;
+    let campaign = lane::campaign_lane(
+        &|| Command::new(&build),
+        &|| Command::new(&sim),
+        &dir.path().join("lane"),
+        &dir.path().join("fuzz-target"),
+        &spec,
+        bounds,
+        lane::start_deadline(bounds),
+    )
+    .expect("the lane runs")
+    .expect("the lane reads its records");
+    assert_eq!(campaign.initial_inputs, 0);
+    assert_eq!(
+        fs::read_to_string(&log).expect("the children logged"),
+        "build campaign build\nsim campaign start\nsim campaign evidence\n"
+    );
 }

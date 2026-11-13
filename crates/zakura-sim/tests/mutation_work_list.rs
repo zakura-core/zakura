@@ -1,11 +1,21 @@
 //! The mutation loop's work list (mutation plan, mut-7.2) covers every
-//! enforced block-sync, block and discovery property exactly once.
+//! enforced block-sync, block and discovery property exactly once, and
+//! each of them has a generator harness or a recorded reason it has none
+//! (mut-4.2).
 #![cfg(zakura_sim)]
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
+};
 
 use serde::Deserialize;
-use zakura_sim::{harness::HARNESSES, property::Status};
+use zakura_sim::{
+    explore::generate::{generator_harnesses, UNTAGGED},
+    harness::HARNESSES,
+    property::Status,
+};
 
 /// The work list, relative to the repository root.
 const WORK_LIST: &str = "qa/native-mutations/work-list.toml";
@@ -22,6 +32,28 @@ struct WorkList {
     entry: Vec<Entry>,
     #[serde(default)]
     excluded: Vec<Excluded>,
+    #[serde(default, rename = "no-generator")]
+    no_generator: Vec<NoGenerator>,
+    #[serde(default, rename = "drawn-witness")]
+    drawn_witness: Vec<DrawnWitness>,
+}
+
+/// The generator harness and scenario families that draw a hand-built test
+/// witness's scenario, for the `cases.json` case of `patch` and `property`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DrawnWitness {
+    patch: String,
+    property: String,
+    harness: String,
+    families: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoGenerator {
+    reason: String,
+    properties: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -196,6 +228,58 @@ fn the_work_list_covers_every_active_id_once() {
     }
 }
 
+/// The `Active` IDs the work list's entries cover: each instance's, and
+/// each registered ID under a protocol table's prefix.
+fn covered(list: &WorkList, registered: &BTreeMap<String, Status>) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for entry in &list.entry {
+        ids.extend(entry.instance.iter().map(|i| i.property.clone()));
+        if let Some(table) = &entry.table {
+            let prefix = format!("{table}/");
+            ids.extend(
+                registered
+                    .keys()
+                    .filter(|id| id.starts_with(&prefix))
+                    .cloned(),
+            );
+        }
+    }
+    ids.retain(|id| registered.get(id) == Some(&Status::Active));
+    ids
+}
+
+/// Every `Active` ID the work list covers has a generator harness, from
+/// `zakura-sim generators`'s map, or a `[[no-generator]]` record with a
+/// reason. Each record names covered `Active` IDs, each once, so a stale or
+/// misspelled ID fails here.
+#[test]
+fn every_covered_id_has_a_generator_or_a_reason() {
+    let list = work_list();
+    let registered = registered();
+    let covered = covered(&list, &registered);
+    let map = generator_harnesses();
+    let mut recorded = BTreeSet::new();
+    for record in &list.no_generator {
+        assert!(!record.reason.trim().is_empty(), "a record has no reason");
+        assert!(!record.properties.is_empty(), "{}: no ID", record.reason);
+        for id in &record.properties {
+            assert!(
+                covered.contains(id),
+                "no-generator names {id}, which isn't a covered Active ID"
+            );
+            assert!(recorded.insert(id.clone()), "{id} is recorded twice");
+        }
+    }
+    let holes: Vec<&String> = covered
+        .iter()
+        .filter(|id| map.get(*id).is_none_or(Vec::is_empty) && !recorded.contains(*id))
+        .collect();
+    assert!(
+        holes.is_empty(),
+        "no generator harness reports these IDs, and the work list records no reason: {holes:?}"
+    );
+}
+
 /// The loop's retained cases, relative to the repository root.
 const CASES: &str = "qa/native-mutations/cases.json";
 
@@ -248,5 +332,69 @@ fn every_named_witness_exists() {
         if let Some(witness) = case.get("witness") {
             check_witness(case["patch"].as_str().unwrap_or(CASES), witness);
         }
+    }
+}
+
+/// Every `cases.json` case whose witness is a hand-built test has a
+/// `[[drawn-witness]]` record, or its property a `[[no-generator]]` one
+/// (mutation plan, mut-6). A record's harness reports the property as a
+/// generator harness, and lists each family the record names, so the
+/// generator can draw the test's scenario. Each record names a test case,
+/// once.
+#[test]
+fn every_test_witness_has_a_drawn_family_or_a_reason() {
+    let list = work_list();
+    let map = generator_harnesses();
+    let unreached: BTreeSet<&str> = list
+        .no_generator
+        .iter()
+        .flat_map(|record| record.properties.iter().map(String::as_str))
+        .collect();
+    let mut records: BTreeMap<(&str, &str), &DrawnWitness> = BTreeMap::new();
+    for record in &list.drawn_witness {
+        let key = (record.patch.as_str(), record.property.as_str());
+        assert!(
+            records.insert(key, record).is_none(),
+            "{key:?} is recorded twice"
+        );
+        assert!(
+            map.get(&record.property)
+                .is_some_and(|harnesses| harnesses.contains(&record.harness.as_str())),
+            "{key:?}: {} isn't a generator harness of the property",
+            record.harness
+        );
+        let entry = HARNESSES
+            .iter()
+            .find(|entry| entry.name == record.harness)
+            .unwrap();
+        let families = (entry.families)();
+        assert!(!record.families.is_empty(), "{key:?}: no family");
+        for family in &record.families {
+            assert!(
+                family == UNTAGGED || families.iter().any(|listed| listed.name == family),
+                "{key:?}: {} lists no family {family}",
+                record.harness
+            );
+        }
+    }
+    let text = fs::read_to_string(root().join(CASES)).unwrap();
+    let cases: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    let mut tested = BTreeSet::new();
+    for case in &cases {
+        if case.pointer("/witness/test").is_none() {
+            continue;
+        }
+        let key = (
+            case["patch"].as_str().unwrap(),
+            case["property"].as_str().unwrap(),
+        );
+        tested.insert(key);
+        assert!(
+            records.contains_key(&key) || unreached.contains(key.1),
+            "{key:?}: a test witness with no drawn family and no no-generator reason"
+        );
+    }
+    for key in records.keys() {
+        assert!(tested.contains(key), "{key:?} names no test-witness case");
     }
 }

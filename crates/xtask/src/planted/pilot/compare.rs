@@ -13,10 +13,7 @@ use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 
-use super::{
-    classify::{CampaignFacts, Class},
-    SeedResult,
-};
+use super::{classify::Class, CampaignFacts, SeedResult};
 
 /// A discovery arm: the semantic feedback mode its campaigns run with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

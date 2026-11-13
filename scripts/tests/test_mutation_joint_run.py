@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -31,6 +32,13 @@ def case(patch, witness, generator=(), baseline=True, test="t", mode="inproc"):
 
 def finding(seed, prop, detail="stopped", mode="inproc"):
     return {"harness": "discovery/wire", "seed": seed, "mode": mode, "property": prop, "detail": detail}
+
+
+def baseline_failure(seed, reason="timeout", mode="inproc"):
+    return {
+        "harness": "block-sync/storage", "seed": seed, "mode": mode,
+        "result": {"class": "harness-failure", "reason": reason}, "log": f"baseline/{seed}",
+    }
 
 
 class DiffTests(unittest.TestCase):
@@ -100,6 +108,20 @@ class DiffTests(unittest.TestCase):
         found = joint.diff(previous, new)["new_property_findings"]
         self.assertEqual([entry["mode"] for entry in found], ["libfuzzer"])
 
+    def test_a_new_generator_baseline_failure_is_news(self):
+        previous = {"cases": [], "generator_baseline_failures": [baseline_failure(11)]}
+        new = {"cases": [], "generator_baseline_failures": [
+            baseline_failure(11, "oom"), baseline_failure(23), baseline_failure(11, mode="libfuzzer"),
+        ]}
+        changes = joint.diff(previous, new)
+        self.assertEqual(
+            [(entry["seed"], entry["mode"]) for entry in changes["new_generator_baseline_failures"]],
+            [(23, "inproc"), (11, "libfuzzer")],
+            "seed 11's inproc search was already blocked",
+        )
+        self.assertTrue(joint.has_news(changes))
+        self.assertFalse(joint.has_news(joint.diff(previous, previous)))
+
     def test_the_loop_runs_on_what_changed_since_the_previous_pin(self):
         command = joint.loop_command({"pinned": "a" * 40}, Path("out"), 500, ["--jobs", "8"])
         self.assertEqual(
@@ -160,6 +182,26 @@ class RoutineTests(unittest.TestCase):
             self.assertEqual(step["argv"][-2:], ["--jobs", "4"])
             self.assertEqual(step["cwd"], "/c")
         self.assertIn("libfuzzer", plan["steps"][2]["argv"])
+        self.assertEqual(plan["cases"]["argv"], ["cargo", "xtask", "planted", "loop", "--list", "--jobs", "4"])
+
+    def test_the_libfuzzer_lane_runs_on_what_changed_since_its_own_pin(self):
+        with tempfile.TemporaryDirectory() as state:
+            (Path(state) / joint.LATEST_FILE).write_text(json.dumps({"pinned": "a" * 40}))
+            (Path(state) / joint.LIBFUZZER_LATEST_FILE).write_text(json.dumps({"pinned": "b" * 40}))
+            plan = self.dry_run(state, "--libfuzzer-seconds", "60")
+        since = {step["name"]: step["argv"][step["argv"].index("--changed-since") + 1] for step in plan["steps"][1:]}
+        self.assertEqual(since, {"loop": "a" * 40, "libfuzzer": "b" * 40})
+
+    def test_the_case_list_is_keyed_as_the_report_is(self):
+        listed = [{"patch": "one.patch", "property": "p", "witness": {"test_target": "t", "test": "x"}}]
+        step = {"name": "cases", "argv": [sys.executable, "-c", f"print({json.dumps(json.dumps(listed))})"],
+                "env": {}, "cwd": "."}
+        failing = {**step, "argv": [sys.executable, "-c", "raise SystemExit(2)"]}
+        with tempfile.TemporaryDirectory() as run_dir:
+            self.assertEqual(joint.current_cases(step, run_dir), {joint.case_key(listed[0])})
+            self.assertIsNone(joint.current_cases(failing, run_dir))
+        reported = {**listed[0], "witness": {"test": "x", "test_target": "t"}, "result": {"class": "survived"}}
+        self.assertEqual(joint.case_key(reported), joint.case_key(listed[0]))
 
     def test_the_units_command_and_example_budget_parse(self):
         service = (UNIT / "zakura-mutation-joint.service").read_text()
@@ -182,19 +224,38 @@ class RoutineTests(unittest.TestCase):
 
 
 class CumulativeTests(unittest.TestCase):
-    def routine(self, state, reports, libfuzzer_seconds="0"):
-        """Run the routine once with each step writing `reports[name]` as its report, if it has one."""
+    def routine(self, state, reports, libfuzzer_seconds="0", triage=None, failing=()):
+        """Run the routine once with each step writing `reports[name]` as its report, if it has one.
+
+        A `triage-<lane>` step calls `triage(argv)` if given, each step in
+        `failing` exits 1, and the steps that ran are in `self.ran`.
+        """
+        self.ran = []
+
         def run_step(step, run_dir):
+            self.ran.append(step)
             if step["name"] in reports:
                 out = Path(run_dir) / step["name"]
                 out.mkdir()
                 (out / joint.REPORT_FILE).write_text(json.dumps(reports[step["name"]]))
-            return 0
+            if step["name"].startswith("triage-") and triage:
+                triage(step["argv"])
+            return int(step["name"] in failing)
+
+        # The checkout lists every case a report so far named, unless the
+        # test sets `self.current`.
+        self.seen = getattr(self, "seen", set())
+        self.seen |= {joint.case_key(entry) for report in reports.values() for entry in report["cases"]}
+
+        def current_cases(step, run_dir):
+            self.listed = step
+            return getattr(self, "current", None) or set(self.seen)
 
         # Each run pins a new commit, so its run directory is new.
         self.pins = getattr(self, "pins", 0) + 1
         with mock.patch.object(joint, "pin", return_value=f"{self.pins:x}" * 40), \
                 mock.patch.object(joint, "run_step", side_effect=run_step), \
+                mock.patch.object(joint, "current_cases", side_effect=current_cases), \
                 contextlib.redirect_stdout(io.StringIO()):
             return joint.main(["routine", "--checkout", "/c", "--state", str(state),
                                "--libfuzzer-seconds", libfuzzer_seconds])
@@ -220,6 +281,116 @@ class CumulativeTests(unittest.TestCase):
             self.assertEqual(self.routine(state, {"loop": killed, "libfuzzer": news}, "60"), 1)
             self.assertEqual(self.routine(state, {"loop": killed, "libfuzzer": news}, "60"), 0)
             self.assertTrue((Path(state) / "cumulative-libfuzzer.json").exists())
+
+    def test_the_cumulative_report_takes_the_checkouts_triage_every_run(self):
+        survivor = case("one.patch", "survived")
+        with tempfile.TemporaryDirectory() as state:
+            cumulative = Path(state) / "cumulative.json"
+            self.routine(state, {"loop": {"cases": [survivor]}})
+            triage = [step for step in self.ran if step["name"] == "triage-loop"]
+            self.assertEqual(triage[0]["argv"], [
+                "cargo", "xtask", "planted", "triage", "--report", str(cumulative),
+            ])
+            self.assertEqual(triage[0]["cwd"], str(Path("/c").resolve()))
+            first = sorted(Path(state, "runs").iterdir())[0]
+            self.assertEqual(len(json.loads((first / "loop" / joint.DIFF_FILE).read_text())["untriaged"]), 1)
+
+            # A triage-only commit selects no case, so the loop writes no
+            # report, and the routine still applies the new record to the
+            # merged report before it lists the untriaged lanes.
+            def record(argv):
+                path = Path(argv[argv.index("--report") + 1])
+                merged = json.loads(path.read_text())
+                self.assertEqual([entry["patch"] for entry in merged["cases"]], ["one.patch"])
+                merged["cases"][0]["triage"] = {"stage": "observation", "reason": "why"}
+                path.write_text(json.dumps(merged))
+
+            self.assertEqual(self.routine(state, {}, triage=record), 0)
+            self.assertEqual([step["name"] for step in self.ran], ["suite", "loop", "triage-loop"])
+            second = sorted(Path(state, "runs").iterdir())[1]
+            changes = json.loads((second / "loop" / joint.DIFF_FILE).read_text())
+            self.assertEqual(changes["untriaged"], [])
+            self.assertEqual(json.loads(cumulative.read_text())["cases"][0]["triage"]["reason"], "why")
+
+    def test_the_cumulative_report_drops_cases_the_checkout_no_longer_lists(self):
+        one, two = case("one.patch", "survived"), case("two.patch", "survived")
+        with tempfile.TemporaryDirectory() as state:
+            self.routine(state, {"loop": {"cases": [one, two]}})
+            self.assertEqual(self.listed["argv"][:5], ["cargo", "xtask", "planted", "loop", "--list"])
+            # A witness change re-keys one.patch, and two.patch is gone.
+            moved = case("one.patch", "survived", test="b")
+            self.current = {joint.case_key(moved)}
+            self.assertEqual(self.routine(state, {"loop": {"cases": [moved]}}), 1, "the re-keyed lane is new")
+            merged = json.loads((Path(state) / "cumulative.json").read_text())
+            self.assertEqual([joint.case_key(entry) for entry in merged["cases"]], [joint.case_key(moved)])
+            second = sorted(Path(state, "runs").iterdir())[1]
+            changes = json.loads((second / "loop" / joint.DIFF_FILE).read_text())
+            self.assertEqual(
+                changes["removed_cases"],
+                [list(joint.case_key(one)), list(joint.case_key(two))],
+            )
+
+    def test_a_failed_case_list_keeps_every_case_and_fails_the_unit(self):
+        with tempfile.TemporaryDirectory() as state:
+            self.routine(state, {"loop": {"cases": [case("one.patch", "killed-by-named-rule")]}})
+            with mock.patch.object(joint, "current_cases", return_value=None):
+                with mock.patch.object(joint, "run_step", return_value=0), \
+                        mock.patch.object(joint, "pin", return_value="f" * 40), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    status = joint.main(["routine", "--checkout", "/c", "--state", state])
+            self.assertEqual(status, 1)
+            merged = json.loads((Path(state) / "cumulative.json").read_text())
+            self.assertEqual(len(merged["cases"]), 1)
+
+    def test_a_blocked_generator_search_fails_the_unit_until_it_clears(self):
+        blocked = {"cases": [case("one.patch", "killed-by-named-rule", [(11, "baseline-fails")])],
+                   "generator_baseline_failures": [baseline_failure(11)]}
+        cleared = {"cases": [case("one.patch", "killed-by-named-rule", [(11, "killed-by-named-rule")])]}
+        other = {"cases": [case("two.patch", "killed-by-named-rule")]}
+        with tempfile.TemporaryDirectory() as state:
+            cumulative = Path(state) / "cumulative.json"
+            self.assertEqual(self.routine(state, {"loop": blocked}), 1)
+            # A run that didn't search seed 11 keeps its failure, so it's no
+            # news again.
+            self.assertEqual(self.routine(state, {"loop": other}), 0)
+            self.assertEqual(len(json.loads(cumulative.read_text())["generator_baseline_failures"]), 1)
+            # A run whose search of seed 11 ended clean clears it, so a new
+            # failure there is news again.
+            self.assertEqual(self.routine(state, {"loop": cleared}), 0)
+            self.assertEqual(json.loads(cumulative.read_text())["generator_baseline_failures"], [])
+            self.assertEqual(self.routine(state, {"loop": blocked}), 1)
+
+    def test_the_libfuzzer_lane_keeps_its_own_pin_until_it_succeeds(self):
+        killed = {"cases": [case("one.patch", "killed-by-named-rule")]}
+
+        def since(step):
+            return step["argv"][step["argv"].index("--changed-since") + 1]
+
+        def steps():
+            return {step["name"]: step for step in self.ran}
+
+        def pin_file():
+            return json.loads((Path(state) / joint.LIBFUZZER_LATEST_FILE).read_text())["pinned"]
+
+        with tempfile.TemporaryDirectory() as state:
+            self.routine(state, {"loop": killed}, "60")
+            self.assertNotIn("libfuzzer", steps(), "a first run has no pin to bound it")
+            self.assertFalse((Path(state) / joint.LIBFUZZER_LATEST_FILE).exists())
+            # Before its own pin, the lane runs on what changed since the
+            # loop's. A failure leaves that pin for the next run.
+            self.assertEqual(self.routine(state, {"loop": killed}, "60", failing={"libfuzzer"}), 1)
+            self.assertEqual(since(steps()["libfuzzer"]), "1" * 40)
+            self.assertEqual(pin_file(), "1" * 40)
+            self.assertEqual(self.routine(state, {"loop": killed}, "60", failing={"libfuzzer"}), 1)
+            self.assertEqual(since(steps()["loop"]), "2" * 40)
+            self.assertEqual(since(steps()["libfuzzer"]), "1" * 40, "the failed run's changes run again")
+            self.assertEqual(pin_file(), "1" * 40)
+            # A success advances it.
+            self.assertEqual(self.routine(state, {"loop": killed}, "60"), 0)
+            self.assertEqual(since(steps()["libfuzzer"]), "1" * 40)
+            self.assertEqual(pin_file(), "4" * 40)
+            self.routine(state, {"loop": killed}, "60")
+            self.assertEqual(since(steps()["libfuzzer"]), "4" * 40)
 
     def test_merge_keeps_every_property_finding(self):
         merged = joint.merge(

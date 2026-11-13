@@ -24,7 +24,10 @@ use super::{
 };
 use crate::{
     check::PropertyOutcome,
-    harness::header_acceptance::tool::{Containment, Record, RunPlan},
+    harness::header_acceptance::{
+        binding,
+        tool::{Containment, Record},
+    },
     property::Status,
     trace::TraceReader,
 };
@@ -2910,7 +2913,8 @@ fn header_record(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let verified = header::read_bounded_json::<RunPlan>(&run_dir.join("plan.json"))
+    // `verify`'s own reader, so both paths refuse the same plans.
+    let verified = binding::read_plan(&run_dir.join("plan.json"))
         .and_then(|plan| {
             verify(
                 repo,

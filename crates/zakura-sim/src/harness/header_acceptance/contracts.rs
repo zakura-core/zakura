@@ -958,18 +958,19 @@ const C2_CATCHES: &[CaseRef] = &[CaseRef {
 }];
 
 /// `commit-only-authorized/later-ancestor`: its patched `Draft` run, through
-/// the real reactor tap, gives two `path` findings at one boundary, on the
-/// one page it stages under the wrong ancestor, each in the recorded full
-/// report.
+/// the real reactor tap, breaks `commit-only-authorized` on the one page it
+/// stages under the wrong ancestor. Its catch judges that break only, not
+/// how many findings the run kept or what each names (narrowed by Adam's
+/// 2026-11-13 rule; see [`C21_CATCHES`] and [`C22_CATCHES`]).
 const LATER_ANCESTOR: CaseRef = CaseRef {
     property: "header-sync/commit-only-authorized",
     name: "later-ancestor",
 };
 
-/// C21's proving catches: [`LATER_ANCESTOR`], the real-tap two-finding
-/// history the claim-reading tests can't give, since `ClaimRun` and the
-/// scripted claim cases insert their claim records themselves (Adam's
-/// ruling on question 8), and `two-reserved-flags-skipped`, the generated
+/// C21's proving catches: [`LATER_ANCESTOR`], the authority check firing
+/// through the real tap (its two findings at one boundary are shown only on
+/// the claim-reading tests' inserted records; their real-path count is a
+/// follow-up), and `two-reserved-flags-skipped`, the generated
 /// receiver checks' two findings at one boundary through the real reader,
 /// which C21_PROVING's
 /// `two_skipped_reserved_flags_frames_keep_two_findings_at_one_boundary`
@@ -982,12 +983,12 @@ const C21_CATCHES: &[CaseRef] = &[
     },
 ];
 
-/// C22's proving catches (Adam's ruling on question 8): [`LATER_ANCESTOR`]'s
-/// two findings at one boundary, and `overgrant`, whose patched `Draft`
-/// run's first finding is its initial `Open`'s credit break, naming the
-/// update and no page. Both come through the real reactor tap, where the
-/// sidecar test's `ClaimRun` inserts its claim records itself and the real
-/// header run finds no authority break.
+/// C22's proving catches (Adam's ruling on question 8): [`LATER_ANCESTOR`]
+/// and `overgrant`, each breaking `commit-only-authorized` through the real
+/// reactor tap. Their catches judge the break only. What each finding names
+/// is shown by [`C22_PROVING`] on scripted and inserted claim records, and
+/// judging the attribution on these real-tap runs is a follow-up (Adam's
+/// 2026-11-13 rule).
 const C22_CATCHES: &[CaseRef] = &[
     LATER_ANCESTOR,
     CaseRef {
@@ -1550,7 +1551,10 @@ pub fn contract_table() -> Vec<Contract> {
                  Their unit-level proof stays: `check_honest_never_punished` and \
                  `downstream::check_with` keep every finding at a step, as \
                  every_punishment_of_an_honest_peer_at_a_step_is_reported and \
-                 every_sender_violation_at_a_step_is_reported show.",
+                 every_sender_violation_at_a_step_is_reported show. Narrowed again by \
+                 Adam's 2026-11-13 rule: later-ancestor's catch shows the check firing \
+                 through the real tap, and its two findings at one boundary are shown \
+                 only on inserted claim records; their real-path count is a follow-up.",
                 C21_PROVING,
                 "hf-8, with its planted catches",
             )
@@ -1561,7 +1565,10 @@ pub fn contract_table() -> Vec<Contract> {
                 C22,
                 "Adam's harness",
                 "Each commit-only-authorized finding names its rule kind and its actual \
-                 subject.",
+                 subject, as the checker's tests and the recorded sidecars show on scripted \
+                 and inserted claim records. later-ancestor's and overgrant's catches show \
+                 the check firing through the real tap; judging their findings' attribution \
+                 on those runs is a follow-up (Adam's 2026-11-13 rule).",
                 C22_PROVING,
                 "hf-9, and E4 for its proving test",
             )

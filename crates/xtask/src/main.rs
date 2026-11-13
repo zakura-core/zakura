@@ -455,7 +455,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "  cargo xtask sim-targets --out <dir> [--target <name>]... [--sanitizer address|none]"
+        "  cargo xtask sim-targets --out <dir> [--target <name>]... [--skip <name>]... [--sanitizer address|none]"
     )?;
     writeln!(output)?;
     writeln!(

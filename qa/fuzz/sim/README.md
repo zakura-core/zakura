@@ -359,10 +359,10 @@ which Git ignores. Don't commit corpus files.
 ## Target readiness
 
 `cargo xtask sim-targets` checks each target `qa/suite.toml` declares in
-this package, or each `--target`:
+this package, or each `--target`, leaving out each `--skip`:
 
 ```console
-cargo xtask sim-targets --out <dir> [--target <name>]... [--sanitizer address|none] [--child-secs <s>]
+cargo xtask sim-targets --out <dir> [--target <name>]... [--skip <name>]... [--sanitizer address|none] [--child-secs <s>]
 ```
 
 For each target, it resolves the harness through

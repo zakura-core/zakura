@@ -44,7 +44,9 @@ still updates it. The routine
 diffs the new report against the previous cumulative one, and lists the
 cumulative report's untriaged lanes. Each run writes under
 `<state>/runs/<UTC time>-<commit>/`, and `<state>/latest.json` names the
-last pin. `--dry-run` prints the steps without running any.
+last pin. The libFuzzer lane keeps its own pin, `<state>/latest-libfuzzer.json`,
+which advances only when its step succeeds, so a failed step's changes run
+again next time. `--dry-run` prints the steps without running any.
 """
 
 import argparse
@@ -58,6 +60,7 @@ import sys
 DIFF_FILE = "joint-diff.json"
 REPORT_FILE = "report.json"
 LATEST_FILE = "latest.json"
+LIBFUZZER_LATEST_FILE = "latest-libfuzzer.json"
 CUMULATIVE_FILES = {"loop": "cumulative.json", "libfuzzer": "cumulative-libfuzzer.json"}
 ROUTINE_FILE = "routine.json"
 NEEDS_TRIAGE = ("survived", "killed-by-other-rule")
@@ -220,14 +223,27 @@ def loop_command(previous, out, generate_runs, extra):
     ]
 
 
-def read_latest(state):
-    """Return the last routine's `{"pinned"}`, or None before the first report."""
-    path = Path(state) / LATEST_FILE
+def read_latest(state, name=LATEST_FILE):
+    """Return the last pin `<state>/<name>` records as `{"pinned"}`, or None before the first."""
+    path = Path(state) / name
     return json.loads(path.read_text()) if path.exists() else None
 
 
-def routine_steps(checkout, run_dir, latest, args):
-    """Return the routine's steps after the checkout is pinned, as {name, argv, env, cwd} dicts."""
+def libfuzzer_since(latest, libfuzzer_latest):
+    """Return the pin the libFuzzer lane runs on what changed since: its own, else the loop's, else None."""
+    for pinned in (libfuzzer_latest, latest):
+        if pinned:
+            return pinned["pinned"]
+    return None
+
+
+def routine_steps(checkout, run_dir, latest, args, libfuzzer_latest=None):
+    """Return the routine's steps after the checkout is pinned, as {name, argv, env, cwd} dicts.
+
+    The loop runs on what changed since `latest`, and the libFuzzer lane on
+    what changed since its own pin, `libfuzzer_latest`, or the loop's before
+    it has one.
+    """
     checkout = str(checkout)
     previous = {"pinned": latest["pinned"]} if latest else None
     sim_env = {"RUSTFLAGS": SIM_RUSTFLAGS}
@@ -247,11 +263,12 @@ def routine_steps(checkout, run_dir, latest, args):
     })
     # The libFuzzer lane is opt-in, and runs only on what changed: a first
     # run has no previous pin to bound it.
-    if args.libfuzzer_seconds and previous:
+    since = libfuzzer_since(latest, libfuzzer_latest)
+    if args.libfuzzer_seconds and since:
         libfuzzer = ["--generate-mode", "libfuzzer", "--generate-seconds", str(args.libfuzzer_seconds)]
         steps.append({
             "name": "libfuzzer",
-            "argv": loop_command(previous, Path(run_dir) / "libfuzzer", args.generate_runs, libfuzzer + extra),
+            "argv": loop_command({"pinned": since}, Path(run_dir) / "libfuzzer", args.generate_runs, libfuzzer + extra),
             "env": {},
             "cwd": checkout,
         })
@@ -320,12 +337,13 @@ def routine(args):
     state = Path(args.state).resolve()
     checkout = Path(args.checkout).resolve()
     latest = read_latest(state)
+    libfuzzer_latest = read_latest(state, LIBFUZZER_LATEST_FILE)
     if args.dry_run:
         run_dir = state / "runs" / "<UTC time>-<commit>"
-        steps = routine_steps(checkout, run_dir, latest, args)
+        steps = routine_steps(checkout, run_dir, latest, args, libfuzzer_latest)
         triage = [triage_step(checkout, lane, state / name) for lane, name in CUMULATIVE_FILES.items()]
         plan = {
-            "latest": latest, "pin": "origin/main", "steps": steps,
+            "latest": latest, "libfuzzer_latest": libfuzzer_latest, "pin": "origin/main", "steps": steps,
             "cases": cases_step(checkout, args), "triage": triage,
         }
         sys.stdout.write(json.dumps(plan, indent=2) + "\n")
@@ -335,9 +353,12 @@ def routine(args):
     run_dir = state / "runs" / f"{stamp}-{pinned[:12]}"
     run_dir.mkdir(parents=True)
     ended = {}
-    for step in routine_steps(checkout, run_dir, latest, args):
+    for step in routine_steps(checkout, run_dir, latest, args, libfuzzer_latest):
         ended[step["name"]] = run_step(step, run_dir)
-    record = {"pinned": pinned, "previous": latest, "steps": ended, "news": {}}
+    record = {
+        "pinned": pinned, "previous": latest, "previous_libfuzzer": libfuzzer_latest,
+        "steps": ended, "news": {},
+    }
     status = 0 if all(code == 0 for code in ended.values()) else 1
     # The cumulative reports keep only the checkout's current cases, so a
     # removed case, or one a witness change re-keyed, leaves them.
@@ -371,6 +392,15 @@ def routine(args):
         (state / LATEST_FILE).write_text(json.dumps({"pinned": pinned, "run": str(run_dir)}, indent=2) + "\n")
     else:
         print(f"the loop failed without a report; {LATEST_FILE} stays")
+    # The libFuzzer lane keeps its own pin, which advances only when its
+    # step succeeds, so the next run covers a failed run's changes again.
+    if "libfuzzer" in ended:
+        if ended["libfuzzer"] == 0:
+            libfuzzer_pin = {"pinned": pinned, "run": str(run_dir)}
+        else:
+            print(f"the libFuzzer lane failed; its pin stays in {LIBFUZZER_LATEST_FILE}")
+            libfuzzer_pin = libfuzzer_latest or {"pinned": libfuzzer_since(latest, None)}
+        (state / LIBFUZZER_LATEST_FILE).write_text(json.dumps(libfuzzer_pin, indent=2) + "\n")
     (run_dir / ROUTINE_FILE).write_text(json.dumps(record, indent=2) + "\n")
     return status
 

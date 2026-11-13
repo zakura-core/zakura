@@ -29,11 +29,13 @@ The droplet timer for mutation plan mut-4.6. Once a day it runs
 Each run writes under `<state>/runs/<UTC time>-<commit>/`: one log per step,
 the loop's report under `loop/`, the diff beside it, and `routine.json` with
 each step's exit status. `<state>/latest.json` names the last pin. The
-unit fails when a step fails or when either diff lists a new survivor, a
-newly failing baseline, a new property finding or a new generator baseline
-failure. `untriaged` in the diff lists
-the cumulative report's lanes that still need a record in
-`qa/native-mutations/triage.toml`.
+libFuzzer lane keeps its own pin in `<state>/latest-libfuzzer.json`, which
+advances only when its step succeeds, so the next run covers a failed run's
+changes again. Before it has one, the lane uses the loop's pin. The unit fails
+when a step fails or when either diff lists a new survivor, a newly failing
+baseline, a new property finding or a new generator baseline failure.
+`untriaged` in the diff lists the cumulative report's lanes that still need a
+record in `qa/native-mutations/triage.toml`.
 
 Install it as root on the host with `deploy/mutation-joint/install.sh`, then
 set the budget in `/etc/zakura-mutation-joint.env`. Check a configuration

@@ -184,6 +184,14 @@ class RoutineTests(unittest.TestCase):
         self.assertIn("libfuzzer", plan["steps"][2]["argv"])
         self.assertEqual(plan["cases"]["argv"], ["cargo", "xtask", "planted", "loop", "--list", "--jobs", "4"])
 
+    def test_the_libfuzzer_lane_runs_on_what_changed_since_its_own_pin(self):
+        with tempfile.TemporaryDirectory() as state:
+            (Path(state) / joint.LATEST_FILE).write_text(json.dumps({"pinned": "a" * 40}))
+            (Path(state) / joint.LIBFUZZER_LATEST_FILE).write_text(json.dumps({"pinned": "b" * 40}))
+            plan = self.dry_run(state, "--libfuzzer-seconds", "60")
+        since = {step["name"]: step["argv"][step["argv"].index("--changed-since") + 1] for step in plan["steps"][1:]}
+        self.assertEqual(since, {"loop": "a" * 40, "libfuzzer": "b" * 40})
+
     def test_the_case_list_is_keyed_as_the_report_is(self):
         listed = [{"patch": "one.patch", "property": "p", "witness": {"test_target": "t", "test": "x"}}]
         step = {"name": "cases", "argv": [sys.executable, "-c", f"print({json.dumps(json.dumps(listed))})"],
@@ -216,11 +224,11 @@ class RoutineTests(unittest.TestCase):
 
 
 class CumulativeTests(unittest.TestCase):
-    def routine(self, state, reports, libfuzzer_seconds="0", triage=None):
+    def routine(self, state, reports, libfuzzer_seconds="0", triage=None, failing=()):
         """Run the routine once with each step writing `reports[name]` as its report, if it has one.
 
-        A `triage-<lane>` step calls `triage(argv)` if given, and the steps
-        that ran are in `self.ran`.
+        A `triage-<lane>` step calls `triage(argv)` if given, each step in
+        `failing` exits 1, and the steps that ran are in `self.ran`.
         """
         self.ran = []
 
@@ -232,7 +240,7 @@ class CumulativeTests(unittest.TestCase):
                 (out / joint.REPORT_FILE).write_text(json.dumps(reports[step["name"]]))
             if step["name"].startswith("triage-") and triage:
                 triage(step["argv"])
-            return 0
+            return int(step["name"] in failing)
 
         # The checkout lists every case a report so far named, unless the
         # test sets `self.current`.
@@ -351,6 +359,38 @@ class CumulativeTests(unittest.TestCase):
             self.assertEqual(self.routine(state, {"loop": cleared}), 0)
             self.assertEqual(json.loads(cumulative.read_text())["generator_baseline_failures"], [])
             self.assertEqual(self.routine(state, {"loop": blocked}), 1)
+
+    def test_the_libfuzzer_lane_keeps_its_own_pin_until_it_succeeds(self):
+        killed = {"cases": [case("one.patch", "killed-by-named-rule")]}
+
+        def since(step):
+            return step["argv"][step["argv"].index("--changed-since") + 1]
+
+        def steps():
+            return {step["name"]: step for step in self.ran}
+
+        def pin_file():
+            return json.loads((Path(state) / joint.LIBFUZZER_LATEST_FILE).read_text())["pinned"]
+
+        with tempfile.TemporaryDirectory() as state:
+            self.routine(state, {"loop": killed}, "60")
+            self.assertNotIn("libfuzzer", steps(), "a first run has no pin to bound it")
+            self.assertFalse((Path(state) / joint.LIBFUZZER_LATEST_FILE).exists())
+            # Before its own pin, the lane runs on what changed since the
+            # loop's. A failure leaves that pin for the next run.
+            self.assertEqual(self.routine(state, {"loop": killed}, "60", failing={"libfuzzer"}), 1)
+            self.assertEqual(since(steps()["libfuzzer"]), "1" * 40)
+            self.assertEqual(pin_file(), "1" * 40)
+            self.assertEqual(self.routine(state, {"loop": killed}, "60", failing={"libfuzzer"}), 1)
+            self.assertEqual(since(steps()["loop"]), "2" * 40)
+            self.assertEqual(since(steps()["libfuzzer"]), "1" * 40, "the failed run's changes run again")
+            self.assertEqual(pin_file(), "1" * 40)
+            # A success advances it.
+            self.assertEqual(self.routine(state, {"loop": killed}, "60"), 0)
+            self.assertEqual(since(steps()["libfuzzer"]), "1" * 40)
+            self.assertEqual(pin_file(), "4" * 40)
+            self.routine(state, {"loop": killed}, "60")
+            self.assertEqual(since(steps()["libfuzzer"]), "4" * 40)
 
     def test_merge_keeps_every_property_finding(self):
         merged = joint.merge(

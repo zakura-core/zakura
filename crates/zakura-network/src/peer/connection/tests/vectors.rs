@@ -25,9 +25,12 @@ use zakura_node_services::block_memory::BlockHandle;
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
-    constants::{MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY, REQUEST_TIMEOUT},
+    constants::{
+        MAX_FIND_BLOCKS_RESPONSE_HASHES, MAX_OVERLOAD_DROP_PROBABILITY,
+        MIN_OVERLOAD_DROP_PROBABILITY, REQUEST_TIMEOUT,
+    },
     peer::{
-        connection::{overload_drop_connection_probability, Connection, State},
+        connection::{overload_drop_connection_probability, Connection, Handler, State},
         ClientRequest, ErrorSlot,
     },
     peer_set::ActiveConnectionCounter,
@@ -1334,6 +1337,49 @@ async fn connection_ping_pong_round_trip() {
 
     drop(peer_tx);
     let _ = connection.await;
+}
+
+/// Test that legacy `FindBlocks` responses keep at most the first
+/// [`MAX_FIND_BLOCKS_RESPONSE_HASHES`] block hashes.
+#[test]
+fn find_blocks_response_hash_limit() {
+    let _init_guard = zakura_test::init();
+
+    let hashes: Vec<block::Hash> = (0..=MAX_FIND_BLOCKS_RESPONSE_HASHES)
+        .map(|i| {
+            let mut hash = [0; 32];
+            // The test only needs distinct hashes, and the range fits in a `u32`.
+            hash[..4].copy_from_slice(&(i as u32).to_le_bytes());
+            block::Hash(hash)
+        })
+        .collect();
+
+    for len in [
+        MAX_FIND_BLOCKS_RESPONSE_HASHES,
+        MAX_FIND_BLOCKS_RESPONSE_HASHES + 1,
+    ] {
+        let mut handler = Handler::FindBlocks;
+        let items = hashes[..len]
+            .iter()
+            .copied()
+            .map(InventoryHash::Block)
+            .collect();
+
+        let ignored = handler.process_message(Message::Inv(items), &mut Vec::new(), None);
+        assert!(
+            ignored.is_none(),
+            "a multi-hash response must not be handled as a block advert"
+        );
+
+        match handler {
+            Handler::Finished(Ok(Response::BlockHashes(response))) => assert_eq!(
+                response,
+                hashes[..MAX_FIND_BLOCKS_RESPONSE_HASHES],
+                "must keep the first {MAX_FIND_BLOCKS_RESPONSE_HASHES} hashes"
+            ),
+            handler => panic!("unexpected handler state for {len} hashes: {handler:?}"),
+        }
+    }
 }
 
 /// Creates a new [`Connection`] instance for unit tests.

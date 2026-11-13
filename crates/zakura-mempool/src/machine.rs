@@ -287,6 +287,20 @@ enum Hidden {
     },
 }
 
+/// When an input next acts on a hidden transaction in state `hidden`, if
+/// ever: a running check's deadline, a retry's time, or the end of a parked
+/// transaction's wait for its parents. A parked transaction's
+/// `missing_since` is set before it parks and does not change while it is
+/// parked, so this stays the same for as long as the state does.
+fn hidden_deadline(hidden: Option<&Hidden>, missing_since: Option<Instant>) -> Option<Instant> {
+    match hidden? {
+        Hidden::Running { deadline, .. } => Some(*deadline),
+        Hidden::Retry { at } => Some(*at),
+        Hidden::Parked { .. } => missing_since.map(|since| since + T_PARK),
+        Hidden::Queued | Hidden::AwaitingChain => None,
+    }
+}
+
 /// What the machine keeps about a pooled transaction. A visible one's body is
 /// in storage. A hidden one's body is here.
 #[derive(Clone, Debug)]
@@ -413,6 +427,13 @@ pub struct MempoolState<E> {
     hidden: BTreeSet<u64>,
     /// The hidden pooled transactions queued for a revalidation.
     queued: BTreeSet<u64>,
+    /// Each hidden pooled transaction with a deadline, by deadline, so an
+    /// input finds the due ones without walking the hidden pool. See
+    /// [`hidden_deadline`].
+    hidden_due: BTreeSet<(Instant, u64)>,
+    /// The parked hidden transactions, by each parent they wait for, so a
+    /// parent's return finds them without walking the hidden pool.
+    parked_on: HashMap<transaction::Hash, BTreeSet<u64>>,
     /// Running revalidations.
     running: usize,
     /// The cost of the hidden transactions' bodies. They count against the
@@ -455,6 +476,8 @@ impl<E: VerifyError> MempoolState<E> {
             pooled: HashMap::default(),
             hidden: BTreeSet::new(),
             queued: BTreeSet::new(),
+            hidden_due: BTreeSet::new(),
+            parked_on: HashMap::default(),
             running: 0,
             hidden_cost: 0,
             children: HashMap::default(),
@@ -943,15 +966,7 @@ impl<E: VerifyError> MempoolState<E> {
             };
             [stage, admission.body_at.map(|at| at + MAX_UNDECIDED)]
         });
-        let hidden = self.hidden.iter().filter_map(|key| {
-            let pooled = &self.pool[key];
-            match &pooled.hidden {
-                Some(Hidden::Running { deadline, .. }) => Some(*deadline),
-                Some(Hidden::Retry { at }) => Some(*at),
-                Some(Hidden::Parked { .. }) => pooled.missing_since.map(|since| since + T_PARK),
-                _ => None,
-            }
-        });
+        let hidden = self.hidden_due.first().map(|(due, _)| *due);
         admissions.flatten().chain(hidden).min()
     }
 
@@ -1113,6 +1128,26 @@ impl<E: VerifyError> MempoolState<E> {
                 "the children index matches the pool at {key}"
             );
         }
+        let due: BTreeSet<(Instant, u64)> = self
+            .pool
+            .iter()
+            .filter_map(|(key, pooled)| {
+                hidden_deadline(pooled.hidden.as_ref(), pooled.missing_since).map(|due| (due, *key))
+            })
+            .collect();
+        assert_eq!(due, self.hidden_due, "the deadline index matches the pool");
+        let mut parked_on: HashMap<transaction::Hash, BTreeSet<u64>> = HashMap::default();
+        for (key, pooled) in &self.pool {
+            if let Some(Hidden::Parked { on }) = &pooled.hidden {
+                for parent in on {
+                    parked_on.entry(*parent).or_default().insert(*key);
+                }
+            }
+        }
+        assert_eq!(
+            parked_on, self.parked_on,
+            "the parked index matches the pool"
+        );
         for pooled in self.pool.values() {
             assert_eq!(
                 pooled.body.is_some(),
@@ -1208,7 +1243,13 @@ impl<E: VerifyError> MempoolState<E> {
                 Charge::None,
             );
         }
-        let keys: Vec<u64> = self.hidden.iter().copied().collect();
+        // Oldest first, as the pool is ordered.
+        let mut keys: Vec<u64> = self
+            .hidden_due
+            .range(..=(now, u64::MAX))
+            .map(|(_, key)| *key)
+            .collect();
+        keys.sort_unstable();
         for key in keys {
             // An earlier removal in this loop can have taken this one with it,
             // as a dependent.
@@ -1891,13 +1932,10 @@ impl<E: VerifyError> MempoolState<E> {
             self.start_admission(key);
         }
         let parked: Vec<u64> = self
-            .hidden
-            .iter()
-            .copied()
-            .filter(|key| {
-                matches!(&self.pool[key].hidden, Some(Hidden::Parked { on }) if on.contains(&parent))
-            })
-            .collect();
+            .parked_on
+            .get(&parent)
+            .map(|keys| keys.iter().copied().collect())
+            .unwrap_or_default();
         for key in parked {
             self.set_hidden(key, Some(Hidden::Queued));
         }
@@ -2111,6 +2149,27 @@ impl<E: VerifyError> MempoolState<E> {
             .pool
             .get_mut(&key)
             .expect("the caller names a pooled transaction");
+        if let Some(due) = hidden_deadline(pooled.hidden.as_ref(), pooled.missing_since) {
+            self.hidden_due.remove(&(due, key));
+        }
+        if let Some(Hidden::Parked { on }) = &pooled.hidden {
+            for parent in on {
+                if let Some(keys) = self.parked_on.get_mut(parent) {
+                    keys.remove(&key);
+                    if keys.is_empty() {
+                        self.parked_on.remove(parent);
+                    }
+                }
+            }
+        }
+        if let Some(due) = hidden_deadline(hidden.as_ref(), pooled.missing_since) {
+            self.hidden_due.insert((due, key));
+        }
+        if let Some(Hidden::Parked { on }) = &hidden {
+            for parent in on {
+                self.parked_on.entry(*parent).or_default().insert(key);
+            }
+        }
         if matches!(pooled.hidden, Some(Hidden::Running { .. })) {
             self.running -= 1;
         }

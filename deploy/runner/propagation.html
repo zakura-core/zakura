@@ -606,18 +606,46 @@ function render() {
   renderTiles(data); renderBlock(data); renderBlocks(data); renderDownloads(data); renderSummary(data);
 }
 
+// A failed refresh is retried this soon, and the page is dimmed only once this many in a
+// row have failed: a dashboard restart drops one or two requests, which is not news.
+const RETRY_MS = 3000;
+const FAILURES_BEFORE_STALE = 2;
+let failures = 0, retry = null;
+
+// Keep what is on screen and say that it is no longer current.
+function markStale(text, link) {
+  document.querySelector("main").classList.add("stale");
+  const updated = document.getElementById("updated");
+  updated.replaceChildren(text);
+  if (link) updated.append(" · ", el("a", { href: link.href, text: link.text }));
+}
+
 async function refresh() {
+  clearTimeout(retry);
+  let response;
   try {
-    const response = await fetch("/propagation/data", { cache: "no-store" });
-    if (!response.ok) throw new Error("status " + response.status);
-    state.data = await response.json();
-    document.querySelector("main").classList.remove("stale");
-    render();
+    response = await fetch("/propagation/data", { cache: "no-store" });
+    if (response.ok) {
+      state.data = await response.json();
+      failures = 0;
+      document.querySelector("main").classList.remove("stale");
+      render();
+      return;
+    }
   } catch (error) {
-    // Keep what is on screen and say that it is no longer current.
-    document.querySelector("main").classList.add("stale");
-    document.getElementById("updated").textContent = "not updating (" + error.message + ")";
+    response = null;
   }
+  if (response && response.status === 401) {
+    // The login is gone, as after the dashboard restarts; retrying cannot bring it back.
+    markStale("signed out", { href: "/", text: "sign in again" });
+    return;
+  }
+  failures += 1;
+  if (failures < FAILURES_BEFORE_STALE) {
+    retry = setTimeout(refresh, RETRY_MS);
+    return;
+  }
+  markStale("not updating (" + (response ? "status " + response.status : "no answer") + ")");
 }
 
 document.getElementById("all-hops").addEventListener("click", (event) => {

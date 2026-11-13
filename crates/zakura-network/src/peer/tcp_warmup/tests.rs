@@ -54,7 +54,7 @@ async fn first_padded_ping(link: &mut mpsc::Receiver<WarmupChunk>) -> WarmupChun
 }
 
 #[test]
-fn default_schedule_doubles_to_the_message_limit() {
+fn default_schedule_doubles_to_its_cap() {
     let schedule = TcpWarmupConfig::default().schedule();
 
     assert_eq!(
@@ -67,9 +67,7 @@ fn default_schedule_doubles_to_the_message_limit() {
             112_000,
             224_000,
             448_000,
-            896_000,
-            1_792_000,
-            crate::constants::MAX_PING_PADDING,
+            512 * 1024,
         ]
     );
 }

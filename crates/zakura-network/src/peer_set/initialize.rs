@@ -64,7 +64,7 @@ mod recent_by_ip;
 mod unconditional_peers;
 
 use unconditional_peers::{
-    keep_unconditional_peers_connected, leave_out_undialable_unconditional_peers,
+    keep_unconditional_peers_connected, leave_out_undialable_unconditional_peers, lookup_host,
     unconditional_peer_dial_addrs,
 };
 
@@ -436,10 +436,12 @@ where
 
         // 2. Unconditional peers, which are dialed again whenever they are not connected.
         let unconditional_dial_addrs = unconditional_peer_dial_addrs(&config, listen_addr);
-        if !unconditional_dial_addrs.is_empty() {
+        if config.unconditional_peer_connection_limit() > 0 {
             let unconditional_peers_fut = keep_unconditional_peers_connected(
                 config.clone(),
                 unconditional_dial_addrs,
+                listen_addr,
+                lookup_host,
                 peer_registry,
                 outbound_connector.clone(),
                 peerset_tx.clone(),

@@ -369,8 +369,9 @@ pub struct Config {
     /// Peers that Zakura never scores or bans, and keeps connected where it can.
     ///
     /// Each entry is an IP address, such as `"192.0.2.1"`, an IP address and port, such
-    /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, or a CIDR range, such as
-    /// `"2001:db8::/32"`. CIDR ranges with host bits set are rejected.
+    /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, a DNS name and port, such as
+    /// `"peer.example.com:8233"`, or a CIDR range, such as `"2001:db8::/32"`. CIDR ranges
+    /// with host bits set are rejected, and a DNS name needs a port.
     /// Use this setting for peers you operate, such as your own nodes, miners, or
     /// sidecars.
     ///
@@ -386,6 +387,15 @@ pub struct Config {
     /// no connections fails quietly, and each failure doubles the delay before the next
     /// dial, up to ten minutes. Zakura keeps at most `max_connections_per_ip` connections
     /// to one IP, so it does not dial further entries on that IP.
+    ///
+    /// Zakura dials a DNS name in the same way. It looks the name up before each dial,
+    /// and never while that peer is connected, so it follows a peer that comes back at a
+    /// new address. It dials the first address in the answer that it can dial, so list
+    /// each peer under a name of its own. That address is then treated like a listed
+    /// address in everything this setting does, until the name resolves to another one.
+    /// When a lookup fails, Zakura dials the last address again. A ban from before the
+    /// name resolved to an address stays until Zakura restarts. The startup dials do not
+    /// wait for the first lookup, so they keep no room for a name's address.
     ///
     /// Each dialed address adds one outbound and one inbound connection slot on top of the
     /// connection limits. Zakura dials each address on an outbound slot of its own, so a
@@ -410,7 +420,8 @@ pub struct Config {
     /// # Security
     ///
     /// Zakura never bans a listed peer, even if it sends invalid blocks or transactions.
-    /// Only list peers you trust.
+    /// Only list peers you trust. Whoever controls a listed DNS name, or the answers this
+    /// node gets for it, chooses an address that Zakura trusts in the same way.
     pub unconditional_peers: UnconditionalPeers,
     /// The initial peer count for full-sized or unknown-sized legacy blocks. At least 1.
     ///
@@ -508,7 +519,8 @@ impl Config {
     }
 
     /// The maximum number of connections that Zakura opens to stay connected to its
-    /// [`unconditional_peers`](Self::unconditional_peers): one for each dialed address.
+    /// [`unconditional_peers`](Self::unconditional_peers): one for each dialed address
+    /// or DNS name.
     ///
     /// These connections are counted separately from
     /// [`peerset_outbound_connection_limit`](Self::peerset_outbound_connection_limit), so

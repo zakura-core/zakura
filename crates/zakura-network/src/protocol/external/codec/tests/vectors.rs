@@ -301,7 +301,7 @@ fn oversized_block_and_tx_messages_are_rejected() {
                 .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
                 .finish(),
         )
-        .send(Message::Block(block.into()))
+        .send(Message::Block(std::sync::Arc::new(block).into()))
         .await
         .expect("an oversized block still fits in a protocol message");
         bytes

@@ -42,6 +42,8 @@ pub(crate) struct Reserving {
     pub(crate) pending: Pending,
     /// The backoff whose probe this call is, if it is one.
     pub(crate) probe: Option<u64>,
+    /// Names the call.
+    pub(crate) call: u64,
 }
 
 /// A `GetTxs` this session sent with no answer yet.
@@ -89,12 +91,11 @@ pub(crate) struct PeerModel {
     /// Ids this node announced to it and has not seen leave the pool, with
     /// the change-log position it announced them at. Full ids.
     pub(crate) announced: HashMap<UnminedTxId, u64>,
-    /// Ids it announced to us or supplied, oldest first, with the change-log
-    /// position when it did, to skip adverts. A removal earlier in the log
-    /// does not erase a later announcement. The real set keeps keyed short
-    /// ids, whose collisions can only make it skip more. This one keeps full
-    /// ids.
-    pub(crate) known: VecDeque<(UnminedTxId, u64)>,
+    /// The short ids of what it announced to us or supplied, oldest first,
+    /// with the change-log position when it did, to skip adverts. A removal
+    /// earlier in the log does not erase a later announcement. A collision
+    /// can only skip one advert to this peer.
+    pub(crate) known: VecDeque<(u64, u64)>,
     /// Adverts held for the advert delay, with when they are due.
     pub(crate) held: Vec<(UnminedTxId, Time)>,
     /// Ids announced before this session had the go, with their sizes,
@@ -188,33 +189,34 @@ impl PeerModel {
         self.tried.push_back((id, generation));
     }
 
-    /// Records that it announced or supplied `id`, at change-log position
-    /// `seq`. Capped, forgetting the oldest, which only costs one redundant
-    /// advert.
-    pub(crate) fn mark_known(&mut self, id: UnminedTxId, seq: u64) {
-        if let Some(entry) = self.known.iter_mut().find(|(known, _)| *known == id) {
+    /// Records that it announced or supplied the id with short id `short`,
+    /// at change-log position `seq`. Capped, forgetting the oldest, which
+    /// only costs one redundant advert.
+    pub(crate) fn mark_known(&mut self, short: u64, seq: u64) {
+        if let Some(entry) = self.known.iter_mut().find(|(known, _)| *known == short) {
             entry.1 = entry.1.max(seq);
             return;
         }
         if self.known.len() >= KNOWN_CAP {
             self.known.pop_front();
         }
-        self.known.push_back((id, seq));
+        self.known.push_back((short, seq));
     }
 
-    /// Whether it announced or supplied `id`.
-    pub(crate) fn knows(&self, id: UnminedTxId) -> bool {
-        self.known.iter().any(|(known, _)| *known == id)
+    /// Whether it announced or supplied an id with short id `short`.
+    pub(crate) fn knows(&self, short: u64) -> bool {
+        self.known.iter().any(|(known, _)| *known == short)
     }
 
-    /// `id` left the pool at change-log position `seq`. What this session
-    /// learned about it before then goes. What it learned later stays.
-    pub(crate) fn forget(&mut self, id: UnminedTxId, seq: u64) {
+    /// `id`, with short id `short`, left the pool at change-log position
+    /// `seq`. What this session learned about it before then goes. What it
+    /// learned later stays.
+    pub(crate) fn forget(&mut self, id: UnminedTxId, short: u64, seq: u64) {
         if self.announced.get(&id).is_some_and(|at| *at < seq) {
             self.announced.remove(&id);
         }
         self.known
-            .retain(|(known, at)| !(*known == id && *at < seq));
+            .retain(|(known, at)| !(*known == short && *at < seq));
         self.held.retain(|(held, _)| *held != id);
     }
 
@@ -254,9 +256,13 @@ impl PeerModel {
         let bytes = outstanding.saturating_add(SENDER_ALLOWANCE);
         let transfer = Duration::from_millis(bytes.saturating_mul(1_000) / MIN_RATE);
         for request in self.requests.values_mut() {
-            let span = BASE_DEADLINE
-                .saturating_add(transfer)
-                .saturating_mul(2u32.saturating_pow(request.repeats));
+            let mut span = BASE_DEADLINE.saturating_add(transfer);
+            for _ in 0..request.repeats {
+                if span == Duration::MAX {
+                    break;
+                }
+                span = span.saturating_mul(2);
+            }
             request.deadline = request.deadline.max(now.saturating_add(span));
         }
     }

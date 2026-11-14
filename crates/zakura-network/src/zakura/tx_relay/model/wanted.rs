@@ -44,9 +44,6 @@ struct Backoff {
     generation: u64,
     /// The session whose reserve call is the probe.
     probe: Option<SessionId>,
-    /// The pool's position for the `NoRoom` that set it. An answer the pool
-    /// decided before that cannot clear it.
-    set_by: u64,
 }
 
 /// What the probe permit allows a session now.
@@ -68,9 +65,6 @@ pub(crate) struct WantedModel {
     next_generation: u64,
     backoff: Option<Backoff>,
     next_backoff: u64,
-    /// The pool's position for the newest answer that showed room. A
-    /// `NoRoom` the pool decided before it is stale.
-    room_seen: u64,
 }
 
 impl WantedModel {
@@ -247,42 +241,40 @@ impl WantedModel {
         self.backoff.is_some()
     }
 
-    /// The pool answered `NoRoom`, at position `seq` in its own order.
-    /// `probe` names the backoff whose probe got it: that backoff doubles. A
-    /// reserve that was already in flight when the backoff began changes
-    /// nothing, one with no backoff set starts one, and one the pool decided
-    /// before it last showed room is stale.
-    pub(crate) fn no_room(&mut self, now: Time, probe: Option<u64>, seq: u64) {
-        if seq < self.room_seen {
-            return;
-        }
+    /// The pool answered `NoRoom`. `probe` names the backoff whose probe got
+    /// it: that backoff doubles. A reserve that was already in flight when
+    /// the backoff began changes nothing, and one with no backoff set starts
+    /// one.
+    ///
+    /// Answers are not ordered across callers, so a `NoRoom` the pool decided
+    /// before a later grant can still start a backoff, and a grant decided
+    /// before a later `NoRoom` can still clear one. Either costs at most one
+    /// backoff's pause or one extra probe. The real routine has no way to
+    /// order them better through the port.
+    pub(crate) fn no_room(&mut self, now: Time, probe: Option<u64>) {
         match (self.backoff, probe) {
             (Some(backoff), Some(generation)) if backoff.generation == generation => {
                 let delay = backoff.delay.saturating_mul(2).min(NO_ROOM_MAX);
-                self.set_backoff(now, delay, seq);
+                self.set_backoff(now, delay);
             }
             (Some(_), _) => {}
-            (None, _) => self.set_backoff(now, NO_ROOM_FIRST, seq),
+            (None, _) => self.set_backoff(now, NO_ROOM_FIRST),
         }
     }
 
-    /// The pool showed room at position `seq`: it granted a reservation, or
-    /// a verdict freed a slot. A backoff set by a later `NoRoom` stays.
-    pub(crate) fn room(&mut self, seq: u64) {
-        self.room_seen = self.room_seen.max(seq);
-        if self.backoff.is_some_and(|backoff| backoff.set_by < seq) {
-            self.backoff = None;
-        }
+    /// The pool showed room: it granted a reservation, or a verdict freed a
+    /// slot.
+    pub(crate) fn room(&mut self) {
+        self.backoff = None;
     }
 
-    fn set_backoff(&mut self, now: Time, delay: Duration, seq: u64) {
+    fn set_backoff(&mut self, now: Time, delay: Duration) {
         self.next_backoff = self.next_backoff.saturating_add(1);
         self.backoff = Some(Backoff {
             until: now.saturating_add(delay),
             delay,
             generation: self.next_backoff,
             probe: None,
-            set_by: seq,
         });
     }
 

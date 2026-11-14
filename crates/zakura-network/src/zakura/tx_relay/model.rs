@@ -132,6 +132,10 @@ pub(crate) const WINDOW_SMALL: usize = 16;
 /// The window for the largest transactions.
 pub(crate) const WINDOW_FULL: usize = 4;
 
+/// A transaction's size unless a test gives another: a small transparent
+/// one.
+pub(crate) const DEFAULT_TX_BYTES: u32 = 300;
+
 /// Sizes at or below this get [`WINDOW_SMALL`].
 pub(crate) const SMALL_TX_BYTES: u32 = 10_000;
 
@@ -246,6 +250,18 @@ enum VerdictOwner {
 struct Call {
     session: SessionId,
     id: UnminedTxId,
+    /// Names this call, so an old call's answer never acts on a newer call
+    /// for the same id.
+    call: u64,
+}
+
+/// Why the pool cancelled a reservation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum CancelCause {
+    /// A block mined the id, at this tip.
+    Mined(Height),
+    /// The pool turned off.
+    Deactivated,
 }
 
 /// The pool's answer to a reserve call, on its way back.
@@ -253,11 +269,11 @@ struct Call {
 struct Answer {
     call: Call,
     answer: Result<ModelReservation, ModelUnreserved>,
-    /// When the pool decided it, in the pool's own order.
-    seq: u64,
+    /// The tip the pool decided it at.
+    decided_at: Height,
     /// The pool cancelled the granted reservation before the caller
-    /// received it, because a block mined the id or the pool turned off.
-    cancelled: bool,
+    /// received it, and why.
+    cancelled: Option<CancelCause>,
 }
 
 /// A verdict on its way back to `tx-relay`.
@@ -268,8 +284,6 @@ struct Delivery {
     verdict: ModelVerdict,
     /// The tip the pool decided it at.
     decided_at: Height,
-    /// When the pool decided it, in the pool's own order.
-    seq: u64,
 }
 
 /// `tx-relay` with the pool behind it.
@@ -300,6 +314,9 @@ pub(crate) struct RelayModel {
     /// reads from the snapshot. The model's transactions carry no size, so
     /// the test gives one function for all of them.
     tx_size: fn(UnminedTxId) -> u32,
+    /// The short id the real skip set keeps for each transaction. Two ids
+    /// with the same short id collide.
+    short_id: fn(UnminedTxId) -> u64,
     /// How long sessions outside an id's window wait. `None` never announces
     /// to them.
     advert_delay: Option<Duration>,
@@ -325,8 +342,8 @@ pub(crate) struct RelayModel {
     answers: VecDeque<Answer>,
     /// Verdicts the pool decided and `tx-relay` has not received.
     deliveries: VecDeque<Delivery>,
-    /// Counts what the pool decided, in its order.
-    pool_seq: u64,
+    /// Names the next reserve call.
+    next_call: u64,
     /// Pool steps waiting to be routed, oldest first.
     inbox: VecDeque<Step>,
     /// What `tx-relay` did, in order, until the test takes it.
@@ -354,7 +371,8 @@ impl RelayModel {
             next_session: 0,
             reservations: HashMap::new(),
             waiters: HashMap::new(),
-            tx_size: |_| SMALL_TX_BYTES,
+            tx_size: |_| DEFAULT_TX_BYTES,
+            short_id: default_short_id,
             advert_delay: Some(ADVERT_DELAY),
             auto_reserves: true,
             auto_reads: true,
@@ -367,7 +385,7 @@ impl RelayModel {
             calls: VecDeque::new(),
             answers: VecDeque::new(),
             deliveries: VecDeque::new(),
-            pool_seq: 0,
+            next_call: 0,
             inbox: VecDeque::new(),
             effects: Vec::new(),
             jobs: Vec::new(),
@@ -396,6 +414,13 @@ impl RelayModel {
     /// decision and its delivery.
     pub(crate) fn with_manual_verdicts(mut self) -> Self {
         self.auto_verdicts = false;
+        self
+    }
+
+    /// The same model with another short id for each transaction, so tests
+    /// can force collisions in the skip set.
+    pub(crate) fn with_short_id(mut self, short_id: fn(UnminedTxId) -> u64) -> Self {
+        self.short_id = short_id;
         self
     }
 
@@ -465,9 +490,10 @@ impl RelayModel {
             // filtered and bounded as the pending set is, so one peer never
             // holds two shares of the table.
             let seq = self.last_seq;
+            let short = self.short_id;
             let state = self.sessions.get_mut(&session).expect("checked above");
             for (id, size) in entries.iter().copied() {
-                state.mark_known(id, seq);
+                state.mark_known(short(id), seq);
                 if self.visible.contains(&id)
                     || size > MAX_TX_BYTES
                     || state.waiting.contains_key(&id)
@@ -484,17 +510,13 @@ impl RelayModel {
         self.settle();
     }
 
-    /// A `Tx` arrived, with the size it had on the wire.
-    pub(crate) fn tx(
-        &mut self,
-        session: SessionId,
-        id: UnminedTxId,
-        body: ModelTx,
-        size: u32,
-        now: Time,
-    ) {
+    /// A `Tx` arrived for `id`, carrying `body`. Its size on the wire is
+    /// the body's own size.
+    pub(crate) fn tx(&mut self, session: SessionId, id: UnminedTxId, body: ModelTx, now: Time) {
         self.enter(now);
         let seq = self.last_seq;
+        let size = (self.tx_size)(body.id);
+        let short = (self.short_id)(id);
         let Some(state) = self.sessions.get_mut(&session) else {
             return self.settle();
         };
@@ -534,7 +556,7 @@ impl RelayModel {
             return;
         }
         state.requests.shift_remove(&id);
-        state.mark_known(id, seq);
+        state.mark_known(short, seq);
         self.reservations.remove(&reservation);
         let (waiter, step) = self.pool.submit(reservation, body, self.now);
         self.waiters.insert(waiter, VerdictOwner::Session(session));
@@ -975,7 +997,7 @@ impl RelayModel {
             state.held.retain(|(id, _)| visible.contains(id));
             if self.pool_live {
                 for id in visible.iter().copied() {
-                    if !state.announced.contains_key(&id) && !state.knows(id) {
+                    if !state.announced.contains_key(&id) && !state.knows((self.short_id)(id)) {
                         state.announced.insert(id, self.last_seq);
                         state.held.retain(|(held, _)| *held != id);
                         self.effects.push(RelayEffect::Advert { session, id });
@@ -994,7 +1016,7 @@ impl RelayModel {
                     if !self.pool_live
                         || !self.visible.contains(&id)
                         || state.announced.contains_key(&id)
-                        || state.knows(id)
+                        || state.knows((self.short_id)(id))
                         || state.held.iter().any(|(held, _)| *held == id)
                     {
                         continue;
@@ -1008,7 +1030,7 @@ impl RelayModel {
                     }
                 }
                 Change::Hidden(id) => state.held.retain(|(held, _)| *held != id),
-                Change::Removed { id, .. } => state.forget(id, *seq),
+                Change::Removed { id, .. } => state.forget(id, (self.short_id)(id), *seq),
                 Change::Refused(_) => {}
             }
         }
@@ -1022,13 +1044,11 @@ impl RelayModel {
             Effect::Cancel(job) => self.jobs.retain(|(running, _)| *running != job),
             Effect::Verdict { waiter, verdict } => match self.waiters.get(&waiter).copied() {
                 Some(owner) => {
-                    self.pool_seq = self.pool_seq.saturating_add(1);
                     let delivery = Delivery {
                         waiter,
                         owner,
                         verdict,
                         decided_at: self.tip,
-                        seq: self.pool_seq,
                     };
                     if self.auto_verdicts {
                         self.verdict(delivery);
@@ -1047,7 +1067,11 @@ impl RelayModel {
                     .find(|answer| answer.answer.is_ok_and(|granted| granted.id == reservation))
                 {
                     // Granted, and cancelled before its caller heard.
-                    answer.cancelled = true;
+                    answer.cancelled = Some(if self.pool_live {
+                        CancelCause::Mined(self.tip)
+                    } else {
+                        CancelCause::Deactivated
+                    });
                 } else {
                     self.outside.push(Effect::CancelFetch(reservation));
                 }
@@ -1064,7 +1088,6 @@ impl RelayModel {
             waiter,
             verdict,
             decided_at,
-            seq,
             ..
         } = delivery;
         let Some(owner) = self.waiters.remove(&waiter) else {
@@ -1090,12 +1113,18 @@ impl RelayModel {
                 (peer, id, generation, None)
             }
         };
-        // A verdict frees a pool slot, unless a newer `NoRoom` came after it.
-        self.wanted.room(seq);
+        // A verdict frees a pool slot.
+        self.wanted.room();
         match verdict {
             ModelVerdict::Admitted => self.verdict_decides(id, generation, session),
             ModelVerdict::Rejected { charge, .. } => {
-                self.verdict_decides(id, generation, session);
+                if self.tip == decided_at {
+                    self.verdict_decides(id, generation, session);
+                } else if let Some(session) = session {
+                    // The tip moved past the rejection, which may be
+                    // forgotten. Another announcer may still supply it.
+                    self.wanted.release(id, generation, session, self.now, true);
+                }
                 self.charge(peer, charge, decided_at);
             }
             ModelVerdict::NoRoom | ModelVerdict::LocalFault(_) => {
@@ -1245,7 +1274,7 @@ impl RelayModel {
         let peer = state.peer;
         let seq = self.last_seq;
         for id in self.reactor.unsettled_ids(peer) {
-            state.mark_known(id, seq);
+            state.mark_known((self.short_id)(id), seq);
         }
         // A session that had the go before, such as one the pool's restart
         // reopens, may not have read everything. It starts again from the
@@ -1256,7 +1285,7 @@ impl RelayModel {
         state.cursor = seq;
         if self.pool_live {
             for id in self.visible.iter().copied() {
-                if !state.announced.contains_key(&id) && !state.knows(id) {
+                if !state.announced.contains_key(&id) && !state.knows((self.short_id)(id)) {
                     state.announced.insert(id, seq);
                     state.held.retain(|(held, _)| *held != id);
                     self.effects.push(RelayEffect::Advert { session, id });
@@ -1273,12 +1302,13 @@ impl RelayModel {
     fn take_ids(&mut self, session: SessionId, entries: &[(UnminedTxId, u32)]) {
         let mut fresh = Vec::new();
         let seq = self.last_seq;
+        let short = self.short_id;
         {
             let Some(state) = self.sessions.get_mut(&session) else {
                 return;
             };
             for (id, size) in entries.iter().copied() {
-                state.mark_known(id, seq);
+                state.mark_known(short(id), seq);
                 if self.visible.contains(&id) || size > MAX_TX_BYTES {
                     continue;
                 }
@@ -1339,7 +1369,7 @@ impl RelayModel {
             for (id, _) in due {
                 if self.visible.contains(&id)
                     && !state.announced.contains_key(&id)
-                    && !state.knows(id)
+                    && !state.knows((self.short_id)(id))
                 {
                     state.announced.insert(id, self.last_seq);
                     self.effects.push(RelayEffect::Advert {
@@ -1404,14 +1434,24 @@ impl RelayModel {
                 if let Some(generation) = probe {
                     self.wanted.take_probe(session, generation);
                 }
+                self.next_call = self.next_call.saturating_add(1);
+                let call = self.next_call;
                 self.sessions
                     .get_mut(&session)
                     .expect("listed above")
                     .reserving
-                    .insert(pending.id, Reserving { pending, probe });
+                    .insert(
+                        pending.id,
+                        Reserving {
+                            pending,
+                            probe,
+                            call,
+                        },
+                    );
                 let call = Call {
                     session,
                     id: pending.id,
+                    call,
                 };
                 if self.auto_reserves {
                     self.process(call);
@@ -1429,7 +1469,8 @@ impl RelayModel {
         let live = self
             .sessions
             .get(&call.session)
-            .is_some_and(|state| state.reserving.contains_key(&call.id));
+            .and_then(|state| state.reserving.get(&call.id))
+            .is_some_and(|reserving| reserving.call == call.call);
         if !live {
             // Its caller gave it up first, so it never reached the pool.
             return;
@@ -1437,12 +1478,11 @@ impl RelayModel {
         let answer = self.pool.reserve(call.id, Intent::Fetch, self.now);
         let step = self.pool.effects();
         self.inbox.push_back(step);
-        self.pool_seq = self.pool_seq.saturating_add(1);
         let answer = Answer {
             call,
             answer,
-            seq: self.pool_seq,
-            cancelled: false,
+            decided_at: self.tip,
+            cancelled: None,
         };
         if self.auto_reserves {
             self.deliver(answer);
@@ -1456,7 +1496,7 @@ impl RelayModel {
         let Answer {
             call,
             answer,
-            seq,
+            decided_at,
             cancelled,
         } = answer;
         let session = call.session;
@@ -1464,6 +1504,12 @@ impl RelayModel {
         let Some(reserving) = self
             .sessions
             .get_mut(&session)
+            .filter(|state| {
+                state
+                    .reserving
+                    .get(&id)
+                    .is_some_and(|reserving| reserving.call == call.call)
+            })
             .and_then(|state| state.reserving.shift_remove(&id))
         else {
             // The caller gave up the call or ended. A granted slot goes
@@ -1474,22 +1520,24 @@ impl RelayModel {
             }
             return;
         };
-        let Reserving { pending, probe } = reserving;
+        let Reserving { pending, probe, .. } = reserving;
+        let peer = self.sessions.get(&session).expect("checked above").peer;
+        // A decision about the chain holds only at the tip it was made at.
+        let tip_unchanged = self.tip == decided_at;
         let still_claimed = self
             .wanted
             .current(id, pending.generation)
             .is_some_and(|entry| entry.claim == Some(session));
         match answer {
-            Ok(reservation) if cancelled => {
+            Ok(reservation) if cancelled.is_some() => {
                 let step = self.pool.release(reservation.id, self.now);
                 self.inbox.push_back(step);
-                if self.pool_live {
-                    self.wanted
-                        .release(id, pending.generation, session, self.now, false);
+                self.wanted
+                    .release(id, pending.generation, session, self.now, false);
+                // Only a mining at the tip the node still has decides the id.
+                // A cancellation because the pool turned off decides nothing.
+                if cancelled == Some(CancelCause::Mined(self.tip)) && self.pool_live {
                     self.decided(id, pending.generation);
-                } else {
-                    self.wanted
-                        .release(id, pending.generation, session, self.now, false);
                 }
                 self.return_probe(probe);
             }
@@ -1498,34 +1546,47 @@ impl RelayModel {
                     !reservation.joined && reservation.wants_body,
                     "a fetch of an undecided id is refused, never joined"
                 );
-                self.wanted.room(seq);
-                if still_claimed && self.pool_live {
+                self.wanted.room();
+                let cooling = self.reactor.is_cooling(peer, self.now);
+                if still_claimed && self.pool_live && !cooling {
                     let state = self.sessions.get_mut(&session).expect("checked above");
                     state.send(pending, reservation.id, self.now);
                     self.reservations.insert(reservation.id, (session, id));
                     self.effects.push(RelayEffect::Ask { session, id });
                 } else {
+                    // The peer started cooling, the pool turned off, or the
+                    // claim is gone: nothing is asked for.
                     let step = self.pool.release(reservation.id, self.now);
                     self.inbox.push_back(step);
                     self.wanted
-                        .release(id, pending.generation, session, self.now, false);
+                        .release(id, pending.generation, session, self.now, cooling);
                 }
                 self.return_probe(probe);
             }
             Err(ModelUnreserved::NoRoom) => {
                 self.wanted
                     .release(id, pending.generation, session, self.now, false);
-                self.wanted.no_room(self.now, probe, seq);
+                self.wanted.no_room(self.now, probe);
             }
             Err(ModelUnreserved::Pending) => {
                 self.wanted
                     .release(id, pending.generation, session, self.now, true);
                 self.return_probe(probe);
             }
-            Err(ModelUnreserved::Pooled | ModelUnreserved::Rejected(_)) => {
+            Err(ModelUnreserved::Pooled) => {
                 self.wanted
                     .release(id, pending.generation, session, self.now, false);
                 self.decided(id, pending.generation);
+                self.return_probe(probe);
+            }
+            Err(ModelUnreserved::Rejected(_)) => {
+                // A rejection the tip has moved past may be forgotten, so the
+                // id is asked about again instead.
+                self.wanted
+                    .release(id, pending.generation, session, self.now, !tip_unchanged);
+                if tip_unchanged {
+                    self.decided(id, pending.generation);
+                }
                 self.return_probe(probe);
             }
             Err(ModelUnreserved::Inactive) => {
@@ -1775,4 +1836,18 @@ pub(crate) fn window(size: Option<u32>) -> usize {
         .saturating_mul(below_full)
         / range;
     WINDOW_FULL + usize::try_from(extra).unwrap_or(spread)
+}
+
+/// A short id from the id's bytes, with the authorizing data folded in, so
+/// ids collide only when a test asks them to.
+fn default_short_id(id: UnminedTxId) -> u64 {
+    let mut bytes = id.mined_id().0;
+    if let UnminedTxId::Witnessed(wtx) = id {
+        for (byte, auth) in bytes.iter_mut().zip(wtx.auth_digest.0) {
+            *byte ^= auth.rotate_left(3);
+        }
+    }
+    let mut short = [0u8; 8];
+    short.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(short)
 }

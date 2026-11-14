@@ -102,7 +102,7 @@ fn bundle_and_sighash(tx: &Transaction) -> Option<(Bundle<Authorized, ZatBalance
     let sighasher = tx
         .sighasher(NetworkUpgrade::Nu5, all_previous_outputs)
         .ok()?;
-    let bundle = sighasher.orchard_bundle()?;
+    let bundle = tx.shielded_bundles(NetworkUpgrade::Nu5).ok()?.orchard?;
 
     Some((bundle, sighasher.sighash(HashType::ALL, None)))
 }

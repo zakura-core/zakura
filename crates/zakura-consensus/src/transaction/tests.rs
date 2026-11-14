@@ -38,7 +38,7 @@ use zakura_chain::{
             fake_v6_with_orchard_and_ironwood_actions, insert_fake_orchard_shielded_data,
             test_transactions, transactions_from_blocks, v5_transactions,
         },
-        zip317, Hash, HashType, JoinSplitData, LockTime, Transaction,
+        zip317, Hash, HashType, JoinSplitData, LockTime, SigHash, Transaction,
     },
     transparent::{self, CoinbaseSpendRestriction},
 };
@@ -51,7 +51,11 @@ use zakura_node_services::mempool;
 use zakura_state::ValidateContextError;
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
-use crate::{error::TransactionError, primitives, BoxError};
+use crate::{
+    error::TransactionError,
+    primitives::{self, ShieldedPool},
+    BoxError,
+};
 
 use super::{check, Request, Verifier};
 
@@ -3886,12 +3890,12 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
                     Arc::new(Vec::new()),
                 )
                 .expect("test fixture has no transparent inputs");
-            let valid_bundle_one = sighasher
-                .sapling_bundle()
+            let valid_bundle_one = transaction
+                .shielded_bundles(NetworkUpgrade::current(&network, height))
+                .expect("test fixture converts to librustzcash")
+                .sapling
                 .expect("test fixture has Sapling shielded data");
-            let valid_bundle_two = sighasher
-                .sapling_bundle()
-                .expect("test fixture has Sapling shielded data");
+            let valid_bundle_two = valid_bundle_one.clone();
             let valid_sighash = sighasher.sighash(HashType::ALL, None);
 
             (valid_bundle_one, valid_bundle_two, valid_sighash)
@@ -3909,18 +3913,14 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
                 Arc::new(Vec::new()),
             )
             .expect("test fixture has no transparent inputs");
-        let batch_bundle = sighasher
-            .sapling_bundle()
+        let batch_bundle = transaction
+            .shielded_bundles(NetworkUpgrade::current(&network, height))
+            .expect("test fixture converts to librustzcash")
+            .sapling
             .expect("test fixture has Sapling shielded data");
-        let single_bundle = sighasher
-            .sapling_bundle()
-            .expect("test fixture has Sapling shielded data");
-        let fallback_bundle = sighasher
-            .sapling_bundle()
-            .expect("test fixture has Sapling shielded data");
-        let synchronous_check_bundle = sighasher
-            .sapling_bundle()
-            .expect("test fixture has Sapling shielded data");
+        let single_bundle = batch_bundle.clone();
+        let fallback_bundle = batch_bundle.clone();
+        let synchronous_check_bundle = batch_bundle.clone();
         let sighash = sighasher.sighash(HashType::ALL, None);
         drop(sighasher);
         let tx_id = transaction.unmined_id();
@@ -4088,12 +4088,12 @@ fn v4_with_malformed_sapling_proof_returns_typed_error() {
                 Arc::new(Vec::new()),
             )
             .expect("test fixture has no transparent inputs");
-        let check_bundle = sighasher
-            .sapling_bundle()
+        let check_bundle = transaction
+            .shielded_bundles(NetworkUpgrade::current(&network, height))
+            .expect("test fixture converts to librustzcash")
+            .sapling
             .expect("test fixture has Sapling shielded data");
-        let bundle = sighasher
-            .sapling_bundle()
-            .expect("test fixture has Sapling shielded data");
+        let bundle = check_bundle.clone();
         let sighash = sighasher.sighash(HashType::ALL, None);
 
         let mut verifier = sapling_crypto::BatchValidator::default();
@@ -6970,8 +6970,10 @@ fn orchard_item(tx: &Transaction, network_upgrade: NetworkUpgrade) -> primitives
     let sighasher = tx
         .sighasher(network_upgrade, Arc::new(Vec::new()))
         .expect("a mainnet Orchard transaction has a sighasher at its own network upgrade");
-    let bundle = sighasher
-        .orchard_bundle()
+    let bundle = tx
+        .shielded_bundles(network_upgrade)
+        .expect("a mainnet Orchard transaction converts to librustzcash")
+        .orchard
         .expect("the transaction was selected for having an Orchard bundle");
 
     primitives::halo2::Item::new_with_wtx_id(
@@ -7112,6 +7114,9 @@ fn orchard_shielded_data_for_mutation(tx: &mut Transaction) -> &mut orchard::Shi
 ///      security fix in PR #10494, and the reason this cache holds a proof rather than a verdict
 ///      on a transaction;
 ///   3. a transaction with any verification input mutated never inherits the record.
+///
+/// Between the first two it also checks when the record lets the verifier skip reading the
+/// transaction's bundles: only when it covers every bundle the transaction has.
 #[test]
 fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
     let _init_guard = zakura_test::init();
@@ -7146,6 +7151,42 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
             primitives::halo2::inner_calls_for(network_upgrade, &item),
             1,
             "the block verification must be answered from the cache"
+        );
+
+        // The record covers this transaction's Orchard bundle, and nothing else.
+        let tx_id = tx.unmined_id();
+        let sighash = tx
+            .sighasher(network_upgrade, Arc::new(Vec::new()))
+            .expect("a mainnet Orchard transaction has a sighasher at its own network upgrade")
+            .sighash(HashType::ALL, None);
+        let are_verified = |sighash: &SigHash, pools: &[ShieldedPool]| {
+            primitives::shielded_bundles_are_verified(
+                network_upgrade,
+                tx_id,
+                sighash,
+                pools.iter().copied(),
+            )
+        };
+
+        assert!(
+            are_verified(&sighash, &[ShieldedPool::Orchard]),
+            "the verified Orchard bundle must be remembered"
+        );
+        assert!(
+            !are_verified(&sighash, &[ShieldedPool::Orchard, ShieldedPool::Sapling]),
+            "one remembered bundle must not vouch for a second bundle that never verified"
+        );
+        assert!(
+            !are_verified(&sighash, &[ShieldedPool::Ironwood]),
+            "the Orchard record must not vouch for an Ironwood bundle"
+        );
+        assert!(
+            !are_verified(&sighash, &[]),
+            "a transaction without shielded bundles has no record to skip the read on"
+        );
+        assert!(
+            !are_verified(&SigHash([0; 32]), &[ShieldedPool::Orchard]),
+            "the record must not vouch for the bundle under another sighash"
         );
 
         // 2. The cached proof does not carry the transaction past the expiry check.
@@ -7208,6 +7249,52 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
             .expect_err("passing chain checks must not accept invalid Orchard authorization");
             assert_eq!(error, TransactionError::Halo2VerificationFailed);
         }
+    });
+}
+
+/// An Orchard action whose `rk` is not a point encoding makes its transaction invalid.
+///
+/// Zakura's own parser keeps `rk` as bytes and accepts it. `librustzcash` rejects it, when the
+/// verifier reads the transaction a second time for its bundles. The verifier skips that read
+/// only for a transaction whose bundles have all verified before, which this one never can.
+#[test]
+fn an_orchard_action_with_an_undecodable_rk_is_rejected() {
+    let _init_guard = zakura_test::init();
+
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let (mut verifier, state) = cache_test_verifier();
+
+        let mut tx = cacheable_mainnet_orchard_transaction();
+        let expiry_height = tx
+            .expiry_height()
+            .expect("a V5 transaction has an expiry height");
+        let network_upgrade = NetworkUpgrade::current(&Network::Mainnet, expiry_height);
+
+        // Not a field element, so not the encoding of any point.
+        for action in orchard_shielded_data_for_mutation(&mut tx)
+            .actions
+            .iter_mut()
+        {
+            action.action.rk = [0xff; 32].into();
+        }
+        let expected = TransactionError::UnsupportedByNetworkUpgrade(tx.version(), network_upgrade);
+
+        let error = verify(&mut verifier, block_request(&tx, expiry_height))
+            .await
+            .expect_err("a block transaction with an undecodable rk must be rejected");
+        assert_eq!(error, expected);
+
+        respond_to_nullifier_and_anchor_check(&state);
+        let error = verify(
+            &mut verifier,
+            Request::Mempool {
+                transaction: tx.into(),
+                height: expiry_height,
+            },
+        )
+        .await
+        .expect_err("a mempool transaction with an undecodable rk must be rejected");
+        assert_eq!(error, expected);
     });
 }
 
@@ -7310,8 +7397,10 @@ fn sapling_item(tx: &Transaction, network_upgrade: NetworkUpgrade) -> primitives
     let sighasher = tx
         .sighasher(network_upgrade, Arc::new(Vec::new()))
         .expect("a mainnet Sapling transaction has a sighasher at its own network upgrade");
-    let bundle = sighasher
-        .sapling_bundle()
+    let bundle = tx
+        .shielded_bundles(network_upgrade)
+        .expect("a mainnet Sapling transaction converts to librustzcash")
+        .sapling
         .expect("the transaction was selected for having a Sapling bundle");
 
     primitives::sapling::Item::new(

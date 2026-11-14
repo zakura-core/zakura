@@ -475,6 +475,17 @@ impl SentHashes {
         self.update_metrics_for_cache();
     }
 
+    /// Returns the sent hashes above `height_bound`, or every sent hash if it is `None`.
+    pub fn hashes_above(&self, height_bound: Option<block::Height>) -> Vec<block::Hash> {
+        self.bufs
+            .iter()
+            .flatten()
+            .chain(self.curr_buf.iter())
+            .filter(|(_, height)| height_bound.is_none_or(|bound| *height > bound))
+            .map(|(hash, _)| *hash)
+            .collect()
+    }
+
     /// Returns true if SentHashes contains the `hash`
     pub fn contains(&self, hash: &block::Hash) -> bool {
         self.sent.contains_key(hash)

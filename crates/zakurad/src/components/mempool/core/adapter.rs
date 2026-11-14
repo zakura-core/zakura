@@ -575,6 +575,35 @@ impl Staged {
     }
 }
 
+/// Applies `verdict`'s charge to `supplier`, the legacy peer that served the
+/// body, if any: a ban through the misbehavior channel, or today's cooldown
+/// while the node is current at the tip the failure was earned at.
+fn charge(
+    shared: &Shared,
+    verdict: &Verdict,
+    supplier: Option<PeerSocketAddr>,
+    tx_id: UnminedTxId,
+) {
+    let (Verdict::Rejected(rejection), Some(peer)) = (verdict, supplier) else {
+        return;
+    };
+    match rejection.charge {
+        Charge::Cooldown if (shared.may_cool)(rejection.tip) => start_peer_cooldown(
+            &shared.cooldowns,
+            &shared.peers,
+            peer,
+            tx_id,
+            shared.expose_peer_addresses,
+        ),
+        Charge::None | Charge::Cooldown => {}
+        Charge::Ban => {
+            let _ = shared
+                .misbehavior_sender
+                .try_send((peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
+        }
+    }
+}
+
 /// Tells the core that `reservation`'s fetch failed, from a task of its own,
 /// so a core slow to take commands cannot hold the caller's answer or its
 /// slots past the deadline. The failure still reaches the change stream when
@@ -612,10 +641,17 @@ async fn queue_held(
     from: Option<QueueSource>,
     deadline: tokio::time::Instant,
 ) -> Result<Receiver, BoxError> {
+    // An item whose deadline passed while earlier items were queued starts
+    // nothing.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(timed_out());
+    }
     // The reservation is asked for from a task of its own, so a caller that
     // times out first leaves it running: if the core grants it later, the
     // failure is reported, and reaches the change stream as today's
-    // timeout does. That task holds neither the body nor a slot.
+    // timeout does. That task holds no body, and keeps the item's node-wide
+    // slot until the core has answered, so a stalled core cannot gather more
+    // of them than the node's limit.
     let mut reserving = tokio::spawn({
         let handle = shared.handle.clone();
         let (id, intent) = (item.id(), intent_of(&item));
@@ -631,6 +667,7 @@ async fn queue_held(
                 if let Ok(Ok(reservation)) = reserving.await {
                     handle.fetch_failed(reservation).await;
                 }
+                drop(queue_slot);
             });
             return Err(timed_out());
         }
@@ -644,7 +681,7 @@ async fn queue_held(
         // Today's download task has one deadline for the fetch and the
         // verification together, and its peer's slot is free once it ends.
         // So does this.
-        let result = bring_in(&shared, reservation, item, from, deadline, queue_slot).await;
+        let result = bring_in(shared, reservation, item, from, deadline, queue_slot).await;
         drop(slot);
         let _ = answer.send(result);
     });
@@ -820,7 +857,7 @@ fn first_stage_refusal(refused: Unreserved) -> Result<Receiver, BoxError> {
 /// node-wide slot that bounds the bodies here, until the core has decided
 /// it, and its outcome reaches the change stream then.
 async fn bring_in(
-    shared: &Shared,
+    shared: Arc<Shared>,
     reservation: Reservation,
     item: Gossip,
     from: Option<QueueSource>,
@@ -867,18 +904,23 @@ async fn bring_in(
                 }
             };
             let Ok(fetched) = fetched else {
-                report_failed(shared, reservation);
+                report_failed(&shared, reservation);
                 return Err(timed_out());
             };
             match fetched {
                 Ok((tx, served_by)) => (tx, served_by),
                 Err(error) => {
-                    metrics::counter!(
-                        "mempool.failed.verify.tasks.total",
-                        "reason" => "download_failed",
-                    )
-                    .increment(1);
-                    report_failed(shared, reservation);
+                    // Today's labels: the state lookup before the fetch can
+                    // fail too, and is counted as such.
+                    let reason = error
+                        .downcast_ref::<TransactionDownloadVerifyError>()
+                        .map_or(
+                            "download_failed",
+                            TransactionDownloadVerifyError::metric_label,
+                        );
+                    metrics::counter!("mempool.failed.verify.tasks.total", "reason" => reason)
+                        .increment(1);
+                    report_failed(&shared, reservation);
                     return Err(format!("failed to validate tx: {tx_id}, error: {error}").into());
                 }
             }
@@ -900,7 +942,7 @@ async fn bring_in(
         && sender.is_some_and(|addr| shared.cooldowns.is_cooling_down(addr.ip(), Instant::now()))
     {
         metrics::counter!("mempool.peer_cooldown.ignored.transactions.total").increment(1);
-        report_failed(shared, reservation);
+        report_failed(&shared, reservation);
         return Err(format!(
             "failed to validate tx: {tx_id}, error: {}",
             TransactionDownloadVerifyError::PeerCoolingDown
@@ -922,9 +964,12 @@ async fn bring_in(
     // task keeps the body's node-wide slot until then, so these bodies stay
     // within the node's limit.
     let submitting = tokio::spawn({
-        let handle = shared.handle.clone();
+        let shared = shared.clone();
         async move {
-            let verdict = handle.submit(reservation, tx).await;
+            let verdict = shared.handle.submit(reservation, tx).await;
+            // Whenever the verdict arrives, its charge goes to the peer
+            // that served the body, as the component that owns peer state.
+            charge(&shared, &verdict, supplier, tx_id);
             drop(queue_slot);
             verdict
         }
@@ -934,23 +979,6 @@ async fn bring_in(
         Ok(Err(_panicked)) => return Err("the pool core's submission task failed".into()),
         Err(_elapsed) => return Err(timed_out()),
     };
-    if let (Verdict::Rejected(rejection), Some(peer)) = (&verdict, supplier) {
-        match rejection.charge {
-            Charge::Cooldown if (shared.may_cool)(rejection.tip) => start_peer_cooldown(
-                &shared.cooldowns,
-                &shared.peers,
-                peer,
-                tx_id,
-                shared.expose_peer_addresses,
-            ),
-            Charge::None | Charge::Cooldown => {}
-            Charge::Ban => {
-                let _ = shared
-                    .misbehavior_sender
-                    .try_send((peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
-            }
-        }
-    }
     second_stage(tx_id, verdict)
 }
 
@@ -2448,8 +2476,20 @@ mod tests {
             .expect_err("the stuck reservation is refused");
         assert_eq!(error.to_string(), "timeout waiting for verification result");
         assert!(started.elapsed() >= RATE_LIMIT_DELAY, "at today's deadline");
-        assert_eq!(queued_count(&core), 0, "its slot is free");
+        assert_eq!(
+            queued_count(&core),
+            1,
+            "the reservation still outstanding keeps the item's node-wide slot"
+        );
+        // The core answers at last, and the slot is free.
         drop(reply);
+        for _ in 0..100 {
+            if queued_count(&core) == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(queued_count(&core), 0, "free once the core has answered");
     }
 
     /// The adapter's queued count, read without holding its lock, so a
@@ -2649,11 +2689,10 @@ mod tests {
         drop(inbox);
     }
 
-    /// In a batch with ids before a body, the body is queued first, so it
-    /// frees its slot at its own deadline, not after each earlier id has
-    /// waited out its own, with a core that answers no reservation.
+    /// In a batch with ids before a body, the body is queued first, so its
+    /// deadline does not wait behind each earlier id's.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_body_after_ids_frees_its_slot_at_its_own_deadline() {
+    async fn a_body_after_ids_is_queued_first() {
         use zakura_node_services::mempool::port::{pool_port, PoolCommand};
 
         let body = Network::Mainnet
@@ -2665,27 +2704,18 @@ mod tests {
         let (handle, mut inbox) = pool_port();
         let mut core = adapter_on(handle);
         publish_empty(&inbox);
-        let silent = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Some(command) = inbox.next().await {
-                if let PoolCommand::Reserve { reply, .. } = command {
-                    held.push(reply);
-                }
-            }
-        });
+        let body_id = body.id();
         let request = tokio::spawn(core.call(Request::Queue(vec![
             Gossip::Id(id(1)),
             Gossip::Id(id(2)),
             Gossip::Tx(body),
         ])));
-        tokio::time::sleep(RATE_LIMIT_DELAY + std::time::Duration::from_secs(1)).await;
-        assert_eq!(
-            queued_count(&core),
-            1,
-            "the body is done, and only the first id holds a slot"
-        );
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the batch reserves");
+        };
+        assert_eq!(tx_id, body_id, "the body is queued before the ids");
         request.abort();
-        silent.abort();
+        drop(reply);
     }
 
     /// A submission that times out before the core takes the body leaves the
@@ -2809,7 +2839,11 @@ mod tests {
             .expect("the caller is answered at its deadline")
             .expect("the task does not panic");
         assert!(answer.is_err(), "the caller timed out");
-        assert_eq!(queued_count(&core), 0, "no slot is held for a late grant");
+        assert_eq!(
+            queued_count(&core),
+            1,
+            "the outstanding reservation keeps its node-wide slot"
+        );
         let _ = reply.send(Ok(inbox.grant(
             ReservationId(1),
             tx_id,
@@ -2821,5 +2855,278 @@ mod tests {
             panic!("the late grant is reported as failed");
         };
         let _accepted = reservation.accept();
+        for _ in 0..100 {
+            if queued_count(&core) == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(queued_count(&core), 0, "free once the failure is reported");
+    }
+
+    /// A verdict that arrives after its caller timed out still charges the
+    /// legacy peer that served the body, since the core did check it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_late_verdict_still_charges_its_peer() {
+        use zakura_node_services::mempool::port::{
+            pool_port, PoolCommand, Rejection, RejectionScope, ReservationId,
+        };
+
+        let (handle, mut inbox) = pool_port();
+        let (misbehavior, mut reports) = mpsc::channel(1);
+        let core = CoreMempool::new(
+            handle,
+            Timeout::new(
+                BoxCloneSyncService::new(NeverReady),
+                TRANSACTION_DOWNLOAD_TIMEOUT,
+            ),
+            BoxCloneSyncService::new(NeverReady),
+            Arc::new(|_| true),
+            Arc::new(|| None),
+            chain_holding(None),
+            super::super::super::Config::default().max_transaction_bytes,
+            false,
+            misbehavior,
+            Arc::new(Exempt::default()),
+        );
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let QueueSource::LegacySocket(addr) = peer() else {
+            unreachable!("the test peer is a legacy peer");
+        };
+        let queued = tokio::spawn(queue(core.shared.clone(), Gossip::Tx(body), Some(peer())));
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the push reserves first");
+        };
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            tx_id,
+            false,
+            true,
+            Default::default(),
+        )));
+        let receiver = queued
+            .await
+            .expect("the task does not panic")
+            .expect("the push passes the first stage");
+        let answer = tokio::time::timeout(RATE_LIMIT_DELAY * 2, receiver)
+            .await
+            .expect("the caller is answered at its deadline")
+            .expect("answered");
+        assert!(answer.is_err(), "the caller timed out");
+        let Some(PoolCommand::Submit {
+            reservation, reply, ..
+        }) = inbox.next().await
+        else {
+            panic!("the body still reaches the core");
+        };
+        let _accepted = reservation.accept();
+        let _ = reply.send(Verdict::Rejected(Rejection {
+            scope: RejectionScope::ExactTip,
+            charge: Charge::Ban,
+            tip: Height(0),
+            detail: Arc::new(std::io::Error::other("invalid")),
+        }));
+        let report = tokio::time::timeout(std::time::Duration::from_secs(1), reports.recv())
+            .await
+            .expect("the late verdict's charge is applied");
+        assert_eq!(
+            report,
+            Some((addr.into(), zn::constants::MAX_PEER_MISBEHAVIOR_SCORE))
+        );
+    }
+
+    /// A staged body whose deadline passed while an earlier body waited out
+    /// the shared deadline starts no work: the core sees one reservation,
+    /// not two, and both are answered as timed out.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_expired_staged_body_starts_nothing() {
+        use zakura_chain::transaction::{LockTime, Transaction, UnminedTx};
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let template = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let bodies: Vec<Gossip> = (1..=2)
+            .map(|height| {
+                let mut transaction = Transaction::clone(template.transaction());
+                if let Transaction::V1 { lock_time, .. }
+                | Transaction::V2 { lock_time, .. }
+                | Transaction::V3 { lock_time, .. }
+                | Transaction::V4 { lock_time, .. }
+                | Transaction::V5 { lock_time, .. } = &mut transaction
+                {
+                    *lock_time = LockTime::Height(Height(height));
+                }
+                Gossip::Tx(UnminedTx::from(transaction))
+            })
+            .collect();
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let request = tokio::spawn(core.call(Request::Queue(bodies)));
+        let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
+            panic!("the first body reserves");
+        };
+        let Ok(Ok(Ok(Response::Queued(answers)))) =
+            tokio::time::timeout(RATE_LIMIT_DELAY * 2, request).await
+        else {
+            panic!("`Queue` is answered with `Queued` by the deadline");
+        };
+        assert!(answers.iter().all(Result::is_err), "both time out");
+        assert!(
+            inbox.try_next().is_none(),
+            "the expired second body asked the core for nothing"
+        );
+        drop(reply);
+    }
+
+    /// A v2 peer through the adapter is held to the same five undecided
+    /// transactions as a legacy peer: of six bodies pushed by one v2 peer,
+    /// five take its slots and the sixth is dropped without asking the core.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_v2_peer_is_held_to_five_undecided_transactions() {
+        use zakura_chain::transaction::{LockTime, Transaction, UnminedTx};
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let template = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let bodies: Vec<Gossip> = (1..=6)
+            .map(|height| {
+                let mut transaction = Transaction::clone(template.transaction());
+                if let Transaction::V1 { lock_time, .. }
+                | Transaction::V2 { lock_time, .. }
+                | Transaction::V3 { lock_time, .. }
+                | Transaction::V4 { lock_time, .. }
+                | Transaction::V5 { lock_time, .. } = &mut transaction
+                {
+                    *lock_time = LockTime::Height(Height(height));
+                }
+                Gossip::Tx(UnminedTx::from(transaction))
+            })
+            .collect();
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let request = tokio::spawn(core.call(Request::QueueFromPeer {
+            transactions: bodies,
+            source: QueueSource::Zakura(vec![7; 32]),
+        }));
+        // The batch's bodies are queued one after another. Each within the
+        // peer's limit reserves, and the core says it is already pooled.
+        for _ in 0..MAX_INBOUND_CONCURRENCY_PER_PEER {
+            let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
+                panic!("each body within the peer's limit reserves");
+            };
+            let _ = reply.send(Err(Unreserved::Pooled));
+        }
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("the batch is answered")
+            .expect("the task does not panic");
+        assert!(matches!(answer, Ok(Response::Queued(_))));
+        assert!(
+            inbox.try_next().is_none(),
+            "the sixth body was dropped without asking the core"
+        );
+    }
+
+    /// An id a v2 peer advertises is fetched from that peer, and a body it
+    /// serves that the core rejects with a ban charges nobody, as today's
+    /// pool never charges v2 peers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_v2_advert_is_fetched_from_its_peer_and_never_charged() {
+        use zakura_node_services::mempool::port::{
+            pool_port, PoolCommand, Rejection, RejectionScope, ReservationId,
+        };
+
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let id = body.id();
+        let asked: Arc<std::sync::Mutex<Vec<zn::Request>>> = Arc::default();
+        let network = {
+            let (asked, body) = (asked.clone(), body.clone());
+            BoxCloneSyncService::new(tower::service_fn(move |request: zn::Request| {
+                asked.lock().expect("not poisoned").push(request);
+                let body = body.clone();
+                async move {
+                    Ok::<_, BoxError>(zn::Response::Transactions(vec![
+                        zn::InventoryResponse::Available((body, None)),
+                    ]))
+                }
+            }))
+        };
+        let (handle, mut inbox) = pool_port();
+        let (misbehavior, mut reports) = mpsc::channel(1);
+        let mut core = CoreMempool::new(
+            handle,
+            Timeout::new(network, TRANSACTION_DOWNLOAD_TIMEOUT),
+            BoxCloneSyncService::new(NeverReady),
+            Arc::new(|_| true),
+            Arc::new(|| None),
+            chain_holding(None),
+            super::super::super::Config::default().max_transaction_bytes,
+            false,
+            misbehavior,
+            Arc::new(Exempt::default()),
+        );
+        publish_empty(&inbox);
+        let v2_peer = vec![7; 32];
+        let request = tokio::spawn(core.call(Request::QueueFromPeer {
+            transactions: vec![Gossip::Id(id)],
+            source: QueueSource::Zakura(v2_peer.clone()),
+        }));
+        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch asks which ids are rejected");
+        };
+        let _ = reply.send(Default::default());
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the advert reserves");
+        };
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            tx_id,
+            false,
+            true,
+            Default::default(),
+        )));
+        let Some(PoolCommand::Submit {
+            reservation, reply, ..
+        }) = inbox.next().await
+        else {
+            panic!("the fetched body is submitted");
+        };
+        let _accepted = reservation.accept();
+        let _ = reply.send(Verdict::Rejected(Rejection {
+            scope: RejectionScope::ExactTip,
+            charge: Charge::Ban,
+            tip: Height(0),
+            detail: Arc::new(std::io::Error::other("invalid")),
+        }));
+        let _ = request.await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let asked = asked.lock().expect("not poisoned");
+        assert!(
+            matches!(
+                asked.as_slice(),
+                [zn::Request::TransactionsByIdFrom { source: zn::PeerSource::Zakura(peer), .. }]
+                    if peer.as_bytes() == v2_peer.as_slice()
+            ),
+            "fetched from the advertising v2 peer: {asked:?}"
+        );
+        assert!(reports.try_recv().is_err(), "a v2 peer is never charged");
     }
 }

@@ -11,6 +11,7 @@ use service_session::{
 pub use service_session::{replay_service_session_bytes, ServiceSessionReplaySummary};
 
 use std::{
+    collections::BTreeMap,
     future,
     io::{Cursor, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -393,10 +394,14 @@ pub struct ZakuraConfig {
     /// `mining_template.jsonl`, which trace the path from a new tip to a mining template.
     /// Legacy peer connections write `legacy_gossip.jsonl`: each block announcement sent to
     /// a peer, the peer's request for that block and the block being sent, and a bounded
-    /// number of the announcements each peer sends. Its rows never hold a peer's address; the
-    /// `ZAKURA_TRACE_PEER_NAMES` environment variable names the peers an operator wants to
-    /// tell apart.
+    /// number of the announcements each peer sends. Its rows never hold a peer's address;
+    /// [`trace_peer_names`](Self::trace_peer_names) names peers an operator wants to tell apart.
     pub trace_dir: Option<PathBuf>,
+    /// Operator-chosen peer names in gossip traces, keyed by IP address.
+    ///
+    /// Only list nodes you operate. Unlisted and proxied peers remain unnamed.
+    /// This has no effect when [`trace_dir`](Self::trace_dir) is unset.
+    pub trace_peer_names: BTreeMap<IpAddr, String>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
     /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
@@ -433,6 +438,7 @@ impl Default for ZakuraConfig {
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
             message_rate_per_second: DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND,
             trace_dir: None,
+            trace_peer_names: BTreeMap::new(),
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
             dev_network: None,

@@ -13,12 +13,7 @@
 //! are written up to a fixed number a minute for each connection.
 //!
 //! Rows never hold a peer's address. A connection has a process-local number, and a peer whose
-//! IP address the operator listed in the `ZAKURA_TRACE_PEER_NAMES` environment variable also
-//! has its name.
-//!
-//! The list is an environment variable, like the node's own trace label, and not a config
-//! setting: a config rejects settings it does not know, so a list written there would stop an
-//! older build from starting after a rollback.
+//! IP address the operator listed in `network.zakura.trace_peer_names` also has its name.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -41,12 +36,6 @@ use super::ConnectedAddr;
 use crate::{protocol::external::canonical_ip, Config};
 
 const TABLE: JsonlTraceTable = JsonlTraceTable::new("legacy_gossip", "legacy_gossip.jsonl");
-
-/// Names for legacy peers in the gossip trace, as `name=ip` pairs separated by commas, for
-/// example `us-0=203.0.113.7,asia-0=198.51.100.9`.
-///
-/// List only nodes you operate: the name tells a reader of the trace files which peer it was.
-const PEER_NAMES_ENV: &str = "ZAKURA_TRACE_PEER_NAMES";
 
 /// How many of the blocks we last announced to a peer are remembered, so that the peer's
 /// request for one of them is traced. A node announces one block at a time, and a peer asks
@@ -88,25 +77,19 @@ pub(crate) struct LegacyGossipTrace {
 
 impl LegacyGossipTrace {
     /// Returns the trace `config` asks for: rows go to `network.zakura.trace_dir`, and
-    /// nothing is written when that is unset. Peers are named from `ZAKURA_TRACE_PEER_NAMES`.
+    /// nothing is written when that is unset. Peer names come from the same typed config.
     pub(crate) fn new(config: &Config) -> Self {
         let Some(trace_dir) = config.zakura.trace_dir.clone() else {
             return Self::with_emitter(JsonlEventEmitter::noop(), []);
         };
 
-        let listed = std::env::var(PEER_NAMES_ENV).unwrap_or_default();
-        let (peer_names, rejected) = parse_peer_names(&listed);
-        if !rejected.is_empty() {
-            // Only the count: an entry that cannot be read can still hold a peer's address.
-            tracing::warn!(
-                rejected = rejected.len(),
-                "ignoring {PEER_NAMES_ENV} entries that are not `name=ip address`"
-            );
-        }
-
         Self::with_emitter(
             JsonlEventEmitter::new(JsonlTracer::spawn(trace_dir), zakura_jsonl_trace::node_id()),
-            peer_names,
+            config
+                .zakura
+                .trace_peer_names
+                .iter()
+                .map(|(ip, name)| (*ip, name.as_str())),
         )
     }
 
@@ -144,29 +127,6 @@ impl LegacyGossipTrace {
             exchanges: Default::default(),
         }
     }
-}
-
-/// Splits a `name=ip,name=ip` list into the pairs it names and the entries it cannot read.
-fn parse_peer_names(listed: &str) -> (Vec<(IpAddr, &str)>, Vec<&str>) {
-    let mut peer_names = Vec::new();
-    let mut rejected = Vec::new();
-
-    for entry in listed.split(',').map(str::trim) {
-        if entry.is_empty() {
-            continue;
-        }
-        let named = entry.split_once('=').and_then(|(name, ip)| {
-            let name = name.trim();
-            let ip = ip.trim().parse().ok()?;
-            (!name.is_empty()).then_some((ip, name))
-        });
-        match named {
-            Some(pair) => peer_names.push(pair),
-            None => rejected.push(entry),
-        }
-    }
-
-    (peer_names, rejected)
 }
 
 /// A block we announced to a peer, until the peer's request for it has been answered.
@@ -517,21 +477,38 @@ pub(super) mod tests {
         assert_eq!(events(&written.take()), ["block_inv_received"]);
     }
 
-    #[test]
-    fn the_peer_list_is_read_as_name_and_address_pairs() {
-        let (peer_names, rejected) = parse_peer_names(
-            " us-0=203.0.113.7 , asia-0 = 2001:db8::9,,no-address,=198.51.100.1,x=not-an-ip",
+    #[tokio::test]
+    async fn peer_names_come_from_configuration() {
+        let directory = tempfile::tempdir().expect("temporary trace directory");
+        let mut config = Config::default();
+        config
+            .zakura
+            .trace_peer_names
+            .insert("192.0.2.1".parse().unwrap(), "us-0".to_owned());
+        config
+            .zakura
+            .trace_peer_names
+            .insert("2001:db8::9".parse().unwrap(), "asia-0".to_owned());
+        assert!(
+            LegacyGossipTrace::new(&config).peer_names.is_empty(),
+            "tracing is disabled without a directory"
         );
-
+        config.zakura.trace_dir = Some(directory.path().to_owned());
+        let trace = LegacyGossipTrace::new(&config);
         assert_eq!(
-            peer_names,
-            [
-                ("203.0.113.7".parse().unwrap(), "us-0"),
-                ("2001:db8::9".parse().unwrap(), "asia-0"),
-            ]
+            trace
+                .for_peer(&direct("[::ffff:192.0.2.1]:8233"))
+                .peer_name
+                .as_deref(),
+            Some("us-0")
         );
-        assert_eq!(rejected, ["no-address", "=198.51.100.1", "x=not-an-ip"]);
-        assert_eq!(parse_peer_names(""), (Vec::new(), Vec::new()));
+        assert_eq!(
+            trace
+                .for_peer(&direct("[2001:db8::9]:8233"))
+                .peer_name
+                .as_deref(),
+            Some("asia-0")
+        );
     }
 
     #[test]

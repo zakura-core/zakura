@@ -527,6 +527,14 @@ pub static INITIAL_MIN_NETWORK_PROTOCOL_VERSION: LazyLock<HashMap<NetworkKind, V
 /// [6.1.3.3  Efficient Resource Usage] <https://tools.ietf.org/rfcmarkup?doc=1123#page-77>
 pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The most system resolver calls for the DNS names of unconditional peers that can be
+/// running at once.
+///
+/// A lookup normally ends within [`DNS_LOOKUP_TIMEOUT`], so this only limits a config
+/// with more names than this looking them up in the same instant, and a resolver whose
+/// calls do not return. Lookups beyond the limit fail, and are retried with backoff.
+pub const MAX_UNCONDITIONAL_PEER_LOOKUPS_IN_FLIGHT: usize = 32;
+
 #[cfg(test)]
 mod tests {
     use zakura_chain::parameters::POST_BLOSSOM_POW_TARGET_SPACING;

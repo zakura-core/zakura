@@ -1,10 +1,20 @@
 //! Keeps connections open to the configured unconditional peers.
 
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashMap,
+    io,
+    net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
+    time::Duration,
+};
 
 use futures::{future::BoxFuture, sink::SinkExt, stream::FuturesUnordered, FutureExt, StreamExt};
+use indexmap::IndexSet;
 use rand_10::RngExt;
-use tokio::time::{sleep, Instant, MissedTickBehavior};
+use tokio::{
+    sync::Semaphore,
+    time::{sleep, Instant, MissedTickBehavior},
+};
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
@@ -16,17 +26,28 @@ use crate::{
     peer::{self, address_is_valid_for_outbound_connections, OutboundConnectorRequest},
     peer_registry::PeerRegistry,
     peer_set::ActiveConnectionCounter,
-    protocol::external::{canonical_ip, canonical_socket_addr},
+    protocol::external::{canonical_ip, canonical_peer_addr, canonical_socket_addr},
     BoxError, Config, PeerSocketAddr,
 };
 
 use super::DiscoveredPeer;
 
+/// The addresses that a lookup of an unconditional peer's DNS name returned.
+type Lookup = io::Result<Vec<SocketAddr>>;
+
 /// The redial state of one dialed unconditional peer.
 #[derive(Debug)]
 struct RedialState {
-    /// The address Zakura dials.
-    addr: PeerSocketAddr,
+    /// The peer's DNS name and port, if it is listed by name, with the name's index in
+    /// [`UnconditionalPeers::dial_names`]. Zakura looks the name up before each dial.
+    ///
+    /// [`UnconditionalPeers::dial_names`]: crate::UnconditionalPeers::dial_names
+    name: Option<(usize, Arc<str>, u16)>,
+
+    /// The address Zakura dials. For a peer listed by name, this is the address Zakura
+    /// picked from the name's last lookup that had one it could dial, and `None` until
+    /// then.
+    addr: Option<PeerSocketAddr>,
 
     /// The earliest time of the next attempt.
     next_attempt: Instant,
@@ -51,8 +72,12 @@ struct RedialState {
 
 /// A finished step of an attempt to connect to the peer at `index`.
 enum AttemptEvent {
-    /// The random delay before the dial is over.
-    Delayed { index: usize },
+    /// The random delay before the dial is over, and so is the lookup of the peer's DNS
+    /// name, if it is listed by name.
+    Delayed {
+        index: usize,
+        lookup: Option<Lookup>,
+    },
 
     /// The dial finished. The peer is boxed because its client is much larger than
     /// the other variant.
@@ -135,6 +160,34 @@ fn connections_with_dials_in_flight(
             .map(|addr| (addr, false)),
     );
     connections
+}
+
+/// The system resolver calls that [`lookup_host`] can have running at once.
+///
+/// A call keeps its blocking thread until it returns, even after its lookup gave up. The
+/// node's state reads and proof checks share those threads, so a resolver that never
+/// returns must not be able to take them all.
+pub(super) static LOOKUPS_IN_FLIGHT: Semaphore =
+    Semaphore::const_new(constants::MAX_UNCONDITIONAL_PEER_LOOKUPS_IN_FLIGHT);
+
+/// Looks up the addresses of the DNS name `name`, with `port`, and gives up after
+/// [`constants::DNS_LOOKUP_TIMEOUT`]. Fails at once while [`LOOKUPS_IN_FLIGHT`] has no
+/// room.
+pub(super) fn lookup_host(name: Arc<str>, port: u16) -> BoxFuture<'static, Lookup> {
+    async move {
+        let in_flight = LOOKUPS_IN_FLIGHT
+            .try_acquire()
+            .map_err(|_| io::Error::other("too many earlier lookups are still running"))?;
+
+        let addrs = tokio::task::spawn_blocking(move || {
+            // Held until the resolver call returns, not until the lookup gives up.
+            let _in_flight = in_flight;
+            (&*name, port).to_socket_addrs().map(Vec::from_iter)
+        });
+
+        tokio::time::timeout(constants::DNS_LOOKUP_TIMEOUT, addrs).await??
+    }
+    .boxed()
 }
 
 /// Returns whether `addr` is a listener address of this node that can be recognized
@@ -236,8 +289,16 @@ fn warn_about_addrs_over_the_ip_limit(dial_addrs: &[PeerSocketAddr], config: &Co
     }
 }
 
-/// Dials each address in `dial_addrs`, and dials it again whenever no connection to that
-/// peer is open, see [`is_connected`]. Sends each new connection to `peerset_tx`.
+/// Dials each address in `dial_addrs` and each DNS name in the configured unconditional
+/// peers, and dials it again whenever no connection to that peer is open, see
+/// [`is_connected`]. Sends each new connection to `peerset_tx`.
+///
+/// A peer listed by name is looked up with `lookup` before each dial, so a peer that
+/// comes back at a new address is found there. Zakura dials one address in the answer
+/// that [`is_dialable`]: the one after the address it dialed last, or the first. It
+/// records that address with [`UnconditionalPeers::set_resolved_ip`], so it is treated
+/// like a listed address. When a lookup fails or has no such address, Zakura dials the
+/// last address it had. A name is never looked up while its peer is connected.
 ///
 /// An attempt that does not lead to a lasting connection doubles the peer's redial
 /// delay, from [`constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY`] up to
@@ -253,15 +314,20 @@ fn warn_about_addrs_over_the_ip_limit(dial_addrs: &[PeerSocketAddr], config: &Co
 /// total connection limit.
 ///
 /// Returns an error when `peerset_tx` is closed.
+///
+/// [`UnconditionalPeers::set_resolved_ip`]: crate::UnconditionalPeers::set_resolved_ip
 #[instrument(skip_all)]
-pub(super) async fn keep_unconditional_peers_connected<C>(
+pub(super) async fn keep_unconditional_peers_connected<C, L>(
     config: Config,
     dial_addrs: Vec<PeerSocketAddr>,
+    listen_addr: SocketAddr,
+    lookup: L,
     peer_registry: PeerRegistry,
     outbound_connector: C,
     mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
 ) -> Result<(), BoxError>
 where
+    L: Fn(Arc<str>, u16) -> BoxFuture<'static, Lookup> + Send + 'static,
     C: Service<
             OutboundConnectorRequest,
             Response = (PeerSocketAddr, peer::Client),
@@ -272,6 +338,7 @@ where
     C::Future: Send + 'static,
 {
     let expose_peer_addresses = config.expose_peer_addresses;
+    let dial_names: Vec<_> = config.unconditional_peers.dial_names().collect();
 
     if expose_peer_addresses {
         // `PeerSocketAddr`'s `Debug` redacts the address, so log the labels.
@@ -281,25 +348,30 @@ where
             .collect();
         info!(
             ?dial_addrs,
+            ?dial_names,
             "keeping connections open to unconditional peers"
         );
     } else {
         info!(
             dial_addrs = dial_addrs.len(),
+            dial_names = dial_names.len(),
             "keeping connections open to unconditional peers"
         );
     }
     warn_about_addrs_over_the_ip_limit(&dial_addrs, &config);
 
-    let mut active_connections = ActiveConnectionCounter::new_counter_with(
-        dial_addrs.len(),
-        "Unconditional Peer Connections",
-    );
-
     let start = Instant::now();
     let mut peers: Vec<RedialState> = dial_addrs
         .into_iter()
-        .map(|addr| RedialState {
+        .map(|addr| (None, Some(addr)))
+        .chain(
+            dial_names
+                .into_iter()
+                .enumerate()
+                .map(|(name_index, (name, port))| (Some((name_index, name, port)), None)),
+        )
+        .map(|(name, addr)| RedialState {
+            name,
             addr,
             next_attempt: start,
             attempts: 0,
@@ -309,6 +381,9 @@ where
             dialing: None,
         })
         .collect();
+
+    let mut active_connections =
+        ActiveConnectionCounter::new_counter_with(peers.len(), "Unconditional Peer Connections");
 
     // Each dial runs in its own task, so it makes progress while this task sleeps.
     let mut events: FuturesUnordered<BoxFuture<'static, AttemptEvent>> = FuturesUnordered::new();
@@ -324,7 +399,7 @@ where
             // An empty pool yields `None`, which disables this branch until the next
             // attempt.
             Some(event) = events.next() => match event {
-                AttemptEvent::Delayed { index } => {
+                AttemptEvent::Delayed { index, lookup } => {
                     let connections = connections_with_dials_in_flight(&peer_registry, &peers);
                     let peer: &mut RedialState = peers
                         .get_mut(index)
@@ -332,10 +407,78 @@ where
 
                     // The peer may have dialed in while this attempt waited, or a dial to
                     // another listed address may have filled its IP.
-                    if is_connected(peer.addr, &connections, config.max_connections_per_ip) {
+                    let is_open = |addr: PeerSocketAddr| {
+                        is_connected(addr, &connections, config.max_connections_per_ip)
+                    };
+
+                    // A peer that came back at its last address keeps that address.
+                    let lookup = lookup.filter(|_| !peer.addr.is_some_and(is_open));
+
+                    if let (Some((name_index, name, _port)), Some(lookup)) = (&peer.name, lookup) {
+                        let dial_addr = lookup.and_then(|addrs| {
+                            // A resolver can repeat an address, and the next address
+                            // must be a different one.
+                            let addrs: IndexSet<_> = addrs
+                                .into_iter()
+                                .map(canonical_peer_addr)
+                                .filter(|&addr| is_dialable(addr, &config, listen_addr))
+                                .collect();
+                            // This attempt follows a failed dial or a closed connection, so
+                            // dial the address after the last one. A first address that
+                            // refuses every dial then doesn't hide the others.
+                            let next = peer
+                                .addr
+                                .and_then(|last| addrs.get_index_of(&last))
+                                .map_or(0, |last| last + 1);
+                            addrs
+                                .get_index(next)
+                                .or(addrs.first())
+                                .copied()
+                                .ok_or_else(|| io::Error::other("no address that Zakura can dial"))
+                        });
+
+                        match dial_addr {
+                            Ok(addr) if peer.addr != Some(addr) => {
+                                debug!(
+                                    peer = %addr.addr_label(expose_peer_addresses),
+                                    "dialing an unconditional peer's DNS name at another address"
+                                );
+                                peer.addr = Some(addr);
+                                // Zakura dials the address below, so exempt it before a
+                                // connection to it can be scored.
+                                config
+                                    .unconditional_peers
+                                    .set_resolved_ip(*name_index, addr.ip());
+                            }
+                            Ok(_) => {}
+                            // Keep the last address, if any: the peer may still be there.
+                            // Like a failed dial, only the first failure is worth an
+                            // operator's attention.
+                            Err(error) => {
+                                let name = expose_peer_addresses.then_some(name);
+                                if peer.attempts <= 1 {
+                                    info!(
+                                        ?name,
+                                        ?error,
+                                        "failed to look up an unconditional peer's DNS name, \
+                                         retrying with backoff"
+                                    );
+                                } else {
+                                    debug!(
+                                        ?name,
+                                        ?error,
+                                        "failed to look up an unconditional peer's DNS name"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // A name that has never resolved has no address to dial.
+                    let Some(addr) = peer.addr.filter(|&addr| !is_open(addr)) else {
                         peer.is_attempting = false;
                         continue;
-                    }
+                    };
 
                     metrics::counter!("peer.unconditional.dial.total").increment(1);
 
@@ -343,10 +486,10 @@ where
                     // small.
                     active_connections.update_count();
                     let request = OutboundConnectorRequest {
-                        addr: peer.addr,
+                        addr,
                         connection_tracker: active_connections.track_connection(),
                     };
-                    peer.dialing = Some(peer.addr);
+                    peer.dialing = Some(addr);
                     let outbound_connector = outbound_connector.clone();
 
                     events.push(
@@ -372,7 +515,10 @@ where
                         .get_mut(index)
                         .expect("event indexes come from the peer list, which never shrinks");
                     peer.is_attempting = false;
-                    peer.dialing = None;
+                    let dialed_addr = peer
+                        .dialing
+                        .take()
+                        .expect("every dial sets `dialing` before it starts");
 
                     match result.map(|peer| *peer) {
                         Ok((addr, client)) => {
@@ -386,7 +532,7 @@ where
                             peerset_tx.send((addr, client)).await?;
                         }
                         Err(error) => {
-                            let addr_label = peer.addr.addr_label(expose_peer_addresses);
+                            let addr_label = dialed_addr.addr_label(expose_peer_addresses);
 
                             // A peer that moves to the v2 protocol closes this
                             // connection without a fault. Its v2 connection is in the
@@ -437,7 +583,9 @@ where
 
                     let now = Instant::now();
 
-                    if is_connected(peer.addr, &connections, config.max_connections_per_ip) {
+                    if peer.addr.is_some_and(|addr| {
+                        is_connected(addr, &connections, config.max_connections_per_ip)
+                    }) {
                         let connected_since = *peer.connected_since.get_or_insert(now);
                         if now.saturating_duration_since(connected_since)
                             >= constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION
@@ -465,10 +613,19 @@ where
                     peer.next_attempt = now + redial_delay(peer.attempts);
                     peer.attempts = peer.attempts.saturating_add(1);
 
+                    let lookup = peer
+                        .name
+                        .as_ref()
+                        .map(|(_name_index, name, port)| lookup(name.clone(), *port));
+
                     events.push(
                         async move {
                             sleep(delay).await;
-                            AttemptEvent::Delayed { index }
+                            let lookup = match lookup {
+                                Some(lookup) => Some(lookup.await),
+                                None => None,
+                            };
+                            AttemptEvent::Delayed { index, lookup }
                         }
                         .boxed(),
                     );

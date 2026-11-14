@@ -829,10 +829,6 @@ impl AddressBook {
             if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
                 // Ban and skip outbound connections with excessively misbehaving peers.
                 let banned_ip = updated.addr.ip();
-                debug_assert!(
-                    !self.unconditional_peers.contains(banned_ip),
-                    "unconditional peers must never be banned"
-                );
                 self.bans_by_ip.insert(banned_ip);
 
                 // `most_recent_by_ip` is only populated when

@@ -146,7 +146,7 @@ use types::{
     z_validate_address::ZValidateAddressResponse,
 };
 
-/// The first mempool recheck after a client receives a coinbase-only template.
+/// The first mempool recheck when the client's long-poll ID names no transactions.
 const EMPTY_TEMPLATE_MEMPOOL_RECHECK_DELAY: Duration = Duration::from_millis(100);
 
 /// Calls a Tower service and maps readiness or call errors to

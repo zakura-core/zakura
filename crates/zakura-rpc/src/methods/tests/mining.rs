@@ -574,7 +574,10 @@ async fn long_poll_early_recheck_detects_transactions_only_after_empty_template(
 
     let transaction = Network::Mainnet
         .unmined_transactions_in_blocks(..)
-        .find(|tx| !tx.transaction.transaction().is_coinbase())
+        .find(|tx| {
+            let tx = tx.transaction.transaction();
+            !tx.is_coinbase() && !tx.has_sprout_joinsplit_data()
+        })
         .unwrap()
         .transaction;
     let miner_fee = transaction.conventional_fee();
@@ -631,7 +634,7 @@ async fn long_poll_early_recheck_detects_transactions_only_after_empty_template(
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         populated.store(true, Ordering::SeqCst);
 
-        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::time::advance(Duration::from_millis(101)).await;
         if initially_populated {
             assert!(futures::poll!(&mut request).is_pending());
             assert_eq!(reads.load(Ordering::SeqCst), 1);
@@ -945,7 +948,7 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
             }));
             tokio::pin!(request);
             assert!(futures::poll!(&mut request).is_pending());
-            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::time::advance(Duration::from_millis(101)).await;
             assert!(futures::poll!(&mut request).is_pending());
             let reads = read_count.load(Ordering::SeqCst);
             tokio::time::advance(Duration::from_secs(2)).await;
@@ -990,7 +993,8 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
         assert!(futures::poll!(&mut request).is_pending());
         // Consume the early recheck before measuring the difficulty deadline.
         // Pausing Tokio's clock does not advance the wall clock sampled by GBT.
-        tokio::time::advance(Duration::from_millis(100)).await;
+        // Allow one extra millisecond for Tokio's timer resolution.
+        tokio::time::advance(Duration::from_millis(101)).await;
         assert!(futures::poll!(&mut request).is_pending());
         let reads_before_expiry = read_count.load(Ordering::SeqCst);
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -1150,7 +1154,7 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         sampled.cur_time = clock.checked_add(Duration32::from_seconds(6)).unwrap();
         info_tx.send_replace(sampled.clone());
         assert!(futures::poll!(&mut request).is_pending());
-        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::time::advance(Duration::from_millis(101)).await;
         assert!(futures::poll!(&mut request).is_pending());
         let reads_before_deadline = read_count.load(Ordering::SeqCst);
 
@@ -1202,7 +1206,7 @@ fn superseded_deadline_build_does_not_resume_long_polling() {
         }));
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
-        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::time::advance(Duration::from_millis(101)).await;
         assert!(futures::poll!(&mut request).is_pending());
         tokio::time::advance(deadline + Duration::from_millis(1)).await;
         assert!(

@@ -690,11 +690,7 @@ async fn bring_in(
                     // the download.
                     drop(reservation);
                     metrics::counter!("mempool.cancelled.verify.tasks.total").increment(1);
-                    return Err(format!(
-                        "failed to validate tx: {tx_id}, error: {}",
-                        TransactionDownloadVerifyError::Cancelled
-                    )
-                    .into());
+                    return Err(cancelled());
                 }
             };
             let Ok(fetched) = fetched else {
@@ -806,6 +802,12 @@ impl Shared {
     }
 }
 
+/// Today's second-stage answer for a fetch or verification a block ended by
+/// mining its transaction.
+fn cancelled() -> BoxError {
+    "verification cancelled".into()
+}
+
 /// Today's second-stage answer for `verdict`.
 fn second_stage(tx_id: UnminedTxId, verdict: Verdict) -> Result<(), BoxError> {
     let failed = |reason: &dyn std::fmt::Display| -> BoxError {
@@ -844,6 +846,12 @@ fn second_stage(tx_id: UnminedTxId, verdict: Verdict) -> Result<(), BoxError> {
                     Err(failed(&format!(
                         "transaction did not pass mempool policy: {error}"
                     )))
+                }
+                // A block mined it while it was verified, which today's pool
+                // answers as a cancelled task.
+                MempoolError::StorageEffectsChain(SameEffectsChainRejectionError::Mined) => {
+                    metrics::counter!("mempool.cancelled.verify.tasks.total").increment(1);
+                    Err(cancelled())
                 }
                 // Today's insertion errors reach the caller as they are.
                 error => Err(error.into()),

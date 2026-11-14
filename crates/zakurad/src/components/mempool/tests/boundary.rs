@@ -1256,6 +1256,73 @@ async fn a_mined_id_frees_its_fetch_slot(mode: Mode) {
     );
 }
 
+/// An id a block mines while the pool is still fetching it is answered at
+/// the second stage as today's pool answers a cancelled task.
+async fn a_transaction_mined_while_it_is_brought_in_is_answered_as_cancelled(mode: Mode) {
+    let mut harness = pool(Config::default(), Peers::Silent, mode).await;
+    harness.activate().await;
+    // Block 1 starts an upgrade, which resets today's pool.
+    harness
+        .commit(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice())
+        .await;
+    let fetched = Network::Mainnet
+        .unmined_transactions_in_blocks(2..=2)
+        .next()
+        .expect("block 2 has a transaction")
+        .transaction;
+    // An id whose fetch never completes, from peers that never answer.
+    let fetching = harness
+        .queue_one(fetched.id())
+        .await
+        .expect("the id is queued");
+
+    harness
+        .commit(zakura_test::vectors::BLOCK_MAINNET_2_BYTES.as_slice())
+        .await;
+    let answer = harness
+        .outcome(fetching)
+        .await
+        .expect_err("the fetch is cancelled");
+    assert_eq!(
+        answer.to_string(),
+        "verification cancelled",
+        "a cancelled fetch"
+    );
+}
+
+/// A body a block mines while the pool is still verifying it is answered
+/// at the second stage as today's pool answers a cancelled task.
+async fn a_body_mined_while_it_is_verified_is_answered_as_cancelled(mode: Mode) {
+    let mut harness = pool(Config::default(), Peers::Silent, mode).await;
+    harness.activate().await;
+    harness
+        .commit(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice())
+        .await;
+    let body = Network::Mainnet
+        .unmined_transactions_in_blocks(2..=2)
+        .next()
+        .expect("block 2 has a transaction")
+        .transaction;
+    let verifying = harness.queue_one(body).await.expect("the body is queued");
+    let _unanswered = harness
+        .verifier
+        .expect_request_that(|request| matches!(request, tx::Request::Mempool { .. }))
+        .await;
+
+    harness
+        .commit(zakura_test::vectors::BLOCK_MAINNET_2_BYTES.as_slice())
+        .await;
+    let answer = harness
+        .outcome(verifying)
+        .await
+        .expect_err("the verification is cancelled");
+    assert_eq!(
+        answer.to_string(),
+        "verification cancelled",
+        "a cancelled verification"
+    );
+}
+
 /// Today's pool only. Its waits register when the request is called, so the
 /// test can hold 65,536 of them without polling. The core's register when
 /// the call is first polled, and the core drops abandoned waits before it
@@ -1873,6 +1940,8 @@ both_pools!(
     full_queue_is_refused_at_the_first_stage,
     one_peer_holds_at_most_five_fetches,
     output_waits_are_limited_to_distinct_outpoints,
+    a_transaction_mined_while_it_is_brought_in_is_answered_as_cancelled,
+    a_body_mined_while_it_is_verified_is_answered_as_cancelled,
 );
 
 /// One step of a replayed trace, and what each pool answered.

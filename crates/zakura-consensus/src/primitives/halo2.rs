@@ -51,6 +51,11 @@ use super::cache::{CacheKey, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
 /// to 12% faster than 64-action batches on x86-64 benchmark hosts.
 const HALO2_MAX_BATCH_SIZE: usize = 128;
 
+/// A typical mainnet Orchard bundle carries two actions, so a full
+/// [`HALO2_MAX_BATCH_SIZE`]-action batch folds about
+/// `HALO2_MAX_BATCH_SIZE / TYPICAL_ACTIONS_PER_BUNDLE` proofs.
+const TYPICAL_ACTIONS_PER_BUNDLE: usize = 2;
+
 /// The result of one batch: each item's admission result, in admission order, and whether the
 /// admitted items verified.
 #[derive(Debug)]
@@ -155,15 +160,33 @@ pub static VERIFYING_KEY_NU6_2: LazyLock<ItemVerifyingKey> =
 pub static VERIFYING_KEY_NU6_3_ONWARD: LazyLock<ItemVerifyingKey> =
     LazyLock::new(|| build_verifying_key(OrchardCircuitVersion::PostNu6_3));
 
-/// Builds every era's verifying key on a blocking thread, current era first.
+/// Builds every era's verifying key on a blocking thread, current era first, then provisions
+/// reusable scratch for a typical full Orchard batch.
 ///
-/// Started once at node startup, so the first shielded block after a restart does not build a
-/// key on its verification path.
+/// Started once at node startup, reducing the first shielded block's initialization and
+/// allocation costs after a restart. The warm-up prepares one expected batch shape; different
+/// shapes, concurrent leases, and equation growth can still allocate.
 pub(crate) fn spawn_key_preload() -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(|| {
         LazyLock::force(&VERIFYING_KEY_NU6_3_ONWARD);
         LazyLock::force(&VERIFYING_KEY_NU6_2);
         LazyLock::force(&VERIFYING_KEY_PRE_NU6_2);
+
+        // Provision one full batch's scratch into the backend's idle cache, reducing the first
+        // `HALO2_MAX_BATCH_SIZE`-action batch's allocation costs. The cache is process-wide
+        // and shared by every era's key.
+        let plan = sensei::warm_up_verifier_scratch(
+            HALO2_MAX_BATCH_SIZE / TYPICAL_ACTIONS_PER_BUNDLE,
+            HALO2_MAX_BATCH_SIZE,
+        );
+        tracing::info!(
+            workspace_bytes = plan.workspace_bytes,
+            equation_bytes = plan.equation_bytes,
+            workspace_slots = plan.workspace_slots,
+            retention_eligible = plan.retention_eligible,
+            max_idle_bytes = plan.max_idle_bytes,
+            "provisioned Orchard proof verification scratch for one full batch",
+        );
     })
 }
 

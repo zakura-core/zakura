@@ -142,7 +142,7 @@ fn sanitize_extremes() {
         ping_sent_at: None,
         last_attempt: None,
         last_failure: None,
-        redial_until: None,
+        connected_since: None,
         last_connection_state: Default::default(),
         misbehavior_score: Default::default(),
         is_inbound: false,
@@ -157,7 +157,7 @@ fn sanitize_extremes() {
         ping_sent_at: None,
         last_attempt: None,
         last_failure: None,
-        redial_until: None,
+        connected_since: None,
         last_connection_state: Default::default(),
         misbehavior_score: Default::default(),
         is_inbound: false,
@@ -668,84 +668,86 @@ fn apply_after(
         .expect("the change is later than the entry, so it is applied")
 }
 
-/// Only the end of a long-lived outbound connection makes a peer a redial candidate.
-#[test]
-fn long_lived_outbound_connection_end_opens_a_redial_window() {
-    let _init_guard = zakura_test::init();
-
-    let start = (Instant::now(), Utc::now());
-    let addr = PeerSocketAddr::from(([192, 168, 180, 9], 10_000));
-    let connected = |is_inbound| {
-        MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, is_inbound)
-            .apply_to_meta_addr(None, start.0, start.1)
-            .expect("a new entry is always created")
-    };
-    assert!(!connected(false).is_redialed_first());
-
-    for (connected_for, is_redialed_first) in [
-        (MIN_REDIAL_CONNECTION, true),
-        (MIN_REDIAL_CONNECTION - Duration::from_millis(1), false),
-    ] {
-        let closed = apply_after(
-            MetaAddr::new_shutdown(addr, connected_for),
-            connected(false),
-            start,
-            connected_for,
-        );
-        assert_eq!(
-            closed.is_redialed_first(),
-            is_redialed_first,
-            "unexpected redial after a connection open for {connected_for:?}"
-        );
-    }
-
-    let failed = apply_after(
-        MetaAddr::new_errored(addr, None),
-        connected(false),
-        start,
-        MIN_REDIAL_CONNECTION,
-    );
-    assert!(
-        !failed.is_redialed_first(),
-        "an error that reports no connection time opens no window"
-    );
-
-    let inbound_closed = apply_after(
-        MetaAddr::new_shutdown(addr, MIN_REDIAL_CONNECTION),
-        connected(true),
-        start,
-        MIN_REDIAL_CONNECTION,
-    );
-    assert!(
-        !inbound_closed.is_redialed_first(),
-        "an inbound peer's address is not a listener to dial"
-    );
-}
-
-/// A redial candidate stays one through failed redials, until it connects or its window
-/// ends.
-#[test]
-fn redial_window_lasts_until_the_peer_connects_or_the_window_ends() {
-    let _init_guard = zakura_test::init();
-
-    let start = (Instant::now(), Utc::now());
-    let addr = PeerSocketAddr::from(([192, 168, 180, 9], 10_000));
-    let connected = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, false)
+/// Returns the entry of a peer that connected at `start` and last responded
+/// `connected_for` later.
+fn peer_connected_for(
+    addr: PeerSocketAddr,
+    is_inbound: bool,
+    start: (Instant, chrono::DateTime<Utc>),
+    connected_for: Duration,
+) -> MetaAddr {
+    let connected = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, is_inbound)
         .apply_to_meta_addr(None, start.0, start.1)
         .expect("a new entry is always created");
 
-    let closed_at = MIN_REDIAL_CONNECTION;
-    let closed = apply_after(
-        MetaAddr::new_shutdown(addr, closed_at),
+    apply_after(
+        MetaAddr::new_responded(addr, None),
         connected,
         start,
-        closed_at,
-    );
+        connected_for,
+    )
+}
 
-    let redialed_at = closed_at + MIN_PEER_RECONNECTION_DELAY;
-    let redialing = apply_after(MetaAddr::new_reconnect(addr), closed, start, redialed_at);
-    assert!(redialing.is_redialed_first());
+/// Only the end of a long-lived outbound connection makes a peer a redial candidate,
+/// whether the connection reported that it ended or not.
+#[test]
+fn long_lived_outbound_connection_end_makes_a_redial_candidate() {
+    let _init_guard = zakura_test::init();
 
+    let start = (Instant::now(), Utc::now());
+    let addr = PeerSocketAddr::from(([192, 168, 180, 9], 10_000));
+    let short_connection = MIN_REDIAL_CONNECTION - Duration::from_secs(1);
+
+    for (connected_for, is_inbound, is_redialed_first) in [
+        (MIN_REDIAL_CONNECTION, false, true),
+        (short_connection, false, false),
+        (MIN_REDIAL_CONNECTION, true, false),
+    ] {
+        let connected = peer_connected_for(addr, is_inbound, start, connected_for);
+        assert!(
+            !connected.is_redialed_first(),
+            "a connected peer needs no redial"
+        );
+
+        // The connection reports an error or a shutdown.
+        let failed = apply_after(
+            MetaAddr::new_shutdown(addr),
+            connected,
+            start,
+            connected_for + Duration::from_secs(1),
+        );
+        // The connection ends without a report, and the peer is dialed when it is next due.
+        let redialing = apply_after(
+            MetaAddr::new_reconnect(addr),
+            connected,
+            start,
+            connected_for + MIN_PEER_RECONNECTION_DELAY + Duration::from_secs(1),
+        );
+
+        for ended in [failed, redialing] {
+            assert_eq!(
+                ended.is_redialed_first(),
+                is_redialed_first,
+                "unexpected redial after a connection open for {connected_for:?}, \
+                 inbound: {is_inbound}: {ended:?}"
+            );
+        }
+    }
+}
+
+/// A redial candidate stays one through failed redials, until it connects or
+/// `REDIAL_WINDOW` has passed since its last response.
+#[test]
+fn redial_candidate_lasts_until_the_peer_connects_or_the_window_ends() {
+    let _init_guard = zakura_test::init();
+
+    let start = (Instant::now(), Utc::now());
+    let addr = PeerSocketAddr::from(([192, 168, 180, 9], 10_000));
+    let last_response = MIN_REDIAL_CONNECTION;
+    let connected = peer_connected_for(addr, false, start, last_response);
+
+    let redialed_at = last_response + MIN_PEER_RECONNECTION_DELAY + Duration::from_secs(1);
+    let redialing = apply_after(MetaAddr::new_reconnect(addr), connected, start, redialed_at);
     let redial_failed = apply_after(
         MetaAddr::new_errored(addr, None),
         redialing,
@@ -754,7 +756,7 @@ fn redial_window_lasts_until_the_peer_connects_or_the_window_ends() {
     );
     assert!(
         redial_failed.is_redialed_first(),
-        "a failed redial keeps the window open"
+        "a failed redial keeps the peer a candidate"
     );
 
     let reconnected = apply_after(
@@ -763,17 +765,23 @@ fn redial_window_lasts_until_the_peer_connects_or_the_window_ends() {
         start,
         redialed_at + Duration::from_secs(1),
     );
+    let reconnection_failed = apply_after(
+        MetaAddr::new_shutdown(addr),
+        reconnected,
+        start,
+        redialed_at + Duration::from_secs(10),
+    );
     assert!(
-        !reconnected.is_redialed_first(),
-        "a connected peer needs no redial"
+        !reconnected.is_redialed_first() && !reconnection_failed.is_redialed_first(),
+        "a new connection has to be long-lived again"
     );
 
-    let last_redial = closed_at + REDIAL_WINDOW - Duration::from_millis(1);
+    let window_end = last_response + REDIAL_WINDOW;
     assert!(apply_after(
         MetaAddr::new_reconnect(addr),
         redial_failed,
         start,
-        last_redial
+        window_end - Duration::from_secs(1),
     )
     .is_redialed_first());
     assert!(
@@ -781,7 +789,7 @@ fn redial_window_lasts_until_the_peer_connects_or_the_window_ends() {
             MetaAddr::new_reconnect(addr),
             redial_failed,
             start,
-            closed_at + REDIAL_WINDOW,
+            window_end
         )
         .is_redialed_first(),
         "the window is over"
@@ -795,26 +803,25 @@ fn redial_candidates_sort_before_untried_addresses() {
     let _init_guard = zakura_test::init();
 
     let start = (Instant::now(), Utc::now());
-    let peer = |host, connected_for| {
+    let closed_peer = |host, connected_for| {
         let addr = PeerSocketAddr::from(([192, 168, 180, host], 10_000));
-        let connected = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, false)
-            .apply_to_meta_addr(None, start.0, start.1)
-            .expect("a new entry is always created");
 
-        match connected_for {
-            Some(connected_for) => apply_after(
-                MetaAddr::new_shutdown(addr, connected_for),
-                connected,
-                start,
-                connected_for,
-            ),
-            None => connected,
-        }
+        apply_after(
+            MetaAddr::new_shutdown(addr),
+            peer_connected_for(addr, false, start, connected_for),
+            start,
+            connected_for + Duration::from_secs(1),
+        )
     };
 
-    let redial = peer(1, Some(MIN_REDIAL_CONNECTION));
-    let short_lived = peer(2, Some(MIN_REDIAL_CONNECTION - Duration::from_millis(1)));
-    let responded = peer(3, None);
+    let redial = closed_peer(1, MIN_REDIAL_CONNECTION);
+    let short_lived = closed_peer(2, MIN_REDIAL_CONNECTION - Duration::from_secs(1));
+    let responded = peer_connected_for(
+        PeerSocketAddr::from(([192, 168, 180, 3], 10_000)),
+        false,
+        start,
+        MIN_REDIAL_CONNECTION,
+    );
     let never_attempted = MetaAddr::new_gossiped_meta_addr(
         PeerSocketAddr::from(([192, 168, 180, 4], 10_000)),
         PeerServices::NODE_NETWORK,

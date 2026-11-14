@@ -800,24 +800,36 @@ fn reconnection_peers_start_with_redial_candidates() {
 
     let start = Instant::now();
     let wall_start = Utc::now();
-    let closed_peer = |addr: &str, connected_for| {
-        let addr = addr.parse().unwrap();
-        let wall_closed =
-            wall_start + chrono::Duration::from_std(connected_for).expect("short duration");
-        let connected = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, false)
-            .apply_to_meta_addr(None, start, wall_start)
-            .expect("a new entry is always created");
+    let wall_after = |after| wall_start + chrono::Duration::from_std(after).expect("short");
+    let second = std::time::Duration::from_secs(1);
 
-        MetaAddr::new_shutdown(addr, connected_for)
-            .apply_to_meta_addr(connected, start + connected_for, wall_closed)
-            .expect("the shutdown is later than the connection")
+    // Each peer connects, last responds at `MIN_REDIAL_CONNECTION` after the start of the
+    // test, and reports a shutdown a second later.
+    let closed_peer = |addr: &str, connected_for: std::time::Duration| {
+        let addr = addr.parse().unwrap();
+        let connected_at = MIN_REDIAL_CONNECTION - connected_for;
+        let connected = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, false)
+            .apply_to_meta_addr(None, start + connected_at, wall_after(connected_at))
+            .expect("a new entry is always created");
+        let responded = MetaAddr::new_responded(addr, None)
+            .apply_to_meta_addr(
+                connected,
+                start + MIN_REDIAL_CONNECTION,
+                wall_after(MIN_REDIAL_CONNECTION),
+            )
+            .expect("the response is later than the connection");
+
+        MetaAddr::new_shutdown(addr)
+            .apply_to_meta_addr(
+                responded,
+                start + MIN_REDIAL_CONNECTION + second,
+                wall_after(MIN_REDIAL_CONNECTION + second),
+            )
+            .expect("the shutdown is later than the response")
     };
 
     let redial = closed_peer("127.0.0.1:1", MIN_REDIAL_CONNECTION);
-    let short_lived = closed_peer(
-        "127.0.0.2:2",
-        MIN_REDIAL_CONNECTION - std::time::Duration::from_millis(1),
-    );
+    let short_lived = closed_peer("127.0.0.2:2", MIN_REDIAL_CONNECTION - second);
     let never_attempted = MetaAddr::new_gossiped_meta_addr(
         "127.0.0.3:3".parse().unwrap(),
         PeerServices::NODE_NETWORK,
@@ -834,21 +846,20 @@ fn reconnection_peers_start_with_redial_candidates() {
     );
 
     let closed_for = |closed_for| {
-        let after = MIN_REDIAL_CONNECTION + closed_for;
-        let wall_after = wall_start + chrono::Duration::from_std(after).expect("short duration");
+        let after = MIN_REDIAL_CONNECTION + second + closed_for;
 
         address_book
-            .reconnection_peers(start + after, wall_after)
+            .reconnection_peers(start + after, wall_after(after))
             .collect::<Vec<_>>()
     };
 
     assert_eq!(
-        closed_for(MIN_PEER_RECONNECTION_DELAY - std::time::Duration::from_secs(1)),
+        closed_for(MIN_PEER_RECONNECTION_DELAY - second),
         [never_attempted],
         "a closed peer waits for the reconnection delay like any other"
     );
     assert_eq!(
-        closed_for(MIN_PEER_RECONNECTION_DELAY + std::time::Duration::from_secs(1)),
+        closed_for(MIN_PEER_RECONNECTION_DELAY + second),
         [redial, never_attempted, short_lived],
     );
 }

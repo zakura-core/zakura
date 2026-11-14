@@ -180,15 +180,12 @@ pub const CONCURRENT_ADDRESS_CHANGE_PERIOD: Duration = Duration::from_secs(5);
 /// specific manner that matches up with this math.
 pub const MIN_PEER_RECONNECTION_DELAY: Duration = Duration::from_secs(59 + 20 + 20 + 20);
 
-/// How long an outbound connection must have been open for its peer to be dialed before
-/// other candidates after the connection ends.
-///
-/// A peer earns the early redials by staying connected, so a peer that keeps dropping
-/// its connections is not dialed more often.
+/// How long an outbound connection must have responded for its peer to be dialed before
+/// other candidates after the connection ends, see `MetaAddr::is_redialed_first`.
 pub const MIN_REDIAL_CONNECTION: Duration = Duration::from_secs(10 * 60);
 
-/// How long a peer is dialed before other candidates after its long-lived outbound
-/// connection ends.
+/// How long after its last response a peer with a long-lived outbound connection is
+/// dialed before other candidates.
 ///
 /// A node that restarts within this time is dialed again by the peers that were
 /// connected to it. Each redial still waits [`MIN_PEER_RECONNECTION_DELAY`] after the

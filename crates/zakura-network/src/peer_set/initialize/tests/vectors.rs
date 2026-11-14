@@ -1094,7 +1094,13 @@ async fn unconditional_peer_name_moves_to_the_next_address_after_a_failed_dial()
         UnconditionalPeerDial::Fail,
     );
 
-    dialer.set_lookup(Some(&["192.0.2.1:18233", "192.0.2.2:18233"]));
+    // A resolver can repeat an address, also as an IPv4-mapped IPv6 address.
+    dialer.set_lookup(Some(&[
+        "192.0.2.1:18233",
+        "192.0.2.1:18233",
+        "[::ffff:192.0.2.1]:18233",
+        "192.0.2.2:18233",
+    ]));
     dialer.wait_for_dial_after(2).await;
     assert_eq!(
         dialer.dial_addrs()[..3],
@@ -1116,6 +1122,53 @@ async fn unconditional_peer_name_moves_to_the_next_address_after_a_failed_dial()
         !unconditional_peers.contains(ip("192.0.2.1")),
         "only the address dialed last is exempt",
     );
+}
+
+/// A peer that dials back in from its last address while its name is being looked up
+/// keeps that address. Zakura does not move the name to the next address or dial it.
+#[tokio::test(start_paused = true)]
+async fn unconditional_peer_name_keeps_an_address_that_reconnects_during_a_lookup() {
+    let _init_guard = zakura_test::init();
+
+    let config: Config =
+        toml::from_str("unconditional_peers = ['peer.example.com:18233']").unwrap();
+    let unconditional_peers = config.unconditional_peers.clone();
+    let peer_registry = PeerRegistry::default();
+    let dialer = spawn_unconditional_peer_dialer(
+        config,
+        peer_registry.clone(),
+        UnconditionalPeerDial::ConnectAndStayOpen,
+    );
+
+    dialer.set_lookup(Some(&["192.0.2.1:18233", "192.0.2.2:18233"]));
+    dialer.wait_for_dial_after(0).await;
+
+    // The connection closes, and the peer dials in while the next lookup is running.
+    let lookup_time = Duration::from_secs(10);
+    dialer.set_lookup_delay(lookup_time);
+    dialer.close_connections();
+    tokio::time::sleep(
+        constants::UNCONDITIONAL_PEER_CHECK_INTERVAL
+            + constants::MAX_UNCONDITIONAL_PEER_REDIAL_JITTER,
+    )
+    .await;
+    assert_eq!(dialer.lookups(), 2, "the second lookup has started");
+    let (_inbound_connection, _updater) =
+        peer_registry.register_legacy(connected_peer(peer_addr("192.0.2.1:50000"), true));
+
+    tokio::time::sleep(lookup_time * 2).await;
+
+    assert_eq!(
+        dialer.dial_addrs(),
+        vec![peer_addr("192.0.2.1:18233")],
+        "a peer that dialed in is not dialed at another address",
+    );
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+    assert!(
+        unconditional_peers.contains(ip("192.0.2.1")),
+        "the connected address stays exempt",
+    );
+    assert!(!unconditional_peers.contains(ip("192.0.2.2")));
 }
 
 /// The real lookup returns the addresses of a name, each with the port it was given.
@@ -1170,6 +1223,9 @@ struct UnconditionalPeerDialer {
     /// The number of lookups so far.
     lookups: Arc<AtomicUsize>,
 
+    /// How long each fake lookup takes to answer.
+    lookup_delay: Arc<std::sync::Mutex<Duration>>,
+
     /// The peers that the dialer sent to the peer set.
     peerset_rx: mpsc::Receiver<DiscoveredPeer>,
 
@@ -1191,6 +1247,11 @@ impl UnconditionalPeerDialer {
             .iter()
             .map(|(addr, _time)| *addr)
             .collect()
+    }
+
+    /// Makes each later fake lookup take `delay` to answer.
+    fn set_lookup_delay(&self, delay: Duration) {
+        *self.lookup_delay.lock().unwrap() = delay;
     }
 
     /// Makes the fake lookup answer every DNS name with `addrs`, or fail when `addrs`
@@ -1258,6 +1319,7 @@ fn spawn_unconditional_peer_dialer(
     let inbound_connections = Arc::new(std::sync::Mutex::new(Vec::new()));
     let lookup = Arc::new(std::sync::Mutex::new(None::<Vec<SocketAddr>>));
     let lookups = Arc::new(AtomicUsize::new(0));
+    let lookup_delay = Arc::new(std::sync::Mutex::new(Duration::ZERO));
     let dial_addrs = config
         .unconditional_peers
         .dial_addrs(config.network.default_port());
@@ -1265,6 +1327,7 @@ fn spawn_unconditional_peer_dialer(
     let fake_lookup = {
         let lookup = lookup.clone();
         let lookups = lookups.clone();
+        let lookup_delay = lookup_delay.clone();
 
         move |_name: Arc<str>, _port: u16| {
             lookups.fetch_add(1, Ordering::SeqCst);
@@ -1273,8 +1336,13 @@ fn spawn_unconditional_peer_dialer(
                 .unwrap()
                 .clone()
                 .ok_or_else(|| std::io::Error::other("test lookup fails"));
+            let delay = *lookup_delay.lock().unwrap();
 
-            async move { answer }.boxed()
+            async move {
+                tokio::time::sleep(delay).await;
+                answer
+            }
+            .boxed()
         }
     };
 
@@ -1360,6 +1428,7 @@ fn spawn_unconditional_peer_dialer(
         inbound_connections,
         lookup,
         lookups,
+        lookup_delay,
         peerset_rx,
         _dialer_task: tokio_util::task::AbortOnDropHandle::new(dialer_task),
     }

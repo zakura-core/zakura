@@ -3,6 +3,7 @@
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::{future::BoxFuture, sink::SinkExt, stream::FuturesUnordered, FutureExt, StreamExt};
+use indexmap::IndexSet;
 use rand_10::RngExt;
 use tokio::time::{sleep, Instant, MissedTickBehavior};
 use tower::{Service, ServiceExt};
@@ -381,9 +382,20 @@ where
                         .get_mut(index)
                         .expect("event indexes come from the peer list, which never shrinks");
 
+                    // The peer may have dialed in while this attempt waited, or a dial to
+                    // another listed address may have filled its IP.
+                    let is_open = |addr: PeerSocketAddr| {
+                        is_connected(addr, &connections, config.max_connections_per_ip)
+                    };
+
+                    // A peer that came back at its last address keeps that address.
+                    let lookup = lookup.filter(|_| !peer.addr.is_some_and(is_open));
+
                     if let (Some((name_index, name, _port)), Some(lookup)) = (&peer.name, lookup) {
                         let dial_addr = lookup.and_then(|addrs| {
-                            let addrs: Vec<_> = addrs
+                            // A resolver can repeat an address, and the next address
+                            // must be a different one.
+                            let addrs: IndexSet<_> = addrs
                                 .into_iter()
                                 .map(canonical_peer_addr)
                                 .filter(|&addr| is_dialable(addr, &config, listen_addr))
@@ -391,12 +403,12 @@ where
                             // This attempt follows a failed dial or a closed connection, so
                             // dial the address after the last one. A first address that
                             // refuses every dial then doesn't hide the others.
-                            let next = addrs
-                                .iter()
-                                .position(|&addr| peer.addr == Some(addr))
+                            let next = peer
+                                .addr
+                                .and_then(|last| addrs.get_index_of(&last))
                                 .map_or(0, |last| last + 1);
                             addrs
-                                .get(next)
+                                .get_index(next)
                                 .or(addrs.first())
                                 .copied()
                                 .ok_or_else(|| io::Error::other("no address that Zakura can dial"))
@@ -439,13 +451,8 @@ where
                         }
                     }
 
-                    // The peer may have dialed in while this attempt waited, or a dial to
-                    // another listed address may have filled its IP. A name that has
-                    // never resolved has no address to dial.
-                    let addr = peer.addr.filter(|&addr| {
-                        !is_connected(addr, &connections, config.max_connections_per_ip)
-                    });
-                    let Some(addr) = addr else {
+                    // A name that has never resolved has no address to dial.
+                    let Some(addr) = peer.addr.filter(|&addr| !is_open(addr)) else {
                         peer.is_attempting = false;
                         continue;
                     };

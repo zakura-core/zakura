@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from release_review.assets import FRONTIER_PATH, SUBTREES_PATH, asset_text
-from release_review.contracts import ReviewError
+from release_review.contracts import Finding, ReviewError
 from release_review.engine import review
 from test_release_review import (
     GitFixture,
@@ -114,10 +114,10 @@ class AssetRepositoryTests(GitFixture):
         self.repository.pin(self.git("rev-parse", "HEAD").strip(), "")
         finding = candidate()
         finding["change_path"] = FRONTIER_PATH
-        self.repository.validate_finding(finding, {FRONTIER_PATH})
+        self.repository.validate_finding(Finding.from_validated(finding), {FRONTIER_PATH})
         finding["reference"]["path"] = FRONTIER_PATH
         with self.assertRaisesRegex(ReviewError, "binary"):
-            self.repository.validate_finding(finding, {FRONTIER_PATH})
+            self.repository.validate_finding(Finding.from_validated(finding), {FRONTIER_PATH})
 
 
 if __name__ == "__main__":

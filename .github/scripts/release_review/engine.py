@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 
 from .checkpoints import contract_digest, restore
 from .config import Settings
-from .contracts import ModelProvider, ModelRequest, ReviewError, parse_turn
+from .contracts import SEVERITIES, Finding, ModelProvider, ModelRequest, ModelTurn, ReviewError, parse_turn
 from .models import Spending
 from .repository import Repository, ReviewUnit
+from .state import ReviewState
 
 
 def review_priority(unit: ReviewUnit) -> int:
@@ -44,54 +46,73 @@ def batch_units(units: list[ReviewUnit], limit: int):
         yield batch
 
 
-def inspect_unit(repo: Repository, provider: ModelProvider, settings: Settings,
-                 spending: Spending, content: dict, deadline: float, checkpoint) -> dict:
-    """Request evidence until the model finishes, subject to shared run safeguards."""
-    messages = [
+def opening_messages(settings: Settings, content: dict) -> list[dict[str, str]]:
+    return [
         {"role": "system", "content": settings.instructions},
         {"role": "user", "content": json.dumps(content, ensure_ascii=False)},
     ]
+
+
+def inspect_unit(repo: Repository, provider: ModelProvider, settings: Settings,
+                 spending: Spending, content: dict, *, deadline: float,
+                 persist_checkpoint: Callable[[], None]) -> ModelTurn:
+    """Request evidence until the model finishes, subject to shared run safeguards."""
+    messages = opening_messages(settings, content)
     while True:
         if time.monotonic() >= deadline:
             raise ReviewError("review time budget exhausted")
         reply = spending.call(provider, ModelRequest(messages, settings.max_output_tokens),
-                              deadline=deadline, checkpoint=checkpoint)
+                              deadline=deadline, persist_reservation=persist_checkpoint)
         turn = parse_turn(reply.text)
-        if turn["complete"]:
-            if len(turn["findings"]) == 12:
+        if turn.complete:
+            if len(turn.findings) == 12:
                 raise ReviewError("model reached the finding limit; additional findings may be missing")
             return turn
         messages.append({"role": "assistant", "content": reply.text})
         results = []
-        for action in turn["actions"]:
+        for action in turn.actions:
             try:
-                if action["kind"] == "read":
-                    result = repo.read(action["revision"], action["path"], action["start"], action["end"])
+                if action.kind == "read":
+                    result = repo.read(action.revision, action.path, action.start, action.end)
                 else:
-                    result = repo.search(action["revision"], action["query"], action["path"])
+                    result = repo.search(action.revision, action.query, action.path)
             except ReviewError as error:
                 result = {"error": str(error)}
-            results.append({"request": action, "result": result})
+            results.append({"request": asdict(action), "result": result})
         messages.append({"role": "user", "content": json.dumps({"repository_tool_results": results})})
 
 
-def deduplicate(findings: list[dict]) -> list[dict]:
+def deduplicate(findings: list[Finding]) -> list[Finding]:
     """Collapse identical source/risk reports; retain distinct bugs at the same location."""
-    result, seen = [], set()
+    unique = {}
     for finding in findings:
-        key = json.dumps([finding["category"], finding["reference"], finding["trigger"]], sort_keys=True)
-        if key not in seen:
-            result.append(finding)
-            seen.add(key)
-    order = {"Critical": 0, "High": 1, "Medium": 2}
-    return sorted(result, key=lambda finding: (order[finding["severity"]], finding["reference"]["path"]))
+        unique.setdefault((finding.category, finding.reference, finding.trigger), finding)
+    return sorted(unique.values(), key=lambda finding: (SEVERITIES.index(finding.severity), finding.reference.path))
+
+
+def synthesis_groups(nodes: list[dict], fits: Callable[[list[dict]], bool]) -> list[list[dict]]:
+    """Pack evidence in order and reject groups that cannot reduce its size."""
+    groups, current = [], []
+    for node in nodes:
+        if current and not fits([*current, node]):
+            groups.append(current)
+            current = []
+        current.append(node)
+        if not fits(current):
+            raise ReviewError("a synthesis item exceeds the configured model input allowance")
+    if current:
+        groups.append(current)
+    if len(groups) > 1 and len(groups) >= len(nodes):
+        raise ReviewError("synthesis cannot reduce the evidence within the configured input allowance")
+    return groups
 
 
 def synthesize(repo: Repository, provider: ModelProvider, settings: Settings,
-               spending: Spending, report: dict, deadline: float, changed: set[str], checkpoint) -> list[dict]:
+               spending: Spending, state: ReviewState, *, deadline: float,
+               changed: set[str], persist_checkpoint: Callable[[], None]) -> list[Finding]:
     """Reduce bounded groups before a final pass across every change's summary."""
-    nodes = [{"summary": summary} for summary in report["summaries"]]
-    nodes.extend({"candidate": finding} for finding in deduplicate(report["candidates"]))
+    nodes = [{"summary": summary} for summary in state.summaries]
+    nodes.extend({"candidate": asdict(finding)} for finding in deduplicate(state.candidates))
 
     def content(group):
         return {
@@ -104,73 +125,59 @@ def synthesize(repo: Repository, provider: ModelProvider, settings: Settings,
         }
 
     def fits(group):
-        request = ModelRequest([
-            {"role": "system", "content": settings.instructions},
-            {"role": "user", "content": json.dumps(content(group), ensure_ascii=False)},
-        ], settings.max_output_tokens)
+        request = ModelRequest(opening_messages(settings, content(group)), settings.max_output_tokens)
         # Leave room for subsequent source requests and their results. Spending.call
         # still checks the full request before every actual provider call.
         return spending.input_bound(request) <= settings.max_input_bytes - min(20000, settings.max_input_bytes // 4)
 
     for level in range(8):
-        groups, current = [], []
-        for node in nodes:
-            if current and not fits([*current, node]):
-                groups.append(current)
-                current = []
-            current.append(node)
-            if not fits(current):
-                raise ReviewError("a synthesis item exceeds the configured model input allowance")
-        if current:
-            groups.append(current)
-        if len(groups) > 1 and len(groups) >= len(nodes):
-            raise ReviewError("synthesis cannot reduce the evidence within the configured input allowance")
+        groups = synthesis_groups(nodes, fits)
         reduced = []
         for index, group in enumerate(groups):
-            turn = inspect_unit(repo, provider, settings, spending, content(group), deadline, checkpoint)
-            for finding in turn["findings"]:
+            turn = inspect_unit(repo, provider, settings, spending, content(group),
+                                deadline=deadline, persist_checkpoint=persist_checkpoint)
+            for finding in turn.findings:
                 repo.validate_finding(finding, changed)
-            report.setdefault("synthesis_steps", []).append({"level": level, "group": index, **turn})
-            checkpoint()
+            state.synthesis_steps.append({"level": level, "group": index, **asdict(turn)})
+            persist_checkpoint()
             if len(groups) == 1:
-                return deduplicate(turn["findings"])
-            reduced.append({"summary": turn["summary"], "candidates": turn["findings"]})
+                return deduplicate(turn.findings)
+            reduced.append({"summary": turn.summary, "candidates": [asdict(finding) for finding in turn.findings]})
         nodes = reduced
     raise ReviewError("synthesis did not converge within the bounded review passes")
 
 
 def review(repo: Repository, provider: ModelProvider, settings: Settings,
-           report: dict, checkpoint, *, prior_report: dict | None = None) -> dict:
-    """Checkpoint coverage and candidates after each unit, including incomplete runs."""
+           report: dict, checkpoint: Callable[[dict], None], *, prior_report: dict | None = None) -> dict:
+    """Review pending batches, synthesize their evidence, and persist each transition."""
+    state = ReviewState()
     spending = Spending(settings)
-    report.update(status="incomplete", findings=[], candidates=[], errors=[], summaries=[],
-                  provider=settings.provider, model=settings.model,
+    report.update(provider=settings.provider, model=settings.model,
                   reasoning_effort=settings.reasoning_effort if settings.provider == "openai" else "provider default",
-                  prompt_digest=settings.prompt_digest,
+                  prompt_digest=settings.prompt_digest, pricing=settings.pricing(),
                   excluded_paths=list(settings.excluded_paths),
-                  usage=spending.report(), synthesis_complete=False)
+                  usage=spending.report())
     deadline = time.monotonic() + settings.max_seconds
-    units, coverage = repo.units(settings.unit_bytes, settings.excluded_paths)
-    report["coverage"] = coverage
-    report["resume_contract_digest"] = contract_digest(repo, settings, units, coverage)
-    changed = {entry["path"] for entry in coverage if entry["status"] != "out_of_scope"}
-    completed = set()
+    units, state.coverage = repo.units(settings.unit_bytes, settings.excluded_paths)
+    report["resume_contract_digest"] = contract_digest(repo, settings, units, state.coverage)
+    report.update(state.snapshot())
+    changed = {entry["path"] for entry in state.coverage if entry["status"] != "out_of_scope"}
     if prior_report is not None:
-        spending, completed = restore(prior_report, report, repo, settings, units, changed)
+        spending = restore(prior_report, report, state, repo, settings, units, changed=changed)
+    state.update_coverage()
 
-    def save():
-        for entry in coverage:
-            if entry["status"] not in {"excluded", "out_of_scope"}:
-                entry["status"] = "reviewed" if all(unit in completed for unit in entry["units"]) else "pending"
-                entry["reviewed_units"] = sum(unit in completed for unit in entry["units"])
+    def persist_checkpoint() -> None:
+        # Serialize evidence and the current ledger, including in-flight reservations.
+        report.update(state.snapshot())
         report["usage"] = spending.report()
         checkpoint(report)
 
-    save()
+    persist_checkpoint()
     try:
-        if coverage and not changed:
+        if state.coverage and not changed:
             raise ReviewError("No changed files remain in the configured review scope")
-        for batch in batch_units([unit for unit in units if unit.id not in completed], settings.unit_bytes):
+        pending = [unit for unit in units if unit.id not in state.completed]
+        for batch in batch_units(pending, settings.unit_bytes):
             turn = inspect_unit(repo, provider, settings, spending, {
                 "task": "Review every release-diff unit in this batch and their interactions; "
                         "use repository reads to check context before reporting a bug.",
@@ -178,22 +185,19 @@ def review(repo: Repository, provider: ModelProvider, settings: Settings,
                 "excluded_paths": settings.excluded_paths,
                 "note": "Each unit can continue a file diff. Complete means every supplied unit was inspected. "
                         "Line citations must be verified against source reads.",
-            }, deadline, save)
-            for finding in turn["findings"]:
+            }, deadline=deadline, persist_checkpoint=persist_checkpoint)
+            for finding in turn.findings:
                 repo.validate_finding(finding, changed)
-            report["candidates"].extend(turn["findings"])
-            report["summaries"].append({"units": [unit.id for unit in batch],
-                                        "paths": list(dict.fromkeys(unit.path for unit in batch)),
-                                        "summary": turn["summary"]})
-            completed.update(unit.id for unit in batch)
-            save()
+            state.record_batch(batch, turn)
+            persist_checkpoint()
         if units:
-            report["findings"] = synthesize(repo, provider, settings, spending, report, deadline, changed, save)
-        report["synthesis_complete"] = True
-        report["status"] = "complete" if all(item["status"] in {"reviewed", "out_of_scope"}
-                                              for item in coverage) else "incomplete"
+            state.findings = synthesize(repo, provider, settings, spending, state,
+                                        deadline=deadline, changed=changed, persist_checkpoint=persist_checkpoint)
+        state.synthesis_complete = True
+        state.status = "complete" if all(item["status"] in {"reviewed", "out_of_scope"}
+                                          for item in state.coverage) else "incomplete"
     except ReviewError as error:
-        report["errors"].append(str(error))
+        state.errors.append(str(error))
     finally:
-        save()
+        persist_checkpoint()
     return report

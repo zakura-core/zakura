@@ -162,6 +162,11 @@ An incomplete review fails the advisory workflow and says **INCOMPLETE** in its 
 does not mean no bugs, and partial coverage is never labeled clean. Preliminary
 candidates remain in the JSON artifact when synthesis cannot finish.
 
+The runner saves JSON checkpoints before model requests and after completed review
+steps. It renders Markdown when the CLI starts, exits, or publishes a report. If a
+job is forcibly stopped, `report.json` contains the latest saved progress; the
+publisher renders its summary from that JSON.
+
 The report contains the baseline and head commits, reviewer commit, prompt
 digest, provider/model, reasoning effort, pricing, usage, duration, findings,
 and coverage. The PR summary leads with the verdict, coverage, model, estimated

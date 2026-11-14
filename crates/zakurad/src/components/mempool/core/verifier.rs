@@ -114,7 +114,12 @@ impl ConsensusVerifier {
                 return Outcome::AlreadyMined(Arc::new(TransactionDownloadVerifyError::InState))
             }
             Ok(_) => unreachable!("a transaction lookup is answered with a transaction"),
-            Err(_) => return Outcome::LocalFault(LocalFault::StateUnavailable),
+            Err(error) => {
+                // The port's fault carries no detail, so it is logged here,
+                // where today's pool would have answered with it.
+                tracing::info!(?error, "the pool core's state lookup failed");
+                return Outcome::LocalFault(LocalFault::StateUnavailable);
+            }
         }
 
         let next_height = (tip.height + 1).unwrap_or(Height::MAX);
@@ -165,7 +170,10 @@ impl ConsensusVerifier {
                 missing: spends,
                 error: TransactionError::TransparentInputNotFound,
             },
-            error if is_local_failure(&error) => Outcome::LocalFault(LocalFault::StateUnavailable),
+            error if is_local_failure(&error) => {
+                tracing::info!(?error, "the pool core's verifier failed on this node");
+                Outcome::LocalFault(LocalFault::StateUnavailable)
+            }
             error => {
                 let charge = if revalidation {
                     // The machine charges nobody for a transaction that

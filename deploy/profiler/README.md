@@ -171,6 +171,29 @@ fleet nodes. On a host where they differ, override `ExecStart` in a drop-in
 (`systemctl edit zakura-profiler`); leave `--trace-dir` out where the node does
 not write trace tables.
 
+## Peer names in gossip traces
+
+Set the IP-to-name mapping in the node configuration to label peers you operate:
+
+```toml
+[network.zakura]
+trace_peer_names = { "192.0.2.1" = "us-east-0", "2001:db8::9" = "asia-0" }
+```
+
+This only labels gossip trace rows; it does not change peer selection or trust.
+Unlisted and proxied peers remain unnamed. Without `trace_dir`, no gossip rows
+are written. Invalid IP addresses are rejected when the configuration loads.
+
+`ensure-trace-config` fills in a missing mapping from the fleet inventory,
+excluding the node itself. It preserves an explicit mapping, including an empty
+one. After retention is ready and the configuration write has been verified, it
+removes the obsolete `trace-peer-names.conf` systemd override and reloads systemd.
+The node is not restarted by this step. Peer names are read from configuration,
+not from `ZAKURA_TRACE_PEER_NAMES`.
+
+An older binary that does not recognize `trace_peer_names` cannot read this
+configuration. Remove that setting before rolling back to such a binary.
+
 ## Tests
 
 ```bash

@@ -2471,3 +2471,40 @@ fn invalid_advert_fanout_config_is_rejected() {
         assert!(error.contains(field), "{config:?} gave {error}");
     }
 }
+
+/// Trace labels deserialize as typed IP addresses and survive config serialization.
+#[test]
+fn trace_peer_names_are_typed_and_optional() {
+    let config: Config = toml::from_str(
+        r#"[zakura]
+trace_peer_names = { "192.0.2.1" = "us-0", "2001:db8::9" = "asia-0" }
+"#,
+    )
+    .expect("valid peer addresses");
+    assert_eq!(
+        config.zakura.trace_peer_names[&"192.0.2.1".parse::<IpAddr>().unwrap()],
+        "us-0"
+    );
+    assert_eq!(
+        config.zakura.trace_peer_names[&"2001:db8::9".parse::<IpAddr>().unwrap()],
+        "asia-0"
+    );
+    let encoded = toml::to_string(&config).expect("serialize config");
+    let decoded: Config = toml::from_str(&encoded).expect("read serialized config");
+    assert_eq!(
+        config.zakura.trace_peer_names,
+        decoded.zakura.trace_peer_names
+    );
+    assert!(Config::default().zakura.trace_peer_names.is_empty());
+}
+
+/// Invalid peer addresses fail at the configuration boundary.
+#[test]
+fn trace_peer_names_reject_invalid_addresses() {
+    assert!(toml::from_str::<Config>(
+        r#"[zakura]
+trace_peer_names = { "not-an-ip" = "us-0" }
+"#,
+    )
+    .is_err());
+}

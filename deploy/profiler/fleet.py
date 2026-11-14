@@ -11,8 +11,9 @@ Three steps, each safe to repeat:
     fleet.py ensure-trace-config --config nodes.toml [--node NAME]
         Install the profiler and verify trace retention before adding `trace_dir`
         under `[network.zakura]` in a node config that has none. Nothing else in the
-        file changes, and the node is not restarted: the setting takes effect the
-        next time it starts. An existing trace directory is preserved.
+        file changes apart from peer names in the same section. Peer names come from
+        the fleet inventory; the old environment override is removed only after the
+        config is verified. The node is not restarted. Existing trace settings are preserved.
 
     fleet.py install --config nodes.toml [--node NAME]
         Copy the profiler to the node, point it at that node's log and trace files,
@@ -30,6 +31,8 @@ import argparse
 import copy
 import hashlib
 import io
+import ipaddress
+import json
 import os
 import re
 import shlex
@@ -140,9 +143,15 @@ def with_trace_dir(config_text, trace_dir=TRACE_DIR):
     confirm that the new setting is the only difference; a layout this cannot edit
     safely (the section written as an inline table, say) raises `FleetError`.
     """
-    if trace_dir_of(config_text) is not None:
+    return with_zakura_setting(config_text, "trace_dir", trace_dir, json.dumps(trace_dir))
+
+
+def with_zakura_setting(config_text, key, value, toml_value):
+    """Add a missing setting, preserving existing values and verifying every other setting."""
+    before = parse_config(config_text)
+    if key in before.get("network", {}).get("zakura", {}):
         return config_text
-    setting = f'trace_dir = "{trace_dir}"\n'
+    setting = f"{key} = {toml_value}\n"
     lines = config_text.splitlines(keepends=True)
     heading = next((i for i, line in enumerate(lines) if ZAKURA_SECTION.match(line)), None)
     if heading is None:
@@ -155,15 +164,48 @@ def with_trace_dir(config_text, trace_dir=TRACE_DIR):
         lines.insert(heading + 1, setting)
     edited = "".join(lines)
 
-    expected = copy.deepcopy(parse_config(config_text))
-    expected.setdefault("network", {}).setdefault("zakura", {})["trace_dir"] = trace_dir
+    expected = copy.deepcopy(before)
+    expected.setdefault("network", {}).setdefault("zakura", {})[key] = value
     try:
         after = tomllib.loads(edited)
     except tomllib.TOMLDecodeError as error:
-        raise FleetError(f"adding trace_dir would break the config ({error}); add it by hand") from error
+        raise FleetError(f"adding {key} would break the config ({error}); add it by hand") from error
     if after != expected:
-        raise FleetError("adding trace_dir would change another setting; add it by hand")
+        raise FleetError(f"adding {key} would change another setting; add it by hand")
     return edited
+
+
+def with_trace_peer_names(config_text, node, nodes):
+    """Name the other fleet nodes by IP, preserving an operator's explicit mapping."""
+    names = {}
+    for peer in nodes:
+        if peer.name == node.name:
+            continue
+        host = peer.ssh_string.rpartition("@")[2]
+        try:
+            address = str(ipaddress.ip_address(host))
+        except ValueError as error:
+            raise FleetError(f"{peer.name}: SSH destination must name an IP address") from error
+        if address in names:
+            raise FleetError(f"{peer.name}: two fleet nodes share an IP address")
+        names[address] = peer.name
+    inline_table = "{ " + ", ".join(
+        f"{json.dumps(ip)} = {json.dumps(name)}" for ip, name in names.items()
+    ) + " }"
+    return with_zakura_setting(config_text, "trace_peer_names", names, inline_table)
+
+
+# Remove only the obsolete tracing override, after the replacement config is verified.
+REMOVE_PEER_NAMES_SCRIPT = """
+set -eu
+unit="$1"
+case "$unit" in *.service) ;; *) unit="$unit.service" ;; esac
+path="/etc/systemd/system/$unit.d/trace-peer-names.conf"
+if [ -f "$path" ]; then
+    rm -- "$path"
+    systemctl daemon-reload
+fi
+"""
 
 
 def config_path_from_unit(exec_start):
@@ -328,17 +370,24 @@ def write_node_config(node, path, text):
         raise FleetError(f"{path} does not hold what was written")
 
 
-def ensure_trace_config(node):
-    """Start verified retention before enabling new trace writes; never restart the node."""
+def ensure_trace_config(node, nodes):
+    """Verify retention, save typed trace settings, then remove the obsolete environment override.
+
+    Existing trace settings are preserved. The service is never restarted here.
+    """
     path, text = read_node_config(node)
-    edited = with_trace_dir(text)
-    if edited == text:
+    edited = with_trace_peer_names(with_trace_dir(text), node, nodes)
+    if trace_dir_of(text) is None:
+        remote(node, CLAIM_TRACE_SCRIPT, TRACE_DIR)
+        start_profiler(node, TRACE_DIR, manage_traces=True)
+    else:
         install_profiler(node)
-        return f"already writes trace files to {trace_dir_of(text)}"
-    remote(node, CLAIM_TRACE_SCRIPT, TRACE_DIR)
-    start_profiler(node, TRACE_DIR, manage_traces=True)
-    write_node_config(node, path, edited)
-    return f"added trace_dir to {path}; it takes effect when the node next starts"
+    if edited != text:
+        write_node_config(node, path, edited)
+    remote(node, REMOVE_PEER_NAMES_SCRIPT, node.service_name)
+    if edited == text:
+        return f"already writes trace files to {trace_dir_of(text)} with configured peer names"
+    return f"updated trace settings in {path}; they take effect when the node next starts"
 
 
 def install_profiler(node):
@@ -418,12 +467,18 @@ def main(argv=None):
     if args.step == "tunnels":
         install_tunnels(nodes)
         return 0
+    fleet_nodes = nodes
     if args.node:
         nodes = [node for node in nodes if node.name == args.node]
         if not nodes:
             print(f"{args.node} has no profiler in {args.config}; nothing to do")
             return 0
-    step = ensure_trace_config if args.step == "ensure-trace-config" else install_profiler
+
+    def step(node):
+        if args.step == "ensure-trace-config":
+            return ensure_trace_config(node, fleet_nodes)
+        return install_profiler(node)
+
     return 1 if for_each_node(nodes, step) else 0
 
 

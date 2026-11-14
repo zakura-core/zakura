@@ -61,9 +61,11 @@
 //!
 //! ### Verification
 //!
-//! * `sprout`: verify Sprout JoinSplit proofs and signatures. ZIP 218 disallows JoinSplits from
-//!   NU7 onward, so only pre-NU7 blocks above the last checkpoint need it. Builds without it stall
-//!   on such a block that has a JoinSplit, rather than rejecting it. Enabled by default.
+//! * `sprout`: opt in to Sprout JoinSplit proof and signature verification.
+//!   ZIP 218 disallows JoinSplits from NU7 onward, so post-NU7 snapshots do not
+//!   need it. Enable it to fully verify pre-NU7 blocks above the last checkpoint.
+//!   Builds without it stall on such a block that has a JoinSplit, rather than
+//!   rejecting it. Disabled by default.
 //!
 //! ### Metrics
 //!

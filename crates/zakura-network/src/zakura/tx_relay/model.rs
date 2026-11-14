@@ -35,18 +35,26 @@
 //!   [`INBOUND_DELAY`] after each release before it may claim that id
 //!   again, so others claim it first. Only a missed deadline doubles the
 //!   next one. A late body is dropped before it reaches the pool.
-//! - **A rejection on the same chain settles the id for every holder,** as
-//!   long as the pool itself would remember it. That includes a rejection
-//!   that came from the pool's contents, such as a conflict, which the pool
-//!   also keeps until the tip changes. A pool restart clears the pool's
-//!   memory, but it also empties the pool, and `tx-relay` does not refill
-//!   it, as today's pool does not. A rejection from before a chain change
-//!   only makes the id be asked about again.
+//! - **A rejection on the same chain settles the id for every holder,** if
+//!   its scope is one the pool remembers. That includes a rejection that
+//!   came from the pool's contents, such as a conflict, which the pool also
+//!   keeps until the tip changes. The relay goes by the scope, not by
+//!   whether the pool still holds the entry: a pool restart, or the cache
+//!   dropping an entry for room, does not undo the settlement. A restart
+//!   also empties the pool, and `tx-relay` does not refill it, as today's
+//!   pool does not. An [`RejectionScope::Uncached`] rejection, such as one
+//!   refused because another variant of the id was in the pool, settles
+//!   nothing: the id stays wanted, and the supplier waits and may retry. A
+//!   rejection from before a chain change only makes the id be asked about
+//!   again.
 //! - **A routine checks the table before it submits a body.** If the entry
 //!   is gone or no longer its claim, it drops the body, and gives back its
 //!   pool slot then. The model gives the slot back when the decision
-//!   happens. That is the only difference, and it is in how long a slot is
-//!   held, not in what reaches the pool.
+//!   happens. The check and a mark that the claim is being submitted are
+//!   one step under the table's lock, and a decision that finds that mark
+//!   leaves the submission to the pool, which answers it. So a decision
+//!   either comes before the check, and the body is dropped, or after the
+//!   mark, and the body is submitted: the two orders the model has.
 //! - **A full pending set is checked for stale references, oldest first,**
 //!   before an announcement is dropped as overflow, within the same lookup
 //!   budget as an overrun. The model has no stale references, so a machine
@@ -101,7 +109,7 @@ use zakura_node_services::mempool::port::{
         Effect, JobId, ModelReservation, ModelTransition, ModelTx, ModelUnreserved, ModelVerdict,
         Outcome, PoolModel, Step, WaiterId,
     },
-    Change, Charge, Generation, GenerationRead, Intent, ReservationId,
+    Change, Charge, Generation, GenerationRead, Intent, RejectionScope, ReservationId,
 };
 
 use self::{
@@ -743,6 +751,13 @@ impl RelayModel {
             self.wanted
                 .release(id, reserving.pending.generation, session, self.now, false);
             self.return_probe(reserving.probe);
+            // Giving up a call is a release by this session, so it waits
+            // before claiming the id again, as after any other release of
+            // its own.
+            let until = self.now.saturating_add(INBOUND_DELAY);
+            if let Some(state) = self.sessions.get_mut(&session) {
+                state.defer(id, reserving.pending.generation, until);
+            }
         }
         self.settle();
     }
@@ -833,7 +848,10 @@ impl RelayModel {
     /// time.
     pub(crate) fn observe_rtt(&mut self, session: SessionId, rtt: Duration, now: Time) {
         self.enter(now);
-        self.reactor.observe_rtt(session, rtt);
+        // A report that arrives after its session ended is ignored.
+        if let Some(peer) = self.sessions.get(&session).map(|state| state.peer) {
+            self.reactor.observe_rtt(peer, session, rtt);
+        }
         self.settle();
     }
 
@@ -1216,13 +1234,18 @@ impl RelayModel {
                         .release(id, generation, session, self.now, false);
                 }
             }
-            ModelVerdict::Rejected { charge, .. } => {
-                if self.generation == submitted_at {
+            ModelVerdict::Rejected { scope, charge } => {
+                // Only a rejection the pool remembers settles the id, and
+                // only on the chain it was made on. An uncached one, such as
+                // a duplicate of another variant already pooled, says nothing
+                // the pool will repeat.
+                let remembered = !matches!(scope, RejectionScope::Uncached);
+                if remembered && self.generation == submitted_at {
                     self.verdict_decides(id);
                 } else if let Some(session) = session {
-                    // The chain changed since the body was submitted, and the
-                    // rejection may be forgotten. Another announcer may still
-                    // supply it.
+                    // The chain changed since the body was submitted, or the
+                    // pool did not remember the rejection. Another announcer
+                    // may still supply it.
                     self.wanted.release(id, generation, session, self.now, true);
                 }
                 self.charge(peer, charge, decided_at);

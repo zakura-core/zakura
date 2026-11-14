@@ -218,8 +218,14 @@ impl ReactorModel {
 
     /// `session`'s routine reports its connection's smoothed round-trip
     /// time. It counts at the next ranking.
-    pub(crate) fn observe_rtt(&mut self, session: SessionId, rtt: Duration) {
-        self.rtts.insert(session, rtt);
+    pub(crate) fn observe_rtt(&mut self, peer: PeerKey, session: SessionId, rtt: Duration) {
+        if self
+            .sessions
+            .get(&peer)
+            .is_some_and(|sessions| sessions.contains(&session))
+        {
+            self.rtts.insert(session, rtt);
+        }
     }
 
     /// Whether the refresh timer is due at `now`. The first refresh is
@@ -288,6 +294,14 @@ impl ReactorModel {
         let mut live: Vec<SessionId> = self.go.values().copied().collect();
         live.sort();
         assert_eq!(ranked, live, "the ranking holds exactly the live sessions");
+        for session in self.rtts.keys() {
+            assert!(
+                self.sessions
+                    .values()
+                    .any(|sessions| sessions.contains(session)),
+                "a round-trip time belongs to a registered session"
+            );
+        }
         for (peer, session) in &self.go {
             assert!(
                 self.sessions

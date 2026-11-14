@@ -1333,16 +1333,17 @@ fn an_old_call_never_acts_on_a_newer_one() {
     let a = open(&mut relay, 1, true, secs(0));
     relay.inv(a, &[(id(1), SIZE)], secs(0));
     relay.cancel_reserve(a, id(1), secs(0));
-    // A claims the id again at once, with a new call.
-    assert_eq!(relay.calls_in_flight(), 2);
+    // The old call was already sent, so it still runs, and its grant goes
+    // back. A waits after its own release, then claims with a new call.
+    assert_eq!(relay.calls_in_flight(), 1);
     while relay.answer_reserve(secs(0)) {}
+    assert!(asks(&relay.take_effects()).is_empty());
+    assert_eq!(relay.pool().slots_in_use(), 0);
+    relay.tick(INBOUND_DELAY);
+    while relay.answer_reserve(INBOUND_DELAY) {}
     assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
     assert_eq!(relay.reservations_held(), 1);
-    assert_eq!(
-        relay.pool().slots_in_use(),
-        1,
-        "the old call never reached the pool"
-    );
+    assert_eq!(relay.pool().slots_in_use(), 1);
     relay.assert_invariants();
 
     // Cancelled after the pool granted it.
@@ -1352,14 +1353,17 @@ fn an_old_call_never_acts_on_a_newer_one() {
     relay.inv(a, &[(id(1), SIZE)], secs(0));
     assert!(relay.process_reserve(secs(0)));
     relay.cancel_reserve(a, id(1), secs(0));
+    assert_eq!(relay.calls_in_flight(), 1, "A waits before a new call");
+    relay.tick(INBOUND_DELAY);
     // The new call is refused, because the old grant still holds the id.
-    assert!(relay.process_reserve(secs(0)));
+    assert!(relay.process_reserve(INBOUND_DELAY));
     // The old grant is given back, not used for the new call.
-    assert!(relay.deliver_reserve(secs(0)));
+    assert!(relay.deliver_reserve(INBOUND_DELAY));
     assert!(asks(&relay.take_effects()).is_empty());
-    assert!(relay.deliver_reserve(secs(0)));
-    relay.tick(RETRY_FIRST);
-    while relay.answer_reserve(RETRY_FIRST) {}
+    assert!(relay.deliver_reserve(INBOUND_DELAY));
+    let later = INBOUND_DELAY + RETRY_FIRST;
+    relay.tick(later);
+    while relay.answer_reserve(later) {}
     assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
     assert_eq!(relay.pool().slots_in_use(), 1);
     relay.assert_invariants();
@@ -2105,9 +2109,9 @@ fn a_cancelled_probe_passes_its_permit_on() {
     relay.tick(NO_ROOM_FIRST);
     assert_eq!(relay.wanted().probe().map(|(holder, _)| holder), Some(a));
     relay.cancel_reserve(a, id(1), NO_ROOM_FIRST);
-    // The permit came back and was taken again at once by the oldest
-    // eligible session, with a new call. Only one probe is ever out.
-    assert!(relay.wanted().probe().is_some());
+    // A gave up its call, so it waits, and the permit passes to B with a
+    // new call. Only one probe is ever out.
+    assert_eq!(relay.wanted().probe().map(|(holder, _)| holder), Some(b));
     assert_eq!(
         relay.calls_in_flight(),
         2,
@@ -2115,8 +2119,8 @@ fn a_cancelled_probe_passes_its_permit_on() {
     );
     relay.assert_invariants();
     // A's old call still runs and finds no room. Its answer arrives while
-    // the new probe is out, and leaves that probe alone: no doubling, and
-    // the permit still with the new call.
+    // B's probe is out, and leaves that probe alone: no doubling, and the
+    // permit still with B.
     assert!(relay.process_reserve(NO_ROOM_FIRST));
     assert!(relay.deliver_reserve(NO_ROOM_FIRST));
     assert_eq!(
@@ -2124,7 +2128,7 @@ fn a_cancelled_probe_passes_its_permit_on() {
         None,
         "the old answer does not extend the ended backoff"
     );
-    assert_eq!(relay.wanted().probe().map(|(holder, _)| holder), Some(a));
+    assert_eq!(relay.wanted().probe().map(|(holder, _)| holder), Some(b));
     relay.assert_invariants();
     // The new probe finds no room, and the backoff doubles once.
     while relay.answer_reserve(NO_ROOM_FIRST) {}
@@ -2463,14 +2467,93 @@ fn every_fourth_place_is_random() {
     rank_sessions(&mut relay, &sessions);
     let ranking = relay.reactor().ranking().to_vec();
     assert_eq!(ranking.len(), sessions.len());
-    // The non-random places keep round-trip order among what is left.
+    // The non-random places keep round-trip order among what is left, and
+    // at least one random place picks someone other than the fastest left,
+    // so a ranking with no random choices fails here.
     let mut left: Vec<SessionId> = sessions.clone();
+    let mut random_picks = 0;
     for (place, session) in ranking.iter().enumerate() {
         if (place + 1) % RANDOM_EVERY != 0 {
             assert_eq!(*session, left[0], "place {place} is the fastest left");
+        } else if *session != left[0] {
+            random_picks += 1;
         }
         left.retain(|s| s != session);
     }
+    assert!(random_picks > 0, "{ranking:?}");
+}
+
+#[test]
+fn an_uncached_rejection_settles_nothing() {
+    // The same sequence as the cached rejection above, but the pool never
+    // remembered this one, for example because another variant of the id
+    // was in the pool when A's body was refused.
+    let mut relay = relay().with_manual_verdicts();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    relay.tx(a, id(1), tx(1), secs(0));
+    let uncached = Outcome::Fail {
+        scope: RejectionScope::Uncached,
+        charge: Charge::None,
+    };
+    finish_all(&mut relay, &uncached, secs(0));
+    relay.end(a, secs(1));
+    relay.deactivate(secs(1));
+    relay.activate(secs(1));
+    let b = open(&mut relay, 2, true, secs(1));
+    relay.inv(b, &[(id(1), SIZE)], secs(1));
+    assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
+    assert!(relay.deliver_verdict(secs(2)));
+    // Nothing confirms the rejection, so B's fetch carries on, and its body
+    // reaches the pool.
+    assert!(relay.wanted().entry(id(1)).is_some());
+    assert_eq!(relay.reservations_held(), 1);
+    relay.tx(b, id(1), tx(1), secs(3));
+    finish_all(&mut relay, &Outcome::Pass, secs(3));
+    while relay.deliver_verdict(secs(3)) {}
+    assert!(relay.wanted().entry(id(1)).is_none());
+    assert_eq!(relay.waiters_outstanding(), 0);
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_late_round_trip_report_is_ignored() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.end(a, secs(0));
+    relay.observe_rtt(a, Duration::from_millis(5), secs(1));
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_decision_after_the_submission_leaves_it_to_the_pool() {
+    let mut relay = relay().with_manual_verdicts();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.tx(a, id(1), tx(1), secs(0));
+    let rejected = Outcome::Fail {
+        scope: RejectionScope::ExactTip,
+        charge: Charge::None,
+    };
+    finish_all(&mut relay, &rejected, secs(0));
+    relay.end(a, secs(1));
+    relay.deactivate(secs(1));
+    relay.activate(secs(1));
+    // B fetches and submits before A's old verdict arrives.
+    let b = open(&mut relay, 2, true, secs(1));
+    relay.inv(b, &[(id(1), SIZE)], secs(1));
+    relay.tx(b, id(1), tx(1), secs(2));
+    assert_eq!(relay.in_flight(PeerKey(2)), 1);
+    assert!(relay.deliver_verdict(secs(2)));
+    // The id is settled, and B's submission is left to the pool, which
+    // answers it.
+    assert!(relay.wanted().entry(id(1)).is_none());
+    finish_all(&mut relay, &Outcome::Pass, secs(3));
+    while relay.deliver_verdict(secs(3)) {}
+    assert_eq!(relay.in_flight(PeerKey(2)), 0);
+    assert_eq!(relay.waiters_outstanding(), 0);
+    relay.assert_invariants();
 }
 
 /// The default short id of `tx_id`, as the model keeps it.

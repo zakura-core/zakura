@@ -110,6 +110,75 @@ fn without_sprout_the_tree_is_unchanged_and_the_first_skip_is_marked() {
     );
 }
 
+/// Removes the Sprout tree marker from the database at `config`, leaving the database as a build
+/// with the `sprout` feature would have synced it.
+#[cfg(not(feature = "sprout"))]
+fn clear_sprout_tree_skipped_marker(config: &crate::config::Config, network: &Network) {
+    use crate::service::finalized_state::{
+        disk_db::WriteDisk, disk_format::RawBytes, PRUNING_METADATA,
+    };
+
+    let db = open_unchecked_db(config, network);
+    let pruning_metadata = db
+        .db()
+        .cf_handle(PRUNING_METADATA)
+        .expect("the pruning metadata column family is opened from the running schema");
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_delete(
+        &pruning_metadata,
+        RawBytes::new_raw_bytes(b"sprout_tree_skipped_from".to_vec()),
+    );
+    db.write_batch(batch).expect("the marker is deleted");
+    assert_eq!(db.sprout_tree_skipped_from(), None);
+}
+
+/// Rolls the database at `config` back to `target_height`.
+#[cfg(not(feature = "sprout"))]
+fn roll_back_to(config: &crate::config::Config, network: &Network, target_height: Height) {
+    crate::rollback_finalized_state(
+        config.clone(),
+        network,
+        crate::RollbackFinalizedStateOptions {
+            target_height,
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("rollback succeeds");
+}
+
+/// A rollback that removes a block with Sprout commitments rebuilds the Sprout tree from
+/// genesis. Without `sprout` that rebuild skips the commitments at or below the target, so it
+/// must mark the database even when no block commit has.
+#[cfg(not(feature = "sprout"))]
+#[test]
+fn rollback_without_sprout_marks_the_commitments_its_rebuild_skips() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain(4, &[2, 4]));
+    clear_sprout_tree_skipped_marker(&config, &network);
+    roll_back_to(&config, &network, Height(3));
+    assert_eq!(
+        open_unchecked_db(&config, &network).sprout_tree_skipped_from(),
+        Some(Height(2)),
+        "the rebuild skipped the retained JoinSplit at height 2"
+    );
+
+    // A rebuild that reaches no Sprout commitments leaves a complete tree, and no marker.
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain(3, &[3]));
+    clear_sprout_tree_skipped_marker(&config, &network);
+    roll_back_to(&config, &network, Height(2));
+    assert_eq!(
+        open_unchecked_db(&config, &network).sprout_tree_skipped_from(),
+        None
+    );
+}
+
 #[cfg(feature = "sprout")]
 #[test]
 fn with_sprout_the_tree_grows_and_nothing_is_marked() {

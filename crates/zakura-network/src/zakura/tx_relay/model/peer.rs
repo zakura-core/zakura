@@ -11,8 +11,8 @@ use zakura_chain::transaction::UnminedTxId;
 use zakura_node_services::mempool::port::{model::WaiterId, ReservationId};
 
 use super::{
-    EntryGen, PeerKey, Time, BASE_DEADLINE, KNOWN_CAP, MAX_REQUESTS_PER_PEER, MAX_TX_BYTES,
-    MIN_RATE, PENDING_PER_PEER, SENDER_ALLOWANCE, TRIED_PER_PEER,
+    EntryGen, PeerKey, Time, BASE_DEADLINE, DEFERRED_PER_PEER, KNOWN_CAP, MAX_REQUESTS_PER_PEER,
+    MAX_TX_BYTES, MIN_RATE, PENDING_PER_PEER, SENDER_ALLOWANCE,
 };
 
 /// What the peer said in its `Hello`.
@@ -24,7 +24,7 @@ pub(crate) struct Hello {
     pub(crate) max_tx_bytes: u32,
 }
 
-/// One id announced by this peer and not yet tried.
+/// One id announced by this peer and not yet answered `NotFound` for.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Pending {
     /// The id.
@@ -81,7 +81,8 @@ pub(crate) struct PeerModel {
     /// late answer.
     pub(crate) pending: Vec<Pending>,
     /// Ids it answered `NotFound` for, oldest first, by entry generation.
-    pub(crate) tried: VecDeque<(UnminedTxId, EntryGen)>,
+    /// It may still be asked for them, but only after waiting.
+    pub(crate) deferred: VecDeque<(UnminedTxId, EntryGen)>,
     /// How often its request for a pending id timed out. Only pending ids
     /// have an entry, so this is bounded by the pending set.
     pub(crate) timed_out: HashMap<(UnminedTxId, EntryGen), u32>,
@@ -110,7 +111,7 @@ pub(crate) struct PeerModel {
     /// The last change-log position this session read.
     pub(crate) cursor: u64,
     /// Ids it announced again while an old request for them was
-    /// outstanding, so that request's `NotFound` does not mark them tried.
+    /// outstanding, so that request's `NotFound` does not take them out of the pending set.
     /// At most one per outstanding request.
     pub(crate) reannounced: HashSet<UnminedTxId>,
     /// Ids dropped because the pending set was full.
@@ -125,7 +126,7 @@ impl PeerModel {
             dialed,
             hello: None,
             pending: Vec::new(),
-            tried: VecDeque::new(),
+            deferred: VecDeque::new(),
             timed_out: HashMap::new(),
             reserving: IndexMap::new(),
             requests: IndexMap::new(),
@@ -147,9 +148,10 @@ impl PeerModel {
             .any(|pending| pending.id == id && pending.generation == generation)
     }
 
-    /// Whether it already answered `NotFound` for `id` in `generation`.
-    pub(crate) fn has_tried(&self, id: UnminedTxId, generation: EntryGen) -> bool {
-        self.tried.contains(&(id, generation))
+    /// Whether it must wait after each release before claiming `id` in
+    /// `generation`, because it answered `NotFound` for it.
+    pub(crate) fn is_deferred(&self, id: UnminedTxId, generation: EntryGen) -> bool {
+        self.deferred.contains(&(id, generation))
     }
 
     /// Room left in its pending set.
@@ -186,17 +188,17 @@ impl PeerModel {
         self.timed_out.remove(&(id, generation));
     }
 
-    /// Records that it answered `NotFound` for `id`. The tried set forgets
-    /// its oldest entry when full, which only lets that peer be asked once
-    /// more.
-    pub(crate) fn mark_tried(&mut self, id: UnminedTxId, generation: EntryGen) {
-        if self.has_tried(id, generation) {
+    /// Records that it answered `NotFound` for `id`, so it waits after
+    /// each release before claiming it again. Bounded, forgetting the
+    /// oldest, which only lets it claim that id a little sooner.
+    pub(crate) fn defer(&mut self, id: UnminedTxId, generation: EntryGen) {
+        if self.is_deferred(id, generation) {
             return;
         }
-        if self.tried.len() >= TRIED_PER_PEER {
-            self.tried.pop_front();
+        if self.deferred.len() >= DEFERRED_PER_PEER {
+            self.deferred.pop_front();
         }
-        self.tried.push_back((id, generation));
+        self.deferred.push_back((id, generation));
     }
 
     /// Records that it announced or supplied the id with short id `short`,

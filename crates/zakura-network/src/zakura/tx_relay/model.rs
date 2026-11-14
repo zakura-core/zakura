@@ -9,7 +9,7 @@
 //! The model has three owners, as the real service does:
 //!
 //! - [`peer::PeerModel`], one per session: everything about one peer. Its
-//!   pending ids with the size it announced, the ids it tried, its
+//!   pending ids with the size it announced, the ids it must wait for, its
 //!   outstanding requests and their deadlines, its submissions, its limit of
 //!   [`MAX_REQUESTS_PER_PEER`], and what it was announced.
 //! - [`wanted::WantedModel`], one per node: the ids this node wants, each
@@ -28,11 +28,22 @@
 //!   go only after every older session of its peer ended.
 //! - **Dialed peers first.** A session this node did not dial waits
 //!   [`INBOUND_DELAY`] after an id's first announcement.
-//! - **Each announcer is tried until it answers once.** `NotFound` marks the
-//!   id tried for that session. A deadline frees the pool's slot and the
-//!   claim, so another announcer can try, and the timed-out session waits
-//!   [`INBOUND_DELAY`] after the release before it may claim the id again.
-//!   A late body is dropped before it reaches the pool.
+//! - **Announcers not yet asked go first.** A `NotFound` takes the id out of
+//!   that session's pending set, so it is asked again only if its peer
+//!   announces the id again. A deadline frees the pool's slot and the claim,
+//!   so another announcer can try. Either way the session waits
+//!   [`INBOUND_DELAY`] after each release before it may claim that id
+//!   again, so others claim it first. Only a missed deadline doubles the
+//!   next one. A late body is dropped before it reaches the pool.
+//! - **A rejection on the same chain settles the id for every holder.**
+//!   Validity depends only on the chain, so a pool restart that clears the
+//!   rejection cache does not make the transaction valid again. A rejection
+//!   from before a chain change only makes the id be asked about again.
+//! - **One step here is several in the machines.** A decision drops the id
+//!   from every pending set at once. The real routines learn of it from the
+//!   table's events, so a machine's state is compared with the model after
+//!   leaving out references to entries that are no longer current, which the
+//!   generation makes harmless meanwhile.
 //! - **The table has no cap of its own.** An entry lives while a pending set
 //!   holds it or a session claims it, so each peer fills only its own share.
 //! - **A full pool costs one probe per backoff.** After a `NoRoom` nobody
@@ -92,8 +103,9 @@ pub(crate) const MAX_REQUESTS_PER_PEER: usize = 5;
 /// Ids one session may hold pending: a whole pool at the default size.
 pub(crate) const PENDING_PER_PEER: usize = 8_000;
 
-/// Ids one session remembers trying.
-pub(crate) const TRIED_PER_PEER: usize = 8_000;
+/// Ids one session remembers it must wait for after a release, because it
+/// answered `NotFound` for them.
+pub(crate) const DEFERRED_PER_PEER: usize = 8_000;
 
 /// Ids one session remembers its peer announcing or supplying.
 pub(crate) const KNOWN_CAP: usize = 2 * 8_000 + PENDING_PER_PEER;
@@ -583,19 +595,12 @@ impl RelayModel {
         // alone, and so does an old answer the peer has since contradicted by
         // announcing the id again.
         let contradicted = state.reannounced.remove(&id);
-        if contradicted {
-            // It stays pending, but counts as a timed-out attempt, so
-            // announcers not yet asked claim it first.
-            if state.holds(id, request.generation) {
-                let count = state.timed_out.entry((id, request.generation)).or_insert(0);
-                *count = count.saturating_add(1);
-            }
-        } else {
-            if state.take_pending_of(id, request.generation).is_some() {
-                self.wanted.unhold(id, request.generation);
-            }
-            state.mark_tried(id, request.generation);
+        if !contradicted && state.take_pending_of(id, request.generation).is_some() {
+            self.wanted.unhold(id, request.generation);
         }
+        // Either way it waits after the release, so announcers not yet asked
+        // claim it first. Only a missed deadline doubles the next one.
+        state.defer(id, request.generation);
         if let Some(reservation) = request.reservation {
             // The fetch ended without a body, which the pool logs.
             self.reservations.remove(&reservation);
@@ -873,6 +878,11 @@ impl RelayModel {
             .map(PeerModel::in_flight)
             .sum::<usize>()
             .saturating_add(self.reactor.unsettled_count(peer))
+    }
+
+    /// Submissions still waiting for a verdict, over every owner.
+    pub(crate) fn waiters_outstanding(&self) -> usize {
+        self.waiters.len()
     }
 
     /// `tx-relay`'s reservations at the pool.
@@ -1336,9 +1346,9 @@ impl RelayModel {
                     continue;
                 }
                 let current = self.wanted.entry(id).map(|entry| entry.generation);
-                let already = current.is_some_and(|generation| {
-                    state.holds(id, generation) || state.has_tried(id, generation)
-                });
+                // A peer that answered `NotFound` is taken back by a fresh
+                // announcement: it says the peer has the id now.
+                let already = current.is_some_and(|generation| state.holds(id, generation));
                 // A request whose fetch was given up, such as one for an older
                 // generation, does not stop a fresh announcement. The id is
                 // asked for again only once that request is answered.
@@ -1354,7 +1364,7 @@ impl RelayModel {
                 // Announcing an id it already holds while a request for it is
                 // outstanding says it has the id now. A `NotFound` for that
                 // request, which can arrive later on the other stream, then
-                // does not mark it tried.
+                // does not take the id out of its pending set.
                 if let Some(generation) = current {
                     if state.requests.contains_key(&id) && state.holds(id, generation) {
                         state.reannounced.insert(id);
@@ -1665,10 +1675,11 @@ impl RelayModel {
             {
                 return false;
             }
-            if state
+            let waits = state
                 .timed_out
                 .contains_key(&(pending.id, pending.generation))
-            {
+                || state.is_deferred(pending.id, pending.generation);
+            if waits {
                 let released = entry.released_at.unwrap_or(entry.first_seen);
                 if self.now < released.saturating_add(INBOUND_DELAY) {
                     return false;
@@ -1734,7 +1745,7 @@ impl RelayModel {
                 );
             }
             assert!(state.pending.len() <= PENDING_PER_PEER);
-            assert!(state.tried.len() <= TRIED_PER_PEER);
+            assert!(state.deferred.len() <= DEFERRED_PER_PEER);
             assert!(state.known.len() <= KNOWN_CAP);
             for id in &state.reannounced {
                 assert!(
@@ -1750,10 +1761,6 @@ impl RelayModel {
             }
             pending_total = pending_total.saturating_add(state.pending.len());
             for pending in &state.pending {
-                assert!(
-                    !state.has_tried(pending.id, pending.generation),
-                    "pending and tried are apart"
-                );
                 *holders.entry((pending.id, pending.generation)).or_default() += 1;
             }
             for (id, request) in &state.requests {
@@ -1814,6 +1821,36 @@ impl RelayModel {
                 .count(),
             "no reservation without a live request"
         );
+        // Every submission has exactly one owner and one recorded
+        // generation, and every owner's submission has a waiter.
+        assert_eq!(self.waiters.len(), self.submitted_at.len());
+        let mut owned = 0usize;
+        for (waiter, owner) in &self.waiters {
+            assert!(
+                self.submitted_at.contains_key(waiter),
+                "a waiter has its generation"
+            );
+            match owner {
+                VerdictOwner::Session(session) => assert!(
+                    self.sessions
+                        .get(session)
+                        .is_some_and(|state| state.submissions.contains_key(waiter)),
+                    "a session's waiter is in its submissions"
+                ),
+                VerdictOwner::Reactor => assert!(
+                    self.reactor.holds_unsettled(*waiter),
+                    "the reactor's waiter is unsettled"
+                ),
+            }
+            owned += 1;
+        }
+        let held: usize = self
+            .sessions
+            .values()
+            .map(|state| state.submissions.len())
+            .sum::<usize>()
+            + self.reactor.unsettled_total();
+        assert_eq!(owned, held, "every submission has a waiter");
         if let Some((holder, generation)) = self.wanted.probe() {
             assert!(
                 self.sessions.get(&holder).is_some_and(|state| state

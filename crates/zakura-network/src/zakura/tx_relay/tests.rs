@@ -11,16 +11,16 @@ use zakura_chain::{
     transaction::{self, AuthDigest, UnminedTxId, WtxId},
 };
 use zakura_node_services::mempool::port::{
-    model::{ModelBlock, ModelTransition, ModelTx, Outcome, PoolModel},
+    model::{JobId, ModelBlock, ModelTransition, ModelTx, Outcome, PoolModel, T_VERIFY},
     Change, Charge, Generation, Intent, RejectionScope, MAX_PENDING,
 };
 
 use super::model::{
     peer::{max_span, Hello},
     window, CloseReason, PeerKey, RelayEffect, RelayModel, SessionId, Violation, ADVERT_DELAY,
-    BASE_COOLDOWN, BASE_DEADLINE, INBOUND_DELAY, MAX_REQUESTS_PER_PEER, MAX_TX_BYTES, MIN_RATE,
-    NO_ROOM_FIRST, PENDING_PER_PEER, RETRY_FIRST, SENDER_ALLOWANCE, TRIED_PER_PEER, WINDOW_FULL,
-    WINDOW_SMALL,
+    BASE_COOLDOWN, BASE_DEADLINE, DEFERRED_PER_PEER, INBOUND_DELAY, MAX_REQUESTS_PER_PEER,
+    MAX_TX_BYTES, MIN_RATE, NO_ROOM_FIRST, PENDING_PER_PEER, RETRY_FIRST, SENDER_ALLOWANCE,
+    WINDOW_FULL, WINDOW_SMALL,
 };
 
 fn id(n: u32) -> UnminedTxId {
@@ -170,14 +170,16 @@ fn not_found_moves_the_id_to_an_announcer_that_has_not_tried_it() {
     assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
 
     // A answers NotFound. A is the older session, so it would win every
-    // race, but it never claims the id again.
+    // race, but the id leaves its pending set and B is asked.
     relay.not_found(a, id(1), secs(1));
     assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
     let generation = relay.wanted().entry(id(1)).unwrap().generation;
-    assert!(relay.session(a).unwrap().has_tried(id(1), generation));
-    // A announcing it again changes nothing.
+    assert!(!relay.session(a).unwrap().holds(id(1), generation));
+    assert!(relay.session(a).unwrap().is_deferred(id(1), generation));
+    // A announcing it again takes it back, but B's fetch goes on.
     relay.inv(a, &[(id(1), SIZE)], secs(1));
-    assert!(relay.session(a).unwrap().pending.is_empty());
+    assert!(relay.session(a).unwrap().holds(id(1), generation));
+    assert!(asks(&relay.take_effects()).is_empty());
     relay.assert_invariants();
 }
 
@@ -673,7 +675,7 @@ fn ids_an_honest_peer_tried_never_take_its_room() {
     }
     let state = relay.session(honest).unwrap();
     assert!(state.pending.is_empty());
-    assert_eq!(state.tried.len(), 20);
+    assert_eq!(state.deferred.len(), 20);
     // The hostile peer still holds every entry. The honest peer's new id is
     // taken and asked for.
     assert_eq!(relay.wanted().len(), 20);
@@ -1516,12 +1518,12 @@ fn more_than_a_pool_of_ids_through_one_session() {
     let mut relay = relay();
     let a = open(&mut relay, 1, true, secs(0));
     let b = open(&mut relay, 2, true, secs(0));
-    let count = u32::try_from(TRIED_PER_PEER).unwrap() + 500;
+    let count = u32::try_from(DEFERRED_PER_PEER).unwrap() + 500;
     for n in 0..count {
         relay.inv(a, &[(id(n), SIZE)], secs(0));
         relay.not_found(a, id(n), secs(0));
     }
-    assert_eq!(relay.session(a).unwrap().tried.len(), TRIED_PER_PEER);
+    assert_eq!(relay.session(a).unwrap().deferred.len(), DEFERRED_PER_PEER);
     relay.take_effects();
     assert_eq!(relay.wanted().len(), 0);
     // The oldest tried mark was forgotten, so A may be asked about it once
@@ -2193,6 +2195,59 @@ fn a_late_verdict_leaves_another_announcers_fetch_alone() {
     relay.assert_invariants();
 }
 
+#[test]
+fn a_fresh_announcement_after_not_found_brings_the_peer_back() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(b, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    relay.not_found(a, id(1), secs(1));
+    assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
+    // A gets the id and announces it again, then B cannot serve it.
+    relay.inv(a, &[(id(1), SIZE)], secs(2));
+    relay.not_found(b, id(1), secs(3));
+    assert!(relay.wanted().entry(id(1)).is_some());
+    // A waits out its delay after the release, then is asked.
+    relay.tick(secs(3) + INBOUND_DELAY);
+    assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
+    relay.tx(a, id(1), tx(1), secs(6));
+    finish_all(&mut relay, &Outcome::Pass, secs(6));
+    assert_eq!(relay.pool().visible(), vec![id(1)]);
+    relay.assert_invariants();
+}
+
+#[test]
+fn contradicted_answers_do_not_grow_the_deadline() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    let first = relay.session(a).unwrap().requests[&id(1)].deadline - secs(0);
+    let mut now = secs(0);
+    for _ in 0..30 {
+        relay.inv(a, &[(id(1), SIZE)], now);
+        relay.not_found(a, id(1), now);
+        now += INBOUND_DELAY;
+        relay.tick(now);
+        assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
+    }
+    let last = relay.session(a).unwrap().requests[&id(1)].deadline - now;
+    assert_eq!(first, last, "no deadline was missed, so none doubled");
+    // A timeout followed by a contradicted NotFound counts once.
+    relay.inv(a, &[(id(1), SIZE)], now);
+    let due = relay.session(a).unwrap().requests[&id(1)].deadline;
+    relay.tick(due);
+    relay.not_found(a, id(1), due + secs(1));
+    relay.tick(due + secs(1) + INBOUND_DELAY);
+    assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
+    let doubled =
+        relay.session(a).unwrap().requests[&id(1)].deadline - (due + secs(1) + INBOUND_DELAY);
+    assert_eq!(doubled, first * 2);
+    relay.assert_invariants();
+}
+
 /// The default short id of `tx_id`, as the model keeps it.
 fn short_of(tx_id: UnminedTxId) -> u64 {
     let mut short = [0u8; 8];
@@ -2300,15 +2355,22 @@ fn run(seed: u64) {
             }
         }
     };
-    let verify = |relay: &mut RelayModel,
-                  failed: &mut HashSet<UnminedTxId>,
-                  rng: &mut Lcg,
-                  now: Duration,
-                  fail_some: bool| {
+    // When each job was first seen, so the oracle counts a failure only if
+    // the pool will apply it, before the job's own deadline.
+    let mut job_seen: HashMap<JobId, Duration> = HashMap::new();
+    let mut verify = |relay: &mut RelayModel,
+                      failed: &mut HashSet<UnminedTxId>,
+                      rng: &mut Lcg,
+                      now: Duration,
+                      fail_some: bool| {
         for (job, tx_id) in relay.job_txs().to_vec() {
+            let seen = *job_seen.entry(job).or_insert(now);
+            let applied = now < seen + T_VERIFY;
             let outcome = if fail_some && rng.next(5) == 0 {
-                failed.insert(tx_id);
-                FAILED_NOW.with(|now| now.borrow_mut().push(tx_id));
+                if applied {
+                    failed.insert(tx_id);
+                    FAILED_NOW.with(|now| now.borrow_mut().push(tx_id));
+                }
                 Outcome::Fail {
                     scope: RejectionScope::ExactTip,
                     charge: Charge::None,
@@ -2468,6 +2530,11 @@ fn run(seed: u64) {
         relay.reservations_held(),
         0,
         "seed {seed}: no reservation is left"
+    );
+    assert_eq!(
+        relay.waiters_outstanding(),
+        0,
+        "seed {seed}: every submission has its verdict"
     );
     assert_eq!(
         relay.reactor().unsettled_peers(),

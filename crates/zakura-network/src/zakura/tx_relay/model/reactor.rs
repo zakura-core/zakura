@@ -118,6 +118,18 @@ impl ReactorModel {
         self.unsettled.get(&peer).map_or(0, BTreeMap::len)
     }
 
+    /// Whether `waiter` is an unsettled submission here.
+    pub(crate) fn holds_unsettled(&self, waiter: WaiterId) -> bool {
+        self.unsettled
+            .values()
+            .any(|waiting| waiting.contains_key(&waiter))
+    }
+
+    /// How many unsettled submissions there are, over every peer.
+    pub(crate) fn unsettled_total(&self) -> usize {
+        self.unsettled.values().map(BTreeMap::len).sum()
+    }
+
     /// How many peers have unsettled submissions.
     pub(crate) fn unsettled_peers(&self) -> usize {
         self.unsettled.len()

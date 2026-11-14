@@ -15,17 +15,14 @@ mod support;
 use std::path::Path;
 
 use support::one_key_off::assert_one_key_off;
+use zakura_sim::refs::{FrameRef, PageRef, Ref};
 use zakura_sim::{
-    check::FrameRef,
     harness::{
         self,
-        header_acceptance::{
-            companions::{
-                fault_close, judge, path_break, rejected_page, run_draft, sent_page, staged_page,
-                DraftEvidence, Refusal, SentPage, StagedPage, CONTENT_FAULT, FAULT_CLOSE,
-                PATH_BREAK, STAGED,
-            },
-            refs::{PageRef, Ref},
+        header_acceptance::companions::{
+            fault_close, judge, path_break, rejected_page, run_draft, sent_page, staged_page,
+            DraftEvidence, Refusal, SentPage, StagedPage, CONTENT_FAULT, FAULT_CLOSE, PATH_BREAK,
+            STAGED,
         },
         header_sync::{HeaderWire, WireScenario},
         Subsystem,

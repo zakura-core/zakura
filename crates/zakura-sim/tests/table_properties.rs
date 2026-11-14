@@ -18,10 +18,10 @@ use zakura_network::zakura::{
 };
 use zakura_sim::NaReason;
 use zakura_sim::{
-    harness::header_acceptance::refs::ConnectionRef,
     model::{consequence, is_fault_cause, Consequence, Label},
     observe::StreamId,
     property::{Property, Source},
+    refs::ConnectionRef,
     table::{rule_row, table_properties, GeneratedId, Template},
     Observation, Outcome, PropertyOutcome, RunReport, Violation,
 };

@@ -770,7 +770,7 @@ fn judge_end(
 /// `property`'s own break (C6): it names the same subject
 /// ([`FindingSubject`](crate::check::FindingSubject)) as one of
 /// `property`'s violations the same way found, compared whole
-/// ([`Ref::joined`](crate::harness::header_acceptance::refs::Ref::joined)), so a member's punishment joins only the case's
+/// ([`Ref::joined`](crate::refs::Ref::joined)), so a member's punishment joins only the case's
 /// punishment of the same connection, by the same event, answering the
 /// same frame. A step's finding must also be caused there: its cause, its
 /// witness's first step, is the step that break broke at. A step check's
@@ -784,7 +784,7 @@ fn judge_end(
 /// of its violations, or every member when the report kept none of
 /// `property`'s.
 fn joined(reports: &[PropertyReport], property: &str, set: &[String]) -> Result<(), WitnessError> {
-    use crate::{check::FindingSubject, harness::header_acceptance::refs::Ref, Violation};
+    use crate::{check::FindingSubject, refs::Ref, Violation};
     let (own_steps, own_ends) = reports
         .iter()
         .find(|r| r.property == property)
@@ -869,7 +869,7 @@ mod tests {
         crate::check::FindingSubject::Punishment {
             connection: 1,
             event: 40,
-            frame: Some(crate::check::FrameRef {
+            frame: Some(crate::refs::FrameRef {
                 connection: 1,
                 kind: 5,
                 version: 9,
@@ -1321,10 +1321,7 @@ mod tests {
     /// doesn't join either.
     #[test]
     fn an_end_found_member_joins_the_case_s_end_break_by_subject() {
-        use crate::{
-            check::FindingSubject,
-            harness::header_acceptance::refs::one_key_off::assert_one_key_off,
-        };
+        use crate::{check::FindingSubject, refs::one_key_off::assert_one_key_off};
         let set = ["test/co".to_owned()];
         let unread = FindingSubject::Publication {
             state_version: "StateVersion(4)".to_owned(),
@@ -1374,7 +1371,7 @@ mod tests {
     /// is the break's.
     #[test]
     fn a_member_at_the_break_s_step_joins_by_its_punishment() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let set = ["test/co".to_owned()];
         let judged = |subject: Option<crate::check::FindingSubject>| {
             let mut member = violated_report("test/co", &[(3, &[3])]);

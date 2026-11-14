@@ -12,10 +12,10 @@ use std::{cell::RefCell, io::Write, path::Path, process::Command};
 use serde_json::Value;
 use support::{inputs, one_key_off::assert_one_key_off};
 use tempfile::TempDir;
+use zakura_sim::refs::{CallRef, Ref, StampRef};
 use zakura_sim::{
     harness::{
         self,
-        header_acceptance::refs::{CallRef, Ref, StampRef},
         header_node::{
             ends::{EndEvidence, EndFact, EnvironmentAction},
             policy::{Allow, Hold, OpKind, Select, Trigger},

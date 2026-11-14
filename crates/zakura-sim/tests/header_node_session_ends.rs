@@ -11,10 +11,10 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc, time::Duratio
 
 use support::{inputs, one_key_off::assert_one_key_off, run};
 use zakura_scheduler::SimInstant;
+use zakura_sim::refs::{ConnectionRef, Ref, SessionIdRef};
 use zakura_sim::{
     check::after_step,
     harness::{
-        header_acceptance::refs::{ConnectionRef, Ref, SessionIdRef},
         header_node::{
             adoption::SessionLife, policy::Trigger, preload, tap::ReactorTap, Chain, Control,
             ControlAction, ControlStep, DispatchFlag, Effects, HeaderNode, Policy, PolicySource,

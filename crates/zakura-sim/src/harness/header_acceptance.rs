@@ -40,7 +40,6 @@ pub mod history;
 pub mod inventory;
 pub mod not_applicable;
 pub mod reasons;
-pub mod refs;
 pub mod required;
 pub mod rows;
 pub mod tool;
@@ -59,7 +58,7 @@ pub use rows::{
 };
 
 use crate::property::{Source, Status};
-use refs::{HistoryRunRef, PlantedRef, PropertyRef, Ref, TestIdRef};
+use crate::refs::{HistoryRunRef, PlantedRef, PropertyRef, Ref, TestIdRef, WitnessRef};
 
 /// One of sim-6.2's six gates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -486,6 +485,63 @@ impl RunId {
             property: NATIVE_DIR.to_owned(),
             name: patch.to_owned(),
             run,
+        }
+    }
+}
+
+impl WitnessRef {
+    /// `witness`'s histories on `harness`.
+    pub fn of(harness: &str, witness: TestRef) -> Self {
+        WitnessRef {
+            harness: harness.to_owned(),
+            package: witness.package.to_owned(),
+            file: witness.file.to_owned(),
+            test: witness.test.to_owned(),
+        }
+    }
+}
+
+impl TestIdRef {
+    /// The whole identity of `test`.
+    pub fn of(test: TestRef) -> Self {
+        TestIdRef {
+            package: test.package.to_owned(),
+            file: test.file.to_owned(),
+            test: test.test.to_owned(),
+        }
+    }
+}
+
+impl HistoryRunRef {
+    /// The whole identity of `history`.
+    pub fn of(history: HistoryRef) -> Self {
+        HistoryRunRef {
+            harness: history.harness.to_owned(),
+            package: history.witness.package.to_owned(),
+            file: history.witness.file.to_owned(),
+            test: history.witness.test.to_owned(),
+            case: history.case.to_owned(),
+        }
+    }
+
+    /// The history `run` is, if it's a history's run rather than a planted
+    /// case's.
+    pub fn of_run(run: &RunId) -> Option<Self> {
+        match run {
+            RunId::History {
+                harness,
+                package,
+                file,
+                test,
+                case,
+            } => Some(HistoryRunRef {
+                harness: harness.clone(),
+                package: package.clone(),
+                file: file.clone(),
+                test: test.clone(),
+                case: case.clone(),
+            }),
+            RunId::Case { .. } => None,
         }
     }
 }
@@ -1270,7 +1326,7 @@ pub fn needs_of(harnesses: &[&str]) -> Result<Vec<(String, String)>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+    use crate::refs::one_key_off::assert_one_key_off;
 
     /// A contract's proving catch takes the catch of its case only on the
     /// case's whole [`PlantedRef`] (Rule 25's template): the key naming

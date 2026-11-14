@@ -139,11 +139,13 @@ use super::{
         ObligationState, Report, ResultFile, ResultRecord, Subject, TestOutcome, TestRan,
     },
     history::{Declaration, DeclaredHistory, Ran, PLAN_FILE, RAN_FILE, SCENARIO_FILE, SCRIPT_FILE},
-    refs::{DeclarationRef, HistoryRunRef, PlantedRef, PropertyRef, Ref, TestIdRef, TriggerRef},
     required::{required_keys, Inventories, GATE_OBLIGATIONS},
     rows::HEADER_HARNESSES,
     CaseRef, CaseRun, Expected, ExpectedId, Gate, Key, Manifest, RunId, COMPOSITION_CHECKS,
     NARROWING, REQUIRED_CONTRACTS,
+};
+use crate::refs::{
+    DeclarationRef, HistoryRunRef, PlantedRef, PropertyRef, Ref, TestIdRef, TriggerRef,
 };
 use crate::{
     harness::coverage::{Bypass, COVERAGE},
@@ -3781,7 +3783,7 @@ mod tests {
     /// row's property moved it has no row, so it isn't listed.
     #[test]
     fn a_draft_s_row_joins_its_whole_property() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let registered = super::super::registered();
         let rows = super::super::rows();
         let at = rows
@@ -5079,7 +5081,7 @@ mod tests {
     /// joins nothing.
     #[test]
     fn a_witness_judges_its_whole_trigger() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let dir = recorded();
         let trigger = TriggerRef {
             property: MACHINE.to_owned(),
@@ -5114,7 +5116,7 @@ mod tests {
     /// case moved finds none.
     #[test]
     fn a_declaration_joins_its_whole_identity() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let root = tempfile::tempdir().expect("a temp dir can be created");
         let scenario = serde_json::json!({ "peers": 2 });
         let wire = "header-sync/wire";
@@ -5153,7 +5155,7 @@ mod tests {
     /// its name moved is found at none.
     #[test]
     fn a_case_run_is_recorded_at_its_whole_case() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let plan = plan(&Manifest::committed(), &repo).expect("the committed manifest plans");
         let named: Vec<(usize, PlantedRef)> = plan
@@ -5215,7 +5217,7 @@ mod tests {
     /// recorded at none.
     #[test]
     fn a_history_run_is_recorded_at_its_whole_history() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let plan = plan(&Manifest::committed(), &repo).expect("the committed manifest plans");
         let (at, run) = plan
@@ -5242,7 +5244,7 @@ mod tests {
     /// none.
     #[test]
     fn a_history_s_target_joins_its_whole_history() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let (history, _) = super::super::rows::history_targets()[0];
         let keys = assert_one_key_off::<HistoryRunRef>(&HistoryRunRef::of(history), |want| {
             history_target(history_named(want)).is_ok()
@@ -5256,7 +5258,7 @@ mod tests {
     /// its package, file or name moved.
     #[test]
     fn a_counted_test_s_inventory_joins_its_whole_test() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let own = TestIdRef {
             package: "zakura-sim".to_owned(),
             file: "tests/header_node.rs".to_owned(),
@@ -5274,7 +5276,7 @@ mod tests {
     /// its test, its harness or its case moved does.
     #[test]
     fn a_declared_history_joins_its_whole_declaration() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let own = DeclarationRef {
             test: "a_test".to_owned(),
             harness: NODE.to_owned(),
@@ -5303,7 +5305,7 @@ mod tests {
     /// the test with its package, file or name moved doesn't.
     #[test]
     fn a_history_s_witness_test_joins_its_whole_test() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let own = TestIdRef {
             package: "zakura-sim".to_owned(),
             file: "tests/header_node.rs".to_owned(),
@@ -5346,7 +5348,7 @@ mod tests {
     /// the run of the test with its package, file or name moved fails.
     #[test]
     fn an_integrity_run_s_test_joins_its_whole_test() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let input = history_run();
         let own = TestIdRef {
             package: "zakura-sim".to_owned(),
@@ -5652,7 +5654,7 @@ mod tests {
     /// one key of what it ran moved (Rule 25's template).
     #[test]
     fn a_draft_run_is_its_baseline_s_counterfactual() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let case = tempfile::tempdir().expect("a temp dir can be created");
         record_into(&case.path().join("baseline"), "s");
         record_into(&case.path().join("draft"), "patched");
@@ -6781,7 +6783,7 @@ mod tests {
     /// the test with its package, file or name moved don't.
     #[test]
     fn a_unit_run_s_test_joins_its_whole_test() {
-        use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let plan = plan(&Manifest::committed(), &repo).expect("the committed manifest plans");
         let task = plan

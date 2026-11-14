@@ -28,11 +28,8 @@
 
 use std::{collections::BTreeMap, sync::OnceLock};
 
-use super::{
-    refs::{PlantedRef, Ref, WitnessRef},
-    rows::harness_matrix,
-    sim_test, CaseRef, ExpectedNa, HistoryRef, RunId, TestRef,
-};
+use super::{rows::harness_matrix, sim_test, CaseRef, ExpectedNa, HistoryRef, RunId, TestRef};
+use crate::refs::{PlantedRef, Ref, WitnessRef};
 use crate::NaReason;
 
 /// `header-sync/wire`.
@@ -3186,7 +3183,7 @@ static HISTORIES: &[HistoryNa] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+    use crate::refs::one_key_off::assert_one_key_off;
 
     /// A catch's `NotApplicable` lists are its own case's only, joined on
     /// the case's whole [`PlantedRef`] (Rule 25's template): a case

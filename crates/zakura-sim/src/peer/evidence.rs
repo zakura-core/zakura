@@ -82,13 +82,13 @@ use super::{
     stage::{discovery_stage, header_stage, NodeView, Stage},
 };
 use crate::{
-    check::FrameRef,
     evidence::LiveEvidence,
     model::{is_fault_cause, FrameHeader, FrameModel, Label, ReaderEnd},
     observe::{
         PeerCredit, ReactorFact, StorageFact, StorageRequest, StreamId, TransitionFact,
         TransportFact,
     },
+    refs::FrameRef,
     storage::{hash, hex, HEADER_SERVICE},
     stores::{debug_snapshot, EvidenceStores, Registered, Snapshot},
     Observation, ObservationLog,

@@ -32,13 +32,11 @@ use std::path::Path;
 
 use support::one_key_off::assert_one_key_off;
 use zakura_network::zakura::{v9::RegtestMessage, Credit, MessageRole};
+use zakura_sim::refs::{ConnectionRef, FrameRef, QuicStreamRef, Ref};
 use zakura_sim::{
     explore::state::crossing::{crossings, Crossed},
     harness::{
-        header_acceptance::{
-            companions::judged_frame,
-            refs::{ConnectionRef, FrameRef, QuicStreamRef, Ref},
-        },
+        header_acceptance::companions::judged_frame,
         header_sync::{HeaderWire, WireScenario},
         run_prepared,
         wire_plans::{act_scenario, SavedPlan},

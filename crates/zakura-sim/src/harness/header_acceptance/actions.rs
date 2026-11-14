@@ -20,11 +20,9 @@
 
 use serde_json::Value;
 
-use super::{
-    evaluate::{Actions, End},
-    refs::{
-        ActNameRef, ControlRef, LinkRef, PeerNameRef, PickRef, Ref, ScriptRef, SessionRef, StampRef,
-    },
+use super::evaluate::{Actions, End};
+use crate::refs::{
+    ActNameRef, ControlRef, LinkRef, PeerNameRef, PickRef, Ref, ScriptRef, SessionRef, StampRef,
 };
 use crate::{
     harness::{
@@ -862,7 +860,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+    use crate::refs::one_key_off::assert_one_key_off;
 
     /// A two-mirror storage history that closes `mirror-0`, relinks it and
     /// closes it again, recorded with no Plan bytes: its trace and full

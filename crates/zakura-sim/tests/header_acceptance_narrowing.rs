@@ -27,13 +27,13 @@ use std::{
 
 use serde_json::Value;
 use support::one_key_off::assert_one_key_off;
+use zakura_sim::refs::{PlantedRef, Ref};
 use zakura_sim::{
     harness::{
         self,
         header_acceptance::{
             contracts::{Narrowing, RunBy},
             evaluate::{result_context, End, Execution, ResultFile, ResultRecord},
-            refs::{PlantedRef, Ref},
             rows::HEADER_HARNESSES,
             tool, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, Manifest,
             ObligationState, ResultKind, RunId, Subject, NARROWING, NATIVE_DIR,

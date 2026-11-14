@@ -46,9 +46,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use zakura_network::zakura::ZAKURA_STREAM_HEADER_SYNC;
 
 use crate::{
-    check::FrameRef,
     model::Label,
     observe::{StreamId, TransportFact},
+    refs::FrameRef,
     Observation,
 };
 

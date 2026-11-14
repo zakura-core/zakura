@@ -43,8 +43,8 @@ use super::{
     ends::{EndEvidence, EndFact, EnvironmentAction},
 };
 use crate::{
-    harness::header_acceptance::refs::{CallRef, Ref},
     observe::{Entry, ReactorFact, StorageFact, StorageRequest, StorageResult},
+    refs::{CallRef, Ref},
     storage::{Blame, FaultAttributions, HEADER_SERVICE},
     stores::{debug_snapshot, EvidenceStores, Guard, Registered, Snapshot},
     Observation, RunEnd,
@@ -978,8 +978,8 @@ impl FaultEnd {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
     use crate::observe::{StorageBranch, StoragePoint, WorkOwner, WorkScope};
+    use crate::refs::one_key_off::assert_one_key_off;
 
     /// The one violation in `end`, if it holds exactly one and nothing
     /// open.

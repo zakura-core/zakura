@@ -7,10 +7,8 @@
 //! contract in [`REQUIRED_CONTRACTS`], unless a [`NARROWING`] entry whose
 //! own test passed releases it.
 
-use super::{
-    refs::{PlantedRef, Ref},
-    sim_test, Approval, CaseRef, Expected, ExpectedResult, Key, ResultKind, TestRef,
-};
+use super::{sim_test, Approval, CaseRef, Expected, ExpectedResult, Key, ResultKind, TestRef};
+use crate::refs::{PlantedRef, Ref};
 
 /// A contract's ID, as the plan's table numbers them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1838,9 +1836,8 @@ pub fn narrowing_test_results(entries: &[Narrowing]) -> Vec<ExpectedResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::header_acceptance::{
-        refs::one_key_off::assert_one_key_off, ExpectedNa, Found,
-    };
+    use crate::harness::header_acceptance::{ExpectedNa, Found};
+    use crate::refs::one_key_off::assert_one_key_off;
 
     /// A contract's proving catch takes the result of its own case only
     /// on the case's whole [`PlantedRef`] (Rule 25's template): among the

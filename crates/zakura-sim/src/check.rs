@@ -10,9 +10,9 @@ use zakura_scheduler::{SimInstant, Status};
 
 use crate::{
     end::{HarnessFailure, RunEnd},
-    harness::header_acceptance::refs::{ConnectionRef, Ref},
     observe::Observation,
     property::{CheckEvent, Pending},
+    refs::{ConnectionRef, FrameRef, Ref},
     Enabled, Identity, ObservationLog,
 };
 
@@ -62,6 +62,10 @@ pub enum FindingSubject {
     },
 }
 
+/// What a finding is about, which the witness judge joins a nested
+/// case's finding to its own break by (C6).
+impl Ref for FindingSubject {}
+
 impl FindingSubject {
     /// The punishment of `connection` the observation at `at` in `entries`,
     /// a run's log, makes, with the frame the node last judged on that
@@ -102,25 +106,6 @@ impl FindingSubject {
             frame,
         }
     }
-}
-
-/// One transport frame: its connection, its stream's kind and version, its
-/// QUIC stream, its direction and its sequence.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FrameRef {
-    /// Its connection.
-    pub connection: u64,
-    /// Its stream's kind.
-    pub kind: u16,
-    /// Its stream's version.
-    pub version: u16,
-    /// Its QUIC stream.
-    pub quic_stream: u64,
-    /// Whether the peer sent it to the node, rather than the node to it.
-    pub inbound: bool,
-    /// Its position among its direction's frames on the stream.
-    pub seq: u64,
 }
 
 /// One property's outcome over a whole run (properties.md, Verdicts and
@@ -640,10 +625,10 @@ impl<C: Checker + ?Sized> Checker for Box<C> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FindingSubject, FrameRef};
+    use super::FindingSubject;
     use crate::{
-        harness::header_acceptance::refs::{one_key_off::assert_one_key_off, ConnectionRef},
         observe::StreamId,
+        refs::{one_key_off::assert_one_key_off, ConnectionRef, FrameRef},
         Observation, ObservationLog,
     };
 

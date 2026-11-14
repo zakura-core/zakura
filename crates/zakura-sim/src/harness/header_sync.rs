@@ -2777,7 +2777,7 @@ fn storage_call_dispatched(view: &StorageView, log: &ObservationLog) -> bool {
     if view.direct_dispatch_broken {
         return true;
     }
-    use super::header_acceptance::refs::{CallRef, Ref};
+    use crate::refs::{CallRef, Ref};
     let dispatched: Vec<CallRef> = log
         .entries()
         .iter()
@@ -4008,7 +4008,7 @@ mod tests {
 
         // The submission joins the dispatch by its whole call (Rule 25's
         // template): the call moved finds no dispatch.
-        use crate::harness::header_acceptance::refs::{one_key_off::assert_one_key_off, CallRef};
+        use crate::refs::{one_key_off::assert_one_key_off, CallRef};
         assert_one_key_off::<CallRef>(&CallRef { call: 1 }, |call| {
             let mut log = ObservationLog::default();
             log_storage(

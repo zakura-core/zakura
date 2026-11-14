@@ -13,11 +13,11 @@ use super::{
         contract_catch_key, contract_test_key, Contract, ContractId, ContractState, Narrowing,
     },
     reasons::NaEntry,
-    refs::{PlantedRef, Ref, TestIdRef},
     sim_test, Approval, CaseRef, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, RunId,
     TestRef, Tier, PLAN, TIERS,
 };
 use crate::property::Status;
+use crate::refs::{PlantedRef, Ref, TestIdRef};
 
 /// One `(harness, ID)` registration, as the registry reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1043,9 +1043,8 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::header_acceptance::{
-        companions::DESPITE_CLOSE, refs::one_key_off::assert_one_key_off, Found,
-    };
+    use crate::harness::header_acceptance::{companions::DESPITE_CLOSE, Found};
+    use crate::refs::one_key_off::assert_one_key_off;
 
     /// The case `planted` names, with its fields leaked to `'static` as a
     /// [`CaseRef`] holds them.

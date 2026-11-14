@@ -13,15 +13,18 @@
 //! dispatch, operation, stale window and release of it ([`DispatchRef`],
 //! [`CallOpRef`], [`StaleCallRef`], [`ReleaseRef`]); and for a finding, its
 //! subject ([`FindingSubject`](crate::check::FindingSubject)), such as the
-//! punished connection, event and frame. A
-//! finding is named by
-//! its step ([`FindingRef`]), within a run every artifact names by its
-//! trace's digest ([`super::binding`]). A join is [`Ref::joined`]:
-//! every item whose ref equals the one wanted, called by the ref's type,
-//! as `FrameRef::joined(&want, items, of)`, so a source scan sees which
-//! ref each join site joins. Each join site has a registered negative
-//! control that reaches it, from one template, which moves each of the
-//! ref's keys in turn (`tests/support/one_key_off.rs`).
+//! punished connection, event and frame. A finding is named by its step
+//! ([`FindingRef`]), within a run every artifact names by its trace's
+//! digest ([`binding`](crate::harness::header_acceptance::binding)). A
+//! join is [`Ref::joined`]: every item whose ref equals the one wanted,
+//! called by the ref's type, as `FrameRef::joined(&want, items, of)`, so
+//! a source scan sees which ref each join site joins. Each join site has
+//! a registered negative control that reaches it, from one template,
+//! which moves each of the ref's keys in turn
+//! (`tests/support/one_key_off.rs`).
+//!
+//! Its code uses only [`crate::observe`], so the property checks, the
+//! harnesses and the acceptance layer can all build on it.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -51,8 +54,24 @@ pub trait Ref: Clone + std::fmt::Debug + PartialEq + Serialize + DeserializeOwne
     }
 }
 
-/// One transport frame, defined beside the findings that name it.
-pub use crate::check::FrameRef;
+/// One transport frame: its connection, its stream's kind and version, its
+/// QUIC stream, its direction and its sequence.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrameRef {
+    /// Its connection.
+    pub connection: u64,
+    /// Its stream's kind.
+    pub kind: u16,
+    /// Its stream's version.
+    pub version: u16,
+    /// Its QUIC stream.
+    pub quic_stream: u64,
+    /// Whether the peer sent it to the node, rather than the node to it.
+    pub inbound: bool,
+    /// Its position among its direction's frames on the stream.
+    pub seq: u64,
+}
 impl Ref for FrameRef {}
 
 /// One QUIC stream of one connection, of one stream kind and version: what
@@ -270,10 +289,6 @@ pub struct LinkRef {
 }
 impl Ref for LinkRef {}
 
-/// What a finding is about ([`crate::check::FindingSubject`]), which the
-/// witness judge joins a nested case's finding to its own break by (C6).
-impl Ref for crate::check::FindingSubject {}
-
 /// What a witness judged: its property, what it expected and the other
 /// IDs it allowed to break beside it, in order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,18 +452,6 @@ pub struct WitnessRef {
 }
 impl Ref for WitnessRef {}
 
-impl WitnessRef {
-    /// `witness`'s histories on `harness`.
-    pub fn of(harness: &str, witness: super::TestRef) -> Self {
-        WitnessRef {
-            harness: harness.to_owned(),
-            package: witness.package.to_owned(),
-            file: witness.file.to_owned(),
-            test: witness.test.to_owned(),
-        }
-    }
-}
-
 /// One adversary act, by its name, such as `bad-content`: the whole
 /// identity the witness's act evidence (`ActsScripted` and `ActRan`) gives
 /// it, which names no peer.
@@ -474,17 +477,6 @@ pub struct TestIdRef {
 }
 impl Ref for TestIdRef {}
 
-impl TestIdRef {
-    /// The whole identity of `test`.
-    pub fn of(test: super::TestRef) -> Self {
-        TestIdRef {
-            package: test.package.to_owned(),
-            file: test.file.to_owned(),
-            test: test.test.to_owned(),
-        }
-    }
-}
-
 /// One acceptance history, as its run names it: its harness, its witness
 /// test's package, file and name, and its case within that test. A case
 /// name is per test, and one test can run a case on two harnesses.
@@ -502,40 +494,6 @@ pub struct HistoryRunRef {
     pub case: String,
 }
 impl Ref for HistoryRunRef {}
-
-impl HistoryRunRef {
-    /// The whole identity of `history`.
-    pub fn of(history: super::HistoryRef) -> Self {
-        HistoryRunRef {
-            harness: history.harness.to_owned(),
-            package: history.witness.package.to_owned(),
-            file: history.witness.file.to_owned(),
-            test: history.witness.test.to_owned(),
-            case: history.case.to_owned(),
-        }
-    }
-
-    /// The history `run` is, if it's a history's run rather than a planted
-    /// case's.
-    pub fn of_run(run: &super::RunId) -> Option<Self> {
-        match run {
-            super::RunId::History {
-                harness,
-                package,
-                file,
-                test,
-                case,
-            } => Some(HistoryRunRef {
-                harness: harness.clone(),
-                package: package.clone(),
-                file: file.clone(),
-                test: test.clone(),
-                case: case.clone(),
-            }),
-            super::RunId::Case { .. } => None,
-        }
-    }
-}
 
 /// One property, by its ID, as a catch key names the property whose
 /// planted cases it takes: a case's property directory is its property's
@@ -559,7 +517,7 @@ impl Ref for ScriptRef {}
 
 /// The one-key-off template, shared with the integration tests.
 #[cfg(test)]
-#[path = "../../../tests/support/one_key_off.rs"]
+#[path = "../tests/support/one_key_off.rs"]
 pub(crate) mod one_key_off;
 
 #[cfg(test)]

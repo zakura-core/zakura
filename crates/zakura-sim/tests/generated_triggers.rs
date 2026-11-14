@@ -12,10 +12,10 @@ use support::{
 };
 use zakura_network::zakura::Stream;
 use zakura_sim::{
-    harness::header_acceptance::refs::{ConnectionRef, ExchangeRef, PeerFrameRef, SourceFrameRef},
     model::Label,
     observe::{RowAt, StreamId, TransitionFact, TransportFact},
     property::PropertyId,
+    refs::{ConnectionRef, ExchangeRef, PeerFrameRef, SourceFrameRef},
     table::{generated_trigger, GeneratedId, Template},
     Observation, ObservationLog,
 };

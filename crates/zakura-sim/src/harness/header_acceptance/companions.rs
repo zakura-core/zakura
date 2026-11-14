@@ -6,7 +6,7 @@
 //! `commit-only-authorized` owns several claim kinds, so its `Caught` alone
 //! could come from another one. Its row names three companions, each judged
 //! on the case's own `Draft` run, and each joined to the rejected page by
-//! its full identity, a Rule 25 ref ([`super::refs`]):
+//! its full identity, a Rule 25 ref ([`crate::refs`]):
 //!
 //! - [`FAULT_CLOSE`]: the node closed the rejected frame's connection with a
 //!   cause in [`FAULT_CAUSES`](crate::model::FAULT_CAUSES), after it judged
@@ -38,11 +38,11 @@ use zakura_network::zakura::observe::ReactorEvent;
 
 use super::{
     binding::{self, Expect, Field},
-    refs::{
-        ConnectionRef, FindingRef, FrameRef, PageRef, PeerNameRef, ReadRef, Ref, SessionRef,
-        StreamRef, SubscriptionRef,
-    },
     CaseRef,
+};
+use crate::refs::{
+    ConnectionRef, FindingRef, FrameRef, PageRef, PeerNameRef, ReadRef, Ref, SessionRef, StreamRef,
+    SubscriptionRef,
 };
 use crate::{
     harness::header_node::authority::AuthorityRule,
@@ -761,10 +761,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{
-        harness::header_acceptance::refs::one_key_off::assert_one_key_off, observe::StreamId,
-        Violation,
-    };
+    use crate::{observe::StreamId, refs::one_key_off::assert_one_key_off, Violation};
 
     /// The header-sync stream.
     const STREAM: StreamId = StreamId {

@@ -26,13 +26,11 @@ use support::{
     prepare_fault::{disconnect_mid_prepare, scenario, LastView, Uncooled, Watched, CHAIN},
     steer::steer,
 };
+use zakura_sim::refs::{ConnectionRef, Ref, SessionIdRef};
 use zakura_sim::{
     domain::header_sync::STALE_COMPLETION_INERT,
     harness::{
-        header_acceptance::{
-            history::run_declared,
-            refs::{ConnectionRef, Ref, SessionIdRef},
-        },
+        header_acceptance::history::run_declared,
         header_node::{
             fault::FaultEnd,
             stale::{StaleWindow, Staleness},

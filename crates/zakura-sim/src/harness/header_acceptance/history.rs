@@ -455,7 +455,7 @@ mod tests {
     /// another attempt left among this one's, otherwise whole.
     #[test]
     fn a_declaration_counts_only_for_its_own_run() {
-        use super::super::refs::one_key_off::assert_one_key_off;
+        use crate::refs::one_key_off::assert_one_key_off;
         let root = tempfile::tempdir().expect("a temp dir can be created");
         let scenario = serde_json::json!({ "peers": 2 });
         let declare = |at: &DeclaredFor, case: &str| {

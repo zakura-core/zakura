@@ -7,13 +7,13 @@
 //! static checks in `tests/header_acceptance.rs` compare two independent
 //! lists.
 
-use super::refs::{HistoryRunRef, PlantedRef, Ref};
 use super::required as obligation;
 use super::{
     sim_test, Approval, CaseRef, Expected, ExpectedNa, ExpectedResult, Found, Gate, HistoryRef,
     Key, Promotion, Row, RunId, TestRef, Tier, PLAN,
 };
 use crate::property::Status;
+use crate::refs::{HistoryRunRef, PlantedRef, Ref};
 
 /// `header-sync/smoke`.
 const SMOKE: &str = "header-sync/smoke";
@@ -4299,7 +4299,7 @@ pub fn tier_results(registered: &[super::Registered]) -> Vec<ExpectedResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+    use crate::refs::one_key_off::assert_one_key_off;
 
     /// `text`, for the life of the test, as a static field.
     fn leaked(text: &str) -> &'static str {

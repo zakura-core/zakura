@@ -28,15 +28,13 @@ use zakura_network::zakura::{MessageRole, MessageRule, Stream};
 
 use crate::{
     downstream,
-    harness::header_acceptance::refs::{
-        ConnectionRef, ExchangeRef, PeerFrameRef, Ref, SourceFrameRef,
-    },
     model::{consequence, is_fault_cause, is_rate_limit_cause, Consequence, Label},
     observe::{Entry, RowAt, StreamId},
     property::{
         Cardinality, CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId,
         Source, Status, Subject, Verdict,
     },
+    refs::{ConnectionRef, ExchangeRef, PeerFrameRef, Ref, SourceFrameRef},
     sender, FindingSubject, Observation, ObservationLog,
 };
 

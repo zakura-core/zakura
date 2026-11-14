@@ -43,7 +43,7 @@ use super::{
     Approval, CaseRun, Expected, ExpectedId, ExpectedNa, ExpectedResult, Found, Gate, Key,
     Manifest, ResultCtx, RunId, TestRef, GATES,
 };
-use crate::harness::header_acceptance::refs::{PlantedRef, Ref, TestIdRef};
+use crate::refs::{PlantedRef, Ref, TestIdRef};
 
 /// An acceptance run's results, as the acceptance tool writes them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1803,7 +1803,7 @@ fn caught_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::header_acceptance::refs::one_key_off::assert_one_key_off;
+    use crate::refs::one_key_off::assert_one_key_off;
 
     /// The committed manifest's first node `Caught`, with a nonempty set,
     /// as its case's whole identity.

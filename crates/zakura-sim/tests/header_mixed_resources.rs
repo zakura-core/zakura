@@ -25,12 +25,10 @@ use support::{
     storage_witnesses::{hold, mirror, step, NODE, SOURCE},
 };
 use zakura_network::zakura::observe::ReactorEvent;
-use zakura_sim::harness::header_acceptance::{
-    history::run_declared,
-    refs::{
-        CallOpRef, DispatchRef, PeerNameRef, Ref, ReleaseRef, SessionRef, StaleCallRef,
-        StorageOpRef, StorageRef, WorkRef,
-    },
+use zakura_sim::harness::header_acceptance::history::run_declared;
+use zakura_sim::refs::{
+    CallOpRef, DispatchRef, PeerNameRef, Ref, ReleaseRef, SessionRef, StaleCallRef, StorageOpRef,
+    StorageRef, WorkRef,
 };
 use zakura_sim::{
     check::{after_step, PropertyOutcome},

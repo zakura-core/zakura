@@ -15,6 +15,7 @@ use std::{
 };
 
 use support::one_key_off::assert_one_key_off;
+use zakura_sim::refs::{PlantedRef, Ref, TestIdRef};
 use zakura_sim::{
     harness::{
         self,
@@ -29,7 +30,6 @@ use zakura_sim::{
                 ResultRecord, TestOutcome, TestRan,
             },
             reasons::{NA_REASONS, NOT_HEADER},
-            refs::{PlantedRef, Ref, TestIdRef},
             required::{gate_rule, required_keys, Inventories, Registered, GATE_OBLIGATIONS},
             rows::{self, NativeClass, HEADER_HARNESSES},
             sim_test, Approval, CaseRef, CaseRun, Expected, ExpectedId, ExpectedResult, Found,
@@ -6754,9 +6754,9 @@ fn the_evaluator_binds_runners_and_traces() {
 const OUTSIDE_REFS: &[(&str, &str, &str)] = &[
     (
         "src/check.rs",
-        "FrameRef",
-        "defined beside the findings whose subject carries it; refs.rs re-exports it as Rule 25's \
-         frame ref",
+        "impl Ref for FindingSubject",
+        "implemented beside the finding type, so refs.rs, which check.rs builds on, doesn't name \
+         it; the control check reads it as refs.rs's own",
     ),
     (
         "src/trace/meta.rs",
@@ -7028,7 +7028,7 @@ fn refs_outside_refs() -> BTreeSet<(String, String)> {
             .expect("under the crate")
             .display()
             .to_string();
-        if relative == "src/harness/header_acceptance/refs.rs" {
+        if relative == "src/refs.rs" {
             continue;
         }
         let text = std::fs::read_to_string(&file).expect("a source file reads");
@@ -7080,7 +7080,7 @@ fn identity_refs_are_defined_only_in_refs() {
                    struct Ref;\n\
                    impl Ref for Dispatch {}\n\
                    impl refs::Ref for Paired {}\n\
-                   fn u() { impl zakura_sim::harness::header_acceptance::refs::Ref for Release {} }\n\
+                   fn u() { impl zakura_sim::refs::Ref for Release {} }\n\
                    impl Serialize for Release {}\n";
     assert_eq!(
         defined_refs(planted, "t.rs"),
@@ -8096,6 +8096,7 @@ fn reaches(
 }
 
 /// The types `refs.rs`, as `text`, implements `Ref` for ([`defined_refs`]).
+/// [`control_gaps`] adds the implementations [`OUTSIDE_REFS`] allows.
 fn ref_impls(text: &str) -> BTreeSet<String> {
     defined_refs(text, "refs.rs")
         .into_iter()
@@ -8132,10 +8133,7 @@ fn crate_sources() -> BTreeMap<String, String> {
             let text = std::fs::read_to_string(&file).expect("a source file reads");
             (relative, text)
         })
-        .filter(|(file, _)| {
-            file != "src/harness/header_acceptance/refs.rs"
-                && file != "tests/support/one_key_off.rs"
-        })
+        .filter(|(file, _)| file != "src/refs.rs" && file != "tests/support/one_key_off.rs")
         .collect()
 }
 
@@ -8185,7 +8183,11 @@ fn control_gaps(
         }
     }
     let joined: BTreeSet<String> = registered.iter().map(|(ty, ..)| ty.clone()).collect();
-    for ty in ref_impls(refs).difference(&joined) {
+    let outside = OUTSIDE_REFS
+        .iter()
+        .filter_map(|(_, name, _)| name.strip_prefix("impl Ref for ").map(str::to_owned));
+    let impls: BTreeSet<String> = ref_impls(refs).into_iter().chain(outside).collect();
+    for ty in impls.difference(&joined) {
         gaps.push(format!("{ty} implements Ref but nothing joins it"));
     }
     for (ty, file, within, test_file, test) in registry {
@@ -8230,8 +8232,7 @@ fn every_ref_has_a_one_key_off_control() {
         .map(|(file, text)| (file.clone(), join_scan(text, file)))
         .collect();
     let krate = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let refs = std::fs::read_to_string(krate.join("src/harness/header_acceptance/refs.rs"))
-        .expect("refs.rs reads");
+    let refs = std::fs::read_to_string(krate.join("src/refs.rs")).expect("refs.rs reads");
     assert_eq!(
         control_gaps(&scans, &refs, REF_CONTROLS),
         Vec::<String>::new()
@@ -9154,17 +9155,16 @@ struct RawJoin {
 
 /// The files [`raw_joins`] reads, relative to the crate: the acceptance
 /// layer's judging code, `header_acceptance.rs` and every Rust file under
-/// `header_acceptance/`, test modules included, but `refs.rs`, where the
-/// join is defined. The rest of the crate is other owners' code, which
-/// Rule 25 doesn't bind (Adam, 2026-11-14). `files` lists the crate's
-/// files, relative to it.
+/// `header_acceptance/`, test modules included. `src/refs.rs`, where the
+/// join is defined, sits outside it. The rest of the crate is other
+/// owners' code, which Rule 25 doesn't bind (Adam, 2026-11-14). `files`
+/// lists the crate's files, relative to it.
 fn raw_join_scope(files: impl IntoIterator<Item = String>) -> Vec<String> {
     const ROOT: &str = "src/harness/header_acceptance.rs";
     const LAYER: &str = "src/harness/header_acceptance/";
     let mut scope: Vec<String> = files
         .into_iter()
         .filter(|file| file == ROOT || (file.starts_with(LAYER) && file.ends_with(".rs")))
-        .filter(|file| file != "src/harness/header_acceptance/refs.rs")
         .collect();
     scope.sort();
     scope
@@ -9561,7 +9561,7 @@ fn identity_joins_go_through_refs() {
                 "tests/header_acceptance.rs",
                 "src/harness/header_acceptance.rs",
                 "src/harness/header_acceptance/tool.rs",
-                "src/harness/header_acceptance/refs.rs",
+                "src/refs.rs",
                 "src/harness/header_acceptance/rows.json",
                 "src/harness/header_acceptance_extra.rs",
             ]

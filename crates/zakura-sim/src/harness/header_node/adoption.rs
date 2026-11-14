@@ -25,7 +25,7 @@ use zakura_network::zakura::{
 
 use super::stamp::Stamps;
 use crate::{
-    harness::header_acceptance::refs::{Ref, StampRef},
+    refs::{Ref, StampRef},
     stores::{debug_snapshot, EvidenceStores, Guard, Registered, Snapshot},
     RunEnd,
 };
@@ -598,7 +598,7 @@ mod tests {
     use crate::{
         domain::header_sync::{watch_end_violations, WATCH_OBSERVED_UNDER_FLOOD},
         end::Drain,
-        harness::header_acceptance::refs::one_key_off::assert_one_key_off,
+        refs::one_key_off::assert_one_key_off,
         Outcome,
     };
     use zakura_scheduler::Status as SchedulerStatus;

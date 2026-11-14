@@ -35,11 +35,11 @@ use support::{
 };
 use tempfile::TempDir;
 use zakura_network::zakura::observe::{ReactorEvent, ReservationEnd};
+use zakura_sim::refs::{Ref, StorageOpRef, StorageRef};
 use zakura_sim::{
     domain::header_sync::COMMIT_ONLY_AUTHORIZED,
     harness::{
         self,
-        header_acceptance::refs::{Ref, StorageOpRef, StorageRef},
         header_node::Policy,
         header_node::{
             policy::Trigger, reservation::ReservationEvidence, session::SessionFact, Chain,

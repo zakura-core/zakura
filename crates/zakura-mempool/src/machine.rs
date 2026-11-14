@@ -1004,6 +1004,11 @@ impl<E: VerifyError> MempoolState<E> {
             .collect()
     }
 
+    /// How many transactions are pooled, visible or hidden.
+    pub fn pooled_count(&self) -> usize {
+        self.pool.len()
+    }
+
     /// How many transactions are undecided: reserved, fetched or being
     /// verified for the first time.
     pub fn undecided_count(&self) -> usize {

@@ -566,6 +566,15 @@ async fn each_applied_chain_event_is_reported_for_the_trace() {
         "the child is checked again"
     );
 
+    // A reset counts what the pool held before it, as today's counts its
+    // retries before it clears: here the reorg's block mines the child, and
+    // it is still counted.
+    harness.change(1, 2, &[&child]);
+    let reset = harness.next_tip().await;
+    assert!(reset.reset, "{reset:?}");
+    assert_eq!((reset.visible, reset.hidden), (0, 0), "the child was mined");
+    assert_eq!(reset.held_before, 1, "the child is counted from before");
+
     // While the pool is off, a chain event is remembered and not applied,
     // so it writes no row, as today's pool writes none while disabled.
     harness.active.send_replace(false);

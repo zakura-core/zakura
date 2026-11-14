@@ -175,10 +175,10 @@ pub(crate) fn start(
             (applied.tip.hash, applied.tip.height),
             applied.visible,
             // Today's pool counts what a reset requeued, its pool and its
-            // pending downloads and verifications, and writes zero for a tip
-            // that grew by one block.
+            // pending downloads and verifications from before the tip, and
+            // writes zero for a tip that grew by one block.
             if applied.reset {
-                applied.hidden.saturating_add(applied.undecided)
+                applied.held_before
             } else {
                 0
             },

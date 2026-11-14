@@ -167,8 +167,10 @@ pub struct TipApplied {
     pub visible: usize,
     /// Hidden transactions waiting to be verified again after it.
     pub hidden: usize,
-    /// Undecided transactions after it, which a reset verifies again too.
-    pub undecided: usize,
+    /// What the pool held or was bringing in before it: pooled
+    /// transactions, visible or hidden, and undecided ones. A reset verifies
+    /// all of these again, and today's trace counts them as requeued.
+    pub held_before: usize,
     /// How long the machine took to apply it.
     pub took: std::time::Duration,
 }
@@ -412,6 +414,10 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
     /// One chain event. The core remembers the tip even while it is off.
     fn chain_event(&mut self, event: ChainEvent) {
         let now = time::Instant::now();
+        let held_before = self
+            .machine
+            .pooled_count()
+            .saturating_add(self.machine.undecided_count());
         let (step, reset) = match event {
             ChainEvent::Transition(transition) => {
                 self.chain_tip = transition.after;
@@ -435,7 +441,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 reset,
                 visible: self.machine.storage_stats().transactions,
                 hidden: self.machine.hidden_count(),
-                undecided: self.machine.undecided_count(),
+                held_before,
                 took: time::Instant::now().saturating_duration_since(now),
             });
         }

@@ -574,17 +574,12 @@ async fn long_poll_early_recheck_detects_transactions_only_after_empty_template(
 
     let transaction = Network::Mainnet
         .unmined_transactions_in_blocks(..)
-        .next()
+        .find(|tx| !tx.transaction.transaction().is_coinbase())
         .unwrap()
         .transaction;
-    let transaction = VerifiedUnminedTx::new(
-        transaction,
-        1_000_000.try_into().unwrap(),
-        0,
-        0,
-        Arc::new(vec![]),
-    )
-    .unwrap();
+    let miner_fee = transaction.conventional_fee();
+    let transaction =
+        VerifiedUnminedTx::new(transaction, miner_fee, 0, 0, Arc::new(vec![])).unwrap();
 
     for initially_populated in [false, true] {
         let info = chain_info(2, 1, 0);
@@ -950,10 +945,12 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
             }));
             tokio::pin!(request);
             assert!(futures::poll!(&mut request).is_pending());
+            tokio::time::advance(Duration::from_millis(100)).await;
+            assert!(futures::poll!(&mut request).is_pending());
             let reads = read_count.load(Ordering::SeqCst);
             tokio::time::advance(Duration::from_secs(2)).await;
             assert!(futures::poll!(&mut request).is_pending());
-            assert_eq!(read_count.load(Ordering::SeqCst), reads + 1);
+            assert_eq!(read_count.load(Ordering::SeqCst), reads);
         }
 
         // Start within one mempool polling interval of the difficulty timeout,
@@ -991,11 +988,14 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
         }));
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
+        // Consume the early recheck before measuring the difficulty deadline.
+        // Pausing Tokio's clock does not advance the wall clock sampled by GBT.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(futures::poll!(&mut request).is_pending());
         let reads_before_expiry = read_count.load(Ordering::SeqCst);
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(futures::poll!(&mut request).is_pending());
-        assert_eq!(read_count.load(Ordering::SeqCst), reads_before_expiry + 1);
-        let reads_before_expiry = read_count.load(Ordering::SeqCst);
+        assert_eq!(read_count.load(Ordering::SeqCst), reads_before_expiry);
 
         let mut minimum = standard.clone();
         minimum.cur_time = standard
@@ -1145,12 +1145,14 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         }));
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
-        let reads_before_deadline = read_count.load(Ordering::SeqCst);
         tokio::time::advance(Duration::from_secs(6) + Duration::from_millis(1)).await;
         let mut sampled = info_tx.borrow().clone();
         sampled.cur_time = clock.checked_add(Duration32::from_seconds(6)).unwrap();
         info_tx.send_replace(sampled.clone());
         assert!(futures::poll!(&mut request).is_pending());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(futures::poll!(&mut request).is_pending());
+        let reads_before_deadline = read_count.load(Ordering::SeqCst);
 
         // Four seconds remain after the fetch. Starting that wait before the fetch
         // would already have expired it and forced a premature replacement.
@@ -1199,6 +1201,8 @@ fn superseded_deadline_build_does_not_resume_long_polling() {
             ..Default::default()
         }));
         tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        tokio::time::advance(Duration::from_millis(100)).await;
         assert!(futures::poll!(&mut request).is_pending());
         tokio::time::advance(deadline + Duration::from_millis(1)).await;
         assert!(

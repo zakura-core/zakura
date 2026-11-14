@@ -67,6 +67,7 @@ pub use primitives::{halo2, redjubjub, redpallas};
 pub use primitives::{ed25519, groth16};
 
 // Benchmarks only: hidden from the documentation, exported so a bench target can reach it.
+#[cfg(any(test, feature = "internal-bench"))]
 #[doc(hidden)]
 pub use primitives::clear_shielded_verification_caches;
 pub use router::RouterError;

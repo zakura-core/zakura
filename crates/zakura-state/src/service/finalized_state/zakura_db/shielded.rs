@@ -1077,7 +1077,7 @@ impl DiskWriteBatch {
 
     /// Deletes the range of Sapling note commitment trees at the given [`Height`]s.
     /// Doesn't delete anchors from the anchor index. Doesn't delete the upper bound.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn delete_range_sapling_tree(&mut self, zakura_db: &ZakuraDb, from: &Height, to: &Height) {
         let sapling_tree_cf = zakura_db
             .db

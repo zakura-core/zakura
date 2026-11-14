@@ -53,7 +53,8 @@ fn first_v5_orchard_only_tx(block: &Block) -> Option<Arc<Transaction>> {
         .iter()
         .find(|tx| {
             tx.version() == 5
-                && !tx.has_transparent_inputs_or_outputs()
+                && !tx.has_transparent_inputs()
+                && !tx.has_transparent_outputs()
                 && !tx.has_sapling_shielded_data()
                 && tx.has_orchard_shielded_data()
         })
@@ -205,7 +206,8 @@ fn bench_zip244_digests(c: &mut Criterion) {
     let ironwood_tx = v6_ironwood_only_tx(&orchard_tx);
 
     assert_eq!(ironwood_tx.version(), 6);
-    assert!(!ironwood_tx.has_transparent_inputs_or_outputs());
+    assert!(!ironwood_tx.has_transparent_inputs());
+    assert!(!ironwood_tx.has_transparent_outputs());
     assert!(!ironwood_tx.has_sapling_shielded_data());
     assert!(!ironwood_tx.has_orchard_shielded_data());
     assert!(ironwood_tx.has_ironwood_shielded_data());

@@ -873,7 +873,11 @@ impl NonFinalizedState {
     /// when there is one, so this skips looking every spent output up again. The caller takes
     /// that result and records the chain this returns, because only the caller knows which parent
     /// chain identity it can offer a later solved block.
-    #[tracing::instrument(level = "debug", skip(self, finalized_state, new_chain))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, new_chain, prepared, finalized_state, contextual_metrics, cached_spends),
+        fields(height = ?prepared.height, hash = %prepared.hash)
+    )]
     fn validate_and_commit(
         &self,
         new_chain: Arc<Chain>,

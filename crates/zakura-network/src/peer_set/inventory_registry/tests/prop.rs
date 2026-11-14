@@ -83,6 +83,7 @@ async fn inv_registry_inbound_wrapper_with(
         test_peer,
         inv_stream_tx.clone(),
         Default::default(),
+        Default::default(),
     )
     .await;
     assert_eq!(

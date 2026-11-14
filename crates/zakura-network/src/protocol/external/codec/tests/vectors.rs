@@ -901,3 +901,161 @@ fn warmup_ping_encodes_as_padded_ping() {
         )
         .expect_err("a warm-up ping over the message limit does not encode");
 }
+
+/// The message checksum matches the shared double SHA-256 checksum for empty, short and
+/// block-sized bodies, including lengths around SHA-256's 64-byte block boundary.
+#[test]
+fn message_checksum_matches_sha256d_checksum() {
+    let _init_guard = zakura_test::init();
+
+    let body: Vec<u8> = (0..2_100_000u32)
+        .map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[3])
+        .collect();
+
+    // Fixed lengths around the 64-byte block boundary, then lengths spread over the whole range
+    // up to a full block from a fixed pseudo-random sequence.
+    // The shift leaves 21 bits, so each length is below 2^21 and fits in `usize` and `body`.
+    let spread = (1..=64u64).map(|i| (i.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 43) as usize);
+    let fixed = [0, 1, 55, 56, 63, 64, 65, 119, 128, 1_000, 65_537, 2_100_000];
+
+    for len in fixed.into_iter().chain(spread) {
+        assert_eq!(
+            message_checksum(&body[..len]),
+            sha256d::Checksum::from(&body[..len]),
+            "checksums differ for a {len} byte body",
+        );
+    }
+
+    // The test vector from zakura-chain's sha256d checksum tests.
+    assert_eq!(
+        message_checksum(b"hello"),
+        sha256d::Checksum([0x95, 0x95, 0xc9, 0xdf]),
+    );
+}
+
+/// Encodes `block` as a `block` message, as a connection does after its handshake.
+fn encode_block(codec: &mut Codec, block: &std::sync::Arc<Block>) -> BytesMut {
+    let mut frame = BytesMut::new();
+    codec.reconfigure_full_body_len();
+    codec
+        .encode(Message::Block(block.clone().into()), &mut frame)
+        .expect("test block should encode");
+    frame
+}
+
+/// A block close to the maximum size, which is large enough to share its checksum.
+fn large_block() -> std::sync::Arc<Block> {
+    let block = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_TESTNET_141042_BYTES[..])
+        .expect("block test vector should deserialize");
+    std::sync::Arc::new(block)
+}
+
+/// A block sent through connections that share checksums is byte-for-byte the block a
+/// connection on its own sends, on the first send and on the ones that reuse its checksum.
+#[test]
+fn block_sent_with_shared_checksums_is_unchanged() {
+    let _init_guard = zakura_test::init();
+    let block = large_block();
+
+    let alone = encode_block(&mut Codec::builder().finish(), &block);
+
+    let shared = BlockChecksums::default();
+    let mut first = Codec::builder()
+        .with_block_checksums(shared.clone())
+        .finish();
+    let mut second = Codec::builder().with_block_checksums(shared).finish();
+
+    assert_eq!(encode_block(&mut first, &block), alone);
+    assert_eq!(encode_block(&mut second, &block), alone);
+    assert_eq!(encode_block(&mut first, &block), alone);
+}
+
+/// A large block whose checksum is already known is sent with that checksum, not hashed again.
+#[test]
+fn large_block_is_sent_with_its_remembered_checksum() {
+    let _init_guard = zakura_test::init();
+    let block = large_block();
+    let body_len = encode_block(&mut Codec::builder().finish(), &block).len() - HEADER_LEN;
+
+    // A value the body does not hash to, so it can only come from the shared checksums.
+    let remembered = sha256d::Checksum([0xAB; 4]);
+    let shared = BlockChecksums::default();
+    shared.insert(block.hash(), body_len, remembered);
+
+    let mut codec = Codec::builder().with_block_checksums(shared).finish();
+    let frame = encode_block(&mut codec, &block);
+
+    assert_eq!(frame[20..HEADER_LEN], remembered.0);
+}
+
+/// A checksum remembered for a body of another length is not used. The body is hashed, and
+/// later sends reuse that checksum.
+#[test]
+fn checksum_remembered_for_another_body_length_is_replaced() {
+    let _init_guard = zakura_test::init();
+    let block = large_block();
+    let alone = encode_block(&mut Codec::builder().finish(), &block);
+    let body_len = alone.len() - HEADER_LEN;
+
+    let shared = BlockChecksums::default();
+    shared.insert(block.hash(), body_len + 1, sha256d::Checksum([0xAB; 4]));
+
+    let mut codec = Codec::builder()
+        .with_block_checksums(shared.clone())
+        .finish();
+
+    assert_eq!(encode_block(&mut codec, &block), alone);
+    assert_eq!(
+        shared.get(block.hash(), body_len),
+        Some(sha256d::Checksum::from(&alone[HEADER_LEN..])),
+    );
+}
+
+/// A small block is always hashed, even when a checksum is remembered for it.
+#[test]
+fn small_block_checksum_is_always_hashed() {
+    let _init_guard = zakura_test::init();
+    let block = std::sync::Arc::new(
+        Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
+            .expect("block test vector should deserialize"),
+    );
+    let alone = encode_block(&mut Codec::builder().finish(), &block);
+    let body_len = alone.len() - HEADER_LEN;
+    assert!(body_len < MIN_SHARED_CHECKSUM_BODY_LEN);
+
+    let shared = BlockChecksums::default();
+    shared.insert(block.hash(), body_len, sha256d::Checksum([0xAB; 4]));
+
+    let mut codec = Codec::builder().with_block_checksums(shared).finish();
+
+    assert_eq!(encode_block(&mut codec, &block), alone);
+}
+
+/// When there is no room left, the block forgotten is the one sent least recently. A block
+/// that was sent again in the meantime is kept.
+#[test]
+fn block_checksums_forget_the_block_sent_least_recently() {
+    let _init_guard = zakura_test::init();
+    let hash = |index: usize| {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&index.to_le_bytes());
+        block::Hash(bytes)
+    };
+    let checksum = sha256d::Checksum([1; 4]);
+
+    let checksums = BlockChecksums::default();
+    for index in 0..SHARED_CHECKSUM_BLOCKS {
+        checksums.insert(hash(index), 100_000, checksum);
+    }
+
+    // Sending the oldest block again makes the second-oldest the next to be forgotten.
+    assert_eq!(checksums.get(hash(0), 100_000), Some(checksum));
+    checksums.insert(hash(SHARED_CHECKSUM_BLOCKS), 100_000, checksum);
+
+    assert_eq!(checksums.get(hash(0), 100_000), Some(checksum));
+    assert_eq!(checksums.get(hash(1), 100_000), None);
+    assert_eq!(
+        checksums.get(hash(SHARED_CHECKSUM_BLOCKS), 100_000),
+        Some(checksum)
+    );
+}

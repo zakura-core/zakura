@@ -99,16 +99,6 @@ where
     tip(chain, db).map(|(height, _hash)| height)
 }
 
-/// Returns the tip [`block::Hash`] of `chain`.
-/// If there is no chain, returns the tip of `db`.
-#[allow(dead_code)]
-pub fn tip_hash<C>(chain: Option<C>, db: &ZakuraDb) -> Option<block::Hash>
-where
-    C: AsRef<Chain>,
-{
-    tip(chain, db).map(|(_height, hash)| hash)
-}
-
 /// Returns the tip of `chain` with its [`ValueBalance`].
 /// If there is no chain, returns the tip of `db`.
 pub fn tip_with_value_balance<C>(

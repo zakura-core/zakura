@@ -115,7 +115,7 @@ zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "17.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.2.3" }
 zakura-script = { path = "../zakura-script", version = "5.0.7" }
-zakura-state = { path = "../zakura-state", version = "16.1.1" }
+zakura-state = { path = "../zakura-state", version = "17.0.0" }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 
@@ -146,7 +146,7 @@ zakura-consensus = { path = "../zakura-consensus", version = "17.0.2", features 
 zakura-network = { path = "../zakura-network", version = "17.0.0", features = [
     "proptest-impl",
 ] }
-zakura-state = { path = "../zakura-state", version = "16.1.1", features = [
+zakura-state = { path = "../zakura-state", version = "17.0.0", features = [
     "proptest-impl",
 ] }
 

@@ -22,11 +22,26 @@
 //! - **Claim, reserve, then ask.** A session with a free slot claims an
 //!   eligible id in its pending set, reserves a slot at the pool, and only
 //!   then sends `GetTxs`. One claim per id. The id ready longest goes
-//!   first: ready since its first announcement, or since its retry delay
-//!   ended. So neither fresh ids nor retries starve the other. A routine
-//!   keeps this order in a queue keyed by that time. While it reconciles
-//!   after missing table events, it may claim the best id it knows of,
-//!   which the comparison with the model allows.
+//!   first, over every session: ready since its first announcement, or
+//!   since its retry delay ended. So neither fresh ids nor retries starve
+//!   the other, and an older session cannot keep taking the room a verdict
+//!   frees. A routine keeps its own order in a queue keyed by that time.
+//!   Across sessions the table orders who goes next: a waiting session
+//!   registers its oldest ready time with the table, which hands the next
+//!   probe permit or freed room to the earliest. While a routine
+//!   reconciles after missing table events, it may claim the best id it
+//!   knows of, which the comparison with the model allows.
+//! - **A session is one connection's `tx-relay` streams.** A connection
+//!   carries at most one, so closing a session's connection ends that
+//!   session only, and a replacement session is always on another
+//!   connection.
+//! - **A stopped core ends claiming until a pool is attached again.** Its
+//!   last snapshot may still show an active pool, so a routine learns of it
+//!   from a `Stopped` answer, releases that claim and any probe permit, and
+//!   claims nothing more until the reactor attaches a pool. A stopped
+//!   answer to a call made to an earlier pool changes nothing. An
+//!   `Inactive` answer while the snapshot shows an active pool waits a retry
+//!   delay, so a missed restart costs one delay.
 //! - **One attempt at a time.** A claim lasts from the reserve call until
 //!   the body's verdict, even if the session ends meanwhile, so no other
 //!   fetch of the same entry starts while the pool decides it. A verdict
@@ -313,6 +328,9 @@ struct Call {
     /// The chain generation of the snapshot the caller held when it made
     /// the call.
     generation: Generation,
+    /// Which attached pool the caller made it to. See
+    /// `RelayModel::attachment`.
+    attachment: u64,
 }
 
 /// The pool's answer to a reserve call, on its way back.
@@ -375,6 +393,20 @@ pub(crate) struct RelayModel {
     /// verification. Only the invariants read it: such an attempt no longer
     /// has a claim to hold.
     settled: HashSet<(UnminedTxId, EntryGen)>,
+    /// The core behind the port stopped: every call is refused as stopped
+    /// until a pool is attached again. The pool's own truth, which
+    /// `tx-relay` learns only from answers.
+    core_stopped: bool,
+    /// `tx-relay` was told the core stopped, so it claims nothing until a
+    /// pool is attached again.
+    stopped: bool,
+    /// Counts the pools `tx-relay` saw attached or turned on. A stopped
+    /// answer from a call to an earlier one changes nothing.
+    attachment: u64,
+    /// Every rejection `tx-relay` received, for the random run's oracle: the
+    /// id, whether its scope is one the pool caches, the chain generation it
+    /// was made on, and the one `tx-relay` held when it arrived.
+    arrivals: Vec<(UnminedTxId, bool, Generation, Generation)>,
     /// Whether a body that passed the check reaches the pool at once. Off,
     /// it waits for [`Self::deliver_submit`].
     auto_submits: bool,
@@ -443,6 +475,10 @@ impl RelayModel {
             waiters: HashMap::new(),
             submitted_at: HashMap::new(),
             settled: HashSet::new(),
+            core_stopped: false,
+            stopped: false,
+            attachment: 0,
+            arrivals: Vec::new(),
             auto_submits: true,
             submits: VecDeque::new(),
             tx_size: |_| DEFAULT_TX_BYTES,
@@ -878,13 +914,37 @@ impl RelayModel {
         self.settle();
     }
 
-    /// The pool is on again, at the latest tip.
+    /// The core behind the port stops. Its last snapshot still shows an
+    /// active pool, so `tx-relay` learns of it only from the answers to its
+    /// calls, which say the core stopped. [`Self::activate`] attaches a pool
+    /// again.
+    pub(crate) fn stop(&mut self, now: Time) {
+        self.enter(now);
+        self.core_stopped = true;
+        // The core's end answers every verdict and cancels every fetch, as
+        // a turned-off pool does.
+        let step = self.pool.deactivate(self.now);
+        self.inbox.push_back(step);
+        self.settle();
+    }
+
+    /// Every rejection received since the last call, as
+    /// `(id, cached scope, made on, held on arrival)`.
+    pub(crate) fn take_arrivals(&mut self) -> Vec<(UnminedTxId, bool, Generation, Generation)> {
+        std::mem::take(&mut self.arrivals)
+    }
+
+    /// The pool is on again, at the latest tip, or a pool is attached again
+    /// after the core stopped.
     pub(crate) fn activate(&mut self, now: Time) {
         self.enter(now);
         self.pool.activate(self.tip, self.generation, self.now);
         let step = self.pool.effects();
         self.inbox.push_back(step);
         self.pool_live = true;
+        self.core_stopped = false;
+        self.stopped = false;
+        self.attachment = self.attachment.wrapping_add(1);
         let opened: Vec<SessionId> = self
             .sessions
             .iter()
@@ -1364,6 +1424,12 @@ impl RelayModel {
                 // docs for why a restart or a cleared cache is not checked.
                 let remembered = !matches!(scope, RejectionScope::Uncached)
                     && self.generation == submitted.chain;
+                self.arrivals.push((
+                    id,
+                    !matches!(scope, RejectionScope::Uncached),
+                    submitted.chain,
+                    self.generation,
+                ));
                 if remembered {
                     self.decided(id, generation);
                 } else {
@@ -1721,52 +1787,74 @@ impl RelayModel {
     /// Every session with a free slot claims and starts a reserve call,
     /// oldest session first. During a backoff only the probe's holder may.
     fn fill(&mut self) {
-        if !self.pool_live {
+        if !self.pool_live || self.stopped {
             return;
         }
-        let sessions: Vec<SessionId> = self.sessions.keys().copied().collect();
-        'sessions: for session in sessions {
-            loop {
+        // Each free slot goes to the id ready longest over every session, so
+        // an older session cannot keep taking the room a verdict frees.
+        loop {
+            // An answer in this loop can say the core stopped.
+            if self.stopped {
+                return;
+            }
+            let mut best: Option<(Time, SessionId, Pending, Option<u64>)> = None;
+            for session in self.sessions.keys().copied() {
                 let probe = match self.wanted.admission(session, self.now) {
-                    Admission::Closed => return,
+                    Admission::Closed => continue,
                     Admission::Open => None,
                     Admission::Probe(generation) => Some(generation),
                 };
                 let Some(pending) = self.next_claim(session) else {
-                    continue 'sessions;
+                    continue;
                 };
-                self.wanted.claim(pending.id, pending.generation, session);
-                if let Some(generation) = probe {
-                    self.wanted.take_probe(session, generation);
-                }
-                self.next_call = self.next_call.saturating_add(1);
-                let call = self.next_call;
-                self.sessions
-                    .get_mut(&session)
-                    .expect("listed above")
-                    .reserving
-                    .insert(
-                        pending.id,
-                        Reserving {
-                            pending,
-                            probe,
-                            call,
-                        },
-                    );
-                let call = Call {
-                    session,
-                    id: pending.id,
-                    call,
-                    generation: self.generation,
-                };
-                if self.auto_reserves {
-                    self.process(call);
-                    self.drain();
-                } else {
-                    self.calls.push_back(call);
+                let ready = self.ready_at(pending);
+                if best.is_none_or(|(oldest, ..)| ready < oldest) {
+                    best = Some((ready, session, pending, probe));
                 }
             }
+            let Some((_, session, pending, probe)) = best else {
+                return;
+            };
+            self.wanted.claim(pending.id, pending.generation, session);
+            if let Some(generation) = probe {
+                self.wanted.take_probe(session, generation);
+            }
+            self.next_call = self.next_call.saturating_add(1);
+            let call = self.next_call;
+            self.sessions
+                .get_mut(&session)
+                .expect("listed above")
+                .reserving
+                .insert(
+                    pending.id,
+                    Reserving {
+                        pending,
+                        probe,
+                        call,
+                    },
+                );
+            let call = Call {
+                session,
+                id: pending.id,
+                call,
+                generation: self.generation,
+                attachment: self.attachment,
+            };
+            if self.auto_reserves {
+                self.process(call);
+                self.drain();
+            } else {
+                self.calls.push_back(call);
+            }
         }
+    }
+
+    /// When `pending` became ready to claim: at its first announcement, or
+    /// when its retry delay ended.
+    fn ready_at(&self, pending: Pending) -> Time {
+        self.wanted
+            .current(pending.id, pending.generation)
+            .map_or(Time::MAX, |entry| entry.first_seen.max(entry.retry_at))
     }
 
     /// The pool processes one reserve call. With automatic reserves its
@@ -1890,6 +1978,12 @@ impl RelayModel {
             Err(ModelUnreserved::Rejected(scope)) => {
                 // The same rule as a verdict's rejection.
                 let remembered = chain_unchanged && !matches!(scope, RejectionScope::Uncached);
+                self.arrivals.push((
+                    id,
+                    !matches!(scope, RejectionScope::Uncached),
+                    call.generation,
+                    self.generation,
+                ));
                 self.wanted
                     .release(id, pending.generation, session, self.now, !remembered);
                 if remembered {
@@ -1897,9 +1991,24 @@ impl RelayModel {
                 }
                 self.return_probe(probe);
             }
-            Err(ModelUnreserved::Inactive) => {
+            Err(ModelUnreserved::Inactive) if self.core_stopped => {
+                // The model's pool answers a stopped core as inactive; the
+                // real port says `Stopped`. `tx-relay` claims nothing more
+                // until a pool is attached again, unless the call was to an
+                // earlier one.
+                if call.attachment == self.attachment {
+                    self.stopped = true;
+                }
                 self.wanted
                     .release(id, pending.generation, session, self.now, false);
+                self.return_probe(probe);
+            }
+            Err(ModelUnreserved::Inactive) => {
+                // The pool turned off, perhaps before a snapshot said so. The
+                // id waits a retry delay, so a missed turn-off and on again
+                // costs one delay, not a busy loop.
+                self.wanted
+                    .release(id, pending.generation, session, self.now, true);
                 self.return_probe(probe);
             }
         }
@@ -1953,11 +2062,7 @@ impl RelayModel {
             }
             true
         });
-        eligible.min_by_key(|pending| {
-            self.wanted
-                .current(pending.id, pending.generation)
-                .map(|entry| entry.first_seen.max(entry.retry_at))
-        })
+        eligible.min_by_key(|pending| self.ready_at(*pending))
     }
 
     /// Checks the rules every reachable state keeps.

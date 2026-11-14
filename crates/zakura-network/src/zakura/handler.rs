@@ -5281,11 +5281,23 @@ async fn spawn_zakura_endpoint_inner(
         endpoint.push_header_sync_task(task).await;
     }
 
+    // Restore the peers the previous run knew before the dialer starts, so a
+    // restart reconnects to them instead of only to the bootstrap peers.
+    let book_file =
+        discovery::DiscoveryBookFile::new(config.zakura_discovery_book_file(&local_node_id));
+    discovery::load_saved_discovery_book(&discovery, &book_file).await;
     super::discovery::insert_static_bootstrap_candidates(
         &discovery,
         &config.zakura.bootstrap_peers,
     )
     .await;
+    endpoint
+        .push_header_sync_task(discovery::spawn_discovery_book_saver(
+            discovery.clone(),
+            book_file,
+            endpoint.background_shutdown_token(),
+        ))
+        .await;
     // Track the maintained bootstrap redial tasks and the discovery candidate
     // dialer under the endpoint shutdown owner so `ZakuraEndpoint::shutdown`
     // drains them. Previously their handles were dropped, leaving detached loops

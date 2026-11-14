@@ -4060,4 +4060,73 @@ mod tests {
         assert_eq!(handle.record_for(relayed.public()).await, None);
         Ok(())
     }
+
+    /// A node's discovery book survives a restart: the saver writes it when the
+    /// endpoint shuts down, and the next start imports it before dialing.
+    #[tokio::test]
+    async fn discovery_book_saved_at_shutdown_reloads_on_the_next_start(
+    ) -> Result<(), crate::BoxError> {
+        use crate::zakura::discovery::{
+            load_saved_discovery_book, spawn_discovery_book_saver, DiscoveryBookFile,
+            ZakuraDiscoveryPersistedEntry,
+        };
+
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let local_secret = NodeSecretKey::generate();
+        let new_handle = || {
+            let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+            ZakuraDiscoveryHandle::new(
+                ZakuraDiscoveryLocalConfig {
+                    secret_key: local_secret.clone(),
+                    direct_addrs: Vec::new(),
+                    services: vec![ZakuraServiceId::discovery()],
+                    zakura_protocol_min: handshake.zakura_protocol_min,
+                    zakura_protocol_max: handshake.zakura_protocol_max,
+                    network_id: handshake.network_id,
+                    chain_id: handshake.chain_id,
+                    last_authored_sequence: None,
+                },
+                ZakuraDiscoveryConfig::default(),
+                connected_rx,
+            )
+        };
+
+        let peer_record = signed_discovery_record(&NodeSecretKey::generate(), &handshake)?;
+        let peer_node_id = peer_record.body.node_id;
+        let now = current_test_unix_secs();
+        let first_run = new_handle()?;
+        let outcome = first_run
+            .import_persisted_entries([ZakuraDiscoveryPersistedEntry {
+                record: peer_record.clone(),
+                source: None,
+                is_static: false,
+                last_seen: now,
+                last_dial_attempt: Some(now),
+                last_success: Some(now),
+                confirmed_addrs: peer_record.body.direct_addrs.clone(),
+                dialed_addrs: peer_record.body.direct_addrs.clone(),
+                failure_count: 0,
+            }])
+            .await;
+        assert_eq!(outcome.added, 1, "the first run knows the peer");
+
+        let dir = tempfile::tempdir()?;
+        let file = DiscoveryBookFile::new(dir.path().join("book"));
+        let shutdown = CancellationToken::new();
+        let saver = spawn_discovery_book_saver(first_run, file.clone(), shutdown.clone());
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), saver)
+            .await
+            .expect("the saver finishes promptly after shutdown")?;
+
+        let second_run = new_handle()?;
+        assert_eq!(second_run.record_for(peer_node_id).await, None);
+        load_saved_discovery_book(&second_run, &file).await;
+        assert_eq!(
+            second_run.record_for(peer_node_id).await,
+            Some(peer_record),
+            "the restarted node knows the peer before it dials"
+        );
+        Ok(())
+    }
 }

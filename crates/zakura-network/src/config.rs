@@ -61,7 +61,8 @@ pub use tcp_warmup::TcpWarmupConfig;
 pub use unconditional_peers::UnconditionalPeers;
 
 pub(crate) use cache_dir::{
-    default_network_identity_dir, zakura_discovery_sequence_file_path,
+    default_network_identity_dir, zakura_discovery_book_file_path,
+    zakura_discovery_sequence_file_path,
     zakura_node_secret_key_file_path as zakura_secret_key_file_path,
 };
 
@@ -1000,6 +1001,12 @@ impl Config {
     /// `node_id` authored, under [`identity_dir`](Self::identity_dir).
     pub(crate) fn zakura_discovery_sequence_file(&self, node_id: &zakura_quic::NodeId) -> PathBuf {
         zakura_discovery_sequence_file_path(&self.identity_dir, &self.network, node_id)
+    }
+
+    /// The file that holds the discovery book `node_id` saved, under
+    /// [`identity_dir`](Self::identity_dir).
+    pub(crate) fn zakura_discovery_book_file(&self, node_id: &zakura_quic::NodeId) -> PathBuf {
+        zakura_discovery_book_file_path(&self.identity_dir, &self.network, node_id)
     }
 
     /// Returns `true` if Zakura should run the legacy TCP Zcash P2P listener, initial peer

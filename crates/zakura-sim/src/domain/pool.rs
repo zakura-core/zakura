@@ -107,6 +107,13 @@ pub struct PoolEvidence {
     pub refused: BTreeSet<usize>,
     /// The transactions a reader of the log read a refusal for.
     pub read_refusals: BTreeSet<usize>,
+    /// The transactions a reader of the log read an addition for.
+    pub read_additions: BTreeSet<usize>,
+    /// The transactions whose fetch a submitter reported as failed, under a
+    /// reservation that opened a new admission. Each one's outcome, a
+    /// refusal or an addition if another caller's body decided it first,
+    /// must reach a reader.
+    pub failed_fetches: BTreeSet<usize>,
     /// The first snapshot the log did not lead to.
     pub log_mismatch: Option<String>,
     /// Reorgs that happened while the pool held visible transactions.
@@ -400,6 +407,19 @@ pub fn end_violations(evidence: &SharedEvidence) -> Vec<EndViolation> {
             expected: "every refusal answered to a submitter reaches a reader of the log"
                 .to_owned(),
             actual: format!("no reader read a refusal for transactions {unread:?}"),
+        });
+    }
+    let untold: Vec<usize> = evidence
+        .failed_fetches
+        .iter()
+        .copied()
+        .filter(|tx| !evidence.read_refusals.contains(tx) && !evidence.read_additions.contains(tx))
+        .collect();
+    if !untold.is_empty() {
+        violations.push(EndViolation {
+            property: PropertyId::new(LOG_COMPLETE),
+            expected: "every failed fetch's outcome reaches a reader of the log".to_owned(),
+            actual: format!("no reader read an outcome for the failed fetches of {untold:?}"),
         });
     }
     if evidence.reorgs_with_pool > 0 {

@@ -556,8 +556,14 @@ async fn submit_all(
                 }
             }
             Op::FetchFails(tx) => {
+                // A granted fetch reservation opened a new admission, whose
+                // failure the change log must carry.
                 if let Some(reservation) = at.reserve(tx, Intent::Fetch).await {
-                    lock(&evidence).held.remove(&tx);
+                    {
+                        let mut evidence = lock(&evidence);
+                        evidence.held.remove(&tx);
+                        evidence.failed_fetches.insert(tx);
+                    }
                     handle.fetch_failed(reservation).await;
                 }
             }
@@ -1004,12 +1010,14 @@ async fn observe(mut handle: PoolHandle, universe: Arc<Universe>, evidence: Shar
         };
         let snapshot = view.snapshot;
         let mut problem = None;
-        let mut refused = Vec::new();
+        let (mut refused, mut added) = (Vec::new(), Vec::new());
         match view.changes {
             ChangesSince::Entries(entries) => {
                 for entry in entries {
-                    if let Change::Refused(id) = entry.change {
-                        refused.extend(universe.index(id));
+                    match entry.change {
+                        Change::Refused(id) => refused.extend(universe.index(id)),
+                        Change::Added(id) => added.extend(universe.index(id)),
+                        _ => {}
                     }
                     if entry.seq.0 != cursor.0 + 1 && problem.is_none() {
                         problem = Some(format!(
@@ -1046,6 +1054,7 @@ async fn observe(mut handle: PoolHandle, universe: Arc<Universe>, evidence: Shar
         let mut evidence = lock(&evidence);
         evidence.logs_checked += 1;
         evidence.read_refusals.extend(refused);
+        evidence.read_additions.extend(added);
         if evidence.log_mismatch.is_none() {
             evidence.log_mismatch = problem;
         }

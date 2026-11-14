@@ -7,7 +7,6 @@ use std::{
 };
 
 use indexmap::IndexMap;
-
 use zakura_chain::transaction::UnminedTxId;
 use zakura_node_services::mempool::port::{model::WaiterId, ReservationId};
 
@@ -36,6 +35,15 @@ pub(crate) struct Pending {
     pub(crate) size: u32,
 }
 
+/// A reserve call this session made and the pool has not answered.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Reserving {
+    /// The id's pending entry.
+    pub(crate) pending: Pending,
+    /// The backoff whose probe this call is, if it is one.
+    pub(crate) probe: Option<u64>,
+}
+
 /// A `GetTxs` this session sent with no answer yet.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Request {
@@ -43,13 +51,11 @@ pub(crate) struct Request {
     pub(crate) generation: EntryGen,
     /// The size the answer must have.
     pub(crate) size: u32,
-    /// When it was sent.
-    pub(crate) sent: Time,
     /// When another announcer may try. It only moves later.
     pub(crate) deadline: Time,
     /// The pool's reservation, while the node waits for this answer. `None`
     /// once the deadline passed or the pool cancelled the fetch: the request
-    /// stays outstanding, and its answer is dropped.
+    /// stays outstanding, and its answer is dropped unread.
     pub(crate) reservation: Option<ReservationId>,
     /// How many earlier requests from this session for this id timed out.
     /// Each doubles the deadline.
@@ -65,17 +71,23 @@ pub(crate) struct PeerModel {
     pub(crate) dialed: bool,
     /// The peer's `Hello`, once it arrived.
     pub(crate) hello: Option<Hello>,
-    /// Ids it announced and has not been asked about, oldest first.
+    /// Ids it announced and has not answered `NotFound` for, oldest first.
+    /// A requested id stays here, so its peer can be asked again after a
+    /// late answer.
     pub(crate) pending: Vec<Pending>,
     /// Ids it answered `NotFound` for, oldest first, by entry generation.
     pub(crate) tried: VecDeque<(UnminedTxId, EntryGen)>,
-    /// How often its request for an id timed out, by entry generation.
+    /// How often its request for a pending id timed out. Only pending ids
+    /// have an entry, so this is bounded by the pending set.
     pub(crate) timed_out: HashMap<(UnminedTxId, EntryGen), u32>,
+    /// Reserve calls the pool has not answered.
+    pub(crate) reserving: IndexMap<UnminedTxId, Reserving>,
     /// Its outstanding requests, oldest first.
     pub(crate) requests: IndexMap<UnminedTxId, Request>,
     /// Bodies it supplied that wait for a verdict.
     pub(crate) submissions: BTreeMap<WaiterId, (UnminedTxId, EntryGen)>,
-    /// Ids this node announced to it, still in the pool. Full ids.
+    /// Ids this node announced to it and has not seen leave the pool. Full
+    /// ids.
     pub(crate) announced: HashSet<UnminedTxId>,
     /// Ids it announced to us or supplied, oldest first, to skip adverts.
     /// The real set keeps keyed short ids. This one keeps full ids, which a
@@ -83,9 +95,12 @@ pub(crate) struct PeerModel {
     pub(crate) known: VecDeque<UnminedTxId>,
     /// Adverts held for the advert delay, with when they are due.
     pub(crate) held: Vec<(UnminedTxId, Time)>,
-    /// Ids announced before this session had the go, with their sizes.
-    /// They enter the table when it gets the go.
-    pub(crate) waiting: Vec<(UnminedTxId, u32)>,
+    /// Ids announced before this session had the go, with their sizes,
+    /// distinct and within the pending bound. They enter the table when it
+    /// gets the go.
+    pub(crate) waiting: IndexMap<UnminedTxId, u32>,
+    /// The last change-log position this session read.
+    pub(crate) cursor: u64,
     /// Ids dropped because the pending set was full.
     pub(crate) overflow: u64,
 }
@@ -100,12 +115,14 @@ impl PeerModel {
             pending: Vec::new(),
             tried: VecDeque::new(),
             timed_out: HashMap::new(),
+            reserving: IndexMap::new(),
             requests: IndexMap::new(),
             submissions: BTreeMap::new(),
             announced: HashSet::new(),
             known: VecDeque::new(),
             held: Vec::new(),
-            waiting: Vec::new(),
+            waiting: IndexMap::new(),
+            cursor: 0,
             overflow: 0,
         }
     }
@@ -127,10 +144,21 @@ impl PeerModel {
         PENDING_PER_PEER.saturating_sub(self.pending.len())
     }
 
-    /// Takes `id` out of the pending set, returning what it held.
+    /// Takes `id` out of the pending set, returning what it held. Its timeout
+    /// history goes with it.
     pub(crate) fn take_pending(&mut self, id: UnminedTxId) -> Option<Pending> {
         let index = self.pending.iter().position(|pending| pending.id == id)?;
-        Some(self.pending.remove(index))
+        let pending = self.pending.remove(index);
+        self.timed_out.remove(&(pending.id, pending.generation));
+        Some(pending)
+    }
+
+    /// Drops every pending reference to `id` in `generation`, because it was
+    /// decided.
+    pub(crate) fn drop_decided(&mut self, id: UnminedTxId, generation: EntryGen) {
+        self.pending
+            .retain(|pending| !(pending.id == id && pending.generation == generation));
+        self.timed_out.remove(&(id, generation));
     }
 
     /// Records that it answered `NotFound` for `id`. The tried set forgets
@@ -170,14 +198,18 @@ impl PeerModel {
         self.held.retain(|(held, _)| *held != id);
     }
 
-    /// Ids requested or awaiting a verdict on this session.
+    /// Ids reserving, requested or awaiting a verdict on this session.
     pub(crate) fn in_flight(&self) -> usize {
-        self.requests.len().saturating_add(self.submissions.len())
+        self.reserving
+            .len()
+            .saturating_add(self.requests.len())
+            .saturating_add(self.submissions.len())
     }
 
-    /// Sends a request for `pending` at `now` and moves every outstanding
-    /// deadline out to cover the bytes now outstanding. Deadlines never move
-    /// earlier.
+    /// Sends a request for `pending` at `now`. Every outstanding request's
+    /// deadline moves out to at least `now` plus the time to move the sender
+    /// allowance and every body now outstanding, so the new work never eats
+    /// into an older request's time. Deadlines never move earlier.
     pub(crate) fn send(&mut self, pending: Pending, reservation: ReservationId, now: Time) {
         let repeats = self
             .timed_out
@@ -189,7 +221,6 @@ impl PeerModel {
             Request {
                 generation: pending.generation,
                 size: pending.size,
-                sent: now,
                 deadline: now,
                 reservation: Some(reservation),
                 repeats,
@@ -206,7 +237,7 @@ impl PeerModel {
             let span = BASE_DEADLINE
                 .saturating_add(transfer)
                 .saturating_mul(1 << request.repeats.min(8));
-            request.deadline = request.deadline.max(request.sent.saturating_add(span));
+            request.deadline = request.deadline.max(now.saturating_add(span));
         }
     }
 }

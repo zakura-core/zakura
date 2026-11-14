@@ -3,7 +3,8 @@
 //! An entry is shared state about one id. It holds no peer facts: not who
 //! announced the id, not who tried it, not any peer's announced size. Those
 //! live in each peer routine. The entry has only its claim, how many pending
-//! sets hold it, and its timing.
+//! sets hold it, and its timing. The table also holds the pool's `NoRoom`
+//! backoff and its one probe permit, which are shared too.
 
 use std::{collections::HashMap, time::Duration};
 
@@ -17,7 +18,7 @@ pub(crate) struct Entry {
     /// Which life of the id this is. An id that leaves and comes back gets a
     /// new generation, so a stale reference never changes a newer entry.
     pub(crate) generation: EntryGen,
-    /// The session fetching it, from its reservation to its verdict.
+    /// The session fetching it, from its reserve call to its verdict.
     pub(crate) claim: Option<SessionId>,
     /// How many pending sets hold it. A number, not a list.
     pub(crate) holders: usize,
@@ -33,11 +34,28 @@ pub(crate) struct Entry {
     pub(crate) released_at: Option<Time>,
 }
 
-/// The pool answered `NoRoom`, so nobody claims until `until`.
+/// The pool answered `NoRoom`, so nobody claims until `until`. After that
+/// one session at a time holds the probe permit and may reserve.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct Backoff {
     until: Time,
     delay: Duration,
+    /// Names this backoff, so a stale probe answer changes nothing.
+    generation: u64,
+    /// The session whose reserve call is the probe.
+    probe: Option<SessionId>,
+}
+
+/// What the probe permit allows a session now.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Admission {
+    /// No backoff: reserve freely.
+    Open,
+    /// The backoff ended and nobody probes: this session may take the
+    /// permit, for the backoff with this generation.
+    Probe(u64),
+    /// Claim nothing now.
+    Closed,
 }
 
 /// The table.
@@ -46,6 +64,7 @@ pub(crate) struct WantedModel {
     entries: HashMap<UnminedTxId, Entry>,
     next_generation: u64,
     backoff: Option<Backoff>,
+    next_backoff: u64,
 }
 
 impl WantedModel {
@@ -91,8 +110,8 @@ impl WantedModel {
         entry.generation
     }
 
-    /// A pending set gives `id` up: it left, tried it, or its session ended.
-    /// An entry nobody holds or claims leaves the table.
+    /// A pending set gives `id` up: it tried it, or its session ended. An
+    /// entry nobody holds or claims leaves the table.
     pub(crate) fn unhold(&mut self, id: UnminedTxId, generation: EntryGen) {
         let Some(entry) = self
             .entries
@@ -123,8 +142,9 @@ impl WantedModel {
         entry.claim = Some(session);
     }
 
-    /// The claim ends without a decision. With `retry`, nobody claims it for
-    /// a delay that doubles each time, because the pool could not take it.
+    /// `session`'s claim on `id` ends without a decision. With `retry`,
+    /// nobody claims it for a delay that doubles each time. A claim of
+    /// another generation or session is left alone.
     pub(crate) fn release(
         &mut self,
         id: UnminedTxId,
@@ -152,8 +172,9 @@ impl WantedModel {
         self.collect(id);
     }
 
-    /// The id is decided: in the pool, rejected, or mined. Its entry leaves,
-    /// whoever holds it. Returns whether `generation` was the current one.
+    /// `id` is decided in `generation`: in the pool, rejected, or mined. Its
+    /// entry leaves, whoever holds it. Returns whether that generation was
+    /// the current one.
     pub(crate) fn decide(&mut self, id: UnminedTxId, generation: EntryGen) -> bool {
         if self
             .entries
@@ -167,32 +188,88 @@ impl WantedModel {
         }
     }
 
-    /// Whether the table holds every claim off for a `NoRoom` backoff.
-    pub(crate) fn in_backoff(&self, now: Time) -> bool {
-        self.backoff.is_some_and(|backoff| now < backoff.until)
+    /// What `session` may do about reserving now.
+    pub(crate) fn admission(&self, session: SessionId, now: Time) -> Admission {
+        match self.backoff {
+            None => Admission::Open,
+            Some(backoff) if now < backoff.until => Admission::Closed,
+            Some(backoff) => match backoff.probe {
+                None => Admission::Probe(backoff.generation),
+                Some(holder) if holder == session => Admission::Closed,
+                Some(_) => Admission::Closed,
+            },
+        }
     }
 
-    /// When the backoff ends, if one is set.
-    pub(crate) fn backoff_until(&self) -> Option<Time> {
-        self.backoff.map(|backoff| backoff.until)
+    /// `session` takes the probe permit of the backoff named `generation`.
+    pub(crate) fn take_probe(&mut self, session: SessionId, generation: u64) {
+        let backoff = self
+            .backoff
+            .as_mut()
+            .filter(|backoff| backoff.generation == generation && backoff.probe.is_none())
+            .expect("the permit is taken only when it is free");
+        backoff.probe = Some(session);
     }
 
-    /// The pool answered `NoRoom`. Start the backoff, or double it if this
-    /// was the probe after one.
-    pub(crate) fn no_room(&mut self, now: Time) {
-        let delay = self.backoff.map_or(NO_ROOM_FIRST, |backoff| {
-            backoff.delay.saturating_mul(2).min(NO_ROOM_MAX)
-        });
-        self.backoff = Some(Backoff {
-            until: now.saturating_add(delay),
-            delay,
-        });
+    /// The probe of the backoff named `generation` ended without an answer
+    /// about room, or its session ended. The permit is free again.
+    pub(crate) fn return_probe(&mut self, generation: u64) {
+        if let Some(backoff) = self
+            .backoff
+            .as_mut()
+            .filter(|backoff| backoff.generation == generation)
+        {
+            backoff.probe = None;
+        }
+    }
+
+    /// Who holds the probe permit, and for which backoff.
+    pub(crate) fn probe(&self) -> Option<(SessionId, u64)> {
+        self.backoff
+            .and_then(|backoff| backoff.probe.map(|probe| (probe, backoff.generation)))
+    }
+
+    /// When the backoff ends, if it has not.
+    pub(crate) fn backoff_until(&self, now: Time) -> Option<Time> {
+        self.backoff
+            .map(|backoff| backoff.until)
+            .filter(|until| *until > now)
+    }
+
+    /// Whether a backoff is set, ended or not.
+    pub(crate) fn in_backoff(&self) -> bool {
+        self.backoff.is_some()
+    }
+
+    /// The pool answered `NoRoom`. `probe` names the backoff whose probe got
+    /// it: that backoff doubles. A reserve that was already in flight when
+    /// the backoff began changes nothing, and one with no backoff set starts
+    /// one.
+    pub(crate) fn no_room(&mut self, now: Time, probe: Option<u64>) {
+        match (self.backoff, probe) {
+            (Some(backoff), Some(generation)) if backoff.generation == generation => {
+                let delay = backoff.delay.saturating_mul(2).min(NO_ROOM_MAX);
+                self.set_backoff(now, delay);
+            }
+            (Some(_), _) => {}
+            (None, _) => self.set_backoff(now, NO_ROOM_FIRST),
+        }
     }
 
     /// The pool has room again: a reservation was granted, or a verdict
     /// freed a slot.
     pub(crate) fn room(&mut self) {
         self.backoff = None;
+    }
+
+    fn set_backoff(&mut self, now: Time, delay: Duration) {
+        self.next_backoff = self.next_backoff.saturating_add(1);
+        self.backoff = Some(Backoff {
+            until: now.saturating_add(delay),
+            delay,
+            generation: self.next_backoff,
+            probe: None,
+        });
     }
 
     /// Drops `id`'s entry once nobody holds or claims it.

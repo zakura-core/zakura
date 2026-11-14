@@ -1,7 +1,10 @@
 //! The cases the M2 plan names, run on the model with the pool's model
 //! behind it, and a random run that must drain.
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use zakura_chain::{
     block::Height,
@@ -255,11 +258,11 @@ fn deadlines_cover_every_body_outstanding_to_the_peer() {
     relay.inv(a, &[(id(1), big)], secs(0));
     relay.inv(a, &[(id(2), big)], secs(1));
     let state = relay.session(a).unwrap();
-    // The first request's deadline grew when the second was sent, so it
-    // covers either order of answers.
+    // The first request's deadline grew when the second was sent, to cover
+    // both bodies from then, in either order.
     let total = 2 * u64::from(big) + SENDER_ALLOWANCE;
     let span = BASE_DEADLINE + Duration::from_millis(total * 1_000 / MIN_RATE);
-    assert_eq!(state.requests[&id(1)].deadline, span);
+    assert_eq!(state.requests[&id(1)].deadline, secs(1) + span);
     assert_eq!(state.requests[&id(2)].deadline, secs(1) + span);
 }
 
@@ -310,19 +313,25 @@ fn a_full_pool_costs_one_probe_per_backoff() {
     let a = open(&mut relay, 1, true, secs(0));
     relay.inv(a, &[(id(1), SIZE), (id(2), SIZE)], secs(0));
     assert!(asks(&relay.take_effects()).is_empty());
-    assert!(relay.wanted().in_backoff(secs(0)));
+    assert!(relay.wanted().in_backoff());
     // The probe after the backoff finds no room again, and the backoff
     // doubles.
     relay.tick(NO_ROOM_FIRST);
     assert!(asks(&relay.take_effects()).is_empty());
-    assert_eq!(relay.wanted().backoff_until(), Some(NO_ROOM_FIRST * 3));
+    assert_eq!(
+        relay.wanted().backoff_until(NO_ROOM_FIRST),
+        Some(NO_ROOM_FIRST * 3)
+    );
     // Room comes back, and the next probe gets it.
     relay.outside(secs(2), |pool, now| ((), pool.release(held[0], now)));
     relay.tick(NO_ROOM_FIRST * 3);
     assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
     // That took the last slot, so the next claim finds the pool full again.
-    assert!(relay.wanted().in_backoff(NO_ROOM_FIRST * 3));
-    assert_eq!(relay.wanted().backoff_until(), Some(NO_ROOM_FIRST * 4));
+    assert!(relay.wanted().in_backoff());
+    assert_eq!(
+        relay.wanted().backoff_until(NO_ROOM_FIRST * 3),
+        Some(NO_ROOM_FIRST * 4)
+    );
     relay.assert_invariants();
 }
 
@@ -395,7 +404,7 @@ fn a_cooldown_goes_to_the_supplier_and_a_second_one_closes_it() {
 #[test]
 fn a_cooldown_waits_for_the_node_to_be_current() {
     let mut relay = relay();
-    relay.set_may_cool(false);
+    relay.set_current(false);
     let a = open(&mut relay, 1, true, secs(0));
     relay.inv(a, &[(id(1), SIZE)], secs(0));
     relay.tx(a, id(1), tx(1), SIZE, secs(0));
@@ -804,20 +813,73 @@ fn a_hidden_transaction_is_announced_when_it_is_revealed() {
 }
 
 #[test]
-fn a_resync_rebuilds_the_announced_set_and_keeps_the_sources() {
-    let mut relay = relay();
+fn a_session_that_falls_off_the_log_rebuilds_from_the_snapshot() {
+    let mut relay =
+        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reads(3);
+    let supplier = open(&mut relay, 1, true, secs(0));
+    let ranked = open(&mut relay, 2, true, secs(0));
+    let outside = open(&mut relay, 3, true, secs(0));
+    relay.set_ranking(vec![ranked]);
+    fetch(&mut relay, supplier, 1, secs(0));
+    relay.read(ranked, secs(0));
+    relay.read(outside, secs(0));
+    assert_eq!(adverts(&relay.take_effects()), vec![(ranked, id(1))]);
+    // The outside session holds its advert for the delay.
+    assert_eq!(relay.session(outside).unwrap().held.len(), 1);
+
+    // Enough admissions to overrun a three-entry log.
+    for n in 2..=6 {
+        fetch(&mut relay, supplier, n, secs(1));
+    }
+    relay.take_effects();
+    relay.read(outside, secs(1));
+    // It announces the whole snapshot it was not told, at once, and its
+    // held advert goes with it, so nothing is sent twice.
+    let sent: HashSet<_> = adverts(&relay.take_effects())
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
+    assert_eq!(sent, (1..=6).map(id).collect());
+    assert!(relay.session(outside).unwrap().held.is_empty());
+    relay.assert_invariants();
+    relay.tick(ADVERT_DELAY + secs(1));
+    assert!(adverts(&relay.take_effects()).is_empty());
+
+    // A session already told the first one sends only the rest. The
+    // supplier is told none, because it supplied them all.
+    relay.read(ranked, secs(3));
+    let sent: HashSet<_> = adverts(&relay.take_effects())
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
+    assert_eq!(sent, (2..=6).map(id).collect());
+    relay.read(supplier, secs(3));
+    assert!(adverts(&relay.take_effects()).is_empty());
+    relay.assert_invariants();
+}
+
+#[test]
+fn an_addition_hidden_before_it_is_read_waits_for_its_reveal() {
+    let mut relay =
+        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reads(100);
     let supplier = open(&mut relay, 1, true, secs(0));
     let a = open(&mut relay, 2, true, secs(0));
-    relay.set_ranking(vec![a, supplier]);
+    relay.set_ranking(vec![a]);
     fetch(&mut relay, supplier, 1, secs(0));
-    fetch(&mut relay, supplier, 2, secs(0));
+    let reorg = ModelTransition {
+        disconnected: 1,
+        connected: vec![ModelBlock::default(), ModelBlock::default()],
+        tip: Height(101),
+        generation: Generation(1),
+        rules_change: false,
+    };
+    relay.transition(reorg, secs(1));
     relay.take_effects();
-    relay.resync(a, secs(1));
-    // A was told both already, so nothing is sent again.
+    relay.read(a, secs(1));
     assert!(adverts(&relay.take_effects()).is_empty());
-    // The supplier is told neither, because it supplied both.
-    relay.resync(supplier, secs(1));
-    assert!(adverts(&relay.take_effects()).is_empty());
+    finish_all(&mut relay, &Outcome::Pass, secs(2));
+    relay.read(a, secs(2));
+    assert_eq!(adverts(&relay.take_effects()), vec![(a, id(1))]);
     relay.assert_invariants();
 }
 
@@ -893,6 +955,320 @@ fn a_hello_lowers_how_many_requests_go_out() {
     assert_eq!(asks(&relay.take_effects()).len(), 2);
 }
 
+#[test]
+fn reserves_in_flight_and_the_one_probe() {
+    let mut relay =
+        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reserves();
+    fill_pool(&mut relay);
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(b, &[(id(2), SIZE)], secs(0));
+    // Both calls are in flight before either is answered.
+    assert_eq!(relay.calls_in_flight(), 2);
+    relay.assert_invariants();
+    assert!(relay.answer_reserve(secs(0)));
+    assert_eq!(relay.wanted().backoff_until(secs(0)), Some(NO_ROOM_FIRST));
+    // The second was already in flight, so it does not extend the backoff.
+    assert!(relay.answer_reserve(secs(0)));
+    assert_eq!(relay.wanted().backoff_until(secs(0)), Some(NO_ROOM_FIRST));
+
+    // After the backoff one probe goes out, though both sessions could ask.
+    relay.tick(NO_ROOM_FIRST);
+    assert_eq!(relay.calls_in_flight(), 1);
+    let (holder, _) = relay.wanted().probe().expect("a probe is out");
+    assert_eq!(holder, a);
+    // The probe's session ends, so the permit passes to the other session.
+    relay.end(a, NO_ROOM_FIRST);
+    assert_eq!(relay.wanted().probe().map(|(holder, _)| holder), Some(b));
+    relay.assert_invariants();
+    // The ended session's call is dropped with it. The new probe finds no
+    // room, and the backoff doubles.
+    assert!(relay.answer_reserve(NO_ROOM_FIRST));
+    assert!(relay.answer_reserve(NO_ROOM_FIRST));
+    assert_eq!(
+        relay.wanted().backoff_until(NO_ROOM_FIRST),
+        Some(NO_ROOM_FIRST * 3)
+    );
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_probe_with_another_answer_hands_the_permit_on() {
+    let mut relay = relay();
+    // Another caller fetches id 1, and the pool is otherwise full.
+    relay.outside(secs(0), |pool, now| {
+        let answer = pool.reserve(id(1), Intent::Fetch, now);
+        (answer.expect("room").id, pool.effects())
+    });
+    for n in 1..u32::try_from(MAX_PENDING).unwrap() {
+        relay.outside(secs(0), |pool, now| {
+            let answer = pool.reserve(id(100_000 + n), Intent::Fetch, now);
+            (answer.expect("room").id, pool.effects())
+        });
+    }
+    // Id 1 is refused as another caller's fetch, then id 2 finds no room.
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE), (id(2), SIZE)], secs(0));
+    assert_eq!(relay.wanted().entry(id(1)).unwrap().retry_at, RETRY_FIRST);
+    assert_eq!(relay.wanted().backoff_until(secs(0)), Some(NO_ROOM_FIRST));
+    // At the end of the backoff the probe asks for id 1 first. That answer
+    // says nothing about room, so the permit passes on at once, and the
+    // next probe, for id 2, finds the pool full.
+    relay.tick(NO_ROOM_FIRST);
+    assert_eq!(
+        relay.wanted().entry(id(1)).unwrap().retry_at,
+        NO_ROOM_FIRST + RETRY_FIRST * 2
+    );
+    assert_eq!(
+        relay.wanted().backoff_until(NO_ROOM_FIRST),
+        Some(NO_ROOM_FIRST * 3)
+    );
+    relay.assert_invariants();
+}
+
+#[test]
+fn an_ended_backoff_with_nobody_to_probe_is_not_a_deadline() {
+    let mut relay = relay();
+    fill_pool(&mut relay);
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.end(a, secs(0));
+    relay.tick(NO_ROOM_FIRST);
+    assert!(relay
+        .next_deadline()
+        .is_none_or(|next| next > NO_ROOM_FIRST));
+    // A new session probes at once.
+    let b = open(&mut relay, 2, true, secs(2));
+    relay.inv(b, &[(id(1), SIZE)], secs(2));
+    assert_eq!(
+        relay.wanted().backoff_until(secs(2)),
+        Some(secs(2) + NO_ROOM_FIRST * 2)
+    );
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_late_or_cooling_body_is_dropped_unread() {
+    // After a deadline.
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.tick(deadline(SIZE, secs(0)));
+    relay.tx(a, id(1), tx(9), SIZE + 1, deadline(SIZE, secs(0)));
+    assert!(closes(&relay.take_effects()).is_empty());
+    assert_eq!(relay.in_flight(PeerKey(1)), 0);
+
+    // After a cancellation.
+    let mut relay = self::relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    let block = ModelTransition {
+        disconnected: 0,
+        connected: vec![ModelBlock {
+            transactions: vec![tx(1)],
+        }],
+        tip: Height(101),
+        generation: Generation(1),
+        rules_change: false,
+    };
+    relay.transition(block, secs(1));
+    relay.tx(a, id(1), tx(9), SIZE + 1, secs(2));
+    assert!(closes(&relay.take_effects()).is_empty());
+
+    // While its peer cools.
+    let mut relay = self::relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE), (id(2), SIZE)], secs(0));
+    relay.tx(a, id(1), tx(1), SIZE, secs(0));
+    let bad = Outcome::Fail {
+        scope: RejectionScope::ExactTip,
+        charge: Charge::Cooldown,
+    };
+    finish_all(&mut relay, &bad, secs(0));
+    relay.take_effects();
+    relay.tx(a, id(2), tx(9), SIZE + 1, secs(1));
+    assert!(closes(&relay.take_effects()).is_empty());
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_waiting_session_keeps_distinct_ids_only() {
+    let mut relay = relay();
+    let old = open(&mut relay, 1, true, secs(0));
+    let new = open(&mut relay, 1, true, secs(0));
+    let copies: Vec<_> = (0..PENDING_PER_PEER).map(|_| (id(1), SIZE)).collect();
+    relay.inv(new, &copies, secs(0));
+    relay.inv(new, &[(id(2), SIZE), (id(3), MAX_TX_BYTES + 1)], secs(0));
+    assert_eq!(relay.session(new).unwrap().waiting.len(), 2);
+    relay.take_effects();
+    relay.end(old, secs(1));
+    assert_eq!(
+        asks(&relay.take_effects()),
+        vec![(new, id(1)), (new, id(2))]
+    );
+}
+
+#[test]
+fn new_work_never_eats_into_an_older_deadline() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    let first = relay.session(a).unwrap().requests[&id(1)].deadline;
+    let later = first - secs(1);
+    relay.inv(a, &[(id(2), MAX_TX_BYTES)], later);
+    let bytes = u64::from(SIZE) + u64::from(MAX_TX_BYTES) + SENDER_ALLOWANCE;
+    let span = BASE_DEADLINE + Duration::from_millis(bytes * 1_000 / MIN_RATE);
+    assert_eq!(
+        relay.session(a).unwrap().requests[&id(1)].deadline,
+        later + span
+    );
+}
+
+#[test]
+fn fan_out_uses_the_size_of_the_body_admitted() {
+    let mut relay = relay();
+    let liar = open(&mut relay, 1, true, secs(0));
+    let supplier = open(&mut relay, 2, true, secs(0));
+    let peers: Vec<_> = (10..30)
+        .map(|p| open(&mut relay, p, true, secs(0)))
+        .collect();
+    relay.set_ranking(peers.clone());
+    relay.inv(liar, &[(id(1), 100)], secs(0));
+    relay.inv(supplier, &[(id(1), MAX_TX_BYTES)], secs(0));
+    relay.not_found(liar, id(1), secs(1));
+    relay.tx(supplier, id(1), tx(1), MAX_TX_BYTES, secs(1));
+    relay.take_effects();
+    finish_all(&mut relay, &Outcome::Pass, secs(1));
+    let now: HashSet<_> = adverts(&relay.take_effects())
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert_eq!(now, peers[..WINDOW_FULL].iter().copied().collect());
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_late_verdict_from_an_ended_session_leaves_a_newer_entry_alone() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.tx(a, id(1), tx(1), SIZE, secs(0));
+    relay.end(a, secs(1));
+    assert_eq!(relay.reactor().unsettled_count(PeerKey(1)), 1);
+    let b = open(&mut relay, 2, true, secs(1));
+    relay.inv(b, &[(id(1), SIZE)], secs(1));
+    let newer = relay.wanted().entry(id(1)).unwrap().generation;
+    let rejected = Outcome::Fail {
+        scope: RejectionScope::ExactTip,
+        charge: Charge::None,
+    };
+    finish_all(&mut relay, &rejected, secs(1));
+    // The old submission's verdict decides only its own generation.
+    assert_eq!(relay.wanted().entry(id(1)).unwrap().generation, newer);
+    assert_eq!(relay.reactor().unsettled_peers(), 0);
+    // B's own reserve then learns of the rejection.
+    relay.tick(secs(1) + RETRY_FIRST);
+    assert!(relay.wanted().entry(id(1)).is_none());
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_timeout_hands_the_id_to_a_peer_that_holds_four() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(
+        b,
+        &[
+            (id(10), SIZE),
+            (id(11), SIZE),
+            (id(12), SIZE),
+            (id(13), SIZE),
+        ],
+        secs(0),
+    );
+    relay.inv(b, &[(id(1), SIZE), (id(14), SIZE)], secs(0));
+    relay.take_effects();
+    assert_eq!(relay.in_flight(PeerKey(2)), 5);
+    // B is full, so it cannot take id 1 even after A's deadline.
+    relay.tick(deadline(SIZE, secs(0)));
+    assert!(asks(&relay.take_effects()).is_empty());
+    let mut relay = self::relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(
+        b,
+        &[
+            (id(10), SIZE),
+            (id(11), SIZE),
+            (id(12), SIZE),
+            (id(13), SIZE),
+        ],
+        secs(0),
+    );
+    relay.inv(b, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    assert_eq!(relay.in_flight(PeerKey(2)), 4);
+    relay.tick(deadline(SIZE, secs(0)));
+    assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
+    assert_eq!(relay.in_flight(PeerKey(2)), 5);
+    relay.assert_invariants();
+}
+
+#[test]
+fn sessions_without_work_leave_no_reactor_record() {
+    let mut relay = relay();
+    for p in 0..10 {
+        let session = open(&mut relay, p, true, secs(0));
+        relay.end(session, secs(0));
+    }
+    assert_eq!(relay.reactor().unsettled_peers(), 0);
+}
+
+#[test]
+fn a_cooldown_needs_the_tip_it_was_earned_at() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.tx(a, id(1), tx(1), SIZE, secs(0));
+    // The node's best tip moved on before the pool applied it.
+    relay.set_best_tip(Height(101));
+    let bad = Outcome::Fail {
+        scope: RejectionScope::ExactTip,
+        charge: Charge::Cooldown,
+    };
+    finish_all(&mut relay, &bad, secs(0));
+    assert!(!relay.reactor().is_cooling(PeerKey(1), secs(0)));
+}
+
+#[test]
+fn timeout_history_lasts_only_while_the_id_is_pending() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    let mut now = secs(0);
+    for n in 0..50 {
+        relay.inv(a, &[(id(n), SIZE)], now);
+        now = relay.session(a).unwrap().requests[&id(n)].deadline;
+        relay.tick(now);
+        relay.not_found(a, id(n), now);
+        assert!(relay.session(a).unwrap().timed_out.is_empty());
+    }
+    relay.assert_invariants();
+}
+
+/// Fills the pool with another caller's reservations.
+fn fill_pool(relay: &mut RelayModel) {
+    for n in 0..u32::try_from(MAX_PENDING).unwrap() {
+        relay.outside(secs(0), |pool, now| {
+            let answer = pool.reserve(id(100_000 + n), Intent::Fetch, now);
+            (answer.expect("room").id, pool.effects())
+        });
+    }
+}
+
 /// A small deterministic generator, so a failing seed can be replayed.
 struct Lcg(u64);
 
@@ -928,7 +1304,11 @@ fn random_runs_drain() {
 
 fn run(seed: u64) {
     let mut rng = Lcg(seed);
+    let manual = seed % 2 == 1;
     let mut relay = RelayModel::new(PoolModel::new(Height(100), Generation(0)).with_limits(8, 2));
+    if manual {
+        relay = relay.with_manual_reserves().with_manual_reads(6);
+    }
     let behaviours = [
         Behaviour::Honest,
         Behaviour::Honest,
@@ -938,7 +1318,10 @@ fn run(seed: u64) {
     ];
     let mut live: Vec<(SessionId, Behaviour)> = Vec::new();
     let mut replies: Vec<(Duration, SessionId, UnminedTxId)> = Vec::new();
-    let mut honest_announced: HashSet<UnminedTxId> = HashSet::new();
+    // What each honest session announced: the oracle, kept apart from the
+    // model's own table.
+    let mut honest: HashMap<SessionId, HashSet<UnminedTxId>> = HashMap::new();
+    let mut failed: HashSet<UnminedTxId> = HashSet::new();
     let mut now = Duration::ZERO;
 
     let answer = |relay: &mut RelayModel,
@@ -949,20 +1332,35 @@ fn run(seed: u64) {
         for effect in relay.take_effects() {
             if let RelayEffect::Ask { session, id } = effect {
                 let behaviour = live.iter().find(|(s, _)| *s == session).map(|(_, b)| *b);
-                match behaviour {
-                    Some(Behaviour::Honest | Behaviour::Liar) => {
-                        let delay = Duration::from_millis(rng.next(1_000));
-                        replies.push((now + delay, session, id));
-                    }
-                    Some(Behaviour::Silent) | None => {}
+                if matches!(behaviour, Some(Behaviour::Honest | Behaviour::Liar)) {
+                    let delay = Duration::from_millis(rng.next(1_000));
+                    replies.push((now + delay, session, id));
                 }
             }
+        }
+    };
+    let verify = |relay: &mut RelayModel,
+                  failed: &mut HashSet<UnminedTxId>,
+                  rng: &mut Lcg,
+                  now: Duration,
+                  fail_some: bool| {
+        for (job, tx_id) in relay.job_txs().to_vec() {
+            let outcome = if fail_some && rng.next(5) == 0 {
+                failed.insert(tx_id);
+                Outcome::Fail {
+                    scope: RejectionScope::ExactTip,
+                    charge: Charge::None,
+                }
+            } else {
+                Outcome::Pass
+            };
+            relay.outcome(job, outcome, now);
         }
     };
 
     for _ in 0..150 {
         now += Duration::from_millis(rng.next(1_500));
-        match rng.next(10) {
+        match rng.next(12) {
             0 | 1 if live.len() < 6 => {
                 let peer = rng.next(5);
                 let behaviour = behaviours[usize::try_from(peer).unwrap()];
@@ -973,6 +1371,7 @@ fn run(seed: u64) {
             2 if !live.is_empty() => {
                 let index = usize::try_from(rng.next(u64::try_from(live.len()).unwrap())).unwrap();
                 let (session, _) = live.remove(index);
+                honest.remove(&session);
                 relay.end(session, now);
             }
             3..=6 if !live.is_empty() => {
@@ -981,21 +1380,16 @@ fn run(seed: u64) {
                 let n = u32::try_from(rng.next(30)).unwrap();
                 relay.inv(session, &[(id(n), SIZE)], now);
                 if behaviour == Behaviour::Honest {
-                    honest_announced.insert(id(n));
+                    honest.entry(session).or_default().insert(id(n));
                 }
             }
-            7 => {
-                for job in relay.jobs().to_vec() {
-                    let outcome = if rng.next(5) == 0 {
-                        Outcome::Fail {
-                            scope: RejectionScope::ExactTip,
-                            charge: Charge::None,
-                        }
-                    } else {
-                        Outcome::Pass
-                    };
-                    relay.outcome(job, outcome, now);
-                }
+            7 => verify(&mut relay, &mut failed, &mut rng, now, true),
+            8 if manual => {
+                relay.answer_reserve(now);
+            }
+            9 if manual && !live.is_empty() => {
+                let index = usize::try_from(rng.next(u64::try_from(live.len()).unwrap())).unwrap();
+                relay.read(live[index].0, now);
             }
             _ => relay.tick(now),
         }
@@ -1004,16 +1398,20 @@ fn run(seed: u64) {
         relay.assert_invariants();
     }
 
-    // Quiet time: only answers, verdicts and the clock.
+    // Quiet time: only answers, reserve replies, reads, verdicts and the
+    // clock.
+    let mut drained = false;
     for _ in 0..5_000 {
-        answer(&mut relay, &mut replies, &live, now, &mut rng);
-        deliver(&mut relay, &mut replies, &live, now);
-        for job in relay.jobs().to_vec() {
-            relay.outcome(job, Outcome::Pass, now);
+        while relay.answer_reserve(now) {}
+        for (session, _) in &live {
+            relay.read(*session, now);
         }
         answer(&mut relay, &mut replies, &live, now, &mut rng);
+        deliver(&mut relay, &mut replies, &live, now);
+        verify(&mut relay, &mut failed, &mut rng, now, false);
+        answer(&mut relay, &mut replies, &live, now, &mut rng);
         relay.assert_invariants();
-        if !relay.jobs().is_empty() {
+        if !relay.jobs().is_empty() || relay.calls_in_flight() > 0 {
             continue;
         }
         let next_reply = replies.iter().map(|(at, _, _)| *at).min();
@@ -1022,49 +1420,54 @@ fn run(seed: u64) {
             .flatten()
             .min()
         else {
+            drained = true;
             break;
         };
-        now = now.max(next);
+        assert!(
+            next > now,
+            "seed {seed}: a deadline that is due must not be returned"
+        );
+        now = next;
         relay.tick(now);
     }
+    assert!(drained, "seed {seed}: quiet time reached a resting state");
 
-    assert!(
-        relay.jobs().is_empty(),
-        "seed {seed}: verifications finished"
-    );
     assert_eq!(
         relay.reservations_held(),
         0,
         "seed {seed}: no reservation is left"
     );
+    assert_eq!(
+        relay.reactor().unsettled_peers(),
+        0,
+        "seed {seed}: every submission settled"
+    );
+    let visible: HashSet<UnminedTxId> = relay.pool().visible().into_iter().collect();
+    for (session, behaviour) in &live {
+        let state = relay.session(*session).expect("live");
+        if *behaviour != Behaviour::Silent {
+            assert!(
+                state.requests.is_empty(),
+                "seed {seed}: only silent peers keep requests"
+            );
+        }
+        if *behaviour == Behaviour::Honest && relay.reactor().has_go(state.peer, *session) {
+            for announced in honest.get(session).into_iter().flatten() {
+                assert!(
+                    visible.contains(announced) || failed.contains(announced),
+                    "seed {seed}: {announced:?} from an honest announcer was not decided"
+                );
+            }
+        }
+    }
     for (id, entry) in relay.wanted().entries() {
         assert!(
             entry.claim.is_none(),
             "seed {seed}: {id:?} is still claimed"
         );
-        for (session, behaviour) in &live {
-            if *behaviour == Behaviour::Honest {
-                let held = relay
-                    .session(*session)
-                    .is_some_and(|state| state.holds(*id, entry.generation));
-                if held {
-                    let state = relay.session(*session).unwrap();
-                    panic!(
-                        "seed {seed}: an honest announcer still holds {id:?}: entry {entry:?}, now {now:?}, next {:?}, go {}, cooling {}, requests {:?}, subs {}, unsettled {}, timed_out {:?}, hello {:?}, backoff {:?}",
-                        relay.next_deadline(),
-                        relay.reactor().has_go(state.peer, *session),
-                        relay.reactor().is_cooling(state.peer, now),
-                        state.requests,
-                        state.submissions.len(),
-                        relay.reactor().unsettled_count(state.peer),
-                        state.timed_out,
-                        state.hello,
-                        relay.wanted().backoff_until(),
-                    );
-                }
-            }
-        }
     }
+    // Sizes for fan-out are kept only for what the pool holds.
+    assert!(relay.sizes_kept() <= visible.len() + relay.pool().hidden().len());
 }
 
 /// Delivers the scripted answers that are due.

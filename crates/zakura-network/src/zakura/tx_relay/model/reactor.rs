@@ -12,7 +12,7 @@ use std::{
 use zakura_chain::transaction::UnminedTxId;
 use zakura_node_services::mempool::port::model::WaiterId;
 
-use super::{PeerKey, SessionId, Time, BASE_COOLDOWN, MAX_COOLDOWN, MAX_COOLDOWN_PEERS};
+use super::{EntryGen, PeerKey, SessionId, Time, BASE_COOLDOWN, MAX_COOLDOWN, MAX_COOLDOWN_PEERS};
 
 /// One peer's cooldown history, as today's `PeerCooldowns` keeps it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -29,8 +29,9 @@ pub(crate) struct ReactorModel {
     sessions: BTreeMap<PeerKey, BTreeSet<SessionId>>,
     /// The one session of each peer that may announce and fetch.
     go: HashMap<PeerKey, SessionId>,
-    /// Submissions whose session ended before the verdict, by peer.
-    unsettled: HashMap<PeerKey, BTreeMap<WaiterId, UnminedTxId>>,
+    /// Submissions whose session ended before the verdict, by peer, with
+    /// the entry generation they were fetched in. No peer has an empty map.
+    unsettled: HashMap<PeerKey, BTreeMap<WaiterId, (UnminedTxId, EntryGen)>>,
     /// Live sessions, lowest round-trip time first, with a random one in
     /// every fourth place. The test sets it, because the model has no clock
     /// of round trips or source of randomness.
@@ -45,15 +46,19 @@ impl ReactorModel {
         self.grant(peer) == Some(session)
     }
 
-    /// `session` of `peer` ended, and its unsettled submissions move here.
-    /// Returns the session that now has the go, if one just got it.
+    /// `session` of `peer` ended, and its unsettled submissions move here in
+    /// the same step. Returns the session that now has the go, if one just
+    /// got it.
     pub(crate) fn end(
         &mut self,
         peer: PeerKey,
         session: SessionId,
-        submissions: impl IntoIterator<Item = (WaiterId, UnminedTxId)>,
+        submissions: impl IntoIterator<Item = (WaiterId, (UnminedTxId, EntryGen))>,
     ) -> Option<SessionId> {
-        self.unsettled.entry(peer).or_default().extend(submissions);
+        let mut submissions = submissions.into_iter().peekable();
+        if submissions.peek().is_some() {
+            self.unsettled.entry(peer).or_default().extend(submissions);
+        }
         if let Some(sessions) = self.sessions.get_mut(&peer) {
             sessions.remove(&session);
             if sessions.is_empty() {
@@ -61,17 +66,16 @@ impl ReactorModel {
             }
         }
         self.ranking.retain(|ranked| *ranked != session);
-        let had_go = self.go.get(&peer) == Some(&session);
-        if had_go {
+        if self.go.get(&peer) == Some(&session) {
             self.go.remove(&peer);
             return self.grant(peer);
         }
         None
     }
 
-    /// Gives the go to `peer`'s oldest session if none has it. The handoff
-    /// in [`Self::end`] already happened for every older session, because a
-    /// session only reaches the front once every older one ended.
+    /// Gives the go to `peer`'s oldest session if none has it. Every older
+    /// session already handed off in [`Self::end`], because a session only
+    /// reaches the front once every older one ended.
     fn grant(&mut self, peer: PeerKey) -> Option<SessionId> {
         if self.go.contains_key(&peer) {
             return None;
@@ -100,16 +104,20 @@ impl ReactorModel {
             .unwrap_or_default()
     }
 
-    /// The submissions of `peer`'s ended sessions still waiting for a
-    /// verdict.
-    pub(crate) fn unsettled(
-        &self,
-        peer: PeerKey,
-    ) -> impl Iterator<Item = (WaiterId, UnminedTxId)> + '_ {
+    /// The ids of `peer`'s submissions from ended sessions still waiting
+    /// for a verdict.
+    pub(crate) fn unsettled_ids(&self, peer: PeerKey) -> Vec<UnminedTxId> {
         self.unsettled
             .get(&peer)
-            .into_iter()
-            .flat_map(|waiting| waiting.iter().map(|(waiter, id)| (*waiter, *id)))
+            .map(|waiting| waiting.values().map(|(id, _)| *id).collect())
+            .unwrap_or_default()
+    }
+
+    /// The ids of every unsettled submission.
+    pub(crate) fn all_unsettled_ids(&self) -> impl Iterator<Item = UnminedTxId> + '_ {
+        self.unsettled
+            .values()
+            .flat_map(|waiting| waiting.values().map(|(id, _)| *id))
     }
 
     /// How many of `peer`'s 5 its ended sessions still hold.
@@ -117,20 +125,25 @@ impl ReactorModel {
         self.unsettled.get(&peer).map_or(0, BTreeMap::len)
     }
 
-    /// Takes `waiter` out of the unsettled submissions. Returns its peer and
-    /// id if the reactor held it.
-    pub(crate) fn settle(&mut self, waiter: WaiterId) -> Option<(PeerKey, UnminedTxId)> {
+    /// How many peers have unsettled submissions.
+    pub(crate) fn unsettled_peers(&self) -> usize {
+        self.unsettled.len()
+    }
+
+    /// Takes `waiter` out of the unsettled submissions. Returns its peer, id
+    /// and entry generation if the reactor held it.
+    pub(crate) fn settle(&mut self, waiter: WaiterId) -> Option<(PeerKey, UnminedTxId, EntryGen)> {
         let peer = *self
             .unsettled
             .iter()
             .find(|(_, waiting)| waiting.contains_key(&waiter))?
             .0;
         let waiting = self.unsettled.get_mut(&peer)?;
-        let id = waiting.remove(&waiter)?;
+        let (id, generation) = waiting.remove(&waiter)?;
         if waiting.is_empty() {
             self.unsettled.remove(&peer);
         }
-        Some((peer, id))
+        Some((peer, id, generation))
     }
 
     /// Whether `peer` is cooling down at `now`.
@@ -191,5 +204,22 @@ impl ReactorModel {
     /// `session`'s place in the ranking, from 0.
     pub(crate) fn rank(&self, session: SessionId) -> Option<usize> {
         self.ranking.iter().position(|ranked| *ranked == session)
+    }
+
+    /// Checks the reactor's own rules.
+    pub(crate) fn assert_invariants(&self) {
+        for (peer, waiting) in &self.unsettled {
+            assert!(!waiting.is_empty(), "no empty record for {peer:?}");
+            assert!(waiting.len() <= super::MAX_REQUESTS_PER_PEER);
+        }
+        for (peer, session) in &self.go {
+            assert!(
+                self.sessions
+                    .get(peer)
+                    .and_then(|sessions| sessions.iter().next())
+                    == Some(session),
+                "the go is the peer's oldest session"
+            );
+        }
     }
 }

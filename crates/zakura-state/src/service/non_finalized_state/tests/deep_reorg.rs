@@ -265,6 +265,12 @@ fn mixed_child(
     };
     let body = Arc::make_mut(&mut block);
     body.transactions.truncate(1);
+    // NU5 coinbase IDs commit to the expiry height rather than the coinbase
+    // script. Keep it at the block height so every coinbase has a distinct ID.
+    let Transaction::V5 { expiry_height, .. } = Arc::make_mut(&mut body.transactions[0]) else {
+        panic!("the NU5 fixture has a V5 coinbase");
+    };
+    *expiry_height = height;
     body.transactions
         .extend([Arc::new(transparent), Arc::new(shielded)]);
     let merkle_root = body.transactions.iter().collect();

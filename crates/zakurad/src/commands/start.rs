@@ -295,13 +295,16 @@ impl StartCmd {
         }
     }
 
-    /// Returns the services advertised to legacy P2P peers.
+    /// Returns the services advertised to legacy P2P peers in every storage mode.
+    ///
+    /// Pruned nodes advertise block service so peers can discover and reconnect to them.
+    /// Requests for block bodies outside their retention window still return `notfound`.
     fn advertised_services(config: &ZakuradConfig) -> PeerServices {
-        if config.zcashd_compat.enabled || config.state.storage_mode == StorageMode::Archive {
-            PeerServices::NODE_NETWORK
-        } else {
-            PeerServices::empty()
+        let mut services = PeerServices::NODE_NETWORK;
+        if matches!(config.state.storage_mode, StorageMode::Pruned(_)) {
+            services |= PeerServices::NODE_PRUNED;
         }
+        services
     }
 
     fn zcashd_compat_default_block_gossip_peer_ips() -> Vec<IpAddr> {
@@ -774,7 +777,9 @@ impl StartCmd {
             pending_blocks,
             sync::end_of_support::end_of_support_height(&config.network.network),
         );
-        let rpc_impl = rpc_impl.with_template_trace(template_path_trace);
+        let rpc_impl = rpc_impl
+            .with_template_trace(template_path_trace)
+            .with_local_services(config.network.handshake_services(advertised_services));
         node_tasks.track(&rpc_tx_queue_handle);
 
         let node_services = ready.as_ref().map(|_| crate::node::NodeServices {
@@ -1525,21 +1530,21 @@ mod tests {
     }
 
     #[test]
-    fn zcashd_compat_advertises_node_network_when_pruned() {
-        let mut config = ZakuradConfig::default();
-        config.state.storage_mode = StorageMode::Pruned(PruningConfig::default());
-
-        assert_eq!(
-            StartCmd::advertised_services(&config),
-            PeerServices::empty()
-        );
-
-        config.zcashd_compat.enabled = true;
-
-        assert_eq!(
-            StartCmd::advertised_services(&config),
-            PeerServices::NODE_NETWORK
-        );
+    fn advertised_services_describe_storage_mode_with_or_without_zcashd_compat() {
+        for compat in [false, true] {
+            for (storage_mode, expected) in [
+                (StorageMode::Archive, PeerServices::NODE_NETWORK),
+                (
+                    StorageMode::Pruned(PruningConfig::default()),
+                    PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED,
+                ),
+            ] {
+                let mut config = ZakuradConfig::default();
+                config.state.storage_mode = storage_mode;
+                config.zcashd_compat.enabled = compat;
+                assert_eq!(StartCmd::advertised_services(&config), expected);
+            }
+        }
     }
 
     #[test]

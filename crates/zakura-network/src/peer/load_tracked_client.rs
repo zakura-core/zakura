@@ -18,7 +18,7 @@ use tower::{
 use crate::{
     constants::{EWMA_DECAY_TIME_NANOS, EWMA_DEFAULT_RTT},
     peer::{Client, ConnectedAddr, ConnectionInfo},
-    protocol::external::{canonical_socket_addr, types::Version},
+    protocol::external::{canonical_socket_addr, types::PeerServices, types::Version},
 };
 
 static NEXT_PEER_TRACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -86,6 +86,19 @@ impl LoadTrackedClient {
         self.connection_info.remote.version
     }
 
+    /// Returns true if the peer may have full block history: its handshake lacks the
+    /// [`PeerServices::NODE_PRUNED`] hint.
+    ///
+    /// Any other service bits are ignored, so peers that advertise no services, such as older
+    /// Zakura pruned nodes, are treated as archive candidates too. The hint is self-reported.
+    pub(crate) fn claims_full_block_history(&self) -> bool {
+        !self
+            .connection_info
+            .remote
+            .services
+            .contains(PeerServices::NODE_PRUNED)
+    }
+
     /// Returns true if the connection would write a request sent now, rather than leave it queued
     /// behind a response the connection is still awaiting.
     ///
@@ -103,13 +116,19 @@ impl LoadTrackedClient {
         self.request_slot.is_free()
     }
 
+    /// Returns true if a block request timed out or was cancelled after at least half its timeout,
+    /// and the peer has not completed a successful block response since then.
+    pub(crate) fn has_unanswered_block_request(&self) -> bool {
+        self.request_slot.block_request_unanswered()
+    }
+
     /// Returns true if block routing should prefer this advertiser over its busy advertisers.
     ///
     /// A connection can write a request now, and the peer did not leave its last block request
     /// unanswered. Otherwise routing only offers this advertiser through ordinary load balancing,
     /// so a peer that withholds blocks can't win every retry while other advertisers are busy.
     pub(crate) fn is_preferred_block_source(&self) -> bool {
-        self.can_send_request_now() && !self.request_slot.block_request_unanswered()
+        self.can_send_request_now() && !self.has_unanswered_block_request()
     }
 
     /// Retrieve the peer's self-reported chain height from its handshake.

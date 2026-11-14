@@ -262,9 +262,8 @@ pub enum MetaAddrChange {
 
         /// The services this node advertises for its own listener address.
         ///
-        /// This must match the services advertised during the handshake, so a
-        /// node that does not advertise [`PeerServices::NODE_NETWORK`] (for
-        /// example, a pruned node) does not gossip itself as a full node.
+        /// This must match the services advertised during the handshake so
+        /// discovery and connections describe the same capabilities and storage mode.
         services: PeerServices,
     },
 

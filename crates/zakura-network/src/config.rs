@@ -44,7 +44,7 @@ use crate::{
         OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     peer::address_is_valid_for_outbound_connections,
-    protocol::external::{canonical_peer_addr, canonical_socket_addr},
+    protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
     zakura::ZakuraConfig,
     BoxError, PeerSocketAddr,
 };
@@ -1027,6 +1027,16 @@ impl Config {
     /// mutually capable peers to the Zakura upgrade hook.
     pub fn v2_p2p(&self) -> bool {
         self.p2p_stack.resolve(&self.network).runs_zakura()
+    }
+
+    /// Returns the services sent in the legacy handshake for the node's own `services`: those
+    /// services with [`PeerServices::NODE_P2P_V2`] set exactly when [`v2_p2p`](Self::v2_p2p) is.
+    pub fn handshake_services(&self, mut services: PeerServices) -> PeerServices {
+        services.remove(PeerServices::NODE_P2P_V2);
+        if self.v2_p2p() {
+            services |= PeerServices::NODE_P2P_V2;
+        }
+        services
     }
 
     /// Builds a network config for tests with [`p2p_stack`](Self::p2p_stack) pinned to

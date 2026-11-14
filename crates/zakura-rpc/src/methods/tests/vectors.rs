@@ -283,6 +283,34 @@ async fn rpc_getinfo() {
     assert!(rpc_tx_queue_task_result.is_none());
 }
 
+/// `getnetworkinfo` reports the services the node sends in its handshake, such as the pruned hint.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getnetworkinfo_reports_configured_local_services() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        NoChainTip,
+        rx,
+    );
+
+    let rpc = rpc.with_local_services(PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED);
+    let network_info = rpc
+        .get_network_info()
+        .await
+        .expect("getnetworkinfo should succeed");
+
+    assert_eq!(network_info.local_services, "0000000002000001");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getdeprecationinfo_uses_latest_checkpoint_without_tip() {
     let _init_guard = zakura_test::init();

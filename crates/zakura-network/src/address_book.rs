@@ -433,9 +433,8 @@ pub struct AddressBook {
     /// The services advertised for our own [`local_listener`](Self::local_listener)
     /// address when it is gossiped to peers.
     ///
-    /// This must match the services advertised during the handshake, so a node
-    /// that does not advertise [`PeerServices::NODE_NETWORK`] (for example, a
-    /// pruned node) does not gossip itself as a full node.
+    /// This must match the services advertised during the handshake so peers
+    /// receive consistent service information through discovery and connections.
     local_listener_services: PeerServices,
 
     /// The configured Zcash network.

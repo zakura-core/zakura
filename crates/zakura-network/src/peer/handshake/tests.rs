@@ -152,9 +152,8 @@ async fn negotiate_test_pair(
     let local_min_version = MinimumPeerVersion::new(NoChainTip, &local_config.network);
     let remote_min_version = MinimumPeerVersion::new(NoChainTip, &remote_config.network);
 
-    let local_services = configured_advertised_services(&local_config, PeerServices::NODE_NETWORK);
-    let remote_services =
-        configured_advertised_services(&remote_config, PeerServices::NODE_NETWORK);
+    let local_services = local_config.handshake_services(PeerServices::NODE_NETWORK);
+    let remote_services = remote_config.handshake_services(PeerServices::NODE_NETWORK);
     let local_user_agent = TEST_LOCAL_USER_AGENT.to_string();
     let remote_user_agent = TEST_REMOTE_USER_AGENT.to_string();
 
@@ -794,11 +793,9 @@ async fn timed_out_initiator_upgrade_does_not_leak_upgrade_dial() {
 async fn p2p_v2_service_bit_advertisement_preserves_user_agent() {
     let _init_guard = zakura_test::init();
 
-    assert!(!configured_advertised_services(
-        &test_config(P2pStack::Legacy),
-        PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2,
-    )
-    .contains(PeerServices::NODE_P2P_V2));
+    assert!(!test_config(P2pStack::Legacy)
+        .handshake_services(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2)
+        .contains(PeerServices::NODE_P2P_V2));
 
     let (disabled_peer_seen_by_enabled, enabled_peer_seen_by_disabled) =
         negotiate_test_pair(test_config(P2pStack::Dual), test_config(P2pStack::Legacy)).await;

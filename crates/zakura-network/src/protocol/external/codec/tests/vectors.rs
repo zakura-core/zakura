@@ -3,6 +3,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::LazyLock;
 
+use crate::meta_addr::MetaAddr;
 use chrono::DateTime;
 use futures::prelude::*;
 
@@ -63,6 +64,37 @@ fn version_message_round_trip() {
     });
 
     assert_eq!(*v, v_parsed);
+}
+
+/// Pruned and v2 hints survive both version and address-gossip wire encodings.
+#[tokio::test]
+async fn pruned_services_round_trip_in_version_and_address_messages() {
+    use tokio_util::codec::{FramedRead, FramedWrite};
+    let services =
+        PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED | PeerServices::NODE_P2P_V2;
+    let Message::Version(mut version) = VERSION_TEST_VECTOR.clone() else {
+        unreachable!()
+    };
+    version.services = services;
+    version.address_from = AddrInVersion::new(version.address_from.addr(), services);
+    version.address_recv = AddrInVersion::new(version.address_recv.addr(), services);
+    let addr = MetaAddr::new_gossiped_meta_addr(
+        "192.0.2.1:8233".parse().unwrap(),
+        services,
+        version.timestamp.try_into().unwrap(),
+    );
+    for message in [Message::Version(version), Message::Addr(vec![addr])] {
+        let mut bytes = Vec::new();
+        let mut writer = FramedWrite::new(&mut bytes, Codec::builder().finish());
+        writer.send(message.clone()).await.unwrap();
+        drop(writer);
+        let decoded = FramedRead::new(Cursor::new(bytes), Codec::builder().finish())
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, message);
+    }
 }
 
 /// Check that version deserialization rejects out-of-range timestamps with

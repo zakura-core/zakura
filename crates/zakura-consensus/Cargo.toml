@@ -63,7 +63,7 @@ getset = { workspace = true }
 
 sapling-crypto = { workspace = true, features = ["multicore", "pinned-vk-only"] }
 orchard.workspace = true
-# The Orchard backend's worker configuration for benchmarks. The crate is already in the
+# The Orchard backend's verifier scratch warm-up. The crate is already in the
 # graph through Orchard; this direct dependency only adds API access.
 sensei = { workspace = true }
 

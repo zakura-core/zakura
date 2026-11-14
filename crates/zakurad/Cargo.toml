@@ -72,11 +72,21 @@ indicatif = []
 
 # Disable x86-64 Pasta assembly for redistributable binaries.
 # Overrides both `x86_64-asm` and compiler-selected Pasta assembly.
-portable = ["dep:orchard", "orchard/portable"]
+portable = [
+    "dep:orchard",
+    "orchard/portable",
+    "dep:pasta_curves",
+    "pasta_curves/portable",
+]
 
 # Force BMI2+ADX Pasta arithmetic without changing global compiler target flags.
 # The startup CPU check rejects unsupported x86-64 machines; `portable` wins.
-x86_64-asm = ["dep:orchard", "orchard/x86_64-asm"]
+x86_64-asm = [
+    "dep:orchard",
+    "orchard/x86_64-asm",
+    "dep:pasta_curves",
+    "pasta_curves/x86_64-asm",
+]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
@@ -162,9 +172,11 @@ zakura-state = { path = "../zakura-state", version = "17.0.0" }
 zakura-script = { path = "../zakura-script", version = "5.0.7" }
 zcash_script = { workspace = true }
 
-# Only used to forward arithmetic features through Orchard and Halo 2. Cargo
-# feature unification applies it to the existing transitive dependencies.
+# Only used to forward arithmetic features to Orchard's proof backend and to
+# the Pasta arithmetic the node uses directly. Cargo feature unification
+# applies them to the existing transitive dependencies.
 orchard = { workspace = true, optional = true }
+pasta_curves = { workspace = true, optional = true }
 
 # Required for crates.io publishing, but it's only used in tests
 zakura-utils = { path = "../zakura-utils", version = "2.3.3", optional = true }

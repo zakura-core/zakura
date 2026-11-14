@@ -281,7 +281,7 @@ impl NoteCommitmentTrees {
 
 #[cfg(test)]
 mod tests {
-    use halo2::pasta::pallas;
+    use pasta_curves::pallas;
 
     use crate::{
         block::{Block, Header, Height},

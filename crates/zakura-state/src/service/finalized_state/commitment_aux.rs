@@ -764,7 +764,7 @@ mod tests {
 
     fn orchard_tree(value: u64) -> orchard::tree::NoteCommitmentTree {
         let mut tree = orchard::tree::NoteCommitmentTree::default();
-        tree.append(halo2::pasta::pallas::Base::from(value))
+        tree.append(pasta_curves::pallas::Base::from(value))
             .expect("single-note Orchard tree is not full");
         tree
     }
@@ -951,7 +951,7 @@ mod tests {
 
     fn non_empty_ironwood_tree(value: u64) -> ironwood::tree::NoteCommitmentTree {
         let mut tree = ironwood::tree::NoteCommitmentTree::default();
-        tree.append(halo2::pasta::pallas::Base::from(value))
+        tree.append(pasta_curves::pallas::Base::from(value))
             .expect("single-note Ironwood tree is not full");
         tree
     }
@@ -1276,7 +1276,7 @@ mod tests {
     fn final_frontiers_bytes_round_trips() {
         let mut ironwood = ironwood::tree::NoteCommitmentTree::default();
         ironwood
-            .append(halo2::pasta::pallas::Base::from(9u64))
+            .append(pasta_curves::pallas::Base::from(9u64))
             .expect("single-note Ironwood tree is not full");
         let frontiers = FinalFrontiers {
             height: block::Height(1_687_200),

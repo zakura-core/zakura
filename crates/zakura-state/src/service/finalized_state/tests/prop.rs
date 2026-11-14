@@ -1829,7 +1829,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // slot: the frontier had no Ironwood field to check against at all).
             let mut wrong_ironwood_frontier = zakura_chain::ironwood::tree::NoteCommitmentTree::default();
             wrong_ironwood_frontier
-                .append(halo2::pasta::pallas::Base::from(1u64))
+                .append(pasta_curves::pallas::Base::from(1u64))
                 .expect("single-note Ironwood tree is not full");
             prop_assert_ne!(
                 wrong_ironwood_frontier.root(),

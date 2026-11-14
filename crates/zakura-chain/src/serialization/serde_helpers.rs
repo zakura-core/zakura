@@ -1,5 +1,5 @@
 use group::{ff::PrimeField, GroupEncoding};
-use halo2::pasta::pallas;
+use pasta_curves::pallas;
 
 #[derive(Deserialize, Serialize)]
 #[serde(remote = "jubjub::AffinePoint")]

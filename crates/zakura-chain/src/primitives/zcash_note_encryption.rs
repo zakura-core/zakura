@@ -87,7 +87,6 @@ fn ironwood_action_decrypts_successfully<A>(act: &orchard::Action<A>) -> bool {
 #[cfg(test)]
 mod tests {
     use group::{ff::PrimeField, CurveAffine, GroupEncoding};
-    use halo2::pasta::pallas;
     use orchard::{
         note::{
             ExtractedNoteCommitment, NoteVersion, Nullifier, RandomSeed, TransmittedNoteCiphertext,
@@ -97,6 +96,7 @@ mod tests {
         value::{NoteValue, ValueCommitment},
         Action, Address, Note,
     };
+    use pasta_curves::pallas;
     use zcash_note_encryption::Domain;
 
     use crate::{

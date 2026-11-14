@@ -1,7 +1,7 @@
 //! Batch decompression of Orchard action points.
 
 use group::{ff::PrimeField, Group, GroupEncoding};
-use halo2::pasta::pallas;
+use pasta_curves::pallas;
 use sha2::{Digest, Sha256};
 
 use crate::{

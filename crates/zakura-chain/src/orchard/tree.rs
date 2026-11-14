@@ -19,12 +19,12 @@ use std::{
     sync::LazyLock,
 };
 
-use halo2::pasta::{group::ff::PrimeField, pallas};
 use hex::ToHex;
 use incrementalmerkletree::{
     frontier::{Frontier, NonEmptyFrontier},
     Hashable,
 };
+use pasta_curves::{group::ff::PrimeField, pallas};
 use thiserror::Error;
 use zcash_primitives::merkle_tree::HashSer;
 

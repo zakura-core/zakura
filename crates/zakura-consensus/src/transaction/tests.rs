@@ -15,7 +15,7 @@ use crate::primitives::fallback::Fallback;
 use chrono::{DateTime, TimeZone, Utc};
 use eyre::Report;
 use futures::{FutureExt, TryFutureExt};
-use halo2::pasta::{group::ff::PrimeField, pallas};
+use pasta_curves::{group::ff::PrimeField, pallas};
 use tokio::time::timeout;
 use tower::{buffer::Buffer, service_fn, Service, ServiceExt};
 

@@ -375,7 +375,7 @@ impl VctFastSyncedChain {
                         .expect("the legacy fixture stores every Orchard frontier");
                     if corrupt == Some(height) {
                         Arc::make_mut(&mut orchard)
-                            .append(halo2::pasta::pallas::Base::from(1u64))
+                            .append(pasta_curves::pallas::Base::from(1u64))
                             .expect("the small fixture Orchard tree is not full");
                     }
 

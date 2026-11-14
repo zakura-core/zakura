@@ -4,7 +4,7 @@
 //! The production `MerkleCRH^Orchard` path in [`crate::orchard::tree`] hashes
 //! through a cached domain instead.
 
-use halo2::pasta::pallas;
+use pasta_curves::pallas;
 use sinsemilla::HashDomain;
 
 /// Sinsemilla Hash Function
@@ -41,7 +41,7 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn sinsemilla_hackworks_test_vectors() {
-        use halo2::pasta::group::ff::PrimeField;
+        use pasta_curves::group::ff::PrimeField;
 
         for tv in tests::vectors::SINSEMILLA.iter() {
             let D = tv.domain.as_slice();

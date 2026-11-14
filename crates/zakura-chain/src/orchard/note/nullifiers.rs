@@ -2,7 +2,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use halo2::pasta::{group::ff::PrimeField, pallas};
+use pasta_curves::{group::ff::PrimeField, pallas};
 
 use crate::serialization::{serde_helpers, SerializationError};
 

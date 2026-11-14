@@ -36,7 +36,7 @@ commit-metrics = []
 # Test-only features
 header-fuzz = []
 proptest-impl = [
-    "dep:halo2",
+    "dep:pasta_curves",
     "proptest",
     "proptest-derive",
     "zakura-chain/proptest-impl"
@@ -45,11 +45,11 @@ proptest-impl = [
 [dependencies]
 chrono = { workspace = true }
 futures = { workspace = true }
-halo2 = { workspace = true, optional = true }
 hex = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 metrics = { workspace = true }
+pasta_curves = { workspace = true, optional = true }
 rocksdb = { workspace = true, features = ["lz4"] }
 semver = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
@@ -96,8 +96,8 @@ proptest = { workspace = true }
 proptest-derive = { workspace = true }
 rand_10 = { workspace = true }
 
-halo2 = { workspace = true }
 orchard = { workspace = true }
+pasta_curves = { workspace = true }
 
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 

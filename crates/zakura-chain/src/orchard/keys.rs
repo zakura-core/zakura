@@ -8,9 +8,9 @@ use crate::serialization::ZcashReader;
 use std::{fmt, io};
 
 use group::{ff::PrimeField, CurveAffine as _, Group, GroupEncoding};
-use halo2::{
+use pasta_curves::{
     arithmetic::{Coordinates, CurveAffine},
-    pasta::pallas,
+    pallas,
 };
 
 use crate::serialization::{

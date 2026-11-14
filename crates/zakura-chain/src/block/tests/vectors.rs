@@ -5,7 +5,7 @@ use std::{
 };
 
 use chrono::{DateTime, Duration, LocalResult, TimeZone, Utc};
-use halo2::pasta::pallas;
+use pasta_curves::pallas;
 
 use crate::{
     amount::{Amount, NonNegative, MAX_MONEY},

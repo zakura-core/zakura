@@ -17,10 +17,11 @@
 //! ZAKURA_BENCH_RAYON_THREADS=1 cargo bench -p zakura-consensus --bench worst_case_tx_verification --features internal-bench
 //! ```
 //!
-//! This matters here specifically: all Zakura proof verification runs on the global rayon
-//! pool, whose size comes from `sync.parallel_cpu_threads`, and the batch middleware
-//! sizes its batch queue from `rayon::current_num_threads()`. A node configured with one
-//! rayon thread verifies serially *and* loses cross-batch pipelining.
+//! This matters here specifically: Zakura proof verification runs on the global rayon
+//! pool and (for Orchard) the backend's private worker pool, both sized from
+//! `sync.parallel_cpu_threads` on a node and from this variable here, and the batch
+//! middleware sizes its batch queue from `rayon::current_num_threads()`. A node configured
+//! with one thread verifies serially *and* loses cross-batch pipelining.
 
 // Disabled due to warnings in criterion macros.
 #![allow(missing_docs)]
@@ -324,7 +325,8 @@ fn worst_case_tx_verification(c: &mut Criterion) {
     print_benchmark_summaries(&benchmark_summaries);
 }
 
-/// Size of the global rayon pool, which is where every proof verification actually runs.
+/// Size of the global rayon pool and the backend's private worker pool, which is where
+/// every proof verification actually runs.
 fn rayon_threads() -> usize {
     env_threads(RAYON_THREADS_VAR)
 }
@@ -357,10 +359,26 @@ fn init_rayon(threads: usize) {
     static INIT_RAYON: Once = Once::new();
 
     INIT_RAYON.call_once(|| {
+        // Mirror zakurad's startup wiring: the same thread count sizes the global rayon
+        // pool and the proving/verification backend's private pool, so the sweep bounds
+        // Orchard proof verification too.
+        sensei::configure_workers(threads).expect(
+            "the benchmark configures the backend pool before any proof verification \
+             initializes it",
+        );
+
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build_global()
             .expect("rayon global thread pool should be initialized before proof verification");
+
+        // Report the effective sizes so results record what actually ran, not just the
+        // requested setting. Reading the budget here is fine: the pool is configured above.
+        println!(
+            "effective worker budgets: rayon={} sensei={}",
+            rayon::current_num_threads(),
+            sensei::worker_budget(),
+        );
     });
 }
 

@@ -9,7 +9,7 @@ use std::{
 
 use ref_cast::RefCast;
 
-use halo2::pasta::pallas;
+use pasta_curves::pallas;
 
 use crate::{
     amount::{Amount, DeferredPoolBalanceChange, NegativeAllowed},

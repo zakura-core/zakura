@@ -24,7 +24,6 @@ use zcash_protocol::value::ZatBalance;
 use super::batch_control::{Batch, BatchControl, RequestWeight};
 use super::fallback::Fallback;
 use crate::{error::TransactionError, BoxError};
-use thiserror::Error;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -51,6 +50,11 @@ use super::cache::{CacheKey, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
 /// parallelizes its fixed costs, so one 128-action batch checks a cold 1.9 MB Orchard block 11%
 /// to 12% faster than 64-action batches on x86-64 benchmark hosts.
 const HALO2_MAX_BATCH_SIZE: usize = 128;
+
+/// A typical mainnet Orchard bundle carries two actions, so a full
+/// [`HALO2_MAX_BATCH_SIZE`]-action batch folds about
+/// `HALO2_MAX_BATCH_SIZE / TYPICAL_ACTIONS_PER_BUNDLE` proofs.
+const TYPICAL_ACTIONS_PER_BUNDLE: usize = 2;
 
 /// The result of one batch: each item's admission result, in admission order, and whether the
 /// admitted items verified.
@@ -108,22 +112,22 @@ pub type ItemVerifyingKey = VerifyingKey;
 // against the fixed key; that is incorrect both for re-syncing pre-soft-fork Orchard blocks (whose
 // proofs only verify under the insecure key) and for NU6.3 Orchard Actions (whose cross-address
 // restriction the fixed key cannot enforce).
-/// Builds the verifying key for `version` and arms halo2's prepared
-/// fixed-base zero-check on its parameters.
+/// Builds the verifying key for `version` and arms the backend's prepared
+/// verification state.
 ///
-/// The prepared state is cached inside the key's params for the lifetime of
-/// the process (shared with clones, never serialized), so every verification
-/// under the key evaluates through it. When halo2 is built without its
-/// opt-in `orbits` feature — currently the case — or its backend declines,
-/// arming is a no-op and verification keeps the plain multiexp, so calling
-/// it unconditionally is never a pessimization.
+/// Under the sensei backend — the current build — arming warms the
+/// process-wide verifier caches shared by every key, and reports success.
+/// Under the legacy halo2 backend it arms the prepared fixed-base zero-check
+/// cached inside the key's params, a documented no-op without halo2's opt-in
+/// `orbits` feature. Either way verification stays correct without arming,
+/// so calling it unconditionally is never a pessimization.
 fn build_verifying_key(version: OrchardCircuitVersion) -> ItemVerifyingKey {
     let vk = ItemVerifyingKey::build(version);
     let prepared = vk.prepare_batch_validation();
     tracing::info!(
         ?version,
         prepared,
-        "built Orchard Action verifying key and armed its prepared zero-check",
+        "built Orchard Action verifying key and armed its prepared verification state",
     );
     vk
 }
@@ -156,15 +160,33 @@ pub static VERIFYING_KEY_NU6_2: LazyLock<ItemVerifyingKey> =
 pub static VERIFYING_KEY_NU6_3_ONWARD: LazyLock<ItemVerifyingKey> =
     LazyLock::new(|| build_verifying_key(OrchardCircuitVersion::PostNu6_3));
 
-/// Builds every era's verifying key on a blocking thread, current era first.
+/// Builds every era's verifying key on a blocking thread, current era first, then provisions
+/// reusable scratch for a typical full Orchard batch.
 ///
-/// Started once at node startup, so the first shielded block after a restart does not build a
-/// key on its verification path.
+/// Started once at node startup, reducing the first shielded block's initialization and
+/// allocation costs after a restart. The warm-up prepares one expected batch shape; different
+/// shapes, concurrent leases, and equation growth can still allocate.
 pub(crate) fn spawn_key_preload() -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(|| {
         LazyLock::force(&VERIFYING_KEY_NU6_3_ONWARD);
         LazyLock::force(&VERIFYING_KEY_NU6_2);
         LazyLock::force(&VERIFYING_KEY_PRE_NU6_2);
+
+        // Provision one full batch's scratch into the backend's idle cache, reducing the first
+        // `HALO2_MAX_BATCH_SIZE`-action batch's allocation costs. The cache is process-wide
+        // and shared by every era's key.
+        let plan = sensei::warm_up_verifier_scratch(
+            HALO2_MAX_BATCH_SIZE / TYPICAL_ACTIONS_PER_BUNDLE,
+            HALO2_MAX_BATCH_SIZE,
+        );
+        tracing::info!(
+            workspace_bytes = plan.workspace_bytes,
+            equation_bytes = plan.equation_bytes,
+            workspace_slots = plan.workspace_slots,
+            retention_eligible = plan.retention_eligible,
+            max_idle_bytes = plan.max_idle_bytes,
+            "provisioned Orchard proof verification scratch for one full batch",
+        );
     })
 }
 
@@ -285,31 +307,6 @@ impl QueueBatchVerify for BatchValidator<'_> {
         }: Item,
     ) -> Result<(), BatchError> {
         self.add_bundle(bundle.as_ref(), sighash.0)
-    }
-}
-
-/// An error that may occur when verifying [Halo2 proofs of Zcash Orchard Action
-/// descriptions][actions].
-///
-/// [actions]: https://zips.z.cash/protocol/protocol.pdf#actiondesc
-// TODO: if halo2::plonk::Error gets the std::error::Error trait derived on it,
-// remove this and just wrap `halo2::plonk::Error` as an enum variant of
-// `crate::transaction::Error`, which does the trait derivation via `thiserror`
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-#[allow(missing_docs)]
-pub enum Halo2Error {
-    #[error("the constraint system is not satisfied")]
-    ConstraintSystemFailure,
-    #[error("unknown Halo2 error")]
-    Other,
-}
-
-impl From<halo2::plonk::Error> for Halo2Error {
-    fn from(err: halo2::plonk::Error) -> Halo2Error {
-        match err {
-            halo2::plonk::Error::ConstraintSystemFailure => Halo2Error::ConstraintSystemFailure,
-            _ => Halo2Error::Other,
-        }
     }
 }
 

@@ -382,14 +382,15 @@ impl TransactionTemplate<NegativeOrZero> {
         let default_memo = MemoBytes::empty();
         let memo = miner_params.memo().unwrap_or(&default_memo);
 
-        // Arms halo2's prepared commitment tables on the process-wide proving key
-        // that `Builder::build_coinbase` below proves a shielded reward output with. The
-        // prepared state is cached inside the key's params for the process
-        // lifetime and repeat arming is free, so the first shielded coinbase pays
-        // it once; without halo2's opt-in `orbits` feature it is a documented
-        // no-op. Called only when a shielded reward output was actually added, so
-        // transparent miners never force the expensive
-        // proving-key build.
+        // Arms the backend's prepared proving state on the process-wide proving
+        // key that `Builder::build_coinbase` below proves a shielded reward
+        // output with. Under the sensei backend this warms the process-wide
+        // prover caches; under the legacy halo2 backend it arms the key's
+        // prepared commitment tables (a documented no-op without its opt-in
+        // `orbits` feature). The warmed state lives for the process lifetime and
+        // repeat arming is free, so the first shielded coinbase pays it once.
+        // Called only when a shielded reward output was actually added, so
+        // transparent miners never force the expensive proving-key build.
         let arm_shielded_reward_proving_key = || -> Result<(), TransactionError> {
             let branch = BranchId::for_height(net, BlockHeight::from(height));
             // Both pools share the circuit at every branch that supports them, so
@@ -407,7 +408,7 @@ impl TransactionTemplate<NegativeOrZero> {
                 tracing::debug!(
                     ?height,
                     prepared,
-                    "armed the coinbase proving key's prepared commitment tables",
+                    "armed the coinbase proving key's prepared proving state",
                 );
             }
             Ok(())

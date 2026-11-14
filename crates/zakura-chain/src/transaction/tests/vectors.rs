@@ -2392,11 +2392,13 @@ fn assert_noncanonical_shielded_protocol_proof_size(error: SerializationError) {
 /// identity point) **deserializes successfully** unless Zebra validates it
 /// using the corresponding librustzcash transaction parser before returning.
 ///
-/// When the same transaction is subsequently fed to the Orchard Halo2 batch
+/// When the same transaction is subsequently fed to the Orchard batch
 /// verifier via [`orchard::bundle::BatchValidator::add_bundle`], the call
-/// chain reaches `orchard::circuit::to_halo2_instance()`, which calls
+/// chain under the legacy halo2 backend reaches
+/// `orchard::circuit::to_halo2_instance()`, which calls
 /// `.coordinates().unwrap()` on the identity point.  `coordinates()` returns
 /// `None` for the identity, so the `unwrap` **panics**, crashing the node.
+/// Rejecting the point at deserialization protects every backend.
 ///
 /// ## Root cause
 ///
@@ -2423,7 +2425,7 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
         primitives::Halo2Proof,
         serialization::ZcashSerialize,
     };
-    use halo2::pasta::pallas;
+    use pasta_curves::pallas;
 
     let _init_guard = zakura_test::init();
 

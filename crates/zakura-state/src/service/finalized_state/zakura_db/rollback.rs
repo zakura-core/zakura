@@ -1267,14 +1267,14 @@ mod tests {
 
     fn orchard_root(value: u64) -> orchard::tree::Root {
         let mut tree = orchard::tree::NoteCommitmentTree::default();
-        tree.append(halo2::pasta::pallas::Base::from(value))
+        tree.append(pasta_curves::pallas::Base::from(value))
             .expect("single-note Orchard tree is not full");
         tree.root()
     }
 
     fn ironwood_root(value: u64) -> zakura_chain::ironwood::tree::Root {
         let mut tree = zakura_chain::ironwood::tree::NoteCommitmentTree::default();
-        tree.append(halo2::pasta::pallas::Base::from(value))
+        tree.append(pasta_curves::pallas::Base::from(value))
             .expect("single-note Ironwood tree is not full");
         tree.root()
     }

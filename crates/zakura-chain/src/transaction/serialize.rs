@@ -5,8 +5,8 @@ use crate::serialization::ZcashReader;
 use std::{borrow::Borrow, io, sync::Arc};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use halo2::pasta::group::ff::PrimeField;
 use hex::FromHex;
+use pasta_curves::group::ff::PrimeField;
 use reddsa::{orchard::Binding, orchard::SpendAuth, Signature};
 
 use crate::{

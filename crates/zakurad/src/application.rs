@@ -343,12 +343,26 @@ fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> 
 
     install_panic_hook(metadata_section.clone());
 
-    // Apply the configured number of threads to the thread pool.
+    // Apply the configured number of threads to the CPU-bound thread pools.
+    //
+    // Sensei's private pool (Orchard proving, proof verification, and pooled
+    // RedPallas batch verification) reads its budget once, when the first
+    // proving or verification API initializes it. A zero setting leaves both
+    // pools on the same fallback: a positive `RAYON_NUM_THREADS`, then all
+    // logical cores. Don't read the budget back with `sensei::worker_budget()`
+    // here: reading it initializes the pool.
     //
     // Known limits, kept from earlier releases:
     // - Rayon uses its default panic handler, which doesn't report through the panic hook.
-    // - `zakura_consensus::init()` doesn't configure this pool when that crate is used by
+    // - `zakura_consensus::init()` doesn't configure these pools when that crate is used by
     //   itself.
+    if config.sync.parallel_cpu_threads != 0 {
+        sensei::configure_workers(config.sync.parallel_cpu_threads).expect(
+            "start() runs before any component that proves or verifies, so sensei's \
+             pool cannot be configured or initialized yet",
+        );
+    }
+
     rayon::ThreadPoolBuilder::new()
         .num_threads(config.sync.parallel_cpu_threads)
         .thread_name(|thread_index| format!("rayon {thread_index}"))

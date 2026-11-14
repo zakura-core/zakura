@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -1326,6 +1327,167 @@ class AddressPrivacyTests(unittest.TestCase):
                    "hash": "a" * 64, "bad": "999.999.999.999", "available": True}
         self.assertEqual(status.redact_private_addresses(payload, {status.address_key("192.0.2.17")}), payload)
 
+
+
+
+class DashboardPasswordTests(unittest.TestCase):
+    """The fleet pages and data need the shared password; the public APIs and local readers do not."""
+
+    PASSWORD = "correct horse battery staple"
+
+    def setUp(self):
+        self.originals = (status.COLLECTOR, status.RATE_LIMITER, status.LOGIN_RATE_LIMITER, status.DASHBOARD_LOGIN)
+        status.COLLECTOR = collector()
+        status.COLLECTOR.rows = [public_row(observed_at=time.time())]
+        status.RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        status.LOGIN_RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        status.DASHBOARD_LOGIN = status.DashboardLogin(
+            status.hash_password(self.PASSWORD, iterations=1000), "test-session-secret")
+        self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), status.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.no_redirect = urllib.request.build_opener(NoRedirect)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        (status.COLLECTOR, status.RATE_LIMITER, status.LOGIN_RATE_LIMITER, status.DASHBOARD_LOGIN) = self.originals
+
+    def get(self, path, headers=None):
+        """(status, headers, body) for a GET that, by default, looks like it came through Caddy."""
+        headers = {"X-Forwarded-For": "198.51.100.7", **(headers or {})}
+        request = urllib.request.Request(self.base_url + path, headers=headers)
+        try:
+            with self.no_redirect.open(request) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.headers, error.read()
+
+    def login(self, password):
+        request = urllib.request.Request(
+            self.base_url + "/login", method="POST",
+            data=urllib.parse.urlencode({"password": password}).encode(),
+            headers={"X-Forwarded-For": "198.51.100.7",
+                     "Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with self.no_redirect.open(request) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.headers, error.read()
+
+    def test_proxied_visitor_without_login_sees_login_page_and_no_data(self):
+        code, _, body = self.get("/")
+        self.assertEqual(code, 200)
+        self.assertIn(b'action="/login"', body)
+        self.assertNotEqual(body, status.PAGE.encode())
+        code, _, body = self.get("/node/linux-reference")
+        self.assertIn(b'action="/login"', body)
+        for path in ("/data", "/data/node/linux-reference", "/profile/linux-reference/api/status"):
+            code, _, body = self.get(path)
+            self.assertEqual(code, 401, path)
+            self.assertEqual(json.loads(body), {"error": "login required"})
+
+    def test_local_reader_without_proxy_header_still_reads_data(self):
+        request = urllib.request.Request(self.base_url + "/data")
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 200)
+            self.assertIn("chain", json.load(response))
+
+    def test_public_apis_and_health_stay_open(self):
+        self.assertEqual(self.get("/ironwood-status.json")[0], 200)
+        self.assertEqual(self.get("/healthz")[0], 200)
+
+    def test_wrong_password_is_rejected(self):
+        code, headers, body = self.login("wrong")
+        self.assertEqual(code, 401)
+        self.assertIn(b"Wrong password", body)
+        self.assertIsNone(headers["Set-Cookie"])
+
+    def test_right_password_sets_a_cookie_that_opens_the_dashboard(self):
+        code, headers, _ = self.login(self.PASSWORD)
+        self.assertEqual(code, 303)
+        cookie = headers["Set-Cookie"]
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("Secure", cookie)
+        token = cookie.split(";", 1)[0]
+        code, _, body = self.get("/", {"Cookie": token})
+        self.assertEqual(body, status.PAGE.encode())
+        code, _, body = self.get("/data", {"Cookie": token})
+        self.assertEqual(code, 200)
+        self.assertIn("chain", json.loads(body))
+
+    def test_cookie_signed_under_another_secret_or_expired_is_rejected(self):
+        other = status.DashboardLogin(status.DASHBOARD_LOGIN.password_hash, "another-secret")
+        foreign = f"{status.SESSION_COOKIE}={other.issue_token(time.time())}"
+        self.assertEqual(self.get("/data", {"Cookie": foreign})[0], 401)
+        expired = f"{status.SESSION_COOKIE}={status.DASHBOARD_LOGIN.issue_token(time.time() - status.SESSION_SECONDS - 1)}"
+        self.assertEqual(self.get("/data", {"Cookie": expired})[0], 401)
+
+    def test_malformed_cookie_signature_is_refused_not_crashed(self):
+        for token in ("123.\u00e9", "abc.def", "9999999999." + "z" * 64, ""):
+            with self.subTest(token=token):
+                self.assertFalse(status.DASHBOARD_LOGIN.token_valid(token, time.time()))
+        self.assertEqual(self.get("/data", {"Cookie": f"{status.SESSION_COOKIE}=1.%C3%A9"})[0], 401)
+
+    def test_login_over_the_plain_http_port_is_refused(self):
+        request = urllib.request.Request(
+            self.base_url + "/login", method="POST",
+            data=urllib.parse.urlencode({"password": self.PASSWORD}).encode())
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.no_redirect.open(request)
+        self.assertEqual(caught.exception.code, 403)
+        self.assertIsNone(caught.exception.headers["Set-Cookie"])
+
+    def test_logout_clears_the_cookie(self):
+        code, headers, _ = self.get("/logout")
+        self.assertEqual(code, 303)
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
+
+    def test_login_guesses_are_rate_limited(self):
+        status.LOGIN_RATE_LIMITER = status.RateLimiter(limit=2, window=60)
+        self.assertEqual(self.login("a")[0], 401)
+        self.assertEqual(self.login("b")[0], 401)
+        self.assertEqual(self.login(self.PASSWORD)[0], 429)
+
+    def test_without_a_password_everything_is_open(self):
+        status.DASHBOARD_LOGIN = None
+        self.assertEqual(self.get("/")[2], status.PAGE.encode())
+        self.assertEqual(self.get("/data")[0], 200)
+        self.assertEqual(self.login(self.PASSWORD)[0], 404)
+
+
+class DashboardLoginConfigTests(unittest.TestCase):
+    def test_hash_round_trip_and_malformed_hash(self):
+        encoded = status.hash_password("pw", iterations=1000)
+        self.assertTrue(status.verify_password("pw", encoded))
+        self.assertFalse(status.verify_password("other", encoded))
+        self.assertFalse(status.verify_password("pw", "garbage"))
+
+    def test_env_without_hash_disables_the_gate(self):
+        self.assertIsNone(status.dashboard_login_from_env({}))
+
+    def test_env_hash_gets_a_fresh_signing_key_per_start(self):
+        env = {"ZAKURA_DASHBOARD_PASSWORD_HASH": status.hash_password("pw", iterations=1000)}
+        first = status.dashboard_login_from_env(env)
+        second = status.dashboard_login_from_env(env)
+        self.assertNotEqual(first.session_secret, second.session_secret)
+        self.assertFalse(second.token_valid(first.issue_token(time.time()), time.time()))
+
+    def test_env_with_a_non_hash_refuses_to_start(self):
+        with self.assertRaises(ValueError):
+            status.dashboard_login_from_env({"ZAKURA_DASHBOARD_PASSWORD_HASH": "plaintext"})
+
+    def test_print_password_hash_reads_stdin(self):
+        result = subprocess.run([sys.executable, str(SCRIPT_PATH), "--print-password-hash"],
+                                input="pw\n", capture_output=True, text=True, check=True, timeout=30)
+        self.assertTrue(status.verify_password("pw", result.stdout.strip()))
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
 
 
 class HttpHandlerTests(unittest.TestCase):

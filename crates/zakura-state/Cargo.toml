@@ -134,6 +134,11 @@ harness = false
 required-features = ["internal-bench"]
 
 [[bench]]
+name = "chain_snapshot_cycle"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
 name = "transparent_index_worst_case"
 harness = false
 required-features = ["internal-bench"]

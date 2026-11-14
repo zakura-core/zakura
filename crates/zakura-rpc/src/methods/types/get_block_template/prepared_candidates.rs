@@ -245,7 +245,8 @@ impl PreparedCandidateResolver {
     /// The result equals what parsing `bytes` would give: the header is parsed from them, and
     /// parsing the identical transaction bytes gives the candidate's transactions.
     pub(crate) fn decode_submitted(&self, bytes: &[u8]) -> Option<Arc<Block>> {
-        // Preserve the full block parser's size limit even when the solution grew since preparation.
+        // Apply the size limit that the bounded parser applies to every other submission, even
+        // when the solution grew since preparation.
         if u64::try_from(bytes.len()).ok()? > MAX_BLOCK_BYTES {
             return None;
         }
@@ -722,7 +723,7 @@ mod tests {
             cache.retain(proposal, ClientProposal);
 
             let decoded = cache.decode_submitted(&bytes);
-            let parsed = Block::zcash_deserialize(&bytes[..]);
+            let parsed = Block::zcash_deserialize_bounded(&mut &bytes[..]);
             assert_eq!(decoded.is_some(), submitted_size <= limit);
             assert_eq!(parsed.is_ok(), submitted_size <= limit);
             if let Some(decoded) = decoded {

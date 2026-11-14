@@ -11,6 +11,7 @@ use service_session::{
 pub use service_session::{replay_service_session_bytes, ServiceSessionReplaySummary};
 
 use std::{
+    collections::BTreeMap,
     future,
     io::{Cursor, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -391,7 +392,16 @@ pub struct ZakuraConfig {
     /// [`Config::expose_peer_addresses`](crate::config::Config::expose_peer_addresses).
     /// The state, mempool, and `getblocktemplate` write `chain_tip.jsonl`, `mempool.jsonl`, and
     /// `mining_template.jsonl`, which trace the path from a new tip to a mining template.
+    /// Legacy peer connections write `legacy_gossip.jsonl`: each block announcement sent to
+    /// a peer, the peer's request for that block and the block being sent, and a bounded
+    /// number of the announcements each peer sends. Its rows never hold a peer's address;
+    /// [`trace_peer_names`](Self::trace_peer_names) names peers an operator wants to tell apart.
     pub trace_dir: Option<PathBuf>,
+    /// Operator-chosen peer names in gossip traces, keyed by IP address.
+    ///
+    /// Only list nodes you operate. Unlisted and proxied peers remain unnamed.
+    /// This has no effect when [`trace_dir`](Self::trace_dir) is unset.
+    pub trace_peer_names: BTreeMap<IpAddr, String>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
     /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
@@ -428,6 +438,7 @@ impl Default for ZakuraConfig {
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
             message_rate_per_second: DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND,
             trace_dir: None,
+            trace_peer_names: BTreeMap::new(),
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
             dev_network: None,
@@ -3176,14 +3187,7 @@ impl ZakuraProtocolHandler {
         };
 
         let remote_node_id = connection.remote_id();
-        let remote_peer_id = match ZakuraPeerId::new(remote_node_id.as_bytes().to_vec()) {
-            Ok(remote_peer_id) => remote_peer_id,
-            Err(error) => {
-                debug!(?error, "Zakura peer id rejected");
-                connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"peer id");
-                return;
-            }
-        };
+        let remote_peer_id = ZakuraPeerId::from_node_id(remote_node_id);
         let conn = ZakuraConnTrace::new(&self.trace, conn_id, &remote_peer_id);
 
         let negotiated = match self
@@ -5450,14 +5454,14 @@ pub(crate) async fn serve_reported_native_dial_connection(
         report.registration
     });
     let remote_node_id = connection.remote_id();
-    let peer_id = ZakuraPeerId::new(remote_node_id.as_bytes().to_vec())?;
+    let peer_id = ZakuraPeerId::from_node_id(remote_node_id);
     let conn = ZakuraConnTrace::new(
         &endpoint.handler.trace,
         trace_conn_id(&connection),
         &peer_id,
     );
     let local_node_id = endpoint.local_node_id();
-    let local_peer_id = ZakuraPeerId::new(local_node_id.as_bytes().to_vec())?;
+    let local_peer_id = ZakuraPeerId::from_node_id(local_node_id);
     let negotiated = {
         let _handshake = sim_chain!(endpoint
             .handler
@@ -7266,10 +7270,10 @@ impl LegacyResponseReadState {
     ) -> Result<LegacyResponseItem, OutboundRequestError> {
         let mut remaining = self.active_chunk.as_slice();
         let item = match kind {
-            LegacyResponseKind::Blocks => Block::zcash_deserialize_from_slice(&mut remaining)
+            LegacyResponseKind::Blocks => Block::zcash_deserialize_bounded(&mut remaining)
                 .map(|block| LegacyResponseItem::Block(Arc::new(block))),
             LegacyResponseKind::Transactions => {
-                Transaction::zcash_deserialize_from_slice(&mut remaining)
+                Transaction::zcash_deserialize_bounded(&mut remaining)
                     .map(|transaction| LegacyResponseItem::Transaction(transaction.into()))
             }
             LegacyResponseKind::BlockHashes

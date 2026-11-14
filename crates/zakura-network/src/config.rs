@@ -44,7 +44,7 @@ use crate::{
         OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     peer::address_is_valid_for_outbound_connections,
-    protocol::external::{canonical_peer_addr, canonical_socket_addr},
+    protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
     zakura::ZakuraConfig,
     BoxError, PeerSocketAddr,
 };
@@ -353,7 +353,8 @@ pub struct Config {
 
     /// Exposes legacy peer IP addresses in peer activity logs and structured trace files.
     /// This includes connected peers and candidate or address book entries.
-    /// Seed and peer-cache Prometheus metrics also use this setting for `remote_ip` labels.
+    /// The `zcash.net.peers.initial` Prometheus metric also uses this setting for its
+    /// `remote_ip` labels.
     ///
     /// Literal addresses supplied in the node configuration can appear in startup logs and
     /// `seed` labels regardless of this setting.
@@ -948,14 +949,15 @@ impl Config {
                     "updated cached peer IP addresses"
                 );
 
-                for ip in &selected_peers {
-                    metrics::counter!(
-                        "zcash.net.peers.cache",
-                        "cache" => peer_cache_file.display().to_string(),
-                        "remote_ip" => ip.addr_label(self.expose_peer_addresses)
-                    )
-                    .increment(1);
-                }
+                // Count the cached peers per cache file. A per-address label would add a series
+                // for every peer ever cached, and the exporter never removes them.
+                metrics::counter!(
+                    "zcash.net.peers.cache",
+                    "cache" => peer_cache_file.display().to_string(),
+                )
+                .increment(
+                    u64::try_from(selected_peers.len()).expect("a peer address count fits in u64"),
+                );
 
                 Ok(())
             }
@@ -1011,6 +1013,16 @@ impl Config {
     /// mutually capable peers to the Zakura upgrade hook.
     pub fn v2_p2p(&self) -> bool {
         self.p2p_stack.resolve(&self.network).runs_zakura()
+    }
+
+    /// Returns the services sent in the legacy handshake for the node's own `services`: those
+    /// services with [`PeerServices::NODE_P2P_V2`] set exactly when [`v2_p2p`](Self::v2_p2p) is.
+    pub fn handshake_services(&self, mut services: PeerServices) -> PeerServices {
+        services.remove(PeerServices::NODE_P2P_V2);
+        if self.v2_p2p() {
+            services |= PeerServices::NODE_P2P_V2;
+        }
+        services
     }
 
     /// Builds a network config for tests with [`p2p_stack`](Self::p2p_stack) pinned to

@@ -149,6 +149,9 @@ jobs:
       - name: Check v2 P2P runtime imports
         if: ${{ !cancelled() }}
         run: cargo xtask check-rt-imports
+      - name: Check peer and RPC code decodes blocks with the size limit
+        if: ${{ !cancelled() }}
+        run: cargo xtask check-bounded-decode
 
   # NOTE: per-crate default / no-default-features checks moved to
   # `test-crates.yml`, which runs `cargo hack check --workspace` (and again with
@@ -289,7 +292,9 @@ jobs:
 
       - name: Continuous profiler tests
         if: ${{ !cancelled() }}
-        run: python3 deploy/profiler/test_zakura_profiler.py
+        run: |
+          python3 deploy/profiler/test_zakura_profiler.py
+          python3 deploy/profiler/test_fleet.py
 
       - name: Compatibility monitoring tests
         if: ${{ !cancelled() }}

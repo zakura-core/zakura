@@ -152,9 +152,8 @@ async fn negotiate_test_pair(
     let local_min_version = MinimumPeerVersion::new(NoChainTip, &local_config.network);
     let remote_min_version = MinimumPeerVersion::new(NoChainTip, &remote_config.network);
 
-    let local_services = configured_advertised_services(&local_config, PeerServices::NODE_NETWORK);
-    let remote_services =
-        configured_advertised_services(&remote_config, PeerServices::NODE_NETWORK);
+    let local_services = local_config.handshake_services(PeerServices::NODE_NETWORK);
+    let remote_services = remote_config.handshake_services(PeerServices::NODE_NETWORK);
     let local_user_agent = TEST_LOCAL_USER_AGENT.to_string();
     let remote_user_agent = TEST_REMOTE_USER_AGENT.to_string();
 
@@ -794,11 +793,9 @@ async fn timed_out_initiator_upgrade_does_not_leak_upgrade_dial() {
 async fn p2p_v2_service_bit_advertisement_preserves_user_agent() {
     let _init_guard = zakura_test::init();
 
-    assert!(!configured_advertised_services(
-        &test_config(P2pStack::Legacy),
-        PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2,
-    )
-    .contains(PeerServices::NODE_P2P_V2));
+    assert!(!test_config(P2pStack::Legacy)
+        .handshake_services(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2)
+        .contains(PeerServices::NODE_P2P_V2));
 
     let (disabled_peer_seen_by_enabled, enabled_peer_seen_by_disabled) =
         negotiate_test_pair(test_config(P2pStack::Dual), test_config(P2pStack::Legacy)).await;
@@ -1124,6 +1121,48 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
     assert_eq!(remote_counter.update_count(), 0);
 }
 
+/// A peer's announcement of one block is traced under the peer's name. An `inv` that names
+/// several blocks answers a query, and one that names only transactions is not about a block,
+/// so neither is traced.
+#[tokio::test]
+async fn only_a_single_block_inv_is_traced_as_an_announcement() {
+    use crate::peer::gossip_trace::tests::test_trace;
+
+    let blocks: Vec<_> = (1..=3).map(|byte| block::Hash([byte; 32])).collect();
+    let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
+    let (trace, mut written) = test_trace(&[("127.0.0.1", "us-0")]);
+    let connected_addr = ConnectedAddr::new_inbound_direct(peer_addr(38233));
+
+    for message in [
+        Message::Inv(vec![InventoryHash::Block(blocks[0])]),
+        Message::Inv(
+            blocks[1..]
+                .iter()
+                .copied()
+                .map(InventoryHash::Block)
+                .collect(),
+        ),
+        Message::Inv(vec![transaction]),
+        Message::GetData(vec![InventoryHash::Block(blocks[0])]),
+    ] {
+        register_inventory_status(
+            Ok(message),
+            connected_addr,
+            broadcast::channel(16).0,
+            AnnouncedBlocks::default(),
+            trace.for_peer(&connected_addr),
+        )
+        .await
+        .expect("the filter passes the message through");
+    }
+
+    let rows = written.take();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["event"], "block_inv_received");
+    assert_eq!(rows[0]["hash"], blocks[0].to_string());
+    assert_eq!(rows[0]["peer_name"], "us-0");
+}
+
 /// Every inbound block `inv` records an announcement, whatever its shape, and `notfound`
 /// withdraws one. Unlike the inventory registry, this covers solicited multi-block `inv`s and
 /// connections without a transient address.
@@ -1173,6 +1212,7 @@ async fn inbound_invs_record_announced_blocks() {
             connected_addr,
             broadcast::channel(16).0,
             announced.clone(),
+            Default::default(),
         )
         .await
         .expect("the filter passes the message through");
@@ -1197,6 +1237,7 @@ async fn inbound_invs_record_announced_blocks() {
         ConnectedAddr::new_inbound_direct(peer_addr(38233)),
         broadcast::channel(16).0,
         announced.clone(),
+        Default::default(),
     )
     .await
     .expect("the filter passes the message through");
@@ -1228,6 +1269,7 @@ async fn body_requests_withdraw_only_requested_block_announcements() {
                 connected_addr,
                 broadcast::channel(16).0,
                 announced.clone(),
+                Default::default(),
             )
             .await
             .expect("the filter passes the request through");

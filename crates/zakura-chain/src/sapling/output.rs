@@ -115,6 +115,40 @@ impl Output {
 
         (prefix, self.zkproof)
     }
+
+    /// Writes this output's V5 prefix, the same bytes as
+    /// [`OutputPrefixInTransactionV5`], without copying the output.
+    pub(crate) fn zcash_serialize_v5_prefix<W: io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), io::Error> {
+        write_prefix(
+            &self.cv,
+            &self.cm_u,
+            &self.ephemeral_key,
+            &self.enc_ciphertext,
+            &self.out_ciphertext,
+            writer,
+        )
+    }
+}
+
+/// Writes the output fields shared by every transaction version, in order:
+/// `cv`, `cmu`, `ephemeralKey`, `encCiphertext` and `outCiphertext`.
+fn write_prefix<W: io::Write + ?Sized>(
+    cv: &commitment::ValueCommitment,
+    cm_u: &sapling_crypto::note::ExtractedNoteCommitment,
+    ephemeral_key: &keys::EphemeralPublicKey,
+    enc_ciphertext: &note::EncryptedNote,
+    out_ciphertext: &note::WrappedNoteKey,
+    writer: &mut W,
+) -> Result<(), io::Error> {
+    writer.write_all(&cv.0)?;
+    writer.write_all(&cm_u.to_bytes())?;
+    ephemeral_key.zcash_serialize(writer)?;
+    enc_ciphertext.zcash_serialize(writer)?;
+    out_ciphertext.zcash_serialize(writer)?;
+    Ok(())
 }
 
 impl OutputInTransactionV4 {
@@ -132,12 +166,8 @@ impl OutputInTransactionV4 {
 
 impl ZcashSerialize for OutputInTransactionV4 {
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
-        let output = self.0.clone();
-        writer.write_all(&output.cv.0)?;
-        writer.write_all(&output.cm_u.to_bytes())?;
-        output.ephemeral_key.zcash_serialize(writer)?;
-        output.enc_ciphertext.zcash_serialize(writer)?;
-        output.out_ciphertext.zcash_serialize(writer)?;
+        let output = &self.0;
+        output.zcash_serialize_v5_prefix(writer)?;
         output.zkproof.zcash_serialize(writer)?;
         Ok(())
     }
@@ -202,12 +232,14 @@ impl ZcashDeserialize for OutputInTransactionV4 {
 
 impl ZcashSerialize for OutputPrefixInTransactionV5 {
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
-        writer.write_all(&self.cv.0)?;
-        writer.write_all(&self.cm_u.to_bytes())?;
-        self.ephemeral_key.zcash_serialize(writer)?;
-        self.enc_ciphertext.zcash_serialize(writer)?;
-        self.out_ciphertext.zcash_serialize(writer)?;
-        Ok(())
+        write_prefix(
+            &self.cv,
+            &self.cm_u,
+            &self.ephemeral_key,
+            &self.enc_ciphertext,
+            &self.out_ciphertext,
+            writer,
+        )
     }
 }
 

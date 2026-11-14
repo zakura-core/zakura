@@ -72,7 +72,7 @@ use super::{
     scenario::Rejection,
     wire_node::{TransportTap, WireNode},
     wire_plans::SavedPlan,
-    NetScenario, Subsystem,
+    NetScenario, ScenarioFamily, Subsystem,
 };
 use crate::{
     domain::{
@@ -1527,6 +1527,12 @@ impl Subsystem for Storage {
         Assumptions::declare(declared).holds_when(Storage::recovery_holds)
     }
 
+    /// The grammar's version byte: a prefix without it draws the default
+    /// scenario.
+    fn families() -> Vec<ScenarioFamily> {
+        vec![ScenarioFamily::new("grammar", [grammar::LAYOUT.version])]
+    }
+
     /// Whether [`grammar::decode`] reads `prefix` rather than rejecting its
     /// version byte.
     fn accepts(prefix: &[u8]) -> bool {
@@ -2141,6 +2147,14 @@ impl Subsystem for HeaderWire {
             ]);
         }
         Assumptions::declare(declared).holds_when(wire_holds)
+    }
+
+    /// Each saved Plan's tag ([`SavedPlan::tag`]).
+    fn families() -> Vec<ScenarioFamily> {
+        SavedPlan::ALL
+            .into_iter()
+            .map(|plan| ScenarioFamily::new(plan.name(), plan.tag()))
+            .collect()
     }
 
     /// The saved Plan's scenario `prefix` tags ([`SavedPlan::tag`]), or

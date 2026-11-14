@@ -1,11 +1,17 @@
 //! The mutation loop's work list (mutation plan, mut-7.2) covers every
-//! enforced block-sync, block and discovery property exactly once.
+//! enforced block-sync, block and discovery property exactly once, and
+//! each of them has a generator harness or a recorded reason it has none
+//! (mut-4.2).
 #![cfg(zakura_sim)]
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
+};
 
 use serde::Deserialize;
-use zakura_sim::{harness::HARNESSES, property::Status};
+use zakura_sim::{explore::generate::generator_harnesses, harness::HARNESSES, property::Status};
 
 /// The work list, relative to the repository root.
 const WORK_LIST: &str = "qa/native-mutations/work-list.toml";
@@ -22,6 +28,15 @@ struct WorkList {
     entry: Vec<Entry>,
     #[serde(default)]
     excluded: Vec<Excluded>,
+    #[serde(default, rename = "no-generator")]
+    no_generator: Vec<NoGenerator>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoGenerator {
+    reason: String,
+    properties: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -194,6 +209,58 @@ fn the_work_list_covers_every_active_id_once() {
             assert!(entries.len() <= 1, "{id} is in {entries:?}");
         }
     }
+}
+
+/// The `Active` IDs the work list's entries cover: each instance's, and
+/// each registered ID under a protocol table's prefix.
+fn covered(list: &WorkList, registered: &BTreeMap<String, Status>) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for entry in &list.entry {
+        ids.extend(entry.instance.iter().map(|i| i.property.clone()));
+        if let Some(table) = &entry.table {
+            let prefix = format!("{table}/");
+            ids.extend(
+                registered
+                    .keys()
+                    .filter(|id| id.starts_with(&prefix))
+                    .cloned(),
+            );
+        }
+    }
+    ids.retain(|id| registered.get(id) == Some(&Status::Active));
+    ids
+}
+
+/// Every `Active` ID the work list covers has a generator harness, from
+/// `zakura-sim generators`'s map, or a `[[no-generator]]` record with a
+/// reason. Each record names covered `Active` IDs, each once, so a stale or
+/// misspelled ID fails here.
+#[test]
+fn every_covered_id_has_a_generator_or_a_reason() {
+    let list = work_list();
+    let registered = registered();
+    let covered = covered(&list, &registered);
+    let map = generator_harnesses();
+    let mut recorded = BTreeSet::new();
+    for record in &list.no_generator {
+        assert!(!record.reason.trim().is_empty(), "a record has no reason");
+        assert!(!record.properties.is_empty(), "{}: no ID", record.reason);
+        for id in &record.properties {
+            assert!(
+                covered.contains(id),
+                "no-generator names {id}, which isn't a covered Active ID"
+            );
+            assert!(recorded.insert(id.clone()), "{id} is recorded twice");
+        }
+    }
+    let holes: Vec<&String> = covered
+        .iter()
+        .filter(|id| map.get(*id).is_none_or(Vec::is_empty) && !recorded.contains(*id))
+        .collect();
+    assert!(
+        holes.is_empty(),
+        "no generator harness reports these IDs, and the work list records no reason: {holes:?}"
+    );
 }
 
 /// The loop's retained cases, relative to the repository root.

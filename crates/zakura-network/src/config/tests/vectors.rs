@@ -3,6 +3,10 @@
 use std::{
     fs,
     net::{IpAddr, SocketAddr},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -82,6 +86,107 @@ async fn peer_cache_preserves_order_and_alternates_with_seeds() {
     config.cache_dir = CacheDir::disabled();
     assert_eq!(config.initial_peers().await.len(), 2);
     assert!(config.load_peer_cache().await.unwrap().is_empty());
+}
+
+/// Records each counter's key and total, so tests can check metric labels.
+#[derive(Default)]
+struct CounterTotals(Mutex<Vec<(metrics::Key, Arc<AtomicU64>)>>);
+
+impl metrics::Recorder for CounterTotals {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        let mut counters = self.0.lock().expect("the test recorder is never poisoned");
+        let total = match counters.iter().find(|(registered, _)| registered == key) {
+            Some((_, total)) => total.clone(),
+            None => {
+                let total = Arc::new(AtomicU64::new(0));
+                counters.push((key.clone(), total.clone()));
+                total
+            }
+        };
+        metrics::Counter::from_arc(total)
+    }
+
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// Peer cache writes count their peers in one series per cache file. Caching different peers
+/// over time must not add a series per peer address, since the exporter never removes series.
+#[tokio::test]
+async fn peer_cache_metric_has_one_series_per_cache_file() {
+    const CACHE_METRIC: &str = "zcash.net.peers.cache";
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        ..Config::default()
+    };
+    // Distinct ports too: the default address redaction keeps only the port.
+    let peers = |first: u16| -> indexmap::IndexSet<PeerSocketAddr> {
+        (first..first + 3)
+            .map(|host| format!("127.0.0.{host}:{}", 18_000 + host).parse().unwrap())
+            .collect()
+    };
+
+    let recorder = CounterTotals::default();
+    {
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        config.update_peer_cache(peers(1)).await.unwrap();
+        config.update_peer_cache(peers(4)).await.unwrap();
+    }
+
+    let counters = recorder
+        .0
+        .lock()
+        .expect("the test recorder is never poisoned");
+    let cache_series: Vec<_> = counters
+        .iter()
+        .filter(|(key, _)| key.name() == CACHE_METRIC)
+        .collect();
+    assert_eq!(cache_series.len(), 1, "one series for the one cache file");
+    let (key, total) = cache_series[0];
+    assert_eq!(
+        key.labels().map(|label| label.key()).collect::<Vec<_>>(),
+        vec!["cache"]
+    );
+    assert_eq!(
+        total.load(Ordering::Relaxed),
+        6,
+        "both writes count their 3 peers"
+    );
 }
 
 /// A one-slot startup uses a fresh seed when available and cached peers as fallback.
@@ -2470,4 +2575,41 @@ fn invalid_advert_fanout_config_is_rejected() {
             .to_string();
         assert!(error.contains(field), "{config:?} gave {error}");
     }
+}
+
+/// Trace labels deserialize as typed IP addresses and survive config serialization.
+#[test]
+fn trace_peer_names_are_typed_and_optional() {
+    let config: Config = toml::from_str(
+        r#"[zakura]
+trace_peer_names = { "192.0.2.1" = "us-0", "2001:db8::9" = "asia-0" }
+"#,
+    )
+    .expect("valid peer addresses");
+    assert_eq!(
+        config.zakura.trace_peer_names[&"192.0.2.1".parse::<IpAddr>().unwrap()],
+        "us-0"
+    );
+    assert_eq!(
+        config.zakura.trace_peer_names[&"2001:db8::9".parse::<IpAddr>().unwrap()],
+        "asia-0"
+    );
+    let encoded = toml::to_string(&config).expect("serialize config");
+    let decoded: Config = toml::from_str(&encoded).expect("read serialized config");
+    assert_eq!(
+        config.zakura.trace_peer_names,
+        decoded.zakura.trace_peer_names
+    );
+    assert!(Config::default().zakura.trace_peer_names.is_empty());
+}
+
+/// Invalid peer addresses fail at the configuration boundary.
+#[test]
+fn trace_peer_names_reject_invalid_addresses() {
+    assert!(toml::from_str::<Config>(
+        r#"[zakura]
+trace_peer_names = { "not-an-ip" = "us-0" }
+"#,
+    )
+    .is_err());
 }

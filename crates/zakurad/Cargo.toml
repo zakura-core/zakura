@@ -7,7 +7,7 @@ name = "zakura"
 # [package.metadata.release] below does it automatically, but only under the
 # full `cargo release` flow (`cargo release version` skips the replace step) -
 # keep the two in sync when bumping by hand.
-version = "1.8.7"
+version = "1.8.8"
 authors.workspace = true
 description = "Zakura, an independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true
@@ -63,10 +63,7 @@ default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc
 
 
 # Standard builds enable Pasta assembly; `portable` is the explicit override.
-#
-# `sprout` stays on until the checkpoints cover NU7 activation on every network,
-# because until then a pre-NU7 block with JoinSplits can still need full verification.
-default = ["default-release-binaries", "sprout"]
+default = ["default-release-binaries"]
 
 # Legacy flags accepted for build compatibility; the progress display is removed.
 progress-bar = ["howudoin", "indicatif", "zakura-consensus/progress-bar", "zakura-state/progress-bar", "zakura-network/progress-bar"]
@@ -84,8 +81,8 @@ x86_64-asm = ["dep:orchard", "orchard/x86_64-asm"]
 # Production features that activate extra dependencies, or extra features in dependencies
 
 # Sprout JoinSplit proof and signature verification, only needed to fully verify
-# pre-NU7 blocks above the last checkpoint. On by default for now. See the `sprout` feature in
-# `zakura-consensus`.
+# pre-NU7 blocks above the last checkpoint. Opt in for historical verification;
+# post-NU7 snapshots do not need it. See the `sprout` feature in `zakura-consensus`.
 sprout = ["zakura-consensus/sprout"]
 
 # Subcommands for developers and release pipelines that node operators don't need, so release
@@ -182,7 +179,7 @@ toml = { workspace = true }
 
 futures = { workspace = true }
 rayon = { workspace = true }
-tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
+tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "net", "signal", "process", "io-util", "sync"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["hedge", "limit"] }
 pin-project = { workspace = true }

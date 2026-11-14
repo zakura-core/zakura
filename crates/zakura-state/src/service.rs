@@ -415,6 +415,12 @@ impl Drop for ReadStateService {
 
 impl StateService {
     const PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+    /// How often the state service exports RocksDB metrics and refreshes the disk usage
+    /// estimate returned for [`ReadRequest::UsageInfo`].
+    ///
+    /// These figures are for diagnosis, not detection: slow writes show up on every commit in
+    /// `zakura.state.rocksdb.batch_commit.duration_seconds`.
+    const ROCKSDB_METRICS_EXPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
     // The 1,000-block reorg bound fits every supported usize target.
     const FAILED_ANCESTOR_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
 
@@ -666,13 +672,32 @@ impl StateService {
         tracing::info!("cached state consensus branch is valid: no legacy chain found");
         timer.finish_desc("legacy chain check");
 
-        // Spawn a background task to periodically export RocksDB metrics to Prometheus
+        // Spawn a background task to periodically export RocksDB metrics to Prometheus.
+        //
+        // # Performance
+        //
+        // The export reads database sizes from RocksDB synchronously, which takes milliseconds
+        // on a large database. It runs on the blocking pool, so it never holds an async worker
+        // thread. We have observed stalls when threads on critical paths, such as block
+        // processing, wait for a thread switch, and this less important read of the state
+        // should not be what a useful thread waits behind.
         let db_for_metrics = read_service.db.clone();
         spawn_erased(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut interval = tokio::time::interval(Self::ROCKSDB_METRICS_EXPORT_INTERVAL);
             loop {
                 interval.tick().await;
-                db_for_metrics.export_metrics();
+
+                // Waiting for each export to finish means two exports never run at once.
+                let db = db_for_metrics.clone();
+                let export = tokio::task::spawn_blocking(move || db.export_metrics());
+
+                if let Err(error) = export.await {
+                    // A cancelled export means the runtime is shutting down, which is expected.
+                    if error.is_panic() {
+                        tracing::warn!(?error, "RocksDB metrics export panicked, stopping it");
+                    }
+                    return;
+                }
             }
         });
 

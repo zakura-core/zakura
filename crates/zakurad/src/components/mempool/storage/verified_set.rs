@@ -10,7 +10,7 @@ use std::{
 use zakura_chain::{
     block::Height,
     ironwood, orchard, sapling, sprout,
-    transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
 use zakura_node_services::mempool::TransactionDependencies;
@@ -100,20 +100,20 @@ pub struct VerifiedSet {
     /// The metric totals for verified transactions in the set.
     metrics: MempoolMetrics,
 
-    /// The set of spent out points by the verified transactions.
-    spent_outpoints: HashSet<transparent::OutPoint>,
+    /// Owners of transparent outpoints spent by verified transactions.
+    spent_outpoints: HashMap<transparent::OutPoint, transaction::Hash>,
 
-    /// The set of revealed Sprout nullifiers.
-    sprout_nullifiers: HashSet<sprout::Nullifier>,
+    /// Owners of revealed Sprout nullifiers.
+    sprout_nullifiers: HashMap<sprout::Nullifier, transaction::Hash>,
 
-    /// The set of revealed Sapling nullifiers.
-    sapling_nullifiers: HashSet<sapling::Nullifier>,
+    /// Owners of revealed Sapling nullifiers.
+    sapling_nullifiers: HashMap<sapling::Nullifier, transaction::Hash>,
 
-    /// The set of revealed Orchard nullifiers.
-    orchard_nullifiers: HashSet<orchard::Nullifier>,
+    /// Owners of revealed Orchard nullifiers.
+    orchard_nullifiers: HashMap<orchard::Nullifier, transaction::Hash>,
 
-    /// The set of revealed Ironwood nullifiers.
-    ironwood_nullifiers: HashSet<ironwood::Nullifier>,
+    /// Owners of revealed Ironwood nullifiers.
+    ironwood_nullifiers: HashMap<ironwood::Nullifier, transaction::Hash>,
 }
 
 impl Drop for VerifiedSet {
@@ -154,7 +154,7 @@ impl VerifiedSet {
 
     /// Returns true if a tx in the set has spent the output at the provided outpoint.
     pub fn has_spent_outpoint(&self, outpoint: &transparent::OutPoint) -> bool {
-        self.spent_outpoints.contains(outpoint)
+        self.spent_outpoints.contains_key(outpoint)
     }
 
     /// Returns the number of verified transactions in the set.
@@ -274,11 +274,18 @@ impl VerifiedSet {
             self.created_outputs.insert(outpoint, output.clone());
             pending_outputs.respond(&outpoint, output)
         }
-        self.spent_outpoints.extend(tx.spent_outpoints());
-        self.sprout_nullifiers.extend(tx.sprout_nullifiers());
-        self.sapling_nullifiers.extend(tx.sapling_nullifiers());
-        self.orchard_nullifiers.extend(tx.orchard_nullifiers());
-        self.ironwood_nullifiers.extend(tx.ironwood_nullifiers());
+        self.spent_outpoints
+            .extend(tx.spent_outpoints().map(|outpoint| (outpoint, tx_id)));
+        self.sprout_nullifiers
+            .extend(tx.sprout_nullifiers().map(|&nullifier| (nullifier, tx_id)));
+        self.sapling_nullifiers
+            .extend(tx.sapling_nullifiers().map(|&nullifier| (nullifier, tx_id)));
+        self.orchard_nullifiers
+            .extend(tx.orchard_nullifiers().map(|&nullifier| (nullifier, tx_id)));
+        self.ironwood_nullifiers.extend(
+            tx.ironwood_nullifiers()
+                .map(|&nullifier| (nullifier, tx_id)),
+        );
 
         self.transactions_serialized_size += transaction.transaction.size();
         self.total_cost += transaction.cost();
@@ -699,13 +706,38 @@ impl VerifiedSet {
     /// Two transactions have a spend conflict if they spend the same UTXO or if they reveal the
     /// same nullifier.
     fn has_spend_conflicts(&self, unmined_tx: &UnminedTx) -> bool {
-        let tx = unmined_tx.transaction();
+        self.conflicting_ids(unmined_tx.transaction())
+            .next()
+            .is_some()
+    }
 
-        Self::has_conflicts(&self.spent_outpoints, tx.spent_outpoints())
-            || Self::has_conflicts(&self.sprout_nullifiers, tx.sprout_nullifiers().copied())
-            || Self::has_conflicts(&self.sapling_nullifiers, tx.sapling_nullifiers().copied())
-            || Self::has_conflicts(&self.orchard_nullifiers, tx.orchard_nullifiers().copied())
-            || Self::has_conflicts(&self.ironwood_nullifiers, tx.ironwood_nullifiers().copied())
+    /// Finds owners of spends shared with `tx` using the admission indexes.
+    ///
+    /// A transaction can appear more than once if several spends conflict.
+    /// Work scales with `tx`'s spends, independently of the mempool size.
+    pub(super) fn conflicting_ids<'a>(
+        &'a self,
+        tx: &'a Transaction,
+    ) -> impl Iterator<Item = UnminedTxId> + 'a {
+        tx.spent_outpoints()
+            .filter_map(|outpoint| self.spent_outpoints.get(&outpoint))
+            .chain(
+                tx.sprout_nullifiers()
+                    .filter_map(|nf| self.sprout_nullifiers.get(nf)),
+            )
+            .chain(
+                tx.sapling_nullifiers()
+                    .filter_map(|nf| self.sapling_nullifiers.get(nf)),
+            )
+            .chain(
+                tx.orchard_nullifiers()
+                    .filter_map(|nf| self.orchard_nullifiers.get(nf)),
+            )
+            .chain(
+                tx.ironwood_nullifiers()
+                    .filter_map(|nf| self.ironwood_nullifiers.get(nf)),
+            )
+            .map(|id| self.transactions[id].transaction.id())
     }
 
     /// Removes the tracked transaction outputs from the mempool.
@@ -726,31 +758,25 @@ impl VerifiedSet {
         let orchard_nullifiers = tx.orchard_nullifiers().map(Cow::Borrowed);
         let ironwood_nullifiers = tx.ironwood_nullifiers().map(Cow::Borrowed);
 
-        Self::remove_from_set(&mut self.spent_outpoints, spent_outpoints);
-        Self::remove_from_set(&mut self.sprout_nullifiers, sprout_nullifiers);
-        Self::remove_from_set(&mut self.sapling_nullifiers, sapling_nullifiers);
-        Self::remove_from_set(&mut self.orchard_nullifiers, orchard_nullifiers);
-        Self::remove_from_set(&mut self.ironwood_nullifiers, ironwood_nullifiers);
+        Self::remove_spends(&mut self.spent_outpoints, spent_outpoints);
+        Self::remove_spends(&mut self.sprout_nullifiers, sprout_nullifiers);
+        Self::remove_spends(&mut self.sapling_nullifiers, sapling_nullifiers);
+        Self::remove_spends(&mut self.orchard_nullifiers, orchard_nullifiers);
+        Self::remove_spends(&mut self.ironwood_nullifiers, ironwood_nullifiers);
     }
 
-    /// Returns `true` if the two sets have common items.
-    fn has_conflicts<T>(set: &HashSet<T>, mut list: impl Iterator<Item = T>) -> bool
-    where
-        T: Eq + Hash,
-    {
-        list.any(|item| set.contains(&item))
-    }
-
-    /// Removes some items from a [`HashSet`].
+    /// Removes spends from an ownership index.
     ///
     /// Each item in the list of `items` should be wrapped in a [`Cow`]. This allows this generic
     /// method to support both borrowed and owned items.
-    fn remove_from_set<'t, T>(set: &mut HashSet<T>, items: impl IntoIterator<Item = Cow<'t, T>>)
-    where
+    fn remove_spends<'t, T>(
+        owners: &mut HashMap<T, transaction::Hash>,
+        items: impl IntoIterator<Item = Cow<'t, T>>,
+    ) where
         T: Clone + Eq + Hash + 't,
     {
         for item in items {
-            set.remove(&item);
+            owners.remove(&item);
         }
     }
 
@@ -998,6 +1024,7 @@ mod tests {
 
         verified.ironwood_nullifiers.insert(
             ironwood::Nullifier::try_from([0; 32]).expect("zero is a valid Pallas base field"),
+            transaction::Hash([0; 32]),
         );
 
         verified.clear();

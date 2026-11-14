@@ -53,8 +53,9 @@ pub enum ConfirmStatus {
     /// task panic is one: it violates `sim/no-task-panic`.
     OtherProperty,
     /// The run violates the property, but the fuzz target's filter can't
-    /// select it alone: the classifier selects another failure, the
-    /// property isn't `Active`, or another property is violated too.
+    /// select it alone: the classifier selects another failure that isn't
+    /// an expected co-violation, the property isn't `Active`, or another
+    /// property is violated too.
     SelectionUnsupported,
     /// The property has no trigger-history check, so no run can show the
     /// causal witness.
@@ -383,7 +384,9 @@ fn judge(
             format!("the run fails on {other}"),
         )),
         _ if !violates => Some((ConfirmStatus::NotViolated, format!("the run is {outcome}"))),
-        (_, Some(other)) if other != want => Some((
+        // The fuzz target's filter matches `property` anywhere in a failing
+        // run's report, so a listed co-violation may come first.
+        (_, Some(other)) if other != want && !also_violates.contains(&other) => Some((
             ConfirmStatus::SelectionUnsupported,
             format!("the classifier selects {other}, and the filter keys on it"),
         )),

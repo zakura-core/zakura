@@ -382,13 +382,11 @@ fn mempool_storage_crud_same_effects_mainnet() {
     let unmined_tx_2 = network
         .unmined_transactions_in_blocks(1..)
         .find(|tx| {
-            tx.transaction
-                .transaction()
-                .spent_outpoints()
-                .next()
-                .is_some()
+            let transaction = tx.transaction.transaction();
+            !transaction.has_sprout_joinsplit_data()
+                && transaction.spent_outpoints().next().is_some()
         })
-        .expect("at least one unmined transaction with at least 1 spent outpoint");
+        .expect("test vectors contain a non-Sprout transaction spending a transparent outpoint");
 
     // Insert unmined tx into the mempool.
     assert_eq!(

@@ -1054,11 +1054,11 @@ fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
 /// The best chain's blocks, lowest height first, without copying their headers.
 fn verified_blocks(
     state: &NonFinalizedState,
-) -> impl DoubleEndedIterator<Item = &Arc<ContextuallyVerifiedBlock>> + ExactSizeIterator + '_ {
+) -> impl DoubleEndedIterator<Item = &Arc<ContextuallyVerifiedBlock>> + '_ {
     state
         .best_chain()
-        .map(|chain| chain.blocks.values())
-        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|chain| chain.blocks.values())
 }
 
 fn verified_header_ref(block: &Arc<ContextuallyVerifiedBlock>) -> VerifiedHeaderRef {
@@ -1233,12 +1233,18 @@ fn full_state_evidence(
 ///
 /// Returns the index in the new path where the changed suffix starts.
 fn classify_verified_change(
-    old_path: impl ExactSizeIterator<Item = block::Hash>,
-    new_path: impl ExactSizeIterator<Item = block::Hash>,
+    old_path: impl Iterator<Item = block::Hash>,
+    mut new_path: impl Iterator<Item = block::Hash>,
 ) -> (VerifiedChangeCause, usize) {
-    let old_len = old_path.len();
-    let grows = new_path.len() > old_len && new_path.zip(old_path).all(|(new, old)| new == old);
-    if grows {
+    // The path grows when the old path is a strict prefix of the new one.
+    let mut old_len = 0;
+    for old in old_path {
+        if new_path.next() != Some(old) {
+            return (VerifiedChangeCause::Reset, 0);
+        }
+        old_len += 1;
+    }
+    if new_path.next().is_some() {
         (VerifiedChangeCause::Grow, old_len)
     } else {
         (VerifiedChangeCause::Reset, 0)

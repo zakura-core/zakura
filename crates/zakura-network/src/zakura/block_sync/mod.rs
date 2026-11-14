@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zakura_chain::{
     block,
-    serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
+    serialization::{SerializationError, ZcashSerialize},
 };
 use zakura_rt::{
     collections::{HashMap, HashSet},

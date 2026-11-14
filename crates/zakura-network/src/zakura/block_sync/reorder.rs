@@ -505,7 +505,7 @@ pub(super) struct DecodeRefusal {
 
 fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> block::Block {
     let mut reader = &payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..];
-    block::Block::zcash_deserialize_from_slice(&mut reader).expect(
+    block::Block::zcash_deserialize_bounded(&mut reader).expect(
         "raw block bytes deserialize because the peer routine decoded them before buffering",
     )
 }

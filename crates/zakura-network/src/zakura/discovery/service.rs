@@ -418,7 +418,7 @@ impl Service for DiscoveryService {
         else {
             return;
         };
-        let Some(peer_node_id) = node_id_from_peer_id(&peer.id) else {
+        let Some(peer_node_id) = peer.id.node_id() else {
             // A peer id that is not a 32-byte node id cannot be a discovery
             // author; drop the stream without registering an exchange.
             return;
@@ -892,13 +892,6 @@ impl DiscoverySink {
         self.state.record_hello();
         Ok(())
     }
-}
-
-/// Returns the node id encoded by a discovery peer id, if it is a 32-byte
-/// node id.
-fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
-    let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
-    NodeId::from_bytes(&bytes).ok()
 }
 
 #[cfg(zakura_sim)]
@@ -1711,7 +1704,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let connection_cancel = CancellationToken::new();
         let close_cause = CloseCause::new();
-        let peer_node_id = node_id_from_peer_id(&peer_id).expect("test peer ids are node ids");
+        let peer_node_id = peer_id.node_id().expect("test peer ids are node ids");
         let states = Arc::new(StdMutex::new(DiscoverySessionStates::default()));
         let slot = SessionSlot {
             states: states.clone(),

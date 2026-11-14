@@ -3187,14 +3187,7 @@ impl ZakuraProtocolHandler {
         };
 
         let remote_node_id = connection.remote_id();
-        let remote_peer_id = match ZakuraPeerId::new(remote_node_id.as_bytes().to_vec()) {
-            Ok(remote_peer_id) => remote_peer_id,
-            Err(error) => {
-                debug!(?error, "Zakura peer id rejected");
-                connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"peer id");
-                return;
-            }
-        };
+        let remote_peer_id = ZakuraPeerId::from_node_id(remote_node_id);
         let conn = ZakuraConnTrace::new(&self.trace, conn_id, &remote_peer_id);
 
         let negotiated = match self
@@ -5461,14 +5454,14 @@ pub(crate) async fn serve_reported_native_dial_connection(
         report.registration
     });
     let remote_node_id = connection.remote_id();
-    let peer_id = ZakuraPeerId::new(remote_node_id.as_bytes().to_vec())?;
+    let peer_id = ZakuraPeerId::from_node_id(remote_node_id);
     let conn = ZakuraConnTrace::new(
         &endpoint.handler.trace,
         trace_conn_id(&connection),
         &peer_id,
     );
     let local_node_id = endpoint.local_node_id();
-    let local_peer_id = ZakuraPeerId::new(local_node_id.as_bytes().to_vec())?;
+    let local_peer_id = ZakuraPeerId::from_node_id(local_node_id);
     let negotiated = {
         let _handshake = sim_chain!(endpoint
             .handler

@@ -2281,13 +2281,10 @@ async fn written_peer_cache_is_automatically_read_on_startup() {
     });
 }
 
-/// Adds a recent gossiped peer that is eligible for the disk cache.
+/// Adds a peer that just responded to this node, so it is eligible for the disk cache.
 fn add_cacheable_peer(address_book: &Arc<std::sync::Mutex<AddressBook>>) -> PeerSocketAddr {
     let peer = "127.0.0.1:8233".parse().expect("valid test peer address");
-    let change =
-        MetaAddr::new_gossiped_meta_addr(peer, PeerServices::NODE_NETWORK, DateTime32::now())
-            .new_gossiped_change()
-            .expect("recent gossiped peer creates an address book change");
+    let change = MetaAddr::new_responded(peer, None);
 
     address_book
         .lock()

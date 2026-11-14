@@ -2,8 +2,10 @@
 //!
 //! These state-level fixtures reuse historical shielded descriptions with new
 //! nullifiers. Their proofs and signatures are not re-created: semantic proof
-//! verification is outside this test. Blocks enter through [`Chain::push`],
-//! with real transparent values and pool deltas, and forks through [`Chain::fork`].
+//! verification is outside this test. Blocks are added through [`Chain::push`],
+//! with real transparent values and pool deltas, and forked through [`Chain::fork`].
+//! Transparent conflicts use [`NonFinalizedState::commit_block`]; shielded
+//! conflicts fail during [`Chain::push`].
 
 use std::{collections::HashMap, sync::Arc};
 

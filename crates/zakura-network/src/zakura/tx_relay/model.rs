@@ -23,7 +23,9 @@
 //!   eligible id in its pending set, reserves a slot at the pool, and only
 //!   then sends `GetTxs`. One claim per id. The id ready longest goes
 //!   first, over every session: ready since its first announcement, or
-//!   since its retry delay ended. So neither fresh ids nor retries starve
+//!   since its retry delay ended. A slot given back is room, so it ends a
+//!   `NoRoom` backoff, and a session waiting after its own release never
+//!   holds back others. So neither fresh ids nor retries starve
 //!   the other, and an older session cannot keep taking the room a verdict
 //!   frees. A routine keeps its own order in a queue keyed by that time.
 //!   Across sessions the table orders who goes next: a waiting session
@@ -35,31 +37,14 @@
 //!   carries at most one, so closing a session's connection ends that
 //!   session only, and a replacement session is always on another
 //!   connection.
-//! - **A stopped core ends claiming until a pool is attached again.** Its
-//!   last snapshot may still show an active pool, so a routine learns of it
-//!   from a `Stopped` answer, releases that claim and any probe permit, and
-//!   claims nothing more until the reactor attaches a pool. A stopped
-//!   answer to a call made to an earlier pool changes nothing. An
-//!   `Inactive` answer while the snapshot shows an active pool waits a retry
-//!   delay, so a missed restart costs one delay.
-//! - **One attempt at a time.** A claim lasts from the reserve call until
-//!   the body's verdict, even if the session ends meanwhile, so no other
-//!   fetch of the same entry starts while the pool decides it. A verdict
-//!   acts only on the entry its body was fetched for and releases only its
-//!   own claim.
-//! - **The limit of 5 is counted once.** Ids requested or awaiting a verdict
-//!   on a session, plus the peer's unsettled submissions from ended
-//!   sessions, never exceed [`MAX_REQUESTS_PER_PEER`]. A new session gets the
-//!   go only after every older session of its peer ended.
-//! - **Dialed peers first.** A session this node did not dial waits
-//!   [`INBOUND_DELAY`] after an id's first announcement.
-//! - **Announcers not yet asked go first.** A `NotFound` takes the id out of
-//!   that session's pending set, so it is asked again only if its peer
-//!   announces the id again. A deadline frees the pool's slot and the claim,
-//!   so another announcer can try. Either way the session waits
-//!   [`INBOUND_DELAY`] after each release before it may claim that id
-//!   again, so others claim it first. Only a missed deadline doubles the
-//!   next one. A late body is dropped before it reaches the pool.
+//! - **A stopped core ends claiming for good.** The port has no way to
+//!   attach another core. A stopped core publishes nothing more, so the
+//!   last snapshot still shows an active pool and no fetch token fires. A
+//!   routine learns of the stop from a `Stopped` answer or verdict, and from
+//!   then on claims nothing. Its outstanding requests end by their
+//!   deadlines or bodies, and nothing goes back to the core. An `Inactive`
+//!   answer while the snapshot shows an active pool waits a retry delay, so
+//!   a missed restart costs one delay.
 //! - **A rejection of a scope the pool caches settles the id for every
 //!   holder,** if it arrives on the chain it was made on, for a verdict and
 //!   a reserve answer alike. That includes one from the pool's contents,
@@ -138,7 +123,7 @@ use zakura_node_services::mempool::port::{
         Effect, JobId, ModelReservation, ModelTransition, ModelTx, ModelUnreserved, ModelVerdict,
         Outcome, PoolModel, Step, WaiterId,
     },
-    Change, Charge, Generation, GenerationRead, Intent, RejectionScope, ReservationId,
+    Change, Charge, Generation, GenerationRead, Intent, LocalFault, RejectionScope, ReservationId,
 };
 
 use self::{
@@ -328,9 +313,6 @@ struct Call {
     /// The chain generation of the snapshot the caller held when it made
     /// the call.
     generation: Generation,
-    /// Which attached pool the caller made it to. See
-    /// `RelayModel::attachment`.
-    attachment: u64,
 }
 
 /// The pool's answer to a reserve call, on its way back.
@@ -341,6 +323,9 @@ struct Answer {
     /// The pool cancelled the granted reservation before the caller
     /// received it. The caller sees only the cancelled token, not why.
     cancelled: bool,
+    /// The core had stopped, so the answer is the port's `Stopped`, which
+    /// the model's pool has no variant for.
+    stopped: bool,
 }
 
 /// Who submitted a body, from which snapshot.
@@ -393,16 +378,11 @@ pub(crate) struct RelayModel {
     /// verification. Only the invariants read it: such an attempt no longer
     /// has a claim to hold.
     settled: HashSet<(UnminedTxId, EntryGen)>,
-    /// The core behind the port stopped: every call is refused as stopped
-    /// until a pool is attached again. The pool's own truth, which
-    /// `tx-relay` learns only from answers.
+    /// The core behind the port stopped for good. The core's own truth,
+    /// which `tx-relay` learns only from answers and verdicts.
     core_stopped: bool,
-    /// `tx-relay` was told the core stopped, so it claims nothing until a
-    /// pool is attached again.
+    /// `tx-relay` was told the core stopped, so it claims nothing more.
     stopped: bool,
-    /// Counts the pools `tx-relay` saw attached or turned on. A stopped
-    /// answer from a call to an earlier one changes nothing.
-    attachment: u64,
     /// Every rejection `tx-relay` received, for the random run's oracle: the
     /// id, whether its scope is one the pool caches, the chain generation it
     /// was made on, and the one `tx-relay` held when it arrived.
@@ -477,7 +457,6 @@ impl RelayModel {
             settled: HashSet::new(),
             core_stopped: false,
             stopped: false,
-            attachment: 0,
             arrivals: Vec::new(),
             auto_submits: true,
             submits: VecDeque::new(),
@@ -658,8 +637,12 @@ impl RelayModel {
             state.requests.shift_remove(&id);
             state.reannounced.remove(&id);
             self.reservations.remove(&reservation);
-            let step = self.pool.release(reservation, self.now);
-            self.inbox.push_back(step);
+            // A stopped core takes nothing back. A slot given back is room.
+            if !self.core_stopped {
+                let step = self.pool.release(reservation, self.now);
+                self.inbox.push_back(step);
+                self.wanted.room();
+            }
             self.wanted
                 .release(id, request.generation, session, self.now, true);
             self.settle();
@@ -735,8 +718,11 @@ impl RelayModel {
         if let Some(reservation) = request.reservation {
             // The fetch ended without a body, which the pool logs.
             self.reservations.remove(&reservation);
-            let step = self.pool.fetch_failed(reservation, self.now);
-            self.inbox.push_back(step);
+            if !self.core_stopped {
+                let step = self.pool.fetch_failed(reservation, self.now);
+                self.inbox.push_back(step);
+                self.wanted.room();
+            }
             self.wanted
                 .release(id, request.generation, session, self.now, false);
         }
@@ -873,6 +859,9 @@ impl RelayModel {
     pub(crate) fn outcome(&mut self, job: JobId, outcome: Outcome, now: Time) {
         self.enter(now);
         self.jobs.retain(|(running, _, _)| *running != job);
+        if self.core_stopped {
+            return self.settle();
+        }
         let stable = GenerationRead::Stable(self.generation);
         let step = self.pool.outcome(job, outcome, stable, stable, self.now);
         self.inbox.push_back(step);
@@ -885,8 +874,10 @@ impl RelayModel {
         self.tip = transition.tip;
         self.best_tip = transition.tip;
         self.generation = transition.generation;
-        let step = self.pool.transition(transition, self.now);
-        self.inbox.push_back(step);
+        if !self.core_stopped {
+            let step = self.pool.transition(transition, self.now);
+            self.inbox.push_back(step);
+        }
         self.settle();
     }
 
@@ -908,23 +899,51 @@ impl RelayModel {
     /// The node fell behind the tip and the pool turned off.
     pub(crate) fn deactivate(&mut self, now: Time) {
         self.enter(now);
+        if self.core_stopped {
+            // A stopped core publishes nothing more.
+            return self.settle();
+        }
         self.pool_live = false;
         let step = self.pool.deactivate(self.now);
         self.inbox.push_back(step);
         self.settle();
     }
 
-    /// The core behind the port stops. Its last snapshot still shows an
-    /// active pool, so `tx-relay` learns of it only from the answers to its
-    /// calls, which say the core stopped. [`Self::activate`] attaches a pool
-    /// again.
+    /// The core behind the port stops for good, as on shutdown or a crash.
+    /// The port has no way to attach another. The core publishes nothing
+    /// more, so the last snapshot and log stay as they were and still show
+    /// an active pool, and no fetch token fires. Every verdict not yet sent
+    /// resolves as stopped. `tx-relay` learns of the stop from a stopped
+    /// verdict or answer.
     pub(crate) fn stop(&mut self, now: Time) {
         self.enter(now);
         self.core_stopped = true;
-        // The core's end answers every verdict and cancels every fetch, as
-        // a turned-off pool does.
-        let step = self.pool.deactivate(self.now);
-        self.inbox.push_back(step);
+        self.jobs.clear();
+        let sent: HashSet<WaiterId> = self
+            .deliveries
+            .iter()
+            .map(|delivery| delivery.waiter)
+            .collect();
+        let mut unsent: Vec<WaiterId> = self
+            .waiters
+            .keys()
+            .filter(|waiter| !sent.contains(waiter))
+            .copied()
+            .collect();
+        unsent.sort();
+        for waiter in unsent {
+            let delivery = Delivery {
+                waiter,
+                owner: self.waiters[&waiter],
+                verdict: ModelVerdict::LocalFault(LocalFault::Stopped),
+                decided_at: self.tip,
+            };
+            if self.auto_verdicts {
+                self.verdict(delivery);
+            } else {
+                self.deliveries.push_back(delivery);
+            }
+        }
         self.settle();
     }
 
@@ -934,17 +953,16 @@ impl RelayModel {
         std::mem::take(&mut self.arrivals)
     }
 
-    /// The pool is on again, at the latest tip, or a pool is attached again
-    /// after the core stopped.
+    /// The pool is on again, at the latest tip.
     pub(crate) fn activate(&mut self, now: Time) {
         self.enter(now);
+        if self.core_stopped {
+            return self.settle();
+        }
         self.pool.activate(self.tip, self.generation, self.now);
         let step = self.pool.effects();
         self.inbox.push_back(step);
         self.pool_live = true;
-        self.core_stopped = false;
-        self.stopped = false;
-        self.attachment = self.attachment.wrapping_add(1);
         let opened: Vec<SessionId> = self
             .sessions
             .iter()
@@ -1126,8 +1144,10 @@ impl RelayModel {
         if self.reactor.refresh_due(now) {
             self.reactor.refresh(now);
         }
-        let step = self.pool.tick(now);
-        self.inbox.push_back(step);
+        if !self.core_stopped {
+            let step = self.pool.tick(now);
+            self.inbox.push_back(step);
+        }
         self.drain();
         self.expire();
         self.release_adverts();
@@ -1437,6 +1457,10 @@ impl RelayModel {
                 }
                 self.charge(peer, charge, decided_at);
             }
+            ModelVerdict::LocalFault(LocalFault::Stopped) => {
+                self.stopped = true;
+                release(self, false);
+            }
             ModelVerdict::NoRoom | ModelVerdict::LocalFault(_) => release(self, true),
         }
     }
@@ -1450,6 +1474,13 @@ impl RelayModel {
             return;
         };
         self.reservations.remove(&marked.reservation);
+        if self.core_stopped {
+            // The port answers at once that the core stopped.
+            self.stopped = true;
+            self.wanted
+                .release(id, marked.generation, session, self.now, false);
+            return;
+        }
         let (waiter, step) = self.pool.submit(marked.reservation, marked.body, self.now);
         state.submissions.insert(waiter, (id, marked.generation));
         self.waiters.insert(waiter, VerdictOwner::Session(session));
@@ -1476,8 +1507,12 @@ impl RelayModel {
             return;
         }
         self.reservations.remove(&reservation);
-        let step = self.pool.release(reservation, self.now);
-        self.inbox.push_back(step);
+        // A stopped core takes nothing back. A slot given back is room.
+        if !self.core_stopped {
+            let step = self.pool.release(reservation, self.now);
+            self.inbox.push_back(step);
+            self.wanted.room();
+        }
         let Some(state) = self.sessions.get_mut(&session) else {
             return;
         };
@@ -1515,8 +1550,12 @@ impl RelayModel {
                 {
                     if let Some(reservation) = request.reservation.take() {
                         self.reservations.remove(&reservation);
-                        let step = self.pool.release(reservation, self.now);
-                        self.inbox.push_back(step);
+                        // A stopped core takes nothing back. A slot given back is room.
+                        if !self.core_stopped {
+                            let step = self.pool.release(reservation, self.now);
+                            self.inbox.push_back(step);
+                            self.wanted.room();
+                        }
                     }
                 }
                 if let Some(reserving) = state
@@ -1602,8 +1641,12 @@ impl RelayModel {
         for (id, request) in &state.requests {
             if let Some(reservation) = request.reservation {
                 self.reservations.remove(&reservation);
-                let step = self.pool.release(reservation, self.now);
-                self.inbox.push_back(step);
+                // A stopped core takes nothing back. A slot given back is room.
+                if !self.core_stopped {
+                    let step = self.pool.release(reservation, self.now);
+                    self.inbox.push_back(step);
+                    self.wanted.room();
+                }
                 self.wanted
                     .release(*id, request.generation, session, self.now, false);
             }
@@ -1776,8 +1819,12 @@ impl RelayModel {
         }
         for (session, id, generation, reservation) in freed {
             self.reservations.remove(&reservation);
-            let step = self.pool.release(reservation, self.now);
-            self.inbox.push_back(step);
+            // A stopped core takes nothing back. A slot given back is room.
+            if !self.core_stopped {
+                let step = self.pool.release(reservation, self.now);
+                self.inbox.push_back(step);
+                self.wanted.room();
+            }
             self.wanted
                 .release(id, generation, session, self.now, false);
         }
@@ -1838,7 +1885,6 @@ impl RelayModel {
                 id: pending.id,
                 call,
                 generation: self.generation,
-                attachment: self.attachment,
             };
             if self.auto_reserves {
                 self.process(call);
@@ -1863,13 +1909,23 @@ impl RelayModel {
         // A command already sent cannot be taken back, so a call its caller
         // gave up still runs, and its answer goes nowhere. A slot it was
         // granted is given back when that answer arrives.
-        let answer = self.pool.reserve(call.id, Intent::Fetch, self.now);
-        let step = self.pool.effects();
-        self.inbox.push_back(step);
-        let answer = Answer {
-            call,
-            answer,
-            cancelled: false,
+        let answer = if self.core_stopped {
+            Answer {
+                call,
+                answer: Err(ModelUnreserved::Inactive),
+                cancelled: false,
+                stopped: true,
+            }
+        } else {
+            let answer = self.pool.reserve(call.id, Intent::Fetch, self.now);
+            let step = self.pool.effects();
+            self.inbox.push_back(step);
+            Answer {
+                call,
+                answer,
+                cancelled: false,
+                stopped: false,
+            }
         };
         if self.auto_reserves {
             self.deliver(answer);
@@ -1884,6 +1940,7 @@ impl RelayModel {
             call,
             answer,
             cancelled,
+            stopped,
         } = answer;
         let session = call.session;
         let id = call.id;
@@ -1901,8 +1958,12 @@ impl RelayModel {
             // The caller gave up the call or ended. A granted slot goes
             // straight back.
             if let Ok(reservation) = answer {
-                let step = self.pool.release(reservation.id, self.now);
-                self.inbox.push_back(step);
+                // A stopped core takes nothing back. A slot given back is room.
+                if !self.core_stopped {
+                    let step = self.pool.release(reservation.id, self.now);
+                    self.inbox.push_back(step);
+                    self.wanted.room();
+                }
             }
             return;
         };
@@ -1917,12 +1978,23 @@ impl RelayModel {
             .current(id, pending.generation)
             .is_some_and(|entry| entry.claim == Some(session));
         match answer {
+            _ if stopped => {
+                // The core stopped. `tx-relay` claims nothing more.
+                self.stopped = true;
+                self.wanted
+                    .release(id, pending.generation, session, self.now, false);
+                self.return_probe(probe);
+            }
             Ok(reservation) if cancelled => {
                 // A cancelled token says nothing about why, so it decides
                 // nothing: the slot goes back and the id is asked about
                 // again, and the current pool answers.
-                let step = self.pool.release(reservation.id, self.now);
-                self.inbox.push_back(step);
+                // A stopped core takes nothing back. A slot given back is room.
+                if !self.core_stopped {
+                    let step = self.pool.release(reservation.id, self.now);
+                    self.inbox.push_back(step);
+                    self.wanted.room();
+                }
                 self.wanted
                     .release(id, pending.generation, session, self.now, false);
                 self.return_probe(probe);
@@ -1942,8 +2014,12 @@ impl RelayModel {
                 } else {
                     // The peer started cooling, the pool turned off, or the
                     // claim is gone: nothing is asked for.
-                    let step = self.pool.release(reservation.id, self.now);
-                    self.inbox.push_back(step);
+                    // A stopped core takes nothing back. A slot given back is room.
+                    if !self.core_stopped {
+                        let step = self.pool.release(reservation.id, self.now);
+                        self.inbox.push_back(step);
+                        self.wanted.room();
+                    }
                     self.wanted
                         .release(id, pending.generation, session, self.now, cooling);
                 }
@@ -1989,18 +2065,6 @@ impl RelayModel {
                 if remembered {
                     self.decided(id, pending.generation);
                 }
-                self.return_probe(probe);
-            }
-            Err(ModelUnreserved::Inactive) if self.core_stopped => {
-                // The model's pool answers a stopped core as inactive; the
-                // real port says `Stopped`. `tx-relay` claims nothing more
-                // until a pool is attached again, unless the call was to an
-                // earlier one.
-                if call.attachment == self.attachment {
-                    self.stopped = true;
-                }
-                self.wanted
-                    .release(id, pending.generation, session, self.now, false);
                 self.return_probe(probe);
             }
             Err(ModelUnreserved::Inactive) => {

@@ -2709,40 +2709,76 @@ fn freed_room_goes_to_the_id_ready_longest_over_every_session() {
 }
 
 #[test]
-fn a_stopped_core_ends_claims_until_a_pool_is_attached() {
+fn a_stopped_core_leaves_the_snapshot_and_fetches_as_they_were() {
     let mut relay = relay();
-    let a = open(&mut relay, 1, true, secs(0));
+    let supplier = open(&mut relay, 1, true, secs(0));
+    fetch(&mut relay, supplier, 2, secs(0));
+    assert!(relay.pool().visible().contains(&id(2)));
+    // A is fetching id 1, and B holds it too.
+    let a = open(&mut relay, 2, true, secs(0));
+    let b = open(&mut relay, 3, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(b, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
     relay.stop(secs(1));
-    // The snapshot still shows an active pool, so A tries once, and the
-    // answer says the core stopped.
-    relay.inv(a, &[(id(1), SIZE)], secs(1));
+    // Nothing was published or cancelled: the pooled id is still visible,
+    // and A's fetch still holds its reservation and the claim.
+    assert!(relay
+        .logged()
+        .iter()
+        .all(|change| !matches!(change, Change::Removed { .. })));
+    assert_eq!(relay.reservations_held(), 1);
+    assert_eq!(relay.wanted().entry(id(1)).unwrap().claim, Some(a));
+    relay.assert_invariants();
+    // C announces a new id. Its one call says the core stopped, so nothing
+    // more is claimed.
+    let c = open(&mut relay, 4, true, secs(2));
+    relay.inv(c, &[(id(3), SIZE)], secs(2));
+    assert!(asks(&relay.take_effects()).is_empty());
+    assert!(relay.wanted().entry(id(3)).unwrap().claim.is_none());
+    // A's body arrives and is refused at once. The claim ends, and B is not
+    // asked.
+    relay.tx(a, id(1), tx(1), secs(3));
+    assert_eq!(relay.reservations_held(), 0);
+    assert_eq!(relay.waiters_outstanding(), 0);
+    relay.tick(secs(120));
     assert!(asks(&relay.take_effects()).is_empty());
     assert!(relay.wanted().entry(id(1)).unwrap().claim.is_none());
-    assert_eq!(relay.calls_in_flight(), 0);
-    // Nothing more is tried, however long it waits.
-    relay.tick(secs(60));
-    assert!(asks(&relay.take_effects()).is_empty());
-    assert!(relay.wanted().probe().is_none());
-    relay.assert_invariants();
-    // A pool is attached again, and A is asked.
-    relay.activate(secs(61));
-    assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
     relay.assert_invariants();
 }
 
 #[test]
-fn a_stopped_answer_from_an_earlier_pool_changes_nothing() {
+fn a_stopped_verdict_ends_claiming() {
+    let mut relay = relay().with_manual_verdicts();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.tx(a, id(1), tx(1), secs(0));
+    relay.stop(secs(1));
+    assert!(relay.deliver_verdict(secs(1)));
+    assert_eq!(relay.waiters_outstanding(), 0);
+    // `tx-relay` knows the core stopped, so a new id is not even tried.
+    relay.inv(a, &[(id(2), SIZE)], secs(2));
+    assert_eq!(relay.calls_in_flight(), 0);
+    assert!(relay.wanted().entry(id(2)).unwrap().claim.is_none());
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_call_queued_before_the_stop_is_answered_stopped() {
     let mut relay = relay().with_manual_reserves();
     let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
     relay.stop(secs(1));
-    relay.inv(a, &[(id(1), SIZE)], secs(1));
     assert!(relay.process_reserve(secs(1)));
-    // A pool is attached before the old answer arrives.
-    relay.activate(secs(2));
-    assert!(relay.deliver_reserve(secs(2)));
-    relay.tick(secs(2) + RETRY_FIRST);
-    while relay.answer_reserve(secs(2) + RETRY_FIRST) {}
-    assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
+    assert!(relay.deliver_reserve(secs(1)));
+    assert!(asks(&relay.take_effects()).is_empty());
+    assert_eq!(
+        relay.pool().slots_in_use(),
+        0,
+        "the stopped core granted nothing"
+    );
+    relay.tick(secs(60));
+    assert_eq!(relay.calls_in_flight(), 0);
     relay.assert_invariants();
 }
 
@@ -2775,6 +2811,26 @@ fn a_delayed_reserve_rejection_after_a_restart_still_settles() {
     relay.inv(a, &[(id(1), SIZE)], secs(2));
     while relay.answer_reserve(secs(2)) {}
     assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_slot_given_back_ends_the_backoff_for_others() {
+    let mut relay = RelayModel::new(PoolModel::new(Height(100), Generation(0)).with_limits(1, 1));
+    // A takes the only slot for X, and B's Y finds no room.
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(b, &[(id(2), SIZE)], secs(1));
+    relay.take_effects();
+    for now in [2, 4, 8] {
+        relay.tick(secs(now));
+    }
+    // A announces X again and answers `NotFound`. The slot it gives back is
+    // room, so B is asked for Y while A waits.
+    relay.inv(a, &[(id(1), SIZE)], secs(9));
+    relay.not_found(a, id(1), secs(9));
+    assert_eq!(asks(&relay.take_effects()), vec![(b, id(2))]);
     relay.assert_invariants();
 }
 
@@ -2881,7 +2937,6 @@ fn run(seed: u64) {
     // announced meets it at once.
     let mut honest: HashMap<SessionId, Vec<(UnminedTxId, bool)>> = HashMap::new();
     let mut now = Duration::ZERO;
-    let mut stopped = false;
 
     let answer = |relay: &mut RelayModel,
                   replies: &mut Vec<(Duration, SessionId, UnminedTxId)>,
@@ -3012,16 +3067,6 @@ fn run(seed: u64) {
                 chain.push(Vec::new());
                 relay.transition(reorg, now);
             }
-            12 if stopped => {
-                // A pool is attached again.
-                relay.activate(now);
-                stopped = false;
-            }
-            12 if rng.next(4) == 0 => {
-                // The core stops behind an active snapshot.
-                relay.stop(now);
-                stopped = true;
-            }
             9 if manual && !live.is_empty() => {
                 let index = usize::try_from(rng.next(u64::try_from(live.len()).unwrap())).unwrap();
                 relay.read(live[index].0, now);
@@ -3034,9 +3079,6 @@ fn run(seed: u64) {
         relay.assert_invariants();
     }
 
-    if stopped {
-        relay.activate(now);
-    }
     // Quiet time: only answers, reserve replies, reads, verdicts and the
     // clock.
     let mut drained = false;

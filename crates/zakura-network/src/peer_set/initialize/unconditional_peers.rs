@@ -154,6 +154,9 @@ fn connections_with_dials_in_flight(
 
 /// Looks up the addresses of the DNS name `name`, with `port`, and gives up after
 /// [`constants::DNS_LOOKUP_TIMEOUT`].
+///
+/// Giving up stops the wait, not the system resolver call, which keeps its blocking
+/// thread until it returns.
 pub(super) fn lookup_host(name: Arc<str>, port: u16) -> BoxFuture<'static, Lookup> {
     async move {
         let addrs = tokio::time::timeout(

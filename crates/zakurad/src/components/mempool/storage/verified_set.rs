@@ -270,9 +270,6 @@ impl VerifiedSet {
         height: Option<Height>,
     ) -> Result<(), SameEffectsTipRejectionError> {
         let ancestors = self.check_insert(&transaction.transaction, &spent_mempool_outpoints)?;
-        let affected = self.dependency_group(ancestors);
-        self.remove_ordering_candidates(&affected);
-
         let tx_id = transaction.transaction.id().mined_id();
         self.transaction_dependencies
             .add(tx_id, spent_mempool_outpoints);
@@ -304,7 +301,8 @@ impl VerifiedSet {
         transaction.height = height;
         self.metrics.add_transaction(&transaction);
         self.transactions.insert(tx_id, transaction);
-        self.insert_ordering_candidates(&self.dependency_group([tx_id]));
+        self.insert_ordering_candidate(tx_id);
+        self.refresh_eviction_candidates(&ancestors);
 
         self.report_metrics();
 
@@ -431,15 +429,8 @@ impl VerifiedSet {
 
     /// Returns the mining candidate using all distinct unconfirmed ancestors.
     fn mining_candidate(&self, id: transaction::Hash) -> MiningCandidate {
-        let parents = self
-            .transaction_dependencies
-            .dependencies()
-            .get(&id)
-            .into_iter()
-            .flatten()
-            .copied();
         let score = self
-            .ancestors(parents)
+            .transaction_ancestors(id)
             .iter()
             .map(|ancestor| Self::eviction_cost(&self.transactions[ancestor]))
             .fold(
@@ -449,48 +440,107 @@ impl VerifiedSet {
         (Reverse(score), self.transactions[&id].time, id)
     }
 
-    /// Removes a group's ordering entries before changing its transactions or
-    /// dependency edges.
-    fn remove_ordering_candidates(&mut self, group: &HashSet<transaction::Hash>) {
-        for &id in group {
-            let scores = self.ordering_scores[&id];
-            let time = self.transactions[&id].time;
+    /// Removes a transaction's cached ordering entries.
+    fn remove_ordering_candidate(
+        &mut self,
+        id: transaction::Hash,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let scores = self
+            .ordering_scores
+            .remove(&id)
+            .expect("every stored transaction has cached ordering scores");
+        assert!(
+            self.eviction_order
+                .remove(&(scores.eviction, Reverse(time), id)),
+            "every stored transaction has its current eviction candidate"
+        );
+        assert!(
+            self.mining_order
+                .remove(&(Reverse(scores.mining), time, id)),
+            "every stored transaction has its current mining candidate"
+        );
+    }
+
+    /// Adds both ordering entries for a transaction without cached keys.
+    fn insert_ordering_candidate(&mut self, id: transaction::Hash) {
+        let eviction = self.eviction_candidate(id, &HashSet::new());
+        let mining = self.mining_candidate(id);
+        let (Reverse(mining_score), _, _) = mining;
+        assert!(
+            self.ordering_scores
+                .insert(
+                    id,
+                    OrderingScores {
+                        eviction: eviction.0,
+                        mining: mining_score,
+                    }
+                )
+                .is_none(),
+            "a transaction's old keys were removed before reinsertion"
+        );
+        assert!(
+            self.eviction_order.insert(eviction),
+            "a transaction's old eviction candidate was removed before insertion"
+        );
+        assert!(
+            self.mining_order.insert(mining),
+            "a transaction's old mining candidate was removed before insertion"
+        );
+    }
+
+    /// Refreshes surviving ancestors whose descendant packages changed.
+    fn refresh_eviction_candidates(&mut self, ids: &HashSet<transaction::Hash>) {
+        for &id in ids {
+            let Some(tx) = self.transactions.get(&id) else {
+                continue;
+            };
+            let time = tx.time;
+            let score = self.package_score(&id, &HashSet::new());
+            let cached = self
+                .ordering_scores
+                .get_mut(&id)
+                .expect("every surviving transaction has cached ordering scores");
+            if cached.eviction == score {
+                continue;
+            }
             assert!(
                 self.eviction_order
-                    .remove(&(scores.eviction, Reverse(time), id)),
-                "every stored transaction has its current eviction candidate"
+                    .remove(&(cached.eviction, Reverse(time), id)),
+                "the previous eviction candidate matches the cached score"
             );
+            cached.eviction = score;
             assert!(
-                self.mining_order
-                    .remove(&(Reverse(scores.mining), time, id)),
-                "every stored transaction has its current mining candidate"
+                self.eviction_order.insert((score, Reverse(time), id)),
+                "the previous eviction candidate was removed before refresh"
             );
         }
     }
 
-    /// Restores ordering entries for a group's survivors after a mutation.
-    fn insert_ordering_candidates(&mut self, group: &HashSet<transaction::Hash>) {
-        let removed = HashSet::new();
-        for &id in group {
-            if self.transactions.contains_key(&id) {
-                let eviction = self.eviction_candidate(id, &removed);
-                let mining = self.mining_candidate(id);
-                self.ordering_scores.insert(
-                    id,
-                    OrderingScores {
-                        eviction: eviction.0,
-                        mining: mining.0 .0,
-                    },
-                );
-                assert!(
-                    self.eviction_order.insert(eviction),
-                    "a group's old eviction candidates were removed before its mutation"
-                );
-                assert!(
-                    self.mining_order.insert(mining),
-                    "a group's old mining candidates were removed before its mutation"
-                );
+    /// Refreshes surviving descendants after their ancestors are mined.
+    fn refresh_mining_candidates(&mut self, ids: &HashSet<transaction::Hash>) {
+        for &id in ids {
+            if !self.transactions.contains_key(&id) {
+                continue;
             }
+            let (Reverse(score), time, _) = self.mining_candidate(id);
+            let cached = self
+                .ordering_scores
+                .get_mut(&id)
+                .expect("every surviving transaction has cached ordering scores");
+            if cached.mining == score {
+                continue;
+            }
+            assert!(
+                self.mining_order
+                    .remove(&(Reverse(cached.mining), time, id)),
+                "the previous mining candidate matches the cached score"
+            );
+            cached.mining = score;
+            assert!(
+                self.mining_order.insert((Reverse(score), time, id)),
+                "the previous mining candidate was removed before refresh"
+            );
         }
     }
 
@@ -570,6 +620,9 @@ impl VerifiedSet {
         removed: &HashSet<transaction::Hash>,
     ) -> HashSet<transaction::Hash> {
         let dependents = self.transaction_dependencies.dependents();
+        if !dependents.contains_key(&tx_id) {
+            return HashSet::new();
+        }
         let mut descendants = HashSet::new();
         let mut pending = vec![tx_id];
 
@@ -613,24 +666,39 @@ impl VerifiedSet {
         ancestors
     }
 
+    /// Returns the unconfirmed ancestors of a stored transaction.
+    fn transaction_ancestors(&self, id: transaction::Hash) -> HashSet<transaction::Hash> {
+        self.ancestors(
+            self.transaction_dependencies
+                .dependencies()
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .copied(),
+        )
+    }
+
     /// Removes mined transactions while retaining their unmined descendants.
     ///
-    /// Detaches mined dependencies between removing and restoring the affected
-    /// ordering entries, so survivors are rescored only once.
+    /// Only surviving ancestors can change eviction priority. Only surviving
+    /// descendants can change mining priority when their ancestors confirm.
     pub(super) fn remove_mined(
         &mut self,
         mined_ids: &HashSet<transaction::Hash>,
     ) -> HashSet<UnminedTxId> {
-        let affected: HashSet<_> = mined_ids
+        let eviction_updates: HashSet<_> = mined_ids
             .iter()
-            .filter(|id| self.transactions.contains_key(id))
-            .flat_map(|&id| self.dependency_group([id]))
+            .flat_map(|&id| self.transaction_ancestors(id))
             .collect();
-        self.remove_ordering_candidates(&affected);
+        let mining_updates: HashSet<_> = mined_ids
+            .iter()
+            .flat_map(|&id| self.descendants(id, &HashSet::new()))
+            .collect();
         self.transaction_dependencies
             .clear_mined_dependencies(mined_ids);
         let removed = self.remove_roots(mined_ids.iter().copied());
-        self.insert_ordering_candidates(&affected);
+        self.refresh_eviction_candidates(&eviction_updates);
+        self.refresh_mining_candidates(&mining_updates);
         if !removed.is_empty() {
             self.report_metrics();
         }
@@ -664,8 +732,8 @@ impl VerifiedSet {
         self.remove_batch([*key_to_remove])
     }
 
-    /// Removes overlapping roots with one ordering update per affected member
-    /// and one metrics report for the batch.
+    /// Removes roots and descendants, then refreshes their surviving ancestors.
+    /// Survivors keep the same ancestors, so their mining priority is unchanged.
     fn remove_batch(
         &mut self,
         tx_ids: impl IntoIterator<Item = transaction::Hash>,
@@ -674,20 +742,24 @@ impl VerifiedSet {
             .into_iter()
             .filter(|id| self.transactions.contains_key(id))
             .collect();
-        let affected: HashSet<_> = roots
-            .iter()
-            .flat_map(|&id| self.dependency_group([id]))
-            .collect();
-        self.remove_ordering_candidates(&affected);
+        let mut eviction_updates = HashSet::new();
+        for &root in &roots {
+            eviction_updates.extend(self.transaction_ancestors(root));
+            // A removed descendant can have another, surviving parent, as in
+            // a join. Its ancestors must also lose that descendant's fee.
+            for descendant in self.descendants(root, &HashSet::new()) {
+                eviction_updates.extend(self.transaction_ancestors(descendant));
+            }
+        }
         let removed = self.remove_roots(roots);
-        self.insert_ordering_candidates(&affected);
+        self.refresh_eviction_candidates(&eviction_updates);
         if !removed.is_empty() {
             self.report_metrics();
         }
         removed
     }
 
-    /// Removes roots and descendants after their ordering entries were removed.
+    /// Removes each victim and its cached ordering entries.
     fn remove_roots(
         &mut self,
         tx_ids: impl IntoIterator<Item = transaction::Hash>,
@@ -704,10 +776,11 @@ impl VerifiedSet {
                     continue;
                 };
 
+                self.remove_ordering_candidate(key_to_remove, removed_tx.time);
+
                 self.transactions_serialized_size -= removed_tx.transaction.size();
                 self.total_cost -= removed_tx.cost();
                 self.metrics.remove_transaction(&removed_tx);
-                self.ordering_scores.remove(&key_to_remove);
                 if let Some(height) = removed_tx.transaction.transaction().expiry_height() {
                     self.expiry_order.remove(&(height, key_to_remove));
                 }
@@ -741,11 +814,12 @@ impl VerifiedSet {
             .transactions
             .keys()
             .map(|&id| {
+                let (Reverse(mining), _, _) = self.mining_candidate(id);
                 (
                     id,
                     OrderingScores {
                         eviction: self.eviction_candidate(id, &removed).0,
-                        mining: self.mining_candidate(id).0 .0,
+                        mining,
                     },
                 )
             })

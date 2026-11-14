@@ -146,6 +146,9 @@ use types::{
     z_validate_address::ZValidateAddressResponse,
 };
 
+/// The first mempool recheck when the client's long-poll ID names no transactions.
+const EMPTY_TEMPLATE_MEMPOOL_RECHECK_DELAY: Duration = Duration::from_millis(100);
+
 /// Calls a Tower service and maps readiness or call errors to
 /// [`server::error::LegacyCode::Misc`].
 async fn call_service<S, Request>(service: S, request: Request) -> Result<S::Response>
@@ -3544,6 +3547,9 @@ where
         let mut wait_reason = WaitReason::Immediate;
 
         let client_long_poll_id = parameters.as_ref().and_then(|params| params.long_poll_id);
+        let mut early_mempool_recheck_pending = client_long_poll_id
+            .as_ref()
+            .is_some_and(|id| id.mempool_transaction_count() == 0);
         let mut template_rejections = self.gbt.template_rejections.subscribe();
 
         let miner_params = self
@@ -3702,13 +3708,19 @@ where
                 //
                 // TODO: when we're happy with this code, split it into a function.
                 //
-                // Periodically check the mempool for changes.
+                // Recheck once soon after an empty template: transactions can
+                // arrive just after the initial snapshot. Later checks use the
+                // normal interval, including when the mempool stays empty.
                 //
                 // Optional TODO:
                 // Remove this polling wait if we switch to using futures to detect sync status
                 // and mempool changes.
-                let wait_for_mempool_request =
-                    tokio::time::sleep(Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL));
+                let mempool_recheck_delay = if std::mem::take(&mut early_mempool_recheck_pending) {
+                    EMPTY_TEMPLATE_MEMPOOL_RECHECK_DELAY
+                } else {
+                    Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL)
+                };
+                let wait_for_mempool_request = tokio::time::sleep(mempool_recheck_delay);
 
                 // Return immediately if the chain tip has changed.
                 // The clone preserves the seen status of the chain tip.
@@ -3808,7 +3820,7 @@ where
                         continue;
                     }
 
-                    // This timer elapses every few seconds
+                    // Check early once after an empty template, then every few seconds.
                     _elapsed = wait_for_mempool_request => {
                         wait_reason = WaitReason::Timer;
                         tracing::debug!(
@@ -3816,8 +3828,8 @@ where
                             ?cur_time,
                             ?server_long_poll_id,
                             ?client_long_poll_id,
-                            MEMPOOL_LONG_POLL_INTERVAL,
-                            "checking for a new mempool change after waiting a few seconds"
+                            ?mempool_recheck_delay,
+                            "checking for a new mempool change after the polling delay"
                         );
                     }
 

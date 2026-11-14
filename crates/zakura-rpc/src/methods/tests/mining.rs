@@ -540,6 +540,120 @@ fn template_id(info: &GetBlockTemplateChainInfo) -> types::long_poll::LongPollId
         .generate_id()
 }
 
+#[tokio::test(start_paused = true)]
+async fn long_poll_rechecks_empty_template_once_after_100ms() {
+    let info = chain_info(2, 1, 0);
+    let (_, info_rx) = watch::channel(info.clone());
+    let (rpc, _tip, read_count, _) = counting_mining_rpc(info_rx);
+    let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+        long_poll_id: Some(template_id(&info)),
+        ..Default::default()
+    }));
+    tokio::pin!(request);
+    assert!(futures::poll!(&mut request).is_pending());
+    assert_eq!(read_count.load(Ordering::SeqCst), 1);
+
+    tokio::time::advance(Duration::from_millis(99)).await;
+    assert!(futures::poll!(&mut request).is_pending());
+    assert_eq!(read_count.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(futures::poll!(&mut request).is_pending());
+    assert_eq!(read_count.load(Ordering::SeqCst), 2);
+
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert!(futures::poll!(&mut request).is_pending());
+    assert_eq!(read_count.load(Ordering::SeqCst), 2);
+    tokio::time::advance(Duration::from_millis(4_900)).await;
+    assert!(futures::poll!(&mut request).is_pending());
+    assert_eq!(read_count.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn long_poll_early_recheck_detects_transactions_only_after_empty_template() {
+    use zakura_chain::transaction::VerifiedUnminedTx;
+
+    let transaction = Network::Mainnet
+        .unmined_transactions_in_blocks(..)
+        .find(|tx| {
+            let tx = tx.transaction.transaction();
+            !tx.is_coinbase() && !tx.has_sprout_joinsplit_data()
+        })
+        .unwrap()
+        .transaction;
+    let miner_fee = transaction.conventional_fee();
+    let transaction =
+        VerifiedUnminedTx::new(transaction, miner_fee, 0, 0, Arc::new(vec![])).unwrap();
+
+    for initially_populated in [false, true] {
+        let info = chain_info(2, 1, 0);
+        let populated = Arc::new(AtomicBool::new(initially_populated));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mempool = {
+            let populated = populated.clone();
+            let reads = reads.clone();
+            let transaction = transaction.clone();
+            let hash = info.tip_hash;
+            tower::service_fn(move |_| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                let transactions = if populated.load(Ordering::SeqCst) {
+                    vec![transaction.clone()]
+                } else {
+                    vec![]
+                };
+                async move {
+                    Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                        transactions,
+                        transaction_dependencies: Default::default(),
+                        last_seen_tip_hash: hash,
+                    })
+                }
+            })
+        };
+        let id = LongPollInput::new(
+            info.tip_height,
+            info.tip_hash,
+            info.max_time,
+            initially_populated.then_some(transaction.transaction.id()),
+        )
+        .generate_id();
+        let (tip, sender) = MockChainTip::new();
+        sender.send_best_tip_height(info.tip_height);
+        sender.send_best_tip_hash(info.tip_hash);
+        let read = tower::service_fn(move |_| {
+            let info = info.clone();
+            async move { Ok::<_, BoxError>(ReadResponse::ChainInfo(info)) }
+        });
+        let (rpc, _verifier) = rpc(network(), mempool, read, tip);
+        tokio::time::pause();
+        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+            long_poll_id: Some(id),
+            ..Default::default()
+        }));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        populated.store(true, Ordering::SeqCst);
+
+        tokio::time::advance(Duration::from_millis(101)).await;
+        if initially_populated {
+            assert!(futures::poll!(&mut request).is_pending());
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            tokio::time::advance(Duration::from_millis(4_900)).await;
+            assert!(futures::poll!(&mut request).is_pending());
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+        } else {
+            tokio::time::resume();
+            let template = bounded(request).await.unwrap().try_into_template().unwrap();
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+            assert_eq!(template.transactions.len(), 1);
+            assert_ne!(template.long_poll_id, id);
+        }
+        if initially_populated {
+            tokio::time::resume();
+        }
+    }
+}
+
 #[tokio::test]
 async fn template_worker_panic_is_an_rpc_error() {
     let (_, info) = watch::channel(chain_info(2, 1, 0));
@@ -834,6 +948,8 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
             }));
             tokio::pin!(request);
             assert!(futures::poll!(&mut request).is_pending());
+            tokio::time::advance(Duration::from_millis(101)).await;
+            assert!(futures::poll!(&mut request).is_pending());
             let reads = read_count.load(Ordering::SeqCst);
             tokio::time::advance(Duration::from_secs(2)).await;
             assert!(futures::poll!(&mut request).is_pending());
@@ -874,6 +990,11 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
             ..Default::default()
         }));
         tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        // Consume the early recheck before measuring the difficulty deadline.
+        // Pausing Tokio's clock does not advance the wall clock sampled by GBT.
+        // Allow one extra millisecond for Tokio's timer resolution.
+        tokio::time::advance(Duration::from_millis(101)).await;
         assert!(futures::poll!(&mut request).is_pending());
         let reads_before_expiry = read_count.load(Ordering::SeqCst);
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -1028,12 +1149,14 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         }));
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
-        let reads_before_deadline = read_count.load(Ordering::SeqCst);
         tokio::time::advance(Duration::from_secs(6) + Duration::from_millis(1)).await;
         let mut sampled = info_tx.borrow().clone();
         sampled.cur_time = clock.checked_add(Duration32::from_seconds(6)).unwrap();
         info_tx.send_replace(sampled.clone());
         assert!(futures::poll!(&mut request).is_pending());
+        tokio::time::advance(Duration::from_millis(101)).await;
+        assert!(futures::poll!(&mut request).is_pending());
+        let reads_before_deadline = read_count.load(Ordering::SeqCst);
 
         // Four seconds remain after the fetch. Starting that wait before the fetch
         // would already have expired it and forced a premature replacement.
@@ -1082,6 +1205,8 @@ fn superseded_deadline_build_does_not_resume_long_polling() {
             ..Default::default()
         }));
         tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        tokio::time::advance(Duration::from_millis(101)).await;
         assert!(futures::poll!(&mut request).is_pending());
         tokio::time::advance(deadline + Duration::from_millis(1)).await;
         assert!(

@@ -190,9 +190,165 @@ impl Service<Request> for CoreMempool {
                 }
                 .boxed()
             }
-            Some(snapshot) => answer(shared, snapshot, request).boxed(),
+            // A submission takes its slots here, in the call, before its
+            // future waits for anything, as today's pool queues it in the
+            // call, so no body waits uncounted in a future not yet polled.
+            Some(snapshot) => match request {
+                Request::Queue(items) => queue_request(shared, snapshot, items).boxed(),
+                Request::QueueFromPeer {
+                    transactions,
+                    source,
+                } => peer_batch(shared, snapshot, transactions, source).boxed(),
+                request => answer(shared, snapshot, request).boxed(),
+            },
             None => async move { inactive_answer(request) }.boxed(),
         }
+    }
+}
+
+/// Answers a local `Queue` request. Every body takes its slots now, before
+/// the returned future waits for anything, and the bodies are queued before
+/// the ids, so a body waits only for the bodies before it, all under
+/// deadlines that started together. An id takes its slots at its turn, as
+/// today's pool checks each in order. The answers keep the request's order.
+fn queue_request(
+    shared: Arc<Shared>,
+    snapshot: Arc<PoolSnapshot>,
+    items: Vec<Gossip>,
+) -> impl Future<Output = Result<Response, BoxError>> + Send + 'static {
+    let (bodies, ids): (Vec<(usize, Gossip)>, Vec<(usize, Gossip)>) = items
+        .into_iter()
+        .enumerate()
+        .partition(|(_, item)| matches!(item, Gossip::Tx(_)));
+    let mut answers: Vec<Option<Result<Receiver, BoxError>>> = std::iter::repeat_with(|| None)
+        .take(bodies.len() + ids.len())
+        .collect();
+    // A body the pool already holds is answered before the limits, as
+    // today's pool answers it, so it cannot take a fresh body's slot. Only a
+    // snapshot of the state's best tip can say so: a newer block may have
+    // mined it, which the core answers.
+    let current = !shared.is_behind(&snapshot);
+    let bodies: Vec<(usize, Staged)> = bodies
+        .into_iter()
+        .filter_map(|(at, item)| {
+            if current && snapshot.transaction(&item.id().mined_id()).is_some() {
+                answers[at] = Some(Err(MempoolError::InMempool.into()));
+                return None;
+            }
+            Some((at, Staged::new(&shared, item, &None)))
+        })
+        .collect();
+    async move {
+        // Bodies holding slots go before the ones over a limit, whose probes
+        // have deadlines of their own.
+        let (held, over): (Vec<(usize, Staged)>, Vec<(usize, Staged)>) = bodies
+            .into_iter()
+            .partition(|(_, body)| matches!(body, Staged::Held { .. }));
+        for (at, body) in held.into_iter().chain(over) {
+            answers[at] = Some(body.queue(shared.clone(), None).await);
+        }
+        for (at, id) in ids {
+            answers[at] = Some(
+                Staged::new(&shared, id, &None)
+                    .queue(shared.clone(), None)
+                    .await,
+            );
+        }
+        Ok(Response::Queued(
+            answers
+                .into_iter()
+                .map(|answer| answer.expect("every item is answered"))
+                .collect(),
+        ))
+    }
+}
+
+/// Answers a peer's `QueueFromPeer` batch, as today's pool does: nothing
+/// from a cooling legacy peer, and whatever it cannot queue dropped. Every
+/// body takes its slots now, before the returned future waits for anything.
+fn peer_batch(
+    shared: Arc<Shared>,
+    snapshot: Arc<PoolSnapshot>,
+    transactions: Vec<Gossip>,
+    source: QueueSource,
+) -> impl Future<Output = Result<Response, BoxError>> + Send + 'static {
+    tracing::trace!(
+        req_count = ?transactions.len(),
+        source = %queue_source_log_label(&source, shared.expose_peer_addresses),
+        "got mempool QueueFromPeer request"
+    );
+    // Today's pool ignores everything a cooling legacy peer sends.
+    let cooling = match &source {
+        QueueSource::LegacySocket(addr) => {
+            shared.cooldowns.is_cooling_down(addr.ip(), Instant::now())
+        }
+        QueueSource::Zakura(_) => false,
+    };
+    if cooling {
+        metrics::counter!("mempool.peer_cooldown.ignored.transactions.total")
+            .increment(u64::try_from(transactions.len()).unwrap_or(u64::MAX));
+    }
+    let transactions = if cooling { Vec::new() } else { transactions };
+    let from = Some(source.clone());
+    let (bodies, ids): (Vec<Gossip>, Vec<Gossip>) = transactions
+        .into_iter()
+        .partition(|item| matches!(item, Gossip::Tx(_)));
+    // A body the pool already holds is skipped before the limits, as today's
+    // pool skips it, so it cannot take a fresh body's slot. Every other body
+    // takes its slots now. Today's pool drops what it cannot queue from a
+    // peer, so a body over a limit is dropped here without asking the core.
+    let bodies: Vec<Staged> = bodies
+        .into_iter()
+        .filter(|body| snapshot.transaction(&body.id().mined_id()).is_none())
+        .map(|item| Staged::new(&shared, item, &from))
+        .filter(|body| match body {
+            Staged::Over { peer_full, .. } => {
+                if *peer_full {
+                    metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
+                }
+                false
+            }
+            Staged::Held { .. } => true,
+        })
+        .collect();
+    async move {
+        for body in bodies {
+            let _ = body.queue(shared.clone(), from.clone()).await;
+        }
+        // Today's pool checks what it already knows about each id before its
+        // limits, at no cost. Here that is one look at the snapshot and one
+        // core command for the whole batch, so a batch of known ids costs the
+        // core one command, not one for each. A pooled transaction is known
+        // by its effects, as `reserve` knows it.
+        let fresh: Vec<UnminedTxId> = ids
+            .iter()
+            .map(Gossip::id)
+            .filter(|id| snapshot.transaction(&id.mined_id()).is_none())
+            .collect();
+        let rejected = if fresh.is_empty() {
+            Default::default()
+        } else {
+            rejected_ids(&shared, fresh.iter().copied().collect()).await
+        };
+        let mut fresh = fresh
+            .into_iter()
+            .filter(|id| !rejected.contains(id))
+            .peekable();
+        // Once either limit is reached, the rest of the batch is refused
+        // here, as today's would refuse each item, without asking the core.
+        while let Some(id) = fresh.next() {
+            if !shared.has_room(&source) {
+                if !shared.node_has_room() {
+                    break;
+                }
+                let refused = 1 + fresh.count();
+                metrics::counter!("mempool.full_queue.per_peer.total")
+                    .increment(u64::try_from(refused).unwrap_or(u64::MAX));
+                break;
+            }
+            let _ = queue(shared.clone(), Gossip::Id(id), from.clone()).await;
+        }
+        Ok(Response::Queued(Vec::new()))
     }
 }
 
@@ -343,135 +499,8 @@ async fn answer(
         Request::RejectedTransactionIds(ids) => {
             Response::RejectedTransactionIds(rejected_ids(&shared, ids).await)
         }
-        Request::Queue(items) => {
-            // Every body takes its slots before anything here waits, and the
-            // bodies are queued before the ids, so a body waits only for the
-            // bodies before it, all under deadlines that started together.
-            // An id takes its slots at its turn, as today's pool checks each
-            // in order. The answers keep the request's order.
-            let (bodies, ids): (Vec<(usize, Gossip)>, Vec<(usize, Gossip)>) = items
-                .into_iter()
-                .enumerate()
-                .partition(|(_, item)| matches!(item, Gossip::Tx(_)));
-            let mut answers: Vec<Option<Result<Receiver, BoxError>>> =
-                std::iter::repeat_with(|| None)
-                    .take(bodies.len() + ids.len())
-                    .collect();
-            // A body the pool already holds is answered before the limits, as
-            // today's pool answers it, so it cannot take a fresh body's slot.
-            let bodies: Vec<(usize, Staged)> = bodies
-                .into_iter()
-                .filter_map(|(at, item)| {
-                    if snapshot.transaction(&item.id().mined_id()).is_some() {
-                        answers[at] = Some(Err(MempoolError::InMempool.into()));
-                        return None;
-                    }
-                    Some((at, Staged::new(&shared, item, &None)))
-                })
-                .collect();
-            // Bodies holding slots go before the ones over a limit, whose
-            // probes have deadlines of their own.
-            let (held, over): (Vec<(usize, Staged)>, Vec<(usize, Staged)>) = bodies
-                .into_iter()
-                .partition(|(_, body)| matches!(body, Staged::Held { .. }));
-            for (at, body) in held.into_iter().chain(over) {
-                answers[at] = Some(body.queue(shared.clone(), None).await);
-            }
-            for (at, id) in ids {
-                answers[at] = Some(
-                    Staged::new(&shared, id, &None)
-                        .queue(shared.clone(), None)
-                        .await,
-                );
-            }
-            Response::Queued(
-                answers
-                    .into_iter()
-                    .map(|answer| answer.expect("every item is answered"))
-                    .collect(),
-            )
-        }
-        Request::QueueFromPeer {
-            transactions,
-            source,
-        } => {
-            tracing::trace!(
-                req_count = ?transactions.len(),
-                source = %queue_source_log_label(&source, shared.expose_peer_addresses),
-                "got mempool QueueFromPeer request"
-            );
-            // Today's pool ignores everything a cooling legacy peer sends.
-            if let QueueSource::LegacySocket(addr) = &source {
-                if shared.cooldowns.is_cooling_down(addr.ip(), Instant::now()) {
-                    metrics::counter!("mempool.peer_cooldown.ignored.transactions.total")
-                        .increment(u64::try_from(transactions.len()).unwrap_or(u64::MAX));
-                    return Ok(Response::Queued(Vec::new()));
-                }
-            }
-            let from = Some(source.clone());
-            let (bodies, ids): (Vec<Gossip>, Vec<Gossip>) = transactions
-                .into_iter()
-                .partition(|item| matches!(item, Gossip::Tx(_)));
-            // A body the pool already holds is skipped before the limits, as
-            // today's pool skips it, so it cannot take a fresh body's slot.
-            let bodies: Vec<Gossip> = bodies
-                .into_iter()
-                .filter(|body| snapshot.transaction(&body.id().mined_id()).is_none())
-                .collect();
-            // Every body takes its slots before anything here waits. Today's
-            // pool drops what it cannot queue from a peer, so a body over a
-            // limit is dropped here without asking the core.
-            let bodies: Vec<Staged> = bodies
-                .into_iter()
-                .map(|item| Staged::new(&shared, item, &from))
-                .collect();
-            for body in bodies {
-                match body {
-                    Staged::Over { peer_full, .. } => {
-                        if peer_full {
-                            metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
-                        }
-                    }
-                    held => {
-                        let _ = held.queue(shared.clone(), from.clone()).await;
-                    }
-                }
-            }
-            // Today's pool checks what it already knows about each id before
-            // its limits, at no cost. Here that is one look at the snapshot
-            // and one core command for the whole batch, so a batch of known
-            // ids costs the core one command, not one for each. A pooled
-            // transaction is known by its effects, as `reserve` knows it.
-            let fresh: Vec<UnminedTxId> = ids
-                .iter()
-                .map(Gossip::id)
-                .filter(|id| snapshot.transaction(&id.mined_id()).is_none())
-                .collect();
-            let rejected = if fresh.is_empty() {
-                Default::default()
-            } else {
-                rejected_ids(&shared, fresh.iter().copied().collect()).await
-            };
-            let mut fresh = fresh
-                .into_iter()
-                .filter(|id| !rejected.contains(id))
-                .peekable();
-            // Once either limit is reached, the rest of the batch is refused
-            // here, as today's would refuse each item, without asking the
-            // core.
-            while let Some(id) = fresh.next() {
-                if !shared.has_room(&source) {
-                    if !shared.node_has_room() {
-                        break;
-                    }
-                    let refused = 1 + fresh.count();
-                    metrics::counter!("mempool.full_queue.per_peer.total")
-                        .increment(u64::try_from(refused).unwrap_or(u64::MAX));
-                    break;
-                }
-                let _ = queue(shared.clone(), Gossip::Id(id), from.clone()).await;
-            }
-            Response::Queued(Vec::new())
+        Request::Queue(_) | Request::QueueFromPeer { .. } => {
+            unreachable!("`CoreMempool::call` stages submissions before anything waits")
         }
         Request::CheckForVerifiedTransactions => Response::CheckedForVerifiedTransactions,
         Request::QueueStats => {
@@ -680,14 +709,20 @@ async fn queue_held(
                     queue_slot: Some(queue_slot),
                     shared: shared.clone(),
                 }),
-                Err(refused) => Err(refused),
+                // The slot goes back with the refusal, so it is freed with the
+                // body, which the caller still holds.
+                Err(refused) => Err((refused, queue_slot)),
             };
             let _ = granted.send(answer);
         }
     });
     let (reservation, queue_slot) = match tokio::time::timeout_at(deadline, grant).await {
         Ok(Ok(Ok(handoff))) => handoff.take(),
-        Ok(Ok(Err(refused))) => return first_stage_refusal(refused),
+        Ok(Ok(Err((refused, queue_slot)))) => {
+            drop(item);
+            drop(queue_slot);
+            return first_stage_refusal(refused);
+        }
         Ok(Err(_lost)) => return Err("the pool core's reservation task failed".into()),
         Err(_elapsed) => return Err(timed_out()),
     };
@@ -3284,5 +3319,75 @@ mod tests {
         let _ = reply.send(Err(Unreserved::Pooled));
         let _ = request.await;
         assert!(inbox.try_next().is_none(), "nothing else is asked");
+    }
+
+    /// A submission takes its slots in the call itself, as today's pool
+    /// queues it in the call, so a body in a future its caller has not polled
+    /// yet is already counted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_submission_takes_its_slots_in_the_call() {
+        use zakura_node_services::mempool::port::pool_port;
+
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let (handle, inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let unpolled = core.call(Request::QueueFromPeer {
+            transactions: vec![Gossip::Tx(body)],
+            source: peer(),
+        });
+        assert_eq!(queued_count(&core), 1, "counted before it is polled");
+        drop(unpolled);
+        assert_eq!(queued_count(&core), 0, "freed with the future");
+    }
+
+    /// The shortcut for a body the pool holds needs a snapshot of the
+    /// state's best tip: with the core a tip behind, a newer block may have
+    /// mined it, so the body goes to the core, which knows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pooled_body_on_a_stale_snapshot_goes_to_the_core() {
+        use zakura_node_services::mempool::port::{
+            pool_port, ChainTip, Generation, PoolCommand, PoolSnapshot,
+        };
+
+        let pooled = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction");
+        let body = pooled.transaction.clone();
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_at(handle, Some(block::Hash([2; 32])));
+        inbox.publish([], |last| {
+            PoolSnapshot::new(
+                ChainTip {
+                    hash: block::Hash([1; 32]),
+                    height: Height(1),
+                },
+                Generation(1),
+                last,
+                vec![pooled],
+                Default::default(),
+            )
+        });
+        let request = tokio::spawn(core.call(Request::Queue(vec![Gossip::Tx(body)])));
+        let Ok(Some(PoolCommand::Reserve { reply, .. })) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), inbox.next()).await
+        else {
+            panic!("the body goes to the core");
+        };
+        let _ = reply.send(Err(Unreserved::Pooled));
+        let Ok(Ok(Response::Queued(answers))) = request.await else {
+            panic!("`Queue` is answered with `Queued`");
+        };
+        assert!(matches!(
+            answers[0]
+                .as_ref()
+                .map_err(|error| error.downcast_ref::<MempoolError>()),
+            Err(Some(MempoolError::InMempool))
+        ));
     }
 }

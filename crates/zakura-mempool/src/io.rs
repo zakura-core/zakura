@@ -167,6 +167,8 @@ pub struct TipApplied {
     pub visible: usize,
     /// Hidden transactions waiting to be verified again after it.
     pub hidden: usize,
+    /// Undecided transactions after it, which a reset verifies again too.
+    pub undecided: usize,
     /// How long the machine took to apply it.
     pub took: std::time::Duration,
 }
@@ -431,6 +433,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 reset,
                 visible: self.machine.storage_stats().transactions,
                 hidden: self.machine.hidden_count(),
+                undecided: self.machine.undecided_count(),
                 took: time::Instant::now().saturating_duration_since(now),
             });
         }

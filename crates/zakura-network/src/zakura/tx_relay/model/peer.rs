@@ -8,7 +8,10 @@ use std::{
 
 use indexmap::IndexMap;
 use zakura_chain::transaction::UnminedTxId;
-use zakura_node_services::mempool::port::{model::WaiterId, ReservationId};
+use zakura_node_services::mempool::port::{
+    model::{ModelTx, WaiterId},
+    Generation, ReservationId,
+};
 
 use super::{
     EntryGen, PeerKey, Time, BASE_DEADLINE, DEFERRED_PER_PEER, KNOWN_CAP, MAX_REQUESTS_PER_PEER,
@@ -67,6 +70,20 @@ pub(crate) struct Request {
     pub(crate) repeats: u32,
 }
 
+/// A body marked as being submitted, between the table check and the pool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Submitting {
+    /// The table entry it was fetched for.
+    pub(crate) generation: EntryGen,
+    /// The reservation it is submitted under.
+    pub(crate) reservation: ReservationId,
+    pub(crate) body: ModelTx,
+    /// The chain generation of the caller's snapshot at the check.
+    pub(crate) chain: Generation,
+    /// The pool's life at the check. See `RelayModel::pool_life`.
+    pub(crate) life: u64,
+}
+
 /// One peer's session.
 #[derive(Clone, Debug)]
 pub(crate) struct PeerModel {
@@ -90,6 +107,9 @@ pub(crate) struct PeerModel {
     pub(crate) reserving: IndexMap<UnminedTxId, Reserving>,
     /// Its outstanding requests, oldest first.
     pub(crate) requests: IndexMap<UnminedTxId, Request>,
+    /// Bodies that passed the check before submitting and are on their way
+    /// to the pool. A decision leaves them to the pool, which answers them.
+    pub(crate) submitting: IndexMap<UnminedTxId, Submitting>,
     /// Bodies it supplied that wait for a verdict.
     pub(crate) submissions: BTreeMap<WaiterId, (UnminedTxId, EntryGen)>,
     /// Ids this node announced to it and has not seen leave the pool, with
@@ -130,6 +150,7 @@ impl PeerModel {
             timed_out: HashMap::new(),
             reserving: IndexMap::new(),
             requests: IndexMap::new(),
+            submitting: IndexMap::new(),
             submissions: BTreeMap::new(),
             announced: HashMap::new(),
             known: VecDeque::new(),
@@ -251,6 +272,7 @@ impl PeerModel {
         self.reserving
             .len()
             .saturating_add(self.requests.len())
+            .saturating_add(self.submitting.len())
             .saturating_add(self.submissions.len())
     }
 

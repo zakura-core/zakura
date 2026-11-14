@@ -140,6 +140,13 @@ impl ReactorModel {
             .any(|waiting| waiting.contains_key(&waiter))
     }
 
+    /// The id and entry an unsettled submission is for.
+    pub(crate) fn unsettled_entry(&self, waiter: WaiterId) -> Option<(UnminedTxId, EntryGen)> {
+        self.unsettled
+            .values()
+            .find_map(|waiting| waiting.get(&waiter).copied())
+    }
+
     /// How many unsettled submissions there are, over every peer.
     pub(crate) fn unsettled_total(&self) -> usize {
         self.unsettled.values().map(BTreeMap::len).sum()

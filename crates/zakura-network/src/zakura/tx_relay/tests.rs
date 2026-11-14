@@ -578,8 +578,9 @@ fn turning_the_pool_off_releases_fetches_until_it_is_live() {
     relay.inv(a, &[(id(2), SIZE)], secs(2));
     assert!(asks(&relay.take_effects()).is_empty());
     relay.activate(secs(3));
+    // The id never asked for goes before the released one.
     let asked = asks(&relay.take_effects());
-    assert_eq!(asked, vec![(a, id(1)), (a, id(2))]);
+    assert_eq!(asked, vec![(a, id(2)), (a, id(1))]);
     relay.assert_invariants();
 }
 
@@ -2228,7 +2229,7 @@ fn a_ban_after_the_session_ended_closes_the_current_one() {
 }
 
 #[test]
-fn a_late_verdict_leaves_another_announcers_fetch_alone() {
+fn a_rejection_from_an_old_chain_lets_another_announcer_fetch() {
     let mut relay = relay().with_manual_verdicts();
     let first = open(&mut relay, 1, true, secs(0));
     relay.inv(first, &[(id(1), SIZE)], secs(0));
@@ -2240,8 +2241,8 @@ fn a_late_verdict_leaves_another_announcers_fetch_alone() {
     };
     finish_all(&mut relay, &rejected, secs(0));
     relay.end(first, secs(1));
-    // A new block forgets the tip-scoped rejection, and another announcer
-    // fetches the id before the old verdict arrives.
+    // A new block forgets the tip-scoped rejection. Another announcer
+    // waits, because the old submission holds the claim until its verdict.
     let block = ModelTransition {
         disconnected: 0,
         connected: vec![ModelBlock::default()],
@@ -2252,9 +2253,13 @@ fn a_late_verdict_leaves_another_announcers_fetch_alone() {
     relay.transition(block, secs(1));
     let second = open(&mut relay, 2, true, secs(1));
     relay.inv(second, &[(id(1), SIZE)], secs(1));
-    assert_eq!(asks(&relay.take_effects()), vec![(second, id(1))]);
+    assert!(asks(&relay.take_effects()).is_empty());
+    relay.assert_invariants();
     assert!(relay.deliver_verdict(secs(2)));
-    assert_eq!(relay.wanted().entry(id(1)).unwrap().claim, Some(second));
+    // The verdict is from the old chain, so the id is still wanted.
+    assert!(relay.wanted().entry(id(1)).unwrap().claim.is_none());
+    relay.tick(secs(2) + RETRY_FIRST);
+    assert_eq!(asks(&relay.take_effects()), vec![(second, id(1))]);
     relay.assert_invariants();
 }
 
@@ -2349,7 +2354,34 @@ fn another_peers_release_never_restarts_a_peers_wait() {
 }
 
 #[test]
-fn a_same_chain_rejection_ends_another_announcers_fetch() {
+fn a_same_chain_rejection_settles_every_holder() {
+    let mut relay = relay().with_manual_verdicts();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    relay.tx(a, id(1), tx(1), secs(0));
+    let rejected = Outcome::Fail {
+        scope: RejectionScope::ExactTip,
+        charge: Charge::None,
+    };
+    finish_all(&mut relay, &rejected, secs(0));
+    // A's session ends, and B announces the id while the pool decides it.
+    // A's submission still holds the claim, so B waits.
+    relay.end(a, secs(1));
+    let b = open(&mut relay, 2, true, secs(1));
+    relay.inv(b, &[(id(1), SIZE)], secs(1));
+    assert!(asks(&relay.take_effects()).is_empty());
+    relay.assert_invariants();
+    assert!(relay.deliver_verdict(secs(2)));
+    // The pool remembers the rejection on this chain, so it settles the id
+    // for B too.
+    assert!(relay.wanted().entry(id(1)).is_none());
+    assert!(relay.session(b).unwrap().pending.is_empty());
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_rejection_from_before_a_restart_settles_nothing() {
     let mut relay = relay().with_manual_verdicts();
     let a = open(&mut relay, 1, true, secs(0));
     relay.inv(a, &[(id(1), SIZE)], secs(0));
@@ -2361,20 +2393,23 @@ fn a_same_chain_rejection_ends_another_announcers_fetch() {
     };
     finish_all(&mut relay, &rejected, secs(0));
     relay.end(a, secs(1));
-    // The pool restarts on the same chain, forgetting the rejection, and B
-    // fetches the id before A's verdict arrives.
+    // The pool restarts on the same chain and forgets the rejection.
     relay.deactivate(secs(1));
     relay.activate(secs(1));
     let b = open(&mut relay, 2, true, secs(1));
     relay.inv(b, &[(id(1), SIZE)], secs(1));
-    assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
+    assert!(asks(&relay.take_effects()).is_empty());
     assert!(relay.deliver_verdict(secs(2)));
-    // The rejection holds on this chain, so it settles the id and ends B's
-    // fetch. B's late body never reaches the pool.
+    // The pool no longer remembers it, so B may supply the id, and its
+    // body reaches the pool.
+    assert!(relay.wanted().entry(id(1)).is_some());
+    relay.tick(secs(2) + RETRY_FIRST);
+    assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
+    relay.tx(b, id(1), tx(1), secs(4));
+    finish_all(&mut relay, &Outcome::Pass, secs(4));
+    while relay.deliver_verdict(secs(4)) {}
+    assert!(relay.pool().visible().contains(&id(1)));
     assert!(relay.wanted().entry(id(1)).is_none());
-    assert_eq!(relay.reservations_held(), 0);
-    relay.tx(b, id(1), tx(1), secs(3));
-    assert_eq!(relay.pool().bodies_held(), 0);
     relay.assert_invariants();
 }
 
@@ -2485,9 +2520,8 @@ fn every_fourth_place_is_random() {
 
 #[test]
 fn an_uncached_rejection_settles_nothing() {
-    // The same sequence as the cached rejection above, but the pool never
-    // remembered this one, for example because another variant of the id
-    // was in the pool when A's body was refused.
+    // The pool never remembered this rejection, for example because
+    // another variant of the id was in the pool when A's body was refused.
     let mut relay = relay().with_manual_verdicts();
     let a = open(&mut relay, 1, true, secs(0));
     relay.inv(a, &[(id(1), SIZE)], secs(0));
@@ -2499,20 +2533,19 @@ fn an_uncached_rejection_settles_nothing() {
     };
     finish_all(&mut relay, &uncached, secs(0));
     relay.end(a, secs(1));
-    relay.deactivate(secs(1));
-    relay.activate(secs(1));
     let b = open(&mut relay, 2, true, secs(1));
     relay.inv(b, &[(id(1), SIZE)], secs(1));
-    assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
+    assert!(asks(&relay.take_effects()).is_empty());
     assert!(relay.deliver_verdict(secs(2)));
-    // Nothing confirms the rejection, so B's fetch carries on, and its body
+    // Nothing confirms the rejection, so B may supply the id, and its body
     // reaches the pool.
     assert!(relay.wanted().entry(id(1)).is_some());
-    assert_eq!(relay.reservations_held(), 1);
-    relay.tx(b, id(1), tx(1), secs(3));
-    finish_all(&mut relay, &Outcome::Pass, secs(3));
-    while relay.deliver_verdict(secs(3)) {}
-    assert!(relay.wanted().entry(id(1)).is_none());
+    relay.tick(secs(2) + RETRY_FIRST);
+    assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
+    relay.tx(b, id(1), tx(1), secs(4));
+    finish_all(&mut relay, &Outcome::Pass, secs(4));
+    while relay.deliver_verdict(secs(4)) {}
+    assert!(relay.pool().visible().contains(&id(1)));
     assert_eq!(relay.waiters_outstanding(), 0);
     relay.assert_invariants();
 }
@@ -2526,33 +2559,111 @@ fn a_late_round_trip_report_is_ignored() {
     relay.assert_invariants();
 }
 
+/// A block that mines `transactions` on top of height 100.
+fn mining(transactions: Vec<ModelTx>) -> ModelTransition {
+    ModelTransition {
+        disconnected: 0,
+        connected: vec![ModelBlock { transactions }],
+        tip: Height(101),
+        generation: Generation(1),
+        rules_change: false,
+    }
+}
+
 #[test]
-fn a_decision_after_the_submission_leaves_it_to_the_pool() {
-    let mut relay = relay().with_manual_verdicts();
+fn a_cancel_after_the_check_leaves_the_body_to_the_pool() {
+    let mut relay = relay().with_manual_submits();
     let a = open(&mut relay, 1, true, secs(0));
     relay.inv(a, &[(id(1), SIZE)], secs(0));
-    relay.tx(a, id(1), tx(1), secs(0));
-    let rejected = Outcome::Fail {
-        scope: RejectionScope::ExactTip,
+    relay.take_effects();
+    // A's body passes the check before submitting and is marked.
+    relay.tx(a, id(1), tx(1), secs(1));
+    assert_eq!(relay.in_flight(PeerKey(1)), 1);
+    // A block mines the id before the body reaches the pool, and the pool
+    // cancels the fetch.
+    relay.transition(mining(vec![tx(1)]), secs(1));
+    assert_eq!(relay.in_flight(PeerKey(1)), 1, "the marked body still goes");
+    assert_eq!(relay.reservations_held(), 1);
+    relay.assert_invariants();
+    // The body reaches the pool, which answers it and frees its slot. Asked
+    // again, the pool says a block mined the id, which decides it.
+    assert!(relay.deliver_submit(secs(2)));
+    finish_all(&mut relay, &Outcome::Pass, secs(2));
+    relay.tick(secs(2) + RETRY_FIRST);
+    assert_eq!(relay.in_flight(PeerKey(1)), 0);
+    assert_eq!(relay.waiters_outstanding(), 0);
+    assert_eq!(relay.pool().slots_in_use(), 0);
+    assert_eq!(relay.pool().bodies_held(), 0);
+    assert!(relay.wanted().entry(id(1)).is_none());
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_cancel_before_the_check_drops_the_body() {
+    let mut relay = relay().with_manual_submits();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    relay.transition(mining(vec![tx(1)]), secs(1));
+    assert_eq!(relay.pool().slots_in_use(), 0);
+    // The pool cancelled the fetch before the body came, so the check
+    // fails and the body never reaches the pool.
+    relay.tx(a, id(1), tx(1), secs(2));
+    assert!(!relay.deliver_submit(secs(2)));
+    assert_eq!(relay.in_flight(PeerKey(1)), 0);
+    assert_eq!(relay.pool().bodies_held(), 0);
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_session_ending_after_the_check_still_submits() {
+    let mut relay = relay().with_manual_submits().with_manual_verdicts();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    relay.tx(a, id(1), tx(1), secs(1));
+    relay.end(a, secs(1));
+    // The marked body went to the pool when the session ended, and the
+    // reactor waits for its verdict, counted against the peer.
+    assert!(!relay.deliver_submit(secs(1)));
+    assert_eq!(relay.in_flight(PeerKey(1)), 1);
+    relay.assert_invariants();
+    finish_all(&mut relay, &Outcome::Pass, secs(2));
+    while relay.deliver_verdict(secs(2)) {}
+    assert_eq!(relay.in_flight(PeerKey(1)), 0);
+    assert!(relay.pool().visible().contains(&id(1)));
+    relay.assert_invariants();
+}
+
+#[test]
+fn retries_never_starve_ids_not_yet_asked() {
+    // Bodies that keep failing without being remembered, such as ids a
+    // block mined before the pool started, alternate with each other.
+    let mut relay = relay().with_manual_verdicts();
+    let a = open(&mut relay, 1, true, secs(0));
+    let announced: Vec<(UnminedTxId, u32)> = (1..=11).map(|n| (id(n), SIZE)).collect();
+    relay.inv(a, &announced, secs(0));
+    let uncached = Outcome::Fail {
+        scope: RejectionScope::Uncached,
         charge: Charge::None,
     };
-    finish_all(&mut relay, &rejected, secs(0));
-    relay.end(a, secs(1));
-    relay.deactivate(secs(1));
-    relay.activate(secs(1));
-    // B fetches and submits before A's old verdict arrives.
-    let b = open(&mut relay, 2, true, secs(1));
-    relay.inv(b, &[(id(1), SIZE)], secs(1));
-    relay.tx(b, id(1), tx(1), secs(2));
-    assert_eq!(relay.in_flight(PeerKey(2)), 1);
-    assert!(relay.deliver_verdict(secs(2)));
-    // The id is settled, and B's submission is left to the pool, which
-    // answers it.
-    assert!(relay.wanted().entry(id(1)).is_none());
-    finish_all(&mut relay, &Outcome::Pass, secs(3));
-    while relay.deliver_verdict(secs(3)) {}
-    assert_eq!(relay.in_flight(PeerKey(2)), 0);
-    assert_eq!(relay.waiters_outstanding(), 0);
+    relay.take_effects();
+    for n in 1..=5 {
+        relay.tx(a, id(n), tx(n), secs(0));
+    }
+    finish_all(&mut relay, &uncached, secs(0));
+    while relay.deliver_verdict(secs(0)) {}
+    let next: Vec<_> = (6..=10).map(|n| (a, id(n))).collect();
+    assert_eq!(asks(&relay.take_effects()), next);
+    for n in 6..=10 {
+        relay.tx(a, id(n), tx(n), secs(1));
+    }
+    finish_all(&mut relay, &uncached, secs(1));
+    // Much later, the first five are due again when a slot frees, but the
+    // id nobody asked for yet goes first.
+    relay.tick(secs(60));
+    assert!(relay.deliver_verdict(secs(60)));
+    assert_eq!(asks(&relay.take_effects()), vec![(a, id(11))]);
     relay.assert_invariants();
 }
 
@@ -2635,7 +2746,8 @@ fn run(seed: u64) {
         relay = relay
             .with_manual_reserves()
             .with_manual_reads(6)
-            .with_manual_verdicts();
+            .with_manual_verdicts()
+            .with_manual_submits();
     }
     let mut height = 100u32;
     let mut generation = 0u64;
@@ -2685,12 +2797,19 @@ fn run(seed: u64) {
         for (job, tx_id, started) in relay.job_txs().to_vec() {
             let applied = now < started + T_VERIFY;
             let outcome = if fail_some && rng.next(5) == 0 {
-                if applied {
-                    failed.insert(tx_id);
-                    FAILED_NOW.with(|now| now.borrow_mut().push(tx_id));
-                }
+                // An uncached failure meets no obligation: the id can still
+                // be supplied, and must reach the pool later.
+                let scope = if rng.next(3) == 0 {
+                    RejectionScope::Uncached
+                } else {
+                    if applied {
+                        failed.insert(tx_id);
+                        FAILED_NOW.with(|now| now.borrow_mut().push(tx_id));
+                    }
+                    RejectionScope::ExactTip
+                };
                 Outcome::Fail {
-                    scope: RejectionScope::ExactTip,
+                    scope,
                     charge: Charge::None,
                 }
             } else {
@@ -2730,12 +2849,15 @@ fn run(seed: u64) {
                 }
             }
             7 => verify(&mut relay, &mut failed, &mut rng, now, true),
-            8 if manual => match rng.next(3) {
+            8 if manual => match rng.next(4) {
                 0 => {
                     relay.process_reserve(now);
                 }
                 1 => {
                     relay.deliver_reserve(now);
+                }
+                2 => {
+                    relay.deliver_submit(now);
                 }
                 _ => {
                     relay.deliver_verdict(now);
@@ -2812,6 +2934,7 @@ fn run(seed: u64) {
     let mut drained = false;
     for _ in 0..5_000 {
         while relay.answer_reserve(now) {}
+        while relay.deliver_submit(now) {}
         while relay.deliver_verdict(now) {}
         for (session, _) in &live {
             relay.read(*session, now);
@@ -2822,7 +2945,10 @@ fn run(seed: u64) {
         answer(&mut relay, &mut replies, &live, now, &mut rng);
         settle_obligations(&relay, &mut honest);
         relay.assert_invariants();
-        if !relay.jobs().is_empty() || relay.calls_in_flight() > 0 || relay.verdicts_in_flight() > 0
+        if !relay.jobs().is_empty()
+            || relay.calls_in_flight() > 0
+            || relay.verdicts_in_flight() > 0
+            || relay.submits_in_flight() > 0
         {
             continue;
         }

@@ -601,9 +601,14 @@ impl VerifiedSet {
         ancestors
     }
 
-    /// Clears a list of mined transaction ids from the lists of dependencies for
-    /// any other transactions in the mempool and removes their dependents.
-    pub fn clear_mined_dependencies(&mut self, mined_ids: &HashSet<transaction::Hash>) {
+    /// Removes mined transactions while retaining their unmined descendants.
+    ///
+    /// Detaches mined dependencies between removing and restoring the affected
+    /// ordering entries, so survivors are rescored only once.
+    pub(super) fn remove_mined(
+        &mut self,
+        mined_ids: &HashSet<transaction::Hash>,
+    ) -> HashSet<UnminedTxId> {
         let affected: HashSet<_> = mined_ids
             .iter()
             .filter(|id| self.transactions.contains_key(id))
@@ -612,7 +617,12 @@ impl VerifiedSet {
         self.remove_ordering_candidates(&affected);
         self.transaction_dependencies
             .clear_mined_dependencies(mined_ids);
+        let removed = self.remove_roots(mined_ids.iter().copied());
         self.insert_ordering_candidates(&affected);
+        if !removed.is_empty() {
+            self.report_metrics();
+        }
+        removed.into_iter().map(|tx| tx.transaction.id()).collect()
     }
 
     /// Removes the listed transactions and their descendants.
@@ -623,22 +633,10 @@ impl VerifiedSet {
         &mut self,
         tx_ids: impl IntoIterator<Item = transaction::Hash>,
     ) -> HashSet<UnminedTxId> {
-        let mut removed_transactions = HashSet::new();
-
-        for key_to_remove in tx_ids {
-            if !self.transactions.contains_key(&key_to_remove) {
-                // A previous removal may already have removed this descendant.
-                continue;
-            }
-
-            removed_transactions.extend(
-                self.remove(&key_to_remove)
-                    .into_iter()
-                    .map(|tx| tx.transaction.id()),
-            );
-        }
-
-        removed_transactions
+        self.remove_batch(tx_ids)
+            .into_iter()
+            .map(|tx| tx.transaction.id())
+            .collect()
     }
 
     /// Accepts a transaction id for a transaction to remove from the verified set.
@@ -651,34 +649,61 @@ impl VerifiedSet {
     ///
     /// Also removes the outputs of any removed transactions from the internal caches.
     pub(super) fn remove(&mut self, key_to_remove: &transaction::Hash) -> Vec<VerifiedUnminedTx> {
-        let affected = self.dependency_group([*key_to_remove]);
-        self.remove_ordering_candidates(&affected);
-        let removed_transactions: Vec<_> = self
-            .transaction_dependencies
-            .remove_all(key_to_remove)
+        self.remove_batch([*key_to_remove])
+    }
+
+    /// Removes overlapping roots with one ordering update per affected member
+    /// and one metrics report for the batch.
+    fn remove_batch(
+        &mut self,
+        tx_ids: impl IntoIterator<Item = transaction::Hash>,
+    ) -> Vec<VerifiedUnminedTx> {
+        let roots: Vec<_> = tx_ids
+            .into_iter()
+            .filter(|id| self.transactions.contains_key(id))
+            .collect();
+        let affected: HashSet<_> = roots
             .iter()
-            .chain(std::iter::once(key_to_remove))
-            .filter_map(|key_to_remove| {
-                let Some(removed_tx) = self.transactions.remove(key_to_remove) else {
+            .flat_map(|&id| self.dependency_group([id]))
+            .collect();
+        self.remove_ordering_candidates(&affected);
+        let removed = self.remove_roots(roots);
+        self.insert_ordering_candidates(&affected);
+        if !removed.is_empty() {
+            self.report_metrics();
+        }
+        removed
+    }
+
+    /// Removes roots and descendants after their ordering entries were removed.
+    fn remove_roots(
+        &mut self,
+        tx_ids: impl IntoIterator<Item = transaction::Hash>,
+    ) -> Vec<VerifiedUnminedTx> {
+        let mut removed = Vec::new();
+        for root in tx_ids {
+            if !self.transactions.contains_key(&root) {
+                continue;
+            }
+            let descendants = self.transaction_dependencies.remove_all(&root);
+            for key_to_remove in descendants.into_iter().chain(std::iter::once(root)) {
+                let Some(removed_tx) = self.transactions.remove(&key_to_remove) else {
                     tracing::warn!(?key_to_remove, "invalid transaction key");
-                    return None;
+                    continue;
                 };
 
                 self.transactions_serialized_size -= removed_tx.transaction.size();
                 self.total_cost -= removed_tx.cost();
                 self.metrics.remove_transaction(&removed_tx);
                 if let Some(height) = removed_tx.transaction.transaction().expiry_height() {
-                    self.expiry_order.remove(&(height, *key_to_remove));
+                    self.expiry_order.remove(&(height, key_to_remove));
                 }
                 self.remove_outputs(&removed_tx.transaction);
 
-                Some(removed_tx)
-            })
-            .collect();
-
-        self.insert_ordering_candidates(&affected);
-        self.report_metrics();
-        removed_transactions
+                removed.push(removed_tx);
+            }
+        }
+        removed
     }
 
     /// Returns transactions expiring at or before `tip_height`.

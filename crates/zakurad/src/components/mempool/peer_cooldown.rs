@@ -24,8 +24,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use zakura_network as zn;
-
 #[cfg(test)]
 mod tests;
 
@@ -51,10 +49,6 @@ pub const MAX_COOLDOWN_PEERS: usize = 20_000;
 #[derive(Clone, Debug, Default)]
 pub struct PeerCooldowns {
     peers: Arc<Mutex<CooldownState>>,
-
-    /// The peers whose cooldowns are ignored, see
-    /// [`is_cooling_down`](Self::is_cooling_down).
-    unconditional_peers: zn::UnconditionalPeerSet,
 }
 
 #[derive(Debug, Default)]
@@ -81,26 +75,12 @@ impl Cooldown {
 }
 
 impl PeerCooldowns {
-    /// Returns an empty history that ignores the cooldowns of `unconditional_peers`.
-    pub fn new(unconditional_peers: zn::UnconditionalPeerSet) -> Self {
-        Self {
-            peers: Arc::default(),
-            unconditional_peers,
-        }
-    }
-
     /// Returns true if transactions from `ip` should be ignored at `now`.
-    ///
-    /// An unconditional peer's transactions are never ignored. Its address can have a
-    /// cooldown from before a configured DNS name resolved to it.
     pub fn is_cooling_down(&self, ip: IpAddr, now: Instant) -> bool {
-        let is_cooling_down = self
-            .peers()
+        self.peers()
             .peers
             .get(&ip.to_canonical())
-            .is_some_and(|cooldown| now < cooldown.until);
-
-        is_cooling_down && !self.unconditional_peers.contains(ip)
+            .is_some_and(|cooldown| now < cooldown.until)
     }
 
     /// Records an invalid transaction from `ip` at `now`.

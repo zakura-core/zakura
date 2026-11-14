@@ -17,6 +17,7 @@ mod max_money;
 mod nsm_value_balance;
 mod prop;
 mod rollback;
+mod sprout_tree;
 mod transparent;
 mod transparent_indexes;
 mod vectors;

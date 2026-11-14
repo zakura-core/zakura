@@ -88,6 +88,8 @@ mod vct;
 pub mod vct_treestate_audit;
 mod zakura_db;
 
+pub(crate) use zakura_db::shielded::{update_note_commitment_trees, MAINTAINS_SPROUT_TREE};
+
 pub(crate) use vct::embedded_last_checkpoint_leaf_counts;
 use vct::{VctCommitState, VctState, VctWriteData};
 
@@ -263,6 +265,10 @@ pub const HEADER_ENGINE_META: &str = "header_engine_meta_v1";
 /// `()`, mapping to the next block height managed by online pruning. The
 /// presence of this entry marks the database as pruned, which is a one-way state:
 /// a pruned database cannot be reopened in archive mode.
+///
+/// It also holds one-way storage markers under their own keys: the first height
+/// committed without transparent indexes, and the first height committed without
+/// its Sprout note commitments (`ZakuraDb::sprout_tree_skipped_from`).
 pub const PRUNING_METADATA: &str = "pruning_metadata";
 
 /// The name of the column family that marks a verified-commitment-trees
@@ -1124,10 +1130,13 @@ impl FinalizedState {
                         // Sprout roots are not supplied by VCT or committed to the modern
                         // history-tree payload. Reconstruct Sprout locally, but only after all
                         // retryable supplied-root and successor checks have succeeded so a
-                        // deferred retry cannot append the same commitments twice.
-                        note_commitment_trees
-                            .update_sprout_tree(&block)
-                            .map_err(ValidateContextError::from)?;
+                        // deferred retry cannot append the same commitments twice. A build that
+                        // does not maintain the Sprout tree leaves it unchanged.
+                        if MAINTAINS_SPROUT_TREE {
+                            note_commitment_trees
+                                .update_sprout_tree(&block)
+                                .map_err(ValidateContextError::from)?;
+                        }
 
                         history_tree = Arc::new(candidate);
                         if let Some(v) = self.vct.source() {
@@ -1162,9 +1171,11 @@ impl FinalizedState {
                                 &ironwood_root,
                             )?;
 
+                            // Without the Sprout tree there is nothing to check the embedded
+                            // Sprout frontier against, and nothing that reads it.
                             let expected_sprout_root = sprout_frontier.root();
                             let actual_sprout_root = note_commitment_trees.sprout.root();
-                            if actual_sprout_root != expected_sprout_root {
+                            if MAINTAINS_SPROUT_TREE && actual_sprout_root != expected_sprout_root {
                                 self.vct.clear_prevalidated_next();
                                 return Err(ValidateContextError::VctSproutHandoffRootMismatch {
                                     height,
@@ -1258,7 +1269,10 @@ impl FinalizedState {
 
                                 timed_commit_phase!(
                                     "zakura.state.write.update_trees.duration_seconds",
-                                    note_commitment_trees.update_trees_parallel(&block)
+                                    update_note_commitment_trees(
+                                        &mut note_commitment_trees,
+                                        &block
+                                    )
                                 )
                             })
                         });

@@ -290,6 +290,26 @@ pub enum StateInitError {
     )]
     VctSproutHistoryUnrepairable,
 
+    /// A build that verifies Sprout JoinSplits opened a database whose Sprout note commitment
+    /// tree a build without the `sprout` feature stopped maintaining, before its finalized tip
+    /// passed NU7 and the last checkpoint.
+    ///
+    /// The incomplete Sprout tree would reject valid pre-NU7 JoinSplits as spending an unknown
+    /// Sprout anchor.
+    #[error(
+        "cannot open state: the database at {path:?} was synced by a build without the `sprout` \
+         feature, which stopped maintaining the Sprout note commitment tree at height \
+         {skipped_from:?}, and its finalized tip is not yet past NU7 and the last checkpoint. \
+         Hint: keep syncing it with a build without `sprout`, or delete the cache directory and \
+         resync from genesis"
+    )]
+    SproutTreeNotMaintained {
+        /// The database path.
+        path: PathBuf,
+        /// The first height committed without its Sprout note commitments.
+        skipped_from: zakura_chain::block::Height,
+    },
+
     /// A database that stopped building transparent address indexes was opened in archive storage mode.
     ///
     /// Archive nodes serve address balances, UTXOs, and histories, which this database cannot

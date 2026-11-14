@@ -767,8 +767,8 @@ impl VerifiedSet {
 
     /// Removes spends from an ownership index.
     ///
-    /// Each item in the list of `items` should be wrapped in a [`Cow`]. This allows this generic
-    /// method to support both borrowed and owned items.
+    /// Each item is wrapped in a [`Cow`] to support borrowed nullifiers and
+    /// owned transparent outpoints.
     fn remove_spends<'t, T>(
         owners: &mut HashMap<T, transaction::Hash>,
         items: impl IntoIterator<Item = Cow<'t, T>>,

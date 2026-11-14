@@ -67,8 +67,6 @@ TRACE_DIR = "/mnt/data/zakura-traces"
 TRACE_MARKER = ".zakura-profiler-managed"
 TRACE_TABLE_CAP_MB = 200
 # The node reads the names of its fleet peers from this variable, as `name=ip,name=ip`.
-PEER_NAMES_VARIABLE = "ZAKURA_TRACE_PEER_NAMES"
-PEER_NAMES_DROP_IN = "trace-peer-names.conf"
 # `systemctl show -p ExecStart` prints the command line as `argv[]=... ;`.
 CONFIG_ARGUMENT = re.compile(r"argv\[\]=[^;]*?\s(?:-c|--config)[ =](\S+)")
 SSH_OPTIONS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-o", "StrictHostKeyChecking=yes")
@@ -480,23 +478,17 @@ def named_peers(node, nodes, private):
     return [peer for peer in nodes if peer.name != node.name and address_key(peer_address(peer)) not in private]
 
 
-def peer_names_drop_in(peers):
-    """The service drop-in that names each node in `peers` by its address."""
-    names = ",".join(f"{peer.name}={peer_address(peer)}" for peer in peers)
-    return f"# Written by deploy/profiler/fleet.py.\n[Service]\nEnvironment={PEER_NAMES_VARIABLE}={names}\n"
-
-
 def set_peer_names(node, nodes, private):
-    """Give the node its fleet peers' names, leaving out the `private` addresses; returns a
-    line saying what was done."""
-    unit = node.service_name if "." in node.service_name else node.service_name + ".service"
+    """Save typed fleet peer names, excluding private addresses and preserving explicit mappings."""
     peers = named_peers(node, nodes, private)
-    drop_in = peer_names_drop_in(peers)
-    result = remote(node, WRITE_DROP_IN_SCRIPT, unit, PEER_NAMES_DROP_IN, stdin=drop_in.encode()).strip()
-    # A count only: the line goes to the workflow log.
+    path, text = read_node_config(node)
+    edited = with_trace_peer_names(text, node, peers)
+    if edited != text:
+        write_node_config(node, path, edited)
+    remote(node, REMOVE_PEER_NAMES_SCRIPT, node.service_name)
     left_out = len(nodes) - 1 - len(peers)
     kept = f", leaving out {left_out} with a private address" if left_out else ""
-    if result == "unchanged":
+    if edited == text:
         return f"already names its {len(peers)} fleet peers{kept}"
     return f"names its {len(peers)} fleet peers once the node next starts{kept}"
 
@@ -559,7 +551,7 @@ def for_each_node(nodes, step):
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     steps = parser.add_subparsers(dest="step", required=True)
-    for name in ("ensure-trace-config", "install"):
+    for name in ("ensure-trace-config", "peer-names", "install"):
         step = steps.add_parser(name)
         step.add_argument("--config", required=True, help="the deployer's node list")
         step.add_argument("--node", default="", help="only this node; all profiled nodes when empty")

@@ -172,16 +172,13 @@ file and its trace files. Both are readable by root only. Nothing else on the
 node changes, and no address leaves the node except through the profiler's
 `/api/propagation`, which only the dashboard host can reach.
 
-**`peer-names`** writes a systemd drop-in for the node's own service
-(`<service>.service.d/trace-peer-names.conf`) that sets
-`ZAKURA_TRACE_PEER_NAMES` to `name=ip` for every other node in the list, with
-the address each is reached at over SSH. The node then writes that name, and
-never the address, in the trace rows for a legacy peer connecting from it. It
-does not restart the node: the names take effect when the node next starts. A
-node build that does not know the variable ignores it. Anyone on the node can
-read the drop-in, so a node whose address is on the private list
-(`--private-addresses`, the dashboard host's list) is named to no node, and
-nothing is written when that list cannot be read.
+**`peer-names`** writes `network.zakura.trace_peer_names` in the node config
+using the address each other node is reached at over SSH. Existing explicit
+mappings are preserved. The node writes that name in trace rows for a legacy
+peer connecting from it. Names take effect when the node next starts; this
+command does not restart it. Peers on the private address list are excluded
+from generated mappings, and nothing is written when that list cannot be read.
+After verifying the config, the command removes the obsolete systemd override.
 
 **`install`** needs `perf` on the node (the `linux-tools` package) and installs
 `binutils` when `c++filt` is missing. It writes the node's own name, log file

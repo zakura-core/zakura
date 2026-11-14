@@ -269,24 +269,6 @@ fn config_env_override_defaults() {
 }
 
 #[test]
-fn config_loads_with_trace_peer_names() {
-    let env = EnvGuard::new();
-    let peer_names = "us-0=192.0.2.1,asia-0=192.0.2.2";
-    env.set_var("ZAKURA_TRACE_PEER_NAMES", peer_names);
-    env.set_var("ZAKURA_NETWORK__NETWORK", "Testnet");
-
-    let config = ZakuradConfig::load(None)
-        .expect("peer trace names must not be interpreted as configuration fields");
-
-    assert_eq!(config.network.network.to_string(), "Testnet");
-    assert_eq!(
-        std::env::var("ZAKURA_TRACE_PEER_NAMES")
-            .expect("peer names remain available to the tracer"),
-        peer_names
-    );
-}
-
-#[test]
 fn config_zakura_env_overrides_legacy_zebra_env() {
     let env = EnvGuard::new();
 

@@ -104,11 +104,6 @@ pub(super) fn load(
             let Ok(key) = key.into_string() else {
                 continue;
             };
-            // The gossip tracer reads this variable directly; it is not a node
-            // configuration override despite sharing the ZAKURA_ prefix.
-            if key == "ZAKURA_TRACE_PEER_NAMES" {
-                continue;
-            }
             if let Some(key) = key.strip_prefix(&prefix_pattern) {
                 let leaf = key.rsplit("__").next().unwrap_or(key);
                 if is_sensitive_leaf_key(leaf) {

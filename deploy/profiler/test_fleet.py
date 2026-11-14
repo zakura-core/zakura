@@ -266,13 +266,12 @@ class InstalledFilesTests(unittest.TestCase):
         self.assertEqual(done.stdout.strip(), "192.0.2.7")
 
     def test_a_node_is_told_every_other_node_s_name_and_address(self):
-        drop_in = fleet.peer_names_drop_in(fleet.named_peers(self.remote, [self.local, self.remote], frozenset()))
-        self.assertEqual(drop_in.splitlines()[1:], ["[Service]", "Environment=ZAKURA_TRACE_PEER_NAMES=us-east-0=192.0.2.1"])
+        edited = fleet.with_trace_peer_names(DUAL_CONFIG, self.remote, [self.local, self.remote])
+        self.assertEqual(tomllib.loads(edited)["network"]["zakura"]["trace_peer_names"], {"192.0.2.1": "us-east-0"})
 
     def test_a_node_with_a_private_address_is_named_to_no_node(self):
         private = fleet.parse_private_addresses('["::ffff:192.0.2.1"]')
         self.assertEqual(fleet.named_peers(self.remote, [self.local, self.remote], private), [])
-        self.assertNotIn("192.0.2.1", fleet.peer_names_drop_in([]))
 
     def test_a_private_list_that_cannot_be_read_is_refused(self):
         for listed in ("", "{}", '["not an address"]', "[1]"):
@@ -465,18 +464,18 @@ class StepTests(unittest.TestCase):
         drop_in = tarfile.open(fileobj=io.BytesIO(sent)).extractfile("node.conf").read().decode()
         self.assertIn("--trace-dir /mnt/data/zakura-traces --trace-table-cap-mb 0", drop_in)
 
-    def test_peer_names_are_written_once_as_a_drop_in_of_the_node_service(self):
+    def test_peer_names_are_written_once_in_the_node_config(self):
         nodes = load(NODE_LIST)
         self.assertEqual(
             fleet.set_peer_names(self.node, nodes, frozenset()), "names its 1 fleet peers once the node next starts"
         )
-        self.assertIn(b"ZAKURA_TRACE_PEER_NAMES=us-east-0=192.0.2.1\n", self.drop_in)
+        self.assertEqual(tomllib.loads(self.config)["network"]["zakura"]["trace_peer_names"], {"192.0.2.1": "us-east-0"})
         self.assertEqual(fleet.set_peer_names(self.node, nodes, frozenset()), "already names its 1 fleet peers")
 
     def test_a_private_peer_is_left_out_and_only_counted(self):
         line = fleet.set_peer_names(self.node, load(NODE_LIST), frozenset({"192.0.2.1"}))
         self.assertEqual(line, "names its 0 fleet peers once the node next starts, leaving out 1 with a private address")
-        self.assertNotIn(b"192.0.2.1", self.drop_in)
+        self.assertEqual(tomllib.loads(self.config)["network"]["zakura"]["trace_peer_names"], {})
 
     def test_no_peer_names_are_written_without_the_private_list(self):
         with tempfile.NamedTemporaryFile("w", suffix=".toml") as node_list, \

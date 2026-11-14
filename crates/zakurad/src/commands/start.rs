@@ -888,8 +888,11 @@ impl StartCmd {
         node_tasks.track(&block_gossip_task_handle);
 
         info!("spawning mempool queue checker task");
-        let mempool_queue_checker_task_handle =
-            mempool::QueueChecker::spawn(mempool.clone(), mempool_verification_finished);
+        let mempool_queue_checker_task_handle = mempool::QueueChecker::spawn(
+            mempool.clone(),
+            mempool_verification_finished,
+            latest_chain_tip.clone(),
+        );
         node_tasks.track(&mempool_queue_checker_task_handle);
 
         info!("spawning mempool transaction gossip task");

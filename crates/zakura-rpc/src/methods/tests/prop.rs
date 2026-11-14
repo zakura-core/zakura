@@ -1,14 +1,15 @@
 //! Randomised property tests for RPC methods.
 
+use crate::tests::test_rpc::{TestChainTip, TestRpcImpl};
 use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
     sync::Arc,
 };
 
+use crate::server::jsonrpc::{ErrorCode, ErrorObject};
 use futures::{join, FutureExt, TryFutureExt};
 use hex::{FromHex, ToHex};
-use jsonrpsee_types::{ErrorCode, ErrorObject};
 use proptest::{collection::vec, prelude::*};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -18,7 +19,7 @@ use zakura_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, Height},
     chain_sync_status::MockSyncStatus,
-    chain_tip::{mock::MockChainTip, ChainTip, NoChainTip},
+    chain_tip::{mock::MockChainTip, NoChainTip},
     history_tree::HistoryTree,
     parameters::{ConsensusBranchId, Network, NetworkUpgrade},
     serialization::{DateTime32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
@@ -31,16 +32,13 @@ use zakura_node_services::mempool;
 use zakura_state::{BoxError, GetBlockTemplateChainInfo};
 use zakura_test::mock_service::MockService;
 
-use crate::methods::{
-    self,
-    types::{
-        get_blockchain_info::GetBlockchainInfoBalance,
-        get_raw_mempool::{GetRawMempoolResponse, MempoolObject},
-    },
+use crate::methods::types::{
+    get_blockchain_info::GetBlockchainInfoBalance,
+    get_raw_mempool::{GetRawMempoolResponse, MempoolObject},
 };
 
 use super::super::{
-    GetAddressBalanceRequest, GetAddressBalanceResponse, NetworkUpgradeStatus, RpcImpl, RpcServer,
+    GetAddressBalanceRequest, GetAddressBalanceResponse, NetworkUpgradeStatus, RpcServer,
     SendRawTransactionResponse,
 };
 
@@ -361,6 +359,21 @@ proptest! {
             let rpc_query = rpc.get_raw_transaction(unknown_txid.encode_hex(), Some(1), None);
 
             let (rpc_rsp, _, _) =  tokio::join!(rpc_query, mempool_query, state_query);
+
+            check_err_code(rpc_rsp, ErrorCode::ServerError(-5))?;
+
+            // And the unknown TXID with verbosity 0, which reads the raw transaction.
+            let mempool_query = mempool
+                .expect_request(mempool::Request::TransactionsByMinedId([unknown_txid].into()))
+                .map_ok(|r| r.respond(mempool::Response::Transactions(vec![])));
+
+            let state_query = state
+                .expect_request(zakura_state::ReadRequest::AnyChainRawTransaction(unknown_txid))
+                .map_ok(|r| r.respond(zakura_state::ReadResponse::RawTransaction(None)));
+
+            let rpc_query = rpc.get_raw_transaction(unknown_txid.encode_hex(), Some(0), None);
+
+            let (rpc_rsp, _, _) = tokio::join!(rpc_query, mempool_query, state_query);
 
             check_err_code(rpc_rsp, ErrorCode::ServerError(-5))?;
 
@@ -862,8 +875,9 @@ proptest! {
                 .respond(response);
 
             // the runner will also query the state again for the transaction
-            let expected_request = zakura_state::ReadRequest::Transaction(transaction_hash);
-            let response = zakura_state::ReadResponse::Transaction(None);
+            let expected_request =
+                zakura_state::ReadRequest::MinedTransactionIds([transaction_hash].into());
+            let response = zakura_state::ReadResponse::MinedTransactionIds(HashSet::new());
 
             state
                 .expect_request(expected_request)
@@ -944,18 +958,16 @@ proptest! {
                 .await?
                 .respond(response);
 
-            // the runner will also query the state again for each transaction
-            for _tx in txs.clone() {
-                let response = zakura_state::ReadResponse::Transaction(None);
+            // the runner will also query the state again for all transactions at once
+            let expected_request = zakura_state::ReadRequest::MinedTransactionIds(
+                txs.iter().map(|tx| tx.hash()).collect(),
+            );
+            let response = zakura_state::ReadResponse::MinedTransactionIds(HashSet::new());
 
-                // we use `expect_request_that` because we can't guarantee the state request order
-                state
-                    .expect_request_that(|request| {
-                        matches!(request, zakura_state::ReadRequest::Transaction(_))
-                    })
-                    .await?
-                    .respond(response);
-            }
+            state
+                .expect_request(expected_request)
+                .await?
+                .respond(response);
 
             // each transaction will be retried
             for tx in txs.clone() {
@@ -1040,49 +1052,20 @@ fn mock_services<Tip>(
         zakura_state::ReadResponse,
         zakura_test::mock_service::PropTestAssertion,
     >,
-    methods::RpcImpl<
-        zakura_test::mock_service::MockService<
-            zakura_node_services::mempool::Request,
-            zakura_node_services::mempool::Response,
-            zakura_test::mock_service::PropTestAssertion,
-        >,
-        tower::buffer::Buffer<
-            zakura_state::Request,
-            <zakura_test::mock_service::MockService<
-                zakura_state::Request,
-                zakura_state::Response,
-                zakura_test::mock_service::PropTestAssertion,
-            > as tower::Service<zakura_state::Request>>::Future,
-        >,
-        tower::buffer::Buffer<
-            zakura_state::ReadRequest,
-            <zakura_test::mock_service::MockService<
-                zakura_state::ReadRequest,
-                zakura_state::ReadResponse,
-                zakura_test::mock_service::PropTestAssertion,
-            > as tower::Service<zakura_state::ReadRequest>>::Future,
-        >,
-        Tip,
-        MockAddressBookPeers,
-        zakura_test::mock_service::MockService<
-            zakura_consensus::Request,
-            block::Hash,
-            zakura_test::mock_service::PropTestAssertion,
-        >,
-        MockSyncStatus,
-    >,
+    TestRpcImpl,
     tokio::task::JoinHandle<()>,
 )
 where
-    Tip: ChainTip + Clone + Send + Sync + 'static,
+    Tip: Into<TestChainTip>,
 {
     let mempool = MockService::build().for_prop_tests();
-    let state = MockService::build().for_prop_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_prop_tests();
     let read_state = MockService::build().for_prop_tests();
-    let block_verifier_router = MockService::build().for_prop_tests();
+    let block_verifier_router: MockService<_, _, _, BoxError> =
+        MockService::build().for_prop_tests();
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, mempool_tx_queue) = RpcImpl::new(
+    let (rpc, mempool_tx_queue) = TestRpcImpl::new_for_tests(
         network,
         Default::default(),
         Default::default(),

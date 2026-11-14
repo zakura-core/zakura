@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 use semver::Version;
 use tower::{util::BoxService, Service};
 
@@ -146,7 +146,14 @@ pub async fn start_state_service_with_cache_dir(
     };
 
     // These tests don't need UTXOs to be verified efficiently, because they use cached states.
-    Ok(zakura_state::init(config, network, Height::MAX, 0).await?)
+    let zakura_state::InitializedState {
+        state,
+        read_state: read,
+        latest_chain_tip: tip,
+        chain_tip_change: change,
+        ..
+    } = zakura_state::init(config, network, Height::MAX, 0).await?;
+    Ok((state, read, tip, change))
 }
 
 /// Loads the finalized tip height from the state stored in a specified directory.

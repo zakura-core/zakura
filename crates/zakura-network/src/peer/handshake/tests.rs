@@ -47,6 +47,18 @@ fn peer_addr(port: u16) -> PeerSocketAddr {
 }
 
 #[test]
+fn serialization_error_metric_labels_ignore_details() {
+    for detail in ["first error detail", "second error detail"] {
+        let error = SerializationError::from(std::io::Error::other(detail));
+        assert_eq!(serialization_error_metric_label(&error), "io");
+        assert_eq!(
+            serialization_error_metric_label(&SerializationError::Parse(detail)),
+            "parse",
+        );
+    }
+}
+
+#[test]
 fn connected_addr_labels_require_explicit_opt_in() {
     let peer = ConnectedAddr::new_outbound_direct(
         "192.0.2.1:8233".parse().expect("valid test peer address"),
@@ -140,9 +152,8 @@ async fn negotiate_test_pair(
     let local_min_version = MinimumPeerVersion::new(NoChainTip, &local_config.network);
     let remote_min_version = MinimumPeerVersion::new(NoChainTip, &remote_config.network);
 
-    let local_services = configured_advertised_services(&local_config, PeerServices::NODE_NETWORK);
-    let remote_services =
-        configured_advertised_services(&remote_config, PeerServices::NODE_NETWORK);
+    let local_services = local_config.handshake_services(PeerServices::NODE_NETWORK);
+    let remote_services = remote_config.handshake_services(PeerServices::NODE_NETWORK);
     let local_user_agent = TEST_LOCAL_USER_AGENT.to_string();
     let remote_user_agent = TEST_REMOTE_USER_AGENT.to_string();
 
@@ -266,9 +277,9 @@ impl ZakuraService for DropSink {
 
 /// Starts a real Zakura endpoint over loopback QUIC for an upgrade test.
 ///
-/// Each endpoint gets an explicit test-only iroh identity so parallel tests do
-/// not share the same persisted `~/.zakura` key or write to the user's real
-/// identity file.
+/// Each endpoint gets an explicit test-only iroh identity and a temporary
+/// identity directory, so parallel tests do not share a persisted key or write
+/// into the user's real `~/.zakura`.
 async fn start_test_zakura_endpoint() -> crate::zakura::ZakuraEndpoint {
     start_test_zakura_endpoint_with_registry().await.0
 }
@@ -279,10 +290,11 @@ async fn start_test_zakura_endpoint_with_registry() -> (crate::zakura::ZakuraEnd
     let key_index = TEST_ZAKURA_SECRET_KEY_COUNTER.fetch_add(1, Ordering::Relaxed) % 255 + 1;
     let key_byte = u8::try_from(key_index).expect("key index is in 1..=255 due to modulo");
     let secret = format!("{key_byte:02x}").repeat(32);
-    let config: Config = toml::from_str(&format!(
+    let mut config: Config = toml::from_str(&format!(
         "p2p_stack = 'dual'\nzakura_node_secret_key = '{secret}'\n[zakura]\nlisten_addr = '127.0.0.1:0'"
     ))
     .expect("test Zakura config with explicit identity key must parse");
+    config.identity_dir = crate::config::test_identity_dir();
 
     let peer_registry = PeerRegistry::default();
     let endpoint = crate::zakura::spawn_zakura_endpoint_with_peer_registry(
@@ -692,7 +704,8 @@ async fn initiator_upgrade_disconnects_on_malformed_prelude() {
 
 /// The legacy handshake runs the initiator upgrade inside `HANDSHAKE_TIMEOUT`,
 /// which is shorter than the native registration wait. When that timeout drops
-/// the upgrade, the maintained native dial the upgrade started must stop too.
+/// the upgrade, the maintained native dial the upgrade started must stop too,
+/// once its in-flight attempt ends.
 /// Otherwise a legacy responder that advertises an unreachable Zakura address
 /// leaks one redialing task per upgrade.
 ///
@@ -763,11 +776,15 @@ async fn timed_out_initiator_upgrade_does_not_leak_upgrade_dial() {
         initiator.is_err(),
         "the upgrade must outlast the handshake timeout, so the timeout drops it",
     );
-    assert_eq!(
-        initiator_endpoint.upgrade_dial_count(),
-        0,
-        "a timed-out legacy upgrade leaked its maintained native dial",
-    );
+    // The cancelled dial starts no new attempt, so it ends with its
+    // in-flight one.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while initiator_endpoint.upgrade_dial_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a timed-out legacy upgrade leaked its maintained native dial");
 
     initiator_endpoint.shutdown().await;
 }
@@ -776,11 +793,9 @@ async fn timed_out_initiator_upgrade_does_not_leak_upgrade_dial() {
 async fn p2p_v2_service_bit_advertisement_preserves_user_agent() {
     let _init_guard = zakura_test::init();
 
-    assert!(!configured_advertised_services(
-        &test_config(P2pStack::Legacy),
-        PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2,
-    )
-    .contains(PeerServices::NODE_P2P_V2));
+    assert!(!test_config(P2pStack::Legacy)
+        .handshake_services(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2)
+        .contains(PeerServices::NODE_P2P_V2));
 
     let (disabled_peer_seen_by_enabled, enabled_peer_seen_by_disabled) =
         negotiate_test_pair(test_config(P2pStack::Dual), test_config(P2pStack::Legacy)).await;
@@ -1104,4 +1119,207 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
     assert!(address_book_rx.try_recv().is_err());
     assert_eq!(local_counter.update_count(), 0);
     assert_eq!(remote_counter.update_count(), 0);
+}
+
+/// A peer's announcement of one block is traced under the peer's name. An `inv` that names
+/// several blocks answers a query, and one that names only transactions is not about a block,
+/// so neither is traced.
+#[tokio::test]
+async fn only_a_single_block_inv_is_traced_as_an_announcement() {
+    use crate::peer::gossip_trace::tests::test_trace;
+
+    let blocks: Vec<_> = (1..=3).map(|byte| block::Hash([byte; 32])).collect();
+    let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
+    let (trace, mut written) = test_trace(&[("127.0.0.1", "us-0")]);
+    let connected_addr = ConnectedAddr::new_inbound_direct(peer_addr(38233));
+
+    for message in [
+        Message::Inv(vec![InventoryHash::Block(blocks[0])]),
+        Message::Inv(
+            blocks[1..]
+                .iter()
+                .copied()
+                .map(InventoryHash::Block)
+                .collect(),
+        ),
+        Message::Inv(vec![transaction]),
+        Message::GetData(vec![InventoryHash::Block(blocks[0])]),
+    ] {
+        register_inventory_status(
+            Ok(message),
+            connected_addr,
+            broadcast::channel(16).0,
+            AnnouncedBlocks::default(),
+            trace.for_peer(&connected_addr),
+        )
+        .await
+        .expect("the filter passes the message through");
+    }
+
+    let rows = written.take();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["event"], "block_inv_received");
+    assert_eq!(rows[0]["hash"], blocks[0].to_string());
+    assert_eq!(rows[0]["peer_name"], "us-0");
+}
+
+/// Every inbound block `inv` records an announcement, whatever its shape, and `notfound`
+/// withdraws one. Unlike the inventory registry, this covers solicited multi-block `inv`s and
+/// connections without a transient address.
+#[tokio::test]
+async fn inbound_invs_record_announced_blocks() {
+    let blocks: Vec<_> = (1..=4).map(|byte| block::Hash([byte; 32])).collect();
+    let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
+
+    for (addressed, message, expected) in [
+        (
+            true,
+            Message::Inv(vec![InventoryHash::Block(blocks[0])]),
+            vec![blocks[0]],
+        ),
+        (
+            true,
+            Message::Inv(
+                blocks[..3]
+                    .iter()
+                    .copied()
+                    .map(InventoryHash::Block)
+                    .collect(),
+            ),
+            blocks[..3].to_vec(),
+        ),
+        (
+            true,
+            Message::Inv(vec![InventoryHash::Block(blocks[3]), transaction]),
+            vec![blocks[3]],
+        ),
+        (true, Message::Inv(vec![transaction]), Vec::new()),
+        (
+            // An isolated connection has no transient address, but still has announcements.
+            false,
+            Message::Inv(vec![InventoryHash::Block(blocks[0])]),
+            vec![blocks[0]],
+        ),
+    ] {
+        let connected_addr = if addressed {
+            ConnectedAddr::new_inbound_direct(peer_addr(38233))
+        } else {
+            ConnectedAddr::new_isolated()
+        };
+        let announced = AnnouncedBlocks::default();
+        let returned = register_inventory_status(
+            Ok(message.clone()),
+            connected_addr,
+            broadcast::channel(16).0,
+            announced.clone(),
+            Default::default(),
+        )
+        .await
+        .expect("the filter passes the message through");
+        assert_eq!(returned, message);
+        for block in &blocks {
+            assert_eq!(
+                announced.announced(*block),
+                expected.contains(block),
+                "{message:?} recorded {block:?} incorrectly"
+            );
+        }
+    }
+
+    // A `notfound` withdraws the peer's claim, so the block is advertised to it again.
+    let announced = AnnouncedBlocks::default();
+    announced.record(blocks.iter().copied());
+    register_inventory_status(
+        Ok(Message::NotFound(vec![
+            InventoryHash::Block(blocks[0]),
+            transaction,
+        ])),
+        ConnectedAddr::new_inbound_direct(peer_addr(38233)),
+        broadcast::channel(16).0,
+        announced.clone(),
+        Default::default(),
+    )
+    .await
+    .expect("the filter passes the message through");
+    assert!(!announced.announced(blocks[0]));
+    assert!(blocks[1..].iter().all(|block| announced.announced(*block)));
+}
+
+/// A body request contradicts only the requested blocks' earlier announcements.
+#[tokio::test]
+async fn body_requests_withdraw_only_requested_block_announcements() {
+    let blocks = [block::Hash([41; 32]), block::Hash([42; 32])];
+    let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
+    for connected_addr in [
+        ConnectedAddr::new_inbound_direct(peer_addr(38233)),
+        ConnectedAddr::new_isolated(),
+    ] {
+        for items in [
+            vec![],
+            vec![transaction],
+            vec![InventoryHash::Block(blocks[0])],
+            vec![InventoryHash::Block(blocks[0]), transaction],
+            blocks.iter().copied().map(InventoryHash::Block).collect(),
+        ] {
+            let announced = AnnouncedBlocks::default();
+            announced.record(blocks);
+            let message = Message::GetData(items.clone());
+            let returned = register_inventory_status(
+                Ok(message.clone()),
+                connected_addr,
+                broadcast::channel(16).0,
+                announced.clone(),
+                Default::default(),
+            )
+            .await
+            .expect("the filter passes the request through");
+            assert_eq!(returned, message);
+            for hash in blocks {
+                assert_eq!(
+                    announced.announced(hash),
+                    !items.contains(&InventoryHash::Block(hash)),
+                    "a body request withdraws only the requested block: {message:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Cancelling a connector also cancels its spawned handshake before the timeout.
+#[tokio::test]
+async fn dropping_handshake_future_releases_stream_and_tracker() {
+    use tokio::io::AsyncReadExt;
+
+    let _init_guard = zakura_test::init();
+    let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
+    let mut handshake =
+        test_handshake_without_zakura_connector(test_config(P2pStack::Legacy), book_tx);
+    let (local_stream, mut remote_stream) = duplex(16 * 1024);
+    let mut counter = ActiveConnectionCounter::new_counter();
+    tokio::time::pause();
+    let started_at = Instant::now();
+    let attempt = handshake.call(HandshakeRequest {
+        data_stream: local_stream,
+        connected_addr: ConnectedAddr::new_outbound_direct(peer_addr(8233)),
+        connection_tracker: counter.track_connection(),
+    });
+
+    // Seeing the version bytes proves the inner task is running and blocked on its peer.
+    timeout(constants::HANDSHAKE_TIMEOUT / 2, remote_stream.read_u8())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(counter.update_count(), 1);
+    drop(attempt);
+
+    let mut remaining = Vec::new();
+    timeout(
+        constants::HANDSHAKE_TIMEOUT / 2,
+        remote_stream.read_to_end(&mut remaining),
+    )
+    .await
+    .expect("cancellation closes the stream without waiting for handshake timeout")
+    .unwrap();
+    assert_eq!(counter.update_count(), 0);
+    assert_eq!(Instant::now(), started_at);
 }

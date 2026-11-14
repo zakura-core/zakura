@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use color_eyre::eyre::{ensure, eyre, Result};
+use eyre::{ensure, eyre, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use zakura_chain::parameters::NetworkKind;

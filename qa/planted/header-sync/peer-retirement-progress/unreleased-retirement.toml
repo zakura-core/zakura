@@ -1,0 +1,23 @@
+# A retirement reports the round retired while the queue keeps it, so
+# neither its capacity release nor the queue's release report happens.
+# This is hdr-5's unreleased-retirement mutation, moved here with the
+# ledger's departed `UnreleasedRound`, which is now this ID's claim. The
+# input closes `mirror-0` while its round receives pages, so the
+# disconnect retires a round the queue still holds.
+# Besides reactor.rs, which the patch changes, the queue decides when the
+# round starts and when it's released, and the session readers decide
+# whether the close reaches the reactor as a disconnect while the round
+# still has its slot. A change there can move the input off its close
+# while receiving.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+# The patch keeps the queue entry on every retirement, a shutdown's
+# included, and a shutdown's early retirement is
+# `outstanding-work-bounded`'s `UnreleasedRound` claim. So a campaign input
+# whose finish stops the node while a round receives, such as the
+# held-locator fixture's, breaks that ID instead.
+also_violates = ["header-sync/outstanding-work-bounded"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-retire-receiving-close.json"
+plan = "crates/zakura-sim/tests/fixtures/header-retire-receiving-close.plan"

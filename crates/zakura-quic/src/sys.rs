@@ -38,7 +38,7 @@ pub fn local_interface_ips() -> Vec<IpAddr> {
     let mut ips = unix_interface_ips();
     #[cfg(not(unix))]
     let mut ips = Vec::new();
-    ips.sort();
+    ips.sort_unstable();
     ips.dedup();
     ips
 }

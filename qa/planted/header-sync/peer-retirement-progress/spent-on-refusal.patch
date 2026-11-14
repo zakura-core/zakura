@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 147b4442fc..ae4c629569 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -1257,6 +1257,10 @@ impl HeaderSyncReactor {
+             }
+             QueueWorkResult::TargetAlreadyAssigned => {
+                 metrics::counter!("sync.header.target.duplicate_suppressed").increment(1);
++                // Mutation: an offer whose target another peer owns is spent,
++                // so no cached pass offers it again once that owner's slot
++                // goes.
++                self.state.spend_status(&peer);
+             }
+             QueueWorkResult::AtCapacity => {
+                 metrics::counter!("sync.header.target.capacity_refused").increment(1);

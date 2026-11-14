@@ -2,7 +2,7 @@
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use color_eyre::eyre::Result;
+use eyre::Result;
 use zakura_chain::{
     amount::Amount,
     parameters::{
@@ -222,7 +222,7 @@ pub fn read_test_network_kind() -> Result<NetworkKind> {
         None | Some("") | Some("Regtest") => Ok(NetworkKind::Regtest),
         Some("Mainnet") => Ok(NetworkKind::Mainnet),
         Some("Testnet") => Ok(NetworkKind::Testnet),
-        Some(other) => Err(color_eyre::eyre::eyre!(
+        Some(other) => Err(eyre::eyre!(
             "unrecognised {}: {other:?} (expected Mainnet, Testnet, or Regtest)",
             super::TEST_ZCASHD_COMPAT_NETWORK,
         )),

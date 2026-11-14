@@ -10,6 +10,8 @@ use quinn_proto::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::driver::SOCKET_QUEUE_BYTES;
+
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 const GIB: u64 = 1024 * MIB;
@@ -18,6 +20,33 @@ const GIB: u64 = 1024 * MIB;
 pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u32 = 10;
 /// Default pending handshakes above which unvalidated sources get a Retry (CTRL-22).
 pub const DEFAULT_RETRY_THRESHOLD: u32 = 8;
+
+/// Payload bytes one connection's flow-control credit can make this node hold,
+/// whether or not the application reads (CTRL-26).
+///
+/// That is unread data up to the receive window and our unacknowledged data up
+/// to the send window. Per-stream receive windows sit inside the connection
+/// window, so they add nothing. Queued datagrams are bounded per socket instead
+/// (see [`SOCKET_DATAGRAM_QUEUE_BYTES`]). Reassembly bookkeeping, allocator
+/// overhead and our writes still waiting for send credit come on top, so this
+/// is not a resident-memory ceiling.
+pub const fn connection_memory_bytes(receive_window_bytes: u32, send_window_bytes: u64) -> u64 {
+    // Widening u32 to u64 is lossless. Saturating keeps an unvalidated window
+    // from wrapping to a small cost.
+    (receive_window_bytes as u64).saturating_add(send_window_bytes)
+}
+
+/// Datagram bytes one bound socket can queue for its connection tasks, however
+/// many connections it serves (DRV-3, CTRL-26).
+///
+/// Connection tasks drain this queue whether or not the application reads, so
+/// it doesn't grow with unread data.
+// Widening the driver's usize constant to u64 is lossless on every supported
+// target.
+pub const SOCKET_DATAGRAM_QUEUE_BYTES: u64 = SOCKET_QUEUE_BYTES as u64;
+
+/// The largest `stream_receive_window_bytes` the QUIC config accepts.
+pub const MAX_STREAM_RECEIVE_WINDOW_BYTES: u64 = 256 * MIB;
 
 /// Congestion controller choice (CTRL-3).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -159,12 +188,12 @@ impl QuicConfig {
             "stream_receive_window_bytes",
             u64::from(self.stream_receive_window_bytes),
             64 * KIB,
-            256 * MIB,
+            MAX_STREAM_RECEIVE_WINDOW_BYTES,
         )?;
         check(
             "receive_window_bytes",
             u64::from(self.receive_window_bytes),
-            u64::from(self.stream_receive_window_bytes),
+            64 * KIB,
             GIB,
         )?;
         check("send_window_bytes", self.send_window_bytes, 64 * KIB, GIB)?;
@@ -207,6 +236,11 @@ impl QuicConfig {
         check("dial_stagger_ms", self.dial_stagger_ms, 0, 5000)?;
         check("kernel_drop_poll_secs", self.kernel_drop_poll_secs, 1, 300)?;
         Ok(())
+    }
+
+    /// [`connection_memory_bytes`] for this config's windows (CTRL-26).
+    pub fn connection_memory_bytes(&self) -> u64 {
+        connection_memory_bytes(self.receive_window_bytes, self.send_window_bytes)
     }
 
     /// The connection idle timeout (CTRL-10).
@@ -330,6 +364,19 @@ pub struct QuicBindConfig {
     pub addrs: Vec<SocketAddr>,
     /// Concurrent bidirectional streams per connection (WIRE-8).
     pub max_bidi_streams: u32,
+    /// Live QUIC connections the endpoint holds across all its sockets:
+    /// handshakes, dial attempts and established connections (ADM-12).
+    pub max_connections: usize,
+    /// Slots of `max_connections` that only dials may take, so inbound
+    /// attempts can't block this node's own dials (ADM-12).
+    pub dial_reserve: usize,
+    /// Live inbound connections the endpoint holds, counted from accept until
+    /// each one closes (ADM-12). `None` leaves inbound attempts limited only
+    /// by the dial reserve.
+    pub max_inbound_connections: Option<usize>,
+    /// Closed connections the endpoint keeps, with their stream buffers
+    /// released, until `quinn-proto` drains them (ADM-13).
+    pub max_closing_connections: usize,
 }
 
 #[cfg(test)]
@@ -416,6 +463,19 @@ mod tests {
     }
 
     #[test]
+    fn connection_memory_counts_both_windows() {
+        // 32 MiB received and 32 MiB sent.
+        assert_eq!(QuicConfig::default().connection_memory_bytes(), 64 * MIB);
+        let config = QuicConfig {
+            receive_window_bytes: 1 << 30,
+            send_window_bytes: GIB,
+            ..QuicConfig::default()
+        };
+        assert_eq!(config.connection_memory_bytes(), 2 * GIB);
+        assert_eq!(SOCKET_DATAGRAM_QUEUE_BYTES, 256 * MIB);
+    }
+
+    #[test]
     fn out_of_range_values_name_the_key() {
         let config = QuicConfig {
             recv_buffer_bytes: 10,
@@ -431,10 +491,17 @@ mod tests {
         assert_eq!(config.validate().unwrap_err().key, "idle_timeout_secs");
 
         let config = QuicConfig {
-            receive_window_bytes: 1024 * 1024,
+            receive_window_bytes: 32 * 1024,
             ..QuicConfig::default()
         };
         assert_eq!(config.validate().unwrap_err().key, "receive_window_bytes");
+
+        // A handshake window below the stream window is valid (CTRL-6).
+        let config = QuicConfig {
+            receive_window_bytes: 1024 * 1024,
+            ..QuicConfig::default()
+        };
+        assert!(config.validate().is_ok());
 
         let config = QuicConfig {
             retry_threshold: Some(70_000),

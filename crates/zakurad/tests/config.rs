@@ -128,6 +128,41 @@ fn legacy_progress_bar_is_accepted_without_redirecting_logs() {
 }
 
 #[test]
+fn legacy_use_journald_is_accepted_and_not_serialized() {
+    let _env = EnvGuard::new();
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config_path = temp_dir.path().join("legacy_journald.toml");
+    fs::write(&config_path, "[tracing]\nuse_journald = true\n").expect("write legacy config");
+
+    let config =
+        ZakuradConfig::load(Some(config_path)).expect("legacy journald setting remains valid");
+
+    let serialized = toml::to_string(&config).expect("serialize config");
+    assert!(!serialized.contains("use_journald"));
+}
+
+#[test]
+fn legacy_opentelemetry_settings_are_accepted_and_not_serialized() {
+    let _env = EnvGuard::new();
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config_path = temp_dir.path().join("legacy_opentelemetry.toml");
+    fs::write(
+        &config_path,
+        "[tracing]\n\
+         opentelemetry_endpoint = \"http://localhost:4318\"\n\
+         opentelemetry_service_name = \"zakura\"\n\
+         opentelemetry_sample_percent = 10\n",
+    )
+    .expect("write legacy config");
+
+    let config =
+        ZakuradConfig::load(Some(config_path)).expect("legacy OpenTelemetry settings remain valid");
+
+    let serialized = toml::to_string(&config).expect("serialize config");
+    assert!(!serialized.contains("opentelemetry"));
+}
+
+#[test]
 fn legacy_progress_bar_preserves_explicit_log_file() {
     let log_file = PathBuf::from("custom-zakura.log");
     let tracing_config = TracingConfig::from(TracingInnerConfig {
@@ -404,6 +439,27 @@ fn config_zakura_network_expose_peer_addresses_env() {
 }
 
 #[test]
+fn config_zakura_network_tcp_warmup_env() {
+    let env = EnvGuard::new();
+
+    env.set_var("ZAKURA_NETWORK__TCP_WARMUP__ENABLED", "true");
+    env.set_var("ZAKURA_NETWORK__TCP_WARMUP__PEER_COOLDOWN", "6h");
+    env.set_var("ZAKURA_NETWORK__TCP_WARMUP__MAX_CONCURRENT", "4");
+
+    let config = ZakuradConfig::load(None).expect("load config with TCP warm-up overrides");
+    let warmup = &config.network.tcp_warmup;
+    assert!(warmup.enabled);
+    assert_eq!(
+        warmup.peer_cooldown,
+        std::time::Duration::from_secs(6 * 60 * 60)
+    );
+    assert_eq!(warmup.max_concurrent, 4);
+
+    env.set_var("ZAKURA_NETWORK__TCP_WARMUP__MAX_CHUNK_BYTES", "2097145");
+    ZakuradConfig::load(None).expect_err("reject padding over the message limit");
+}
+
+#[test]
 fn config_zakura_tracing_log_file_env() {
     let env = EnvGuard::new();
 
@@ -526,6 +582,26 @@ fn config_preserves_file_scalar_conversions_and_bom() {
     assert_eq!(config.rpc.cookie_file_name, "123");
 }
 
+/// A v1.8.5 generated config sets `advert_delay_max`. Overriding the delay through the
+/// environment's new name must apply instead of failing as a duplicate field.
+#[test]
+fn config_env_advert_delay_overrides_previous_file_name() {
+    let env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[network]\nadvert_delay_min = \"0s\"\nadvert_delay_max = \"0s\"\n",
+    )
+    .expect("write config");
+    env.set_var("ZAKURA_NETWORK__ADVERT_DELAY", "250ms");
+    let config = ZakuradConfig::load(Some(path)).expect("load merged config");
+    assert_eq!(
+        config.network.advert_delay,
+        std::time::Duration::from_millis(250)
+    );
+}
+
 #[test]
 fn config_env_preserves_file_siblings() {
     let env = EnvGuard::new();
@@ -602,6 +678,19 @@ fn config_generated_file_roundtrip() {
         ZakuradConfig::load(Some(path)).expect("reload config"),
         expected
     );
+}
+
+#[test]
+fn config_rejects_sections_written_as_arrays() {
+    let _env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "rpc = []\n").expect("write config");
+    let error = ZakuradConfig::load(Some(path))
+        .expect_err("reject a section written as an array")
+        .to_string();
+    assert!(error.contains("rpc"), "{error}");
+    assert!(error.contains("sequence"), "{error}");
 }
 
 #[test]

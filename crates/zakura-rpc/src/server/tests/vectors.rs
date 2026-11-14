@@ -3,6 +3,7 @@
 // These tests call functions which can take unit arguments if some features aren't enabled.
 #![allow(clippy::unit_arg)]
 
+use crate::tests::test_rpc::TestRpcImpl;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use tokio::sync::watch;
@@ -40,6 +41,7 @@ async fn rpc_server_spawn() {
         cookie_dir: Default::default(),
         cookie_file_name: ".cookie".to_string(),
         enable_cookie_auth: false,
+        allow_unauthenticated_admin: false,
         max_response_body_size: Default::default(),
         tls: None,
     };
@@ -53,7 +55,7 @@ async fn rpc_server_spawn() {
     info!("spawning RPC server...");
 
     let (_tx, rx) = watch::channel(None);
-    let (rpc_impl, _) = RpcImpl::new(
+    let (rpc_impl, _) = TestRpcImpl::new_for_tests(
         Mainnet,
         Default::default(),
         false,
@@ -115,6 +117,7 @@ async fn rpc_spawn_unallocated_port(do_shutdown: bool) {
         cookie_dir: Default::default(),
         cookie_file_name: ".cookie".to_string(),
         enable_cookie_auth: false,
+        allow_unauthenticated_admin: false,
         max_response_body_size: Default::default(),
         tls: None,
     };
@@ -128,7 +131,7 @@ async fn rpc_spawn_unallocated_port(do_shutdown: bool) {
     info!("spawning RPC server...");
 
     let (_tx, rx) = watch::channel(None);
-    let (rpc_impl, _) = RpcImpl::new(
+    let (rpc_impl, _) = TestRpcImpl::new_for_tests(
         Mainnet,
         Default::default(),
         false,
@@ -179,6 +182,7 @@ async fn rpc_server_spawn_port_conflict() {
         cookie_dir: Default::default(),
         cookie_file_name: ".cookie".to_string(),
         enable_cookie_auth: false,
+        allow_unauthenticated_admin: false,
         max_response_body_size: Default::default(),
         tls: None,
     };
@@ -190,7 +194,7 @@ async fn rpc_server_spawn_port_conflict() {
         MockService::build().for_unit_tests();
 
     let (_tx, rx) = watch::channel(None);
-    let (rpc_impl, _) = RpcImpl::new(
+    let (rpc_impl, _) = TestRpcImpl::new_for_tests(
         Mainnet,
         Default::default(),
         false,

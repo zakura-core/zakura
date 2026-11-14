@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-storage/src/header/adapter.rs b/crates/zakura-storage/src/header/adapter.rs
+index 0b178bb334..9afdf17ddc 100644
+--- a/crates/zakura-storage/src/header/adapter.rs
++++ b/crates/zakura-storage/src/header/adapter.rs
+@@ -648,7 +648,11 @@ impl EnginePort {
+     > {
+         let engine = self.engine();
+         let snapshot = engine.snapshot();
+-        let locator = HeaderLocator::for_selected_path(&snapshot, |height| {
++        // Mutation: the locator holds only the selected tip, while the read
++        // still reports the real generation and finalized anchor.
++        let mut tip_only = snapshot.clone();
++        tip_only.frontiers.finalized = tip_only.frontiers.header_best;
++        let locator = HeaderLocator::for_selected_path(&tip_only, |height| {
+             let projection = engine.selected_projection();
+             let index = projection
+                 .binary_search_by_key(&height, |frontier| frontier.height)

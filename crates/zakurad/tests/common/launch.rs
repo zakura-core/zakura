@@ -342,10 +342,9 @@ pub fn can_spawn_zakurad_for_test_type<S: AsRef<str> + Debug>(
 macro_rules! assert_with_context {
     ($pred:expr, $source:expr) => {
         if !$pred {
-            use color_eyre::Section as _;
-            use color_eyre::SectionExt as _;
+            use zakura_test::report::{Section as _, SectionExt as _};
             use zakura_test::command::ContextFrom as _;
-            let report = color_eyre::eyre::eyre!("failed assertion")
+            let report = eyre::eyre!("failed assertion")
                 .section(stringify!($pred).header("Predicate:"))
                 .context_from($source);
 
@@ -354,10 +353,9 @@ macro_rules! assert_with_context {
     };
     ($pred:expr, $source:expr, $($fmt_arg:tt)+) => {
         if !$pred {
-            use color_eyre::Section as _;
-            use color_eyre::SectionExt as _;
+            use zakura_test::report::{Section as _, SectionExt as _};
             use zakura_test::command::ContextFrom as _;
-            let report = color_eyre::eyre::eyre!("failed assertion")
+            let report = eyre::eyre!("failed assertion")
                 .section(stringify!($pred).header("Predicate:"))
                 .context_from($source)
                 .wrap_err(format!($($fmt_arg)+));

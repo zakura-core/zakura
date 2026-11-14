@@ -7,15 +7,19 @@ use tokio::sync::Mutex;
 use zakura_quic::{Conn as Connection, QuicConfig, QuicEndpoint, RecvStream, SendStream, VarInt};
 
 use super::{LocalEndpointFactory, ZakuraTestNode};
+#[cfg(test)]
+use crate::zakura::{
+    header_sync::v9::CommonMessage,
+    wire_codec::{decode_frame, encode_frame},
+};
 use crate::{
     zakura::{
-        legacy_gossip::ZAKURA_STREAM_GOSSIP, run_native_initiator_handshake, Frame,
-        HeaderSyncCodec, HeaderSyncMessage, StreamPrelude, ZakuraHandshakeConfig,
-        ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES, LEGACY_GOSSIP_VERSION, P2P_V2_ALPN,
-        STREAM_PRELUDE_MAGIC, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-        ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
-        ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
+        legacy_gossip::ZAKURA_STREAM_GOSSIP, run_native_initiator_handshake, Frame, StreamPrelude,
+        ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES,
+        LEGACY_GOSSIP_VERSION, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC, ZAKURA_CAP_HEADER_SYNC,
+        ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
     },
     BoxError, Config,
 };
@@ -92,23 +96,21 @@ impl HostilePeer {
         )?)
     }
 
-    /// Encode and send one canonical protocol-v8 header-sync message.
-    pub async fn send_header_sync_message(
+    /// Encode and send one Mainnet header-sync version 9 message.
+    #[cfg(test)]
+    pub(crate) async fn send_header_sync_message(
         &self,
-        codec: &HeaderSyncCodec,
-        message: &HeaderSyncMessage,
+        message: &CommonMessage,
     ) -> Result<(), BoxError> {
-        let frame = codec.encode_frame(message)?;
+        let frame = encode_frame(message)?;
         self.send_raw_frame(ZAKURA_STREAM_HEADER_SYNC, frame).await
     }
 
-    /// Receive and decode one canonical protocol-v8 header-sync message.
-    pub async fn recv_header_sync_message(
-        &self,
-        codec: &HeaderSyncCodec,
-    ) -> Result<HeaderSyncMessage, BoxError> {
+    /// Receive and decode one Mainnet header-sync version 9 message.
+    #[cfg(test)]
+    pub(crate) async fn recv_header_sync_message(&self) -> Result<CommonMessage, BoxError> {
         let frame = self.recv_ordered_frame(ZAKURA_STREAM_HEADER_SYNC).await?;
-        Ok(codec.decode_frame(frame, None)?)
+        Ok(decode_frame(&frame)?)
     }
 
     /// Wait until the victim closes this QUIC connection.

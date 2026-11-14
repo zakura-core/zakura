@@ -1,0 +1,9 @@
+# Omits the work queue's reset when the sequencer takes a new body-work
+# epoch, so the old epoch's taken work above the verified tip survives the
+# transition. The input forks the mirrors' chain while block sync holds work
+# above the fork point, and the node's header sync carries the fork to its
+# block sync.
+input = "crates/zakura-sim/tests/fixtures/sync-storage-reorg.bin"
+# Besides sequencer_task/state.rs, which the patch changes, header sync's
+# apply and the rest of block sync decide what work is held at the fork.
+checks = ["crates/zakura-network/src/zakura/block_sync", "crates/zakura-network/src/zakura/header_sync"]

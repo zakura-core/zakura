@@ -4,12 +4,12 @@
 //! stale address queries. A durable marker preserves this across restarts and rollback.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     path::Path,
     sync::Arc,
 };
 
-use crossbeam_channel::bounded;
+use crate::service::finalized_state::disk_format::upgrade::cancel_channel;
 use tempfile::TempDir;
 use tower::{Service, ServiceExt};
 
@@ -36,7 +36,6 @@ use crate::{
             CheckpointVerifiedBlock, FinalizedState, ZakuraDb, PRUNING_METADATA,
             STATE_COLUMN_FAMILIES_IN_CODE,
         },
-        non_finalized_state::CreatedUtxos,
     },
     ContextuallyVerifiedBlock, ReadRequest, ReadResponse, RollbackFinalizedStateError,
     RollbackFinalizedStateOptions, SemanticallyVerifiedBlock, StateInitError,
@@ -187,13 +186,8 @@ fn commit_checkpoint(state: &mut FinalizedState, blocks: &[Arc<Block>]) {
 fn commit_contextual(state: &mut FinalizedState, block: Arc<Block>) {
     let network = state.network();
     let semantically_verified = SemanticallyVerifiedBlock::from(block);
-    let spent_utxos = check::utxo::transparent_spend(
-        &semantically_verified,
-        &CreatedUtxos::default(),
-        &HashMap::new(),
-        &state.db,
-    )
-    .expect("the test block only spends valid finalized outputs");
+    let spent_utxos = check::utxo::transparent_spend(&semantically_verified, None, &state.db)
+        .expect("the test block only spends valid finalized outputs");
     let contextually_verified = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
         &network,
         semantically_verified,
@@ -240,8 +234,7 @@ fn check_spends(
     all_transactions.extend(transactions);
     let block = SemanticallyVerifiedBlock::from(child_block(parent, all_transactions));
 
-    check::utxo::transparent_spend(&block, &CreatedUtxos::default(), &HashMap::new(), db)
-        .map(|spent| spent.into_keys().collect())
+    check::utxo::transparent_spend(&block, None, db).map(|spent| spent.into_keys().collect())
 }
 
 /// Runs every spend check this file cares about, returning a comparable summary.
@@ -451,6 +444,68 @@ fn skipped_and_indexed_databases_keep_identical_validation_state() {
     );
     assert!(skipped.db.utxo(&chain.unspent_output).is_none());
     assert!(indexed.db.utxo(&chain.unspent_output).is_none());
+}
+
+/// Committing contextually verified blocks with the spent UTXOs that validation resolved
+/// writes the same transparent state as committing the same blocks as checkpoint-verified,
+/// which reads the spent UTXOs from the database.
+#[test]
+fn contextual_commit_with_resolved_spends_matches_checkpoint_commit() {
+    let _init_guard = zakura_test::init();
+    let chain = test_chain();
+    let network = chain.network.clone();
+
+    // Height 4 spends an output created at height 3, which is committed contextually, then
+    // spends its own new output in the same block.
+    let tip = chain.blocks.last().expect("the chain has blocks");
+    let spend4 = spend_tx(chain.unspent_output, amount(15_000), &chain.address);
+    let spend5 = spend_tx(outpoint(&spend4, 0), amount(10_000), &chain.other);
+    let block4 = child_block(
+        tip,
+        vec![
+            coinbase_tx(Height(4), amount(4_000), &chain.other),
+            spend4,
+            spend5,
+        ],
+    );
+
+    let checkpoint_dir = TempDir::new().expect("temp dir");
+    let contextual_dir = TempDir::new().expect("temp dir");
+    let mut checkpoint = open(
+        &config_at(checkpoint_dir.path(), NodeConfig::Archive),
+        &network,
+    );
+    let mut contextual = open(
+        &config_at(contextual_dir.path(), NodeConfig::Archive),
+        &network,
+    );
+
+    let mut all_blocks = chain.blocks.clone();
+    all_blocks.push(block4.clone());
+    commit_checkpoint(&mut checkpoint, &all_blocks);
+
+    // Height 3 spends an output created at height 2, which is committed as checkpoint-verified.
+    let (below_contextual, contextual_blocks) = chain.blocks.split_at(3);
+    commit_checkpoint(&mut contextual, below_contextual);
+    for block in contextual_blocks.iter().cloned().chain([block4]) {
+        commit_contextual(&mut contextual, block);
+    }
+
+    assert_eq!(contextual.db.finalized_tip_height(), Some(Height(4)));
+    for cf in ["utxo_by_out_loc", "tx_loc_by_hash", "hash_by_tx_loc"]
+        .into_iter()
+        .chain(TRANSPARENT_INDEX_COLUMN_FAMILIES)
+    {
+        assert_eq!(
+            contextual.db.raw_column_family_entries_for_test(cf),
+            checkpoint.db.raw_column_family_entries_for_test(cf),
+            "{cf} is the same for contextual and checkpoint commits"
+        );
+    }
+    assert!(
+        transparent_index_entry_count(&contextual.db) > 0,
+        "the databases built transparent indexes"
+    );
 }
 
 /// The marker is written with the first skipped block, before raw transaction pruning starts.
@@ -1188,7 +1243,7 @@ fn format_checks_never_rebuild_omitted_transparent_indexes() {
     // Reopening runs the startup format check, which includes the indexer spender rebuild when
     // that feature is enabled.
     let state = open(&config, &network);
-    let (_cancel_sender, cancel_receiver) = bounded(1);
+    let (_cancel_sender, cancel_receiver) = cancel_channel();
     assert_eq!(
         DbFormatChange::format_validity_checks_detailed(&state.db, &cancel_receiver)
             .expect("checks are not cancelled"),
@@ -1226,7 +1281,7 @@ fn transparent_index_marker_does_not_mark_a_database_pruned() {
     assert!(state.db.transparent_indexes_skipped_from().is_some());
     assert_eq!(state.db.lowest_retained_height(), None);
     assert!(!state.db.is_pruned());
-    assert!(state.db.block(Height(1).into()).is_some());
+    assert!(state.db.block(Height(1).into()).unwrap().is_some());
     assert_eq!(
         state
             .db

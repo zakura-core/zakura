@@ -5,9 +5,7 @@
 //! - peer connection limits, and
 //! - peer connection timeouts.
 
-use std::{collections::HashMap, time::Duration};
-
-use lazy_static::lazy_static;
+use std::{collections::HashMap, sync::LazyLock, time::Duration};
 
 // TODO: should these constants be split into protocol also?
 use crate::protocol::external::types::*;
@@ -20,6 +18,12 @@ use zakura_chain::{
     },
     serialization::Duration32,
 };
+
+/// The largest padding a `ping` can carry: the protocol message limit minus the 8-byte nonce.
+/// Peers disconnect on a larger message.
+// The message limit is 2 MiB, so the cast to u32 is lossless.
+pub const MAX_PING_PADDING: u32 =
+    (zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN - 8) as u32;
 
 /// A multiplier used to calculate the inbound connection limit for the peer set,
 ///
@@ -85,6 +89,27 @@ pub const OUTBOUND_PEER_LIMIT_DIVISOR: usize = 2;
 ///       connections to an IP.
 pub const DEFAULT_MAX_CONNS_PER_IP: usize = 1;
 
+/// The default initial peer count for a full-sized or unknown-sized block.
+pub const DEFAULT_ADVERT_WINDOW_FULL_BLOCK: usize = 32;
+
+/// The default initial peer count for a small block.
+pub const DEFAULT_ADVERT_WINDOW_SMALL_BLOCK: usize = 64;
+
+/// The default block size at and below which a block gets the small-block advert window, 100 KiB.
+///
+/// This will be used as `Config.advert_window_small_size_bytes` if it is not configured.
+pub const DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES: u64 = 102_400;
+
+/// The default block size at and above which a block gets the full-block advert window, 1.5 MiB.
+///
+/// This will be used as `Config.advert_window_full_size_bytes` if it is not configured.
+pub const DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES: u64 = 1_572_864;
+
+/// The default delay before announcing a block to peers outside the initial group.
+///
+/// This will be used as `Config.advert_delay` if it is not configured.
+pub const DEFAULT_ADVERT_DELAY: Duration = Duration::from_millis(500);
+
 /// The default peerset target size.
 ///
 /// This will be used as `Config.peerset_initial_target_size` if no valid value is provided.
@@ -109,6 +134,9 @@ pub const PEERSET_BUFFER_SIZE: usize = 3;
 /// The timeout for sending a message to a remote peer,
 /// and receiving a response from a remote peer.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Bounds a daemon block broadcast, including peer discovery and delivery tracking.
+pub const BLOCK_GOSSIP_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The timeout for connections and handshakes when connecting to new peers.
 ///
@@ -229,6 +257,42 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(59);
 ///
 /// It also enforces a minimum per-peer reconnection interval, and filters failed outbound peers.
 pub const MIN_OUTBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The maximum number of concurrent legacy connection attempts to initial peers at startup.
+///
+/// Each completed attempt immediately admits the next initial peer, so startup is not paced by
+/// [`MIN_OUTBOUND_PEER_CONNECTION_INTERVAL`]. `peerset_initial_target_size` still bounds the total
+/// number of startup attempts.
+pub const INITIAL_PEER_DIAL_CONCURRENCY: usize = 50;
+
+/// How often Zakura checks whether each dialed unconditional peer is still connected.
+///
+/// A peer that is no longer connected is dialed again within this interval, unless it
+/// is waiting out a redial delay.
+pub const UNCONDITIONAL_PEER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The shortest delay between two dials to the same unconditional peer.
+///
+/// Each further dial that does not lead to a lasting connection doubles the delay, up to
+/// [`MAX_UNCONDITIONAL_PEER_REDIAL_DELAY`].
+pub const MIN_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(1);
+
+/// The longest delay between two dials to the same unconditional peer, before jitter.
+pub const MAX_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(10 * 60);
+
+/// The longest random delay that Zakura adds before it dials an unconditional peer
+/// again.
+///
+/// Two nodes that list each other would otherwise redial at the same moment after
+/// their connection drops, and each could keep the dial that the other one drops.
+/// The delay must be much longer than a round trip between two such nodes.
+pub const MAX_UNCONDITIONAL_PEER_REDIAL_JITTER: Duration = Duration::from_secs(2);
+
+/// How long a connection to an unconditional peer must last to reset its redial delay.
+///
+/// A peer that keeps dropping new connections is dialed at the maximum delay, instead of
+/// in a tight loop.
+pub const UNCONDITIONAL_PEER_HEALTHY_CONNECTION: Duration = Duration::from_secs(60);
 
 /// The minimum time between _successful_ inbound peer connections, implemented by
 /// `peer_set::initialize::accept_inbound_connections`.
@@ -410,40 +474,49 @@ pub const MIN_PEER_SET_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// disconnected and banned.
 pub const MAX_PEER_MISBEHAVIOR_SCORE: u32 = 100;
 
-/// The most block hashes a Zakura native `FindBlocks` response may carry.
+/// The most block hashes a `FindBlocks` response may carry.
 ///
-/// A zakurad responder sends at most `MAX_FIND_BLOCK_HASHES_RESULTS` from
+/// Zakura native requesters reject longer responses, and legacy `inv` responses
+/// are truncated to this length. A zakurad responder sends at most `MAX_FIND_BLOCK_HASHES_RESULTS` from
 /// `zakura-state`; zakurad checks at compile time that the two match.
 pub const MAX_FIND_BLOCKS_RESPONSE_HASHES: usize = 500;
 
 /// The maximum number of banned IP addresses to be stored in-memory at any time.
 pub const MAX_BANNED_IPS: usize = 20_000;
 
-lazy_static! {
-    /// The minimum network protocol version accepted by this crate for each network,
-    /// represented as a network upgrade.
-    ///
-    /// The minimum protocol version is used to check the protocol versions of our
-    /// peers during the initial block download. After the initial block download,
-    /// we use the current block height to select the minimum network protocol
-    /// version.
-    ///
-    /// If peer versions are too old, we will disconnect from them.
-    ///
-    /// The minimum network protocol version typically changes after Mainnet and
-    /// Testnet network upgrades.
-    // TODO: Change `Nu6_2` to `Nu7` after NU7 activation.
-    // TODO: Move the value here to a field on `testnet::Parameters` (#8367)
-    pub static ref INITIAL_MIN_NETWORK_PROTOCOL_VERSION: HashMap<NetworkKind, Version> = {
+/// The minimum network protocol version accepted by this crate for each network,
+/// represented as a network upgrade.
+///
+/// The minimum protocol version is used to check the protocol versions of our
+/// peers during the initial block download. After the initial block download,
+/// we use the current block height to select the minimum network protocol
+/// version.
+///
+/// If peer versions are too old, we will disconnect from them.
+///
+/// The minimum network protocol version typically changes after Mainnet and
+/// Testnet network upgrades.
+// TODO: Change `Nu6_2` to `Nu7` after NU7 activation.
+// TODO: Move the value here to a field on `testnet::Parameters` (#8367)
+pub static INITIAL_MIN_NETWORK_PROTOCOL_VERSION: LazyLock<HashMap<NetworkKind, Version>> =
+    LazyLock::new(|| {
         let mut hash_map = HashMap::new();
 
-        hash_map.insert(NetworkKind::Mainnet, Version::min_specified_for_upgrade(&Mainnet, Nu6_2));
-        hash_map.insert(NetworkKind::Testnet, Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6_2));
-        hash_map.insert(NetworkKind::Regtest, Version::min_specified_for_upgrade(&Network::new_regtest(Default::default()), Nu6_2));
+        hash_map.insert(
+            NetworkKind::Mainnet,
+            Version::min_specified_for_upgrade(&Mainnet, Nu6_2),
+        );
+        hash_map.insert(
+            NetworkKind::Testnet,
+            Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6_2),
+        );
+        hash_map.insert(
+            NetworkKind::Regtest,
+            Version::min_specified_for_upgrade(&Network::new_regtest(Default::default()), Nu6_2),
+        );
 
         hash_map
-    };
-}
+    });
 
 /// The timeout for DNS lookups.
 ///

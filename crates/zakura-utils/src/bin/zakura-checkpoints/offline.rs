@@ -20,7 +20,7 @@
 
 use std::{fs, io::Write, path::Path, time::Instant};
 
-use color_eyre::eyre::{ensure, eyre, Context, Result};
+use eyre::{ensure, eyre, Context, Result};
 
 use zakura_chain::{
     block::{self, Height, MAX_BLOCK_BYTES},

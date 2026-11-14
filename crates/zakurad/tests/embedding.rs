@@ -35,7 +35,8 @@ fn regtest_config(dir: &std::path::Path) -> ZakuradConfig {
 fn embedded_node_leaves_host_process_state_alone() {
     // The host owns the error report hook. Creating any report installs a default hook,
     // so the host has to install its own before running the node.
-    color_eyre::install().expect("nothing else has installed an error hook yet");
+    eyre::set_hook(Box::new(eyre::DefaultHandler::default_with))
+        .expect("nothing else has installed an error hook yet");
 
     let host_panic_hook_called = Arc::new(AtomicBool::new(false));
     let default_panic_hook = std::panic::take_hook();

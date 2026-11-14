@@ -2,6 +2,7 @@
 use super::state::BlockSyncFrontiers;
 use super::{request::*, *};
 use std::num::NonZeroU64;
+use zakura_node_services::block_memory::BlockHandle;
 
 /// Committed header metadata used by block sync to schedule and validate a body.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -158,11 +159,6 @@ impl BlockApplyOutcome {
         self.verification.as_ref()
     }
 
-    /// Consume this wrapper and return canonical typed verification evidence.
-    pub fn into_verification(self) -> zakura_header_chain::BodyVerificationOutcome {
-        *self.verification
-    }
-
     pub(crate) fn attributed_source(&self) -> Option<zakura_header_chain::SourceId> {
         match self.verification.as_ref() {
             zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(evidence) => {
@@ -256,7 +252,7 @@ pub enum BlockSyncAction {
         /// Submission token to echo in [`BlockSyncEvent::BlockApplyFinished`].
         token: BlockApplyToken,
         /// Block body that is contiguous above `verified_block_tip`.
-        block: Arc<block::Block>,
+        block: BlockHandle,
     },
     /// Persist one completion-gated transient body result.
     RecordBodyUnavailable {

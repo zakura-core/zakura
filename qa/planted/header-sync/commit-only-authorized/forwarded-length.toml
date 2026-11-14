@@ -1,0 +1,11 @@
+# The session forwards each page to its subscriber one byte shorter than
+# it arrived, so the subscriber charges, counts and records a cursor that
+# agree with each other but not with the page's layout. The reactor, the
+# subscriber and the queue decide how the witness's rounds start, stage
+# and are credited, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-multi-page-sync.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-multi-page-sync.plan"

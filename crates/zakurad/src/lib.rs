@@ -59,6 +59,14 @@
 //! features](https://doc.rust-lang.org/cargo/reference/features.html#command-line-feature-options)
 //! are available at compile time:
 //!
+//! ### Verification
+//!
+//! * `sprout`: opt in to Sprout JoinSplit proof and signature verification.
+//!   ZIP 218 disallows JoinSplits from NU7 onward, so post-NU7 snapshots do not
+//!   need it. Enable it to fully verify pre-NU7 blocks above the last checkpoint.
+//!   Builds without it stall on such a block that has a JoinSplit, rather than
+//!   rejecting it. Disabled by default.
+//!
 //! ### Metrics
 //!
 //! * `prometheus`: export metrics to prometheus.
@@ -67,16 +75,13 @@
 //!
 //! Sending traces to different subscribers:
 //! * configuring a `tracing.log_file`: appends traces to a file on disk.
-//! * `journald`: send tracing spans and events to `systemd-journald`.
 //!
 //! Changing the traces that are collected:
 //! * `error-debug`: enable extra debugging in release builds.
-//! * `tokio-console`: enable tokio's `console-subscriber` (needs [specific compiler flags])
 //! * A set of features that [skip verbose tracing].
 //!   The default features ignore `debug` and `trace` logs in release builds.
 //!
 //! [skip verbose tracing]: https://docs.rs/tracing/0.1.35/tracing/level_filters/index.html#compile-time-filters
-//! [specific compiler flags]: https://docs.rs/console-subscriber/latest/console_subscriber/#enabling-tokio-instrumentation
 //!
 //! ### Testing
 //!
@@ -118,6 +123,11 @@
 
 #[macro_use]
 extern crate tracing;
+
+// Keep the build-only dependency explicit: it builds the checkpoint utility
+// for acceptance tests, and the feature forwards that utility's build flag.
+#[cfg(any(test, feature = "zakura-checkpoints"))]
+extern crate zakura_utils as _;
 
 /// Error type alias to make working with tower traits easier.
 ///

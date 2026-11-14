@@ -136,6 +136,10 @@ pub struct DiskDb {
     /// applying any format changes that may have been required.
     finished_format_upgrades: Arc<AtomicBool>,
 
+    /// Set by the first instance that runs the shutdown format check.
+    /// Every instance that shuts down the shared database would otherwise run it.
+    shutdown_format_check_claimed: Arc<AtomicBool>,
+
     // Owned State
     //
     // Everything contained in this state must be shared by all clones, or read-only.
@@ -160,7 +164,7 @@ pub struct DiskDb {
     /// The temporary workspace RocksDB uses to follow a primary database.
     ///
     /// This must be declared after `db` so the RocksDB handle is dropped before the directory.
-    _secondary_dir: Option<Arc<tempfile::TempDir>>,
+    _secondary_dir: Option<Arc<zakura_chain::common::TempDir>>,
 }
 
 /// Wrapper struct to ensure low-level database writes go through the correct API.
@@ -833,6 +837,16 @@ impl DiskDb {
             .store(true, atomic::Ordering::SeqCst);
     }
 
+    /// Returns true for the first caller across all clones of this database, and false after.
+    ///
+    /// The shutdown format check calls this so that it runs once per database, not once per
+    /// instance that shuts the database down.
+    pub(crate) fn claim_shutdown_format_check(&self) -> bool {
+        !self
+            .shutdown_format_check_claimed
+            .swap(true, atomic::Ordering::SeqCst)
+    }
+
     /// Returns true if the `finished_format_upgrades` flag has been set to true to
     /// indicate that Zebra has finished applying any required db format upgrades.
     pub fn finished_format_upgrades(&self) -> bool {
@@ -877,7 +891,30 @@ impl DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
-        self.zs_range_iter_with_direction(cf, range, false)
+        self.zs_range_iter_with_direction(cf, range, false, None)
+    }
+
+    /// Returns a forward iterator over the items in `cf` in `range`, like
+    /// [`Self::zs_forward_range_iter`], that fetches up to `read_ahead_bytes` of the range
+    /// from disk at a time instead of one small block per read.
+    ///
+    /// Use this for a scan that reads a whole bounded range of large values. RocksDB does
+    /// not read past the end of `range`, so a short range costs no extra disk reads.
+    ///
+    /// Holding this iterator open might delay block commit transactions.
+    pub fn zs_forward_range_iter_with_read_ahead<C, K, V, R>(
+        &self,
+        cf: &C,
+        range: R,
+        read_ahead_bytes: usize,
+    ) -> impl Iterator<Item = (K, V)> + '_
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk,
+        R: RangeBounds<K>,
+    {
+        self.zs_range_iter_with_direction(cf, range, false, Some(read_ahead_bytes))
     }
 
     /// Returns a reverse iterator over the items in `cf` in `range`.
@@ -894,7 +931,7 @@ impl DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
-        self.zs_range_iter_with_direction(cf, range, true)
+        self.zs_range_iter_with_direction(cf, range, true, None)
     }
 
     /// Returns an iterator over the items in `cf` in `range`.
@@ -902,12 +939,17 @@ impl DiskDb {
     /// RocksDB iterators are ordered by increasing key bytes by default.
     /// Otherwise, if `reverse` is `true`, the iterator is ordered by decreasing key bytes.
     ///
+    /// With `read_ahead_bytes`, the scan fetches that much of the range from disk at a time.
+    /// Without it, RocksDB starts with single blocks and reads ahead only after two
+    /// sequential reads.
+    ///
     /// Holding this iterator open might delay block commit transactions.
     fn zs_range_iter_with_direction<C, K, V, R>(
         &self,
         cf: &C,
         range: R,
         reverse: bool,
+        read_ahead_bytes: Option<usize>,
     ) -> impl Iterator<Item = (K, V)> + '_
     where
         C: rocksdb::AsColumnFamilyRef,
@@ -932,7 +974,10 @@ impl DiskDb {
         let range = (start_bound, end_bound);
 
         let mode = Self::zs_iter_mode(&range, reverse);
-        let opts = Self::zs_iter_opts(&range);
+        let mut opts = Self::zs_iter_opts(&range);
+        if let Some(read_ahead_bytes) = read_ahead_bytes {
+            opts.set_readahead_size(read_ahead_bytes);
+        }
 
         // Reading multiple items from iterators has caused database hangs,
         // in previous RocksDB versions
@@ -1185,10 +1230,11 @@ impl DiskDb {
 
         let secondary_dir = read_only.then(|| {
             Arc::new(
-                tempfile::Builder::new()
-                    .prefix("zebra-secondary-state-")
-                    .tempdir()
-                    .expect("temporary RocksDB secondary directory can be created"),
+                zakura_chain::common::TempDir::new_in(
+                    std::env::temp_dir(),
+                    "zebra-secondary-state-",
+                )
+                .expect("temporary RocksDB secondary directory can be created"),
             )
         });
 
@@ -1221,6 +1267,7 @@ impl DiskDb {
                     db: Arc::new(db),
                     _secondary_dir: secondary_dir,
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
+                    shutdown_format_check_claimed: Arc::new(AtomicBool::new(false)),
                     cached_size: Arc::new(AtomicU64::new(0)),
                     retained_block_height: tokio::sync::watch::channel(Height::MIN).0,
                 };
@@ -1266,7 +1313,9 @@ impl DiskDb {
     /// Returns the temporary RocksDB secondary workspace in tests.
     #[cfg(test)]
     pub(crate) fn secondary_path(&self) -> Option<&Path> {
-        self._secondary_dir.as_deref().map(tempfile::TempDir::path)
+        self._secondary_dir
+            .as_deref()
+            .map(zakura_chain::common::TempDir::path)
     }
 
     /// Returns the low-level rocksdb inner database.
@@ -1592,6 +1641,12 @@ impl DiskDb {
         None
     }
 
+    /// The fewest RocksDB background flush and compaction jobs to run.
+    const MIN_BACKGROUND_JOBS: usize = 2;
+
+    /// The most RocksDB background flush and compaction jobs to run.
+    const MAX_BACKGROUND_JOBS: usize = 16;
+
     /// Returns the database options for the finalized state database.
     fn options() -> rocksdb::Options {
         let mut opts = rocksdb::Options::default();
@@ -1617,6 +1672,19 @@ impl DiskDb {
         //
         // This improves Zebra's initial sync speed slightly, as of April 2022.
         opts.optimize_level_style_compaction(Self::MEMTABLE_RAM_CACHE_MEGABYTES * ONE_MEGABYTE);
+
+        // Let flushes and compactions use the machine's cores. RocksDB defaults to
+        // two background jobs, which lets compaction debt build up during sync
+        // until writes stall.
+        let background_jobs = std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(Self::MIN_BACKGROUND_JOBS)
+            .clamp(Self::MIN_BACKGROUND_JOBS, Self::MAX_BACKGROUND_JOBS);
+        let background_jobs = i32::try_from(background_jobs)
+            .expect("background job count is clamped to MAX_BACKGROUND_JOBS, which fits in i32");
+        opts.increase_parallelism(background_jobs);
+        opts.set_max_background_jobs(background_jobs);
+        opts.set_max_subcompactions(4);
 
         // Bound WAL growth so heavy sync cannot accumulate tens of GiB of logs
         // that must be replayed before Zebra can restart.
@@ -1745,28 +1813,12 @@ impl DiskDb {
                 DiskDb::IDEAL_OPEN_FILE_LIMIT
             );
         } else if cfg!(windows) {
-            // This log is verbose during tests.
-            #[cfg(not(test))]
             info!(
                 min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
                 ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
                 "assuming the open file limit is high enough for Zakura",
             );
-            #[cfg(test)]
-            debug!(
-                min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
-                ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
-                "assuming the open file limit is high enough for Zakura",
-            );
         } else {
-            #[cfg(not(test))]
-            debug!(
-                ?current_limit,
-                min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
-                ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
-                "the open file limit is high enough for Zakura",
-            );
-            #[cfg(test)]
             debug!(
                 ?current_limit,
                 min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
@@ -1824,15 +1876,7 @@ impl DiskDb {
                     ephemeral_note = " and removing ephemeral files";
                 }
 
-                // This log is verbose during tests.
-                #[cfg(not(test))]
                 info!(
-                    ?path,
-                    "forcing shutdown{} of a state database with multiple active instances",
-                    ephemeral_note,
-                );
-                #[cfg(test)]
-                debug!(
                     ?path,
                     "forcing shutdown{} of a state database with multiple active instances",
                     ephemeral_note,
@@ -1989,11 +2033,7 @@ impl DiskDb {
 
         let path = self.path();
 
-        // This log is verbose during tests.
-        #[cfg(not(test))]
         info!(?path, "removing temporary database files");
-        #[cfg(test)]
-        debug!(?path, "removing temporary database files");
 
         // We'd like to use `rocksdb::Env::mem_env` for ephemeral databases,
         // but the Zcash blockchain might not fit in memory. So we just
@@ -2010,15 +2050,7 @@ impl DiskDb {
         let result = std::fs::remove_dir_all(path);
 
         if result.is_err() {
-            // This log is verbose during tests.
-            #[cfg(not(test))]
             info!(
-                ?result,
-                ?path,
-                "removing temporary database files caused an error",
-            );
-            #[cfg(test)]
-            debug!(
                 ?result,
                 ?path,
                 "removing temporary database files caused an error",

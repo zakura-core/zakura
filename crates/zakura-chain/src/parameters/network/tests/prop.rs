@@ -55,7 +55,7 @@ proptest! {
         let scheduled = i64::from(halving_block_subsidy(Height(height), &network).unwrap());
         let actual = i64::from(block_subsidy(Height(height), &network, Some(Amount::try_from(balance).unwrap())).unwrap());
         let bonus = if height >= 3 {
-            let numerator = 1_375;
+            let numerator = 8_022_777;
             super::reissuance_bonus_oracle(balance, numerator)
         } else {
             0

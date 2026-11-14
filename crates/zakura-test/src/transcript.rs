@@ -5,12 +5,11 @@ use std::{
     task::{Context, Poll},
 };
 
-use color_eyre::{
-    eyre::{eyre, Report},
-    section::{Section, SectionExt},
-};
+use eyre::{eyre, Report};
 use futures::future::{ready, Ready};
 use tower::{Service, ServiceExt};
+
+use crate::report::{Section, SectionExt};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -20,10 +19,6 @@ pub enum ExpectedTranscriptError {
     /// Match any error.
     Any,
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("ErrorChecker Error: {0}")]
-struct ErrorCheckerError(BoxError);
 
 /// A transcript: a list of requests and expected results.
 #[must_use]
@@ -84,8 +79,9 @@ where
                         .with_section(|| format!("{rsp:?}").header("Found Response:"));
                 }
                 (Err(e), Ok(expected_rsp)) => {
+                    let e: BoxError = e.into();
                     Err(eyre!("received an error when a response was expected"))
-                        .with_error(|| ErrorCheckerError(e.into()))
+                        .with_section(|| format!("{e:?}").header("Found Error:"))
                         .with_section(|| format!("{expected_rsp:?}").header("Expected Response:"))?
                 }
                 (Err(_), Err(_)) => continue,

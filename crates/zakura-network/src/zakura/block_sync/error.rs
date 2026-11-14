@@ -21,19 +21,6 @@ pub enum BlockSyncWireError {
         max: usize,
     },
 
-    /// A decoded request or response block count exceeded its contract.
-    #[error("Zakura block-sync block count {actual} exceeds cap {max}")]
-    BlockCountLimit {
-        /// Actual count.
-        actual: u32,
-        /// Maximum allowed count.
-        max: u32,
-    },
-
-    /// A `GetBlocks`, `BlocksDone`, or `RangeUnavailable` count was zero.
-    #[error("Zakura block-sync count must be non-zero")]
-    ZeroBlockCount,
-
     /// A decoded block body exceeded the consensus block-size limit.
     #[error("Zakura block-sync block length {actual} exceeds consensus cap {max}")]
     OversizedBlock {
@@ -42,10 +29,6 @@ pub enum BlockSyncWireError {
         /// Maximum allowed serialized block length.
         max: usize,
     },
-
-    /// A height exceeded Zebra's supported height range.
-    #[error("Zakura block-sync height {0} exceeds supported range")]
-    HeightOutOfRange(u32),
 
     /// A payload used an unknown stream-6 message discriminator.
     #[error("unknown Zakura block-sync message type {0}")]
@@ -80,7 +63,20 @@ pub enum BlockSyncWireError {
     #[error("Zakura block-sync wire I/O error: {0}")]
     Io(#[from] io::Error),
 
+    /// A control message broke the stream-6 layout or its field bounds.
+    #[error("Zakura block-sync control message: {0}")]
+    Wire(#[source] crate::zakura::wire_codec::WireError),
+
     /// Zcash serialization failed.
     #[error("Zakura block-sync Zcash serialization error: {0}")]
     Serialization(#[from] SerializationError),
+}
+
+impl From<crate::zakura::wire_codec::WireError> for BlockSyncWireError {
+    fn from(error: crate::zakura::wire_codec::WireError) -> Self {
+        match error {
+            crate::zakura::wire_codec::WireError::TrailingBytes => Self::TrailingBytes,
+            error => Self::Wire(error),
+        }
+    }
 }

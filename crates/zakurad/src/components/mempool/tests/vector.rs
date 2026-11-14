@@ -8,24 +8,27 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::Report;
+use eyre::Report;
 use tokio::time::{self, timeout};
 use tower::{
-    util::{BoxCloneService, BoxService},
+    util::{BoxCloneService, BoxCloneSyncService, BoxService},
     ServiceBuilder, ServiceExt,
 };
 
-use rand::{seq::SliceRandom, thread_rng};
+use rand_10::{rng as thread_rng, seq::IndexedRandom};
 use zakura_chain::{
     amount::Amount,
     block::Block,
     fmt::humantime_seconds,
     parameters::Network,
     serialization::ZcashDeserializeInto,
-    transaction::{Transaction, VerifiedUnminedTx},
+    transaction::{
+        Hash, LockTime, Transaction, VerifiedUnminedTx, MEMPOOL_TRANSACTION_COST_THRESHOLD,
+    },
     transparent::{self, OutPoint},
 };
 use zakura_consensus::transaction as tx;
+use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
 use zakura_node_services::mempool::QueueSource;
 use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
@@ -305,13 +308,13 @@ fn transaction_data_failures_ban_every_version() {
 /// its upgrade, and the verifier rejects a mismatch before these checks.
 #[test]
 fn upgrade_dependent_failures_ban_only_v5_and_later() {
-    use zakura_chain::primitives::{ed25519, reddsa, redjubjub};
+    use zakura_chain::primitives::{reddsa, redjubjub};
 
     for error in [
         TransactionError::Script(zakura_script::Error::ScriptInvalid),
         TransactionError::SaplingVerificationFailed,
         TransactionError::Halo2VerificationFailed,
-        TransactionError::Ed25519(ed25519::Error::InvalidSignature),
+        TransactionError::Ed25519("invalid signature".to_owned()),
         TransactionError::RedJubjub(redjubjub::Error::InvalidSignature),
         TransactionError::RedPallas(reddsa::Error::InvalidSignature),
         TransactionError::DisabledAddToOrchardPool,
@@ -912,6 +915,45 @@ async fn zcashd_compat_peer_is_never_penalized() -> Result<(), Report> {
     Ok(())
 }
 
+/// Unconditional IPs and ranges bypass mempool penalties, including mapped IPs.
+#[tokio::test(flavor = "multi_thread")]
+async fn unconditional_peers_are_never_penalized() {
+    let config: zn::Config =
+        toml::from_str("unconditional_peers = ['192.0.2.1', '198.51.100.0/24', '2001:db8::/32']")
+            .unwrap();
+    for (address, trusted) in [
+        ("192.0.2.1:8233", true),
+        ("[::ffff:192.0.2.1]:8233", true),
+        ("198.51.100.7:8233", true),
+        ("[::ffff:198.51.100.7]:8233", true),
+        ("[2001:db8::7]:8233", true),
+        ("192.0.2.2:8233", false),
+        ("198.51.101.7:8233", false),
+        ("[2001:db9::7]:8233", false),
+    ] {
+        let peer = address.parse().unwrap();
+        for (error, expected) in [
+            (
+                TransactionError::Script(zakura_script::Error::ScriptInvalid),
+                (!trusted, false),
+            ),
+            (TransactionError::NoInputs, (false, !trusted)),
+        ] {
+            assert_eq!(
+                peer_penalties_with_unconditional(
+                    peer,
+                    error,
+                    &Network::Mainnet,
+                    config.unconditional_peers.clone(),
+                )
+                .await,
+                expected,
+                "peer {address}",
+            );
+        }
+    }
+}
+
 /// A v4 signature hash uses the tip's branch ID, so a peer that lags an upgrade
 /// activation relays v4 transactions that fail script checks. Those failures
 /// start no cooldown in the upgrade's grace period.
@@ -951,6 +993,16 @@ async fn peer_penalties(
     error: TransactionError,
     network: &Network,
 ) -> (bool, bool) {
+    peer_penalties_with_unconditional(peer, error, network, zn::UnconditionalPeers::default()).await
+}
+
+/// Exercise the failure-handling path with a configured unconditional allowlist.
+async fn peer_penalties_with_unconditional(
+    peer: PeerSocketAddr,
+    error: TransactionError,
+    network: &Network,
+    unconditional_peers: zn::UnconditionalPeers,
+) -> (bool, bool) {
     let transaction = Network::Mainnet
         .unmined_transactions_in_blocks(2..)
         .next()
@@ -968,6 +1020,15 @@ async fn peer_penalties(
     ) = setup_with_mempool_config(network, mempool::Config::default(), true).await;
     let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
     mempool.misbehavior_sender = misbehavior_sender;
+    // An expired prior cooldown would make the next penalty disconnect the peer.
+    // Trusted peers must bypass that escalation as well as the first cooldown.
+    if unconditional_peers.contains(peer.ip()) {
+        mempool.peer_cooldowns.record_invalid_transaction(
+            peer.ip(),
+            Instant::now() - peer_cooldown::BASE_COOLDOWN - Duration::from_secs(1),
+        );
+    }
+    mempool.unconditional_peers = unconditional_peers;
     mempool.zcashd_compat_peer_ips = [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter().collect();
     // Cooldowns only start when the mempool's validation context is current.
     let _chain_tip_sender = mempool.use_current_chain_tip(network);
@@ -1024,6 +1085,8 @@ async fn peer_penalties(
         }
         Err(_) => false,
     };
+
+    peer_set.expect_no_requests().await;
 
     (cooling_down, banned)
 }
@@ -1826,6 +1889,189 @@ async fn disabled_mempool_waits_for_sync_status_and_tip_distance() -> Result<(),
     Ok(())
 }
 
+/// A post-verification fixture with a unique input and one standard output.
+fn expiry_fixture_transaction(
+    index: u64,
+    expiry_height: Height,
+    input: Option<OutPoint>,
+) -> VerifiedUnminedTx {
+    let input = input.unwrap_or_else(|| {
+        let mut hash = [0; 32];
+        hash[..8].copy_from_slice(&index.to_le_bytes());
+        OutPoint::from_usize(Hash(hash), 0)
+    });
+    let transaction = Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height,
+        inputs: vec![transparent::Input::PrevOut {
+            outpoint: input,
+            unlock_script: transparent::Script::new(&[]),
+            sequence: u32::MAX,
+        }],
+        outputs: vec![transparent::Output {
+            value: Amount::new(1_000_000),
+            lock_script: p2pkh_script([0; 20]),
+        }],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    VerifiedUnminedTx::new(
+        transaction.into(),
+        Amount::new(10_000),
+        0,
+        0,
+        Arc::new(Vec::new()),
+    )
+    .expect("fixture fee covers its conventional fee")
+}
+
+/// Expiry on a growing tip removes descendants and pending gossip at the
+/// boundary, while preserving later-expiring and non-expiring transactions.
+#[tokio::test]
+async fn mempool_expiry_follows_block_growth() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        mut changes,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    // Block 1 resets the tip at the first network-upgrade boundary. Block 2
+    // then exercises ordinary growth with a populated mempool.
+    let block1: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, block1),
+    )
+    .await?;
+    mempool.dummy_call().await;
+
+    let parent = expiry_fixture_transaction(1, Height(2), None);
+    let outpoint = OutPoint::from_usize(parent.transaction.id().mined_id(), 0);
+    let child = expiry_fixture_transaction(2, Height(3), Some(outpoint));
+    let later = expiry_fixture_transaction(3, Height(3), None);
+    let no_expiry = expiry_fixture_transaction(4, Height(0), None);
+    let expired = HashSet::from([parent.transaction.id(), child.transaction.id()]);
+    let survivors = HashSet::from([later.transaction.id(), no_expiry.transaction.id()]);
+    mempool
+        .storage()
+        .insert(parent, Vec::new(), Some(Height(1)))?;
+    mempool
+        .storage()
+        .insert(child, vec![outpoint], Some(Height(1)))?;
+    mempool
+        .storage()
+        .insert(later, Vec::new(), Some(Height(1)))?;
+    mempool
+        .storage()
+        .insert(no_expiry, Vec::new(), Some(Height(1)))?;
+    let ActiveState::Enabled {
+        pending_gossip_tx_ids,
+        ..
+    } = &mut mempool.active_state
+    else {
+        panic!("mempool was enabled above");
+    };
+    pending_gossip_tx_ids.extend(expired.iter().chain(&survivors).copied());
+
+    // No new block: transactions remain, including the parent whose expiry is
+    // exactly the next block height.
+    mempool.dummy_call().await;
+    assert_eq!(mempool.storage().transaction_count(), 4);
+
+    let block2: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, block2),
+    )
+    .await?;
+    mempool.dummy_call().await;
+    assert_eq!(mempool.storage().transaction_count(), 2);
+    assert_eq!(
+        timeout(Duration::from_secs(3), changes.recv()).await??,
+        MempoolChange::invalidated(expired),
+    );
+    assert_eq!(
+        mempool.storage().tx_ids().collect::<HashSet<_>>(),
+        survivors
+    );
+    let ActiveState::Enabled {
+        pending_gossip_tx_ids,
+        ..
+    } = &mempool.active_state
+    else {
+        panic!("mempool stays enabled after growth");
+    };
+    assert_eq!(*pending_gossip_tx_ids, survivors);
+    Ok(())
+}
+
+/// Measures actual service polling with an unchanged tip. Run the same harness
+/// on the control and candidate revisions; fixture setup is outside timings.
+#[tokio::test]
+#[ignore = "manual performance measurement; run with --release --ignored --nocapture"]
+#[allow(clippy::print_stdout, reason = "manual benchmark results")]
+async fn benchmark_mempool_idle_poll() -> Result<(), Report> {
+    use std::{hint::black_box, time::Instant};
+
+    const POLLS: u32 = 2_000;
+    const SAMPLES: usize = 21;
+    let default_count = Config::default().tx_cost_limit / MEMPOOL_TRANSACTION_COST_THRESHOLD;
+    for count in [0, default_count / 8, default_count] {
+        let (
+            mut mempool,
+            _peer_set,
+            _state_service,
+            _chain_tip_change,
+            _tx_verifier,
+            mut recent_syncs,
+            _changes,
+        ) = setup(&Network::Mainnet, Config::default().tx_cost_limit, true).await;
+        mempool.enable(&mut recent_syncs).await;
+        for index in 0..count {
+            mempool.storage().insert(
+                expiry_fixture_transaction(index, Height(100), None),
+                Vec::new(),
+                Some(Height(0)),
+            )?;
+        }
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..POLLS {
+            assert!(mempool.poll_ready(&mut cx).is_ready());
+        }
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let start = Instant::now();
+            for _ in 0..POLLS {
+                assert!(black_box(mempool.poll_ready(black_box(&mut cx))).is_ready());
+            }
+            samples.push(start.elapsed() / POLLS);
+        }
+        samples.sort();
+        println!(
+            "idle_poll transactions={count} polls_per_sample={POLLS} samples={SAMPLES} \
+             median_ns={} min_ns={} max_ns={}",
+            samples[SAMPLES / 2].as_nanos(),
+            samples[0].as_nanos(),
+            samples[SAMPLES - 1].as_nanos(),
+        );
+        assert_eq!(
+            mempool.storage().transaction_count(),
+            usize::try_from(count)?
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn mempool_cancel_mined() -> Result<(), Report> {
     let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
@@ -2422,7 +2668,7 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
 
     // Don't commit the mainnet genesis block; we commit the generated chain instead.
     let (
-        mut mempool,
+        mempool,
         mut peer_set,
         mut state_service,
         mut chain_tip_change,
@@ -2430,6 +2676,9 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
         mut recent_syncs,
         _mempool_transaction_receiver,
     ) = setup(&network, u64::MAX, false).await;
+    let (trace_tx, mut trace_rx) = tokio::sync::mpsc::channel(16);
+    let mut mempool =
+        mempool.with_trace(JsonlEventEmitter::new(JsonlTracer::new(trace_tx), "test"));
 
     // Commit the chain up to (but not including) the NU5 reset boundary. These commits are the
     // genesis reset followed by plain `Grow`s, leaving the tip at `NU5_ACTIVATION_TEST_HEIGHT - 2`.
@@ -2550,8 +2799,12 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
 
     // Commit the next block (a plain `Grow`). This increases the tip height past the expected
     // tip height that the tx was verified at, so the mempool must re-verify it.
-    commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, grow_block)
-        .await;
+    commit_block_and_wait_for_tip_change(
+        &mut state_service,
+        &mut chain_tip_change,
+        grow_block.clone(),
+    )
+    .await;
 
     // Query the mempool to make it poll tx_downloads.pending and try reverifying transactions
     // because the tip height has changed.
@@ -2561,6 +2814,29 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     // no transactions were inserted in the mempool.
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
     assert_eq!(mempool.storage().transaction_count(), 0);
+
+    // The trace records the reset that re-queued the transaction, then the grow.
+    let mut rows = Vec::new();
+    while let Ok(written) = trace_rx.try_recv() {
+        let row: serde_json::Value =
+            serde_json::from_slice(&written.line).expect("each trace row is JSON");
+        rows.push(row);
+    }
+    for (block, action, requeued) in [(&reset_block, "reset", 1), (&grow_block, "grow", 0)] {
+        let row = rows
+            .iter()
+            .find(|row| row["tip_hash"] == block.hash().to_string())
+            .unwrap_or_else(|| panic!("no row for {}: {rows:?}", block.hash()));
+        assert_eq!(row["event"], "mempool_tip_processed");
+        assert_eq!(row["action"], action);
+        assert_eq!(
+            row["tip_height"],
+            block.coinbase_height().expect("the block has a height").0
+        );
+        assert_eq!(row["tx_count_after"], 0);
+        assert_eq!(row["requeued"], requeued);
+        assert!(row["process_us"].is_u64(), "{row}");
+    }
 
     Ok(())
 }
@@ -3608,14 +3884,14 @@ fn pick_transaction_with_prevout(network: &Network) -> VerifiedUnminedTx {
     network
         .unmined_transactions_in_blocks(..)
         .find(|transaction| {
-            transaction
-                .transaction
-                .transaction()
-                .inputs()
-                .iter()
-                .any(|input| matches!(input, transparent::Input::PrevOut { .. }))
+            let transaction = transaction.transaction.transaction();
+            !transaction.has_sprout_joinsplit_data()
+                && transaction
+                    .inputs()
+                    .iter()
+                    .any(|input| matches!(input, transparent::Input::PrevOut { .. }))
         })
-        .expect("missing non-coinbase transaction")
+        .expect("test vectors contain a non-Sprout transaction with a transparent input")
 }
 
 /// The height at which the network returned by [`nu_activation_test_network`] activates NU5.
@@ -3747,10 +4023,15 @@ async fn setup_with_mempool_config(
 
     // UTXO verification doesn't matter here.
     let state_config = StateConfig::ephemeral();
-    let (state, read_only_state_service, latest_chain_tip, mut chain_tip_change) =
-        zakura_state::init(state_config, network, Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let zakura_state::InitializedState {
+        state,
+        read_state: read_only_state_service,
+        latest_chain_tip,
+        mut chain_tip_change,
+        ..
+    } = zakura_state::init(state_config, network, Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
     let mut state_service = ServiceBuilder::new().buffer(10).service(state);
 
     let tx_verifier = MockService::build().for_unit_tests();
@@ -3759,7 +4040,7 @@ async fn setup_with_mempool_config(
     let (mempool, mempool_transaction_subscriber) = Mempool::new(
         &mempool_config,
         false,
-        Buffer::new(BoxService::new(peer_set.clone()), 1),
+        BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 1)),
         state_service.clone(),
         BoxCloneService::new(read_only_state_service),
         Buffer::new(BoxService::new(tx_verifier.clone()), 1),
@@ -3768,6 +4049,7 @@ async fn setup_with_mempool_config(
         chain_tip_change.clone(),
         tokio::sync::mpsc::channel(1).0,
         Vec::new(),
+        zn::UnconditionalPeers::default(),
     );
 
     let mut mempool_transaction_receiver = mempool_transaction_subscriber.subscribe();
@@ -3818,6 +4100,7 @@ async fn setup_with_mempool_config(
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn cancel_handles_drained_after_verification_timeout() {
     use futures::stream::StreamExt;
+    use tokio::sync::Notify;
     use tower::timeout::Timeout;
     use zakura_node_services::mempool::Gossip;
 
@@ -3841,6 +4124,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
         false,
         u64::MAX,
         PeerCooldowns::default(),
+        Arc::new(Notify::new()),
     ));
 
     let mut iter = Network::Mainnet.unmined_transactions_in_blocks(1..=10);

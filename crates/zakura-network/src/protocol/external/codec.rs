@@ -4,6 +4,7 @@ use std::{
     fmt,
     io::{Cursor, Read, Write},
     panic::{self, AssertUnwindSafe},
+    sync::{Arc, Mutex},
 };
 
 #[cfg(test)]
@@ -12,6 +13,7 @@ use std::cell::Cell;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use chrono::{TimeZone, Utc};
+use indexmap::IndexMap;
 use tokio_util::codec::{Decoder, Encoder};
 
 use zakura_chain::{
@@ -46,11 +48,34 @@ const HEADER_LEN: usize = 24usize;
 const BLOOM_FILTER_COMMANDS: [[u8; 12]; 3] =
     [*b"filterload\0\0", *b"filteradd\0\0\0", *b"filterclear\0"];
 
+/// The most body bytes the decoder reserves before they arrive.
+///
+/// A peer names a body length in a 24-byte header. Reserving only this much keeps a
+/// hostile length from allocating a whole body. The buffer then grows with the bytes
+/// that actually arrive, and TCP flow control bounds those.
+const MAX_UNRECEIVED_BODY_RESERVATION: usize = 64 * 1024;
+
+/// The most bytes one connection's decoder can hold for an incomplete message: one
+/// header and one body of the protocol's maximum size.
+pub(crate) const MAX_INCOMPLETE_MESSAGE_BYTES: usize = HEADER_LEN + MAX_PROTOCOL_MESSAGE_LEN;
+
 /// The maximum body length allowed before the handshake completes.
 ///
 /// Version messages are ~344 bytes max (including a 256-byte user agent);
 /// verack is 0 bytes. 1 KB provides headroom for future protocol changes.
 const MAX_HANDSHAKE_BODY_LEN: usize = 1024;
+
+/// The smallest `block` message body whose checksum is shared between connections.
+///
+/// Looking a checksum up hashes the block's header, which is about 1.5 kB. Hashing a body
+/// smaller than this costs too little for the lookup to save time.
+const MIN_SHARED_CHECKSUM_BODY_LEN: usize = 64 * 1024;
+
+/// The number of blocks whose checksums are remembered.
+///
+/// Peers request the newest few blocks in bursts. The rest of the room keeps those entries
+/// while syncing peers request older large blocks in between.
+const SHARED_CHECKSUM_BLOCKS: usize = 32;
 
 /// The parse error returned when a legacy message body parser panics.
 const PANICKED_MESSAGE_BODY_PARSE_ERROR: &str = "panic while parsing peer message body";
@@ -71,12 +96,75 @@ fn escape_command(command: &[u8; 12]) -> String {
         .collect()
 }
 
+/// Writes `count` zero bytes to `writer`.
+fn write_zeros<W: Write + ?Sized>(writer: &mut W, count: u32) -> Result<(), Error> {
+    const ZEROS: [u8; 4096] = [0; 4096];
+    // Widening u32 to usize is lossless on supported targets.
+    let mut remaining = count as usize;
+    while remaining > 0 {
+        let len = remaining.min(ZEROS.len());
+        writer.write_all(&ZEROS[..len])?;
+        remaining -= len;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum BodyDecodePanic {
     CommandDispatch,
     AfterBlockConversion,
     AfterTransactionConversion,
+}
+
+/// Checksums of the large `block` messages this node sent most recently.
+///
+/// Sending the same block body to multiple peers uses the same message checksum.
+/// Hashing a full block takes milliseconds, and many peers request a new block at the same
+/// moment. Connections that share one `BlockChecksums` reuse a
+/// block's checksum after a send has calculated and stored it. Concurrent sends that miss the
+/// cache can each calculate the checksum before either stores it.
+///
+/// A checksum is found by the block's hash. Bodies using this cache must come from committed
+/// state, or from trusted `submitblock` callers after semantic verification. Before contextual
+/// verification checks `hashBlockCommitments`, different v5 authorization data can produce
+/// bodies with the same block hash and length, even when their proofs and signatures verify.
+/// Untrusted bodies served before that check must not use this cache: they could leave a
+/// checksum that is later reused for a different body. Cache hits refresh the entry's recency,
+/// so repeated requests can keep such an entry present.
+///
+/// The body length is checked as well, so a body of another length is hashed again. This check
+/// does not distinguish different bodies of the same length or replace commitment validation.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BlockChecksums(Arc<Mutex<IndexMap<block::Hash, (usize, sha256d::Checksum)>>>);
+
+impl BlockChecksums {
+    /// Returns the remembered checksum of the block `hash`, if its body was `body_len` bytes.
+    ///
+    /// A block that is found becomes the last one to be forgotten.
+    fn get(&self, hash: block::Hash, body_len: usize) -> Option<sha256d::Checksum> {
+        let mut checksums = self
+            .0
+            .lock()
+            .expect("the lock is only held for map operations, which do not panic");
+        let (remembered_len, checksum) = checksums.shift_remove(&hash)?;
+        checksums.insert(hash, (remembered_len, checksum));
+        (remembered_len == body_len).then_some(checksum)
+    }
+
+    /// Remembers `checksum` for the `body_len` byte body of the block `hash`, forgetting the
+    /// block that was sent least recently if there is no room.
+    fn insert(&self, hash: block::Hash, body_len: usize, checksum: sha256d::Checksum) {
+        let mut checksums = self
+            .0
+            .lock()
+            .expect("the lock is only held for map operations, which do not panic");
+        checksums.shift_remove(&hash);
+        if checksums.len() >= SHARED_CHECKSUM_BLOCKS {
+            checksums.shift_remove_index(0);
+        }
+        checksums.insert(hash, (body_len, checksum));
+    }
 }
 
 /// A codec which produces Bitcoin messages from byte streams and vice versa.
@@ -95,6 +183,8 @@ pub struct Builder {
     version: Version,
     /// The maximum allowable message length.
     max_len: usize,
+    /// The block checksums this codec reuses. A codec has its own unless it is given shared ones.
+    block_checksums: BlockChecksums,
 }
 
 impl Codec {
@@ -104,6 +194,7 @@ impl Codec {
             network: Network::Mainnet,
             version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
             max_len: MAX_HANDSHAKE_BODY_LEN,
+            block_checksums: BlockChecksums::default(),
         }
     }
 
@@ -144,6 +235,29 @@ impl Builder {
         self.max_len = len;
         self
     }
+
+    /// Share `block_checksums` with the other codecs that were given a clone of it, so later
+    /// sends can reuse a block's remembered checksum.
+    pub(crate) fn with_block_checksums(mut self, block_checksums: BlockChecksums) -> Self {
+        self.block_checksums = block_checksums;
+        self
+    }
+}
+
+/// Returns the checksum in a message header: the first four bytes of SHA-256 applied twice to
+/// `body`.
+///
+/// This is the same value as [`sha256d::Checksum::from`]. It is calculated with `ring`, whose
+/// SHA-256 uses assembly for the instructions each CPU has. On CPUs without SHA instructions it
+/// hashes about twice as fast as `sha2`. Every message sent or received is hashed on its
+/// connection's task, and blocks are the largest messages, so this hash bounds how fast one
+/// connection can send or receive blocks.
+fn message_checksum(body: &[u8]) -> sha256d::Checksum {
+    let first = ring::digest::digest(&ring::digest::SHA256, body);
+    let second = ring::digest::digest(&ring::digest::SHA256, first.as_ref());
+    let mut checksum = [0; 4];
+    checksum.copy_from_slice(&second.as_ref()[..4]);
+    sha256d::Checksum(checksum)
 }
 
 // ======== Encoding =========
@@ -173,7 +287,7 @@ impl Encoder<Message> for Codec {
         let command = match item {
             Version { .. } => b"version\0\0\0\0\0",
             Verack => b"verack\0\0\0\0\0\0",
-            Ping { .. } => b"ping\0\0\0\0\0\0\0\0",
+            Ping { .. } | PaddedPing { .. } => b"ping\0\0\0\0\0\0\0\0",
             Pong { .. } => b"pong\0\0\0\0\0\0\0\0",
             Reject { .. } => b"reject\0\0\0\0\0\0",
             P2pV2Upgrade(_) => crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES,
@@ -205,7 +319,7 @@ impl Encoder<Message> for Codec {
 
             self.write_body(&item, dst)?;
         }
-        let checksum = sha256d::Checksum::from(&dst[start_len + HEADER_LEN..]);
+        let checksum = self.body_checksum(&item, &dst[start_len + HEADER_LEN..]);
         dst[start_len + 20..][..4].copy_from_slice(&checksum.0);
 
         Ok(())
@@ -228,10 +342,31 @@ impl Codec {
         writer.0
     }
 
+    /// Returns the checksum of `body`, the serialized body of `msg`.
+    ///
+    /// A large block's checksum is taken from [`BlockChecksums`] when another send already
+    /// hashed that block, and is remembered there otherwise. Every other body is hashed.
+    fn body_checksum(&self, msg: &Message, body: &[u8]) -> sha256d::Checksum {
+        let block = match msg {
+            Message::Block(block) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => block,
+            _ => return message_checksum(body),
+        };
+
+        let hash = block.hash();
+        let block_checksums = &self.builder.block_checksums;
+        if let Some(checksum) = block_checksums.get(hash, body.len()) {
+            return checksum;
+        }
+
+        let checksum = message_checksum(body);
+        block_checksums.insert(hash, body.len(), checksum);
+        checksum
+    }
+
     /// Write the body of the message into the given writer. This allows writing
     /// the message body prior to writing the header, so that the header can
     /// contain a checksum of the message body.
-    fn write_body<W: Write>(&self, msg: &Message, mut writer: W) -> Result<(), Error> {
+    fn write_body<W: Write + ?Sized>(&self, msg: &Message, writer: &mut W) -> Result<(), Error> {
         match msg {
             Message::Version(VersionMessage {
                 version,
@@ -251,8 +386,8 @@ impl Codec {
                 // serialization can not error.
                 writer.write_i64::<LittleEndian>(timestamp.timestamp())?;
 
-                address_recv.zcash_serialize(&mut writer)?;
-                address_from.zcash_serialize(&mut writer)?;
+                address_recv.zcash_serialize(writer)?;
+                address_from.zcash_serialize(writer)?;
 
                 writer.write_u64::<LittleEndian>(nonce.0)?;
 
@@ -263,13 +398,17 @@ impl Codec {
                     ));
                 }
 
-                user_agent.zcash_serialize(&mut writer)?;
+                user_agent.zcash_serialize(writer)?;
                 writer.write_u32::<LittleEndian>(start_height.0)?;
                 writer.write_u8(*relay as u8)?;
             }
             Message::Verack => { /* Empty payload -- no-op */ }
             Message::Ping(nonce) => {
                 writer.write_u64::<LittleEndian>(nonce.0)?;
+            }
+            Message::PaddedPing { nonce, padding } => {
+                writer.write_u64::<LittleEndian>(nonce.0)?;
+                write_zeros(writer, *padding)?;
             }
             Message::Pong(nonce) => {
                 writer.write_u64::<LittleEndian>(nonce.0)?;
@@ -287,7 +426,7 @@ impl Codec {
                     ));
                 }
 
-                message.zcash_serialize(&mut writer)?;
+                message.zcash_serialize(writer)?;
 
                 writer.write_u8(*ccode as u8)?;
 
@@ -297,7 +436,7 @@ impl Codec {
                     ));
                 }
 
-                reason.zcash_serialize(&mut writer)?;
+                reason.zcash_serialize(writer)?;
                 if let Some(data) = data {
                     writer.write_all(data)?;
                 }
@@ -319,27 +458,27 @@ impl Codec {
                 // Regardless of the way we received the address,
                 // Zebra always sends `addr` messages
                 let v1_addrs: Vec<AddrV1> = addrs.iter().map(|addr| AddrV1::from(*addr)).collect();
-                v1_addrs.zcash_serialize(&mut writer)?
+                v1_addrs.zcash_serialize(writer)?
             }
             Message::GetAddr => { /* Empty payload -- no-op */ }
-            Message::Block(block) => block.zcash_serialize(&mut writer)?,
+            Message::Block(block) => block.zcash_serialize(writer)?,
             Message::GetBlocks { known_blocks, stop } => {
                 writer.write_u32::<LittleEndian>(self.builder.version.0)?;
-                known_blocks.zcash_serialize(&mut writer)?;
+                known_blocks.zcash_serialize(writer)?;
                 stop.unwrap_or(block::Hash([0; 32]))
-                    .zcash_serialize(&mut writer)?;
+                    .zcash_serialize(writer)?;
             }
             Message::GetHeaders { known_blocks, stop } => {
                 writer.write_u32::<LittleEndian>(self.builder.version.0)?;
-                known_blocks.zcash_serialize(&mut writer)?;
+                known_blocks.zcash_serialize(writer)?;
                 stop.unwrap_or(block::Hash([0; 32]))
-                    .zcash_serialize(&mut writer)?;
+                    .zcash_serialize(writer)?;
             }
-            Message::Headers(headers) => headers.zcash_serialize(&mut writer)?,
-            Message::Inv(hashes) => hashes.zcash_serialize(&mut writer)?,
-            Message::GetData(hashes) => hashes.zcash_serialize(&mut writer)?,
-            Message::NotFound(hashes) => hashes.zcash_serialize(&mut writer)?,
-            Message::Tx(transaction) => transaction.transaction().zcash_serialize(&mut writer)?,
+            Message::Headers(headers) => headers.zcash_serialize(writer)?,
+            Message::Inv(hashes) => hashes.zcash_serialize(writer)?,
+            Message::GetData(hashes) => hashes.zcash_serialize(writer)?,
+            Message::NotFound(hashes) => hashes.zcash_serialize(writer)?,
+            Message::Tx(transaction) => transaction.transaction().zcash_serialize(writer)?,
             Message::Mempool => { /* Empty payload -- no-op */ }
         }
         Ok(())
@@ -383,6 +522,11 @@ impl Decoder for Codec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         use Error::Parse;
 
+        // Ignored Bloom and unknown commands continue to the next message in the same
+        // call. Returning `Ok(None)` with a complete message buffered would stall the
+        // reader until the peer sends more bytes. Each discarded body is within
+        // `max_len`, and one call only discards bytes already buffered, so the work
+        // per call stays bounded without a separate count.
         'messages: loop {
             match self.state {
                 DecodeState::Head => {
@@ -426,8 +570,8 @@ impl Decoder for Codec {
                     metrics::counter!("zcash.net.in.bytes.total")
                         .increment((body_len + HEADER_LEN) as u64);
 
-                    // Reserve buffer space for the expected body and the following header.
-                    src.reserve(body_len + HEADER_LEN);
+                    // Reserve buffer space for the next arriving bytes, not the claimed body.
+                    src.reserve(body_len.min(MAX_UNRECEIVED_BODY_RESERVATION) + HEADER_LEN);
 
                     self.state = DecodeState::Body {
                         body_len,
@@ -455,13 +599,15 @@ impl Decoder for Codec {
                     let body = src.split_to(body_len);
                     self.state = DecodeState::Head;
 
-                    if checksum != sha256d::Checksum::from(&body[..]) {
+                    if checksum != message_checksum(&body[..]) {
                         return Err(Parse(
                             "supplied message checksum does not match computed checksum",
                         ));
                     }
 
                     if BLOOM_FILTER_COMMANDS.contains(&command) {
+                        metrics::counter!("zcash.net.in.discarded", "reason" => "bloom")
+                            .increment(1);
                         debug!(
                             command = %escape_command(&command),
                             "ignored unsupported bloom filter message"
@@ -518,6 +664,8 @@ impl Decoder for Codec {
                                 // Since we can't verify their source, Zebra needs to ignore
                                 // unexpected messages, because closing the connection could
                                 // cause a denial of service or eclipse attack.
+                                metrics::counter!("zcash.net.in.discarded", "reason" => "unknown")
+                                    .increment(1);
                                 debug!(?command, %command_string, "unknown message command from peer");
                                 return Ok(None);
                             }
@@ -538,6 +686,8 @@ impl Decoder for Codec {
                     }));
 
                     match decode_result {
+                        // An unknown command decodes to nothing; continue to the next one.
+                        Ok(Ok(None)) => continue 'messages,
                         Ok(result) => return result,
                         Err(_panic_payload) => {
                             // Escaped for consistency with the other command logs:
@@ -742,12 +892,12 @@ impl Codec {
 
     fn read_block(&self, reader: &mut &[u8]) -> Result<Message, Error> {
         let result = self.deserialize_block_spawning(reader);
-        let block = result?.into();
+        let block: std::sync::Arc<Block> = result?.into();
 
         #[cfg(test)]
         self.panic_at_body_decode_point(BodyDecodePanic::AfterBlockConversion);
 
-        Ok(Message::Block(block))
+        Ok(Message::Block(block.into()))
     }
 
     fn read_getblocks<R: Read>(&self, mut reader: R) -> Result<Message, Error> {

@@ -1,0 +1,22 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/regulated/requester.rs b/crates/zakura-network/src/zakura/block_sync/regulated/requester.rs
+index 09ba7e091a..11cced70ae 100644
+--- a/crates/zakura-network/src/zakura/block_sync/regulated/requester.rs
++++ b/crates/zakura-network/src/zakura/block_sync/regulated/requester.rs
+@@ -301,14 +301,9 @@ impl Requester {
+             .ranges
+             .get(&ending.start)
+             .ok_or(ResponseError::Ending)?;
+-        // Counts fit usize on supported targets.
+-        let matches = ending.count != 0
+-            && match ending.outcome {
+-                Outcome::Done => ending.count as usize == pending.received,
+-                Outcome::Unavailable => {
+-                    pending.received == 0 && ending.count <= pending.range.count()
+-                }
+-            };
++        // Mutation: any nonzero ending closes its range, whatever bodies
++        // came before it.
++        let matches = ending.count != 0;
+         if !matches {
+             return Err(ResponseError::Ending);
+         }

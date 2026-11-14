@@ -14,7 +14,7 @@
 //! baked into the case table:
 //!
 //! ```sh
-//! ZAKURA_BENCH_RAYON_THREADS=1 cargo bench -p zakura-consensus --bench worst_case_tx_verification
+//! ZAKURA_BENCH_RAYON_THREADS=1 cargo bench -p zakura-consensus --bench worst_case_tx_verification --features internal-bench
 //! ```
 //!
 //! This matters here specifically: all Zakura proof verification runs on the global rayon
@@ -470,10 +470,11 @@ fn build_workload(case: &BenchmarkCase, candidates: &[CandidateTx]) -> Option<Wo
             stats.verifier_checks += candidate.counts.verifier_check_counts();
 
             Request::Block {
-                transaction_hash: candidate.transaction.hash(),
-                transaction: candidate.transaction.clone(),
+                transaction_id: candidate.transaction.unmined_id(),
+                transaction: candidate.transaction.clone().into(),
                 known_outpoint_hashes: known_outpoint_hashes.clone(),
                 known_utxos: known_utxos.clone(),
+                parent_utxos: Arc::new(HashMap::new()),
                 height: candidate.height,
                 time: candidate.time,
             }

@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use crossbeam_channel::{Receiver, TryRecvError};
 use itertools::Itertools;
+use std::sync::mpsc::TryRecvError;
 use tracing::instrument;
 
 use zakura_chain::{
@@ -16,7 +16,7 @@ use zakura_chain::{
 };
 
 use crate::service::finalized_state::{
-    disk_format::upgrade::{CancelFormatChange, FormatChangeError},
+    disk_format::upgrade::{CancelFormatChange, CancelReceiver, FormatChangeError},
     ZakuraDb,
 };
 
@@ -24,7 +24,7 @@ use crate::service::finalized_state::{
 #[allow(clippy::unwrap_in_result)]
 pub(super) fn detailed_check(
     db: &ZakuraDb,
-    cancel_receiver: &Receiver<CancelFormatChange>,
+    cancel_receiver: &CancelReceiver,
 ) -> Result<Result<(), String>, FormatChangeError> {
     // Fast-synced databases deliberately have no per-height note-commitment
     // trees or subtrees below the checkpoint handoff height, so the subtree
@@ -238,7 +238,7 @@ fn quick_check_orchard_subtrees(db: &ZakuraDb) -> Result<(), &'static str> {
 /// Returns an error if a note commitment subtree is missing or incorrect.
 fn check_sapling_subtrees(
     db: &ZakuraDb,
-    cancel_receiver: &Receiver<CancelFormatChange>,
+    cancel_receiver: &CancelReceiver,
 ) -> Result<Result<(), &'static str>, CancelFormatChange> {
     let Some(NoteCommitmentSubtreeIndex(mut first_incomplete_subtree_index)) =
         db.sapling_tree_for_tip().subtree_index()
@@ -369,7 +369,7 @@ fn check_sapling_subtrees(
 /// Returns an error if a note commitment subtree is missing or incorrect.
 fn check_orchard_subtrees(
     db: &ZakuraDb,
-    cancel_receiver: &Receiver<CancelFormatChange>,
+    cancel_receiver: &CancelReceiver,
 ) -> Result<Result<(), &'static str>, CancelFormatChange> {
     let Some(NoteCommitmentSubtreeIndex(mut first_incomplete_subtree_index)) =
         db.orchard_tree_for_tip().subtree_index()
@@ -578,7 +578,7 @@ fn calculate_sapling_subtree(
         // TODO: consider just reading the block's transactions from the database file,
         //       because we don't use the block header data at all.
         let block = read_db
-            .block(end_height.into())
+            .stored_block(end_height.into())
             .expect("height with note commitment tree should have block");
         let sapling_note_commitments = block
             .sapling_note_commitments()
@@ -703,7 +703,7 @@ fn calculate_orchard_subtree(
         // TODO: consider just reading the block's transactions from the database file,
         //       because we don't use the block header data at all.
         let block = read_db
-            .block(end_height.into())
+            .stored_block(end_height.into())
             .expect("height with note commitment tree should have block");
         let orchard_note_commitments = block
             .orchard_note_commitments()

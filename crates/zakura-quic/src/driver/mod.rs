@@ -16,17 +16,17 @@
 //!
 //! Nothing shares a `quinn-proto` object, so no lock guards one.
 
-use std::{
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 use quinn_proto::{ConnectionError, StreamId, VarInt};
-use tokio::sync::{mpsc, oneshot, watch};
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        counter, mpsc, oneshot, watch, Mutex, MutexGuard, Notify, PoisonError,
+    },
+};
 
 use crate::{
     error::{ReadError, WriteError},
@@ -44,6 +44,10 @@ pub(crate) const READ_BATCH_BYTES: usize = 256 * 1024;
 /// at 10 Gbit/s (32 receive calls of up to 64 KiB). Counting bytes rather than
 /// datagrams also bounds memory when a peer sends 64 KiB datagrams.
 pub(crate) const CONNECTION_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Datagram bytes the endpoint queues for a closed connection (ADM-13). A
+/// closed connection only answers with CONNECTION_CLOSE, so it needs little.
+pub(crate) const CLOSING_QUEUE_BYTES: usize = 64 * 1024;
 
 /// The datagram bytes one socket may queue across all its connections
 /// (SPEC §6a), so many lagging connection tasks can't add up to
@@ -81,19 +85,26 @@ pub(crate) enum ConnCmd {
         /// The most bytes to take from quinn-proto, capped at
         /// [`READ_BATCH_BYTES`].
         max: usize,
+        /// Receive credit the stream's reader holds since its last command,
+        /// which the connection takes from its window before this read.
+        hold: u64,
         reply: oneshot::Sender<ReadReply>,
     },
     Stop {
         id: StreamId,
         code: VarInt,
+        /// As in [`ConnCmd::Read`].
+        hold: u64,
     },
     /// A send handle dropped without finishing or resetting: finish it.
     DropSend {
         id: StreamId,
     },
-    /// A receive handle dropped before the stream ended: stop it.
+    /// A receive handle dropped: stop the stream unless it ended.
     DropRecv {
         id: StreamId,
+        /// As in [`ConnCmd::Read`].
+        hold: u64,
     },
     Close {
         code: VarInt,
@@ -119,28 +130,108 @@ pub(crate) type ReadReply = Result<Option<Vec<Bytes>>, ReadError>;
 pub(crate) struct ConnShared {
     /// Set once, when the connection closes.
     pub(crate) closed: watch::Sender<Option<ConnectionError>>,
+    /// One slot per stream that a [`SendStream::stopped`] waits on or that
+    /// the peer stopped. A slot holds the peer's STOP_SENDING code once this
+    /// node reset the stream in answer, or will reset it once it is accepted,
+    /// and [`SendStream::stopped`] resolves. The task keeps its own copy of
+    /// each code for writes and accepts, so it locks this map only on a stop
+    /// and when a handle finishes, resets or drops.
+    ///
+    /// The connection task drops a stream's slot once the handle finishes,
+    /// resets or drops it. Each stream has its own slot, so a stop wakes
+    /// only that stream's waiters, not every waiter on the connection.
+    ///
+    /// [`SendStream::stopped`]: crate::SendStream::stopped
+    stopped: Mutex<HashMap<StreamId, watch::Sender<Option<VarInt>>>>,
     pub(crate) stable_id: usize,
     /// The connection task's latest load snapshot (API-9).
     pub(crate) load: watch::Sender<crate::conn::ConnLoad>,
     /// Datagram bytes the endpoint queued that the task hasn't handled yet.
     pub(crate) queued_datagram_bytes: AtomicUsize,
     /// Datagrams the endpoint dropped because the queue was full.
-    pub(crate) queue_drops: AtomicU64,
+    pub(crate) queue_drops: counter::AtomicU64,
     /// The queued datagram bytes of every connection on this socket.
     pub(crate) socket_queued_bytes: Arc<AtomicUsize>,
+    /// Receive credit that dropped holds returned and the task hasn't added
+    /// back to the window yet.
+    released_credit: AtomicU64,
+    /// Wakes the task when `released_credit` leaves zero.
+    credit_released: Notify,
+    /// The ID both ends derive from the TLS handshake, set when the
+    /// handshake completes ([`crate::Conn::shared_id`]).
+    #[cfg(any(test, zakura_sim, feature = "test-support"))]
+    pub(crate) shared_id: std::sync::OnceLock<[u8; crate::tls::SHARED_ID_LEN]>,
 }
 
 impl ConnShared {
     fn new(remote: SocketAddr, socket_queued_bytes: Arc<AtomicUsize>) -> Arc<Self> {
-        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        // A trace ID, so a metrics atomic. It's process-wide, so two runs in
+        // one process number their connections differently.
+        static NEXT_ID: counter::AtomicUsize = counter::AtomicUsize::new(0);
         Arc::new(Self {
             closed: watch::Sender::new(None),
+            stopped: Mutex::new(HashMap::new()),
             stable_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             load: watch::Sender::new(crate::conn::ConnLoad::new(remote)),
             queued_datagram_bytes: AtomicUsize::new(0),
-            queue_drops: AtomicU64::new(0),
+            queue_drops: counter::AtomicU64::new(0),
             socket_queued_bytes,
+            released_credit: AtomicU64::new(0),
+            credit_released: Notify::new(),
+            #[cfg(any(test, zakura_sim, feature = "test-support"))]
+            shared_id: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Keeps the peer's STOP_SENDING code for `id` and wakes that stream's
+    /// [`SendStream::stopped`](crate::SendStream::stopped) waiters.
+    pub(crate) fn record_stop(&self, id: StreamId, code: VarInt) {
+        self.stop_slots()
+            .entry(id)
+            .or_insert_with(|| watch::Sender::new(None))
+            .send_replace(Some(code));
+    }
+
+    /// Drops the slot for `id` once its handle can't write. A waiter whose
+    /// slot drops waits only for the connection's close.
+    pub(crate) fn forget_stop(&self, id: StreamId) {
+        self.stop_slots().remove(&id);
+    }
+
+    /// Subscribes to the slot for `id`, adding the slot if it's missing.
+    pub(crate) fn watch_stop(&self, id: StreamId) -> watch::Receiver<Option<VarInt>> {
+        self.stop_slots()
+            .entry(id)
+            .or_insert_with(|| watch::Sender::new(None))
+            .subscribe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_slot_count(&self) -> usize {
+        self.stop_slots().len()
+    }
+
+    fn stop_slots(&self) -> MutexGuard<'_, HashMap<StreamId, watch::Sender<Option<VarInt>>>> {
+        self.stopped.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Returns `bytes` of a dropped hold to the connection's window. Only the
+    /// release that finds nothing pending wakes the task, which adds back
+    /// every release since its last drive at once.
+    pub(crate) fn release_credit(&self, bytes: u64) {
+        if bytes > 0 && self.released_credit.fetch_add(bytes, Ordering::AcqRel) == 0 {
+            self.credit_released.notify_one();
+        }
+    }
+
+    /// Takes the credit released since the last call.
+    pub(crate) fn take_released_credit(&self) -> u64 {
+        self.released_credit.swap(0, Ordering::AcqRel)
+    }
+
+    /// Resolves after a release that found nothing pending.
+    pub(crate) async fn credit_released(&self) {
+        self.credit_released.notified().await;
     }
 
     /// Records the close reason unless one is already set.

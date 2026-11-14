@@ -122,7 +122,7 @@ sequenceDiagram
   R->>E: install_committed_transition
   R-->>W: ApplyResult
   R->>P: publish the committed snapshot
-  P->>N: GetHeaders for the next target
+  P->>N: Grant or Open for the next target
 ```
 
 The reactor learns what happened from the publisher rather than from the value its own call
@@ -131,7 +131,7 @@ returned. Every frontier it schedules against is therefore already on disk.
 ## Peer to Reactor
 
 The delivery arrives as
-[`HeaderSyncMessage::Headers`](../../../crates/zakura-network/src/zakura/header_sync/wire.rs) on
+a [`Headers`](../../../crates/zakura-network/src/zakura/header_sync/v9/wire.rs) page on
 the header-sync stream. Peers are not trusted. Authenticating a peer's key establishes who sent
 the message, and it says nothing about whether the contents are true, so every field in the
 message is a claim. If the reactor derived a chain fact from that claim, the peer would take
@@ -539,4 +539,4 @@ the read surface would put peers to work on a frontier that may never commit.
 | `Publisher` | [`finalized_state/header_chain.rs`](../../../crates/zakura-state/src/service/finalized_state/header_chain.rs) | a published frontier that is not on disk. It is a latest-value channel fed only from inside the writer lock, so a published snapshot is by construction one the writer committed |
 | `RetiredWork` | [`transition/types/outcome.rs`](../../../crates/zakura-header-chain/src/transition/types/outcome.rs) | a reset that leaves dead work alive, or a retirement that cancels a just-scheduled request. It names the generation flags and the exact owners |
 | `HeaderLocator` | [`discovery/mod.rs`](../../../crates/zakura-header-chain/src/discovery/mod.rs) | a locator built from anything but committed state. It builds from the committed selected projection and fails with `StoreError::Incoherent` on a gap |
-| cancelled-id window | [`header_sync/pipe.rs`](../../../crates/zakura-network/src/zakura/header_sync/pipe.rs) | an honest answer to a cancelled request scored as misbehavior. The pipe drops recently cancelled ids for a short grace window instead |
+| cancelled-id window | [`header_sync/peer.rs`](../../../crates/zakura-network/src/zakura/header_sync/peer.rs) | an honest answer to a cancelled request scored as misbehavior. The pipe drops recently cancelled ids for a short grace window instead |

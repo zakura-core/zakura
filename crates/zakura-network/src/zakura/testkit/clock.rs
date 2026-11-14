@@ -7,7 +7,7 @@ use std::{
 
 pub use crate::zakura::{Clock, RealClock};
 
-use tokio::time::Instant;
+use zakura_rt::time::Instant;
 
 /// Manually advanced test clock.
 #[derive(Clone, Debug)]

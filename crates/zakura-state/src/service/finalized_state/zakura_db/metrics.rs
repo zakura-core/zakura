@@ -2,7 +2,7 @@
 
 use zakura_chain::{
     amount::NonNegative,
-    block::{self, Block},
+    block::{self},
     value_balance::ValueBalance,
 };
 
@@ -10,18 +10,19 @@ use zakura_chain::{
 ///
 /// The metrics are updated after contextually validating a block,
 /// but before writing its batch to the state.
-pub(crate) fn block_precommit_metrics(block: &Block, hash: block::Hash, height: block::Height) {
-    let transaction_count = block.transactions.len();
-    let transparent_prevout_count = block
-        .transactions
-        .iter()
+pub(crate) fn block_precommit_metrics(
+    block: &block::BlockRef,
+    hash: block::Hash,
+    height: block::Height,
+) {
+    let transaction_count = block.transactions().len();
+    let transparent_prevout_count = block.transactions()
         .flat_map(|t| t.inputs().iter())
         .count()
         // Each block has a single coinbase input which is not a previous output.
         - 1;
     let transparent_newout_count = block
-        .transactions
-        .iter()
+        .transactions()
         .flat_map(|t| t.outputs().iter())
         .count();
 

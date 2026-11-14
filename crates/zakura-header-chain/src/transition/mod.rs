@@ -8,6 +8,8 @@ mod recovery;
 mod types;
 
 pub use authority::{Clock, FullStateEvidenceAuthority, SystemClock, TransitionContext};
+#[cfg(any(test, feature = "test-support", zakura_sim))]
+pub use engine::DurableState;
 pub use engine::{
     CommittedTransitionError, EngineHydrationError, HeaderChainEngine, HeaderInsertionFacts,
     HeaderValidationFacts, TransitionInput,
@@ -27,9 +29,9 @@ pub use planner::{
     TransitionFailure,
 };
 pub use recovery::{
-    audit_store, audit_store_at, audit_store_for_trust_anchor_update, AuditViolation,
-    RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead, StoreAuditSnapshot,
-    ValidationContextRecord,
+    audit_store, audit_store_at, audit_store_for_trust_anchor_update,
+    audit_store_for_trust_anchor_update_at, AuditViolation, RecoveryFailure, RecoveryPlan,
+    RecoveryRepair, StoreAuditRead, StoreAuditSnapshot, ValidationContextRecord,
 };
 pub(crate) use types::semantic_payload_fingerprint;
 pub use types::*;

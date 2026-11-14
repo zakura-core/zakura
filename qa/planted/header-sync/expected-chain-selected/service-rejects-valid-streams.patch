@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/service.rs b/crates/zakura-network/src/zakura/header_sync/service.rs
+index 6994496496..df4da38896 100644
+--- a/crates/zakura-network/src/zakura/header_sync/service.rs
++++ b/crates/zakura-network/src/zakura/header_sync/service.rs
+@@ -715,7 +715,7 @@ impl Service for HeaderSyncService {
+             return;
+         };
+         // The publisher needs room for a page and for control.
+-        if stream_version != ZAKURA_HEADER_SYNC_STREAM_VERSION
++        if stream_version == ZAKURA_HEADER_SYNC_STREAM_VERSION
+             || peer.negotiated & ZAKURA_CAP_HEADER_SYNC == 0
+             || send.max_capacity() < 2
+         {

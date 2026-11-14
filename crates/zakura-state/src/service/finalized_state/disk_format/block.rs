@@ -7,7 +7,7 @@
 
 use zakura_chain::{
     block::{self, Height},
-    serialization::{ZcashDeserializeInto, ZcashSerialize},
+    serialization::{ZcashDeserialize, ZcashSerialize},
     transaction::{self, Transaction},
 };
 
@@ -101,12 +101,6 @@ impl TransactionIndex {
                 .try_into()
                 .expect("the maximum valid index fits in the inner type"),
         )
-    }
-
-    /// Returns this index as a `u64`.
-    #[allow(dead_code)]
-    pub fn as_u64(&self) -> u64 {
-        self.0.into()
     }
 
     /// The minimum value of a transaction index.
@@ -216,10 +210,9 @@ impl IntoDisk for block::Header {
 
 impl FromDisk for block::Header {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        let bytes = bytes.as_ref();
+        let mut bytes = bytes.as_ref();
 
-        bytes
-            .zcash_deserialize_into()
+        Self::zcash_deserialize_from_slice(&mut bytes)
             .expect("deserialization format should match the serialization format used by IntoDisk")
     }
 }
@@ -291,12 +284,11 @@ impl IntoDisk for Transaction {
 
 impl FromDisk for Transaction {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        let bytes = bytes.as_ref();
+        let mut bytes = bytes.as_ref();
 
         // TODO: skip cryptography verification during transaction deserialization from storage,
         //       or do it in a rayon thread (ideally in parallel with other transactions)
-        bytes
-            .zcash_deserialize_into()
+        Self::zcash_deserialize_from_slice(&mut bytes)
             .expect("deserialization format should match the serialization format used by IntoDisk")
     }
 }

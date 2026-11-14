@@ -328,23 +328,24 @@ pub struct FinalizedState {
     vct: VctCommitState,
 }
 
+/// Durably writes a prepared block's batch, given the block's VCT authentication proof.
+///
+/// The block commit code is large, so it takes this boxed callback rather than a generic one,
+/// which would compile a copy of that code for each caller.
+type CommitBatch<'a> = Box<
+    dyn FnOnce(
+            &mut ZakuraDb,
+            DiskWriteBatch,
+            VctAuthenticationProof,
+        ) -> Result<(), CommitCheckpointVerifiedError>
+        + 'a,
+>;
+
 impl FinalizedState {
     /// Returns an on-disk database instance for `config` and `network`.
     /// If there is no existing database, creates a new database on disk.
     pub fn new(config: &Config, network: &Network) -> Result<Self, StateInitError> {
         Self::new_with_debug(config, network, false, false)
-    }
-
-    /// Opens (or creates) the on-disk finalized state database read-write, for
-    /// offline tooling (e.g. the replay benchmark).
-    ///
-    /// Equivalent to [`FinalizedState::new`] for offline tooling.
-    pub fn new_writable(config: &Config, network: &Network) -> Self {
-        Self::new_with_debug(config, network, false, false).expect(
-            "opening the read-write finalized state database failed; check that the \
-             state cache directory is writable and not locked by another Zakura instance, \
-             and that there is free disk space",
-        )
     }
 
     /// Returns an on-disk database instance with the supplied production and debug settings.
@@ -649,7 +650,11 @@ impl FinalizedState {
         vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         commit: C,
     ) -> Result<
-        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (
+            CheckpointVerifiedBlock,
+            NoteCommitmentTrees,
+            tokio::sync::oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+        ),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     >
     where
@@ -693,6 +698,10 @@ impl FinalizedState {
                 Ok(())
             },
         )
+        .map(|(block, trees, response)| {
+            let _ = response.send(Ok(block.hash));
+            (block, trees)
+        })
     }
 
     fn commit_finalized_inner_with<C>(
@@ -703,7 +712,11 @@ impl FinalizedState {
         vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         commit: C,
     ) -> Result<
-        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (
+            CheckpointVerifiedBlock,
+            NoteCommitmentTrees,
+            tokio::sync::oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+        ),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     >
     where
@@ -720,7 +733,7 @@ impl FinalizedState {
             vct_successor_witness,
             vct_auxiliary_window,
             "commit checkpoint-verified request",
-            commit,
+            Box::new(commit),
         );
 
         if result.is_ok() {
@@ -741,9 +754,8 @@ impl FinalizedState {
         };
 
         match result {
-            Ok((hash, note_commitment_trees)) => {
-                let _ = rsp_tx.send(Ok(hash));
-                Ok((checkpoint_verified, note_commitment_trees))
+            Ok((_, note_commitment_trees)) => {
+                Ok((checkpoint_verified, note_commitment_trees, rsp_tx))
             }
             Err(error) => Err(((checkpoint_verified, rsp_tx, attempt), error)),
         }
@@ -798,12 +810,12 @@ impl FinalizedState {
             vct_successor_witness,
             Some(vct_auxiliary_window),
             source,
-            |db, batch, _proof| {
+            Box::new(|db, batch, _proof| {
                 db.header_chain_disk_db()
                     .write(batch)
                     .expect("unexpected rocksdb error while writing block");
                 Ok(())
-            },
+            }),
         )
     }
 
@@ -829,27 +841,20 @@ impl FinalizedState {
             vct_successor_witness,
             None,
             source,
-            commit,
+            Box::new(commit),
         )
     }
 
     /// Prepare a finalized block with exact auxiliary provenance and delegate its durable batch.
-    fn commit_finalized_direct_with_aux<C>(
+    fn commit_finalized_direct_with_aux(
         &mut self,
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         vct_successor_witness: Option<VctSuccessorWitness>,
         vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         source: &str,
-        commit: C,
-    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError>
-    where
-        C: FnOnce(
-            &mut ZakuraDb,
-            DiskWriteBatch,
-            VctAuthenticationProof,
-        ) -> Result<(), CommitCheckpointVerifiedError>,
-    {
+        commit: CommitBatch<'_>,
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let mut vct_authentication = VctAuthenticationProof::NotAuthenticated;
         let (height, hash, finalized, prev_note_commitment_trees, retention, fast_write) =
             match finalizable_block {
@@ -1230,7 +1235,7 @@ impl FinalizedState {
                         // tree. They are independent; the history push below joins them.
                         #[cfg(feature = "commit-metrics")]
                         metrics::histogram!("zakura.state.write.block_tx_count")
-                            .record(block.transactions.len() as f64);
+                            .record(block.transactions().len() as f64);
                         #[cfg(feature = "commit-metrics")]
                         let _ckpt_compute = std::time::Instant::now();
                         let mut commitment_result = None;
@@ -1272,7 +1277,7 @@ impl FinalizedState {
                         history_tree_mut
                             .push(
                                 &network,
-                                block.clone(),
+                                &block,
                                 &sapling_root,
                                 &orchard_root,
                                 &ironwood_root,
@@ -1329,7 +1334,8 @@ impl FinalizedState {
         // Assert that callers (including unit tests) get the chain order correct
         if self.db.is_empty() {
             assert_eq!(
-                committed_tip_hash, finalized.block.header.previous_block_hash,
+                committed_tip_hash,
+                finalized.block.header().previous_block_hash,
                 "the first block added to an empty state must be a genesis block, source: {source}",
             );
             assert_eq!(
@@ -1345,7 +1351,8 @@ impl FinalizedState {
             );
 
             assert_eq!(
-                committed_tip_hash, finalized.block.header.previous_block_hash,
+                committed_tip_hash,
+                finalized.block.header().previous_block_hash,
                 "committed block must be a child of the finalized tip, source: {source}",
             );
         }
@@ -1612,11 +1619,7 @@ impl FinalizedState {
             None => return false,
         };
 
-        if block_height < debug_stop_at_height {
-            return false;
-        }
-
-        true
+        block_height >= debug_stop_at_height
     }
 
     /// Exit the host process.

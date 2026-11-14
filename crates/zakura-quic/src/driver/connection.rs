@@ -1,10 +1,10 @@
 //! The connection task: the peer routine that owns one QUIC connection.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     mem,
     net::{IpAddr, SocketAddr},
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -13,7 +13,10 @@ use quinn_proto::{
     ConnectionError, ConnectionEvent, ConnectionHandle, Dir, EndpointEvent, Event, StreamEvent,
     StreamId, Transmit, TransportError, TransportErrorCode, VarInt,
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    sync::{atomic::Ordering, mpsc, oneshot, watch},
+};
 
 use super::{ConnCmd, ConnShared, Handshake, ReadReply, READ_BATCH_BYTES};
 use crate::{
@@ -22,9 +25,10 @@ use crate::{
         CongestionStats, ConnLimits, ConnLoad, ConnSample, ConnStats, DriverStats, Hooks,
         LOAD_INTERVAL, SAMPLE_INTERVAL,
     },
+    endpoint::ConnectionSlot,
     error::{ReadError, WriteError},
     key::NodeId,
-    socket::SocketCell,
+    socket::{SocketCell, UdpIo},
     sys::canonical_ip,
     tls,
 };
@@ -37,13 +41,15 @@ const MAX_INPUTS_PER_WAKEUP: usize = 64;
 /// The shortest gap between two warnings about failed sends.
 const SEND_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The current time on tokio's clock, so paused-time tests drive quinn-proto.
+/// The driver's clock: `zakura-rt`'s monotonic clock, which is tokio's in
+/// production, so paused-time tests drive quinn-proto, and virtual inside a
+/// simulated run.
 pub(crate) fn now() -> Instant {
-    tokio::time::Instant::now().into_std()
+    zakura_rt::time::Instant::now().into_std()
 }
 
 /// Everything a connection task starts with.
-pub(crate) struct ConnTaskParams {
+pub(crate) struct ConnTaskParams<S> {
     pub(crate) handle: ConnectionHandle,
     pub(crate) conn: quinn_proto::Connection,
     pub(crate) shared: Arc<ConnShared>,
@@ -53,7 +59,7 @@ pub(crate) struct ConnTaskParams {
     pub(crate) datagrams: mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
     pub(crate) control: mpsc::UnboundedReceiver<ConnectionEvent>,
     pub(crate) to_endpoint: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-    pub(crate) socket: Arc<SocketCell>,
+    pub(crate) socket: Arc<SocketCell<S>>,
     pub(crate) closing: watch::Receiver<bool>,
     pub(crate) network: watch::Receiver<u64>,
     pub(crate) probe: Arc<CongestionProbe>,
@@ -62,11 +68,13 @@ pub(crate) struct ConnTaskParams {
     pub(crate) handshake: oneshot::Sender<Result<Handshake, ConnectionError>>,
     /// The limits the transport config starts the connection with.
     pub(crate) limits: CurrentLimits,
+    pub(crate) slot: Arc<ConnectionSlot>,
 }
 
 /// The connection's limits as last set (API-9).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CurrentLimits {
+    /// The receive window before held credit (API-10).
     pub(crate) receive_window: u64,
     pub(crate) send_window: u64,
     pub(crate) max_bidi_streams: u64,
@@ -114,12 +122,12 @@ struct Exported {
     datagrams_sent: u64,
 }
 
-struct ConnTask {
+struct ConnTask<S: UdpIo> {
     handle: ConnectionHandle,
     conn: quinn_proto::Connection,
     shared: Arc<ConnShared>,
     to_endpoint: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-    socket: Arc<SocketCell>,
+    socket: Arc<SocketCell<S>>,
     probe: Arc<CongestionProbe>,
     hooks: Arc<Hooks>,
     admitted: SocketAddr,
@@ -133,6 +141,11 @@ struct ConnTask {
     /// The peer's IP as of the last path check (PATH-3).
     path_ip: IpAddr,
     limits: CurrentLimits,
+    /// Every credit hold this task applied, and every release it took
+    /// (API-10). The window leaves out their difference. Separate totals keep
+    /// a release that arrives before its hold from being lost.
+    credit_held: u64,
+    credit_released: u64,
     /// When the load snapshot was last published, and whether it is stale.
     load_published: Option<Instant>,
     load_stale: bool,
@@ -146,7 +159,9 @@ struct ConnTask {
     /// The peer's STOP_SENDING code for each stream this node reset in
     /// answer, or will reset once it is accepted, until the handle finishes,
     /// resets or drops it. A later write gets `Stopped(code)` instead of the
-    /// reset stream's `ClosedStream`.
+    /// reset stream's `ClosedStream`. The task writes each code here and to
+    /// `ConnShared`'s slot at once, so writes and accepts read it here
+    /// without a lock.
     stopped: HashMap<StreamId, VarInt>,
     /// Streams whose send handles can still issue writes.
     writable_handles: HashSet<StreamId>,
@@ -156,6 +171,15 @@ struct ConnTask {
     /// Each stream's waiting read and the most bytes it asked for.
     reads: HashMap<StreamId, (oneshot::Sender<ReadReply>, usize)>,
     recv_ends: HashMap<StreamId, RecvEnd>,
+    /// Streams whose receive half may still buffer unread data in
+    /// quinn-proto, and whose send half may still hold unacknowledged data.
+    /// Closing releases exactly these (ADM-13), so the work is bounded by the
+    /// open streams, not by every stream the connection ever had.
+    recv_payload: HashSet<StreamId>,
+    send_payload: HashSet<StreamId>,
+    /// This connection's ADM-12 slot, which moves to the closing allowance
+    /// at close (ADM-13).
+    slot: Arc<ConnectionSlot>,
 
     send_buf: Vec<u8>,
     blocked: Option<(Transmit, Vec<u8>)>,
@@ -165,7 +189,7 @@ struct ConnTask {
 }
 
 /// Runs one connection until quinn-proto drains it.
-pub(crate) async fn run(params: ConnTaskParams) {
+pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
     let ConnTaskParams {
         handle,
         conn,
@@ -182,8 +206,10 @@ pub(crate) async fn run(params: ConnTaskParams) {
         admitted,
         handshake,
         limits,
+        slot,
     } = params;
     let mut socket_generation = socket.subscribe();
+    let credit = shared.clone();
     let mut task = ConnTask {
         handle,
         conn,
@@ -200,6 +226,8 @@ pub(crate) async fn run(params: ConnTaskParams) {
         drained_sent: false,
         path_ip: canonical_ip(admitted.ip()),
         limits,
+        credit_held: 0,
+        credit_released: 0,
         load_published: None,
         load_stale: false,
         last_send_warning: None,
@@ -213,6 +241,9 @@ pub(crate) async fn run(params: ConnTaskParams) {
         accepted_bidi: 0,
         reads: HashMap::new(),
         recv_ends: HashMap::new(),
+        recv_payload: HashSet::new(),
+        send_payload: HashSet::new(),
+        slot,
         send_buf: Vec::new(),
         blocked: None,
         more_to_send: false,
@@ -221,13 +252,14 @@ pub(crate) async fn run(params: ConnTaskParams) {
     };
 
     let mut cmds_open = true;
-    let mut timer = Box::pin(tokio::time::sleep(Duration::ZERO));
+    let mut timer = Box::pin(zakura_rt::time::sleep(Duration::ZERO));
     let mut timer_deadline: Option<Instant> = None;
-    let mut sampler = tokio::time::interval(SAMPLE_INTERVAL);
-    sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sampler = zakura_rt::time::interval(SAMPLE_INTERVAL);
+    sampler.set_missed_tick_behavior(zakura_rt::time::MissedTickBehavior::Delay);
     sampler.tick().await;
-    let mut publish = Box::pin(tokio::time::sleep(Duration::ZERO));
+    let mut publish = Box::pin(zakura_rt::time::sleep(Duration::ZERO));
     let mut publish_deadline: Option<Instant> = None;
+    let mut closing_seen = false;
     if *closing.borrow() {
         task.close(
             VarInt::from_u32(0),
@@ -240,11 +272,20 @@ pub(crate) async fn run(params: ConnTaskParams) {
         if task.conn.is_drained() {
             break;
         }
+        if !closing_seen && task.conn.is_closed() {
+            closing_seen = true;
+            if !task.enter_closing(&mut datagrams) {
+                // ADM-13: the closing allowance is full, so drop the state
+                // now. Dropping the task reports the connection drained.
+                metrics::counter!("zakura.quic.connections.closing_full").increment(1);
+                break;
+            }
+        }
         match task.publish_load() {
             Some(deadline) if publish_deadline != Some(deadline) => {
                 publish
                     .as_mut()
-                    .reset(tokio::time::Instant::from_std(deadline));
+                    .reset(zakura_rt::time::Instant::from_std(deadline));
                 publish_deadline = Some(deadline);
             }
             Some(_) => {}
@@ -254,7 +295,7 @@ pub(crate) async fn run(params: ConnTaskParams) {
             Some(deadline) if timer_deadline != Some(deadline) => {
                 timer
                     .as_mut()
-                    .reset(tokio::time::Instant::from_std(deadline));
+                    .reset(zakura_rt::time::Instant::from_std(deadline));
                 timer_deadline = Some(deadline);
             }
             Some(_) => {}
@@ -268,7 +309,7 @@ pub(crate) async fn run(params: ConnTaskParams) {
         // network progress themselves, while a peer can keep the queue full.
         // Datagrams first would let a flood starve close, limits, shutdown
         // and the PATH-3 check.
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             event = control.recv() => match event {
                 Some(event) => task.conn.handle_event(event),
@@ -310,6 +351,8 @@ pub(crate) async fn run(params: ConnTaskParams) {
                 task.conn.local_address_changed();
             }
             Ok(()) = socket_generation.changed() => {}
+            // The next drive adds the released credit back (API-10).
+            () = credit.credit_released() => {}
             _ = sampler.tick() => task.sample(),
             () = &mut publish, if publish_deadline.is_some() => publish_deadline = None,
             event = datagrams.recv() => match event {
@@ -328,13 +371,13 @@ pub(crate) async fn run(params: ConnTaskParams) {
             _ = async { blocked_io.as_ref()?.writable().await.ok() }, if blocked_io.is_some() => {}
             // Yield between transmit batches, so a busy connection can't hold
             // the worker thread.
-            () = tokio::task::yield_now(), if more_to_send => {}
+            () = zakura_rt::task::yield_now(), if more_to_send => {}
         }
     }
     task.drain_datagrams(&mut datagrams).await;
 }
 
-impl ConnTask {
+impl<S: UdpIo> ConnTask<S> {
     async fn drain_datagrams(
         &self,
         datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
@@ -440,6 +483,7 @@ impl ConnTask {
 
     /// Moves every pending output: app events, datagrams and endpoint events.
     fn drive(&mut self) {
+        self.update_credit(0);
         if self
             .conn
             .poll_timeout()
@@ -553,7 +597,10 @@ impl ConnTask {
                 Event::Stream(StreamEvent::Available { dir: Dir::Uni }) => {}
                 Event::Stream(StreamEvent::Readable { id }) => self.serve_reader(id),
                 Event::Stream(StreamEvent::Writable { id }) => self.serve_writer(id),
-                Event::Stream(StreamEvent::Finished { .. }) => {}
+                // All sent data is acknowledged, so quinn-proto holds none.
+                Event::Stream(StreamEvent::Finished { id }) => {
+                    self.send_payload.remove(&id);
+                }
                 Event::Stream(StreamEvent::Stopped { id, error_code }) => {
                     self.on_stopped(id, error_code);
                 }
@@ -568,6 +615,8 @@ impl ConnTask {
             alpn: tls::negotiated_alpn(session),
         };
         self.remote_id = handshake.remote_id;
+        #[cfg(any(test, zakura_sim, feature = "test-support"))]
+        let _ = self.shared.shared_id.set(tls::shared_id(session));
         metrics::gauge!("zakura.quic.connections").increment(1.0);
         if let Some(reply) = self.handshake.take() {
             let _ = reply.send(Ok(handshake));
@@ -607,6 +656,50 @@ impl ConnTask {
             if let Some(observer) = self.hooks.observer() {
                 observer(&sample);
             }
+        }
+    }
+
+    /// Releases a closed connection's payload and moves its slot to the
+    /// closing allowance (ADM-13). Returns `false` when the allowance is full,
+    /// and the caller then drops the connection's state at once.
+    fn enter_closing(
+        &mut self,
+        datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
+    ) -> bool {
+        self.release_streams();
+        let slot = self.slot.clone();
+        // The backlog was queued under the live limit. A closed connection
+        // only answers with CONNECTION_CLOSE, so dropping it loses nothing.
+        // Drop only what was queued at the switch: refunds reopen room, so a
+        // loop until empty could run as long as the peer keeps sending.
+        // Later datagrams sit under the closing limit, and the run loop
+        // handles them as usual.
+        slot.begin_closing(|| {
+            for _ in 0..datagrams.len() {
+                let Ok((_, bytes)) = datagrams.try_recv() else {
+                    break;
+                };
+                self.refund_datagram(bytes);
+            }
+        })
+    }
+
+    /// Frees the stream payload quinn-proto still holds for a closed
+    /// connection (ADM-13). quinn-proto keeps every stream's buffers until the
+    /// connection drains, though a closed connection neither sends nor
+    /// receives stream data. Stopping a receive half drops its buffered data
+    /// and resetting a send half drops its unacknowledged data.
+    fn release_streams(&mut self) {
+        // Remote streams the application never accepted can hold data too.
+        while let Some(id) = self.conn.streams().accept(Dir::Bi) {
+            self.accepted_bidi = id.index() + 1;
+            self.recv_payload.insert(id);
+        }
+        for id in self.recv_payload.drain() {
+            let _ = self.conn.recv_stream(id).stop(VarInt::from_u32(0));
+        }
+        for id in self.send_payload.drain() {
+            let _ = self.conn.send_stream(id).reset(VarInt::from_u32(0));
         }
     }
 
@@ -663,6 +756,7 @@ impl ConnTask {
             }
             ConnCmd::Finish { id } | ConnCmd::DropSend { id } => {
                 self.writable_handles.remove(&id);
+                self.shared.forget_stop(id);
                 if self.stopped.remove(&id).is_none() {
                     match self.sends.get_mut(&id) {
                         Some(state) if !state.writes.is_empty() => state.finish_after = true,
@@ -675,7 +769,9 @@ impl ConnTask {
             ConnCmd::Reset { id, code } => {
                 self.writable_handles.remove(&id);
                 self.stopped.remove(&id);
+                self.shared.forget_stop(id);
                 self.fail_writes(id, WriteError::ClosedStream);
+                self.send_payload.remove(&id);
                 let _ = self.conn.send_stream(id).reset(code);
             }
             ConnCmd::Unclaimed { id, accepted } => {
@@ -689,12 +785,25 @@ impl ConnTask {
                     self.serve_openers();
                 }
             }
-            ConnCmd::Read { id, max, reply } => {
+            ConnCmd::Read {
+                id,
+                max,
+                hold,
+                reply,
+            } => {
+                // Before the read, so the bytes it takes pay the hold first.
+                self.update_credit(hold);
                 self.reads.insert(id, (reply, max));
                 self.serve_reader(id);
             }
-            ConnCmd::Stop { id, code } => self.stop(id, code),
-            ConnCmd::DropRecv { id } => self.stop(id, VarInt::from_u32(0)),
+            ConnCmd::Stop { id, code, hold } => {
+                self.update_credit(hold);
+                self.stop(id, code);
+            }
+            ConnCmd::DropRecv { id, hold } => {
+                self.update_credit(hold);
+                self.stop(id, VarInt::from_u32(0));
+            }
             ConnCmd::Close { code, reason } => self.close(code, reason),
             ConnCmd::Stats { reply } => {
                 let _ = reply.send(self.stats());
@@ -708,9 +817,8 @@ impl ConnTask {
 
     fn set_limits(&mut self, limits: ConnLimits) {
         if let Some(bytes) = limits.receive_window {
-            self.conn
-                .set_receive_window(VarInt::from_u64(bytes).unwrap_or(VarInt::MAX));
             self.limits.receive_window = bytes;
+            self.apply_receive_window();
         }
         if let Some(bytes) = limits.send_window {
             self.conn.set_send_window(bytes);
@@ -723,8 +831,41 @@ impl ConnTask {
         }
     }
 
+    /// Takes a reader's new `hold` and every release since the last update
+    /// into the receive window (API-10).
+    ///
+    /// quinn-proto counts a shrink as debt that later reads pay before they
+    /// grant the peer more credit, so the bytes the reader takes next return
+    /// no credit until the hold drops. A grow grants the released credit at
+    /// once.
+    fn update_credit(&mut self, hold: u64) {
+        let released = self.shared.take_released_credit();
+        if hold == 0 && released == 0 {
+            return;
+        }
+        self.credit_held = self.credit_held.saturating_add(hold);
+        self.credit_released = self.credit_released.saturating_add(released);
+        self.apply_receive_window();
+    }
+
+    /// The credit that live holds keep from the peer.
+    fn outstanding_credit(&self) -> u64 {
+        self.credit_held.saturating_sub(self.credit_released)
+    }
+
+    fn apply_receive_window(&mut self) {
+        let window = self
+            .limits
+            .receive_window
+            .saturating_sub(self.outstanding_credit());
+        self.conn
+            .set_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::MAX));
+    }
+
     fn stop(&mut self, id: StreamId, code: VarInt) {
         self.reads.remove(&id);
+        // Stopping drops whatever quinn-proto buffered for the stream.
+        self.recv_payload.remove(&id);
         if self.recv_ends.remove(&id).is_none() {
             let _ = self.conn.recv_stream(id).stop(code);
         }
@@ -735,11 +876,12 @@ impl ConnTask {
             if reply.is_closed() {
                 continue;
             }
-            let Some(id) = self
-                .opened_spare
-                .pop_front()
-                .or_else(|| self.conn.streams().open(Dir::Bi))
-            else {
+            let Some(id) = self.opened_spare.pop_front().or_else(|| {
+                let id = self.conn.streams().open(Dir::Bi)?;
+                self.recv_payload.insert(id);
+                self.send_payload.insert(id);
+                Some(id)
+            }) else {
                 self.openers.push_front(reply);
                 return;
             };
@@ -765,9 +907,12 @@ impl ConnTask {
                         return;
                     };
                     self.accepted_bidi = id.index() + 1;
+                    self.recv_payload.insert(id);
                     // The reset `on_stopped` deferred until this accept.
                     if let Some(&code) = self.stopped.get(&id) {
                         let _ = self.conn.send_stream(id).reset(code);
+                    } else {
+                        self.send_payload.insert(id);
                     }
                     id
                 }
@@ -835,17 +980,25 @@ impl ConnTask {
             // quinn-proto counts a remote send stream only once it is
             // accepted, so a reset acked before then underflows that count.
             // `serve_acceptors` sends the reset on accept.
-            self.stopped.insert(id, error_code);
+            self.record_stop(id, error_code);
             return;
         }
         if self.writable_handles.contains(&id) {
-            self.stopped.insert(id, error_code);
+            self.record_stop(id, error_code);
         }
         // RFC 9000 §3.5: answer STOP_SENDING with RESET_STREAM. quinn-proto
         // leaves this to the application, and without it the peer never
         // learns the final size, so it never frees the stream or returns its
         // stream credit.
+        self.send_payload.remove(&id);
         let _ = self.conn.send_stream(id).reset(error_code);
+    }
+
+    /// Keeps the peer's code for the task's writes and accepts, and publishes
+    /// it to the stream's `stopped` waiters.
+    fn record_stop(&mut self, id: StreamId, code: VarInt) {
+        self.stopped.insert(id, code);
+        self.shared.record_stop(id, code);
     }
 
     fn fail_writes(&mut self, id: StreamId, error: WriteError) {
@@ -877,6 +1030,7 @@ impl ConnTask {
         let mut chunks = match stream.read(true) {
             Ok(chunks) => chunks,
             Err(_) => {
+                self.recv_payload.remove(&id);
                 let _ = reply.send(Err(ReadError::ClosedStream));
                 return;
             }
@@ -903,8 +1057,13 @@ impl ConnTask {
                 }
             }
         }
-        // Reading frees receive window; the next drive() sends the credit.
+        // Reading pays any held credit first, then frees receive window; the
+        // next drive() sends the credit.
         let _ = chunks.finalize();
+        if end.is_some() {
+            // Read to the end or reset: quinn-proto buffers nothing more.
+            self.recv_payload.remove(&id);
+        }
         match (data.is_empty(), end) {
             (false, end) => {
                 if let Some(end) = end {
@@ -1007,7 +1166,7 @@ impl ConnTask {
     }
 }
 
-impl Drop for ConnTask {
+impl<S: UdpIo> Drop for ConnTask<S> {
     fn drop(&mut self) {
         self.terminate(ConnectionError::LocallyClosed);
         if !self.drained_sent {
@@ -1072,29 +1231,39 @@ fn export_delta(previous: &Exported, next: &Exported) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{socket::UdpIo, NodeSecretKey};
-    use std::sync::atomic::AtomicUsize;
+    use crate::{socket::TokioUdpIo, NodeSecretKey};
+    use zakura_rt::sync::atomic::AtomicUsize;
 
-    fn task() -> ConnTask {
+    fn task() -> ConnTask<TokioUdpIo> {
+        client_task().1
+    }
+
+    /// A task for a client connection that hasn't sent anything yet, and the
+    /// client endpoint that routes its datagrams.
+    fn client_task() -> (quinn_proto::Endpoint, ConnTask<TokioUdpIo>) {
+        client_task_with(quinn_proto::TransportConfig::default())
+    }
+
+    /// [`client_task`] with `transport` on the client connection.
+    fn client_task_with(
+        transport: quinn_proto::TransportConfig,
+    ) -> (quinn_proto::Endpoint, ConnTask<TokioUdpIo>) {
         let key = NodeSecretKey::from_bytes(&[1; 32]);
         let crypto = tls::TlsConfig::new(&key)
             .client_config(key.public(), &[b"test"])
             .unwrap();
         let mut endpoint = quinn_proto::Endpoint::new(Arc::default(), None, true, None);
         let admitted = "127.0.0.1:12345".parse().unwrap();
+        let mut config = quinn_proto::ClientConfig::new(Arc::new(crypto));
+        config.transport_config(Arc::new(transport));
         let (handle, conn) = endpoint
-            .connect(
-                now(),
-                quinn_proto::ClientConfig::new(Arc::new(crypto)),
-                admitted,
-                tls::UNSENT_SERVER_NAME,
-            )
+            .connect(now(), config, admitted, tls::UNSENT_SERVER_NAME)
             .unwrap();
         let shared = ConnShared::new(admitted, Arc::new(AtomicUsize::new(0)));
         let to_endpoint = mpsc::unbounded_channel().0;
         let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         udp.set_nonblocking(true).unwrap();
-        let socket = Arc::new(SocketCell::new(UdpIo::new(udp, false).unwrap()));
+        let socket = Arc::new(SocketCell::new(TokioUdpIo::new(udp, false).unwrap()));
         let probe = Arc::default();
         let hooks = Arc::default();
         let handshake = oneshot::channel().0;
@@ -1103,7 +1272,7 @@ mod tests {
             send_window: 1024,
             max_bidi_streams: 16,
         };
-        ConnTask {
+        let task = ConnTask {
             handle,
             conn,
             shared,
@@ -1119,6 +1288,8 @@ mod tests {
             drained_sent: false,
             path_ip: canonical_ip(admitted.ip()),
             limits,
+            credit_held: 0,
+            credit_released: 0,
             load_published: None,
             load_stale: false,
             last_send_warning: None,
@@ -1132,12 +1303,360 @@ mod tests {
             accepted_bidi: 0,
             reads: HashMap::new(),
             recv_ends: HashMap::new(),
+            recv_payload: HashSet::new(),
+            send_payload: HashSet::new(),
+            slot: crate::endpoint::ConnectionSlots::new(1, 0, None, 1)
+                .claim_dial()
+                .unwrap(),
             send_buf: Vec::new(),
             blocked: None,
             more_to_send: false,
             counters: Counters::default(),
             exported: Exported::default(),
+        };
+        (endpoint, task)
+    }
+
+    /// A server endpoint that accepts the test client.
+    fn server_endpoint() -> quinn_proto::Endpoint {
+        server_endpoint_with(quinn_proto::TransportConfig::default())
+    }
+
+    /// [`server_endpoint`] with `transport` on accepted connections.
+    fn server_endpoint_with(transport: quinn_proto::TransportConfig) -> quinn_proto::Endpoint {
+        let key = NodeSecretKey::from_bytes(&[1; 32]);
+        let crypto = tls::TlsConfig::new(&key)
+            .server_config(vec![b"test".to_vec()])
+            .unwrap();
+        let mut config = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto));
+        config.transport_config(Arc::new(transport));
+        quinn_proto::Endpoint::new(Arc::default(), Some(Arc::new(config)), true, None)
+    }
+
+    /// Moves datagrams between the task's connection and the server's in
+    /// memory until neither has more to send, accepting the server side on
+    /// the client's first Initial.
+    fn pump(
+        client: &mut quinn_proto::Endpoint,
+        task: &mut ConnTask<TokioUdpIo>,
+        server: &mut quinn_proto::Endpoint,
+        accepted: &mut Option<(ConnectionHandle, quinn_proto::Connection)>,
+    ) {
+        let client_addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        for _ in 0..64 {
+            let mut moved = false;
+            let mut buf = Vec::new();
+            while let Some(transmit) = task.conn.poll_transmit(now(), 1, &mut buf) {
+                moved = true;
+                let data = bytes::BytesMut::from(&buf[..transmit.size]);
+                let mut response = Vec::new();
+                match server.handle(now(), client_addr, None, None, data, &mut response) {
+                    Some(quinn_proto::DatagramEvent::NewConnection(incoming)) => {
+                        *accepted =
+                            Some(server.accept(incoming, now(), &mut response, None).unwrap());
+                    }
+                    Some(quinn_proto::DatagramEvent::ConnectionEvent(_, event)) => {
+                        accepted.as_mut().unwrap().1.handle_event(event);
+                    }
+                    _ => {}
+                }
+                buf.clear();
+            }
+            if let Some((handle, conn)) = accepted.as_mut() {
+                while let Some(event) = conn.poll_endpoint_events() {
+                    if let Some(event) = server.handle_event(*handle, event) {
+                        conn.handle_event(event);
+                    }
+                }
+                while let Some(transmit) = conn.poll_transmit(now(), 1, &mut buf) {
+                    moved = true;
+                    let data = bytes::BytesMut::from(&buf[..transmit.size]);
+                    let mut response = Vec::new();
+                    if let Some(quinn_proto::DatagramEvent::ConnectionEvent(_, event)) =
+                        client.handle(now(), task.admitted, None, None, data, &mut response)
+                    {
+                        task.conn.handle_event(event);
+                    }
+                    buf.clear();
+                }
+            }
+            while let Some(event) = task.conn.poll_endpoint_events() {
+                if let Some(event) = client.handle_event(task.handle, event) {
+                    task.conn.handle_event(event);
+                }
+            }
+            if !moved {
+                return;
+            }
         }
+    }
+
+    /// The connection and stream receive windows of a [`CreditPair`] client.
+    const WINDOW: u64 = 64 * 1024;
+
+    /// A connected client task with [`WINDOW`] as both receive windows, and a
+    /// server peer that sends on one bidirectional stream as fast as the
+    /// client's credit allows.
+    struct CreditPair {
+        client: quinn_proto::Endpoint,
+        task: ConnTask<TokioUdpIo>,
+        server: quinn_proto::Endpoint,
+        accepted: Option<(ConnectionHandle, quinn_proto::Connection)>,
+        stream: StreamId,
+        /// Bytes the peer's send stream took, at least what reached the client.
+        sent: u64,
+    }
+
+    impl CreditPair {
+        fn connected() -> Self {
+            let mut client_transport = quinn_proto::TransportConfig::default();
+            client_transport
+                .receive_window(VarInt::from_u64(WINDOW).unwrap())
+                .stream_receive_window(VarInt::from_u64(WINDOW).unwrap());
+            // A congestion window far above WINDOW, so flow control alone
+            // limits the peer and every pump delivers what it sent.
+            let mut server_transport = quinn_proto::TransportConfig::default();
+            let mut cubic = quinn_proto::congestion::CubicConfig::default();
+            cubic.initial_window(64 * WINDOW);
+            server_transport.congestion_controller_factory(Arc::new(cubic));
+            let (client, mut task) = client_task_with(client_transport);
+            task.limits.receive_window = WINDOW;
+            let mut pair = Self {
+                client,
+                task,
+                server: server_endpoint_with(server_transport),
+                accepted: None,
+                stream: StreamId::new(quinn_proto::Side::Server, Dir::Bi, 0),
+                sent: 0,
+            };
+            pair.pump();
+            assert!(!pair.task.conn.is_handshaking());
+            let opened = pair.peer().streams().open(Dir::Bi).unwrap();
+            assert_eq!(opened, pair.stream);
+            pair
+        }
+
+        fn peer(&mut self) -> &mut quinn_proto::Connection {
+            &mut self.accepted.as_mut().unwrap().1
+        }
+
+        fn pump(&mut self) {
+            pump(
+                &mut self.client,
+                &mut self.task,
+                &mut self.server,
+                &mut self.accepted,
+            );
+        }
+
+        /// Writes until the peer's flow control blocks, delivers the bytes and
+        /// returns how many the peer took.
+        fn fill(&mut self) -> u64 {
+            let stream = self.stream;
+            let mut took = 0;
+            while let Ok(written) = self.peer().send_stream(stream).write(&[7; 4096]) {
+                // usize fits in u64 on supported targets.
+                took += written as u64;
+            }
+            self.sent += took;
+            self.pump();
+            took
+        }
+
+        /// Reads up to `max` bytes straight from quinn-proto, bypassing the
+        /// task, and delivers the credit the read frees.
+        fn read_direct(&mut self, max: u64) -> u64 {
+            let mut stream = self.task.conn.recv_stream(self.stream);
+            let mut chunks = stream.read(true).unwrap();
+            let mut read = 0;
+            // usize holds WINDOW on supported targets.
+            while let Ok(Some(chunk)) = chunks.next((max - read) as usize) {
+                read += chunk.bytes.len() as u64;
+                if read == max {
+                    break;
+                }
+            }
+            let _ = chunks.finalize();
+            self.pump();
+            read
+        }
+    }
+
+    /// API-10 relies on quinn-proto 0.11 counting a shrink below granted
+    /// credit as debt that reads repay before they grant the peer more, and
+    /// granting a grow at once.
+    #[tokio::test]
+    async fn a_receive_window_shrink_is_debt_that_reads_repay() {
+        let mut pair = CreditPair::connected();
+        assert_eq!(pair.fill(), WINDOW);
+        let _ = pair.task.conn.streams().accept(Dir::Bi).unwrap();
+
+        // Hold a quarter: reading it repays the debt and grants nothing.
+        let quarter = WINDOW / 4;
+        pair.task
+            .conn
+            .set_receive_window(VarInt::from_u64(WINDOW - quarter).unwrap());
+        assert_eq!(pair.read_direct(quarter), quarter);
+        assert_eq!(pair.fill(), 0);
+
+        // Releasing it grants the quarter back without a read.
+        pair.task
+            .conn
+            .set_receive_window(VarInt::from_u64(WINDOW).unwrap());
+        pair.pump();
+        assert_eq!(pair.fill(), quarter);
+
+        // Without a hold, a read grants its bytes.
+        assert_eq!(pair.read_direct(quarter), quarter);
+        assert_eq!(pair.fill(), quarter);
+    }
+
+    /// API-10: with a greedy peer and random holds, reads and releases, the
+    /// bytes the peer sent minus the bytes whose credit came back never
+    /// exceed the receive window, and every release returns its credit.
+    #[tokio::test]
+    async fn held_credit_bounds_a_greedy_peer() {
+        for seed in 1..=8u64 {
+            let mut pair = CreditPair::connected();
+            pair.fill();
+            let (reply, accepted) = oneshot::channel();
+            pair.task.handle_cmd(ConnCmd::AcceptBi { reply });
+            assert_eq!(accepted.await.unwrap().unwrap(), pair.stream);
+
+            let mut rng = seed;
+            let mut next = |bound: u64| {
+                // xorshift64: a fixed sequence per seed.
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng % bound
+            };
+            let mut holds = Vec::new();
+            let mut released = 0;
+            // The unread bytes of the frame the latest hold covers.
+            let mut frame_left = 0;
+            let mut read = None;
+            for _ in 0..400 {
+                if read.is_none() && next(3) != 0 {
+                    let (max, hold) = match (frame_left, next(2)) {
+                        (0, 0) => (next(WINDOW / 4) + 1, 0),
+                        (0, _) => {
+                            let frame = next(WINDOW / 4) + 1;
+                            holds.push(frame);
+                            frame_left = frame;
+                            (frame, frame)
+                        }
+                        (left, _) => (left, 0),
+                    };
+                    let (reply, result) = oneshot::channel();
+                    pair.task.handle_cmd(ConnCmd::Read {
+                        id: pair.stream,
+                        // usize holds WINDOW on supported targets.
+                        max: max as usize,
+                        hold,
+                        reply,
+                    });
+                    read = Some((result, frame_left > 0));
+                } else if !holds.is_empty() {
+                    // Any hold, the unfinished frame's included.
+                    // usize holds the hold count on supported targets.
+                    let hold = holds.swap_remove(next(holds.len() as u64) as usize);
+                    pair.task.shared.release_credit(hold);
+                    pair.task.update_credit(0);
+                    released += hold;
+                }
+                pair.pump();
+                pair.task.process_events();
+                if let Some((result, in_frame)) = read.as_mut() {
+                    if let Ok(reply) = result.try_recv() {
+                        let chunks = reply.unwrap().unwrap();
+                        // usize fits in u64 on supported targets.
+                        let n: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+                        if *in_frame {
+                            frame_left -= n;
+                        } else {
+                            released += n;
+                        }
+                        read = None;
+                    }
+                }
+                pair.fill();
+                assert!(
+                    pair.sent.saturating_sub(released) <= WINDOW,
+                    "seed {seed}: sent {} released {released}",
+                    pair.sent
+                );
+            }
+
+            // Every release returns its credit: with no hold left, reads
+            // alone keep the peer sending.
+            for hold in holds.drain(..) {
+                pair.task.shared.release_credit(hold);
+            }
+            pair.task.update_credit(0);
+            assert_eq!(pair.task.outstanding_credit(), 0);
+            let before = pair.sent;
+            pair.task.reads.clear();
+            pair.read_direct(WINDOW);
+            pair.fill();
+            assert!(pair.sent > before, "seed {seed}");
+        }
+    }
+
+    /// API-10: read-ahead can deliver a frame before its hold reaches the
+    /// task, so a release can arrive first. The window still ends where it
+    /// started, instead of losing the hold for good.
+    #[tokio::test]
+    async fn a_release_before_its_hold_leaves_no_credit_held() {
+        let mut task = task();
+        task.update_credit(100);
+        task.shared.release_credit(40);
+        task.update_credit(0);
+        assert_eq!(task.outstanding_credit(), 60);
+        // The second hold's release overtakes it.
+        task.shared.release_credit(60 + 25);
+        task.update_credit(0);
+        assert_eq!(task.outstanding_credit(), 0);
+        task.update_credit(25);
+        assert_eq!(task.outstanding_credit(), 0);
+    }
+
+    /// ADM-13: closing stops every receive half that may buffer data, the
+    /// streams the application never accepted included, and resets every
+    /// send half that may hold unacknowledged data.
+    #[tokio::test]
+    async fn closing_releases_every_stream_that_may_hold_payload() {
+        let (mut client, mut task) = client_task();
+        let mut server = server_endpoint();
+        let mut accepted = None;
+        pump(&mut client, &mut task, &mut server, &mut accepted);
+        assert!(!task.conn.is_handshaking());
+
+        // The peer sends on a stream this node never accepts.
+        let (_, peer) = accepted.as_mut().unwrap();
+        let unaccepted = peer.streams().open(Dir::Bi).unwrap();
+        peer.send_stream(unaccepted).write(&[1; 4096]).unwrap();
+        pump(&mut client, &mut task, &mut server, &mut accepted);
+
+        // This node writes data the peer never acknowledges.
+        let (reply, opened) = oneshot::channel();
+        task.handle_cmd(ConnCmd::OpenBi { reply });
+        let unacked = opened.await.unwrap().unwrap();
+        let (reply, _written) = oneshot::channel();
+        task.handle_cmd(ConnCmd::Write {
+            id: unacked,
+            data: Bytes::from_static(&[2; 4096]),
+            reply,
+        });
+
+        task.close(VarInt::from_u32(0), Bytes::from_static(b"test"));
+        task.release_streams();
+        assert!(task.recv_payload.is_empty());
+        assert!(task.send_payload.is_empty());
+        // Both were released already, so releasing them again fails.
+        let code = VarInt::from_u32(0);
+        assert!(task.conn.recv_stream(unaccepted).stop(code).is_err());
+        assert!(task.conn.send_stream(unacked).reset(code).is_err());
     }
 
     #[tokio::test]
@@ -1189,6 +1708,57 @@ mod tests {
         );
     }
 
+    /// ADM-13: entering the closing allowance drops and refunds the datagrams
+    /// queued under the live limit, so the closed connection holds no more
+    /// than its closing charge.
+    #[tokio::test]
+    async fn entering_closing_drops_the_live_datagram_backlog() {
+        let (_client, mut task) = client_task();
+        let mut server = server_endpoint();
+        let remote = "127.0.0.1:54321".parse().unwrap();
+        let mut packet = Vec::new();
+        let transmit = task.conn.poll_transmit(now(), 1, &mut packet).unwrap();
+        let data = bytes::BytesMut::from(&packet[..transmit.size]);
+        let mut response = Vec::new();
+        let Some(quinn_proto::DatagramEvent::NewConnection(incoming)) =
+            server.handle(now(), remote, None, None, data.clone(), &mut response)
+        else {
+            panic!("client Initial must create an incoming connection")
+        };
+        let _connection = server.accept(incoming, now(), &mut response, None).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let other_connection_bytes = 73;
+        task.shared
+            .socket_queued_bytes
+            .store(other_connection_bytes, Ordering::Relaxed);
+        // More than the closing limit, queued while the connection was live.
+        let charged = super::super::CLOSING_QUEUE_BYTES;
+        for _ in 0..3 {
+            let Some(quinn_proto::DatagramEvent::ConnectionEvent(_, event)) =
+                server.handle(now(), remote, None, None, data.clone(), &mut response)
+            else {
+                panic!("duplicate Initial must route to the accepted connection")
+            };
+            task.shared
+                .queued_datagram_bytes
+                .fetch_add(charged, Ordering::Relaxed);
+            task.shared
+                .socket_queued_bytes
+                .fetch_add(charged, Ordering::Relaxed);
+            tx.send((event, charged)).unwrap();
+        }
+
+        task.close(VarInt::from_u32(0), Bytes::from_static(b"test"));
+        assert!(task.enter_closing(&mut rx));
+        assert!(task.slot.is_closing());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(task.shared.queued_datagram_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            task.shared.socket_queued_bytes.load(Ordering::Relaxed),
+            other_connection_bytes
+        );
+    }
+
     #[tokio::test]
     async fn stopped_codes_live_only_until_send_handle_closes() {
         for close_kind in 0..3 {
@@ -1212,11 +1782,103 @@ mod tests {
             task.handle_cmd(close);
             assert!(!task.writable_handles.contains(&id));
             assert!(task.stopped.is_empty());
+            assert_eq!(task.shared.stop_slot_count(), 0);
             task.on_stopped(id, code);
-            assert!(
-                task.stopped.is_empty(),
+            assert!(task.stopped.is_empty());
+            assert_eq!(
+                task.shared.stop_slot_count(),
+                0,
                 "late STOP_SENDING must not retain a code"
             );
         }
+    }
+
+    /// Writes and accepts read the task's own copy of each stop code, so they
+    /// never take `ConnShared`'s slot lock. Another thread holds that lock
+    /// meanwhile, and a write or accept that took it would wait until that
+    /// thread gives up.
+    #[tokio::test]
+    async fn writes_and_accepts_take_no_shared_lock() {
+        let (mut client, mut task) = client_task();
+        let mut server = server_endpoint();
+        let mut accepted = None;
+        pump(&mut client, &mut task, &mut server, &mut accepted);
+        let (_, peer) = accepted.as_mut().unwrap();
+        let stopped_id = peer.streams().open(Dir::Bi).unwrap();
+        peer.send_stream(stopped_id).write(b"x").unwrap();
+        pump(&mut client, &mut task, &mut server, &mut accepted);
+        // The peer stops the stream before this node accepts it.
+        let code = VarInt::from_u32(9);
+        task.on_stopped(stopped_id, code);
+        let (reply, opened) = oneshot::channel();
+        task.handle_cmd(ConnCmd::OpenBi { reply });
+        let live_id = opened.await.unwrap().unwrap();
+
+        let shared = task.shared.clone();
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let (done_tx, done) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _slots = shared.stop_slots();
+            held_tx.send(()).unwrap();
+            done.recv_timeout(Duration::from_secs(1)).is_ok()
+        });
+        held.recv().unwrap();
+        let (reply, accept) = oneshot::channel();
+        task.handle_cmd(ConnCmd::AcceptBi { reply });
+        let (reply, stopped_write) = oneshot::channel();
+        task.handle_cmd(ConnCmd::Write {
+            id: stopped_id,
+            data: Bytes::from_static(b"x"),
+            reply,
+        });
+        let (reply, live_write) = oneshot::channel();
+        task.handle_cmd(ConnCmd::Write {
+            id: live_id,
+            data: Bytes::from_static(b"x"),
+            reply,
+        });
+        let _ = done_tx.send(());
+        assert!(
+            holder.join().unwrap(),
+            "a write or accept waited on the shared slot lock"
+        );
+
+        assert_eq!(accept.await.unwrap().unwrap(), stopped_id);
+        assert_eq!(stopped_write.await.unwrap(), Err(WriteError::Stopped(code)));
+        assert_eq!(live_write.await.unwrap(), Ok(()));
+        assert_eq!(task.shared.stop_slot_count(), 1);
+        task.handle_cmd(ConnCmd::DropSend { id: stopped_id });
+        assert!(task.stopped.is_empty());
+        assert_eq!(task.shared.stop_slot_count(), 0);
+    }
+
+    /// A stop wakes only its own stream's waiter, and a waiter's slot drops
+    /// with its handle even when the peer never stopped the stream.
+    #[tokio::test]
+    async fn a_stop_wakes_only_its_own_stream() {
+        let mut task = task();
+        let stopped_id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        let other_id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        task.writable_handles.extend([stopped_id, other_id]);
+        let mut stopped = task.shared.watch_stop(stopped_id);
+        let mut other = task.shared.watch_stop(other_id);
+        assert_eq!(task.shared.stop_slot_count(), 2);
+
+        task.on_stopped(stopped_id, VarInt::from_u32(9));
+        assert!(stopped.has_changed().unwrap());
+        assert_eq!(*stopped.borrow_and_update(), Some(VarInt::from_u32(9)));
+        assert!(
+            !other.has_changed().unwrap(),
+            "another stream's stop woke this one"
+        );
+
+        for id in [stopped_id, other_id] {
+            task.handle_cmd(ConnCmd::DropSend { id });
+        }
+        assert_eq!(task.shared.stop_slot_count(), 0);
+        assert!(
+            other.changed().await.is_err(),
+            "the slot dropped with its handle"
+        );
     }
 }

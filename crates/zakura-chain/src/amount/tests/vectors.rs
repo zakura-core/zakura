@@ -6,7 +6,7 @@ use super::super::*;
 
 use std::{collections::hash_map::RandomState, collections::HashSet, fmt::Debug};
 
-use color_eyre::eyre::Result;
+use eyre::Result;
 
 #[test]
 fn test_add_bare() -> Result<()> {

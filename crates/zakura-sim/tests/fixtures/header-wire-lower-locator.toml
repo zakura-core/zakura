@@ -1,0 +1,13 @@
+# The committed fuzz input `header-wire-lower-locator.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `lower-locator` scenario, and
+# `header-wire-lower-locator.end.json` is its pinned end record.
+harness = "header-sync/wire"
+generator = 4
+sha256 = "acd2a28e63066b8326688c4c7ae113d676a623207eaa4acd641cbc07a98ce8ab"
+scenario_sha256 = "e04adfa491e4fbed5cee289b5d24ddb04b30aae9bb31491d0aa187fdb01a0c79"
+source = "crates/zakura-sim/tests/header_wire_lifecycle.rs"
+
+[[witness]]
+property = "header-sync/commit-only-authorized"
+expect = "holds"

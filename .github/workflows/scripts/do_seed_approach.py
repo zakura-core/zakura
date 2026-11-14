@@ -156,9 +156,18 @@ def seed(args):
                 if process.poll() is None:
                     process.kill()
                     process.wait()
-        # The new binary must actually reopen this frozen DB before publication.
+        # Normal startup upgrades the disposable copy before read-only inspection.
+        # Stop at its existing tip without syncing or changing the fixture height.
         value = remote(
             args.ip,
+            "cat > /root/upgrade-approach.toml <<'TOML'\n"
+            '[network]\nnetwork = "Mainnet"\np2p_stack = "zakura"\n'
+            '[state]\ncache_dir = "/mnt/bake-approach/tip"\n'
+            'storage_mode = "pruned"\ndebug_stop_at_height = 0\n'
+            '[consensus]\ncheckpoint_sync = true\nvct_fast_sync = true\n'
+            "TOML\n"
+            "timeout 240 /root/cargo-target/release/zakurad "
+            "-c /root/upgrade-approach.toml start && "
             "printf '[state]\\nstorage_mode = \"pruned\"\\n' "
             "> /root/inspect-approach.toml && "
             "/root/cargo-target/release/zakurad -c /root/inspect-approach.toml "

@@ -220,8 +220,8 @@ proptest! {
                 .next()
                 .unwrap();
             prop_assert!(!chain.unspent_utxos().contains_key(&expected_outpoint));
-            prop_assert!(chain.created_utxos.contains_key(&expected_outpoint));
-            prop_assert!(chain.spent_utxos.contains_key(&expected_outpoint));
+            prop_assert!(chain.created_ordered_utxo(&expected_outpoint).is_some());
+            prop_assert!(chain.spent_utxo(&expected_outpoint).is_some());
             prop_assert!(chain
                 .blocks
                 .get(&Height(1))
@@ -315,15 +315,15 @@ proptest! {
 
             if use_finalized_state_output {
                 // the chain has spent the UTXO from the finalized state
-                prop_assert!(!chain.created_utxos.contains_key(&expected_outpoint));
-                prop_assert!(chain.spent_utxos.contains_key(&expected_outpoint));
+                prop_assert!(!chain.created_ordered_utxo(&expected_outpoint).is_some());
+                prop_assert!(chain.spent_utxo(&expected_outpoint).is_some());
                 // the finalized state has the UTXO, but it will get deleted on commit
                 prop_assert!(finalized_state.utxo(&expected_outpoint).is_some());
             } else {
                 // the chain has spent its own UTXO
                 prop_assert!(!chain.unspent_utxos().contains_key(&expected_outpoint));
-                prop_assert!(chain.created_utxos.contains_key(&expected_outpoint));
-                prop_assert!(chain.spent_utxos.contains_key(&expected_outpoint));
+                prop_assert!(chain.created_ordered_utxo(&expected_outpoint).is_some());
+                prop_assert!(chain.spent_utxo(&expected_outpoint).is_some());
                 // the finalized state does not have the UTXO
                 prop_assert!(finalized_state.utxo(&expected_outpoint).is_none());
             }
@@ -653,12 +653,12 @@ proptest! {
                 // the finalized state has the unspent UTXO
                 prop_assert!(finalized_state.utxo(&expected_outpoint).is_some());
                 // the non-finalized state has spent the UTXO
-                prop_assert!(chain.spent_utxos.contains_key(&expected_outpoint));
+                prop_assert!(chain.spent_utxo(&expected_outpoint).is_some());
             } else {
                 // the non-finalized state has created and spent the UTXO
                 prop_assert!(!chain.unspent_utxos().contains_key(&expected_outpoint));
-                prop_assert!(chain.created_utxos.contains_key(&expected_outpoint));
-                prop_assert!(chain.spent_utxos.contains_key(&expected_outpoint));
+                prop_assert!(chain.created_ordered_utxo(&expected_outpoint).is_some());
+                prop_assert!(chain.spent_utxo(&expected_outpoint).is_some());
                 // the finalized state does not have the UTXO
                 prop_assert!(finalized_state.utxo(&expected_outpoint).is_none());
             }
@@ -917,8 +917,8 @@ fn new_state_with_mainnet_transparent_data(
             "unexpected invalid block 1, modified with generated transactions: \n\
              converted coinbase: {:?} \n\
              generated non-coinbase: {:?}",
-            block1.block.transactions[0],
-            block1.block.transactions[1],
+            block1.block.transaction(0),
+            block1.block.transaction(1),
         );
         assert_eq!(
             Some((Height(1), block1.hash)),

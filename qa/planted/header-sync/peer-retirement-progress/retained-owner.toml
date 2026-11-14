@@ -1,0 +1,14 @@
+# Retiring a disconnected peer's work returns its round's capacity but
+# keeps the queue entry, so its slot stays with the departed session. The
+# input closes `mirror-0` while its round receives pages, so the
+# disconnect's unit leaves that slot listed under the ended session.
+# Besides reactor.rs and peer_work.rs, which the patch changes, the session
+# readers decide whether the close reaches the reactor as a disconnect
+# while the round still has its slot. A change there can move the input
+# off its close while receiving.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-retire-receiving-close.json"
+plan = "crates/zakura-sim/tests/fixtures/header-retire-receiving-close.plan"

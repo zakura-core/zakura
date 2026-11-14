@@ -1,41 +1,40 @@
 //! Fixed test vectors for codec.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::LazyLock;
 
+use crate::meta_addr::MetaAddr;
 use chrono::DateTime;
 use futures::prelude::*;
-use lazy_static::lazy_static;
 
 use super::*;
 
-lazy_static! {
-    static ref VERSION_TEST_VECTOR: Message = {
-        let services = PeerServices::NODE_NETWORK;
-        let timestamp = Utc
-            .timestamp_opt(1_568_000_000, 0)
-            .single()
-            .expect("in-range number of seconds and valid nanosecond");
+static VERSION_TEST_VECTOR: LazyLock<Message> = LazyLock::new(|| {
+    let services = PeerServices::NODE_NETWORK;
+    let timestamp = Utc
+        .timestamp_opt(1_568_000_000, 0)
+        .single()
+        .expect("in-range number of seconds and valid nanosecond");
 
-        VersionMessage {
-            version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+    VersionMessage {
+        version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        services,
+        timestamp,
+        address_recv: AddrInVersion::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
             services,
-            timestamp,
-            address_recv: AddrInVersion::new(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
-                services,
-            ),
-            address_from: AddrInVersion::new(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
-                services,
-            ),
-            nonce: Nonce(0x9082_4908_8927_9238),
-            user_agent: "Zebra".to_owned(),
-            start_height: block::Height(540_000),
-            relay: true,
-        }
-        .into()
-    };
-}
+        ),
+        address_from: AddrInVersion::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6)), 8233),
+            services,
+        ),
+        nonce: Nonce(0x9082_4908_8927_9238),
+        user_agent: "Zebra".to_owned(),
+        start_height: block::Height(540_000),
+        relay: true,
+    }
+    .into()
+});
 
 /// Check that the version test vector serializes and deserializes correctly
 #[test]
@@ -65,6 +64,37 @@ fn version_message_round_trip() {
     });
 
     assert_eq!(*v, v_parsed);
+}
+
+/// Pruned and v2 hints survive both version and address-gossip wire encodings.
+#[tokio::test]
+async fn pruned_services_round_trip_in_version_and_address_messages() {
+    use tokio_util::codec::{FramedRead, FramedWrite};
+    let services =
+        PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED | PeerServices::NODE_P2P_V2;
+    let Message::Version(mut version) = VERSION_TEST_VECTOR.clone() else {
+        unreachable!()
+    };
+    version.services = services;
+    version.address_from = AddrInVersion::new(version.address_from.addr(), services);
+    version.address_recv = AddrInVersion::new(version.address_recv.addr(), services);
+    let addr = MetaAddr::new_gossiped_meta_addr(
+        "192.0.2.1:8233".parse().unwrap(),
+        services,
+        version.timestamp.try_into().unwrap(),
+    );
+    for message in [Message::Version(version), Message::Addr(vec![addr])] {
+        let mut bytes = Vec::new();
+        let mut writer = FramedWrite::new(&mut bytes, Codec::builder().finish());
+        writer.send(message.clone()).await.unwrap();
+        drop(writer);
+        let decoded = FramedRead::new(Cursor::new(bytes), Codec::builder().finish())
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, message);
+    }
 }
 
 /// Check that version deserialization rejects out-of-range timestamps with
@@ -132,6 +162,8 @@ fn deserialize_version_with_time(time: i64) -> Result<Message, Error> {
     })
 }
 
+/// L.ignored: ignored Bloom commands pass their checksum and leave nothing behind. The
+/// decoder continues to the next message in the same turn, as the protocol rule requires.
 #[test]
 fn bloom_filter_messages_are_discarded_without_dropping_following_messages() {
     let mut codec = Codec::builder().finish();
@@ -666,7 +698,10 @@ fn block_conversion_panic_returns_parse_error() {
     let mut encoding_codec = Codec::builder().finish();
     encoding_codec.reconfigure_full_body_len();
     encoding_codec
-        .encode(Message::Block(block.into()), &mut block_frame)
+        .encode(
+            Message::Block(std::sync::Arc::new(block).into()),
+            &mut block_frame,
+        )
         .expect("test block should encode");
 
     zakura_test::MULTI_THREADED_RUNTIME.block_on(async move {
@@ -856,5 +891,203 @@ fn unknown_command_is_escaped_in_debug_log() {
     assert!(
         !log_output.contains("\nFORGED"),
         "raw newlines from the command must not reach the log output: {log_output:?}",
+    );
+}
+
+/// A warm-up ping encodes as `ping` with its padding after the nonce, decodes as a plain
+/// `Ping` because receivers ignore the trailing bytes, and fits the protocol message limit
+/// at its largest padding.
+#[test]
+fn warmup_ping_encodes_as_padded_ping() {
+    let _init_guard = zakura_test::init();
+    let mut codec = Codec::builder().finish();
+    codec.reconfigure_full_body_len();
+    let nonce = Nonce(0x0123_4567_89ab_cdef);
+
+    for padding in [0, 1, 16 * 1024, crate::constants::MAX_PING_PADDING] {
+        let mut bytes = BytesMut::new();
+        codec
+            .encode(Message::PaddedPing { nonce, padding }, &mut bytes)
+            .expect("a warm-up ping within the message limit encodes");
+
+        assert_eq!(&bytes[4..16], b"ping\0\0\0\0\0\0\0\0");
+        let body_len = 8 + usize::try_from(padding).expect("padding fits in usize");
+        assert_eq!(bytes.len(), HEADER_LEN + body_len);
+        assert!(bytes[HEADER_LEN + 8..].iter().all(|byte| *byte == 0));
+
+        assert_eq!(
+            codec.decode(&mut bytes).expect("a padded ping decodes"),
+            Some(Message::Ping(nonce)),
+        );
+        assert!(bytes.is_empty(), "the decoder consumes the padding");
+    }
+
+    let mut bytes = BytesMut::new();
+    codec
+        .encode(
+            Message::PaddedPing {
+                nonce,
+                padding: crate::constants::MAX_PING_PADDING + 1,
+            },
+            &mut bytes,
+        )
+        .expect_err("a warm-up ping over the message limit does not encode");
+}
+
+/// The message checksum matches the shared double SHA-256 checksum for empty, short and
+/// block-sized bodies, including lengths around SHA-256's 64-byte block boundary.
+#[test]
+fn message_checksum_matches_sha256d_checksum() {
+    let _init_guard = zakura_test::init();
+
+    let body: Vec<u8> = (0..2_100_000u32)
+        .map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[3])
+        .collect();
+
+    // Fixed lengths around the 64-byte block boundary, then lengths spread over the whole range
+    // up to a full block from a fixed pseudo-random sequence.
+    // The shift leaves 21 bits, so each length is below 2^21 and fits in `usize` and `body`.
+    let spread = (1..=64u64).map(|i| (i.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 43) as usize);
+    let fixed = [0, 1, 55, 56, 63, 64, 65, 119, 128, 1_000, 65_537, 2_100_000];
+
+    for len in fixed.into_iter().chain(spread) {
+        assert_eq!(
+            message_checksum(&body[..len]),
+            sha256d::Checksum::from(&body[..len]),
+            "checksums differ for a {len} byte body",
+        );
+    }
+
+    // The test vector from zakura-chain's sha256d checksum tests.
+    assert_eq!(
+        message_checksum(b"hello"),
+        sha256d::Checksum([0x95, 0x95, 0xc9, 0xdf]),
+    );
+}
+
+/// Encodes `block` as a `block` message, as a connection does after its handshake.
+fn encode_block(codec: &mut Codec, block: &std::sync::Arc<Block>) -> BytesMut {
+    let mut frame = BytesMut::new();
+    codec.reconfigure_full_body_len();
+    codec
+        .encode(Message::Block(block.clone().into()), &mut frame)
+        .expect("test block should encode");
+    frame
+}
+
+/// A block close to the maximum size, which is large enough to share its checksum.
+fn large_block() -> std::sync::Arc<Block> {
+    let block = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_TESTNET_141042_BYTES[..])
+        .expect("block test vector should deserialize");
+    std::sync::Arc::new(block)
+}
+
+/// A block sent through connections that share checksums is byte-for-byte the block a
+/// connection on its own sends, on the first send and on the ones that reuse its checksum.
+#[test]
+fn block_sent_with_shared_checksums_is_unchanged() {
+    let _init_guard = zakura_test::init();
+    let block = large_block();
+
+    let alone = encode_block(&mut Codec::builder().finish(), &block);
+
+    let shared = BlockChecksums::default();
+    let mut first = Codec::builder()
+        .with_block_checksums(shared.clone())
+        .finish();
+    let mut second = Codec::builder().with_block_checksums(shared).finish();
+
+    assert_eq!(encode_block(&mut first, &block), alone);
+    assert_eq!(encode_block(&mut second, &block), alone);
+    assert_eq!(encode_block(&mut first, &block), alone);
+}
+
+/// A large block whose checksum is already known is sent with that checksum, not hashed again.
+#[test]
+fn large_block_is_sent_with_its_remembered_checksum() {
+    let _init_guard = zakura_test::init();
+    let block = large_block();
+    let body_len = encode_block(&mut Codec::builder().finish(), &block).len() - HEADER_LEN;
+
+    // A value the body does not hash to, so it can only come from the shared checksums.
+    let remembered = sha256d::Checksum([0xAB; 4]);
+    let shared = BlockChecksums::default();
+    shared.insert(block.hash(), body_len, remembered);
+
+    let mut codec = Codec::builder().with_block_checksums(shared).finish();
+    let frame = encode_block(&mut codec, &block);
+
+    assert_eq!(frame[20..HEADER_LEN], remembered.0);
+}
+
+/// A checksum remembered for a body of another length is not used. The body is hashed, and
+/// later sends reuse that checksum.
+#[test]
+fn checksum_remembered_for_another_body_length_is_replaced() {
+    let _init_guard = zakura_test::init();
+    let block = large_block();
+    let alone = encode_block(&mut Codec::builder().finish(), &block);
+    let body_len = alone.len() - HEADER_LEN;
+
+    let shared = BlockChecksums::default();
+    shared.insert(block.hash(), body_len + 1, sha256d::Checksum([0xAB; 4]));
+
+    let mut codec = Codec::builder()
+        .with_block_checksums(shared.clone())
+        .finish();
+
+    assert_eq!(encode_block(&mut codec, &block), alone);
+    assert_eq!(
+        shared.get(block.hash(), body_len),
+        Some(sha256d::Checksum::from(&alone[HEADER_LEN..])),
+    );
+}
+
+/// A small block is always hashed, even when a checksum is remembered for it.
+#[test]
+fn small_block_checksum_is_always_hashed() {
+    let _init_guard = zakura_test::init();
+    let block = std::sync::Arc::new(
+        Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
+            .expect("block test vector should deserialize"),
+    );
+    let alone = encode_block(&mut Codec::builder().finish(), &block);
+    let body_len = alone.len() - HEADER_LEN;
+    assert!(body_len < MIN_SHARED_CHECKSUM_BODY_LEN);
+
+    let shared = BlockChecksums::default();
+    shared.insert(block.hash(), body_len, sha256d::Checksum([0xAB; 4]));
+
+    let mut codec = Codec::builder().with_block_checksums(shared).finish();
+
+    assert_eq!(encode_block(&mut codec, &block), alone);
+}
+
+/// When there is no room left, the block forgotten is the one sent least recently. A block
+/// that was sent again in the meantime is kept.
+#[test]
+fn block_checksums_forget_the_block_sent_least_recently() {
+    let _init_guard = zakura_test::init();
+    let hash = |index: usize| {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&index.to_le_bytes());
+        block::Hash(bytes)
+    };
+    let checksum = sha256d::Checksum([1; 4]);
+
+    let checksums = BlockChecksums::default();
+    for index in 0..SHARED_CHECKSUM_BLOCKS {
+        checksums.insert(hash(index), 100_000, checksum);
+    }
+
+    // Sending the oldest block again makes the second-oldest the next to be forgotten.
+    assert_eq!(checksums.get(hash(0), 100_000), Some(checksum));
+    checksums.insert(hash(SHARED_CHECKSUM_BLOCKS), 100_000, checksum);
+
+    assert_eq!(checksums.get(hash(0), 100_000), Some(checksum));
+    assert_eq!(checksums.get(hash(1), 100_000), None);
+    assert_eq!(
+        checksums.get(hash(SHARED_CHECKSUM_BLOCKS), 100_000),
+        Some(checksum)
     );
 }

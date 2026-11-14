@@ -29,31 +29,9 @@ For full stack documentation, see the [Observability README](../README.md).
 
 ## Datasources
 
-Grafana is provisioned with two datasources:
-
-| Datasource | UID | Description |
-|------------|-----|-------------|
-| Prometheus | `zakura-prometheus` | Metrics storage and queries |
-| Jaeger | `zebra-jaeger` | Distributed tracing |
+Grafana is provisioned with a Prometheus datasource (UID `zakura-prometheus`).
 
 Configuration: `provisioning/datasources/datasources.yml`
-
-### Using Jaeger in Grafana
-
-The Jaeger datasource allows you to:
-
-- Search traces by service name
-- View trace details and span timelines
-- Correlate traces with metrics (via trace IDs)
-
-To explore traces:
-
-1. Go to **Explore** in Grafana
-2. Select **Jaeger** datasource
-3. Search for service `zakura`
-
-Or access Jaeger UI directly at <http://localhost:16686> for full trace exploration.
-See the [Jaeger README](../jaeger/README.md) for detailed tracing documentation.
 
 ## Dashboard Configuration
 

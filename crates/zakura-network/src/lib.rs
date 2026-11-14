@@ -130,6 +130,12 @@
 // Long Tower service and future types are routine in this crate, and factoring
 // them into type aliases would not make the code clearer.
 #![allow(clippy::type_complexity)]
+// Most unit tests and the testkit's test stack name tokio's types, so they
+// don't build under `zakura_sim`. The helpers they share go unused there.
+#![cfg_attr(
+    all(zakura_sim, any(test, feature = "zakura-testkit")),
+    allow(dead_code, unused_imports)
+)]
 
 #[macro_use]
 extern crate pin_project;
@@ -159,6 +165,7 @@ pub mod constants;
 
 mod address_book;
 mod address_book_updater;
+mod inbound_resources;
 #[cfg(any(test, feature = "proptest-impl"))]
 mod isolated;
 mod meta_addr;
@@ -166,31 +173,30 @@ mod peer;
 mod peer_cache_updater;
 mod peer_registry;
 mod peer_set;
-mod policies;
 mod protocol;
 pub mod zakura;
 
-#[allow(unused)]
-pub(crate) use peer_set::PeerSet;
-
 #[cfg(any(test, feature = "proptest-impl"))]
-pub use crate::{isolated::connect_isolated_with_inbound, protocol::external::canonical_peer_addr};
+pub use crate::{
+    isolated::connect_isolated_with_inbound,
+    peer_set::{init, init_with_zakura_header_sync},
+    protocol::external::canonical_peer_addr,
+};
 
 pub use crate::{
     address_book::{AddressBook, BannedIps},
     address_book_peers::AddressBookPeers,
-    config::{CacheDir, Config, P2pStack},
+    config::{CacheDir, Config, P2pStack, UnconditionalPeers},
     meta_addr::{PeerAddrState, PeerSocketAddr},
     peer::{
         Client, ConnectedAddr, ConnectionInfo, HandshakeError, NotFoundClass, PeerError,
         SharedPeerError,
     },
     peer_registry::ConnectedPeer,
-    peer_set::{init, init_with_zakura, init_with_zakura_header_sync},
-    policies::RetryLimit,
+    peer_set::init_with_zakura,
     protocol::{
         external::{Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE},
-        internal::{InventoryResponse, PeerSource, Request, Response},
+        internal::{AdvertisedBlock, InventoryResponse, PeerSource, Request, Response},
     },
 };
 

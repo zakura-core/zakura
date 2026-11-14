@@ -28,8 +28,12 @@ use std::sync::mpsc;
 use tempfile::TempDir;
 use zakura_chain::parameters::Network;
 use zakura_state::{PruningConfig, StorageMode};
-use zakura_test::command::{CommandExt, TestChild};
+use zakura_test::command::{check_failure_regexes, CommandExt, TestChild};
 use zakurad::config::ZakuradConfig;
+
+#[allow(dead_code)]
+#[path = "common/failure_messages.rs"]
+mod failure_messages;
 
 /// How long a node may take to log a startup milestone or exit.
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
@@ -809,6 +813,42 @@ fn occupied_p2p_listener_exits_with_failure() {
     run.assert_status(101)
         .assert_stdout_contains("Starting zakurad")
         .assert_stdout_lacks(STOPPED);
+
+    let panic_header = run
+        .stderr
+        .lines()
+        .find(|line| line.contains("panicked at"))
+        .expect("the default panic hook prints a panic header");
+    let assert_panic_detected = |patterns: &[&str]| {
+        let failures = regex::RegexSet::new(patterns).expect("failure patterns are valid regexes");
+        let ignores = regex::RegexSet::empty();
+        assert!(
+            check_failure_regexes(
+                Ok(panic_header.to_owned()),
+                &failures,
+                &ignores,
+                "zakurad",
+                false,
+            )
+            .is_err(),
+            "acceptance tests must detect the node's panic output: {}",
+            run.stderr,
+        );
+        assert!(
+            check_failure_regexes(
+                Ok("Starting zakurad".to_owned()),
+                &failures,
+                &ignores,
+                "zakurad",
+                false,
+            )
+            .is_ok(),
+            "normal startup output must not be treated as a panic",
+        );
+    };
+    assert_panic_detected(failure_messages::ZAKURA_FAILURE_MESSAGES);
+    #[cfg(feature = "zakura-checkpoints")]
+    assert_panic_detected(failure_messages::ZAKURA_CHECKPOINTS_FAILURE_MESSAGES);
 }
 
 /// A panic during startup, after logging has started, reports the panic and still writes
@@ -892,36 +932,6 @@ fn log_file_is_flushed_on_shutdown() {
         last_line.contains(STOPPED),
         "the last logged line is {last_line:?}, not {STOPPED:?}"
     );
-}
-
-/// A configured OpenTelemetry exporter with no collector doesn't stop the node from
-/// shutting down cleanly, and its endpoint is not logged.
-#[cfg(all(unix, feature = "opentelemetry"))]
-#[test]
-fn opentelemetry_exporter_shuts_down_with_the_node() {
-    let scratch = Scratch::new();
-    let (listener, addr) = occupied_port();
-    // Leave nothing listening on the collector port.
-    drop(listener);
-    let endpoint = format!("http://user:{SYNTHETIC_CREDENTIAL}@{addr}");
-    let config = scratch.write_config("zakura.toml", &{
-        let mut config = scratch.regtest_config();
-        config.tracing.opentelemetry_endpoint = Some(endpoint);
-        config
-    });
-
-    let mut node = scratch.spawn(&mut scratch.command([
-        OsStr::new("-c"),
-        config.as_os_str(),
-        OsStr::new("start"),
-    ]));
-    node.wait_for_stdout(STARTED);
-    node.signal("TERM");
-    let run = node.wait();
-
-    run.assert_stopped_cleanly()
-        .assert_stdout_contains("installed OpenTelemetry tracing layer")
-        .assert_no_output_contains(SYNTHETIC_CREDENTIAL);
 }
 
 // Utility commands
@@ -1091,20 +1101,22 @@ fn generate_reports_file_creation_failure() {
 fn failing_utility_command_exits_with_failure() {
     let scratch = Scratch::new();
     let config = scratch.write_config("zakura.toml", &scratch.regtest_config());
-    let missing = scratch.path().join("missing-subtrees.bin");
+    let missing = scratch.path().join("missing-state");
 
     let run = scratch.run(&mut scratch.command([
         OsStr::new("-c"),
         config.as_os_str(),
-        OsStr::new("verify-historical-treestates"),
+        OsStr::new("rollback-state"),
+        OsStr::new("--height"),
+        OsStr::new("5"),
         OsStr::new("--network"),
-        OsStr::new("Mainnet"),
-        OsStr::new("--subtree-input"),
+        OsStr::new("Testnet"),
+        OsStr::new("--cache-dir"),
         missing.as_os_str(),
     ]));
 
     run.assert_status(1)
-        .assert_stdout_contains("Subtree-root artifact verification failed")
+        .assert_stdout_contains("Failed to roll back finalized state")
         .assert_stdout_lacks("Starting zakurad");
 }
 
@@ -1125,15 +1137,20 @@ fn help_and_version_are_printed() {
     let scratch = Scratch::new();
 
     let mut help_args = vec![vec!["--help"], vec!["help"]];
-    for subcommand in [
-        "audit-historical-treestates",
+    let mut subcommands = vec![
         "generate",
         "prune-state",
         "rollback-state",
         "start",
         "tip-height",
-        "verify-historical-treestates",
-    ] {
+    ];
+    if cfg!(feature = "debug-commands") {
+        subcommands.extend([
+            "audit-historical-treestates",
+            "verify-historical-treestates",
+        ]);
+    }
+    for subcommand in subcommands {
         help_args.push(vec![subcommand, "--help"]);
     }
 
@@ -1164,14 +1181,33 @@ fn missing_arguments_use_parser_exit_status() {
         (&["-c"][..], "a value is required for '--config <CONFIG>'"),
         (&["rollback-state"][..], "--height <HEIGHT>"),
         (&["prune-state"][..], "--tx-retention <TX_RETENTION>"),
-        (
-            &["verify-historical-treestates"][..],
-            "--subtree-input <SUBTREE_INPUT>",
-        ),
     ] {
         let run = scratch.run(&mut scratch.command(args));
 
         run.assert_status(2).assert_stderr_contains(expected);
         assert_eq!(run.stdout, "", "parse errors write nothing to stdout");
+    }
+
+    #[cfg(feature = "debug-commands")]
+    scratch
+        .run(&mut scratch.command(["verify-historical-treestates"]))
+        .assert_status(2)
+        .assert_stderr_contains("--subtree-input <SUBTREE_INPUT>");
+}
+
+/// Builds without `debug-commands` reject its subcommands as unknown.
+#[cfg(not(feature = "debug-commands"))]
+#[test]
+fn debug_commands_need_their_feature() {
+    let scratch = Scratch::new();
+
+    for subcommand in [
+        "audit-historical-treestates",
+        "verify-historical-treestates",
+    ] {
+        scratch
+            .run(&mut scratch.command([subcommand]))
+            .assert_status(2)
+            .assert_stderr_contains("unrecognized subcommand");
     }
 }

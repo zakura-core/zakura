@@ -243,7 +243,6 @@ pub struct PreparedHeaderBatch {
 }
 
 impl PreparedHeaderBatch {
-    #[allow(dead_code)] // Called by the public preparation pipeline introduced in PR-11.
     pub(crate) fn new(
         headers: Vec<PreparedHeader>,
         parent: Frontier,

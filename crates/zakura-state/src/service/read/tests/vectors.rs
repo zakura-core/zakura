@@ -1,6 +1,7 @@
 //! Fixed test vectors for the ReadStateService.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
+use zakura_node_services::block_memory::TransactionHandle;
 
 use tower::ServiceExt;
 use zakura_chain::{
@@ -8,7 +9,7 @@ use zakura_chain::{
     block::{Block, Height},
     ironwood, orchard,
     parameters::{Network, Network::*},
-    serialization::ZcashDeserializeInto,
+    serialization::{ZcashDeserializeInto, ZcashSerialize},
     subtree::{
         NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex,
         TRACKED_SUBTREE_HEIGHT,
@@ -59,8 +60,12 @@ async fn empty_read_state_still_responds_to_requests() -> Result<()> {
     let transcript = Transcript::from(empty_state_test_cases());
 
     let network = Mainnet;
-    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
-        init_test_services(&network).await;
+    // Keep the writer alive while exercising the read-only service.
+    let crate::InitializedState {
+        state: _state,
+        read_state,
+        ..
+    } = init_test_services(&network).await;
 
     transcript.check(read_state).await?;
 
@@ -86,20 +91,49 @@ async fn populated_read_state_responds_correctly() -> Result<()> {
     let empty_cases = Transcript::from(empty_state_test_cases());
     empty_cases.check(read_state.clone()).await?;
 
+    // Every indexed transaction is mined, and an unknown ID is not.
+    // Spec: transactions in the genesis block are ignored.
+    let mined: HashSet<transaction::Hash> = blocks
+        .iter()
+        .skip(1)
+        .flat_map(|block| block.transactions.iter().map(|tx| tx.hash()))
+        .collect();
+    let mut requested = mined.clone();
+    requested.insert(transaction::Hash([0xff; 32]));
+    let transcript = Transcript::from(vec![(
+        ReadRequest::MinedTransactionIds(requested),
+        Ok(ReadResponse::MinedTransactionIds(mined)),
+    )]);
+    transcript.check(read_state.clone()).await?;
+
     for block in blocks {
         let block_cases = vec![
             (
                 ReadRequest::Block(block.hash().into()),
-                Ok(ReadResponse::Block(Some(block.clone()))),
+                Ok(ReadResponse::Block(Some(block.clone().into()))),
             ),
             (
                 ReadRequest::Block(block.coinbase_height().unwrap().into()),
-                Ok(ReadResponse::Block(Some(block.clone()))),
+                Ok(ReadResponse::Block(Some(block.clone().into()))),
             ),
         ];
 
         let block_cases = Transcript::from(block_cases);
         block_cases.check(read_state.clone()).await?;
+
+        // The raw read returns exactly the block's consensus serialization.
+        let serialized = block.zcash_serialize_to_vec()?;
+        for hash_or_height in [block.hash().into(), block.coinbase_height().unwrap().into()] {
+            match read_state
+                .clone()
+                .oneshot(ReadRequest::RawBlock(hash_or_height))
+                .await
+                .expect("raw block read succeeds")
+            {
+                ReadResponse::RawBlock(Some(raw)) => assert_eq!(*raw, serialized),
+                response => panic!("unexpected raw block response: {response:?}"),
+            }
+        }
 
         // Spec: transactions in the genesis block are ignored.
         if block.coinbase_height().unwrap().0 == 0 {
@@ -107,10 +141,24 @@ async fn populated_read_state_responds_correctly() -> Result<()> {
         }
 
         for transaction in &block.transactions {
+            match read_state
+                .clone()
+                .oneshot(ReadRequest::AnyChainRawTransaction(transaction.hash()))
+                .await
+                .expect("raw transaction read succeeds")
+            {
+                ReadResponse::RawTransaction(Some(raw)) => {
+                    assert_eq!(*raw, transaction.zcash_serialize_to_vec()?)
+                }
+                response => panic!("unexpected raw transaction response: {response:?}"),
+            }
+        }
+
+        for transaction in &block.transactions {
             let transaction_cases = vec![(
                 ReadRequest::Transaction(transaction.hash()),
                 Ok(ReadResponse::Transaction(Some(MinedTx {
-                    tx: transaction.clone(),
+                    tx: TransactionHandle::Shared(transaction.clone()),
                     height: block.coinbase_height().unwrap(),
                     confirmations: 1 + tip_height.0 - block.coinbase_height().unwrap().0,
                     block_time: block.header.time,
@@ -454,6 +502,18 @@ fn empty_state_test_cases() -> Vec<(ReadRequest, Result<ReadResponse, ExpectedTr
             ReadRequest::Block(block.coinbase_height().unwrap().into()),
             Ok(ReadResponse::Block(None)),
         ),
+        (
+            ReadRequest::RawBlock(block.hash().into()),
+            Ok(ReadResponse::RawBlock(None)),
+        ),
+        (
+            ReadRequest::RawBlock(block.coinbase_height().unwrap().into()),
+            Ok(ReadResponse::RawBlock(None)),
+        ),
+        (
+            ReadRequest::AnyChainRawTransaction(transaction::Hash([0; 32])),
+            Ok(ReadResponse::RawTransaction(None)),
+        ),
     ]
 }
 
@@ -688,7 +748,8 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         non_finalized_state.chain_iter(),
         &finalized_state.db,
         side_hash.into(),
-    );
+    )
+    .unwrap();
     assert!(
         found.is_some(),
         "any_block should find side chain block by hash"
@@ -700,7 +761,8 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         non_finalized_state.best_chain(),
         &finalized_state.db,
         side_hash.into(),
-    );
+    )
+    .unwrap();
     assert!(
         found.is_none(),
         "block should NOT find side chain block by hash"
@@ -711,7 +773,8 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         non_finalized_state.chain_iter(),
         &finalized_state.db,
         best_hash.into(),
-    );
+    )
+    .unwrap();
     assert!(
         found.is_some(),
         "any_block should find best chain block by hash"
@@ -723,12 +786,92 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         non_finalized_state.best_chain(),
         &finalized_state.db,
         best_hash.into(),
-    );
+    )
+    .unwrap();
     assert!(
         found.is_some(),
         "block should find best chain block by hash"
     );
     assert_eq!(found.unwrap().hash(), best_hash);
+
+    // Mined transaction IDs come from the best chain's index only.
+    use crate::service::read::block::mined_transaction_ids;
+
+    let best_txid = best_chain_block.transactions[0].hash();
+    let unknown_txid = transaction::Hash([0xff; 32]);
+    let mined = mined_transaction_ids(
+        non_finalized_state.best_chain(),
+        &finalized_state.db,
+        &[best_txid, unknown_txid].into(),
+    );
+    assert_eq!(mined, [best_txid].into());
+
+    let side_only: HashSet<_> = side_chain_block
+        .transactions
+        .iter()
+        .map(|tx| tx.hash())
+        .filter(|hash| {
+            !non_finalized_state
+                .best_chain()
+                .unwrap()
+                .contains_transaction(hash)
+        })
+        .collect();
+    assert!(
+        mined_transaction_ids(
+            non_finalized_state.best_chain(),
+            &finalized_state.db,
+            &side_only,
+        )
+        .is_empty(),
+        "side chain transactions are not mined in the best chain"
+    );
+
+    // Raw reads serialize non-finalized blocks and transactions from memory.
+    use crate::service::read::block::{any_raw_transaction, raw_block};
+
+    let raw = raw_block(
+        non_finalized_state.best_chain(),
+        &finalized_state.db,
+        best_hash.into(),
+    )?
+    .expect("raw_block should find the best chain block by hash");
+    assert_eq!(*raw, best_chain_block.zcash_serialize_to_vec()?);
+
+    assert!(
+        raw_block(
+            non_finalized_state.best_chain(),
+            &finalized_state.db,
+            side_hash.into(),
+        )?
+        .is_none(),
+        "raw_block should NOT find the side chain block by hash"
+    );
+
+    // `any_transaction` returns each in-memory transaction with its bytes.
+    let (any_tx, raw) = crate::service::read::block::any_transaction(
+        non_finalized_state.chain_iter(),
+        &finalized_state.db,
+        best_chain_block.transactions[0].hash(),
+    )?
+    .expect("any_transaction should find the best chain transaction");
+    let tx: TransactionHandle = any_tx.into();
+    assert_eq!(*tx, *best_chain_block.transactions[0]);
+    assert_eq!(
+        *raw,
+        best_chain_block.transactions[0].zcash_serialize_to_vec()?
+    );
+
+    for block in [&best_chain_block, &side_chain_block] {
+        let transaction = &block.transactions[0];
+        let raw = any_raw_transaction(
+            non_finalized_state.chain_iter(),
+            &finalized_state.db,
+            transaction.hash(),
+        )?
+        .expect("any_raw_transaction should find transactions in every chain");
+        assert_eq!(*raw, transaction.zcash_serialize_to_vec()?);
+    }
 
     Ok(())
 }
@@ -1464,8 +1607,12 @@ fn newer_artifact_fills_only_the_skipped_band() {
 #[tokio::test]
 async fn historical_subtrees_accept_a_newer_artifact_for_an_older_fast_sync_marker() {
     let _init_guard = zakura_test::init();
-    let (_state, mut read_state, _latest_chain_tip, _chain_tip_change) =
-        init_test_services(&Network::new_default_testnet()).await;
+    // Keep the writer alive while exercising the read-only service.
+    let crate::InitializedState {
+        state: _state,
+        mut read_state,
+        ..
+    } = init_test_services(&Network::new_default_testnet()).await;
     let artifact_checkpoint = Height(10);
 
     read_state.historical_subtrees = Some(Arc::new(SubtreeArtifact {

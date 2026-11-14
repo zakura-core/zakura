@@ -1,6 +1,6 @@
 //! Compatibility checks for the legacy bitflags Serde representation.
 
-use crate::orchard::Flags;
+use crate::{orchard::Flags, serialization::bincode_format};
 
 #[test]
 fn serde_flags_preserve_all_bits_and_the_legacy_format() {
@@ -9,7 +9,7 @@ fn serde_flags_preserve_all_bits_and_the_legacy_format() {
         let json = format!(r#"{{"bits":{bits}}}"#);
         assert_eq!(serde_json::to_string(&flags).unwrap(), json);
         assert_eq!(serde_json::from_str::<Flags>(&json).unwrap().bits(), bits);
-        assert_eq!(bincode::serialize(&flags).unwrap(), [bits]);
+        assert_eq!(bincode_format::serialize(&flags).unwrap(), [bits]);
     }
 }
 
@@ -29,5 +29,5 @@ fn serde_flags_reject_missing_duplicate_unknown_and_invalid_fields() {
 
     // The old adapter accepts maps only when deserializing, even in binary
     // formats; retaining that behavior avoids broadening the accepted input.
-    assert!(bincode::deserialize::<Flags>(&[1]).is_err());
+    assert!(bincode_format::deserialize::<Flags>(&[1]).is_err());
 }

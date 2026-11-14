@@ -16,6 +16,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     io,
+    sync::LazyLock,
 };
 
 use halo2::pasta::{group::ff::PrimeField, pallas};
@@ -24,7 +25,6 @@ use incrementalmerkletree::{
     frontier::{Frontier, NonEmptyFrontier},
     Hashable,
 };
-use lazy_static::lazy_static;
 use thiserror::Error;
 use zcash_primitives::merkle_tree::HashSer;
 
@@ -68,23 +68,23 @@ const SINSEMILLA_WORD_MASK: u16 = (1 << K) - 1;
 const CHILD_REMAINDER_MASK: u8 = (1 << MERKLE_CRH_CHILD_REMAINDER_BITS) - 1;
 const BYTE_BITS: usize = u8::BITS as usize;
 
-lazy_static! {
-    /// The position-weighted Sinsemilla evaluator for `MerkleCRH^Orchard`,
-    /// specialized to the fixed 52-word `l || left || right` message layout.
-    ///
-    /// Built once from the `"z.cash:Orchard-MerkleCRH"` [`HashDomain`]. Its
-    /// precomputed per-position generator table (a few MiB on the heap, see
-    /// [`UncheckedFixedLengthHashDomain::table_bytes`]) replaces the
-    /// doubling recurrence with table lookups and point additions, and omits
-    /// Sinsemilla's incomplete-addition exceptional-case checks. Omitting
-    /// them is sound because an input on which this evaluator differs from
-    /// [`HashDomain`] would exhibit a nontrivial discrete-log relation
-    /// between the independently generated Sinsemilla bases — the same
-    /// hardness assumption Orchard already rests on. See the security
-    /// argument in [`sinsemilla::weighted`].
-    static ref ORCHARD_MERKLE_CRH_DOMAIN: UncheckedFixedLengthHashDomain<MERKLE_CRH_WORDS> =
-        UncheckedFixedLengthHashDomain::new(&HashDomain::new("z.cash:Orchard-MerkleCRH"));
-}
+/// The position-weighted Sinsemilla evaluator for `MerkleCRH^Orchard`,
+/// specialized to the fixed 52-word `l || left || right` message layout.
+///
+/// Built once from the `"z.cash:Orchard-MerkleCRH"` [`HashDomain`]. Its
+/// precomputed per-position generator table (a few MiB on the heap, see
+/// [`UncheckedFixedLengthHashDomain::table_bytes`]) replaces the
+/// doubling recurrence with table lookups and point additions, and omits
+/// Sinsemilla's incomplete-addition exceptional-case checks. Omitting
+/// them is sound because an input on which this evaluator differs from
+/// [`HashDomain`] would exhibit a nontrivial discrete-log relation
+/// between the independently generated Sinsemilla bases — the same
+/// hardness assumption Orchard already rests on. See the security
+/// argument in [`sinsemilla::weighted`].
+static ORCHARD_MERKLE_CRH_DOMAIN: LazyLock<UncheckedFixedLengthHashDomain<MERKLE_CRH_WORDS>> =
+    LazyLock::new(|| {
+        UncheckedFixedLengthHashDomain::new(&HashDomain::new("z.cash:Orchard-MerkleCRH"))
+    });
 
 /// MerkleCRH^Orchard Hash Function
 ///
@@ -155,30 +155,26 @@ fn merkle_crh_words(layer: u8, left: pallas::Base, right: pallas::Base) -> [u16;
     words
 }
 
-lazy_static! {
-    /// List of "empty" Orchard note commitment nodes, one for each layer.
-    ///
-    /// The list is indexed by the layer number (0: root; MERKLE_DEPTH: leaf).
-    ///
-    /// <https://zips.z.cash/protocol/protocol.pdf#constants>
-    pub(super) static ref EMPTY_ROOTS: Vec<pallas::Base> = {
-        // The empty leaf node. This is layer 32.
-        let mut v = vec![NoteCommitmentTree::uncommitted()];
+/// List of "empty" Orchard note commitment nodes, one for each layer.
+///
+/// The list is indexed by the layer number (0: root; MERKLE_DEPTH: leaf).
+///
+/// <https://zips.z.cash/protocol/protocol.pdf#constants>
+pub(super) static EMPTY_ROOTS: LazyLock<Vec<pallas::Base>> = LazyLock::new(|| {
+    // The empty leaf node. This is layer 32.
+    let mut v = vec![NoteCommitmentTree::uncommitted()];
 
-        // Starting with layer 31 (the first internal layer, after the leaves),
-        // generate the empty roots up to layer 0, the root.
-        for layer in (0..MERKLE_DEPTH).rev()
-        {
-            // The vector is generated from the end, pushing new nodes to its beginning.
-            // For this reason, the layer below is v[0].
-            let next = merkle_crh_orchard(layer, v[0], v[0]);
-            v.insert(0, next);
-        }
+    // Starting with layer 31 (the first internal layer, after the leaves),
+    // generate the empty roots up to layer 0, the root.
+    for layer in (0..MERKLE_DEPTH).rev() {
+        // The vector is generated from the end, pushing new nodes to its beginning.
+        // For this reason, the layer below is v[0].
+        let next = merkle_crh_orchard(layer, v[0], v[0]);
+        v.insert(0, next);
+    }
 
-        v
-
-    };
-}
+    v
+});
 
 /// Orchard note commitment tree root node hash.
 ///
@@ -247,7 +243,7 @@ impl TryFrom<[u8; 32]> for Root {
 }
 
 impl ZcashSerialize for Root {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&<[u8; 32]>::from(*self)[..])?;
 
         Ok(())
@@ -873,7 +869,6 @@ impl From<Vec<pallas::Base>> for NoteCommitmentTree {
 
 #[cfg(test)]
 mod tests {
-    use bitvec::prelude::*;
     use incrementalmerkletree::{frontier::Frontier, Position};
 
     use super::*;
@@ -940,12 +935,19 @@ mod tests {
         left: pallas::Base,
         right: pallas::Base,
     ) -> pallas::Base {
-        let mut s = bitvec![u8, Lsb0;];
+        // The bits of `bytes`, starting with the least-significant bit of `bytes[0]`.
+        fn le_bits(bytes: &[u8]) -> impl Iterator<Item = bool> + '_ {
+            bytes
+                .iter()
+                .flat_map(|byte| (0..8).map(move |i| (byte >> i) & 1 == 1))
+        }
 
         let l = MERKLE_DEPTH - 1 - layer;
-        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from([l, 0])[0..10]);
-        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(left.to_repr())[0..255]);
-        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(right.to_repr())[0..255]);
+        let s: Vec<bool> = le_bits(&[l, 0])
+            .take(10)
+            .chain(le_bits(&left.to_repr()).take(255))
+            .chain(le_bits(&right.to_repr()).take(255))
+            .collect();
 
         match crate::orchard::sinsemilla::sinsemilla_hash(b"z.cash:Orchard-MerkleCRH", &s) {
             Some(h) => h,

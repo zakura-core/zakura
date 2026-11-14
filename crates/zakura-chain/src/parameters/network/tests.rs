@@ -5,7 +5,7 @@ mod vectors;
 mod zip218_funding_streams;
 mod zip218_rounding;
 
-use color_eyre::Report;
+use eyre::Report;
 
 use super::Network;
 use crate::{
@@ -136,9 +136,10 @@ fn regtest_first_halving_follows_the_target_spacing() {
 #[test]
 fn halving_test() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
-    // Exercise the historical two-era schedule; NU7 is covered separately.
+    // Exercise the historical two-era schedule, using the Mainnet heights without
+    // the scheduled NU7; the ZIP 218 halvings after NU7 are covered separately.
     for network in [
-        Network::Mainnet,
+        zip218_funding_streams::mainnet_with_nu7(None),
         testnet_with_nu7(None)
             .to_network()
             .expect("the historical Testnet schedule is valid"),
@@ -269,9 +270,10 @@ fn halving_for_network(network: &Network) -> Result<(), Report> {
 fn block_subsidy_test() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
-    // Exercise the historical two-era schedule; NU7 is covered separately.
+    // Exercise the historical two-era schedule, using the Mainnet heights without
+    // the scheduled NU7; the ZIP 218 subsidy after NU7 is covered separately.
     for network in [
-        Network::Mainnet,
+        zip218_funding_streams::mainnet_with_nu7(None),
         testnet_with_nu7(None)
             .to_network()
             .expect("the historical Testnet schedule is valid"),
@@ -764,7 +766,7 @@ fn nsm_reissuance_requires_nu7_and_a_crossing() {
         ..Default::default()
     });
 
-    for network in [Network::Mainnet, configured, regtest] {
+    for network in [configured, regtest] {
         assert_eq!(nsm_reissuance_height(&network), None, "{network:?}");
         assert!(!is_zip234_active(&network, Height::MAX), "{network:?}");
     }
@@ -815,7 +817,7 @@ fn default_testnet_nsm_reissuance_boundary() {
             i64::try_from(reserve).expect("the reference reserve fits the amount range"),
         )
         .expect("the reference reserve is non-negative");
-        let bonus = reissuance_bonus(reserve).expect("the reference bonus is valid");
+        let bonus = reissuance_bonus(reserve, &network).expect("the reference bonus is valid");
         let scheduled = halving_block_subsidy(height, &network).expect("valid subsidy");
         assert_eq!(bonus < scheduled, is_crossing);
     }
@@ -971,15 +973,32 @@ fn nsm_crossing_includes_only_the_permitted_run() {
         (threshold + 2 * subsidy + 1, None),
     ] {
         assert_eq!(
-            first_nsm_crossing_in_subsidy_run(10, 12, 0, subsidy, reserve),
+            first_nsm_crossing_in_subsidy_run(
+                10,
+                12,
+                0,
+                subsidy,
+                reserve,
+                BLOCK_SUBSIDY_FRACTION_NUMERATOR
+            ),
             Ok(expected)
         );
     }
     assert_eq!(
-        first_nsm_crossing_in_subsidy_run(10, 9, 0, subsidy, threshold),
+        first_nsm_crossing_in_subsidy_run(
+            10,
+            9,
+            0,
+            subsidy,
+            threshold,
+            BLOCK_SUBSIDY_FRACTION_NUMERATOR
+        ),
         Ok(None)
     );
-    assert_eq!(first_nsm_crossing_in_subsidy_run(10, 12, 0, 0, 0), Ok(None));
+    assert_eq!(
+        first_nsm_crossing_in_subsidy_run(10, 12, 0, 0, 0, BLOCK_SUBSIDY_FRACTION_NUMERATOR),
+        Ok(None)
+    );
 }
 
 proptest::proptest! {
@@ -1090,52 +1109,35 @@ fn nsm_reissuance_crossing_uses_the_post_nu7_schedule() {
     }
 }
 
-/// The proposed Mainnet schedule places the direct crossing in February 2031.
+/// The ZIP 259 Mainnet schedule places the direct crossing in February 2031.
 ///
-/// The NU7 height and timestamp are the estimates from the 2026-09-17 NU7 timeline,
-/// not consensus constants. This test checks the calendar interpretation of the
-/// spacing-aware equation without activating reissuance.
+/// The NU7 activation height is the ZIP 259 consensus constant; the activation
+/// timestamp is still the estimate from the 2026-09-17 NU7 timeline. This test
+/// checks the calendar interpretation of the spacing-aware equation.
 #[test]
-fn estimated_mainnet_nsm_crossing_lands_in_february_2031() {
+fn mainnet_nsm_crossing_estimated_for_february_2031() {
     use chrono::{Datelike, Duration, TimeZone, Utc};
 
     use crate::parameters::{
         constants::activation_heights::mainnet, subsidy::nsm_reissuance_crossing_height,
     };
 
-    const ESTIMATED_NU7_HEIGHT: u32 = 3_543_000;
-
     let _init_guard = zakura_test::init();
-    let network = testnet::Parameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(mainnet::BEFORE_OVERWINTER.0),
-            overwinter: Some(mainnet::OVERWINTER.0),
-            sapling: Some(mainnet::SAPLING.0),
-            blossom: Some(mainnet::BLOSSOM.0),
-            heartwood: Some(mainnet::HEARTWOOD.0),
-            canopy: Some(mainnet::CANOPY.0),
-            nu5: Some(mainnet::NU5.0),
-            nu6: Some(mainnet::NU6.0),
-            nu6_1: Some(mainnet::NU6_1.0),
-            nu6_2: Some(mainnet::NU6_2.0),
-            nu6_3: Some(mainnet::NU6_3.0),
-            nu7: Some(ESTIMATED_NU7_HEIGHT),
-        })
-        .expect("the estimated Mainnet activation schedule is ordered")
-        .clear_funding_streams()
-        .to_network()
-        .expect("the Mainnet subsidy schedule is valid");
+    let network = Network::Mainnet;
+    let nu7_height = NetworkUpgrade::Nu7
+        .activation_height(&network)
+        .expect("ZIP 259 schedules NU7 on Mainnet");
 
     assert_eq!(
         height_for_halving(2, &network),
         Some(mainnet::NU6),
-        "the configured network reproduces Mainnet's second halving"
+        "NU7 leaves Mainnet's second halving in place"
     );
 
     let crossing = nsm_reissuance_crossing_height(&network)
         .expect("crossing arithmetic is valid")
-        .expect("the estimated Mainnet schedule has a crossing");
-    assert_eq!(crossing, Height(8_940_474));
+        .expect("the Mainnet schedule has a crossing");
+    assert_eq!(crossing, Height(8_939_664));
     assert_eq!(
         crate::parameters::subsidy::nsm_reissuance_height(&network),
         Some(crossing)
@@ -1145,7 +1147,7 @@ fn estimated_mainnet_nsm_crossing_lands_in_february_2031() {
         .with_ymd_and_hms(2026, 11, 5, 12, 0, 0)
         .single()
         .expect("the estimated NU7 timestamp is valid");
-    let post_nu7_blocks = i64::from(crossing.0 - ESTIMATED_NU7_HEIGHT);
+    let post_nu7_blocks = i64::from(crossing.0 - nu7_height.0);
     let crossing_time = estimated_nu7_time
         + Duration::seconds(post_nu7_blocks * NetworkUpgrade::Nu7.target_spacing().num_seconds());
 
@@ -1201,12 +1203,6 @@ fn nsm_reissuance_crossing_can_be_absent() {
     use crate::parameters::subsidy::nsm_reissuance_crossing_height;
 
     let _init_guard = zakura_test::init();
-    assert_eq!(
-        nsm_reissuance_crossing_height(&Network::Mainnet).expect("valid arithmetic"),
-        None,
-        "Mainnet has no NU7 height yet"
-    );
-
     let regtest = Network::new_regtest(
         ConfiguredActivationHeights {
             nu7: Some(1),
@@ -1230,20 +1226,20 @@ proptest::proptest! {
         supply_before_first in 0u128..1_000_000,
         subsidy in 1u128..1_000_000,
         excess_reserve in 0u128..100_000_000,
+        numerator in 1u128..=1_155_280_000,
     ) {
         use crate::parameters::subsidy::{
             first_nsm_crossing_in_subsidy_run, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
-            BLOCK_SUBSIDY_FRACTION_NUMERATOR,
         };
 
         let run_end = first + run_length;
         let threshold = (subsidy - 1) * BLOCK_SUBSIDY_FRACTION_DENOMINATOR
-            / BLOCK_SUBSIDY_FRACTION_NUMERATOR;
+            / numerator;
         let max_money = supply_before_first + threshold + excess_reserve;
         let expected = (first..=run_end).find(|height| {
             let issued_in_run = u128::from(*height - first) * subsidy;
             let reserve = max_money.saturating_sub(supply_before_first + issued_in_run);
-            let reference_subsidy = (reserve * BLOCK_SUBSIDY_FRACTION_NUMERATOR)
+            let reference_subsidy = (reserve * numerator)
                 .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
 
             reference_subsidy < subsidy
@@ -1254,6 +1250,7 @@ proptest::proptest! {
             supply_before_first,
             subsidy,
             max_money,
+            numerator,
         )
         .expect("generated arithmetic fits");
 
@@ -1338,8 +1335,9 @@ fn block_subsidy_fraction_halves_the_balance_over_one_interval() {
     let mut remaining =
         Amount::<NonNegative>::try_from(initial).expect("100 ZEC is a valid amount");
     for _ in 0..5_040_000 {
-        remaining = (remaining - reissuance_bonus(remaining).expect("valid bonus"))
-            .expect("the bonus never exceeds the remaining balance");
+        remaining = (remaining
+            - reissuance_bonus(remaining, &Network::Mainnet).expect("valid bonus"))
+        .expect("the bonus never exceeds the remaining balance");
     }
 
     let half = initial / 2;
@@ -1411,7 +1409,8 @@ fn reissuance_bonus_rounding_boundaries() {
         (10_000_000_000 + 1, 1_376),
         (MAX_MONEY, 288_750_000),
     ] {
-        let actual = reissuance_bonus(Amount::try_from(balance).unwrap()).unwrap();
+        let actual =
+            reissuance_bonus(Amount::try_from(balance).unwrap(), &Network::Mainnet).unwrap();
         assert_eq!(i64::from(actual), expected, "balance {balance}");
     }
 }
@@ -1446,7 +1445,7 @@ proptest::proptest! {
         let numerator = i128::try_from(BLOCK_SUBSIDY_FRACTION_NUMERATOR).unwrap();
         let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
         let expected = (i128::from(balance) * numerator + denominator - 1) / denominator;
-        let actual = reissuance_bonus(Amount::try_from(balance).unwrap()).unwrap();
+        let actual = reissuance_bonus(Amount::try_from(balance).unwrap(), &Network::Mainnet).unwrap();
         proptest::prop_assert_eq!(i128::from(i64::from(actual)), expected);
         proptest::prop_assert!(i64::from(actual) <= balance);
         proptest::prop_assert!(balance == 0 || i64::from(actual) > 0);
@@ -1640,7 +1639,7 @@ fn reissuance_activation_and_rounding_boundary_matrix() {
                         scheduled
                     );
                 }
-                let numerator = 1_375;
+                let numerator = 8_022_777;
                 // The largest deficit that still rounds up to a one-zatoshi bonus.
                 let boundary = i64::try_from(10_000_000_000 / numerator).unwrap();
                 for deficit in [
@@ -1729,8 +1728,10 @@ fn scheduled_issuance_stops_at_a_halving_overflow_inside_slow_start() {
 fn spacing_schedule_preserves_existing_halving_and_subsidy() {
     use crate::parameters::{subsidy::constants::MAX_BLOCK_SUBSIDY, testnet};
     let _init_guard = zakura_test::init();
+    // Networks without NU7, where the spacing-aware schedule must reproduce the
+    // historical halvings and subsidies.
     let mut networks = vec![
-        Network::Mainnet,
+        zip218_funding_streams::mainnet_with_nu7(None),
         testnet_with_nu7(None)
             .to_network()
             .expect("the historical Testnet schedule is valid"),

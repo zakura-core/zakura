@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/work_queue.rs b/crates/zakura-network/src/zakura/block_sync/work_queue.rs
+index 7c3d774e0b..17822006a4 100644
+--- a/crates/zakura-network/src/zakura/block_sync/work_queue.rs
++++ b/crates/zakura-network/src/zakura/block_sync/work_queue.rs
+@@ -557,7 +557,7 @@ impl WorkQueue {
+     ///
+     /// Settle request estimates for removed heights after unlocking.
+     pub(super) fn reset_above(&self, floor: block::Height) {
+-        let mut release = self.budget.deferred_release();
++        let release = self.budget.deferred_release();
+         let mut inner = self.lock();
+         // Retain upgraded owners until after unlocking: a concurrently dropped
+         // queue entry can make this the last reference, whose Drop settles work.
+@@ -571,7 +571,6 @@ impl WorkQueue {
+             inner.request_writes.remove(&claim.owner());
+         }
+         let delta = inner.state.reset_above(floor);
+-        inner.settle(&mut release, delta.released_bytes);
+         drop(inner);
+         drop(release);
+         drop(claims);

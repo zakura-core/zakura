@@ -11,6 +11,9 @@ With --nu7-config it also serves the NU7 fork's public `/v1/status` (schema
 version 1) for zakura.com/nu7/. A node's optional `monitor` table selects how it
 is reached: `local = true` probes it on this host without SSH, and `status_url`
 reads a remote node's deploy/nu7-fork/miner/remote-status.py report instead.
+`profiler_url` names the node's continuous CPU profiler (deploy/profiler/): the
+fleet table marks such a node as profiled and `/profile/<name>` shows its flame
+graphs, forwarded from that URL.
 
 Only the Python stdlib is used.
 """
@@ -19,6 +22,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
+import hmac
+import html
 import ipaddress
 import json
 import logging
@@ -26,8 +32,10 @@ import math
 import os
 import statistics
 import re
+import secrets
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import tomllib
@@ -60,6 +68,19 @@ PUBLIC_ERROR_MESSAGE = "A fresh Ironwood status is not available."
 # that stalls mid-request keeps one.
 MAX_CONCURRENT_REQUESTS = 16
 REQUEST_TIMEOUT_SECONDS = 10
+# A node's continuous profiler (deploy/profiler/) answers on loopback. Its status is
+# read on every poll; the rest is forwarded only when someone opens the profile page.
+PROFILER_STATUS_TIMEOUT_SECONDS = 2
+PROFILER_REQUEST_TIMEOUT_SECONDS = 8
+PROFILER_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+PROFILER_MAX_PARAM_LENGTH = 400
+# The profiler requests the profile page may make, and the parameters each accepts.
+PROFILER_API = {
+    "status": (),
+    "flame": ("range", "from", "to", "view", "lens", "focus"),
+    "timeline": ("range", "from", "to"),
+    "blocks": ("limit",),
+}
 PUBLIC_ORIGINS = {
     "mainnet": frozenset({"https://zakura.com"}),
     "testnet": frozenset({
@@ -117,6 +138,10 @@ ALERT_DIAGNOSTIC_METRICS = (
     "sync_header_work_oldest_missing_height",
     "sync_header_work_in_flight_count",
     "sync_block_applying",
+    "sync_zakura_apply_operations",
+    "sync_zakura_apply_in_flight",
+    "sync_zakura_apply_oldest_seconds",
+    "sync_zakura_apply_phase",
     "sync_block_best_header_tip_height",
     "sync_block_verified_tip_height",
     "sync_block_fill_stop",
@@ -169,7 +194,7 @@ DEFAULTS = {
     "monitor": None,
     "internal_miner": False,
 }
-MONITOR_KEYS = {"local", "status_url", "label", "id", "region"}
+MONITOR_KEYS = {"local", "status_url", "label", "id", "region", "profiler_url"}
 
 
 @dataclass
@@ -200,6 +225,8 @@ class Node:
     miner_id: str = ""
     region: str = ""
     internal_miner: bool = False
+    # Where this node's continuous CPU profiler answers, when it runs one.
+    profiler_url: str = ""
 
     def ssh_cmd(self, *remote: str) -> list[str]:
         if self.local:
@@ -239,6 +266,9 @@ def load_nodes(config_path: Path) -> list[Node]:
                            or not re.fullmatch(r"https?://[A-Za-z0-9.:\[\]-]+/[A-Za-z0-9/._-]*",
                                                status_url)):
             raise SystemExit(f"{name}: status_url must be an http(s) URL on a remote node")
+        profiler_url = monitor.get("profiler_url", "")
+        if profiler_url and not re.fullmatch(r"https?://[A-Za-z0-9.:\[\]-]+", profiler_url):
+            raise SystemExit(f"{name}: profiler_url must be an http(s) origin without a path")
         nodes.append(
             Node(
                 name=name,
@@ -265,12 +295,50 @@ def load_nodes(config_path: Path) -> list[Node]:
                 miner_id=str(monitor.get("id") or ""),
                 region=str(monitor.get("region") or ""),
                 internal_miner=merged["internal_miner"] is True,
+                profiler_url=profiler_url,
             )
         )
 
     if not nodes:
         raise SystemExit(f"no [[nodes]] defined in {config_path}")
     return nodes
+
+
+def fetch_profiler(profiler_url: str, path: str, timeout: float) -> tuple[int, bytes, str]:
+    """Ask a node's profiler for `path`; returns `(status, body, content_type)`.
+
+    A profiler that cannot be reached, or answers with more than the size cap, is
+    reported as a 502 so the page can say so instead of hanging.
+    """
+    try:
+        with urllib.request.urlopen(profiler_url + path, timeout=timeout) as response:
+            body = response.read(PROFILER_MAX_RESPONSE_BYTES + 1)
+            status, content_type = response.status, response.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as error:
+        with error:
+            return error.code, error.read(PROFILER_MAX_RESPONSE_BYTES), "application/json"
+    except (OSError, ValueError):
+        return 502, b'{"error":"profiler unreachable"}', "application/json"
+    if len(body) > PROFILER_MAX_RESPONSE_BYTES:
+        return 502, b'{"error":"profiler response too large"}', "application/json"
+    return status, body, content_type
+
+
+def profiler_summary(profiler_url: str) -> dict:
+    """The few facts about a node's profiler that the fleet table shows."""
+    status, body, _ = fetch_profiler(profiler_url, "/api/status", PROFILER_STATUS_TIMEOUT_SECONDS)
+    try:
+        report = json.loads(body) if status == 200 else {}
+    except ValueError:
+        report = {}
+    if not isinstance(report, dict) or not isinstance(report.get("state"), str):
+        return {"state": "unreachable"}
+    summary = {"state": report["state"][:40]}
+    for key in ("rate_hz", "overhead_pct_last_hour", "last_window_end"):
+        value = report.get(key)
+        if type(value) in (int, float) and math.isfinite(value):
+            summary[key] = value
+    return summary
 
 
 def ssh_host(ssh_string: str) -> str:
@@ -417,6 +485,9 @@ WANTED_METRICS = frozenset((
     "sync_header_chain_frontier_finalized_height",
     "sync_header_chain_frontier_divergence",
     "sync_header_chain_reorg_depth",
+    "sync_zakura_apply_operations",
+    "sync_zakura_apply_in_flight",
+    "sync_zakura_apply_oldest_seconds",
     "sync_zakura_apply_phase",
     "sync_zakura_apply_epoch",
     "sync_zakura_legacy_fallback_active",
@@ -915,6 +986,10 @@ if rpc_url:
                 header = rpc_call("getblockheader", [best_hash, True])
                 if isinstance(header, dict):
                     out["previous_hash"] = header.get("previousblockhash") or ""
+                    # Bind the target to the accepted tip, rather than a header
+                    # observed at another height while the chain advances.
+                    if header.get("hash") == best_hash and header.get("height") == tip_height:
+                        out["difficulty_bits"] = header.get("bits")
             except Exception as error:
                 out["previous_hash_error"] = str(error)
 
@@ -1216,6 +1291,15 @@ def monitoring_snapshot(value, node_names):
         for field in ("block_hash", "previous_hash"):
             if block_hash(row.get(field)):
                 safe[field] = row[field]
+        bits = row.get("difficulty_bits")
+        if isinstance(bits, str) and re.fullmatch(r"[0-9a-fA-F]{8}", bits):
+            safe["difficulty_bits"] = bits
+        safe["rpc_ok"] = row.get("rpc_ok") is True
+        if row.get("rpc_chain") in {"main", "test", "regtest"}:
+            safe["rpc_chain"] = row["rpc_chain"]
+        for field in ("last_seen_at", "last_advanced_at"):
+            if number(row.get(field)):
+                safe[field] = row[field]
         ancestors = row.get("ancestor_hashes")
         if isinstance(ancestors, dict):
             safe["ancestor_hashes"] = {depth: value for depth, value in ancestors.items()
@@ -1396,13 +1480,21 @@ class ClusterCollector:
                 pool.submit(probe_node, node, self.should_scrape_metrics(node.name, started), ancestor_height): node
                 for node in self.nodes
             }
+            profilers = {
+                node.name: pool.submit(profiler_summary, node.profiler_url)
+                for node in self.nodes
+                if node.profiler_url
+            }
             for future in concurrent.futures.as_completed(futures):
                 node = futures[future]
                 try:
                     probe = future.result()
                 except Exception as error:
                     probe = {"error": str(error)}
-                rows.append(self.row_for(node, probe, time.time()))
+                row = self.row_for(node, probe, time.time())
+                if node.name in profilers:
+                    row["profiler"] = profilers[node.name].result()
+                rows.append(row)
 
         if private_enabled:
             self.last_height.setdefault("mac-os-cranelift", self.private_mac_progress.get("height"))
@@ -1678,6 +1770,7 @@ class ClusterCollector:
             "commit": probe.get("commit") or "",
             "block_hash": block_hash,
             "previous_hash": previous_block_hash,
+            "difficulty_bits": probe.get("difficulty_bits"),
             "ancestor_hashes": ancestor_hashes,
             "node_id": node.node_id or probe.get("node_id") or "",
             "version": probe.get("version") or "",
@@ -3432,6 +3525,20 @@ function badge(text, toneName) {
   const cls = toneName && toneName !== 'neutral' ? ' tone-' + toneName : '';
   return '<span class="badge' + cls + '">' + esc(text) + '</span>';
 }
+// A link to the node's CPU flame graphs, for nodes that run the continuous profiler.
+function profilerBadge(row) {
+  const profiler = row.profiler;
+  if (!profiler) return '';
+  const working = profiler.state === 'ok';
+  const title = working
+    ? 'Continuous CPU profile: sampling at ' + profiler.rate_hz + ' Hz, using '
+      + (profiler.overhead_pct_last_hour == null ? 'under 1' : profiler.overhead_pct_last_hour)
+      + '% of one core. Open the flame graph.'
+    : 'Continuous CPU profiler is ' + profiler.state + '. Open the profile page.';
+  return '<a class="node-link badge tone-' + (working ? 'info' : 'warn') + '" href="/profile/'
+    + encodeURIComponent(row.name) + '" title="' + esc(title) + '">'
+    + (working ? 'profiled' : 'profiler ' + esc(profiler.state)) + '</a>';
+}
 function tipEventLabel(event) {
   if (event === 'reorg_height_drop') return 'height drop';
   if (event === 'tip_switch') return 'tip switch';
@@ -3549,8 +3656,10 @@ function renderFleet(data) {
     const client = row.client_name || 'unknown';
     clients[client] = (clients[client] || 0) + 1;
   }
-  el('client-mix').textContent = Object.keys(clients).sort()
-    .map((client) => clients[client] + ' ' + client).join(' · ') || 'no clients';
+  const profiled = rows.filter((row) => row.profiler).length;
+  el('client-mix').textContent = (Object.keys(clients).sort()
+    .map((client) => clients[client] + ' ' + client).join(' · ') || 'no clients')
+    + (profiled ? ' · CPU profile on ' + profiled + ' of ' + rows.length : '');
 
   const heights = rows.map((row) => row.height).filter((height) => height != null);
   el('fleet-max-height').textContent = heights.length ? num(Math.max(...heights)) : '—';
@@ -3802,7 +3911,8 @@ function renderTable(data) {
       + '<div class="stack"><a class="node-link node-name" href="/node/'
       + encodeURIComponent(row.name) + '" title="Open node detail">' + esc(row.name) + '</a>'
       + '<span class="node-sub" title="' + esc(row.node_id || '') + '">'
-      + esc(row.node_id ? tinyHash(row.node_id) : 'node id unknown') + '</span></div></div></td>'
+      + esc(row.node_id ? tinyHash(row.node_id) : 'node id unknown') + '</span>'
+      + profilerBadge(row) + '</div></div></td>'
       + '<td class="col-health"><div class="stack">'
       + badge(HEALTH_LABEL[row.health] || row.health, healthTone) + vitalBadges(row) + '</div></td>'
       + '<td class="col-chain"><div class="stack">'
@@ -3908,7 +4018,8 @@ function renderNodeHeader(data) {
     + badge(row.chain_role || 'unknown', tone(CHAIN_TONE, row.chain_role))
     + badge('service ' + (row.active_state || 'unknown'),
       row.active_state === 'active' ? 'ok' : 'bad')
-    + (row.tip_event ? badge(tipEventLabel(row.tip_event) || row.tip_event, 'bad') : '');
+    + (row.tip_event ? badge(tipEventLabel(row.tip_event) || row.tip_event, 'bad') : '')
+    + profilerBadge(row);
 
   const pill = el('state-pill');
   pill.textContent = { healthy: 'Healthy', stale: 'Stale', verification_error: 'Verification error', rpc_error: 'RPC error', down: 'Down' }[row.health]
@@ -4295,10 +4406,123 @@ setInterval(renderFreshness, 1000);
 </html>"""
 
 
+# -- the shared dashboard password --------------------------------------------
+# One password gates the fleet pages and their data. Only its salted PBKDF2
+# hash reaches this process, through the environment. A login sets a cookie
+# holding an expiry and an HMAC of it under a random key made at startup and
+# never stored, so every restart signs everyone out.
+SESSION_COOKIE = "zakura_status_session"
+SESSION_SECONDS = 7 * 86400
+PASSWORD_HASH_ALGORITHM = "pbkdf2_sha256"
+PASSWORD_HASH_ITERATIONS = 200_000
+MAX_LOGIN_BODY = 4096
+
+
+def hash_password(password: str, salt: bytes | None = None,
+                  iterations: int = PASSWORD_HASH_ITERATIONS) -> str:
+    """`pbkdf2_sha256$<iterations>$<salt hex>$<hash hex>` for a password."""
+    salt = secrets.token_bytes(16) if salt is None else salt
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return f"{PASSWORD_HASH_ALGORITHM}${iterations}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    """Whether a password matches a hash from `hash_password`; false for a malformed hash."""
+    try:
+        algorithm, iterations, salt_hex, digest_hex = encoded.split("$")
+        if algorithm != PASSWORD_HASH_ALGORITHM:
+            return False
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations))
+    except ValueError:
+        return False
+    return hmac.compare_digest(actual, expected)
+
+
+def parse_cookies(header: str | None) -> dict[str, str]:
+    """The cookies in a `Cookie` request header."""
+    cookies = {}
+    for part in (header or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name:
+            cookies[name] = value
+    return cookies
+
+
+@dataclass(frozen=True)
+class DashboardLogin:
+    """The password hash and the in-memory key that signs login cookies."""
+
+    password_hash: str
+    session_secret: str
+
+    def _signature(self, expiry: int) -> str:
+        return hmac.new(self.session_secret.encode(), str(expiry).encode(), hashlib.sha256).hexdigest()
+
+    def issue_token(self, now: float) -> str:
+        """A cookie value `<expiry>.<signature>` that `token_valid` accepts for `SESSION_SECONDS`."""
+        expiry = int(now) + SESSION_SECONDS
+        return f"{expiry}.{self._signature(expiry)}"
+
+    def token_valid(self, token: str | None, now: float) -> bool:
+        """Whether a cookie value was signed under this secret and has not expired."""
+        expiry_text, _, signature = (token or "").partition(".")
+        if not (expiry_text.isascii() and expiry_text.isdigit()) or not re.fullmatch(r"[0-9a-f]{64}", signature):
+            return False
+        expiry = int(expiry_text)
+        return hmac.compare_digest(signature, self._signature(expiry)) and expiry > now
+
+
+def dashboard_login_from_env(environ) -> DashboardLogin | None:
+    """The login gate configured by `ZAKURA_DASHBOARD_PASSWORD_HASH`, or None when no password is set.
+
+    The cookie-signing key is fresh for this process and kept only in memory.
+    """
+    password_hash = environ.get("ZAKURA_DASHBOARD_PASSWORD_HASH", "").strip()
+    if not password_hash:
+        return None
+    if not password_hash.startswith(PASSWORD_HASH_ALGORITHM + "$"):
+        raise ValueError("ZAKURA_DASHBOARD_PASSWORD_HASH is not a pbkdf2_sha256 hash")
+    return DashboardLogin(password_hash, secrets.token_hex(32))
+
+
+LOGIN_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zakura fleet status</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #5d6677; --line: #d8dde6; --accent: #2f6fde; --bad: #c0392b; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #11151c; --card: #1a2029; --text: #e6e9ef; --muted: #98a2b3; --line: #2c3442; --accent: #6b9bff; --bad: #ff7b6b; } }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, sans-serif; }
+  form { width: min(340px, calc(100vw - 32px)); background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 24px; display: grid; gap: 12px; }
+  h1 { margin: 0; font-size: 18px; }
+  p { margin: 0; color: var(--muted); }
+  input, button { font: inherit; padding: 9px 11px; border-radius: 7px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  button { background: var(--accent); border-color: var(--accent); color: #fff; cursor: pointer; }
+  .error { color: var(--bad); }
+</style>
+</head>
+<body>
+<form method="post" action="/login">
+  <h1>Zakura fleet status</h1>
+  <p>Enter the dashboard password.</p>
+  <p class="error">{{error}}</p>
+  <input type="password" name="password" autocomplete="current-password" autofocus required aria-label="Password">
+  <button type="submit">Sign in</button>
+</form>
+</body>
+</html>"""
+
+
 COLLECTOR: ClusterCollector | None = None
 ACTIVATION_FEED = None
 TRUSTED_PROXY_IPS = set()
 RATE_LIMITER = RateLimiter()
+DASHBOARD_LOGIN: DashboardLogin | None = None
+# Password guesses per client per minute.
+LOGIN_RATE_LIMITER = RateLimiter(limit=10, window=60)
 # The page and its data both change every poll, and the HTML carries no
 # fingerprint. Without this a browser heuristically caches the page and keeps
 # serving a stale build after a dashboard deploy.
@@ -4306,6 +4530,10 @@ NO_STORE = {
     "Cache-Control": "no-store, must-revalidate",
     "X-Content-Type-Options": "nosniff",
 }
+# The fleet pages and their data need the dashboard password when one is set.
+# The public APIs (`/ironwood-status.json`, `/v1/*`) and `/healthz` stay open.
+PASSWORD_GATED_PAGES = {"/", "/data"}
+PASSWORD_GATED_PREFIXES = ("/data/node/", "/node/", "/profile/")
 
 
 class BoundedHTTPServer(ThreadingHTTPServer):
@@ -4418,8 +4646,121 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         return str(peer_address)
 
+    def serve_profile(self, parsed: urllib.parse.ParseResult) -> None:
+        """Forward the profile page and its data requests to the node's own profiler.
+
+        `/profile/<node>` is the page; `/profile/<node>/api/<request>` is one of the
+        requests in PROFILER_API, with only the parameters listed there.
+        """
+        assert COLLECTOR is not None
+        name, _, rest = parsed.path[len("/profile/"):].partition("/")
+        node = COLLECTOR.nodes_by_name.get(urllib.parse.unquote(name))
+        request = rest[len("api/"):] if rest.startswith("api/") else None
+        if node is None or not node.profiler_url or (rest and request not in PROFILER_API):
+            return self.send_body(
+                404, b"not found\n", "text/plain; charset=utf-8", {"X-Content-Type-Options": "nosniff"}
+            )
+        if not RATE_LIMITER.allow(self.rate_limit_client()):
+            return self.send_json(
+                429, {"error": "Request rate limit exceeded"},
+                {**NO_STORE, "Retry-After": str(int(PUBLIC_RATE_WINDOW))},
+            )
+        if request is None:
+            status, body, _ = fetch_profiler(node.profiler_url, "/", PROFILER_REQUEST_TIMEOUT_SECONDS)
+            if status != 200:
+                body = b"The profiler on this node is not answering.\n"
+            content_type = "text/html; charset=utf-8" if status == 200 else "text/plain; charset=utf-8"
+            return self.send_body(status, body, content_type, NO_STORE)
+        params = [
+            (key, value)
+            for key, value in urllib.parse.parse_qsl(parsed.query)
+            if key in PROFILER_API[request] and len(value) <= PROFILER_MAX_PARAM_LENGTH
+        ]
+        path = f"/api/{request}" + ("?" + urllib.parse.urlencode(params) if params else "")
+        status, body, _ = fetch_profiler(node.profiler_url, path, PROFILER_REQUEST_TIMEOUT_SECONDS)
+        return self.send_body(status, body, "application/json", NO_STORE)
+
+    def is_local_client(self) -> bool:
+        """A process on this host talking to the port directly, not through the reverse proxy.
+
+        Caddy always adds `X-Forwarded-For`, so a loopback request without it
+        comes from a local reader such as the fleet watchdog.
+        """
+        try:
+            peer = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        return peer.is_loopback and "X-Forwarded-For" not in self.headers
+
+    def logged_in(self) -> bool:
+        """No password is configured, the client is local, or it carries a valid login cookie."""
+        if DASHBOARD_LOGIN is None or self.is_local_client():
+            return True
+        token = parse_cookies(self.headers.get("Cookie")).get(SESSION_COOKIE)
+        return DASHBOARD_LOGIN.token_valid(token, time.time())
+
+    def send_login_page(self, status: int, error: str = "") -> None:
+        page = LOGIN_PAGE.replace("{{error}}", html.escape(error))
+        self.send_body(status, page.encode(), "text/html; charset=utf-8", NO_STORE)
+
+    def redirect_home(self, cookie: str) -> None:
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header("Set-Cookie", cookie)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def came_through_proxy(self) -> bool:
+        """The request arrived through the TLS reverse proxy, which always adds `X-Forwarded-For`."""
+        try:
+            peer = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        return (peer.is_loopback or peer in TRUSTED_PROXY_IPS) and "X-Forwarded-For" in self.headers
+
+    def do_POST(self) -> None:
+        if urllib.parse.urlparse(self.path).path != "/login" or DASHBOARD_LOGIN is None:
+            return self.send_body(404, b"not found\n", "text/plain; charset=utf-8",
+                                  {"X-Content-Type-Options": "nosniff"})
+        # The password must only cross an encrypted connection, so refuse logins
+        # that reached the plain-HTTP port directly instead of through the proxy.
+        if not self.came_through_proxy():
+            return self.send_body(403, b"log in through the HTTPS dashboard address\n",
+                                  "text/plain; charset=utf-8", {"X-Content-Type-Options": "nosniff"})
+        if not LOGIN_RATE_LIMITER.allow(self.rate_limit_client()):
+            return self.send_login_page(429, "Too many attempts; wait a minute and try again")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_LOGIN_BODY:
+            return self.send_login_page(413, "Request too large")
+        form = urllib.parse.parse_qs(self.rfile.read(length).decode(errors="replace"))
+        password = form.get("password", [""])[0]
+        if not verify_password(password, DASHBOARD_LOGIN.password_hash):
+            return self.send_login_page(401, "Wrong password")
+        token = DASHBOARD_LOGIN.issue_token(time.time())
+        self.redirect_home(f"{SESSION_COOKIE}={token}; Max-Age={SESSION_SECONDS}; Path=/; HttpOnly; Secure; SameSite=Lax")
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/logout":
+            return self.redirect_home(f"{SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax")
+        if parsed.path in PASSWORD_GATED_PAGES or parsed.path.startswith(PASSWORD_GATED_PREFIXES):
+            if not self.logged_in():
+                if not self.came_through_proxy():
+                    return self.send_json(401, {"error": "use the HTTPS dashboard address"}, NO_STORE)
+                is_page = parsed.path == "/" or (parsed.path.startswith(("/node/", "/profile/"))
+                                                 and "/api/" not in parsed.path)
+                if is_page:
+                    return self.send_login_page(200)
+                return self.send_json(401, {"error": "login required"}, NO_STORE)
+        return self.serve_get(parsed)
+
+    def serve_get(self, parsed: urllib.parse.ParseResult) -> None:
+        if parsed.path.startswith("/profile/"):
+            return self.serve_profile(parsed)
         if parsed.path == "/data":
             assert COLLECTOR is not None
             body = json.dumps(COLLECTOR.snapshot()).encode()
@@ -4534,9 +4875,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global COLLECTOR, ACTIVATION_FEED, TRUSTED_PROXY_IPS
+    global COLLECTOR, ACTIVATION_FEED, TRUSTED_PROXY_IPS, DASHBOARD_LOGIN
 
     parser = argparse.ArgumentParser(description="Serve a Zakura fleet status dashboard.")
+    if sys.argv[1:] == ["--print-password-hash"]:
+        password = sys.stdin.readline().rstrip("\n")
+        if not password:
+            sys.exit("empty password on stdin")
+        print(hash_password(password))
+        return
     parser.add_argument("--config", required=True, help="path to deploy/deployer nodes TOML")
     parser.add_argument("--host", default="0.0.0.0", help="dashboard bind host")
     parser.add_argument("--port", type=int, default=8090, help="dashboard bind port")
@@ -4592,6 +4939,7 @@ def main() -> None:
                         help="explicit reverse-proxy IP allowed to supply X-Forwarded-For; repeat per IP")
     args = parser.parse_args()
     TRUSTED_PROXY_IPS = set(args.trusted_proxy)
+    DASHBOARD_LOGIN = dashboard_login_from_env(os.environ)
 
     nodes = load_nodes(Path(args.config))
     state_file = Path(args.state_file) if args.state_file else None
@@ -4619,6 +4967,7 @@ def main() -> None:
         f"cluster status dashboard bound on {args.host}:{args.port}; "
         f"polling {len(nodes)} node(s) every {args.interval}s"
         + (f"; state {state_file}" if state_file else "")
+        + ("; fleet pages need the dashboard password" if DASHBOARD_LOGIN else "; no dashboard password set")
     )
     BoundedHTTPServer((args.host, args.port), Handler).serve_forever()
 

@@ -5,17 +5,18 @@
 //! The stream table checks frames and observes cadence before payload allocation.
 
 pub(super) mod live_requester;
+pub(super) use requester::CompletedRange;
 mod requester;
 mod serving;
 pub(super) mod session;
 pub(super) mod status_sender;
 pub(super) mod wire;
 
-#[cfg(all(test, feature = "zakura-testkit"))]
+#[cfg(all(test, feature = "zakura-testkit", not(zakura_sim)))]
 mod conformance_tests;
 #[cfg(test)]
 mod requester_tests;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests;
 #[cfg(test)]
 mod wire_tests;

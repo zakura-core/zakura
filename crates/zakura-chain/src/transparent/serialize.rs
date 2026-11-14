@@ -96,7 +96,7 @@ fn parse_coinbase_height(script_sig: &[u8]) -> Result<(Height, Vec<u8>), Seriali
 }
 
 impl ZcashSerialize for OutPoint {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&self.hash.0[..])?;
         writer.write_u32::<LittleEndian>(self.index)?;
         Ok(())
@@ -137,15 +137,15 @@ impl ZcashSerialize for Input {
     ///
     /// This check is required, because the genesis block does not include an encoded
     /// coinbase height,
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         match self {
             Input::PrevOut {
                 outpoint,
                 unlock_script,
                 sequence,
             } => {
-                outpoint.zcash_serialize(&mut writer)?;
-                unlock_script.zcash_serialize(&mut writer)?;
+                outpoint.zcash_serialize(writer)?;
+                unlock_script.zcash_serialize(writer)?;
                 writer.write_u32::<LittleEndian>(*sequence)?;
             }
             Input::Coinbase { sequence, .. } => {
@@ -156,7 +156,7 @@ impl ZcashSerialize for Input {
                 // Write the script sig containing the height and data.
                 self.coinbase_script()
                     .ok_or_else(|| io::Error::other("invalid coinbase script sig"))?
-                    .zcash_serialize(&mut writer)?;
+                    .zcash_serialize(writer)?;
 
                 // Write the sequence.
                 writer.write_u32::<LittleEndian>(*sequence)?;
@@ -227,9 +227,9 @@ impl ZcashDeserialize for Input {
 }
 
 impl ZcashSerialize for Output {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        self.value.zcash_serialize(&mut writer)?;
-        self.lock_script.zcash_serialize(&mut writer)?;
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        self.value.zcash_serialize(writer)?;
+        self.lock_script.zcash_serialize(writer)?;
         Ok(())
     }
 }

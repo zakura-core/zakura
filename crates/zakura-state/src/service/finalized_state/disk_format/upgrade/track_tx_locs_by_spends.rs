@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use crossbeam_channel::{Receiver, TryRecvError};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use std::sync::mpsc::TryRecvError;
 
 use zakura_chain::block::Height;
 
@@ -12,7 +12,7 @@ use crate::{
     Spend,
 };
 
-use super::{super::super::DiskWriteBatch, CancelFormatChange};
+use super::{super::super::DiskWriteBatch, CancelFormatChange, CancelReceiver};
 
 /// Runs disk format upgrade for tracking transaction locations by their inputs and revealed nullifiers.
 ///
@@ -22,7 +22,7 @@ use super::{super::super::DiskWriteBatch, CancelFormatChange};
 pub fn run(
     initial_finalized_tip_height: Height,
     zakura_db: &ZakuraDb,
-    cancel_receiver: &Receiver<CancelFormatChange>,
+    cancel_receiver: &CancelReceiver,
 ) -> Result<(), CancelFormatChange> {
     if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
         return Err(CancelFormatChange);
@@ -40,7 +40,7 @@ pub fn run(
             let mut batch = DiskWriteBatch::new();
             let mut should_index_at_height = false;
 
-            let transactions = zakura_db.transactions_by_location_range(
+            let transactions = zakura_db.stored_transactions_by_location_range(
                 crate::TransactionLocation::from_index(height, 1)
                     ..=crate::TransactionLocation::max_for_height(height),
             );

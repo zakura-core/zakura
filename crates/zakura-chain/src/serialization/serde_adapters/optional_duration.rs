@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::fmt::human_duration::format_duration;
+
 #[derive(Deserialize)]
 #[serde(transparent)]
 struct HumanDuration(#[serde(with = "super::duration")] Duration);
@@ -14,7 +16,7 @@ pub fn serialize<S: Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     duration
-        .map(|value| humantime::format_duration(value).to_string())
+        .map(|value| format_duration(value).to_string())
         .serialize(serializer)
 }
 

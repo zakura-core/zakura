@@ -1,0 +1,18 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+index 9905b6dafc..e037e42f9e 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+@@ -591,7 +591,12 @@ impl Live {
+             operation,
+             subscription_id: self.id,
+             update_sequence: update.sequence,
+-            initial_target_tip_hash: self.target,
++            // Mutation: a Grant names another target than its Open.
++            initial_target_tip_hash: if operation == Operation::Grant {
++                block::Hash([0x55; 32])
++            } else {
++                self.target
++            },
+             acknowledged: update.acknowledged,
+             locator_hashes: match operation {
+                 Operation::Open => self.locators.iter().map(|locator| locator.hash).collect(),

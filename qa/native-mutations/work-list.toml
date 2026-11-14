@@ -1,0 +1,401 @@
+# The mutation loop's work list (mutation plan, mut-7.2).
+#
+# Each entry is one run of PROMPT.md. The entries come from reg-10.1's
+# inventory, "Properties shared across reactors" in properties.md. Paths are
+# relative to the repository root.
+#
+# An entry's `kind` is one of:
+# - `shared-definition`: one idea with several instances. `shared` names the
+#   toolkit code every instance runs through. A break there runs against
+#   every instance. A break in one instance's `code` runs against that
+#   instance only.
+# - `single`: one property with one instance.
+# - `machine`: one owner checked against its independent model.
+# - `shared-wire-path`: the production side of the wire rules every protocol
+#   table enforces. A break here runs once against each table it lists.
+# - `protocol-table`: one protocol table's own guards, covered once, not
+#   per message type. Its `table` prefixes every generated ID it covers.
+#
+# Each witness is one of:
+# - `planted = "<case>.toml"`: the committed input or typed scenario of a
+#   retained `qa/planted/` case, which `zakura-sim record --witness <id>
+#   --expect holds` runs on the unpatched build;
+# - `input = "<file>.bin"`: a committed fuzz input with its sidecar;
+# - `test = "<selector>"` with `test_target = "<file>"`: one `zakura-sim`
+#   integration test, run with `--exact`.
+# Every witness holds on `main`.
+#
+# `crates/zakura-sim/tests/mutation_work_list.rs` checks that every
+# `Active` block-sync, block and discovery ID appears in exactly one entry
+# or under `[[excluded]]`, and that each protocol table appears once.
+# `scripts/mutation_inventory.py` checks each generated case against this
+# file. The `[[no-generator]]` records at the end say which IDs no
+# generator harness reaches (mutation plan, mut-4.2).
+
+schema = 1
+
+[[entry]]
+id = "bounds"
+kind = "shared-definition"
+claim = "Block sync's retained, reserved, look-ahead and decoded bytes stay within their stated bounds."
+check = ["crates/zakura-sim/src/domain/shared/bounds.rs", "crates/zakura-sim/src/domain/block_sync.rs", "crates/zakura-sim/src/domain/block_sync_semantic.rs"]
+shared = ["crates/zakura-network/src/zakura/transport/guard.rs"]
+
+[[entry.instance]]
+property = "block-sync/retained-byte-bound"
+code = ["crates/zakura-network/src/zakura/block_sync/admission.rs", "crates/zakura-network/src/zakura/block_sync/sequencer_task.rs"]
+witness = { planted = "qa/planted/block-sync/retained-byte-bound/wide-commit-window.toml" }
+
+[[entry.instance]]
+property = "block-sync/reserved-byte-bound"
+code = ["crates/zakura-network/src/zakura/block_sync/admission.rs", "crates/zakura-network/src/zakura/block_sync/work_queue/request_write.rs"]
+witness = { planted = "qa/planted/block-sync/reserved-byte-bound/above-floor-charge.toml" }
+
+[[entry.instance]]
+property = "block-sync/lookahead-overshoot-bound"
+code = ["crates/zakura-network/src/zakura/block_sync/admission.rs"]
+witness = { planted = "qa/planted/block-sync/lookahead-overshoot-bound/omit-outstanding-estimates.toml" }
+
+[[entry.instance]]
+property = "block-sync/input-decoded-bound"
+code = ["crates/zakura-network/src/zakura/block_sync/sequencer_task.rs"]
+witness = { planted = "qa/planted/block-sync/input-decoded-bound/no-room-check.toml" }
+
+[[entry]]
+id = "teardown"
+kind = "shared-definition"
+claim = "Once every peer has left and teardown settles, block sync's charges return to zero."
+check = ["crates/zakura-sim/src/domain/block_sync.rs"]
+shared = ["crates/zakura-network/src/zakura/transport/guard.rs", "crates/zakura-network/src/zakura/regulation/serve/lease.rs", "crates/zakura-network/src/zakura/regulation/session_capacity.rs"]
+
+[[entry.instance]]
+property = "block-sync/teardown-returns-baseline"
+code = ["crates/zakura-network/src/zakura/block_sync/peer_routine.rs", "crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs", "crates/zakura-network/src/zakura/block_sync/regulated/serving.rs"]
+witness = { planted = "qa/planted/block-sync/teardown-returns-baseline/skip-return-on-drop.toml" }
+
+[[entry]]
+id = "stale-completion"
+kind = "shared-definition"
+claim = "A stale completion changes nothing another owner holds."
+check = ["crates/zakura-sim/src/domain/block_sync_semantic.rs"]
+shared = ["crates/zakura-header-chain/src/work/completion.rs"]
+
+[[entry.instance]]
+property = "block-sync/stale-completion-inert"
+code = ["crates/zakura-network/src/zakura/block_sync/sequencer.rs", "crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs"]
+witness = { planted = "qa/planted/block-sync/stale-completion-inert/release-by-height.toml" }
+
+[[entry]]
+id = "wakes"
+kind = "shared-definition"
+claim = "Released capacity wakes the work waiting for it. The instances share the idea, not the code."
+check = ["crates/zakura-sim/src/domain/block_sync_semantic.rs", "crates/zakura-sim/src/domain/discovery.rs"]
+shared = []
+
+[[entry.instance]]
+property = "block-sync/capacity-release-wakes"
+code = ["crates/zakura-network/src/zakura/block_sync/sequencer_task.rs", "crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs", "crates/zakura-network/src/zakura/block_sync/sequencer.rs"]
+witness = { planted = "qa/planted/block-sync/capacity-release-wakes/stale-completion-no-wake.toml" }
+
+[[entry.instance]]
+property = "discovery/wait-complete-wakes"
+code = ["crates/zakura-network/src/zakura/discovery/peer.rs"]
+witness = { planted = "qa/planted/discovery/wait-complete-wakes/lost-wakeup.toml" }
+
+[[entry]]
+id = "storage-operation-ids"
+kind = "single"
+claim = "Block operations get rising IDs, and each completes at most once, after its submission."
+check = ["crates/zakura-sim/src/harness/block_sync.rs", "crates/zakura-sim/src/harness/header_sync.rs"]
+shared = []
+
+[[entry.instance]]
+property = "block-sync/storage-operation-ids"
+code = ["crates/zakura-network/src/zakura/block_sync/sequencer_task.rs", "crates/zakura-network/src/zakura/block_sync/sequencer.rs"]
+witness = { test = "honest_sync_reaches_the_fixture_tip", test_target = "block_node" }
+
+[[entry]]
+id = "budget-ledgers-agree"
+kind = "single"
+claim = "At rest, the byte budget equals the work queue's tally and the routines' unreceived estimates."
+check = ["crates/zakura-sim/src/domain/block_sync.rs"]
+shared = []
+
+[[entry.instance]]
+property = "block-sync/budget-ledgers-agree"
+code = ["crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs", "crates/zakura-network/src/zakura/block_sync/work_queue", "crates/zakura-network/src/zakura/block_sync/state.rs"]
+witness = { planted = "qa/planted/block-sync/budget-ledgers-agree/handoff-keeps-charge.toml" }
+
+[[entry]]
+id = "body-work-authority"
+kind = "shared-definition"
+claim = "Block sync queries and holds body work only under the authority of header sync's latest committed view."
+check = ["crates/zakura-sim/src/domain/block_sync_semantic/authority.rs", "crates/zakura-sim/src/domain/block_sync_semantic.rs"]
+shared = []
+
+[[entry.instance]]
+property = "block-sync/query-work-authorized"
+code = ["crates/zakura-network/src/zakura/block_sync/reactor.rs", "crates/zakura-network/src/zakura/block_sync/reactor/state.rs"]
+witness = { planted = "qa/planted/block-sync/query-work-authorized/accept-retired-authority.toml" }
+
+[[entry.instance]]
+property = "block-sync/frontier-work-consistent"
+code = ["crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs", "crates/zakura-network/src/zakura/block_sync/work_queue"]
+witness = { planted = "qa/planted/block-sync/frontier-work-consistent/omit-work-reset.toml" }
+
+[[entry]]
+id = "payload-inventory-agrees"
+kind = "single"
+claim = "At each sequencer boundary, every runtime payload has a policy entry with the same identity and decoded size."
+check = ["crates/zakura-sim/src/domain/block_sync.rs"]
+shared = []
+
+[[entry.instance]]
+property = "block-sync/payload-inventory-agrees"
+code = ["crates/zakura-network/src/zakura/block_sync/sequencer_task.rs", "crates/zakura-network/src/zakura/block_sync/sequencer.rs"]
+witness = { planted = "qa/planted/block-sync/payload-inventory-agrees/lost-payload-release.toml" }
+
+[[entry]]
+id = "submit-only-requested"
+kind = "single"
+claim = "Each submitted block names a published request, and its body crossed into the node in an open exchange for that hash."
+check = ["crates/zakura-sim/src/domain/block_sync_semantic.rs"]
+shared = []
+
+[[entry.instance]]
+property = "block-sync/submit-only-requested"
+code = ["crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs", "crates/zakura-network/src/zakura/block_sync/peer_routine", "crates/zakura-network/src/zakura/block_sync/request.rs"]
+witness = { planted = "qa/planted/block-sync/submit-only-requested/height-only.toml" }
+
+[[entry]]
+id = "detached-submission-bounded"
+kind = "single"
+claim = "Attached and detached submissions share the count limit and decoded target, and a detached holder releases once its verdict arrives."
+check = ["crates/zakura-sim/src/domain/block_sync_semantic.rs"]
+shared = []
+
+[[entry.instance]]
+property = "block-sync/detached-submission-bounded"
+code = ["crates/zakura-network/src/zakura/block_sync/sequencer.rs"]
+witness = { planted = "qa/planted/block-sync/detached-submission-bounded/forget-on-reset.toml" }
+
+[[entry]]
+id = "verification-capacity"
+kind = "single"
+claim = "Unsettled discovery verification results stay within the slots, and every slot is free once each reader returns."
+check = ["crates/zakura-sim/src/domain/discovery.rs"]
+shared = ["crates/zakura-network/src/zakura/regulation/slots.rs"]
+
+[[entry.instance]]
+property = "discovery/verification-capacity"
+code = ["crates/zakura-network/src/zakura/discovery/protocol.rs"]
+witness = { planted = "qa/planted/discovery/verification-capacity/release-before-install.toml" }
+
+[[entry]]
+id = "block-machines"
+kind = "machine"
+claim = "Each block-sync owner agrees with its independent model after every operation."
+check = ["crates/zakura-sim/src/harness/block_work.rs", "crates/zakura-sim/src/harness/machine.rs"]
+shared = []
+
+[[entry.instance]]
+property = "block/work-ownership"
+code = ["crates/zakura-network/src/zakura/block_sync/work_queue"]
+witness = { planted = "qa/planted/block/work-ownership/missing-published-charge.toml" }
+
+[[entry.instance]]
+property = "block/reactor-policy"
+code = ["crates/zakura-network/src/zakura/block_sync/reactor"]
+witness = { planted = "qa/planted/block/reactor-policy/refusal-consumes-query-id.toml" }
+
+[[entry.instance]]
+property = "block/work-funding"
+code = ["crates/zakura-network/src/zakura/block_sync/work_queue", "crates/zakura-network/src/zakura/transport/guard.rs"]
+witness = { planted = "qa/planted/block/work-funding/lost-reservation-release.toml" }
+
+[[entry.instance]]
+property = "block/decoded-retention"
+code = ["crates/zakura-node-services/src/block_memory.rs"]
+witness = { planted = "qa/planted/block/decoded-retention/missing-admission.toml" }
+
+[[entry]]
+id = "discovery-machines"
+kind = "machine"
+claim = "Discovery's record book and session installation agree with their independent models after every operation."
+check = ["crates/zakura-sim/src/harness/discovery_machine.rs", "crates/zakura-sim/src/harness/machine.rs"]
+shared = []
+
+[[entry.instance]]
+property = "discovery/record-book"
+code = ["crates/zakura-network/src/zakura/discovery/protocol.rs"]
+witness = { planted = "qa/planted/discovery/record-book/skip-book-eviction.toml" }
+
+[[entry.instance]]
+property = "discovery/session-installation"
+code = ["crates/zakura-network/src/zakura/discovery/state.rs"]
+witness = { planted = "qa/planted/discovery/session-installation/install-superseded-result.toml" }
+
+[[entry]]
+id = "shared-wire-path"
+kind = "shared-wire-path"
+claim = "The transport closes a session on a frame its table's rules refuse, and only on one."
+# The checker side, which a patch reads and never changes.
+check = ["crates/zakura-sim/src/peer/content.rs", "crates/zakura-sim/src/model/consequence.rs", "crates/zakura-sim/src/table.rs"]
+shared = [
+    "crates/zakura-network/src/zakura/transport/message_rule.rs",
+    "crates/zakura-network/src/zakura/transport/message_rule",
+    "crates/zakura-network/src/zakura/transport/pipe.rs",
+    "crates/zakura-network/src/zakura/transport/session.rs",
+    "crates/zakura-network/src/zakura/handler.rs",
+]
+# Each table's witness, which the runner runs once per shared-path patch.
+# The block-sync harness's relay checks each header but never runs
+# `admit_inbound_message` (handler.rs), so a break to that admission step
+# (its size check, cadence charge and row `expect`) reaches stream 6 only
+# in production. Its runs count only through discovery/s4v2.
+tables = [
+    { table = "block-sync/s6v3", witness = { test = "each_probe_fault_reaches_its_exact_id", test_target = "block_table" } },
+    { table = "discovery/s4v2", witness = { test = "hello_acts_apply_in_their_witnesses", test_target = "discovery_wire_witness" } },
+]
+
+[[entry]]
+id = "block-sync-table"
+kind = "protocol-table"
+table = "block-sync/s6v3"
+claim = "Block sync's serving session and routine enforce stream 6's rules: they close on refused frames and send only what the table allows."
+check = ["crates/zakura-sim/src/peer/content.rs", "crates/zakura-sim/src/model/consequence.rs", "crates/zakura-sim/src/table.rs"]
+shared = []
+code = [
+    "crates/zakura-network/src/zakura/block_sync/wire.rs",
+    "crates/zakura-network/src/zakura/block_sync/wire",
+    "crates/zakura-network/src/zakura/block_sync/regulated",
+    "crates/zakura-network/src/zakura/block_sync/peer_routine",
+    "crates/zakura-network/src/zakura/block_sync/request.rs",
+]
+witnesses = [
+    { test = "each_probe_fault_reaches_its_exact_id", test_target = "block_table" },
+    { test = "faults_inside_the_nodes_exchange_reach_their_exact_ids", test_target = "block_table" },
+    { test = "requests_past_twice_the_serving_limit_reach_over_margin", test_target = "block_table" },
+    { test = "honest_runs_hold_every_generated_id_they_reach", test_target = "block_table" },
+    { test = "old_chain_bodies_after_a_reset_hold_receiver_work_authorized", test_target = "block_table" },
+    { test = "the_stale_request_body_input_holds_receiver_work_authorized", test_target = "block_table" },
+]
+
+[[entry]]
+id = "discovery-table"
+kind = "protocol-table"
+table = "discovery/s4v2"
+claim = "Discovery's serving admission, requester precheck, query claims and verdicts enforce stream 4's rules."
+check = ["crates/zakura-sim/src/peer/content.rs", "crates/zakura-sim/src/model/consequence.rs", "crates/zakura-sim/src/table.rs"]
+shared = []
+code = [
+    "crates/zakura-network/src/zakura/discovery/serving.rs",
+    "crates/zakura-network/src/zakura/discovery/service.rs",
+    "crates/zakura-network/src/zakura/discovery/requester.rs",
+    "crates/zakura-network/src/zakura/discovery/requester",
+    "crates/zakura-network/src/zakura/discovery/protocol.rs",
+    "crates/zakura-network/src/zakura/discovery/peer.rs",
+    "crates/zakura-network/src/zakura/discovery/wire.rs",
+]
+witnesses = [
+    { test = "hello_acts_apply_in_their_witnesses", test_target = "discovery_wire_witness" },
+    { test = "get_peers_acts_apply_in_their_witnesses", test_target = "discovery_wire_witness" },
+    { test = "peers_acts_apply_in_their_witnesses", test_target = "discovery_wire_witness" },
+    { test = "get_services_acts_apply_in_their_witnesses", test_target = "discovery_wire_witness" },
+    { test = "services_acts_apply_in_their_witnesses", test_target = "discovery_wire_witness" },
+    { test = "conformant_controls_hold_conformant_never_closes", test_target = "discovery_wire_witness" },
+    { test = "answers_within_their_requests_hold_sender_within_owed", test_target = "discovery_wire_witness" },
+]
+
+# discovery/late-response-admitted is the discovery table's entry's too
+# (mutation plan, mut-7 "One protocol table, once"), but its ID sits outside
+# the table's prefix, so it is listed here.
+[[entry]]
+id = "late-response-admitted"
+kind = "single"
+claim = "A correlated answer the node reads after its initial exchange timed out gets no fault close and no Misbehavior."
+check = ["crates/zakura-sim/src/domain/discovery.rs"]
+shared = []
+
+[[entry.instance]]
+property = "discovery/late-response-admitted"
+code = ["crates/zakura-network/src/zakura/discovery/requester.rs", "crates/zakura-network/src/zakura/discovery/peer.rs"]
+witness = { planted = "qa/planted/discovery/late-response-admitted/revoke-on-timeout.toml" }
+
+[[excluded]]
+property = "block-sync/reactor-query-lifecycle"
+reason = "Draft: the claim itself is under test, so its violation doesn't end a run."
+
+# Each `[[no-generator]]` names `Active` IDs that no generator harness can
+# reach, and why. A generator harness is one that reports the ID and doesn't
+# plant its bugs (`zakura-sim generators`); every ID here has one, but its
+# grammar never builds the run the ID applies to. `cargo xtask planted loop
+# --generate-harness auto` gives these IDs' cases no generator lane and
+# reports the reason instead. `crates/zakura-sim/tests/mutation_work_list.rs`
+# checks that every in-scope `Active` ID has a generator harness or a record
+# here.
+
+[[no-generator]]
+reason = "Each ID applies only when a peer sends a frame that stream 6's table refuses. block-sync/storage, the only harness that reports these IDs, draws honest mirrors only. Its hostile frames come from `ProbeSend` control steps, which no drawn scenario carries: only typed scenarios and the `block_table` tests build them. A 50-run `zakura-sim generate` on seed 11 applied none of them."
+properties = [
+    "block-sync/s6v3/block/bad-content-closes",
+    "block-sync/s6v3/block/long-payload-closes",
+    "block-sync/s6v3/block/over-owed-closes",
+    "block-sync/s6v3/block/reserved-flags-closes",
+    "block-sync/s6v3/block/short-payload-closes",
+    "block-sync/s6v3/block/unsolicited-closes",
+    "block-sync/s6v3/blocks-done/bad-content-closes",
+    "block-sync/s6v3/blocks-done/long-payload-closes",
+    "block-sync/s6v3/blocks-done/over-owed-closes",
+    "block-sync/s6v3/blocks-done/reserved-flags-closes",
+    "block-sync/s6v3/blocks-done/short-payload-closes",
+    "block-sync/s6v3/blocks-done/unsolicited-closes",
+    "block-sync/s6v3/get-blocks/bad-content-closes",
+    "block-sync/s6v3/get-blocks/long-payload-closes",
+    "block-sync/s6v3/get-blocks/over-margin-closes",
+    "block-sync/s6v3/get-blocks/reserved-flags-closes",
+    "block-sync/s6v3/get-blocks/short-payload-closes",
+    "block-sync/s6v3/range-unavailable/bad-content-closes",
+    "block-sync/s6v3/range-unavailable/long-payload-closes",
+    "block-sync/s6v3/range-unavailable/over-owed-closes",
+    "block-sync/s6v3/range-unavailable/reserved-flags-closes",
+    "block-sync/s6v3/range-unavailable/short-payload-closes",
+    "block-sync/s6v3/range-unavailable/unsolicited-closes",
+    "block-sync/s6v3/status/bad-content-closes",
+    "block-sync/s6v3/status/long-payload-closes",
+    "block-sync/s6v3/status/reserved-flags-closes",
+    "block-sync/s6v3/status/short-payload-closes",
+    "block-sync/s6v3/undeclared-type-closes",
+]
+
+[[no-generator]]
+reason = "Each ID applies only when a peer sends a frame that stream 4's table refuses. discovery/wire, the only harness that reports these IDs, draws only its honest saved Plans and the default honest peer. Its refused frames come from the `discovery_wire_witness` tests' act scenarios, which its grammar can't encode."
+properties = [
+    "discovery/s4v2/get-peers/bad-content-closes",
+    "discovery/s4v2/get-peers/long-payload-closes",
+    "discovery/s4v2/get-peers/over-margin-closes",
+    "discovery/s4v2/get-peers/reserved-flags-closes",
+    "discovery/s4v2/get-peers/short-payload-closes",
+    "discovery/s4v2/get-services/bad-content-closes",
+    "discovery/s4v2/get-services/long-payload-closes",
+    "discovery/s4v2/get-services/over-margin-closes",
+    "discovery/s4v2/get-services/reserved-flags-closes",
+    "discovery/s4v2/get-services/short-payload-closes",
+    "discovery/s4v2/hello/bad-content-closes",
+    "discovery/s4v2/hello/long-payload-closes",
+    "discovery/s4v2/hello/reserved-flags-closes",
+    "discovery/s4v2/hello/short-payload-closes",
+    "discovery/s4v2/peers/bad-content-closes",
+    "discovery/s4v2/peers/long-payload-closes",
+    "discovery/s4v2/peers/over-owed-closes",
+    "discovery/s4v2/peers/reserved-flags-closes",
+    "discovery/s4v2/peers/short-payload-closes",
+    "discovery/s4v2/peers/unsolicited-closes",
+    "discovery/s4v2/services/bad-content-closes",
+    "discovery/s4v2/services/long-payload-closes",
+    "discovery/s4v2/services/over-owed-closes",
+    "discovery/s4v2/services/reserved-flags-closes",
+    "discovery/s4v2/services/short-payload-closes",
+    "discovery/s4v2/services/unsolicited-closes",
+    "discovery/s4v2/undeclared-type-closes",
+]

@@ -1,9 +1,9 @@
 //! Owned permits for bounded collections of retained or active work.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use zakura_rt::sync::{downgrade, OwnedSemaphorePermit, Semaphore, Weak};
 
 /// A slot capacity cannot provide usable, representable permits.
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
@@ -21,7 +21,7 @@ pub(crate) struct SlotBudgetCapacityError {
 /// admitted item makes ordinary drop and cancellation release capacity.
 #[derive(Clone, Debug)]
 pub(crate) struct SlotBudget {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz", zakura_sim))]
     capacity: usize,
     permits: Arc<Semaphore>,
 }
@@ -37,7 +37,7 @@ impl SlotBudget {
         }
 
         Ok(Self {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "p2p-fuzz", zakura_sim))]
             capacity,
             permits: Arc::new(Semaphore::new(capacity)),
         })
@@ -50,10 +50,17 @@ impl SlotBudget {
     }
 
     /// Return the number of currently owned slots.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz", zakura_sim))]
     pub(crate) fn reserved(&self) -> usize {
         self.capacity
             .saturating_sub(self.permits.available_permits())
+    }
+
+    /// [`Self::reserved`], read with no simulator preemption point, for an
+    /// observer's report.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn peek_reserved(&self) -> usize {
+        self.capacity.saturating_sub(peek_available(&self.permits))
     }
 
     /// Free slots now. Another owner can take them at any time.
@@ -61,13 +68,20 @@ impl SlotBudget {
         self.permits.available_permits()
     }
 
+    /// [`Self::available`], read with no simulator preemption point, for an
+    /// observer's report.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn peek_available(&self) -> usize {
+        peek_available(&self.permits)
+    }
+
     /// Create a non-owning handle to this same pool for registry bookkeeping.
     /// This does not change capacity or release any reserved slots.
     pub(super) fn downgrade(&self) -> WeakSlotBudget {
         WeakSlotBudget {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "p2p-fuzz", zakura_sim))]
             capacity: self.capacity,
-            permits: Arc::downgrade(&self.permits),
+            permits: downgrade(&self.permits),
         }
     }
 
@@ -133,12 +147,27 @@ impl OutputByteBudget {
         self.capacity
     }
 
+    /// The semaphore that counts this budget's free bytes, for a transport
+    /// probe's peeks.
+    #[cfg(zakura_sim)]
+    pub(crate) fn semaphore(&self) -> &Arc<Semaphore> {
+        &self.bytes
+    }
+
     /// Bytes currently granted.
-    #[cfg(test)]
     pub(crate) fn granted(&self) -> u64 {
         // Widening usize to u64 is lossless on supported targets.
         self.capacity
             .saturating_sub(self.bytes.available_permits() as u64)
+    }
+
+    /// [`Self::granted`], read with no simulator preemption point, for an
+    /// observer's report.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn peek_granted(&self) -> u64 {
+        // Widening usize to u64 is lossless on supported targets.
+        self.capacity
+            .saturating_sub(peek_available(&self.bytes) as u64)
     }
 
     /// The largest grant [`Self::grant`] can complete: the whole budget, or
@@ -157,7 +186,16 @@ impl OutputByteBudget {
             .acquire_many_owned(bytes)
             .await
             .expect("output budget semaphore stays open because this type never closes it");
-        OutputGrant { _permit: permit }
+        OutputGrant { permit }
+    }
+
+    /// Take `bytes` now, or nothing. Pass a value from [`Self::clamp`].
+    pub(crate) fn try_grant(&self, bytes: u32) -> Option<OutputGrant> {
+        self.bytes
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .ok()
+            .map(|permit| OutputGrant { permit })
     }
 
     /// Take every free byte, up to 4 GiB.
@@ -168,13 +206,13 @@ impl OutputByteBudget {
             .clone()
             .try_acquire_many_owned(free)
             .ok()
-            .map(|permit| OutputGrant { _permit: permit })
+            .map(|permit| OutputGrant { permit })
     }
 
-    pub(super) fn downgrade(&self) -> WeakOutputByteBudget {
+    pub(crate) fn downgrade(&self) -> WeakOutputByteBudget {
         WeakOutputByteBudget {
             capacity: self.capacity,
-            bytes: Arc::downgrade(&self.bytes),
+            bytes: downgrade(&self.bytes),
         }
     }
 }
@@ -183,22 +221,45 @@ impl OutputByteBudget {
 #[derive(Debug)]
 #[must_use = "dropping an output grant releases its bytes"]
 pub(crate) struct OutputGrant {
-    _permit: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
+}
+
+impl OutputGrant {
+    /// Return every granted byte above `bytes`. A smaller grant stays as it is.
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
+        let keep = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let extra = self.permit.num_permits().saturating_sub(keep);
+        drop(self.permit.split(extra));
+    }
 }
 
 /// A registry handle to an output budget that does not keep it alive.
 #[derive(Debug)]
-pub(super) struct WeakOutputByteBudget {
+pub(crate) struct WeakOutputByteBudget {
     capacity: u64,
     bytes: Weak<Semaphore>,
 }
 
 impl WeakOutputByteBudget {
-    pub(super) fn upgrade(&self) -> Option<OutputByteBudget> {
+    pub(crate) fn upgrade(&self) -> Option<OutputByteBudget> {
         Some(OutputByteBudget {
             capacity: self.capacity,
             bytes: self.bytes.upgrade()?,
         })
+    }
+
+    /// Whether [`Self::upgrade`] would find the budget, read with no
+    /// simulator preemption point, for an observer's report.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn peek_alive(&self) -> bool {
+        #[cfg(zakura_sim)]
+        {
+            self.bytes.peek_strong_count() > 0
+        }
+        #[cfg(not(zakura_sim))]
+        {
+            self.bytes.strong_count() > 0
+        }
     }
 }
 
@@ -220,7 +281,7 @@ pub(crate) struct SlotPermit {
 /// can then remove the stale entry.
 #[derive(Debug)]
 pub(super) struct WeakSlotBudget {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz", zakura_sim))]
     capacity: usize,
     permits: Weak<Semaphore>,
 }
@@ -232,13 +293,41 @@ impl WeakSlotBudget {
         self.permits.strong_count() > 0
     }
 
+    /// [`Self::is_alive`], read with no simulator preemption point, for an
+    /// observer's report.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn peek_alive(&self) -> bool {
+        #[cfg(zakura_sim)]
+        {
+            self.permits.peek_strong_count() > 0
+        }
+        #[cfg(not(zakura_sim))]
+        {
+            self.permits.strong_count() > 0
+        }
+    }
+
     /// Obtain shared ownership of the existing pool, or `None` if it is gone.
     /// This never creates a new pool or resets its available capacity.
     pub(super) fn upgrade(&self) -> Option<SlotBudget> {
         Some(SlotBudget {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "p2p-fuzz", zakura_sim))]
             capacity: self.capacity,
             permits: self.permits.upgrade()?,
         })
+    }
+}
+
+/// `semaphore`'s free permits, read with no simulator preemption point, so
+/// an observer's report adds no scheduling point to the run it reports.
+#[cfg(any(test, zakura_sim))]
+fn peek_available(semaphore: &Semaphore) -> usize {
+    #[cfg(zakura_sim)]
+    {
+        semaphore.peek_available()
+    }
+    #[cfg(not(zakura_sim))]
+    {
+        semaphore.available_permits()
     }
 }

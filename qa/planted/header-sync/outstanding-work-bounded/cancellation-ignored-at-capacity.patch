@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+index 83453b265f..49cea86443 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+@@ -705,7 +705,9 @@ async fn publish<const HEADER_BYTES: usize>(
+         // it. Each wake still reaches `end_due` on the next pass.
+         zakura_rt::select! {
+             biased;
+-            () = cancel.cancelled() => {
++            // Mutation: the publisher ignores its cancellation and stays
++            // parked.
++            () = std::future::pending::<()>() => {
+                 lock(&task.shared).state.cancelled();
+                 return;
+             }

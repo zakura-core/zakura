@@ -1,0 +1,22 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+index 9c52c3e436..3ea7d2f297 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+@@ -594,7 +594,16 @@ impl Live {
+             subscription_id: self.id,
+             update_sequence: update.sequence,
+             initial_target_tip_hash: self.target,
+-            acknowledged: update.acknowledged,
++            // Mutation: a Grant acknowledges one byte more than its cursor
++            // consumed, at the right header.
++            acknowledged: if operation == Operation::Grant {
++                Cursor {
++                    bytes: update.acknowledged.bytes + 1,
++                    ..update.acknowledged
++                }
++            } else {
++                update.acknowledged
++            },
+             locator_hashes: match operation {
+                 Operation::Open => self.locators.iter().map(|locator| locator.hash).collect(),
+                 Operation::Grant | Operation::Close => Vec::new(),

@@ -1,0 +1,22 @@
+# hdr-13's faulted target remembered, on the fault class: a failed prepare
+# remembers its target in a set the reactor never clears, and an offer of
+# a remembered target counts as covered, so no peer offers it again. The
+# set sits outside the reactor's completed targets, whose dead keys
+# `outstanding-work-bounded` finds, so this case fails only on progress. In
+# the fault fixture every prepare fails `local-resource` until the
+# recover, which comes once the first has. Recovery offers only engine
+# outcomes after it, but the honest source's target stays refused, so the
+# node stays at A3, its baseline at the `Recover` pick. The `recovered`
+# pick owes A4 to A6, and the obligation runs to its 30-second deadline.
+# The harness offers a time boundary just past it, so the violation comes
+# there, and the fixture's finish ends the run idle after it.
+# Besides reactor.rs, which the patch changes, the offer policy decides
+# whether a covered target is offered, and the rest of header sync decides
+# whether the first prepare is dispatched. A change there can move the
+# input off its failed prepare.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-recovery-faults.json"
+plan = "crates/zakura-sim/tests/fixtures/header-recovery-faults.plan"

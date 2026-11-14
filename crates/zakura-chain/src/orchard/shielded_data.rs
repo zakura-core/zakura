@@ -15,7 +15,7 @@ use crate::{
     amount::{Amount, NegativeAllowed},
     block::MAX_BLOCK_BYTES,
     memory::{bounded_vec_capacity_bytes, vec_capacity_bytes, AttributedMemorySize},
-    orchard::{tree, Action, Nullifier, ValueCommitment},
+    orchard::{tree, Action, Nullifier},
     primitives::Halo2Proof,
     serialization::{
         AtLeastOne, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashSerialize,
@@ -100,40 +100,6 @@ impl ShieldedData {
     /// Collect the [`Nullifier`]s for this transaction.
     pub fn nullifiers(&self) -> impl Iterator<Item = &Nullifier> {
         self.actions().map(|action| &action.nullifier)
-    }
-
-    /// Calculate the Action binding verification key.
-    ///
-    /// Getting the binding signature validating key from the Action description
-    /// value commitments and the balancing value implicitly checks that the
-    /// balancing value is consistent with the value transferred in the
-    /// Action descriptions, but also proves that the signer knew the
-    /// randomness used for the Action value commitments, which
-    /// prevents replays of Action descriptions that perform an output.
-    /// In Orchard, all Action descriptions have a spend authorization signature,
-    /// therefore the proof of knowledge of the value commitment randomness
-    /// is less important, but stills provides defense in depth, and reduces the
-    /// differences between Orchard and Sapling.
-    ///
-    /// The net value of Orchard spends minus outputs in a transaction
-    /// is called the balancing value, measured in zatoshi as a signed integer
-    /// cv_balance.
-    ///
-    /// Consistency of cv_balance with the value commitments in Action
-    /// descriptions is enforced by the binding signature.
-    ///
-    /// Instead of generating a key pair at random, we generate it as a function
-    /// of the value commitments in the Action descriptions of the transaction, and
-    /// the balancing value.
-    ///
-    /// <https://zips.z.cash/protocol/protocol.pdf#orchardbalance>
-    pub fn binding_verification_key(&self) -> reddsa::VerificationKeyBytes<Binding> {
-        let cv: ValueCommitment = self.actions().map(|action| action.cv).sum();
-        let cv_balance: ValueCommitment =
-            ValueCommitment::new(pallas::Scalar::zero(), self.value_balance);
-
-        let key_bytes: [u8; 32] = (cv - cv_balance).into();
-        key_bytes.into()
     }
 
     /// Provide access to the `value_balance` field of the shielded data.
@@ -241,6 +207,17 @@ impl TrustedPreallocate for Action {
             assert!(MAX < (1 << 16));
         }
         MAX
+    }
+}
+
+/// Compressed actions are the same size on the wire as [`Action`]s, so they share its limits.
+impl TrustedPreallocate for super::action::ActionEncoding {
+    fn min_serialized_size() -> u64 {
+        Action::min_serialized_size()
+    }
+
+    fn max_allocation() -> u64 {
+        Action::max_allocation()
     }
 }
 
@@ -355,7 +332,7 @@ impl<'de> serde::Deserialize<'de> for Flags {
 }
 
 impl ZcashSerialize for Flags {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_u8(self.bits())?;
 
         Ok(())

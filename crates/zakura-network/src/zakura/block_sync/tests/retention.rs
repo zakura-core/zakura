@@ -1,4 +1,5 @@
 use super::*;
+use tokio::time;
 
 struct RetentionHarness {
     retained: Option<watch::Sender<block::Height>>,
@@ -12,7 +13,7 @@ impl RetentionHarness {
     fn new(retained: u32) -> Self {
         Self::from_startup(
             retained,
-            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()),
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap(),
         )
     }
 
@@ -159,6 +160,7 @@ async fn retention_coalesces_corrections_at_the_status_deadline() {
     }
 
     let startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+        .unwrap()
         .with_range_source(Arc::new(StatusOnlySource));
     let harness = RetentionHarness::from_startup(1, startup);
     let resources = harness
@@ -169,7 +171,6 @@ async fn retention_coalesces_corrections_at_the_status_deadline() {
     resources.admitted();
     let (inbound, receiver) = framed_channel(16);
     let (sender, mut outbound) = framed_channel(2);
-    let connected_at = time::Instant::now();
     harness.service.add_peer(Peer::new_with_service_streams(
         0,
         peer(0xeb),
@@ -210,6 +211,16 @@ async fn retention_coalesces_corrections_at_the_status_deadline() {
         }))
         .await
         .expect("tip growth queues");
+    // A new tip goes out without waiting for the Status interval.
+    let frame = time::timeout(Duration::from_secs(3), outbound.recv())
+        .await
+        .expect("a new tip is sent a second after the previous Status")
+        .expect("the outbound stream stays open");
+    let tip_sent = time::Instant::now();
+    let BlockSyncMessage::Status(tip) = BlockSyncMessage::decode_frame(frame).unwrap() else {
+        panic!("the new tip is a Status");
+    };
+    assert_eq!(tip.servable_high, block::Height(4));
     let retained = harness.retained.as_ref().expect("publisher exists");
     retained.send(block::Height(2)).expect("reactor subscribes");
     await_until("first correction", Duration::from_secs(1), || {
@@ -226,7 +237,7 @@ async fn retention_coalesces_corrections_at_the_status_deadline() {
 
     // The reactor uses wall time, so exercise the real connection deadline.
     assert!(
-        time::timeout_at(connected_at + Duration::from_secs(29), outbound.recv())
+        time::timeout_at(tip_sent + Duration::from_secs(29), outbound.recv())
             .await
             .is_err(),
         "range corrections must obey the shared Status cadence"
@@ -274,7 +285,7 @@ async fn retention_advertisement_keeps_pruned_heights_out_of_download_requests()
     let blocks = mainnet_blocks_1_to_3();
     let config = immediate_body_download_config();
     let (_tip, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
-    let startup = BlockSyncStartup::new(
+    let startup = header_tip_startup(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
@@ -321,7 +332,7 @@ async fn retention_advertisement_keeps_pruned_heights_out_of_download_requests()
 async fn retention_deferred_status_applies_after_peer_goes_quiet() {
     let config = ZakuraBlockSyncConfig::default();
     let (handle, mut actions, task) =
-        spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()))
+        spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()).unwrap())
             .expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let mut advertised = BlockSyncStatus {

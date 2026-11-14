@@ -16,7 +16,7 @@ use std::{
 use chrono::{TimeZone, Utc};
 use futures::{channel::oneshot, future, pin_mut, FutureExt, SinkExt, StreamExt};
 use indexmap::IndexSet;
-use rand::{rngs::OsRng, RngCore};
+use rand_10::Rng;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::broadcast,
@@ -24,7 +24,7 @@ use tokio::{
     time::{error, timeout, Instant},
 };
 use tokio_stream::wrappers::IntervalStream;
-use tokio_util::codec::Framed;
+use tokio_util::{codec::Framed, task::AbortOnDropHandle};
 use tower::Service;
 use tracing::Instrument;
 use tracing::{span, Level, Span};
@@ -35,18 +35,23 @@ use zakura_chain::{
     parameters::Network,
     serialization::{DateTime32, SerializationError},
 };
+use zakura_node_services::task::erased;
 
 use crate::{
     constants,
+    inbound_resources::{InboundBudget, TCP_INBOUND_RETAINED_BYTES},
     meta_addr::MetaAddrChange,
     peer::{
-        CancelHeartbeatTask, Client, ClientRequest, Connection, ErrorSlot, HandshakeError,
-        MinimumPeerVersion, PeerError,
+        gossip_trace::{LegacyGossipTrace, PeerGossipTrace},
+        AnnouncedBlocks, CancelHeartbeatTask, Client, ClientRequest, Connection,
+        ConnectionRequests, ErrorSlot, HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
     },
     peer_registry::PeerRegistry,
     peer_set::{ConnectionTracker, InventoryChange},
     protocol::{
-        external::{canonical_ip, types::*, AddrInVersion, Codec, InventoryHash, Message},
+        external::{
+            canonical_ip, types::*, AddrInVersion, BlockChecksums, Codec, InventoryHash, Message,
+        },
         internal::{Request, Response},
     },
     types::MetaAddr,
@@ -56,7 +61,7 @@ use crate::{
         P2P_V2_UPGRADE_COMMAND, PRELUDE_MAGIC,
     },
     zakura::{ZakuraHandshakeConnector, ZakuraRejectReason, ZakuraUpgradeOutcome},
-    BoxError, Config, PeerSocketAddr, VersionMessage,
+    BannedIps, BoxError, Config, PeerSocketAddr, VersionMessage,
 };
 
 #[cfg(test)]
@@ -93,6 +98,22 @@ where
     /// drop (operator-configured block-gossip / zcashd-compat sidecars),
     /// canonicalized for IPv4-mapped matching. Empty when unconfigured.
     protected_peer_ips: Arc<HashSet<IpAddr>>,
+
+    /// Funds decoded TCP payloads across this node's connections.
+    inbound_budget: InboundBudget,
+
+    /// Lets this node's connections reuse checksums of blocks they send.
+    block_checksums: BlockChecksums,
+
+    /// The live ban list, rechecked by each connection before it writes a block advert.
+    bans: BannedIps,
+
+    /// Warms each new connection's send direction, if warm-up is enabled.
+    tcp_warmup: Option<TcpWarmup>,
+
+    /// Records block announcements and block serving on each connection, when the node
+    /// writes trace files.
+    gossip_trace: LegacyGossipTrace,
 
     parent_span: Span,
 }
@@ -140,6 +161,11 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector.clone(),
             peer_registry: self.peer_registry.clone(),
             protected_peer_ips: self.protected_peer_ips.clone(),
+            inbound_budget: self.inbound_budget.clone(),
+            block_checksums: self.block_checksums.clone(),
+            bans: self.bans.clone(),
+            tcp_warmup: self.tcp_warmup.clone(),
+            gossip_trace: self.gossip_trace.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -267,7 +293,7 @@ impl ConnectedAddr {
     /// Returns a new outbound connected addr via `proxy`.
     ///
     /// `local_addr` is the ephemeral local address of the connection.
-    #[allow(unused)]
+    #[cfg(test)]
     pub fn new_outbound_proxy(proxy: SocketAddr, local_addr: SocketAddr) -> ConnectedAddr {
         OutboundProxy {
             proxy_addr: proxy,
@@ -279,7 +305,7 @@ impl ConnectedAddr {
     //
     // TODO: distinguish between direct listeners and proxy listeners in the
     //       rest of zakura-network
-    #[allow(unused)]
+    #[cfg(test)]
     pub fn new_inbound_proxy(proxy: SocketAddr) -> ConnectedAddr {
         InboundProxy {
             transient_addr: proxy,
@@ -497,6 +523,8 @@ where
     peer_registry: Option<PeerRegistry>,
     protected_peer_ips: Option<Arc<HashSet<IpAddr>>>,
     latest_chain_tip: C,
+    bans: Option<BannedIps>,
+    tcp_warmup: Option<TcpWarmup>,
 }
 
 impl<S, C> Builder<S, C>
@@ -581,6 +609,8 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector,
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips,
+            bans: self.bans,
+            tcp_warmup: self.tcp_warmup,
         }
     }
 
@@ -607,6 +637,22 @@ where
     /// exempted and every connection behaves exactly as before.
     pub fn with_protected_peer_ips(mut self, protected_peer_ips: Arc<HashSet<IpAddr>>) -> Self {
         self.protected_peer_ips = Some(protected_peer_ips);
+        self
+    }
+
+    /// Share the live ban list with connection advert delivery. Optional.
+    ///
+    /// If this is unset, block adverts are not checked against bans when they are written.
+    pub fn with_bans(mut self, bans: BannedIps) -> Self {
+        self.bans = Some(bans);
+        self
+    }
+
+    /// Warm each new connection's send direction with padded pings. Optional.
+    ///
+    /// If this is unset or `None`, connections are not warmed.
+    pub fn with_tcp_warmup(mut self, tcp_warmup: Option<TcpWarmup>) -> Self {
+        self.tcp_warmup = tcp_warmup;
         self
     }
 
@@ -638,13 +684,12 @@ where
         });
         let nonces = Arc::new(futures::lock::Mutex::new(IndexSet::new()));
         let user_agent = self.user_agent.unwrap_or_default();
-        let our_services = configured_advertised_services(
-            &config,
-            self.our_services.unwrap_or_else(PeerServices::empty),
-        );
+        let our_services =
+            config.handshake_services(self.our_services.unwrap_or_else(PeerServices::empty));
         let relay = self.relay.unwrap_or(false);
         let network = config.network.clone();
         let minimum_peer_version = MinimumPeerVersion::new(self.latest_chain_tip, &network);
+        let gossip_trace = LegacyGossipTrace::new(&config);
 
         Ok(Handshake {
             config,
@@ -659,6 +704,11 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector,
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
+            inbound_budget: InboundBudget::new(TCP_INBOUND_RETAINED_BYTES),
+            block_checksums: BlockChecksums::default(),
+            bans: self.bans.unwrap_or_default(),
+            tcp_warmup: self.tcp_warmup,
+            gossip_trace,
             parent_span: Span::current(),
         })
     }
@@ -686,19 +736,10 @@ where
             peer_registry: None,
             protected_peer_ips: None,
             latest_chain_tip: NoChainTip,
+            bans: None,
+            tcp_warmup: None,
         }
     }
-}
-
-/// Return the services Zakura should advertise for this handshake.
-fn configured_advertised_services(config: &Config, mut services: PeerServices) -> PeerServices {
-    services.remove(PeerServices::NODE_P2P_V2);
-
-    if config.v2_p2p() {
-        services |= PeerServices::NODE_P2P_V2;
-    }
-
-    services
 }
 
 fn inbound_error_address_change(
@@ -1219,7 +1260,7 @@ where
     PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut upgrade_nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut upgrade_nonce);
+    rand_10::rng().fill_bytes(&mut upgrade_nonce);
 
     let init = P2pV2UpgradeInit {
         magic: PRELUDE_MAGIC,
@@ -1341,7 +1382,7 @@ where
     };
 
     let mut responder_upgrade_nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut responder_upgrade_nonce);
+    rand_10::rng().fill_bytes(&mut responder_upgrade_nonce);
 
     let accept = P2pV2UpgradeAccept {
         magic: PRELUDE_MAGIC,
@@ -1523,6 +1564,8 @@ where
             connected_addr,
             connection_tracker,
         } = req;
+        let inbound_budget = self.inbound_budget.clone();
+        let block_checksums = self.block_checksums.clone();
 
         let addr_label = connected_addr.addr_label(self.config.expose_peer_addresses);
         let negotiator_span = debug_span!(
@@ -1546,11 +1589,14 @@ where
         let inbound_service = self.inbound_service.clone();
         let address_book_updater = self.address_book_updater.clone();
         let inv_collector = self.inv_collector.clone();
+        let gossip_trace = self.gossip_trace.clone();
         let config = self.config.clone();
         let user_agent = self.user_agent.clone();
         let our_services = self.our_services;
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
+        let bans = self.bans.clone();
+        let tcp_warmup = self.tcp_warmup.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
         let peer_registry = self.peer_registry.clone();
 
@@ -1575,7 +1621,10 @@ where
 
             let mut peer_conn = Framed::new(
                 data_stream,
-                Codec::builder().for_network(&config.network).finish(),
+                Codec::builder()
+                    .for_network(&config.network)
+                    .with_block_checksums(block_checksums)
+                    .finish(),
             );
             let mut connection_tracker = connection_tracker;
 
@@ -1587,9 +1636,10 @@ where
                 user_agent,
                 our_services,
                 relay,
-                minimum_peer_version,
+                minimum_peer_version.clone(),
                 is_protected_peer,
             )
+            .boxed()
             .await
             {
                 Ok(info) => {
@@ -1646,6 +1696,7 @@ where
                     peer_registry.as_ref(),
                     &address_book_updater,
                 )
+                .boxed()
                 .await
                 {
                     Ok(
@@ -1712,6 +1763,11 @@ where
             // and between the different connection tasks. We create separate tasks and channels
             // for each new connection.
             let (server_tx, server_rx) = futures::channel::mpsc::channel(0);
+            // Bound pending adverts; slow peers can catch up through later tip gossip.
+            let (block_advert_tx, block_advert_rx) =
+                tokio::sync::mpsc::channel(super::block_gossip::BLOCK_ADVERT_QUEUE);
+            let (warmup_tx, warmup_rx) =
+                tokio::sync::mpsc::channel(super::tcp_warmup::WARMUP_QUEUE);
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let error_slot = ErrorSlot::default();
 
@@ -1746,6 +1802,11 @@ where
             // (This significantly improves performance, by reducing time system calls.)
             let inbound_ts_collector = address_book_updater.clone();
             let inbound_inv_collector = inv_collector.clone();
+            // Block gossip skips this peer for the blocks it announces to us.
+            let announced_blocks = AnnouncedBlocks::default();
+            let inbound_announced_blocks = announced_blocks.clone();
+            let gossip_trace = gossip_trace.for_peer(&connected_addr);
+            let inbound_gossip_trace = gossip_trace.clone();
             let ts_inner_conn_span = connection_span.clone();
             let inv_inner_conn_span = connection_span.clone();
             let peer_rx = peer_rx
@@ -1773,7 +1834,7 @@ where
                             Err(err) => {
                                 metrics::counter!(
                                     "zakura.net.in.errors",
-                                    "error" => err.to_string(),
+                                    "error" => serialization_error_metric_label(err),
                                 )
                                 .increment(1);
 
@@ -1799,9 +1860,17 @@ where
                 })
                 .then(move |msg| {
                     let inbound_inv_collector = inbound_inv_collector.clone();
+                    let inbound_announced_blocks = inbound_announced_blocks.clone();
+                    let inbound_gossip_trace = inbound_gossip_trace.clone();
                     let span = debug_span!(parent: inv_inner_conn_span.clone(), "inventory_filter");
-                    register_inventory_status(msg, connected_addr, inbound_inv_collector)
-                        .instrument(span)
+                    register_inventory_status(
+                        msg,
+                        connected_addr,
+                        inbound_inv_collector,
+                        inbound_announced_blocks,
+                        inbound_gossip_trace,
+                    )
+                    .instrument(span)
                 })
                 .boxed();
 
@@ -1834,16 +1903,25 @@ where
 
             let server = Connection::new(
                 inbound_service,
-                server_rx,
+                ConnectionRequests {
+                    client_rx: server_rx,
+                    block_advert_rx,
+                    warmup_rx,
+                    minimum_peer_version,
+                    bans,
+                },
                 error_slot.clone(),
                 peer_tx,
                 connection_tracker,
                 connection_info.clone(),
                 addr_label,
                 alternate_addrs.collect(),
-            );
+                inbound_budget,
+            )
+            .with_gossip_trace(gossip_trace);
 
             let block_uploads = server.block_uploads.clone();
+            let request_slot = server.request_slot.clone();
             let client_peer_registry_updater = peer_registry_updater.clone();
 
             let connection_task = tokio::spawn(
@@ -1854,6 +1932,19 @@ where
                 .instrument(connection_span.clone())
                 .boxed(),
             );
+
+            // The warm-up task ends by itself when the connection closes its warm-up channel.
+            if let (Some(tcp_warmup), Some(peer_addr)) =
+                (tcp_warmup, connected_addr.get_transient_addr())
+            {
+                tokio::spawn(
+                    tcp_warmup
+                        .run(canonical_ip(peer_addr.ip()), warmup_tx)
+                        .instrument(
+                            tracing::debug_span!(parent: connection_span.clone(), "tcp_warmup"),
+                        ),
+                );
+            }
 
             let heartbeat_task = tokio::spawn(
                 send_periodic_heartbeats_with_shutdown_handle(
@@ -1868,11 +1959,14 @@ where
             );
 
             let client = Client {
+                announced_blocks,
                 block_uploads,
+                request_slot,
                 peer_registry_updater: client_peer_registry_updater,
                 connection_info,
                 shutdown_tx: Some(shutdown_tx),
                 server_tx,
+                block_advert_tx,
                 inv_collector,
                 error_slot,
                 connection_task,
@@ -1885,8 +1979,9 @@ where
         // Correctness: As a defence-in-depth against hangs, wrap the entire handshake in a timeout.
         let fut = timeout(constants::HANDSHAKE_TIMEOUT, fut);
 
-        // Spawn a new task to drive this handshake, forwarding panics to the calling task.
-        tokio::spawn(fut.instrument(negotiator_span))
+        // Keep the spawned handshake owned by its caller. Dropping a timed-out
+        // connector must also release the inner handshake's stream and tracker.
+        AbortOnDropHandle::new(tokio::spawn(erased(fut.instrument(negotiator_span))))
             .map(
                 |join_result: Result<
                     Result<Result<Client, HandshakeError>, error::Elapsed>,
@@ -1908,12 +2003,54 @@ where
     }
 }
 
+/// Returns a bounded serialization error label without error details.
+fn serialization_error_metric_label(error: &SerializationError) -> &'static str {
+    match error {
+        SerializationError::Io(_) => "io",
+        SerializationError::Parse(_) => "parse",
+        SerializationError::NonCanonicalShieldedProofSize => "non_canonical_shielded_proof_size",
+        SerializationError::Utf8Error(_) => "utf8_error",
+        SerializationError::TryFromSliceError(_) => "try_from_slice_error",
+        SerializationError::TryFromIntError(_) => "try_from_int_error",
+        SerializationError::FromHexError(_) => "from_hex_error",
+        SerializationError::Amount { .. } => "amount",
+        SerializationError::BadTransactionBalance => "bad_transaction_balance",
+        SerializationError::Script(_) => "script",
+        SerializationError::Opcode(_) => "opcode",
+        SerializationError::Num(_) => "num",
+    }
+}
+
 /// Register any advertised or missing inventory in `msg` for `connected_addr`.
+///
+/// Also records the blocks this peer announces in `announced_blocks`, so block gossip can skip
+/// a peer that already has the block. Unlike the inventory registry, this covers every block
+/// `inv`, solicited or not, and connections without a transient address. Requests for block
+/// bodies withdraw the peer's earlier claim to have those blocks.
+///
+/// An `inv` that names exactly one block is a new block announcement, and is written to
+/// `gossip_trace`. One that names several is the answer to a query.
 pub(crate) async fn register_inventory_status(
     msg: Result<Message, SerializationError>,
     connected_addr: ConnectedAddr,
     inv_collector: broadcast::Sender<InventoryChange>,
+    announced_blocks: AnnouncedBlocks,
+    gossip_trace: PeerGossipTrace,
 ) -> Result<Message, SerializationError> {
+    match &msg {
+        Ok(Message::Inv(items)) => {
+            announced_blocks.record(items.iter().filter_map(InventoryHash::block_hash));
+            if let [InventoryHash::Block(hash)] = items[..] {
+                gossip_trace.block_inv_received(hash);
+            }
+        }
+        // A request for the body or a missing response contradicts an earlier announcement.
+        Ok(Message::GetData(items) | Message::NotFound(items)) => {
+            announced_blocks.forget(items.iter().filter_map(InventoryHash::block_hash));
+        }
+        _ => {}
+    }
+
     match (&msg, connected_addr.get_transient_addr()) {
         (Ok(Message::Inv(advertised)), Some(transient_addr)) => {
             // We ignore inventory messages with more than one

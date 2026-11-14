@@ -38,6 +38,10 @@ pub enum ConnectError {
     /// The peer's key isn't the dialed node ID (TLS-7).
     #[error("the peer presented a different identity than the dialed node ID")]
     WrongIdentity,
+    /// This endpoint cannot reserve every address attempt under this dial's
+    /// connection ceiling (ADM-12).
+    #[error("endpoint has insufficient connection capacity for this dial")]
+    ConnectionLimit,
     /// The endpoint is shut down or refused the remote address.
     #[error("endpoint can't dial: {0}")]
     Endpoint(#[from] quinn_proto::ConnectError),
@@ -74,8 +78,15 @@ impl ConnectError {
     }
 
     /// Ranks errors so a multi-address dial reports the most informative one.
+    ///
+    /// `ConnectionLimit` comes only from the slot claim before a dial's first
+    /// attempt (ADM-12), so it never competes with a peer's result. It ranks
+    /// first anyway, so a local cap can never blame the peer: a signed record
+    /// proves the node key, not that it owns every address it lists, and a
+    /// decoy address can answer for another node or cohort.
     pub(crate) fn rank(&self) -> u8 {
         match self {
+            Self::ConnectionLimit => 7,
             Self::AlpnMismatch => 6,
             Self::WrongIdentity => 5,
             Self::Refused => 4,
@@ -97,6 +108,10 @@ pub enum BindError {
     /// No bind address was given.
     #[error("no bind address configured")]
     NoAddress,
+    /// `QuicBindConfig::max_connections` is zero, so the endpoint could
+    /// neither dial nor accept (ADM-12).
+    #[error("QuicBindConfig::max_connections must allow at least one connection")]
+    NoConnectionSlots,
     /// A socket failed to bind or configure.
     #[error("failed to bind {addr}: {source}")]
     Socket {
@@ -174,5 +189,27 @@ pub struct ClosedStream {
 impl ClosedStream {
     pub(crate) fn new() -> Self {
         Self { _private: () }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A multi-address dial reports the cap over every other result, so an
+    /// address this node never tried doesn't blame the peer, even when a
+    /// decoy address answered for another node (ADM-12).
+    #[test]
+    fn the_connection_limit_outranks_every_other_result() {
+        let limit = ConnectError::ConnectionLimit.rank();
+        for other in [
+            ConnectError::AlpnMismatch,
+            ConnectError::WrongIdentity,
+            ConnectError::Refused,
+            ConnectError::HandshakeTimeout,
+            ConnectError::Transport(ConnectionError::TimedOut),
+        ] {
+            assert!(limit > other.rank(), "{other:?}");
+        }
     }
 }

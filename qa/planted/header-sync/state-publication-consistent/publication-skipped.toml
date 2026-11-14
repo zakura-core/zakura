@@ -1,0 +1,12 @@
+# An operator event installs its new engine state and skips the
+# selected-chain watch's publication. On the quiet-reset witness the
+# invalidation commits with no publication in its step. No node-side commit
+# happens, so hdr-7c's flood properties don't apply. The storage adapter
+# decides how a reset publishes, so a change there can move the witness off
+# it.
+checks = ["crates/zakura-storage/src/header"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-quiet-reset.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-quiet-reset.plan"

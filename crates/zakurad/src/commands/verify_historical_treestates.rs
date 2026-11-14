@@ -19,7 +19,7 @@
 use std::{fs, path::PathBuf};
 
 use clap::Parser;
-use color_eyre::eyre::{eyre, Result, WrapErr};
+use eyre::{eyre, Result, WrapErr};
 
 use zakura_chain::{block::Height, parameters::Network};
 

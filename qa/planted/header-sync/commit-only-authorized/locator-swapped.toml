@@ -1,0 +1,10 @@
+# After the subscriber checks a round's first page, the reactor stages it
+# under another of the round's locators than the one its headers extend.
+# The reactor, the subscriber and the queue decide how the witness's rounds
+# start and stage, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

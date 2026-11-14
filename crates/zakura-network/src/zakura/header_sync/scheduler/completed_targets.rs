@@ -1,8 +1,7 @@
 //! Exact generation- and branch-keyed completed header targets.
 
-use std::collections::HashSet;
-
 use zakura_header_chain::{BranchId, Frontier, HeaderGeneration};
+use zakura_rt::collections::HashSet;
 
 /// Exact selected-header generation and completed branch identity.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
@@ -47,6 +46,24 @@ impl CompletedHeaderTargets {
     ) {
         self.0
             .retain(|key| key.generation == generation && key.branch.anchor_hash == finalized.hash);
+    }
+
+    /// Every completed target, by generation and branch, sorted.
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::header_sync) fn keys(&self) -> Vec<(HeaderGeneration, BranchId)> {
+        let mut keys: Vec<(HeaderGeneration, BranchId)> = self
+            .0
+            .iter()
+            .map(|key| (key.generation, key.branch))
+            .collect();
+        keys.sort_unstable_by_key(|(generation, branch)| {
+            (
+                generation.get(),
+                branch.anchor_hash.0,
+                branch.target_tip_hash.0,
+            )
+        });
+        keys
     }
 
     #[cfg(test)]

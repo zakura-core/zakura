@@ -11,10 +11,11 @@
 
 use std::{path::Path, sync::Arc};
 
-use crossbeam_channel::bounded;
+use crate::service::finalized_state::disk_format::upgrade::cancel_channel;
 use semver::Version;
 
 use zakura_chain::{diagnostic::task::WaitForPanics, parameters::Network};
+use zakura_node_services::block_memory::{DecodedBlockPool, ReadMemoryBudget};
 
 use crate::{
     config::database_format_version_on_disk,
@@ -32,7 +33,6 @@ use super::disk_format::upgrade::restorable_db_versions;
 
 pub mod block;
 pub mod chain;
-#[allow(dead_code)]
 pub(crate) mod commitment_roots_db;
 #[allow(dead_code)]
 pub mod highest_completed_checkpoint;
@@ -68,6 +68,47 @@ pub mod arbitrary;
 
 /// Wrapper struct to ensure high-level `zakura-state` database access goes through the correct API.
 ///
+/// Admission and memory limits for reads. Clones share every limit.
+///
+/// Worker slots bound transient parser memory: each worker reads one result at a time.
+/// One retained-byte budget bounds every result that leaves its worker.
+#[derive(Clone, Debug)]
+struct ReadCapacity {
+    /// Shared admission for blocking read-service jobs, including cancelled waiters' jobs.
+    workers: crate::request::ReadWorkerPool,
+
+    /// Admission reserved for bounded chain-tip and depth queries.
+    control_workers: crate::request::ReadWorkerPool,
+
+    /// Retained bytes of disk results until their final holders drop them.
+    memory: ReadMemoryBudget,
+
+    /// Disk blocks' final-holder ownership. Its count never refuses: `memory` bounds it.
+    blocks: DecodedBlockPool,
+
+    /// Chain-tip publication cannot spend ordinary callers' result capacity.
+    chain_tip_blocks: DecodedBlockPool,
+}
+
+impl ReadCapacity {
+    fn new(config: &Config) -> Self {
+        Self {
+            workers: crate::request::ReadWorkerPool::new(usize::from(
+                config.read_concurrency_limit.get(),
+            )),
+            control_workers: crate::request::ReadWorkerPool::new(
+                crate::constants::CONTROL_READ_CONCURRENCY,
+            ),
+            memory: ReadMemoryBudget::new(config.read_result_byte_limit()),
+            blocks: DecodedBlockPool::for_block_count(std::num::NonZeroU64::MAX),
+            chain_tip_blocks: DecodedBlockPool::for_block_count(
+                std::num::NonZeroU64::new(crate::constants::CHAIN_TIP_BLOCK_RETENTION)
+                    .expect("chain-tip retention has a nonzero fixed allowance"),
+            ),
+        }
+    }
+}
+
 /// `rocksdb` allows concurrent writes through a shared reference,
 /// so database instances are cloneable. When the final clone is dropped,
 /// the database is closed.
@@ -102,6 +143,9 @@ pub struct ZakuraDb {
     //
     // TODO: move the generic upgrade code and fields to DiskDb
     format_change_handle: Option<DbFormatChangeThreadHandle>,
+
+    /// Admission and memory limits for reads, shared by database clones.
+    read_capacity: ReadCapacity,
 
     /// The inner low-level database wrapper for the RocksDB database.
     db: DiskDb,
@@ -187,6 +231,10 @@ impl ZakuraDb {
             return Err(StateInitError::ReadOnlyDatabaseNotFound { path: db_path });
         }
 
+        // Reject read limits that cannot fund their workers before touching the disk.
+        let read_memory_bound = config.read_memory_bound()?;
+        tracing::info!(read_memory_bound, "checked the read memory bound");
+
         // Format upgrades try to write to the database, so we always skip them
         // if `read_only` is `true`.
         //
@@ -210,6 +258,7 @@ impl ZakuraDb {
 
         let mut db = ZakuraDb {
             config: Arc::new(config.clone()),
+            read_capacity: ReadCapacity::new(config),
             debug_skip_format_upgrades,
             format_change_handle: None,
             db: disk_db,
@@ -263,7 +312,7 @@ impl ZakuraDb {
 
         // No state service can commit while this synchronous startup operation is running.
         let initial_finalized_tip_height = self.finalized_tip_height();
-        let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
+        let (_never_cancel_handle, never_cancel_receiver) = cancel_channel();
         format_change
             .run_format_change_or_check(self, initial_finalized_tip_height, &never_cancel_receiver)
             .map_err(|source| StateInitError::DatabaseFormatUpgrade {
@@ -291,6 +340,32 @@ impl ZakuraDb {
     /// indicate that Zebra has finished applying any required db format upgrades.
     pub fn finished_format_upgrades(&self) -> bool {
         self.db.finished_format_upgrades()
+    }
+
+    /// Return the shared admission pool for blocking read-service jobs.
+    pub(crate) fn read_worker_capacity(&self) -> crate::request::ReadWorkerPool {
+        self.read_capacity.workers.clone()
+    }
+
+    /// Return the admission pool that bulk reads cannot occupy.
+    pub(crate) fn control_read_worker_capacity(&self) -> crate::request::ReadWorkerPool {
+        self.read_capacity.control_workers.clone()
+    }
+
+    /// Charge `bytes` serialized from a non-finalized block to the read memory
+    /// budget, so they share its limit with serialized disk results.
+    ///
+    /// The bytes already exist, like a read worker's transient parser memory, so
+    /// a refusal drops them and returns an error.
+    pub(crate) fn retain_serialized_bytes(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<
+        zakura_node_services::block_memory::OwnedPayload<Vec<u8>>,
+        zakura_node_services::block_memory::ReadMemoryExhausted,
+    > {
+        let charge = u64::try_from(bytes.capacity()).unwrap_or(u64::MAX);
+        self.read_capacity.memory.try_reserve(charge)?.retain(bytes)
     }
 
     /// Returns config for this database.
@@ -431,11 +506,16 @@ impl ZakuraDb {
             if let Some(disk_version) = disk_version {
                 // We need to keep the cancel handle until the format check has finished,
                 // because dropping it cancels the format check.
-                let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
+                let (_never_cancel_handle, never_cancel_receiver) = cancel_channel();
 
                 // We block here because the checks are quick and database validity is
                 // consensus-critical.
-                if disk_version >= self.db.format_version_in_code() {
+                // Several instances shut the database down. The block write task shuts it down
+                // after its last commit, and the read service waits for that task first, so the
+                // first instance to claim the check sees the final database.
+                if disk_version >= self.db.format_version_in_code()
+                    && self.db.claim_shutdown_format_check()
+                {
                     DbFormatChange::check_new_blocks(self)
                         .run_format_change_or_check(
                             self,
@@ -630,6 +710,24 @@ mod tests {
             .expect("fixture version write succeeds");
     }
 
+    /// Every instance that shuts the database down used to rerun the full format check,
+    /// so a node shutdown ran it up to three times. Only the first shutdown runs it now.
+    #[test]
+    fn shutdown_format_check_runs_once_per_database() {
+        let _init_guard = zakura_test::init();
+        let (_cache, config) = persistent_config();
+        let network = Network::Mainnet;
+        let db = open(&config, &network, false).expect("a new database opens");
+        let mut first_owner = db.clone();
+
+        first_owner.shutdown(true);
+
+        assert!(
+            !db.db.claim_shutdown_format_check(),
+            "the first shutdown claims the format check for every clone of the database"
+        );
+    }
+
     /// A Mainnet database written by the original VCT fast path is missing historical Sprout
     /// anchors and can no longer be repaired, so it must be refused in every open mode.
     #[test]
@@ -649,6 +747,28 @@ mod tests {
                 "read_only = {read_only} startup must refuse an unrepairable VCT database"
             );
         }
+    }
+
+    /// A database still waiting for a format upgrade is not checked at shutdown, so its
+    /// shutdown must not stop a later shutdown in the current format from running the check.
+    #[test]
+    fn shutdown_of_an_older_format_does_not_claim_the_format_check() {
+        let _init_guard = zakura_test::init();
+        let (_cache, config) = persistent_config();
+        let network = Network::Mainnet;
+        let db = open(&config, &network, false).expect("a new database opens");
+        let mut first_owner = db.clone();
+        // Any version below the code version means the upgrade has not finished.
+        let older = Version::new(state_database_format_version_in_code().major - 1, 0, 0);
+        db.update_format_version_on_disk(&older)
+            .expect("the test can write the version file");
+
+        first_owner.shutdown(true);
+
+        assert!(
+            db.db.claim_shutdown_format_check(),
+            "a skipped check leaves the claim for a later shutdown"
+        );
     }
 
     /// The guard is narrow: it must not reject databases that are not missing Sprout history.

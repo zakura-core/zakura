@@ -11,11 +11,212 @@ use zakura_chain::{
 };
 
 use crate::{
-    constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE},
+    address_book_peers::AddressBookPeers,
+    config::UnconditionalPeers,
+    constants::{
+        DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE,
+        MIN_PEER_RECONNECTION_DELAY,
+    },
     meta_addr::{MetaAddr, MetaAddrChange},
     protocol::external::types::PeerServices,
     AddressBook,
 };
+
+/// Cache ranking uses measured RTT, retaining book order for measured ties.
+#[test]
+fn peer_cache_ranks_by_rtt_with_stable_ties() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    for (ip, millis) in [
+        (1, None),
+        (2, Some(50)),
+        (3, Some(10)),
+        (4, Some(10)),
+        (5, None),
+    ] {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, ip], 8233)).into();
+        // Start with the measured response: adjacent same-state updates are ignored
+        // by the address book's concurrent-update guard.
+        book.update(MetaAddr::new_responded(
+            addr,
+            millis.map(std::time::Duration::from_millis),
+        ));
+    }
+    let before: Vec<_> = book.peers.ordered_values().cloned().collect();
+    let ranked = book.cacheable(Utc::now());
+    assert_eq!(
+        ranked
+            .iter()
+            .map(|peer| peer.rtt().map(|rtt| rtt.as_millis()))
+            .collect::<Vec<_>>(),
+        vec![Some(10), Some(10), Some(50), None, None]
+    );
+    let rtt = Some(std::time::Duration::from_millis(10));
+    assert_eq!(
+        ranked
+            .iter()
+            .filter(|peer| peer.rtt() == rtt)
+            .map(|peer| peer.addr)
+            .collect::<Vec<_>>(),
+        before
+            .iter()
+            .filter(|peer| peer.rtt() == rtt)
+            .map(|peer| peer.addr)
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// A gossiped last seen time does not make a peer cacheable: only this node's own
+/// responses show that an address is a reachable listener.
+#[test]
+fn peer_cache_excludes_gossip_only_peers() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let responded = "127.0.0.1:8233".parse().unwrap();
+    let gossiped = "127.0.0.2:8233".parse().unwrap();
+    book.update(MetaAddr::new_responded(responded, None));
+    book.update(
+        MetaAddr::new_gossiped_meta_addr(gossiped, PeerServices::NODE_NETWORK, DateTime32::now())
+            .new_gossiped_change()
+            .unwrap(),
+    );
+
+    let cached: Vec<_> = book
+        .cacheable(Utc::now())
+        .iter()
+        .map(|peer| peer.addr)
+        .collect();
+    assert_eq!(cached, vec![responded]);
+
+    let later = Utc::now()
+        + chrono::Duration::from(crate::constants::MAX_PEER_ACTIVE_FOR_GOSSIP)
+        + chrono::Duration::seconds(1);
+    assert!(
+        book.cacheable(later).is_empty(),
+        "a response older than the cache window is not cached"
+    );
+}
+
+/// Peers without a measured RTT have no trusted preference and do not keep a fixed
+/// cache prefix.
+#[test]
+fn peer_cache_shuffles_unmeasured_peers() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let measured = "127.0.0.9:8233".parse().unwrap();
+    book.update(MetaAddr::new_responded(
+        measured,
+        Some(std::time::Duration::from_millis(10)),
+    ));
+    let mut expected = std::collections::HashSet::new();
+    for ip in 1..=8 {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, ip], 8233)).into();
+        expected.insert(addr);
+        book.update(MetaAddr::new_responded(addr, None));
+    }
+    let mut orders = std::collections::HashSet::new();
+    for _ in 0..16 {
+        let cached = book.cacheable(Utc::now());
+        assert_eq!(cached[0].addr, measured, "measured peers retain priority");
+        let unknown: Vec<_> = cached[1..].iter().map(|peer| peer.addr).collect();
+        assert_eq!(
+            unknown
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            expected
+        );
+        orders.insert(unknown);
+    }
+    // Sixteen identical independent shuffles of eight peers have probability (8!)^-15.
+    assert!(
+        orders.len() > 1,
+        "unmeasured peers must not retain deterministic priority"
+    );
+}
+
+/// Both service flags preserve discovery, restart caching, and outbound eligibility.
+#[test]
+fn pruned_peers_remain_dialable_cacheable_and_gossipable() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let addr = "192.0.2.1:8233".parse().unwrap();
+    let services = PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED;
+    book.update(MetaAddr::new_connected(addr, &services, false));
+    book.update(MetaAddr::new_responded(addr, None));
+    let peer = book.get(addr).unwrap();
+    assert!(peer.last_known_info_is_valid_for_outbound(&Mainnet));
+    assert_eq!(peer.sanitize(&Mainnet).unwrap().services, Some(services));
+    assert!(book
+        .cacheable(Utc::now())
+        .iter()
+        .any(|peer| peer.addr == addr));
+    assert!(book
+        .sanitized(Utc::now())
+        .iter()
+        .any(|peer| peer.addr == addr && peer.services == Some(services)));
+}
+
+/// Known non-nodes remain recorded at runtime but are not saved for restart.
+#[test]
+fn peer_cache_excludes_known_non_node_services() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let non_node = "127.0.0.1:8233".parse().unwrap();
+    let full_node = "127.0.0.2:8233".parse().unwrap();
+    let unknown = "127.0.0.3:8233".parse().unwrap();
+    for (addr, services) in [
+        (non_node, PeerServices::empty()),
+        (full_node, PeerServices::NODE_NETWORK),
+    ] {
+        book.update(MetaAddr::new_connected(addr, &services, false));
+        book.update(MetaAddr::new_responded(
+            addr,
+            Some(std::time::Duration::from_millis(10)),
+        ));
+    }
+    book.update(MetaAddr::new_responded(
+        unknown,
+        Some(std::time::Duration::from_millis(20)),
+    ));
+    assert!(!book
+        .get(non_node)
+        .unwrap()
+        .last_known_info_is_valid_for_outbound(&Mainnet));
+    assert_eq!(book.get(unknown).unwrap().services, None);
+    assert_eq!(
+        book.cacheable(Utc::now())
+            .iter()
+            .map(|peer| peer.addr)
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([full_node, unknown])
+    );
+}
 
 /// Make sure an empty address book is actually empty.
 #[test]
@@ -153,6 +354,84 @@ fn misbehavior_ban_removes_all_addresses_for_ip() {
         1,
         "published metrics should exclude all addresses on the banned IP"
     );
+}
+
+/// The published metrics count the peers in each connection state, and split
+/// responded peers by how recently they answered, as peers change state and
+/// leave the address book.
+#[test]
+fn address_metrics_count_peers_by_state() {
+    let _init_guard = zakura_test::init();
+
+    let addr = |last_octet: u8| -> crate::PeerSocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, last_octet], 8233)).into()
+    };
+    let [pending, responded_a, responded_b, failed, gossiped] = [1, 2, 3, 4, 5].map(addr);
+
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let address_metrics = address_book.address_metrics_watcher();
+
+    for (seconds, peer) in (0..).zip([pending, responded_a, responded_b, failed, gossiped]) {
+        address_book.update(gossiped_change(
+            peer,
+            PeerServices::NODE_NETWORK,
+            DateTime32::MIN.saturating_add(Duration32::from_seconds(seconds)),
+        ));
+    }
+    address_book.update(MetaAddr::new_reconnect(pending));
+    for peer in [responded_a, responded_b] {
+        address_book.update(MetaAddr::new_reconnect(peer));
+        address_book.update(MetaAddr::new_responded(peer, None));
+    }
+    address_book.update(MetaAddr::new_reconnect(failed));
+    address_book.update(MetaAddr::new_errored(failed, PeerServices::NODE_NETWORK));
+    address_book.peers.assert_consistent();
+
+    let now = Utc::now();
+    let metrics = address_book.address_metrics(now);
+    assert_eq!(metrics, *address_metrics.borrow());
+    assert_eq!(metrics.responded, 2);
+    assert_eq!(metrics.never_attempted_gossiped, 1);
+    assert_eq!(metrics.failed, 1);
+    assert_eq!(metrics.attempt_pending, 1);
+    assert_eq!(metrics.recently_live, 2);
+    assert_eq!(metrics.recently_stopped_responding, 0);
+    assert_eq!(metrics.num_addresses, 5);
+    assert_eq!(
+        address_book.recently_live_peers(now).len(),
+        metrics.recently_live
+    );
+
+    // Responded peers stay in that state after they go quiet, but stop
+    // counting as live.
+    let after_peers_went_quiet = now
+        + chrono::Duration::from_std(MIN_PEER_RECONNECTION_DELAY * 2)
+            .expect("reconnection delay fits in a chrono duration");
+    let metrics = address_book.address_metrics(after_peers_went_quiet);
+    assert_eq!(metrics.responded, 2);
+    assert_eq!(metrics.recently_live, 0);
+    assert_eq!(metrics.recently_stopped_responding, 2);
+    assert!(address_book
+        .recently_live_peers(after_peers_went_quiet)
+        .is_empty());
+
+    // A banned peer leaves the address book and its state's count.
+    address_book.update(MetaAddrChange::UpdateMisbehavior {
+        addr: responded_a,
+        score_increment: MAX_PEER_MISBEHAVIOR_SCORE,
+    });
+    address_book.peers.assert_consistent();
+
+    let metrics = address_book.address_metrics(Utc::now());
+    assert_eq!(metrics, *address_metrics.borrow());
+    assert_eq!(metrics.responded, 1);
+    assert_eq!(metrics.recently_live, 1);
+    assert_eq!(metrics.num_addresses, 4);
 }
 
 /// Make sure peers are attempted in priority order.
@@ -300,6 +579,174 @@ fn test_reconnection_peers_skips_recently_updated_ip<
     } else {
         assert_ne!(next_reconnection_peer, None,);
     }
+}
+
+/// The crawler's candidates leave out every address on the IP of a dialed unconditional
+/// peer, whatever its port, so another node on that IP cannot take the room the listed
+/// peer needs. Addresses on other IPs, including those only in a listed range, stay.
+#[test]
+fn reconnection_peers_leave_out_dialed_unconditional_peer_ips() {
+    let listed: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let same_ip: crate::PeerSocketAddr = "127.0.0.1:18233".parse().unwrap();
+    let in_range: crate::PeerSocketAddr = "127.0.0.4:8233".parse().unwrap();
+    let other: crate::PeerSocketAddr = "127.0.0.3:8233".parse().unwrap();
+
+    let unconditional_peers: UnconditionalPeers = ["127.0.0.1/32", "127.0.0.4/30"]
+        .iter()
+        .map(|net| net.parse::<ipnet::IpNet>().unwrap())
+        .collect();
+    let addrs = [listed, same_ip, in_range, other]
+        .map(|addr| {
+            MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, DateTime32::MIN)
+        })
+        .to_vec();
+    let address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        addrs,
+    )
+    .with_unconditional_peers(unconditional_peers);
+
+    let candidates: std::collections::HashSet<_> = address_book
+        .reconnection_peers(Instant::now(), Utc::now())
+        .map(|peer| peer.addr)
+        .collect();
+    assert_eq!(
+        candidates,
+        std::collections::HashSet::from([in_range, other])
+    );
+}
+
+/// Helper: build an address book with `unconditional_peers`, containing a
+/// responded entry for each of `addrs`.
+fn address_book_with_unconditional_peers(
+    unconditional_peers: &[&str],
+    addrs: &[crate::PeerSocketAddr],
+) -> AddressBook {
+    let unconditional_peers: UnconditionalPeers = unconditional_peers
+        .iter()
+        .map(|net| net.parse::<ipnet::IpNet>().unwrap())
+        .collect();
+
+    let mut address_book =
+        AddressBook::new("0.0.0.0:0".parse().unwrap(), &Mainnet, 2, Span::current())
+            .with_unconditional_peers(unconditional_peers);
+
+    for &addr in addrs {
+        address_book.update(gossiped_change(
+            addr,
+            PeerServices::NODE_NETWORK,
+            DateTime32::MIN,
+        ));
+        address_book.update(MetaAddr::new_reconnect(addr));
+        address_book.update(MetaAddr::new_responded(addr, None));
+        assert!(address_book.get(addr).is_some());
+    }
+
+    address_book
+}
+
+/// A ban-threshold misbehavior report for an unconditional peer leaves its
+/// score at zero and does not ban it, while other peers are still banned.
+#[test]
+fn unconditional_peer_misbehavior_is_ignored() {
+    let unconditional_addr: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let other_addr: crate::PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+
+    let mut address_book =
+        address_book_with_unconditional_peers(&["127.0.0.1/32"], &[unconditional_addr, other_addr]);
+    let bans = address_book.bans();
+
+    let updated = address_book.update(MetaAddr::new_misbehavior(
+        unconditional_addr,
+        MAX_PEER_MISBEHAVIOR_SCORE,
+    ));
+    address_book.peers.assert_consistent();
+
+    assert_eq!(updated, None, "the misbehavior report should be dropped");
+    assert!(!bans.contains(unconditional_addr.ip()));
+    assert_eq!(
+        address_book
+            .get(unconditional_addr)
+            .expect("unconditional peer should stay in the address book")
+            .misbehavior(),
+        0,
+    );
+
+    address_book.update(MetaAddr::new_misbehavior(
+        other_addr,
+        MAX_PEER_MISBEHAVIOR_SCORE,
+    ));
+
+    assert!(
+        bans.contains(other_addr.ip()),
+        "peers that are not unconditional should still be banned"
+    );
+    assert!(address_book.get(other_addr).is_none());
+    assert!(address_book.get(unconditional_addr).is_some());
+}
+
+/// Repeated sub-threshold misbehavior reports for an unconditional peer never
+/// add up to a ban.
+#[test]
+fn unconditional_peer_misbehavior_does_not_accumulate() {
+    let unconditional_addr: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+
+    let mut address_book =
+        address_book_with_unconditional_peers(&["127.0.0.1/32"], &[unconditional_addr]);
+    let bans = address_book.bans();
+
+    for _ in 0..10 {
+        address_book.update(MetaAddr::new_misbehavior(
+            unconditional_addr,
+            MAX_PEER_MISBEHAVIOR_SCORE / 2,
+        ));
+    }
+
+    assert!(!bans.contains(unconditional_addr.ip()));
+    assert_eq!(
+        address_book
+            .get(unconditional_addr)
+            .expect("unconditional peer should stay in the address book")
+            .misbehavior(),
+        0,
+    );
+}
+
+/// Unconditional CIDR ranges cover their inner addresses, including reports
+/// that use the IPv4-mapped IPv6 form, and do not cover outer addresses.
+#[test]
+fn unconditional_peer_ranges_match_inner_and_mapped_addresses() {
+    let inner_addr: crate::PeerSocketAddr = "127.0.0.3:8233".parse().unwrap();
+    let mapped_inner_addr: crate::PeerSocketAddr = "[::ffff:127.0.0.3]:8233".parse().unwrap();
+    let outer_addr: crate::PeerSocketAddr = "127.0.0.4:8233".parse().unwrap();
+
+    let mut address_book =
+        address_book_with_unconditional_peers(&["127.0.0.0/30"], &[inner_addr, outer_addr]);
+    let bans = address_book.bans();
+
+    address_book.update(MetaAddr::new_misbehavior(
+        inner_addr,
+        MAX_PEER_MISBEHAVIOR_SCORE,
+    ));
+    address_book.update(MetaAddr::new_misbehavior(
+        mapped_inner_addr,
+        MAX_PEER_MISBEHAVIOR_SCORE,
+    ));
+    address_book.update(MetaAddr::new_misbehavior(
+        outer_addr,
+        MAX_PEER_MISBEHAVIOR_SCORE,
+    ));
+
+    assert!(!bans.contains(inner_addr.ip()));
+    assert!(!bans.contains(mapped_inner_addr.ip()));
+    assert!(address_book.get(inner_addr).is_some());
+
+    assert!(bans.contains(outer_addr.ip()));
+    assert!(address_book.get(outer_addr).is_none());
 }
 
 /// An inbound peer's ephemeral source endpoint is never dialed or written to the peer

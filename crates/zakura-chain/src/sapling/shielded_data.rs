@@ -274,12 +274,11 @@ where
     /// the checkpoint verifier trusts block hashes and skips it. Spend `rk` is
     /// validated separately at deserialization.
     pub fn point_encodings_are_valid(&self) -> bool {
-        self.spends()
-            .all(|spend| spend.cv.is_valid_not_small_order())
-            && self.outputs().all(|output| {
-                output.cv.is_valid_not_small_order()
-                    && output.ephemeral_key.is_valid_not_small_order()
-            })
+        let encodings = self.spends().map(|spend| spend.cv.0).chain(
+            self.outputs()
+                .flat_map(|output| [output.cv.0, output.ephemeral_key.0]),
+        );
+        super::all_valid_not_small_order(encodings)
     }
 
     /// Provide the shared anchor for this transaction, if present.
@@ -332,18 +331,18 @@ where
     /// (`Transaction::sapling_point_encodings_are_valid`), so a `None` here means
     /// the caller is working with an unvalidated transaction.
     pub fn binding_verification_key(&self) -> Option<redjubjub::VerificationKeyBytes<Binding>> {
-        let cv_old: sapling_crypto::value::CommitmentSum = self
-            .spends()
-            .map(|spend| spend.cv.commitment())
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .sum();
-        let cv_new: sapling_crypto::value::CommitmentSum = self
-            .outputs()
-            .map(|output| output.cv.commitment())
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .sum();
+        let cv_old = sapling_crypto::value::CommitmentSum::try_sum(
+            &self
+                .spends()
+                .map(|spend| spend.cv.unvalidated())
+                .collect::<Vec<_>>(),
+        )?;
+        let cv_new = sapling_crypto::value::CommitmentSum::try_sum(
+            &self
+                .outputs()
+                .map(|output| output.cv.unvalidated())
+                .collect::<Vec<_>>(),
+        )?;
 
         Some(
             (cv_old - cv_new)

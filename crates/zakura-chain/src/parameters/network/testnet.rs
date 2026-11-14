@@ -74,6 +74,7 @@ pub struct ConfiguredFundingStreamRecipient {
 impl ConfiguredFundingStreamRecipient {
     /// Creates a new [`ConfiguredFundingStreamRecipient`] with the provided receiver and default
     /// values for other fields.
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub fn new_for(receiver: FundingStreamReceiver) -> Self {
         use FundingStreamReceiver::*;
         match receiver {
@@ -295,6 +296,7 @@ impl ConfiguredFundingStreams {
     /// # Panics
     ///
     /// If `height_range` is None.
+    #[cfg(test)]
     pub fn into_funding_streams_unchecked(self) -> FundingStreams {
         let height_range = self.height_range.expect("must have height range");
         let recipients = self
@@ -674,7 +676,7 @@ impl ConfiguredActivationHeights {
 
 /// Configurable checkpoints, either a path to a checkpoints file, a "default" keyword to indicate
 /// that Zebra should use the default Testnet checkpoints, or a list of block heights and hashes.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(untagged)]
 pub enum ConfiguredCheckpoints {
     /// A boolean indicating whether Zebra should use the default Testnet checkpoints.
@@ -683,6 +685,39 @@ pub enum ConfiguredCheckpoints {
     Path(std::path::PathBuf),
     /// Directly configured block heights and hashes to be used as Zebra's checkpoints.
     HeightsAndHashes(Vec<(block::Height, block::Hash)>),
+}
+
+impl<'de> serde::Deserialize<'de> for ConfiguredCheckpoints {
+    /// Dispatches on the value's type instead of buffering it like `#[serde(untagged)]`.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CheckpointsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for CheckpointsVisitor {
+            type Value = ConfiguredCheckpoints;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a boolean, a checkpoints file path, or heights and hashes")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(ConfiguredCheckpoints::Default(value))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, path: &str) -> Result<Self::Value, E> {
+                Ok(ConfiguredCheckpoints::Path(path.into()))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(ConfiguredCheckpoints::HeightsAndHashes)
+            }
+        }
+
+        deserializer.deserialize_any(CheckpointsVisitor)
+    }
 }
 
 impl Default for ConfiguredCheckpoints {
@@ -1259,6 +1294,10 @@ impl ParametersBuilder {
     /// builder to a configured [`Network::Testnet`].
     pub fn to_network(self) -> Result<Network, ParametersBuilderError> {
         let network = self.to_network_unchecked();
+        if NetworkUpgrade::Nu7.activation_height(&network).is_some() {
+            super::subsidy::block_subsidy_fraction_numerator(&network)
+                .map_err(|_| ParametersBuilderError::InvalidReissuanceFraction)?;
+        }
 
         // Final check that the configured funding streams will be valid for these Testnet parameters.
         // The network holds the height ranges after NU7 moves the inherited ones.
@@ -1458,6 +1497,16 @@ impl Default for Parameters {
     }
 }
 
+/// The default Regtest parameters, which `is_regtest` compares against.
+///
+/// Built once: network-kind checks run on hot paths such as address encoding.
+fn default_regtest() -> &'static Parameters {
+    static DEFAULT_REGTEST: OnceLock<Parameters> = OnceLock::new();
+    DEFAULT_REGTEST.get_or_init(|| {
+        Parameters::new_regtest(Default::default()).expect("default regtest parameters are valid")
+    })
+}
+
 impl Parameters {
     /// Creates a new [`ParametersBuilder`].
     pub fn build() -> ParametersBuilder {
@@ -1576,18 +1625,18 @@ impl Parameters {
             // identity check for the same reason the halving interval stays in: it is
             // derived from the defaults above, not chosen.
             initial_nsm_value_balance: _,
-        } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
+        } = default_regtest();
 
-        self.network_name == network_name
-            && self.genesis_hash == genesis_hash
-            && self.slow_start_interval == slow_start_interval
-            && self.slow_start_shift == slow_start_shift
-            && self.target_difficulty_limit == target_difficulty_limit
-            && self.disable_pow == disable_pow
+        self.network_name == *network_name
+            && self.genesis_hash == *genesis_hash
+            && self.slow_start_interval == *slow_start_interval
+            && self.slow_start_shift == *slow_start_shift
+            && self.target_difficulty_limit == *target_difficulty_limit
+            && self.disable_pow == *disable_pow
             && self.should_allow_unshielded_coinbase_spends
-                == should_allow_unshielded_coinbase_spends
-            && self.pre_blossom_halving_interval == pre_blossom_halving_interval
-            && self.post_blossom_halving_interval == post_blossom_halving_interval
+                == *should_allow_unshielded_coinbase_spends
+            && self.pre_blossom_halving_interval == *pre_blossom_halving_interval
+            && self.post_blossom_halving_interval == *post_blossom_halving_interval
     }
 
     /// Returns the network name

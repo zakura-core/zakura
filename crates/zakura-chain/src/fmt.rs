@@ -7,21 +7,26 @@ use proptest::prelude::*;
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
+pub(crate) mod human_duration;
 pub mod time;
 
 pub use time::{duration_short, humantime_milliseconds, humantime_seconds};
 
 /// Wrapper to override `Debug`, redirecting it to only output the type's name.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
+///
+/// Property tests use it to keep failure output short.
+#[cfg(any(test, feature = "proptest-impl"))]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Arbitrary)]
 pub struct TypeNameToDebug<T>(pub T);
 
+#[cfg(any(test, feature = "proptest-impl"))]
 impl<T> fmt::Debug for TypeNameToDebug<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(std::any::type_name::<T>())
     }
 }
 
+#[cfg(any(test, feature = "proptest-impl"))]
 impl<T> ops::Deref for TypeNameToDebug<T> {
     type Target = T;
 
@@ -30,12 +35,14 @@ impl<T> ops::Deref for TypeNameToDebug<T> {
     }
 }
 
+#[cfg(any(test, feature = "proptest-impl"))]
 impl<T> ops::DerefMut for TypeNameToDebug<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
+#[cfg(any(test, feature = "proptest-impl"))]
 impl<T> From<T> for TypeNameToDebug<T> {
     fn from(t: T) -> Self {
         Self(t)
@@ -170,10 +177,13 @@ pub struct HexDebug<T: AsRef<[u8]>>(pub T);
 
 impl<T: AsRef<[u8]>> fmt::Debug for HexDebug<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple(std::any::type_name::<T>())
-            .field(&hex::encode(self.as_ref()))
-            .finish()
+        debug_hex(f, std::any::type_name::<T>(), self.as_ref())
     }
+}
+
+/// The body of `HexDebug<T>`'s `Debug`, kept non-generic so it is compiled once.
+fn debug_hex(f: &mut fmt::Formatter<'_>, name: &str, bytes: &[u8]) -> fmt::Result {
+    f.debug_tuple(name).field(&hex::encode(bytes)).finish()
 }
 
 impl<T: AsRef<[u8]>> ops::Deref for HexDebug<T> {

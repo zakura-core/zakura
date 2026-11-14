@@ -23,12 +23,12 @@
 //! requester's bookkeeping has a node-wide bound. A full pool makes the node
 //! wait before its next request; it never acts against a peer.
 //!
-//! The live reservations also owe the peer a total: each one's frames left
-//! plus its ending, and its bytes left. A reader that queues frames before the
-//! handler claims them charges each against that total with
-//! [`Reservations::admit`], so the queue never holds more than this node
-//! requested. A frame past it is a violation that no conformant responder can
-//! cause.
+//! The live reservations of each request type also owe the peer a total:
+//! each one's frames left plus its ending, and its bytes left. A reader that
+//! queues frames before the handler claims them charges each against its
+//! request type's total with [`Reservations::admit`], so the queue never holds
+//! more answers to a request type than this node requested. A frame past it is
+//! a violation that no conformant responder can cause.
 //!
 //! [`Reservations::reserve_fenced`] makes a reservation own its request's
 //! [`Exchange`]. The ending's claim ends the exchange. Dropping the map at the
@@ -45,6 +45,7 @@
 //! | Reserving is local and bounded | `reserving_is_local_and_bounded` |
 //! | The precheck needs a live reservation with room | `the_precheck_needs_a_live_reservation_with_room` |
 //! | Queued frames never exceed what the live reservations owe | `queued_frames_never_exceed_what_the_live_reservations_owe` |
+//! | One request type's debt never admits another's answers | `one_request_type_never_admits_answers_owed_to_another` |
 //! | A refused precheck allocates no decoded body | `a_refused_precheck_allocates_no_decoded_body` |
 //! | A full pool waits, with no lost or spurious wakeup and no allocation | `a_full_pool_waits_without_lost_or_spurious_wakeups` |
 //! | Racing threads never overcommit the pool | `racing_threads_never_overcommit_the_pool` |
@@ -52,12 +53,19 @@
 //! | The ending ends a fenced exchange; the map's drop closes a started one | `a_fenced_reservation_ends_its_exchange_with_its_ending` |
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     hash::Hash,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, OnceLock},
 };
 
 use thiserror::Error;
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        CancellationToken, Mutex, MutexGuard, PoisonError,
+    },
+};
 
 use super::{
     serve::{ending_reserve, ResponseCap},
@@ -103,7 +111,7 @@ impl ReservationPool {
     }
 
     /// Entries in use across the node.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(crate) fn held(&self) -> usize {
         self.entries.reserved()
     }
@@ -180,6 +188,18 @@ pub(crate) enum ClaimRefused {
 }
 
 impl ClaimRefused {
+    /// The transport reader's rejection for a refused header.
+    pub(crate) fn frame_rejection(self) -> FrameRejection {
+        match self {
+            Self::OverBytes { bytes } => FrameRejection::AboveReservation { bytes },
+            Self::OverOwed { frames, bytes } => FrameRejection::AboveOwed { frames, bytes },
+            Self::Unsolicited { .. }
+            | Self::WrongRequest { .. }
+            | Self::WrongRole { .. }
+            | Self::OverFrames { .. } => FrameRejection::Unsolicited,
+        }
+    }
+
     /// Stable metric and trace label.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -218,7 +238,7 @@ struct Reservation {
     frames: u32,
     bytes: u64,
     abandoned: bool,
-    _entry: PoolEntry,
+    entry: PoolEntry,
     /// The request's exchange, if the reactor fences its writers. Dropping a
     /// started exchange without its ending closes the connection.
     exchange: Option<Exchange>,
@@ -263,13 +283,38 @@ pub(crate) struct Reservations<K> {
     rules: &'static [MessageRule],
     cap: usize,
     live: HashMap<K, Reservation>,
-    /// Remaining payload bytes of the live reservations, as a multiset per
-    /// request type, so the precheck finds the largest in `O(log n)`.
-    remaining: HashMap<u16, BTreeMap<u64, usize>>,
+    /// The live reservations of each request type. A family has few request
+    /// types, so a row stays once created.
+    rows: HashMap<u16, Row>,
+}
+
+/// The live reservations of one request type.
+#[derive(Debug, Default)]
+struct Row {
+    /// Remaining payload bytes of each live reservation, as a multiset, so
+    /// the precheck finds the largest in `O(log n)`.
+    remaining: BTreeMap<u64, usize>,
     /// What the live reservations still owe, summed.
     owed: Load,
     /// Frames a reader admitted that the handler has not yet taken.
     queued: Load,
+}
+
+impl Row {
+    fn track(&mut self, remaining: u64) {
+        *self.remaining.entry(remaining).or_default() += 1;
+    }
+
+    fn untrack(&mut self, remaining: u64) {
+        let count = self
+            .remaining
+            .get_mut(&remaining)
+            .expect("every live reservation is tracked under its remaining bytes");
+        *count -= 1;
+        if *count == 0 {
+            self.remaining.remove(&remaining);
+        }
+    }
 }
 
 impl<K: Eq + Hash> Reservations<K> {
@@ -283,9 +328,7 @@ impl<K: Eq + Hash> Reservations<K> {
             rules,
             cap,
             live: HashMap::new(),
-            remaining: HashMap::new(),
-            owed: Load::default(),
-            queued: Load::default(),
+            rows: HashMap::new(),
         }
     }
 
@@ -351,11 +394,12 @@ impl<K: Eq + Hash> Reservations<K> {
             frames: 0,
             bytes: 0,
             abandoned: false,
-            _entry: entry,
+            entry,
             exchange,
         };
-        self.track(request_type, reservation.remaining_bytes());
-        self.owed.add(reservation.owed());
+        let row = self.rows.entry(request_type).or_default();
+        row.track(reservation.remaining_bytes());
+        row.owed.add(reservation.owed());
         self.live.insert(key, reservation);
         Ok(())
     }
@@ -369,8 +413,9 @@ impl<K: Eq + Hash> Reservations<K> {
             return false;
         };
         shrink_after_peak(&mut self.live);
-        self.untrack(reservation.request, reservation.remaining_bytes());
-        self.owed.sub(reservation.owed());
+        let row = self.row(reservation.request);
+        row.untrack(reservation.remaining_bytes());
+        row.owed.sub(reservation.owed());
         true
     }
 
@@ -393,15 +438,24 @@ impl<K: Eq + Hash> Reservations<K> {
         message_type: u16,
         payload_len: usize,
     ) -> Result<(), ClaimRefused> {
-        let Some(MessageRole::Response { request, .. }) =
-            MessageRule::find(self.rules, message_type).map(|row| row.role)
-        else {
-            return Err(ClaimRefused::WrongRole { message_type });
-        };
+        self.prechecked_request(message_type, payload_len)
+            .map(|_| ())
+    }
+
+    /// Check a response header as [`Self::precheck`] does, and return the
+    /// request type it answers.
+    fn prechecked_request(
+        &self,
+        message_type: u16,
+        payload_len: usize,
+    ) -> Result<u16, ClaimRefused> {
+        let request = self
+            .request_of(message_type)
+            .ok_or(ClaimRefused::WrongRole { message_type })?;
         let Some((&largest, _)) = self
-            .remaining
+            .rows
             .get(&request)
-            .and_then(|remaining| remaining.last_key_value())
+            .and_then(|row| row.remaining.last_key_value())
         else {
             return Err(ClaimRefused::Unsolicited { message_type });
         };
@@ -409,53 +463,78 @@ impl<K: Eq + Hash> Reservations<K> {
         if payload_len as u64 > largest {
             return Err(ClaimRefused::OverBytes { bytes: largest });
         }
-        Ok(())
+        Ok(request)
+    }
+
+    /// The request type that a `message_type` response answers.
+    fn request_of(&self, message_type: u16) -> Option<u16> {
+        match MessageRule::find(self.rules, message_type)?.role {
+            MessageRole::Response { request, .. } => Some(request),
+            _ => None,
+        }
+    }
+
+    /// The live reservations of `request`, which has one.
+    fn row(&mut self, request: u16) -> &mut Row {
+        self.rows
+            .get_mut(&request)
+            .expect("every live reservation's request type has a row")
     }
 
     /// Check a response header as [`Self::precheck`] does, and charge it to
     /// the queue until [`Self::take_admitted`] releases it.
     ///
-    /// The queue holds at most what the live reservations still owe, so a
-    /// reader that admits frames ahead of the handler never buffers more than
-    /// this node requested. A conformant responder sends at most that.
+    /// The queue holds at most what the live reservations of the answered
+    /// request type still owe, so a reader that admits frames ahead of the
+    /// handler never buffers more answers to a request type than this node
+    /// requested. A conformant responder sends at most that.
     pub(crate) fn admit(
         &mut self,
         message_type: u16,
         payload_len: usize,
     ) -> Result<(), ClaimRefused> {
-        self.precheck(message_type, payload_len)?;
+        let request = self.prechecked_request(message_type, payload_len)?;
+        let row = self.row(request);
         // Widening usize to u64 is lossless on supported targets.
         let frame = Load {
             frames: 1,
             bytes: payload_len as u64,
         };
-        if self.queued.frames + frame.frames > self.owed.frames
-            || self.queued.bytes + frame.bytes > self.owed.bytes
+        if row.queued.frames + frame.frames > row.owed.frames
+            || row.queued.bytes + frame.bytes > row.owed.bytes
         {
             metrics::counter!("zakura.p2p.reservation.refused", "reason" => "over_owed")
                 .increment(1);
             return Err(ClaimRefused::OverOwed {
-                frames: self.owed.frames,
-                bytes: self.owed.bytes,
+                frames: row.owed.frames,
+                bytes: row.owed.bytes,
             });
         }
-        self.queued.add(frame);
+        row.queued.add(frame);
         Ok(())
     }
 
-    /// Release an admitted frame when the handler takes it, before its claim.
-    pub(crate) fn take_admitted(&mut self, payload_len: usize) {
+    /// Release an admitted `message_type` frame when the handler takes it,
+    /// before its claim.
+    pub(crate) fn take_admitted(&mut self, message_type: u16, payload_len: usize) {
+        let row = self
+            .request_of(message_type)
+            .and_then(|request| self.rows.get_mut(&request));
         // Widening usize to u64 is lossless on supported targets.
         let frame = Load {
             frames: 1,
             bytes: payload_len as u64,
         };
         debug_assert!(
-            self.queued.frames >= frame.frames && self.queued.bytes >= frame.bytes,
+            row.as_ref().is_some_and(|row| {
+                row.queued.frames >= frame.frames && row.queued.bytes >= frame.bytes
+            }),
             "only an admitted frame is taken"
         );
-        self.queued.frames = self.queued.frames.saturating_sub(frame.frames);
-        self.queued.bytes = self.queued.bytes.saturating_sub(frame.bytes);
+        if let Some(row) = row {
+            row.queued.frames = row.queued.frames.saturating_sub(frame.frames);
+            row.queued.bytes = row.queued.bytes.saturating_sub(frame.bytes);
+        }
     }
 
     /// Charge a frame that does not end the exchange, before decode.
@@ -467,8 +546,9 @@ impl<K: Eq + Hash> Reservations<K> {
     ) -> Result<Claimed, ClaimRefused> {
         let (request, before, after, abandoned) =
             self.charge(key, message_type, payload_len, false)?;
-        self.untrack(request, before);
-        self.track(request, after);
+        let row = self.row(request);
+        row.untrack(before);
+        row.track(after);
         Ok(Claimed { abandoned })
     }
 
@@ -479,8 +559,22 @@ impl<K: Eq + Hash> Reservations<K> {
         message_type: u16,
         payload_len: usize,
     ) -> Result<Ended, ClaimRefused> {
+        self.claim_end_holding_entry(key, message_type, payload_len)
+            .map(|(ended, _entry)| ended)
+    }
+
+    /// Consume the reservation with its ending, as [`Self::claim_end`] does,
+    /// and hand its pool entry to the caller. The entry keeps counting
+    /// against the node pool while the caller decodes and processes the
+    /// ending.
+    pub(crate) fn claim_end_holding_entry(
+        &mut self,
+        key: &K,
+        message_type: u16,
+        payload_len: usize,
+    ) -> Result<(Ended, PoolEntry), ClaimRefused> {
         let (request, before, _, _) = self.charge(key, message_type, payload_len, true)?;
-        self.untrack(request, before);
+        self.row(request).untrack(before);
         let mut reservation = self
             .live
             .remove(key)
@@ -489,11 +583,17 @@ impl<K: Eq + Hash> Reservations<K> {
         if let Some(exchange) = &mut reservation.exchange {
             exchange.end();
         }
-        Ok(Ended {
+        let ended = Ended {
             frames: reservation.frames,
             bytes: reservation.bytes,
             abandoned: reservation.abandoned,
-        })
+        };
+        Ok((ended, reservation.entry))
+    }
+
+    /// Whether the transport reader queued a frame the handler has not taken.
+    pub(crate) fn has_queued(&self) -> bool {
+        self.rows.values().any(|row| row.queued.frames > 0)
     }
 
     /// Check and charge one frame. Returns the request type, the remaining
@@ -521,7 +621,7 @@ impl<K: Eq + Hash> Reservations<K> {
         let reservation = self
             .live
             .get_mut(key)
-            .ok_or(refused(ClaimRefused::Unsolicited { message_type }))?;
+            .ok_or_else(|| refused(ClaimRefused::Unsolicited { message_type }))?;
         if request != reservation.request {
             return Err(refused(ClaimRefused::WrongRequest { message_type }));
         }
@@ -549,9 +649,10 @@ impl<K: Eq + Hash> Reservations<K> {
         // An ending removes the reservation, so only a frame still owes.
         let owed_after = (!ends).then(|| reservation.owed());
         let abandoned = reservation.abandoned;
-        self.owed.sub(owed_before);
+        let row = self.row(request);
+        row.owed.sub(owed_before);
         if let Some(owed_after) = owed_after {
-            self.owed.add(owed_after);
+            row.owed.add(owed_after);
         }
         if abandoned {
             metrics::counter!(
@@ -561,32 +662,6 @@ impl<K: Eq + Hash> Reservations<K> {
             .increment(1);
         }
         Ok((request, before, before - len, abandoned))
-    }
-
-    fn track(&mut self, request: u16, remaining: u64) {
-        *self
-            .remaining
-            .entry(request)
-            .or_default()
-            .entry(remaining)
-            .or_default() += 1;
-    }
-
-    fn untrack(&mut self, request: u16, remaining: u64) {
-        let by_request = self
-            .remaining
-            .get_mut(&request)
-            .expect("every live reservation is tracked under its request type");
-        let count = by_request
-            .get_mut(&remaining)
-            .expect("every live reservation is tracked under its remaining bytes");
-        *count -= 1;
-        if *count == 0 {
-            by_request.remove(&remaining);
-        }
-        if by_request.is_empty() {
-            self.remaining.remove(&request);
-        }
     }
 
     /// Live reservations.
@@ -628,7 +703,7 @@ impl<K: Eq + Hash> SharedReservations<K> {
     }
 
     /// Lock the reservations. No holder panics, so the lock is never poisoned.
-    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Reservations<K>> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Reservations<K>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -637,10 +712,7 @@ impl<K: Eq + Hash + std::fmt::Debug + Send + 'static> ResponsePrecheck for Share
     fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
         self.lock()
             .precheck(message_type, payload_len)
-            .map_err(|refused| match refused {
-                ClaimRefused::OverBytes { bytes } => FrameRejection::AboveReservation { bytes },
-                _ => FrameRejection::Unsolicited,
-            })
+            .map_err(ClaimRefused::frame_rejection)
     }
 }
 
@@ -693,21 +765,22 @@ pub(crate) struct PrecheckSlot(Arc<PrecheckSetup>);
 #[derive(Debug, Default)]
 struct PrecheckSetup {
     choice: OnceLock<Option<Arc<dyn ResponsePrecheck>>>,
-    gated: std::sync::atomic::AtomicBool,
-    ready: tokio_util::sync::CancellationToken,
+    gated: AtomicBool,
+    ready: CancellationToken,
+    /// The stream's transport observer, shared by its reader and service.
+    #[cfg(any(test, zakura_sim))]
+    tap: OnceLock<Arc<crate::zakura::StreamTap>>,
 }
 
 impl PrecheckSlot {
     /// Pause ingress before spawning the transport reader.
     pub(crate) fn pause(&self) {
-        self.0
-            .gated
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.0.gated.store(true, Ordering::Release);
     }
 
     /// Wait for the service to choose its header check.
     pub(crate) async fn ready(&self) {
-        if self.0.gated.load(std::sync::atomic::Ordering::Acquire) {
+        if self.0.gated.load(Ordering::Acquire) {
             self.0.ready.cancelled().await;
         }
     }
@@ -728,6 +801,19 @@ impl PrecheckSlot {
     /// The attached precheck.
     pub(crate) fn get(&self) -> Option<&dyn ResponsePrecheck> {
         self.0.choice.get().and_then(|choice| choice.as_deref())
+    }
+
+    /// Report this stream's reads, writes and regulation through `tap`. Only
+    /// the first call attaches one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observe_with(&self, tap: Arc<crate::zakura::StreamTap>) {
+        let _ = self.0.tap.set(tap);
+    }
+
+    /// The stream's transport observer, if one is attached.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn tap(&self) -> Option<&Arc<crate::zakura::StreamTap>> {
+        self.0.tap.get()
     }
 }
 

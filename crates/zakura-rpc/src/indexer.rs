@@ -1,11 +1,10 @@
 //! A tonic RPC server for Zebra's indexer API.
 
-use std::sync::Arc;
-
 use zakura_chain::{
     block,
     serialization::{BytesInDisplayOrder, ZcashDeserializeInto, ZcashSerialize},
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 #[cfg(test)]
 mod tests;
@@ -28,32 +27,14 @@ pub(crate) const RECEIPT_SESSION_HEADER: &str = "x-zakura-receipt-session";
 /// Receipt orders in this process share one session.
 pub(crate) fn receipt_session() -> &'static str {
     static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SESSION.get_or_init(|| format!("{:032x}", rand::random::<u128>()))
+    SESSION.get_or_init(|| format!("{:032x}", rand_10::random::<u128>()))
 }
-
-pub(crate) const FILE_DESCRIPTOR_SET: &[u8] =
-    tonic::include_file_descriptor_set!("indexer_descriptor");
 
 impl BlockHashAndHeight {
     /// Create a new [`BlockHashAndHeight`] from a [`block::Hash`] and [`block::Height`].
     pub fn new(hash: block::Hash, block::Height(height): block::Height) -> Self {
         let hash = hash.bytes_in_display_order().to_vec();
         BlockHashAndHeight { hash, height }
-    }
-
-    /// Try to convert a [`BlockHashAndHeight`] into a tuple of a block hash and height.
-    pub fn try_into_hash_and_height(self) -> Option<(block::Hash, block::Height)> {
-        self.hash
-            .try_into()
-            .map(|bytes| block::Hash::from_bytes_in_display_order(&bytes))
-            .map_err(|bytes: Vec<_>| {
-                tracing::warn!(
-                    "failed to convert BlockHash to Hash, unexpected len: {}",
-                    bytes.len()
-                )
-            })
-            .ok()
-            .zip(self.height.try_into().ok())
     }
 }
 
@@ -63,12 +44,23 @@ impl BlockAndHash {
     /// # Panics
     ///
     /// This function will panic if the block serialization fails (if the header version is invalid).
-    pub fn new(hash: block::Hash, block: Arc<block::Block>) -> Self {
+    pub fn new(hash: block::Hash, block: impl Into<BlockHandle>) -> Self {
+        let block = block.into();
         BlockAndHash {
             hash: hash.bytes_in_display_order().to_vec(),
             data: block
                 .zcash_serialize_to_vec()
                 .expect("block serialization should not fail"),
+            receipt_order: None,
+        }
+    }
+
+    /// Creates a new [`BlockAndHash`] from a block's hash and its Zcash
+    /// consensus serialization, without decoding the block.
+    pub fn from_serialized(hash: block::Hash, data: Vec<u8>) -> Self {
+        BlockAndHash {
+            hash: hash.bytes_in_display_order().to_vec(),
+            data,
             receipt_order: None,
         }
     }

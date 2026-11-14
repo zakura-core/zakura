@@ -26,7 +26,27 @@ pub trait ZcashDeserialize: Sized {
     /// This function has a `zcash_` prefix to alert the reader that the
     /// serialization in use is consensus-critical serialization, rather than
     /// some other kind of serialization.
-    fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
+    ///
+    /// The input length is unknown, so collection counts are only checked against
+    /// protocol limits.
+    ///
+    /// Do not override this method; implement [`Self::zcash_deserialize_from`].
+    /// Values nested inside other types are decoded with `zcash_deserialize_from`
+    /// through [`ZcashReader::read_value`], so an override here would be skipped.
+    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+        Self::zcash_deserialize_from_stream(&mut reader)
+    }
+
+    /// Decode from a stream of unknown length, as [`Self::zcash_deserialize`] does.
+    ///
+    /// The stream's type is erased, so each type's stream decoder is compiled once,
+    /// rather than once for every reader type passed to `zcash_deserialize`.
+    /// Bytes already in memory decode faster through
+    /// [`Self::zcash_deserialize_from_slice`], which also checks collection counts
+    /// against the bytes that remain.
+    fn zcash_deserialize_from_stream(
+        reader: &mut dyn io::Read,
+    ) -> Result<Self, SerializationError> {
         Self::zcash_deserialize_from(&mut ZcashReader::from_stream(reader))
     }
 
@@ -38,17 +58,46 @@ pub trait ZcashDeserialize: Sized {
 
     /// Decode one value while keeping track of how many input bytes remain.
     ///
+    /// This is the one decoder every type implements; [`Self::zcash_deserialize`]
+    /// and [`Self::zcash_deserialize_from_slice`] call it for stream and slice input.
+    ///
     /// Implementations must use the reader's `read_value`, `read_external_count`,
     /// and `read_bytes` methods for nested data, so those decoders keep the same
-    /// remaining byte count and check counts before allocating. The default rejects
-    /// types that only implement the older streaming method.
+    /// remaining byte count and check counts before allocating. Fixed-size fields
+    /// can be read through the reader's [`io::Read`] implementation.
     fn zcash_deserialize_from<R: io::Read>(
-        _reader: &mut ZcashReader<R>,
-    ) -> Result<Self, SerializationError> {
-        // Implementers must override this method (or `zcash_deserialize` for stream-only types).
-        Err(SerializationError::Parse("type has no bounded decoder"))
-    }
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError>;
 }
+
+/// Compiles a type's slice and stream decoders once, in this crate.
+///
+/// [`ZcashDeserialize::zcash_deserialize_from_slice`] and
+/// [`ZcashDeserialize::zcash_deserialize_from_stream`] are generic over `Self`, so
+/// every crate that calls it compiles its own copy of the type's whole decoder.
+/// Expanding this macro inside a type's `ZcashDeserialize` impl overrides it with
+/// a non-generic method that other crates call instead. Use it for types with
+/// large decoders that other crates decode, such as blocks and transactions.
+macro_rules! compile_deserialize_entry_points_here {
+    () => {
+        #[inline(never)]
+        fn zcash_deserialize_from_slice(
+            bytes: &mut &[u8],
+        ) -> Result<Self, $crate::serialization::SerializationError> {
+            Self::zcash_deserialize_from(&mut $crate::serialization::ZcashReader::from_slice(bytes))
+        }
+
+        #[inline(never)]
+        fn zcash_deserialize_from_stream(
+            reader: &mut dyn std::io::Read,
+        ) -> Result<Self, $crate::serialization::SerializationError> {
+            Self::zcash_deserialize_from(&mut $crate::serialization::ZcashReader::from_stream(
+                reader,
+            ))
+        }
+    };
+}
+pub(crate) use compile_deserialize_entry_points_here;
 
 /// Deserialize a `Vec`, where the number of items is set by a CompactSize
 /// prefix in the data. This is the most common format in Zcash.

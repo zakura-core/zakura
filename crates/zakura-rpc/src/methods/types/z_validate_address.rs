@@ -1,8 +1,8 @@
 //! Response type for the `z_validateaddress` RPC.
 
+use crate::server::jsonrpc::RpcResult;
 use derive_new::new;
 use getset::{CopyGetters, Getters};
-use jsonrpsee::core::RpcResult;
 
 use zakura_chain::{
     parameters::{Network, NetworkKind},

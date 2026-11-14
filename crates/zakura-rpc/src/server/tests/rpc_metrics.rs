@@ -7,15 +7,13 @@ use std::{
 };
 
 use futures::executor::block_on;
-use jsonrpsee::{
-    core::middleware::{Batch, Notification},
-    server::middleware::rpc::RpcServiceT,
-    types::{Id, Request},
-    MethodResponse, ResponsePayload,
-};
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 
-use crate::server::rpc_metrics::RpcMetricsMiddleware;
+use crate::server::{
+    jsonrpc::{Id, MethodResponse, Notification, Request},
+    rpc_metrics::RpcMetricsMiddleware,
+    rpc_service::RpcServiceT,
+};
 
 /// A metrics recorder that keeps the key of every metric registered with it.
 #[derive(Default)]
@@ -71,20 +69,8 @@ impl Recorder for KeyRecorder {
 struct NullResult;
 
 impl RpcServiceT for NullResult {
-    type MethodResponse = MethodResponse;
-    type NotificationResponse = MethodResponse;
-    type BatchResponse = MethodResponse;
-
     fn call<'a>(&self, request: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
-        ready(MethodResponse::response(
-            request.id,
-            ResponsePayload::success(()),
-            usize::MAX,
-        ))
-    }
-
-    fn batch<'a>(&self, _batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
-        ready(MethodResponse::notification())
+        ready(MethodResponse::response(request.id, &Ok(()), usize::MAX))
     }
 
     fn notification<'a>(
@@ -105,7 +91,7 @@ fn unregistered_methods_share_one_metrics_label() {
 
     metrics::with_local_recorder(&recorder, || {
         for method in ["getblockcount", "made-up-method", long_name.as_str()] {
-            block_on(service.call(Request::owned(method.to_owned(), None, Id::Number(1))));
+            block_on(service.call(Request::new(method, None, Id::Number(1))));
         }
     });
 

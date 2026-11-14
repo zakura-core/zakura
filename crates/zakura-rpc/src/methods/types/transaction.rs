@@ -1,5 +1,6 @@
 //! Transaction-related types.
 
+#[cfg(test)]
 use std::sync::Arc;
 
 use crate::methods::arrayhex;
@@ -17,7 +18,6 @@ use zakura_chain::{
         subsidy::{block_subsidy, funding_stream_values, miner_fee_share, miner_subsidy},
         Network, NetworkUpgrade,
     },
-    primitives::ed25519,
     sapling::ValueCommitment,
     serialization::{CompactSizeMessage, ZcashSerialize},
     transaction::{
@@ -31,7 +31,6 @@ use zakura_state::IntoDisk;
 use zcash_primitives::transaction::{
     builder::{cached_orchard_proving_key, BuildConfig, Builder},
     components::orchard::{bundle_version_for_branch, ACTION_SIZE},
-    fees::fixed::FeeRule,
     TxVersion,
 };
 use zcash_protocol::{
@@ -62,7 +61,7 @@ where
     FeeConstraint: amount::Constraint + Clone + Copy,
 {
     /// The hex-encoded serialized data for this transaction.
-    #[serde(with = "hex")]
+    #[serde(with = "crate::methods::hex_data")]
     #[getset(get = "pub")]
     pub(crate) data: SerializedTransaction,
 
@@ -221,7 +220,7 @@ impl CoinbasePlan {
             })
             .collect::<Vec<_>>();
 
-        funding_stream_outputs.sort();
+        funding_stream_outputs.sort_unstable();
 
         Ok(Self {
             miner_reward_address,
@@ -384,7 +383,7 @@ impl TransactionTemplate<NegativeOrZero> {
         let memo = miner_params.memo().unwrap_or(&default_memo);
 
         // Arms halo2's prepared commitment tables on the process-wide proving key
-        // that `Builder::build` below proves a shielded reward output with. The
+        // that `Builder::build_coinbase` below proves a shielded reward output with. The
         // prepared state is cached inside the key's params for the process
         // lifetime and repeat arming is free, so the first shielded coinbase pays
         // it once; without halo2's opt-in `orbits` feature it is a documented
@@ -395,7 +394,7 @@ impl TransactionTemplate<NegativeOrZero> {
             let branch = BranchId::for_height(net, BlockHeight::from(height));
             // Both pools share the circuit at every branch that supports them, so
             // the Orchard-pool mapping covers Ironwood rewards too (this mirrors
-            // the derivation in `Builder::build`).
+            // the derivation in `Builder::build_coinbase`).
             if let Some(version) = bundle_version_for_branch(branch, ::orchard::ValuePool::Orchard)
             {
                 let prepared = cached_orchard_proving_key(version.circuit_version())
@@ -439,15 +438,8 @@ impl TransactionTemplate<NegativeOrZero> {
             builder.add_transparent_output(&fs_addr, fs_amount)?;
         }
 
-        let build_result = builder.build(
-            &Default::default(),
-            Default::default(),
-            Default::default(),
-            rand_10::rng(),
-            &NoSaplingProver,
-            &NoSaplingProver,
-            &FeeRule::non_standard(Zatoshis::ZERO),
-        )?;
+        let build_result =
+            builder.build_coinbase(rand_10::rng(), &NoSaplingProver, &NoSaplingProver)?;
 
         let tx = build_result.transaction();
         let mut data = vec![];
@@ -478,7 +470,7 @@ pub struct TransactionObject {
     #[getset(get_copy = "pub")]
     pub(crate) in_active_chain: Option<bool>,
     /// The raw transaction, encoded as hex bytes.
-    #[serde(with = "hex")]
+    #[serde(with = "crate::methods::hex_data")]
     #[getset(get = "pub")]
     pub(crate) hex: SerializedTransaction,
     /// The height of the block in the best chain that contains the tx, -1 if
@@ -546,7 +538,7 @@ pub struct TransactionObject {
         rename = "joinSplitSig"
     )]
     #[getset(get_copy = "pub")]
-    pub(crate) joinsplit_sig: Option<[u8; ed25519::Signature::BYTE_SIZE]>,
+    pub(crate) joinsplit_sig: Option<[u8; transaction::JoinSplitSig::BYTE_SIZE]>,
 
     /// Orchard actions of the transaction.
     #[serde(rename = "orchard", skip_serializing_if = "Option::is_none")]
@@ -649,7 +641,7 @@ pub enum Input {
     /// A coinbase input.
     Coinbase {
         /// The coinbase scriptSig as hex.
-        #[serde(with = "hex")]
+        #[serde(with = "crate::methods::hex_data")]
         coinbase: Vec<u8>,
         /// The script sequence number.
         sequence: u32,
@@ -831,7 +823,10 @@ pub struct JoinSplit {
     #[getset(get_copy = "pub")]
     new_public_value_zat: i64,
     /// Merkle root of the Sprout note commitment tree.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     anchor: [u8; 32],
     /// The nullifier of the input notes.
@@ -850,12 +845,18 @@ pub struct JoinSplit {
     commitments: Vec<[u8; 32]>,
     /// The onetime public key used to encrypt the ciphertexts
     #[serde(rename = "onetimePubKey")]
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     one_time_pubkey: [u8; 32],
     /// The random seed
     #[serde(rename = "randomSeed")]
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     random_seed: [u8; 32],
     /// The input notes MACs.
@@ -866,7 +867,10 @@ pub struct JoinSplit {
     #[getset(get = "pub")]
     macs: Vec<[u8; 32]>,
     /// A zero-knowledge proof using the Sprout circuit.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get = "pub")]
     proof: Vec<u8>,
     /// The output notes ciphertexts.
@@ -886,23 +890,39 @@ pub struct ShieldedSpend {
     #[getset(get_copy = "pub")]
     cv: ValueCommitment,
     /// Merkle root of the Sapling note commitment tree.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     anchor: [u8; 32],
     /// The nullifier of the input note.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     nullifier: [u8; 32],
     /// The randomized public key for spendAuthSig.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     rk: [u8; 32],
     /// A zero-knowledge proof using the Sapling Spend circuit.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     proof: [u8; 192],
     /// A signature authorizing this Spend.
-    #[serde(rename = "spendAuthSig", with = "hex")]
+    #[serde(
+        rename = "spendAuthSig",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     spend_auth_sig: [u8; 64],
 }
@@ -915,11 +935,19 @@ pub struct ShieldedOutput {
     #[getset(get_copy = "pub")]
     cv: ValueCommitment,
     /// The u-coordinate of the note commitment for the output note.
-    #[serde(rename = "cmu", with = "hex")]
+    #[serde(
+        rename = "cmu",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     cm_u: [u8; 32],
     /// A Jubjub public key.
-    #[serde(rename = "ephemeralKey", with = "hex")]
+    #[serde(
+        rename = "ephemeralKey",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     ephemeral_key: [u8; 32],
     /// The output note encrypted to the recipient.
@@ -927,11 +955,18 @@ pub struct ShieldedOutput {
     #[getset(get_copy = "pub")]
     enc_ciphertext: [u8; 580],
     /// A ciphertext enabling the sender to recover the output note.
-    #[serde(rename = "outCiphertext", with = "hex")]
+    #[serde(
+        rename = "outCiphertext",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     out_ciphertext: [u8; 80],
     /// A zero-knowledge proof using the Sapling Output circuit.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     proof: [u8; 192],
 }
@@ -1023,23 +1058,40 @@ impl OrchardFlags {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, CopyGetters, new)]
 pub struct OrchardAction {
     /// A value commitment to the net value of the input note minus the output note.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     cv: [u8; 32],
     /// The nullifier of the input note.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     nullifier: [u8; 32],
     /// The randomized validating key for spendAuthSig.
-    #[serde(with = "hex")]
+    #[serde(
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     rk: [u8; 32],
     /// The x-coordinate of the note commitment for the output note.
-    #[serde(rename = "cmx", with = "hex")]
+    #[serde(
+        rename = "cmx",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     cm_x: [u8; 32],
     /// An encoding of an ephemeral Pallas public key.
-    #[serde(rename = "ephemeralKey", with = "hex")]
+    #[serde(
+        rename = "ephemeralKey",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     ephemeral_key: [u8; 32],
     /// The output note encrypted to the recipient.
@@ -1047,11 +1099,19 @@ pub struct OrchardAction {
     #[getset(get_copy = "pub")]
     enc_ciphertext: [u8; 580],
     /// A ciphertext enabling the sender to recover the output note.
-    #[serde(rename = "spendAuthSig", with = "hex")]
+    #[serde(
+        rename = "spendAuthSig",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     spend_auth_sig: [u8; 64],
     /// A signature authorizing the spend in this Action.
-    #[serde(rename = "outCiphertext", with = "hex")]
+    #[serde(
+        rename = "outCiphertext",
+        serialize_with = "crate::methods::hex_data::serialize",
+        deserialize_with = "hex::deserialize"
+    )]
     #[getset(get_copy = "pub")]
     out_ciphertext: [u8; 80],
 }
@@ -1173,10 +1233,9 @@ impl Default for TransactionObject {
 impl TransactionObject {
     /// Converts `tx` and `height` into a verbose
     /// [`GetRawTransactionResponse`](crate::methods::GetRawTransactionResponse).
-    #[allow(clippy::unwrap_in_result)]
     #[allow(clippy::too_many_arguments)]
     pub fn from_transaction(
-        tx: Arc<Transaction>,
+        tx: impl AsRef<Transaction>,
         height: Option<block::Height>,
         confirmations: Option<i64>,
         network: &Network,
@@ -1185,9 +1244,41 @@ impl TransactionObject {
         in_active_chain: Option<bool>,
         txid: transaction::Hash,
     ) -> Self {
+        let tx = tx.as_ref();
+        Self::from_serialized_transaction(
+            tx,
+            tx.into(),
+            height,
+            confirmations,
+            network,
+            block_time,
+            block_hash,
+            in_active_chain,
+            txid,
+        )
+    }
+
+    /// Converts `tx` like [`Self::from_transaction`], using `hex` as its Zcash
+    /// consensus serialization instead of serializing it again.
+    ///
+    /// `hex` must be the serialization of `tx`.
+    #[allow(clippy::unwrap_in_result)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_serialized_transaction(
+        tx: impl AsRef<Transaction>,
+        hex: SerializedTransaction,
+        height: Option<block::Height>,
+        confirmations: Option<i64>,
+        network: &Network,
+        block_time: Option<DateTime<Utc>>,
+        block_hash: Option<block::Hash>,
+        in_active_chain: Option<bool>,
+        txid: transaction::Hash,
+    ) -> Self {
+        let tx = tx.as_ref();
         let block_time = block_time.map(|bt| bt.timestamp());
         Self {
-            hex: tx.clone().into(),
+            hex,
             height: if in_active_chain.unwrap_or_default() {
                 height.map(|height| height.0 as i32)
             } else if block_hash.is_some() {

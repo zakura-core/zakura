@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-node-services/src/block_memory.rs b/crates/zakura-node-services/src/block_memory.rs
+index c7181f7999..d31844ae59 100644
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -428,7 +428,7 @@ impl DecodedBlockPool {
+             .pipeline_bytes
+             .checked_update(|used| {
+                 let next = used.checked_add(bytes)?;
+-                (next <= limit || admission == Admission::PipelineExempt).then_some(next)
++                (used <= limit || admission == Admission::PipelineExempt).then_some(next)
+             })
+             .map_err(|_| AdmissionFailure::Capacity)?;
+         Ok(bytes)

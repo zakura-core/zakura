@@ -1,0 +1,74 @@
+//! The consequence table (properties.md, Consequence table): what the node
+//! must do after it reads a labelled frame. It comes from the regulation
+//! specification, not from production code.
+
+use super::Label;
+
+/// What the node must do after it reads a frame with a given label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Consequence {
+    /// Close the connection with a fault cause before quiescence.
+    FaultClose,
+    /// The family's content consequence, such as block sync's `Misbehavior`
+    /// request.
+    FamilyContent,
+    /// No fault close and no `Misbehavior`.
+    NoPunishment,
+}
+
+/// The consequence of a frame labelled `label`.
+pub const fn consequence(label: Label) -> Consequence {
+    match label {
+        Label::UndeclaredType
+        | Label::ReservedFlags
+        | Label::ShortPayload
+        | Label::LongPayload
+        | Label::OverMargin
+        | Label::Unsolicited
+        | Label::OverOwed
+        | Label::OverLive
+        | Label::OverCredit
+        | Label::AfterClose
+        | Label::BadCursor => Consequence::FaultClose,
+        Label::BadContent => Consequence::FamilyContent,
+        Label::Conformant => Consequence::NoPunishment,
+    }
+}
+
+/// The close causes that assign the peer a fault (properties.md, Close
+/// cause until P3c). Until P3c sends close code 6, a fault close is a close
+/// whose first recorded cause is one of these. Timeouts, transport errors
+/// and resource decisions are neutral.
+pub const FAULT_CAUSES: &[&str] = &[
+    "service_protocol_reject",
+    "header_peer_fault",
+    "request_protocol_reject",
+    "ordered_oversize",
+    "request_oversize",
+    "ordered_read_rejected",
+    "request_read_rejected",
+    "undersized_frame_cap",
+];
+
+/// True if a close with first recorded cause `cause` assigns the peer a
+/// fault.
+pub fn is_fault_cause(cause: &str) -> bool {
+    FAULT_CAUSES.contains(&cause)
+}
+
+/// The close causes of a rate limit: the reader closed the connection
+/// because a frame found its bucket empty. They're neutral, so they assign
+/// no fault. A cadence row records exhaustion without rejecting the frame,
+/// so `cadence-never-closes` counts them as a punishment.
+///
+/// The close names no stream. That count assumes no harness carries a
+/// stream without a table beside a tabled one: such a stream's message
+/// bucket does throttle, so a peer that floods it gets a justified
+/// rate-limit close that the check would blame on the cadence row. No
+/// harness carries one today.
+pub const RATE_LIMIT_CAUSES: &[&str] = &["ordered_rate_limited"];
+
+/// True if a close with first recorded cause `cause` is a rate limit.
+pub fn is_rate_limit_cause(cause: &str) -> bool {
+    RATE_LIMIT_CAUSES.contains(&cause)
+}

@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+index c847aa6cfc..4d220ff160 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+@@ -391,7 +391,8 @@ impl CapacityWaits {
+ 
+     /// Forget every wait outside `current`.
+     fn retain(&mut self, current: &[CapacityWait]) {
+-        self.signals.retain(|(wait, _)| current.contains(wait));
++        // Mutation: every wait stays, even once no stall references it.
++        let _ = current;
+     }
+ 
+     /// The signals held.

@@ -77,11 +77,11 @@ pub struct BlockCommitmentRoots {
 }
 
 impl ZcashSerialize for BlockCommitmentRoots {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_u32::<LittleEndian>(self.height.0)?;
-        self.sapling_root.zcash_serialize(&mut writer)?;
-        self.orchard_root.zcash_serialize(&mut writer)?;
-        self.ironwood_root.zcash_serialize(&mut writer)?;
+        self.sapling_root.zcash_serialize(writer)?;
+        self.orchard_root.zcash_serialize(writer)?;
+        self.ironwood_root.zcash_serialize(writer)?;
         writer.write_u64::<LittleEndian>(self.sapling_tx)?;
         writer.write_u64::<LittleEndian>(self.orchard_tx)?;
         writer.write_u64::<LittleEndian>(self.ironwood_tx)?;

@@ -64,7 +64,7 @@ prop_compose! {
 }
 
 #[test]
-fn equihash_prop_test_solution() -> color_eyre::eyre::Result<()> {
+fn equihash_prop_test_solution() -> eyre::Result<()> {
     let _init_guard = zakura_test::init();
 
     let headers = test_headers();
@@ -110,7 +110,7 @@ prop_compose! {
 }
 
 #[test]
-fn equihash_prop_test_nonce() -> color_eyre::eyre::Result<()> {
+fn equihash_prop_test_nonce() -> eyre::Result<()> {
     let _init_guard = zakura_test::init();
 
     let headers = test_headers();
@@ -154,7 +154,7 @@ prop_compose! {
 }
 
 #[test]
-fn equihash_prop_test_input() -> color_eyre::eyre::Result<()> {
+fn equihash_prop_test_input() -> eyre::Result<()> {
     let _init_guard = zakura_test::init();
 
     let headers = test_headers();

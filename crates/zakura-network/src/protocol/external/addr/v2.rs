@@ -210,7 +210,7 @@ impl AddrV2 {
 // See the detailed note about ZIP-155 activation above.
 #[cfg(test)]
 impl ZcashSerialize for AddrV2 {
-    fn zcash_serialize<W: Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: Write + ?Sized>(&self, writer: &mut W) -> Result<(), std::io::Error> {
         if let AddrV2::IpAddr {
             untrusted_last_seen,
             untrusted_services,
@@ -218,11 +218,11 @@ impl ZcashSerialize for AddrV2 {
         } = self
         {
             // > uint32  Time that this node was last seen as connected to the network.
-            untrusted_last_seen.zcash_serialize(&mut writer)?;
+            untrusted_last_seen.zcash_serialize(writer)?;
 
             // > Service bits. A CompactSize-encoded bit field that is 64 bits wide.
             let untrusted_services: CompactSize64 = untrusted_services.bits().into();
-            untrusted_services.zcash_serialize(&mut writer)?;
+            untrusted_services.zcash_serialize(writer)?;
 
             match addr.ip() {
                 IpAddr::V4(ip) => {
@@ -234,7 +234,7 @@ impl ZcashSerialize for AddrV2 {
                     let ip: [u8; ADDR_V2_IPV4_ADDR_SIZE] = ip.octets();
                     // > CompactSize      The length in bytes of addr.
                     // > uint8[sizeAddr]  Network address. The interpretation depends on networkID.
-                    zcash_serialize_bytes(&ip.to_vec(), &mut writer)?;
+                    zcash_serialize_bytes(&ip.to_vec(), writer)?;
 
                     // > uint16  Network port. If not relevant for the network this MUST be 0.
                     writer.write_u16::<BigEndian>(addr.port())?;
@@ -243,7 +243,7 @@ impl ZcashSerialize for AddrV2 {
                     writer.write_u8(ADDR_V2_IPV6_NETWORK_ID)?;
 
                     let ip: [u8; ADDR_V2_IPV6_ADDR_SIZE] = ip.octets();
-                    zcash_serialize_bytes(&ip.to_vec(), &mut writer)?;
+                    zcash_serialize_bytes(&ip.to_vec(), writer)?;
 
                     writer.write_u16::<BigEndian>(addr.port())?;
                 }

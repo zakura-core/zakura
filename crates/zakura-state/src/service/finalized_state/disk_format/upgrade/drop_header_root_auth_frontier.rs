@@ -8,13 +8,13 @@
 //!
 //! [`STATE_COLUMN_FAMILIES_IN_CODE`]: crate::service::finalized_state::STATE_COLUMN_FAMILIES_IN_CODE
 
-use crossbeam_channel::{Receiver, TryRecvError};
 use semver::Version;
+use std::sync::mpsc::TryRecvError;
 use zakura_chain::block::Height;
 
 use crate::service::finalized_state::ZakuraDb;
 
-use super::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError};
+use super::{CancelFormatChange, CancelReceiver, DiskFormatUpgrade, FormatChangeError};
 
 /// First format that no longer maintains a header-root authentication frontier.
 pub(crate) const UPGRADE_VERSION: Version = Version::new(28, 1, 4);
@@ -35,7 +35,7 @@ impl DiskFormatUpgrade for Upgrade {
         &self,
         _initial_finalized_tip_height: Option<Height>,
         state_database: &ZakuraDb,
-        cancel_receiver: &Receiver<CancelFormatChange>,
+        cancel_receiver: &CancelReceiver,
     ) -> Result<(), FormatChangeError> {
         check_cancelled(cancel_receiver)?;
         state_database
@@ -48,7 +48,7 @@ impl DiskFormatUpgrade for Upgrade {
     fn validate(
         &self,
         state_database: &ZakuraDb,
-        _cancel_receiver: &Receiver<CancelFormatChange>,
+        _cancel_receiver: &CancelReceiver,
     ) -> Result<Result<(), String>, FormatChangeError> {
         Ok(
             if state_database.has_retired_header_root_auth_frontier_row() {
@@ -60,9 +60,7 @@ impl DiskFormatUpgrade for Upgrade {
     }
 }
 
-fn check_cancelled(
-    cancel_receiver: &Receiver<CancelFormatChange>,
-) -> Result<(), CancelFormatChange> {
+fn check_cancelled(cancel_receiver: &CancelReceiver) -> Result<(), CancelFormatChange> {
     match cancel_receiver.try_recv() {
         Err(TryRecvError::Empty) => Ok(()),
         _ => Err(CancelFormatChange),
@@ -71,6 +69,7 @@ fn check_cancelled(
 
 #[cfg(test)]
 mod tests {
+    use super::super::cancel_channel;
     use super::*;
     use crate::{
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
@@ -117,7 +116,7 @@ mod tests {
         db.write_batch(batch).expect("retired frontier row writes");
         assert!(db.has_retired_header_root_auth_frontier_row());
 
-        let (_cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
+        let (_cancel_tx, cancel_rx) = cancel_channel();
         DiskFormatUpgrade::run(&Upgrade, Some(Height::MIN), &db, &cancel_rx)
             .expect("clearing the frontier is not cancelled");
         DiskFormatUpgrade::run(&Upgrade, Some(Height::MIN), &db, &cancel_rx)
@@ -151,7 +150,7 @@ mod tests {
             "a new database must not create the retired column family"
         );
 
-        let (_cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
+        let (_cancel_tx, cancel_rx) = cancel_channel();
         DiskFormatUpgrade::run(&Upgrade, Some(Height::MIN), &db, &cancel_rx)
             .expect("a missing column family is not an error");
         assert!(matches!(

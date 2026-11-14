@@ -1,10 +1,19 @@
-//! A client for calling Zebra's JSON-RPC methods.
+//! A client for calling Zakura's JSON-RPC methods.
 //!
-//! Used in the rpc sync scanning functionality and in various tests and tools.
+//! Used in various tests and tools.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{fmt, net::SocketAddr, time::Duration};
 
-use reqwest::Client;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{
+    client::conn::http1,
+    header::{AUTHORIZATION, CONTENT_TYPE, HOST},
+    Method, Request, Response,
+};
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpStream;
 
 use crate::BoxError;
 
@@ -17,8 +26,48 @@ const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 /// An HTTP client for making JSON-RPC requests.
 #[derive(Clone, Debug)]
 pub struct RpcRequestClient {
-    client: Client,
     rpc_address: SocketAddr,
+    timeout: Duration,
+    /// The value of the `Authorization` header, if requests use HTTP basic authentication.
+    authorization: Option<String>,
+}
+
+/// Why an RPC request failed.
+#[derive(Debug)]
+pub enum RpcRequestError {
+    /// The server didn't answer within the client's timeout.
+    TimedOut(Duration),
+    /// The client couldn't connect to the server.
+    Connect(std::io::Error),
+    /// The HTTP exchange failed.
+    Http(hyper::Error),
+}
+
+impl RpcRequestError {
+    /// Whether the request timed out.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::TimedOut(_))
+    }
+}
+
+impl fmt::Display for RpcRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut(timeout) => write!(f, "RPC request timed out after {timeout:?}"),
+            Self::Connect(error) => write!(f, "failed to connect to the RPC server: {error}"),
+            Self::Http(error) => write!(f, "RPC request failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RpcRequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TimedOut(_) => None,
+            Self::Connect(error) => Some(error),
+            Self::Http(error) => Some(error),
+        }
+    }
 }
 
 impl RpcRequestClient {
@@ -31,22 +80,20 @@ impl RpcRequestClient {
     ///
     /// Use [`RpcRequestClient::new()`] for the default timeout.
     pub fn new_with_timeout(rpc_address: SocketAddr, timeout: Duration) -> Self {
-        // Reqwest uses the process TLS provider; retain an existing provider.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        // Bundled roots keep even HTTP-only clients independent of system CAs.
-        let tls = rustls::ClientConfig::builder()
-            .with_root_certificates(rustls::RootCertStore {
-                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-            })
-            .with_no_client_auth();
         Self {
-            client: Client::builder()
-                .tls_backend_preconfigured(tls)
-                .timeout(timeout)
-                .build()
-                .expect("bundled trust roots and the default TLS configuration are valid"),
             rpc_address,
+            timeout,
+            authorization: None,
         }
+    }
+
+    /// Returns this client, sending HTTP basic authentication with `user` and `password`.
+    pub fn with_basic_auth(mut self, user: &str, password: &str) -> Self {
+        self.authorization = Some(format!(
+            "Basic {}",
+            STANDARD.encode(format!("{user}:{password}"))
+        ));
+        self
     }
 
     /// Builds rpc request
@@ -54,18 +101,8 @@ impl RpcRequestClient {
         &self,
         method: impl AsRef<str>,
         params: impl AsRef<str>,
-    ) -> reqwest::Result<reqwest::Response> {
-        let method = method.as_ref();
-        let params = params.as_ref();
-
-        self.client
-            .post(format!("http://{}", self.rpc_address))
-            .body(format!(
-                r#"{{"jsonrpc": "2.0", "method": "{method}", "params": {params}, "id":123 }}"#
-            ))
-            .header("Content-Type", "application/json")
-            .send()
-            .await
+    ) -> Result<Response<Bytes>, RpcRequestError> {
+        self.post(method, params, Some("application/json")).await
     }
 
     /// Builds rpc request with a variable `content-type`.
@@ -74,18 +111,8 @@ impl RpcRequestClient {
         method: impl AsRef<str>,
         params: impl AsRef<str>,
         content_type: String,
-    ) -> reqwest::Result<reqwest::Response> {
-        let method = method.as_ref();
-        let params = params.as_ref();
-
-        self.client
-            .post(format!("http://{}", self.rpc_address))
-            .body(format!(
-                r#"{{"jsonrpc": "2.0", "method": "{method}", "params": {params}, "id":123 }}"#
-            ))
-            .header("Content-Type", content_type)
-            .send()
-            .await
+    ) -> Result<Response<Bytes>, RpcRequestError> {
+        self.post(method, params, Some(&content_type)).await
     }
 
     /// Builds rpc request with no content type.
@@ -93,17 +120,8 @@ impl RpcRequestClient {
         &self,
         method: impl AsRef<str>,
         params: impl AsRef<str>,
-    ) -> reqwest::Result<reqwest::Response> {
-        let method = method.as_ref();
-        let params = params.as_ref();
-
-        self.client
-            .post(format!("http://{}", self.rpc_address))
-            .body(format!(
-                r#"{{"jsonrpc": "2.0", "method": "{method}", "params": {params}, "id":123 }}"#
-            ))
-            .send()
-            .await
+    ) -> Result<Response<Bytes>, RpcRequestError> {
+        self.post(method, params, None).await
     }
 
     /// Builds rpc request and gets text from response
@@ -111,8 +129,73 @@ impl RpcRequestClient {
         &self,
         method: impl AsRef<str>,
         params: impl AsRef<str>,
-    ) -> reqwest::Result<String> {
-        self.call(method, params).await?.text().await
+    ) -> Result<String, RpcRequestError> {
+        let response = self.call(method, params).await?;
+        Ok(String::from_utf8_lossy(response.body()).into_owned())
+    }
+
+    /// Sends a `GET` request for the server's root path, for HTTP endpoints like metrics.
+    pub async fn get(&self) -> Result<Response<Bytes>, RpcRequestError> {
+        self.send(Method::GET, None, Bytes::new()).await
+    }
+
+    /// Sends a JSON-RPC request for `method` with `params`, with `content_type` if it is set.
+    async fn post(
+        &self,
+        method: impl AsRef<str>,
+        params: impl AsRef<str>,
+        content_type: Option<&str>,
+    ) -> Result<Response<Bytes>, RpcRequestError> {
+        let method = method.as_ref();
+        let params = params.as_ref();
+        let body =
+            format!(r#"{{"jsonrpc": "2.0", "method": "{method}", "params": {params}, "id":123 }}"#);
+        self.send(Method::POST, content_type, body.into()).await
+    }
+
+    /// Sends a request on a new connection, and receives the whole response, within the
+    /// client's timeout.
+    async fn send(
+        &self,
+        method: Method,
+        content_type: Option<&str>,
+        body: Bytes,
+    ) -> Result<Response<Bytes>, RpcRequestError> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/")
+            .header(HOST, self.rpc_address.to_string());
+        if let Some(content_type) = content_type {
+            request = request.header(CONTENT_TYPE, content_type);
+        }
+        if let Some(authorization) = &self.authorization {
+            request = request.header(AUTHORIZATION, authorization);
+        }
+        let request = request
+            .body(Full::new(body))
+            .expect("the method, path, and headers are valid");
+
+        let exchange = async {
+            let stream = TcpStream::connect(self.rpc_address)
+                .await
+                .map_err(RpcRequestError::Connect)?;
+            let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+                .await
+                .map_err(RpcRequestError::Http)?;
+            tokio::spawn(connection);
+
+            let response = sender
+                .send_request(request)
+                .await
+                .map_err(RpcRequestError::Http)?;
+            let (parts, body) = response.into_parts();
+            let body = body.collect().await.map_err(RpcRequestError::Http)?;
+            Ok(Response::from_parts(parts, body.to_bytes()))
+        };
+
+        tokio::time::timeout(self.timeout, exchange)
+            .await
+            .map_err(|_| RpcRequestError::TimedOut(self.timeout))?
     }
 
     /// Builds an RPC request, awaits its response, and attempts to deserialize
@@ -133,20 +216,72 @@ impl RpcRequestClient {
     fn json_result_from_response_text<T: serde::de::DeserializeOwned>(
         response_text: &str,
     ) -> std::result::Result<T, BoxError> {
-        let output: jsonrpsee_types::Response<serde_json::Value> =
+        let mut response: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(response_text)?;
-        match output.payload {
-            jsonrpsee_types::ResponsePayload::Success(success) => {
-                Ok(serde_json::from_value(success.into_owned())?)
-            }
-            jsonrpsee_types::ResponsePayload::Error(failure) => Err(failure.to_string().into()),
+
+        if let Some(error) = response.remove("error").filter(|error| !error.is_null()) {
+            return Err(Box::new(serde_json::from_value::<RpcError>(error)?));
         }
+
+        let result = response
+            .remove("result")
+            .ok_or("JSON-RPC response has neither a result nor an error")?;
+
+        Ok(serde_json::from_value(result)?)
     }
 }
+
+/// An error object from a JSON-RPC response.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct RpcError {
+    /// The error code.
+    pub code: i32,
+    /// The error message.
+    pub message: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_results_and_errors() {
+        let result: u32 = RpcRequestClient::json_result_from_response_text(
+            r#"{"jsonrpc":"2.0","id":1,"result":7}"#,
+        )
+        .expect("the response has a result");
+        assert_eq!(result, 7);
+
+        let result: Option<u32> = RpcRequestClient::json_result_from_response_text(
+            r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+        )
+        .expect("a null result is a result");
+        assert_eq!(result, None);
+
+        let error = RpcRequestClient::json_result_from_response_text::<u32>(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-8,"message":"Block not found"}}"#,
+        )
+        .expect_err("the response has an error");
+        assert_eq!(
+            error.downcast_ref::<RpcError>(),
+            Some(&RpcError {
+                code: -8,
+                message: "Block not found".to_string(),
+            })
+        );
+        assert_eq!(error.to_string(), "-8: Block not found");
+
+        RpcRequestClient::json_result_from_response_text::<u32>(r#"{"jsonrpc":"2.0","id":1}"#)
+            .expect_err("the response has no result");
+    }
     use std::sync::{Arc, Mutex};
 
     /// Proves that `RpcRequestClient` times out instead of hanging indefinitely

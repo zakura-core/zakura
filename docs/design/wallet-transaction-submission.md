@@ -102,8 +102,7 @@ reads the ALPN extension. It passes the ALPN to `Acceptor::admit` in
 share. It then accepts with a small transport profile, which the driver
 passes to `Endpoint::accept`: a receive window of one in-flight budget plus
 control overhead, and `K + 2` streams. Full peers keep `p2p-v2/3` and their
-current profile. Wallet sessions never take one of the 256 peer connection
-slots.
+current profile. Wallet sessions never take a peer connection slot.
 
 Two alternatives were rejected:
 

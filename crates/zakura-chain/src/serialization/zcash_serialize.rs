@@ -33,26 +33,62 @@ pub trait ZcashSerialize: Sized {
     /// serialization MUST be infallible up to errors in the underlying writer.
     /// In other words, any type implementing `ZcashSerialize` must make illegal
     /// states unrepresentable.
-    fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error>;
+    ///
+    /// Implementations pass `writer` itself to nested values, so a nested
+    /// encoder is compiled once per writer type rather than once per nesting depth.
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error>;
+
+    /// Append `self` to the end of `out`.
+    fn zcash_serialize_into_vec(&self, out: &mut Vec<u8>) -> Result<(), io::Error> {
+        self.zcash_serialize(out)
+    }
 
     /// Helper function to construct a vec to serialize the current struct into
     fn zcash_serialize_to_vec(&self) -> Result<Vec<u8>, io::Error> {
         let mut data = Vec::new();
-        self.zcash_serialize(&mut data)?;
+        self.zcash_serialize_into_vec(&mut data)?;
         Ok(data)
     }
 
     /// Get the size of `self` by using a fake writer.
     fn zcash_serialized_size(&self) -> usize {
-        let mut writer = FakeWriter(0);
-        self.zcash_serialize(&mut writer)
-            .expect("writer should never fail");
-        writer.0
+        serialized_size_with_fake_writer(self)
     }
 }
 
+/// The number of bytes `value` serializes to, counted without allocating.
+pub(crate) fn serialized_size_with_fake_writer<T: ZcashSerialize>(value: &T) -> usize {
+    let mut writer = FakeWriter(0);
+    value
+        .zcash_serialize(&mut writer)
+        .expect("writer should never fail");
+    writer.0
+}
+
+/// Compiles a type's `Vec` and size encoders once, in this crate.
+///
+/// The provided `ZcashSerialize` methods are generic over `Self`, so every crate
+/// that calls them compiles its own copy of the type's whole encoder. Expanding
+/// this macro inside a type's `ZcashSerialize` impl overrides them with
+/// non-generic methods that other crates call instead. Use it for types with
+/// large encoders that other crates serialize, such as blocks and transactions.
+macro_rules! compile_serialize_entry_points_here {
+    () => {
+        #[inline(never)]
+        fn zcash_serialize_into_vec(&self, out: &mut Vec<u8>) -> Result<(), std::io::Error> {
+            self.zcash_serialize(out)
+        }
+
+        #[inline(never)]
+        fn zcash_serialized_size(&self) -> usize {
+            $crate::serialization::serialized_size_with_fake_writer(self)
+        }
+    };
+}
+pub(crate) use compile_serialize_entry_points_here;
+
 impl ZcashSerialize for u8 {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_u8(*self)
     }
 }
@@ -78,12 +114,12 @@ impl std::io::Write for FakeWriter {
 /// See `zcash_serialize_external_count` for more details, and usage information.
 impl<T: ZcashSerialize> ZcashSerialize for Vec<T> {
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         let len: CompactSizeMessage = self
             .len()
             .try_into()
             .expect("len fits in MAX_PROTOCOL_MESSAGE_LEN");
-        len.zcash_serialize(&mut writer)?;
+        len.zcash_serialize(writer)?;
 
         zcash_serialize_external_count(self, writer)
     }
@@ -92,8 +128,8 @@ impl<T: ZcashSerialize> ZcashSerialize for Vec<T> {
 /// Serialize an `AtLeastOne` vector as a CompactSize number of items, then the
 /// items. This is the most common format in Zcash.
 impl<T: ZcashSerialize> ZcashSerialize for AtLeastOne<T> {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        self.as_vec().zcash_serialize(&mut writer)
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        self.as_vec().zcash_serialize(writer)
     }
 }
 
@@ -108,15 +144,18 @@ impl<T: ZcashSerialize> ZcashSerialize for AtLeastOne<T> {
 //
 // we specifically want to serialize `Vec`s here, rather than generic slices
 #[allow(clippy::ptr_arg)]
-pub fn zcash_serialize_bytes<W: io::Write>(vec: &Vec<u8>, mut writer: W) -> Result<(), io::Error> {
-    CompactSizeMessage::try_from(vec.len())?.zcash_serialize(&mut writer)?;
+pub fn zcash_serialize_bytes<W: io::Write + ?Sized>(
+    vec: &Vec<u8>,
+    writer: &mut W,
+) -> Result<(), io::Error> {
+    CompactSizeMessage::try_from(vec.len())?.zcash_serialize(writer)?;
 
     zcash_serialize_bytes_external_count(vec, writer)
 }
 
 /// Serialize an empty list of items, by writing a zero CompactSize length.
 /// (And no items.)
-pub fn zcash_serialize_empty_list<W: io::Write>(writer: W) -> Result<(), io::Error> {
+pub fn zcash_serialize_empty_list<W: io::Write + ?Sized>(writer: &mut W) -> Result<(), io::Error> {
     CompactSizeMessage::default().zcash_serialize(writer)
 }
 
@@ -147,12 +186,12 @@ pub fn zcash_serialize_empty_list<W: io::Write>(writer: W) -> Result<(), io::Err
 //
 // we specifically want to serialize `Vec`s here, rather than generic slices
 #[allow(clippy::ptr_arg)]
-pub fn zcash_serialize_external_count<W: io::Write, T: ZcashSerialize>(
+pub fn zcash_serialize_external_count<W: io::Write + ?Sized, T: ZcashSerialize>(
     vec: &Vec<T>,
-    mut writer: W,
+    writer: &mut W,
 ) -> Result<(), io::Error> {
     for x in vec {
-        x.zcash_serialize(&mut writer)?;
+        x.zcash_serialize(writer)?;
     }
     Ok(())
 }
@@ -164,16 +203,16 @@ pub fn zcash_serialize_external_count<W: io::Write, T: ZcashSerialize>(
 //
 // we specifically want to serialize `Vec`s here, rather than generic slices
 #[allow(clippy::ptr_arg)]
-pub fn zcash_serialize_bytes_external_count<W: io::Write>(
+pub fn zcash_serialize_bytes_external_count<W: io::Write + ?Sized>(
     vec: &Vec<u8>,
-    mut writer: W,
+    writer: &mut W,
 ) -> Result<(), io::Error> {
     writer.write_all(vec)
 }
 
 /// Write a Bitcoin-encoded UTF-8 `&str`.
 impl ZcashSerialize for &str {
-    fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         let str_bytes = self.as_bytes().to_vec();
         zcash_serialize_bytes(&str_bytes, writer)
     }
@@ -181,8 +220,8 @@ impl ZcashSerialize for &str {
 
 /// Write a Bitcoin-encoded UTF-8 `String`.
 impl ZcashSerialize for String {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        self.as_str().zcash_serialize(&mut writer)
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        self.as_str().zcash_serialize(writer)
     }
 }
 
@@ -191,7 +230,7 @@ impl ZcashSerialize for String {
 
 /// Write a Bitcoin-encoded IPv6 address.
 impl ZcashSerialize for Ipv6Addr {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), std::io::Error> {
         writer.write_all(&self.octets())
     }
 }

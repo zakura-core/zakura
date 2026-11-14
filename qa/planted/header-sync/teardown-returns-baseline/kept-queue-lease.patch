@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index 8498490dde..a21bf2e31f 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -515,7 +515,7 @@ impl PeerWorkQueue {
+         #[cfg(any(test, zakura_sim))]
+         self.end_as(peer, ReservationEnd::Released);
+         self.request_reservations.remove(peer);
+-        self.staged_capacity.remove(peer);
++        // Mutation: the queue keeps its own clones of the round's leases.
+     }
+ 
+     pub(in crate::zakura::header_sync) fn stage(

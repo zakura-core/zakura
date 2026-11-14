@@ -1,0 +1,25 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index ba4271fbdf..4a65807e5a 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -622,7 +622,8 @@ impl HeaderSyncReactor {
+                 },
+                 _ = zakura_rt::task::yield_now(), if handled_event => {},
+                 changed = async {
+-                    match committed_snapshots.as_mut() {
++                    // Mutation: and its committed watch's arm never fires.
++                    match committed_snapshots.as_mut().filter(|_| false) {
+                         Some(snapshots) => snapshots.changed().await,
+                         None => std::future::pending().await,
+                     }
+@@ -712,7 +713,9 @@ impl HeaderSyncReactor {
+         }
+         // `changed` delivers a final unseen value before reporting channel closure.
+         // A spent coop budget mustn't hide a change. See the `a_spent_budget_hides_no_*` tests.
+-        if let Some(snapshots) = committed_snapshots.as_mut() {
++        // Mutation: the run loop never checks its committed watch as it
++        // settles its ready inputs at the top of its turn.
++        if let Some(snapshots) = committed_snapshots.as_mut().filter(|_| false) {
+             match coop::unconstrained(snapshots.changed()).now_or_never() {
+                 Some(Ok(())) => {
+                     let snapshot = snapshots.borrow_and_update().clone();

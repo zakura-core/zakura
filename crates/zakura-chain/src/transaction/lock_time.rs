@@ -87,6 +87,7 @@ impl LockTime {
     /// value returned by this function.
     //
     // TODO: replace Utc.timestamp with DateTime32 (#2211)
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub fn max_lock_time_timestamp() -> LockTime {
         LockTime::Time(
             Utc.timestamp_opt(Self::MAX_TIMESTAMP, 0)
@@ -103,7 +104,7 @@ impl LockTime {
 
 impl ZcashSerialize for LockTime {
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         // This implementation does not check the invariants on `LockTime` so that the
         // serialization is fallible only if the underlying writer is. This ensures that
         // we can always compute a hash of a transaction object.

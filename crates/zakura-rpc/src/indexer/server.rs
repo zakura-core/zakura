@@ -24,6 +24,7 @@ use tonic::transport::{
 use tower::BoxError;
 use zakura_chain::chain_tip::ChainTip;
 use zakura_node_services::mempool::MempoolTxSubscriber;
+use zakura_node_services::task::spawn_erased;
 use zakura_state::ReadState;
 
 use crate::{
@@ -38,6 +39,14 @@ const MAX_CONNECTIONS: usize = 64;
 
 /// Maximum number of concurrent HTTP/2 streams on each connection.
 const MAX_CONCURRENT_STREAMS_PER_CONNECTION: u32 = 64;
+
+/// Maximum encoded size of a request message, in bytes.
+///
+/// tonic rejects a longer message from its length prefix, before buffering or decoding it, so a
+/// caller cannot make the server allocate an oversized field that a handler would only reject
+/// afterwards. The largest valid request names every non-finalized chain tip and a receipt
+/// session, which takes under 400 bytes; tonic's default would admit 4 MiB.
+pub(crate) const MAX_REQUEST_MESSAGE_BYTES: usize = 4096;
 
 /// Maximum time an unauthenticated connection may spend negotiating TLS.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -118,11 +127,6 @@ where
         mempool_change,
     };
 
-    let reflection_service = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(crate::indexer::FILE_DESCRIPTOR_SET)
-        .build_v1()
-        .unwrap();
-
     let request_limit = usize::try_from(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
         .expect("the small HTTP/2 stream limit fits in usize");
     let mut server = Server::builder()
@@ -140,12 +144,12 @@ where
     tracing::info!("{OPENED_RPC_ENDPOINT_MSG}{}", listen_addr);
 
     let incoming = limited_tcp_incoming(tcp_listener, MAX_CONNECTIONS);
-    let server_task: JoinHandle<Result<(), BoxError>> = tokio::spawn(async move {
-        server
-            .add_service(reflection_service)
-            .add_service(IndexerServer::new(indexer_service))
-            .serve_with_incoming(incoming)
-            .await?;
+    let server_task: JoinHandle<Result<(), BoxError>> = spawn_erased(async move {
+        // The generated service dispatches on the method path itself, and answers unknown
+        // methods with `Unimplemented`, so a single service needs no tonic router.
+        let indexer_server = IndexerServer::new(indexer_service)
+            .max_decoding_message_size(MAX_REQUEST_MESSAGE_BYTES);
+        server.serve_with_incoming(indexer_server, incoming).await?;
 
         Ok(())
     });

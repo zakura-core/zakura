@@ -23,18 +23,10 @@ use zcash_address::{ToAddress, ZcashAddress};
 
 use super::super::*;
 use super::utils::fake_history_tree;
+use crate::tests::test_rpc::TestRpcImpl;
 
 type Mock<Req, Resp> = MockService<Req, Resp, PanicAssertion, BoxError>;
 type Verifier = Mock<zakura_consensus::Request, Hash>;
-type TestRpc<M, R> = RpcImpl<
-    M,
-    Mock<zakura_state::Request, zakura_state::Response>,
-    R,
-    MockChainTip,
-    MockAddressBookPeers,
-    Verifier,
-    MockSyncStatus,
->;
 
 fn network() -> Network {
     Network::new_regtest(RegtestParameters {
@@ -52,7 +44,7 @@ fn rpc<M: MempoolService, R: ReadStateService>(
     mempool: M,
     read: R,
     tip: MockChainTip,
-) -> (TestRpc<M, R>, Verifier) {
+) -> (TestRpcImpl, Verifier) {
     // Template construction runs on the blocking pool and can exceed the mock
     // default of 300 ms on busy CI runners. Use the enclosing test deadline.
     let verifier: Verifier = MockService::build()
@@ -62,7 +54,7 @@ fn rpc<M: MempoolService, R: ReadStateService>(
     let mut sync_status = MockSyncStatus::default();
     sync_status.set_is_close_to_tip(true);
     let (_, rx) = watch::channel(None);
-    let (rpc, queue) = RpcImpl::new(
+    let (rpc, queue) = TestRpcImpl::new_for_tests(
         network,
         config::mining::Config {
             miner_address: Some(miner_address),
@@ -247,7 +239,7 @@ fn chain_info(height: u32, hash: u8, balance: i64) -> GetBlockTemplateChainInfo 
 fn mining_rpc(
     info: watch::Receiver<GetBlockTemplateChainInfo>,
 ) -> (
-    TestRpc<impl MempoolService, impl ReadStateService>,
+    TestRpcImpl,
     zakura_chain::chain_tip::mock::MockChainTipSender,
     Verifier,
 ) {
@@ -286,7 +278,7 @@ fn mining_rpc(
 fn counting_mining_rpc(
     info: watch::Receiver<GetBlockTemplateChainInfo>,
 ) -> (
-    TestRpc<impl MempoolService, impl ReadStateService>,
+    TestRpcImpl,
     zakura_chain::chain_tip::mock::MockChainTipSender,
     Arc<AtomicUsize>,
     Arc<AtomicBool>,
@@ -424,7 +416,7 @@ fn precomputed_template_does_not_wait_for_proof_capacity() {
             vec![],
             Some(false),
         ));
-        let Poll::Ready(Ok(template)) = futures::poll!(&mut template) else {
+        let Poll::Ready(Ok((template, _))) = futures::poll!(&mut template) else {
             panic!("a precomputed coinbase must not wait behind proof construction");
         };
         assert_eq!(template.coinbase_txn.data, expected_coinbase);
@@ -753,8 +745,8 @@ async fn preactivation_template_accepts_negative_balance() {
 fn assert_reward(template: &BlockTemplateResponse, balance: i64) {
     use zakura_chain::parameters::subsidy::halving_block_subsidy;
     let base = halving_block_subsidy(Height(template.height), &network()).unwrap();
-    // Independent fixed NU7 payout oracle, including rounding up.
-    let bonus = (i128::from(balance) * 1_375 + 9_999_999_999) / 10_000_000_000;
+    // Independent Regtest NU7 payout oracle, including rounding up.
+    let bonus = (i128::from(balance) * 8_022_777 + 9_999_999_999) / 10_000_000_000;
     let expected = i64::from(base)
         + if template.height >= 3 {
             i64::try_from(bonus).unwrap()
@@ -995,6 +987,7 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         sender.send_best_tip_height(original.tip_height);
         sender.send_best_tip_hash(original.tip_hash);
         sender.send_estimated_distance_to_network_chain_tip(0);
+        sender.send_best_tip_block_time(chrono::Utc::now());
         let read_count = Arc::new(AtomicUsize::new(0));
         let reads = read_count.clone();
         let slow_read = Arc::new(AtomicBool::new(false));
@@ -1236,7 +1229,7 @@ fn recovery_construction_yields_and_rebuilds_on_parent_change() {
             let (_, info) = watch::channel(chain.clone());
             let (rpc, tip, mut verifier) = mining_rpc(info);
             let params = rpc.gbt.miner_params().unwrap();
-            let template = bounded(rpc.build_mining_template(
+            let (template, _) = bounded(rpc.build_mining_template(
                 None,
                 params,
                 &chain,
@@ -1311,7 +1304,7 @@ fn failed_recovery_validation_rebuilds_when_committed_state_moved_on() {
         let (info_tx, info) = watch::channel(chain.clone());
         let (rpc, _tip, mut verifier) = mining_rpc(info);
         let params = rpc.gbt.miner_params().unwrap();
-        let template = bounded(rpc.build_mining_template(
+        let (template, _) = bounded(rpc.build_mining_template(
             None,
             params,
             &chain,
@@ -1409,7 +1402,7 @@ async fn shielded_template_rewards() {
     let chain = chain_info(2, 1, 400_000_000);
     let id =
         LongPollInput::new(chain.tip_height, chain.tip_hash, chain.max_time, vec![]).generate_id();
-    let template = tokio::time::timeout(
+    let (template, _) = tokio::time::timeout(
         Duration::from_secs(300),
         rpc.build_mining_template(None, &params, &chain, id, vec![], None),
     )
@@ -1423,7 +1416,9 @@ async fn shielded_template_rewards() {
         .zcash_deserialize_into()
         .unwrap();
     let base = i64::from(halving_block_subsidy(Height(3), &net).unwrap());
-    let expected = base + 55;
+    // Independent Regtest NU7 payout oracle for the 400,000,000 zatoshi balance: the
+    // 8,022,777 / 10^10 fraction, rounded up.
+    let expected = base + 320_912;
     let (sapling, orchard, ironwood) = (
         i64::from(tx.sapling_value_balance().sapling_amount()),
         i64::from(tx.orchard_value_balance().orchard_amount()),

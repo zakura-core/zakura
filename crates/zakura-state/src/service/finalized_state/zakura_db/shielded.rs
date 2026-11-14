@@ -705,13 +705,13 @@ impl DiskWriteBatch {
 
         // Index each transaction's shielded data
         #[cfg(feature = "indexer")]
-        for (tx_index, transaction) in block.transactions.iter().enumerate() {
+        for (tx_index, transaction) in block.view().transactions().enumerate() {
             let tx_loc = TransactionLocation::from_usize(*height, tx_index);
             self.prepare_nullifier_batch(zakura_db, transaction, tx_loc);
         }
 
         #[cfg(not(feature = "indexer"))]
-        for transaction in &finalized.block.transactions {
+        for transaction in finalized.block.view().transactions() {
             self.prepare_nullifier_batch(zakura_db, transaction);
         }
     }
@@ -1077,7 +1077,7 @@ impl DiskWriteBatch {
 
     /// Deletes the range of Sapling note commitment trees at the given [`Height`]s.
     /// Doesn't delete anchors from the anchor index. Doesn't delete the upper bound.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn delete_range_sapling_tree(&mut self, zakura_db: &ZakuraDb, from: &Height, to: &Height) {
         let sapling_tree_cf = zakura_db
             .db

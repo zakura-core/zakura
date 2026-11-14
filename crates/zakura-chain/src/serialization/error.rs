@@ -1,6 +1,6 @@
 //! Errors for Zcash consensus-critical serialization.
 
-use std::{array::TryFromSliceError, io, num::TryFromIntError, str::Utf8Error, sync::Arc};
+use std::{array::TryFromSliceError, fmt, io, num::TryFromIntError, str::Utf8Error, sync::Arc};
 
 use bounded_vec::BoundedVecOutOfBounds;
 use hex::FromHexError;
@@ -8,7 +8,7 @@ use thiserror::Error;
 
 /// A serialization error.
 // TODO: refine error types -- better to use boxed errors?
-#[derive(Clone, Error, Debug)]
+#[derive(Clone, Error)]
 pub enum SerializationError {
     /// An io error that prevented deserialization
     #[error("io error: {0}")]
@@ -68,6 +68,30 @@ pub enum SerializationError {
     /// Errors that occur when parsing integers in transparent scripts.
     #[error("script number error: {0}")]
     Num(#[from] zcash_script::num::Error),
+}
+
+// Written out instead of derived: derived `Debug` is `#[inline]`, so every
+// codegen unit that formats this type compiles its own copy. The output
+// matches the derive.
+impl fmt::Debug for SerializationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => f.debug_tuple("Io").field(error).finish(),
+            Self::Parse(message) => f.debug_tuple("Parse").field(message).finish(),
+            Self::NonCanonicalShieldedProofSize => f.write_str("NonCanonicalShieldedProofSize"),
+            Self::Utf8Error(error) => f.debug_tuple("Utf8Error").field(error).finish(),
+            Self::TryFromSliceError(error) => {
+                f.debug_tuple("TryFromSliceError").field(error).finish()
+            }
+            Self::TryFromIntError(error) => f.debug_tuple("TryFromIntError").field(error).finish(),
+            Self::FromHexError(error) => f.debug_tuple("FromHexError").field(error).finish(),
+            Self::Amount { source } => f.debug_struct("Amount").field("source", source).finish(),
+            Self::BadTransactionBalance => f.write_str("BadTransactionBalance"),
+            Self::Script(error) => f.debug_tuple("Script").field(error).finish(),
+            Self::Opcode(error) => f.debug_tuple("Opcode").field(error).finish(),
+            Self::Num(error) => f.debug_tuple("Num").field(error).finish(),
+        }
+    }
 }
 
 impl From<SerializationError> for io::Error {

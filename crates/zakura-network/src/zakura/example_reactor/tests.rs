@@ -256,16 +256,57 @@ impl MessageSample for ExampleMessage {
 
 message_suite!(message_family, ExampleMessage);
 
+/// Whether `message_type` is a row of [`WatchMessage`].
+fn watched(message_type: u16) -> bool {
+    MessageRule::find(WatchMessage::RULES, message_type).is_some()
+}
+
+/// The example's test data, cut to the watch family's rows.
+impl MessageSample for WatchMessage {
+    fn samples() -> Vec<Self> {
+        ExampleMessage::samples()
+            .into_iter()
+            .filter(|message| watched(message.message_type()))
+            .map(Self)
+            .collect()
+    }
+
+    fn arbitrary_valid() -> BoxedStrategy<Self> {
+        ExampleMessage::arbitrary_valid()
+            .prop_filter("a row outside the watch family", |message| {
+                watched(message.message_type())
+            })
+            .prop_map(Self)
+            .boxed()
+    }
+
+    fn violations() -> Vec<Violation<Self>> {
+        ExampleMessage::violations()
+            .into_iter()
+            .filter(|violation| watched(violation.frame.message_type))
+            .map(|violation| Violation {
+                name: violation.name,
+                frame: violation.frame,
+                rejected_by: violation.rejected_by,
+            })
+            .collect()
+    }
+}
+
+message_suite!(watch_family, WatchMessage);
+
 #[test]
-fn both_layouts_carry_exactly_the_family_rows() {
+fn every_layout_carries_exactly_its_family_rows() {
     check_layout_carries_family::<ExampleMessage>(&SINGLE);
     check_layout_carries_family::<ExampleMessage>(&PAIRED);
+    check_layout_carries_family::<WatchMessage>(&WATCH_ONLY);
 }
 
 #[test]
-fn readers_follow_both_layouts() {
+fn readers_follow_every_layout() {
     check_frame_filter(&SINGLE);
     check_frame_filter(&PAIRED);
+    check_frame_filter(&WATCH_ONLY);
 }
 
 /// The conformance suite's view of the example: exchange `e` asks for the
@@ -358,10 +399,22 @@ impl StreamConformance for ExampleConformance {
             bytes: super::exchange::item_bytes(height),
         }
     }
+
+    fn read_page(message: &ExampleMessage) -> Option<(u32, u32)> {
+        let ExampleMessage::Pushed { id, height, .. } = message else {
+            return None;
+        };
+        Some((*id, height.0))
+    }
 }
 
 stream_conformance_suite!(single_stream_conformance, SINGLE, ExampleConformance);
 stream_conformance_suite!(paired_stream_conformance, PAIRED, ExampleConformance);
+stream_conformance_suite!(
+    watch_only_stream_conformance,
+    WATCH_ONLY,
+    ExampleConformance
+);
 
 /// A one-page credit window still exercises Close while its page waits on send capacity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

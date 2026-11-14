@@ -1,0 +1,10 @@
+# Preparation copies a round's staged entries into its prepare call and
+# keeps them, so the preparing round still holds entries its call took.
+# The reactor and the queue decide when the witness's rounds prepare, so a
+# change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

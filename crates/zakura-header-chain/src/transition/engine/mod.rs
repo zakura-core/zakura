@@ -17,7 +17,7 @@ use crate::{
     TransitionContext, TransitionFailure, UntrustedAuxDeliveryRow,
 };
 
-use super::planner::derive_transition_plan;
+use super::planner::{derive_transition_plan, needs_validation_lease};
 use install::{merge_auxiliary_delivery_changes, merge_projection_delta, verify_projection};
 pub(crate) use recovery::validate_recovered_auxiliary_rows;
 
@@ -74,6 +74,48 @@ pub struct HeaderChainEngine {
     aux_deliveries: HashMap<block::Hash, Vec<AuxDelivery>>,
     /// Retained header hash keyed by globally unique delivery identity.
     aux_delivery_index: HashMap<crate::EvidenceId, block::Hash>,
+}
+
+/// A header-chain engine's durable state: every field except the
+/// process-local transition identity (`instance_capability`,
+/// `source_revision`) and the auxiliary deliveries, which the simulator
+/// judges by hash on their own. For a test or the simulator to compare two
+/// states whole.
+#[cfg(any(test, feature = "test-support", zakura_sim))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct DurableState {
+    pub graph: crate::GraphState,
+    pub metadata: EngineMetadata,
+    pub selected_projection: Vec<crate::Frontier>,
+    pub verified_projection: Vec<crate::Frontier>,
+    pub aux_delivery_index: HashMap<crate::EvidenceId, block::Hash>,
+}
+
+#[cfg(any(test, feature = "test-support", zakura_sim))]
+impl HeaderChainEngine {
+    /// The engine's [`DurableState`]. The engine is destructured with no
+    /// `..`, so a field added later fails to compile here until it's
+    /// classified.
+    pub fn durable_state(&self) -> DurableState {
+        let HeaderChainEngine {
+            instance_capability: _,
+            source_revision: _,
+            graph,
+            metadata,
+            selected_projection,
+            verified_projection,
+            aux_deliveries: _,
+            aux_delivery_index,
+        } = self;
+        DurableState {
+            graph: graph.state(),
+            metadata: metadata.clone(),
+            selected_projection: selected_projection.clone(),
+            verified_projection: verified_projection.clone(),
+            aux_delivery_index: aux_delivery_index.clone(),
+        }
+    }
 }
 
 /// Private identity of one exact in-memory transition source.
@@ -276,6 +318,45 @@ impl HeaderChainEngine {
         context: &TransitionContext<'_>,
     ) -> Result<EngineTransition, TransitionFailure> {
         derive_transition_plan(self, input, context)
+    }
+
+    /// Returns whether [`Self::plan_transition`] can read a durable [`crate::ValidationLease`]
+    /// rooted at `parent` when it plans under `context`.
+    ///
+    /// An adapter may leave that lease out of [`HeaderValidationFacts`] when this returns `false`:
+    /// the plan is the same with or without it. It returns `false` only when both hold:
+    ///
+    /// - the retained graph holds every header contextual validation reads from `parent`
+    ///   downward, so no walk through `parent` runs out of retained headers; and
+    /// - `parent` is not a retention reference that only a lease can authenticate.
+    ///
+    /// Ask with the engine that will plan the transition, before anything else changes it, and
+    /// with the retention references and authority that planning will use. The answer does not
+    /// depend on which leases that authority authorizes.
+    pub fn needs_validation_lease(
+        &self,
+        parent: block::Hash,
+        context: &TransitionContext<'_>,
+    ) -> bool {
+        needs_validation_lease(self, parent, parent, context)
+    }
+
+    /// Returns whether [`Self::plan_transition`] can read a durable [`crate::ValidationLease`]
+    /// rooted at `lease_root` when every difficulty/time walk it runs starts at `walk_from` or
+    /// passes through it.
+    ///
+    /// A header insertion runs one such walk, from the parent of its batch, so the lease rooted at
+    /// another header, such as the finalized header, is read only when that walk runs out of
+    /// retained headers, or when `lease_root` is a retention reference that only a lease can
+    /// authenticate. The same conditions as [`Self::needs_validation_lease`] apply to the engine,
+    /// references and authority used to ask.
+    pub fn needs_validation_lease_for_walk(
+        &self,
+        walk_from: block::Hash,
+        lease_root: block::Hash,
+        context: &TransitionContext<'_>,
+    ) -> bool {
+        needs_validation_lease(self, walk_from, lease_root, context)
     }
 
     /// Install a verified transition after its durable batch has committed.

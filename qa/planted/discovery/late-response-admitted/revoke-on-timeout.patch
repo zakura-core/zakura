@@ -1,0 +1,34 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/peer.rs b/crates/zakura-network/src/zakura/discovery/peer.rs
+--- a/crates/zakura-network/src/zakura/discovery/peer.rs
++++ b/crates/zakura-network/src/zakura/discovery/peer.rs
+@@ -179,7 +179,10 @@ impl PeerIO {
+             biased;
+             _ = cancel.cancelled() => InitialWait::Cancelled,
+             _ = self.state.wait_complete() => InitialWait::Complete,
+-            _ = zakura_rt::time::sleep(timeout) => InitialWait::TimedOut,
++            _ = zakura_rt::time::sleep(timeout) => {
++                self.queries.revoke();
++                InitialWait::TimedOut
++            }
+         }
+     }
+ 
+diff --git a/crates/zakura-network/src/zakura/discovery/requester.rs b/crates/zakura-network/src/zakura/discovery/requester.rs
+--- a/crates/zakura-network/src/zakura/discovery/requester.rs
++++ b/crates/zakura-network/src/zakura/discovery/requester.rs
+@@ -553,6 +553,15 @@ impl Queries {
+         }
+     }
+ 
++    /// Drops every live query and its reservation, as if the initial wait's
++    /// timeout ended their authority, so a late answer finds no query. The
++    /// requests' exchanges leak instead of dropping, so the connection stays
++    /// open until the late answer comes.
++    pub(super) fn revoke(&self) {
++        let revoked = std::mem::replace(&mut *self.lock(), LiveQueries::new());
++        std::mem::forget(revoked);
++    }
++
+     /// Ends the session's queries: an unwritten query is skipped, and an
+     /// unanswered written query closes the connection. The reservations
+     /// return to the pool, even while the transport reader outlives the

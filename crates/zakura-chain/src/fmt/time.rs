@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use super::human_duration::format_duration;
+
 /// The minimum amount of time displayed with only seconds (no milliseconds).
 pub const MIN_SECONDS_ONLY_TIME: Duration = Duration::from_secs(5);
 
@@ -30,7 +32,7 @@ pub fn humantime_seconds(duration: impl Into<Duration>) -> String {
     // Truncate fractional seconds.
     let duration = Duration::from_secs(duration.as_secs());
 
-    let duration = humantime::format_duration(duration);
+    let duration = format_duration(duration);
 
     format!("{duration}")
 }
@@ -43,7 +45,7 @@ pub fn humantime_milliseconds(duration: impl Into<Duration>) -> String {
     let duration_secs = Duration::from_secs(duration.as_secs());
     let duration_millis = Duration::from_millis(duration.subsec_millis().into());
 
-    let duration = humantime::format_duration(duration_secs + duration_millis);
+    let duration = format_duration(duration_secs + duration_millis);
 
     format!("{duration}")
 }
@@ -57,7 +59,7 @@ pub fn humantime_microseconds(duration: impl Into<Duration>) -> String {
     let duration_millis = Duration::from_millis(duration.subsec_millis().into());
     let duration_micros = Duration::from_micros(duration.subsec_micros().into());
 
-    let duration = humantime::format_duration(duration_secs + duration_millis + duration_micros);
+    let duration = format_duration(duration_secs + duration_millis + duration_micros);
 
     format!("{duration}")
 }

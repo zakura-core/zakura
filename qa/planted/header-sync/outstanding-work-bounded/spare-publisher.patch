@@ -1,0 +1,20 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/service.rs b/crates/zakura-network/src/zakura/header_sync/service.rs
+index a35baf5bd5..066a47edff 100644
+--- a/crates/zakura-network/src/zakura/header_sync/service.rs
++++ b/crates/zakura-network/src/zakura/header_sync/service.rs
+@@ -795,6 +795,15 @@ impl Service for HeaderSyncService {
+         );
+         #[cfg(any(test, zakura_sim))]
+         let session = session.with_origin(origin);
++        // Mutation: the service spawns a spare publisher for the session.
++        let _spare = sim_arg!(spawn_publisher(
++            &self.header_sync,
++            header_bytes,
++            &peer_id,
++            session_id,
++            send.clone(),
++            service_cancel_token.clone(),
++        ); (None, self.header_sync.credit_tap(&peer_id, session_id)));
+         let (publisher, publishing) = sim_arg!(spawn_publisher(
+             &self.header_sync,
+             header_bytes,

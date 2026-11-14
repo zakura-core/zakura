@@ -141,8 +141,8 @@ pub(super) fn peer(n: u8) -> ZakuraPeerId {
 }
 
 /// One served session, its output, and its cancellation.
-pub(super) struct Session {
-    pub(super) serve: Serve<Scripted>,
+pub(super) struct Session<P: Produce = Scripted> {
+    pub(super) serve: Serve<P>,
     pub(super) output: FramedRecv,
     pub(super) cancel: CancellationToken,
 }
@@ -691,6 +691,42 @@ async fn output_bytes_return_only_when_the_last_frame_is_written() {
     }
 }
 
+/// `responses_written` resolves once the last frame is written, and once a
+/// cancelled session drops its requests.
+#[tokio::test]
+async fn responses_written_waits_for_the_last_frame_or_cancellation() {
+    for order in ORDERS {
+        let capacity = capacity(LIMITS);
+        let mut session = session_in(order, &capacity, 1, 4);
+        let written = session.serve.responses_written();
+        let unwritten = || futures::FutureExt::now_or_never(written.wait()).is_none();
+        assert!(!unwritten(), "an idle session has nothing to write");
+        session
+            .serve
+            .admit(Job {
+                parts: 1,
+                part_len: 8,
+                ..job()
+            })
+            .unwrap();
+        settle().await;
+        assert!(unwritten());
+        next(&mut session.output).await;
+        assert!(unwritten(), "the ending is unwritten");
+        next(&mut session.output).await;
+        assert!(!unwritten());
+
+        let gate = Arc::new(Semaphore::new(0));
+        session.serve.admit(gated(&gate)).unwrap();
+        settle().await;
+        assert!(unwritten());
+        session.cancel.cancel();
+        gate.add_permits(1);
+        settle().await;
+        assert!(!unwritten(), "a cancelled session drops its requests");
+    }
+}
+
 /// Tiny responses must stop on bookkeeping capacity before encoded bytes fill.
 #[tokio::test]
 async fn tiny_responses_with_a_blocked_writer_hold_response_slots() {
@@ -941,6 +977,7 @@ fn sink_and_core(
     let commitments = Arc::new(Commitments {
         open: AtomicU32::new(1),
         limit: AtomicU32::new(1),
+        tap: std::sync::OnceLock::new(),
     });
     let (frames, queued) = mpsc::unbounded_channel();
     let core = SinkCore::new(
@@ -954,6 +991,7 @@ fn sink_and_core(
             _peer: grant(),
             _peer_response: SlotBudget::new(1).unwrap().try_reserve().unwrap(),
             _peer_budgets: capacity(LIMITS).peer(&peer(1)),
+            _unwritten: None,
         }),
         Commitment(Some(commitments.clone()), None),
     );
@@ -971,6 +1009,7 @@ fn ending_publication_frees_the_count_before_a_peer_can_replace_its_request() {
         let counts = Arc::new(Commitments {
             open: AtomicU32::new(1),
             limit: AtomicU32::new(1),
+            tap: std::sync::OnceLock::new(),
         });
         let completed = Completions::default();
         let mut old = Commitment(Some(counts.clone()), tracked.then(|| completed.track(1)));
@@ -1344,4 +1383,326 @@ async fn one_slot_serving_drains_before_control_uses_the_slot() {
         assert!(!cancel.is_cancelled());
         cancel.cancel();
     }
+}
+
+#[test]
+fn only_more_than_twice_the_limit_is_over_committed() {
+    for limit in [0u32, 1, 2, 7, u32::MAX / 2, u32::MAX] {
+        let margin = limit.saturating_mul(2);
+        for open in [0u32, 1, limit, limit.saturating_add(1), margin] {
+            if open > margin {
+                continue;
+            }
+            assert_eq!(
+                commitment_over_limit(open, limit),
+                Ok(open > limit),
+                "{open}/{limit}"
+            );
+        }
+        if let Some(open) = limit.checked_mul(2).and_then(|twice| twice.checked_add(1)) {
+            assert_eq!(
+                commitment_over_limit(open, limit),
+                Err(ServeViolation::OverCommitted { open, limit })
+            );
+        }
+    }
+}
+
+/// [`Scripted`], logging the node execution slots held at each lease report.
+#[derive(Debug)]
+struct Leased {
+    capacity: ServeCapacity,
+    log: Arc<std::sync::Mutex<Vec<(&'static str, usize)>>>,
+}
+
+static SCRIPTED: Scripted = Scripted;
+
+impl Produce for Leased {
+    type Request = Job;
+    type Message = Probe;
+
+    fn response_cap(&self, job: &Job) -> ResponseCap {
+        SCRIPTED.response_cap(job)
+    }
+
+    async fn produce(
+        &self,
+        job: &Job,
+        lease: WorkLease,
+        sink: ResponseSink<Probe>,
+    ) -> Result<Responded, ServeEnd> {
+        SCRIPTED.produce(job, lease, sink).await
+    }
+
+    fn local_failure(&self, job: &Job, sent: SinkProgress) -> Probe {
+        SCRIPTED.local_failure(job, sent)
+    }
+
+    fn observe_lease(&self, _job: &Job) -> Option<ReleaseReport> {
+        let held = self.capacity.node_execution_held();
+        self.log.lock().unwrap().push(("acquired", held));
+        let (capacity, log) = (self.capacity.clone(), self.log.clone());
+        Some(ReleaseReport::new(move || {
+            let held = capacity.node_execution_held();
+            log.lock().unwrap().push(("released", held));
+        }))
+    }
+}
+
+/// A [`Leased`] session and its log.
+fn leased(
+    capacity: &ServeCapacity,
+) -> (
+    Session<Leased>,
+    Arc<std::sync::Mutex<Vec<(&'static str, usize)>>>,
+) {
+    let log = Arc::default();
+    let (send, output) = framed_channel(64);
+    let cancel = CancellationToken::new();
+    let serve = capacity.session_with_order(
+        OutputOrder::Admission,
+        Arc::new(Leased {
+            capacity: capacity.clone(),
+            log: Arc::clone(&log),
+        }),
+        &peer(1),
+        4,
+        send,
+        cancel.clone(),
+        cancel.clone(),
+        crate::zakura::CloseCause::default(),
+    );
+    (
+        Session {
+            serve,
+            output,
+            cancel,
+        },
+        log,
+    )
+}
+
+/// Dispatch reports each lease right after it takes the slots, before it can
+/// take the next request's slots, and each release reports once both slots
+/// returned. Two queued requests let dispatch take both requests' slots
+/// before either task first runs.
+#[tokio::test]
+async fn each_lease_reports_while_it_holds_its_slots() {
+    let capacity = capacity(LIMITS);
+    let gate = Arc::new(Semaphore::new(0));
+    let (mut session, log) = leased(&capacity);
+    let logged = || log.lock().unwrap().clone();
+    session.serve.admit(gated(&gate)).unwrap();
+    session.serve.admit(gated(&gate)).unwrap();
+    settle().await;
+    assert_eq!(logged(), [("acquired", 1), ("acquired", 2)]);
+    gate.add_permits(2);
+    for _ in 0..2 {
+        assert_eq!(next(&mut session.output).await, Probe::Done(0));
+    }
+    settle().await;
+    assert_eq!(
+        logged(),
+        [
+            ("acquired", 1),
+            ("acquired", 2),
+            ("released", 1),
+            ("released", 0)
+        ]
+    );
+}
+
+/// A lease clone that `produce` leaves running keeps the slots, so the
+/// release reports only once that clone drops.
+#[tokio::test]
+async fn a_leaked_lease_clone_delays_the_release_report() {
+    let capacity = capacity(LIMITS);
+    let probe = ExecutionProbe::new(true, false);
+    let _release = probe.release_on_drop();
+    let (mut session, log) = leased(&capacity);
+    let logged = || log.lock().unwrap().clone();
+    session
+        .serve
+        .admit(Job {
+            blocking: Some(probe.clone()),
+            detach_blocking: true,
+            ..job()
+        })
+        .unwrap();
+    assert_eq!(next(&mut session.output).await, Probe::Done(0));
+    probe.wait_started(1).await;
+    settle().await;
+    assert_eq!(logged(), [("acquired", 1)]);
+    probe.release();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while logged().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the release reports once the blocking operation ends");
+    assert_eq!(logged(), [("acquired", 1), ("released", 0)]);
+}
+
+/// A pushed frame's output stays with its unpolled future, and dropping that
+/// future returns the grants and takes no transport slot.
+#[tokio::test]
+async fn an_unpolled_push_send_returns_its_grants() {
+    let capacity = capacity(LIMITS);
+    let peer = peer(1);
+    let push = capacity.push(&peer);
+    let permit = push.acquire(8).await;
+    assert!(capacity.node_output.granted() > 0);
+    let (send, _output) = crate::zakura::transport::worker_framed_channel(1);
+    let unpolled = permit.reserve_send(&send);
+    assert!(
+        capacity.node_output.granted() > 0,
+        "the future owns the grants"
+    );
+    drop(unpolled);
+    assert_eq!(capacity.node_output.granted(), 0);
+    assert_eq!(send.capacity(), 1);
+}
+
+/// Every serving peer holds its whole output budget at once, as a fast reader does
+/// because a grant reserves a response's cap until its write. None of it waits for
+/// the node budget, so these peers can't pause each other.
+#[test]
+fn every_serving_peer_can_hold_its_output_budget_at_once() {
+    const PEERS: u8 = 128;
+    let limits = crate::zakura::regulation::sizing::serve_limits(
+        1 << 20,
+        Duration::from_millis(1),
+        usize::from(PEERS),
+    );
+    let capacity = capacity(limits);
+    let peer_bytes = u32::try_from(limits.peer_output_bytes).expect("64 MiB fits u32");
+    let budgets: Vec<_> = (0..PEERS).map(|n| capacity.peer(&peer(n))).collect();
+    let grants: Vec<_> = budgets
+        .iter()
+        .map(|budgets| {
+            (
+                budgets
+                    .output
+                    .try_grant(peer_bytes)
+                    .expect("the peer budget is free"),
+                capacity
+                    .node_output
+                    .try_grant(peer_bytes)
+                    .expect("the node budget holds every peer's budget"),
+            )
+        })
+        .collect();
+    assert_eq!(capacity.node_output_held(), limits.node_output_bytes);
+    drop(grants);
+    assert_eq!(capacity.node_output_held(), 0);
+}
+
+/// A lookup's pruning reports each peer it removes and, read at that
+/// removal's own decision, whether any of its budgets was still alive: peer
+/// 1's session dropped its budgets but a bare output grant still holds its
+/// byte pool, so the pruning removes it with a live budget, and peer 2,
+/// whose budgets all dropped, is removed dead.
+#[test]
+fn pruning_reports_each_removal_with_its_liveness() {
+    type Pruned = Vec<(Vec<ZakuraPeerId>, Vec<ZakuraPeerId>, Vec<ZakuraPeerId>)>;
+    let pruned: Arc<std::sync::Mutex<Pruned>> = Arc::default();
+    let record = pruned.clone();
+    let capacity = capacity(LIMITS).with_reports(Some(ServeReports::new(
+        move |expired, removed, removed_live| {
+            record
+                .lock()
+                .expect("no test panics while holding it")
+                .push((expired, removed, removed_live));
+        },
+        |_, _| {},
+    )));
+    let (live, dead) = (capacity.peer(&peer(1)), capacity.peer(&peer(2)));
+    let grant = live.output.try_grant(1).expect("the peer budget is free");
+    drop((live, dead));
+    pruned
+        .lock()
+        .expect("no test panics while holding it")
+        .clear();
+    let _ = capacity.peer(&peer(3));
+    let mut last = pruned
+        .lock()
+        .expect("no test panics while holding it")
+        .pop()
+        .expect("the lookup reported its pruning");
+    last.0
+        .sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    last.1
+        .sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    assert_eq!(
+        last,
+        (
+            vec![peer(1), peer(2)],
+            vec![peer(1), peer(2)],
+            vec![peer(1)]
+        )
+    );
+    drop(grant);
+}
+
+/// Records each commitment transition a stream tap reports.
+#[derive(Debug, Default)]
+struct Transitions(std::sync::Mutex<Vec<crate::zakura::Transition>>);
+
+impl crate::zakura::TransportObserver for Transitions {
+    fn observe(&self, event: crate::zakura::TransportEvent) {
+        if let crate::zakura::TransportEvent::Regulated { transition, .. } = event {
+            self.0
+                .lock()
+                .expect("no test panics while holding it")
+                .push(transition);
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_observed_session_reports_each_count_and_release_with_its_frame() {
+    use crate::zakura::{ConnTap, StreamTap, Transition};
+
+    let observer = Arc::new(Transitions::default());
+    let conn = Arc::new(ConnTap::new(
+        observer.clone(),
+        "127.0.0.1:9".parse().expect("a valid socket address"),
+    ));
+    conn.registered(7);
+    let tap = Arc::new(StreamTap::new(conn, 0));
+    let capacity = capacity(LIMITS);
+    let session = session(&capacity, 1, 4);
+    tap.tag_frames();
+    session.serve.observe_with(tap.clone(), GET.message_type);
+
+    let first = Arc::new(Semaphore::new(0));
+    let second = Arc::new(Semaphore::new(0));
+    for gate in [&first, &second] {
+        tap.header_read(GET.message_type, 0, 4);
+        tap.queue_tag();
+        tap.take_tag();
+        session.serve.admit(gated(gate)).unwrap();
+    }
+    settle().await;
+    first.add_permits(1);
+    settle().await;
+
+    let message_type = GET.message_type;
+    assert_eq!(
+        *observer.0.lock().expect("no test panics while holding it"),
+        [
+            Transition::CommitmentCounted {
+                seq: Some(0),
+                message_type,
+            },
+            Transition::CommitmentCounted {
+                seq: Some(1),
+                message_type,
+            },
+            Transition::CommitmentReleased { message_type },
+        ],
+    );
+    assert_eq!(session.serve.open(), 1);
+    second.add_permits(1);
 }

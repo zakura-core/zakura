@@ -220,24 +220,6 @@ def status_line(status: dict[str, Any]) -> str:
     )
 
 
-def details_text(kind: str, status: dict[str, Any], statuses: list[dict[str, Any]], reason: str) -> str:
-    cluster = "\n".join(status_line(item) for item in statuses)
-    return (
-        f"*Zakura alert details: {status['hostname']} {kind}*\n"
-        f"*Full reason:* {reason}\n"
-        f"*Service:* {status.get('service')}\n"
-        f"*Service active:* {status.get('service_active')}\n"
-        f"*Metrics:* {status.get('metrics_status')}\n"
-        f"*Current height:* {height_text(status)}\n"
-        f"*P2P mode:* {status.get('mode', 'unknown')}\n"
-        f"*Connection:* {status.get('alias_connection')} | {status.get('connection')}\n"
-        f"*Node log:* `{status.get('log_path')}`\n"
-        f"*Traces:* `{status.get('trace_path')}`\n"
-        f"*Monitor log:* `{status.get('monitor_log_path')}`\n"
-        f"*Cluster status:*\n```{cluster}```"
-    )
-
-
 def slack_webhook_url() -> str:
     return (
         os.environ.get("SLACK_WEB_HOOK", "")

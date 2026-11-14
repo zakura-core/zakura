@@ -1,0 +1,1843 @@
+//! Logical header-sync reactor state.
+//!
+//! The types here hold plain values. They own no session, channel, future,
+//! permit, or timer, and they read no clock. [`super::HeaderSyncReactor`]
+//! owns those runtime resources and runs the operations this state records.
+
+use std::{collections::VecDeque, time::Duration};
+
+use zakura_chain::block;
+use zakura_header_chain::HeaderWorkAuthority;
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
+
+pub(super) use super::StorageCall;
+pub use super::StorageCallKind;
+use super::{
+    source_id_from_peer, v9, AdvertisedHeaderTarget, AuxSchema, CompletedHeaderTargets,
+    HeaderPortOperation, HeaderRequestTerminal, HeaderTargetPhase, HeaderTargetPurpose, PageLimits,
+    PeerWorkPriority, RepairRequirement, RepairRequirementSlot, Status, ZakuraPeerId, MAX_HS_RANGE,
+    VCT_REPAIR_RETRY_INTERVAL,
+};
+
+/// The header-sync reactor's scheduling records.
+#[derive(Debug)]
+pub(super) struct ReactorState {
+    /// Scheduling facts for each admitted peer's current session.
+    pub(super) peers: HashMap<ZakuraPeerId, PeerSchedule>,
+    /// Direct storage calls in flight, with their exact identities.
+    pub(super) calls: StorageCalls,
+    /// Direct continuation-locator reads in flight.
+    pub(super) locators: LocatorQueries,
+    /// Changes whenever an input can make a held-back ordinary offer eligible.
+    pub(super) scheduling_revision: u64,
+    pub(super) last_scheduling_opportunity: Option<SchedulingOpportunity>,
+    pub(super) cached_pass_budget: CachedPassBudget,
+    /// A changed key whose pass waits for [`Self::cached_pass_budget`] to refill.
+    pub(super) cached_pass_deferred: bool,
+    /// Deadlines until which the reactor refuses header-sync readmission to dropped peers.
+    ///
+    /// Each entry represents one admitted session that survived
+    /// [`ZakuraHeaderSyncConfig::max_unproductive_header_requests`](super::ZakuraHeaderSyncConfig::max_unproductive_header_requests)
+    /// request timeouts, or that sent headers failing validation.
+    /// The reactor prunes expired entries during insertion and maintenance.
+    ///
+    /// [`HeaderSyncReactor::admitted_peer_limit`](super::HeaderSyncReactor::admitted_peer_limit)
+    /// bounds the count, as for [`Self::departed_strikes`], so the insert
+    /// prune, the eviction scan and the per-publish sort stay bounded however
+    /// many identities fault in one cooldown. Past the limit the cooldown that
+    /// ends first ends now. Evicting one takes more faulting identities in one
+    /// cooldown than the node admits at once, and it gains the evicted identity little: a cooldown only
+    /// refuses the exact identity, so a fresh one already gets back in for the
+    /// cost of one handshake.
+    pub(super) unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,
+    /// No later than the earliest end in [`Self::unproductive_peer_cooldowns`],
+    /// so maintenance wakes to republish it without scanning the map each turn.
+    /// A replaced or evicted entry can leave it early; the prune that wake runs
+    /// makes it exact again.
+    cooldowns_end: Option<Instant>,
+    /// How many cooldown entries [`Self::start_readmission_cooldown`] has
+    /// installed, so the reactor reports `CooldownStarted` only for an
+    /// actual install. Test and simulator builds only.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) cooldowns_installed: u64,
+    /// Unproductive-request strikes of peers whose last session ended, with the
+    /// deadline until which a reconnect resumes them.
+    ///
+    /// The deadline is one readmission cooldown after the disconnect, so a peer
+    /// that stays away that long has served the penalty its strikes lead to.
+    /// Each entry represents one identity that held a strike when its session
+    /// ended. The reactor prunes expired entries with the cooldowns, and the
+    /// admitted peer limits bound the count, so cycling fresh identities only
+    /// ends the earliest holds.
+    pub(super) departed_strikes: HashMap<ZakuraPeerId, (u32, Instant)>,
+    pub(super) request_deadlines: HashMap<ZakuraPeerId, Instant>,
+    /// Peers whose armed request deadline a carried replacement budget
+    /// shortened. A timeout under one costs only an ordinary timeout's strike.
+    /// See [`PeerSchedule::replaced_request_budget`].
+    pub(super) carried_request_deadlines: HashSet<ZakuraPeerId>,
+    /// Sessions whose subscription this node closed, with the deadline for
+    /// its terminal outcome. See [`super::HeaderSyncReactor::close_subscription`].
+    pub(super) close_deadlines: HashMap<ZakuraPeerId, (u64, Instant)>,
+    /// Sessions whose `Close` a full queue refused, with the session ID and
+    /// when to try again. The time moves only after an actual attempt, so
+    /// steady traffic cannot keep postponing the retry.
+    pub(super) pending_closes: HashMap<ZakuraPeerId, (u64, Instant)>,
+    /// What `HistoryPruned` taught the reactor about each peer. It outlives
+    /// the peer's sessions, so reconnecting alone cannot reset its backoff,
+    /// and maintenance drops entries once they no longer matter.
+    ///
+    /// [`HeaderSyncReactor::admitted_peer_limit`](super::HeaderSyncReactor::admitted_peer_limit)
+    /// bounds the count, so identities that each answer `HistoryPruned` once
+    /// and leave cannot grow it. Past the limit the entry that stops mattering
+    /// first goes, a departed peer's before a connected one's. Eviction forgets
+    /// both waits and their doubled delays. So a peer that returns before they
+    /// would have ended can repeat a schema 1 round and a round without
+    /// records, each ending `HistoryPruned` without penalty, and then backs off
+    /// again from [`PRUNED_BACKOFF_MIN`].
+    pub(super) pruned_peers: HashMap<ZakuraPeerId, PrunedPeer>,
+    pub(super) completed_targets: CompletedHeaderTargets,
+    /// State version of the latest ordinary admission refused by a committed resource stall.
+    pub(super) ordinary_resource_stall: Option<zakura_header_chain::StateVersion>,
+    pub(super) vct_repair: RepairRequirementSlot,
+    /// Escalation state for a repair generation that has not completed.
+    pub(super) vct_repair_stall: Option<VctRepairStall>,
+    /// Hard deadline for the one locally executing VCT repair mutation.
+    pub(super) vct_local_operation: Option<VctLocalOperation>,
+    /// Admitted authenticated peers in stable supplier selection order.
+    ///
+    /// The admitted peer limits bound this queue. New identities enter behind established peers.
+    pub(super) vct_supplier_order: VecDeque<ZakuraPeerId>,
+}
+
+impl ReactorState {
+    /// Empty state whose cached-pass budget is full at `now`.
+    pub(super) fn new(now: Instant) -> Self {
+        Self {
+            peers: HashMap::new(),
+            calls: StorageCalls::default(),
+            locators: LocatorQueries::default(),
+            scheduling_revision: 0,
+            last_scheduling_opportunity: None,
+            cached_pass_budget: CachedPassBudget::new(now),
+            cached_pass_deferred: false,
+            unproductive_peer_cooldowns: HashMap::new(),
+            cooldowns_end: None,
+            #[cfg(any(test, zakura_sim))]
+            cooldowns_installed: 0,
+            departed_strikes: HashMap::new(),
+            request_deadlines: HashMap::new(),
+            carried_request_deadlines: HashSet::new(),
+            close_deadlines: HashMap::new(),
+            pending_closes: HashMap::new(),
+            pruned_peers: HashMap::new(),
+            completed_targets: CompletedHeaderTargets::default(),
+            ordinary_resource_stall: None,
+            vct_repair: RepairRequirementSlot::default(),
+            vct_repair_stall: None,
+            vct_local_operation: None,
+            vct_supplier_order: VecDeque::new(),
+        }
+    }
+
+    /// Install fresh scheduling facts for `peer`'s new session, and return
+    /// whether they replace an earlier session's facts.
+    ///
+    /// A replacement keeps the earlier session's unproductive-request strikes, and
+    /// a reconnect before `now` passes the departed session's hold resumes them,
+    /// so neither replacing nor reconnecting a session resets them. A
+    /// replacement also keeps an unconsumed
+    /// [`PeerSchedule::replaced_request_budget`].
+    ///
+    /// A new peer joins the back of the repair supplier order. A replacement
+    /// keeps its position until [`Self::rotate_supplier`] moves it.
+    ///
+    /// The replaced session's pending `Close` dies with it. The peer's pending
+    /// locator read stays pending until its storage operation settles.
+    pub(super) fn admit_session(&mut self, peer: &ZakuraPeerId, now: Instant) -> bool {
+        self.close_deadlines.remove(peer);
+        self.pending_closes.remove(peer);
+        self.bump_scheduling_revision();
+        let previous = self.peers.insert(peer.clone(), PeerSchedule::default());
+        let replaced = previous.is_some();
+        let departed = self
+            .departed_strikes
+            .remove(peer)
+            .filter(|(_, until)| *until > now)
+            .map(|(strikes, _)| strikes);
+        let replaced_request_budget = previous
+            .as_ref()
+            .and_then(|previous| previous.replaced_request_budget);
+        let strikes = previous
+            .map(|previous| previous.unproductive_requests)
+            .or(departed)
+            .unwrap_or(0);
+        let schedule = self
+            .peers
+            .get_mut(peer)
+            .expect("the fresh schedule was just inserted");
+        schedule.unproductive_requests = strikes;
+        schedule.replaced_request_budget = replaced_request_budget;
+        if !replaced {
+            self.vct_supplier_order.push_back(peer.clone());
+        }
+        replaced
+    }
+
+    /// Remove `peer`'s session facts and its pending `Close`, and hold its
+    /// unproductive-request strikes for `hold` after `now` so a reconnect
+    /// resumes them.
+    ///
+    /// At most `max_departed` peers keep held strikes; past that, the hold that
+    /// ends first ends now. A zero `hold` holds nothing.
+    pub(super) fn remove_session(
+        &mut self,
+        peer: &ZakuraPeerId,
+        now: Instant,
+        hold: Duration,
+        max_departed: usize,
+    ) {
+        if let Some(schedule) = self.peers.remove(peer) {
+            self.bump_scheduling_revision();
+            if schedule.unproductive_requests > 0 && !hold.is_zero() {
+                self.departed_strikes
+                    .insert(peer.clone(), (schedule.unproductive_requests, now + hold));
+                while self.departed_strikes.len() > max_departed {
+                    let earliest = self
+                        .departed_strikes
+                        .iter()
+                        .min_by_key(|(_, (_, until))| *until)
+                        .map(|(peer, _)| peer.clone())
+                        .expect("an over-limit map has an entry");
+                    self.departed_strikes.remove(&earliest);
+                }
+            }
+        }
+        self.close_deadlines.remove(peer);
+        self.pending_closes.remove(peer);
+        self.vct_supplier_order.retain(|queued| queued != peer);
+    }
+
+    /// Record `status` as `peer`'s unspent offer.
+    pub(super) fn record_status(&mut self, peer: &ZakuraPeerId, status: Status) {
+        if let Some(schedule) = self.peers.get_mut(peer) {
+            schedule.last_status = Some(status);
+            schedule.status_spent = false;
+        }
+    }
+
+    /// Spend `peer`'s offer.
+    pub(super) fn spend_status(&mut self, peer: &ZakuraPeerId) {
+        if let Some(schedule) = self.peers.get_mut(peer) {
+            schedule.status_spent = true;
+        }
+    }
+
+    /// Forget `key`'s read, which IO refused for lack of locator capacity, and
+    /// keep the peer's offer for a later pass.
+    pub(super) fn refuse_locator(&mut self, key: &LocatorKey) {
+        let _ = self.locators.remove_exact(key);
+        self.retain_offer(&key.peer);
+    }
+
+    /// Keep `peer`'s offer for a later pass, because a local blocker deferred its work.
+    pub(super) fn retain_offer(&mut self, peer: &ZakuraPeerId) {
+        self.bump_scheduling_revision();
+        if let Some(schedule) = self.peers.get_mut(peer) {
+            schedule.status_spent = false;
+        }
+    }
+
+    pub(super) fn bump_scheduling_revision(&mut self) {
+        self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
+    }
+
+    /// Restore the offer of every peer without work, because the header
+    /// authority changed.
+    pub(super) fn restore_idle_offers(&mut self, has_work: impl Fn(&ZakuraPeerId) -> bool) {
+        for (peer, schedule) in &mut self.peers {
+            if !has_work(peer) {
+                schedule.status_spent = false;
+            }
+        }
+    }
+
+    /// Whether a full cached-offer pass may help, because `opportunity`
+    /// differs from the key of the last pass.
+    ///
+    /// Only a pass refused by [`Self::take_cached_pass`] waits for a refill.
+    /// Every other caller either has nothing to do or waits for its own
+    /// wakeup, so this clears the refill wait first. A stale refill deadline
+    /// would spin the reactor.
+    pub(super) fn cached_pass_wanted(&mut self, opportunity: SchedulingOpportunity) -> bool {
+        self.cached_pass_deferred = false;
+        self.last_scheduling_opportunity != Some(opportunity)
+    }
+
+    /// Take one full cached-offer pass from the budget at `now`. A refused
+    /// pass waits for the next refill, and its key stays uncached.
+    pub(super) fn take_cached_pass(&mut self, now: Instant) -> bool {
+        let taken = self.cached_pass_budget.try_take(now);
+        if !taken {
+            self.cached_pass_deferred = true;
+        }
+        taken
+    }
+
+    /// Finish the cached-offer pass for `opportunity` that ended at `now`.
+    ///
+    /// The pass keeps its pre-pass key: an external lease can drop while it
+    /// scans, and a fresh key would swallow that release's wakeup.
+    pub(super) fn finish_cached_pass(&mut self, opportunity: SchedulingOpportunity, now: Instant) {
+        self.cached_pass_budget.finish_pass(now);
+        self.last_scheduling_opportunity = Some(opportunity);
+    }
+
+    /// The unspent offers of peers without work, in cached-pass order: more
+    /// claimed work first, then ascending peer bytes.
+    ///
+    /// `session_id` names each admitted peer's session.
+    pub(super) fn cached_offers(
+        &self,
+        local: &zakura_header_chain::EngineSnapshot,
+        has_work: impl Fn(&ZakuraPeerId) -> bool,
+        session_id: impl Fn(&ZakuraPeerId) -> u64,
+    ) -> Vec<(ZakuraPeerId, AdvertisedHeaderTarget)> {
+        let mut offers: Vec<_> = self
+            .peers
+            .iter()
+            .filter(|(peer, schedule)| !schedule.status_spent && !has_work(peer))
+            .filter_map(|(peer, schedule)| {
+                let status = schedule.last_status.as_ref()?;
+                let target = AdvertisedHeaderTarget {
+                    scope: HeaderWorkAuthority::for_target(local, status.selected_tip_hash),
+                    session_id: session_id(peer),
+                    status: status.clone(),
+                };
+                let priority = PeerWorkPriority::from_work_order(target.claimed_work_order(local));
+                Some((priority, peer.clone(), target))
+            })
+            .collect();
+        offers.sort_unstable_by(
+            |(left_priority, left_peer, _), (right_priority, right_peer, _)| {
+                right_priority
+                    .cmp(left_priority)
+                    .then_with(|| left_peer.as_bytes().cmp(right_peer.as_bytes()))
+            },
+        );
+        offers
+            .into_iter()
+            .map(|(_, peer, target)| (peer, target))
+            .collect()
+    }
+
+    /// Whether `peer`'s readmission cooldown still holds at `now`.
+    pub(super) fn readmission_refused(&self, peer: &ZakuraPeerId, now: Instant) -> bool {
+        self.unproductive_peer_cooldowns
+            .get(peer)
+            .is_some_and(|until| *until > now)
+    }
+
+    /// Refuse `peer`'s readmission for `cooldown` from `now`. A zero cooldown
+    /// refuses nothing.
+    ///
+    /// At most `max_cooldowns` peers hold a cooldown; past that, the other
+    /// peer's cooldown that ends first ends now. See
+    /// [`Self::unproductive_peer_cooldowns`] for why that's safe.
+    pub(super) fn start_readmission_cooldown(
+        &mut self,
+        peer: &ZakuraPeerId,
+        now: Instant,
+        cooldown: Duration,
+        max_cooldowns: usize,
+    ) {
+        if !cooldown.is_zero() {
+            let _ = self.prune_readmission_cooldowns(now);
+            let until = now + cooldown;
+            self.unproductive_peer_cooldowns.insert(peer.clone(), until);
+            while self.unproductive_peer_cooldowns.len() > max_cooldowns {
+                let earliest = self
+                    .unproductive_peer_cooldowns
+                    .iter()
+                    .filter(|(held, _)| *held != peer)
+                    .min_by_key(|(_, until)| **until)
+                    .map_or_else(|| peer.clone(), |(held, _)| held.clone());
+                self.unproductive_peer_cooldowns.remove(&earliest);
+            }
+            self.cooldowns_end = Some(self.cooldowns_end.map_or(until, |end| end.min(until)));
+            #[cfg(any(test, zakura_sim))]
+            {
+                self.cooldowns_installed += 1;
+            }
+        }
+    }
+
+    /// Drop the cooldowns and held strikes that end by `now`, and return whether
+    /// any cooldown did.
+    pub(super) fn prune_readmission_cooldowns(&mut self, now: Instant) -> bool {
+        self.departed_strikes.retain(|_, (_, until)| *until > now);
+        let before = self.unproductive_peer_cooldowns.len();
+        let mut end: Option<Instant> = None;
+        self.unproductive_peer_cooldowns.retain(|_, until| {
+            let holds = *until > now;
+            if holds {
+                end = Some(end.map_or(*until, |end| end.min(*until)));
+            }
+            holds
+        });
+        self.cooldowns_end = end;
+        self.unproductive_peer_cooldowns.len() != before
+    }
+
+    /// The peers whose request deadline passed by `now`.
+    pub(super) fn timed_out_requests(&self, now: Instant) -> Vec<ZakuraPeerId> {
+        self.request_deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(peer, _)| peer.clone())
+            .collect()
+    }
+
+    /// Record an attempt at `now` to close the subscription of `peer`'s
+    /// session `session_id`.
+    ///
+    /// A refused `Close` waits [`CLOSE_RETRY_INTERVAL`] for a retry. A refused
+    /// `Close` already waiting for this session keeps its retry time, so steady
+    /// traffic cannot keep postponing it. A sent `Close` on a live
+    /// subscription waits `outcome_timeout` for the terminal outcome, unless
+    /// one already waits for this session.
+    pub(super) fn record_close_attempt(
+        &mut self,
+        peer: &ZakuraPeerId,
+        session_id: u64,
+        attempt: CloseAttempt,
+        now: Instant,
+        outcome_timeout: Duration,
+    ) {
+        let CloseAttempt::Sent { live } = attempt else {
+            if self
+                .pending_closes
+                .get(peer)
+                .is_none_or(|(pending, _)| *pending != session_id)
+            {
+                self.pending_closes
+                    .insert(peer.clone(), (session_id, now + CLOSE_RETRY_INTERVAL));
+            }
+            return;
+        };
+        self.pending_closes.remove(peer);
+        if !live {
+            return;
+        }
+        if self
+            .close_deadlines
+            .get(peer)
+            .is_none_or(|(closing, _)| *closing != session_id)
+        {
+            self.close_deadlines
+                .insert(peer.clone(), (session_id, now + outcome_timeout));
+        }
+    }
+
+    /// Remove and return each refused `Close` due for a retry by `now`, with
+    /// its session ID.
+    pub(super) fn take_due_closes(&mut self, now: Instant) -> Vec<(ZakuraPeerId, u64)> {
+        take_due(&mut self.pending_closes, now)
+    }
+
+    /// Remove and return each sent `Close` whose terminal outcome was due by
+    /// `now`, with its session ID.
+    pub(super) fn take_expired_closes(&mut self, now: Instant) -> Vec<(ZakuraPeerId, u64)> {
+        take_due(&mut self.close_deadlines, now)
+    }
+
+    /// The schema for an ordinary round of up to `count` headers after `start`
+    /// from `peer`, whose status is `status`, at `now`: `schema` while the
+    /// round ends at or below the peer's work anchor and no `HistoryPruned`
+    /// fallback holds, and no records otherwise.
+    ///
+    /// A publisher is sure to hold records only through its finalized height,
+    /// and a schema 1 page waits for a missing record rather than dropping it,
+    /// so a round past the anchor could stall. A pruned publisher lacks them
+    /// below its index height too, which the fallback learns.
+    pub(super) fn ordinary_schema(
+        &self,
+        peer: &ZakuraPeerId,
+        schema: AuxSchema,
+        status: &Status,
+        start: block::Height,
+        count: u32,
+        now: Instant,
+    ) -> AuxSchema {
+        let fallback = self
+            .pruned_peers
+            .get(peer)
+            .and_then(|pruned| pruned.aux_fallback)
+            .is_some_and(|fallback| fallback.until > now);
+        if !fallback && start.0.saturating_add(count) <= status.work_anchor_height.0 {
+            schema
+        } else {
+            AuxSchema::None
+        }
+    }
+
+    /// Whether ordinary discovery with `peer` still waits at `now` after a
+    /// round without records ended `HistoryPruned` at the selected header tip
+    /// `tip`.
+    pub(super) fn pruned_pause_holds(
+        &self,
+        peer: &ZakuraPeerId,
+        tip: zakura_header_chain::Frontier,
+        now: Instant,
+    ) -> bool {
+        self.pruned_peers
+            .get(peer)
+            .and_then(|pruned| pruned.pruned_pause)
+            .is_some_and(|(pause, paused_at)| pause.until > now && paused_at == tip)
+    }
+
+    /// Remember that `peer` ended an ordinary round asking for `schema` with
+    /// `HistoryPruned` at `now`, while the selected header tip was `tip`.
+    /// This is legal and never a fault.
+    ///
+    /// After a schema 1 round, the peer's next rounds ask for no records,
+    /// starting at once from the validated tip, and schema 1 is probed again
+    /// after a backoff. After a round without records, ordinary discovery with
+    /// the peer pauses instead, so another peer takes the target.
+    ///
+    /// A new entry beyond `max_pruned_peers` evicts another, as
+    /// [`Self::pruned_peers`] describes.
+    ///
+    /// Return whether the peer's rounds now fall back to no records.
+    pub(super) fn note_history_pruned(
+        &mut self,
+        peer: &ZakuraPeerId,
+        schema: AuxSchema,
+        tip: Option<zakura_header_chain::Frontier>,
+        now: Instant,
+        max_pruned_peers: usize,
+    ) -> bool {
+        let Some(schedule) = self.peers.get_mut(peer) else {
+            return false;
+        };
+        let pruned = self.pruned_peers.entry(peer.clone()).or_default();
+        let falls_back = match schema {
+            AuxSchema::V1 => {
+                pruned.aux_fallback = Some(PrunedBackoff::after(pruned.aux_fallback, now));
+                schedule.status_spent = false;
+                self.bump_scheduling_revision();
+                true
+            }
+            AuxSchema::None => {
+                if let Some(tip) = tip {
+                    let previous = pruned.pruned_pause.map(|(pause, _)| pause);
+                    pruned.pruned_pause = Some((PrunedBackoff::after(previous, now), tip));
+                }
+                false
+            }
+        };
+        if self.pruned_peers.len() > max_pruned_peers {
+            self.prune_pruned_peers(now);
+            while self.pruned_peers.len() > max_pruned_peers {
+                let Some(evicted) = self
+                    .pruned_peers
+                    .iter()
+                    .filter(|(held, _)| *held != peer)
+                    .min_by_key(|(held, pruned)| {
+                        (self.peers.contains_key(*held), pruned.relevant_until())
+                    })
+                    .map(|(held, _)| held.clone())
+                else {
+                    break;
+                };
+                self.pruned_peers.remove(&evicted);
+            }
+        }
+        falls_back
+    }
+
+    /// End `peer`'s `HistoryPruned` pause after an admitted ordinary round,
+    /// and its schema fallback when the round asked for `schema` 1.
+    pub(super) fn note_ordinary_round_admitted(&mut self, peer: &ZakuraPeerId, schema: AuxSchema) {
+        let Some(pruned) = self.pruned_peers.get_mut(peer) else {
+            return;
+        };
+        pruned.pruned_pause = None;
+        if schema == AuxSchema::V1 {
+            pruned.aux_fallback = None;
+        }
+        if *pruned == PrunedPeer::default() {
+            self.pruned_peers.remove(peer);
+        }
+    }
+
+    /// Drop what `HistoryPruned` taught about peers once it no longer matters at `now`.
+    pub(super) fn prune_pruned_peers(&mut self, now: Instant) {
+        self.pruned_peers.retain(|_, pruned| pruned.relevant(now));
+    }
+
+    /// Hold back ordinary discovery until the committed state version passes
+    /// `state_version`, where state refused an admission for local resources.
+    pub(super) fn note_resource_stall(&mut self, state_version: zakura_header_chain::StateVersion) {
+        self.ordinary_resource_stall = self.ordinary_resource_stall.max(Some(state_version));
+    }
+
+    /// Whether a committed resource stall still holds back new ordinary
+    /// attempts under the committed state version `committed`.
+    ///
+    /// Every supplier would hit the same local stall, so discovery waits until
+    /// the committed state version advances past the stall receipt.
+    pub(super) fn ordinary_discovery_paused(
+        &self,
+        committed: Option<zakura_header_chain::StateVersion>,
+    ) -> bool {
+        self.ordinary_resource_stall
+            .is_some_and(|stalled_at| committed.is_none_or(|committed| committed <= stalled_at))
+    }
+
+    /// Arm `peer`'s request deadline `timeout` after `now`, as a full timeout.
+    pub(super) fn arm_request_deadline(
+        &mut self,
+        peer: ZakuraPeerId,
+        now: Instant,
+        timeout: Duration,
+    ) {
+        self.forget_carried_request_deadline(&peer);
+        self.request_deadlines.insert(peer, now + timeout);
+    }
+
+    /// Forget that `peer`'s request deadline is a carried budget's.
+    ///
+    /// The set is almost always empty, and each staged page re-arms a
+    /// deadline, so the common path checks only its length.
+    fn forget_carried_request_deadline(&mut self, peer: &ZakuraPeerId) {
+        if !self.carried_request_deadlines.is_empty() {
+            self.carried_request_deadlines.remove(peer);
+        }
+    }
+
+    /// Arm the deadline of the request just started for `peer`, ordinary or
+    /// VCT repair, `timeout` after `now`, capped by and using up any
+    /// [`PeerSchedule::replaced_request_budget`].
+    pub(super) fn arm_started_request_deadline(
+        &mut self,
+        peer: ZakuraPeerId,
+        now: Instant,
+        timeout: Duration,
+    ) {
+        let carried = self
+            .peers
+            .get_mut(&peer)
+            .and_then(|schedule| schedule.replaced_request_budget.take())
+            .filter(|carried| *carried < timeout);
+        match carried {
+            None => self.arm_request_deadline(peer, now, timeout),
+            Some(carried) => {
+                self.arm_request_deadline(peer.clone(), now, carried);
+                self.carried_request_deadlines.insert(peer);
+            }
+        }
+    }
+
+    /// Whether `peer`'s armed request deadline is a carried replacement
+    /// budget's. See [`PeerSchedule::replaced_request_budget`].
+    pub(super) fn request_deadline_is_carried(&self, peer: &ZakuraPeerId) -> bool {
+        self.carried_request_deadlines.contains(peer)
+    }
+
+    /// Carry `budget`, the time left on the unanswered request that admitting
+    /// `peer`'s new session retired, to that session's first request.
+    pub(super) fn carry_replaced_request_budget(&mut self, peer: &ZakuraPeerId, budget: Duration) {
+        if let Some(schedule) = self.peers.get_mut(peer) {
+            schedule.replaced_request_budget = Some(
+                schedule
+                    .replaced_request_budget
+                    .map_or(budget, |carried| carried.min(budget)),
+            );
+        }
+    }
+
+    pub(super) fn clear_request_deadline(&mut self, peer: &ZakuraPeerId) {
+        self.forget_carried_request_deadline(peer);
+        self.request_deadlines.remove(peer);
+    }
+
+    /// Forget the `Close` this node sent to `peer`'s `session_id` once that session's
+    /// subscription ends.
+    pub(super) fn settle_close(&mut self, peer: &ZakuraPeerId, session_id: u64) {
+        if self
+            .close_deadlines
+            .get(peer)
+            .is_some_and(|(closing, _)| *closing == session_id)
+        {
+            self.close_deadlines.remove(peer);
+        }
+    }
+
+    /// Charge one unproductive request to `peer`'s current session.
+    ///
+    /// Returns whether the session reached `limit`. A zero `limit` never drops a session.
+    pub(super) fn charge_unproductive_request(&mut self, peer: &ZakuraPeerId, limit: u32) -> bool {
+        let schedule = self
+            .peers
+            .get_mut(peer)
+            .expect("sessions and schedules share their keys");
+        schedule.unproductive_requests = schedule.unproductive_requests.saturating_add(1);
+        limit != 0 && schedule.unproductive_requests >= limit
+    }
+
+    pub(super) fn reset_unproductive_requests(&mut self, peer: &ZakuraPeerId) {
+        if let Some(schedule) = self.peers.get_mut(peer) {
+            schedule.unproductive_requests = 0;
+        }
+    }
+
+    /// Move the supplier whose session `source` names to the back of the repair supplier order.
+    pub(super) fn rotate_supplier(&mut self, source: zakura_header_chain::SourceId) {
+        let Some(index) = self
+            .vct_supplier_order
+            .iter()
+            .position(|peer| source_id_from_peer(peer) == source)
+        else {
+            return;
+        };
+        let peer = self
+            .vct_supplier_order
+            .remove(index)
+            .expect("the supplier index came from this bounded queue");
+        self.vct_supplier_order.push_back(peer);
+    }
+
+    /// Apply `retry`'s attribution to `owner`'s repair and report whether a retry is scheduled.
+    ///
+    /// Supplier and excluded-input failures charge the supplier and rotate it to the back
+    /// of the supplier order. A charge stays with the supplier's identity across session
+    /// replacement and disconnect, until the episode ends or
+    /// [`RepairRequirement::retain_connected_sources`] releases it. A session that ended before its
+    /// supplier answered charges nothing. A `TargetNotSelected` answer waits for a status
+    /// other than the one the request was built from. A local failure backs the repair off
+    /// until [`VCT_REPAIR_RETRY_INTERVAL`] after `now`. A stale episode schedules nothing.
+    /// A timeout under a carried replacement budget rotates the supplier and
+    /// requeues the repair without excluding it. See
+    /// [`PeerSchedule::replaced_request_budget`].
+    pub(super) fn schedule_repair_retry(
+        &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        retry: VctRepairRetry,
+        now: Instant,
+    ) -> bool {
+        let source = retry.source;
+        let scheduled =
+            self.vct_repair
+                .get_mut(owner)
+                .is_some_and(|task| match retry.attribution {
+                    VctRepairRetryAttribution::Supplier => match retry.terminal {
+                        HeaderRequestTerminal::SessionReplaced
+                        | HeaderRequestTerminal::Disconnected => task.requeue(source).is_ok(),
+                        HeaderRequestTerminal::TargetNotSelected => {
+                            task.wait_for_supplier_status(source).is_ok()
+                        }
+                        _ => task.retry(source).is_ok(),
+                    },
+                    VctRepairRetryAttribution::ExcludedInput => task.exclude_input(source).is_ok(),
+                    VctRepairRetryAttribution::CarriedTimeout => task.requeue(source).is_ok(),
+                    VctRepairRetryAttribution::Stale => false,
+                    VctRepairRetryAttribution::Local => task
+                        .defer_local_retry_until(now + VCT_REPAIR_RETRY_INTERVAL)
+                        .is_ok(),
+                });
+        if !scheduled {
+            return false;
+        }
+        if retry.attribution.charges_supplier() {
+            self.rotate_supplier(source);
+        }
+        true
+    }
+
+    /// Record the latest reason repair `generation` has not completed.
+    ///
+    /// A new generation restarts the stall clock at `now`.
+    pub(super) fn record_repair_stall(
+        &mut self,
+        generation: u64,
+        predecessor: zakura_header_chain::Frontier,
+        rejections: VctSupplierRejections,
+        outcome: VctRepairStallOutcome,
+        now: Instant,
+    ) {
+        match self.vct_repair_stall.as_mut() {
+            Some(record) if record.generation == generation => {
+                record.predecessor = predecessor;
+                record.rejections = rejections;
+                record.outcome = outcome;
+            }
+            _ => {
+                self.vct_repair_stall = Some(VctRepairStall {
+                    generation,
+                    since: now,
+                    last_trace: None,
+                    reported: false,
+                    predecessor,
+                    rejections,
+                    outcome,
+                });
+            }
+        }
+    }
+
+    /// Return the stall output due at `now`, and mark it emitted.
+    ///
+    /// The stall record dies with its generation. At most one trace row is due per
+    /// [`VCT_REPAIR_STALL_TRACE_INTERVAL`], and at most one error report per generation.
+    pub(super) fn refresh_repair_stall(&mut self, now: Instant) -> Option<RepairStallDue> {
+        let record = self.vct_repair_stall?;
+        let Some(task) = self
+            .vct_repair
+            .current()
+            .filter(|task| task.repair_generation == record.generation)
+        else {
+            self.vct_repair_stall = None;
+            return None;
+        };
+        let stalled_for = now.saturating_duration_since(record.since);
+        let trace = record.last_trace.is_none_or(|last| {
+            now.saturating_duration_since(last) >= VCT_REPAIR_STALL_TRACE_INTERVAL
+        });
+        let report = !record.reported && stalled_for >= VCT_REPAIR_STALL_REPORT_AFTER;
+        if !trace && !report {
+            return None;
+        }
+        // Copy the task, with its supplier history, only when output is due.
+        let task = task.clone();
+        let best_peer_tip = self
+            .peers
+            .values()
+            .filter_map(|schedule| schedule.last_status.as_ref())
+            .map(|status| (status.selected_tip_height, status.selected_tip_hash))
+            .max_by_key(|(height, _)| *height);
+        if let Some(current) = self.vct_repair_stall.as_mut() {
+            if trace {
+                current.last_trace = Some(now);
+            }
+            if report {
+                current.reported = true;
+            }
+        }
+        Some(RepairStallDue {
+            task,
+            record,
+            trace,
+            report,
+            stalled_for,
+            best_peer_tip,
+        })
+    }
+
+    /// Mark `owner`'s repair applied, rotate its supplier, and end its stall record.
+    pub(super) fn complete_repair(
+        &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
+    ) {
+        let _ = self
+            .vct_repair
+            .get_mut(owner)
+            .expect("the admitted repair remains owned by its active request")
+            .complete();
+        self.rotate_supplier(source);
+        self.vct_repair_stall = None;
+    }
+
+    /// Whether `desired` is the repair the reactor already runs.
+    pub(super) fn preserves_repair(&self, desired: &RepairRequirement) -> bool {
+        self.vct_repair.current().is_some_and(|task| {
+            task.repair_generation == desired.repair_generation
+                && task.height == desired.height
+                && task.owner.header_generation == desired.owner.header_generation
+                && task.owner.verified_generation == desired.owner.verified_generation
+                && task.owner.branch == desired.owner.branch
+        })
+    }
+
+    /// Remove the current repair and its stall record.
+    pub(super) fn retire_repair(&mut self) -> Option<RepairRequirement> {
+        self.vct_repair_stall = None;
+        self.vct_repair.take()
+    }
+
+    /// Install `desired` as the sole repair.
+    pub(super) fn install_repair(&mut self, desired: RepairRequirement) {
+        let replaced = self.vct_repair.insert(desired);
+        debug_assert!(
+            replaced.is_none(),
+            "the sole repair is cleared before scheduling its replacement"
+        );
+    }
+
+    /// Clear the local operation that `owner` finished in `phase`.
+    ///
+    /// An operation already reported as fatal stays installed until shutdown.
+    pub(super) fn finish_local_operation(
+        &mut self,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
+        phase: HeaderTargetPhase,
+    ) {
+        if self.vct_local_operation.as_ref().is_some_and(|operation| {
+            operation.owner == owner && operation.phase == phase && !operation.fatal_sent
+        }) {
+            self.vct_local_operation = None;
+        }
+    }
+
+    /// Whether the local operation was already reported as fatal.
+    pub(super) fn local_operation_fatal(&self) -> bool {
+        self.vct_local_operation
+            .as_ref()
+            .is_some_and(|operation| operation.fatal_sent)
+    }
+
+    /// Check the local operation's hard deadline at `now`.
+    ///
+    /// An expired operation is marked fatal once, and stays installed.
+    pub(super) fn expire_local_operation(&mut self, now: Instant) -> LocalOperationExpiry {
+        let Some(operation) = self.vct_local_operation.as_mut() else {
+            return LocalOperationExpiry::Idle;
+        };
+        if operation.fatal_sent {
+            return LocalOperationExpiry::AlreadyFatal;
+        }
+        if operation.deadline > now {
+            return LocalOperationExpiry::Running;
+        }
+        operation.fatal_sent = true;
+        LocalOperationExpiry::Expired(operation.clone())
+    }
+
+    /// The earliest deadline this state waits for, if any.
+    pub(super) fn next_deadline(&self) -> Option<Instant> {
+        self.request_deadlines
+            .values()
+            .copied()
+            .chain(self.close_deadlines.values().map(|(_, deadline)| *deadline))
+            .chain(self.pending_closes.values().map(|(_, retry_at)| *retry_at))
+            // Maintenance republishes a cooldown's end, which the header
+            // service waits for before it re-offers that peer.
+            .chain(self.cooldowns_end)
+            .chain(
+                self.vct_repair
+                    .current()
+                    .and_then(RepairRequirement::next_deadline),
+            )
+            .chain(self.vct_repair_stall.map(VctRepairStall::next_deadline))
+            .chain(
+                self.cached_pass_deferred
+                    .then(|| self.cached_pass_budget.next_refill()),
+            )
+            .chain(
+                self.vct_local_operation
+                    .as_ref()
+                    .filter(|operation| !operation.fatal_sent)
+                    .map(|operation| operation.deadline),
+            )
+            .min()
+    }
+}
+
+/// How an attempt to send `Close` on a session ended.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum CloseAttempt {
+    /// The session's full queue refused the `Close`.
+    Refused,
+    /// The `Close` entered the queue, or the session could not take it at all.
+    Sent {
+        /// Whether a subscription was live when the reactor tried to close it.
+        live: bool,
+    },
+}
+
+/// Remove and return each `(session_id, deadline)` entry due by `now`.
+fn take_due(
+    entries: &mut HashMap<ZakuraPeerId, (u64, Instant)>,
+    now: Instant,
+) -> Vec<(ZakuraPeerId, u64)> {
+    let due: Vec<_> = entries
+        .iter()
+        .filter(|(_, (_, deadline))| *deadline <= now)
+        .map(|(peer, (session_id, _))| (peer.clone(), *session_id))
+        .collect();
+    for (peer, _) in &due {
+        entries.remove(peer);
+    }
+    due
+}
+
+/// Scheduling facts for one admitted peer's current session.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct PeerSchedule {
+    pub(super) last_status: Option<Status>,
+    /// Whether `last_status` already had its one chance to start ordinary work.
+    ///
+    /// Staging spends a status, as does a status received during an ordinary attempt or
+    /// one that cannot yield work under the current header authority. Fresh status or
+    /// header authority restores it. Unstarted work deferred by local capacity, a committed
+    /// stall, or repair preemption also keeps its offer until the blocker clears.
+    /// Failed locator reads, sends, and ordinary attempts remain spent.
+    pub(super) status_spent: bool,
+    /// Consecutive requests this peer's sessions answered with nothing usable,
+    /// since it last supplied usable work. See [`ReactorState::departed_strikes`].
+    pub(super) unproductive_requests: u32,
+    /// The time that was left on the unanswered request a session
+    /// replacement retired, until the next request start consumes it.
+    ///
+    /// The rule: a session replacement never gives a peer more unanswered
+    /// time, or a smaller penalty, than staying on one session would. Without
+    /// the budget, a peer could replace its session just before each timeout
+    /// and never be charged.
+    ///
+    /// So the next request started for the peer, ordinary or VCT repair, has
+    /// its timeout capped by this budget, counted from when the request is
+    /// sent, so the node's own delay before sending isn't charged to the peer.
+    /// A peer that answers within the budget re-arms a full timeout and pays
+    /// nothing. A further replacement before any request keeps the smaller
+    /// budget.
+    ///
+    /// A request that times out under the budget costs one strike, like an
+    /// ordinary timeout. A repair also requeues, without the episode exclusion
+    /// a full repair timeout adds, so the budget never costs more than the
+    /// strike a timeout on one session would. A sole repair supplier that
+    /// replaces just before each timeout therefore takes a strike each cycle
+    /// and reaches the strike limit.
+    ///
+    /// A replacement with very little time left can draw one strike before the
+    /// new request even reaches the peer. That's accepted: the peer had already
+    /// sat on the request for most of a timeout, a strike is one of the limit's
+    /// three by default, and its next usable answer clears it. A grace period
+    /// would need its own state so further replacements couldn't renew it.
+    ///
+    /// A first request that the peer ends with a terminal outcome, such as
+    /// `TargetNotRetained`, uses the budget up without a strike. That's out of
+    /// scope: on one session a peer can already hold a request for most of a
+    /// timeout and then decline it for free, so a replacement buys nothing
+    /// more.
+    pub(super) replaced_request_budget: Option<Duration>,
+}
+
+impl StorageCallKind {
+    /// The kind of storage call `action` makes, or `None` for an action that
+    /// the reactor only records.
+    pub(super) fn of(action: &HeaderPortOperation) -> Option<Self> {
+        match action {
+            HeaderPortOperation::QueryHeaderLocator { .. } => Some(Self::Locator),
+            HeaderPortOperation::QueryVctRepairContext { .. } => Some(Self::VctRepairContext),
+            HeaderPortOperation::PrepareHeaderTarget { .. } => Some(Self::Prepare),
+            HeaderPortOperation::ApplyHeaderTarget { .. } => Some(Self::Apply),
+            HeaderPortOperation::Misbehavior { .. } | HeaderPortOperation::DropPeer { .. } => None,
+        }
+    }
+}
+
+/// Accepted direct storage calls that have not settled.
+///
+/// Each call settles once, and only its exact number and kind settle it. The
+/// reactor pushes one future per accepted call, so its pending futures bound
+/// this map.
+#[derive(Debug, Default)]
+pub(super) struct StorageCalls {
+    last: u64,
+    pending: HashMap<u64, StorageCallKind>,
+}
+
+impl StorageCalls {
+    /// The numbers of the calls counted as pending, sorted.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn pending_numbers(&self) -> Vec<u64> {
+        let mut numbers: Vec<u64> = self.pending.keys().copied().collect();
+        numbers.sort_unstable();
+        numbers
+    }
+
+    /// Number a new call of `kind`. The call has not started.
+    pub(super) fn propose(&mut self, kind: StorageCallKind) -> StorageCall {
+        self.last = self.last.wrapping_add(1);
+        StorageCall {
+            number: self.last,
+            kind,
+        }
+    }
+
+    /// Record that `call` started.
+    pub(super) fn accept(&mut self, call: StorageCall) {
+        self.pending.insert(call.number, call.kind);
+    }
+
+    /// Settle exactly `call`, and return whether it was pending.
+    pub(super) fn settle(&mut self, call: StorageCall) -> bool {
+        match self.pending.get(&call.number) {
+            Some(kind) if *kind == call.kind => {
+                self.pending.remove(&call.number);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Accepted calls that have not settled, by ascending number.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn pending(&self) -> Vec<StorageCall> {
+        let mut pending: Vec<_> = self
+            .pending
+            .iter()
+            .map(|(number, kind)| StorageCall {
+                number: *number,
+                kind: *kind,
+            })
+            .collect();
+        pending.sort_unstable_by_key(|call| call.number);
+        pending
+    }
+}
+
+/// The identity of one continuation-locator read.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct LocatorKey {
+    /// The peer whose awaiting target the read serves.
+    pub(super) peer: ZakuraPeerId,
+    /// The storage call that performs this read.
+    pub(super) call: StorageCall,
+}
+
+/// How a locator request for one peer proceeds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum LocatorProposal {
+    /// The peer's read in flight, this exact call, also serves this request.
+    Joined(StorageCall),
+    /// State recorded a new read, which IO must start or refuse.
+    Start(LocatorKey),
+}
+
+/// What a settled locator read does to its peer's awaiting target.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum LocatorDisposition {
+    /// No read with this key is pending, or the peer awaits no target.
+    Stale,
+    /// The read cannot serve the awaiting target, so the target needs a fresh read.
+    Refetch,
+    /// The read serves the awaiting target.
+    Ready,
+}
+
+/// One pending continuation-locator read.
+#[derive(Copy, Clone, Debug)]
+struct LocatorQuery {
+    call: StorageCall,
+    /// The authority whose selected path the read follows.
+    scope: HeaderWorkAuthority,
+}
+
+/// Continuation-locator reads in flight, at most one per peer.
+///
+/// A peer's read stays pending until its storage operation settles, even when
+/// the peer's session or awaiting target changes. A later request for the same
+/// peer joins the pending read instead of starting another.
+#[derive(Debug, Default)]
+pub(super) struct LocatorQueries {
+    pending: HashMap<ZakuraPeerId, LocatorQuery>,
+}
+
+impl LocatorQueries {
+    /// Each pending read's peer and call number, sorted by peer.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn pending_calls(&self) -> Vec<(ZakuraPeerId, u64)> {
+        let mut reads: Vec<(ZakuraPeerId, u64)> = self
+            .pending
+            .iter()
+            .map(|(peer, query)| (peer.clone(), query.call.number))
+            .collect();
+        reads.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        reads
+    }
+
+    /// The read pending for `peer`, with its call and authority.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn pending_read(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Option<(StorageCall, HeaderWorkAuthority)> {
+        self.pending
+            .get(peer)
+            .map(|query| (query.call, query.scope))
+    }
+
+    /// Whether a read for `peer` is pending.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn contains(&self, peer: &ZakuraPeerId) -> bool {
+        self.pending.contains_key(peer)
+    }
+
+    /// The number of pending reads.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Record a read for `peer` under `scope`, unless `peer` already has one pending.
+    pub(super) fn propose(
+        &mut self,
+        peer: &ZakuraPeerId,
+        scope: HeaderWorkAuthority,
+        calls: &mut StorageCalls,
+    ) -> LocatorProposal {
+        if let Some(pending) = self.pending.get(peer) {
+            return LocatorProposal::Joined(pending.call);
+        }
+        let call = calls.propose(StorageCallKind::Locator);
+        self.pending
+            .insert(peer.clone(), LocatorQuery { call, scope });
+        LocatorProposal::Start(LocatorKey {
+            peer: peer.clone(),
+            call,
+        })
+    }
+
+    /// Remove the read that `key` names, and return its authority.
+    ///
+    /// Another read for the same peer stays pending.
+    pub(super) fn remove_exact(&mut self, key: &LocatorKey) -> Option<HeaderWorkAuthority> {
+        let pending = self.pending.get(&key.peer)?;
+        if pending.call != key.call {
+            return None;
+        }
+        let scope = pending.scope;
+        self.pending.remove(&key.peer);
+        Some(scope)
+    }
+
+    /// Settle the read that `key` names, and classify its effect on `awaiting`,
+    /// the peer's current awaiting target.
+    ///
+    /// Locators follow the local selected path, so tip churn under the same
+    /// header generation and finality anchor can reuse one read, even across a
+    /// session replacement. A generation or reanchor change needs a fresh read,
+    /// and so does a failed read that belonged to a replaced tip.
+    pub(super) fn settle(
+        &mut self,
+        key: &LocatorKey,
+        awaiting: Option<&AdvertisedHeaderTarget>,
+        found: bool,
+    ) -> LocatorDisposition {
+        let Some(query_scope) = self.remove_exact(key) else {
+            return LocatorDisposition::Stale;
+        };
+        let Some(target) = awaiting else {
+            return LocatorDisposition::Stale;
+        };
+        let same_selected_path_authority = target.scope.header_generation
+            == query_scope.header_generation
+            && target.scope.branch.anchor_hash == query_scope.branch.anchor_hash;
+        let superseded_tip = target.status.selected_tip_hash != query_scope.branch.target_tip_hash;
+        if !same_selected_path_authority || (!found && superseded_tip) {
+            LocatorDisposition::Refetch
+        } else {
+            LocatorDisposition::Ready
+        }
+    }
+}
+
+/// Inputs that can make a previously blocked ordinary offer eligible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SchedulingOpportunity {
+    pub(super) policy_revision: u64,
+    pub(super) queue_revision: u64,
+    pub(super) claimed_headers: usize,
+    pub(super) available_locators: usize,
+    pub(super) resource_stalled: bool,
+}
+
+/// Full cached-offer passes the reactor may run back to back.
+///
+/// A pass clones and sorts every idle offer. One peer whose statuses keep
+/// changing its own unstarted target changes the scheduling key on every
+/// message, so without a budget it could buy one such pass per message.
+/// Past the burst, passes refill one per [`CACHED_PASS_REFILL`].
+pub(super) const CACHED_PASS_BURST: u32 = 32;
+
+/// The interval that refills one full cached-offer pass.
+pub(in crate::zakura::header_sync) const CACHED_PASS_REFILL: std::time::Duration =
+    std::time::Duration::from_millis(1);
+
+/// A token bucket of full cached-offer passes; see [`CACHED_PASS_BURST`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CachedPassBudget {
+    pub(super) passes: u32,
+    pub(super) refilled_at: Instant,
+}
+
+impl CachedPassBudget {
+    /// A full bucket at `now`.
+    pub(super) fn new(now: Instant) -> Self {
+        Self {
+            passes: CACHED_PASS_BURST,
+            refilled_at: now,
+        }
+    }
+
+    /// Refill for the time since the last refill, then take one pass if any
+    /// is left.
+    pub(super) fn try_take(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.refilled_at);
+        let refills = elapsed.as_nanos() / CACHED_PASS_REFILL.as_nanos();
+        if refills > 0 {
+            // At most the burst refills count, which fits u32.
+            let refills = u32::try_from(refills.min(u128::from(CACHED_PASS_BURST)))
+                .expect("the burst fits u32");
+            self.passes = self.passes.saturating_add(refills).min(CACHED_PASS_BURST);
+            self.refilled_at = if self.passes == CACHED_PASS_BURST {
+                now
+            } else {
+                self.refilled_at + CACHED_PASS_REFILL * refills
+            };
+        }
+        let Some(passes) = self.passes.checked_sub(1) else {
+            return false;
+        };
+        self.passes = passes;
+        true
+    }
+
+    /// Restart the refill clock when a pass ends at `now`.
+    ///
+    /// Time spent scanning earns no refill. Otherwise a pass that takes a whole
+    /// refill interval would pay for the next one, and passes could run back to
+    /// back.
+    pub(super) fn finish_pass(&mut self, now: Instant) {
+        self.refilled_at = self.refilled_at.max(now);
+    }
+
+    /// When the next pass refills.
+    pub(super) fn next_refill(&self) -> Instant {
+        self.refilled_at + CACHED_PASS_REFILL
+    }
+}
+
+/// How often a `Close` that a session's full queue refused is tried again.
+pub(super) const CLOSE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The first wait after an ordinary round ends `HistoryPruned`. Each repeat
+/// before a success doubles it, up to [`PRUNED_BACKOFF_MAX`].
+pub(super) const PRUNED_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The longest wait after repeated `HistoryPruned` rounds with one peer.
+pub(super) const PRUNED_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(16 * 60);
+
+/// What `HistoryPruned` taught the reactor about one peer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct PrunedPeer {
+    /// Set when an ordinary schema 1 round with this peer ended
+    /// `HistoryPruned`, because a pruned publisher lacks the records. Ordinary
+    /// rounds ask for no records until it expires, then probe schema 1 once.
+    /// An admitted schema 1 round clears it.
+    pub(super) aux_fallback: Option<PrunedBackoff>,
+    /// Set when an ordinary round without records also ended
+    /// `HistoryPruned`. Ordinary discovery with this peer waits until it
+    /// expires or the selected header tip it names moves. An admitted round
+    /// clears it.
+    pub(super) pruned_pause: Option<(PrunedBackoff, zakura_header_chain::Frontier)>,
+}
+
+impl PrunedPeer {
+    /// Whether either wait still matters at `now`. See [`Self::relevant_until`].
+    pub(super) fn relevant(&self, now: Instant) -> bool {
+        self.relevant_until().is_some_and(|until| until > now)
+    }
+
+    /// When neither wait matters any more, or `None` when neither is set. An
+    /// expired fallback stays for one more maximum backoff, so a failed probe
+    /// soon after still doubles its delay.
+    fn relevant_until(&self) -> Option<Instant> {
+        let fallback = self
+            .aux_fallback
+            .map(|fallback| fallback.until + PRUNED_BACKOFF_MAX);
+        let pause = self.pruned_pause.map(|(pause, _)| pause.until);
+        fallback.max(pause)
+    }
+}
+
+/// A wait that doubles each time it is renewed, until a success clears it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PrunedBackoff {
+    pub(super) until: Instant,
+    pub(super) delay: std::time::Duration,
+}
+
+impl PrunedBackoff {
+    /// The wait from `now` after `previous`: [`PRUNED_BACKOFF_MIN`] at first,
+    /// then twice the previous delay, at most [`PRUNED_BACKOFF_MAX`].
+    pub(super) fn after(previous: Option<Self>, now: Instant) -> Self {
+        let delay = previous.map_or(PRUNED_BACKOFF_MIN, |previous| {
+            previous.delay.saturating_mul(2).min(PRUNED_BACKOFF_MAX)
+        });
+        Self {
+            until: now + delay,
+            delay,
+        }
+    }
+}
+
+/// Hard deadline for one VCT repair prepare or apply operation.
+pub(super) const VCT_LOCAL_OPERATION_FATAL_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+/// Minimum interval between repeated stalled-repair trace rows for one repair generation.
+///
+/// The reactor emits the first row immediately, then samples while nothing changes. The bound
+/// keeps a long stalled repair from dominating the header-sync JSONL trace.
+pub(super) const VCT_REPAIR_STALL_TRACE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// Time one repair generation may stay stalled before the reactor reports it at error level.
+pub(super) const VCT_REPAIR_STALL_REPORT_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Why each advertised peer failed to qualify as a VCT repair supplier.
+///
+/// The reactor reports the tally when no supplier qualifies. Without it the trace records only
+/// that the repair made no progress, not which requirement excluded the network.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct VctSupplierRejections {
+    /// Peers that had advertised a status.
+    pub(super) considered: u64,
+    /// Peers whose selected tip is below the repair target.
+    pub(super) below_target_height: u64,
+    /// Peers that advertise no capacity for the one-header repair response.
+    pub(super) insufficient_capacity: u64,
+    /// Peers that do not support the V1 auxiliary schema.
+    pub(super) unsupported_schema: u64,
+    /// Peers already serving another header request.
+    pub(super) already_serving: u64,
+    /// Peers already tried in the current durable episode.
+    pub(super) already_tried: u64,
+    /// Peers waiting for a later status after a temporary Busy response.
+    pub(super) supplier_status_wait: u64,
+    /// Peers that already supplied a retained rooted payload for this target.
+    pub(super) retained_source: u64,
+    /// Peers that already returned semantic input excluded by this episode.
+    pub(super) excluded_input: u64,
+    /// Eligible peers whose request could not enter the ordered send queue.
+    pub(super) send_failed: u64,
+}
+
+/// The facts about one admitted peer that decide whether it can supply a repair.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct RepairSupplierFacts<'a> {
+    pub(super) peer: &'a ZakuraPeerId,
+    /// The peer's last status.
+    pub(super) status: &'a Status,
+    /// Whether the peer holds started header work.
+    pub(super) serving: bool,
+    /// Whether the peer's session holds a live subscription.
+    pub(super) subscription_live: bool,
+}
+
+/// The local limits on one repair supplier pass.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct RepairSupplierLimits {
+    /// One header's wire size on this network.
+    pub(super) header_bytes: usize,
+    /// The serving limits this node advertises.
+    pub(super) page_limits: PageLimits,
+    /// The aggregate header capacity this repair can reserve now.
+    pub(super) local_capacity: u32,
+}
+
+/// One peer that can supply a repair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RepairCandidate {
+    pub(super) peer: ZakuraPeerId,
+    pub(super) source: zakura_header_chain::SourceId,
+    pub(super) status: Status,
+    /// The headers to request from this peer.
+    pub(super) request_count: u32,
+}
+
+/// The outcome of one repair supplier pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct RepairCandidates {
+    /// Peers that can supply the repair, in supplier order.
+    pub(super) candidates: Vec<RepairCandidate>,
+    /// Why every other peer cannot.
+    pub(super) rejections: VctSupplierRejections,
+    /// Peers whose live subscription must end before a repair can open its own.
+    pub(super) closing: Vec<ZakuraPeerId>,
+}
+
+/// Choose the suppliers for `task`'s repair of `context`, in the order `suppliers` names.
+///
+/// A peer can serve the exact repair target from its retained header graph or
+/// from its finalized state, and those two bands are exhaustive below its selected
+/// tip. So this checks only reachable height, response capacity, and schema
+/// support. The supplier proves branch membership by returning the exact target
+/// hash after the exact predecessor hash, and admission rejects anything else.
+pub(super) fn repair_candidates<'a>(
+    task: &RepairRequirement,
+    context: &zakura_header_chain::VctRepairContext,
+    limits: RepairSupplierLimits,
+    suppliers: impl IntoIterator<Item = RepairSupplierFacts<'a>>,
+) -> RepairCandidates {
+    let desired_count = u32::try_from(context.selected_header_count())
+        .expect("a VCT repair range fits the transition header limit");
+    let mut pass = RepairCandidates::default();
+    let rejections = &mut pass.rejections;
+    for supplier in suppliers {
+        let status = supplier.status;
+        rejections.considered += 1;
+        if status.selected_tip_height < context.target.height {
+            rejections.below_target_height += 1;
+            continue;
+        }
+        let reachable_count = status
+            .selected_tip_height
+            .0
+            .checked_sub(context.target.height.0)
+            .and_then(|distance| distance.checked_add(1))
+            .unwrap_or(0);
+        let message_capacity = v9::page_capacity(
+            limits.header_bytes,
+            AuxSchema::V1,
+            usize::try_from(status.max_message_bytes.min(limits.page_limits.max_bytes))
+                .unwrap_or(usize::MAX),
+        );
+        let peer_supported_count = desired_count
+            .min(reachable_count)
+            .min(status.max_headers_per_response)
+            .min(limits.page_limits.max_headers)
+            .min(message_capacity)
+            .min(MAX_HS_RANGE);
+        if peer_supported_count == 0 {
+            rejections.insufficient_capacity += 1;
+            continue;
+        }
+        let supported_count = if limits.local_capacity == 0 {
+            peer_supported_count
+        } else {
+            peer_supported_count.min(limits.local_capacity)
+        };
+        // An ambiguous boundary repair cannot shorten, so its supplier must serve both headers.
+        // Missing local capacity only delays the full request.
+        let unshortenable = context
+            .bounded_prefix(usize::try_from(supported_count).unwrap_or(usize::MAX))
+            .is_none();
+        if unshortenable && peer_supported_count < desired_count {
+            rejections.insufficient_capacity += 1;
+            continue;
+        }
+        if status.tree_aux_schema_mask & AuxSchema::V1.mask_bit() == 0 {
+            rejections.unsupported_schema += 1;
+            continue;
+        }
+        if supplier.serving {
+            rejections.already_serving += 1;
+            continue;
+        }
+        if supplier.subscription_live {
+            // A repair opens its own subscription after this one ends.
+            pass.closing.push(supplier.peer.clone());
+            rejections.already_serving += 1;
+            continue;
+        }
+        let source = source_id_from_peer(supplier.peer);
+        if context.retains_source(source) {
+            rejections.retained_source += 1;
+            continue;
+        }
+        if task.excluded_input_sources.contains(&source) {
+            rejections.excluded_input += 1;
+            continue;
+        }
+        if task.tried_sources.contains(&source) {
+            rejections.already_tried += 1;
+            continue;
+        }
+        if task.supplier_is_waiting_for_status(source) {
+            rejections.supplier_status_wait += 1;
+            continue;
+        }
+        pass.candidates.push(RepairCandidate {
+            peer: supplier.peer.clone(),
+            source,
+            status: status.clone(),
+            request_count: if unshortenable {
+                desired_count
+            } else {
+                supported_count
+            },
+        });
+    }
+    pass
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum VctRepairStallOutcome {
+    LocalCapacityUnavailable,
+    LocalFailure,
+    LocalOperationPending,
+    LocalSendFailure,
+    NoEligibleSupplier,
+    SupplierFailure,
+    SupplierSendFailure,
+}
+
+impl VctRepairStallOutcome {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::LocalCapacityUnavailable => "local_capacity_unavailable",
+            Self::LocalFailure => "local_failure",
+            Self::LocalOperationPending => "local_operation_pending",
+            Self::LocalSendFailure => "local_send_failed",
+            Self::NoEligibleSupplier => "no_eligible_supplier",
+            Self::SupplierFailure => "supplier_failure",
+            Self::SupplierSendFailure => "supplier_send_failed",
+        }
+    }
+
+    pub(super) fn attribution(self) -> &'static str {
+        match self {
+            Self::LocalCapacityUnavailable
+            | Self::LocalFailure
+            | Self::LocalOperationPending
+            | Self::LocalSendFailure => "local",
+            Self::NoEligibleSupplier | Self::SupplierFailure | Self::SupplierSendFailure => {
+                "supplier"
+            }
+        }
+    }
+}
+
+/// One repair generation that has not completed after its first failed attempt.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct VctRepairStall {
+    /// Repair generation this record tracks.
+    pub(super) generation: u64,
+    /// First failed attempt for this generation.
+    pub(super) since: Instant,
+    /// Last emitted trace row, or none before the immediate first row.
+    pub(super) last_trace: Option<Instant>,
+    /// Whether the reactor already reported this generation at error level.
+    pub(super) reported: bool,
+    /// Latest exact predecessor for diagnostic output.
+    pub(super) predecessor: zakura_header_chain::Frontier,
+    /// Latest supplier rejection tally.
+    pub(super) rejections: VctSupplierRejections,
+    /// Latest local or supplier outcome that kept the repair stalled.
+    pub(super) outcome: VctRepairStallOutcome,
+}
+
+impl VctRepairStall {
+    pub(super) fn next_deadline(self) -> Instant {
+        let trace_at = self
+            .last_trace
+            .map_or(self.since, |last| last + VCT_REPAIR_STALL_TRACE_INTERVAL);
+        if self.reported {
+            trace_at
+        } else {
+            trace_at.min(self.since + VCT_REPAIR_STALL_REPORT_AFTER)
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum VctRepairRetryAttribution {
+    Supplier,
+    ExcludedInput,
+    /// The supplier's request timed out under a carried replacement budget.
+    CarriedTimeout,
+    Stale,
+    Local,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct VctRepairRetry {
+    pub(super) source: zakura_header_chain::SourceId,
+    pub(super) terminal: HeaderRequestTerminal,
+    pub(super) attribution: VctRepairRetryAttribution,
+}
+
+impl VctRepairRetryAttribution {
+    /// Whether the failure charges the supplier and rotates it in the supplier order.
+    pub(super) fn charges_supplier(self) -> bool {
+        matches!(
+            self,
+            Self::Supplier | Self::ExcludedInput | Self::CarriedTimeout
+        )
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Supplier => "supplier_retry",
+            Self::ExcludedInput => "excluded_input",
+            Self::CarriedTimeout => "carried_timeout",
+            Self::Stale => "stale_episode",
+            Self::Local => "local_backoff",
+        }
+    }
+
+    pub(super) fn stall_outcome(self) -> VctRepairStallOutcome {
+        match self {
+            Self::Supplier | Self::ExcludedInput | Self::CarriedTimeout => {
+                VctRepairStallOutcome::SupplierFailure
+            }
+            Self::Stale | Self::Local => VctRepairStallOutcome::LocalFailure,
+        }
+    }
+}
+
+impl VctRepairRetry {
+    pub(super) fn supplier(
+        source: zakura_header_chain::SourceId,
+        terminal: HeaderRequestTerminal,
+    ) -> Self {
+        Self {
+            source,
+            terminal,
+            attribution: VctRepairRetryAttribution::Supplier,
+        }
+    }
+
+    pub(super) fn local(
+        source: zakura_header_chain::SourceId,
+        terminal: HeaderRequestTerminal,
+    ) -> Self {
+        Self {
+            source,
+            terminal,
+            attribution: VctRepairRetryAttribution::Local,
+        }
+    }
+
+    /// A repair request timed out under a carried replacement budget. See
+    /// [`PeerSchedule::replaced_request_budget`].
+    pub(super) fn carried_timeout(source: zakura_header_chain::SourceId) -> Self {
+        Self {
+            source,
+            terminal: HeaderRequestTerminal::TimedOut,
+            attribution: VctRepairRetryAttribution::CarriedTimeout,
+        }
+    }
+
+    pub(super) fn excluded_input(source: zakura_header_chain::SourceId) -> Self {
+        Self {
+            source,
+            terminal: HeaderRequestTerminal::ExcludedAuxiliaryInput,
+            attribution: VctRepairRetryAttribution::ExcludedInput,
+        }
+    }
+
+    pub(super) fn stale(source: zakura_header_chain::SourceId) -> Self {
+        Self {
+            source,
+            terminal: HeaderRequestTerminal::RepairObsolete,
+            attribution: VctRepairRetryAttribution::Stale,
+        }
+    }
+}
+
+pub(super) fn vct_error_retry(
+    source: zakura_header_chain::SourceId,
+    terminal: HeaderRequestTerminal,
+    error: &zakura_header_chain::HeaderChainError,
+) -> VctRepairRetry {
+    if error.category == zakura_header_chain::ErrorCategory::StaleTargetOrGeneration {
+        return VctRepairRetry::stale(source);
+    }
+    let attributed_source = match error.attribution {
+        zakura_header_chain::Attribution::HeaderPeer(attributed)
+        | zakura_header_chain::Attribution::BodyPeer(attributed)
+        | zakura_header_chain::Attribution::AuxPeer(attributed) => Some(attributed),
+        zakura_header_chain::Attribution::None => None,
+    };
+    if attributed_source == Some(source) {
+        VctRepairRetry::supplier(source, terminal)
+    } else {
+        VctRepairRetry::local(source, HeaderRequestTerminal::LocalError)
+    }
+}
+
+/// Stall output that [`ReactorState::refresh_repair_stall`] found due.
+#[derive(Clone, Debug)]
+pub(super) struct RepairStallDue {
+    pub(super) task: RepairRequirement,
+    pub(super) record: VctRepairStall,
+    /// Emit one stall trace row.
+    pub(super) trace: bool,
+    /// Report the stall at error level.
+    pub(super) report: bool,
+    pub(super) stalled_for: Duration,
+    pub(super) best_peer_tip: Option<(block::Height, block::Hash)>,
+}
+
+/// The local operation's state at one deadline check.
+#[derive(Clone, Debug)]
+pub(super) enum LocalOperationExpiry {
+    /// No local operation runs.
+    Idle,
+    /// The operation runs within its deadline.
+    Running,
+    /// The operation was already reported as fatal.
+    AlreadyFatal,
+    /// The operation passed its deadline at this check.
+    Expired(VctLocalOperation),
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct VctLocalOperation {
+    pub(super) phase: HeaderTargetPhase,
+    pub(super) owner: zakura_header_chain::HeaderSyncWorkOwner,
+    pub(super) repair_generation: u64,
+    pub(super) target: zakura_header_chain::Frontier,
+    pub(super) started_at: Instant,
+    pub(super) deadline: Instant,
+    pub(super) fatal_sent: bool,
+}
+
+impl VctLocalOperation {
+    pub(super) fn from_action(action: &HeaderPortOperation, now: Instant) -> Option<Self> {
+        let (phase, purpose, owner) = match action {
+            HeaderPortOperation::PrepareHeaderTarget { purpose, owner, .. } => {
+                (HeaderTargetPhase::Preparing, purpose, *owner)
+            }
+            HeaderPortOperation::ApplyHeaderTarget { purpose, owner, .. } => {
+                (HeaderTargetPhase::Applying, purpose, *owner)
+            }
+            _ => return None,
+        };
+        let HeaderTargetPurpose::SelectedAuxiliaryRepair {
+            selected_target,
+            repair_generation,
+            ..
+        } = purpose
+        else {
+            return None;
+        };
+        Some(Self {
+            phase,
+            owner,
+            repair_generation: *repair_generation,
+            target: *selected_target,
+            started_at: now,
+            deadline: now + VCT_LOCAL_OPERATION_FATAL_AFTER,
+            fatal_sent: false,
+        })
+    }
+
+    pub(super) fn phase_label(&self) -> &'static str {
+        match self.phase {
+            HeaderTargetPhase::Preparing => "prepare",
+            HeaderTargetPhase::Applying => "apply",
+            HeaderTargetPhase::Receiving => {
+                unreachable!("only local VCT operation phases have hard deadlines")
+            }
+        }
+    }
+}

@@ -262,9 +262,8 @@ pub enum MetaAddrChange {
 
         /// The services this node advertises for its own listener address.
         ///
-        /// This must match the services advertised during the handshake, so a
-        /// node that does not advertise [`PeerServices::NODE_NETWORK`] (for
-        /// example, a pruned node) does not gossip itself as a full node.
+        /// This must match the services advertised during the handshake so
+        /// discovery and connections describe the same capabilities and storage mode.
         services: PeerServices,
     },
 
@@ -482,7 +481,9 @@ impl MetaAddr {
         self.addr
     }
 
-    /// Return the address preference level for this `MetaAddr`.
+    /// Validate this address, returning equal preference for all valid listening ports.
+    ///
+    /// This published accessor remains available, but no longer ranks default ports.
     pub fn peer_preference(&self) -> Result<PeerPreference, &'static str> {
         PeerPreference::new(self.addr, None)
     }
@@ -901,14 +902,6 @@ impl MetaAddrChange {
         }
     }
 
-    /// Return the timestamp when a ping was last sent, if available.
-    pub fn ping_sent(&self) -> Option<Instant> {
-        match self {
-            UpdatePingSent { ping_sent_at, .. } => Some(*ping_sent_at),
-            _ => None,
-        }
-    }
-
     /// Return the RTT for this change, if available
     pub fn rtt(&self) -> Option<Duration> {
         match self {
@@ -1194,7 +1187,13 @@ impl MetaAddrChange {
                 // This is a wall clock time, but we already checked that responses are in order.
                 // Even if the wall clock time has jumped, we want to use the latest time.
                 last_response: self.last_response(local_now).or(previous.last_response),
-                rtt: self.rtt(),
+                // Only measurements from the current connection remain useful.
+                rtt: match self {
+                    MetaAddrChange::UpdatePingSent { .. }
+                    | MetaAddrChange::UpdateResponded { .. }
+                    | MetaAddrChange::UpdateMisbehavior { .. } => self.rtt().or(previous.rtt),
+                    _ => None,
+                },
                 ping_sent_at: self.ping_sent_at(),
                 // These are monotonic times, we already checked the responses are in order.
                 last_attempt: self.last_attempt(instant_now).or(previous.last_attempt),
@@ -1226,8 +1225,7 @@ impl Ord for MetaAddr {
         // First, try states that are more likely to work
         let more_reliable_state = self.last_connection_state.cmp(&other.last_connection_state);
 
-        // Then, try addresses that are more likely to be valid.
-        // Currently, this prefers addresses with canonical Zcash ports.
+        // Keep valid addresses before invalid ones, without ranking their ports.
         let more_likely_valid = self.peer_preference().cmp(&other.peer_preference());
 
         // # Security and Correctness

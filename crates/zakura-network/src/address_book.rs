@@ -15,6 +15,7 @@ use tracing::Span;
 use zakura_chain::{parameters::Network, serialization::DateTime32};
 
 use crate::{
+    config::UnconditionalPeers,
     constants::{self, ADDR_RESPONSE_LIMIT_DENOMINATOR, MAX_ADDRS_IN_MESSAGE},
     meta_addr::MetaAddrChange,
     peer_registry::PeerRegistry,
@@ -27,9 +28,19 @@ use crate::{
 mod tests;
 
 /// Read-only access to currently banned peer IP addresses.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct BannedIps {
     inner: Arc<RwLock<BanList>>,
+    changes: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for BannedIps {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+            changes: tokio::sync::watch::channel(()).0,
+        }
+    }
 }
 
 /// A bounded FIFO list of banned peer IP addresses.
@@ -65,6 +76,27 @@ impl BanList {
 }
 
 impl BannedIps {
+    /// Watches authorization changes without polling the ban list.
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    /// Applies a ban and notifies readers after releasing the list lock.
+    fn insert(&self, ip: IpAddr) {
+        let changed = {
+            let mut list = self
+                .inner
+                .write()
+                .expect("ban list lock should not be poisoned");
+            let changed = !list.ips.contains(&canonical_ip(ip));
+            list.insert(ip);
+            changed
+        };
+        if changed {
+            self.changes.send_replace(());
+        }
+    }
+
     /// Returns whether `ip` is currently banned.
     pub fn contains(&self, ip: IpAddr) -> bool {
         let ip = canonical_ip(ip);
@@ -79,11 +111,48 @@ impl BannedIps {
     #[cfg(test)]
     pub(crate) fn with_banned_ip(ip: IpAddr) -> Self {
         let bans = Self::default();
-        bans.inner
-            .write()
-            .expect("ban list lock should not be poisoned")
-            .insert(ip);
+        bans.insert(ip);
         bans
+    }
+}
+
+/// The number of peers in each [`PeerAddrState`].
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct StateCounts {
+    responded: usize,
+    never_attempted_gossiped: usize,
+    failed: usize,
+    attempt_pending: usize,
+}
+
+impl StateCounts {
+    fn get(&self, state: PeerAddrState) -> usize {
+        match state {
+            PeerAddrState::Responded => self.responded,
+            PeerAddrState::NeverAttemptedGossiped => self.never_attempted_gossiped,
+            PeerAddrState::Failed => self.failed,
+            PeerAddrState::AttemptPending => self.attempt_pending,
+        }
+    }
+
+    fn get_mut(&mut self, state: PeerAddrState) -> &mut usize {
+        match state {
+            PeerAddrState::Responded => &mut self.responded,
+            PeerAddrState::NeverAttemptedGossiped => &mut self.never_attempted_gossiped,
+            PeerAddrState::Failed => &mut self.failed,
+            PeerAddrState::AttemptPending => &mut self.attempt_pending,
+        }
+    }
+
+    fn add(&mut self, state: PeerAddrState) {
+        *self.get_mut(state) += 1;
+    }
+
+    fn remove(&mut self, state: PeerAddrState) {
+        let count = self.get_mut(state);
+        *count = count
+            .checked_sub(1)
+            .expect("every indexed peer was counted when it was inserted");
     }
 }
 
@@ -98,11 +167,29 @@ struct AddressBookIndex {
 
     /// Canonical listener addresses grouped by canonical IP.
     by_ip: HashMap<IpAddr, HashSet<PeerSocketAddr>>,
+
+    /// The number of indexed peers in each connection state.
+    state_counts: StateCounts,
 }
 
 impl AddressBookIndex {
     fn len(&self) -> usize {
         self.by_addr.len()
+    }
+
+    /// Returns the number of peers whose last connection state is `state`.
+    fn state_count(&self, state: PeerAddrState) -> usize {
+        self.state_counts.get(state)
+    }
+
+    /// Returns the peers in the `Responded` state, in connection-attempt order.
+    ///
+    /// [`MetaAddr`]'s order puts `Responded` peers first, so this visits only
+    /// those peers rather than the whole index.
+    fn responded_values(&self) -> impl Iterator<Item = &MetaAddr> {
+        self.by_priority
+            .iter()
+            .take_while(|peer| peer.last_connection_state == PeerAddrState::Responded)
     }
 
     fn get(&self, addr: &PeerSocketAddr) -> Option<MetaAddr> {
@@ -117,6 +204,7 @@ impl AddressBookIndex {
                 self.by_priority.remove(&previous),
                 "replaced peer must exist in the priority index"
             );
+            self.state_counts.remove(previous.last_connection_state);
         } else {
             assert!(
                 self.by_ip.entry(addr.ip()).or_default().insert(addr),
@@ -128,6 +216,7 @@ impl AddressBookIndex {
             self.by_priority.insert(meta_addr),
             "new peer metadata must be unique in the priority index"
         );
+        self.state_counts.add(meta_addr.last_connection_state);
     }
 
     fn remove(&mut self, addr: &PeerSocketAddr) -> Option<MetaAddr> {
@@ -137,6 +226,7 @@ impl AddressBookIndex {
             self.by_priority.remove(&removed),
             "removed peer must exist in the priority index"
         );
+        self.state_counts.remove(removed.last_connection_state);
 
         let remove_ip = {
             let Some(same_ip_addrs) = self.by_ip.get_mut(&addr.ip()) else {
@@ -170,6 +260,7 @@ impl AddressBookIndex {
                 self.by_priority.remove(&removed),
                 "IP index peer must exist in the priority index"
             );
+            self.state_counts.remove(removed.last_connection_state);
         }
     }
 
@@ -207,6 +298,17 @@ impl AddressBookIndex {
 
         let peers: Vec<_> = self.ordered_values().copied().collect();
         assert!(peers.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let mut recounted = StateCounts::default();
+        for peer in &peers {
+            recounted.add(peer.last_connection_state);
+        }
+        assert_eq!(self.state_counts, recounted);
+        assert_eq!(
+            self.responded_values().count(),
+            recounted.responded,
+            "responded peers must sort before every other peer"
+        );
     }
 }
 
@@ -264,15 +366,21 @@ pub struct AddressBook {
     /// A list of banned addresses, with the time they were banned.
     bans_by_ip: BannedIps,
 
+    /// Peer IP addresses and ranges that are never scored or banned.
+    ///
+    /// The address book drops misbehavior changes for these peers, and leaves the IPs
+    /// that Zakura dials to stay connected to them out of
+    /// [`reconnection_peers`](Self::reconnection_peers).
+    unconditional_peers: UnconditionalPeers,
+
     /// The local listener address.
     local_listener: SocketAddr,
 
     /// The services advertised for our own [`local_listener`](Self::local_listener)
     /// address when it is gossiped to peers.
     ///
-    /// This must match the services advertised during the handshake, so a node
-    /// that does not advertise [`PeerServices::NODE_NETWORK`] (for example, a
-    /// pruned node) does not gossip itself as a full node.
+    /// This must match the services advertised during the handshake so peers
+    /// receive consistent service information through discovery and connections.
     local_listener_services: PeerServices,
 
     /// The configured Zcash network.
@@ -375,6 +483,7 @@ impl AddressBook {
             last_address_log: None,
             most_recent_by_ip: should_limit_outbound_conns_per_ip.then(HashMap::new),
             bans_by_ip: Default::default(),
+            unconditional_peers: UnconditionalPeers::default(),
         };
 
         new_book.update_metrics(instant_now, chrono_now);
@@ -394,6 +503,16 @@ impl AddressBook {
     #[must_use]
     pub(crate) fn with_expose_peer_addresses(mut self, expose_peer_addresses: bool) -> Self {
         self.expose_peer_addresses = expose_peer_addresses;
+        self
+    }
+
+    /// Sets the peer IP addresses and ranges that are never scored or banned.
+    #[must_use]
+    pub(crate) fn with_unconditional_peers(
+        mut self,
+        unconditional_peers: UnconditionalPeers,
+    ) -> Self {
+        self.unconditional_peers = unconditional_peers;
         self
     }
 
@@ -514,7 +633,7 @@ impl AddressBook {
     /// Get the active addresses in `self` in random order with sanitized timestamps,
     /// including our local listener address.
     pub(crate) fn sanitized(&self, now: chrono::DateTime<Utc>) -> Vec<MetaAddr> {
-        use rand::seq::SliceRandom;
+        use rand_10::seq::SliceRandom;
         let _guard = self.span.enter();
 
         let mut peers = self.peers.clone();
@@ -541,34 +660,49 @@ impl AddressBook {
             .filter(|addr| addr.is_active_for_gossip(now))
             .collect();
 
-        peers.shuffle(&mut rand::thread_rng());
+        peers.shuffle(&mut rand_10::rng());
 
         peers
     }
 
-    /// Get the active addresses in `self`, in preferred caching order,
-    /// excluding our local listener address.
+    /// Get outbound listener addresses that responded to this node within
+    /// [`MAX_PEER_ACTIVE_FOR_GOSSIP`](constants::MAX_PEER_ACTIVE_FOR_GOSSIP), in
+    /// measured RTT order, followed by shuffled addresses without a measurement,
+    /// excluding our local listener.
     pub fn cacheable(&self, now: chrono::DateTime<Utc>) -> Vec<MetaAddr> {
         let _guard = self.span.enter();
 
         let peers = self.peers.clone();
 
-        // Get peers in preferred order, then keep the recently active ones
-        peers
+        // Get peers in preferred order, then keep the ones that recently responded
+        let mut eligible: Vec<_> = peers
             .ordered_values()
             // # Security
             //
-            // Remove peers that:
-            //   - last responded more than three hours ago, or
-            //   - haven't responded yet but were reported last seen more than three hours ago
-            //
-            // This prevents Zebra from caching nodes that are likely unreachable,
-            // which improves startup time and reliability.
-            .filter(|addr| addr.is_active_for_gossip(now))
+            // Keep only peers that responded to this node within the gossip window.
+            // A gossiped last seen time does not show that an address is a reachable
+            // listener, and startup dials cached peers first, so caching unproven
+            // addresses spends startup attempts on peers that are likely unreachable.
+            .filter(|addr| {
+                addr.last_response().is_some_and(|last_response| {
+                    last_response.saturating_elapsed(now) <= constants::MAX_PEER_ACTIVE_FOR_GOSSIP
+                })
+            })
             // An inbound peer's entry holds its ephemeral source port, not a listener.
             .filter(|addr| !addr.is_inbound())
+            // Address-only persistence must not forget a known rejection.
+            .filter(|addr| addr.last_known_info_is_valid_for_outbound(&self.network))
             .cloned()
-            .collect()
+            .collect();
+
+        // Keep measured RTT preference and stable measured ties. Unmeasured peers
+        // have no trusted ranking: gossip timestamps and address values must not
+        // decide which ones survive cache truncation.
+        eligible.sort_by_key(|peer| (peer.rtt().is_none(), peer.rtt()));
+        let first_unmeasured = eligible.partition_point(|peer| peer.rtt().is_some());
+        use rand_10::seq::SliceRandom;
+        eligible[first_unmeasured..].shuffle(&mut rand_10::rng());
+        eligible
     }
 
     /// Look up `addr` in the address book, and return its [`MetaAddr`].
@@ -637,6 +771,9 @@ impl AddressBook {
     /// As an exception, this function can ignore all changes for specific
     /// [`PeerSocketAddr`]s. Ignored addresses will never be used to connect to
     /// peers.
+    ///
+    /// It also drops misbehavior changes for configured unconditional peers,
+    /// which are never scored or banned but can still be connected.
     pub fn update(&mut self, change: MetaAddrChange) -> Option<MetaAddr> {
         let updated = self.update_inner(change);
         self.publish_metrics();
@@ -654,6 +791,18 @@ impl AddressBook {
                 ?change,
                 "attempted to add a banned peer addr to address book"
             );
+            return None;
+        }
+
+        if matches!(change, MetaAddrChange::UpdateMisbehavior { .. })
+            && self.unconditional_peers.contains(change.addr().ip())
+        {
+            debug!(
+                peer = %addr_label,
+                score_increment = change.misbehavior_score(),
+                "ignored misbehavior report for an unconditional peer"
+            );
+            metrics::counter!("address_book.misbehavior.unconditional_ignored.total").increment(1);
             return None;
         }
 
@@ -680,15 +829,11 @@ impl AddressBook {
             if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
                 // Ban and skip outbound connections with excessively misbehaving peers.
                 let banned_ip = updated.addr.ip();
-                {
-                    let mut bans_by_ip = self
-                        .bans_by_ip
-                        .inner
-                        .write()
-                        .expect("ban list lock should not be poisoned");
-
-                    bans_by_ip.insert(banned_ip);
-                }
+                debug_assert!(
+                    !self.unconditional_peers.contains(banned_ip),
+                    "unconditional peers must never be banned"
+                );
+                self.bans_by_ip.insert(banned_ip);
 
                 // `most_recent_by_ip` is only populated when
                 // `max_connections_per_ip == 1`. The ban path runs for any
@@ -790,55 +935,6 @@ impl AddressBook {
         updated
     }
 
-    /// Removes the entry with `addr`, returning it if it exists
-    ///
-    /// # Note
-    ///
-    /// All address removals should go through `take`, so that the address
-    /// book metrics are accurate.
-    #[allow(dead_code)]
-    fn take(&mut self, removed_addr: PeerSocketAddr) -> Option<MetaAddr> {
-        let _guard = self.span.enter();
-
-        let chrono_now = Utc::now();
-
-        trace!(
-            ?removed_addr,
-            total_peers = self.peers.len(),
-            recent_peers = self.recently_live_peers(chrono_now).len(),
-        );
-
-        if let Some(entry) = self.peers.remove(&removed_addr) {
-            self.address_metrics_dirty = true;
-
-            // Check if this surplus peer's addr matches that in `most_recent_by_ip`
-            // for this the surplus peer's ip to remove it there as well.
-            if self.should_remove_most_recent_by_ip(entry.addr) {
-                if let Some(most_recent_by_ip) = self.most_recent_by_ip.as_mut() {
-                    most_recent_by_ip.remove(&entry.addr.ip());
-                }
-            }
-
-            std::mem::drop(_guard);
-            self.publish_metrics();
-            Some(entry)
-        } else {
-            None
-        }
-    }
-
-    /// Returns true if the given [`PeerSocketAddr`] is pending a reconnection
-    /// attempt.
-    pub fn pending_reconnection_addr(&mut self, addr: PeerSocketAddr) -> bool {
-        let meta_addr = self.get(addr);
-
-        let _guard = self.span.enter();
-        match meta_addr {
-            None => false,
-            Some(peer) => peer.last_connection_state == PeerAddrState::AttemptPending,
-        }
-    }
-
     /// Return an iterator over all peers.
     ///
     /// Returns peers in reconnection attempt order, including recently connected peers.
@@ -869,6 +965,10 @@ impl AddressBook {
 
     /// Return an iterator over peers that are due for a reconnection attempt,
     /// in reconnection attempt order.
+    ///
+    /// Leaves out every address on the IP of a dialed unconditional peer. Zakura keeps
+    /// that peer connected on a slot of its own, and a connection to another node on its
+    /// IP could take the room under `max_connections_per_ip` that the peer needs.
     pub fn reconnection_peers(
         &'_ self,
         instant_now: Instant,
@@ -884,6 +984,7 @@ impl AddressBook {
                 // Inbound entries stay in the book for liveness, bans, and per-IP dial
                 // limits, but their ephemeral source ports are not listeners to dial.
                 !peer.is_inbound()
+                    && !self.unconditional_peers.is_dial_address(peer.addr.ip())
                     && peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
                     && self.is_ready_for_connection_attempt_with_ip(&peer.addr.ip(), chrono_now)
             })
@@ -960,14 +1061,14 @@ impl AddressBook {
     /// in production code, to avoid deadlocks.
     /// (Using the watch channel receiver does not lock the address book mutex.)
     fn address_metrics_internal(&self, now: chrono::DateTime<Utc>) -> AddressMetrics {
-        let responded = self.state_peers(PeerAddrState::Responded).count();
+        let responded = self.peers.state_count(PeerAddrState::Responded);
         let never_attempted_gossiped = self
-            .state_peers(PeerAddrState::NeverAttemptedGossiped)
-            .count();
-        let failed = self.state_peers(PeerAddrState::Failed).count();
-        let attempt_pending = self.state_peers(PeerAddrState::AttemptPending).count();
+            .peers
+            .state_count(PeerAddrState::NeverAttemptedGossiped);
+        let failed = self.peers.state_count(PeerAddrState::Failed);
+        let attempt_pending = self.peers.state_count(PeerAddrState::AttemptPending);
 
-        let recently_live = self.recently_live_peers(now).len();
+        let recently_live = self.recently_live(now).count();
         let recently_stopped_responding = responded
             .checked_sub(recently_live)
             .expect("all recently live peers must have responded");
@@ -984,6 +1085,13 @@ impl AddressBook {
             num_addresses,
             address_limit: self.addr_limit,
         }
+    }
+
+    /// Returns the peers that have responded recently, in connection-attempt order.
+    fn recently_live(&self, now: chrono::DateTime<Utc>) -> impl Iterator<Item = &MetaAddr> {
+        self.peers
+            .responded_values()
+            .filter(move |peer| peer.was_recently_live(now))
     }
 
     /// Publish metrics if the address book changed since the previous update.
@@ -1073,11 +1181,7 @@ impl AddressBookPeers for AddressBook {
     fn recently_live_peers(&self, now: chrono::DateTime<Utc>) -> Vec<MetaAddr> {
         let _guard = self.span.enter();
 
-        self.peers
-            .ordered_values()
-            .filter(|peer| peer.was_recently_live(now))
-            .cloned()
-            .collect()
+        self.recently_live(now).copied().collect()
     }
 
     fn connected_peers(&self) -> Option<Vec<crate::ConnectedPeer>> {
@@ -1158,6 +1262,7 @@ impl Clone for AddressBook {
             last_address_log: None,
             most_recent_by_ip: self.most_recent_by_ip.clone(),
             bans_by_ip: self.bans_by_ip.clone(),
+            unconditional_peers: self.unconditional_peers.clone(),
         }
     }
 }

@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs b/crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs
+index ef4319e817bee26d9fde7fd715ac478326767980..95138249fa4c1f0bb01b19f17290f35bfffefba3 100644
+--- a/crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs
+@@ -403,9 +403,9 @@ impl SequencerState {
+     }
+ 
+     fn offer_body(&mut self, mut body: ReceivedBody) -> BodyAcceptance {
+-        let scope_is_current = self.current_scope.is_some_and(|current| {
+-            current.body_work_epoch == body.owner.authority().body_work_epoch
+-        });
++        // Key the body by its height alone: whatever epoch its owner asked
++        // for it in, the current scope adopts it below.
++        let scope_is_current = self.current_scope.is_some();
+         if !scope_is_current {
+             return BodyAcceptance::StaleScope;
+         }

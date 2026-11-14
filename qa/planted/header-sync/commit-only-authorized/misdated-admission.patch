@@ -1,0 +1,42 @@
+diff --git a/crates/zakura-header-chain/src/transition/engine/mod.rs b/crates/zakura-header-chain/src/transition/engine/mod.rs
+index 50346354a1..51ba0d3846 100644
+--- a/crates/zakura-header-chain/src/transition/engine/mod.rs
++++ b/crates/zakura-header-chain/src/transition/engine/mod.rs
+@@ -355,6 +355,20 @@ impl HeaderChainEngine {
+         Ok(())
+     }
+ 
++    /// Mutation: the apply's new selected tip is stored deferred for a
++    /// day past its time, with eligibility recomputed to match, though the
++    /// clock admits it now.
++    pub fn planted_corrupt(&mut self) {
++        let tip = self.metadata.frontiers.header_best;
++        let time = self.graph.header_node(tip.hash).map(|node| node.header.time);
++        if let Some(time) = time {
++            let _ = self.graph.set_header_validation_state(
++                tip.hash,
++                crate::HeaderValidationState::DeferredUntil(time + chrono::Duration::days(1)),
++            );
++        }
++    }
++
+     /// Return the private identity of this exact in-memory source revision.
+     pub(crate) fn transition_source(&self) -> EngineTransitionSource {
+         EngineTransitionSource {
+diff --git a/crates/zakura-storage/src/header/adapter.rs b/crates/zakura-storage/src/header/adapter.rs
+index 0b178bb334..ee3d06b5be 100644
+--- a/crates/zakura-storage/src/header/adapter.rs
++++ b/crates/zakura-storage/src/header/adapter.rs
+@@ -873,6 +873,12 @@ impl EnginePort {
+         engine
+             .install_committed_transition(transition)
+             .map_err(|error| local_resource(owner, Some(Box::new(error))))?;
++        // Mutation: a node round's apply corrupts the engine after its
++        // install. The fixture's own preload, under its fixed source,
++        // applies faithfully.
++        if source != SourceId::from_digest([7; 32]) {
++            engine.planted_corrupt();
++        }
+         let updates = hint_updates(&engine, hints);
+         self.publish_locked(after, effect, updates);
+         drop(engine);

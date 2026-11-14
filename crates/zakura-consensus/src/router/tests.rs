@@ -2,15 +2,17 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
-use color_eyre::eyre::Report;
-use once_cell::sync::Lazy;
+use eyre::Report;
 use tower::{layer::Layer, timeout::TimeoutLayer};
 
 use zakura_chain::{
     block::Block,
-    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
 };
 use zakura_state as zs;
 use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
@@ -288,42 +290,46 @@ async fn verifiers_from_network(
     (block_verifier_router, state_service)
 }
 
-static BLOCK_VERIFY_TRANSCRIPT_GENESIS: Lazy<
+static BLOCK_VERIFY_TRANSCRIPT_GENESIS: LazyLock<
     Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
             .into();
     let hash = Ok(block.hash());
 
-    vec![(Request::Commit(block), hash)]
+    vec![(Request::Commit(block.into()), hash)]
 });
 
-static BLOCK_VERIFY_TRANSCRIPT_GENESIS_FAIL: Lazy<
+static BLOCK_VERIFY_TRANSCRIPT_GENESIS_FAIL: LazyLock<
     Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
             .into();
 
-    vec![(Request::Commit(block), Err(ExpectedTranscriptError::Any))]
+    vec![(
+        Request::Commit(block.into()),
+        Err(ExpectedTranscriptError::Any),
+    )]
 });
 
-static NO_COINBASE_TRANSCRIPT: Lazy<Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>> =
-    Lazy::new(|| {
-        let block = block_no_transactions();
+static NO_COINBASE_TRANSCRIPT: LazyLock<
+    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
+> = LazyLock::new(|| {
+    let block = block_no_transactions();
 
-        vec![(
-            Request::Commit(Arc::new(block)),
-            Err(ExpectedTranscriptError::Any),
-        )]
-    });
+    vec![(
+        Request::Commit(Arc::new(block).into()),
+        Err(ExpectedTranscriptError::Any),
+    )]
+});
 
-static NO_COINBASE_STATE_TRANSCRIPT: Lazy<
+static NO_COINBASE_STATE_TRANSCRIPT: LazyLock<
     Vec<(zs::Request, Result<zs::Response, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block = block_no_transactions();
     let hash = block.hash();
 
@@ -333,9 +339,9 @@ static NO_COINBASE_STATE_TRANSCRIPT: Lazy<
     )]
 });
 
-static STATE_VERIFY_TRANSCRIPT_GENESIS: Lazy<
+static STATE_VERIFY_TRANSCRIPT_GENESIS: LazyLock<
     Vec<(zs::Request, Result<zs::Response, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
@@ -344,7 +350,7 @@ static STATE_VERIFY_TRANSCRIPT_GENESIS: Lazy<
 
     vec![(
         zs::Request::Block(hash.into()),
-        Ok(zs::Response::Block(Some(block))),
+        Ok(zs::Response::Block(Some(block.into()))),
     )]
 });
 
@@ -509,7 +515,11 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
     for mined in [true, false] {
         let mut state_config = zs::Config::ephemeral();
         state_config.vct_fast_sync = false;
-        let (state, _read, _tip, _change) = zs::init(state_config, &network, boundary, 0)
+        let zakura_state::InitializedState {
+            state,
+            read_state: _read,
+            ..
+        } = zs::init(state_config, &network, boundary, 0)
             .await
             .expect("ephemeral state opens");
         let state = Buffer::new(state, 32);
@@ -526,10 +536,14 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
                 &network,
                 None,
                 boundary,
-                state.clone(),
+                crate::transaction::boxed_state(state.clone()),
             ),
             max_checkpoint_height: boundary,
-            block: SemanticBlockVerifier::new(&network, state.clone(), transaction),
+            block: SemanticBlockVerifier::new(
+                &network,
+                crate::transaction::boxed_state(state.clone()),
+                crate::transaction::boxed_transaction_verifier(transaction),
+            ),
         };
         let mut router =
             TimeoutLayer::new(Duration::from_secs(VERIFY_TIMEOUT_SECONDS)).layer(router);
@@ -539,7 +553,7 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
                 .ready()
                 .await
                 .unwrap()
-                .call(Request::Commit(genesis.clone()))
+                .call(Request::Commit(genesis.clone().into()))
                 .await
                 .unwrap(),
             genesis.hash()
@@ -577,11 +591,12 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
         };
         let request = if mined {
             Request::CommitMined {
-                block: candidate,
+                size: candidate.zcash_serialized_size(),
+                block: candidate.into(),
                 admission: zs::BlockAdmission::pending(),
             }
         } else {
-            Request::Commit(candidate)
+            Request::Commit(candidate.into())
         };
         let candidate_response = tokio::spawn(router.ready().await.unwrap().call(request));
 
@@ -619,7 +634,7 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
                     .ready()
                     .await
                     .unwrap()
-                    .call(Request::Commit(block.clone()))
+                    .call(Request::Commit(block.clone().into()))
                     .await
                     .unwrap(),
                 block.hash(),
@@ -719,17 +734,21 @@ async fn forged_lookahead_height_is_rejected_before_checkpoint_routing() {
             ],
             &Network::Mainnet,
             Some((checkpoint_height, checkpoint_hash)),
-            state,
+            crate::transaction::boxed_state(state),
         )
         .unwrap();
         let router = BlockVerifierRouter {
             checkpoint,
             max_checkpoint_height: checkpoint_height,
-            block: SemanticBlockVerifier::new(&Network::Mainnet, state, transaction),
+            block: SemanticBlockVerifier::new(
+                &Network::Mainnet,
+                crate::transaction::boxed_state(state),
+                crate::transaction::boxed_transaction_verifier(transaction),
+            ),
         };
         let error = tokio::time::timeout(
             Duration::from_secs(5),
-            router.oneshot(Request::Commit(Arc::new(block))),
+            router.oneshot(Request::Commit(Arc::new(block).into())),
         )
         .await
         .unwrap()
@@ -817,12 +836,12 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
                 ],
                 &Network::Mainnet,
                 None,
-                unknown_block_state,
+                crate::transaction::boxed_state(unknown_block_state),
             )
             .unwrap()
         };
         let checkpoint_error = in_progress_checkpoint()
-            .oneshot(block.clone())
+            .oneshot(block.clone().into())
             .await
             .unwrap_err();
         assert_eq!(
@@ -832,11 +851,14 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
         );
 
         // Reference 2: the semantic verifier rejects the body on its Merkle root.
-        let semantic_error =
-            SemanticBlockVerifier::new(&Network::Mainnet, unknown_block_state, transaction)
-                .oneshot(Request::Commit(block.clone()))
-                .await
-                .unwrap_err();
+        let semantic_error = SemanticBlockVerifier::new(
+            &Network::Mainnet,
+            crate::transaction::boxed_state(unknown_block_state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        )
+        .oneshot(Request::Commit(block.clone().into()))
+        .await
+        .unwrap_err();
         assert_eq!(
             semantic_error.body_verification_class(),
             payload_mismatch,
@@ -850,12 +872,12 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
                 max_checkpoint_height,
                 block: SemanticBlockVerifier::new(
                     &Network::Mainnet,
-                    unknown_block_state,
-                    transaction,
+                    crate::transaction::boxed_state(unknown_block_state),
+                    crate::transaction::boxed_transaction_verifier(transaction),
                 ),
             };
             let error = router
-                .oneshot(Request::Commit(block.clone()))
+                .oneshot(Request::Commit(block.clone().into()))
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -909,16 +931,20 @@ async fn forged_height_across_upgrade_is_a_payload_mismatch() {
         ],
         &Network::Mainnet,
         Some((checkpoint_height, checkpoint_hash)),
-        state,
+        crate::transaction::boxed_state(state),
     )
     .unwrap();
     let router = BlockVerifierRouter {
         checkpoint,
         max_checkpoint_height: checkpoint_height,
-        block: SemanticBlockVerifier::new(&Network::Mainnet, state, transaction),
+        block: SemanticBlockVerifier::new(
+            &Network::Mainnet,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        ),
     };
     let error = router
-        .oneshot(Request::Commit(Arc::new(block)))
+        .oneshot(Request::Commit(Arc::new(block).into()))
         .await
         .unwrap_err();
     assert_eq!(

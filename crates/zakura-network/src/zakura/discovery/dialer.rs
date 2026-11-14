@@ -1,11 +1,18 @@
 //! Bootstrap and candidate dial entry points for native discovery.
 
-use std::{collections::HashMap, net::SocketAddr, str::FromStr};
+use std::{net::SocketAddr, str::FromStr};
 
+use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
+use zakura_rt::{
+    collections::HashMap,
+    sync::{oneshot, CancellationToken},
+    task::JoinHandle,
+};
 
 use super::{native_dial_supervised, RedialPolicy};
 use crate::zakura::{
+    handler::{DialRegistration, DialReport},
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
     DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
 };
@@ -19,7 +26,7 @@ pub(crate) fn spawn_native_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
     bootstrap_peers: Vec<String>,
     limits: ZakuraLocalLimits,
-) -> Vec<tokio::task::JoinHandle<()>> {
+) -> Vec<JoinHandle<()>> {
     if bootstrap_peers.is_empty() {
         return Vec::new();
     }
@@ -39,11 +46,56 @@ pub(crate) fn spawn_native_bootstrap_dialer(
     for node_addr in node_addrs {
         let endpoint = endpoint.clone();
         let limits = limits.clone();
-        tasks.push(tokio::spawn(async move {
-            native_dial_supervised(endpoint, node_addr, limits, policy).await
+        tasks.push(spawn_erased_named("bootstrap_dial", async move {
+            native_dial_supervised(
+                endpoint,
+                node_addr,
+                limits,
+                policy,
+                CancellationToken::new(),
+            )
+            .await;
         }));
     }
     tasks
+}
+
+/// Refuses a remote bootstrap identity, grouped as the bootstrap dialer groups
+/// them, whose dial would make more address attempts than `dial_reserve`.
+/// `attempts` counts the attempts a dial to an address set makes.
+///
+/// A maintained dial claims a transport slot for each attempt at once
+/// (zakura-quic ADM-12), so a dial needing more could never start while
+/// inbound peers and discovery fill every slot outside the reserve.
+pub(crate) fn check_bootstrap_dials_fit(
+    bootstrap_peers: &[String],
+    local_node_id: NodeId,
+    dial_reserve: usize,
+    attempts: impl Fn(&NodeAddr) -> usize,
+) -> Result<(), String> {
+    for node_addr in grouped_remote_bootstrap_peers(bootstrap_peers.to_vec(), local_node_id) {
+        let attempts = attempts(&node_addr);
+        if attempts > dial_reserve {
+            // The reserve never exceeds one record's addresses, so raising the
+            // limits helps only below that cap.
+            let remedy = if dial_reserve < super::MAX_DIRECT_ADDRS_PER_RECORD {
+                format!(
+                    "list at most {dial_reserve} for it, or raise max_connections or \
+                     max_pending_handshakes to reserve up to {}",
+                    super::MAX_DIRECT_ADDRS_PER_RECORD,
+                )
+            } else {
+                format!("list at most {dial_reserve} for it, the most one identity can use")
+            };
+            return Err(format!(
+                "zakura.bootstrap_peers gives node {} {attempts} addresses this node can dial, \
+                 but its connection limits reserve {dial_reserve} dial slots, so its \
+                 maintained dial could fail whenever inbound peers fill the table; {remedy}",
+                node_addr.id,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn grouped_remote_bootstrap_peers(
@@ -79,26 +131,45 @@ fn grouped_remote_bootstrap_peers(
         .collect()
 }
 
+/// Dials and serves a maintained connection, and reports on `registration`
+/// how its registration ended.
 pub(crate) async fn native_bootstrap_dial(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
+    registration: oneshot::Sender<DialRegistration>,
 ) -> Result<(), ZakuraHandlerError> {
-    crate::zakura::handler::serve_native_dial_connection(endpoint, node_addr, limits).await
+    // Only discovery uses the admitted address, to settle per-IP reservations
+    // and confirm the record address the dial reached.
+    let (admitted_addr, _) = oneshot::channel();
+    let report = DialReport {
+        admitted_addr,
+        registration,
+    };
+    crate::zakura::handler::serve_reported_native_dial_connection(
+        endpoint,
+        node_addr,
+        limits,
+        Some(report),
+        crate::zakura::handler::NativeDialKind::Maintained,
+    )
+    .await
 }
 
-/// Dials a discovery candidate and reports the IP whose handshake TLS authenticated.
+/// Dials a discovery candidate and reports on `report` the address whose
+/// handshake TLS authenticated and how registration ended.
 pub(crate) async fn native_discovery_dial(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
-    admitted_ip: tokio::sync::oneshot::Sender<std::net::IpAddr>,
+    report: DialReport,
 ) -> Result<(), ZakuraHandlerError> {
-    crate::zakura::handler::serve_native_dial_connection_reporting_admitted_ip(
+    crate::zakura::handler::serve_reported_native_dial_connection(
         endpoint,
         node_addr,
         limits,
-        Some(admitted_ip),
+        Some(report),
+        crate::zakura::handler::NativeDialKind::Discovery,
     )
     .await
 }
@@ -115,11 +186,117 @@ pub(crate) fn parse_bootstrap_peer(entry: &str) -> Result<NodeAddr, ZakuraHandle
     Ok(NodeAddr::with_addrs(node_id, [direct_addr]))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use crate::{BoxError, Config};
 
     use crate::zakura::{DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BOOTSTRAP_PEERS};
+
+    /// Startup refuses a remote bootstrap identity whose distinct addresses
+    /// outnumber the dial reserve its limits give, at the defaults and at
+    /// small caps, and ignores the local identity.
+    #[test]
+    fn bootstrap_dials_must_fit_the_dial_reserve() {
+        let remote = zakura_quic::NodeSecretKey::generate().public();
+        let local = zakura_quic::NodeSecretKey::generate().public();
+        let peers = |node_id: NodeId, count: u16| {
+            (0..count)
+                .map(|port| format!("{node_id}@127.0.0.1:{}", 8233 + port))
+                // A repeated address counts once.
+                .chain([format!("{node_id}@127.0.0.1:8233")])
+                .collect::<Vec<_>>()
+        };
+        let reserve = |connections: usize, pending: usize| {
+            let mut config = Config::default();
+            config.zakura.max_connections = connections;
+            config.zakura.max_pending_handshakes = pending;
+            ZakuraLocalLimits::from_config(&config)
+                .quic_bind_config(Vec::new())
+                .dial_reserve
+        };
+
+        // Every distinct address is dialable here; the transport's own count
+        // is `QuicEndpoint::dial_attempt_count`.
+        let every = |node_addr: &NodeAddr| node_addr.direct.len();
+
+        let defaults = reserve(92, 32);
+        assert_eq!(defaults, 8);
+        for list in [
+            DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
+            DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
+        ] {
+            let list = list.iter().map(|peer| peer.to_string()).collect::<Vec<_>>();
+            check_bootstrap_dials_fit(&list, local, 1, every)
+                .expect("default peers list one address each");
+        }
+        check_bootstrap_dials_fit(&peers(remote, 8), local, defaults, every)
+            .expect("a full record fits the default reserve");
+        let error = check_bootstrap_dials_fit(&peers(remote, 9), local, defaults, every)
+            .expect_err("a ninth address can't fit the default reserve");
+        assert!(
+            !error.contains("max_pending_handshakes"),
+            "raising limits can't grow a reserve already at its cap: {error}"
+        );
+
+        let small = reserve(16, 4);
+        assert_eq!(small, 5);
+        check_bootstrap_dials_fit(&peers(remote, 5), local, small, every)
+            .expect("five addresses fit");
+        let error = check_bootstrap_dials_fit(&peers(remote, 8), local, small, every)
+            .expect_err("a full record can't fit a five-slot reserve");
+        assert!(error.contains("zakura.bootstrap_peers"), "{error}");
+        assert!(error.contains("max_pending_handshakes"), "{error}");
+
+        check_bootstrap_dials_fit(&peers(local, 9), local, small, every)
+            .expect("the local identity is never dialed");
+        check_bootstrap_dials_fit(&peers(remote, 8), local, small, |_| small)
+            .expect("only the addresses the transport would dial count");
+    }
+
+    /// The discovery caller uses the lower transport ceiling and reports a
+    /// local limit when a small configuration has room only for inbound peers.
+    #[tokio::test]
+    async fn discovery_dial_uses_the_inbound_preserving_limit() -> Result<(), BoxError> {
+        use crate::zakura::testkit::ZakuraTestNode;
+        use crate::zakura::ZakuraLocalLimits;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let limits = ZakuraLocalLimits {
+                max_connections: 1,
+                max_pending_handshakes: 1,
+                ..ZakuraLocalLimits::from_config(&Config::default())
+            };
+            let node = ZakuraTestNode::builder(151_508)
+                .limits(limits.clone())
+                .spawn()
+                .await?;
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let target = NodeAddr::with_addrs(
+                zakura_quic::NodeSecretKey::generate().public(),
+                [silent.local_addr()?],
+            );
+            let endpoint = node.endpoint();
+            assert_eq!(endpoint.discovery_admission_capacity(), 0);
+            let (admitted_addr, _admitted_rx) = tokio::sync::oneshot::channel();
+            let (registration, _registration_rx) = tokio::sync::oneshot::channel();
+            let report = DialReport {
+                admitted_addr,
+                registration,
+            };
+            let result = tokio::time::timeout(
+                Duration::from_millis(200),
+                native_discovery_dial(&endpoint, target, &limits, report),
+            )
+            .await?;
+            assert!(matches!(result, Err(ref error) if error.is_pre_dial_limit()));
+            node.shutdown().await;
+            Ok::<_, BoxError>(())
+        })
+        .await?
+    }
 
     #[test]
     fn bootstrap_peer_requires_node_id_and_direct_address() {

@@ -5,7 +5,6 @@ use crate::{
 
 use crate::primitives::zcash_history::Version as ZebraHistoryVersion;
 use crate::primitives::zcash_history::*;
-use color_eyre::eyre;
 use eyre::Result;
 use zakura_mmr_tree::Version as ZcashHistoryVersion;
 

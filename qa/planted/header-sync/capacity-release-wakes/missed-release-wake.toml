@@ -1,0 +1,15 @@
+# Returning headers to the chunk budget no longer wakes the reactor. The
+# input's release comes from a completion drained at the top of the
+# reactor's loop, so the turn then blocks in its `select!` with the
+# waiting offer unscheduled, and only the release wake would get it back
+# to the offer. The violation comes when the reactor first goes quiet with
+# the wake open, before the clock moves again. The fixture lets
+# `mirror-1`'s held prepare run only once the clock is past the wake's
+# deadline, so that release can't hide the bug, and a run that goes on
+# past the violation ends with nothing held.
+input ="crates/zakura-sim/tests/fixtures/header-release-wake.bin"
+# Besides peer_work.rs, which the patch changes, the reactor's loop decides
+# where in a turn the completion is drained, and the queue and the offer
+# policy decide when the offer waits for room. A change there can move the
+# input off its top-of-loop release.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

@@ -1,16 +1,9 @@
 //! Zakura protocol service trait surface.
 
-use std::{
-    collections::HashMap,
-    fmt,
-    future::Future,
-    net::IpAddr,
-    pin::Pin,
-    time::{Duration, Instant},
-};
+use std::{fmt, future::Future, net::IpAddr, pin::Pin, time::Duration};
 
 use thiserror::Error;
-use tokio_util::sync::CancellationToken;
+use zakura_rt::{collections::HashMap, sync::CancellationToken, time::Instant};
 
 use super::{CloseCause, FramedRecv, FramedSend, MessageRule};
 use crate::{
@@ -39,6 +32,84 @@ pub enum SessionOpening {
     InitiatorOnly,
     /// Either endpoint may open the stream; simultaneous opens use the transport tiebreak.
     EitherSide,
+}
+
+/// One step of a service's session lifecycle on a connection.
+///
+/// A service session has three identities. An attempt counts this endpoint's
+/// local opens of the service. A wire ID names the members of one inbound
+/// multi-stream offer. A generation is the local ID of one admitted session.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SessionStep {
+    /// This endpoint started opening the service.
+    AttemptStarted {
+        /// The attempt.
+        attempt: u64,
+    },
+    /// A local open failed before the session started.
+    AttemptFailed {
+        /// The attempt.
+        attempt: u64,
+    },
+    /// A member of an inbound offer finished setup.
+    MemberArrived {
+        /// The offer's wire ID, zero for a single-stream session.
+        wire_id: u64,
+        /// The member's stream kind.
+        member: u16,
+    },
+    /// An incomplete inbound offer expired and released its members.
+    OfferExpired {
+        /// The offer's wire ID.
+        wire_id: u64,
+    },
+    /// A generation started all its workers.
+    GenerationInstalled {
+        /// The generation.
+        generation: u64,
+        /// The attempt that opened it, or `None` for a peer-opened session.
+        attempt: Option<u64>,
+    },
+    /// This endpoint refused a complete inbound generation and is retiring it.
+    GenerationParked {
+        /// The generation.
+        generation: u64,
+    },
+    /// Every worker of a generation finished.
+    GenerationExited {
+        /// The generation.
+        generation: u64,
+        /// Whether this endpoint opened it.
+        opened_locally: bool,
+        /// Whether the state still recorded it. A false value means a stale exit.
+        current: bool,
+    },
+}
+
+impl SessionStep {
+    /// The trace row's event name.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::AttemptStarted { .. } => "session.attempt_started",
+            Self::AttemptFailed { .. } => "session.attempt_failed",
+            Self::MemberArrived { .. } => "session.member_arrived",
+            Self::OfferExpired { .. } => "session.offer_expired",
+            Self::GenerationInstalled { .. } => "session.generation_installed",
+            Self::GenerationParked { .. } => "session.generation_parked",
+            Self::GenerationExited { .. } => "session.generation_exited",
+        }
+    }
+
+    /// The trace row's identity: the attempt, wire ID, or generation.
+    pub(crate) fn identity(self) -> u64 {
+        match self {
+            Self::AttemptStarted { attempt } | Self::AttemptFailed { attempt } => attempt,
+            Self::MemberArrived { wire_id, .. } | Self::OfferExpired { wire_id } => wire_id,
+            Self::GenerationInstalled { generation, .. }
+            | Self::GenerationParked { generation }
+            | Self::GenerationExited { generation, .. } => generation,
+        }
+    }
 }
 
 /// Static transport policy for one persistent service session.
@@ -189,6 +260,9 @@ pub(crate) struct ServiceStream {
     pub(crate) recv: FramedRecv,
     pub(crate) send: FramedSend,
     pub(crate) cancel_token: CancellationToken,
+    /// Where the stream's session came from, if its builder said.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) origin: Option<SessionOrigin>,
 }
 
 impl ServiceStream {
@@ -205,8 +279,38 @@ impl ServiceStream {
             recv,
             send,
             cancel_token,
+            #[cfg(any(test, zakura_sim))]
+            origin: None,
         }
     }
+}
+
+/// Reads the first cause recorded for a connection's close, such as
+/// `service_protocol_reject`.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Debug)]
+pub struct CloseCauseReader(CloseCause);
+
+#[cfg(any(test, zakura_sim))]
+impl CloseCauseReader {
+    /// The first recorded cause, or `None` while no path recorded one.
+    pub fn get(&self) -> Option<&'static str> {
+        self.0.get()
+    }
+}
+
+/// Where a service session came from: its connection, QUIC stream and
+/// service generation. It travels with the session apart from the session ID
+/// the service is handed, so a simulator check can compare the two.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionOrigin {
+    /// The connection that carries the session.
+    pub connection: ZakuraConnId,
+    /// The session's QUIC stream ID, or `None` on an in-memory link.
+    pub quic_stream: Option<u64>,
+    /// The service generation the transport installed for it.
+    pub generation: u64,
 }
 
 /// Per-peer transport state handed to a service when a peer connects.
@@ -265,6 +369,52 @@ impl Peer {
             direction,
             streams,
             cancel_token,
+        )
+    }
+
+    /// Build a peer that carries one persistent stream of kind `stream_kind`
+    /// at `version`, in service session `session_id`, as the transport hands
+    /// it to a service after admitting that session.
+    ///
+    /// [`Peer::new`] and [`Peer::new_with_direction`] leave every stream at
+    /// version 0, which a service that checks its stream version refuses.
+    /// This is the in-memory way to open a versioned session, such as a
+    /// simulator linking two nodes with [`framed_channel`](super::framed_channel)s.
+    ///
+    /// The peer has no remote IP and a fresh close cause. Its stream's
+    /// cancellation token is a child of `cancel_token`, so cancelling
+    /// `cancel_token` closes the connection and the session with it.
+    ///
+    /// A session that replaces another needs a `conn_id` greater than the
+    /// current connection's for that peer, since [`ZakuraConnId`]s only
+    /// increase and header sync refuses a session from an older connection.
+    /// It also needs a new token and a `session_id` never used before for
+    /// the same peer. Header sync matches a session's teardown by peer and
+    /// session ID alone, so a reused ID would let the replaced session's
+    /// late teardown remove its replacement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_versioned(
+        conn_id: ZakuraConnId,
+        id: ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+        stream_kind: u16,
+        version: u16,
+        session_id: u64,
+        (recv, send): (FramedRecv, FramedSend),
+        cancel_token: CancellationToken,
+    ) -> Self {
+        let stream =
+            ServiceStream::new(session_id, version, recv, send, cancel_token.child_token());
+        Self::new_with_service_streams(
+            conn_id,
+            id,
+            None,
+            negotiated,
+            direction,
+            HashMap::from([(stream_kind, stream)]),
+            cancel_token,
+            CloseCause::new(),
         )
     }
 
@@ -376,6 +526,24 @@ impl Peer {
         }
     }
 
+    /// This peer, with every stream it carries reporting `origin` as where
+    /// its session came from. An in-memory peer from [`Peer::new_versioned`]
+    /// carries one stream, so its one session takes `origin`.
+    #[cfg(any(test, zakura_sim))]
+    pub fn with_origin(mut self, origin: SessionOrigin) -> Self {
+        for stream in self.streams.values_mut() {
+            stream.origin = Some(origin);
+        }
+        self
+    }
+
+    /// Where the session of this peer's `kind` stream came from, if its
+    /// builder said.
+    #[cfg(any(test, zakura_sim))]
+    pub fn origin(&self, kind: u16) -> Option<SessionOrigin> {
+        self.streams.get(&kind).and_then(|stream| stream.origin)
+    }
+
     /// Take ownership of a stream's receive and send handles for `kind`.
     pub fn take_stream(&mut self, kind: u16) -> Option<(FramedRecv, FramedSend)> {
         self.streams
@@ -422,6 +590,22 @@ impl Peer {
     /// Return the shared first-cause connection close recorder.
     pub(crate) fn close_cause(&self) -> CloseCause {
         self.close_cause.clone()
+    }
+
+    /// Makes `reader` the reader of this peer's stream: a frame it refuses
+    /// records its close cause on this connection and closes it.
+    #[cfg(any(test, zakura_sim))]
+    pub fn read_through(&self, reader: &super::StreamReader) {
+        reader.bind(self.close_cause.clone(), self.cancel_token.clone());
+    }
+
+    /// Return a reader for the cause of this peer's connection close.
+    ///
+    /// A service takes the peer by value, so the simulator keeps this reader
+    /// from before [`Service::add_peer`] to see why the connection closed.
+    #[cfg(any(test, zakura_sim))]
+    pub fn close_cause_reader(&self) -> CloseCauseReader {
+        CloseCauseReader(self.close_cause.clone())
     }
 
     /// Split this peer into fields so the registry can fan streams out by owner.
@@ -576,6 +760,11 @@ pub trait RequestResponseService: Service {
     /// is the peer's negotiated full-message cap. Responders must size outbound
     /// frame payloads against the smaller of the two so the peer never receives
     /// a frame larger than its accepted message cap.
+    ///
+    /// The future must return every [`SinkReject::Protocol`] before its first
+    /// `Pending`. The request worker drops a call whose requester stopped the
+    /// response stream, and it sees the stop only after the call is pending,
+    /// so a later protocol rejection would go unreported.
     fn request_frame<'a>(
         &'a self,
         peer_id: ZakuraPeerId,
@@ -585,6 +774,19 @@ pub trait RequestResponseService: Service {
         max_message_bytes: u32,
         frame: Frame,
     ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>>;
+
+    /// Runs the protocol checks `request_frame` runs on `frame`, without its
+    /// work, and returns the same [`SinkReject::Protocol`] for a frame that
+    /// breaks the protocol.
+    ///
+    /// The request worker calls this when the requester stops the response
+    /// stream before `request_frame` is polled, so a stop never hides a
+    /// protocol fault. It must not start backend work or allocate a response.
+    /// A service whose `request_frame` can return `SinkReject::Protocol` must
+    /// override it with the same checks. The default accepts every frame.
+    fn check_request(&self, _stream_kind: u16, _frame: &Frame) -> Result<(), SinkReject> {
+        Ok(())
+    }
 }
 
 /// A per-stream reader owned by a service.

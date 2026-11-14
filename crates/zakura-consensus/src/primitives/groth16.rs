@@ -1,15 +1,15 @@
 //! Async Groth16 verifier service for Sprout JoinSplit proofs
 
 use std::fmt;
+use std::sync::LazyLock;
 
 use bellman::{
     gadgets::multipack,
-    groth16::{batch, PreparedVerifyingKey, VerifyingKey},
+    groth16::{batch, PreparedVerifyingKey},
     VerificationError,
 };
 use bls12_381::Bls12;
 use futures::{future::BoxFuture, FutureExt};
-use once_cell::sync::Lazy;
 
 use tokio::sync::watch;
 use tower::util::ServiceFn;
@@ -18,11 +18,9 @@ use super::batch_control::RequestWeight;
 use super::fallback::BoxedError;
 
 use zakura_chain::{
-    primitives::{
-        ed25519::{self, VerificationKeyBytes},
-        Groth16Proof,
-    },
+    primitives::Groth16Proof,
     sprout::{JoinSplit, Nullifier, RandomSeed},
+    transaction::JoinSplitPubKey,
 };
 
 use crate::BoxError;
@@ -65,10 +63,6 @@ impl Item {
     }
 }
 
-/// The type of a raw verifying key.
-/// This is the key used to verify batches.
-pub type BatchVerifyingKey = VerifyingKey<Bls12>;
-
 /// The type of a prepared verifying key.
 /// This is the key used to verify individual items.
 pub type ItemVerifyingKey = PreparedVerifyingKey<Bls12>;
@@ -81,9 +75,9 @@ pub type ItemVerifyingKey = PreparedVerifyingKey<Bls12>;
 /// Note that making a `Service` call requires mutable access to the service, so
 /// you should call `.clone()` on the global handle to create a local, mutable
 /// handle.
-pub static JOINSPLIT_VERIFIER: Lazy<
+pub static JOINSPLIT_VERIFIER: LazyLock<
     ServiceFn<fn(Item) -> BoxFuture<'static, Result<(), BoxedError>>>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     // We just need a Service to use: there is no batch verification for JoinSplits.
     //
     // See the note on [`SPEND_VERIFIER`] for details.
@@ -113,7 +107,7 @@ pub(super) fn h_sig(
     random_seed: &RandomSeed,
     nf1: &Nullifier,
     nf2: &Nullifier,
-    joinsplit_pub_key: &VerificationKeyBytes,
+    joinsplit_pub_key: &JoinSplitPubKey,
 ) -> [u8; 32] {
     let h_sig: [u8; 32] = blake2b_simd::Params::new()
         .hash_length(32)
@@ -149,7 +143,7 @@ impl Item {
     #[allow(clippy::needless_borrow)]
     pub fn from_joinsplit(
         joinsplit: &JoinSplit<Groth16Proof>,
-        joinsplit_pub_key: &ed25519::VerificationKeyBytes,
+        joinsplit_pub_key: &JoinSplitPubKey,
     ) -> Result<Self, TransactionError> {
         let rt: [u8; 32] = joinsplit.anchor.into();
         let mac1: [u8; 32] = (&joinsplit.vmacs[0]).into();

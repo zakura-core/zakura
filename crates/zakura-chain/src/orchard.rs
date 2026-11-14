@@ -3,9 +3,9 @@
 #![warn(missing_docs)]
 
 mod action;
-mod address;
 mod commitment;
 mod note;
+#[cfg(test)]
 mod sinsemilla;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -18,8 +18,7 @@ pub mod shielded_data;
 pub mod tree;
 
 pub use action::Action;
-pub use address::Address;
-pub use commitment::{CommitmentRandomness, NoteCommitment, ValueCommitment};
-pub use keys::Diversifier;
+pub(crate) use action::ActionEncoding;
+pub use commitment::ValueCommitment;
 pub use note::{EncryptedNote, Nullifier, WrappedNoteKey};
 pub use shielded_data::{AuthorizedAction, Flags, ShieldedData};

@@ -1,0 +1,12 @@
+//! Domain properties: claims about one subsystem of the node, each a
+//! [`Property`](crate::property::Property) a harness registers.
+
+pub mod block_sync;
+pub mod block_sync_semantic;
+pub mod connection;
+pub mod cross;
+pub mod discovery;
+pub mod header_sync;
+pub mod header_sync_progress;
+pub mod session;
+pub mod shared;

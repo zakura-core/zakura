@@ -23,7 +23,8 @@ use crate::{
 use itertools::Itertools;
 
 use super::{
-    FieldNotPresent, JoinSplitData, LockTime, Memo, Transaction, UnminedTx, VerifiedUnminedTx,
+    FieldNotPresent, JoinSplitData, JoinSplitPubKey, JoinSplitSig, LockTime, Transaction,
+    UnminedTx, VerifiedUnminedTx,
 };
 
 /// The maximum number of arbitrary transactions, inputs, or outputs.
@@ -63,7 +64,7 @@ impl Transaction {
                     inputs,
                     outputs,
                     lock_time,
-                    joinsplit_data,
+                    joinsplit_data: joinsplit_data.map(Box::new),
                 },
             )
             .boxed()
@@ -84,7 +85,7 @@ impl Transaction {
                     outputs,
                     lock_time,
                     expiry_height,
-                    joinsplit_data,
+                    joinsplit_data: joinsplit_data.map(Box::new),
                 },
             )
             .boxed()
@@ -118,13 +119,13 @@ impl Transaction {
                             // The genesis block should not contain any joinsplits.
                             None
                         } else {
-                            joinsplit_data
+                            joinsplit_data.map(Box::new)
                         },
                         sapling_shielded_data: if ledger_state.height.is_min() {
                             // The genesis block should not contain any shielded data.
                             None
                         } else {
-                            sapling_shielded_data
+                            sapling_shielded_data.map(Box::new)
                         },
                     }
                 },
@@ -167,13 +168,13 @@ impl Transaction {
                             // The genesis block should not contain any shielded data.
                             None
                         } else {
-                            sapling_shielded_data
+                            sapling_shielded_data.map(Box::new)
                         },
                         orchard_shielded_data: if ledger_state.height.is_min() {
                             // The genesis block should not contain any shielded data.
                             None
                         } else {
-                            orchard_shielded_data
+                            orchard_shielded_data.map(Box::new)
                         },
                     }
                 },
@@ -518,22 +519,6 @@ impl Transaction {
     }
 }
 
-impl Arbitrary for Memo {
-    type Parameters = ();
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        (vec(any::<u8>(), 512))
-            .prop_map(|v| {
-                let mut bytes = [0; 512];
-                bytes.copy_from_slice(v.as_slice());
-                Memo(Box::new(bytes))
-            })
-            .boxed()
-    }
-
-    type Strategy = BoxedStrategy<Self>;
-}
-
 /// Generates arbitrary [`LockTime`]s.
 impl Arbitrary for LockTime {
     type Parameters = ();
@@ -569,8 +554,8 @@ impl<P: ZkSnarkProof + Arbitrary + 'static> Arbitrary for JoinSplitData<P> {
             .prop_map(|(first, rest, pub_key_bytes, sig_bytes)| Self {
                 first,
                 rest,
-                pub_key: ed25519_zebra::VerificationKeyBytes::from(pub_key_bytes),
-                sig: ed25519_zebra::Signature::from({
+                pub_key: JoinSplitPubKey(pub_key_bytes),
+                sig: JoinSplitSig({
                     let mut b = [0u8; 64];
                     b.copy_from_slice(sig_bytes.as_slice());
                     b
@@ -949,8 +934,10 @@ pub fn transaction_to_fake_v5(
             lock_time: *lock_time,
             expiry_height: height,
             sapling_shielded_data: sapling_shielded_data
-                .clone()
-                .and_then(sapling_shielded_v4_to_fake_v5),
+                .as_deref()
+                .cloned()
+                .and_then(sapling_shielded_v4_to_fake_v5)
+                .map(Box::new),
             orchard_shielded_data: None,
         },
         v5 @ V5 { .. } => v5.clone(),
@@ -1103,7 +1090,7 @@ pub fn insert_fake_orchard_shielded_data(
             orchard_shielded_data,
             ..
         } => {
-            *orchard_shielded_data = Some(dummy_shielded_data);
+            *orchard_shielded_data = Some(Box::new(dummy_shielded_data));
 
             orchard_shielded_data
                 .as_mut()
@@ -1158,7 +1145,7 @@ pub fn fake_v5_with_sapling_outputs(count: usize) -> Arc<Transaction> {
         Transaction::V5 {
             sapling_shielded_data,
             ..
-        } => *sapling_shielded_data = Some(shielded_data),
+        } => *sapling_shielded_data = Some(Box::new(shielded_data)),
         _ => unreachable!("empty_v5_transaction returns a V5 transaction"),
     }
 
@@ -1198,7 +1185,7 @@ pub fn fake_v6_with_orchard_and_ironwood_actions(
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: fake_orchard_protocol_shielded_data(orchard_actions),
+        orchard_shielded_data: fake_orchard_protocol_shielded_data(orchard_actions).map(Box::new),
         ironwood_shielded_data: fake_orchard_protocol_shielded_data(ironwood_actions),
     })
 }

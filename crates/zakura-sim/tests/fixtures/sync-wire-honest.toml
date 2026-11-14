@@ -1,0 +1,9 @@
+# The committed fuzz input `sync-wire-honest.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `honest` scenario, and
+# `sync-wire-honest.end.json` is its pinned end record.
+harness = "sync/wire"
+generator = 4
+sha256 = "0ae7b0503ae77d153e4747c652deeaba896527ea5199e0771d69be32ef26f03a"
+scenario_sha256 = "7cf4230992826371d11e350bd0797d8f60b3eb47c9bdab4b2f767d798a2594cd"
+source = "crates/zakura-sim/tests/sync_wire.rs"

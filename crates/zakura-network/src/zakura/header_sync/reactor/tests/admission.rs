@@ -1,4 +1,5 @@
 use super::*;
+use tokio::time;
 
 #[test]
 fn committed_header_generation_reconsiders_the_cached_peer_target() {
@@ -23,7 +24,8 @@ fn committed_header_generation_reconsiders_the_cached_peer_target() {
         .status
         .clone();
     reactor
-        .peer_state
+        .state
+        .peers
         .get_mut(&peer)
         .expect("the peer is connected")
         .last_status = Some(advertised.clone());
@@ -83,6 +85,7 @@ fn committed_resource_stall_is_terminal_without_retry_or_peer_fault() {
 
     assert!(reactor.peer_work_queue.active(&peer).is_none());
     assert!(!reactor
+        .state
         .completed_targets
         .contains(owner.header_authority().header_generation, branch));
     assert!(
@@ -114,6 +117,7 @@ fn committed_snapshot_retires_in_flight_state_results() {
         });
         assert!(
             reactor
+                .state
                 .completed_targets
                 .contains(owner.header_authority().header_generation, branch),
             "the current-result control proves the live handler can mark completion"
@@ -156,6 +160,7 @@ fn committed_snapshot_retires_in_flight_state_results() {
 
         assert!(reactor.peer_work_queue.active(&peer).is_none());
         assert!(!reactor
+            .state
             .completed_targets
             .contains(owner.header_authority().header_generation, old_branch));
         let published_tip = handle.best_header_tip();
@@ -173,6 +178,7 @@ fn committed_snapshot_retires_in_flight_state_results() {
         assert_eq!(handle.best_header_tip(), published_tip);
         assert_eq!(handle.candidate_state(), published_candidates);
         assert!(!reactor
+            .state
             .completed_targets
             .contains(owner.header_authority().header_generation, old_branch));
         assert!(matches!(
@@ -240,7 +246,7 @@ fn monotone_finality_records_an_exact_rebased_apply_completion() {
         actions.try_recv().is_err(),
         "the completed state call emits no duplicate action or peer score"
     );
-    assert!(reactor.completed_targets.contains(
+    assert!(reactor.state.completed_targets.contains(
         completion_authority.header_generation,
         completion_authority.branch,
     ));
@@ -385,13 +391,7 @@ async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or
         .recv()
         .await
         .expect("the initial committed status is sent");
-    assert!(matches!(
-        handle
-            .codec()
-            .decode_frame(initial_status, None)
-            .expect("the initial status decodes"),
-        HeaderSyncMessage::Status(_)
-    ));
+    decode_status(initial_status);
 
     let (source, owner, old_branch) =
         seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
@@ -404,6 +404,7 @@ async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or
 
     assert!(reactor.peer_work_queue.active(&peer).is_none());
     assert!(!reactor
+        .state
         .completed_targets
         .contains(owner.header_authority().header_generation, old_branch));
     assert!(
@@ -461,22 +462,16 @@ async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or
         .recv()
         .await
         .expect("the bounded status floor eventually publishes the new anchor");
-    let HeaderSyncMessage::Status(status) = handle
-        .codec()
-        .decode_frame(refreshed, None)
-        .expect("the refreshed status decodes")
-    else {
-        panic!("the re-anchor publication must be Status");
-    };
+    let status = decode_status(refreshed);
     assert_eq!(status.work_anchor_height, replacement.height);
     assert_eq!(status.work_anchor_hash, replacement.hash);
     assert_eq!(status.selected_tip_height, replacement.height);
     assert_eq!(status.selected_tip_hash, replacement.hash);
     assert!(
         !reactor
-            .peer_state
+            .sessions
             .get(&peer)
-            .and_then(|state| state.status_publisher.as_ref())
+            .and_then(|handles| handles.status_publisher.as_ref())
             .expect("the connected peer retains its publisher")
             .due(Instant::now()),
         "one refreshed publication satisfies the changed status"
@@ -527,6 +522,7 @@ fn restart_drops_old_preparation_and_admission_completions() {
     assert_eq!(same_handle.candidate_state(), same_candidates);
     assert!(same_reactor.peer_work_queue.active(&peer).is_none());
     assert!(!same_reactor
+        .state
         .completed_targets
         .contains(owner.header_authority().header_generation, old_branch));
     assert!(matches!(
@@ -575,6 +571,7 @@ fn restart_drops_old_preparation_and_admission_completions() {
     assert_eq!(committed_handle.candidate_state(), committed_candidates);
     assert!(committed_reactor.peer_work_queue.active(&peer).is_none());
     assert!(!committed_reactor
+        .state
         .completed_targets
         .contains(owner.header_authority().header_generation, old_branch));
     assert!(matches!(
@@ -616,15 +613,15 @@ async fn restart_rejects_old_ordered_stream_response() {
         .pop()
         .expect("the fixture has one response entry");
     let stale_response = Headers {
-        request_id: old_active.request_id.get(),
-        target_tip_hash: old_active.target.status.selected_tip_hash,
+        subscription_id: old_active.request_id.get(),
+        initial_target_tip_hash: old_active.target.status.selected_tip_hash,
         common_ancestor_height: anchor.height,
         common_ancestor_hash: anchor.hash,
-        complete: true,
+        reaches_initial_target: true,
         tree_aux_schema: AuxSchema::None,
         entries: vec![response_entry],
     };
-    let stale_scope = old_active.owner.header_authority();
+    let _stale_scope = old_active.owner.header_authority();
     drop(old_reactor);
 
     let mut fresh_startup = startup(CancellationToken::new());
@@ -645,13 +642,7 @@ async fn restart_rejects_old_ordered_stream_response() {
         .recv()
         .await
         .expect("the replacement stream receives its initial status");
-    assert!(matches!(
-        fresh_handle
-            .codec()
-            .decode_frame(status, None)
-            .expect("the replacement status decodes"),
-        HeaderSyncMessage::Status(_)
-    ));
+    decode_status(status);
     let _ = seed_applying_request(&mut fresh_reactor, &snapshot, peer.clone(), 8);
     let fresh_active = fresh_reactor
         .peer_work_queue
@@ -664,16 +655,11 @@ async fn restart_rejects_old_ordered_stream_response() {
     let published_tip = fresh_handle.best_header_tip();
     let published_candidates = fresh_handle.candidate_state();
 
-    fresh_reactor.handle_event(Event::SessionResponse {
-        peer: peer.clone(),
-        session_id: 7,
-        scope: stale_scope,
-        msg: HeaderSyncMessage::Headers(stale_response),
-    });
+    fresh_reactor.deliver_page(peer.clone(), 7, stale_response);
 
     assert_eq!(
         fresh_reactor
-            .peer_state
+            .sessions
             .get(&peer)
             .expect("the replacement peer remains connected")
             .session
@@ -758,13 +744,7 @@ async fn peer_admission_catches_up_snapshot_before_initial_status() {
         .await
         .expect("the initial status is sent promptly")
         .expect("the peer outbound remains open");
-    let HeaderSyncMessage::Status(status) = handle
-        .codec()
-        .decode_frame(status_frame, None)
-        .expect("the initial status decodes")
-    else {
-        panic!("the first session message must be the committed status");
-    };
+    let status = decode_status(status_frame);
     assert_eq!(status.selected_tip_height, header_best.height);
     assert_eq!(status.selected_tip_hash, header_best.hash);
 
@@ -800,7 +780,7 @@ fn verified_progress_reopens_refill_without_a_status_refresh_or_reanchor() {
             .status
             .clone();
         advertised.selected_tip_height = block::Height(anchor.height.0 + target_height);
-        reactor.peer_state.get_mut(&peer).unwrap().last_status = Some(advertised.clone());
+        reactor.state.peers.get_mut(&peer).unwrap().last_status = Some(advertised.clone());
         reactor.clear_peer_work_for_test(&peer);
         let caught_up_peer = ZakuraPeerId::new(vec![0x72; 32]).unwrap();
         let (send, _caught_up_outbound) = framed_channel(8);
@@ -814,7 +794,8 @@ fn verified_progress_reopens_refill_without_a_status_refresh_or_reanchor() {
         caught_up.selected_tip_height = initial.frontiers.header_best.height;
         caught_up.selected_tip_hash = initial.frontiers.header_best.hash;
         reactor
-            .peer_state
+            .state
+            .peers
             .get_mut(&caught_up_peer)
             .unwrap()
             .last_status = Some(caught_up);
@@ -860,16 +841,19 @@ fn verified_progress_reopens_refill_without_a_status_refresh_or_reanchor() {
 
 #[test]
 fn retiring_repair_reopens_refill_at_the_batch_boundary() {
-    assert_retiring_repair_reopens_refill(400);
+    assert_retiring_repair_reopens_refill(400, false);
 }
 
 #[test]
 fn retiring_repair_preserves_refill_above_the_batch_boundary() {
-    assert_retiring_repair_reopens_refill(401);
+    assert_retiring_repair_reopens_refill(401, true);
 }
 
 /// Exercise a real repair reservation without another peer status or header authority change.
-fn assert_retiring_repair_reopens_refill(initial_window: u32) {
+///
+/// `window_open` says whether the initial body window admits an ordinary request. A closed
+/// window leaves the status unspent instead of spending a locator read on it.
+fn assert_retiring_repair_reopens_refill(initial_window: u32, window_open: bool) {
     let frontier = |height: u32| {
         let mut hash = [0; 32];
         hash[..4].copy_from_slice(&height.to_le_bytes());
@@ -884,10 +868,11 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32) {
     startup.committed_snapshots = Some(snapshots_rx);
     let (_handle, mut actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
     let peer = peer();
-    let (send, _outbound) = framed_channel(8);
+    let (send, mut outbound) = framed_channel(8);
     reactor.handle_event(Event::PeerConnected(
         PeerSession::from_parts_with_session_id(peer.clone(), 7, send, CancellationToken::new()),
     ));
+    decode_status(outbound.try_recv().expect("the initial status was sent"));
     reactor.observe_vct_root_repair(zakura_header_chain::VctRootRepairStatus {
         state: zakura_header_chain::VctRootRepairState::Unavailable {
             height: block::Height(500),
@@ -899,10 +884,10 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32) {
         panic!("the repair must request its context");
     };
     let target = frontier(20_000);
-    reactor.handle_wire_message(
+    reactor.handle_status(
         peer.clone(),
         7,
-        HeaderSyncMessage::Status(Status {
+        Status {
             work_anchor_height: anchor.height,
             work_anchor_hash: anchor.hash,
             selected_tip_height: target.height,
@@ -910,16 +895,20 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32) {
             suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(20_000_u32),
             oldest_retained_height: anchor.height,
             max_headers_per_response: 401,
-            max_inflight_requests: 1,
+            max_subscriptions: 1,
             max_message_bytes: 2_000_000,
             tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-        }),
+        },
     );
-    assert!(matches!(
-        actions.try_recv().unwrap(),
-        HeaderPortOperation::QueryHeaderLocator { .. }
-    ));
-    // The repair takes the peer slot while the ordinary locator query is outstanding.
+    if window_open {
+        assert!(matches!(
+            actions.try_recv().unwrap(),
+            HeaderPortOperation::QueryHeaderLocator { .. }
+        ));
+    } else {
+        assert!(actions.try_recv().is_err());
+    }
+    // The repair takes the peer slot, including any outstanding ordinary locator query.
     let selected: Vec<_> = (500..901).map(frontier).collect();
     let context = zakura_header_chain::VctRepairContext::from_durable_rows(
         selected[0],
@@ -940,6 +929,11 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32) {
     assert_eq!(reactor.peer_work_queue.reserved_header_count(&peer), 401);
     assert_eq!(reactor.peer_work_queue.claimed_header_count(), 401);
     assert!(actions.try_recv().is_err());
+    let repair_open = update(
+        outbound
+            .try_recv()
+            .expect("the repair opens a subscription"),
+    );
 
     for (advance, expected_queries) in [(1, 1), (2, 0)] {
         snapshot.frontiers.verified_best = frontier(initial_window + advance);
@@ -947,6 +941,26 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32) {
         snapshot.state_version = snapshot.state_version.checked_next().unwrap();
         reactor.observe_latest_committed_snapshot(snapshot.clone());
         assert_eq!(reactor.peer_work_queue.claimed_header_count(), 0);
+        if advance == 1 {
+            assert!(
+                std::iter::from_fn(|| actions.try_recv().ok()).all(|action| !matches!(
+                    action,
+                    HeaderPortOperation::QueryHeaderLocator { .. }
+                )),
+                "refill waits for the retired repair's subscription to end"
+            );
+            let session = reactor.sessions[&peer].session.clone();
+            reactor.handle_event(outcome_event(
+                &session,
+                HeadersOutcome {
+                    subscription_id: repair_open.subscription_id,
+                    initial_target_tip_hash: repair_open.initial_target_tip_hash,
+                    outcome: HeadersOutcomeCode::SubscriptionClosed,
+                },
+            ));
+            // The run loop schedules cached statuses after every event.
+            reactor.schedule_cached_statuses();
+        }
         let mut locator_queries = 0;
         while let Ok(action) = actions.try_recv() {
             match action {
@@ -965,7 +979,7 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32) {
         }
         assert_eq!(
             locator_queries, expected_queries,
-            "retiring the repair must wake refill once, without waiting for peer status"
+            "ending the repair must wake refill once, without waiting for peer status"
         );
     }
 }
@@ -988,14 +1002,18 @@ fn apply_completion_observes_committed_headers_before_reusing_capacity() {
     committed.state_version = committed.state_version.checked_next().unwrap();
     snapshots_tx.send_replace(Some(committed.clone()));
 
-    reactor.handle_port_completion(PortOperationResult::Completed(Box::new(move |reactor| {
-        reactor.handle_header_target_admission_ready(
+    let call = reactor.state.calls.propose(StorageCallKind::Apply);
+    reactor.state.calls.accept(call);
+    reactor.handle_port_completion(StorageOutcome::Completed {
+        call,
+        completion: Box::new(StorageCompletion::TargetAdmission {
             peer,
             source,
             owner,
-            HeaderTargetAdmissionResult::Applied,
-        );
-    })));
+            result: HeaderTargetAdmissionResult::Applied,
+        }),
+        retained: None,
+    });
 
     assert_eq!(reactor.peer_work_queue.claimed_header_count(), 0);
     assert_eq!(reactor.committed_snapshot.as_ref(), Some(&committed));

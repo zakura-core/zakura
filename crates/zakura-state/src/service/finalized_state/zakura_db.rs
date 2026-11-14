@@ -25,6 +25,7 @@ use crate::{
             block::MAX_ON_DISK_HEIGHT,
             upgrade::{DbFormatChange, DbFormatChangeThreadHandle},
         },
+        static_file::{blocks_per_file, StaticFiles, STATIC_FILE_DIR},
     },
     write_database_format_version_to_disk, BoxError, Config, StateInitError,
 };
@@ -60,6 +61,7 @@ pub(crate) const PARALLEL_BLOCK_READ_THRESHOLD: usize = 16;
 pub mod prune;
 pub mod rollback;
 pub mod shielded;
+pub(crate) mod static_file;
 pub mod transparent;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -149,6 +151,9 @@ pub struct ZakuraDb {
 
     /// The inner low-level database wrapper for the RocksDB database.
     db: DiskDb,
+
+    /// Finalized transaction bodies moved out of `tx_by_loc`, see [`static_file`].
+    static_files: Arc<StaticFiles>,
 }
 
 impl ZakuraDb {
@@ -256,13 +261,31 @@ impl ZakuraDb {
             read_only,
         )?;
 
+        let static_file_dir = disk_db.path().join(STATIC_FILE_DIR);
+        let static_files = StaticFiles::open(
+            static_file_dir.clone(),
+            !read_only,
+            blocks_per_file(config.pruning_config().map(|pruning| pruning.tx_retention)),
+        )
+        .map_err(|source| StateInitError::StaticFiles {
+            path: static_file_dir,
+            source: Box::new(source),
+        })?;
+
         let mut db = ZakuraDb {
             config: Arc::new(config.clone()),
             read_capacity: ReadCapacity::new(config),
             debug_skip_format_upgrades,
             format_change_handle: None,
             db: disk_db,
+            static_files: Arc::new(static_files),
         };
+
+        // Like reth, check the static files against the database before anything
+        // reads them. A read-only secondary leaves that to the primary.
+        if !read_only {
+            db.heal_static_files()?;
+        }
 
         // Reject stale address-query state before any upgrade can modify it. This also
         // applies to read-only and offline utility opens, which skip format upgrades.
@@ -570,21 +593,44 @@ impl ZakuraDb {
     /// Call this periodically (e.g., every 30 seconds) from a background task.
     pub(crate) fn export_metrics(&self) {
         self.db.export_metrics();
+        // Static file sizes stay far below `f64`'s exact integer range of 2^53 bytes.
+        ::metrics::gauge!("zakura.state.static_files.total_disk_size_bytes")
+            .set(self.static_files.committed_bytes() as f64);
     }
 
-    /// Returns the estimated total disk space usage of the database.
+    /// Returns the estimated total disk space usage of the database and its
+    /// transaction static files.
     pub fn size(&self) -> u64 {
-        self.db.size()
+        self.db.size() + self.static_files.committed_bytes()
     }
 
-    /// Returns the most recently cached disk space estimate.
+    /// Returns the most recently cached disk space estimate, including static files.
     pub(crate) fn cached_size(&self) -> u64 {
-        self.db.cached_size()
+        self.db.cached_size() + self.static_files.committed_bytes()
     }
 }
 
 #[cfg(test)]
 impl ZakuraDb {
+    /// Appends `blocks` to the static files without recording them, like a move
+    /// whose database write failed.
+    pub(crate) fn append_static_file_blocks_for_test(
+        &self,
+        blocks: &[(
+            zakura_chain::block::Height,
+            Vec<super::disk_format::RawBytes>,
+        )],
+    ) {
+        self.static_files
+            .append_blocks(blocks)
+            .expect("test blocks append above the static file tip");
+    }
+
+    /// Returns the bytes of the current SST files of the column family named `cf_name`.
+    pub(crate) fn live_sst_bytes_for_test(&self, cf_name: &str) -> u64 {
+        self.db.live_sst_bytes_for_test(cf_name)
+    }
+
     /// Returns every raw key and value in the column family named `cf_name`, in key order.
     pub(crate) fn raw_column_family_entries_for_test(
         &self,

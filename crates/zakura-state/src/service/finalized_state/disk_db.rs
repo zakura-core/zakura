@@ -25,6 +25,10 @@ use std::{
 use itertools::Itertools;
 
 use rocksdb::{ColumnFamilyDescriptor, ErrorKind, Options, ReadOptions};
+
+/// The readahead of [`DiskDb::raw_sequential_scan_cf`], large enough that a
+/// scan of cold data reads at disk throughput rather than disk latency.
+const SEQUENTIAL_SCAN_READAHEAD_BYTES: usize = 4 * 1024 * 1024;
 use semver::Version;
 use zakura_chain::{
     block::Height, parameters::Network, primitives::byte_array::increment_big_endian,
@@ -853,6 +857,18 @@ impl DiskDb {
         self.finished_format_upgrades.load(atomic::Ordering::SeqCst)
     }
 
+    /// Syncs the write-ahead log, so every batch written so far survives a power
+    /// cut. [`DiskDb::write`] doesn't sync, so call this before deleting files that
+    /// only those batches stop referencing.
+    pub(crate) fn sync_wal(&self) -> Result<(), rocksdb::Error> {
+        self.db.flush_wal(true)
+    }
+
+    /// Returns `true` if this is a read-only secondary instance.
+    pub(crate) fn is_read_only_secondary(&self) -> bool {
+        self.mode.is_read_only()
+    }
+
     /// When called with a secondary DB instance, tries to catch up with the primary DB instance
     pub fn try_catch_up_with_primary(&self) -> Result<(), rocksdb::Error> {
         self.db.try_catch_up_with_primary()?;
@@ -1423,6 +1439,35 @@ impl DiskDb {
         Ok(())
     }
 
+    /// Returns a forward iterator over the raw entries of `cf` in `lower..upper`,
+    /// for one long sequential scan of cold data.
+    ///
+    /// It reads ahead [`SEQUENTIAL_SCAN_READAHEAD_BYTES`] at a time. RocksDB's
+    /// adaptive readahead starts at 8 KiB per iterator and caps at 256 KiB, so
+    /// cold scans otherwise become many small reads bound by disk latency.
+    pub(crate) fn raw_sequential_scan_cf<C>(
+        &self,
+        cf: &C,
+        lower: &[u8],
+        upper: &[u8],
+    ) -> impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + '_
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        let mut options = ReadOptions::default();
+        options.set_iterate_lower_bound(lower.to_vec());
+        options.set_iterate_upper_bound(upper.to_vec());
+        options.set_readahead_size(SEQUENTIAL_SCAN_READAHEAD_BYTES);
+        options.fill_cache(false);
+        self.db
+            .iterator_cf_opt(
+                cf,
+                options,
+                rocksdb::IteratorMode::From(lower, rocksdb::Direction::Forward),
+            )
+            .map(|result| result.expect("unexpected database failure"))
+    }
+
     /// Collect a raw half-open key range without panicking on iterator failure.
     pub(crate) fn raw_range_cf<C>(
         &self,
@@ -1489,6 +1534,37 @@ impl DiskDb {
     /// Flushes pending writes to SST files.
     pub(crate) fn flush(&self) -> Result<(), rocksdb::Error> {
         self.db.flush()
+    }
+
+    /// Returns the bytes of the current SST files of the column family named `cf_name`.
+    #[cfg(test)]
+    pub(crate) fn live_sst_bytes_for_test(&self, cf_name: &str) -> u64 {
+        let cf = self
+            .cf_handle(cf_name)
+            .expect("tests only read column families opened from the running schema");
+        self.db
+            .property_int_value_cf(&cf, "rocksdb.live-sst-files-size")
+            .expect("reading a test database property succeeds")
+            .unwrap_or(0)
+    }
+
+    /// Deletes the SST files of `cf` whose keys all lie in `from..=to`, which
+    /// frees their space at once instead of after compaction.
+    ///
+    /// Rows covered by a range delete stay on disk until compaction rewrites
+    /// their files, which for cold history may never happen. This ignores
+    /// snapshots, so only call it for ranges whose rows are all deleted. RocksDB
+    /// leaves level 0 files and files partly outside the range for compaction.
+    pub(crate) fn delete_files_in_range_cf<C>(
+        &self,
+        cf: &C,
+        from: &[u8],
+        to: &[u8],
+    ) -> Result<(), rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        self.db.delete_file_in_range_cf(cf, from, to)
     }
 
     // Private methods

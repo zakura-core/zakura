@@ -191,12 +191,18 @@ def minimum_release(
 def release_patch_waiver(
     base: Version, target: Version, entries: dict[str, list[str]]
 ) -> str | None:
-    """Apply the approved node-only exception for the stable v1.8.6 release."""
+    """Apply release-owner exceptions for specific stable node releases."""
     if base == parse_version("1.8.5") and target == parse_version("1.8.6"):
         return (
             "The release owner approved v1.8.6 as a patch, including the documented "
             "removal of historical treestate commands from default builds and unused "
             "Sprout library types. Library crates retain independent SemVer bumps."
+        )
+    if base == parse_version("1.8.7") and target == parse_version("1.8.8"):
+        return (
+            "The release owner approved v1.8.8 as a node patch despite the pending "
+            "Added, Changed, and Removed changelog entries. Library crates retain "
+            "independent SemVer bumps."
         )
     return patch_waiver_reason(entries)
 
@@ -309,7 +315,11 @@ class SelfTests(unittest.TestCase):
         self.assertEqual((level, str(minimum)), ("patch", "1.8.6"))
 
     def test_patch_exception_does_not_apply_to_other_releases(self) -> None:
-        for base, target in (("1.8.5", "1.8.6-rc0"), ("1.8.5", "1.8.7"), ("1.8.6", "1.8.7")):
+        for base, target in (
+            ("1.8.5", "1.8.6-rc0"), ("1.8.5", "1.8.7"), ("1.8.6", "1.8.7"),
+            ("1.8.7", "1.8.8-rc0"), ("1.8.6", "1.8.8"), ("1.8.7", "1.8.9"),
+            ("1.8.8", "1.8.9"),
+        ):
             with self.subTest(base=base, target=target):
                 with self.assertRaisesRegex(ReadinessError, "minor floor"):
                     minimum_release(
@@ -318,11 +328,30 @@ class SelfTests(unittest.TestCase):
                     )
 
     def test_patch_exception_preserves_network_upgrade_floor(self) -> None:
-        with self.assertRaisesRegex(ReadinessError, "major floor"):
-            minimum_release(
-                parse_version("1.8.5"), parse_version("1.8.6"),
-                {"Added": ["- Added the Mainnet Network Upgrade."]},
+        for base, target in (("1.8.5", "1.8.6"), ("1.8.7", "1.8.8")):
+            with self.subTest(base=base, target=target):
+                with self.assertRaisesRegex(ReadinessError, "major floor"):
+                    minimum_release(
+                        parse_version(base), parse_version(target),
+                        {"Added": ["- Added the Mainnet Network Upgrade."]},
+                    )
+
+    def test_approved_node_patch_reports_exception_for_pending_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs" / "changelog" / "unreleased").mkdir(parents=True)
+            (root / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## [Unreleased]\n\n"
+                "### Added\n\n- Added a node feature.\n\n"
+                "### Changed\n\n- Changed node behavior.\n\n"
+                "### Removed\n\n- Removed a node option.\n\n"
+                "## [1.8.7] - 2026-11-12\n\n### Fixed\n\n- Fixed a bug.\n"
             )
+            report = version_report(root, "1.8.7", "v1.8.8")
+        self.assertEqual(report["minimum_level"], "patch")
+        self.assertEqual(report["minimum_version"], "1.8.8")
+        self.assertEqual(report["categories"], ["Added", "Changed", "Removed"])
+        self.assertIn("approved v1.8.8", report["patch_waiver_reason"])
 
     def test_assembled_untagged_section_still_sets_release_floor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

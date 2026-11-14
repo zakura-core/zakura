@@ -776,7 +776,12 @@ fn probe_in(
         budget,
         &dir.join("sim"),
     );
-    command.arg("-runs=0").arg(&corpus);
+    // Without a prefix, libFuzzer writes a failed input to its working
+    // directory, which may be a checkout.
+    command
+        .arg("-runs=0")
+        .arg(format!("-artifact_prefix={}/", dir.display()))
+        .arg(&corpus);
     let (exit, log) = run_logged(
         command,
         &dir.join("log.txt"),

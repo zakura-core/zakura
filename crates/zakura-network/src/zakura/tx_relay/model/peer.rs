@@ -11,8 +11,8 @@ use zakura_chain::transaction::UnminedTxId;
 use zakura_node_services::mempool::port::{model::WaiterId, ReservationId};
 
 use super::{
-    EntryGen, PeerKey, Time, BASE_DEADLINE, KNOWN_CAP, MIN_RATE, PENDING_PER_PEER,
-    SENDER_ALLOWANCE, TRIED_PER_PEER,
+    EntryGen, PeerKey, Time, BASE_DEADLINE, KNOWN_CAP, MAX_REQUESTS_PER_PEER, MAX_TX_BYTES,
+    MIN_RATE, PENDING_PER_PEER, SENDER_ALLOWANCE, TRIED_PER_PEER,
 };
 
 /// What the peer said in its `Hello`.
@@ -53,7 +53,10 @@ pub(crate) struct Request {
     pub(crate) generation: EntryGen,
     /// The size the answer must have.
     pub(crate) size: u32,
-    /// When another announcer may try. It only moves later.
+    /// When it was sent.
+    pub(crate) sent: Time,
+    /// When another announcer may try. It only moves later, and never past
+    /// [`max_span`] after `sent`.
     pub(crate) deadline: Time,
     /// The pool's reservation, while the node waits for this answer. `None`
     /// once the deadline passed or the pool cancelled the fetch: the request
@@ -250,6 +253,7 @@ impl PeerModel {
             Request {
                 generation: pending.generation,
                 size: pending.size,
+                sent: now,
                 deadline: now,
                 reservation: Some(reservation),
                 repeats,
@@ -263,14 +267,35 @@ impl PeerModel {
         let bytes = outstanding.saturating_add(SENDER_ALLOWANCE);
         let transfer = Duration::from_millis(bytes.saturating_mul(1_000) / MIN_RATE);
         for request in self.requests.values_mut() {
-            let mut span = BASE_DEADLINE.saturating_add(transfer);
-            for _ in 0..request.repeats {
-                if span == Duration::MAX {
-                    break;
-                }
-                span = span.saturating_mul(2);
-            }
-            request.deadline = request.deadline.max(now.saturating_add(span));
+            let span = doubled(BASE_DEADLINE.saturating_add(transfer), request.repeats);
+            // Later requests can push a deadline out, but only as far as the
+            // most bytes a peer can have outstanding at once, so a peer that
+            // keeps adding requests cannot hold an id forever.
+            let cap = request.sent.saturating_add(max_span(request.repeats));
+            request.deadline = request.deadline.max(now.saturating_add(span)).min(cap);
         }
     }
+}
+
+/// `span` doubled `repeats` times, saturating.
+fn doubled(mut span: Duration, repeats: u32) -> Duration {
+    for _ in 0..repeats {
+        if span == Duration::MAX {
+            break;
+        }
+        span = span.saturating_mul(2);
+    }
+    span
+}
+
+/// The longest a request can wait after it was sent before another
+/// announcer may try: the fixed part plus the time to move the sender
+/// allowance and the most bodies a peer can have outstanding, at the
+/// slowest supported rate, doubled for each earlier timeout.
+pub(crate) fn max_span(repeats: u32) -> Duration {
+    let bytes = u64::from(MAX_TX_BYTES)
+        .saturating_mul(u64::try_from(MAX_REQUESTS_PER_PEER).unwrap_or(u64::MAX))
+        .saturating_add(SENDER_ALLOWANCE);
+    let transfer = Duration::from_millis(bytes.saturating_mul(1_000) / MIN_RATE);
+    doubled(BASE_DEADLINE.saturating_add(transfer), repeats)
 }

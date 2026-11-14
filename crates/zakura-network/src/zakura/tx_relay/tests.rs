@@ -12,14 +12,15 @@ use zakura_chain::{
 };
 use zakura_node_services::mempool::port::{
     model::{ModelBlock, ModelTransition, ModelTx, Outcome, PoolModel},
-    Charge, Generation, Intent, RejectionScope, MAX_PENDING,
+    Change, Charge, Generation, Intent, RejectionScope, MAX_PENDING,
 };
 
 use super::model::{
-    peer::Hello, window, CloseReason, PeerKey, RelayEffect, RelayModel, SessionId, Violation,
-    ADVERT_DELAY, BASE_COOLDOWN, BASE_DEADLINE, INBOUND_DELAY, MAX_REQUESTS_PER_PEER, MAX_TX_BYTES,
-    MIN_RATE, NO_ROOM_FIRST, PENDING_PER_PEER, RETRY_FIRST, SENDER_ALLOWANCE, TRIED_PER_PEER,
-    WINDOW_FULL, WINDOW_SMALL,
+    peer::{max_span, Hello},
+    window, CloseReason, PeerKey, RelayEffect, RelayModel, SessionId, Violation, ADVERT_DELAY,
+    BASE_COOLDOWN, BASE_DEADLINE, INBOUND_DELAY, MAX_REQUESTS_PER_PEER, MAX_TX_BYTES, MIN_RATE,
+    NO_ROOM_FIRST, PENDING_PER_PEER, RETRY_FIRST, SENDER_ALLOWANCE, TRIED_PER_PEER, WINDOW_FULL,
+    WINDOW_SMALL,
 };
 
 fn id(n: u32) -> UnminedTxId {
@@ -1801,20 +1802,98 @@ fn a_collision_after_a_removal_costs_one_redundant_advert() {
     relay.assert_invariants();
 }
 
-/// The default short id of `tx_id`, as the model keeps it.
-fn short_of(tx_id: UnminedTxId) -> u64 {
-    let mut short = [0u8; 8];
-    short.copy_from_slice(&tx_id.mined_id().0[..8]);
-    u64::from_le_bytes(short)
+#[test]
+fn another_authorizing_variant_in_the_pool_settles_the_id() {
+    let mut relay = relay();
+    let supplier = open(&mut relay, 1, true, secs(0));
+    let x = witnessed(1, 7);
+    relay.inv(supplier, &[(x, SIZE)], secs(0));
+    relay.tx(supplier, x, ModelTx::new(x), secs(0));
+    finish_all(&mut relay, &Outcome::Pass, secs(0));
+    relay.take_effects();
+    let a = open(&mut relay, 2, true, secs(0));
+    let y = witnessed(1, 8);
+    relay.inv(a, &[(y, SIZE)], secs(0));
+    // The pool answers `Pooled` by mined id, and that settles it.
+    assert!(relay.wanted().entry(y).is_none());
+    relay.tick(secs(60));
+    assert!(asks(&relay.take_effects()).is_empty());
+    relay.assert_invariants();
 }
 
-/// Id 1 is a 2,000,000 byte transaction. Every other id is small.
-fn one_is_big(tx_id: UnminedTxId) -> u32 {
-    if tx_id == id(1) {
-        MAX_TX_BYTES
-    } else {
-        SIZE
+#[test]
+fn a_reannouncement_during_a_live_request_survives_its_not_found() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(b, &[(id(1), SIZE)], secs(0));
+    assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
+    // A says it has the id again before its NotFound arrives.
+    relay.inv(a, &[(id(1), SIZE)], secs(1));
+    relay.not_found(a, id(1), secs(2));
+    let entry = relay.wanted().entry(id(1)).cloned().expect("still wanted");
+    assert!(relay.session(a).unwrap().holds(id(1), entry.generation));
+    // B, not yet asked, goes first.
+    assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
+    // The failed fetch reaches the pool's log.
+    assert!(relay.logged().contains(&Change::Refused(id(1))));
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_peer_adding_requests_cannot_hold_an_id_forever() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(b, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    let mut now = secs(0);
+    let mut n = 100;
+    let mut b_asked = false;
+    while now < max_span(0) + secs(10) {
+        now += secs(5);
+        relay.inv(a, &[(id(n), SIZE)], now);
+        relay.not_found(a, id(n), now);
+        n += 1;
+        if asks(&relay.take_effects()).contains(&(b, id(1))) {
+            b_asked = true;
+            break;
+        }
     }
+    assert!(b_asked, "B is asked within the longest deadline");
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_pooled_answer_from_before_a_restart_settles_nothing() {
+    let mut relay =
+        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reserves();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    // Another caller admits id 1 while A's call waits, so the pool answers
+    // A `Pooled`.
+    relay.outside(secs(0), |pool, now| {
+        let reservation = pool.reserve(id(1), Intent::Deliver, now).expect("room");
+        let _ = pool.effects();
+        let (_, step) = pool.submit(reservation.id, tx(1), now);
+        ((), step)
+    });
+    finish_all(&mut relay, &Outcome::Pass, secs(0));
+    assert!(relay.process_reserve(secs(0)));
+    // The pool restarts empty before A hears.
+    relay.deactivate(secs(1));
+    relay.activate(secs(2));
+    assert!(relay.deliver_reserve(secs(2)));
+    assert!(
+        relay.wanted().entry(id(1)).is_some(),
+        "Pooled settles nothing now"
+    );
+    relay.tick(secs(2) + RETRY_FIRST);
+    while relay.answer_reserve(secs(2) + RETRY_FIRST) {}
+    assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
+    relay.assert_invariants();
 }
 
 #[test]
@@ -2114,6 +2193,22 @@ fn a_late_verdict_leaves_another_announcers_fetch_alone() {
     relay.assert_invariants();
 }
 
+/// The default short id of `tx_id`, as the model keeps it.
+fn short_of(tx_id: UnminedTxId) -> u64 {
+    let mut short = [0u8; 8];
+    short.copy_from_slice(&tx_id.mined_id().0[..8]);
+    u64::from_le_bytes(short)
+}
+
+/// Id 1 is a 2,000,000 byte transaction. Every other id is small.
+fn one_is_big(tx_id: UnminedTxId) -> u32 {
+    if tx_id == id(1) {
+        MAX_TX_BYTES
+    } else {
+        SIZE
+    }
+}
+
 /// Fills the pool with another caller's reservations.
 fn fill_pool(relay: &mut RelayModel) {
     for n in 0..u32::try_from(MAX_PENDING).unwrap() {
@@ -2186,7 +2281,7 @@ fn run(seed: u64) {
     // An obligation is met once the id is seen in the pool, fails, or is
     // mined after it was announced. Rejections and minings still in force
     // when it is announced meet it at once.
-    let mut honest: HashMap<SessionId, HashMap<UnminedTxId, bool>> = HashMap::new();
+    let mut honest: HashMap<SessionId, Vec<(UnminedTxId, bool)>> = HashMap::new();
     let mut failed: HashSet<UnminedTxId> = HashSet::new();
     let mut now = Duration::ZERO;
 
@@ -2250,12 +2345,8 @@ fn run(seed: u64) {
                     let settled = failed.contains(&id(n))
                         || chain.iter().flatten().any(|mined| *mined == id(n))
                         || relay.pool().visible().contains(&id(n));
-                    let met = honest
-                        .entry(session)
-                        .or_default()
-                        .entry(id(n))
-                        .or_insert(false);
-                    *met |= settled;
+                    // Each announcement is its own obligation.
+                    honest.entry(session).or_default().push((id(n), settled));
                 }
             }
             7 => verify(&mut relay, &mut failed, &mut rng, now, true),
@@ -2294,8 +2385,10 @@ fn run(seed: u64) {
                 chain.push(transactions.iter().map(|tx| tx.id).collect());
                 for mined in transactions.iter().map(|tx| tx.id) {
                     for obligations in honest.values_mut() {
-                        if let Some(met) = obligations.get_mut(&mined) {
-                            *met = true;
+                        for (announced, met) in obligations.iter_mut() {
+                            if *announced == mined {
+                                *met = true;
+                            }
                         }
                     }
                 }
@@ -2425,7 +2518,7 @@ thread_local! {
 /// last look.
 fn settle_obligations(
     relay: &RelayModel,
-    honest: &mut HashMap<SessionId, HashMap<UnminedTxId, bool>>,
+    honest: &mut HashMap<SessionId, Vec<(UnminedTxId, bool)>>,
 ) {
     let visible: HashSet<UnminedTxId> = relay.pool().visible().into_iter().collect();
     let failed: Vec<UnminedTxId> = FAILED_NOW.with(|now| std::mem::take(&mut *now.borrow_mut()));

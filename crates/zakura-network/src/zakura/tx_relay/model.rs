@@ -533,6 +533,7 @@ impl RelayModel {
             // The peer started cooling while the body was in flight. Dropped
             // unread, as the legacy adapter drops it.
             state.requests.shift_remove(&id);
+            state.reannounced.remove(&id);
             self.reservations.remove(&reservation);
             let step = self.pool.release(reservation, self.now);
             self.inbox.push_back(step);
@@ -552,6 +553,7 @@ impl RelayModel {
             return;
         }
         state.requests.shift_remove(&id);
+        state.reannounced.remove(&id);
         state.mark_known(short, seq);
         self.reservations.remove(&reservation);
         let (waiter, step) = self.pool.submit(reservation, body, self.now);
@@ -581,15 +583,23 @@ impl RelayModel {
         // alone, and so does an old answer the peer has since contradicted by
         // announcing the id again.
         let contradicted = state.reannounced.remove(&id);
-        if !contradicted {
+        if contradicted {
+            // It stays pending, but counts as a timed-out attempt, so
+            // announcers not yet asked claim it first.
+            if state.holds(id, request.generation) {
+                let count = state.timed_out.entry((id, request.generation)).or_insert(0);
+                *count = count.saturating_add(1);
+            }
+        } else {
             if state.take_pending_of(id, request.generation).is_some() {
                 self.wanted.unhold(id, request.generation);
             }
             state.mark_tried(id, request.generation);
         }
         if let Some(reservation) = request.reservation {
+            // The fetch ended without a body, which the pool logs.
             self.reservations.remove(&reservation);
-            let step = self.pool.release(reservation, self.now);
+            let step = self.pool.fetch_failed(reservation, self.now);
             self.inbox.push_back(step);
             self.wanted
                 .release(id, request.generation, session, self.now, false);
@@ -821,6 +831,12 @@ impl RelayModel {
     /// not received.
     pub(crate) fn calls_in_flight(&self) -> usize {
         self.calls.len().saturating_add(self.answers.len())
+    }
+
+    /// Every change the pool logged that the model still keeps, oldest
+    /// first.
+    pub(crate) fn logged(&self) -> Vec<Change> {
+        self.log.iter().map(|(_, change)| *change).collect()
     }
 
     /// Verdicts `tx-relay` has not received.
@@ -1336,16 +1352,11 @@ impl RelayModel {
                         .values()
                         .any(|(held, generation)| *held == id && Some(*generation) == current);
                 // Announcing an id it already holds while a request for it is
-                // outstanding that the node stopped waiting for says it has
-                // the id now. The answer to that old request, which can
-                // arrive later on the other stream, then does not mark it
-                // tried.
+                // outstanding says it has the id now. A `NotFound` for that
+                // request, which can arrive later on the other stream, then
+                // does not mark it tried.
                 if let Some(generation) = current {
-                    let stale_request = state
-                        .requests
-                        .get(&id)
-                        .is_some_and(|request| request.reservation.is_none());
-                    if stale_request && state.holds(id, generation) {
+                    if state.requests.contains_key(&id) && state.holds(id, generation) {
                         state.reannounced.insert(id);
                     }
                 }
@@ -1590,7 +1601,12 @@ impl RelayModel {
             Err(ModelUnreserved::Pooled) => {
                 // It settles the id only if the caller's current snapshot
                 // still holds it: the pool may have restarted since.
-                let pooled = self.visible.contains(&id);
+                // The pool answers `Pooled` by mined id, so the check is by
+                // mined id too: another authorizing-data variant settles it.
+                let pooled = self
+                    .visible
+                    .iter()
+                    .any(|visible| visible.mined_id() == id.mined_id());
                 self.wanted
                     .release(id, pending.generation, session, self.now, !pooled);
                 if pooled {
@@ -1722,11 +1738,8 @@ impl RelayModel {
             assert!(state.known.len() <= KNOWN_CAP);
             for id in &state.reannounced {
                 assert!(
-                    state
-                        .requests
-                        .get(id)
-                        .is_some_and(|request| request.reservation.is_none()),
-                    "a re-announcement is noted only beside a request the node stopped waiting for"
+                    state.requests.contains_key(id),
+                    "a re-announcement is noted only beside an outstanding request"
                 );
             }
             for key in state.timed_out.keys() {

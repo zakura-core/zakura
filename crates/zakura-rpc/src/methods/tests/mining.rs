@@ -1416,7 +1416,9 @@ async fn shielded_template_rewards() {
         .zcash_deserialize_into()
         .unwrap();
     let base = i64::from(halving_block_subsidy(Height(3), &net).unwrap());
-    let expected = base + 55;
+    // Independent Regtest NU7 payout oracle for the 400,000,000 zatoshi balance: the
+    // 8,022,777 / 10^10 fraction, rounded up.
+    let expected = base + 320_912;
     let (sapling, orchard, ironwood) = (
         i64::from(tx.sapling_value_balance().sapling_amount()),
         i64::from(tx.orchard_value_balance().orchard_amount()),

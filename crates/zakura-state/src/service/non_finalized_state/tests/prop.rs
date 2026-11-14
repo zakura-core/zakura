@@ -238,7 +238,7 @@ fn forked_equals_pushed_genesis() -> Result<()> {
         // This check is redundant, but it's useful for debugging.
         prop_assert_eq!(forked.blocks.len(), partial_chain.blocks.len());
 
-        for (height, forked_block) in &forked.blocks {
+        for (height, forked_block) in forked.blocks.iter() {
             let original_block = full_chain
                 .blocks
                 .get(height)

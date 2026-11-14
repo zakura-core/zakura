@@ -719,10 +719,7 @@ impl StartCmd {
             chain_tip_change.clone(),
             misbehavior_sender.clone(),
             zcashd_compat_block_gossip_peer_ips.clone(),
-            address_book
-                .lock()
-                .expect("unexpected panic in address book mutex guard")
-                .unconditional_peers(),
+            config.network.unconditional_peers.clone(),
         );
         let mempool = mempool.with_trace(template_path_trace.clone());
         let mempool_verification_finished = mempool.verification_finished();

@@ -694,106 +694,6 @@ async fn repeated_cooldown_disconnects_peer_without_banning() {
     );
 }
 
-/// A cooldown that an address has from before it became an unconditional peer does
-/// not hold back its transactions. A DNS name can resolve to an address with one.
-#[tokio::test(flavor = "multi_thread")]
-async fn earlier_cooldown_does_not_hold_back_an_unconditional_peer() {
-    let network = Network::Mainnet;
-    let transaction = network
-        .unmined_transactions_in_blocks(2..)
-        .next()
-        .expect("mainnet test vectors contain an unmined transaction")
-        .transaction
-        .clone();
-    let tx_id = transaction.id();
-    let config: zn::Config =
-        toml::from_str(&format!("unconditional_peers = ['{}']", test_peer().ip())).unwrap();
-
-    for is_unconditional in [false, true] {
-        let unconditional_peers = if is_unconditional {
-            config.unconditional_peers.clone()
-        } else {
-            zn::UnconditionalPeers::default()
-        };
-        let (mut mempool, _peer_set, _state, _tip, mut tx_verifier, mut recent_syncs, _receiver) =
-            setup_with_unconditional_peers(
-                &network,
-                mempool::Config::default(),
-                true,
-                unconditional_peers.into(),
-            )
-            .await;
-        mempool.enable(&mut recent_syncs).await;
-
-        mempool
-            .peer_cooldowns
-            .record_invalid_transaction(test_peer().ip(), Instant::now());
-
-        mempool
-            .ready()
-            .await
-            .expect("mempool service becomes ready")
-            .call(Request::QueueFromPeer {
-                transactions: vec![transaction.clone().into()],
-                source: QueueSource::LegacySocket(test_peer().remove_socket_addr_privacy()),
-            })
-            .await
-            .expect("mempool service answers the pushed transaction");
-
-        if is_unconditional {
-            tx_verifier
-                .expect_request_that(|request| {
-                    matches!(
-                        request,
-                        tx::Request::Mempool { transaction, .. } if transaction.id() == tx_id
-                    )
-                })
-                .await
-                .respond(Err(TransactionError::NoInputs));
-        } else {
-            tx_verifier.expect_no_requests().await;
-        }
-    }
-}
-
-/// A repeated cooldown does not disconnect a peer that became unconditional after the
-/// mempool checked it, as when a listed DNS name resolves to it in between.
-#[tokio::test(flavor = "multi_thread")]
-async fn cooldown_disconnect_skips_a_peer_that_became_unconditional() {
-    let network = Network::Mainnet;
-    let tx_id = network
-        .unmined_transactions_in_blocks(2..)
-        .next()
-        .expect("mainnet test vectors contain an unmined transaction")
-        .transaction
-        .id();
-    let config: zn::Config =
-        toml::from_str(&format!("unconditional_peers = ['{}']", test_peer().ip())).unwrap();
-    let (mempool, mut peer_set, _state, _tip, _tx_verifier, _recent_syncs, _receiver) =
-        setup_with_unconditional_peers(
-            &network,
-            mempool::Config::default(),
-            true,
-            config.unconditional_peers.into(),
-        )
-        .await;
-
-    // The peer's first cooldown has already ended, so this one would disconnect it.
-    mempool.peer_cooldowns.record_invalid_transaction(
-        test_peer().ip(),
-        Instant::now() - peer_cooldown::BASE_COOLDOWN - Duration::from_secs(1),
-    );
-    start_peer_cooldown(
-        &mempool.peer_cooldowns,
-        &mempool.outbound,
-        test_peer(),
-        tx_id,
-        false,
-    );
-
-    peer_set.expect_no_requests().await;
-}
-
 /// Pushes an early Mainnet transaction from [`test_peer`], fails its
 /// verification with `error`, and waits until the mempool rejects it.
 ///
@@ -1117,13 +1017,7 @@ async fn peer_penalties_with_unconditional(
         mut tx_verifier,
         mut recent_syncs,
         _mempool_transaction_receiver,
-    ) = setup_with_unconditional_peers(
-        network,
-        mempool::Config::default(),
-        true,
-        unconditional_peers.clone().into(),
-    )
-    .await;
+    ) = setup_with_mempool_config(network, mempool::Config::default(), true).await;
     let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
     mempool.misbehavior_sender = misbehavior_sender;
     // An expired prior cooldown would make the next penalty disconnect the peer.
@@ -1134,6 +1028,7 @@ async fn peer_penalties_with_unconditional(
             Instant::now() - peer_cooldown::BASE_COOLDOWN - Duration::from_secs(1),
         );
     }
+    mempool.unconditional_peers = unconditional_peers;
     mempool.zcashd_compat_peer_ips = [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter().collect();
     // Cooldowns only start when the mempool's validation context is current.
     let _chain_tip_sender = mempool.use_current_chain_tip(network);
@@ -4124,31 +4019,6 @@ async fn setup_with_mempool_config(
     RecentSyncLengths,
     tokio::sync::broadcast::Receiver<MempoolChange>,
 ) {
-    setup_with_unconditional_peers(
-        network,
-        mempool_config,
-        should_commit_genesis_block,
-        zn::UnconditionalPeerSet::default(),
-    )
-    .await
-}
-
-/// Create a new [`Mempool`] instance using mocked services, which never penalizes
-/// `unconditional_peers`.
-async fn setup_with_unconditional_peers(
-    network: &Network,
-    mempool_config: mempool::Config,
-    should_commit_genesis_block: bool,
-    unconditional_peers: zn::UnconditionalPeerSet,
-) -> (
-    Mempool,
-    MockPeerSet,
-    StateService,
-    ChainTipChange,
-    MockTxVerifier,
-    RecentSyncLengths,
-    tokio::sync::broadcast::Receiver<MempoolChange>,
-) {
     let peer_set = MockService::build().for_unit_tests();
 
     // UTXO verification doesn't matter here.
@@ -4179,7 +4049,7 @@ async fn setup_with_unconditional_peers(
         chain_tip_change.clone(),
         tokio::sync::mpsc::channel(1).0,
         Vec::new(),
-        unconditional_peers,
+        zn::UnconditionalPeers::default(),
     );
 
     let mut mempool_transaction_receiver = mempool_transaction_subscriber.subscribe();

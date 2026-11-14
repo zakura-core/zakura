@@ -26,6 +26,7 @@ use super::super::{
     reorder::BufferedBlockBody,
     sequencer_task::{charge_decoded_handoff, DecodedHandoffCharge, SequencedBody, SequencerView},
     state::{OutstandingBlockRange, RequestKey, ThroughputMeter, WriteOutcome},
+    wire::DecodedBlockPayload,
     work_queue::{RequestWriteStatus, WorkQueue},
     BlockSyncMisbehavior, BlockSyncPeerSession, ZakuraPeerId, ZakuraTrace,
 };
@@ -436,7 +437,7 @@ pub(super) struct ReceivedBody<B = Arc<block::Block>> {
     pub(super) previous_block_hash: block::Hash,
     pub(super) block: B,
     /// The frame payload `block` was decoded from.
-    pub(super) raw_payload: Arc<[u8]>,
+    pub(super) raw_payload: DecodedBlockPayload,
     /// The length of `raw_payload`, measured on the per-peer task.
     pub(super) serialized_bytes: u64,
     pub(super) permit: mpsc::OwnedPermit<SequencedBody>,

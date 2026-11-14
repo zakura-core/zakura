@@ -1,4 +1,4 @@
-use super::{state::*, wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES, *};
+use super::{state::*, wire::DecodedBlockPayload, *};
 use zakura_node_services::block_memory::{
     Admission, AdmissionFailure, BlockHandle, DecodedBlockPool, OwnedBlock,
 };
@@ -349,7 +349,7 @@ pub(super) enum PayloadChange {
 
 #[derive(Clone, Debug)]
 pub(super) enum BufferedBlockBody {
-    RawFramePayload(Arc<[u8]>),
+    RawFramePayload(DecodedBlockPayload),
     // Only tests hand the sequencer a decoded body without its raw bytes.
     #[cfg_attr(not(test), allow(dead_code))]
     Decoded {
@@ -358,7 +358,7 @@ pub(super) enum BufferedBlockBody {
     },
     DecodedWithRawFramePayload {
         block: BlockHandle,
-        raw_frame_payload: Arc<[u8]>,
+        raw_frame_payload: DecodedBlockPayload,
         decoded_attributed_memory_size_bytes: u64,
     },
 }
@@ -367,7 +367,7 @@ impl BufferedBlockBody {
     #[cfg(test)]
     pub(super) fn from_decoded_block(
         block: Arc<block::Block>,
-        raw_frame_payload: Option<Arc<[u8]>>,
+        raw_frame_payload: Option<DecodedBlockPayload>,
     ) -> Self {
         let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
         let block = block.into();
@@ -393,7 +393,7 @@ impl BufferedBlockBody {
     ///
     /// One cap holds at every height, because the input queue is not the
     /// checkpoint window.
-    pub(super) fn for_handoff(block: OwnedBlock, raw_frame_payload: Arc<[u8]>) -> Self {
+    pub(super) fn for_handoff(block: OwnedBlock, raw_frame_payload: DecodedBlockPayload) -> Self {
         let decoded_attributed_memory_size_bytes = block.decoded_bytes();
         BufferedBlockBody::DecodedWithRawFramePayload {
             block: BlockHandle::Owned(block),
@@ -436,7 +436,7 @@ impl BufferedBlockBody {
             BufferedBlockBody::RawFramePayload(raw_frame_payload)
             | BufferedBlockBody::DecodedWithRawFramePayload {
                 raw_frame_payload, ..
-            } => Arc::as_ptr(raw_frame_payload).cast::<u8>().addr(),
+            } => raw_frame_payload.allocation(),
             BufferedBlockBody::Decoded { block, .. } => match block {
                 BlockHandle::Shared(block) => Arc::as_ptr(block).addr(),
                 BlockHandle::Owned(_) => std::ptr::from_ref(block.header()).addr(),
@@ -476,12 +476,12 @@ impl BufferedBlockBody {
             BufferedBlockBody::Decoded { block, .. }
             | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => Ok(block.clone()),
             BufferedBlockBody::RawFramePayload(payload) => {
-                let block = pool
-                    .try_admit(decode_raw_frame_payload(payload), admission)
-                    .map_err(|rejected| DecodeRefusal {
-                        reason: rejected.reason,
-                        decoded_bytes: rejected.decoded_bytes,
-                    })?;
+                let block =
+                    pool.try_admit(payload.decode_block(), admission)
+                        .map_err(|rejected| DecodeRefusal {
+                            reason: rejected.reason,
+                            decoded_bytes: rejected.decoded_bytes,
+                        })?;
                 let decoded_attributed_memory_size_bytes = block.decoded_bytes();
                 let block = BlockHandle::Owned(block);
                 *self = BufferedBlockBody::DecodedWithRawFramePayload {
@@ -501,11 +501,4 @@ pub(super) struct DecodeRefusal {
     pub(super) reason: AdmissionFailure,
     /// Attributed bytes of the refused decoded block.
     pub(super) decoded_bytes: u64,
-}
-
-fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> block::Block {
-    let mut reader = &payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..];
-    block::Block::zcash_deserialize_bounded(&mut reader).expect(
-        "raw block bytes deserialize because the peer routine decoded them before buffering",
-    )
 }

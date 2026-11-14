@@ -51,7 +51,7 @@ use super::{
     },
     state::{BlockSyncFrontiers, ThroughputMeter},
     trace::{height as trace_height, BlockTraceEvent},
-    wire::BlockSyncMessage,
+    wire::{decode_block_payload, BlockSyncMessage},
     work_queue::WorkQueue,
 };
 
@@ -272,10 +272,11 @@ impl BenchBodyFeeder {
     ) -> bool {
         let previous_block_hash = block.header.previous_block_hash;
         // Hand the body over as a peer routine does.
-        let raw_frame_payload: Arc<[u8]> = BlockSyncMessage::Block(block.clone())
+        let payload = BlockSyncMessage::Block(block.clone())
             .encode()
-            .expect("a chain block encodes within the block-sync message limits")
-            .into();
+            .expect("a chain block encodes within the block-sync message limits");
+        let (_, raw_frame_payload) =
+            decode_block_payload(payload).expect("an encoded chain block decodes");
         let admitted = Arc::try_unwrap(block).ok().and_then(|block| {
             let charge = charge_decoded_handoff(
                 &self.body_input_decoded_attributed_memory_bytes,

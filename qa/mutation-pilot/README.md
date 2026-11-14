@@ -258,9 +258,9 @@ whatever its class. A campaign's unique
 abstract states are the distinct protocol-state features its runs hit, in
 either arm. The report sets no discovery threshold.
 
-A full run takes 340 campaigns: per seed and arm, one original campaign for
-each of five targets and one mutant campaign for each of twelve cases. At
-600 seconds each, that's 57 hours of campaign time, less the time that
+A full run takes 300 campaigns: per seed and arm, one original campaign for
+each of five targets and one mutant campaign for each of ten cases. At
+600 seconds each, that's 50 hours of campaign time, less the time that
 mutant campaigns stop early at a finding. Run it only on a remote campaign
 host. One invocation per target, with `--only` naming each of the target's
 cases, keeps every case's seeds and arms in one report, and runs each

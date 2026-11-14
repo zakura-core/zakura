@@ -72,11 +72,9 @@ property = "header-sync/commit-only-authorized"
 target = "header_sync_wire"
 fault_class = "authorization"
 
-[[case]]
-case = "header-sync/honest-progress/skipped-apply"
-property = "header-sync/honest-progress"
-target = "header_sync_wire"
-fault_class = "liveness"
+# header-sync/honest-progress/skipped-apply left the list: the property is
+# `Draft`, and a fuzz target fails only on an `Active` property, so no
+# campaign can detect the case.
 
 # sync_storage
 
@@ -86,11 +84,9 @@ property = "block-sync/query-work-authorized"
 target = "sync_storage"
 fault_class = "authorization"
 
-[[case]]
-case = "sync/header-reorg-retires-block-work/accept-stale-scope-bodies"
-property = "sync/header-reorg-retires-block-work"
-target = "sync_storage"
-fault_class = "stale-result"
+# sync/header-reorg-retires-block-work/accept-stale-scope-bodies left the
+# list: since zakura#2321, its committed input no longer brings an old
+# epoch's body to the sequencer, and the patched run holds.
 
 [[case]]
 case = "sync/tips-consistent/keep-epoch-on-replaced-selection"

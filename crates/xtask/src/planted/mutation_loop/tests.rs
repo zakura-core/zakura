@@ -1,10 +1,7 @@
 //! The loop runner's classes on synthetic runs, its run failures, and its
 //! report's schema. No test builds the simulator.
 
-use std::{collections::BTreeMap, fs, path::Path, process::Command};
-
-#[cfg(unix)]
-use std::time::Duration;
+use std::{collections::BTreeMap, fs, path::Path, process::Command, time::Duration};
 
 #[cfg(unix)]
 use super::run_measured;

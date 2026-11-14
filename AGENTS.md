@@ -167,6 +167,7 @@ S::Future: Send + 'static,
 - Use `TrustedPreallocate` for deserializing collections from untrusted sources
 - Bound all loops/allocations over attacker-controlled data
 - Validate at system boundaries (network, RPC, disk)
+- Decode blocks and transactions from peers and RPC clients with `zcash_deserialize_bounded`; the plain parsers don't enforce the block size limit. `cargo xtask check-bounded-decode` enforces this in `zakura-network` and `zakura-rpc`.
 
 ### Performance
 

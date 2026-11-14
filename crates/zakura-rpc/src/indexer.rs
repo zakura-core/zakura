@@ -78,8 +78,7 @@ impl BlockAndHash {
             })
             .ok()
             .and_then(|hash| {
-                self.data
-                    .zcash_deserialize_into()
+                block::Block::zcash_deserialize_bounded(&mut self.data.as_slice())
                     .map_err(|err| tracing::warn!(?err, "failed to deserialize block",))
                     .ok()
                     .and_then(|block: block::Block| {
@@ -107,8 +106,7 @@ impl BlockAndHeight {
             })
             .ok()
             .and_then(|height| {
-                self.data
-                    .zcash_deserialize_into()
+                block::Block::zcash_deserialize_bounded(&mut self.data.as_slice())
                     .map_err(|err| tracing::warn!(?err, "failed to deserialize block",))
                     .ok()
                     .zip(Some(height))

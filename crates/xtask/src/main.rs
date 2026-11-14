@@ -7,6 +7,7 @@ use std::{
     process::{Command, ExitStatus},
 };
 
+mod bounded_decode;
 mod header_acceptance;
 mod header_conformance;
 mod header_fuzz;
@@ -89,6 +90,15 @@ fn try_main() -> Result<(), BoxError> {
             }
 
             rpc_artifacts::check(&repo_root()?)
+        }
+        Some("check-bounded-decode") => {
+            if args.next().is_some() {
+                return Err(Box::new(UsageError(
+                    "`cargo xtask check-bounded-decode` does not accept arguments",
+                )));
+            }
+
+            bounded_decode::check(&repo_root()?)
         }
         Some("check-rt-imports") => {
             if args.next().is_some() {
@@ -381,6 +391,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "  cargo xtask generate-rpc-artifacts")?;
     writeln!(output, "  cargo xtask check-rpc-artifacts")?;
     writeln!(output, "  cargo xtask check-rt-imports")?;
+    writeln!(output, "  cargo xtask check-bounded-decode")?;
     writeln!(
         output,
         "  cargo xtask planted [--shard <index>/<count>] [--changed-since <rev>] [--targets] [<property-id>]"

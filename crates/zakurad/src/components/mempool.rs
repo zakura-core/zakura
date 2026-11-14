@@ -1182,10 +1182,10 @@ impl Service<Request> for Mempool {
             // This runs after the pending set is extended, so it also covers
             // transactions that were inserted and then invalidated or mined
             // within this same `poll_ready` call.
-            if !invalidated_ids.is_empty() || !mined_mempool_ids.is_empty() {
-                pending_gossip_tx_ids.retain(|tx_id| {
-                    !invalidated_ids.contains(tx_id) && !mined_mempool_ids.contains(tx_id)
-                });
+            // Remove changed IDs directly, so a stalled gossip backlog is not
+            // scanned whenever a transaction leaves the mempool.
+            for tx_id in invalidated_ids.iter().chain(&mined_mempool_ids) {
+                pending_gossip_tx_ids.remove(tx_id);
             }
 
             // Send transactions that were rejected to RPC listeners.

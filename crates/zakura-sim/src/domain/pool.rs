@@ -107,13 +107,13 @@ pub struct PoolEvidence {
     pub refused: BTreeSet<usize>,
     /// The transactions a reader of the log read a refusal for.
     pub read_refusals: BTreeSet<usize>,
-    /// The transactions a reader of the log read an addition for.
-    pub read_additions: BTreeSet<usize>,
-    /// The transactions whose fetch a submitter reported as failed, under a
-    /// reservation that opened a new admission. Each one's outcome, a
-    /// refusal or an addition if another caller's body decided it first,
-    /// must reach a reader.
-    pub failed_fetches: BTreeSet<usize>,
+    /// How many outcomes, additions and refusals, a reader of the log read
+    /// for each transaction.
+    pub read_outcomes: std::collections::BTreeMap<usize, u64>,
+    /// How many admissions a submitter opened for each transaction: grants
+    /// that did not join another's, less those it abandoned, which end with
+    /// nothing logged. Each one ends with an outcome a reader must read.
+    pub admissions_opened: std::collections::BTreeMap<usize, u64>,
     /// The first snapshot the log did not lead to.
     pub log_mismatch: Option<String>,
     /// Reorgs that happened while the pool held visible transactions.
@@ -409,17 +409,22 @@ pub fn end_violations(evidence: &SharedEvidence) -> Vec<EndViolation> {
             actual: format!("no reader read a refusal for transactions {unread:?}"),
         });
     }
-    let untold: Vec<usize> = evidence
-        .failed_fetches
+    let untold: Vec<(usize, u64, u64)> = evidence
+        .admissions_opened
         .iter()
-        .copied()
-        .filter(|tx| !evidence.read_refusals.contains(tx) && !evidence.read_additions.contains(tx))
+        .map(|(tx, opened)| {
+            let read = evidence.read_outcomes.get(tx).copied().unwrap_or(0);
+            (*tx, *opened, read)
+        })
+        .filter(|(_, opened, read)| read < opened)
         .collect();
     if !untold.is_empty() {
         violations.push(EndViolation {
             property: PropertyId::new(LOG_COMPLETE),
-            expected: "every failed fetch's outcome reaches a reader of the log".to_owned(),
-            actual: format!("no reader read an outcome for the failed fetches of {untold:?}"),
+            expected: "every admission's outcome reaches a reader of the log".to_owned(),
+            actual: format!(
+                "admissions opened and outcomes read, as (transaction, opened, read): {untold:?}"
+            ),
         });
     }
     if evidence.reorgs_with_pool > 0 {

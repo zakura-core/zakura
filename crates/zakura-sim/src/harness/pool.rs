@@ -505,9 +505,9 @@ fn submitters() -> Vec<Submitter> {
             script: &[Op::Pause(6), Op::Deliver(T14)],
         },
         // This node: the parent T9 waits for, an expiring body, the body a
-        // block will mine, a failed fetch, an abandoned reservation, an
-        // invalid body, and once the chain is quiet a burst past the node's
-        // limit.
+        // block will mine, a failed fetch, an abandoned reservation, the same
+        // fetch failing again, an invalid body, and once the chain is quiet a
+        // burst past the node's limit.
         Submitter {
             label: "local",
             script: &[
@@ -517,6 +517,9 @@ fn submitters() -> Vec<Submitter> {
                 Op::Deliver(T10),
                 Op::FetchFails(T12),
                 Op::Abandon(T13),
+                // Failed again, so each admission's outcome, not only the
+                // first, has to reach a reader.
+                Op::FetchFails(T12),
                 Op::Deliver(T15),
                 Op::AfterChain(5),
                 Op::Burst(&FILL),
@@ -559,17 +562,19 @@ async fn submit_all(
                 // A granted fetch reservation opened a new admission, whose
                 // failure the change log must carry.
                 if let Some(reservation) = at.reserve(tx, Intent::Fetch).await {
-                    {
-                        let mut evidence = lock(&evidence);
-                        evidence.held.remove(&tx);
-                        evidence.failed_fetches.insert(tx);
-                    }
+                    lock(&evidence).held.remove(&tx);
                     handle.fetch_failed(reservation).await;
                 }
             }
             Op::Abandon(tx) => {
                 if let Some(reservation) = at.reserve(tx, Intent::Fetch).await {
-                    lock(&evidence).held.remove(&tx);
+                    // A plain drop ends the admission with nothing logged.
+                    let mut evidence = lock(&evidence);
+                    evidence.held.remove(&tx);
+                    if let Some(opened) = evidence.admissions_opened.get_mut(&tx) {
+                        *opened = opened.saturating_sub(1);
+                    }
+                    drop(evidence);
                     drop(reservation);
                 }
             }
@@ -601,6 +606,9 @@ impl Submitting<'_> {
         let answer = self.handle.reserve(self.universe.id(tx), intent).await;
         let reservation = answer.ok()?;
         let mut evidence = lock(self.evidence);
+        if !reservation.joined() {
+            *evidence.admissions_opened.entry(tx).or_default() += 1;
+        }
         evidence.held.insert(tx);
         evidence.count_slots();
         Some(reservation)
@@ -1053,8 +1061,11 @@ async fn observe(mut handle: PoolHandle, universe: Arc<Universe>, evidence: Shar
         }
         let mut evidence = lock(&evidence);
         evidence.logs_checked += 1;
+        let refused_or_added: Vec<usize> = refused.iter().chain(&added).copied().collect();
         evidence.read_refusals.extend(refused);
-        evidence.read_additions.extend(added);
+        for tx in refused_or_added {
+            *evidence.read_outcomes.entry(tx).or_default() += 1;
+        }
         if evidence.log_mismatch.is_none() {
             evidence.log_mismatch = problem;
         }

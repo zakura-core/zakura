@@ -33,16 +33,19 @@ impl HeldSeats {
         }
     }
 
-    /// Holds the seat of `closed` for its IP if the connection was long-lived and
-    /// fewer than the limit are held.
-    pub fn hold(&mut self, closed: ClosedConnection) {
-        if closed.open_for < constants::MIN_HELD_SEAT_CONNECTION {
+    /// Holds the seat of `closed` for its IP if the connection was long-lived, its hold
+    /// is not already over at `now`, and fewer than the limit are held.
+    pub fn hold(&mut self, closed: ClosedConnection, now: Instant) {
+        let release_at = closed.closed_at + constants::HELD_SEAT_DURATION;
+        if closed.open_for < constants::MIN_HELD_SEAT_CONNECTION || release_at <= now {
             return;
         }
 
+        // A hold that is over must not count towards the limit.
+        self.release_expired(now);
+
         if self.release_at.len() < self.limit || self.release_at.contains_key(&closed.ip) {
-            self.release_at
-                .insert(closed.ip, closed.closed_at + constants::HELD_SEAT_DURATION);
+            self.release_at.insert(closed.ip, release_at);
             metrics::counter!("peer.inbound.held_seats.held").increment(1);
         }
     }
@@ -50,12 +53,21 @@ impl HeldSeats {
     /// Returns the number of seats held for IPs other than `ip` at `now`, after
     /// releasing the seats whose hold is over.
     pub fn held_for_others(&mut self, ip: IpAddr, now: Instant) -> usize {
-        self.release_at.retain(|_ip, release_at| now < *release_at);
+        self.release_expired(now);
 
         self.release_at.len() - usize::from(self.release_at.contains_key(&ip))
     }
 
+    /// Releases the seats whose hold is over at `now`.
+    fn release_expired(&mut self, now: Instant) {
+        self.release_at.retain(|_ip, release_at| now < *release_at);
+    }
+
     /// Releases the seat held for `ip`, because its peer took it back.
+    ///
+    /// The hold is over even if the peer's handshake then fails. The listener refuses
+    /// another connection from that IP for [`constants::MIN_PEER_RECONNECTION_DELAY`]
+    /// either way, which is most of [`constants::HELD_SEAT_DURATION`].
     pub fn release(&mut self, ip: IpAddr) {
         if self.release_at.remove(&ip).is_some() {
             metrics::counter!("peer.inbound.held_seats.taken_back").increment(1);
@@ -88,7 +100,7 @@ mod tests {
         let other_ip = closed(2, Duration::ZERO, now).ip;
         let mut seats = HeldSeats::new(100);
 
-        seats.hold(peer);
+        seats.hold(peer, now);
         assert_eq!(seats.held_for_others(other_ip, now), 1);
         assert_eq!(seats.held_for_others(peer.ip, now), 0);
 
@@ -98,7 +110,7 @@ mod tests {
         seats.release(peer.ip);
         assert_eq!(seats.held_for_others(other_ip, last_held), 0);
 
-        seats.hold(peer);
+        seats.hold(peer, now);
         assert_eq!(
             seats.held_for_others(other_ip, now + constants::HELD_SEAT_DURATION),
             0,
@@ -112,12 +124,15 @@ mod tests {
         let now = Instant::now();
         let mut seats = HeldSeats::new(100);
 
-        seats.hold(closed(
-            1,
-            constants::MIN_HELD_SEAT_CONNECTION - Duration::from_millis(1),
+        seats.hold(
+            closed(
+                1,
+                constants::MIN_HELD_SEAT_CONNECTION - Duration::from_millis(1),
+                now,
+            ),
             now,
-        ));
-        seats.hold(closed(2, Duration::ZERO, now));
+        );
+        seats.hold(closed(2, Duration::ZERO, now), now);
 
         assert_eq!(
             seats.held_for_others(closed(3, Duration::ZERO, now).ip, now),
@@ -135,7 +150,7 @@ mod tests {
         for (inbound_limit, expected_held) in [(9, 0), (10, 1), (30, 3), (300, 30)] {
             let mut seats = HeldSeats::new(inbound_limit);
             for host in 0..100 {
-                seats.hold(closed(host, constants::MIN_HELD_SEAT_CONNECTION, now));
+                seats.hold(closed(host, constants::MIN_HELD_SEAT_CONNECTION, now), now);
             }
 
             assert_eq!(
@@ -144,5 +159,23 @@ mod tests {
                 "unexpected held seats with an inbound limit of {inbound_limit}"
             );
         }
+    }
+
+    /// A hold that is over frees its place under the limit for the next peer that
+    /// leaves.
+    #[test]
+    fn an_expired_hold_does_not_count_towards_the_limit() {
+        let now = Instant::now();
+        let expired = now + constants::HELD_SEAT_DURATION;
+        let first = closed(1, constants::MIN_HELD_SEAT_CONNECTION, now);
+        let second = closed(2, constants::MIN_HELD_SEAT_CONNECTION, expired);
+        // An inbound limit of 10 holds one seat.
+        let mut seats = HeldSeats::new(10);
+
+        seats.hold(first, now);
+        seats.hold(second, expired);
+
+        assert_eq!(seats.held_for_others(first.ip, expired), 1);
+        assert_eq!(seats.held_for_others(second.ip, expired), 0);
     }
 }

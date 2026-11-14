@@ -59,6 +59,11 @@ use crate::request::Spend;
 #[cfg(test)]
 mod tests;
 
+/// Extra bytes read ahead when a block's transactions are read from disk, on top
+/// of the block's recorded size: about one 4 KiB data block before the first
+/// transaction and one after the last, with room for block trailers.
+const BLOCK_SCAN_READAHEAD_SLACK_BYTES: usize = 16 * 1024;
+
 pub(in crate::service::finalized_state) const ZAKURA_HEADER_HASH_BY_HEIGHT: &str =
     "zakura_header_hash_by_height";
 pub(in crate::service::finalized_state) const ZAKURA_HEADER_HEIGHT_BY_HASH: &str =
@@ -341,51 +346,57 @@ impl ZakuraDb {
     /// The block is assembled from the stored raw bytes — the header, the
     /// CompactSize-encoded transaction count, and the raw transactions — so
     /// it is never deserialized. The recorded block size is checked before the
-    /// transactions are read, and the exact size before the parts are copied
-    /// into the returned buffer.
+    /// transactions are read, and copying stops as soon as the block grows past
+    /// `max_bytes`.
     ///
     /// Returns `None` if the block does not exist, if its transaction bodies
     /// are missing because they have been pruned, or if it does not fit.
+    ///
+    /// Old blocks are rarely in memory, so this read is shaped for the disk: the
+    /// transactions are fetched in about one disk read sized from the recorded
+    /// block size, and each one is copied once, straight into the returned buffer.
     #[allow(clippy::unwrap_in_result)]
     pub(crate) fn raw_block_bytes_within(
         &self,
         hash_or_height: HashOrHeight,
         max_bytes: usize,
     ) -> Option<Vec<u8>> {
+        let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
+
         // The recorded size skips a block that cannot fit before its
-        // transactions are read.
-        if self
-            .block_info(hash_or_height)
-            .is_some_and(|info| usize::try_from(info.size()).is_ok_and(|size| size > max_bytes))
-        {
+        // transactions are read, and sizes the disk read and the buffer.
+        let recorded_size = self.block_info(height.into()).map(|info| info.size());
+        let recorded_len = recorded_size.and_then(|size| usize::try_from(size).ok());
+        if recorded_len.is_some_and(|size| size > max_bytes) {
             return None;
         }
-        let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
 
-        let tx_count = CompactSizeMessage::try_from(raw_txs.len())
-            .expect("must work for a previously serialized block");
-        let tx_count = tx_count
+        let raw_header = self.raw_block_header(height.into())?;
+        let mut bytes = Vec::with_capacity(recorded_len.unwrap_or_default());
+        bytes.extend_from_slice(raw_header.raw_bytes());
+
+        // The transaction count is only known after the scan. Blocks with fewer
+        // than 253 transactions encode it in one byte, so that byte is reserved
+        // here and widened afterwards for larger blocks.
+        let count_offset = bytes.len();
+        bytes.push(0);
+
+        let tx_count = self.visit_raw_transactions(height, recorded_size, |raw_tx| {
+            // Stop copying as soon as the block cannot fit.
+            if bytes.len().saturating_add(raw_tx.len()) > max_bytes {
+                return false;
+            }
+            bytes.extend_from_slice(raw_tx);
+            true
+        })?;
+
+        let tx_count = CompactSizeMessage::try_from(tx_count)
+            .expect("must work for a previously serialized block")
             .zcash_serialize_to_vec()
             .expect("must work for a previously serialized block");
+        bytes.splice(count_offset..=count_offset, tx_count);
 
-        let size = raw_header.raw_bytes().len()
-            + tx_count.len()
-            + raw_txs
-                .iter()
-                .map(|raw_tx| raw_tx.raw_bytes().len())
-                .sum::<usize>();
-        if size > max_bytes {
-            return None;
-        }
-
-        let mut bytes = Vec::with_capacity(size);
-        bytes.extend_from_slice(raw_header.raw_bytes());
-        bytes.extend_from_slice(&tx_count);
-        for raw_tx in &raw_txs {
-            bytes.extend_from_slice(raw_tx.raw_bytes());
-        }
-
-        Some(bytes)
+        (bytes.len() <= max_bytes).then_some(bytes)
     }
 
     /// Returns the raw [`Block`] with [`block::Hash`] or
@@ -394,31 +405,81 @@ impl ZakuraDb {
     ///
     /// Returns `None` if the block does not exist, or if its transaction bodies
     /// are missing because they have been pruned.
-    #[allow(clippy::unwrap_in_result)]
     fn raw_block(&self, hash_or_height: HashOrHeight) -> Option<(RawBytes, Vec<RawBytes>)> {
-        // Block
         let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
-        if !self.contains_body_at_height(height) {
+        let header = self.raw_block_header(height.into())?;
+
+        let mut transactions = Vec::new();
+        self.visit_raw_transactions(height, None, |raw_tx| {
+            transactions.push(RawBytes::new_raw_bytes(raw_tx.to_vec()));
+            true
+        })?;
+
+        Some((header, transactions))
+    }
+
+    /// Calls `visit` with the stored bytes of each transaction in the finalized
+    /// block at `height`, in block order, and returns how many there were.
+    ///
+    /// Returns `None` if the block's body is not stored, because it was pruned or
+    /// never committed, or if `visit` returns `false` to stop early.
+    ///
+    /// `recorded_size` is the block's recorded serialized size, if the caller
+    /// has it. The transactions are then read from disk in about one read of
+    /// that size, instead of one small data block at a time: see
+    /// [`DiskDb::zs_visit_range_with_readahead`]. Without a recorded size, the scan
+    /// uses the default whole-block read-ahead size.
+    ///
+    /// [`DiskDb::zs_visit_range_with_readahead`]: crate::service::finalized_state::DiskDb::zs_visit_range_with_readahead
+    #[allow(clippy::unwrap_in_result)]
+    fn visit_raw_transactions(
+        &self,
+        height: Height,
+        recorded_size: Option<u32>,
+        mut visit: impl FnMut(&[u8]) -> bool,
+    ) -> Option<usize> {
+        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+
+        // The scan can start up to a data block before the block's first
+        // transaction, and each stored transaction also carries its key.
+        let readahead_bytes = recorded_size
+            .and_then(|size| usize::try_from(size).ok())
+            .map_or(BLOCK_TRANSACTIONS_READ_AHEAD_BYTES, |size| {
+                size.saturating_add(size / 16)
+                    .saturating_add(BLOCK_SCAN_READAHEAD_SLACK_BYTES)
+            });
+
+        let mut tx_count = 0;
+        let mut stopped = false;
+        self.db.zs_visit_range_with_readahead(
+            &tx_by_loc,
+            TransactionLocation::min_for_height(height)
+                ..=TransactionLocation::max_for_height(height),
+            readahead_bytes,
+            |key, raw_tx| {
+                // Every valid block has a coinbase transaction at index 0, so a
+                // stored body starts there. A scan that starts anywhere else has
+                // no body to return.
+                if tx_count == 0 && TransactionLocation::from_bytes(key).index.index() != 0 {
+                    return false;
+                }
+                tx_count += 1;
+                stopped = !visit(raw_tx);
+                !stopped
+            },
+        );
+        if stopped || tx_count == 0 {
             return None;
         }
 
-        let header = self.raw_block_header(height.into())?;
-
-        // Transactions
-
-        let transactions: Vec<RawBytes> = self
-            .raw_transactions_by_height(height)
-            .map(|(_, tx)| tx)
-            .collect();
-
         if self.raw_block_transactions_may_be_pruned(height) {
             let transaction_hashes = self.transaction_hashes_for_block(height.into())?;
-            if transactions.len() != transaction_hashes.len() {
+            if tx_count != transaction_hashes.len() {
                 return None;
             }
         }
 
-        Some((header, transactions))
+        Some(tx_count)
     }
 
     /// Returns `true` if `height` is in the range where raw transactions may
@@ -685,25 +746,6 @@ impl ZakuraDb {
         self.transactions_by_location_range(
             TransactionLocation::min_for_height(height)
                 ..=TransactionLocation::max_for_height(height),
-        )
-    }
-
-    /// Returns an iterator of all raw [`Transaction`]s for a provided block
-    /// height in finalized state.
-    ///
-    /// The scan reads the block's transactions from disk
-    /// [`BLOCK_TRANSACTIONS_READ_AHEAD_BYTES`] at a time, because the caller reads all of them.
-    #[allow(clippy::unwrap_in_result)]
-    fn raw_transactions_by_height(
-        &self,
-        height: Height,
-    ) -> impl Iterator<Item = (TransactionLocation, RawBytes)> + '_ {
-        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
-        self.db.zs_forward_range_iter_with_read_ahead(
-            tx_by_loc,
-            TransactionLocation::min_for_height(height)
-                ..=TransactionLocation::max_for_height(height),
-            BLOCK_TRANSACTIONS_READ_AHEAD_BYTES,
         )
     }
 

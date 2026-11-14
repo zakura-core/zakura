@@ -30,7 +30,9 @@ use crate::{
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     request::{FinalizedBlock, Treestate},
     service::finalized_state::{
-        disk_db::DiskWriteBatch, ZakuraDb, PRUNING_METADATA, STATE_COLUMN_FAMILIES_IN_CODE,
+        disk_db::{DiskWriteBatch, WriteDisk},
+        disk_format::block::TransactionLocation,
+        ZakuraDb, PRUNING_METADATA, STATE_COLUMN_FAMILIES_IN_CODE,
     },
     CheckpointVerifiedBlock, Config, SemanticallyVerifiedBlock,
 };
@@ -589,25 +591,113 @@ fn test_block_db_round_trip() {
     test_block_db_round_trip_with(&Mainnet, iter::once(block));
 }
 
-fn test_block_db_round_trip_with(
-    network: &Network,
-    block_test_cases: impl IntoIterator<Item = Block>,
-) {
-    let _init_guard = zakura_test::init();
-
-    let state = ZakuraDb::new(
+/// Opens an empty ephemeral block database that accepts blocks written without validation.
+fn ephemeral_block_db(network: &Network) -> ZakuraDb {
+    ZakuraDb::new(
         &Config::ephemeral(),
         STATE_DATABASE_KIND,
         &state_database_format_version_in_code(),
         network,
-        // The raw database accesses in this test create invalid database formats.
+        // The raw database accesses in these tests create invalid database formats.
         true,
         STATE_COLUMN_FAMILIES_IN_CODE
             .iter()
             .map(ToString::to_string),
         false,
     )
-    .expect("opening an ephemeral database should succeed");
+    .expect("opening an ephemeral database should succeed")
+}
+
+/// Writes `block`'s header and transactions to `state` without validating it,
+/// and returns the stored block. A block without a coinbase height is stored at height zero.
+fn write_block_without_validation(state: &ZakuraDb, block: Arc<Block>) -> FinalizedBlock {
+    let checkpoint_verified = if block.coinbase_height().is_some() {
+        CheckpointVerifiedBlock::from(block)
+    } else {
+        // Fake a zero height
+        let hash = block.hash();
+        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        let new_outputs = new_ordered_outputs_with_height(&block, Height(0), &transaction_hashes);
+
+        CheckpointVerifiedBlock(SemanticallyVerifiedBlock {
+            block: block.into(),
+            hash,
+            height: Height(0),
+            new_outputs: Arc::new(new_outputs),
+            transaction_hashes,
+            deferred_pool_balance_change: None,
+            origin: crate::BlockOrigin::Network,
+            auth_data_root: None,
+            receipt_order: None,
+        })
+    };
+
+    let dummy_treestate = Treestate::default();
+    let finalized = FinalizedBlock::from_checkpoint_verified(checkpoint_verified, dummy_treestate);
+
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_block_header_and_transaction_data_batch(state, &finalized, true, None)
+        .expect("test block header and transaction batch is valid");
+    state.db.write(batch).expect("block is valid for writing");
+
+    finalized
+}
+
+/// A block served to peers is its exact consensus bytes when it fits the byte
+/// cap, nothing when it is even one byte over, and nothing when its coinbase
+/// transaction is not stored, because a stored body always starts with it.
+#[test]
+fn served_block_bytes_fit_the_cap_and_need_a_stored_coinbase() {
+    let _init_guard = zakura_test::init();
+
+    let block = large_multi_transaction_block();
+    assert!(
+        block.transactions.len() >= 253,
+        "the transaction count must need a multi-byte CompactSize, so the served bytes cover widening it",
+    );
+    let expected = block
+        .zcash_serialize_to_vec()
+        .expect("serialization to vec never fails");
+
+    let state = ephemeral_block_db(&Mainnet);
+    let height = write_block_without_validation(&state, Arc::new(block)).height;
+
+    assert_eq!(
+        state.raw_block_bytes_within(height.into(), expected.len()),
+        Some(expected.clone()),
+        "a block that exactly fits the cap is served as its consensus bytes",
+    );
+    assert_eq!(
+        state.raw_block_bytes_within(height.into(), expected.len() - 1),
+        None,
+        "a block one byte over the cap is not served",
+    );
+
+    let tx_by_loc = state.db.cf_handle("tx_by_loc").unwrap();
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_delete(&tx_by_loc, TransactionLocation::min_for_height(height));
+    state.db.write(batch).expect("deleting a row is valid");
+
+    assert!(!state.contains_body_at_height(height));
+    assert_eq!(
+        state.raw_block_bytes_within(height.into(), usize::MAX),
+        None,
+        "a block whose coinbase is missing has no body to serve",
+    );
+    assert!(
+        state.stored_block(height.into()).is_none(),
+        "a block whose coinbase is missing has no body to decode",
+    );
+}
+
+fn test_block_db_round_trip_with(
+    network: &Network,
+    block_test_cases: impl IntoIterator<Item = Block>,
+) {
+    let _init_guard = zakura_test::init();
+
+    let state = ephemeral_block_db(network);
 
     // Check that each block round-trips to the database
     for original_block in block_test_cases.into_iter() {
@@ -633,42 +723,7 @@ fn test_block_db_round_trip_with(
 
         // Now, use the database
         let original_block = Arc::new(original_block);
-        let checkpoint_verified = if original_block.coinbase_height().is_some() {
-            CheckpointVerifiedBlock::from(original_block.clone())
-        } else {
-            // Fake a zero height
-            let hash = original_block.hash();
-            let transaction_hashes: Arc<[_]> = original_block
-                .transactions
-                .iter()
-                .map(|tx| tx.hash())
-                .collect();
-            let new_outputs =
-                new_ordered_outputs_with_height(&original_block, Height(0), &transaction_hashes);
-
-            CheckpointVerifiedBlock(SemanticallyVerifiedBlock {
-                block: original_block.clone().into(),
-                hash,
-                height: Height(0),
-                new_outputs: Arc::new(new_outputs),
-                transaction_hashes,
-                deferred_pool_balance_change: None,
-                origin: crate::BlockOrigin::Network,
-                auth_data_root: None,
-                receipt_order: None,
-            })
-        };
-
-        let dummy_treestate = Treestate::default();
-        let finalized =
-            FinalizedBlock::from_checkpoint_verified(checkpoint_verified, dummy_treestate);
-
-        // Skip validation by writing the block directly to the database
-        let mut batch = DiskWriteBatch::new();
-        batch
-            .prepare_block_header_and_transaction_data_batch(&state, &finalized, true, None)
-            .expect("test block header and transaction batch is valid");
-        state.db.write(batch).expect("block is valid for writing");
+        let finalized = write_block_without_validation(&state, original_block.clone());
 
         // Now read it back from the state
         let stored_block = state

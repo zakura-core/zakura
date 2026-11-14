@@ -14,7 +14,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::{Debug, Write},
     fs, io,
-    ops::RangeBounds,
+    ops::{RangeBounds, RangeInclusive},
     path::Path,
     sync::{
         atomic::{self, AtomicBool, AtomicU64},
@@ -915,6 +915,46 @@ impl DiskDb {
         R: RangeBounds<K>,
     {
         self.zs_range_iter_with_direction(cf, range, false, Some(read_ahead_bytes))
+    }
+
+    /// Calls `visit` with the stored key and value bytes of each item in `cf` in
+    /// `range`, in key order, until `visit` returns `false`.
+    ///
+    /// When `readahead_bytes` is non-zero, each table file is read
+    /// `readahead_bytes` at a time from the first read, so a range spread over
+    /// many small data blocks costs one disk read rather than one per data block.
+    /// Pass zero to keep RocksDB's default, which reads ahead only after it sees
+    /// several sequential reads. The bytes are borrowed from RocksDB rather than
+    /// copied.
+    pub fn zs_visit_range_with_readahead<C, K>(
+        &self,
+        cf: &C,
+        range: RangeInclusive<K>,
+        readahead_bytes: usize,
+        mut visit: impl FnMut(&[u8], &[u8]) -> bool,
+    ) where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk,
+    {
+        let start = range.start().as_bytes().as_ref().to_vec();
+        let end = range.end().as_bytes().as_ref().to_vec();
+
+        // The bounds stop the iterator after `end`, so the loop below needs no
+        // range check of its own.
+        let mut opts = Self::zs_iter_opts(&(start.clone()..=end));
+        if readahead_bytes > 0 {
+            opts.set_readahead_size(readahead_bytes);
+        }
+
+        let mut iter = self.db.raw_iterator_cf_opt(cf, opts);
+        iter.seek(&start);
+        while let (Some(key), Some(value)) = (iter.key(), iter.value()) {
+            if !visit(key, value) {
+                return;
+            }
+            iter.next();
+        }
+        iter.status().expect("unexpected database failure");
     }
 
     /// Returns a reverse iterator over the items in `cf` in `range`.

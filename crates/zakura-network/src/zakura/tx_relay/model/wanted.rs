@@ -1,0 +1,208 @@
+//! The model of `WantedIds`: the node-wide table of ids this node wants.
+//!
+//! An entry is shared state about one id. It holds no peer facts: not who
+//! announced the id, not who tried it, not any peer's announced size. Those
+//! live in each peer routine. The entry has only its claim, how many pending
+//! sets hold it, and its timing.
+
+use std::{collections::HashMap, time::Duration};
+
+use zakura_chain::transaction::UnminedTxId;
+
+use super::{EntryGen, SessionId, Time, NO_ROOM_FIRST, NO_ROOM_MAX, RETRY_FIRST, RETRY_MAX};
+
+/// One wanted id.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Entry {
+    /// Which life of the id this is. An id that leaves and comes back gets a
+    /// new generation, so a stale reference never changes a newer entry.
+    pub(crate) generation: EntryGen,
+    /// The session fetching it, from its reservation to its verdict.
+    pub(crate) claim: Option<SessionId>,
+    /// How many pending sets hold it. A number, not a list.
+    pub(crate) holders: usize,
+    /// When the first announcement of this generation arrived. An inbound
+    /// announcer waits [`super::INBOUND_DELAY`] after it.
+    pub(crate) first_seen: Time,
+    /// Nobody claims it before this.
+    pub(crate) retry_at: Time,
+    /// The last retry delay, which doubles on each retry.
+    pub(crate) retry_delay: Option<Duration>,
+    /// When its claim was last released. A session whose own request for it
+    /// timed out waits [`super::INBOUND_DELAY`] after this.
+    pub(crate) released_at: Option<Time>,
+}
+
+/// The pool answered `NoRoom`, so nobody claims until `until`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct Backoff {
+    until: Time,
+    delay: Duration,
+}
+
+/// The table.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WantedModel {
+    entries: HashMap<UnminedTxId, Entry>,
+    next_generation: u64,
+    backoff: Option<Backoff>,
+}
+
+impl WantedModel {
+    /// The entry for `id`, if the node wants it.
+    pub(crate) fn entry(&self, id: UnminedTxId) -> Option<&Entry> {
+        self.entries.get(&id)
+    }
+
+    /// The entry for `id` if it is still `generation`.
+    pub(crate) fn current(&self, id: UnminedTxId, generation: EntryGen) -> Option<&Entry> {
+        self.entries
+            .get(&id)
+            .filter(|entry| entry.generation == generation)
+    }
+
+    /// Every wanted id and its entry.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&UnminedTxId, &Entry)> {
+        self.entries.iter()
+    }
+
+    /// How many ids the node wants.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// A pending set takes `id`. Makes a new entry and generation if there is
+    /// none, and counts one more holder.
+    pub(crate) fn hold(&mut self, id: UnminedTxId, now: Time) -> EntryGen {
+        let next = &mut self.next_generation;
+        let entry = self.entries.entry(id).or_insert_with(|| {
+            *next = next.saturating_add(1);
+            Entry {
+                generation: EntryGen(*next),
+                claim: None,
+                holders: 0,
+                first_seen: now,
+                retry_at: now,
+                retry_delay: None,
+                released_at: None,
+            }
+        });
+        entry.holders = entry.holders.saturating_add(1);
+        entry.generation
+    }
+
+    /// A pending set gives `id` up: it left, tried it, or its session ended.
+    /// An entry nobody holds or claims leaves the table.
+    pub(crate) fn unhold(&mut self, id: UnminedTxId, generation: EntryGen) {
+        let Some(entry) = self
+            .entries
+            .get_mut(&id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return;
+        };
+        entry.holders = entry
+            .holders
+            .checked_sub(1)
+            .expect("a pending reference counts as one holder");
+        self.collect(id);
+    }
+
+    /// `session` claims `id`.
+    ///
+    /// # Panics
+    ///
+    /// If someone else holds the claim. Callers check first.
+    pub(crate) fn claim(&mut self, id: UnminedTxId, generation: EntryGen, session: SessionId) {
+        let entry = self
+            .entries
+            .get_mut(&id)
+            .filter(|entry| entry.generation == generation)
+            .expect("only a current entry is claimed");
+        assert!(entry.claim.is_none(), "one claim per id");
+        entry.claim = Some(session);
+    }
+
+    /// The claim ends without a decision. With `retry`, nobody claims it for
+    /// a delay that doubles each time, because the pool could not take it.
+    pub(crate) fn release(
+        &mut self,
+        id: UnminedTxId,
+        generation: EntryGen,
+        session: SessionId,
+        now: Time,
+        retry: bool,
+    ) {
+        let Some(entry) = self
+            .entries
+            .get_mut(&id)
+            .filter(|entry| entry.generation == generation && entry.claim == Some(session))
+        else {
+            return;
+        };
+        entry.claim = None;
+        entry.released_at = Some(now);
+        if retry {
+            let delay = entry
+                .retry_delay
+                .map_or(RETRY_FIRST, |delay| delay.saturating_mul(2).min(RETRY_MAX));
+            entry.retry_delay = Some(delay);
+            entry.retry_at = now.saturating_add(delay);
+        }
+        self.collect(id);
+    }
+
+    /// The id is decided: in the pool, rejected, or mined. Its entry leaves,
+    /// whoever holds it. Returns whether `generation` was the current one.
+    pub(crate) fn decide(&mut self, id: UnminedTxId, generation: EntryGen) -> bool {
+        if self
+            .entries
+            .get(&id)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            self.entries.remove(&id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the table holds every claim off for a `NoRoom` backoff.
+    pub(crate) fn in_backoff(&self, now: Time) -> bool {
+        self.backoff.is_some_and(|backoff| now < backoff.until)
+    }
+
+    /// When the backoff ends, if one is set.
+    pub(crate) fn backoff_until(&self) -> Option<Time> {
+        self.backoff.map(|backoff| backoff.until)
+    }
+
+    /// The pool answered `NoRoom`. Start the backoff, or double it if this
+    /// was the probe after one.
+    pub(crate) fn no_room(&mut self, now: Time) {
+        let delay = self.backoff.map_or(NO_ROOM_FIRST, |backoff| {
+            backoff.delay.saturating_mul(2).min(NO_ROOM_MAX)
+        });
+        self.backoff = Some(Backoff {
+            until: now.saturating_add(delay),
+            delay,
+        });
+    }
+
+    /// The pool has room again: a reservation was granted, or a verdict
+    /// freed a slot.
+    pub(crate) fn room(&mut self) {
+        self.backoff = None;
+    }
+
+    /// Drops `id`'s entry once nobody holds or claims it.
+    fn collect(&mut self, id: UnminedTxId) {
+        if self
+            .entries
+            .get(&id)
+            .is_some_and(|entry| entry.holders == 0 && entry.claim.is_none())
+        {
+            self.entries.remove(&id);
+        }
+    }
+}

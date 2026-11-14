@@ -18,6 +18,65 @@ fn with_expiry(mut tx: VerifiedUnminedTx, height: Height) -> VerifiedUnminedTx {
 }
 
 #[test]
+fn expiry_tracks_boundaries_removal_and_clear() {
+    let mut factory = TxFactory::new();
+    let mut storage = Storage::new(&Config::default());
+    let removed_early = with_expiry(factory.tx(10_000), Height(10));
+    let due = with_expiry(factory.tx(10_000), Height(10));
+    let future = with_expiry(factory.tx(10_000), Height(11));
+    let no_expiry = with_expiry(factory.tx(10_000), Height(0));
+    let early_id = removed_early.transaction.id();
+    let due_id = due.transaction.id();
+    let survivors = HashSet::from([future.transaction.id(), no_expiry.transaction.id()]);
+    for tx in [removed_early, due, future, no_expiry] {
+        storage.insert(tx, Vec::new(), None).unwrap();
+    }
+    assert!(storage.remove_expired_transactions(Height(9)).is_empty());
+    assert_eq!(storage.remove_exact(&HashSet::from([early_id])), 1);
+    assert_eq!(
+        storage.remove_expired_transactions(Height(10)),
+        HashSet::from([due_id]),
+    );
+    assert!(storage.remove_expired_transactions(Height(10)).is_empty());
+    assert_eq!(storage.tx_ids().collect::<HashSet<_>>(), survivors);
+
+    storage.clear();
+    let last = with_expiry(factory.tx(10_000), Height::MAX);
+    let last_id = last.transaction.id();
+    storage.insert(last, Vec::new(), None).unwrap();
+    assert_eq!(
+        storage.remove_expired_transactions(Height::MAX),
+        HashSet::from([last_id]),
+    );
+    assert_eq!(storage.transaction_count(), 0);
+}
+
+#[test]
+fn expiry_removes_later_expiring_descendants_from_the_index() {
+    let mut factory = TxFactory::new();
+    let mut storage = Storage::new(&Config::default());
+    let parent = with_expiry(factory.tx_with(10_000, 1, 0), Height(10));
+    let child = with_expiry(factory.tx(10_000), Height(20));
+    let parent_id = parent.transaction.id();
+    let child_id = child.transaction.id();
+    storage.insert(parent, Vec::new(), None).unwrap();
+    storage
+        .insert(
+            child,
+            vec![OutPoint::from_usize(parent_id.mined_id(), 0)],
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        storage.remove_expired_transactions(Height(10)),
+        HashSet::from([parent_id, child_id]),
+    );
+    assert!(storage.remove_expired_transactions(Height(20)).is_empty());
+    assert!(storage.rejection_error(&child_id).is_none());
+    storage.verified.assert_dependency_groups_are_bounded();
+}
+
+#[test]
 fn expiry_removes_overlapping_roots_and_reports_each_transaction_once() {
     let mut factory = TxFactory::new();
     let mut storage = Storage::new(&Config::default());

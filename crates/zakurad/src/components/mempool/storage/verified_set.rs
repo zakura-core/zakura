@@ -78,6 +78,9 @@ pub struct VerifiedSet {
     /// Higher fee per cost comes first, with older insertion times breaking ties.
     mining_order: BTreeSet<MiningCandidate>,
 
+    /// Expiring transactions ordered by height, excluding no-expiry values.
+    expiry_order: BTreeSet<(Height, transaction::Hash)>,
+
     #[cfg(test)]
     eviction_score_evaluations: std::sync::atomic::AtomicUsize,
 
@@ -190,6 +193,7 @@ impl VerifiedSet {
         self.transactions.clear();
         self.eviction_order.clear();
         self.mining_order.clear();
+        self.expiry_order.clear();
         self.transaction_dependencies.clear();
         self.spent_outpoints.clear();
         self.sprout_nullifiers.clear();
@@ -269,6 +273,9 @@ impl VerifiedSet {
 
         // Inserts the transaction's outputs into the internal caches and responds to pending output requests.
         let tx = &transaction.transaction.transaction();
+        if let Some(expiry_height) = tx.expiry_height() {
+            self.expiry_order.insert((expiry_height, tx_id));
+        }
         for (index, output) in tx.outputs().iter().cloned().enumerate() {
             let outpoint = transparent::OutPoint::from_usize(tx_id, index);
             self.created_outputs.insert(outpoint, output.clone());
@@ -660,6 +667,9 @@ impl VerifiedSet {
                 self.transactions_serialized_size -= removed_tx.transaction.size();
                 self.total_cost -= removed_tx.cost();
                 self.metrics.remove_transaction(&removed_tx);
+                if let Some(height) = removed_tx.transaction.transaction().expiry_height() {
+                    self.expiry_order.remove(&(height, *key_to_remove));
+                }
                 self.remove_outputs(&removed_tx.transaction);
 
                 Some(removed_tx)
@@ -669,6 +679,20 @@ impl VerifiedSet {
         self.insert_ordering_candidates(&affected);
         self.report_metrics();
         removed_transactions
+    }
+
+    /// Returns transactions expiring at or before `tip_height`.
+    ///
+    /// Iteration stops at the first future expiry, so unrelated transactions
+    /// are never visited. Removal also removes any later-expiring descendants.
+    pub(super) fn expired_transaction_ids(
+        &self,
+        tip_height: Height,
+    ) -> impl Iterator<Item = transaction::Hash> + '_ {
+        self.expiry_order
+            .iter()
+            .take_while(move |(height, _)| *height <= tip_height)
+            .map(|(_, id)| *id)
     }
 
     /// Checks ordering-index consistency and the dependency-group bound.

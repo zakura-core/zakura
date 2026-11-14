@@ -1010,15 +1010,7 @@ impl Storage {
         &mut self,
         tip_height: zakura_chain::block::Height,
     ) -> HashSet<UnminedTxId> {
-        let mut tx_ids = HashSet::new();
-
-        for (&tx_id, tx) in self.transactions() {
-            if let Some(expiry_height) = tx.transaction.transaction().expiry_height() {
-                if tip_height >= expiry_height {
-                    tx_ids.insert(tx_id);
-                }
-            }
-        }
+        let tx_ids: HashSet<_> = self.verified.expired_transaction_ids(tip_height).collect();
 
         // Expiry height is effecting data, so match by non-malleable TXID.
         let removed_tx_ids = self.verified.remove_all(tx_ids.iter().copied());

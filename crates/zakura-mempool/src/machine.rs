@@ -1553,6 +1553,17 @@ impl<E: VerifyError> MempoolState<E> {
                 );
                 self.forget_evicted(evicted);
                 if let Err(error) = result {
+                    // A refusal for room while hidden bodies take room says
+                    // nothing final, as with a conflict with a hidden
+                    // transaction, and storage has not cached it.
+                    if matches!(
+                        error,
+                        MempoolError::StorageExactTip(ExactTipRejectionError::BelowEvictionCost)
+                    ) && self.storage.room_is_unsettled()
+                    {
+                        self.fail_locally(key, LocalFault::PoolUnsettled);
+                        return;
+                    }
                     // Storage has cached what it refused.
                     self.refuse(key, error);
                     return;

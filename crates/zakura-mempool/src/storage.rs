@@ -443,6 +443,14 @@ impl<E: Clone> Storage<E> {
         self.insert_checked(tx, spent_mempool_outpoints, height, now, time, false)
     }
 
+    /// Whether bodies held outside storage take room that storage can't
+    /// free. A refusal for room is then not final: once they are back in
+    /// storage, the same bytes may pay enough to evict one. So such a
+    /// refusal is not cached.
+    pub fn room_is_unsettled(&self) -> bool {
+        self.outside_cost > 0
+    }
+
     /// Sets the cost the pool holds outside this storage, which counts
     /// against the cost limit.
     pub fn set_outside_cost(&mut self, cost: u64) {
@@ -513,7 +521,7 @@ impl<E: Clone> Storage<E> {
                 // again, take room but can't be evicted. So while there are
                 // any, this refusal is not remembered: once they are back, the
                 // same bytes may pay enough to evict one.
-                if self.outside_cost == 0 {
+                if !self.room_is_unsettled() {
                     self.reject_exact(unmined_tx_id, error.clone());
                 }
                 return (Err(error.into()), HashSet::new());

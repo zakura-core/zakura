@@ -1655,8 +1655,11 @@ fn hidden_transactions_count_against_the_cost_limit() {
     // against it.
     let read = GenerationRead::Stable(Generation(1));
     assert!(
-        matches!(admit(&mut machine, &txs[2], read), Verdict::Rejected(_)),
-        "the pool is full of hidden transactions"
+        matches!(
+            admit(&mut machine, &txs[2], read),
+            Verdict::LocalFault(LocalFault::PoolUnsettled)
+        ),
+        "the pool is full of hidden transactions, so nothing is decided"
     );
     assert!(
         machine

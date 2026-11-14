@@ -101,7 +101,7 @@ zakura_jsonl_trace::impl_jsonl_trace_event!(LegacyRequestError, LEGACY_REQUEST_T
 
 fn response_summary(response: &Response) -> (&'static str, u64, u64) {
     match response {
-        Response::Blocks(blocks) => (
+        Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. } => (
             "Blocks",
             bounded_u64(blocks.len()),
             bounded_u64(blocks.iter().filter(|block| block.is_missing()).count()),

@@ -236,6 +236,7 @@ where
     ///
     /// Used to route inventory requests to peers that are likely to have it.
     inventory_registry: InventoryRegistry,
+    block_suppliers: crate::block_feedback::BlockSuppliers,
 
     /// Senders for the current ready and busy connection generations.
     block_gossip_peers: HashMap<D::Key, BlockGossipPeer>,
@@ -378,6 +379,7 @@ where
             ready_services: HashMap::new(),
             // Request Routing
             inventory_registry: InventoryRegistry::new(inv_stream, config.expose_peer_addresses),
+            block_suppliers: Default::default(),
             block_gossip_peers: HashMap::new(),
             block_gossip_peers_tx: watch::channel(Vec::new()).0,
             block_gossip_peers_changed: false,
@@ -1333,10 +1335,14 @@ where
         req: Request,
         hash: InventoryHash,
     ) -> <Self as tower::Service<Request>>::Future {
+        let supplier_allowed = |addr: &PeerSocketAddr| match hash {
+            InventoryHash::Block(hash) => !self.block_suppliers.rejected(hash, &(*addr).into()),
+            _ => true,
+        };
         let advertising_peer_list = self
             .inventory_registry
             .advertising_peers(hash)
-            .filter(|&addr| self.ready_services.contains_key(addr))
+            .filter(|&addr| self.ready_services.contains_key(addr) && supplier_allowed(addr))
             .copied()
             .collect();
 
@@ -1370,7 +1376,19 @@ where
                 )),
                 _ => None,
             };
+            let feedback = match hash {
+                InventoryHash::Block(hash) => {
+                    Some(self.block_suppliers.feedback(hash, peer.into()))
+                }
+                _ => None,
+            };
             let fut = svc.call(req);
+            let fut = async move {
+                fut.await.map(|response| match feedback {
+                    Some(feedback) => feedback.attach(response),
+                    None => response,
+                })
+            };
             self.push_unready(peer, svc);
             if let Some((request_id, peer, hash, started)) = trace_context {
                 let trace = self.legacy_peer_trace.clone();
@@ -1400,11 +1418,18 @@ where
         // No ready peer advertised this block, so its known source is the most likely to have it:
         // a child's advertiser has validated the child's parent. Advertisers go first, so this
         // can't take a request away from a peer that said it has the block.
+        let not_rejected = |addr: &PeerSocketAddr| match hash {
+            InventoryHash::Block(hash) => !self.block_suppliers.rejected(hash, &(*addr).into()),
+            _ => true,
+        };
         let block_source = match &req {
             Request::BlocksByHashFrom {
                 source: PeerSource::LegacySocket(addr),
                 ..
-            } if self.ready_services.contains_key(addr) && !missing_peer_list.contains(addr) => {
+            } if self.ready_services.contains_key(addr)
+                && !missing_peer_list.contains(addr)
+                && not_rejected(addr) =>
+            {
                 Some(*addr)
             }
             _ => None,
@@ -1414,7 +1439,7 @@ where
             None => self
                 .ready_services
                 .keys()
-                .filter(|addr| !missing_peer_list.contains(addr))
+                .filter(|addr| !missing_peer_list.contains(addr) && not_rejected(addr))
                 .copied()
                 .collect(),
         };
@@ -1443,7 +1468,19 @@ where
                 )),
                 _ => None,
             };
+            let feedback = match hash {
+                InventoryHash::Block(hash) => {
+                    Some(self.block_suppliers.feedback(hash, peer.into()))
+                }
+                _ => None,
+            };
             let fut = svc.call(req);
+            let fut = async move {
+                fut.await.map(|response| match feedback {
+                    Some(feedback) => feedback.attach(response),
+                    None => response,
+                })
+            };
             self.push_unready(peer, svc);
             if let Some((request_id, peer, hash, started)) = trace_context {
                 let trace = self.legacy_peer_trace.clone();

@@ -490,20 +490,82 @@ async fn pruned_routing_retries_when_all_candidates_left_blocks_unanswered() {
     );
 }
 
-/// `getblocks` returns block hashes, which pruned peers keep, so it has no storage preference: a
-/// syncing node sends it to pruned peers too.
+impl StoragePeers {
+    fn find_blocks_request() -> Request {
+        Request::FindBlocks {
+            known_blocks: vec![BLOCK_HASH],
+            stop: None,
+        }
+    }
+
+    /// An `inv` with several blocks, which answers `getblocks` without advertising any of them.
+    fn find_blocks_reply() -> Message {
+        Message::Inv(vec![BLOCK_HASH.into(), block::Hash([0x88; 32]).into()])
+    }
+}
+
+/// A pruned peer leaves a `getblocks` from below its retained range unanswered, so a syncing
+/// node sends `getblocks` to the archive peer.
 #[tokio::test(start_paused = true)]
-async fn pruned_routing_findblocks_reaches_pruned_peers_while_syncing() {
+async fn pruned_routing_findblocks_prefers_archive_while_syncing() {
+    let _init_guard = zakura_test::init();
+    let mut peers = StoragePeers::new().await;
+
+    for _ in 0..REPEATS {
+        let response = peers
+            .set
+            .ready()
+            .await
+            .unwrap()
+            .call(StoragePeers::find_blocks_request());
+        assert!(matches!(
+            StoragePeers::next_message(&mut peers.archive).await,
+            Message::GetBlocks { .. }
+        ));
+        assert_eq!(peers.pruned.written_now().await, None);
+        peers
+            .archive
+            .peer_inbound
+            .send(Ok(StoragePeers::find_blocks_reply()))
+            .await
+            .unwrap();
+        response.await.unwrap();
+    }
+}
+
+/// With no archive peer connected, a syncing node still sends `getblocks` to a pruned peer.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_findblocks_falls_back_without_an_archive() {
+    let _init_guard = zakura_test::init();
+    let mut peers = StoragePeers::new().await;
+    peers
+        .set
+        .call(Request::DisconnectPeer(peers.archive.addr))
+        .await
+        .unwrap();
+    let _response = peers
+        .set
+        .ready()
+        .await
+        .unwrap()
+        .call(StoragePeers::find_blocks_request());
+    assert!(matches!(
+        StoragePeers::next_message(&mut peers.pruned).await,
+        Message::GetBlocks { .. }
+    ));
+}
+
+/// Near the network tip a `getblocks` locator is inside every pruned peer's retained range, so
+/// pruned peers share `getblocks` requests with the archive peer.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_findblocks_reaches_pruned_peers_near_the_tip() {
     let _init_guard = zakura_test::init();
     const REQUESTS: usize = 32;
 
     let mut peers = StoragePeers::new().await;
-    let request = Request::FindBlocks {
-        known_blocks: vec![BLOCK_HASH],
-        stop: None,
-    };
-    // An `inv` with several blocks answers `getblocks` without advertising any of them.
-    let found = vec![BLOCK_HASH.into(), block::Hash([0x88; 32]).into()];
+    reach_network_tip(&peers.tip);
+    let request = StoragePeers::find_blocks_request();
+    let found = StoragePeers::find_blocks_reply();
 
     // Both peers have the same load, so each request picks one of them at random.
     let mut pruned_requests = 0;
@@ -519,17 +581,13 @@ async fn pruned_routing_findblocks_reaches_pruned_peers_while_syncing() {
             ));
             &mut peers.archive
         };
-        selected
-            .peer_inbound
-            .send(Ok(Message::Inv(found.clone())))
-            .await
-            .unwrap();
+        selected.peer_inbound.send(Ok(found.clone())).await.unwrap();
         response.await.unwrap();
     }
 
     assert!(
         pruned_requests > 0,
-        "the pruned peer received none of {REQUESTS} getblocks requests"
+        "the pruned peer received none of {REQUESTS} getblocks requests near the tip"
     );
 }
 
@@ -669,6 +727,47 @@ async fn pruned_routing_treats_pruned_peers_alike_near_the_tip() {
     assert!(
         archive_selections < SELECTIONS * 3 / 20,
         "the archive took {archive_selections} of {SELECTIONS} selections near the tip"
+    );
+}
+
+/// While syncing, `getblocks` goes to the one archive peer among many pruned peers.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_findblocks_skips_pruned_peers_while_syncing() {
+    let _init_guard = zakura_test::init();
+    const SELECTIONS: usize = 200;
+
+    let peers = ArchiveAmongPruned::new().await;
+    fall_behind_network_tip(&peers.tip);
+    let request = StoragePeers::find_blocks_request();
+    let archive_selections = (0..SELECTIONS)
+        .filter(|_| peers.set.select_ready_p2c_peer(&request) == Some(peers.archive))
+        .count();
+    assert_eq!(
+        archive_selections, SELECTIONS,
+        "a pruned peer was selected for getblocks while this node was far behind the network tip",
+    );
+}
+
+/// Pruned peers keep every header, so `getheaders` has no storage preference even while syncing.
+#[tokio::test(start_paused = true)]
+async fn pruned_routing_findheaders_reaches_pruned_peers_while_syncing() {
+    let _init_guard = zakura_test::init();
+    const SELECTIONS: usize = 4000;
+
+    let peers = ArchiveAmongPruned::new().await;
+    fall_behind_network_tip(&peers.tip);
+    let request = Request::FindHeaders {
+        known_blocks: vec![BLOCK_HASH],
+        stop: None,
+    };
+
+    // The archive is one of 10 equally loaded peers, so expect about 400 of 4000 selections.
+    let archive_selections = (0..SELECTIONS)
+        .filter(|_| peers.set.select_ready_p2c_peer(&request) == Some(peers.archive))
+        .count();
+    assert!(
+        archive_selections < SELECTIONS * 3 / 20,
+        "the archive took {archive_selections} of {SELECTIONS} getheaders selections while syncing"
     );
 }
 

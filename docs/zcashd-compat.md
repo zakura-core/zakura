@@ -248,7 +248,10 @@ response restores the peer's eligibility; if every candidate has left a block
 unanswered, all remain eligible. A peer that advertised the block,
 or a block's known source, keeps priority. Near the network tip, pruned peers
 are treated like any other peer, because they keep the recent blocks.
-`getblocks` requests go to any peer, since pruned nodes keep block hashes.
+While syncing, `getblocks` requests prefer the same peers, because a pruned
+node only advertises blocks it can serve and leaves a `getblocks` from below
+its retained range unanswered. `getheaders` requests go to any peer, since
+pruned nodes keep every header.
 Older clients continue to use `NODE_NETWORK`.
 The pruned flag describes storage mode; it guarantees neither a particular
 retention window nor that the peer is synced.

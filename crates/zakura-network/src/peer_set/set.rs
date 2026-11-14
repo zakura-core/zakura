@@ -94,6 +94,7 @@
 //! [ZIP-201]: https://zips.z.cash/zip-0201
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     convert,
     fmt::Debug,
@@ -949,13 +950,14 @@ where
     /// hold the sidecar's only connection until it times out, and the block `inv`s the sidecar
     /// follows would queue behind it.
     ///
-    /// For a request for block bodies (`is_block_body_request`), chooses among the remaining peers
-    /// with [`Self::select_block_body_peer`].
-    fn select_ready_p2c_peer(
-        &self,
-        is_find_request: bool,
-        is_block_body_request: bool,
-    ) -> Option<D::Key> {
+    /// For a request for block bodies, chooses among the remaining peers with
+    /// [`Self::select_block_body_peer`]. For a `FindBlocks` request, chooses with
+    /// [`Self::select_block_hashes_peer`].
+    fn select_ready_p2c_peer(&self, req: &Request) -> Option<D::Key> {
+        let is_find_request = matches!(
+            req,
+            Request::FindBlocks { .. } | Request::FindHeaders { .. }
+        );
         let candidates = self
             .ready_services
             .iter()
@@ -964,10 +966,49 @@ where
             })
             .map(|(key, _)| *key)
             .collect();
-        if is_block_body_request {
-            self.select_block_body_peer(&candidates)
+        match req {
+            Request::BlocksByHash(_) | Request::BlocksByHashFrom { .. } => {
+                self.select_block_body_peer(&candidates)
+            }
+            Request::FindBlocks { .. } => self.select_block_hashes_peer(&candidates),
+            _ => self.select_p2c_peer_from_list(&candidates),
+        }
+    }
+
+    /// Performs P2C on `candidates` for a `FindBlocks` request.
+    ///
+    /// A `getblocks` reply advertises blocks the peer can serve, so a pruned peer stops before
+    /// the first body it has deleted. While this node is syncing its locator is usually below a
+    /// pruned peer's retained range, and the peer sends nothing back: the request then holds
+    /// until an unrelated block `inv` or the request timeout. So prefer peers that may hold old
+    /// blocks, as for block bodies. `getheaders` is unaffected, as pruned peers keep every header.
+    fn select_block_hashes_peer(&self, candidates: &HashSet<D::Key>) -> Option<D::Key> {
+        if self.is_near_network_tip() {
+            return self.select_p2c_peer_from_list(candidates);
+        }
+        self.select_p2c_peer_from_list(&self.prefer_old_block_holders(candidates))
+    }
+
+    /// Returns the `candidates` that may hold old blocks, see [`Self::may_hold_old_blocks`], or
+    /// all of them if none does.
+    fn prefer_old_block_holders<'a>(
+        &self,
+        candidates: &'a HashSet<D::Key>,
+    ) -> Cow<'a, HashSet<D::Key>> {
+        let archive_candidates: HashSet<D::Key> = candidates
+            .iter()
+            .filter(|key| {
+                self.ready_services
+                    .get(key)
+                    .is_some_and(|service| self.may_hold_old_blocks(service))
+            })
+            .copied()
+            .collect();
+
+        if archive_candidates.is_empty() {
+            Cow::Borrowed(candidates)
         } else {
-            self.select_p2c_peer_from_list(&candidates)
+            Cow::Owned(archive_candidates)
         }
     }
 
@@ -1060,21 +1101,7 @@ where
             &responsive_candidates
         };
 
-        let archive_candidates: HashSet<D::Key> = candidates
-            .iter()
-            .filter(|key| {
-                self.ready_services
-                    .get(key)
-                    .is_some_and(|service| self.may_hold_old_blocks(service))
-            })
-            .copied()
-            .collect();
-
-        if archive_candidates.is_empty() {
-            self.select_p2c_peer_from_list(candidates)
-        } else {
-            self.select_p2c_peer_from_list(&archive_candidates)
-        }
+        self.select_p2c_peer_from_list(&self.prefer_old_block_holders(candidates))
     }
 
     /// Performs P2C on `ready_service_list` to randomly select a less-loaded ready service.
@@ -1223,11 +1250,7 @@ where
             Request::FindBlocks { .. } | Request::FindHeaders { .. }
         );
 
-        let is_block_body_request = matches!(
-            &req,
-            Request::BlocksByHash(_) | Request::BlocksByHashFrom { .. }
-        );
-        if let Some(p2c_key) = self.select_ready_p2c_peer(is_find_request, is_block_body_request) {
+        if let Some(p2c_key) = self.select_ready_p2c_peer(&req) {
             tracing::trace!(
                 peer = %p2c_key.addr_label(self.expose_peer_addresses),
                 "routing based on p2c"

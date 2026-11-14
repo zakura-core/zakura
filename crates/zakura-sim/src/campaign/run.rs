@@ -656,6 +656,10 @@ pub(super) fn fuzzer_command(
     command
         .arg(format!("-max_len={}", budget.max_len))
         .arg(format!("-timeout={}", budget.timeout_secs))
+        // libFuzzer saves a `slow-unit-*` artifact for an input slower than
+        // this, and the run counts every artifact as a failure. A slow input
+        // under the timeout is no failure; one past it is a timeout.
+        .arg(format!("-report_slow_units={}", budget.timeout_secs))
         .arg(format!("-rss_limit_mb={}", budget.rss_limit_mb))
         .args(&budget.libfuzzer_args)
         .env(ARTIFACTS_VAR, sim)

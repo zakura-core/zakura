@@ -60,6 +60,7 @@ const RESERVED_FLAGS: &[&str] = &[
     "-workers",
     "-max_len",
     "-timeout",
+    "-report_slow_units",
     "-rss_limit_mb",
     "-minimize_crash",
     "-cleanse_crash",
@@ -869,6 +870,24 @@ mod tests {
         assert!(budget(&["-use_value_profile=1"]).check().is_ok());
         assert!(budget(&["-seed=3"]).check().is_err());
         assert!(budget(&["-runs=10"]).check().is_err());
+        assert!(budget(&["-report_slow_units=5"]).check().is_err());
         assert!(budget(&["corpus"]).check().is_err());
+
+        // A slow input under the timeout leaves no `slow-unit-*` artifact,
+        // which the run would count as a failure.
+        let command = super::super::run::fuzzer_command(
+            Path::new("fuzzer"),
+            None,
+            &budget(&[]),
+            Path::new("sim"),
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
+        assert!(
+            args.iter().any(|arg| arg == "-report_slow_units=30"),
+            "{args:?}"
+        );
     }
 }

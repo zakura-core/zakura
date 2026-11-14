@@ -26,6 +26,11 @@ defaults:
       - label!=do-not-merge
       # has at least one approving reviewer
       - "#approved-reviews-by >= 1"
+      # Consensus-critical changes require three distinct reviewers with
+      # admin, write, or maintain permission.
+      - or:
+          - label = consensus-not-critical
+          - "#approved-reviews-by >= 3"
 
 
 # Allows to define the rules that reign over our merge queues

@@ -77,6 +77,12 @@ type Receiver = oneshot::Receiver<Result<(), BoxError>>;
 /// the core is stuck, and the request then gets the pool the core has.
 const MAX_TIP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The longest a request waits for the core to answer a lookup, such as
+/// which ids it has rejected. Today's pool answers these at once, so this is
+/// reached only if the core takes commands too slowly, and the request then
+/// answers as if nothing were rejected.
+const MAX_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How often a waiting request checks the tips again when no new snapshot
 /// arrives, since the state's best tip can move too.
 const TIP_RECHECK: std::time::Duration = std::time::Duration::from_millis(2);
@@ -185,6 +191,17 @@ impl Service<Request> for CoreMempool {
             None => async move { inactive_answer(request) }.boxed(),
         }
     }
+}
+
+/// Which of `ids` the core has rejected, or none if it does not answer
+/// within [`MAX_LOOKUP_WAIT`].
+async fn rejected_ids(
+    shared: &Shared,
+    ids: std::collections::HashSet<UnminedTxId>,
+) -> std::collections::HashSet<UnminedTxId> {
+    tokio::time::timeout(MAX_LOOKUP_WAIT, shared.handle.rejected_ids(ids))
+        .await
+        .unwrap_or_default()
 }
 
 /// Whether `request` is answered from the snapshot alone. Only these wait
@@ -321,18 +338,22 @@ async fn answer(
             last_seen_tip_hash: snapshot.tip.hash,
         },
         Request::RejectedTransactionIds(ids) => {
-            Response::RejectedTransactionIds(shared.handle.rejected_ids(ids).await)
+            Response::RejectedTransactionIds(rejected_ids(&shared, ids).await)
         }
         Request::Queue(items) => {
             // Every body takes its slots before anything here waits, so no
             // body in the request waits outside them. An id takes its slots
             // at its turn, as today's pool checks each in order.
-            let staged: Vec<Staged> = items
+            let staged: Vec<Result<Staged, Gossip>> = items
                 .into_iter()
-                .map(|item| Staged::new(&shared, item, &None))
+                .map(|item| match item {
+                    Gossip::Tx(_) => Ok(Staged::new(&shared, item, &None)),
+                    Gossip::Id(_) => Err(item),
+                })
                 .collect();
             let mut answers = Vec::with_capacity(staged.len());
             for item in staged {
+                let item = item.unwrap_or_else(|id| Staged::new(&shared, id, &None));
                 answers.push(item.queue(shared.clone(), None).await);
             }
             Response::Queued(answers)
@@ -390,10 +411,7 @@ async fn answer(
             let rejected = if fresh.is_empty() {
                 Default::default()
             } else {
-                shared
-                    .handle
-                    .rejected_ids(fresh.iter().copied().collect())
-                    .await
+                rejected_ids(&shared, fresh.iter().copied().collect()).await
             };
             let mut fresh = fresh
                 .into_iter()
@@ -472,6 +490,9 @@ enum Staged {
         item: Gossip,
         queue_slot: QueueSlot,
         peer_slot: Option<PeerSlot>,
+        /// Today's one deadline for the item, `RATE_LIMIT_DELAY` from when it
+        /// took its slots. Every wait the item makes runs under it.
+        deadline: tokio::time::Instant,
     },
     /// Over the node's limit, or its peer's if `peer_full`. Its body, if
     /// it had one, is already dropped.
@@ -504,6 +525,7 @@ impl Staged {
             item,
             queue_slot,
             peer_slot,
+            deadline: tokio::time::Instant::now() + RATE_LIMIT_DELAY,
         }
     }
 
@@ -520,7 +542,8 @@ impl Staged {
                 item,
                 queue_slot,
                 peer_slot,
-            } => queue_held(shared, item, queue_slot, peer_slot, from).await,
+                deadline,
+            } => queue_held(shared, item, queue_slot, peer_slot, from, deadline).await,
             Self::Over {
                 id,
                 intent,
@@ -528,6 +551,16 @@ impl Staged {
             } => known_or_full(&shared, id, intent, peer_full).await,
         }
     }
+}
+
+/// Tells the core that `reservation`'s fetch failed, from a task of its own,
+/// so a core slow to take commands cannot hold the caller's answer or its
+/// slots past the deadline. The failure still reaches the change stream when
+/// the core takes the command. Each such task holds only the reservation,
+/// which the core granted, so there are at most as many as its slots.
+fn report_failed(shared: &Shared, reservation: Reservation) {
+    let handle = shared.handle.clone();
+    tokio::spawn(async move { handle.fetch_failed(reservation).await });
 }
 
 /// Today's answer for an item whose task reached its deadline.
@@ -546,17 +579,17 @@ fn intent_of(item: &Gossip) -> Intent {
 
 /// Queues `item` under its slots: reserves its core slot and answers the
 /// first stage, and leaves a task that brings the body in and answers the
-/// second. Today's one deadline, `RATE_LIMIT_DELAY`, starts before the
-/// reservation, so a core that takes no commands cannot hold the slots and
-/// the caller forever.
+/// second, all by `deadline`, which started when the item took its slots.
+/// So a core that takes no commands cannot hold the slots and the caller
+/// past it, however long the item waited for its turn.
 async fn queue_held(
     shared: Arc<Shared>,
     item: Gossip,
     queue_slot: QueueSlot,
     slot: Option<PeerSlot>,
     from: Option<QueueSource>,
+    deadline: tokio::time::Instant,
 ) -> Result<Receiver, BoxError> {
-    let deadline = tokio::time::Instant::now() + RATE_LIMIT_DELAY;
     let reserved =
         tokio::time::timeout_at(deadline, shared.handle.reserve(item.id(), intent_of(&item))).await;
     let reservation = match reserved {
@@ -796,7 +829,7 @@ async fn bring_in(
                 }
             };
             let Ok(fetched) = fetched else {
-                shared.handle.fetch_failed(reservation).await;
+                report_failed(shared, reservation);
                 return Err(timed_out());
             };
             match fetched {
@@ -807,7 +840,7 @@ async fn bring_in(
                         "reason" => "download_failed",
                     )
                     .increment(1);
-                    shared.handle.fetch_failed(reservation).await;
+                    report_failed(shared, reservation);
                     return Err(format!("failed to validate tx: {tx_id}, error: {error}").into());
                 }
             }
@@ -829,7 +862,7 @@ async fn bring_in(
         && sender.is_some_and(|addr| shared.cooldowns.is_cooling_down(addr.ip(), Instant::now()))
     {
         metrics::counter!("mempool.peer_cooldown.ignored.transactions.total").increment(1);
-        shared.handle.fetch_failed(reservation).await;
+        report_failed(shared, reservation);
         return Err(format!(
             "failed to validate tx: {tx_id}, error: {}",
             TransactionDownloadVerifyError::PeerCoolingDown
@@ -2358,5 +2391,196 @@ mod tests {
             "its slot is free"
         );
         drop(reply);
+    }
+
+    /// A snapshot at height 1 with nothing pooled, so the adapter is on.
+    fn publish_empty(inbox: &zakura_node_services::mempool::port::PoolInbox) {
+        use zakura_node_services::mempool::port::{ChainTip, Generation, PoolSnapshot};
+
+        inbox.publish([], |last| {
+            PoolSnapshot::new(
+                ChainTip {
+                    hash: block::Hash([1; 32]),
+                    height: Height(1),
+                },
+                Generation(1),
+                last,
+                Vec::new(),
+                Default::default(),
+            )
+        });
+    }
+
+    /// A batch of ids takes each id's slots at its turn, as today's pool
+    /// checks each in order: 500 pooled ids, each answered by the core and
+    /// freeing its slots, leave room for a fresh id after them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ids_take_their_slots_at_their_turn() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
+
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let ids: Vec<Gossip> = (0..=MAX_INBOUND_CONCURRENCY)
+            .map(|n| {
+                let mut hash = [5; 32];
+                hash[..8].copy_from_slice(&u64::try_from(n).expect("few").to_le_bytes());
+                Gossip::Id(UnminedTxId::Legacy(zakura_chain::transaction::Hash(hash)))
+            })
+            .collect();
+        let request = tokio::spawn(core.call(Request::Queue(ids)));
+        for answered in 0..=MAX_INBOUND_CONCURRENCY {
+            let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+                panic!("each id reserves at its turn");
+            };
+            let answer = if answered < MAX_INBOUND_CONCURRENCY {
+                Err(Unreserved::Pooled)
+            } else {
+                Ok(inbox.grant(ReservationId(1), tx_id, false, true, Default::default()))
+            };
+            let _ = reply.send(answer);
+        }
+        let Ok(Ok(Response::Queued(answers))) = request.await else {
+            panic!("`Queue` is answered with `Queued`");
+        };
+        assert!(answers[..MAX_INBOUND_CONCURRENCY]
+            .iter()
+            .all(|answer| matches!(
+                answer
+                    .as_ref()
+                    .map_err(|error| error.downcast_ref::<MempoolError>()),
+                Err(Some(MempoolError::InMempool))
+            )));
+        assert!(
+            answers[MAX_INBOUND_CONCURRENCY].is_ok(),
+            "the fresh id after them is queued"
+        );
+    }
+
+    /// Bodies staged together share deadlines that start when they take
+    /// their slots: with a core that answers no reservation, a batch of two
+    /// is answered by one task deadline, not one deadline after the other.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn staged_bodies_reach_their_deadlines_together() {
+        use zakura_chain::transaction::{LockTime, Transaction, UnminedTx};
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let template = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let bodies: Vec<Gossip> = (1..=2)
+            .map(|height| {
+                let mut transaction = Transaction::clone(template.transaction());
+                if let Transaction::V1 { lock_time, .. }
+                | Transaction::V2 { lock_time, .. }
+                | Transaction::V3 { lock_time, .. }
+                | Transaction::V4 { lock_time, .. }
+                | Transaction::V5 { lock_time, .. } = &mut transaction
+                {
+                    *lock_time = LockTime::Height(Height(height));
+                }
+                Gossip::Tx(UnminedTx::from(transaction))
+            })
+            .collect();
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        // The core takes each reservation and never answers it.
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(command) = inbox.next().await {
+                if let PoolCommand::Reserve { reply, .. } = command {
+                    held.push(reply);
+                }
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let answered = tokio::time::timeout(
+            RATE_LIMIT_DELAY + std::time::Duration::from_secs(10),
+            core.call(Request::Queue(bodies)),
+        )
+        .await
+        .expect("both bodies are answered by one task deadline");
+        let Ok(Response::Queued(answers)) = answered else {
+            panic!("`Queue` is answered with `Queued`");
+        };
+        assert!(answers.iter().all(Result::is_err), "both time out");
+        assert!(started.elapsed() >= RATE_LIMIT_DELAY);
+        silent.abort();
+    }
+
+    /// A fetch that reaches its deadline is answered, and frees its slots,
+    /// even when the core's command queue is full, so a core slow to take
+    /// commands cannot hold them past the deadline.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_timed_out_fetch_is_answered_while_the_core_is_full_of_commands() {
+        use zakura_node_services::mempool::port::{
+            pool_port, PoolCommand, ReservationId, COMMAND_QUEUE,
+        };
+
+        let (handle, mut inbox) = pool_port();
+        let core = adapter_on(handle.clone());
+        let id = UnminedTxId::Legacy(zakura_chain::transaction::Hash([8; 32]));
+        let queued = tokio::spawn(queue(core.shared.clone(), Gossip::Id(id), Some(peer())));
+        let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
+            panic!("the fetch reserves first");
+        };
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            id,
+            false,
+            true,
+            Default::default(),
+        )));
+        let receiver = queued
+            .await
+            .expect("the task does not panic")
+            .expect("the fetch is queued");
+        // Fill the core's command queue, and keep it full.
+        let fillers: Vec<_> = (0..COMMAND_QUEUE + 10)
+            .map(|_| {
+                let handle = handle.clone();
+                tokio::spawn(async move { handle.rejected_ids(Default::default()).await })
+            })
+            .collect();
+        let answer = tokio::time::timeout(RATE_LIMIT_DELAY * 2, receiver)
+            .await
+            .expect("the fetch is answered at its deadline")
+            .expect("answered");
+        assert!(answer.is_err(), "the fetch timed out");
+        assert_eq!(
+            *core.shared.queued.lock().expect("not poisoned"),
+            0,
+            "its slots are free"
+        );
+        for filler in fillers {
+            filler.abort();
+        }
+        drop(inbox);
+    }
+
+    /// A rejection lookup the core never answers ends within
+    /// [`MAX_LOOKUP_WAIT`], answering that nothing is rejected.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_rejection_lookup_the_core_never_answers_ends_in_time() {
+        use zakura_node_services::mempool::port::pool_port;
+
+        let (handle, inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let id = UnminedTxId::Legacy(zakura_chain::transaction::Hash([4; 32]));
+        let answered = tokio::time::timeout(
+            MAX_LOOKUP_WAIT * 2,
+            core.call(Request::RejectedTransactionIds([id].into_iter().collect())),
+        )
+        .await
+        .expect("the lookup ends in time");
+        let Ok(Response::RejectedTransactionIds(rejected)) = answered else {
+            panic!("answered with rejected ids");
+        };
+        assert!(rejected.is_empty());
+        drop(inbox);
     }
 }

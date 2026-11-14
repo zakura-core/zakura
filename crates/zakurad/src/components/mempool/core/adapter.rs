@@ -358,7 +358,12 @@ async fn answer(
                 std::iter::repeat_with(|| None)
                     .take(bodies.len() + ids.len())
                     .collect();
-            for (at, body) in bodies {
+            // Bodies holding slots go before the ones over a limit, whose
+            // probes have deadlines of their own.
+            let (held, over): (Vec<(usize, Staged)>, Vec<(usize, Staged)>) = bodies
+                .into_iter()
+                .partition(|(_, body)| matches!(body, Staged::Held { .. }));
+            for (at, body) in held.into_iter().chain(over) {
                 answers[at] = Some(body.queue(shared.clone(), None).await);
             }
             for (at, id) in ids {
@@ -607,12 +612,28 @@ async fn queue_held(
     from: Option<QueueSource>,
     deadline: tokio::time::Instant,
 ) -> Result<Receiver, BoxError> {
-    let reserved =
-        tokio::time::timeout_at(deadline, shared.handle.reserve(item.id(), intent_of(&item))).await;
-    let reservation = match reserved {
-        Ok(Ok(reservation)) => reservation,
-        Ok(Err(refused)) => return first_stage_refusal(refused),
-        Err(_elapsed) => return Err(timed_out()),
+    // The reservation is asked for from a task of its own, so a caller that
+    // times out first leaves it running: if the core grants it later, the
+    // failure is reported, and reaches the change stream as today's
+    // timeout does. That task holds neither the body nor a slot.
+    let mut reserving = tokio::spawn({
+        let handle = shared.handle.clone();
+        let (id, intent) = (item.id(), intent_of(&item));
+        async move { handle.reserve(id, intent).await }
+    });
+    let reservation = match tokio::time::timeout_at(deadline, &mut reserving).await {
+        Ok(Ok(Ok(reservation))) => reservation,
+        Ok(Ok(Err(refused))) => return first_stage_refusal(refused),
+        Ok(Err(_panicked)) => return Err("the pool core's reservation task failed".into()),
+        Err(_elapsed) => {
+            let handle = shared.handle.clone();
+            tokio::spawn(async move {
+                if let Ok(Ok(reservation)) = reserving.await {
+                    handle.fetch_failed(reservation).await;
+                }
+            });
+            return Err(timed_out());
+        }
     };
     // A joined submission takes no core slot, but it still counts against
     // its peer until its verdict, so one peer cannot hold more than its
@@ -623,9 +644,8 @@ async fn queue_held(
         // Today's download task has one deadline for the fetch and the
         // verification together, and its peer's slot is free once it ends.
         // So does this.
-        let result = bring_in(&shared, reservation, item, from, deadline).await;
+        let result = bring_in(&shared, reservation, item, from, deadline, queue_slot).await;
         drop(slot);
-        drop(queue_slot);
         let _ = answer.send(result);
     });
     Ok(receiver)
@@ -796,15 +816,16 @@ fn first_stage_refusal(refused: Unreserved) -> Result<Receiver, BoxError> {
 ///
 /// A fetch still out at the deadline is reported as failed, which frees
 /// the slot and reaches the change stream, as today's timeout does. A body
-/// the core already holds when the deadline passes stays under the core's
-/// own deadlines and node-wide slot, and its outcome reaches the change
-/// stream when the core decides it.
+/// on its way to the core when the deadline passes keeps `queue_slot`, the
+/// node-wide slot that bounds the bodies here, until the core has decided
+/// it, and its outcome reaches the change stream then.
 async fn bring_in(
     shared: &Shared,
     reservation: Reservation,
     item: Gossip,
     from: Option<QueueSource>,
     deadline: tokio::time::Instant,
+    queue_slot: QueueSlot,
 ) -> Result<(), BoxError> {
     let tx_id = item.id();
     // The body, and the legacy peer whose bytes it is, if any.
@@ -896,12 +917,17 @@ async fn bring_in(
     .filter(|_| !reservation.joined() || reservation.wants_body());
     // The body goes to the core from a task of its own, which the deadline
     // does not cancel: a caller that times out first gets its answer and
-    // frees its slots, and the core still takes the body when it can, so its
-    // outcome reaches the change stream as today's timeout does. The core's
-    // own slot, which the reservation holds, bounds these bodies.
+    // frees its peer's slot, and the core still takes the body when it can,
+    // so its outcome reaches the change stream as today's timeout does. The
+    // task keeps the body's node-wide slot until then, so these bodies stay
+    // within the node's limit.
     let submitting = tokio::spawn({
         let handle = shared.handle.clone();
-        async move { handle.submit(reservation, tx).await }
+        async move {
+            let verdict = handle.submit(reservation, tx).await;
+            drop(queue_slot);
+            verdict
+        }
     });
     let verdict = match tokio::time::timeout_at(deadline, submitting).await {
         Ok(Ok(verdict)) => verdict,
@@ -1826,15 +1852,21 @@ mod tests {
             .map(|(n, id)| tokio::spawn(queue(core.shared.clone(), Gossip::Id(*id), Some(peer(n)))))
             .collect();
 
-        // The core grants every slot, then answers the offers past the
-        // node's limit, which ask about their ids alone, that it has no room,
-        // then stops taking commands.
-        for granted in 0..offered {
+        // The core grants a slot to each offer that took the adapter's, and
+        // answers the offers past the node's limit, which ask about their ids
+        // alone, that it has no room, then stops taking commands. The
+        // reservations come from tasks of their own, so they can arrive in
+        // any order.
+        let within: std::collections::HashSet<UnminedTxId> =
+            ids[..MAX_PENDING].iter().copied().collect();
+        let mut granted = 0;
+        for _ in 0..offered {
             let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
                 panic!("each offer reserves, or asks about its id");
             };
-            let answer = if granted < MAX_PENDING {
-                let id = ReservationId(u64::try_from(granted).expect("few"));
+            let answer = if within.contains(&tx_id) {
+                granted += 1;
+                let id = ReservationId(granted);
                 Ok(inbox.grant(id, tx_id, false, true, Default::default()))
             } else {
                 Err(Unreserved::NoRoom)
@@ -1909,35 +1941,40 @@ mod tests {
                     [10, 2, high, low],
                     8233,
                 )));
-                tokio::spawn(queue(
-                    core.shared.clone(),
-                    Gossip::Tx(UnminedTx::from(transaction)),
-                    Some(peer),
-                ))
+                let body = UnminedTx::from(transaction);
+                let id = body.id();
+                (
+                    id,
+                    tokio::spawn(queue(core.shared.clone(), Gossip::Tx(body), Some(peer))),
+                )
             })
             .collect();
+        // The pushes that took the adapter's slots, in staging order.
+        let within: std::collections::HashSet<UnminedTxId> = pushes[..MAX_INBOUND_CONCURRENCY]
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        let pushes: Vec<_> = pushes.into_iter().map(|(_, push)| push).collect();
 
-        // The core answers nothing. Each push within the limit waits for its
-        // reservation, holding its body.
+        // The core answers nothing to a push within the limit, which waits
+        // for its reservation holding its body. Each push past the limit
+        // drops its body and asks about its id alone, without a slot, and the
+        // core knows none of them. The two can arrive in any order.
         let mut waiting = Vec::new();
-        for _ in 0..MAX_INBOUND_CONCURRENCY {
-            let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
-                panic!("each push within the limit reserves");
-            };
-            waiting.push(reply);
-        }
-        // Each push past the limit drops its body and asks about its id
-        // alone, without a slot. The core knows none of them.
-        for _ in MAX_INBOUND_CONCURRENCY..pushed {
-            let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
-                panic!("each push past the limit asks about its id");
+        for _ in 0..pushed {
+            let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+                panic!("each push reserves, or asks about its id");
             };
             assert_eq!(
                 queued_count(&core),
                 MAX_INBOUND_CONCURRENCY,
-                "a push past the limit takes no slot while it asks"
+                "only the pushes within the limit hold slots"
             );
-            let _ = reply.send(Err(Unreserved::NoRoom));
+            if within.contains(&tx_id) {
+                waiting.push(reply);
+            } else {
+                let _ = reply.send(Err(Unreserved::NoRoom));
+            }
         }
         for _ in 0..1_000 {
             if pushes.iter().filter(|push| push.is_finished()).count()
@@ -2697,5 +2734,92 @@ mod tests {
             !reply.is_closed(),
             "the core can still decide it, so its outcome is logged"
         );
+    }
+
+    /// A body whose caller timed out before the core took it keeps its
+    /// node-wide slot until the core decides it, so the bodies waiting for
+    /// the core and the bodies the adapter takes in after them stay within
+    /// one limit.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_timed_out_submission_keeps_its_node_slot() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
+
+        let (handle, mut inbox) = pool_port();
+        let core = adapter_on(handle);
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let queued = tokio::spawn(queue(core.shared.clone(), Gossip::Tx(body), None));
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the push reserves first");
+        };
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            tx_id,
+            false,
+            true,
+            Default::default(),
+        )));
+        let receiver = queued
+            .await
+            .expect("the task does not panic")
+            .expect("the push passes the first stage");
+        let answer = tokio::time::timeout(RATE_LIMIT_DELAY * 2, receiver)
+            .await
+            .expect("the caller is answered at its deadline")
+            .expect("answered");
+        assert!(answer.is_err(), "the caller timed out");
+        assert_eq!(
+            queued_count(&core),
+            1,
+            "the body waiting for the core keeps its slot"
+        );
+        // The core takes the body and decides it, and the slot is free.
+        let Some(PoolCommand::Submit { reply, .. }) = inbox.next().await else {
+            panic!("the body reaches the core");
+        };
+        let _ = reply.send(Verdict::Admitted);
+        for _ in 0..100 {
+            if queued_count(&core) == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(queued_count(&core), 0, "free once the core decided it");
+    }
+
+    /// A reservation the core grants only after its caller timed out is
+    /// reported as failed, so the change stream hears of the timeout as
+    /// today's pool reports one.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_reservation_granted_after_its_deadline_is_reported_as_failed() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
+
+        let (handle, mut inbox) = pool_port();
+        let core = adapter_on(handle);
+        let id = UnminedTxId::Legacy(zakura_chain::transaction::Hash([3; 32]));
+        let queued = tokio::spawn(queue(core.shared.clone(), Gossip::Id(id), None));
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the fetch reserves first");
+        };
+        let answer = tokio::time::timeout(RATE_LIMIT_DELAY * 2, queued)
+            .await
+            .expect("the caller is answered at its deadline")
+            .expect("the task does not panic");
+        assert!(answer.is_err(), "the caller timed out");
+        assert_eq!(queued_count(&core), 0, "no slot is held for a late grant");
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            tx_id,
+            false,
+            true,
+            Default::default(),
+        )));
+        let Some(PoolCommand::FetchFailed(reservation)) = inbox.next().await else {
+            panic!("the late grant is reported as failed");
+        };
+        let _accepted = reservation.accept();
     }
 }

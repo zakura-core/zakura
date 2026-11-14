@@ -3037,6 +3037,7 @@ dependencies = [
  "proptest-derive",
  "rand 0.10.2",
  "rayon",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -3481,7 +3482,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "16.1.1"
+version = "17.0.0"
 dependencies = [
  "chrono",
  "derive-new",

@@ -250,12 +250,15 @@ jobs:
           # The archive stores compiled binaries, so it must be built in the same
           # mode the shards run. The run-time-only filters (`--profile`,
           # `--partition`, `--run-ignored`) are applied by the shard jobs, not here.
+          # `zakura-sim` is empty without `--cfg zakura_sim`, so its 120-odd test
+          # binaries hold no tests here. sim-build runs them, and lint.yml still
+          # checks that the crate compiles without the flag.
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            cargo nextest archive --locked --release --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --workspace --exclude zakura-sim --release --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           elif [[ "${FULL_COVERAGE}" == "true" ]]; then
-            cargo nextest archive --locked --cargo-profile ci-tests --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --workspace --exclude zakura-sim --cargo-profile ci-tests --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           else
-            cargo nextest archive --locked --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --workspace --exclude zakura-sim --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           fi
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}

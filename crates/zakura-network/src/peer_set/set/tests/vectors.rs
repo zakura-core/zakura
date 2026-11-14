@@ -26,7 +26,9 @@ use crate::{
         stall_tracker::FIND_RESPONSE_STALL_THRESHOLD,
     },
     protocol::external::{types::Version, InventoryHash},
+    unconditional_peer_set::UnconditionalPeerSet,
     BannedIps, BoxError, PeerSocketAddr, PeerSource, Request, Response, SharedPeerError,
+    UnconditionalPeers,
 };
 
 use super::{PeerSetBuilder, PeerVersions};
@@ -101,6 +103,39 @@ fn disconnect_request_cancels_busy_peer_without_banning() {
         assert!(!peers.cancel_handles.contains_key(&busy_addr));
         assert!(!peers.ready_services.contains_key(&busy_addr));
         assert!(!peers.bans.contains(busy_addr.ip()));
+    });
+}
+
+/// A disconnect request leaves an unconditional peer connected, even one that a DNS
+/// answer made unconditional after the peer set was built, as an answer can while the
+/// request waits for the peer set.
+#[test]
+fn disconnect_request_keeps_a_peer_that_became_unconditional() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    let versions = PeerVersions {
+        peer_versions: vec![CURRENT_NETWORK_PROTOCOL_VERSION; 2],
+    };
+    let (discovered, _handles) = versions.mock_peer_discovery();
+    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let (unconditional_peers, resolved_peers) =
+        UnconditionalPeerSet::new(UnconditionalPeers::default());
+    runtime.block_on(async move {
+        let (mut peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .with_unconditional_peers(unconditional_peers)
+            .max_conns_per_ip(2)
+            .build();
+        peers.ready().await.unwrap();
+        assert_eq!(peers.ready_services.len(), 2);
+        let addr = *peers.ready_services.keys().next().unwrap();
+
+        resolved_peers.publish([addr.ip()]);
+        peers.call(Request::DisconnectPeer(addr)).await.unwrap();
+
+        assert!(peers.ready_services.contains_key(&addr));
+        assert_eq!(peers.ready_services.len(), 2);
     });
 }
 

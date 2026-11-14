@@ -274,6 +274,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
 
     /// The most a `Grant` may add now: the window left after the accepted
     /// progress.
+    #[cfg(test)]
     pub(crate) fn grantable(&self, key: &K) -> Option<Credit> {
         let subscribed = self.live.get(key)?;
         let granted = subscribed.credit.granted();

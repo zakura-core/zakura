@@ -391,6 +391,11 @@ pub struct ZakuraConfig {
     /// [`Config::expose_peer_addresses`](crate::config::Config::expose_peer_addresses).
     /// The state, mempool, and `getblocktemplate` write `chain_tip.jsonl`, `mempool.jsonl`, and
     /// `mining_template.jsonl`, which trace the path from a new tip to a mining template.
+    /// Legacy peer connections write `legacy_gossip.jsonl`: each block announcement sent to
+    /// a peer, the peer's request for that block and the block being sent, and a bounded
+    /// number of the announcements each peer sends. Its rows never hold a peer's address; the
+    /// `ZAKURA_TRACE_PEER_NAMES` environment variable names the peers an operator wants to
+    /// tell apart.
     pub trace_dir: Option<PathBuf>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
@@ -2849,16 +2854,22 @@ pub(crate) fn admit_tabled_message(
 }
 
 impl InboundMessageAdmission {
+    /// The error an ordered stream's worker closes with for this result, or
+    /// `None` if it admits the frame.
+    pub(crate) fn ordered_error(self) -> Option<ZakuraHandlerError> {
+        match self {
+            InboundMessageAdmission::Admit => None,
+            InboundMessageAdmission::Oversize => Some(ZakuraHandlerError::Oversize),
+            InboundMessageAdmission::Throttled => Some(ZakuraHandlerError::RateLimited),
+        }
+    }
+
     /// The close cause the ordered stream reader records for this result,
     /// or `None` if it admits the frame.
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn ordered_close_cause(self) -> Option<&'static str> {
-        let error = match self {
-            InboundMessageAdmission::Admit => return None,
-            InboundMessageAdmission::Oversize => ZakuraHandlerError::Oversize,
-            InboundMessageAdmission::Throttled => ZakuraHandlerError::RateLimited,
-        };
-        Some(read_close_cause(ReadPath::Ordered, &error))
+        self.ordered_error()
+            .map(|error| read_close_cause(ReadPath::Ordered, &error))
     }
 }
 
@@ -5304,6 +5315,7 @@ fn sought_services_with_custom(custom_services: &[CustomService]) -> Vec<ZakuraS
 }
 
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
+#[cfg(test)]
 pub async fn spawn_zakura_endpoint(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
@@ -6312,8 +6324,10 @@ async fn persistent_stream_worker_with_policy(
                     // While the reader waited for raw capacity, the peer kept
                     // sending into transport buffers, as during a queue wait below.
                     reader_context.credit_read_pause(admitted.grant.waited());
-                    match admit_inbound_message(&admitted.frame, &reader_context, stream_kind) {
-                        InboundMessageAdmission::Admit => {
+                    match admit_inbound_message(&admitted.frame, &reader_context, stream_kind)
+                        .ordered_error()
+                    {
+                        None => {
                             #[cfg(any(test, zakura_sim))]
                             if let Some(tap) = reader_context.precheck.tap() {
                                 tap.queue_tag();
@@ -6348,8 +6362,7 @@ async fn persistent_stream_worker_with_policy(
                             .set(queue_depth_limit.saturating_sub(inbound_tx.capacity()) as f64);
                             continue;
                         }
-                        InboundMessageAdmission::Oversize => ZakuraHandlerError::Oversize,
-                        InboundMessageAdmission::Throttled => ZakuraHandlerError::RateLimited,
+                        Some(error) => error,
                     }
                 }
                 Err(error) => {

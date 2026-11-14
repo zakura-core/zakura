@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -1328,6 +1329,167 @@ class AddressPrivacyTests(unittest.TestCase):
 
 
 
+
+class DashboardPasswordTests(unittest.TestCase):
+    """The fleet pages and data need the shared password; the public APIs and local readers do not."""
+
+    PASSWORD = "correct horse battery staple"
+
+    def setUp(self):
+        self.originals = (status.COLLECTOR, status.RATE_LIMITER, status.LOGIN_RATE_LIMITER, status.DASHBOARD_LOGIN)
+        status.COLLECTOR = collector()
+        status.COLLECTOR.rows = [public_row(observed_at=time.time())]
+        status.RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        status.LOGIN_RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        status.DASHBOARD_LOGIN = status.DashboardLogin(
+            status.hash_password(self.PASSWORD, iterations=1000), "test-session-secret")
+        self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), status.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.no_redirect = urllib.request.build_opener(NoRedirect)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        (status.COLLECTOR, status.RATE_LIMITER, status.LOGIN_RATE_LIMITER, status.DASHBOARD_LOGIN) = self.originals
+
+    def get(self, path, headers=None):
+        """(status, headers, body) for a GET that, by default, looks like it came through Caddy."""
+        headers = {"X-Forwarded-For": "198.51.100.7", **(headers or {})}
+        request = urllib.request.Request(self.base_url + path, headers=headers)
+        try:
+            with self.no_redirect.open(request) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.headers, error.read()
+
+    def login(self, password):
+        request = urllib.request.Request(
+            self.base_url + "/login", method="POST",
+            data=urllib.parse.urlencode({"password": password}).encode(),
+            headers={"X-Forwarded-For": "198.51.100.7",
+                     "Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with self.no_redirect.open(request) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.headers, error.read()
+
+    def test_proxied_visitor_without_login_sees_login_page_and_no_data(self):
+        code, _, body = self.get("/")
+        self.assertEqual(code, 200)
+        self.assertIn(b'action="/login"', body)
+        self.assertNotEqual(body, status.PAGE.encode())
+        code, _, body = self.get("/node/linux-reference")
+        self.assertIn(b'action="/login"', body)
+        for path in ("/data", "/data/node/linux-reference", "/profile/linux-reference/api/status"):
+            code, _, body = self.get(path)
+            self.assertEqual(code, 401, path)
+            self.assertEqual(json.loads(body), {"error": "login required"})
+
+    def test_local_reader_without_proxy_header_still_reads_data(self):
+        request = urllib.request.Request(self.base_url + "/data")
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 200)
+            self.assertIn("chain", json.load(response))
+
+    def test_public_apis_and_health_stay_open(self):
+        self.assertEqual(self.get("/ironwood-status.json")[0], 200)
+        self.assertEqual(self.get("/healthz")[0], 200)
+
+    def test_wrong_password_is_rejected(self):
+        code, headers, body = self.login("wrong")
+        self.assertEqual(code, 401)
+        self.assertIn(b"Wrong password", body)
+        self.assertIsNone(headers["Set-Cookie"])
+
+    def test_right_password_sets_a_cookie_that_opens_the_dashboard(self):
+        code, headers, _ = self.login(self.PASSWORD)
+        self.assertEqual(code, 303)
+        cookie = headers["Set-Cookie"]
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("Secure", cookie)
+        token = cookie.split(";", 1)[0]
+        code, _, body = self.get("/", {"Cookie": token})
+        self.assertEqual(body, status.PAGE.encode())
+        code, _, body = self.get("/data", {"Cookie": token})
+        self.assertEqual(code, 200)
+        self.assertIn("chain", json.loads(body))
+
+    def test_cookie_signed_under_another_secret_or_expired_is_rejected(self):
+        other = status.DashboardLogin(status.DASHBOARD_LOGIN.password_hash, "another-secret")
+        foreign = f"{status.SESSION_COOKIE}={other.issue_token(time.time())}"
+        self.assertEqual(self.get("/data", {"Cookie": foreign})[0], 401)
+        expired = f"{status.SESSION_COOKIE}={status.DASHBOARD_LOGIN.issue_token(time.time() - status.SESSION_SECONDS - 1)}"
+        self.assertEqual(self.get("/data", {"Cookie": expired})[0], 401)
+
+    def test_malformed_cookie_signature_is_refused_not_crashed(self):
+        for token in ("123.\u00e9", "abc.def", "9999999999." + "z" * 64, ""):
+            with self.subTest(token=token):
+                self.assertFalse(status.DASHBOARD_LOGIN.token_valid(token, time.time()))
+        self.assertEqual(self.get("/data", {"Cookie": f"{status.SESSION_COOKIE}=1.%C3%A9"})[0], 401)
+
+    def test_login_over_the_plain_http_port_is_refused(self):
+        request = urllib.request.Request(
+            self.base_url + "/login", method="POST",
+            data=urllib.parse.urlencode({"password": self.PASSWORD}).encode())
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.no_redirect.open(request)
+        self.assertEqual(caught.exception.code, 403)
+        self.assertIsNone(caught.exception.headers["Set-Cookie"])
+
+    def test_logout_clears_the_cookie(self):
+        code, headers, _ = self.get("/logout")
+        self.assertEqual(code, 303)
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
+
+    def test_login_guesses_are_rate_limited(self):
+        status.LOGIN_RATE_LIMITER = status.RateLimiter(limit=2, window=60)
+        self.assertEqual(self.login("a")[0], 401)
+        self.assertEqual(self.login("b")[0], 401)
+        self.assertEqual(self.login(self.PASSWORD)[0], 429)
+
+    def test_without_a_password_everything_is_open(self):
+        status.DASHBOARD_LOGIN = None
+        self.assertEqual(self.get("/")[2], status.PAGE.encode())
+        self.assertEqual(self.get("/data")[0], 200)
+        self.assertEqual(self.login(self.PASSWORD)[0], 404)
+
+
+class DashboardLoginConfigTests(unittest.TestCase):
+    def test_hash_round_trip_and_malformed_hash(self):
+        encoded = status.hash_password("pw", iterations=1000)
+        self.assertTrue(status.verify_password("pw", encoded))
+        self.assertFalse(status.verify_password("other", encoded))
+        self.assertFalse(status.verify_password("pw", "garbage"))
+
+    def test_env_without_hash_disables_the_gate(self):
+        self.assertIsNone(status.dashboard_login_from_env({}))
+
+    def test_env_hash_gets_a_fresh_signing_key_per_start(self):
+        env = {"ZAKURA_DASHBOARD_PASSWORD_HASH": status.hash_password("pw", iterations=1000)}
+        first = status.dashboard_login_from_env(env)
+        second = status.dashboard_login_from_env(env)
+        self.assertNotEqual(first.session_secret, second.session_secret)
+        self.assertFalse(second.token_valid(first.issue_token(time.time()), time.time()))
+
+    def test_env_with_a_non_hash_refuses_to_start(self):
+        with self.assertRaises(ValueError):
+            status.dashboard_login_from_env({"ZAKURA_DASHBOARD_PASSWORD_HASH": "plaintext"})
+
+    def test_print_password_hash_reads_stdin(self):
+        result = subprocess.run([sys.executable, str(SCRIPT_PATH), "--print-password-hash"],
+                                input="pw\n", capture_output=True, text=True, check=True, timeout=30)
+        self.assertTrue(status.verify_password("pw", result.stdout.strip()))
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 class HttpHandlerTests(unittest.TestCase):
     def setUp(self):
         self.original_collector = status.COLLECTOR
@@ -1584,6 +1746,149 @@ class HttpHandlerTests(unittest.TestCase):
 
         self.assertEqual(context.exception.code, 404)
         context.exception.close()
+
+
+# --------------------------------------------------------------------------- #
+# Continuous profiler: which nodes run one, and the routes that show its pages
+# --------------------------------------------------------------------------- #
+
+
+class StubProfiler(BaseHTTPRequestHandler):
+    """Stands in for a node's deploy/profiler service and records what it is asked."""
+
+    requests: list[str] = []
+    status_report = {"state": "ok", "rate_hz": 199, "overhead_pct_last_hour": 1.2,
+                     "last_window_end": 1_000.0, "build": "1.2.3", "error": "details stay on the node"}
+
+    def log_message(self, *args) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        type(self).requests.append(self.path)
+        if self.path == "/":
+            body, content_type = b"<!doctype html><title>profile</title>", "text/html; charset=utf-8"
+        elif self.path == "/api/status":
+            body, content_type = json.dumps(self.status_report).encode(), "application/json"
+        elif self.path.startswith("/api/flame?view=nope"):
+            self.send_response(400)
+            self.end_headers()
+            return
+        else:
+            body, content_type = b'{"total_us": 5}', "application/json"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class ProfilerRouteTests(unittest.TestCase):
+    def setUp(self):
+        StubProfiler.requests = []
+        self.profiler = status.ThreadingHTTPServer(("127.0.0.1", 0), StubProfiler)
+        threading.Thread(target=self.profiler.serve_forever, daemon=True).start()
+        self.profiler_url = f"http://127.0.0.1:{self.profiler.server_port}"
+        profiled = node("profiled")
+        profiled.profiler_url = self.profiler_url
+        self.original_collector = status.COLLECTOR
+        self.original_limiter = status.RATE_LIMITER
+        status.COLLECTOR = status.ClusterCollector(
+            [profiled, node("plain")], interval=10, stale_after=300, network="testnet"
+        )
+        status.RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), status.Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        for server in (self.server, self.profiler):
+            server.shutdown()
+            server.server_close()
+        status.COLLECTOR = self.original_collector
+        status.RATE_LIMITER = self.original_limiter
+
+    def fetch(self, path):
+        try:
+            with urllib.request.urlopen(self.base_url + path) as response:
+                return response.status, response.read(), response.headers
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, error.read(), error.headers
+
+    def test_profile_page_comes_from_the_nodes_profiler_and_is_never_cached(self):
+        code, body, headers = self.fetch("/profile/profiled")
+        self.assertEqual(code, 200)
+        self.assertIn(b"<title>profile</title>", body)
+        self.assertIn("no-store", headers["Cache-Control"])
+        self.assertEqual(StubProfiler.requests, ["/"])
+
+    def test_profile_data_forwards_only_the_parameters_each_request_accepts(self):
+        code, body, _ = self.fetch(
+            "/profile/profiled/api/flame?range=1h&view=verification&evil=1&focus=" + "x" * 500
+        )
+        self.assertEqual((code, json.loads(body)), (200, {"total_us": 5}))
+        self.assertEqual(StubProfiler.requests, ["/api/flame?range=1h&view=verification"])
+
+    def test_a_request_the_profiler_refuses_is_refused_with_the_same_status(self):
+        self.assertEqual(self.fetch("/profile/profiled/api/flame?view=nope")[0], 400)
+
+    def test_only_listed_requests_on_profiled_nodes_are_served(self):
+        for path in (
+            "/profile/unknown",
+            "/profile/plain",
+            "/profile/plain/api/status",
+            "/profile/profiled/api/shutdown",
+            "/profile/profiled/anything",
+            "/profile/profiled/api/",
+        ):
+            self.assertEqual(self.fetch(path)[0], 404, path)
+        self.assertEqual(StubProfiler.requests, [])
+
+    def test_a_profiler_that_is_down_is_reported_not_waited_on(self):
+        self.profiler.shutdown()
+        self.profiler.server_close()
+        self.assertEqual(self.fetch("/profile/profiled/api/status")[0], 502)
+        code, body, _ = self.fetch("/profile/profiled")
+        self.assertEqual(code, 502)
+        self.assertIn(b"not answering", body)
+        self.assertEqual(status.profiler_summary(self.profiler_url), {"state": "unreachable"})
+        # Reopen so tearDown can close it like any other test.
+        self.profiler = status.ThreadingHTTPServer(("127.0.0.1", 0), StubProfiler)
+        threading.Thread(target=self.profiler.serve_forever, daemon=True).start()
+
+    def test_profile_routes_share_the_public_rate_limit(self):
+        status.RATE_LIMITER = status.RateLimiter(limit=1, window=60)
+        self.assertEqual(self.fetch("/profile/profiled/api/status")[0], 200)
+        code, _, headers = self.fetch("/profile/profiled/api/status")
+        self.assertEqual(code, 429)
+        self.assertEqual(headers["Retry-After"], "60")
+
+    def test_fleet_rows_say_which_nodes_are_profiled(self):
+        with mock.patch.object(status, "probe_node", return_value={}):
+            status.COLLECTOR.poll_once()
+        rows = {row["name"]: row for row in status.COLLECTOR.snapshot()["rows"]}
+        self.assertEqual(
+            rows["profiled"]["profiler"],
+            {"state": "ok", "rate_hz": 199, "overhead_pct_last_hour": 1.2, "last_window_end": 1_000.0},
+        )
+        self.assertNotIn("profiler", rows["plain"])
+
+    def test_page_links_a_profiled_node_to_its_flame_graph(self):
+        self.assertIn("function profilerBadge(row)", status.PAGE)
+        self.assertIn('<a class="node-link badge tone-', status.PAGE)
+        self.assertIn("href=\"/profile/'", status.PAGE)
+
+    def test_profiler_url_is_read_from_the_monitor_table(self):
+        template = (
+            '[[nodes]]\nname = "a"\nssh_string = "root@a"\nmonitor = {{ profiler_url = "{url}" }}\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nodes.toml"
+            path.write_text(template.format(url="http://127.0.0.1:8097"))
+            self.assertEqual(status.load_nodes(path)[0].profiler_url, "http://127.0.0.1:8097")
+            path.write_text(template.format(url="http://127.0.0.1:8097/api/status"))
+            with self.assertRaises(SystemExit):
+                status.load_nodes(path)
 
 
 # --------------------------------------------------------------------------- #

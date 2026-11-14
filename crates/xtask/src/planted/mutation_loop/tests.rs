@@ -1056,9 +1056,10 @@ fn a_case_watches_its_work_list_entrys_paths() {
 
 /// With generator lanes on, every case watches the inputs the lanes read:
 /// the work list, whose `[[no-generator]]` records apply to a planted case
-/// that names no entry, then the excluded inputs for an `inproc` search or
-/// the fuzz targets for a `libfuzzer` lane. With the lanes off, a planted
-/// case watches none of them.
+/// that names no entry, then the excluded `.bin` inputs for an `inproc`
+/// search or the fuzz targets for a `libfuzzer` lane. A triage-only change
+/// affects no case. With the lanes off, a planted case watches none of
+/// them.
 #[test]
 fn generator_lanes_watch_their_inputs() {
     let repo_root = crate::repo_root().expect("xtask lives in the workspace");
@@ -1070,9 +1071,8 @@ fn generator_lanes_watch_their_inputs() {
     assert_eq!(case.entry, None);
     let own = super::watched(&repo_root, case).expect("the case's files read");
     let watches = |flags: &GenerateFlags, path: &str| {
-        let mut watched = own.clone();
-        watched.extend(super::generate::watched(flags));
-        crate::planted::is_affected(&watched, &[path.into()])
+        let changed = [std::path::PathBuf::from(path)];
+        crate::planted::is_affected(&own, &changed) || super::generate::affected(flags, &changed)
     };
     let inproc = GenerateFlags {
         runs: 10,
@@ -1085,12 +1085,14 @@ fn generator_lanes_watch_their_inputs() {
     let work_list = "qa/native-mutations/work-list.toml";
     let excluded = "qa/planted/discovery/s4v2/hello/sender-cadence/repeat-hello.plan.bin";
     let target = "qa/fuzz/sim/fuzz_targets/block_sync_storage.rs";
-    for path in [work_list, excluded, target] {
+    let triage = "qa/native-mutations/triage.toml";
+    for path in [work_list, excluded, target, triage] {
         assert!(!watches(&GenerateFlags::default(), path), "off: {path}");
     }
     assert!(watches(&inproc, work_list));
     assert!(watches(&inproc, excluded));
     assert!(!watches(&inproc, target));
+    assert!(!watches(&inproc, triage));
     assert!(watches(&libfuzzer, work_list));
     assert!(!watches(&libfuzzer, excluded));
     assert!(watches(&libfuzzer, target));

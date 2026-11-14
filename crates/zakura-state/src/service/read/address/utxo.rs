@@ -75,7 +75,6 @@ impl AddressUtxos {
     /// its location in the chain, and the address it was sent to.
     ///
     /// The UTXOs are returned in chain order, across all addresses.
-    #[allow(dead_code)]
     pub fn utxos(
         &self,
     ) -> impl Iterator<

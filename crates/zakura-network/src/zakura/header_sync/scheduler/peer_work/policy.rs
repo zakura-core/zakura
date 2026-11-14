@@ -278,6 +278,7 @@ impl ActiveHeaderRequest {
     }
 
     /// Whether one explicit outcome exactly matches the active request.
+    #[cfg(any(test, feature = "header-fuzz"))]
     pub fn accepts_outcome(
         &self,
         request_id: HeaderSyncRequestId,

@@ -405,6 +405,12 @@ class CompletenessTests(unittest.TestCase):
         self.assertEqual(report["inconclusive"], [])
         self.assertIn({"id": "test/zakura-sim/lib", "by": "suite", "exit": 1}, report["ran"])
 
+    def test_without_the_suite_step_each_sim_test_row_names_that(self):
+        report = suite.completeness(full_manifest(), {}, None, None)
+        reasons = {entry["id"]: entry["reason"] for entry in report["not_run"]}
+        self.assertEqual(reasons["test/zakura-sim/lib"], "the routine ran no suite step")
+        self.assertEqual(reasons["test/zakura-rt/lib"], "the routine's suite step runs only zakura-sim's tests")
+
     def test_the_cli_reads_the_routines_steps_and_writes_the_report(self):
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)

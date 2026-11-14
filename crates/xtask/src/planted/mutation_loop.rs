@@ -51,7 +51,7 @@
 //! affect, by `cargo xtask planted`'s rule: the patch, the case file, the
 //! witness's files, the files the patch changes, and the shared machinery.
 //! With generator lanes on, a change to the work list, or to the inputs
-//! their searches read, affects every case ([`generate::watched`]).
+//! their searches read, affects every case ([`generate::affected`]).
 //!
 //! `--list` prints the cases the other flags select, as JSON, by the fields
 //! that tell a case apart in a report ([`ListedCase`]), and runs nothing.
@@ -706,9 +706,9 @@ fn select(
     let changed = changed_since_rev(repo_root, rev)?;
     let mut affected = Vec::new();
     for case in cases {
-        let mut watched = watched(repo_root, &case)?;
-        watched.extend(generate::watched(generate));
-        if is_affected(&watched, &changed) {
+        if is_affected(&watched(repo_root, &case)?, &changed)
+            || generate::affected(generate, &changed)
+        {
             affected.push(case);
         }
     }

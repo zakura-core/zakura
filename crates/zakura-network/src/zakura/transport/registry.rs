@@ -387,6 +387,7 @@ impl ServiceRegistry {
     }
 
     /// Return true when the service owning `kind` still wants this peer.
+    #[cfg(test)]
     pub fn wants_session(
         &self,
         kind: u16,

@@ -35,10 +35,24 @@
 //!   [`INBOUND_DELAY`] after each release before it may claim that id
 //!   again, so others claim it first. Only a missed deadline doubles the
 //!   next one. A late body is dropped before it reaches the pool.
-//! - **A rejection on the same chain settles the id for every holder.**
-//!   Validity depends only on the chain, so a pool restart that clears the
-//!   rejection cache does not make the transaction valid again. A rejection
-//!   from before a chain change only makes the id be asked about again.
+//! - **A rejection on the same chain settles the id for every holder,** as
+//!   long as the pool itself would remember it. That includes a rejection
+//!   that came from the pool's contents, such as a conflict, which the pool
+//!   also keeps until the tip changes. A pool restart clears the pool's
+//!   memory, but it also empties the pool, and `tx-relay` does not refill
+//!   it, as today's pool does not. A rejection from before a chain change
+//!   only makes the id be asked about again.
+//! - **A routine checks the table before it submits a body.** If the entry
+//!   is gone or no longer its claim, it drops the body, and gives back its
+//!   pool slot then. The model gives the slot back when the decision
+//!   happens. That is the only difference, and it is in how long a slot is
+//!   held, not in what reaches the pool.
+//! - **A full pending set is checked for stale references, oldest first,**
+//!   before an announcement is dropped as overflow, within the same lookup
+//!   budget as an overrun. The model has no stale references, so a machine
+//!   may drop an announcement the model keeps while its set is full of
+//!   references it has not checked yet. Overflow is counted and is never a
+//!   violation.
 //! - **One step here is several in the machines.** A decision drops the id
 //!   from every pending set at once. The real routines learn of it from the
 //!   table's events, so a machine's state is compared with the model after
@@ -136,6 +150,13 @@ pub(crate) const NO_ROOM_FIRST: Duration = Duration::from_secs(1);
 
 /// The longest `NoRoom` backoff.
 pub(crate) const NO_ROOM_MAX: Duration = Duration::from_secs(30);
+
+/// How often the reactor ranks the sessions again.
+pub(crate) const RANK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Every this many places in the ranking, a random session takes the next
+/// one, as block relay does.
+pub(crate) const RANDOM_EVERY: usize = 4;
 
 /// How long a session outside an id's window waits to announce it.
 pub(crate) const ADVERT_DELAY: Duration = Duration::from_secs(2);
@@ -808,12 +829,28 @@ impl RelayModel {
         self.best_tip = tip;
     }
 
-    /// The reactor's ranking.
-    pub(crate) fn set_ranking(&mut self, ranking: Vec<SessionId>) {
-        self.reactor.set_ranking(ranking);
+    /// `session`'s routine reports its connection's smoothed round-trip
+    /// time.
+    pub(crate) fn observe_rtt(&mut self, session: SessionId, rtt: Duration, now: Time) {
+        self.enter(now);
+        self.reactor.observe_rtt(session, rtt);
+        self.settle();
+    }
+
+    /// The reactor's ranking refresh timer fired, which it does every
+    /// [`RANK_INTERVAL`]. Every input also fires it when it is due.
+    pub(crate) fn refresh_ranking(&mut self, now: Time) {
+        self.enter(now);
+        self.reactor.refresh(self.now);
+        self.settle();
     }
 
     // Outputs and observations.
+
+    /// The model's current time.
+    pub(crate) fn now(&self) -> Time {
+        self.now
+    }
 
     /// What `tx-relay` did since the last call.
     pub(crate) fn take_effects(&mut self) -> Vec<RelayEffect> {
@@ -940,6 +977,9 @@ impl RelayModel {
     fn enter(&mut self, now: Time) {
         assert!(now >= self.now, "time does not go back");
         self.now = now;
+        if self.reactor.refresh_due(now) {
+            self.reactor.refresh(now);
+        }
         let step = self.pool.tick(now);
         self.inbox.push_back(step);
         self.drain();

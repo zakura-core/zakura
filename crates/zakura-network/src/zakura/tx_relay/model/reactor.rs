@@ -12,7 +12,10 @@ use std::{
 use zakura_chain::transaction::UnminedTxId;
 use zakura_node_services::mempool::port::model::WaiterId;
 
-use super::{EntryGen, PeerKey, SessionId, Time, BASE_COOLDOWN, MAX_COOLDOWN, MAX_COOLDOWN_PEERS};
+use super::{
+    EntryGen, PeerKey, SessionId, Time, BASE_COOLDOWN, MAX_COOLDOWN, MAX_COOLDOWN_PEERS,
+    RANDOM_EVERY, RANK_INTERVAL,
+};
 
 /// One peer's cooldown history, as today's `PeerCooldowns` keeps it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -33,9 +36,16 @@ pub(crate) struct ReactorModel {
     /// the entry generation they were fetched in. No peer has an empty map.
     unsettled: HashMap<PeerKey, BTreeMap<WaiterId, (UnminedTxId, EntryGen)>>,
     /// Live sessions, lowest round-trip time first, with a random one in
-    /// every fourth place. The test sets it, because the model has no clock
-    /// of round trips or source of randomness.
+    /// every fourth place. Ranked again when a session starts or ends, and on
+    /// the refresh timer, so it is sticky in between.
     ranking: Vec<SessionId>,
+    /// Each session's smoothed round-trip time, as its routine last
+    /// reported it.
+    rtts: HashMap<SessionId, Duration>,
+    /// The deterministic source of the random places.
+    random: u64,
+    /// When the ranking is next refreshed.
+    next_refresh: Option<Time>,
 }
 
 impl ReactorModel {
@@ -43,7 +53,9 @@ impl ReactorModel {
     /// which it does when it is the peer's only session.
     pub(crate) fn connect(&mut self, peer: PeerKey, session: SessionId) -> bool {
         self.sessions.entry(peer).or_default().insert(session);
-        self.grant(peer) == Some(session)
+        let granted = self.grant(peer) == Some(session);
+        self.rerank();
+        granted
     }
 
     /// `session` of `peer` ended, and its unsettled submissions move here in
@@ -65,12 +77,15 @@ impl ReactorModel {
                 self.sessions.remove(&peer);
             }
         }
-        self.ranking.retain(|ranked| *ranked != session);
-        if self.go.get(&peer) == Some(&session) {
+        self.rtts.remove(&session);
+        let next = if self.go.get(&peer) == Some(&session) {
             self.go.remove(&peer);
-            return self.grant(peer);
-        }
-        None
+            self.grant(peer)
+        } else {
+            None
+        };
+        self.rerank();
+        next
     }
 
     /// Gives the go to `peer`'s oldest session if none has it. Every older
@@ -201,9 +216,60 @@ impl ReactorModel {
         Some(length)
     }
 
-    /// Sets the ranking. Sessions it does not name are outside every window.
-    pub(crate) fn set_ranking(&mut self, ranking: Vec<SessionId>) {
+    /// `session`'s routine reports its connection's smoothed round-trip
+    /// time. It counts at the next ranking.
+    pub(crate) fn observe_rtt(&mut self, session: SessionId, rtt: Duration) {
+        self.rtts.insert(session, rtt);
+    }
+
+    /// Whether the refresh timer is due at `now`. The first refresh is
+    /// scheduled by the first call.
+    pub(crate) fn refresh_due(&mut self, now: Time) -> bool {
+        match self.next_refresh {
+            None => {
+                self.next_refresh = Some(now.saturating_add(RANK_INTERVAL));
+                false
+            }
+            Some(at) => now >= at,
+        }
+    }
+
+    /// The refresh timer fired: rank again and schedule the next one.
+    pub(crate) fn refresh(&mut self, now: Time) {
+        self.rerank();
+        self.next_refresh = Some(now.saturating_add(RANK_INTERVAL));
+    }
+
+    /// Ranks the live sessions: lowest round-trip time first, unmeasured
+    /// ones last, and in every fourth place a session picked at random from
+    /// those not yet placed.
+    fn rerank(&mut self) {
+        let mut remaining: Vec<SessionId> = self.go.values().copied().collect();
+        remaining.sort_by_key(|session| {
+            let rtt = self.rtts.get(session).copied();
+            (rtt.is_none(), rtt, *session)
+        });
+        let mut ranking = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            let place = ranking.len().saturating_add(1);
+            let index = if place % RANDOM_EVERY == 0 && remaining.len() > 1 {
+                self.random = self
+                    .random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let len = u64::try_from(remaining.len()).unwrap_or(u64::MAX);
+                usize::try_from((self.random >> 33) % len).unwrap_or(0)
+            } else {
+                0
+            };
+            ranking.push(remaining.remove(index));
+        }
         self.ranking = ranking;
+    }
+
+    /// The ranking, best first.
+    pub(crate) fn ranking(&self) -> &[SessionId] {
+        &self.ranking
     }
 
     /// `session`'s place in the ranking, from 0.
@@ -217,6 +283,11 @@ impl ReactorModel {
             assert!(!waiting.is_empty(), "no empty record for {peer:?}");
             assert!(waiting.len() <= super::MAX_REQUESTS_PER_PEER);
         }
+        let mut ranked: Vec<SessionId> = self.ranking.clone();
+        ranked.sort();
+        let mut live: Vec<SessionId> = self.go.values().copied().collect();
+        live.sort();
+        assert_eq!(ranked, live, "the ranking holds exactly the live sessions");
         for (peer, session) in &self.go {
             assert!(
                 self.sessions

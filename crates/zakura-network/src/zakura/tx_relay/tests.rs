@@ -19,8 +19,8 @@ use super::model::{
     peer::{max_span, Hello},
     window, CloseReason, PeerKey, RelayEffect, RelayModel, SessionId, Violation, ADVERT_DELAY,
     BASE_COOLDOWN, BASE_DEADLINE, DEFERRED_PER_PEER, INBOUND_DELAY, MAX_REQUESTS_PER_PEER,
-    MAX_TX_BYTES, MIN_RATE, NO_ROOM_FIRST, PENDING_PER_PEER, RETRY_FIRST, SENDER_ALLOWANCE,
-    WINDOW_FULL, WINDOW_SMALL,
+    MAX_TX_BYTES, MIN_RATE, NO_ROOM_FIRST, PENDING_PER_PEER, RANDOM_EVERY, RANK_INTERVAL,
+    RETRY_FIRST, SENDER_ALLOWANCE, WINDOW_FULL, WINDOW_SMALL,
 };
 
 fn id(n: u32) -> UnminedTxId {
@@ -718,7 +718,7 @@ fn a_session_announces_the_pool_once_and_never_back_to_its_source() {
     let mut relay = relay();
     let a = open(&mut relay, 1, true, secs(0));
     let b = open(&mut relay, 2, true, secs(0));
-    relay.set_ranking(vec![a, b]);
+    rank_sessions(&mut relay, &[a, b]);
     fetch(&mut relay, a, 1, secs(0));
     // B hears it at once, inside the window. A supplied it and does not.
     assert_eq!(adverts(&relay.take_effects()), vec![(b, id(1))]);
@@ -736,23 +736,39 @@ fn sessions_outside_the_window_hear_after_the_delay() {
     let peers: Vec<_> = (1..=20)
         .map(|p| open(&mut relay, p, true, secs(0)))
         .collect();
-    relay.set_ranking(peers.clone());
+    rank_sessions(&mut relay, &peers);
     assert_eq!(window(Some(SIZE)), WINDOW_SMALL);
+    let ranking = relay.reactor().ranking().to_vec();
     fetch(&mut relay, supplier, 1, secs(0));
     let now: HashSet<_> = adverts(&relay.take_effects())
         .into_iter()
         .map(|(s, _)| s)
         .collect();
-    assert_eq!(now, peers[..WINDOW_SMALL].iter().copied().collect());
+    let inside: HashSet<_> = ranking[..WINDOW_SMALL]
+        .iter()
+        .copied()
+        .filter(|session| *session != supplier)
+        .collect();
+    assert_eq!(now, inside);
 
     // One outside the window announced it meanwhile, so it is skipped.
-    relay.inv(peers[19], &[(id(1), SIZE)], secs(1));
+    let quiet = ranking[WINDOW_SMALL..]
+        .iter()
+        .copied()
+        .find(|session| *session != supplier)
+        .expect("someone is outside the window");
+    relay.inv(quiet, &[(id(1), SIZE)], secs(1));
     relay.tick(ADVERT_DELAY);
     let later: HashSet<_> = adverts(&relay.take_effects())
         .into_iter()
         .map(|(s, _)| s)
         .collect();
-    assert_eq!(later, peers[WINDOW_SMALL..19].iter().copied().collect());
+    let rest: HashSet<_> = ranking[WINDOW_SMALL..]
+        .iter()
+        .copied()
+        .filter(|session| *session != supplier && *session != quiet)
+        .collect();
+    assert_eq!(later, rest);
     assert_eq!(window(Some(MAX_TX_BYTES)), WINDOW_FULL);
     relay.assert_invariants();
 }
@@ -764,30 +780,36 @@ fn with_no_advert_delay_only_the_window_hears() {
     let peers: Vec<_> = (1..=20)
         .map(|p| open(&mut relay, p, true, secs(0)))
         .collect();
-    relay.set_ranking(peers.clone());
+    rank_sessions(&mut relay, &peers);
+    let inside = relay.reactor().ranking()[..WINDOW_SMALL]
+        .iter()
+        .filter(|session| **session != supplier)
+        .count();
     fetch(&mut relay, supplier, 1, secs(0));
-    assert_eq!(adverts(&relay.take_effects()).len(), WINDOW_SMALL);
+    assert_eq!(adverts(&relay.take_effects()).len(), inside);
     relay.tick(secs(60));
     assert!(adverts(&relay.take_effects()).is_empty());
 }
 
 #[test]
 fn only_an_announced_exact_id_is_served() {
-    let mut relay = relay();
+    let mut relay =
+        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reads(100);
     let supplier = open(&mut relay, 1, true, secs(0));
     let a = open(&mut relay, 2, true, secs(0));
     let b = open(&mut relay, 3, true, secs(0));
-    relay.set_ranking(vec![a]);
     let tx_id = witnessed(1, 7);
     relay.inv(supplier, &[(tx_id, SIZE)], secs(0));
     relay.tx(supplier, tx_id, ModelTx::new(tx_id), secs(0));
     finish_all(&mut relay, &Outcome::Pass, secs(0));
+    // A reads the admission. B has not read it yet.
+    relay.read(a, secs(0));
     relay.take_effects();
 
     relay.get_txs(a, tx_id, secs(1));
     // The same mined id with other authorizing data was never announced.
     relay.get_txs(a, witnessed(1, 8), secs(1));
-    // B is outside the window and has not been told yet.
+    // B has not been told yet.
     relay.get_txs(b, tx_id, secs(1));
     assert_eq!(
         relay.take_effects(),
@@ -826,7 +848,7 @@ fn a_hidden_transaction_is_announced_when_it_is_revealed() {
     assert_eq!(relay.pool().hidden(), vec![id(1)]);
     // A session that opens now does not announce it.
     let a = open(&mut relay, 2, true, secs(1));
-    relay.set_ranking(vec![a]);
+    rank_sessions(&mut relay, &[a]);
     assert!(adverts(&relay.take_effects()).is_empty());
     finish_all(&mut relay, &Outcome::Pass, secs(2));
     assert_eq!(adverts(&relay.take_effects()), vec![(a, id(1))]);
@@ -835,13 +857,26 @@ fn a_hidden_transaction_is_announced_when_it_is_revealed() {
 
 #[test]
 fn a_session_that_falls_off_the_log_rebuilds_from_the_snapshot() {
-    let mut relay =
-        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reads(3);
+    // Every transaction is large, so the window is 4, and enough sessions
+    // that some fall outside it.
+    let mut relay = RelayModel::new(PoolModel::new(Height(100), Generation(0)))
+        .with_manual_reads(3)
+        .with_tx_size(|_| MAX_TX_BYTES);
     let supplier = open(&mut relay, 1, true, secs(0));
-    let ranked = open(&mut relay, 2, true, secs(0));
-    let outside = open(&mut relay, 3, true, secs(0));
-    relay.set_ranking(vec![ranked]);
-    fetch(&mut relay, supplier, 1, secs(0));
+    let others: Vec<_> = (2..=9)
+        .map(|p| open(&mut relay, p, true, secs(0)))
+        .collect();
+    rank_sessions(&mut relay, &others);
+    let ranking = relay.reactor().ranking().to_vec();
+    let rank = |session: SessionId| ranking.iter().position(|s| *s == session).unwrap();
+    let ranked = *others.iter().find(|s| rank(**s) < WINDOW_FULL).unwrap();
+    let outside = *others.iter().find(|s| rank(**s) >= WINDOW_FULL).unwrap();
+    let big = |relay: &mut RelayModel, n: u32, now: Duration| {
+        relay.inv(supplier, &[(id(n), MAX_TX_BYTES)], now);
+        relay.tx(supplier, id(n), tx(n), now);
+        finish_all(relay, &Outcome::Pass, now);
+    };
+    big(&mut relay, 1, secs(0));
     relay.read(ranked, secs(0));
     relay.read(outside, secs(0));
     assert_eq!(adverts(&relay.take_effects()), vec![(ranked, id(1))]);
@@ -850,7 +885,7 @@ fn a_session_that_falls_off_the_log_rebuilds_from_the_snapshot() {
 
     // Enough admissions to overrun a three-entry log.
     for n in 2..=6 {
-        fetch(&mut relay, supplier, n, secs(1));
+        big(&mut relay, n, secs(1));
     }
     relay.take_effects();
     relay.read(outside, secs(1));
@@ -864,13 +899,16 @@ fn a_session_that_falls_off_the_log_rebuilds_from_the_snapshot() {
     assert!(relay.session(outside).unwrap().held.is_empty());
     relay.assert_invariants();
     relay.tick(ADVERT_DELAY + secs(1));
-    assert!(adverts(&relay.take_effects()).is_empty());
+    assert!(adverts(&relay.take_effects())
+        .iter()
+        .all(|(session, _)| *session != outside));
 
     // A session already told the first one sends only the rest. The
     // supplier is told none, because it supplied them all.
     relay.read(ranked, secs(3));
     let sent: HashSet<_> = adverts(&relay.take_effects())
         .into_iter()
+        .filter(|(session, _)| *session == ranked)
         .map(|(_, id)| id)
         .collect();
     assert_eq!(sent, (2..=6).map(id).collect());
@@ -885,7 +923,7 @@ fn an_addition_hidden_before_it_is_read_waits_for_its_reveal() {
         RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reads(100);
     let supplier = open(&mut relay, 1, true, secs(0));
     let a = open(&mut relay, 2, true, secs(0));
-    relay.set_ranking(vec![a]);
+    rank_sessions(&mut relay, &[a]);
     fetch(&mut relay, supplier, 1, secs(0));
     let reorg = ModelTransition {
         disconnected: 1,
@@ -1154,7 +1192,7 @@ fn fan_out_uses_the_size_of_the_body_admitted() {
     let peers: Vec<_> = (10..30)
         .map(|p| open(&mut relay, p, true, secs(0)))
         .collect();
-    relay.set_ranking(peers.clone());
+    rank_sessions(&mut relay, &peers);
     relay.inv(liar, &[(id(1), 100)], secs(0));
     relay.inv(supplier, &[(id(1), MAX_TX_BYTES)], secs(0));
     relay.not_found(liar, id(1), secs(1));
@@ -1165,7 +1203,12 @@ fn fan_out_uses_the_size_of_the_body_admitted() {
         .into_iter()
         .map(|(s, _)| s)
         .collect();
-    assert_eq!(now, peers[..WINDOW_FULL].iter().copied().collect());
+    let inside: HashSet<_> = relay.reactor().ranking()[..WINDOW_FULL]
+        .iter()
+        .copied()
+        .filter(|session| *session != liar && *session != supplier)
+        .collect();
+    assert_eq!(now, inside);
     relay.assert_invariants();
 }
 
@@ -1468,7 +1511,7 @@ fn repeated_log_overruns_across_hides_reveals_and_removals() {
         RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reads(2);
     let supplier = open(&mut relay, 1, true, secs(0));
     let a = open(&mut relay, 2, true, secs(0));
-    relay.set_ranking(vec![a]);
+    rank_sessions(&mut relay, &[a]);
     let mut now = secs(0);
     let mut height = 100;
     for round in 0..4u32 {
@@ -1569,7 +1612,7 @@ fn a_short_id_collision_only_skips_one_advert_to_one_peer() {
     let supplier = open(&mut relay, 1, true, secs(0));
     let a = open(&mut relay, 2, true, secs(0));
     let b = open(&mut relay, 3, true, secs(0));
-    relay.set_ranking(vec![a, b]);
+    rank_sessions(&mut relay, &[a, b]);
     // A announced id 1, so its skip set holds the short id 1.
     relay.inv(a, &[(id(1), SIZE)], secs(0));
     relay.take_effects();
@@ -1775,7 +1818,7 @@ fn a_collision_after_a_removal_costs_one_redundant_advert() {
     }
     let mut relay = relay().with_short_id(collide);
     let a = open(&mut relay, 1, true, secs(0));
-    relay.set_ranking(vec![a]);
+    rank_sessions(&mut relay, &[a]);
     fetch(&mut relay, a, 1, secs(0));
     fetch(&mut relay, a, 2, secs(0));
     assert!(adverts(&relay.take_effects()).is_empty(), "A supplied both");
@@ -1968,7 +2011,7 @@ fn a_restarted_pool_reconciles_unread_removals() {
         RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reads(100);
     let supplier = open(&mut relay, 1, true, secs(0));
     let a = open(&mut relay, 2, true, secs(0));
-    relay.set_ranking(vec![a]);
+    rank_sessions(&mut relay, &[a]);
     fetch(&mut relay, supplier, 1, secs(0));
     relay.read(a, secs(0));
     assert!(relay.session(a).unwrap().announced.contains_key(&id(1)));
@@ -2071,9 +2114,19 @@ fn a_cancelled_probe_passes_its_permit_on() {
         "the cancelled call and the new probe"
     );
     relay.assert_invariants();
-    // A's old call still runs and finds no room, which changes nothing
-    // because a backoff is set. The new probe finds no room too, and the
-    // backoff doubles once.
+    // A's old call still runs and finds no room. Its answer arrives while
+    // the new probe is out, and leaves that probe alone: no doubling, and
+    // the permit still with the new call.
+    assert!(relay.process_reserve(NO_ROOM_FIRST));
+    assert!(relay.deliver_reserve(NO_ROOM_FIRST));
+    assert_eq!(
+        relay.wanted().backoff_until(NO_ROOM_FIRST),
+        None,
+        "the old answer does not extend the ended backoff"
+    );
+    assert_eq!(relay.wanted().probe().map(|(holder, _)| holder), Some(a));
+    relay.assert_invariants();
+    // The new probe finds no room, and the backoff doubles once.
     while relay.answer_reserve(NO_ROOM_FIRST) {}
     assert_eq!(
         relay.wanted().backoff_until(NO_ROOM_FIRST),
@@ -2141,7 +2194,7 @@ fn an_outside_admission_uses_its_own_size_for_fan_out() {
     let peers: Vec<_> = (1..=40)
         .map(|p| open(&mut relay, p, true, secs(0)))
         .collect();
-    relay.set_ranking(peers);
+    rank_sessions(&mut relay, &peers);
     relay.outside(secs(0), |pool, now| {
         let reservation = pool.reserve(id(1), Intent::Deliver, now).expect("room");
         let _ = pool.effects();
@@ -2327,7 +2380,7 @@ fn a_lagging_read_announces_a_readded_id_once() {
         RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reads(100);
     let supplier = open(&mut relay, 1, true, secs(0));
     let a = open(&mut relay, 2, true, secs(0));
-    relay.set_ranking(vec![a]);
+    rank_sessions(&mut relay, &[a]);
     fetch(&mut relay, supplier, 1, secs(0));
     // Mined, then the block is reorged away, and the id is admitted again.
     let block = ModelTransition {
@@ -2358,6 +2411,68 @@ fn a_lagging_read_announces_a_readded_id_once() {
     relay.assert_invariants();
 }
 
+#[test]
+fn the_reactor_ranks_every_live_session() {
+    let mut relay = relay().with_advert_delay(None);
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    rank_sessions(&mut relay, &[a, b]);
+    // A session that opens later is ranked at once, unmeasured and so last,
+    // and with three live sessions it is inside the window.
+    let c = open(&mut relay, 3, true, secs(0));
+    assert_eq!(relay.reactor().ranking(), &[a, b, c]);
+    relay.outside(secs(0), |pool, now| {
+        let reservation = pool.reserve(id(1), Intent::Deliver, now).expect("room");
+        let _ = pool.effects();
+        let (_, step) = pool.submit(reservation.id, tx(1), now);
+        ((), step)
+    });
+    finish_all(&mut relay, &Outcome::Pass, secs(0));
+    let told: HashSet<_> = adverts(&relay.take_effects())
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert_eq!(told, [a, b, c].into_iter().collect());
+    relay.assert_invariants();
+}
+
+#[test]
+fn the_ranking_is_sticky_until_a_session_changes_or_the_timer_fires() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    rank_sessions(&mut relay, &[a, b]);
+    assert_eq!(relay.reactor().ranking(), &[a, b]);
+    // B becomes faster. Nothing changes until the timer.
+    relay.observe_rtt(b, Duration::from_micros(1), secs(1));
+    assert_eq!(relay.reactor().ranking(), &[a, b]);
+    relay.tick(secs(1) + RANK_INTERVAL);
+    assert_eq!(relay.reactor().ranking(), &[b, a]);
+    // A session ending ranks again at once.
+    let c = open(&mut relay, 3, true, secs(40));
+    relay.end(a, secs(41));
+    assert_eq!(relay.reactor().ranking(), &[b, c]);
+}
+
+#[test]
+fn every_fourth_place_is_random() {
+    let mut relay = relay();
+    let sessions: Vec<_> = (1..=12)
+        .map(|p| open(&mut relay, p, true, secs(0)))
+        .collect();
+    rank_sessions(&mut relay, &sessions);
+    let ranking = relay.reactor().ranking().to_vec();
+    assert_eq!(ranking.len(), sessions.len());
+    // The non-random places keep round-trip order among what is left.
+    let mut left: Vec<SessionId> = sessions.clone();
+    for (place, session) in ranking.iter().enumerate() {
+        if (place + 1) % RANDOM_EVERY != 0 {
+            assert_eq!(*session, left[0], "place {place} is the fastest left");
+        }
+        left.retain(|s| s != session);
+    }
+}
+
 /// The default short id of `tx_id`, as the model keeps it.
 fn short_of(tx_id: UnminedTxId) -> u64 {
     let mut short = [0u8; 8];
@@ -2372,6 +2487,18 @@ fn one_is_big(tx_id: UnminedTxId) -> u32 {
     } else {
         SIZE
     }
+}
+
+/// Reports round-trip times so that `sessions` rank in this order, lowest
+/// first, and fires the reactor's refresh timer at the model's current time.
+/// The reactor still puts a random session in every fourth place.
+fn rank_sessions(relay: &mut RelayModel, sessions: &[SessionId]) {
+    let now = relay.now();
+    for (place, session) in sessions.iter().enumerate() {
+        let rtt = Duration::from_millis(u64::try_from(place).unwrap() + 1);
+        relay.observe_rtt(*session, rtt, now);
+    }
+    relay.refresh_ranking(now);
 }
 
 /// Fills the pool with another caller's reservations.
@@ -2645,6 +2772,11 @@ fn run(seed: u64) {
         "seed {seed}: every submission has its verdict"
     );
     // Nothing is left at the pool either: no reservation, slot or body.
+    assert_eq!(
+        relay.pool().slots_in_use(),
+        0,
+        "seed {seed}: the pool holds no slot"
+    );
     assert_eq!(
         relay.pool().caller_held(),
         0,

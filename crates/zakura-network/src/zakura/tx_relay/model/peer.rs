@@ -82,7 +82,7 @@ pub(crate) struct PeerModel {
     pub(crate) pending: Vec<Pending>,
     /// Ids it answered `NotFound` for, oldest first, by entry generation.
     /// It may still be asked for them, but only after waiting.
-    pub(crate) deferred: VecDeque<(UnminedTxId, EntryGen)>,
+    pub(crate) deferred: VecDeque<(UnminedTxId, EntryGen, Time)>,
     /// How often its request for a pending id timed out. Only pending ids
     /// have an entry, so this is bounded by the pending set.
     pub(crate) timed_out: HashMap<(UnminedTxId, EntryGen), u32>,
@@ -148,10 +148,18 @@ impl PeerModel {
             .any(|pending| pending.id == id && pending.generation == generation)
     }
 
-    /// Whether it must wait after each release before claiming `id` in
-    /// `generation`, because it answered `NotFound` for it.
+    /// Whether it answered `NotFound` for `id` in `generation`, or missed a
+    /// deadline for it, so it waits after its own releases.
     pub(crate) fn is_deferred(&self, id: UnminedTxId, generation: EntryGen) -> bool {
-        self.deferred.contains(&(id, generation))
+        self.waits_until(id, generation).is_some()
+    }
+
+    /// Until when it waits before claiming `id` in `generation` again.
+    pub(crate) fn waits_until(&self, id: UnminedTxId, generation: EntryGen) -> Option<Time> {
+        self.deferred
+            .iter()
+            .find(|(held, held_generation, _)| *held == id && *held_generation == generation)
+            .map(|(_, _, until)| *until)
     }
 
     /// Room left in its pending set.
@@ -188,17 +196,23 @@ impl PeerModel {
         self.timed_out.remove(&(id, generation));
     }
 
-    /// Records that it answered `NotFound` for `id`, so it waits after
-    /// each release before claiming it again. Bounded, forgetting the
-    /// oldest, which only lets it claim that id a little sooner.
-    pub(crate) fn defer(&mut self, id: UnminedTxId, generation: EntryGen) {
-        if self.is_deferred(id, generation) {
+    /// Records that it must wait until `until` before claiming `id` in
+    /// `generation` again, after its own `NotFound` or missed deadline.
+    /// Bounded, forgetting the oldest, which only lets it claim that id a
+    /// little sooner.
+    pub(crate) fn defer(&mut self, id: UnminedTxId, generation: EntryGen, until: Time) {
+        if let Some(entry) = self
+            .deferred
+            .iter_mut()
+            .find(|(held, held_generation, _)| *held == id && *held_generation == generation)
+        {
+            entry.2 = entry.2.max(until);
             return;
         }
         if self.deferred.len() >= DEFERRED_PER_PEER {
             self.deferred.pop_front();
         }
-        self.deferred.push_back((id, generation));
+        self.deferred.push_back((id, generation, until));
     }
 
     /// Records that it announced or supplied the id with short id `short`,

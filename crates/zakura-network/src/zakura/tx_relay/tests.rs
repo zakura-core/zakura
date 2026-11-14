@@ -11,7 +11,7 @@ use zakura_chain::{
     transaction::{self, AuthDigest, UnminedTxId, WtxId},
 };
 use zakura_node_services::mempool::port::{
-    model::{JobId, ModelBlock, ModelTransition, ModelTx, Outcome, PoolModel, T_VERIFY},
+    model::{ModelBlock, ModelTransition, ModelTx, Outcome, PoolModel, T_VERIFY},
     Change, Charge, Generation, Intent, RejectionScope, MAX_PENDING,
 };
 
@@ -1170,7 +1170,7 @@ fn fan_out_uses_the_size_of_the_body_admitted() {
 }
 
 #[test]
-fn a_late_verdict_from_an_ended_session_leaves_a_newer_entry_alone() {
+fn a_late_verdict_from_an_ended_session_settles_a_newer_entry_on_the_same_chain() {
     let mut relay = relay();
     let a = open(&mut relay, 1, true, secs(0));
     relay.inv(a, &[(id(1), SIZE)], secs(0));
@@ -1185,10 +1185,12 @@ fn a_late_verdict_from_an_ended_session_leaves_a_newer_entry_alone() {
         charge: Charge::None,
     };
     finish_all(&mut relay, &rejected, secs(1));
-    // The old submission's verdict decides only its own generation.
-    assert_eq!(relay.wanted().entry(id(1)).unwrap().generation, newer);
+    // The rejection holds on this chain, so the old submission's verdict
+    // settles the id's newer entry too, and B's waiting call changes
+    // nothing.
+    let _ = newer;
+    assert!(relay.wanted().entry(id(1)).is_none());
     assert_eq!(relay.reactor().unsettled_peers(), 0);
-    // B's own reserve then learns of the rejection.
     relay.tick(secs(1) + RETRY_FIRST);
     assert!(relay.wanted().entry(id(1)).is_none());
     relay.assert_invariants();
@@ -2007,11 +2009,14 @@ fn a_fresh_announcement_waits_behind_an_old_request() {
     let second = relay.wanted().entry(id(1)).unwrap().generation;
     assert!(relay.session(a).unwrap().holds(id(1), second));
     assert!(asks(&relay.take_effects()).is_empty());
-    // The old answer leaves the new entry pending, and A is asked again.
+    // The old answer leaves the id pending, and after its wait A is asked
+    // again.
     relay.not_found(a, id(1), secs(3));
+    assert!(asks(&relay.take_effects()).is_empty());
+    relay.tick(secs(3) + INBOUND_DELAY);
     assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
-    relay.tx(a, id(1), tx(1), secs(4));
-    finish_all(&mut relay, &Outcome::Pass, secs(4));
+    relay.tx(a, id(1), tx(1), secs(6));
+    finish_all(&mut relay, &Outcome::Pass, secs(6));
     assert_eq!(relay.pool().visible(), vec![id(1)]);
     relay.assert_invariants();
 }
@@ -2066,8 +2071,9 @@ fn a_cancelled_probe_passes_its_permit_on() {
         "the cancelled call and the new probe"
     );
     relay.assert_invariants();
-    // A's call never reaches the pool. B's finds no room, and the backoff
-    // doubles.
+    // A's old call still runs and finds no room, which changes nothing
+    // because a backoff is set. The new probe finds no room too, and the
+    // backoff doubles once.
     while relay.answer_reserve(NO_ROOM_FIRST) {}
     assert_eq!(
         relay.wanted().backoff_until(NO_ROOM_FIRST),
@@ -2248,6 +2254,110 @@ fn contradicted_answers_do_not_grow_the_deadline() {
     relay.assert_invariants();
 }
 
+#[test]
+fn another_peers_release_never_restarts_a_peers_wait() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(b, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    relay.not_found(a, id(1), secs(1));
+    assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
+    relay.inv(a, &[(id(1), SIZE)], Duration::from_millis(1_500));
+    relay.not_found(b, id(1), secs(2));
+    relay.inv(b, &[(id(1), SIZE)], secs(3));
+    // A wins the first race, then keeps answering NotFound promptly after
+    // announcing again. B's own wait ended, so B is asked next.
+    let mut now = secs(4);
+    relay.tick(now);
+    let mut b_asked = false;
+    for _ in 0..5 {
+        for (session, asked) in asks(&relay.take_effects()) {
+            if session == b {
+                b_asked = true;
+            } else {
+                relay.inv(a, &[(asked, SIZE)], now);
+                relay.not_found(a, asked, now);
+            }
+        }
+        if b_asked {
+            break;
+        }
+        now += INBOUND_DELAY;
+        relay.tick(now);
+    }
+    assert!(b_asked, "B is asked although A wins every race");
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_same_chain_rejection_ends_another_announcers_fetch() {
+    let mut relay = relay().with_manual_verdicts();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    relay.tx(a, id(1), tx(1), secs(0));
+    let rejected = Outcome::Fail {
+        scope: RejectionScope::ExactTip,
+        charge: Charge::None,
+    };
+    finish_all(&mut relay, &rejected, secs(0));
+    relay.end(a, secs(1));
+    // The pool restarts on the same chain, forgetting the rejection, and B
+    // fetches the id before A's verdict arrives.
+    relay.deactivate(secs(1));
+    relay.activate(secs(1));
+    let b = open(&mut relay, 2, true, secs(1));
+    relay.inv(b, &[(id(1), SIZE)], secs(1));
+    assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
+    assert!(relay.deliver_verdict(secs(2)));
+    // The rejection holds on this chain, so it settles the id and ends B's
+    // fetch. B's late body never reaches the pool.
+    assert!(relay.wanted().entry(id(1)).is_none());
+    assert_eq!(relay.reservations_held(), 0);
+    relay.tx(b, id(1), tx(1), secs(3));
+    assert_eq!(relay.pool().bodies_held(), 0);
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_lagging_read_announces_a_readded_id_once() {
+    let mut relay =
+        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reads(100);
+    let supplier = open(&mut relay, 1, true, secs(0));
+    let a = open(&mut relay, 2, true, secs(0));
+    relay.set_ranking(vec![a]);
+    fetch(&mut relay, supplier, 1, secs(0));
+    // Mined, then the block is reorged away, and the id is admitted again.
+    let block = ModelTransition {
+        disconnected: 0,
+        connected: vec![ModelBlock {
+            transactions: vec![tx(1)],
+        }],
+        tip: Height(101),
+        generation: Generation(1),
+        rules_change: false,
+    };
+    relay.transition(block, secs(1));
+    let reorg = ModelTransition {
+        disconnected: 1,
+        connected: vec![ModelBlock::default(), ModelBlock::default()],
+        tip: Height(102),
+        generation: Generation(2),
+        rules_change: false,
+    };
+    relay.transition(reorg, secs(1));
+    relay.inv(supplier, &[(id(1), SIZE)], secs(2));
+    relay.tx(supplier, id(1), tx(1), secs(2));
+    finish_all(&mut relay, &Outcome::Pass, secs(2));
+    relay.take_effects();
+    // A reads added, removed and added in one go, and announces once.
+    relay.read(a, secs(3));
+    assert_eq!(adverts(&relay.take_effects()), vec![(a, id(1))]);
+    relay.assert_invariants();
+}
+
 /// The default short id of `tx_id`, as the model keeps it.
 fn short_of(tx_id: UnminedTxId) -> u64 {
     let mut short = [0u8; 8];
@@ -2355,17 +2465,15 @@ fn run(seed: u64) {
             }
         }
     };
-    // When each job was first seen, so the oracle counts a failure only if
-    // the pool will apply it, before the job's own deadline.
-    let mut job_seen: HashMap<JobId, Duration> = HashMap::new();
-    let mut verify = |relay: &mut RelayModel,
-                      failed: &mut HashSet<UnminedTxId>,
-                      rng: &mut Lcg,
-                      now: Duration,
-                      fail_some: bool| {
-        for (job, tx_id) in relay.job_txs().to_vec() {
-            let seen = *job_seen.entry(job).or_insert(now);
-            let applied = now < seen + T_VERIFY;
+    // The oracle counts a failure only if the pool will apply it: before the
+    // job's own deadline, counted from when the pool started it.
+    let verify = |relay: &mut RelayModel,
+                  failed: &mut HashSet<UnminedTxId>,
+                  rng: &mut Lcg,
+                  now: Duration,
+                  fail_some: bool| {
+        for (job, tx_id, started) in relay.job_txs().to_vec() {
+            let applied = now < started + T_VERIFY;
             let outcome = if fail_some && rng.next(5) == 0 {
                 if applied {
                     failed.insert(tx_id);
@@ -2535,6 +2643,17 @@ fn run(seed: u64) {
         relay.waiters_outstanding(),
         0,
         "seed {seed}: every submission has its verdict"
+    );
+    // Nothing is left at the pool either: no reservation, slot or body.
+    assert_eq!(
+        relay.pool().caller_held(),
+        0,
+        "seed {seed}: the pool holds no reservation"
+    );
+    assert_eq!(
+        relay.pool().bodies_held(),
+        0,
+        "seed {seed}: the pool holds no body"
     );
     assert_eq!(
         relay.reactor().unsettled_peers(),

@@ -382,13 +382,12 @@ jobs:
           cargo test --locked -p zakura-chain balance_ignores_transfers
           cargo test --locked -p zakura-state balance_rollback_replay_and_fork_equivalence
 
-  sprout-disabled:
-    name: consensus without sprout
+  sprout-enabled:
+    name: consensus with sprout
     needs: changes
-    # zakurad enables `sprout` by default, and workspace feature unification
-    # turns it on for zakura-consensus in the shared archive. Test the
-    # consensus crate on its own, where `sprout` is off, so the disabled path
-    # keeps coverage.
+    # The shared archive now tests the default build without `sprout`. Opt in
+    # here so historical JoinSplit proof and signature verification keeps
+    # coverage alongside the default retryable verifier-unavailable path.
     if: vars.TEMPORARY_PR_CI != 'true' && (needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request')
     permissions:
       contents: read
@@ -402,8 +401,8 @@ jobs:
         with:
           toolchain: stable
       - uses: ./.github/actions/setup-zakura-build
-      - name: Test zakura-consensus without Sprout verification
-        run: cargo test --locked -p zakura-consensus
+      - name: Test zakura-consensus with Sprout verification
+        run: cargo test --locked -p zakura-consensus --features sprout
 
   network-dependent:
     name: network-dependent acceptance tests
@@ -917,7 +916,7 @@ jobs:
       - unit-tests
       - zakura-config
       - extended-reissuance-properties
-      - sprout-disabled
+      - sprout-enabled
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
@@ -943,7 +942,7 @@ jobs:
         with:
           jobs: ${{ toJSON(needs) }}
           # These jobs are skipped outside their event or changed-path scope:
-          # build-tests / unit-tests / sprout-disabled / network-dependent skip on pull requests
+          # build-tests / unit-tests / sprout-enabled / network-dependent skip on pull requests
           # that touch no test-relevant paths (unit-tests and zakura-config
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
@@ -953,7 +952,7 @@ jobs:
           # this status and reaches report-nightly-result. sim-planted and
           # sim-planted-targets report to one failure issue per shard instead.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: temporary-unit-tests, check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, sprout-disabled, network-dependent, publish-graph, sim-build, sim-sanitizers, sim-feedback, sim-targets, zakura-testkit
+          allowed-skips: temporary-unit-tests, check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, sprout-enabled, network-dependent, publish-graph, sim-build, sim-sanitizers, sim-feedback, sim-targets, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

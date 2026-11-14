@@ -578,9 +578,9 @@ fn turning_the_pool_off_releases_fetches_until_it_is_live() {
     relay.inv(a, &[(id(2), SIZE)], secs(2));
     assert!(asks(&relay.take_effects()).is_empty());
     relay.activate(secs(3));
-    // The id never asked for goes before the released one.
+    // The id ready longest goes first.
     let asked = asks(&relay.take_effects());
-    assert_eq!(asked, vec![(a, id(2)), (a, id(1))]);
+    assert_eq!(asked, vec![(a, id(1)), (a, id(2))]);
     relay.assert_invariants();
 }
 
@@ -1056,9 +1056,9 @@ fn reserves_in_flight_and_the_one_probe() {
 #[test]
 fn a_probe_with_another_answer_hands_the_permit_on() {
     let mut relay = relay();
-    // Another caller fetches id 1, and the pool is otherwise full.
+    // Another caller fetches id 2, and the pool is otherwise full.
     relay.outside(secs(0), |pool, now| {
-        let answer = pool.reserve(id(1), Intent::Fetch, now);
+        let answer = pool.reserve(id(2), Intent::Fetch, now);
         (answer.expect("room").id, pool.effects())
     });
     for n in 1..u32::try_from(MAX_PENDING).unwrap() {
@@ -1067,17 +1067,20 @@ fn a_probe_with_another_answer_hands_the_permit_on() {
             (answer.expect("room").id, pool.effects())
         });
     }
-    // Id 1 is refused as another caller's fetch, then id 2 finds no room.
+    // A's id 2 is refused as another caller's fetch, then B's id 1 finds no
+    // room.
     let a = open(&mut relay, 1, true, secs(0));
-    relay.inv(a, &[(id(1), SIZE), (id(2), SIZE)], secs(0));
-    assert_eq!(relay.wanted().entry(id(1)).unwrap().retry_at, RETRY_FIRST);
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(2), SIZE)], secs(0));
+    relay.inv(b, &[(id(1), SIZE)], secs(0));
+    assert_eq!(relay.wanted().entry(id(2)).unwrap().retry_at, RETRY_FIRST);
     assert_eq!(relay.wanted().backoff_until(secs(0)), Some(NO_ROOM_FIRST));
-    // At the end of the backoff the probe asks for id 1 first. That answer
-    // says nothing about room, so the permit passes on at once, and the
-    // next probe, for id 2, finds the pool full.
+    // At the end of the backoff A, the older session, probes for id 2.
+    // That answer says nothing about room, so the permit passes on at once,
+    // and B's probe, for id 1, finds the pool full.
     relay.tick(NO_ROOM_FIRST);
     assert_eq!(
-        relay.wanted().entry(id(1)).unwrap().retry_at,
+        relay.wanted().entry(id(2)).unwrap().retry_at,
         NO_ROOM_FIRST + RETRY_FIRST * 2
     );
     assert_eq!(
@@ -1214,25 +1217,28 @@ fn fan_out_uses_the_size_of_the_body_admitted() {
 }
 
 #[test]
-fn a_late_verdict_from_an_ended_session_settles_a_newer_entry_on_the_same_chain() {
+fn a_verdict_for_an_ended_session_settles_the_entry_it_still_claims() {
     let mut relay = relay();
     let a = open(&mut relay, 1, true, secs(0));
     relay.inv(a, &[(id(1), SIZE)], secs(0));
     relay.tx(a, id(1), tx(1), secs(0));
     relay.end(a, secs(1));
     assert_eq!(relay.reactor().unsettled_count(PeerKey(1)), 1);
+    relay.take_effects();
+    // B joins the same entry, which A's submission still claims.
     let b = open(&mut relay, 2, true, secs(1));
     relay.inv(b, &[(id(1), SIZE)], secs(1));
-    let newer = relay.wanted().entry(id(1)).unwrap().generation;
+    assert!(asks(&relay.take_effects()).is_empty());
+    assert!(relay
+        .session(b)
+        .unwrap()
+        .holds(id(1), relay.wanted().entry(id(1)).unwrap().generation));
     let rejected = Outcome::Fail {
         scope: RejectionScope::ExactTip,
         charge: Charge::None,
     };
     finish_all(&mut relay, &rejected, secs(1));
-    // The rejection holds on this chain, so the old submission's verdict
-    // settles the id's newer entry too, and B's waiting call changes
-    // nothing.
-    let _ = newer;
+    // The rejection holds on this chain, so it settles the entry for B too.
     assert!(relay.wanted().entry(id(1)).is_none());
     assert_eq!(relay.reactor().unsettled_peers(), 0);
     relay.tick(secs(1) + RETRY_FIRST);
@@ -2381,7 +2387,7 @@ fn a_same_chain_rejection_settles_every_holder() {
 }
 
 #[test]
-fn a_rejection_from_before_a_restart_settles_nothing() {
+fn a_rejection_after_a_restart_still_settles_and_a_new_announcement_is_asked() {
     let mut relay = relay().with_manual_verdicts();
     let a = open(&mut relay, 1, true, secs(0));
     relay.inv(a, &[(id(1), SIZE)], secs(0));
@@ -2393,23 +2399,25 @@ fn a_rejection_from_before_a_restart_settles_nothing() {
     };
     finish_all(&mut relay, &rejected, secs(0));
     relay.end(a, secs(1));
-    // The pool restarts on the same chain and forgets the rejection.
+    // The pool restarts on the same chain and forgets the rejection. The
+    // port shows no restart that a caller can rely on seeing, so the old
+    // verdict still settles what is held when it arrives.
     relay.deactivate(secs(1));
     relay.activate(secs(1));
     let b = open(&mut relay, 2, true, secs(1));
     relay.inv(b, &[(id(1), SIZE)], secs(1));
     assert!(asks(&relay.take_effects()).is_empty());
     assert!(relay.deliver_verdict(secs(2)));
-    // The pool no longer remembers it, so B may supply the id, and its
-    // body reaches the pool.
-    assert!(relay.wanted().entry(id(1)).is_some());
-    relay.tick(secs(2) + RETRY_FIRST);
+    assert!(relay.wanted().entry(id(1)).is_none());
+    assert!(relay.session(b).unwrap().pending.is_empty());
+    // A later announcement is a new entry, and the current pool, which no
+    // longer remembers the rejection, lets B fetch it.
+    relay.inv(b, &[(id(1), SIZE)], secs(3));
     assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
     relay.tx(b, id(1), tx(1), secs(4));
     finish_all(&mut relay, &Outcome::Pass, secs(4));
     while relay.deliver_verdict(secs(4)) {}
     assert!(relay.pool().visible().contains(&id(1)));
-    assert!(relay.wanted().entry(id(1)).is_none());
     relay.assert_invariants();
 }
 
@@ -2664,6 +2672,11 @@ fn retries_never_starve_ids_not_yet_asked() {
     relay.tick(secs(60));
     assert!(relay.deliver_verdict(secs(60)));
     assert_eq!(asks(&relay.take_effects()), vec![(a, id(11))]);
+    // A fresh id announced now waits behind the retries that were ready
+    // first, so a steady stream of new ids never starves them either.
+    relay.inv(a, &[(id(12), SIZE)], secs(60));
+    assert!(relay.deliver_verdict(secs(60)));
+    assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
     relay.assert_invariants();
 }
 

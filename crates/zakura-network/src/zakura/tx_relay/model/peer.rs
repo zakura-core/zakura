@@ -80,8 +80,6 @@ pub(crate) struct Submitting {
     pub(crate) body: ModelTx,
     /// The chain generation of the caller's snapshot at the check.
     pub(crate) chain: Generation,
-    /// The pool's life at the check. See `RelayModel::pool_life`.
-    pub(crate) life: u64,
 }
 
 /// One peer's session.

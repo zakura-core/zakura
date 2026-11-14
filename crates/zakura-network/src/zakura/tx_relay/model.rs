@@ -21,9 +21,12 @@
 //!
 //! - **Claim, reserve, then ask.** A session with a free slot claims an
 //!   eligible id in its pending set, reserves a slot at the pool, and only
-//!   then sends `GetTxs`. One claim per id. Ids nobody was asked for yet go
-//!   first, oldest first, then released ones, longest released first, so
-//!   retries never starve fresh work.
+//!   then sends `GetTxs`. One claim per id. The id ready longest goes
+//!   first: ready since its first announcement, or since its retry delay
+//!   ended. So neither fresh ids nor retries starve the other. A routine
+//!   keeps this order in a queue keyed by that time. While it reconciles
+//!   after missing table events, it may claim the best id it knows of,
+//!   which the comparison with the model allows.
 //! - **One attempt at a time.** A claim lasts from the reserve call until
 //!   the body's verdict, even if the session ends meanwhile, so no other
 //!   fetch of the same entry starts while the pool decides it. A verdict
@@ -42,14 +45,18 @@
 //!   [`INBOUND_DELAY`] after each release before it may claim that id
 //!   again, so others claim it first. Only a missed deadline doubles the
 //!   next one. A late body is dropped before it reaches the pool.
-//! - **A rejection settles the id for every holder only if the pool still
-//!   remembers it:** its scope is one the pool caches, and neither the chain
-//!   nor the pool's life (a restart) changed since the body was checked.
-//!   That includes a rejection that came from the pool's contents, such as
-//!   a conflict, which the pool also keeps until the tip changes. Any other
-//!   rejection, such as an [`RejectionScope::Uncached`] one, lets another
-//!   announcer try after a retry delay. Since the claim was held until the
-//!   verdict, a rejection never ends another announcer's fetch.
+//! - **A rejection of a scope the pool caches settles the id for every
+//!   holder,** if it arrives on the chain it was made on, for a verdict and
+//!   a reserve answer alike. That includes one from the pool's contents,
+//!   such as a conflict, which the pool also keeps until the tip changes.
+//!   The port shows no restart or cache clearing a caller can rely on
+//!   seeing, so neither is checked: as with today's rejection cache, an
+//!   announcement held when the rejection arrives is dropped, and the id is
+//!   asked about again only when a peer announces it again. The current
+//!   pool then answers. An [`RejectionScope::Uncached`] rejection, or one
+//!   from before a chain change, lets another announcer try after a retry
+//!   delay. Since the claim is held until the verdict, a rejection never
+//!   ends another announcer's fetch.
 //! - **A routine checks the table before it submits a body.** If the entry
 //!   is gone or no longer its claim, it drops the body and gives back its
 //!   pool slot. The check and a mark that the body is being submitted are one
@@ -326,8 +333,6 @@ struct Submitted {
     session: SessionId,
     /// The chain generation of its snapshot at the check before submitting.
     chain: Generation,
-    /// The pool's life then.
-    life: u64,
 }
 
 /// A verdict on its way back to `tx-relay`.
@@ -366,9 +371,10 @@ pub(crate) struct RelayModel {
     /// it from which snapshot.
     waiters: HashMap<WaiterId, VerdictOwner>,
     submitted_at: HashMap<WaiterId, Submitted>,
-    /// Counts the pool's restarts. A restart forgets every rejection, so a
-    /// rejection from an earlier life settles nothing.
-    pool_life: u64,
+    /// Entries decided while a body fetched for them was still marked or in
+    /// verification. Only the invariants read it: such an attempt no longer
+    /// has a claim to hold.
+    settled: HashSet<(UnminedTxId, EntryGen)>,
     /// Whether a body that passed the check reaches the pool at once. Off,
     /// it waits for [`Self::deliver_submit`].
     auto_submits: bool,
@@ -436,7 +442,7 @@ impl RelayModel {
             reservations: HashMap::new(),
             waiters: HashMap::new(),
             submitted_at: HashMap::new(),
-            pool_life: 0,
+            settled: HashSet::new(),
             auto_submits: true,
             submits: VecDeque::new(),
             tx_size: |_| DEFAULT_TX_BYTES,
@@ -646,7 +652,6 @@ impl RelayModel {
                 reservation,
                 body,
                 chain: self.generation,
-                life: self.pool_life,
             },
         );
         if self.auto_submits {
@@ -868,7 +873,6 @@ impl RelayModel {
     pub(crate) fn deactivate(&mut self, now: Time) {
         self.enter(now);
         self.pool_live = false;
-        self.pool_life = self.pool_life.wrapping_add(1);
         let step = self.pool.deactivate(self.now);
         self.inbox.push_back(step);
         self.settle();
@@ -1074,6 +1078,55 @@ impl RelayModel {
         self.drain();
         self.fill();
         self.drain();
+        if !self.settled.is_empty() {
+            let open: HashSet<(UnminedTxId, EntryGen)> = self
+                .attempts()
+                .map(|(id, generation, _, _)| (id, generation))
+                .collect();
+            self.settled.retain(|attempt| open.contains(attempt));
+        }
+    }
+
+    /// Every attempt in flight: each reserve call, fetch with a reservation,
+    /// marked body and submission, with the session whose claim it holds and
+    /// what it is.
+    fn attempts(
+        &self,
+    ) -> impl Iterator<Item = (UnminedTxId, EntryGen, SessionId, &'static str)> + '_ {
+        let live = self.sessions.iter().flat_map(|(session, state)| {
+            let session = *session;
+            let reserving = state
+                .reserving
+                .iter()
+                .map(move |(id, call)| (*id, call.pending.generation, session, "a reserve call"));
+            let fetching = state
+                .requests
+                .iter()
+                .filter(|(_, request)| request.reservation.is_some())
+                .map(move |(id, request)| (*id, request.generation, session, "a fetch"));
+            let marked = state
+                .submitting
+                .iter()
+                .map(move |(id, marked)| (*id, marked.generation, session, "a marked body"));
+            let submitted = state
+                .submissions
+                .values()
+                .map(move |(id, generation)| (*id, *generation, session, "a submission"));
+            reserving.chain(fetching).chain(marked).chain(submitted)
+        });
+        let handed = self.submitted_at.iter().filter_map(|(waiter, submitted)| {
+            self.reactor
+                .unsettled_entry(*waiter)
+                .map(|(id, generation)| {
+                    (
+                        id,
+                        generation,
+                        submitted.session,
+                        "an ended session's submission",
+                    )
+                })
+        });
+        live.chain(handed)
     }
 
     /// Routes pool steps in the order the pool produced them. A step's
@@ -1306,12 +1359,11 @@ impl RelayModel {
                 }
             }
             ModelVerdict::Rejected { scope, charge } => {
-                // Only a rejection the pool still remembers settles the id:
-                // a scope it caches, on the chain and in the pool life it was
-                // made in. Anything else lets another announcer try.
+                // A rejection of a scope the pool caches, on the chain it was
+                // made on, settles the id when it arrives. See the module
+                // docs for why a restart or a cleared cache is not checked.
                 let remembered = !matches!(scope, RejectionScope::Uncached)
-                    && self.generation == submitted.chain
-                    && self.pool_life == submitted.life;
+                    && self.generation == submitted.chain;
                 if remembered {
                     self.decided(id, generation);
                 } else {
@@ -1340,7 +1392,6 @@ impl RelayModel {
             Submitted {
                 session,
                 chain: marked.chain,
-                life: marked.life,
             },
         );
         self.inbox.push_back(step);
@@ -1385,6 +1436,7 @@ impl RelayModel {
         if !self.wanted.decide(id, generation) {
             return;
         }
+        self.settled.insert((id, generation));
         // A fetch of the decided id ends with it: its slot goes back, and the
         // request stays outstanding with its answer dropped. A reserve call
         // in flight finds its claim gone and gives back what it gets.
@@ -1835,10 +1887,12 @@ impl RelayModel {
                 }
                 self.return_probe(probe);
             }
-            Err(ModelUnreserved::Rejected(_)) => {
+            Err(ModelUnreserved::Rejected(scope)) => {
+                // The same rule as a verdict's rejection.
+                let remembered = chain_unchanged && !matches!(scope, RejectionScope::Uncached);
                 self.wanted
-                    .release(id, pending.generation, session, self.now, !chain_unchanged);
-                if chain_unchanged {
+                    .release(id, pending.generation, session, self.now, !remembered);
+                if remembered {
                     self.decided(id, pending.generation);
                 }
                 self.return_probe(probe);
@@ -1872,8 +1926,9 @@ impl RelayModel {
         if in_flight >= MAX_REQUESTS_PER_PEER || asking >= hello.serves {
             return None;
         }
-        // Ids nobody was asked for yet go first, then released ones, longest
-        // released first, so retries never starve fresh work.
+        // The id ready longest goes first: since its first announcement, or
+        // since its retry delay ended. Neither fresh work nor retries starve
+        // the other.
         let eligible = state.pending.iter().copied().filter(|pending| {
             let Some(entry) = self.wanted.current(pending.id, pending.generation) else {
                 return false;
@@ -1901,7 +1956,7 @@ impl RelayModel {
         eligible.min_by_key(|pending| {
             self.wanted
                 .current(pending.id, pending.generation)
-                .and_then(|entry| entry.released_at)
+                .map(|entry| entry.first_seen.max(entry.retry_at))
         })
     }
 
@@ -2134,6 +2189,23 @@ impl RelayModel {
             }
         }
         assert!(holders.is_empty(), "every pending reference has its entry");
+        // One attempt at a time: every attempt holds its entry's claim until
+        // the entry is decided, so no entry has two.
+        let mut per_entry: HashMap<(UnminedTxId, EntryGen), usize> = HashMap::new();
+        for (id, generation, session, what) in self.attempts() {
+            *per_entry.entry((id, generation)).or_default() += 1;
+            let claimed = self
+                .wanted
+                .current(id, generation)
+                .is_some_and(|entry| entry.claim == Some(session));
+            assert!(
+                claimed || self.settled.contains(&(id, generation)),
+                "{what} for {id:?} holds its claim until its entry is decided"
+            );
+        }
+        for ((id, _), count) in per_entry {
+            assert!(count <= 1, "one attempt at a time for {id:?}");
+        }
         assert!(
             self.wanted.len() <= pending_total + self.reactor.unsettled_total(),
             "the table is bounded by the pending sets and unsettled submissions"

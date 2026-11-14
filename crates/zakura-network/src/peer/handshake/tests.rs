@@ -1323,3 +1323,35 @@ async fn dropping_handshake_future_releases_stream_and_tracker() {
     assert_eq!(counter.update_count(), 0);
     assert_eq!(Instant::now(), started_at);
 }
+
+/// The heartbeat task reports how long the connection was open when it ends, whether the
+/// client shut it down or a heartbeat failed.
+#[tokio::test(start_paused = true)]
+async fn heartbeat_task_reports_how_long_the_connection_was_open() {
+    let connected_addr = ConnectedAddr::new_outbound_direct(peer_addr(8233));
+    let (address_book_updater, mut address_book_changes) = tokio::sync::mpsc::channel(2);
+    let connected_at = Instant::now();
+    let connected_for = Duration::from_secs(10 * 60);
+    tokio::time::advance(connected_for).await;
+
+    handle_heartbeat_shutdown(
+        PeerError::ClientDropped,
+        &address_book_updater,
+        &connected_addr,
+        connected_at,
+    )
+    .await
+    .expect_err("a shutdown ends the heartbeat task");
+    handle_heartbeat_error(
+        Err::<(), _>(PeerError::ConnectionClosed),
+        &address_book_updater,
+        &connected_addr,
+        connected_at,
+    )
+    .await
+    .expect_err("the heartbeat error is passed on");
+
+    let expected = MetaAddr::new_shutdown(peer_addr(8233), connected_for);
+    assert_eq!(address_book_changes.recv().await, Some(expected));
+    assert_eq!(address_book_changes.recv().await, Some(expected));
+}

@@ -180,6 +180,21 @@ pub const CONCURRENT_ADDRESS_CHANGE_PERIOD: Duration = Duration::from_secs(5);
 /// specific manner that matches up with this math.
 pub const MIN_PEER_RECONNECTION_DELAY: Duration = Duration::from_secs(59 + 20 + 20 + 20);
 
+/// How long an outbound connection must have been open for its peer to be dialed before
+/// other candidates after the connection ends.
+///
+/// A peer earns the early redials by staying connected, so a peer that keeps dropping
+/// its connections is not dialed more often.
+pub const MIN_REDIAL_CONNECTION: Duration = Duration::from_secs(10 * 60);
+
+/// How long a peer is dialed before other candidates after its long-lived outbound
+/// connection ends.
+///
+/// A node that restarts within this time is dialed again by the peers that were
+/// connected to it. Each redial still waits [`MIN_PEER_RECONNECTION_DELAY`] after the
+/// last one, so this allows about 15 of them.
+pub const REDIAL_WINDOW: Duration = Duration::from_secs(30 * 60);
+
 /// Zebra rotates its peer inventory registry every time this interval elapses.
 ///
 /// After 2 of these intervals, Zebra's local available and missing inventory entries expire.

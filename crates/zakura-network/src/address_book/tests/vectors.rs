@@ -15,7 +15,7 @@ use crate::{
     config::UnconditionalPeers,
     constants::{
         DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE,
-        MIN_PEER_RECONNECTION_DELAY,
+        MIN_PEER_RECONNECTION_DELAY, MIN_REDIAL_CONNECTION,
     },
     meta_addr::{MetaAddr, MetaAddrChange},
     protocol::external::types::PeerServices,
@@ -789,4 +789,66 @@ fn disconnected_inbound_endpoint_is_not_dialed_or_cached() {
         );
         assert_eq!(cached, !is_inbound, "inbound {is_inbound}: cacheable");
     }
+}
+
+/// A peer whose long-lived outbound connection ended is the next reconnection candidate
+/// once the reconnection delay is over, ahead of addresses that were never tried. A peer
+/// whose connection was short waits behind them.
+#[test]
+fn reconnection_peers_start_with_redial_candidates() {
+    let _init_guard = zakura_test::init();
+
+    let start = Instant::now();
+    let wall_start = Utc::now();
+    let closed_peer = |addr: &str, connected_for| {
+        let addr = addr.parse().unwrap();
+        let wall_closed =
+            wall_start + chrono::Duration::from_std(connected_for).expect("short duration");
+        let connected = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, false)
+            .apply_to_meta_addr(None, start, wall_start)
+            .expect("a new entry is always created");
+
+        MetaAddr::new_shutdown(addr, connected_for)
+            .apply_to_meta_addr(connected, start + connected_for, wall_closed)
+            .expect("the shutdown is later than the connection")
+    };
+
+    let redial = closed_peer("127.0.0.1:1", MIN_REDIAL_CONNECTION);
+    let short_lived = closed_peer(
+        "127.0.0.2:2",
+        MIN_REDIAL_CONNECTION - std::time::Duration::from_millis(1),
+    );
+    let never_attempted = MetaAddr::new_gossiped_meta_addr(
+        "127.0.0.3:3".parse().unwrap(),
+        PeerServices::NODE_NETWORK,
+        DateTime32::now(),
+    );
+
+    let address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        [never_attempted, short_lived, redial],
+    );
+
+    let closed_for = |closed_for| {
+        let after = MIN_REDIAL_CONNECTION + closed_for;
+        let wall_after = wall_start + chrono::Duration::from_std(after).expect("short duration");
+
+        address_book
+            .reconnection_peers(start + after, wall_after)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        closed_for(MIN_PEER_RECONNECTION_DELAY - std::time::Duration::from_secs(1)),
+        [never_attempted],
+        "a closed peer waits for the reconnection delay like any other"
+    );
+    assert_eq!(
+        closed_for(MIN_PEER_RECONNECTION_DELAY + std::time::Duration::from_secs(1)),
+        [redial, never_attempted, short_lived],
+    );
 }

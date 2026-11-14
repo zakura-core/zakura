@@ -2142,11 +2142,15 @@ async fn send_periodic_heartbeats_with_shutdown_handle(
 ) -> Result<(), BoxError> {
     use futures::future::Either;
 
+    // The heartbeat task starts when the handshake finishes.
+    let connected_at = Instant::now();
+
     let heartbeat_run_loop = send_periodic_heartbeats_run_loop(
         connected_addr,
         server_tx,
         heartbeat_ts_collector.clone(),
         peer_registry_updater,
+        connected_at,
     );
 
     pin_mut!(shutdown_rx);
@@ -2168,6 +2172,7 @@ async fn send_periodic_heartbeats_with_shutdown_handle(
                 PeerError::ClientCancelledHeartbeatTask,
                 &heartbeat_ts_collector,
                 &connected_addr,
+                connected_at,
             )
             .await
         }
@@ -2177,6 +2182,7 @@ async fn send_periodic_heartbeats_with_shutdown_handle(
                 PeerError::ClientDropped,
                 &heartbeat_ts_collector,
                 &connected_addr,
+                connected_at,
             )
             .await
         }
@@ -2198,6 +2204,7 @@ async fn send_periodic_heartbeats_run_loop(
     mut server_tx: futures::channel::mpsc::Sender<ClientRequest>,
     heartbeat_ts_collector: tokio::sync::mpsc::Sender<MetaAddrChange>,
     peer_registry_updater: Option<crate::peer_registry::PeerRegistryUpdater>,
+    connected_at: Instant,
 ) -> Result<(), BoxError> {
     // Don't send the first heartbeat immediately - we've just completed the handshake!
     let mut interval = tokio::time::interval_at(
@@ -2224,7 +2231,13 @@ async fn send_periodic_heartbeats_run_loop(
         }
 
         let heartbeat = send_one_heartbeat(&mut server_tx);
-        let rtt = heartbeat_timeout(heartbeat, &heartbeat_ts_collector, &connected_addr).await?;
+        let rtt = heartbeat_timeout(
+            heartbeat,
+            &heartbeat_ts_collector,
+            &connected_addr,
+            connected_at,
+        )
+        .await?;
 
         if let (Some(peer_registry_updater), Some(rtt)) = (&peer_registry_updater, rtt) {
             peer_registry_updater.record_response(rtt);
@@ -2305,13 +2318,26 @@ async fn heartbeat_timeout(
     fut: impl Future<Output = Result<Response, BoxError>>,
     address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
     connected_addr: &ConnectedAddr,
+    connected_at: Instant,
 ) -> Result<Option<Duration>, BoxError> {
     let response = match timeout(constants::HEARTBEAT_INTERVAL, fut).await {
         Ok(inner_result) => {
-            handle_heartbeat_error(inner_result, address_book_updater, connected_addr).await?
+            handle_heartbeat_error(
+                inner_result,
+                address_book_updater,
+                connected_addr,
+                connected_at,
+            )
+            .await?
         }
         Err(elapsed) => {
-            handle_heartbeat_error(Err(elapsed), address_book_updater, connected_addr).await?
+            handle_heartbeat_error(
+                Err(elapsed),
+                address_book_updater,
+                connected_addr,
+                connected_at,
+            )
+            .await?
         }
     };
 
@@ -2323,11 +2349,13 @@ async fn heartbeat_timeout(
     Ok(rtt)
 }
 
-/// If `result.is_err()`, mark `connected_addr` as failed using `address_book_updater`.
+/// If `result.is_err()`, mark `connected_addr` as failed using `address_book_updater`,
+/// after a connection that has been open since `connected_at`.
 async fn handle_heartbeat_error<T, E>(
     result: Result<T, E>,
     address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
     connected_addr: &ConnectedAddr,
+    connected_at: Instant,
 ) -> Result<T, E>
 where
     E: std::fmt::Debug,
@@ -2345,7 +2373,7 @@ where
             // - after the first error or shutdown, the peer is disconnected
             if let Some(book_addr) = connected_addr.get_address_book_addr() {
                 let _ = address_book_updater
-                    .send(MetaAddr::new_errored(book_addr, None))
+                    .send(MetaAddr::new_shutdown(book_addr, connected_at.elapsed()))
                     .await;
             }
             Err(err)
@@ -2353,17 +2381,19 @@ where
     }
 }
 
-/// Mark `connected_addr` as shut down using `address_book_updater`.
+/// Mark `connected_addr` as shut down using `address_book_updater`, after a connection
+/// that has been open since `connected_at`.
 async fn handle_heartbeat_shutdown(
     peer_error: PeerError,
     address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
     connected_addr: &ConnectedAddr,
+    connected_at: Instant,
 ) -> Result<(), BoxError> {
     tracing::debug!(?peer_error, "client shutdown, shutting down heartbeat");
 
     if let Some(book_addr) = connected_addr.get_address_book_addr() {
         let _ = address_book_updater
-            .send(MetaAddr::new_shutdown(book_addr))
+            .send(MetaAddr::new_shutdown(book_addr, connected_at.elapsed()))
             .await;
     }
 

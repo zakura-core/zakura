@@ -210,6 +210,17 @@ pub struct MetaAddr {
     /// See the [`MetaAddr::last_failure`] method for details.
     last_failure: Option<Instant>,
 
+    /// When this peer stops being dialed before other candidates.
+    ///
+    /// Set when an outbound connection that was open for
+    /// [`constants::MIN_REDIAL_CONNECTION`] ends, so a peer that restarts is dialed again
+    /// while it has free inbound slots. Cleared when the peer connects.
+    ///
+    /// The time is only checked when this entry changes, so a peer can get one more
+    /// early dial after it.
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(value = "None"))]
+    redial_until: Option<Instant>,
+
     /// The misbehavior score for this peer.
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(value = 0))]
     misbehavior_score: u32,
@@ -316,6 +327,9 @@ pub enum MetaAddrChange {
         )]
         addr: PeerSocketAddr,
         services: Option<PeerServices>,
+        /// How long the connection that just ended was open, or `None` if the peer did
+        /// not finish a handshake.
+        connected_for: Option<Duration>,
     },
 
     /// Updates an existing `MetaAddr` when a peer misbehaves such as by advertising
@@ -352,6 +366,7 @@ impl MetaAddr {
             ping_sent_at: None,
             last_attempt: None,
             last_failure: None,
+            redial_until: None,
             last_connection_state: NeverAttemptedGossiped,
             misbehavior_score: 0,
             is_inbound: false,
@@ -453,6 +468,7 @@ impl MetaAddr {
         UpdateFailed {
             addr: canonical_peer_addr(*addr),
             services: services.into(),
+            connected_for: None,
         }
     }
 
@@ -469,11 +485,14 @@ impl MetaAddr {
         }
     }
 
-    /// Create a new `MetaAddr` for a peer that has just shut down.
-    pub fn new_shutdown(addr: PeerSocketAddr) -> MetaAddrChange {
-        // TODO: if the peer shut down in the Responded state, preserve that
-        // state. All other states should be treated as (timeout) errors.
-        MetaAddr::new_errored(addr, None)
+    /// Returns a [`MetaAddrChange::UpdateFailed`] for a peer whose connection has just
+    /// ended after being open for `connected_for`.
+    pub fn new_shutdown(addr: PeerSocketAddr, connected_for: Duration) -> MetaAddrChange {
+        UpdateFailed {
+            addr: canonical_peer_addr(*addr),
+            services: None,
+            connected_for: Some(connected_for),
+        }
     }
 
     /// Return the address for this `MetaAddr`.
@@ -600,6 +619,12 @@ impl MetaAddr {
             // If there has never been any attempt, it can't possibly be live
             false
         }
+    }
+
+    /// Returns true if this peer is dialed before other candidates, because its
+    /// long-lived outbound connection ended a short time ago.
+    pub fn is_redialed_first(&self) -> bool {
+        self.redial_until.is_some()
     }
 
     /// Have we recently had a failed connection to this peer?
@@ -764,6 +789,7 @@ impl MetaAddr {
             ping_sent_at: None,
             last_attempt: None,
             last_failure: None,
+            redial_until: None,
             last_connection_state: NeverAttemptedGossiped,
             misbehavior_score: 0,
             is_inbound: false,
@@ -937,6 +963,23 @@ impl MetaAddrChange {
         }
     }
 
+    /// Returns when `previous` stops being dialed before other candidates, after this
+    /// change is applied at `now`. See [`MetaAddr::redial_until`].
+    fn redial_until(&self, previous: &MetaAddr, now: Instant) -> Option<Instant> {
+        match self {
+            UpdateFailed {
+                connected_for: Some(connected_for),
+                ..
+            } if !previous.is_inbound && *connected_for >= constants::MIN_REDIAL_CONNECTION => {
+                Some(now + constants::REDIAL_WINDOW)
+            }
+            UpdateConnected { .. } | UpdateResponded { .. } => None,
+            _ => previous
+                .redial_until
+                .filter(|redial_until| now < *redial_until),
+        }
+    }
+
     /// Return the peer connection state for this change.
     pub fn peer_addr_state(&self) -> PeerAddrState {
         match self {
@@ -966,6 +1009,7 @@ impl MetaAddrChange {
             ping_sent_at: self.ping_sent_at(),
             last_attempt: self.last_attempt(instant_now),
             last_failure: self.last_failure(instant_now),
+            redial_until: None,
             last_connection_state: self.peer_addr_state(),
             misbehavior_score: self.misbehavior_score(),
             is_inbound: self.is_inbound(),
@@ -1011,6 +1055,7 @@ impl MetaAddrChange {
             ping_sent_at: None,
             last_attempt: None,
             last_failure: None,
+            redial_until: None,
             last_connection_state: self.peer_addr_state(),
             misbehavior_score: self.misbehavior_score(),
             is_inbound: self.is_inbound(),
@@ -1167,6 +1212,7 @@ impl MetaAddrChange {
                 ping_sent_at: None,
                 last_attempt: None,
                 last_failure: None,
+                redial_until: None,
                 last_connection_state: self.peer_addr_state(),
                 misbehavior_score: previous.misbehavior_score + self.misbehavior_score(),
                 is_inbound: previous.is_inbound || self.is_inbound(),
@@ -1198,6 +1244,7 @@ impl MetaAddrChange {
                 // These are monotonic times, we already checked the responses are in order.
                 last_attempt: self.last_attempt(instant_now).or(previous.last_attempt),
                 last_failure: self.last_failure(instant_now).or(previous.last_failure),
+                redial_until: self.redial_until(&previous, instant_now),
                 // Replace the state with the updated state.
                 last_connection_state: self.peer_addr_state(),
                 misbehavior_score: previous.misbehavior_score + self.misbehavior_score(),
@@ -1209,7 +1256,8 @@ impl MetaAddrChange {
 
 impl Ord for MetaAddr {
     /// `MetaAddr`s are sorted in approximate reconnection attempt order, but
-    /// with `Responded` peers sorted first as a group.
+    /// with `Responded` peers sorted first as a group, then peers that are being
+    /// redialed.
     ///
     /// But this order should not be used for reconnection attempts: use
     /// [`reconnection_peers`] instead.
@@ -1222,7 +1270,26 @@ impl Ord for MetaAddr {
         use std::net::IpAddr::{V4, V6};
         use Ordering::*;
 
-        // First, try states that are more likely to work
+        // Keep `Responded` peers first as a group, because the address book reads them as
+        // a prefix of this order.
+        let responded_first = (self.last_connection_state != PeerAddrState::Responded)
+            .cmp(&(other.last_connection_state != PeerAddrState::Responded));
+
+        // Then, try peers whose long-lived connection ended a short time ago. A peer that
+        // restarts has free inbound slots, but other nodes take them within minutes.
+        //
+        // # Security
+        //
+        // A peer only gets here by keeping a connection open for
+        // `MIN_REDIAL_CONNECTION`, and each redial still waits
+        // `MIN_PEER_RECONNECTION_DELAY`. So it is dialed no more often than a peer that
+        // stays connected, and it cannot get here by dropping connections.
+        let redial_first = self
+            .redial_until
+            .is_none()
+            .cmp(&other.redial_until.is_none());
+
+        // Then, try states that are more likely to work
         let more_reliable_state = self.last_connection_state.cmp(&other.last_connection_state);
 
         // Keep valid addresses before invalid ones, without ranking their ports.
@@ -1295,7 +1362,9 @@ impl Ord for MetaAddr {
         };
         let port_tie_breaker = self.addr.port().cmp(&other.addr.port());
 
-        more_reliable_state
+        responded_first
+            .then(redial_first)
+            .then(more_reliable_state)
             .then(more_likely_valid)
             .then(older_attempt)
             .then(older_failure)

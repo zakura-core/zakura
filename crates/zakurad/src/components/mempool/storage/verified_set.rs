@@ -44,6 +44,13 @@ type MiningCandidate = (
     transaction::Hash,
 );
 
+/// Scores currently stored in the two ordering indexes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OrderingScores {
+    eviction: EvictionCost,
+    mining: EvictionCost,
+}
+
 #[cfg(feature = "mempool-bench")]
 pub(super) mod benchmarks;
 
@@ -76,6 +83,9 @@ pub struct VerifiedSet {
     /// One candidate per transaction, scored with its unconfirmed ancestors.
     /// Higher fee per cost comes first, with older insertion times breaking ties.
     mining_order: BTreeSet<MiningCandidate>,
+
+    /// Current scores, so removal does not reconstruct keys from the graph.
+    ordering_scores: HashMap<transaction::Hash, OrderingScores>,
 
     /// Expiring transactions ordered by height, excluding no-expiry values.
     expiry_order: BTreeSet<(Height, transaction::Hash)>,
@@ -189,6 +199,7 @@ impl VerifiedSet {
         self.transactions.clear();
         self.eviction_order.clear();
         self.mining_order.clear();
+        self.ordering_scores.clear();
         self.expiry_order.clear();
         self.transaction_dependencies.clear();
         self.spent_outpoints.clear();
@@ -441,16 +452,17 @@ impl VerifiedSet {
     /// Removes a group's ordering entries before changing its transactions or
     /// dependency edges.
     fn remove_ordering_candidates(&mut self, group: &HashSet<transaction::Hash>) {
-        let removed = HashSet::new();
         for &id in group {
-            let eviction = self.eviction_candidate(id, &removed);
-            let mining = self.mining_candidate(id);
+            let scores = self.ordering_scores[&id];
+            let time = self.transactions[&id].time;
             assert!(
-                self.eviction_order.remove(&eviction),
+                self.eviction_order
+                    .remove(&(scores.eviction, Reverse(time), id)),
                 "every stored transaction has its current eviction candidate"
             );
             assert!(
-                self.mining_order.remove(&mining),
+                self.mining_order
+                    .remove(&(Reverse(scores.mining), time, id)),
                 "every stored transaction has its current mining candidate"
             );
         }
@@ -463,6 +475,13 @@ impl VerifiedSet {
             if self.transactions.contains_key(&id) {
                 let eviction = self.eviction_candidate(id, &removed);
                 let mining = self.mining_candidate(id);
+                self.ordering_scores.insert(
+                    id,
+                    OrderingScores {
+                        eviction: eviction.0,
+                        mining: mining.0 .0,
+                    },
+                );
                 assert!(
                     self.eviction_order.insert(eviction),
                     "a group's old eviction candidates were removed before its mutation"
@@ -688,6 +707,7 @@ impl VerifiedSet {
                 self.transactions_serialized_size -= removed_tx.transaction.size();
                 self.total_cost -= removed_tx.cost();
                 self.metrics.remove_transaction(&removed_tx);
+                self.ordering_scores.remove(&key_to_remove);
                 if let Some(height) = removed_tx.transaction.transaction().expiry_height() {
                     self.expiry_order.remove(&(height, key_to_remove));
                 }
@@ -717,6 +737,20 @@ impl VerifiedSet {
     #[cfg(test)]
     pub(super) fn assert_dependency_groups_are_bounded(&self) {
         let removed = HashSet::new();
+        let expected: HashMap<_, _> = self
+            .transactions
+            .keys()
+            .map(|&id| {
+                (
+                    id,
+                    OrderingScores {
+                        eviction: self.eviction_candidate(id, &removed).0,
+                        mining: self.mining_candidate(id).0 .0,
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(self.ordering_scores, expected);
         let expected: BTreeSet<_> = self
             .transactions
             .keys()

@@ -318,6 +318,18 @@ impl PeerState {
             .map(OutstandingBlockRange::is_complete)
     }
 
+    /// Record a body this session asked for that arrived after the block reached
+    /// the commit pipeline from another source. It proves progress. It feeds no
+    /// delivery sample and offsets no timeout, because the request was withdrawn
+    /// before it could time out.
+    pub(in super::super) fn record_superseded_body(
+        &mut self,
+        now: Instant,
+        liveness_timeout: Duration,
+    ) {
+        self.window.note_block_progress(now, liveness_timeout);
+    }
+
     /// Record a wanted body `hash` at `height` that matches no outstanding
     /// request, typically one that arrived just after its request timed out.
     /// It proves progress. It offsets the reliability charge of the timed-out

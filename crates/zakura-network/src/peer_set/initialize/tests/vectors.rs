@@ -2718,6 +2718,41 @@ async fn listener_holds_the_seat_of_a_long_lived_peer() {
     listener.stop().await;
 }
 
+/// A dialed unconditional peer that returns to its own slot gives up the public seat that
+/// is held for it, so other peers can take that seat.
+#[tokio::test]
+async fn listener_releases_the_held_seat_of_an_unconditional_peer_that_returns() {
+    let _init_guard = zakura_test::init();
+
+    let Some(mut listener) = UnconditionalPeerListener::spawn("['::1']", &[], 4).await else {
+        return;
+    };
+
+    // The peer fills its own slot, so its second connection takes a public seat.
+    let own_slot = listener.offer(LISTENER_UNCONDITIONAL_IP).await;
+    let mut public_seat = listener
+        .offer(LISTENER_UNCONDITIONAL_IP)
+        .await
+        .expect("the listener has free public seats");
+    public_seat
+        .2
+        .mark_open_at(std::time::Instant::now() - constants::MIN_HELD_SEAT_CONNECTION);
+    std::mem::drop(own_slot);
+    std::mem::drop(public_seat);
+
+    let _returned_peer = listener
+        .offer(LISTENER_UNCONDITIONAL_IP)
+        .await
+        .expect("the peer's own slot is free");
+    assert_eq!(
+        listener.offer_until_refused(LISTENER_PUBLIC_IP).await.len(),
+        listener.inbound_limit,
+        "no public seat is held for a peer that is back",
+    );
+
+    listener.stop().await;
+}
+
 /// One IP holds at most `max_connections_per_ip` of the inbound slots that dialed
 /// unconditional peers share, so one listed peer cannot take another's slot. Its slots
 /// are free for it again once its connections close.

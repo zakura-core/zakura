@@ -969,6 +969,9 @@ where
                 // at most `max_connections_per_ip` of them, so it cannot take the slot of
                 // another listed peer. A peer that gets no slot here competes for a public
                 // slot, and waits like any other.
+                //
+                // The peer is back, so it needs no public seat that is held for it.
+                held_seats.release(canonical_ip);
                 active_unconditional_connections.track_connection_from(canonical_ip)
             } else if is_zcashd_compat_peer
                 || active_public_inbound_connections + seats_held_for_others

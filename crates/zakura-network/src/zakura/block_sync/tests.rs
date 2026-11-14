@@ -10,6 +10,7 @@ use zakura_node_services::block_memory::BlockHandle;
 
 use proptest::{prop_assert, prop_assert_eq};
 
+use super::wire::DecodedBlockPayload;
 use super::*;
 use super::{
     config::{
@@ -67,12 +68,8 @@ fn mainnet_blocks_1_to_3() -> Vec<Arc<block::Block>> {
     ]
 }
 
-fn raw_block_payload(block: &Arc<block::Block>) -> Arc<[u8]> {
-    let frame = BlockSyncMessage::Block(block.clone())
-        .encode_frame()
-        .expect("test block frame encodes");
-
-    Arc::from(frame.payload.into_boxed_slice())
+fn raw_block_payload(block: &Arc<block::Block>) -> DecodedBlockPayload {
+    DecodedBlockPayload::of_block(block)
 }
 
 fn forked_block(block: &Arc<block::Block>, nonce_tag: u8) -> Arc<block::Block> {

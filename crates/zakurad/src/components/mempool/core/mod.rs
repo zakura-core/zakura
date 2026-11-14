@@ -24,7 +24,11 @@ use tokio::{
 };
 use tower::{buffer::Buffer, timeout::Timeout, util::BoxService};
 
-use zakura_chain::{block::Height, parameters::Network};
+use zakura_chain::{
+    block::{self, Height},
+    chain_tip::ChainTip,
+    parameters::Network,
+};
 use zakura_jsonl_trace::JsonlEventEmitter;
 use zakura_mempool::io::PoolCore;
 use zakura_network::{self as zn, PeerSocketAddr};
@@ -123,6 +127,10 @@ pub(crate) fn start(
     exempt: Exempt,
     trace: JsonlEventEmitter,
 ) -> Result<CoreParts, BoxError> {
+    let best_tip: Arc<dyn Fn() -> Option<block::Hash> + Send + Sync> = {
+        let latest_chain_tip = latest_chain_tip.clone();
+        Arc::new(move || latest_chain_tip.best_tip_hash())
+    };
     let activation = activation::Activation::new(
         config,
         sync_status,
@@ -149,6 +157,7 @@ pub(crate) fn start(
             let currentness = activation.currentness();
             Arc::new(move |height| currentness.may_cool(height))
         },
+        best_tip,
         misbehavior_sender,
         exempt,
         active_rx,
@@ -217,6 +226,7 @@ pub(crate) fn assemble(
     tx_verifier: TxVerifier,
     network: Network,
     may_cool: Arc<dyn Fn(Height) -> bool + Send + Sync>,
+    best_tip: Arc<dyn Fn() -> Option<block::Hash> + Send + Sync>,
     misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
     exempt: Exempt,
     active: watch::Receiver<bool>,
@@ -255,6 +265,7 @@ pub(crate) fn assemble(
         Timeout::new(outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
         outbound,
         may_cool,
+        best_tip,
         adapter_read_state,
         config.max_transaction_bytes,
         expose_peer_addresses,

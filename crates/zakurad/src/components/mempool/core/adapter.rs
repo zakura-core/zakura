@@ -33,7 +33,10 @@ use futures::FutureExt;
 use tokio::sync::{mpsc, oneshot};
 use tower::{timeout::Timeout, Service};
 
-use zakura_chain::{block::Height, transaction::UnminedTxId};
+use zakura_chain::{
+    block::{self, Height},
+    transaction::UnminedTxId,
+};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
     port::{
@@ -69,6 +72,15 @@ type CoreMempoolError = zakura_mempool::MempoolError<zakura_consensus::error::Tr
 /// A queued item's second answer.
 type Receiver = oneshot::Receiver<Result<(), BoxError>>;
 
+/// The longest a request waits for the core to apply the state's best tip.
+/// The core applies a block within milliseconds, so this is only reached if
+/// the core is stuck, and the request then gets the pool the core has.
+const MAX_TIP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How often a waiting request checks the tips again when no new snapshot
+/// arrives, since the state's best tip can move too.
+const TIP_RECHECK: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// What every submission task shares.
 struct Shared {
     handle: PoolHandle,
@@ -83,6 +95,8 @@ struct Shared {
     /// tip is still the one the failure was verified at, and asks when it
     /// handles the failure.
     may_cool: Arc<dyn Fn(Height) -> bool + Send + Sync>,
+    /// The state's best tip, if it has one. See [`caught_up`].
+    best_tip: Arc<dyn Fn() -> Option<block::Hash> + Send + Sync>,
     /// The largest body the pool takes, which today's downloader checks
     /// before a cooldown.
     max_transaction_bytes: u64,
@@ -108,14 +122,16 @@ pub(crate) struct CoreMempool {
 
 impl CoreMempool {
     /// A service on `handle` that fetches through `outbound` and bans through
-    /// `misbehavior_sender`. It never charges a peer in `exempt`, and starts
-    /// a cooldown only when `may_cool` allows it for the verdict's tip.
+    /// `misbehavior_sender`. It never charges a peer in `exempt`, starts a
+    /// cooldown only when `may_cool` allows it for the verdict's tip, and
+    /// answers from a pool of the tip `best_tip` names. See [`caught_up`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         handle: PoolHandle,
         outbound: Timeout<Outbound>,
         peers: Outbound,
         may_cool: Arc<dyn Fn(Height) -> bool + Send + Sync>,
+        best_tip: Arc<dyn Fn() -> Option<block::Hash> + Send + Sync>,
         read_state: ReadState,
         max_transaction_bytes: u64,
         expose_peer_addresses: bool,
@@ -129,6 +145,7 @@ impl CoreMempool {
                 peers,
                 cooldowns: PeerCooldowns::default(),
                 may_cool,
+                best_tip,
                 max_transaction_bytes,
                 queued: std::sync::Mutex::new(0),
                 per_peer: std::sync::Mutex::new(HashMap::new()),
@@ -155,9 +172,36 @@ impl Service<Request> for CoreMempool {
         let shared = self.shared.clone();
         let snapshot = shared.handle.snapshot().filter(|snapshot| snapshot.active);
         match snapshot {
+            Some(snapshot) if shared.is_behind(&snapshot) => async move {
+                match caught_up(&shared).await {
+                    Some(snapshot) => answer(shared, snapshot, request).await,
+                    None => inactive_answer(request),
+                }
+            }
+            .boxed(),
             Some(snapshot) => answer(shared, snapshot, request).boxed(),
             None => async move { inactive_answer(request) }.boxed(),
         }
+    }
+}
+
+/// The latest snapshot once it is of the state's best tip, or once
+/// [`MAX_TIP_WAIT`] has passed, or `None` if the pool turned off meanwhile.
+///
+/// Today's pool applies a new tip before it answers any request, so a caller
+/// that just saw a block in the state never gets the pool from before it. An
+/// RPC that looks a mined transaction up in the pool first would otherwise
+/// find it still there. The core applies tips in its own task, so a request
+/// that arrives in between waits for it.
+async fn caught_up(shared: &Shared) -> Option<Arc<PoolSnapshot>> {
+    let deadline = tokio::time::Instant::now() + MAX_TIP_WAIT;
+    let mut reader = shared.handle.reader();
+    loop {
+        let snapshot = reader.snapshot().filter(|snapshot| snapshot.active)?;
+        if !shared.is_behind(&snapshot) || tokio::time::Instant::now() >= deadline {
+            return Some(snapshot);
+        }
+        let _changed = tokio::time::timeout(TIP_RECHECK, reader.snapshot_changed()).await;
     }
 }
 
@@ -635,6 +679,12 @@ async fn bring_in(
 }
 
 impl Shared {
+    /// Whether `snapshot` is of a tip other than the state's best tip. A
+    /// state with no tip yet has nothing to be behind.
+    fn is_behind(&self, snapshot: &PoolSnapshot) -> bool {
+        (self.best_tip)().is_some_and(|best| best != snapshot.tip.hash)
+    }
+
     /// The legacy peer to charge for a body `peer` served: the peer, unless
     /// the pool must never charge it.
     fn supplier(&self, peer: PeerSocketAddr) -> Option<PeerSocketAddr> {
@@ -919,6 +969,7 @@ mod tests {
             outbound,
             BoxCloneSyncService::new(NeverReady),
             Arc::new(may_cool),
+            Arc::new(|| None),
             chain_holding(None),
             max_transaction_bytes,
             false,
@@ -1172,6 +1223,7 @@ mod tests {
             ),
             BoxCloneSyncService::new(NeverReady),
             Arc::new(move |_| may_cool),
+            Arc::new(|| None),
             chain_holding(None),
             super::super::super::Config::default().max_transaction_bytes,
             false,
@@ -1273,6 +1325,74 @@ mod tests {
             assert_eq!(cooling, charged, "cooling down: {address}");
             assert!(report.is_none(), "a cooldown is not a ban: {address}");
         }
+    }
+
+    /// A query that arrives after the state has a new best tip, but before
+    /// the core has applied it, waits for the core's pool of that tip, since
+    /// today's pool applies a new tip before it answers. Without that, an RPC
+    /// that looks a just-mined transaction up in the pool first finds it
+    /// still there. A core that never catches up is answered with the pool it
+    /// has after [`MAX_TIP_WAIT`].
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_query_waits_for_the_core_to_apply_the_states_best_tip() {
+        use zakura_node_services::mempool::port::{pool_port, ChainTip, Generation, PoolSnapshot};
+
+        let (handle, inbox) = pool_port();
+        let best = Arc::new(std::sync::Mutex::new(block::Hash([2; 32])));
+        let mut core = CoreMempool::new(
+            handle,
+            Timeout::new(
+                BoxCloneSyncService::new(NeverReady),
+                TRANSACTION_DOWNLOAD_TIMEOUT,
+            ),
+            BoxCloneSyncService::new(NeverReady),
+            Arc::new(|_| true),
+            {
+                let best = best.clone();
+                Arc::new(move || Some(*best.lock().expect("not poisoned")))
+            },
+            chain_holding(None),
+            super::super::super::Config::default().max_transaction_bytes,
+            false,
+            mpsc::channel(1).0,
+            Arc::new(Exempt::default()),
+        );
+        let tip = |byte: u8| ChainTip {
+            hash: block::Hash([byte; 32]),
+            height: Height(u32::from(byte)),
+        };
+        let mined = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction");
+        // The core still holds a transaction the state's tip 2 mined.
+        inbox.publish([], |last| {
+            PoolSnapshot::new(tip(1), Generation(1), last, vec![mined], Default::default())
+        });
+        let mut query = core.call(Request::TransactionIds);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut query)
+                .await
+                .is_err(),
+            "the query waits while the core is a tip behind"
+        );
+        inbox.publish([], |last| {
+            PoolSnapshot::new(tip(2), Generation(2), last, Vec::new(), Default::default())
+        });
+        let Ok(Response::TransactionIds(ids)) = query.await else {
+            panic!("`TransactionIds` is answered with ids");
+        };
+        assert!(ids.is_empty(), "answered from the pool of the state's tip");
+
+        *best.lock().expect("not poisoned") = block::Hash([3; 32]);
+        let started = tokio::time::Instant::now();
+        let Ok(Response::TransactionIds(_)) = core.call(Request::TransactionIds).await else {
+            panic!("`TransactionIds` is answered with ids");
+        };
+        assert!(
+            started.elapsed() >= MAX_TIP_WAIT,
+            "a core that never catches up is answered at the bound"
+        );
     }
 
     /// A cooldown charge cools the peer that pushed the body only while the

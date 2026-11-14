@@ -249,6 +249,10 @@ async fn pool_on(
                 tx_verifier,
                 network.clone(),
                 Arc::new(|_| true),
+                {
+                    let latest_chain_tip = latest_chain_tip.clone();
+                    Arc::new(move || latest_chain_tip.best_tip_hash())
+                },
                 tokio::sync::mpsc::channel(1).0,
                 Exempt::default(),
                 active_rx,

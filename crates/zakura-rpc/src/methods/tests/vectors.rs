@@ -1110,7 +1110,7 @@ async fn rpc_getblock() {
 }
 
 /// A header read refused for lack of capacity reports a retryable error, not a missing
-/// block. Other state errors keep the `zcashd` missing-block error.
+/// block. A block that is not in the best chain keeps the `zcashd` missing-block error.
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblockheader_reports_read_capacity_refusal_as_retryable() {
     let _init_guard = zakura_test::init();
@@ -1134,7 +1134,9 @@ async fn rpc_getblockheader_reports_read_capacity_refusal_as_retryable() {
             crate::server::error::LegacyCode::OutOfMemory,
         ),
         (
-            BoxError::from("block is missing"),
+            BoxError::from(zakura_state::BlockHeaderNotFound {
+                hash_or_height: Height(1).into(),
+            }),
             crate::server::error::LegacyCode::InvalidParameter,
         ),
     ] {

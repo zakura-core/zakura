@@ -1575,6 +1575,7 @@ impl DiskDb {
     /// db to a new path so it can be used again. It does so by merely trying to rename the path
     /// corresponding to the db version directly preceding the current version to the path that is
     /// used by the current db. If successful, it also deletes the db version file.
+    /// External transaction static files move to the new version's directory the same way.
     ///
     /// Returns the old disk version if one existed and the db directory was renamed, or None otherwise.
     // TODO: Update this function to rename older major db format version to the current version (#9565).
@@ -1661,6 +1662,38 @@ impl DiskDb {
                     }
                 };
 
+                // External static files move first. If the process stops before the
+                // database moves, the next start finds them in place and moves it. If
+                // the database move fails, the new version's static files have no
+                // database, so the arm below stops startup.
+                if let (Some(old_static), Some(new_static)) = (
+                    config.external_static_files_path(old_major_db_ver, network),
+                    config.external_static_files_path(major_db_ver, network),
+                ) {
+                    if fs::exists(&old_static).ok()? {
+                        let moved = fs::create_dir_all(
+                            new_static
+                                .parent()
+                                .expect("static file paths end in a network directory"),
+                        )
+                        .and_then(|()| fs::rename(&old_static, &new_static));
+                        if let Err(e) = moved {
+                            warn!(
+                                "could not move transaction static files from {old_static:?} \
+                                 to {new_static:?}: {e}"
+                            );
+                            return None;
+                        }
+                        info!(
+                            "moved transaction static files from {old_static:?} to {new_static:?}"
+                        );
+                        if let Some(old_version_dir) = old_static.parent() {
+                            // Only succeeds if it's empty, which is all we want.
+                            let _ = fs::remove_dir(old_version_dir);
+                        }
+                    }
+                }
+
                 match fs::rename(&old_path, &new_path) {
                     Ok(()) => {
                         info!("moved state cache from {old_path:?} to {new_path:?}");
@@ -1708,6 +1741,23 @@ impl DiskDb {
                         return Some(disk_version);
                     }
                     Err(e) => {
+                        // Checks the directory rather than this call's move, so it
+                        // also covers a crash between the two moves. A fresh database
+                        // here would refuse these files on every start.
+                        if let Some(new_static) =
+                            config.external_static_files_path(major_db_ver, network)
+                        {
+                            let has_static_files = fs::read_dir(&new_static)
+                                .is_ok_and(|mut entries| entries.next().is_some());
+                            if has_static_files {
+                                panic!(
+                                    "transaction static files at {new_static:?} were moved for \
+                                     a major upgrade, but the state cache could not move from \
+                                     {old_path:?} to {new_path:?}: {e}. Fix this and restart \
+                                     to finish the upgrade. Do not delete either directory."
+                                );
+                            }
+                        }
                         warn!("could not move state cache from {old_path:?} to {new_path:?}: {e}");
                     }
                 };

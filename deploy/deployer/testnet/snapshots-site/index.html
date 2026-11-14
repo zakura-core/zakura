@@ -558,6 +558,7 @@
             <button class="copy" type="button" data-copy="restore-command" aria-label="Copy restore command" title="Copy"><span class="copy-icon" aria-hidden="true"></span></button>
           </div>
           <p class="note">Commands assume the runner host serves this page on port 8091.</p>
+          <p class="note">Snapshots keep transaction static files in <code>state/vN/testnet/static_files</code>. If your node sets <code>state.static_files_dir</code>, move that directory's contents into <code>&lt;static_files_dir&gt;/vN/testnet/</code> before starting it. Zakura doesn't follow a <code>static_files</code> link.</p>
         </article>
 
         <article class="panel panel-full">

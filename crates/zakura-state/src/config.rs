@@ -109,6 +109,28 @@ pub struct Config {
     /// state versions.
     pub cache_dir: PathBuf,
 
+    /// The root directory for finalized transaction body static files, if they should live
+    /// outside the state directory.
+    ///
+    /// Set to `None` by default, which keeps them in a `static_files` directory inside each
+    /// state directory, for example `state/v31/mainnet/static_files`. Set it to put the bodies,
+    /// most of an archive node's disk usage, on a different disk, like reth's
+    /// `--datadir.static-files`. Zakura doesn't follow a `static_files` link, so use this setting
+    /// or mount the other disk at the default path instead.
+    ///
+    /// Each state format version and network gets its own `vN/<network>` subdirectory, for
+    /// example `vN/mainnet`, because static file names don't record either. Reusable format
+    /// upgrades move it with the state directory, and old version cleanup deletes outdated
+    /// subdirectories, like it does for [`cache_dir`](Config::cache_dir). Read-only RPC
+    /// secondaries must use the same setting as their primary. Ignored for
+    /// [ephemeral](Config::ephemeral) databases.
+    ///
+    /// Give each node its own root. A new database refuses to start if its static file
+    /// directory already holds blocks, so clear it after deleting the state to resync. When
+    /// restoring a snapshot that holds a `static_files` directory, move that directory's
+    /// contents into the `vN/<network>` subdirectory.
+    pub static_files_dir: Option<PathBuf>,
+
     /// Whether to use an ephemeral database.
     ///
     /// Ephemeral databases are stored in a new temporary directory.
@@ -286,6 +308,23 @@ impl Config {
                 .join(major_version)
                 .join(net_dir)
         }
+    }
+
+    /// Returns the transaction static file directory under
+    /// [`static_files_dir`](Config::static_files_dir) for a state format major version and
+    /// network, or `None` if static files stay inside the state directory.
+    pub fn external_static_files_path(
+        &self,
+        major_version: u64,
+        network: &Network,
+    ) -> Option<PathBuf> {
+        if self.ephemeral {
+            return None;
+        }
+        self.static_files_dir.as_ref().map(|root| {
+            root.join(format!("v{major_version}"))
+                .join(network.lowercase_name())
+        })
     }
 
     /// Returns the path for the non-finalized state backup directory, based on the network.
@@ -633,6 +672,7 @@ impl Default for Config {
             read_result_byte_limit: None,
             read_concurrency_limit: NonZeroU16::new(64).expect("the default limit is nonzero"),
             cache_dir: default_cache_dir(),
+            static_files_dir: None,
             ephemeral: false,
             should_backup_non_finalized_state: true,
             repair_zakura_header_store_on_startup: false,
@@ -653,6 +693,52 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_version_cleanup_deletes_outdated_external_static_files() {
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let root = tempfile::tempdir().expect("temp dir");
+        let config = Config {
+            cache_dir: cache_dir.path().to_path_buf(),
+            static_files_dir: Some(root.path().to_path_buf()),
+            ..Config::default()
+        };
+        let network = Network::Mainnet;
+        let current = state_database_format_version_in_code().major;
+        let reusable = restorable_db_versions()
+            .into_iter()
+            .find(|&version| version == current)
+            .map(|version| version - 1);
+        let version_dir = |major: u64| {
+            config
+                .external_static_files_path(major, &network)
+                .expect("static files are external")
+        };
+        let mut versions = vec![1, current];
+        versions.extend(reusable);
+        for major in &versions {
+            fs::create_dir_all(version_dir(*major)).expect("fixture directory is created");
+        }
+
+        delete_old_databases(
+            config.clone(),
+            STATE_DATABASE_KIND.to_string(),
+            current,
+            &network,
+        );
+
+        assert!(
+            !root.path().join("v1").exists(),
+            "an old version is deleted"
+        );
+        assert!(version_dir(current).exists(), "the current version is kept");
+        if let Some(reusable) = reusable {
+            assert!(
+                version_dir(reusable).exists(),
+                "a version the next open can reuse is kept"
+            );
+        }
+    }
 
     #[test]
     fn default_read_memory_bound_sums_every_partition() {
@@ -942,6 +1028,9 @@ pub fn check_and_delete_old_state_databases(config: &Config, network: &Network) 
 /// - The directory name without the prefix can be parsed as an unsigned number.
 /// - The parsed number is lower than the `major_version`.
 ///
+/// For the state, it also deletes old `vN` directories under
+/// [`Config::static_files_dir`] by the same rules.
+///
 /// The network is used to generate the path, then ignored.
 /// If `config` is an ephemeral database, no databases are deleted.
 ///
@@ -1005,11 +1094,37 @@ fn delete_old_databases(config: Config, db_kind: String, major_version: u64, net
 
     if let Some(db_kind_dir) = read_dir(&db_path) {
         for entry in db_kind_dir.flatten() {
-            let deleted_db =
-                check_and_delete_database(&config, major_version, &restorable_db_versions, &entry);
+            let deleted_db = check_and_delete_database(
+                &config.cache_dir,
+                major_version,
+                &restorable_db_versions,
+                &entry,
+            );
 
             if let Some(deleted_db) = deleted_db {
                 info!(?deleted_db, "deleted outdated {db_kind} database directory");
+            }
+        }
+    }
+
+    // Static files inside the state directory went with it above. External ones
+    // use the same `vN` layout under their own root.
+    if db_kind == STATE_DATABASE_KIND {
+        if let Some(static_files_root) = &config.static_files_dir {
+            for entry in read_dir(static_files_root).into_iter().flatten().flatten() {
+                let deleted = check_and_delete_database(
+                    static_files_root,
+                    major_version,
+                    &restorable_db_versions,
+                    &entry,
+                );
+
+                if let Some(deleted) = deleted {
+                    info!(
+                        ?deleted,
+                        "deleted outdated transaction static file directory"
+                    );
+                }
             }
         }
     }
@@ -1032,7 +1147,7 @@ fn read_dir(dir: &Path) -> Option<ReadDir> {
 ///
 /// If the directory was deleted, returns its path.
 fn check_and_delete_database(
-    config: &Config,
+    base_dir: &Path,
     major_version: u64,
     restorable_db_versions: &[u64],
     entry: &DirEntry,
@@ -1057,13 +1172,14 @@ fn check_and_delete_database(
 
     // # Correctness
     //
-    // Check that the path we're about to delete is inside the cache directory.
+    // Check that the path we're about to delete is inside `base_dir`, the cache
+    // directory or the static file root.
     // If the user has symlinked the outdated state directory to a non-cache directory,
     // we don't want to delete it, because it might contain other files.
     //
     // We don't attempt to guard against malicious symlinks created by attackers
     // (TOCTOU attacks). Zebra should not be run with elevated privileges.
-    let cache_path = canonicalize(&config.cache_dir).ok()?;
+    let cache_path = canonicalize(base_dir).ok()?;
     let outdated_path = canonicalize(outdated_path).ok()?;
 
     if !outdated_path.starts_with(&cache_path) {

@@ -162,7 +162,9 @@ The workflow also refreshes a static Zakura Ironwood testnet snapshots website o
 
 The deploy refreshes `index.html` but does not delete uploaded snapshot files or
 overwrite an existing host-side `snapshots.json`. To publish a snapshot manually,
-upload the archive and then edit the metadata on the runner host:
+upload the archive and then edit the metadata on the runner host. Make archives
+from a node without `state.static_files_dir`, so its transaction static files
+are inside `state/vN/<network>/static_files` where restores expect them:
 
 ```bash
 scp zakura-ironwood-testnet-archive-YYYYMMDD-height.tar.zst \

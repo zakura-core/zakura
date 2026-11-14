@@ -1,5 +1,6 @@
 //! Types and functions for the `getblocktemplate` RPC.
 
+pub(crate) mod json;
 mod miner_address;
 
 pub mod constants;
@@ -12,6 +13,7 @@ mod tests;
 
 pub(crate) mod prepared_candidates;
 pub(crate) mod trace;
+use super::transaction::json::TransactionDataCache;
 use prepared_candidates::PreparedCandidateResolver;
 
 use std::{
@@ -303,7 +305,7 @@ type InBlockTxDependenciesDepth = usize;
 /// This is the output of the `getblocktemplate` RPC in the default 'template' mode. See
 /// [`BlockProposalResponse`] for the output in 'proposal' mode.
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new)]
+#[derive(Clone, Eq, PartialEq, serde::Deserialize, Getters, CopyGetters, new)]
 pub struct BlockTemplateResponse {
     /// The getblocktemplate RPC capabilities supported by Zebra.
     ///
@@ -459,6 +461,12 @@ pub struct BlockTemplateResponse {
     pub(crate) submit_old: Option<bool>,
 }
 
+impl serde::Serialize for BlockTemplateResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&json::ordinary(self), serializer)
+    }
+}
+
 impl fmt::Debug for BlockTemplateResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // A block with a lot of transactions can be extremely long in logs.
@@ -518,6 +526,7 @@ impl BlockTemplateResponse {
         chain_info: &GetBlockTemplateChainInfo,
         long_poll_id: LongPollId,
         mempool_txs: Vec<zip317::SelectedMempoolTx>,
+        transaction_data: &TransactionDataCache,
         submit_old: Option<bool>,
     ) -> Result<Self, TransactionError> {
         // Determine the next block height.
@@ -528,8 +537,10 @@ impl BlockTemplateResponse {
 
         // Convert transactions into TransactionTemplates.
         #[cfg(not(test))]
-        let (mempool_tx_templates, mempool_txs): (Vec<_>, Vec<_>) =
-            mempool_txs.into_iter().map(|tx| ((&tx).into(), tx)).unzip();
+        let (mempool_tx_templates, mempool_txs): (Vec<_>, Vec<_>) = mempool_txs
+            .into_iter()
+            .map(|tx| (TransactionTemplate::from_cached(&tx, transaction_data), tx))
+            .unzip();
 
         // Production keeps the selection order, which is deterministic and puts
         // parents before children. Tests re-sort by dependency depth, then hash,
@@ -547,7 +558,13 @@ impl BlockTemplateResponse {
                 VerifiedUnminedTx,
             )> = mempool_txs
                 .into_iter()
-                .map(|(min_tx_index, tx)| (min_tx_index, (&tx).into(), tx))
+                .map(|(min_tx_index, tx)| {
+                    (
+                        min_tx_index,
+                        TransactionTemplate::from_cached(&tx, transaction_data),
+                        tx,
+                    )
+                })
                 .collect();
 
             // `zcashd` sorts in serialized data order, excluding the length byte.
@@ -815,6 +832,9 @@ where
     /// Reconstructs compact submissions from bounded RPC work-ID aliases.
     prepared_candidates: PreparedCandidateResolver,
 
+    /// Bounded immutable payload reuse across mining-template builds.
+    pub(crate) transaction_data: TransactionDataCache,
+
     /// The chain sync status, used for checking if Zebra is likely close to the network chain tip.
     #[allow(dead_code)]
     sync_status: SyncStatus,
@@ -868,6 +888,7 @@ where
             miner_params: MinerParams::new(net, conf).ok(),
             block_verifier_router,
             prepared_candidates: PreparedCandidateResolver::default(),
+            transaction_data: TransactionDataCache::default(),
             sync_status,
             mined_block_sender: mined_block_sender
                 .unwrap_or(EarlyMinedBlockChannel::default().sender()),

@@ -42,7 +42,11 @@ use zcash_transparent::{
     address::TransparentAddress, bundle::TxOut, coinbase::MAX_COINBASE_SCRIPT_LEN,
 };
 
+pub(crate) mod json;
 mod no_sapling;
+use json::TransactionData;
+#[cfg(test)]
+mod serialization_experiment;
 
 use super::zec::Zec;
 use super::{
@@ -52,9 +56,7 @@ use super::{
 use no_sapling::NoSaplingProver;
 
 /// Transaction data and fields needed to generate blocks using the `getblocktemplate` RPC.
-#[derive(
-    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
-)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, Getters, CopyGetters)]
 #[serde(bound = "FeeConstraint: amount::Constraint + Clone")]
 pub struct TransactionTemplate<FeeConstraint>
 where
@@ -62,8 +64,7 @@ where
 {
     /// The hex-encoded serialized data for this transaction.
     #[serde(with = "crate::methods::hex_data")]
-    #[getset(get = "pub")]
-    pub(crate) data: SerializedTransaction,
+    pub(crate) data: TransactionData,
 
     /// The transaction ID of this transaction.
     #[serde(with = "hex")]
@@ -105,6 +106,35 @@ where
     pub(crate) required: bool,
 }
 
+impl<C: amount::Constraint + Clone + Copy> TransactionTemplate<C> {
+    /// Creates an entry from transaction bytes and current template metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        data: SerializedTransaction,
+        hash: transaction::Hash,
+        auth_digest: transaction::AuthDigest,
+        depends: Vec<u16>,
+        fee: Amount<C>,
+        sigops: u32,
+        required: bool,
+    ) -> Self {
+        Self {
+            data: data.into(),
+            hash,
+            auth_digest,
+            depends,
+            fee,
+            sigops,
+            required,
+        }
+    }
+
+    /// Returns the serialized transaction bytes, independently of its JSON representation.
+    pub fn data(&self) -> &SerializedTransaction {
+        self.data.bytes()
+    }
+}
+
 // Convert from a mempool transaction to a non-coinbase transaction template.
 impl From<&VerifiedUnminedTx> for TransactionTemplate<NonNegative> {
     fn from(tx: &VerifiedUnminedTx) -> Self {
@@ -113,8 +143,23 @@ impl From<&VerifiedUnminedTx> for TransactionTemplate<NonNegative> {
             "unexpected coinbase transaction in mempool"
         );
 
+        Self::with_data(tx, tx.transaction.transaction().as_ref().into())
+    }
+}
+
+impl TransactionTemplate<NonNegative> {
+    /// Rebuilds metadata while sharing only immutable payloads across template builds.
+    pub(crate) fn from_cached(tx: &VerifiedUnminedTx, cache: &json::TransactionDataCache) -> Self {
+        assert!(
+            !tx.transaction.transaction().is_coinbase(),
+            "unexpected coinbase transaction in mempool"
+        );
+        Self::with_data(tx, cache.get(&tx.transaction))
+    }
+
+    fn with_data(tx: &VerifiedUnminedTx, data: TransactionData) -> Self {
         Self {
-            data: tx.transaction.transaction().as_ref().into(),
+            data,
             hash: tx.transaction.id().mined_id(),
             auth_digest: tx
                 .transaction

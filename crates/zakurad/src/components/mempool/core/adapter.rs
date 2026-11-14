@@ -324,9 +324,16 @@ async fn answer(
             Response::RejectedTransactionIds(shared.handle.rejected_ids(ids).await)
         }
         Request::Queue(items) => {
-            let mut answers = Vec::with_capacity(items.len());
-            for item in items {
-                answers.push(queue(shared.clone(), item, None).await);
+            // Every body takes its slots before anything here waits, so no
+            // body in the request waits outside them. An id takes its slots
+            // at its turn, as today's pool checks each in order.
+            let staged: Vec<Staged> = items
+                .into_iter()
+                .map(|item| Staged::new(&shared, item, &None))
+                .collect();
+            let mut answers = Vec::with_capacity(staged.len());
+            for item in staged {
+                answers.push(item.queue(shared.clone(), None).await);
             }
             Response::Queued(answers)
         }
@@ -347,35 +354,55 @@ async fn answer(
                     return Ok(Response::Queued(Vec::new()));
                 }
             }
+            let from = Some(source.clone());
+            let (bodies, ids): (Vec<Gossip>, Vec<Gossip>) = transactions
+                .into_iter()
+                .partition(|item| matches!(item, Gossip::Tx(_)));
+            // Every body takes its slots before anything here waits. Today's
+            // pool drops what it cannot queue from a peer, so a body over a
+            // limit is dropped here without asking the core.
+            let bodies: Vec<Staged> = bodies
+                .into_iter()
+                .map(|item| Staged::new(&shared, item, &from))
+                .collect();
+            for body in bodies {
+                match body {
+                    Staged::Over { peer_full, .. } => {
+                        if peer_full {
+                            metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
+                        }
+                    }
+                    held => {
+                        let _ = held.queue(shared.clone(), from.clone()).await;
+                    }
+                }
+            }
             // Today's pool checks what it already knows about each id before
             // its limits, at no cost. Here that is one look at the snapshot
             // and one core command for the whole batch, so a batch of known
-            // ids costs the core one command, not one for each.
-            let fresh: Vec<Gossip> = transactions
-                .into_iter()
-                .filter(|item| {
-                    let id = item.id();
-                    snapshot
-                        .transaction(&id.mined_id())
-                        .is_none_or(|pooled| pooled.transaction.id() != id)
-                })
+            // ids costs the core one command, not one for each. A pooled
+            // transaction is known by its effects, as `reserve` knows it.
+            let fresh: Vec<UnminedTxId> = ids
+                .iter()
+                .map(Gossip::id)
+                .filter(|id| snapshot.transaction(&id.mined_id()).is_none())
                 .collect();
             let rejected = if fresh.is_empty() {
                 Default::default()
             } else {
                 shared
                     .handle
-                    .rejected_ids(fresh.iter().map(Gossip::id).collect())
+                    .rejected_ids(fresh.iter().copied().collect())
                     .await
             };
             let mut fresh = fresh
                 .into_iter()
-                .filter(|item| !rejected.contains(&item.id()))
+                .filter(|id| !rejected.contains(id))
                 .peekable();
-            // Today's pool drops what it cannot queue from a peer. Once either
-            // limit is reached, the rest of the batch is refused here, as
-            // today's would refuse each item, without asking the core.
-            while let Some(item) = fresh.next() {
+            // Once either limit is reached, the rest of the batch is refused
+            // here, as today's would refuse each item, without asking the
+            // core.
+            while let Some(id) = fresh.next() {
                 if !shared.has_room(&source) {
                     if !shared.node_has_room() {
                         break;
@@ -385,7 +412,7 @@ async fn answer(
                         .increment(u64::try_from(refused).unwrap_or(u64::MAX));
                     break;
                 }
-                let _ = queue(shared.clone(), item, Some(source.clone())).await;
+                let _ = queue(shared.clone(), Gossip::Id(id), from.clone()).await;
             }
             Response::Queued(Vec::new())
         }
@@ -431,30 +458,111 @@ async fn queue(
     item: Gossip,
     from: Option<QueueSource>,
 ) -> Result<Receiver, BoxError> {
-    let id = item.id();
-    let intent = match item {
+    Staged::new(&shared, item, &from)
+        .queue(shared.clone(), from)
+        .await
+}
+
+/// An item that has taken, or failed to take, its slots: the node's
+/// limit, then its peer's, as today, both before the core is asked for a
+/// slot, so a body never waits for the core outside them.
+enum Staged {
+    /// Within both limits.
+    Held {
+        item: Gossip,
+        queue_slot: QueueSlot,
+        peer_slot: Option<PeerSlot>,
+    },
+    /// Over the node's limit, or its peer's if `peer_full`. Its body, if
+    /// it had one, is already dropped.
+    Over {
+        id: UnminedTxId,
+        intent: Intent,
+        peer_full: bool,
+    },
+}
+
+impl Staged {
+    /// Takes `item`'s slots now, for an item from `from`.
+    fn new(shared: &Arc<Shared>, item: Gossip, from: &Option<QueueSource>) -> Self {
+        let over = |item: Gossip, peer_full| Self::Over {
+            id: item.id(),
+            intent: intent_of(&item),
+            peer_full,
+        };
+        let Some(queue_slot) = QueueSlot::take(shared) else {
+            return over(item, false);
+        };
+        let peer_slot = match from {
+            Some(peer) => match PeerSlot::take(shared, peer) {
+                Some(slot) => Some(slot),
+                None => return over(item, true),
+            },
+            None => None,
+        };
+        Self::Held {
+            item,
+            queue_slot,
+            peer_slot,
+        }
+    }
+
+    /// Reserves the held item's slot in the core and answers its first
+    /// stage, leaving a task that answers its second. An item over a limit
+    /// is answered by [`known_or_full`].
+    async fn queue(
+        self,
+        shared: Arc<Shared>,
+        from: Option<QueueSource>,
+    ) -> Result<Receiver, BoxError> {
+        match self {
+            Self::Held {
+                item,
+                queue_slot,
+                peer_slot,
+            } => queue_held(shared, item, queue_slot, peer_slot, from).await,
+            Self::Over {
+                id,
+                intent,
+                peer_full,
+            } => known_or_full(&shared, id, intent, peer_full).await,
+        }
+    }
+}
+
+/// Today's answer for an item whose task reached its deadline.
+fn timed_out() -> BoxError {
+    metrics::counter!("mempool.failed.verify.tasks.total", "reason" => "timeout").increment(1);
+    "timeout waiting for verification result".into()
+}
+
+/// What a reservation for `item` asks of the core.
+fn intent_of(item: &Gossip) -> Intent {
+    match item {
         Gossip::Tx(_) => Intent::Deliver,
         Gossip::Id(_) => Intent::Fetch,
-    };
-    // The node's limit, then the peer's, as today, both before the core is
-    // asked for a slot, so a body never waits for the core outside them. An
-    // item over either is answered by `known_or_full`.
-    let Some(queue_slot) = QueueSlot::take(&shared) else {
-        return known_or_full(&shared, item, false).await;
-    };
-    let slot = match &from {
-        Some(peer) => match PeerSlot::take(&shared, peer) {
-            Some(slot) => Some(slot),
-            None => {
-                drop(queue_slot);
-                return known_or_full(&shared, item, true).await;
-            }
-        },
-        None => None,
-    };
-    let reservation = match shared.handle.reserve(id, intent).await {
-        Ok(reservation) => reservation,
-        Err(refused) => return first_stage_refusal(refused),
+    }
+}
+
+/// Queues `item` under its slots: reserves its core slot and answers the
+/// first stage, and leaves a task that brings the body in and answers the
+/// second. Today's one deadline, `RATE_LIMIT_DELAY`, starts before the
+/// reservation, so a core that takes no commands cannot hold the slots and
+/// the caller forever.
+async fn queue_held(
+    shared: Arc<Shared>,
+    item: Gossip,
+    queue_slot: QueueSlot,
+    slot: Option<PeerSlot>,
+    from: Option<QueueSource>,
+) -> Result<Receiver, BoxError> {
+    let deadline = tokio::time::Instant::now() + RATE_LIMIT_DELAY;
+    let reserved =
+        tokio::time::timeout_at(deadline, shared.handle.reserve(item.id(), intent_of(&item))).await;
+    let reservation = match reserved {
+        Ok(Ok(reservation)) => reservation,
+        Ok(Err(refused)) => return first_stage_refusal(refused),
+        Err(_elapsed) => return Err(timed_out()),
     };
     // A joined submission takes no core slot, but it still counts against
     // its peer until its verdict, so one peer cannot hold more than its
@@ -462,10 +570,9 @@ async fn queue(
     metrics::counter!("mempool.queued.transactions.total").increment(1);
     let (answer, receiver) = oneshot::channel();
     tokio::spawn(async move {
-        // Today's download task has one deadline, `RATE_LIMIT_DELAY`, for the
-        // fetch and the verification together, and its peer's slot is free
-        // once it ends. So does this.
-        let deadline = tokio::time::Instant::now() + RATE_LIMIT_DELAY;
+        // Today's download task has one deadline for the fetch and the
+        // verification together, and its peer's slot is free once it ends.
+        // So does this.
         let result = bring_in(&shared, reservation, item, from, deadline).await;
         drop(slot);
         drop(queue_slot);
@@ -474,31 +581,30 @@ async fn queue(
     Ok(receiver)
 }
 
-/// The first-stage answer for `item` when the node's limit, or its peer's
-/// if `peer_full`, is reached. Today's pool answers what it already knows
-/// about an id before it checks its limits: in the pool, already queued, or
-/// a cached rejection, some of which it answers at the second stage. So the
-/// core is asked about the id alone, with the body dropped first so it is
-/// not held outside the limits, and an id it does not know is refused as a
-/// full queue.
+/// The first-stage answer for an item with id `id` when the node's limit,
+/// or its peer's if `peer_full`, is reached. Today's pool answers what it
+/// already knows about an id before it checks its limits: in the pool,
+/// already queued, or a cached rejection, some of which it answers at the
+/// second stage. So the core is asked about the id alone, the body having
+/// been dropped, and an id it does not know is refused as a full queue.
 async fn known_or_full(
     shared: &Shared,
-    item: Gossip,
+    id: UnminedTxId,
+    intent: Intent,
     peer_full: bool,
 ) -> Result<Receiver, BoxError> {
-    let id = item.id();
-    let intent = match item {
-        Gossip::Tx(_) => Intent::Deliver,
-        Gossip::Id(_) => Intent::Fetch,
-    };
-    drop(item);
     let full = || {
         if peer_full {
             metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
         }
         Err(MempoolError::FullQueue.into())
     };
-    match shared.handle.reserve(id, intent).await {
+    let Ok(reserved) =
+        tokio::time::timeout(RATE_LIMIT_DELAY, shared.handle.reserve(id, intent)).await
+    else {
+        return Err(timed_out());
+    };
+    match reserved {
         // A body for an id another caller is bringing in would join it.
         Ok(reservation) if reservation.joined() => Err(MempoolError::AlreadyQueued.into()),
         // A slot the core grants here is given back at once.
@@ -650,10 +756,6 @@ async fn bring_in(
     from: Option<QueueSource>,
     deadline: tokio::time::Instant,
 ) -> Result<(), BoxError> {
-    let timed_out = || -> BoxError {
-        metrics::counter!("mempool.failed.verify.tasks.total", "reason" => "timeout").increment(1);
-        "timeout waiting for verification result".into()
-    };
     let tx_id = item.id();
     // The body, and the legacy peer whose bytes it is, if any.
     let (tx, sender) = match item {
@@ -1869,12 +1971,6 @@ mod tests {
             source: peer(),
         }));
         let soon = std::time::Duration::from_millis(1);
-        let Ok(Some(PoolCommand::RejectedIds { reply, .. })) =
-            tokio::time::timeout(soon, inbox.next()).await
-        else {
-            panic!("the batch asks which ids are rejected without waiting for the tip");
-        };
-        let _ = reply.send(Default::default());
         let Ok(Some(PoolCommand::Reserve { .. })) = tokio::time::timeout(soon, inbox.next()).await
         else {
             panic!("the push reserves without waiting for the tip");
@@ -2017,10 +2113,19 @@ mod tests {
         let (handle, mut inbox) = pool_port();
         let mut core = adapter_on(handle);
         let pooled = Network::Mainnet
-            .unmined_transactions_in_blocks(1..=1)
-            .next()
-            .expect("a vector transaction");
+            .unmined_transactions_in_blocks(..)
+            .find(|tx| tx.transaction.id().auth_digest().is_some())
+            .expect("the vectors have a witnessed transaction");
         let pooled_id = pooled.transaction.id();
+        // The pooled transaction's effects under other authorizations, which
+        // `reserve` would answer as pooled too.
+        let other_authorizations: Vec<UnminedTxId> = (1..=10)
+            .map(|n| {
+                let mut id = pooled_id;
+                id.auth_digest_mut().expect("a witnessed id").0[0] ^= n;
+                id
+            })
+            .collect();
         inbox.publish([], |last| {
             PoolSnapshot::new(
                 ChainTip {
@@ -2042,6 +2147,7 @@ mod tests {
         };
         let rejected_id = id(0);
         let mut batch = vec![Gossip::Id(pooled_id), Gossip::Id(rejected_id)];
+        batch.extend(other_authorizations.iter().copied().map(Gossip::Id));
         batch.extend((1..1_000).map(|n| Gossip::Id(id(n))));
         let call = tokio::spawn(core.call(Request::QueueFromPeer {
             transactions: batch,
@@ -2052,8 +2158,11 @@ mod tests {
             panic!("the batch asks once which ids are rejected");
         };
         assert!(
-            !ids.contains(&pooled_id),
-            "the pooled id is answered from the snapshot"
+            !ids.contains(&pooled_id)
+                && other_authorizations
+                    .iter()
+                    .all(|other| !ids.contains(other)),
+            "a pooled transaction's effects are answered from the snapshot"
         );
         assert_eq!(ids.len(), 1_000, "every other id, in one command");
         let _ = reply.send([rejected_id].into_iter().collect());
@@ -2074,5 +2183,180 @@ mod tests {
             inbox.try_next().is_none(),
             "the rest of the batch is refused without the core"
         );
+    }
+
+    /// Bodies pushed through the service while the core takes no commands
+    /// wait for their reservations under today's node-wide limit, and the
+    /// pushes past it are dropped without the core, as today's pool drops
+    /// what it cannot queue from a peer. No body waits for anything before
+    /// it holds its slots.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pushes_through_the_service_wait_only_within_the_node_limit() {
+        use zakura_chain::transaction::{LockTime, Transaction, UnminedTx};
+        use zakura_node_services::mempool::port::{
+            pool_port, ChainTip, Generation, PoolCommand, PoolSnapshot,
+        };
+
+        let pushed = MAX_INBOUND_CONCURRENCY + 100;
+        let template = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let (handle, mut inbox) = pool_port();
+        let core = adapter_on(handle);
+        inbox.publish([], |last| {
+            PoolSnapshot::new(
+                ChainTip {
+                    hash: block::Hash([1; 32]),
+                    height: Height(1),
+                },
+                Generation(1),
+                last,
+                Vec::new(),
+                Default::default(),
+            )
+        });
+        let pushes: Vec<_> = (0..pushed)
+            .map(|n| {
+                let mut transaction = Transaction::clone(template.transaction());
+                let height = u32::try_from(n + 1).expect("few pushes");
+                if let Transaction::V1 { lock_time, .. }
+                | Transaction::V2 { lock_time, .. }
+                | Transaction::V3 { lock_time, .. }
+                | Transaction::V4 { lock_time, .. }
+                | Transaction::V5 { lock_time, .. } = &mut transaction
+                {
+                    *lock_time = LockTime::Height(Height(height));
+                }
+                let peer = u16::try_from(n).expect("few peers");
+                let [high, low] = peer.to_be_bytes();
+                let source = QueueSource::LegacySocket(std::net::SocketAddr::from((
+                    [10, 3, high, low],
+                    8233,
+                )));
+                let mut core = core.clone();
+                tokio::spawn(core.call(Request::QueueFromPeer {
+                    transactions: vec![Gossip::Tx(UnminedTx::from(transaction))],
+                    source,
+                }))
+            })
+            .collect();
+        let mut waiting = Vec::new();
+        for _ in 0..MAX_INBOUND_CONCURRENCY {
+            let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
+                panic!("each push within the limit reserves, and nothing else is asked");
+            };
+            waiting.push(reply);
+        }
+        for _ in 0..1_000 {
+            if pushes.iter().filter(|push| push.is_finished()).count()
+                == pushed - MAX_INBOUND_CONCURRENCY
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            pushes.iter().filter(|push| push.is_finished()).count(),
+            pushed - MAX_INBOUND_CONCURRENCY,
+            "the pushes past the limit are dropped at once"
+        );
+        assert!(inbox.try_next().is_none(), "the core is asked nothing else");
+        assert_eq!(
+            *core.shared.queued.lock().expect("not poisoned"),
+            MAX_INBOUND_CONCURRENCY,
+            "the waiting pushes fill the node's limit"
+        );
+        drop(waiting);
+    }
+
+    /// Every body in one `Queue` request takes its slots before the first
+    /// reservation waits, so the request's later bodies are not held
+    /// outside the limits while it waits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queued_batch_takes_every_bodys_slots_first() {
+        use zakura_chain::transaction::{LockTime, Transaction, UnminedTx};
+        use zakura_node_services::mempool::port::{
+            pool_port, ChainTip, Generation, PoolCommand, PoolSnapshot,
+        };
+
+        let template = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let bodies: Vec<Gossip> = (1..=3)
+            .map(|height| {
+                let mut transaction = Transaction::clone(template.transaction());
+                if let Transaction::V1 { lock_time, .. }
+                | Transaction::V2 { lock_time, .. }
+                | Transaction::V3 { lock_time, .. }
+                | Transaction::V4 { lock_time, .. }
+                | Transaction::V5 { lock_time, .. } = &mut transaction
+                {
+                    *lock_time = LockTime::Height(Height(height));
+                }
+                Gossip::Tx(UnminedTx::from(transaction))
+            })
+            .collect();
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        inbox.publish([], |last| {
+            PoolSnapshot::new(
+                ChainTip {
+                    hash: block::Hash([1; 32]),
+                    height: Height(1),
+                },
+                Generation(1),
+                last,
+                Vec::new(),
+                Default::default(),
+            )
+        });
+        let request = tokio::spawn(core.call(Request::Queue(bodies)));
+        let Some(PoolCommand::Reserve { .. }) = inbox.next().await else {
+            panic!("the first body reserves");
+        };
+        assert_eq!(
+            *core.shared.queued.lock().expect("not poisoned"),
+            3,
+            "every body holds its slot while the first waits"
+        );
+        request.abort();
+    }
+
+    /// A submission to a core that takes no reservation is answered at
+    /// today's whole-task deadline, and frees its slots, so a stuck core
+    /// cannot hold a caller or its slots forever.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_reservation_the_core_never_answers_ends_at_the_task_deadline() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let (handle, mut inbox) = pool_port();
+        let core = adapter_on(handle);
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let started = tokio::time::Instant::now();
+        let queued = tokio::spawn(queue(core.shared.clone(), Gossip::Tx(body), None));
+        let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
+            panic!("the body reserves");
+        };
+        let error = tokio::time::timeout(RATE_LIMIT_DELAY * 2, queued)
+            .await
+            .expect("the stuck reservation ends by the deadline")
+            .expect("the task does not panic")
+            .expect_err("the stuck reservation is refused");
+        assert_eq!(error.to_string(), "timeout waiting for verification result");
+        assert!(started.elapsed() >= RATE_LIMIT_DELAY, "at today's deadline");
+        assert_eq!(
+            *core.shared.queued.lock().expect("not poisoned"),
+            0,
+            "its slot is free"
+        );
+        drop(reply);
     }
 }

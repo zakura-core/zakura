@@ -174,7 +174,9 @@ pub(crate) fn start(
             },
             (applied.tip.hash, applied.tip.height),
             applied.visible,
-            applied.hidden,
+            // Today's pool counts what a reset requeued, and writes zero for
+            // a tip that grew by one block.
+            if applied.reset { applied.hidden } else { 0 },
             applied.took,
         );
     });

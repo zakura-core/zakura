@@ -13,8 +13,13 @@ use crate::{constants, peer_set::limit::ClosedConnection};
 /// Only the IP that left can take a held seat.
 ///
 /// At most `inbound limit / HELD_SEAT_LIMIT_DIVISOR` seats are held at once, so peers
-/// that all leave together cannot reserve the listener. A peer gains nothing by holding
-/// a seat that it could not get by staying connected.
+/// that all leave together cannot reserve the listener.
+///
+/// A hold does not depend on why the connection closed. A peer that this node dropped,
+/// for example because it stalled, also gets one. That peer could already take the free
+/// seat back by dialing again at once, because the listener keeps no record of dropped
+/// peers. A banned peer is refused before it reaches its held seat, so that seat stays
+/// empty until the hold is over.
 #[derive(Debug)]
 pub struct HeldSeats {
     /// When each held seat is released, by the IP it is held for.

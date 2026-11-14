@@ -2,9 +2,8 @@ use super::*;
 use std::collections::BTreeMap;
 use zakura_node_services::block_memory::Admission;
 
-use crate::zakura::block_sync::reorder::RetainedBody;
+use crate::zakura::block_sync::{reorder::RetainedBody, wire::DecodedBlockPayload};
 
-use zakura_chain::serialization::ZcashSerialize;
 use zakura_test::vectors::{BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES, BLOCK_MAINNET_5_BYTES};
 
 /// The reorder, applying, and in-flight submission gauges, and the view
@@ -99,10 +98,10 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     for (index, (height, bytes)) in fixtures.into_iter().enumerate() {
         let height = block::Height(height);
         let block: Arc<block::Block> = Arc::new(bytes.zcash_deserialize_into().unwrap());
-        let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
-        let wire_bytes = raw.len() as u64;
-        allocations.insert(height, Arc::as_ptr(&raw).cast::<u8>().addr());
-        bodies.push((height, Arc::downgrade(&block), Arc::downgrade(&raw)));
+        let raw = DecodedBlockPayload::of_block(&block);
+        let wire_bytes = raw.block_len() as u64;
+        allocations.insert(height, raw.allocation());
+        bodies.push((height, Arc::downgrade(&block), raw.downgrade()));
         let mut body = SequencedBody::new_queued(
             super::super::test_work_owner(),
             zakura_header_chain::SourceId::from_digest([1; 32]),
@@ -314,9 +313,9 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
 
     let block: Arc<block::Block> =
         Arc::new(BLOCK_MAINNET_2_BYTES.zcash_deserialize_into().unwrap());
-    let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
-    let allocation = Arc::as_ptr(&raw).cast::<u8>().addr();
-    let bytes = raw.len() as u64;
+    let raw = DecodedBlockPayload::of_block(&block);
+    let allocation = raw.allocation();
+    let bytes = raw.block_len() as u64;
     let decoded_attributed_memory_bytes = block.attributed_memory_size_bytes();
     body_tx
         .try_send(SequencedBody::new_queued(
@@ -375,7 +374,7 @@ fn runtime_payload(
     };
     let hash = block.hash();
     let previous = block.header.previous_block_hash;
-    let bytes = u64::try_from(raw.len()).unwrap();
+    let bytes = u64::try_from(raw.block_len()).unwrap();
     let mut payloads = SequencerPayloads::default();
     let facts = payloads.insert(BufferedBlockBody::from_decoded_block(block, Some(raw)));
     let mut policy = Sequencer::new(block::Height(0), 1);
@@ -571,10 +570,7 @@ async fn decoded_capacity_release_retries_pending_body_without_apply_completion(
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         task.control_input_rx = control_rx;
         let block = test_block();
-        let raw = BlockSyncMessage::Block(block.clone())
-            .encode()
-            .unwrap()
-            .into();
+        let raw = DecodedBlockPayload::of_block(&block);
         let mut body = SequencedBody::new_queued(
             super::super::test_work_owner(),
             zakura_header_chain::SourceId::from_digest([1; 32]),
@@ -689,10 +685,7 @@ async fn commit_window_body_submits_at_a_full_decoded_byte_bound() {
     let (actions, mut actions_rx) = mpsc::channel(1);
     task.actions = actions;
     let block = test_block();
-    let raw = BlockSyncMessage::Block(block.clone())
-        .encode()
-        .unwrap()
-        .into();
+    let raw = DecodedBlockPayload::of_block(&block);
     let mut body = SequencedBody::new_queued(
         super::super::test_work_owner(),
         zakura_header_chain::SourceId::from_digest([1; 32]),
@@ -753,10 +746,7 @@ async fn teardown_keeps_decoded_view_and_charge_while_the_driver_holds_a_submiss
     task.actions = actions;
     let view = task.view_tx.subscribe();
     let block = test_block();
-    let raw = BlockSyncMessage::Block(block.clone())
-        .encode()
-        .unwrap()
-        .into();
+    let raw = DecodedBlockPayload::of_block(&block);
     let mut body = SequencedBody::new_queued(
         super::super::test_work_owner(),
         zakura_header_chain::SourceId::from_digest([1; 32]),
@@ -815,7 +805,7 @@ fn decoded_byte_totals_follow_raw_to_decoded_changes() {
             Admission::WithinLimit,
         )
         .unwrap();
-    let raw: Arc<[u8]> = BlockSyncMessage::Block(block).encode().unwrap().into();
+    let raw = DecodedBlockPayload::of_block(&block);
     let mut body = BufferedBlockBody::RawFramePayload(raw);
 
     assert_eq!(

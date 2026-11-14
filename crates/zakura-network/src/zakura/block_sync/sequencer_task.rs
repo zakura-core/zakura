@@ -500,10 +500,7 @@ impl SequencerPayloads {
             | BufferedBlockBody::DecodedWithRawFramePayload {
                 raw_frame_payload: raw,
                 ..
-            } => Some(
-                raw.len()
-                    .saturating_sub(super::wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES),
-            ),
+            } => Some(raw.block_len()),
             BufferedBlockBody::Decoded { .. } => None,
         };
         let facts = BodyFacts {
@@ -554,10 +551,7 @@ impl SequencerPayloads {
             .get_mut(&id)
             .expect("policy names a retained payload");
         let newly_decoded_wire_bytes = match body {
-            BufferedBlockBody::RawFramePayload(raw) => Some(
-                raw.len()
-                    .saturating_sub(super::wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES),
-            ),
+            BufferedBlockBody::RawFramePayload(raw) => Some(raw.block_len()),
             _ => None,
         };
         if let Some((refused, refused_admission, decoded_bytes)) = self.capacity_refused {
@@ -1423,7 +1417,9 @@ mod tests {
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
-    use super::super::{reactor::BS_ACTION_CONTROL_RESERVE, tests::genesis_frontiers};
+    use super::super::{
+        reactor::BS_ACTION_CONTROL_RESERVE, tests::genesis_frontiers, wire::DecodedBlockPayload,
+    };
     use super::*;
 
     fn test_view() -> SequencerView {
@@ -1638,26 +1634,25 @@ mod tests {
         .with_retained_body_limit(limit)
     }
 
-    fn received_test_block() -> (Arc<block::Block>, Arc<[u8]>) {
-        use zakura_chain::serialization::ZcashSerialize;
+    fn received_test_block() -> (Arc<block::Block>, DecodedBlockPayload) {
         let block: Arc<block::Block> = Arc::new(
             zakura_test::vectors::BLOCK_MAINNET_982681_BYTES
                 .zcash_deserialize_into()
                 .unwrap(),
         );
-        let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
+        let raw = DecodedBlockPayload::of_block(&block);
         (block, raw)
     }
 
     /// Wire size of every body [`received_test_body`] builds.
     fn received_test_body_bytes() -> u64 {
-        u64::try_from(received_test_block().1.len()).unwrap()
+        u64::try_from(received_test_block().1.block_len()).unwrap()
     }
 
     // Use a real serialized block. Only the scheduling height is synthetic.
     fn received_test_body(task: &mut SequencerIO, height: u32, estimate: u64) -> SequencedBody {
         let (block, raw) = received_test_block();
-        let bytes = u64::try_from(raw.len()).unwrap();
+        let bytes = u64::try_from(raw.block_len()).unwrap();
         let height = block::Height(height);
         task.work.extend(
             super::test_work_scope(),

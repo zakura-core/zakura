@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the fleet installer: the node list, the config edit and the files it writes."""
 
+import contextlib
 import hashlib
 import io
 import shutil
@@ -155,6 +156,26 @@ class TraceConfigTests(unittest.TestCase):
         with self.assertRaises(fleet.FleetError):
             fleet.with_trace_dir("[network\n")
 
+    def test_peer_addresses_are_switched_on_where_the_config_is_silent(self):
+        edited = fleet.with_peer_addresses(DUAL_CONFIG)
+        added = "expose_peer_addresses = true\n"
+        self.assertEqual(edited.replace(added, "", 1), DUAL_CONFIG)
+        self.assertIn("[network]\n" + added + 'listen_addr = "0.0.0.0:8233"', edited)
+        self.assertTrue(fleet.exposes_peer_addresses(edited))
+        self.assertEqual(fleet.with_peer_addresses(edited), edited)
+
+    def test_a_config_that_hides_peer_addresses_on_purpose_is_left_alone(self):
+        hidden = DUAL_CONFIG.replace("[network]\n", "[network]\nexpose_peer_addresses = false\n")
+        self.assertEqual(fleet.with_peer_addresses(hidden), hidden)
+        self.assertFalse(fleet.exposes_peer_addresses(hidden))
+
+    def test_both_settings_can_be_added_to_one_config(self):
+        edited = fleet.with_peer_addresses(fleet.with_trace_dir(LEGACY_CONFIG))
+        parsed = tomllib.loads(edited)
+        self.assertEqual(parsed["network"]["expose_peer_addresses"], True)
+        self.assertEqual(parsed["network"]["zakura"], {"trace_dir": "/mnt/data/zakura-traces"})
+        self.assertEqual(parsed["network"]["listen_addr"], "0.0.0.0:8233")
+
     def test_the_config_path_is_read_from_the_service_command_line(self):
         shown = (
             "{ path=/usr/local/bin/zakurad ; argv[]=/usr/local/bin/zakurad -c /root/.config/zakura.toml start ;"
@@ -232,6 +253,36 @@ class InstalledFilesTests(unittest.TestCase):
         )
         self.assertEqual(archive.extractfile("node.conf").read(), b"[Service]\n")
 
+    def test_the_installed_profiler_normalizes_addresses_without_the_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with tarfile.open(fileobj=io.BytesIO(fleet.profiler_archive("[Service]\n"))) as archive:
+                archive.extractall(directory, filter="data")
+            done = subprocess.run(
+                [sys.executable, "-I", "-c",
+                 "import sys; sys.path.insert(0, sys.argv[1]); import blocks; "
+                 "print(blocks.canonical_ip('[::ffff:192.0.2.7]:8233'))", directory],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+        self.assertEqual(done.stdout.strip(), "192.0.2.7")
+
+    def test_a_node_is_told_every_other_node_s_name_and_address(self):
+        edited = fleet.with_trace_peer_names(DUAL_CONFIG, self.remote, [self.local, self.remote])
+        self.assertEqual(tomllib.loads(edited)["network"]["zakura"]["trace_peer_names"], {"192.0.2.1": "us-east-0"})
+
+    def test_a_node_with_a_private_address_is_named_to_no_node(self):
+        private = fleet.parse_private_addresses('["::ffff:192.0.2.1"]')
+        self.assertEqual(fleet.named_peers(self.remote, [self.local, self.remote], private), [])
+
+    def test_a_private_list_that_cannot_be_read_is_refused(self):
+        for listed in ("", "{}", '["not an address"]', "[1]"):
+            with self.assertRaises(fleet.FleetError):
+                fleet.parse_private_addresses(listed)
+
+    def test_a_node_reached_by_host_name_cannot_be_named(self):
+        named = load(NODE_LIST.replace("root@192.0.2.2", "root@archive.example"))[1]
+        with self.assertRaises(fleet.FleetError):
+            fleet.peer_address(named)
+
     def test_the_tunnel_settings_name_the_dashboard_port_and_the_node(self):
         self.assertEqual(
             fleet.tunnel_env(self.remote), "LOCAL_PORT=8098\nSSH_TARGET=root@192.0.2.2\nSSH_PORT=22\n"
@@ -303,6 +354,7 @@ class StepTests(unittest.TestCase):
         self.install_error = None
         self.write_error = None
         self.steps = []
+        self.drop_in = b""
         self.real_remote = fleet.remote
         fleet.remote = self.fake_remote
         self.addCleanup(lambda: setattr(fleet, "remote", self.real_remote))
@@ -329,6 +381,11 @@ class StepTests(unittest.TestCase):
             return ""
         if script == fleet.READ_TRACE_MARKER_SCRIPT:
             return "managed" if self.managed else ""
+        if script == fleet.WRITE_DROP_IN_SCRIPT:
+            self.assertEqual(arguments, ("zakurad.service", "trace-peer-names.conf"))
+            changed = stdin != self.drop_in
+            self.drop_in = stdin
+            return "written\n" if changed else "unchanged\n"
         if script == fleet.INSTALL_SCRIPT:
             self.assertEqual(arguments, (fleet.TRACE_DIR, "200" if self.managed else "0"))
             if self.install_error:
@@ -341,6 +398,7 @@ class StepTests(unittest.TestCase):
         first = fleet.ensure_trace_config(self.node, load(NODE_LIST))
         self.assertIn("updated trace settings in /etc/zakura/zakura.toml", first)
         self.assertEqual(fleet.trace_dir_of(self.config), fleet.TRACE_DIR)
+        self.assertTrue(fleet.exposes_peer_addresses(self.config))
         written = self.config
         self.assertIn("already writes trace files to /mnt/data/zakura-traces", fleet.ensure_trace_config(self.node, load(NODE_LIST)))
         self.assertEqual(self.config, written)
@@ -369,7 +427,9 @@ class StepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "nodes.toml"
             config.write_text(NODE_LIST)
-            self.assertEqual(fleet.main(["ensure-trace-config", "--config", str(config), "--node", self.node.name]), 0)
+            private = Path(directory) / "private.json"
+            private.write_text("[]")
+            self.assertEqual(fleet.main(["ensure-trace-config", "--config", str(config), "--node", self.node.name, "--private-addresses", str(private)]), 0)
         self.assertEqual(tomllib.loads(self.config)["network"]["zakura"]["trace_peer_names"], {"192.0.2.1": "us-east-0"})
 
     def test_a_retention_readiness_failure_also_prevents_enabling_traces(self):
@@ -377,6 +437,18 @@ class StepTests(unittest.TestCase):
         with self.assertRaisesRegex(fleet.FleetError, "did not confirm trace retention"):
             fleet.ensure_trace_config(self.node, load(NODE_LIST))
         self.assertEqual(self.config, DUAL_CONFIG)
+
+    def test_a_node_that_hides_peer_addresses_is_reported_and_keeps_its_choice(self):
+        self.config = DUAL_CONFIG.replace("[network]\n", "[network]\nexpose_peer_addresses = false\n")
+        self.assertTrue(fleet.ensure_trace_config(self.node, load(NODE_LIST)).endswith("its config keeps peer addresses hidden"))
+        self.assertFalse(fleet.exposes_peer_addresses(self.config))
+
+    def test_a_node_that_already_traces_gets_peer_addresses_after_its_profiler_is_running(self):
+        self.config = fleet.with_trace_dir(DUAL_CONFIG)
+        self.assertIn("updated trace settings in", fleet.ensure_trace_config(self.node, load(NODE_LIST)))
+        self.assertTrue(fleet.exposes_peer_addresses(self.config))
+        self.assertFalse(self.managed)
+        self.assertLess(self.steps.index(fleet.INSTALL_SCRIPT), self.steps.index(fleet.WRITE_CONFIG_SCRIPT))
 
     def test_the_profiler_is_pointed_at_the_trace_directory_in_the_node_s_config(self):
         fleet.ensure_trace_config(self.node, load(NODE_LIST))
@@ -393,6 +465,30 @@ class StepTests(unittest.TestCase):
         sent = self.archives[-1]
         drop_in = tarfile.open(fileobj=io.BytesIO(sent)).extractfile("node.conf").read().decode()
         self.assertIn("--trace-dir /mnt/data/zakura-traces --trace-table-cap-mb 0", drop_in)
+
+    def test_peer_names_are_written_once_in_the_node_config(self):
+        nodes = load(NODE_LIST)
+        self.assertEqual(
+            fleet.set_peer_names(self.node, nodes, frozenset()), "names its 1 fleet peers once the node next starts"
+        )
+        self.assertEqual(tomllib.loads(self.config)["network"]["zakura"]["trace_peer_names"], {"192.0.2.1": "us-east-0"})
+        self.assertEqual(fleet.set_peer_names(self.node, nodes, frozenset()), "already names its 1 fleet peers")
+
+    def test_a_private_peer_is_left_out_and_only_counted(self):
+        line = fleet.set_peer_names(self.node, load(NODE_LIST), frozenset({"192.0.2.1"}))
+        self.assertEqual(line, "names its 0 fleet peers once the node next starts, leaving out 1 with a private address")
+        self.assertEqual(tomllib.loads(self.config)["network"]["zakura"]["trace_peer_names"], {})
+
+    def test_no_peer_names_are_written_without_the_private_list(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as node_list, \
+                contextlib.redirect_stderr(io.StringIO()):
+            node_list.write(NODE_LIST)
+            node_list.flush()
+            missing = node_list.name + ".missing"
+            self.assertEqual(
+                fleet.main(["peer-names", "--config", node_list.name, "--private-addresses", missing]), 2
+            )
+        self.assertNotIn(fleet.WRITE_DROP_IN_SCRIPT, self.steps)
 
     def test_one_failing_node_does_not_stop_the_others(self):
         def step(node):

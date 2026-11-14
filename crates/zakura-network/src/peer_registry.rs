@@ -277,6 +277,8 @@ impl Drop for PeerRegistryGuard {
     }
 }
 
+/// Returns `user_agent` with every character a peer could use to forge log or trace
+/// text removed.
 fn sanitize_subversion(user_agent: &str) -> String {
     user_agent
         .chars()
@@ -284,6 +286,21 @@ fn sanitize_subversion(user_agent: &str) -> String {
             character.is_ascii_alphanumeric() || matches!(character, ' ' | '.' | '-' | '/' | ':')
         })
         .collect()
+}
+
+/// The longest user agent a trace row carries. Real ones, such as `/MagicBean:6.2.0/`,
+/// are under 30 characters; a peer may send up to 256.
+const TRACE_USER_AGENT_MAX_CHARS: usize = 64;
+
+/// Returns `user_agent` sanitized and cut to [`TRACE_USER_AGENT_MAX_CHARS`], for trace rows.
+///
+/// A peer chooses its user agent and can trigger many rows, so the cut bounds how much
+/// trace file each row it causes can take.
+pub(crate) fn trace_user_agent(user_agent: &str) -> String {
+    let mut sanitized = sanitize_subversion(user_agent);
+    // Sanitized text is ASCII, so this byte index is a character boundary.
+    sanitized.truncate(TRACE_USER_AGENT_MAX_CHARS);
+    sanitized
 }
 
 #[cfg(test)]
@@ -396,5 +413,15 @@ mod tests {
             sanitize_subversion("/Magic Bean:2.1.1-1/\u{1b}[31m\n"),
             "/Magic Bean:2.1.1-1/31m"
         );
+    }
+
+    #[test]
+    fn trace_user_agent_is_sanitized_and_cut_to_its_limit() {
+        assert_eq!(trace_user_agent("/MagicBean:6.2.0/\n"), "/MagicBean:6.2.0/");
+
+        let long = format!("/{}/", "a".repeat(254));
+        let traced = trace_user_agent(&long);
+        assert_eq!(traced.len(), TRACE_USER_AGENT_MAX_CHARS);
+        assert!(long.starts_with(&traced));
     }
 }

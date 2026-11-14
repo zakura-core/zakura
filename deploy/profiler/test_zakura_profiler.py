@@ -383,6 +383,52 @@ class PerfScriptTests(unittest.TestCase):
         self.assertEqual((status["state"], status["error"]), ("error", "perf record could not start"))
 
 
+class ScratchBudgetTests(unittest.TestCase):
+    """Windows on disk at once stay within the scratch budget the unit's memory limit allows."""
+
+    MIB = 1024 * 1024
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.scratch = Path(directory.name)
+        args = argparse.Namespace(
+            node_name="n", service="zakurad", window=60, log_file="", perf="perf",
+            scratch_dir=str(self.scratch), trace_dir="", trace_table_cap_mb=0,
+        )
+        self.profiler = profiler_module.Profiler(args, profiler_module.Store(self.scratch / "store"))
+
+    def window(self, name, mib):
+        """A scratch file of `mib` MiB that takes no real space."""
+        path = self.scratch / f"{name}.data"
+        with path.open("wb") as handle:
+            handle.truncate(mib * self.MIB)
+        return {"path": path}
+
+    def test_an_empty_scratch_directory_allows_a_full_window(self):
+        self.assertEqual(self.profiler.make_room(), profiler_module.MAX_WINDOW_BYTES)
+
+    def test_waiting_windows_are_dropped_oldest_first_but_never_the_one_being_read(self):
+        reading = self.window("reading", 300)
+        oldest, newest = self.window("oldest", 100), self.window("newest", 100)
+        self.profiler._processing = reading
+        self.profiler._jobs.extend([oldest, newest])
+
+        room = self.profiler.make_room()
+
+        self.assertEqual(room, (512 - 300 - 100) * self.MIB)
+        self.assertEqual(list(self.profiler._jobs), [newest])
+        self.assertEqual(self.profiler.dropped_windows, 1)
+        self.assertFalse(oldest["path"].exists())
+        self.assertTrue(reading["path"].exists())
+
+    def test_no_window_starts_while_the_one_being_read_leaves_too_little_room(self):
+        reading = self.window("reading", 500)
+        self.profiler._processing = reading
+        self.assertLess(self.profiler.make_room(), profiler_module.MIN_WINDOW_BYTES)
+        self.assertTrue(reading["path"].exists())
+
+
 class TraceRetentionTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -875,6 +921,218 @@ class TraceFollowingTests(unittest.TestCase):
         )  # fmt: skip
         self.assertIn(60, self.heights(follower.poll()))
 
+    def test_a_legacy_block_records_who_it_was_heard_from_and_served_to(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        started = 1794528928.0  # the start time in NODE_RUN
+        self.append(
+            "legacy_gossip",
+            trace_row("block_inv_received", 900_000, hash=BLOCK_HASH, connection_id=3),
+            trace_row("block_inv_received", 950_000, hash=BLOCK_HASH, connection_id=4, peer_name="us-0"),
+            trace_row("block_inv_sent", 1_011_000, hash=BLOCK_HASH, connection_id=5),
+            trace_row("block_inv_sent", 1_012_000, hash=BLOCK_HASH, connection_id=6, peer_name="asia-0"),
+            trace_row("block_getdata_received", 1_030_000, hash=BLOCK_HASH, connection_id=6, peer_name="asia-0"),
+            trace_row("block_sent", 1_070_000, hash=BLOCK_HASH, connection_id=6, peer_name="asia-0"),
+        )
+        self.append(
+            "legacy_peer_request",
+            trace_row("block_request_finish", 1_000_000, result="available", returned_hash=BLOCK_HASH,
+                      returned_height=10, elapsed_ms=40),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(1_010_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+
+        self.assertEqual(
+            record["wall"],
+            {
+                "heard": started + 0.9, "asked": started + 0.96, "body": started + 1.0,
+                "queued": started + 1.0055, "tip": started + 1.01, "told": started + 1.011,
+            },
+        )  # fmt: skip
+        # First heard from a peer that cannot be told apart.
+        self.assertIsNone(record["heard_from"])
+        self.assertEqual(
+            record["peers"],
+            {
+                "name:us-0": {"heard": started + 0.95},
+                "name:asia-0": {"told": started + 1.012, "asked": started + 1.03, "sent": started + 1.07},
+            },
+        )
+        self.assertEqual(record["unnamed"], {"heard": 1, "told": 1})
+
+    def test_a_header_announcement_before_the_tip_is_kept_apart_from_telling(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        started = 1794528928.0
+        self.append(
+            "header_sync",
+            # The node announces the block's header to peer:bbbb before it has the block.
+            trace_row("header_status_sent", 400_000, peer="peer:bbbb", selected_tip_hash=BLOCK_HASH),
+        )
+        self.append("chain_tip", tip_row(1_000_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        self.append("block_sync", trace_row("block_status_sent", 1_002_000, peer="peer:bbbb", height=10))
+        self.append("chain_tip", tip_row(9_500_000, height=12, block_hash="12" * 32))
+        record = follower.poll()[0]
+
+        self.assertEqual(record["peers"]["peer:bbbb"], {"announced": started + 0.4, "told": started + 1.002})
+        # The node's own first telling after its tip is still the block status.
+        self.assertEqual(record["wall"]["told"], started + 1.002)
+
+    def test_a_zakura_peer_is_kept_under_the_label_the_node_writes(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        started = 1794528928.0
+        self.append(
+            "header_sync",
+            trace_row("header_status_received", 800_000, peer="peer:aaaa", selected_tip_hash=BLOCK_HASH),
+            trace_row("header_status_received", 850_000, peer="peer:bbbb", selected_tip_hash=BLOCK_HASH),
+        )
+        self.append("chain_tip", tip_row(1_000_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        self.append(
+            "block_sync",
+            trace_row("block_status_sent", 1_002_000, peer="peer:bbbb", height=10),
+            trace_row("block_status_sent", 1_003_000, peer="peer:cccc", height=10),
+        )
+        self.append("chain_tip", tip_row(9_500_000, height=12, block_hash="12" * 32))
+        record = follower.poll()[0]
+
+        self.assertEqual(record["heard_from"], "peer:aaaa")
+        self.assertEqual(record["wall"]["heard"], started + 0.8)
+        self.assertEqual(record["wall"]["told"], started + 1.002)
+        self.assertEqual(
+            record["peers"],
+            {
+                "peer:aaaa": {"heard": started + 0.8},
+                "peer:bbbb": {"heard": started + 0.85, "told": started + 1.002},
+                "peer:cccc": {"told": started + 1.003},
+            },
+        )
+
+    def test_every_legacy_download_attempt_is_kept_with_its_peer(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        started = 1794528928.0
+        self.append(
+            "legacy_peer_request",
+            # The first peer did not have the block; its address is hidden by the node.
+            trace_row("block_request_finish", 700_000, result="notfound_response", requested_hash=BLOCK_HASH,
+                      peer="v4redacted:8233", user_agent="/MagicBean:6.2.0/", elapsed_ms=250, route="maybe"),
+            trace_row("block_request_finish", 1_000_000, result="available", requested_hash=BLOCK_HASH,
+                      returned_hash=BLOCK_HASH, returned_height=10, peer="192.0.2.7:8233",
+                      user_agent="/Zakura:1.8.7/", elapsed_ms=40, route="advertised"),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(1_010_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+
+        self.assertEqual(
+            record["downloads"],
+            [
+                {"stack": "legacy", "addr": None, "agent": "/MagicBean:6.2.0/", "ms": 250,
+                 "result": "notfound_response", "route": "maybe", "at": started + 0.7},
+                {"stack": "legacy", "addr": "192.0.2.7", "agent": "/Zakura:1.8.7/", "ms": 40,
+                 "result": "available", "route": "advertised", "at": started + 1.0},
+            ],
+        )  # fmt: skip
+        # The failed attempt does not move the block's own download time.
+        self.assertEqual(record["ms"]["body_download"], 40)
+
+    def test_the_first_outside_announcer_is_named_from_its_connection_s_request_rows(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append(
+            "legacy_gossip",
+            trace_row("block_inv_received", 500_000, hash=BLOCK_HASH, connection_id=3),
+            trace_row("block_inv_received", 600_000, hash=BLOCK_HASH, connection_id=4),
+        )  # fmt: skip
+        self.append(
+            "legacy_peer_request",
+            # Connection 3 never served the block, but asking it for hashes wrote its address.
+            trace_row("find_blocks_finish", 100_000, result="block_hashes", connection_id=3,
+                      peer="203.0.113.5:8233", user_agent="/MagicBean:6.2.0/", elapsed_ms=30),
+            trace_row("block_request_finish", 1_000_000, result="available", requested_hash=BLOCK_HASH,
+                      returned_hash=BLOCK_HASH, returned_height=10, connection_id=4,
+                      peer="192.0.2.7:8233", user_agent="/Zakura:1.8.7/", elapsed_ms=40, route="advertised"),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(1_010_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+
+        self.assertIsNone(record["heard_from"])
+        self.assertEqual(record["heard_from_peer"], {"addr": "203.0.113.5", "agent": "/MagicBean:6.2.0/"})
+        # Asking for hashes is not a download of the block.
+        self.assertEqual([download["addr"] for download in record["downloads"]], ["192.0.2.7"])
+
+    def test_an_announcer_whose_connection_wrote_no_request_row_is_not_named(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append("legacy_gossip", trace_row("block_inv_received", 500_000, hash=BLOCK_HASH, connection_id=3))
+        self.append("chain_tip", tip_row(1_010_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+        self.assertNotIn("heard_from_peer", record)
+
+    def test_a_zakura_download_names_the_peer_its_upgrade_row_described(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append(
+            "handshake",
+            trace_row("peer_upgraded", 100_000, peer="peer:aaaa", addr="[::ffff:192.0.2.9]:8233",
+                      user_agent="/Zakura:1.8.6/", direction="outbound"),
+        )  # fmt: skip
+        self.append(
+            "block_sync",
+            trace_row("block_body_received", 950_000, peer="peer:aaaa", height=10, serialized_bytes=1500,
+                      request_elapsed_ms=62),
+            trace_row("block_body_received", 960_000, peer="peer:bbbb", height=10, serialized_bytes=1500),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(1_000_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+
+        known, unknown = record["downloads"]
+        self.assertEqual(
+            {key: known[key] for key in ("stack", "peer", "addr", "agent", "ms", "bytes", "result")},
+            {"stack": "zakura", "peer": "peer:aaaa", "addr": "192.0.2.9", "agent": "/Zakura:1.8.6/", "ms": 62,
+             "bytes": 1500, "result": "available"},
+        )  # fmt: skip
+        # A peer with no upgrade row on record keeps its label and nothing else.
+        self.assertEqual((unknown["peer"], unknown["addr"], unknown["agent"], unknown["ms"]), ("peer:bbbb", None, None, None))
+
+    def test_a_zakura_peer_is_named_only_from_its_own_node_run(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        restarted = "200-1794529928000000000"
+        # The first run recorded who peer:aaaa was; the restarted run has no upgrade row for it.
+        self.append(
+            "handshake",
+            trace_row("peer_upgraded", 100_000, peer="peer:aaaa", addr="192.0.2.9:8233",
+                      user_agent="/Zakura:1.8.6/", direction="outbound"),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(200_000, height=9, block_hash="cd" * 32))
+        follower.poll()
+        self.append(
+            "block_sync",
+            trace_row("block_body_received", 950_000, restarted, peer="peer:aaaa", height=10,
+                      serialized_bytes=1500, request_elapsed_ms=62),
+        )  # fmt: skip
+        self.append(
+            "chain_tip",
+            tip_row(1_000_000, process=restarted),
+            tip_row(9_000_000, height=11, block_hash="ef" * 32, process=restarted),
+        )
+        (record,) = [record for record in follower.poll() if record["height"] == 10]
+
+        (download,) = record["downloads"]
+        self.assertEqual((download["peer"], download["addr"], download["agent"]), ("peer:aaaa", None, None))
+
+    def test_a_peer_address_is_read_in_every_form_the_node_writes(self):
+        self.assertEqual(blocks.canonical_ip("192.0.2.7:8233"), "192.0.2.7")
+        self.assertEqual(blocks.canonical_ip("[2001:db8::7]:8233"), "2001:db8::7")
+        self.assertEqual(blocks.canonical_ip("[::ffff:192.0.2.7]:8233"), "192.0.2.7")
+        for hidden in ("v4redacted:8233", "v6redacted:8233", "isolated", "", None):
+            self.assertIsNone(blocks.canonical_ip(hidden), hidden)
+
+    def test_a_run_whose_start_time_cannot_be_read_has_no_wall_clock_times(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append(
+            "chain_tip",
+            tip_row(1_000_000, process="no-start-time"),
+            tip_row(9_000_000, height=11, block_hash="ef" * 32, process="no-start-time"),
+        )
+        (record,) = follower.poll()
+        self.assertNotIn("wall", record)
+        self.assertIsNone(blocks.process_started("no-start-time"))
+        self.assertEqual(blocks.process_started(NODE_RUN), 1794528928.0)
+
     def test_a_cap_of_zero_never_empties_a_table(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=0)
         self.append("discovery", *[trace_row("peer_seen", index, peer="p" * 40) for index in range(40)])
@@ -935,10 +1193,7 @@ class ApiTests(unittest.TestCase):
         profiler = profiler_module.Profiler(args, store)
         profiler.state = "ok"
         self.queries = profiler_module.Queries(store, profiler)
-        page = Path(__file__).resolve().with_name("page.html")
-        self.server = ThreadingHTTPServer(
-            ("127.0.0.1", 0), profiler_module.make_handler(self.queries, profiler, page)
-        )
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), profiler_module.make_handler(self.queries, profiler))
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -1036,11 +1291,65 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(self.get(path)[0], 400, path)
         self.assertEqual(self.get("/api/nothing")[0], 404)
 
-    def test_page_and_health_are_served(self):
-        code, body = self.get("/")
+    def test_propagation_serves_only_blocks_with_wall_clock_times(self):
+        wall = {"heard": 100.0, "tip": 100.05}
+        self.queries.store.add_block_stages(
+            [{**stage_record(9, "ab" * 32), "wall": wall, "heard_from": "peer:aaaa", "peers": {}, "unnamed": {}}]
+        )
+        self.queries.store.add_blocks([(100.051, 9, "ab" * 32)])
+        code, body = self.get("/api/propagation?limit=50")
         self.assertEqual(code, 200)
-        self.assertIn(b"continuous CPU profile", body)
+        report = json.loads(body)
+        self.assertEqual(report["node"], "test-node")
+        self.assertIn("clock", report)
+        # The three records stored without wall-clock times are left out.
+        (block,) = report["blocks"]
+        self.assertEqual((block["height"], block["wall"], block["heard_from"]), (9, wall, "peer:aaaa"))
+        # The node log's time for the same block, to check the trace clock against.
+        self.assertEqual(block["t"], 100.051)
+        self.assertEqual(self.get("/api/propagation?limit=many")[0], 400)
+
+    def test_peer_addresses_are_served_to_the_cluster_view_only(self):
+        download = {"stack": "legacy", "addr": "192.0.2.7", "agent": "/Zakura:1.8.7/", "ms": 40, "result": "available"}
+        self.queries.store.add_block_stages(
+            [{**stage_record(9, "ab" * 32), "wall": {"tip": 100.05}, "downloads": [download]}]
+        )
+        self.queries.store.add_blocks([(100.051, 9, "ab" * 32)])
+        (block,) = json.loads(self.get("/api/propagation?limit=50")[1])["blocks"]
+        self.assertEqual(block["downloads"], [download])
+        # `/api/blocks` is one of the requests the dashboard passes on to the public.
+        self.assertNotIn(b"192.0.2.7", self.get("/api/blocks?limit=50")[1])
+
+    def test_the_clock_offset_is_read_from_chrony(self):
+        tracking = (
+            "Reference ID    : A9FEA97B (169.254.169.123)\n"
+            "System time     : 0.000040404 seconds slow of NTP time\n"
+            "Last offset     : -0.000011222 seconds\n"
+            "RMS offset      : 0.000243539 seconds\n"
+        )
+        self.assertEqual(profiler_module.parse_clock_offset(tracking), {"offset_ms": -0.04, "rms_ms": 0.244})
+        self.assertEqual(
+            profiler_module.parse_clock_offset(tracking.replace("slow", "fast"))["offset_ms"], 0.04
+        )
+        self.assertIsNone(profiler_module.parse_clock_offset("506 Cannot talk to daemon\n"))
+
+    def test_the_clock_offset_is_read_from_timesyncd_where_there_is_no_chrony(self):
+        status = (
+            "       Server: 2001:db8::40 (ntp.example)\n"
+            "Root distance: 4.417ms (max: 5s)\n"
+            "       Offset: -18us\n"
+            "        Delay: 69.555ms\n"
+            "       Jitter: 496us\n"
+        )
+        self.assertEqual(profiler_module.parse_timesync_offset(status), {"offset_ms": 0.018, "rms_ms": 0.496})
+        self.assertEqual(
+            profiler_module.parse_timesync_offset(status.replace("-18us", "+1.5ms"))["offset_ms"], -1.5
+        )
+        self.assertIsNone(profiler_module.parse_timesync_offset("Failed to query server: unit not found\n"))
+
+    def test_health_is_served_and_the_page_lives_on_the_dashboard(self):
         self.assertEqual(self.get("/healthz"), (200, b"ok\n"))
+        self.assertEqual(self.get("/")[0], 404)
 
 
 if __name__ == "__main__":

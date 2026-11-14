@@ -219,6 +219,11 @@ pub(crate) struct PeerGossipTrace {
 }
 
 impl PeerGossipTrace {
+    /// This connection's process-local number, shared by every trace row about it.
+    pub(crate) fn connection_id(&self) -> u64 {
+        self.connection_id
+    }
+
     /// The peer announced the block `hash` to us.
     ///
     /// Written for the first [`TRACED_ANNOUNCEMENTS_PER_WINDOW`] announcements of each

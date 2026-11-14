@@ -14,6 +14,8 @@ import json
 import os
 import re
 
+from peer_addresses import canonical_ip
+
 ANNOUNCEMENT_MARKER = b"sending block announcement"
 ANNOUNCEMENT = re.compile(
     rb"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z\s.*"
@@ -154,12 +156,41 @@ def announcements(lines):
 TABLE_SUFFIX = ".jsonl"
 MOVED_SUFFIX = ".1"
 TRACE_TABLES = {
-    "header_sync": ("header_request_sent", "header_response_received", "header_target_admitted"),
+    "header_sync": (
+        "header_request_sent", "header_response_received", "header_target_admitted", "header_status_received",
+        "header_status_sent",
+    ),
     "block_sync": ("block_get_blocks_sent", "block_body_received", "block_body_submitted", "block_status_sent"),
-    "legacy_peer_request": ("block_request_finish",),
+    "legacy_peer_request": ("block_request_finish", "find_blocks_finish"),
+    "legacy_gossip": ("block_inv_received", "block_inv_sent", "block_getdata_received", "block_sent"),
+    "handshake": ("peer_upgraded",),
     "commit_state": ("commit_start", "commit_finish"),
     "chain_tip": ("tip_published",),
 }
+# Rows that say a peer and this node exchanged word of a block, and which step each is:
+# the peer told us ("heard"), we announced the block's header to the peer before having
+# the block ("announced"), we told the peer we had the block ("told"), the peer asked us
+# for it ("asked"), or we finished sending it ("sent").
+PEER_STEPS = {
+    "block_inv_received": "heard",
+    "header_status_received": "heard",
+    "block_inv_sent": "told",
+    # A Zakura node announces a new header tip before it has the block, so the first
+    # thing a peer hears of a block is often this header status, not the block status.
+    "header_status_sent": "announced",
+    "block_status_sent": "told",
+    "block_getdata_received": "asked",
+    "block_sent": "sent",
+}
+# A legacy peer the operator named is kept as `name:<name>`; a Zakura peer by the label
+# the node writes for it (`peer:<hash of its node id>`). Other legacy peers are counted.
+NAMED_PEER = "name:"
+MAX_PEERS_PER_BLOCK = 64
+# A block is normally downloaded once; more than this many attempts are not kept.
+MAX_DOWNLOADS_PER_BLOCK = 16
+# Zakura peers, and legacy connections, whose address and software are remembered,
+# newest kept.
+MAX_KNOWN_PEERS = 4096
 # A block's record is closed this long (in the node's clock) after its tip was
 # published, which leaves time for the status messages to its peers to be recorded.
 SETTLE_MICROSECONDS = 3_000_000
@@ -205,6 +236,96 @@ STAGE_BOUNDARIES = {
 }
 
 
+def process_started(process_trace_id):
+    """The unix time a node run's `ts` counts from, read from its trace id, else `None`.
+
+    The id is `<pid>-<start time in nanoseconds>`. On builds where the id and the `ts`
+    origin are one reading of the clock, this plus a row's `ts` is its wall-clock time.
+    """
+    try:
+        return int(str(process_trace_id).rsplit("-", 1)[1]) / 1e9
+    except (IndexError, ValueError):
+        return None
+
+
+def peer_of(row):
+    """Who a peer row is about: a named legacy peer, a Zakura peer label, or `None`."""
+    if isinstance(row.get("peer_name"), str):
+        return NAMED_PEER + row["peer_name"]
+    peer = row.get("peer")
+    return peer if isinstance(peer, str) and peer.startswith("peer:") else None
+
+
+def note_download(seen, download):
+    """Record in `seen`, one block's events, one attempt to download the block."""
+    downloads = seen.setdefault("downloads", [])
+    if len(downloads) < MAX_DOWNLOADS_PER_BLOCK:
+        downloads.append(download)
+
+
+def block_downloads(attempts, started, zakura_peers, process):
+    """Every attempt to download one block, oldest first, as the cluster view reads them.
+
+    Each says which network it used (`stack`), the peer's IP address (`addr`, `None`
+    when the node hides addresses), the software the peer says it runs (`agent`), how
+    long the attempt took (`ms`), how it ended (`result`, "available" when the block
+    arrived) and when it ended (`at`, unix seconds, when the run's start is known). A
+    Zakura peer also has its trace label (`peer`) and the block's size (`bytes`); a
+    legacy one says whether the peer had announced the block (`route`).
+
+    `zakura_peers` is keyed by `(process, label)`: a peer is named only from the upgrade
+    row of the node run that made the download, since a restart can change both the
+    peer behind a connection and whether the node writes addresses.
+    """
+    downloads = []
+    for attempt in sorted(attempts, key=lambda attempt: attempt["when"]):
+        download = {key: value for key, value in attempt.items() if key != "when"}
+        if "peer" in download:
+            # A Zakura row names the peer by label; its upgrade row said who that is.
+            download.update(zakura_peers.get((process, download["peer"]), {"addr": None, "agent": None}))
+        if started is not None:
+            download["at"] = round(started + attempt["when"] / 1e6, 6)
+        downloads.append(download)
+    return downloads
+
+
+def note_peer_step(seen, step, peer, when):
+    """Record in `seen`, one block's events, that `step` happened with `peer` at `when`.
+
+    Keeps the first time per peer and step for peers that can be told apart, counts
+    the announcements of those that cannot, and remembers the earliest "heard" of all.
+    """
+    if step == "heard" and when < seen.get("first_heard", (when + 1,))[0]:
+        seen["first_heard"] = (when, peer)
+    if peer is None:
+        counts = seen.setdefault("unnamed", {})
+        counts[step] = counts.get(step, 0) + 1
+        if step == "told":
+            seen["first_told_unnamed"] = min(when, seen.get("first_told_unnamed", when))
+        return
+    peers = seen.setdefault("peers", {})
+    if peer in peers or len(peers) < MAX_PEERS_PER_BLOCK:
+        steps = peers.setdefault(peer, {})
+        steps[step] = min(when, steps.get(step, when))
+
+
+def remember(known, key, peer):
+    """Keep `peer`'s `{"addr", "agent"}` under `key`, dropping the oldest past the limit."""
+    known.pop(key, None)
+    known[key] = peer
+    while len(known) > MAX_KNOWN_PEERS:
+        del known[next(iter(known))]
+
+
+def merged_peers(*tables):
+    """One `{peer: {step: time}}` table from several that may name the same peers."""
+    merged = {}
+    for peers in tables:
+        for peer, steps in peers.items():
+            merged.setdefault(peer, {}).update(steps)
+    return merged
+
+
 def block_path(events):
     """Which network the block's download was recorded on."""
     if "commit_start" in events:
@@ -242,6 +363,58 @@ def stage_durations(events, queue_us, commit_us, typical_status):
     return stages
 
 
+def cluster_times(events, block):
+    """When one block reached each point on this node, on the wall clock.
+
+    These are the facts another node's record of the same block can be joined to:
+
+    - `wall`: unix seconds at which the node first heard of the block, asked for it,
+      had its bytes, queued it for the writer, published it as its tip and first told a
+      peer. A point that was not recorded is missing.
+    - `heard_from`: the peer it was first heard from, `None` for an unnamed legacy peer.
+    - `peers`: for each peer that can be told apart, when it told us, we announced the
+      block's header to it, we told it we had the block, it asked us and we finished
+      sending.
+    - `unnamed`: how many announcements came from and went to the other legacy peers.
+
+    Empty when the run's start time cannot be read from its trace id.
+    """
+    started = process_started(block["process"])
+    if started is None:
+        return {}
+
+    def wall(node_clock):
+        return None if node_clock is None else round(started + node_clock / 1e6, 6)
+
+    path = block_path(events)
+    if path == PATH_LEGACY:
+        body = events.get("block_request_finish")
+        # The download row is written when it ends and says how long it took.
+        asked = None if body is None else body - round(events.get("download_ms", 0) * 1000)
+    else:
+        asked, body = events.get("block_get_blocks_sent"), events.get("block_body_received")
+    peers = events.get("peers", {})
+    told = [steps["told"] for steps in peers.values() if "told" in steps]
+    told += [when for when in (events.get("first_told_unnamed"),) if when is not None]
+    first_heard = events.get("first_heard", (None, None))
+    points = {
+        "heard": first_heard[0],
+        "asked": asked,
+        "body": body,
+        "queued": block["tip"] - block["queue_us"] - block["commit_us"],
+        "tip": block["tip"],
+        "told": min((when for when in told if when >= block["tip"]), default=None),
+    }
+    return {
+        "wall": {point: wall(when) for point, when in points.items() if when is not None},
+        "heard_from": first_heard[1],
+        "peers": {
+            peer: {step: wall(when) for step, when in steps.items()} for peer, steps in peers.items()
+        },
+        "unnamed": events.get("unnamed", {}),
+    }
+
+
 class BlockStages:
     """Joins trace rows into one record per block that became the node's tip.
 
@@ -256,6 +429,11 @@ class BlockStages:
         self._open = []
         self._latest = 0
         self._process = None
+        # What each Zakura peer's upgrade row said about it, per node run:
+        # `{(process, label): {"addr", "agent"}}`.
+        self._zakura_peers = {}
+        # `{(process, connection_id): {"addr", "agent"}}` of legacy connections.
+        self._connections = {}
 
     def feed(self, row):
         """Take one parsed trace row. Rows may arrive in any order across tables."""
@@ -266,6 +444,38 @@ class BlockStages:
             # A restarted node counts time from zero again.
             self._process, self._latest = row.get("process_trace_id"), when
         self._latest = max(self._latest, when)
+        process = row.get("process_trace_id")
+        if event == "peer_upgraded":
+            if isinstance(row.get("peer"), str):
+                peer = {"addr": canonical_ip(row.get("addr")), "agent": row.get("user_agent")}
+                remember(self._zakura_peers, (process, row["peer"]), peer)
+            return
+        if event in ("block_request_finish", "find_blocks_finish") and type(row.get("connection_id")) is int:
+            # A request row is where a legacy connection's address and software are written;
+            # its announcements carry only the connection's number.
+            peer = {"addr": canonical_ip(row.get("peer")), "agent": row.get("user_agent")}
+            remember(self._connections, (process, row["connection_id"]), peer)
+        if event == "find_blocks_finish":
+            return
+        if event == "block_request_finish" and isinstance(row.get("requested_hash"), str):
+            # Every attempt counts as a download, whether or not the peer had the block.
+            note_download(
+                self._by_hash.setdefault((process, row["requested_hash"]), {}),
+                {
+                    "when": when, "stack": PATH_LEGACY, "addr": canonical_ip(row.get("peer")),
+                    "agent": row.get("user_agent"), "ms": row.get("elapsed_ms"),
+                    "result": row.get("result"), "route": row.get("route"),
+                },
+            )  # fmt: skip
+        if event == "block_body_received" and type(row.get("height")) is int:
+            note_download(
+                self._by_height.setdefault((process, row["height"]), {}),
+                {
+                    "when": when, "stack": PATH_ZAKURA, "peer": row.get("peer"),
+                    "ms": row.get("request_elapsed_ms"), "bytes": row.get("serialized_bytes"),
+                    "result": "available",
+                },
+            )  # fmt: skip
         if event == "block_request_finish" and row.get("result") != "available":
             return
         height = row.get("tip_height", row.get("height", row.get("returned_height")))
@@ -276,11 +486,21 @@ class BlockStages:
             # The request names the tip it is fetching toward at the end of its owner.
             found = HASH_IN_TEXT.findall(str(row.get("request_owner", "")))
             block_hash = found[-1] if found else None
-        process = row.get("process_trace_id")
+        if event in ("header_status_received", "header_status_sent"):
+            # A Zakura header status names the sender's tip, not a block of ours.
+            block_hash, height = row.get("selected_tip_hash"), None
         for key, table in ((block_hash, self._by_hash), (height, self._by_height)):
             if key is None:
                 continue
             seen = table.setdefault((process, key), {})
+            if event in PEER_STEPS:
+                note_peer_step(seen, PEER_STEPS[event], peer_of(row), when)
+                connection = row.get("connection_id")
+                if event == "block_inv_received" and type(connection) is int and peer_of(row) is None:
+                    if when < seen.get("first_inv_unnamed", (when + 1,))[0]:
+                        seen["first_inv_unnamed"] = (when, connection)
+                if event != "block_status_sent":
+                    continue
             if event == "block_status_sent":
                 times = seen.setdefault("status_times", [])
                 if len(times) < MAX_STATUS_TIMES:
@@ -306,6 +526,16 @@ class BlockStages:
                 }
             )
 
+    def _outside_announcer(self, events, process):
+        """`{"heard_from_peer": {"addr", "agent"}}` when an unnamed legacy peer told the node
+        of the block first and the node has written that connection's address; else empty."""
+        first_heard = events.get("first_heard", (None, None))
+        first_inv = events.get("first_inv_unnamed")
+        if first_heard[1] is not None or first_inv is None or first_inv[0] != first_heard[0]:
+            return {}
+        peer = self._connections.get((process, first_inv[1]))
+        return {} if peer is None else {"heard_from_peer": dict(peer)}
+
     def finished(self):
         """The records of blocks whose tip was published long enough ago to be complete."""
         done, still_open = [], []
@@ -314,10 +544,14 @@ class BlockStages:
             if same_run and self._latest - block["tip"] < SETTLE_MICROSECONDS:
                 still_open.append(block)
                 continue
-            events = {
-                **self._by_height.get((block["process"], block["height"]), {}),
-                **self._by_hash.get((block["process"], block["hash"]), {}),
-            }
+            by_height = self._by_height.get((block["process"], block["height"]), {})
+            by_hash = self._by_hash.get((block["process"], block["hash"]), {})
+            events = {**by_height, **by_hash}
+            # Zakura status rows name a height and announcements a hash, so what a block
+            # exchanged with one peer can be split across the two.
+            events["peers"] = merged_peers(by_height.get("peers", {}), by_hash.get("peers", {}))
+            # A legacy download names the block by hash and a Zakura one by height.
+            attempts = by_height.get("downloads", []) + by_hash.get("downloads", [])
             # The status messages of this block's fan-out, soonest first.
             told = sorted(
                 when
@@ -331,6 +565,11 @@ class BlockStages:
                     "process": block["process"],
                     "tip_us": block["tip"],
                     "reorg": block["reorg"],
+                    **cluster_times(events, block),
+                    **self._outside_announcer(events, block["process"]),
+                    "downloads": block_downloads(
+                        attempts, process_started(block["process"]), self._zakura_peers, block["process"]
+                    ),
                     "path": block_path(events),
                     "size": events.get("size"),
                     "status_peers": len(told),

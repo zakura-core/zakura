@@ -2,8 +2,8 @@
 
 `zakura_profiler.py` runs beside a `zakurad` node, samples where the node spends
 its CPU time all day, and serves flame graphs of it. The cluster status
-dashboard links to it: a node with a profiler shows a "profiled" badge that
-opens `/profile/<node>`.
+dashboard shows them in the "CPU profile" section of the node's page,
+`/node/<node>#profile`; the fleet table marks such a node "profiled".
 
 It runs on every mainnet node that has a `profiler_url` in the deploy workflow's
 node list: the regional nodes and `archive-vct-off`.
@@ -31,8 +31,29 @@ trace tables (`trace_dir` under `[network.zakura]` in its config), the profiler
 also reads how long each block spent in each stage: download, verification,
 the wait for the state writer, the commit, and telling Zakura peers about the
 new tip. This includes waiting. Blocks that arrive over the legacy Zcash
-network have no header stages, and there is no trace point between the new tip
-and the hand-off to legacy gossip.
+network have no header stages.
+
+**A block's path between nodes.** For each block the profiler also keeps the
+wall-clock time at which the node first heard of it, asked for it, had its
+bytes, finished verifying it, made it the tip and told its peers, and what it
+exchanged with each peer it can tell apart: a Zakura peer by the label the
+trace rows carry for its node id, a legacy peer by the name the node was given
+for its address (`peer-names` below). It serves these records at
+`/api/propagation`, with the node's clock offset as chrony or
+systemd-timesyncd reports it. The
+status dashboard reads them from every node and joins them into the block
+propagation page (`deploy/runner/README.md`). That request is for the
+dashboard only and is not among those it passes through to the public.
+
+**Who served each block.** Each record also lists the node's attempts to
+download the block, up to 16: the network stack, how long the attempt took,
+how it ended, and the peer's software as its handshake gave it. Legacy attempts
+include failures; Zakura attempts currently include only received bodies. A
+whole-range unavailable event is not evidence that every body in it failed.
+When the node writes peer addresses (`expose_peer_addresses`, below) an attempt also has the
+peer's IP address; otherwise the address is absent. These addresses are every
+peer's, with nothing left out, which is why `/api/propagation` is not passed
+through: the dashboard drops the private ones when it joins the nodes.
 
 ## Staying out of the node's way
 
@@ -55,15 +76,15 @@ or arrange separate retention: stopping the profiler does not stop trace writes.
 
 | Path on the node | Contents |
 | --- | --- |
-| `/opt/zakura-profiler/` | `zakura_profiler.py`, `stacks.py`, `blocks.py`, `page.html` |
+| `/opt/zakura-profiler/` | `zakura_profiler.py`, `stacks.py`, `blocks.py`, `peer_addresses.py` |
 | `/etc/systemd/system/zakura-profiler.service` | the unit, with the resource limits |
 | `/etc/systemd/system/zakura-profiler.service.d/node.conf` | this node's name, log file and trace directory |
 | `/mnt/data/zakura-profiler/` | one file per minute for 48 hours, one per hour for 14 days, capped at 2 GiB |
-| `/run/zakura-profiler/` | scratch space in memory for the window being sampled |
+| `/run/zakura-profiler/` | scratch space in memory for sampled windows, 512 MiB at most in all |
 
 The service listens on `127.0.0.1:8097`. The dashboard reaches it through the
-node's `monitor.profiler_url` setting and serves it publicly, rate limited, at
-`/profile/<node>`.
+node's `monitor.profiler_url` setting and forwards the node page's requests to it,
+rate limited, under `/profile/<node>/api/`. The profiler serves no page of its own.
 
 The node never rotates its trace tables. Given `--trace-dir`, the profiler
 renames any table in that directory that grows past `--trace-table-cap-mb`
@@ -99,12 +120,18 @@ monitor    = { profiler_url = "http://127.0.0.1:8100" }
 ```
 
 The mainnet deploy workflow prepares each node before deploying its binary and
-installs the tunnels afterwards. The commands are safe to repeat; the two node
+installs the tunnels afterwards. The commands are safe to repeat; the three node
 commands accept `--node NAME` to act on one node.
 
 ```bash
 # Before the node restarts: install retention, then enable trace writes.
-python3 deploy/profiler/fleet.py ensure-trace-config --config nodes.toml
+sudo -n cat /etc/zakura-mainnet-dashboard/private/addresses.json \
+  | python3 deploy/profiler/fleet.py ensure-trace-config --config nodes.toml \
+      --private-addresses -
+# Before the node restarts: tell it the other nodes' names, except private ones.
+sudo -n cat /etc/zakura-mainnet-dashboard/private/addresses.json \
+  | python3 deploy/profiler/fleet.py peer-names --config nodes.toml \
+      --private-addresses -
 # To refresh the profiler alone, without changing the node's config:
 python3 deploy/profiler/fleet.py install --config nodes.toml
 # On the dashboard host: one SSH tunnel per node on another host.
@@ -115,10 +142,13 @@ python3 deploy/profiler/fleet.py tunnels --config nodes.toml
 command line, installs the profiler, and verifies its trace-retention worker is
 running with the expected directory and cap. Only then does it add
 `trace_dir = "/mnt/data/zakura-traces"` under
-`[network.zakura]` when the config sets no `trace_dir`. It changes nothing else,
+`[network.zakura]` when the config sets no `trace_dir`, and
+`expose_peer_addresses = true` under `[network]` when the config does not set
+it. It changes nothing else,
 keeps the first original as `<config>.before-trace-dir`, and does not restart
-the node: the setting takes effect when the node next starts. A config that
-already names a trace directory is left as it is.
+the node: the settings take effect when the node next starts. A config that
+already names a trace directory keeps it, and one that sets
+`expose_peer_addresses = false` keeps that and is reported.
 The node replaces its config only after checking that the new text arrived
 whole, so a connection that drops mid-write leaves the config as it was.
 An installation or readiness failure leaves a node without tracing unchanged.
@@ -137,6 +167,20 @@ touch /mnt/data/zakura-traces/.zakura-profiler-managed
 
 Without it the profiler on `us-east-0` reads that directory with a cap of 0 and
 its trace files grow without limit.
+
+With `expose_peer_addresses` on, the node writes its peers' real addresses,
+where it wrote `v4redacted` before, in two places on its own disk: its log
+file and its trace files. Both are readable by root only. Nothing else on the
+node changes, and no address leaves the node except through the profiler's
+`/api/propagation`, which only the dashboard host can reach.
+
+**`peer-names`** writes `network.zakura.trace_peer_names` in the node config
+using the address each other node is reached at over SSH. Existing explicit
+mappings are preserved. The node writes that name in trace rows for a legacy
+peer connecting from it. Names take effect when the node next starts; this
+command does not restart it. Peers on the private address list are excluded
+from generated mappings, and nothing is written when that list cannot be read.
+After verifying the config, the command removes the obsolete systemd override.
 
 **`install`** needs `perf` on the node (the `linux-tools` package) and installs
 `binutils` when `c++filt` is missing. It writes the node's own name, log file
@@ -159,7 +203,7 @@ To install by hand on one host instead:
 
 ```bash
 install -d /opt/zakura-profiler
-install -m 644 zakura_profiler.py stacks.py blocks.py page.html /opt/zakura-profiler/
+install -m 644 zakura_profiler.py stacks.py blocks.py peer_addresses.py /opt/zakura-profiler/
 install -m 644 zakura-profiler.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now zakura-profiler

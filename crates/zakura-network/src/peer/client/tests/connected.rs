@@ -125,6 +125,7 @@ impl ConnectedClient {
             request_slot,
             peer_registry_updater: None,
             connection_info,
+            connection_id: 0,
             shutdown_tx: Some(shutdown_tx),
             server_tx,
             block_advert_tx,

@@ -9,6 +9,7 @@ import json
 import io
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -25,6 +26,8 @@ from unittest import mock
 
 
 SCRIPT_PATH = Path(__file__).with_name("zakura-cluster-status.py")
+# The dashboard imports its sibling modules, as it does when run as a script.
+sys.path.insert(0, str(SCRIPT_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("zakura_cluster_status", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 status = importlib.util.module_from_spec(SPEC)
@@ -506,12 +509,14 @@ zcash_net_in_bytes_total 12345
 
         self.assertEqual(probe["host"]["oom_kills_24h"], 0)
 
-    def test_oom_kills_are_counted_by_line(self):
+    def test_oom_kills_are_counted_once_per_killed_process(self):
+        # Two kills, each logged twice, as a cgroup kill and a repeated journal line.
+        kill = "Memory cgroup out of memory: Killed process {} (perf) total-vm:1kB\\n"
         with contextlib.ExitStack() as stack:
             env = self.stub_journalctl(
                 stack,
                 exit_code=0,
-                stdout="oom-kill: one\\noom-kill: two\\n",
+                stdout=(kill.format(4101) * 2) + (kill.format(4202) * 2),
             )
             probe = self.run_probe(env=env)
 
@@ -1384,7 +1389,11 @@ class DashboardPasswordTests(unittest.TestCase):
         self.assertNotEqual(body, status.PAGE.encode())
         code, _, body = self.get("/node/linux-reference")
         self.assertIn(b'action="/login"', body)
-        for path in ("/data", "/data/node/linux-reference", "/profile/linux-reference/api/status"):
+        # The propagation page lists outside peers' addresses, so it is gated like the rest.
+        code, _, body = self.get("/propagation")
+        self.assertIn(b'action="/login"', body)
+        for path in ("/data", "/data/node/linux-reference", "/profile/linux-reference/api/status",
+                     "/propagation/data"):
             code, _, body = self.get(path)
             self.assertEqual(code, 401, path)
             self.assertEqual(json.loads(body), {"error": "login required"})
@@ -1468,12 +1477,13 @@ class DashboardLoginConfigTests(unittest.TestCase):
     def test_env_without_hash_disables_the_gate(self):
         self.assertIsNone(status.dashboard_login_from_env({}))
 
-    def test_env_hash_gets_a_fresh_signing_key_per_start(self):
+    def test_login_survives_a_restart_until_the_password_changes(self):
         env = {"ZAKURA_DASHBOARD_PASSWORD_HASH": status.hash_password("pw", iterations=1000)}
-        first = status.dashboard_login_from_env(env)
-        second = status.dashboard_login_from_env(env)
-        self.assertNotEqual(first.session_secret, second.session_secret)
-        self.assertFalse(second.token_valid(first.issue_token(time.time()), time.time()))
+        token = status.dashboard_login_from_env(env).issue_token(time.time())
+        restarted = status.dashboard_login_from_env(env)
+        self.assertTrue(restarted.token_valid(token, time.time()))
+        new_password = {"ZAKURA_DASHBOARD_PASSWORD_HASH": status.hash_password("new", iterations=1000)}
+        self.assertFalse(status.dashboard_login_from_env(new_password).token_valid(token, time.time()))
 
     def test_env_with_a_non_hash_refuses_to_start(self):
         with self.assertRaises(ValueError):
@@ -1815,12 +1825,48 @@ class ProfilerRouteTests(unittest.TestCase):
             with error:
                 return error.code, error.read(), error.headers
 
-    def test_profile_page_comes_from_the_nodes_profiler_and_is_never_cached(self):
+    def test_the_old_profile_page_address_opens_the_node_pages_profile(self):
         code, body, headers = self.fetch("/profile/profiled")
         self.assertEqual(code, 200)
-        self.assertIn(b"<title>profile</title>", body)
         self.assertIn("no-store", headers["Cache-Control"])
-        self.assertEqual(StubProfiler.requests, ["/"])
+        self.assertIn(b'href="/node/profiled#profile"', body)
+        self.assertEqual(StubProfiler.requests, [])
+
+    @unittest.skipUnless(shutil.which("node"), "needs node to run the page's JavaScript")
+    def test_a_saved_profile_link_keeps_its_view_on_the_node_page(self):
+        # A link saved from the old page carries its view in the fragment, which only
+        # the browser sees: the redirect page moves it, and the profile reads it back.
+        old_view = "#from=1700000000&to=1700000600&view=verification&lens=block&focus=zakura%3A%3Averify"
+        redirect = re.search(r"<script>(.*?)</script>", status.profile_redirect_page("profiled").decode()).group(1)
+        read_hash = re.search(r"function readHash\(\) \{.*?\n\}", status.PAGE, re.S).group(0)
+        script = f"""
+            const location = {{ hash: {json.dumps(old_view)}, replace(url) {{ this.next = url; }} }};
+            {redirect}
+            location.hash = location.next.slice(location.next.indexOf("#"));
+            const state = {{}};
+            {read_hash}
+            readHash();
+            console.log(JSON.stringify({{ url: location.next, state }}));
+        """
+        result = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout)
+        self.assertTrue(result["url"].startswith("/node/profiled#profile&"))
+        self.assertEqual(result["state"], {
+            "from": 1700000000, "to": 1700000600, "view": "verification", "lens": "block", "focus": "zakura::verify",
+        })
+
+    def test_every_profile_button_the_click_handler_names_is_on_the_page(self):
+        names = set(re.findall(r'button\.id === "([^"]+)"', status.PAGE))
+        self.assertEqual(names, {"pf-live", "pf-focus-fn", "pf-zoom-out", "pf-stage-median"})
+        for name in names:
+            self.assertIn(f'<button id="{name}"', status.PAGE)
+
+    def test_the_node_page_holds_the_cpu_profile_and_a_jump_bar(self):
+        code, body, _ = self.fetch("/node/profiled")
+        self.assertEqual(code, 200)
+        self.assertIn(b'id="node-nav"', body)
+        self.assertIn(b'<section class="pf" id="profile"', body)
+        # The profile reads the forwarder, never a page of the profiler's own.
+        self.assertIn(b'const BASE = "/profile/" + encodeURIComponent(node);', body)
 
     def test_profile_data_forwards_only_the_parameters_each_request_accepts(self):
         code, body, _ = self.fetch(
@@ -1838,6 +1884,9 @@ class ProfilerRouteTests(unittest.TestCase):
             "/profile/plain",
             "/profile/plain/api/status",
             "/profile/profiled/api/shutdown",
+            # The profiler's block records name peers by address before any is dropped.
+            "/profile/profiled/api/propagation",
+            "/profile/profiled/api/propagation?limit=5",
             "/profile/profiled/anything",
             "/profile/profiled/api/",
         ):
@@ -1848,9 +1897,6 @@ class ProfilerRouteTests(unittest.TestCase):
         self.profiler.shutdown()
         self.profiler.server_close()
         self.assertEqual(self.fetch("/profile/profiled/api/status")[0], 502)
-        code, body, _ = self.fetch("/profile/profiled")
-        self.assertEqual(code, 502)
-        self.assertIn(b"not answering", body)
         self.assertEqual(status.profiler_summary(self.profiler_url), {"state": "unreachable"})
         # Reopen so tearDown can close it like any other test.
         self.profiler = status.ThreadingHTTPServer(("127.0.0.1", 0), StubProfiler)
@@ -1873,10 +1919,11 @@ class ProfilerRouteTests(unittest.TestCase):
         )
         self.assertNotIn("profiler", rows["plain"])
 
-    def test_page_links_a_profiled_node_to_its_flame_graph(self):
+    def test_page_links_a_profiled_node_to_its_cpu_profile_section(self):
         self.assertIn("function profilerBadge(row)", status.PAGE)
         self.assertIn('<a class="node-link badge tone-', status.PAGE)
-        self.assertIn("href=\"/profile/'", status.PAGE)
+        self.assertIn("href=\"/node/'", status.PAGE)
+        self.assertIn("'#profile\" title=\"'", status.PAGE)
 
     def test_profiler_url_is_read_from_the_monitor_table(self):
         template = (
@@ -1954,6 +2001,207 @@ def nu7_rows(**overrides):
     rows.update(overrides)
     return list(rows.values())
 
+
+
+class PropagationRouteTests(unittest.TestCase):
+    """The cluster view against stand-in profilers that each report one block."""
+
+    BLOCK = "ab" * 32
+    # Documentation addresses: a peer outside the fleet, and one that must stay private.
+    OUTSIDE = "198.51.100.9"
+    PRIVATE = "192.0.2.17"
+
+    def setUp(self):
+        import propagation
+
+        self.asked = []
+        # What each stand-in profiler says its node downloaded the block from.
+        self.downloads = {}
+        self.original = (status.PROPAGATION, status.RATE_LIMITER, status.fetch_profiler)
+        heard_first, heard_later = node("heard-first"), node("heard-later")
+        down, plain = node("down"), node("plain")
+        heard_first.profiler_url, heard_later.profiler_url, down.profiler_url = "first", "later", "down"
+        status.fetch_profiler = self.fake_profiler
+        status.PROPAGATION = status.PropagationView([heard_first, heard_later, down, plain], propagation.join)
+        status.RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), status.Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        status.PROPAGATION, status.RATE_LIMITER, status.fetch_profiler = self.original
+
+    def fake_profiler(self, profiler_url, path, timeout):
+        self.asked.append((profiler_url, path))
+        if profiler_url == "down":
+            return 502, b"", "text/plain"
+        tip = 1_794_000_000.0 + (0.05 if profiler_url == "first" else 0.25)
+        block = {
+            "hash": self.BLOCK, "height": 7, "path": "legacy", "t": tip, "wall": {"tip": tip}, "peers": {},
+            "downloads": self.downloads.get(profiler_url, []),
+        }
+        return 200, json.dumps({"node": profiler_url, "clock": None, "blocks": [block]}).encode(), "application/json"
+
+    def fetch(self, path):
+        try:
+            with urllib.request.urlopen(self.base_url + path) as response:
+                return response.status, response.read(), response.headers
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, error.read(), error.headers
+
+    def test_the_data_joins_every_profiled_node_s_report_of_a_block(self):
+        code, body, headers = self.fetch("/propagation/data")
+        self.assertEqual((code, headers["Cache-Control"]), (200, status.NO_STORE["Cache-Control"]))
+        joined = json.loads(body)
+        self.assertEqual(joined["nodes"], ["heard-first", "heard-later", "down"])
+        self.assertEqual(joined["unreachable"], ["down"])
+        (block,) = joined["blocks"]
+        self.assertEqual((block["hash"], block["first_node"], block["spread_ms"]), (self.BLOCK, "heard-first", 200.0))
+
+    @staticmethod
+    def download(addr, ms=420, agent="/Zakura:1.8.7/"):
+        return {"stack": "legacy", "addr": addr, "agent": agent, "ms": ms, "result": "available", "route": "ready"}
+
+    def test_a_download_names_an_outside_peer_and_a_fleet_node(self):
+        self.downloads = {
+            "first": [self.download(self.OUTSIDE)],
+            # `heard-first` is reached at this address, so the peer is one of ours.
+            "later": [self.download("203.0.113.5", ms=30)],
+        }
+        status.PROPAGATION.fleet_addresses = {"203.0.113.5": "heard-first"}
+        joined = json.loads(self.fetch("/propagation/data")[1])
+        (peer,) = joined["outside_peers"]
+        self.assertEqual((peer["ip"], peer["agent"], peer["nodes"]), (self.OUTSIDE, "/Zakura:1.8.7/", ["heard-first"]))
+        slowest, fastest = joined["slowest_downloads"]
+        self.assertEqual((slowest["node"], slowest["kind"], slowest["ip"], slowest["ms"]),
+                         ("heard-first", "outside", self.OUTSIDE, 420))
+        self.assertEqual((fastest["node"], fastest["kind"], fastest["name"]), ("heard-later", "fleet", "heard-first"))
+        self.assertNotIn("203.0.113.5", json.dumps(joined))
+
+    def test_every_node_in_the_list_is_one_of_ours_by_its_address(self):
+        named = [node("with-profiler"), node("without")]
+        named[0].ssh_string, named[1].ssh_string = "root@203.0.113.5", "deploy@[2001:db8::7]:22"
+        named[0].profiler_url = "first"
+        view = status.PropagationView(named, None)
+        self.assertEqual(view.fleet_addresses, {"203.0.113.5": "with-profiler", "2001:db8::7": "without"})
+
+    def test_a_peer_made_private_is_not_served_from_the_cached_view(self):
+        private_agent = "/Zakura:9.9.9-private/"
+        self.downloads = {"first": [self.download(self.PRIVATE, agent=private_agent)]}
+        with mock.patch.object(status, "private_addresses", return_value=frozenset()):
+            self.assertIn(private_agent.encode(), self.fetch("/propagation/data")[1])
+        protected = frozenset({status.address_key(self.PRIVATE)})
+        with mock.patch.object(status, "private_addresses", return_value=protected):
+            body = self.fetch("/propagation/data")[1]
+        self.assertNotIn(private_agent.encode(), body)
+        self.assertEqual(json.loads(body)["outside_peers"], [])
+
+    def test_a_queued_request_reads_the_private_list_after_acquiring_the_cache(self):
+        private_agent = "/Zakura:9.9.9-private/"
+        self.downloads = {"first": [self.download(self.PRIVATE, agent=private_agent)]}
+        view = status.PROPAGATION
+        queued = threading.Event()
+        lock = threading.Lock()
+
+        class QueuedLock:
+            def __enter__(self):
+                queued.set()
+                lock.acquire()
+
+            def __exit__(self, *args):
+                lock.release()
+
+        view._lock = QueuedLock()
+        protected = frozenset()
+        result = []
+        with mock.patch.object(status, "private_addresses", side_effect=lambda: protected):
+            with lock:
+                worker = threading.Thread(target=lambda: result.append(view.data()), daemon=True)
+                worker.start()
+                self.assertTrue(queued.wait(2), "the request must reach the busy cache")
+                protected = frozenset({status.address_key(self.PRIVATE)})
+            worker.join(2)
+        self.assertFalse(worker.is_alive(), "the queued request must finish")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["outside_peers"], [])
+        self.assertNotIn(private_agent, json.dumps(result[0]))
+
+    def test_a_private_peer_s_address_and_software_are_never_served(self):
+        private_agent = "/Zakura:9.9.9-private/"
+        self.downloads = {
+            "first": [
+                self.download(self.PRIVATE, ms=900, agent=private_agent),
+                self.download(f"{self.PRIVATE}:8233", ms=800, agent=private_agent),
+                self.download(f"::ffff:{self.PRIVATE}", ms=700, agent=private_agent),
+                self.download(f"[::ffff:{self.PRIVATE}]:8233", ms=600, agent=private_agent),
+            ],
+            "later": [self.download(self.OUTSIDE)],
+        }
+        protected = frozenset({status.address_key(self.PRIVATE)})
+        with mock.patch.object(status, "private_addresses", return_value=protected):
+            code, body, _ = self.fetch("/propagation/data")
+        self.assertEqual(code, 200)
+        for secret in (self.PRIVATE.encode(), b"9.9.9-private", b"redacted-address"):
+            self.assertNotIn(secret, body)
+        joined = json.loads(body)
+        self.assertEqual([peer["ip"] for peer in joined["outside_peers"]], [self.OUTSIDE])
+        # The node's slow downloads are still shown, without saying who served them.
+        private = [d for d in joined["slowest_downloads"] if d["node"] == "heard-first"]
+        self.assertEqual([(d["kind"], d["ms"]) for d in private],
+                         [("private", 900), ("private", 800), ("private", 700), ("private", 600)])
+        self.assertTrue(all("ip" not in d and "agent" not in d for d in private))
+
+    def test_nothing_is_served_when_the_private_addresses_cannot_be_read(self):
+        self.downloads = {"first": [self.download(self.PRIVATE)]}
+        for failure in (ValueError("private address configuration required"), OSError("unreadable")):
+            with mock.patch.object(status, "private_addresses", side_effect=failure):
+                code, body, _ = self.fetch("/propagation/data")
+            self.assertEqual((code, json.loads(body)), (503, {"error": "privacy configuration unavailable"}))
+            self.assertNotIn(self.PRIVATE.encode(), body)
+        self.assertEqual(self.asked, [])
+
+    def test_profilers_are_asked_once_for_requests_close_together(self):
+        self.fetch("/propagation/data")
+        self.fetch("/propagation/data")
+        self.assertEqual(
+            sorted(self.asked),
+            [(url, f"/api/propagation?limit={status.PROPAGATION_BLOCKS}") for url in ("down", "first", "later")],
+        )
+
+    def test_the_page_is_served_and_asks_for_that_data(self):
+        code, body, headers = self.fetch("/propagation")
+        self.assertEqual((code, headers["Content-Type"]), (200, "text/html; charset=utf-8"))
+        self.assertIn(b'fetch("/propagation/data"', body)
+        # A selected block is named in the page address, so it can be linked to.
+        self.assertIn(b'"#block=" + hash', body)
+        # The downloads each node made: the slowest ones, and the outside peers that served them.
+        for part in (b'<table id="slowest">', b'<table id="outside">', b'"private peer"'):
+            self.assertIn(part, body)
+        # zcashd is shown by that name, not by the "MagicBean" it sends when connecting.
+        self.assertIn(b'.replace("MagicBean", "zcashd")', body)
+        self.assertIn("kvRow(peerSoftwareName(entry[0]), num(entry[1]))", status.PAGE)
+        # A node's name on the page leads to that node's own page.
+        self.assertIn(b'"/node/" + encodeURIComponent(name)', body)
+        self.assertIn(b'"Legacy failures"', body)
+        self.assertIn(b'every profiled node had the tip', body)
+        self.assertNotIn(b'every node had the tip', body)
+
+    def test_other_paths_and_a_dashboard_without_profilers_have_no_cluster_view(self):
+        self.assertEqual(self.fetch("/propagation/other")[0], 404)
+        status.PROPAGATION = None
+        self.assertEqual(self.fetch("/propagation/data")[0], 404)
+
+    def test_the_cluster_view_shares_the_public_rate_limit(self):
+        status.RATE_LIMITER = status.RateLimiter(limit=1, window=60)
+        self.assertEqual(self.fetch("/propagation/data")[0], 200)
+        self.assertEqual(self.fetch("/propagation")[0], 429)
+
+    def test_the_fleet_page_links_to_the_cluster_view(self):
+        self.assertIn('id="propagation-link" href="/propagation" hidden', status.PAGE)
+        self.assertIn("el('propagation-link').hidden = !profiled;", status.PAGE)
 
 class Nu7StatusTests(unittest.TestCase):
     def setUp(self):

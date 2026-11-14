@@ -1,0 +1,741 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zakura block propagation</title>
+<style>
+/* Theme values match the cluster status dashboard, which links here. */
+:root {
+  color-scheme: dark;
+  --void: #07060e; --base: #0d0b16; --surface: #12101d; --raised: #191627;
+  --line: #221f33; --line-hi: #322d49;
+  --ink: #ebe8f7; --ink-2: #b6b0d0; --muted: #837ca0; --dim: #4f4870;
+  --pink: #c2457a; --pink-hi: #e8709f; --pink-soft: rgba(194, 69, 122, 0.12);
+  --warn: #efc255; --warn-soft: rgba(239, 194, 85, 0.10); --warn-line: rgba(239, 194, 85, 0.32);
+  --r-lg: 16px; --r-md: 12px; --r-sm: 8px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  /* One colour per thing a node does with a block, in the order it does them. Five
+     hues checked for colour-blind separation on --surface. */
+  --c-wait_to_ask: #3987e5; --c-download: #d95926; --c-verify: #199e70;
+  --c-commit: #c98500; --c-tell_peers: #d55181;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  margin: 0; background: var(--base); color: var(--ink);
+  font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  padding: 20px max(16px, env(safe-area-inset-right)) 56px max(16px, env(safe-area-inset-left));
+}
+main { max-width: 1320px; margin: 0 auto; display: grid; gap: 16px; }
+a { color: var(--pink-hi); text-decoration: none; }
+a:hover { text-decoration: underline; }
+h1 { font-size: 24px; line-height: 1.2; margin: 0; letter-spacing: -0.01em; }
+h2 { font-size: 16px; margin: 0; }
+p { margin: 0; }
+.mono { font-family: var(--mono); }
+a.node-link { color: inherit; border-radius: 4px; }
+a.node-link:hover { color: var(--pink-hi); text-decoration: underline; }
+a.node-link:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
+.eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.note { color: var(--muted); font-size: 13px; max-width: 96ch; }
+header.top { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: flex-end; justify-content: space-between; }
+header.top .title { display: grid; gap: 4px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 16px; display: grid; gap: 12px; min-width: 0; }
+.panel > header { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: baseline; justify-content: space-between; }
+.badge { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line-hi); border-radius: 999px; padding: 1px 9px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+.badge.tone-warn { border-color: var(--warn-line); background: var(--warn-soft); color: var(--warn); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.tile { background: var(--raised); border: 1px solid var(--line); border-radius: var(--r-md); padding: 10px 12px; display: grid; gap: 2px; }
+.tile b { font-family: var(--mono); font-size: 19px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.tile span { color: var(--muted); font-size: 12px; }
+button {
+  font: inherit; font-size: 13px; color: var(--ink-2); background: var(--raised); cursor: pointer;
+  border: 1px solid var(--line-hi); border-radius: var(--r-sm); padding: 4px 10px;
+}
+button:hover { color: var(--ink); border-color: var(--muted); }
+button[aria-pressed="true"] { color: var(--ink); border-color: var(--pink); background: var(--pink-soft); }
+button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
+.swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: none; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); align-items: center; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend svg { flex: none; }
+.chart { overflow-x: auto; min-width: 0; position: relative; }
+.scroll { overflow: auto; max-height: 420px; min-width: 0; }
+svg { display: block; }
+svg text { font-family: var(--mono); font-size: 11px; fill: var(--muted); }
+svg text.node { fill: var(--ink-2); font-family: inherit; font-size: 13px; }
+svg text.value { fill: var(--ink); }
+svg a:hover text.node, svg a:focus text.node { fill: var(--pink-hi); text-decoration: underline; }
+svg a:focus { outline: none; }
+svg .grid { stroke: var(--line); stroke-width: 1; }
+svg .track { stroke: var(--line-hi); stroke-width: 1; }
+svg .hop { stroke: var(--ink-2); stroke-width: 1.5; fill: none; opacity: 0.75; }
+svg .hop.inferred { stroke-dasharray: 4 3; }
+svg .hop.other { stroke: var(--muted); stroke-width: 1; opacity: 0.45; }
+svg .tip { fill: var(--ink); stroke: var(--surface); stroke-width: 2; }
+svg rect.hit { fill: transparent; }
+svg rect.hit:hover, svg rect.hit:focus { fill: var(--pink-soft); outline: none; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; white-space: nowrap; }
+th { font-weight: 600; color: var(--muted); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; position: sticky; top: 0; background: var(--surface); }
+th.num, td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+th.num { font-family: inherit; }
+th button.sort { all: inherit; display: inline; padding: 0; border: 0; background: none; cursor: pointer; }
+th button.sort:hover, th button.sort.active { color: var(--ink); }
+th button.sort:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
+td .quiet { color: var(--muted); }
+td.wrap { white-space: normal; min-width: 200px; max-width: 360px; }
+#blocks td button { all: unset; cursor: pointer; color: var(--pink-hi); font-family: var(--mono); }
+#blocks td button:hover { text-decoration: underline; }
+#blocks td button:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
+#blocks tbody tr, #slowest tbody tr { cursor: pointer; }
+#blocks tbody tr:hover td, #slowest tbody tr:hover td { background: var(--raised); }
+#blocks tr[aria-selected="true"] td, #slowest tr[aria-selected="true"] td { background: var(--pink-soft); }
+#slowest td button { all: unset; cursor: pointer; color: var(--pink-hi); font-family: var(--mono); }
+#slowest td button:hover { text-decoration: underline; }
+#slowest td button:focus-visible { outline: 2px solid var(--pink-hi); outline-offset: 2px; }
+.bar { height: 6px; border-radius: 3px; min-width: 2px; background: var(--c-wait_to_ask); }
+.tooltip {
+  position: fixed; z-index: 5; pointer-events: none; background: var(--raised); border: 1px solid var(--line-hi);
+  border-radius: var(--r-sm); padding: 8px 10px; font-size: 12px; display: grid; gap: 4px; max-width: 320px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+.tooltip .head { color: var(--ink); font-weight: 600; }
+.tooltip .row { display: grid; grid-template-columns: 14px auto 1fr; gap: 8px; align-items: center; color: var(--ink-2); }
+.tooltip .row b { font-family: var(--mono); font-weight: 500; color: var(--ink); font-variant-numeric: tabular-nums; }
+.tooltip .key { width: 14px; height: 3px; border-radius: 2px; }
+.stale { opacity: 0.55; }
+</style>
+</head>
+<body>
+<main>
+  <header class="top">
+    <div class="title">
+      <span class="eyebrow">Zakura mainnet fleet</span>
+      <h1>Block propagation</h1>
+      <p class="note">How each block travelled between our nodes and where it spent time on each one. Every
+        time is in milliseconds after the first of our nodes heard of the block.</p>
+    </div>
+    <div class="legend">
+      <span id="updated" class="badge">loading</span>
+      <span id="unreachable" class="badge tone-warn" hidden></span>
+      <a href="/">Fleet status</a>
+    </div>
+  </header>
+
+  <section class="tiles" id="tiles" aria-label="Summary of the blocks shown"></section>
+
+  <section class="panel" id="block-panel">
+    <header>
+      <h2 id="block-title">Block</h2>
+      <div class="legend" id="legend"></div>
+    </header>
+    <p class="note" id="block-note"></p>
+    <div class="chart" id="chart"><svg id="waterfall" role="img" aria-labelledby="block-title"></svg></div>
+    <div class="legend">
+      <button id="all-hops" type="button" aria-pressed="false">Show every announcement between our nodes</button>
+      <span class="note">Arrows show which of our nodes each node first heard the block from; a dashed
+        arrow is one the sending node did not record.</span>
+    </div>
+    <div class="scroll"><table id="block-nodes" aria-label="The selected block on each node"></table></div>
+    <div class="scroll" id="hops-wrap"><table id="block-hops" aria-label="Announcements between our nodes for the selected block"></table></div>
+  </section>
+
+  <section class="panel">
+    <header><h2>Recent blocks</h2>
+      <div class="legend"><span class="note">Select a block to see its path. The address then leads to that block.</span>
+        <button id="follow" type="button" aria-pressed="true">Follow the newest block</button></div></header>
+    <div class="scroll"><table id="blocks"></table></div>
+  </section>
+
+  <section class="panel" id="slowest-panel">
+    <header><h2>Slowest downloads</h2>
+      <span class="note">Single attempts to download a block, over the blocks shown. Select one to see its block.</span></header>
+    <div class="scroll"><table id="slowest"></table></div>
+    <p class="note" id="slowest-note"></p>
+  </section>
+
+  <section class="panel" id="outside-panel">
+    <header><h2>Peers outside the fleet</h2>
+      <div class="legend"><span class="note" id="outside-intro"></span>
+        <button id="outside-by-peer" type="button" aria-pressed="true">By peer</button>
+        <button id="outside-by-software" type="button" aria-pressed="false">By software</button></div></header>
+    <div class="scroll"><table id="outside"></table></div>
+    <p class="note" id="outside-note"></p>
+  </section>
+
+  <section class="panel">
+    <header><h2>Each node over these blocks</h2>
+      <span class="note">Medians. "Tip" is how long after the first sighting the node had the block as its tip.</span></header>
+    <div class="scroll"><table id="node-summary"></table></div>
+  </section>
+
+  <section class="panel">
+    <header><h2>Between pairs of nodes</h2>
+      <span class="note">From one node telling another about a block to the other hearing it, slowest pairs first.</span></header>
+    <div class="scroll"><table id="pair-summary"></table></div>
+    <p class="note" id="clock-note"></p>
+  </section>
+</main>
+<div class="tooltip" id="tooltip" hidden></div>
+
+<script>
+"use strict";
+const SVG_NS = "http://www.w3.org/2000/svg";
+const REFRESH_MS = 10000;
+// What a node did between two points on a block's way through it, in order.
+const INTERVALS = [
+  { key: "wait_to_ask", label: "Waiting to ask", from: "heard", to: "asked" },
+  { key: "download", label: "Downloading", from: "asked", to: "body" },
+  { key: "verify", label: "Verifying", from: "body", to: "queued" },
+  { key: "commit", label: "Committing", from: "queued", to: "tip" },
+  { key: "tell_peers", label: "Telling peers", from: "tip", to: "told" },
+];
+const POINT_LABELS = {
+  heard: "Heard", asked: "Asked", body: "Had the block", queued: "Verified", tip: "Tip", told: "Told peers",
+};
+const state = {
+  data: null, selected: null, followNewest: true, allHops: false, outsideBy: "peer",
+  // The outside peers panel's order, per view: the column it sorts by and its direction.
+  outsideSort: { peer: { key: "p90_ms", descending: true }, software: { key: "peers", descending: true } },
+};
+
+// Every name on this page comes from node reports, so text is only ever set as text.
+function el(tag, attributes = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [name, value] of Object.entries(attributes)) {
+    if (name === "text") node.textContent = value;
+    else if (name === "style") node.style.cssText = value;
+    else if (value !== null && value !== undefined) node.setAttribute(name, value);
+  }
+  node.append(...children);
+  return node;
+}
+function svg(tag, attributes = {}, text) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [name, value] of Object.entries(attributes)) node.setAttribute(name, value);
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+function ms(value) {
+  if (value === null || value === undefined) return "–";
+  const size = Math.abs(value);
+  if (size >= 10000) return (value / 1000).toFixed(1) + " s";
+  return (size >= 100 ? value.toFixed(0) : size >= 10 ? value.toFixed(1) : value.toFixed(2)) + " ms";
+}
+function shortHash(hash) { return hash.slice(0, 8) + "…" + hash.slice(-6); }
+function clockTime(unixSeconds) { return new Date(unixSeconds * 1000).toISOString().slice(11, 19) + " UTC"; }
+function color(key) { return `var(--c-${key})`; }
+
+// How far two readings on this node's clock can be from true time, in ms.
+function clockError(node) {
+  const clock = state.data.clocks[node];
+  return clock && typeof clock.offset_ms === "number" ? Math.abs(clock.offset_ms) + (clock.rms_ms || 0) : null;
+}
+function withinClockError(first, second, gap) {
+  const a = clockError(first), b = clockError(second);
+  return a !== null && b !== null && Math.abs(gap) <= a + b;
+}
+function spans(view) {
+  return INTERVALS.filter(({ from, to }) => from in view.at && to in view.at && view.at[to] >= view.at[from])
+    .map((interval) => ({ ...interval, start: view.at[interval.from], end: view.at[interval.to] }));
+}
+function slowest(block) {
+  let name = null;
+  for (const [node, view] of Object.entries(block.nodes)) {
+    if (name === null || view.at.tip > block.nodes[name].at.tip) name = node;
+  }
+  const longest = spans(block.nodes[name]).sort((a, b) => (b.end - b.start) - (a.end - a.start))[0];
+  return { name, tip: block.nodes[name].at.tip, longest };
+}
+function source(view) {
+  if (view.from === "outside") return "a peer outside the fleet";
+  return view.from === "unknown" ? "a source the node did not record" : view.from;
+}
+
+// The block the page address names, as `#block=<hash>`, if any.
+function linkedBlock() {
+  const linked = /^#block=([0-9a-f]{64})$/.exec(location.hash);
+  return linked ? linked[1] : null;
+}
+// Show one block and stop following the newest; the address then leads to that block.
+function selectBlock(hash) {
+  state.selected = hash;
+  state.followNewest = false;
+  history.replaceState(null, "", "#block=" + hash);
+  render();
+  document.getElementById("block-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+function followNewest(follow) {
+  state.followNewest = follow;
+  if (follow) history.replaceState(null, "", location.pathname);
+  else if (state.selected) history.replaceState(null, "", "#block=" + state.selected);
+  render();
+}
+
+// `columns` are `[label, numeric, sortKey]`. With `sort` (`{ key, descending, onSort }`), a
+// column that has a sort key gets a heading button that sorts by it.
+function table(target, columns, rows, sort) {
+  const head = el("tr", {}, ...columns.map(([label, numeric, key]) => {
+    const th = el("th", { class: numeric ? "num" : null });
+    if (!sort || !key) {
+      th.textContent = label;
+      return th;
+    }
+    const active = sort.key === key;
+    th.setAttribute("aria-sort", active ? (sort.descending ? "descending" : "ascending") : "none");
+    const button = el("button", { type: "button", class: "sort" + (active ? " active" : ""),
+      text: label + (active ? (sort.descending ? " ↓" : " ↑") : "") });
+    button.addEventListener("click", () => sort.onSort(key));
+    th.append(button);
+    return th;
+  }));
+  target.replaceChildren(el("thead", {}, head), el("tbody", {}, ...rows));
+}
+function cell(text, numeric) { return el("td", { text, class: numeric ? "num" : null }); }
+// Every node has a page of its own on the status dashboard; a node's name links to it.
+function nodeHref(name) { return "/node/" + encodeURIComponent(name); }
+function nodeLink(name) { return el("a", { class: "node-link", href: nodeHref(name), text: name }); }
+// A block's source is one of our nodes, somewhere outside the fleet, or not recorded.
+function sourceLink(name, outside) {
+  if (name === "outside") return outside;
+  return name === "unknown" ? el("span", { class: "quiet", text: "not recorded" }) : nodeLink(name);
+}
+function nodeCell(name) { return el("td", {}, nodeLink(name)); }
+
+// What a peer says it runs, as its handshake wrote it: "/Zakura:1.8.7/" reads "Zakura 1.8.7".
+// zcashd names itself "MagicBean" there, so it is shown by the name people know it by.
+// A peer may send an empty name, which is all a node then knows about its software.
+function software(agent) {
+  if (!agent) return "no name sent";
+  const parts = agent.split("/").filter(Boolean)
+    .map((part) => part.replace(":", " ").replace("MagicBean", "zcashd"));
+  return parts.length ? parts.join(", ") : agent;
+}
+// Who served a download: one of our nodes, an outside peer by address, a peer whose address
+// the node did not record, or a peer whose address is kept private.
+function peerName(download) {
+  if (download.kind === "fleet") return nodeLink(download.name);
+  if (download.kind === "outside") return el("span", { class: "mono", text: download.ip });
+  return el("span", { class: "quiet", text: download.kind === "private" ? "private peer" : "address hidden" });
+}
+// Where a node first heard of a block: one of our nodes, or the outside peer that told it
+// when the node recorded that peer's address.
+function heardFrom(view) {
+  if (view.from !== "outside" || !view.from_peer) return el("td", {}, sourceLink(view.from, "outside"));
+  const agent = view.from_peer.agent ? " (" + software(view.from_peer.agent) + ")" : "";
+  return el("td", {}, peerName(view.from_peer), el("span", { class: "quiet", text: agent }));
+}
+function peerSoftware(download) {
+  if (download.kind === "fleet") return "one of ours";
+  if (download.kind === "private") return "–";
+  // Only Zakura speaks the Zakura stack. A peer our node dialled there directly, without
+  // the legacy handshake first, never names its software, so its version is not known.
+  if (!download.agent && download.stack === "zakura") return "Zakura, version not recorded";
+  return software(download.agent);
+}
+function outcome(result) {
+  if (result === "available") return "delivered";
+  return result === "missing" ? "did not have it" : String(result).replaceAll("_", " ");
+}
+function bytes(value) {
+  if (value === null || value === undefined) return "–";
+  return value >= 1e6 ? (value / 1e6).toFixed(2) + " MB" : value >= 1e3 ? (value / 1e3).toFixed(1) + " kB" : value + " B";
+}
+// Where a node got one block: the attempt that delivered it, and how many others it made.
+function downloadedFrom(view) {
+  const attempts = view.downloads || [];
+  const delivered = attempts.find((download) => download.result === "available") || attempts[0];
+  if (!delivered) return el("td", {}, el("span", { class: "quiet", text: "–" }));
+  const others = attempts.length - 1;
+  const detail = [peerSoftware(delivered), delivered.result === "available" ? ms(delivered.ms) : outcome(delivered.result)];
+  if (others > 0) detail.push(`${others} other attempt${others === 1 ? "" : "s"}`);
+  return el("td", {}, peerName(delivered), el("span", { class: "quiet", text: " · " + detail.join(" · ") }));
+}
+
+// A profiler that answers can still lack a block, so "every profiled node" holds only for a
+// block that every configured profiled node recorded.
+function recordedBy(block) { return Object.keys(block.nodes).length; }
+function everyProfiledNode(block, data) { return recordedBy(block) === data.nodes.length; }
+
+function renderTiles(data) {
+  const complete = data.blocks.filter((block) => everyProfiledNode(block, data) && recordedBy(block) > 1);
+  const spreads = complete.map((block) => block.spread_ms).sort((a, b) => a - b);
+  const reporting = data.nodes.length - data.unreachable.length;
+  const firsts = Object.entries(data.summary.nodes).sort((a, b) => b[1].first - a[1].first)[0];
+  const tiles = [
+    [String(data.blocks.length), "blocks shown"],
+    [`${reporting} of ${data.nodes.length}`, "profiled nodes reporting"],
+    [spreads.length ? ms(spreads[Math.floor(spreads.length / 2)]) : "–",
+      `median time until every profiled node had the tip, over the ${complete.length} blocks every profiled node recorded`],
+    [spreads.length ? ms(spreads[Math.min(spreads.length - 1, Math.floor(spreads.length * 0.9))]) : "–", "the same, 9 blocks in 10"],
+    [firsts ? firsts[0] : "–", firsts ? `heard first most often (${firsts[1].first} blocks)` : "heard first most often"],
+  ];
+  document.getElementById("tiles").replaceChildren(
+    ...tiles.map(([value, label]) => el("div", { class: "tile" }, el("b", { text: value }), el("span", { text: label }))));
+}
+
+function renderBlocks(data) {
+  const rows = data.blocks.map((block) => {
+    const slow = slowest(block);
+    const pick = el("button", { type: "button", text: String(block.height ?? "?") });
+    pick.setAttribute("aria-label", `Show block ${block.height ?? shortHash(block.hash)}`);
+    const first = el("td", {}, nodeLink(block.first_node),
+      el("span", { class: "quiet" }, " ← ", sourceLink(block.first_from, "outside")));
+    const slowCell = el("td", {}, nodeLink(slow.name),
+      el("span", { class: "quiet", text: slow.longest ? ` · ${slow.longest.label.toLowerCase()} ${ms(slow.longest.end - slow.longest.start)}` : "" }));
+    const row = el("tr", { "aria-selected": block.hash === state.selected ? "true" : "false" },
+      el("td", {}, pick), el("td", { class: "mono", text: shortHash(block.hash) + (block.reorg ? " (reorg)" : "") }),
+      cell(clockTime(block.origin)), first, cell(ms(block.spread_ms), true), slowCell,
+      cell(`${Object.keys(block.nodes).length} / ${data.nodes.length}`, true));
+    // Anywhere on the row selects the block, except a node name, which leads to that node.
+    row.addEventListener("click", (event) => { if (!event.target.closest("a")) selectBlock(block.hash); });
+    return row;
+  });
+  table(document.getElementById("blocks"), [["Height"], ["Hash"], ["First heard"], ["First node ← its source"],
+    ["Last node at tip after", true], ["Last node · its longest step"], ["Nodes recorded", true]], rows);
+}
+
+function niceStep(span, target) {
+  const rough = span / target, power = Math.pow(10, Math.floor(Math.log10(rough)));
+  return [1, 2, 5, 10].map((factor) => factor * power).find((step) => step >= rough);
+}
+
+function showTooltip(event, heading, rows) {
+  const tip = document.getElementById("tooltip");
+  tip.replaceChildren(el("div", { class: "head", text: heading }), ...rows.map(([key, label, value]) =>
+    el("div", { class: "row" }, el("span", { class: "key", style: key ? `background:${key}` : "" }), el("b", { text: value }), el("span", { text: label }))));
+  tip.hidden = false;
+  const box = tip.getBoundingClientRect();
+  const anchor = event.clientX === undefined ? event.target.getBoundingClientRect() : { left: event.clientX, top: event.clientY };
+  tip.style.left = Math.max(8, Math.min(window.innerWidth - box.width - 8, anchor.left + 14)) + "px";
+  tip.style.top = Math.max(8, Math.min(window.innerHeight - box.height - 8, anchor.top + 14)) + "px";
+}
+function hideTooltip() { document.getElementById("tooltip").hidden = true; }
+
+function renderWaterfall(block) {
+  const chart = document.getElementById("chart"), root = document.getElementById("waterfall");
+  const names = Object.keys(block.nodes).sort((a, b) =>
+    Math.min(...Object.values(block.nodes[a].at)) - Math.min(...Object.values(block.nodes[b].at)));
+  const left = 150, right = 96, top = 26, rowHeight = 30, barHeight = 12;
+  const width = Math.max(720, chart.clientWidth), height = top + names.length * rowHeight + 8;
+  const last = Math.max(1, ...names.flatMap((name) => Object.values(block.nodes[name].at)));
+  const step = niceStep(last, Math.max(3, Math.floor((width - left - right) / 110)));
+  const end = Math.ceil(last / step) * step;
+  const x = (value) => left + (value / end) * (width - left - right);
+  const rowY = (name) => top + names.indexOf(name) * rowHeight + rowHeight / 2;
+  root.setAttribute("width", width); root.setAttribute("height", height); root.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  root.replaceChildren();
+  const defs = svg("defs");
+  for (const [id, fill] of [["arrow", "var(--ink-2)"], ["arrow-other", "var(--muted)"]]) {
+    const marker = svg("marker", { id, viewBox: "0 0 8 8", refX: 7, refY: 4, markerWidth: 6, markerHeight: 6, orient: "auto" });
+    marker.append(svg("path", { d: "M0 0 L8 4 L0 8 z", fill }));
+    defs.append(marker);
+  }
+  root.append(defs);
+  for (let tick = 0; tick <= end + step / 2; tick += step) {
+    root.append(svg("line", { class: "grid", x1: x(tick), x2: x(tick), y1: top - 4, y2: height - 4 }));
+    root.append(svg("text", { x: x(tick), y: 12, "text-anchor": tick === 0 ? "start" : "middle" }, tick === 0 ? "0 ms" : ms(tick).replace(/\.0+ /, " ")));
+  }
+  for (const name of names) {
+    const view = block.nodes[name], y = rowY(name);
+    const link = svg("a", { href: nodeHref(name) });
+    link.append(svg("text", { class: "node", x: 0, y: y + 4 }, name));
+    root.append(link);
+    const first = Math.min(...Object.values(view.at));
+    root.append(svg("line", { class: "track", x1: x(first), x2: x(Math.max(...Object.values(view.at))), y1: y, y2: y }));
+    for (const span of spans(view)) {
+      // A 2 px gap separates neighbouring steps; a step too short to show one keeps 1 px.
+      const from = x(span.start), size = Math.max(1, x(span.end) - from - (x(span.end) - from > 4 ? 2 : 0));
+      root.append(svg("rect", { x: from, y: y - barHeight / 2, width: size, height: barHeight, rx: Math.min(3, size / 2), fill: color(span.key) }));
+    }
+    root.append(svg("circle", { class: "tip", cx: x(view.at.tip), cy: y, r: 4 }));
+    const edge = x(Math.max(...Object.values(view.at)));
+    root.append(svg("text", { class: "value", x: edge + 10, y: y + 4 }, "tip " + ms(view.at.tip)));
+  }
+  // Arrows: by default only the announcement each node acted on first.
+  const drawn = [];
+  for (const name of names) {
+    const sender = block.nodes[name].from, heard = block.nodes[name].at.heard;
+    if (!(sender in block.nodes) || heard === undefined) continue;
+    const hop = block.hops.find((entry) => entry.from === sender && entry.to === name);
+    const told = hop ? hop.told : block.nodes[sender].at.told ?? block.nodes[sender].at.tip;
+    drawn.push({ from: sender, to: name, told, heard, kind: hop ? "" : " inferred" });
+  }
+  if (state.allHops) {
+    for (const hop of block.hops) {
+      if (hop.heard === undefined || drawn.some((entry) => entry.from === hop.from && entry.to === hop.to)) continue;
+      drawn.unshift({ ...hop, kind: " other" });
+    }
+  }
+  for (const hop of drawn) {
+    root.append(svg("line", {
+      class: "hop" + hop.kind, x1: x(hop.told), y1: rowY(hop.from), x2: x(hop.heard), y2: rowY(hop.to),
+      "marker-end": hop.kind === " other" ? "url(#arrow-other)" : "url(#arrow)",
+    }));
+  }
+  // One readout per node, on hover and on keyboard focus.
+  for (const name of names) {
+    const view = block.nodes[name];
+    const hit = svg("rect", { class: "hit", x: left - 8, y: rowY(name) - rowHeight / 2, width: width - left + 8, height: rowHeight, tabindex: 0, "aria-label": name + ", times" });
+    const rows = [[null, `first heard from ${source(view)}`, "heard " + ms(view.at.heard)]]
+      .concat(spans(view).map((span) => [color(span.key), span.label.toLowerCase(), ms(span.end - span.start)]))
+      .concat([[null, "after the first sighting in the fleet", "tip " + ms(view.at.tip)]]);
+    const show = (event) => showTooltip(event, `${name} · ${view.path || "unknown"} stack`, rows);
+    hit.addEventListener("pointermove", show); hit.addEventListener("focus", show);
+    hit.addEventListener("pointerleave", hideTooltip); hit.addEventListener("blur", hideTooltip);
+    root.append(hit);
+  }
+}
+
+function renderBlock(data) {
+  const block = data.blocks.find((entry) => entry.hash === state.selected);
+  const title = document.getElementById("block-title"), note = document.getElementById("block-note");
+  if (!block) {
+    title.textContent = "No block recorded yet";
+    note.textContent = "Nodes report a block once it is their tip. A node that did not answer is listed at the top.";
+    for (const id of ["waterfall", "block-nodes", "block-hops"]) document.getElementById(id).replaceChildren();
+    return;
+  }
+  title.textContent = `Block ${block.height ?? "?"}`;
+  const slow = slowest(block);
+  note.replaceChildren(el("span", { class: "mono", text: block.hash }),
+    ` · first heard at ${clockTime(block.origin)} by `, nodeLink(block.first_node), ", from ",
+    sourceLink(block.first_from, "a peer outside the fleet"),
+    everyProfiledNode(block, data)
+      ? ` · every profiled node had it as tip after ${ms(block.spread_ms)}, `
+      : ` · ${recordedBy(block)} of ${data.nodes.length} profiled nodes recorded this block; the last of them had it as tip after ${ms(block.spread_ms)}, `,
+    nodeLink(slow.name), " last");
+  renderWaterfall(block);
+  const names = Object.keys(block.nodes).sort((a, b) => block.nodes[a].at.tip - block.nodes[b].at.tip);
+  table(document.getElementById("block-nodes"),
+    [["Node"], ["Stack"], ["First heard from"], ["Downloaded from"],
+      ...Object.values(POINT_LABELS).map((label) => [label, true]), ["Clock"]],
+    names.map((name) => {
+      const view = block.nodes[name];
+      return el("tr", {}, nodeCell(name), cell(view.path || "–"), heardFrom(view),
+        downloadedFrom(view),
+        ...Object.keys(POINT_LABELS).map((point) => cell(ms(view.at[point]), true)),
+        cell(view.clock === "log" ? "node log (trace clock was off)" : "trace"));
+    }));
+  const hops = block.hops.filter((hop) => hop.heard !== undefined);
+  document.getElementById("hops-wrap").hidden = hops.length === 0;
+  table(document.getElementById("block-hops"),
+    [["From"], ["To"], ["Told", true], ["Heard", true], ["In transit", true], ["Asked back", true], ["Block sent", true]],
+    hops.map((hop) => {
+      const gap = hop.heard - hop.told;
+      const transit = el("td", { class: "num" }, ms(gap),
+        el("span", { class: "quiet", text: withinClockError(hop.from, hop.to, gap) ? " (within clock error)" : "" }));
+      return el("tr", {}, nodeCell(hop.from), nodeCell(hop.to), cell(ms(hop.told), true), cell(ms(hop.heard), true), transit,
+        cell(ms(hop.asked), true), cell(ms(hop.sent), true));
+    }));
+}
+
+function renderSummary(data) {
+  const entries = Object.entries(data.summary.nodes).sort((a, b) => a[1].tip_median_ms - b[1].tip_median_ms);
+  const worst = Math.max(1, ...entries.map(([, node]) => node.tip_median_ms));
+  table(document.getElementById("node-summary"),
+    [["Node"], ["Blocks", true], ["Heard first", true], ["Tip, median", true], [""], ["Tip, 9 in 10", true],
+      ...INTERVALS.map(({ label }) => [label, true]), ["Clock error", true]],
+    entries.map(([name, node]) => {
+      const error = clockError(name);
+      return el("tr", {}, nodeCell(name), cell(String(node.blocks), true), cell(String(node.first), true),
+        cell(ms(node.tip_median_ms), true),
+        el("td", { style: "min-width:120px" }, el("div", { class: "bar", style: `width:${(node.tip_median_ms / worst) * 100}%` })),
+        cell(ms(node.tip_p90_ms), true),
+        ...INTERVALS.map(({ key }) => cell(node.intervals[key] ? ms(node.intervals[key].median_ms) : "–", true)),
+        cell(error === null ? "unknown" : "± " + ms(error), true));
+    }));
+  const pairs = [...data.summary.pairs].sort((a, b) => b.median_ms - a.median_ms);
+  table(document.getElementById("pair-summary"), [["From"], ["To"], ["Blocks", true], ["Median in transit", true]],
+    pairs.map((pair) => el("tr", {}, nodeCell(pair.from), nodeCell(pair.to), cell(String(pair.hops), true),
+      el("td", { class: "num" }, ms(pair.median_ms),
+        el("span", { class: "quiet", text: withinClockError(pair.from, pair.to, pair.median_ms) ? " (within clock error)" : "" })))));
+  document.getElementById("clock-note").textContent = pairs.length
+    ? "Two nodes' clocks differ by up to the sum of their clock errors, so a shorter time between them says only that the hop was fast."
+    : "No announcement between two of our nodes has been recorded by both ends yet.";
+}
+
+function renderDownloads(data) {
+  const slow = data.slowest_downloads || [];
+  table(document.getElementById("slowest"),
+    [["Took", true], ["Our node"], ["Downloaded from"], ["That peer runs"], ["Block"], ["Size", true], ["Stack"], ["Outcome"]],
+    slow.map((download) => {
+      const pick = el("button", { type: "button", text: String(download.height ?? shortHash(download.hash)) });
+      pick.setAttribute("aria-label", `Show block ${download.height ?? shortHash(download.hash)}`);
+      const row = el("tr", { "aria-selected": download.hash === state.selected ? "true" : "false" },
+        cell(ms(download.ms), true), nodeCell(download.node), el("td", {}, peerName(download)),
+        cell(peerSoftware(download)), el("td", {}, pick), cell(bytes(download.bytes ?? download.size), true),
+        cell(download.stack || "–"), cell(outcome(download.result)));
+      row.addEventListener("click", (event) => { if (!event.target.closest("a")) selectBlock(download.hash); });
+      return row;
+    }));
+  document.getElementById("slowest-note").textContent = slow.length
+    ? "A time on the legacy stack is in whole milliseconds and includes any wait behind other requests on the same connection."
+    : "No download has been recorded yet. A node records them once it runs a build that writes them.";
+
+  renderOutside(data);
+}
+
+// The outside peers' downloads, one row per peer or one per software version.
+// Sorts `rows` by `key`; a row without a value goes last whichever the direction.
+function sortedRows(rows, { key, descending }) {
+  const blank = (value) => value === null || value === undefined || value === "";
+  return [...rows].sort((a, b) => {
+    if (blank(a[key]) || blank(b[key])) return blank(a[key]) - blank(b[key]);
+    const order = typeof a[key] === "number" ? a[key] - b[key] : String(a[key]).localeCompare(String(b[key]));
+    return descending ? -order : order;
+  });
+}
+
+function renderOutside(data) {
+  const view = state.outsideBy;
+  const bySoftware = view === "software";
+  document.getElementById("outside-by-peer").setAttribute("aria-pressed", String(!bySoftware));
+  document.getElementById("outside-by-software").setAttribute("aria-pressed", String(bySoftware));
+  const first = bySoftware
+    ? [["Software", false, "agent"], ["Peers", true, "peers"]]
+    : [["Peer address", false, "ip"], ["Peer runs", false, "agent"]];
+  const columns = [...first, [bySoftware ? "Our nodes that downloaded from them" : "Our nodes that downloaded from it"],
+    ["Downloads", true, "downloads"], ["Legacy failures", true, "failed"], ["Median", true, "median_ms"],
+    ["9 in 10", true, "p90_ms"], [""], ["Slowest", true, "max_ms"], ["Last used", false, "last"]];
+  const sort = state.outsideSort[view];
+  const sortLabel = columns.find((column) => column[2] === sort.key)[0].toLowerCase();
+  document.getElementById("outside-intro").textContent = (bySoftware
+    ? "One row per software version that outside peers named when connecting."
+    : "One row per peer that is not ours and that one of our nodes downloaded a block from. The software is the peer's own, as it named it when connecting.")
+    + ` Ordered by ${sortLabel}, ${sort.descending ? "highest" : "lowest"} first; select a column heading to sort by it.`;
+  const rows = sortedRows((bySoftware ? data.outside_software : data.outside_peers) || [], sort);
+  const worst = Math.max(1, ...rows.map((row) => row.p90_ms || 0));
+  table(document.getElementById("outside"), columns,
+    rows.map((row) => {
+      const users = el("td", { class: "wrap" });
+      row.nodes.forEach((name, index) => users.append(index ? ", " : "", nodeLink(name)));
+      const lead = bySoftware
+        ? [cell(software(row.agent)), cell(String(row.peers), true)]
+        : [el("td", { class: "mono", text: row.ip }), cell(software(row.agent))];
+      return el("tr", {}, ...lead, users,
+        cell(String(row.downloads), true), cell(String(row.failed), true), cell(ms(row.median_ms), true),
+        cell(ms(row.p90_ms), true),
+        el("td", { style: "min-width:120px" }, row.p90_ms === null ? "" :
+          el("div", { class: "bar", style: `width:${(row.p90_ms / worst) * 100}%;background:var(--c-download)` })),
+        cell(ms(row.max_ms), true), cell(clockTime(row.last)));
+    }),
+    { ...sort, onSort: (key) => {
+      // The same column again reverses it; a new one starts with the most telling end:
+      // highest first for numbers and times, A to Z for names and addresses.
+      state.outsideSort[view] = key === sort.key
+        ? { key, descending: !sort.descending }
+        : { key, descending: !["ip", "agent"].includes(key) };
+      renderOutside(data);
+    } });
+  document.getElementById("outside-note").textContent = rows.length
+    ? (bySoftware
+      ? "A version is the exact name a peer sent, so each release is its own row. Times count every download from those peers that delivered the block. "
+      : "A peer is known by its IP address alone, so two nodes behind one address are one row. Times count only the downloads that delivered the block. ")
+      + "\"Legacy failures\" counts only legacy attempts: a download over Zakura is recorded when its block arrives, so a Zakura peer never shows a failure here."
+    : "No outside peer is listed yet. A node records peer addresses only after it restarts with them switched on; until then its downloads show as \"address hidden\".";
+}
+
+function renderLegend() {
+  const arrow = svg("svg", { width: 26, height: 10, viewBox: "0 0 26 10" });
+  arrow.append(svg("path", { d: "M1 5 H22 M18 1.5 L23 5 L18 8.5", fill: "none", stroke: "var(--ink-2)", "stroke-width": 1.5 }));
+  const tip = svg("svg", { width: 10, height: 10, viewBox: "0 0 10 10" });
+  tip.append(svg("circle", { cx: 5, cy: 5, r: 4, fill: "var(--ink)" }));
+  document.getElementById("legend").replaceChildren(
+    ...INTERVALS.map(({ key, label }) => el("span", {}, el("i", { class: "swatch", style: `background:${color(key)}` }), label)),
+    el("span", {}, tip, "tip"), el("span", {}, arrow, "first heard from"));
+}
+
+function render() {
+  const data = state.data;
+  if (!data) return;
+  if (!state.followNewest && !data.blocks.some((block) => block.hash === state.selected)) {
+    // The selected block is older than the blocks the nodes still report.
+    state.followNewest = true;
+    history.replaceState(null, "", location.pathname);
+  }
+  if (state.followNewest) {
+    // The newest block is still arriving on some nodes: follow the newest one that the
+    // most nodes have reported.
+    const recent = data.blocks.slice(0, 10);
+    const most = Math.max(0, ...recent.map((block) => Object.keys(block.nodes).length));
+    const pick = recent.find((block) => Object.keys(block.nodes).length === most);
+    state.selected = pick ? pick.hash : null;
+  }
+  document.getElementById("follow").setAttribute("aria-pressed", String(state.followNewest));
+  document.getElementById("updated").textContent = "updated " + clockTime(data.generated_at);
+  const unreachable = document.getElementById("unreachable");
+  unreachable.hidden = data.unreachable.length === 0;
+  unreachable.textContent = "no answer from " + data.unreachable.join(", ");
+  renderTiles(data); renderBlock(data); renderBlocks(data); renderDownloads(data); renderSummary(data);
+}
+
+// A failed refresh is retried this soon, and the page is dimmed only once this many in a
+// row have failed: a dashboard restart drops one or two requests, which is not news.
+const RETRY_MS = 3000;
+const FAILURES_BEFORE_STALE = 2;
+let failures = 0, retry = null;
+
+// Keep what is on screen and say that it is no longer current.
+function markStale(text, link) {
+  document.querySelector("main").classList.add("stale");
+  const updated = document.getElementById("updated");
+  updated.replaceChildren(text);
+  if (link) updated.append(" · ", el("a", { href: link.href, text: link.text }));
+}
+
+async function refresh() {
+  clearTimeout(retry);
+  let response;
+  try {
+    response = await fetch("/propagation/data", { cache: "no-store" });
+    if (response.ok) {
+      state.data = await response.json();
+      failures = 0;
+      document.querySelector("main").classList.remove("stale");
+      render();
+      return;
+    }
+  } catch (error) {
+    response = null;
+  }
+  if (response && response.status === 401) {
+    // The login is gone, as after the dashboard restarts; retrying cannot bring it back.
+    markStale("signed out", { href: "/", text: "sign in again" });
+    return;
+  }
+  failures += 1;
+  if (failures < FAILURES_BEFORE_STALE) {
+    retry = setTimeout(refresh, RETRY_MS);
+    return;
+  }
+  markStale("not updating (" + (response ? "status " + response.status : "no answer") + ")");
+}
+
+document.getElementById("all-hops").addEventListener("click", (event) => {
+  state.allHops = !state.allHops;
+  event.currentTarget.setAttribute("aria-pressed", String(state.allHops));
+  render();
+});
+document.getElementById("follow").addEventListener("click", () => followNewest(!state.followNewest));
+for (const by of ["peer", "software"]) {
+  document.getElementById("outside-by-" + by).addEventListener("click", () => {
+    state.outsideBy = by;
+    if (state.data) renderOutside(state.data);
+  });
+}
+function readAddress() {
+  const linked = linkedBlock();
+  if (linked) { state.selected = linked; state.followNewest = false; }
+}
+window.addEventListener("hashchange", () => { readAddress(); render(); });
+readAddress();
+window.addEventListener("resize", () => render());
+renderLegend();
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>

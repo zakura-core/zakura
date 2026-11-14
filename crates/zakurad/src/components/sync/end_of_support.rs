@@ -16,7 +16,7 @@ use crate::application::release_version;
 ///
 /// Set during release preparation from the verified Mainnet release-state bundle.
 /// The Mainnet halt height remains capped by [`MAINNET_EOS_HEIGHT`].
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_573_519;
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_575_919;
 
 /// The estimated number of blocks per day at the post-Blossom target spacing.
 ///

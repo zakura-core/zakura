@@ -108,7 +108,7 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.8.7 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.8.8 zakura
 ```
 
 Sprout JoinSplit proof and signature verification is disabled by default. When

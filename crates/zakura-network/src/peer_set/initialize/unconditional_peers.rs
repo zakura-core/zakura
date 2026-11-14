@@ -1,11 +1,20 @@
 //! Keeps connections open to the configured unconditional peers.
 
-use std::{collections::HashMap, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    io,
+    net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
+    time::Duration,
+};
 
 use futures::{future::BoxFuture, sink::SinkExt, stream::FuturesUnordered, FutureExt, StreamExt};
 use indexmap::IndexSet;
 use rand_10::RngExt;
-use tokio::time::{sleep, Instant, MissedTickBehavior};
+use tokio::{
+    sync::Semaphore,
+    time::{sleep, Instant, MissedTickBehavior},
+};
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
@@ -152,20 +161,30 @@ fn connections_with_dials_in_flight(
     connections
 }
 
-/// Looks up the addresses of the DNS name `name`, with `port`, and gives up after
-/// [`constants::DNS_LOOKUP_TIMEOUT`].
+/// The system resolver calls that [`lookup_host`] can have running at once.
 ///
-/// Giving up stops the wait, not the system resolver call, which keeps its blocking
-/// thread until it returns.
+/// A call keeps its blocking thread until it returns, even after its lookup gave up. The
+/// node's state reads and proof checks share those threads, so a resolver that never
+/// returns must not be able to take them all.
+pub(super) static LOOKUPS_IN_FLIGHT: Semaphore =
+    Semaphore::const_new(constants::MAX_UNCONDITIONAL_PEER_LOOKUPS_IN_FLIGHT);
+
+/// Looks up the addresses of the DNS name `name`, with `port`, and gives up after
+/// [`constants::DNS_LOOKUP_TIMEOUT`]. Fails at once while [`LOOKUPS_IN_FLIGHT`] has no
+/// room.
 pub(super) fn lookup_host(name: Arc<str>, port: u16) -> BoxFuture<'static, Lookup> {
     async move {
-        let addrs = tokio::time::timeout(
-            constants::DNS_LOOKUP_TIMEOUT,
-            tokio::net::lookup_host((&*name, port)),
-        )
-        .await??;
+        let in_flight = LOOKUPS_IN_FLIGHT
+            .try_acquire()
+            .map_err(|_| io::Error::other("too many earlier lookups are still running"))?;
 
-        Ok(addrs.collect())
+        let addrs = tokio::task::spawn_blocking(move || {
+            // Held until the resolver call returns, not until the lookup gives up.
+            let _in_flight = in_flight;
+            (&*name, port).to_socket_addrs().map(Vec::from_iter)
+        });
+
+        tokio::time::timeout(constants::DNS_LOOKUP_TIMEOUT, addrs).await??
     }
     .boxed()
 }

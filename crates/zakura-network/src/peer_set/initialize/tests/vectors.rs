@@ -47,9 +47,9 @@ use crate::{
             accept_inbound_connections, add_initial_peers, batch_misbehavior_reports,
             crawl_and_dial, keep_unconditional_peers_connected,
             leave_out_undialable_unconditional_peers, lookup_host, open_listener,
-            outbound_peer_replenishment_demand, unconditional_peer_dial_addrs, DiscoveredPeer,
-            ReplenishmentBudget, MISBEHAVIOR_BATCH_INTERVAL,
-            OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR,
+            outbound_peer_replenishment_demand, unconditional_peer_dial_addrs,
+            unconditional_peers::LOOKUPS_IN_FLIGHT, DiscoveredPeer, ReplenishmentBudget,
+            MISBEHAVIOR_BATCH_INTERVAL, OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR,
             OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR,
         },
         set::MorePeers,
@@ -1171,7 +1171,9 @@ async fn unconditional_peer_name_keeps_an_address_that_reconnects_during_a_looku
     assert!(!unconditional_peers.contains(ip("192.0.2.2")));
 }
 
-/// The real lookup returns the addresses of a name, each with the port it was given.
+/// The real lookup returns the addresses of a name, each with the port it was given. It
+/// fails without calling the resolver while as many earlier calls as the limit are
+/// still running.
 #[tokio::test]
 async fn unconditional_peer_lookup_resolves_a_name_with_its_port() {
     let _init_guard = zakura_test::init();
@@ -1185,6 +1187,20 @@ async fn unconditional_peer_lookup_resolves_a_name_with_its_port() {
         assert!(addr.ip().is_loopback(), "{addr} is a loopback address");
         assert_eq!(addr.port(), 18233);
     }
+
+    // No other test runs the real lookup, so this test holds every permit.
+    let limit = u32::try_from(constants::MAX_UNCONDITIONAL_PEER_LOOKUPS_IN_FLIGHT).unwrap();
+    let running_calls = LOOKUPS_IN_FLIGHT
+        .try_acquire_many(limit)
+        .expect("the first lookup's call has returned");
+    lookup_host("localhost".into(), 18233)
+        .await
+        .expect_err("a lookup fails while the limit of calls is running");
+
+    drop(running_calls);
+    lookup_host("localhost".into(), 18233)
+        .await
+        .expect("a lookup works again once the earlier calls return");
 }
 
 /// What the fake connector in unconditional peer tests does with each dial.

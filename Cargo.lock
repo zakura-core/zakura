@@ -2716,6 +2716,7 @@ dependencies = [
  "zakura-pasta-curves",
  "zakura-rpc",
  "zakura-script",
+ "zakura-sensei",
  "zakura-state",
  "zakura-storage",
  "zakura-test",
@@ -2856,7 +2857,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "17.0.2"
+version = "18.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -2885,7 +2886,6 @@ dependencies = [
  "zakura-bellman",
  "zakura-bls12-381",
  "zakura-chain",
- "zakura-halo2-proofs",
  "zakura-header-chain",
  "zakura-node-services",
  "zakura-orchard",
@@ -2895,6 +2895,7 @@ dependencies = [
  "zakura-rt",
  "zakura-sapling-crypto",
  "zakura-script",
+ "zakura-sensei",
  "zakura-state",
  "zakura-test",
  "zakura-transparent",
@@ -3392,9 +3393,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-sensei"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d8925f1d2a07dbdc7f31ec21ebabeee3ca4d7852373b85ce1b7401f3302a294"
+checksum = "1c53a15f2f2674f3d64bfa3c4bb8589d018bafa83f9a2e9402913a089eb3b135"
 dependencies = [
  "blake2b_simd",
  "once_cell",

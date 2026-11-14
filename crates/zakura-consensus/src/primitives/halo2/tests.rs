@@ -948,15 +948,16 @@ fn prove_shielding_bundle(pk: &ProvingKey) -> (Bundle<Authorized, ZatBalance>, S
     (bundle, SigHash(sighash))
 }
 
-/// Arming halo2's prepared-MSM state must not change proving or verification
-/// results.
+/// Arming the backend's prepared proving and verification state must not
+/// change proving or verification results.
 ///
 /// The production verifying-key statics are armed at construction
 /// ([`super::build_verifying_key`]); freshly built keys are the unarmed
-/// control. With halo2's opt-in `orbits` feature off (the current build),
-/// arming is a documented no-op, so this pins that arming unconditionally is
-/// harmless; in a build with the feature on, the same assertions compare the
-/// prepared and unprepared paths for real.
+/// control. Under the sensei backend (the current build) arming warms
+/// process-wide caches shared by every key, so this pins that a cold key and
+/// a warmed one agree; under the legacy halo2 backend arming is per-key (a
+/// documented no-op without its opt-in `orbits` feature) and the same
+/// assertions compare the prepared and unprepared paths.
 #[test]
 fn prepared_msm_arming_does_not_change_proving_or_verification() {
     let _init_guard = zakura_test::init();

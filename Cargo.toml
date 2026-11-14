@@ -51,11 +51,11 @@ edition = "2021"
 # gate refers to `zakura-assets` and nothing else.
 zakura-assets = { version = "=0.3563151.0" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
-orchard = { version = "=5.4.0", package = "zakura-orchard", default-features = false, features = ["backend-halo2", "circuit", "multicore", "std"] }
+orchard = { version = "=5.4.0", package = "zakura-orchard", default-features = false, features = ["backend-sensei", "circuit", "multicore", "std"] }
 sapling-crypto = { version = "=5.4.0", package = "zakura-sapling-crypto", default-features = false, features = ["circuit", "multicore"] }
 zcash_address = { version = "=5.4.0", package = "zakura-address", default-features = false, features = ["std"] }
 zakura-mmr-tree = { path = "crates/zakura-mmr-tree", version = "0.1.0" }
-zcash_primitives = { version = "=5.4.0", package = "zakura-primitives", default-features = false, features = ["std", "circuits", "multicore", "backend-halo2"] }
+zcash_primitives = { version = "=5.4.0", package = "zakura-primitives", default-features = false, features = ["std", "circuits", "multicore", "backend-sensei"] }
 zcash_transparent = { version = "=5.4.0", package = "zakura-transparent", default-features = false, features = ["std"] }
 zcash_protocol = { version = "=5.4.0", package = "zakura-protocol", default-features = false, features = ["std"] }
 base64 = "0.22.1"
@@ -82,7 +82,6 @@ futures-core = "0.3.31"
 futures-util = "0.3.31"
 getset = "0.1.7"
 group = "0.14"
-halo2 = { version = "=5.4.0", package = "zakura-halo2-proofs" }
 pasta_curves = { version = "=5.4.0", package = "zakura-pasta-curves" }
 hex = "0.4.3"
 http-body = "1.0.1"
@@ -135,6 +134,7 @@ rustls-pki-types = "1.12"
 rocksdb = { version = "=0.24.4", package = "zakura-rocksdb", default-features = false }
 secp256k1 = "0.33"
 semver = "1.0.26"
+sensei = { version = "=0.1.3", package = "zakura-sensei", default-features = false, features = ["verifier", "multicore"] }
 serde = "1.0.219"
 serde_json = "1.0.140"
 sha2 = "0.10"
@@ -245,21 +245,42 @@ overflow-checks = false
 incremental = false
 codegen-units = 16
 
-[profile.dev.package.zakura-halo2-proofs]
-opt-level = 3
-debug-assertions = false
-overflow-checks = false
-incremental = false
-codegen-units = 16
-
-[profile.dev.package.zakura-halo2-gadgets]
-opt-level = 3
-debug-assertions = false
-overflow-checks = false
-incremental = false
-codegen-units = 16
-
 [profile.dev.package.zakura-bls12-381]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 16
+
+[profile.dev.package.zakura-sensei]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 16
+
+[profile.dev.package.zakura-sensei-shared]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 16
+
+[profile.dev.package.zakura-udon]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 16
+
+[profile.dev.package.zakura-bento]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 16
+
+[profile.dev.package.zakura-bento-core]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false

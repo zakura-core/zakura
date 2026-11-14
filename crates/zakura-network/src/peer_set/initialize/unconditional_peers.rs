@@ -54,10 +54,11 @@ enum AttemptEvent {
     /// The random delay before the dial is over.
     Delayed { index: usize },
 
-    /// The dial finished.
+    /// The dial finished. The peer is boxed because its client is much larger than
+    /// the other variant.
     Dialed {
         index: usize,
-        result: Result<DiscoveredPeer, BoxError>,
+        result: Result<Box<DiscoveredPeer>, BoxError>,
     },
 }
 
@@ -353,7 +354,7 @@ where
                             async move {
                                 AttemptEvent::Dialed {
                                     index,
-                                    result: outbound_connector.oneshot(request).await,
+                                    result: outbound_connector.oneshot(request).await.map(Box::new),
                                 }
                             }
                             .in_current_span(),
@@ -373,7 +374,7 @@ where
                     peer.is_attempting = false;
                     peer.dialing = None;
 
-                    match result {
+                    match result.map(|peer| *peer) {
                         Ok((addr, client)) => {
                             info!(
                                 peer = %addr.addr_label(expose_peer_addresses),

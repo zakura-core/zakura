@@ -427,7 +427,9 @@ class StepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "nodes.toml"
             config.write_text(NODE_LIST)
-            self.assertEqual(fleet.main(["ensure-trace-config", "--config", str(config), "--node", self.node.name]), 0)
+            private = Path(directory) / "private.json"
+            private.write_text("[]")
+            self.assertEqual(fleet.main(["ensure-trace-config", "--config", str(config), "--node", self.node.name, "--private-addresses", str(private)]), 0)
         self.assertEqual(tomllib.loads(self.config)["network"]["zakura"]["trace_peer_names"], {"192.0.2.1": "us-east-0"})
 
     def test_a_retention_readiness_failure_also_prevents_enabling_traces(self):

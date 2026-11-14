@@ -66,7 +66,6 @@ PROFILER_PORT = 8097
 TRACE_DIR = "/mnt/data/zakura-traces"
 TRACE_MARKER = ".zakura-profiler-managed"
 TRACE_TABLE_CAP_MB = 200
-# The node reads the names of its fleet peers from this variable, as `name=ip,name=ip`.
 # `systemctl show -p ExecStart` prints the command line as `argv[]=... ;`.
 CONFIG_ARGUMENT = re.compile(r"argv\[\]=[^;]*?\s(?:-c|--config)[ =](\S+)")
 SSH_OPTIONS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-o", "StrictHostKeyChecking=yes")
@@ -474,7 +473,7 @@ def parse_private_addresses(text):
 
 def named_peers(node, nodes, private):
     """The nodes in `nodes` that `node` is told about: every other node, except one whose
-    address is in `private`, since the drop-in can be read by anyone on the node."""
+    address is in `private`."""
     return [peer for peer in nodes if peer.name != node.name and address_key(peer_address(peer)) not in private]
 
 
@@ -555,7 +554,7 @@ def parse_args(argv):
         step = steps.add_parser(name)
         step.add_argument("--config", required=True, help="the deployer's node list")
         step.add_argument("--node", default="", help="only this node; all profiled nodes when empty")
-        if name == "peer-names":
+        if name in ("peer-names", "ensure-trace-config"):
             step.add_argument(
                 "--private-addresses", required=True,
                 help="JSON list of addresses never to name to a node, `-` for stdin",
@@ -577,7 +576,7 @@ def main(argv=None):
         return 0
     fleet = nodes
     private = frozenset()
-    if args.step == "peer-names":
+    if args.step in ("peer-names", "ensure-trace-config"):
         try:
             if args.private_addresses == "-":
                 listed = sys.stdin.read()
@@ -594,7 +593,7 @@ def main(argv=None):
             print(f"{args.node} has no profiler in {args.config}; nothing to do")
             return 0
     step = {
-        "ensure-trace-config": lambda node: ensure_trace_config(node, fleet),
+        "ensure-trace-config": lambda node: ensure_trace_config(node, named_peers(node, fleet, private)),
         "peer-names": lambda node: set_peer_names(node, fleet, private),
         "install": install_profiler,
     }[args.step]

@@ -125,7 +125,9 @@ commands accept `--node NAME` to act on one node.
 
 ```bash
 # Before the node restarts: install retention, then enable trace writes.
-python3 deploy/profiler/fleet.py ensure-trace-config --config nodes.toml
+sudo -n cat /etc/zakura-mainnet-dashboard/private/addresses.json \
+  | python3 deploy/profiler/fleet.py ensure-trace-config --config nodes.toml \
+      --private-addresses -
 # Before the node restarts: tell it the other nodes' names, except private ones.
 sudo -n cat /etc/zakura-mainnet-dashboard/private/addresses.json \
   | python3 deploy/profiler/fleet.py peer-names --config nodes.toml \

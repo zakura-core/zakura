@@ -593,7 +593,8 @@ jobs:
             args+=(--node "${NODE}")
           fi
 
-          python3 deploy/profiler/fleet.py ensure-trace-config "${args[@]}" \
+          sudo -n cat /etc/zakura-mainnet-dashboard/private/addresses.json \
+            | python3 deploy/profiler/fleet.py ensure-trace-config --private-addresses - "${args[@]}" \
             || echo "::warning::profiling could not be prepared on every node; see the step log" >&2
 
           # Each node is also told the names of the other nodes, by address, so its

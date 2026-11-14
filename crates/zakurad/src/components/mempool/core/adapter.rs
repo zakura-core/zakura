@@ -341,22 +341,39 @@ async fn answer(
             Response::RejectedTransactionIds(rejected_ids(&shared, ids).await)
         }
         Request::Queue(items) => {
-            // Every body takes its slots before anything here waits, so no
-            // body in the request waits outside them. An id takes its slots
-            // at its turn, as today's pool checks each in order.
-            let staged: Vec<Result<Staged, Gossip>> = items
+            // Every body takes its slots before anything here waits, and the
+            // bodies are queued before the ids, so a body waits only for the
+            // bodies before it, all under deadlines that started together.
+            // An id takes its slots at its turn, as today's pool checks each
+            // in order. The answers keep the request's order.
+            let (bodies, ids): (Vec<(usize, Gossip)>, Vec<(usize, Gossip)>) = items
                 .into_iter()
-                .map(|item| match item {
-                    Gossip::Tx(_) => Ok(Staged::new(&shared, item, &None)),
-                    Gossip::Id(_) => Err(item),
-                })
+                .enumerate()
+                .partition(|(_, item)| matches!(item, Gossip::Tx(_)));
+            let bodies: Vec<(usize, Staged)> = bodies
+                .into_iter()
+                .map(|(at, item)| (at, Staged::new(&shared, item, &None)))
                 .collect();
-            let mut answers = Vec::with_capacity(staged.len());
-            for item in staged {
-                let item = item.unwrap_or_else(|id| Staged::new(&shared, id, &None));
-                answers.push(item.queue(shared.clone(), None).await);
+            let mut answers: Vec<Option<Result<Receiver, BoxError>>> =
+                std::iter::repeat_with(|| None)
+                    .take(bodies.len() + ids.len())
+                    .collect();
+            for (at, body) in bodies {
+                answers[at] = Some(body.queue(shared.clone(), None).await);
             }
-            Response::Queued(answers)
+            for (at, id) in ids {
+                answers[at] = Some(
+                    Staged::new(&shared, id, &None)
+                        .queue(shared.clone(), None)
+                        .await,
+                );
+            }
+            Response::Queued(
+                answers
+                    .into_iter()
+                    .map(|answer| answer.expect("every item is answered"))
+                    .collect(),
+            )
         }
         Request::QueueFromPeer {
             transactions,
@@ -877,10 +894,19 @@ async fn bring_in(
         _ => sender.and_then(|addr| shared.supplier(addr)),
     }
     .filter(|_| !reservation.joined() || reservation.wants_body());
-    let Ok(verdict) =
-        tokio::time::timeout_at(deadline, shared.handle.submit(reservation, tx)).await
-    else {
-        return Err(timed_out());
+    // The body goes to the core from a task of its own, which the deadline
+    // does not cancel: a caller that times out first gets its answer and
+    // frees its slots, and the core still takes the body when it can, so its
+    // outcome reaches the change stream as today's timeout does. The core's
+    // own slot, which the reservation holds, bounds these bodies.
+    let submitting = tokio::spawn({
+        let handle = shared.handle.clone();
+        async move { handle.submit(reservation, tx).await }
+    });
+    let verdict = match tokio::time::timeout_at(deadline, submitting).await {
+        Ok(Ok(verdict)) => verdict,
+        Ok(Err(_panicked)) => return Err("the pool core's submission task failed".into()),
+        Err(_elapsed) => return Err(timed_out()),
     };
     if let (Verdict::Rejected(rejection), Some(peer)) = (&verdict, supplier) {
         match rejection.charge {
@@ -1907,7 +1933,7 @@ mod tests {
                 panic!("each push past the limit asks about its id");
             };
             assert_eq!(
-                *core.shared.queued.lock().expect("not poisoned"),
+                queued_count(&core),
                 MAX_INBOUND_CONCURRENCY,
                 "a push past the limit takes no slot while it asks"
             );
@@ -1945,7 +1971,7 @@ mod tests {
             "no push past the limit is submitted"
         );
         assert_eq!(
-            *core.shared.queued.lock().expect("not poisoned"),
+            queued_count(&core),
             MAX_INBOUND_CONCURRENCY,
             "the waiting pushes fill the node's limit"
         );
@@ -2009,7 +2035,7 @@ mod tests {
             panic!("the push reserves without waiting for the tip");
         };
         assert_eq!(
-            *core.shared.queued.lock().expect("not poisoned"),
+            queued_count(&core),
             1,
             "the push holds a node-wide slot while it waits"
         );
@@ -2297,7 +2323,7 @@ mod tests {
         );
         assert!(inbox.try_next().is_none(), "the core is asked nothing else");
         assert_eq!(
-            *core.shared.queued.lock().expect("not poisoned"),
+            queued_count(&core),
             MAX_INBOUND_CONCURRENCY,
             "the waiting pushes fill the node's limit"
         );
@@ -2352,7 +2378,7 @@ mod tests {
             panic!("the first body reserves");
         };
         assert_eq!(
-            *core.shared.queued.lock().expect("not poisoned"),
+            queued_count(&core),
             3,
             "every body holds its slot while the first waits"
         );
@@ -2385,12 +2411,18 @@ mod tests {
             .expect_err("the stuck reservation is refused");
         assert_eq!(error.to_string(), "timeout waiting for verification result");
         assert!(started.elapsed() >= RATE_LIMIT_DELAY, "at today's deadline");
-        assert_eq!(
-            *core.shared.queued.lock().expect("not poisoned"),
-            0,
-            "its slot is free"
-        );
+        assert_eq!(queued_count(&core), 0, "its slot is free");
         drop(reply);
+    }
+
+    /// The adapter's queued count, read without holding its lock, so a
+    /// failed assertion on it does not poison the lock for the slots.
+    fn queued_count(core: &CoreMempool) -> usize {
+        *core
+            .shared
+            .queued
+            .lock()
+            .expect("no test panics holding the queued count")
     }
 
     /// A snapshot at height 1 with nothing pooled, so the adapter is on.
@@ -2550,11 +2582,7 @@ mod tests {
             .expect("the fetch is answered at its deadline")
             .expect("answered");
         assert!(answer.is_err(), "the fetch timed out");
-        assert_eq!(
-            *core.shared.queued.lock().expect("not poisoned"),
-            0,
-            "its slots are free"
-        );
+        assert_eq!(queued_count(&core), 0, "its slots are free");
         for filler in fillers {
             filler.abort();
         }
@@ -2582,5 +2610,92 @@ mod tests {
         };
         assert!(rejected.is_empty());
         drop(inbox);
+    }
+
+    /// In a batch with ids before a body, the body is queued first, so it
+    /// frees its slot at its own deadline, not after each earlier id has
+    /// waited out its own, with a core that answers no reservation.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_body_after_ids_frees_its_slot_at_its_own_deadline() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let id = |byte| UnminedTxId::Legacy(zakura_chain::transaction::Hash([byte; 32]));
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(command) = inbox.next().await {
+                if let PoolCommand::Reserve { reply, .. } = command {
+                    held.push(reply);
+                }
+            }
+        });
+        let request = tokio::spawn(core.call(Request::Queue(vec![
+            Gossip::Id(id(1)),
+            Gossip::Id(id(2)),
+            Gossip::Tx(body),
+        ])));
+        tokio::time::sleep(RATE_LIMIT_DELAY + std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            queued_count(&core),
+            1,
+            "the body is done, and only the first id holds a slot"
+        );
+        request.abort();
+        silent.abort();
+    }
+
+    /// A submission that times out before the core takes the body leaves the
+    /// body with the core, so the core can still decide it and its outcome
+    /// reaches the change stream, where cancelling it would release the
+    /// reservation with nothing logged.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_submission_that_times_out_still_reaches_the_core() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
+
+        let (handle, mut inbox) = pool_port();
+        let core = adapter_on(handle);
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let queued = tokio::spawn(queue(core.shared.clone(), Gossip::Tx(body), None));
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the push reserves first");
+        };
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            tx_id,
+            false,
+            true,
+            Default::default(),
+        )));
+        let receiver = queued
+            .await
+            .expect("the task does not panic")
+            .expect("the push passes the first stage");
+        // The core takes nothing until the caller's deadline has passed.
+        let answer = tokio::time::timeout(RATE_LIMIT_DELAY * 2, receiver)
+            .await
+            .expect("the caller is answered at its deadline")
+            .expect("answered");
+        assert_eq!(
+            answer.expect_err("timed out").to_string(),
+            "timeout waiting for verification result"
+        );
+        let Some(PoolCommand::Submit { reply, .. }) = inbox.next().await else {
+            panic!("the body still reaches the core");
+        };
+        assert!(
+            !reply.is_closed(),
+            "the core can still decide it, so its outcome is logged"
+        );
     }
 }

@@ -666,11 +666,6 @@ impl Storage {
         self.verified.remove_all(tx_ids).len()
     }
 
-    /// Clears a list of mined transaction ids from the verified set's tracked transaction dependencies.
-    pub fn clear_mined_dependencies(&mut self, mined_ids: &HashSet<transaction::Hash>) {
-        self.verified.clear_mined_dependencies(mined_ids);
-    }
-
     /// Reject and remove transactions from the mempool via non-malleable [`transaction::Hash`].
     /// - For v5 transactions, transactions are matched by TXID,
     ///   using only the non-malleable transaction ID.
@@ -690,7 +685,7 @@ impl Storage {
         mined_ids: &HashSet<transaction::Hash>,
         transactions: Vec<impl AsRef<Transaction>>,
     ) -> RemovedTransactionIds {
-        let removed_mined = self.verified.remove_all(mined_ids.iter().copied());
+        let removed_mined = self.verified.remove_mined(mined_ids);
 
         let duplicate_spend_ids: HashSet<_> = transactions
             .iter()

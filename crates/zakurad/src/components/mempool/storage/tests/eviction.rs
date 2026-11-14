@@ -485,7 +485,6 @@ fn mining_a_parent_releases_capacity_for_another_grandchild() {
     let grandchild = factory.tx_with(10_000, 1, 0);
     insert(&mut storage, &grandchild, vec![first_output(&child)]);
     let mined = [parent.transaction.id().mined_id()].into();
-    storage.clear_mined_dependencies(&mined);
     storage.reject_and_remove_same_effects(
         &mined,
         Vec::<Arc<zakura_chain::transaction::Transaction>>::new(),
@@ -982,7 +981,6 @@ proptest! {
                     .collect();
                 let mined = roots[parent_picks.first().map_or(0, |pick| pick.index(roots.len()))];
                 let mined: HashSet<_> = [mined].into();
-                storage.clear_mined_dependencies(&mined);
                 storage.reject_and_remove_same_effects(&mined, Vec::<Arc<zakura_chain::transaction::Transaction>>::new());
                 storage.verified.assert_dependency_groups_are_bounded();
                 continue;

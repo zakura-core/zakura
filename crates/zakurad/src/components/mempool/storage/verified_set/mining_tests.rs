@@ -76,9 +76,7 @@ fn mining_uses_ancestors_and_rescores_children_when_the_parent_is_mined() {
     assert_eq!(ids(&verified), vec![independent, child, parent]);
     verified.assert_dependency_groups_are_bounded();
 
-    verified.clear_mined_dependencies(&HashSet::from([parent]));
-    assert_eq!(ids(&verified), vec![child, independent, parent]);
-    verified.remove_all([parent]);
+    verified.remove_mined(&HashSet::from([parent]));
     assert_eq!(ids(&verified), vec![child, independent]);
     verified.assert_dependency_groups_are_bounded();
 }

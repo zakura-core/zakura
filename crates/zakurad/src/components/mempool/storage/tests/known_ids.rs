@@ -130,13 +130,98 @@ fn mined_parent_keeps_unmined_child_and_ignores_unknown_mined_ids() {
         )
         .unwrap();
     let mined = HashSet::from([parent_id.mined_id(), missing]);
-    storage.clear_mined_dependencies(&mined);
     let removed = storage.reject_and_remove_same_effects(&mined, block_transactions);
     assert_eq!(removed.mined, HashSet::from([parent_id]));
     assert!(removed.invalidated.is_empty());
     assert_eq!(
         storage.tx_ids().collect::<HashSet<_>>(),
         HashSet::from([child_id])
+    );
+    storage.verified.assert_dependency_groups_are_bounded();
+}
+
+#[test]
+fn mining_parent_and_child_preserves_the_unmined_grandchild() {
+    let mut factory = TxFactory::new();
+    let mut storage = Storage::new(&Config::default());
+    let parent = factory.tx_with(10_000, 1, 0);
+    let child = factory.tx_with(10_000, 1, 0);
+    let grandchild = factory.tx(10_000);
+    let parent_id = parent.transaction.id();
+    let child_id = child.transaction.id();
+    let grandchild_id = grandchild.transaction.id();
+    let block = vec![
+        parent.transaction.transaction().clone(),
+        child.transaction.transaction().clone(),
+    ];
+    storage.insert(parent, Vec::new(), None).unwrap();
+    storage
+        .insert(
+            child,
+            vec![OutPoint::from_usize(parent_id.mined_id(), 0)],
+            None,
+        )
+        .unwrap();
+    storage
+        .insert(
+            grandchild,
+            vec![OutPoint::from_usize(child_id.mined_id(), 0)],
+            None,
+        )
+        .unwrap();
+    let mined = HashSet::from([parent_id.mined_id(), child_id.mined_id()]);
+    let removed = storage.reject_and_remove_same_effects(&mined, block);
+    assert_eq!(removed.mined, HashSet::from([parent_id, child_id]));
+    assert!(removed.invalidated.is_empty());
+    assert_eq!(
+        storage.tx_ids().collect::<HashSet<_>>(),
+        HashSet::from([grandchild_id])
+    );
+    assert!(storage.transaction_dependencies().dependencies().is_empty());
+    storage.verified.assert_dependency_groups_are_bounded();
+}
+
+#[test]
+fn batch_removal_deduplicates_overlapping_roots_and_keeps_unrelated_transactions() {
+    let mut factory = TxFactory::new();
+    let mut storage = Storage::new(&Config::default());
+    let parent = factory.tx_with(10_000, 1, 0);
+    let child = factory.tx_with(10_000, 1, 0);
+    let grandchild = factory.tx(10_000);
+    let survivor = factory.tx(10_000);
+    let parent_id = parent.transaction.id();
+    let child_id = child.transaction.id();
+    let grandchild_id = grandchild.transaction.id();
+    let survivor_id = survivor.transaction.id();
+    storage.insert(parent, Vec::new(), None).unwrap();
+    storage
+        .insert(
+            child,
+            vec![OutPoint::from_usize(parent_id.mined_id(), 0)],
+            None,
+        )
+        .unwrap();
+    storage
+        .insert(
+            grandchild,
+            vec![OutPoint::from_usize(child_id.mined_id(), 0)],
+            None,
+        )
+        .unwrap();
+    storage.insert(survivor, Vec::new(), None).unwrap();
+    let missing = factory.tx(10_000).transaction.id().mined_id();
+    assert_eq!(
+        storage.verified.remove_all([
+            child_id.mined_id(),
+            parent_id.mined_id(),
+            missing,
+            child_id.mined_id()
+        ]),
+        HashSet::from([parent_id, child_id, grandchild_id]),
+    );
+    assert_eq!(
+        storage.tx_ids().collect::<HashSet<_>>(),
+        HashSet::from([survivor_id])
     );
     storage.verified.assert_dependency_groups_are_bounded();
 }
@@ -159,7 +244,6 @@ fn block_conflict_removes_descendants_and_caches_the_conflicting_root() {
             None,
         )
         .unwrap();
-    storage.clear_mined_dependencies(&mined);
     let removed = storage
         .reject_and_remove_same_effects(&mined, vec![conflict.transaction.transaction().clone()]);
     assert!(removed.mined.is_empty());
@@ -221,7 +305,6 @@ fn benchmark_mempool_known_id_cleanup() {
                             .remove_expired_transactions(black_box(Height(1)))
                             .len()
                     } else {
-                        storage.clear_mined_dependencies(black_box(&mined));
                         storage
                             .reject_and_remove_same_effects(
                                 black_box(&mined),

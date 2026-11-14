@@ -81,7 +81,10 @@ const MAX_TIP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// which ids it has rejected. Today's pool answers these at once, so this is
 /// reached only if the core takes commands too slowly, and the request then
 /// answers as if nothing were rejected.
-const MAX_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+///
+/// It fits well inside the inbound service's own five-second request
+/// budget, so a stalled lookup reaches its fallback before inbound gives up.
+const MAX_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How often a waiting request checks the tips again when no new snapshot
 /// arrives, since the state's best tip can move too.
@@ -350,14 +353,22 @@ async fn answer(
                 .into_iter()
                 .enumerate()
                 .partition(|(_, item)| matches!(item, Gossip::Tx(_)));
-            let bodies: Vec<(usize, Staged)> = bodies
-                .into_iter()
-                .map(|(at, item)| (at, Staged::new(&shared, item, &None)))
-                .collect();
             let mut answers: Vec<Option<Result<Receiver, BoxError>>> =
                 std::iter::repeat_with(|| None)
                     .take(bodies.len() + ids.len())
                     .collect();
+            // A body the pool already holds is answered before the limits, as
+            // today's pool answers it, so it cannot take a fresh body's slot.
+            let bodies: Vec<(usize, Staged)> = bodies
+                .into_iter()
+                .filter_map(|(at, item)| {
+                    if snapshot.transaction(&item.id().mined_id()).is_some() {
+                        answers[at] = Some(Err(MempoolError::InMempool.into()));
+                        return None;
+                    }
+                    Some((at, Staged::new(&shared, item, &None)))
+                })
+                .collect();
             // Bodies holding slots go before the ones over a limit, whose
             // probes have deadlines of their own.
             let (held, over): (Vec<(usize, Staged)>, Vec<(usize, Staged)>) = bodies
@@ -401,6 +412,12 @@ async fn answer(
             let (bodies, ids): (Vec<Gossip>, Vec<Gossip>) = transactions
                 .into_iter()
                 .partition(|item| matches!(item, Gossip::Tx(_)));
+            // A body the pool already holds is skipped before the limits, as
+            // today's pool skips it, so it cannot take a fresh body's slot.
+            let bodies: Vec<Gossip> = bodies
+                .into_iter()
+                .filter(|body| snapshot.transaction(&body.id().mined_id()).is_none())
+                .collect();
             // Every body takes its slots before anything here waits. Today's
             // pool drops what it cannot queue from a peer, so a body over a
             // limit is dropped here without asking the core.
@@ -646,31 +663,33 @@ async fn queue_held(
     if tokio::time::Instant::now() >= deadline {
         return Err(timed_out());
     }
-    // The reservation is asked for from a task of its own, so a caller that
-    // times out first leaves it running: if the core grants it later, the
-    // failure is reported, and reaches the change stream as today's
-    // timeout does. That task holds no body, and keeps the item's node-wide
-    // slot until the core has answered, so a stalled core cannot gather more
-    // of them than the node's limit.
-    let mut reserving = tokio::spawn({
-        let handle = shared.handle.clone();
+    // The reservation is asked for by a task of its own that holds the
+    // item's node-wide slot, so a stalled core cannot gather more of these
+    // than the node's limit, however its callers leave. The grant comes back
+    // as a `Handoff`: a caller that timed out or was cancelled leaves it to
+    // be dropped, which reports the fetch as failed, as today's timeout is
+    // reported.
+    let (granted, grant) = oneshot::channel();
+    tokio::spawn({
+        let shared = shared.clone();
         let (id, intent) = (item.id(), intent_of(&item));
-        async move { handle.reserve(id, intent).await }
-    });
-    let reservation = match tokio::time::timeout_at(deadline, &mut reserving).await {
-        Ok(Ok(Ok(reservation))) => reservation,
-        Ok(Ok(Err(refused))) => return first_stage_refusal(refused),
-        Ok(Err(_panicked)) => return Err("the pool core's reservation task failed".into()),
-        Err(_elapsed) => {
-            let handle = shared.handle.clone();
-            tokio::spawn(async move {
-                if let Ok(Ok(reservation)) = reserving.await {
-                    handle.fetch_failed(reservation).await;
-                }
-                drop(queue_slot);
-            });
-            return Err(timed_out());
+        async move {
+            let answer = match shared.handle.reserve(id, intent).await {
+                Ok(reservation) => Ok(Handoff {
+                    reservation: Some(reservation),
+                    queue_slot: Some(queue_slot),
+                    shared: shared.clone(),
+                }),
+                Err(refused) => Err(refused),
+            };
+            let _ = granted.send(answer);
         }
+    });
+    let (reservation, queue_slot) = match tokio::time::timeout_at(deadline, grant).await {
+        Ok(Ok(Ok(handoff))) => handoff.take(),
+        Ok(Ok(Err(refused))) => return first_stage_refusal(refused),
+        Ok(Err(_lost)) => return Err("the pool core's reservation task failed".into()),
+        Err(_elapsed) => return Err(timed_out()),
     };
     // A joined submission takes no core slot, but it still counts against
     // its peer until its verdict, so one peer cannot hold more than its
@@ -686,6 +705,40 @@ async fn queue_held(
         let _ = answer.send(result);
     });
     Ok(receiver)
+}
+
+/// A granted reservation on its way to its caller, with the item's
+/// node-wide slot. Dropped without being taken, because its caller timed
+/// out or was cancelled first, it reports the fetch as failed and frees the
+/// slot.
+struct Handoff {
+    reservation: Option<Reservation>,
+    queue_slot: Option<QueueSlot>,
+    shared: Arc<Shared>,
+}
+
+impl Handoff {
+    /// The reservation and the slot, for a caller that is still waiting.
+    fn take(mut self) -> (Reservation, QueueSlot) {
+        (
+            self.reservation
+                .take()
+                .expect("a handoff holds its reservation until it is taken"),
+            self.queue_slot
+                .take()
+                .expect("a handoff holds its slot until it is taken"),
+        )
+    }
+}
+
+impl Drop for Handoff {
+    /// Reports a reservation nobody took as a failed fetch. The slot goes
+    /// with it.
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            report_failed(&self.shared, reservation);
+        }
+    }
 }
 
 /// The first-stage answer for an item with id `id` when the node's limit,
@@ -3128,5 +3181,108 @@ mod tests {
             "fetched from the advertising v2 peer: {asked:?}"
         );
         assert!(reports.try_recv().is_err(), "a v2 peer is never charged");
+    }
+
+    /// A request cancelled while its reservation waits, as inbound cancels a
+    /// request after its own timeout, leaves the reservation holding the
+    /// item's node-wide slot, and a late grant is reported as failed, so
+    /// cancelled requests cannot gather work beyond the node's limit or lose
+    /// their change-stream event.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_request_leaves_its_reservation_counted_and_reported() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
+
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let request = tokio::spawn(core.call(Request::QueueFromPeer {
+            transactions: vec![Gossip::Tx(body)],
+            source: peer(),
+        }));
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the push reserves");
+        };
+        request.abort();
+        let _ = request.await;
+        assert_eq!(
+            queued_count(&core),
+            1,
+            "the reservation keeps the item's node-wide slot"
+        );
+        let _ = reply.send(Ok(inbox.grant(
+            ReservationId(1),
+            tx_id,
+            false,
+            true,
+            Default::default(),
+        )));
+        let Some(PoolCommand::FetchFailed(reservation)) = inbox.next().await else {
+            panic!("the grant nobody takes is reported as failed");
+        };
+        let _accepted = reservation.accept();
+        for _ in 0..100 {
+            if queued_count(&core) == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(queued_count(&core), 0, "free once it is reported");
+    }
+
+    /// Bodies the pool already holds are skipped before the limits, as
+    /// today's pool skips them, so five of them ahead of a fresh body in one
+    /// peer's batch cannot take that peer's five slots: only the fresh body
+    /// reserves.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pooled_bodies_do_not_take_a_fresh_bodys_slot() {
+        use zakura_node_services::mempool::port::{
+            pool_port, ChainTip, Generation, PoolCommand, PoolSnapshot,
+        };
+
+        let mut vectors = Network::Mainnet.unmined_transactions_in_blocks(..);
+        let pooled: Vec<_> = vectors
+            .by_ref()
+            .take(MAX_INBOUND_CONCURRENCY_PER_PEER)
+            .collect();
+        let fresh = vectors
+            .next()
+            .expect("another vector transaction")
+            .transaction;
+        let fresh_id = fresh.id();
+        let mut batch: Vec<Gossip> = pooled
+            .iter()
+            .map(|tx| Gossip::Tx(tx.transaction.clone()))
+            .collect();
+        batch.push(Gossip::Tx(fresh));
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        inbox.publish([], |last| {
+            PoolSnapshot::new(
+                ChainTip {
+                    hash: block::Hash([1; 32]),
+                    height: Height(1),
+                },
+                Generation(1),
+                last,
+                pooled,
+                Default::default(),
+            )
+        });
+        let request = tokio::spawn(core.call(Request::QueueFromPeer {
+            transactions: batch,
+            source: peer(),
+        }));
+        let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+            panic!("the fresh body reserves");
+        };
+        assert_eq!(tx_id, fresh_id, "only the fresh body reserves");
+        let _ = reply.send(Err(Unreserved::Pooled));
+        let _ = request.await;
+        assert!(inbox.try_next().is_none(), "nothing else is asked");
     }
 }

@@ -240,6 +240,11 @@ fn queue_request(
             Some((at, Staged::new(&shared, item, &None)))
         })
         .collect();
+    // The whole request has today's one task deadline from this call: an
+    // item not started by then is answered as timed out, and starts nothing,
+    // so a large batch its caller gave up on cannot go on starting work.
+    let request_deadline = tokio::time::Instant::now() + RATE_LIMIT_DELAY;
+    let expired = move || tokio::time::Instant::now() >= request_deadline;
     // The work starts here, in a task of its own, as today's pool starts its
     // downloads in the call, so a caller that holds the response without
     // polling it cannot hold the staged slots past their deadlines.
@@ -250,14 +255,20 @@ fn queue_request(
             .into_iter()
             .partition(|(_, body)| matches!(body, Staged::Held { .. }));
         for (at, body) in held.into_iter().chain(over) {
-            answers[at] = Some(body.queue(shared.clone(), None).await);
+            answers[at] = Some(if expired() {
+                Err(timed_out())
+            } else {
+                body.queue(shared.clone(), None).await
+            });
         }
         for (at, id) in ids {
-            answers[at] = Some(
+            answers[at] = Some(if expired() {
+                Err(timed_out())
+            } else {
                 Staged::new(&shared, id, &None)
                     .queue(shared.clone(), None)
-                    .await,
-            );
+                    .await
+            });
         }
         Ok(Response::Queued(
             answers
@@ -3489,5 +3500,54 @@ mod tests {
         ));
         assert!(started.elapsed() <= MAX_LOOKUP_WAIT * 2);
         drop(full);
+    }
+
+    /// A large batch of ids against a full node and a core that answers
+    /// nothing ends by the request's one deadline: the ids not started by
+    /// then are answered as timed out and start nothing, so a batch its
+    /// caller gave up on cannot go on starting work.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_large_batch_ends_by_its_request_deadline() {
+        use zakura_node_services::mempool::port::pool_port;
+
+        let (handle, inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let full: Vec<QueueSlot> = (0..MAX_INBOUND_CONCURRENCY)
+            .map(|_| QueueSlot::take(&core.shared).expect("room for each"))
+            .collect();
+        // Far more ids than one-second probes fit in the deadline.
+        let ids: Vec<Gossip> = (0..1_000u16)
+            .map(|n| {
+                let mut hash = [3; 32];
+                hash[..2].copy_from_slice(&n.to_be_bytes());
+                Gossip::Id(UnminedTxId::Legacy(zakura_chain::transaction::Hash(hash)))
+            })
+            .collect();
+        let started = tokio::time::Instant::now();
+        let answered = tokio::time::timeout(RATE_LIMIT_DELAY * 2, core.call(Request::Queue(ids)))
+            .await
+            .expect("the batch ends by its deadline");
+        let Ok(Response::Queued(answers)) = answered else {
+            panic!("`Queue` is answered with `Queued`");
+        };
+        assert_eq!(answers.len(), 1_000, "every id is answered");
+        assert!(
+            started.elapsed() <= RATE_LIMIT_DELAY + MAX_LOOKUP_WAIT * 2,
+            "within one probe of the request's deadline"
+        );
+        let timed_out = answers
+            .iter()
+            .filter(|answer| {
+                answer.as_ref().err().is_some_and(|error| {
+                    error.to_string() == "timeout waiting for verification result"
+                })
+            })
+            .count();
+        assert!(
+            timed_out > 0,
+            "the ids not started by the deadline time out"
+        );
+        drop((full, inbox));
     }
 }

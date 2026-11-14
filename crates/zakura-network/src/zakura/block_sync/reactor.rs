@@ -16,7 +16,6 @@ use state::{
 };
 use std::num::NonZeroU64;
 use zakura_node_services::task::spawn_erased_named;
-use zakura_quic::NodeId;
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 mod state;
@@ -738,7 +737,7 @@ impl ReactorIO {
                         return None;
                     }
                 }
-                node_id_from_block_peer_id(&peer_id)
+                peer_id.node_id()
             })
             .collect();
         admitted_node_ids.sort_unstable();
@@ -1887,11 +1886,6 @@ fn cancel_expired_floor_claims(
         }
         cancelled(&claim, released);
     }
-}
-
-pub(super) fn node_id_from_block_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
-    let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
-    NodeId::from_bytes(&bytes).ok()
 }
 
 fn elapsed_ms_u64(duration: Duration) -> u64 {

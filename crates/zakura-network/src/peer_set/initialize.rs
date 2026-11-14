@@ -60,6 +60,7 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+mod held_seats;
 mod recent_by_ip;
 mod unconditional_peers;
 
@@ -868,6 +869,7 @@ where
 {
     let mut recent_inbound_connections =
         recent_by_ip::RecentByIp::new(None, Some(config.max_connections_per_ip));
+    let mut held_seats = held_seats::HeldSeats::new(config.peerset_inbound_connection_limit());
 
     let mut active_inbound_connections = ActiveConnectionCounter::new_counter_with(
         config.peerset_inbound_connection_limit(),
@@ -933,7 +935,8 @@ where
                 continue;
             }
 
-            let active_public_inbound_connections = active_inbound_connections.update_count();
+            let active_public_inbound_connections = active_inbound_connections
+                .update_count_with_closed(|closed| held_seats.hold(closed));
             let active_zcashd_compat_inbound_connections =
                 active_zcashd_compat_connections.update_count();
             let active_unconditional_inbound_connections =
@@ -942,6 +945,14 @@ where
                 active_public_inbound_connections + active_zcashd_compat_inbound_connections;
             let canonical_ip = canonical_socket_addr(addr.remove_socket_addr_privacy()).ip();
             let is_zcashd_compat_peer = zcashd_compat_peer_ips.contains(&canonical_ip);
+            // A full listener keeps the seats of long-lived peers that just left for
+            // those peers, so a peer that restarts finds its seat free when it dials back.
+            let seats_held_for_others =
+                held_seats.held_for_others(canonical_ip, std::time::Instant::now());
+            let is_refused_for_held_seats = active_public_inbound_connections
+                < public_inbound_connection_limit
+                && active_public_inbound_connections + seats_held_for_others
+                    >= public_inbound_connection_limit;
             let connection_tracker = if is_zcashd_compat_peer
                 && active_zcashd_compat_inbound_connections < zcashd_compat_reserved_slots
                 && active_total_inbound_connections < config.peerset_inbound_connection_limit()
@@ -960,20 +971,25 @@ where
                 // slot, and waits like any other.
                 active_unconditional_connections.track_connection_from(canonical_ip)
             } else if is_zcashd_compat_peer
-                || active_public_inbound_connections >= public_inbound_connection_limit
+                || active_public_inbound_connections + seats_held_for_others
+                    >= public_inbound_connection_limit
                 || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
                 || recent_inbound_connections.is_past_limit_or_add(addr.ip())
             {
                 // A zcashd-compat peer never takes a public slot. Otherwise there are too
-                // many open inbound connections or pending handshakes already.
+                // many open inbound connections, pending handshakes or held seats already.
                 // Close the connection.
+                if is_refused_for_held_seats && !is_zcashd_compat_peer {
+                    metrics::counter!("peer.inbound.held_seats.refused").increment(1);
+                }
                 std::mem::drop(tcp_stream);
                 // Allow invalid connections to be cleared quickly,
                 // but still put a limit on our CPU and network usage from failed connections.
                 tokio::time::sleep(constants::MIN_INBOUND_PEER_FAILED_CONNECTION_INTERVAL).await;
                 continue;
             } else {
-                active_inbound_connections.track_connection()
+                held_seats.release(canonical_ip);
+                active_inbound_connections.track_connection_from(canonical_ip)
             };
             debug!(
                 inbound_connections = ?active_total_inbound_connections,

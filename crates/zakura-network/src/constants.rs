@@ -310,6 +310,20 @@ pub const UNCONDITIONAL_PEER_HEALTHY_CONNECTION: Duration = Duration::from_secs(
 /// control the selection or reconnections of inbound peers.
 pub const MIN_INBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long an inbound connection must have been open for the listener to hold its seat
+/// after it closes, see `peer_set::initialize::held_seats::HeldSeats`.
+///
+/// Short connections, such as crawlers and monitors, hold no seat.
+pub const MIN_HELD_SEAT_CONNECTION: Duration = Duration::from_secs(10 * 60);
+
+/// How long the listener holds the seat of a long-lived inbound peer after its connection
+/// closes, so the peer can take it back after a restart.
+pub const HELD_SEAT_DURATION: Duration = Duration::from_secs(3 * 60);
+
+/// The listener holds at most its inbound connection limit divided by this number of
+/// seats at once.
+pub const HELD_SEAT_LIMIT_DIVISOR: usize = 10;
+
 /// The minimum time between _failed_ inbound peer connections, implemented by
 /// `peer_set::initialize::accept_inbound_connections`.
 ///

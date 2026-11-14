@@ -2672,6 +2672,52 @@ async fn listener_keeps_an_unconditional_peer_slot_after_its_connection_closes()
     listener.stop().await;
 }
 
+/// A full listener holds the seat of a long-lived peer that leaves. Another peer cannot
+/// take it, and the peer that left can. A short-lived peer's seat is not held.
+#[tokio::test]
+async fn listener_holds_the_seat_of_a_long_lived_peer() {
+    let _init_guard = zakura_test::init();
+
+    // A target size of 4 gives 12 inbound seats, so one seat can be held.
+    let Some(mut listener) = UnconditionalPeerListener::spawn("[]", &[], 4).await else {
+        return;
+    };
+    const RETURNING_PEER_IP: IpAddr = LISTENER_UNCONDITIONAL_IP;
+
+    let mut returning_peer = listener
+        .offer(RETURNING_PEER_IP)
+        .await
+        .expect("the listener has free seats");
+    returning_peer
+        .2
+        .mark_open_at(std::time::Instant::now() - constants::MIN_HELD_SEAT_CONNECTION);
+    let mut other_peers = listener.offer_until_refused(LISTENER_PUBLIC_IP).await;
+    assert_eq!(other_peers.len(), listener.inbound_limit - 1);
+
+    // The other peers are short-lived, so the next peer takes a seat that one leaves.
+    other_peers.pop();
+    other_peers.push(
+        listener
+            .offer(RETURNING_PEER_IP)
+            .await
+            .expect("a short-lived peer's seat is not held"),
+    );
+
+    std::mem::drop(returning_peer);
+    assert!(
+        listener.offer(LISTENER_PUBLIC_IP).await.is_none(),
+        "another peer cannot take the held seat",
+    );
+    let returned_peer = listener.offer(RETURNING_PEER_IP).await;
+    assert!(returned_peer.is_some(), "the peer takes its seat back");
+    assert!(
+        listener.offer(LISTENER_PUBLIC_IP).await.is_none(),
+        "the listener is full again",
+    );
+
+    listener.stop().await;
+}
+
 /// One IP holds at most `max_connections_per_ip` of the inbound slots that dialed
 /// unconditional peers share, so one listed peer cannot take another's slot. Its slots
 /// are free for it again once its connections close.

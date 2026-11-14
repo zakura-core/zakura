@@ -3989,14 +3989,14 @@ fn pick_transaction_with_prevout(network: &Network) -> VerifiedUnminedTx {
     network
         .unmined_transactions_in_blocks(..)
         .find(|transaction| {
-            transaction
-                .transaction
-                .transaction()
-                .inputs()
-                .iter()
-                .any(|input| matches!(input, transparent::Input::PrevOut { .. }))
+            let transaction = transaction.transaction.transaction();
+            !transaction.has_sprout_joinsplit_data()
+                && transaction
+                    .inputs()
+                    .iter()
+                    .any(|input| matches!(input, transparent::Input::PrevOut { .. }))
         })
-        .expect("missing non-coinbase transaction")
+        .expect("test vectors contain a non-Sprout transaction with a transparent input")
 }
 
 /// The height at which the network returned by [`nu_activation_test_network`] activates NU5.

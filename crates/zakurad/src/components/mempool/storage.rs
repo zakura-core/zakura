@@ -169,6 +169,10 @@ pub enum RejectionError {
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum NonStandardTransactionError {
+    /// Sprout is retired from the mempool, including on pre-NU7 networks.
+    #[error("Sprout JoinSplits are not accepted in the mempool")]
+    SproutJoinSplit,
+
     #[error(
         "transaction is {actual_bytes} bytes, exceeding the configured mempool maximum of {max_bytes} bytes"
     )]
@@ -313,6 +317,12 @@ impl Storage {
 
         let transaction = tx.transaction.transaction().as_ref();
         let spent_outputs = &tx.spent_outputs;
+
+        // NU7 excludes versions 1-4. Keep Sprout out of storage even on custom
+        // pre-NU7 networks, so conflict tracking needs no Sprout index.
+        if transaction.has_sprout_joinsplit_data() {
+            return self.reject_non_standard(tx, NonStandardTransactionError::SproutJoinSplit);
+        }
 
         for input in transaction.inputs() {
             let unlock_script = match input {

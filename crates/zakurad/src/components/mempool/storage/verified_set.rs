@@ -9,7 +9,7 @@ use std::{
 
 use zakura_chain::{
     block::Height,
-    ironwood, orchard, sapling, sprout,
+    ironwood, orchard, sapling,
     transaction::{self, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
@@ -62,7 +62,6 @@ use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 /// - the dependencies of transactions that spent the outputs of other transactions in the mempool
 /// - the outputs of transactions in the mempool
 /// - the transparent outpoints spent by transactions in the mempool
-/// - the Sprout nullifiers revealed by transactions in the mempool
 /// - the Sapling nullifiers revealed by transactions in the mempool
 /// - the Orchard nullifiers revealed by transactions in the mempool
 /// - the Ironwood nullifiers revealed by transactions in the mempool
@@ -105,9 +104,6 @@ pub struct VerifiedSet {
 
     /// Owners of transparent outpoints spent by verified transactions.
     spent_outpoints: HashMap<transparent::OutPoint, transaction::Hash>,
-
-    /// Owners of revealed Sprout nullifiers.
-    sprout_nullifiers: HashMap<sprout::Nullifier, transaction::Hash>,
 
     /// Owners of revealed Sapling nullifiers.
     sapling_nullifiers: HashMap<sapling::Nullifier, transaction::Hash>,
@@ -196,7 +192,6 @@ impl VerifiedSet {
         self.expiry_order.clear();
         self.transaction_dependencies.clear();
         self.spent_outpoints.clear();
-        self.sprout_nullifiers.clear();
         self.sapling_nullifiers.clear();
         self.orchard_nullifiers.clear();
         self.ironwood_nullifiers.clear();
@@ -283,8 +278,6 @@ impl VerifiedSet {
         }
         self.spent_outpoints
             .extend(tx.spent_outpoints().map(|outpoint| (outpoint, tx_id)));
-        self.sprout_nullifiers
-            .extend(tx.sprout_nullifiers().map(|&nullifier| (nullifier, tx_id)));
         self.sapling_nullifiers
             .extend(tx.sapling_nullifiers().map(|&nullifier| (nullifier, tx_id)));
         self.orchard_nullifiers
@@ -764,16 +757,13 @@ impl VerifiedSet {
     ///
     /// A transaction can appear more than once if several spends conflict.
     /// Work scales with `tx`'s spends, independently of the mempool size.
+    /// Sprout JoinSplits are excluded by mempool standardness policy.
     pub(super) fn conflicting_ids<'a>(
         &'a self,
         tx: &'a Transaction,
     ) -> impl Iterator<Item = UnminedTxId> + 'a {
         tx.spent_outpoints()
             .filter_map(|outpoint| self.spent_outpoints.get(&outpoint))
-            .chain(
-                tx.sprout_nullifiers()
-                    .filter_map(|nf| self.sprout_nullifiers.get(nf)),
-            )
             .chain(
                 tx.sapling_nullifiers()
                     .filter_map(|nf| self.sapling_nullifiers.get(nf)),
@@ -802,13 +792,11 @@ impl VerifiedSet {
         }
 
         let spent_outpoints = tx.spent_outpoints().map(Cow::Owned);
-        let sprout_nullifiers = tx.sprout_nullifiers().map(Cow::Borrowed);
         let sapling_nullifiers = tx.sapling_nullifiers().map(Cow::Borrowed);
         let orchard_nullifiers = tx.orchard_nullifiers().map(Cow::Borrowed);
         let ironwood_nullifiers = tx.ironwood_nullifiers().map(Cow::Borrowed);
 
         Self::remove_spends(&mut self.spent_outpoints, spent_outpoints);
-        Self::remove_spends(&mut self.sprout_nullifiers, sprout_nullifiers);
         Self::remove_spends(&mut self.sapling_nullifiers, sapling_nullifiers);
         Self::remove_spends(&mut self.orchard_nullifiers, orchard_nullifiers);
         Self::remove_spends(&mut self.ironwood_nullifiers, ironwood_nullifiers);

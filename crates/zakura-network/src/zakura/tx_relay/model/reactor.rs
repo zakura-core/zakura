@@ -113,13 +113,6 @@ impl ReactorModel {
             .unwrap_or_default()
     }
 
-    /// The ids of every unsettled submission.
-    pub(crate) fn all_unsettled_ids(&self) -> impl Iterator<Item = UnminedTxId> + '_ {
-        self.unsettled
-            .values()
-            .flat_map(|waiting| waiting.values().map(|(id, _)| *id))
-    }
-
     /// How many of `peer`'s 5 its ended sessions still hold.
     pub(crate) fn unsettled_count(&self, peer: PeerKey) -> usize {
         self.unsettled.get(&peer).map_or(0, BTreeMap::len)

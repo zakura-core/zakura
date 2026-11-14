@@ -2,7 +2,7 @@
 //! session is live.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     time::Duration,
 };
 
@@ -86,13 +86,15 @@ pub(crate) struct PeerModel {
     pub(crate) requests: IndexMap<UnminedTxId, Request>,
     /// Bodies it supplied that wait for a verdict.
     pub(crate) submissions: BTreeMap<WaiterId, (UnminedTxId, EntryGen)>,
-    /// Ids this node announced to it and has not seen leave the pool. Full
+    /// Ids this node announced to it and has not seen leave the pool, with
+    /// the change-log position it announced them at. Full ids.
+    pub(crate) announced: HashMap<UnminedTxId, u64>,
+    /// Ids it announced to us or supplied, oldest first, with the change-log
+    /// position when it did, to skip adverts. A removal earlier in the log
+    /// does not erase a later announcement. The real set keeps keyed short
+    /// ids, whose collisions can only make it skip more. This one keeps full
     /// ids.
-    pub(crate) announced: HashSet<UnminedTxId>,
-    /// Ids it announced to us or supplied, oldest first, to skip adverts.
-    /// The real set keeps keyed short ids. This one keeps full ids, which a
-    /// collision can only make skip more.
-    pub(crate) known: VecDeque<UnminedTxId>,
+    pub(crate) known: VecDeque<(UnminedTxId, u64)>,
     /// Adverts held for the advert delay, with when they are due.
     pub(crate) held: Vec<(UnminedTxId, Time)>,
     /// Ids announced before this session had the go, with their sizes,
@@ -118,7 +120,7 @@ impl PeerModel {
             reserving: IndexMap::new(),
             requests: IndexMap::new(),
             submissions: BTreeMap::new(),
-            announced: HashSet::new(),
+            announced: HashMap::new(),
             known: VecDeque::new(),
             held: Vec::new(),
             waiting: IndexMap::new(),
@@ -142,6 +144,18 @@ impl PeerModel {
     /// Room left in its pending set.
     pub(crate) fn room(&self) -> usize {
         PENDING_PER_PEER.saturating_sub(self.pending.len())
+    }
+
+    /// Takes `id` out of the pending set if it is pending in `generation`.
+    pub(crate) fn take_pending_of(
+        &mut self,
+        id: UnminedTxId,
+        generation: EntryGen,
+    ) -> Option<Pending> {
+        if !self.holds(id, generation) {
+            return None;
+        }
+        self.take_pending(id)
     }
 
     /// Takes `id` out of the pending set, returning what it held. Its timeout
@@ -174,27 +188,33 @@ impl PeerModel {
         self.tried.push_back((id, generation));
     }
 
-    /// Records that it announced or supplied `id`. Capped, forgetting the
-    /// oldest, which only costs one redundant advert.
-    pub(crate) fn mark_known(&mut self, id: UnminedTxId) {
-        if self.known.contains(&id) {
+    /// Records that it announced or supplied `id`, at change-log position
+    /// `seq`. Capped, forgetting the oldest, which only costs one redundant
+    /// advert.
+    pub(crate) fn mark_known(&mut self, id: UnminedTxId, seq: u64) {
+        if let Some(entry) = self.known.iter_mut().find(|(known, _)| *known == id) {
+            entry.1 = entry.1.max(seq);
             return;
         }
         if self.known.len() >= KNOWN_CAP {
             self.known.pop_front();
         }
-        self.known.push_back(id);
+        self.known.push_back((id, seq));
     }
 
     /// Whether it announced or supplied `id`.
     pub(crate) fn knows(&self, id: UnminedTxId) -> bool {
-        self.known.contains(&id)
+        self.known.iter().any(|(known, _)| *known == id)
     }
 
-    /// Forgets `id` from every announcement set, because it left the pool.
-    pub(crate) fn forget(&mut self, id: UnminedTxId) {
-        self.announced.remove(&id);
-        self.known.retain(|known| *known != id);
+    /// `id` left the pool at change-log position `seq`. What this session
+    /// learned about it before then goes. What it learned later stays.
+    pub(crate) fn forget(&mut self, id: UnminedTxId, seq: u64) {
+        if self.announced.get(&id).is_some_and(|at| *at < seq) {
+            self.announced.remove(&id);
+        }
+        self.known
+            .retain(|(known, at)| !(*known == id && *at < seq));
         self.held.retain(|(held, _)| *held != id);
     }
 
@@ -236,7 +256,7 @@ impl PeerModel {
         for request in self.requests.values_mut() {
             let span = BASE_DEADLINE
                 .saturating_add(transfer)
-                .saturating_mul(1 << request.repeats.min(8));
+                .saturating_mul(2u32.saturating_pow(request.repeats));
             request.deadline = request.deadline.max(now.saturating_add(span));
         }
     }

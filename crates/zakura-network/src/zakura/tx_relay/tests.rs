@@ -284,7 +284,8 @@ fn only_an_announcers_own_size_binds_its_body() {
     assert_eq!(relay.pool().visible(), vec![id(1)]);
 
     // The other order: the honest size first, and a body of another size
-    // from the peer that announced it is that peer's violation.
+    // from the peer that announced it is that peer's violation. The honest
+    // peer, asked first, has its body accepted.
     let mut relay = self::relay();
     let honest = open(&mut relay, 1, true, secs(0));
     let hostile = open(&mut relay, 2, true, secs(0));
@@ -296,6 +297,19 @@ fn only_an_announcers_own_size_binds_its_body() {
         closes(&relay.take_effects()),
         vec![(hostile, CloseReason::Violation(Violation::WrongSize))]
     );
+    relay.assert_invariants();
+
+    let mut relay = self::relay();
+    let honest = open(&mut relay, 1, true, secs(0));
+    let hostile = open(&mut relay, 2, true, secs(0));
+    relay.inv(honest, &[(id(1), SIZE)], secs(0));
+    relay.inv(hostile, &[(id(1), 100)], secs(0));
+    assert_eq!(asks(&relay.take_effects()), vec![(honest, id(1))]);
+    relay.tx(honest, id(1), tx(1), SIZE, secs(1));
+    finish_all(&mut relay, &Outcome::Pass, secs(1));
+    assert!(closes(&relay.take_effects()).is_empty());
+    assert_eq!(relay.pool().visible(), vec![id(1)]);
+    let _ = hostile;
     relay.assert_invariants();
 }
 
@@ -1127,7 +1141,7 @@ fn new_work_never_eats_into_an_older_deadline() {
 
 #[test]
 fn fan_out_uses_the_size_of_the_body_admitted() {
-    let mut relay = relay();
+    let mut relay = relay().with_tx_size(one_is_big);
     let liar = open(&mut relay, 1, true, secs(0));
     let supplier = open(&mut relay, 2, true, secs(0));
     let peers: Vec<_> = (10..30)
@@ -1259,6 +1273,299 @@ fn timeout_history_lasts_only_while_the_id_is_pending() {
     relay.assert_invariants();
 }
 
+/// Id 1 is a 2,000,000 byte transaction. Every other id is small.
+fn one_is_big(tx_id: UnminedTxId) -> u32 {
+    if tx_id == id(1) {
+        MAX_TX_BYTES
+    } else {
+        SIZE
+    }
+}
+
+#[test]
+fn work_that_falls_due_is_done_on_any_input() {
+    let mut relay = relay();
+    let inbound = open(&mut relay, 1, false, secs(0));
+    relay.inv(inbound, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    // An input that does nothing else still claims what became due.
+    assert!(!relay.answer_reserve(INBOUND_DELAY));
+    assert_eq!(asks(&relay.take_effects()), vec![(inbound, id(1))]);
+}
+
+#[test]
+fn a_body_above_the_requesters_limit_is_never_served() {
+    let mut relay = relay().with_tx_size(one_is_big);
+    let supplier = open(&mut relay, 1, true, secs(0));
+    fetch(&mut relay, supplier, 1, secs(0));
+    let small = relay.connect(PeerKey(2), true, secs(1));
+    relay.hello(
+        small,
+        Hello {
+            serves: MAX_REQUESTS_PER_PEER,
+            max_tx_bytes: 1_000,
+        },
+        secs(1),
+    );
+    relay.take_effects();
+    relay.get_txs(small, id(1), secs(1));
+    assert_eq!(
+        relay.take_effects(),
+        vec![RelayEffect::NotFound {
+            session: small,
+            id: id(1)
+        }]
+    );
+}
+
+#[test]
+fn an_old_removal_does_not_erase_a_newer_announcement() {
+    let mut relay =
+        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reads(100);
+    let supplier = open(&mut relay, 1, true, secs(0));
+    let a = open(&mut relay, 2, true, secs(0));
+    fetch(&mut relay, supplier, 1, secs(0));
+    let block = ModelTransition {
+        disconnected: 0,
+        connected: vec![ModelBlock {
+            transactions: vec![tx(1)],
+        }],
+        tip: Height(101),
+        generation: Generation(1),
+        rules_change: false,
+    };
+    relay.transition(block, secs(1));
+    // A announces it after the removal, before reading the removal.
+    relay.inv(a, &[(id(1), SIZE)], secs(2));
+    relay.read(a, secs(2));
+    assert!(relay.session(a).unwrap().knows(id(1)));
+}
+
+#[test]
+fn a_restarted_pool_reconciles_unread_removals() {
+    let mut relay =
+        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reads(100);
+    let supplier = open(&mut relay, 1, true, secs(0));
+    let a = open(&mut relay, 2, true, secs(0));
+    relay.set_ranking(vec![a]);
+    fetch(&mut relay, supplier, 1, secs(0));
+    relay.read(a, secs(0));
+    assert!(relay.session(a).unwrap().announced.contains_key(&id(1)));
+    relay.deactivate(secs(1));
+    relay.activate(secs(2));
+    assert!(relay.session(a).unwrap().announced.is_empty());
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_fresh_announcement_waits_behind_an_old_request() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    let first = relay.wanted().entry(id(1)).unwrap().generation;
+    // A block mines it, and the request is left outstanding.
+    let block = ModelTransition {
+        disconnected: 0,
+        connected: vec![ModelBlock {
+            transactions: vec![tx(1)],
+        }],
+        tip: Height(101),
+        generation: Generation(1),
+        rules_change: false,
+    };
+    relay.transition(block, secs(1));
+    // A announces it again. It is kept, but not asked for twice at once.
+    relay.inv(a, &[(id(1), SIZE)], secs(2));
+    let second = relay.wanted().entry(id(1)).map(|entry| entry.generation);
+    assert!(second.is_some_and(|second| second != first));
+    assert!(asks(&relay.take_effects()).is_empty());
+    // The old answer leaves the new entry pending.
+    relay.not_found(a, id(1), secs(3));
+    assert!(
+        relay.session(a).unwrap().holds(id(1), second.unwrap())
+            || relay.wanted().entry(id(1)).is_none()
+    );
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_sole_slow_announcer_keeps_doubling() {
+    let mut relay = relay();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    let mut now = secs(0);
+    let mut last_span = Duration::ZERO;
+    for round in 0..12 {
+        let request = relay.session(a).unwrap().requests[&id(1)];
+        let span = request.deadline - now;
+        if round > 0 {
+            assert_eq!(span, last_span * 2, "round {round}");
+        }
+        last_span = span;
+        now = request.deadline;
+        relay.tick(now);
+        relay.tx(a, id(1), tx(1), SIZE, now);
+        now += INBOUND_DELAY;
+        relay.tick(now);
+        assert_eq!(
+            asks(&relay.take_effects()),
+            vec![(a, id(1))],
+            "round {round}"
+        );
+    }
+}
+
+#[test]
+fn a_cancelled_probe_passes_its_permit_on() {
+    let mut relay =
+        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reserves();
+    fill_pool(&mut relay);
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(b, &[(id(2), SIZE)], secs(0));
+    while relay.answer_reserve(secs(0)) {}
+    relay.tick(NO_ROOM_FIRST);
+    assert_eq!(relay.wanted().probe().map(|(holder, _)| holder), Some(a));
+    relay.cancel_reserve(a, id(1), NO_ROOM_FIRST);
+    // The permit came back and was taken again at once by the oldest
+    // eligible session, with a new call. Only one probe is ever out.
+    assert!(relay.wanted().probe().is_some());
+    assert_eq!(
+        relay.calls_in_flight(),
+        2,
+        "the cancelled call and the new probe"
+    );
+    relay.assert_invariants();
+    // A's call never reaches the pool. B's finds no room, and the backoff
+    // doubles.
+    while relay.answer_reserve(NO_ROOM_FIRST) {}
+    assert_eq!(
+        relay.wanted().backoff_until(NO_ROOM_FIRST),
+        Some(NO_ROOM_FIRST * 3)
+    );
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_stale_grant_does_not_clear_a_newer_backoff() {
+    let mut relay = RelayModel::new(PoolModel::new(Height(100), Generation(0)).with_limits(1, 1))
+        .with_manual_reserves();
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(b, &[(id(2), SIZE)], secs(0));
+    // The pool grants A, then refuses B, and B hears first.
+    assert!(relay.process_reserve(secs(0)));
+    assert!(relay.process_reserve(secs(0)));
+    assert!(relay.deliver_reserve_for(b, secs(0)));
+    assert!(relay.wanted().in_backoff());
+    assert!(relay.deliver_reserve_for(a, secs(0)));
+    assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
+    assert!(
+        relay.wanted().in_backoff(),
+        "the grant came before the refusal"
+    );
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_cooldown_delivered_after_the_tip_moved_does_not_start() {
+    for move_tip in [false, true] {
+        let mut relay = relay().with_manual_verdicts();
+        let a = open(&mut relay, 1, true, secs(0));
+        relay.inv(a, &[(id(1), SIZE)], secs(0));
+        relay.tx(a, id(1), tx(1), SIZE, secs(0));
+        let bad = Outcome::Fail {
+            scope: RejectionScope::ExactTip,
+            charge: Charge::Cooldown,
+        };
+        finish_all(&mut relay, &bad, secs(0));
+        assert_eq!(relay.verdicts_in_flight(), 1);
+        if move_tip {
+            let block = ModelTransition {
+                disconnected: 0,
+                connected: vec![ModelBlock::default()],
+                tip: Height(101),
+                generation: Generation(1),
+                rules_change: false,
+            };
+            relay.transition(block, secs(1));
+        }
+        assert!(relay.deliver_verdict(secs(1)));
+        assert_eq!(relay.reactor().is_cooling(PeerKey(1), secs(1)), !move_tip);
+        relay.assert_invariants();
+    }
+}
+
+#[test]
+fn an_outside_admission_uses_its_own_size_for_fan_out() {
+    let mut relay = relay().with_advert_delay(None);
+    let peers: Vec<_> = (1..=40)
+        .map(|p| open(&mut relay, p, true, secs(0)))
+        .collect();
+    relay.set_ranking(peers);
+    relay.outside(secs(0), |pool, now| {
+        let reservation = pool.reserve(id(1), Intent::Deliver, now).expect("room");
+        let _ = pool.effects();
+        let (_, step) = pool.submit(reservation.id, tx(1), now);
+        ((), step)
+    });
+    finish_all(&mut relay, &Outcome::Pass, secs(0));
+    assert_eq!(adverts(&relay.take_effects()).len(), WINDOW_SMALL);
+}
+
+#[test]
+fn a_ban_after_the_session_ended_closes_the_current_one() {
+    let mut relay = relay();
+    let old = open(&mut relay, 1, true, secs(0));
+    relay.inv(old, &[(id(1), SIZE)], secs(0));
+    relay.tx(old, id(1), tx(1), SIZE, secs(0));
+    relay.end(old, secs(1));
+    let new = open(&mut relay, 1, true, secs(1));
+    relay.take_effects();
+    let banned = Outcome::Fail {
+        scope: RejectionScope::ExactTip,
+        charge: Charge::Ban,
+    };
+    finish_all(&mut relay, &banned, secs(2));
+    assert_eq!(closes(&relay.take_effects()), vec![(new, CloseReason::Ban)]);
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_late_verdict_leaves_another_announcers_fetch_alone() {
+    let mut relay = relay().with_manual_verdicts();
+    let first = open(&mut relay, 1, true, secs(0));
+    relay.inv(first, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    relay.tx(first, id(1), tx(1), SIZE, secs(0));
+    let rejected = Outcome::Fail {
+        scope: RejectionScope::ExactTip,
+        charge: Charge::None,
+    };
+    finish_all(&mut relay, &rejected, secs(0));
+    relay.end(first, secs(1));
+    // A new block forgets the tip-scoped rejection, and another announcer
+    // fetches the id before the old verdict arrives.
+    let block = ModelTransition {
+        disconnected: 0,
+        connected: vec![ModelBlock::default()],
+        tip: Height(101),
+        generation: Generation(1),
+        rules_change: false,
+    };
+    relay.transition(block, secs(1));
+    let second = open(&mut relay, 2, true, secs(1));
+    relay.inv(second, &[(id(1), SIZE)], secs(1));
+    assert_eq!(asks(&relay.take_effects()), vec![(second, id(1))]);
+    assert!(relay.deliver_verdict(secs(2)));
+    assert_eq!(relay.wanted().entry(id(1)).unwrap().claim, Some(second));
+    relay.assert_invariants();
+}
+
 /// Fills the pool with another caller's reservations.
 fn fill_pool(relay: &mut RelayModel) {
     for n in 0..u32::try_from(MAX_PENDING).unwrap() {
@@ -1297,7 +1604,7 @@ enum Behaviour {
 /// peer announced must be decided, and nothing may be left held.
 #[test]
 fn random_runs_drain() {
-    for seed in 0..200 {
+    for seed in 0..400 {
         run(seed);
     }
 }
@@ -1307,8 +1614,14 @@ fn run(seed: u64) {
     let manual = seed % 2 == 1;
     let mut relay = RelayModel::new(PoolModel::new(Height(100), Generation(0)).with_limits(8, 2));
     if manual {
-        relay = relay.with_manual_reserves().with_manual_reads(6);
+        relay = relay
+            .with_manual_reserves()
+            .with_manual_reads(6)
+            .with_manual_verdicts();
     }
+    let mut height = 100u32;
+    let mut generation = 0u64;
+    let mut mined: HashSet<UnminedTxId> = HashSet::new();
     let behaviours = [
         Behaviour::Honest,
         Behaviour::Honest,
@@ -1360,7 +1673,7 @@ fn run(seed: u64) {
 
     for _ in 0..150 {
         now += Duration::from_millis(rng.next(1_500));
-        match rng.next(12) {
+        match rng.next(13) {
             0 | 1 if live.len() < 6 => {
                 let peer = rng.next(5);
                 let behaviour = behaviours[usize::try_from(peer).unwrap()];
@@ -1384,8 +1697,52 @@ fn run(seed: u64) {
                 }
             }
             7 => verify(&mut relay, &mut failed, &mut rng, now, true),
-            8 if manual => {
-                relay.answer_reserve(now);
+            8 if manual => match rng.next(3) {
+                0 => {
+                    relay.process_reserve(now);
+                }
+                1 => {
+                    relay.deliver_reserve(now);
+                }
+                _ => {
+                    relay.deliver_verdict(now);
+                }
+            },
+            10 => {
+                // A block, mining one pooled transaction if there is one.
+                let visible = relay.pool().visible();
+                let transactions = if visible.is_empty() {
+                    Vec::new()
+                } else {
+                    let pick = visible
+                        [usize::try_from(rng.next(u64::try_from(visible.len()).unwrap())).unwrap()];
+                    mined.insert(pick);
+                    vec![ModelTx::new(pick)]
+                };
+                height += 1;
+                generation += 1;
+                let block = ModelTransition {
+                    disconnected: 0,
+                    connected: vec![ModelBlock { transactions }],
+                    tip: Height(height),
+                    generation: Generation(generation),
+                    rules_change: false,
+                };
+                relay.transition(block, now);
+            }
+            11 => {
+                // A one-block reorg, which hides the pool while it is checked
+                // again.
+                height += 1;
+                generation += 1;
+                let reorg = ModelTransition {
+                    disconnected: 1,
+                    connected: vec![ModelBlock::default(), ModelBlock::default()],
+                    tip: Height(height),
+                    generation: Generation(generation),
+                    rules_change: false,
+                };
+                relay.transition(reorg, now);
             }
             9 if manual && !live.is_empty() => {
                 let index = usize::try_from(rng.next(u64::try_from(live.len()).unwrap())).unwrap();
@@ -1403,6 +1760,7 @@ fn run(seed: u64) {
     let mut drained = false;
     for _ in 0..5_000 {
         while relay.answer_reserve(now) {}
+        while relay.deliver_verdict(now) {}
         for (session, _) in &live {
             relay.read(*session, now);
         }
@@ -1411,7 +1769,8 @@ fn run(seed: u64) {
         verify(&mut relay, &mut failed, &mut rng, now, false);
         answer(&mut relay, &mut replies, &live, now, &mut rng);
         relay.assert_invariants();
-        if !relay.jobs().is_empty() || relay.calls_in_flight() > 0 {
+        if !relay.jobs().is_empty() || relay.calls_in_flight() > 0 || relay.verdicts_in_flight() > 0
+        {
             continue;
         }
         let next_reply = replies.iter().map(|(at, _, _)| *at).min();
@@ -1454,7 +1813,9 @@ fn run(seed: u64) {
         if *behaviour == Behaviour::Honest && relay.reactor().has_go(state.peer, *session) {
             for announced in honest.get(session).into_iter().flatten() {
                 assert!(
-                    visible.contains(announced) || failed.contains(announced),
+                    visible.contains(announced)
+                        || failed.contains(announced)
+                        || mined.contains(announced),
                     "seed {seed}: {announced:?} from an honest announcer was not decided"
                 );
             }
@@ -1466,8 +1827,6 @@ fn run(seed: u64) {
             "seed {seed}: {id:?} is still claimed"
         );
     }
-    // Sizes for fan-out are kept only for what the pool holds.
-    assert!(relay.sizes_kept() <= visible.len() + relay.pool().hidden().len());
 }
 
 /// Delivers the scripted answers that are due.

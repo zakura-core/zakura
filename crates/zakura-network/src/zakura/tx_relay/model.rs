@@ -71,8 +71,8 @@ use indexmap::IndexSet;
 use zakura_chain::{block::Height, transaction::UnminedTxId};
 use zakura_node_services::mempool::port::{
     model::{
-        Effect, JobId, ModelTransition, ModelTx, ModelUnreserved, ModelVerdict, Outcome, PoolModel,
-        Step, WaiterId,
+        Effect, JobId, ModelReservation, ModelTransition, ModelTx, ModelUnreserved, ModelVerdict,
+        Outcome, PoolModel, Step, WaiterId,
     },
     Change, Charge, Generation, GenerationRead, Intent, ReservationId,
 };
@@ -248,6 +248,30 @@ struct Call {
     id: UnminedTxId,
 }
 
+/// The pool's answer to a reserve call, on its way back.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct Answer {
+    call: Call,
+    answer: Result<ModelReservation, ModelUnreserved>,
+    /// When the pool decided it, in the pool's own order.
+    seq: u64,
+    /// The pool cancelled the granted reservation before the caller
+    /// received it, because a block mined the id or the pool turned off.
+    cancelled: bool,
+}
+
+/// A verdict on its way back to `tx-relay`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct Delivery {
+    waiter: WaiterId,
+    owner: VerdictOwner,
+    verdict: ModelVerdict,
+    /// The tip the pool decided it at.
+    decided_at: Height,
+    /// When the pool decided it, in the pool's own order.
+    seq: u64,
+}
+
 /// `tx-relay` with the pool behind it.
 #[derive(Debug)]
 pub(crate) struct RelayModel {
@@ -272,10 +296,10 @@ pub(crate) struct RelayModel {
     reservations: HashMap<ReservationId, (SessionId, UnminedTxId)>,
     /// Who waits for each of `tx-relay`'s submissions.
     waiters: HashMap<WaiterId, VerdictOwner>,
-    /// The serialized size of each body `tx-relay` submitted, while it is
-    /// undecided or in the pool, for its fan-out window. The real routine
-    /// reads it from the snapshot.
-    sizes: HashMap<UnminedTxId, u32>,
+    /// The serialized size of every transaction, which the real routine
+    /// reads from the snapshot. The model's transactions carry no size, so
+    /// the test gives one function for all of them.
+    tx_size: fn(UnminedTxId) -> u32,
     /// How long sessions outside an id's window wait. `None` never announces
     /// to them.
     advert_delay: Option<Duration>,
@@ -285,6 +309,9 @@ pub(crate) struct RelayModel {
     /// Whether sessions read the change log at once. Off, they wait for
     /// [`Self::read`].
     auto_reads: bool,
+    /// Whether verdicts reach `tx-relay` at once. Off, they wait for
+    /// [`Self::deliver_verdict`].
+    auto_verdicts: bool,
     /// The change log, newest last, at most `log_capacity` entries.
     log: VecDeque<(u64, Change)>,
     log_capacity: usize,
@@ -292,8 +319,14 @@ pub(crate) struct RelayModel {
     /// The visible pool and the hidden transactions, as the log says.
     visible: IndexSet<UnminedTxId>,
     hidden: HashSet<UnminedTxId>,
-    /// Reserve calls the pool has not answered, oldest first.
+    /// Reserve calls the pool has not processed, oldest first.
     calls: VecDeque<Call>,
+    /// Answers the pool decided and the caller has not received.
+    answers: VecDeque<Answer>,
+    /// Verdicts the pool decided and `tx-relay` has not received.
+    deliveries: VecDeque<Delivery>,
+    /// Counts what the pool decided, in its order.
+    pool_seq: u64,
     /// Pool steps waiting to be routed, oldest first.
     inbox: VecDeque<Step>,
     /// What `tx-relay` did, in order, until the test takes it.
@@ -321,16 +354,20 @@ impl RelayModel {
             next_session: 0,
             reservations: HashMap::new(),
             waiters: HashMap::new(),
-            sizes: HashMap::new(),
+            tx_size: |_| SMALL_TX_BYTES,
             advert_delay: Some(ADVERT_DELAY),
             auto_reserves: true,
             auto_reads: true,
+            auto_verdicts: true,
             log: VecDeque::new(),
             log_capacity: usize::MAX,
             last_seq: 0,
             visible: IndexSet::new(),
             hidden: HashSet::new(),
             calls: VecDeque::new(),
+            answers: VecDeque::new(),
+            deliveries: VecDeque::new(),
+            pool_seq: 0,
             inbox: VecDeque::new(),
             effects: Vec::new(),
             jobs: Vec::new(),
@@ -345,10 +382,26 @@ impl RelayModel {
         self
     }
 
-    /// The same model with reserve calls answered only by
-    /// [`Self::answer_reserve`], so calls can be in flight together.
+    /// The same model with reserve calls processed by
+    /// [`Self::process_reserve`] and their answers received by
+    /// [`Self::deliver_reserve`], so calls and answers can be in flight
+    /// together and the pool can act between deciding and delivering.
     pub(crate) fn with_manual_reserves(mut self) -> Self {
         self.auto_reserves = false;
+        self
+    }
+
+    /// The same model with verdicts received only by
+    /// [`Self::deliver_verdict`], so the chain can move between a verdict's
+    /// decision and its delivery.
+    pub(crate) fn with_manual_verdicts(mut self) -> Self {
+        self.auto_verdicts = false;
+        self
+    }
+
+    /// The same model with another size for each transaction.
+    pub(crate) fn with_tx_size(mut self, tx_size: fn(UnminedTxId) -> u32) -> Self {
+        self.tx_size = tx_size;
         self
     }
 
@@ -381,7 +434,7 @@ impl RelayModel {
     pub(crate) fn hello(&mut self, session: SessionId, hello: Hello, now: Time) {
         self.enter(now);
         let Some(state) = self.sessions.get_mut(&session) else {
-            return;
+            return self.settle();
         };
         if state.hello.is_some() {
             self.violation(session, Violation::HelloTwice);
@@ -400,11 +453,10 @@ impl RelayModel {
     pub(crate) fn inv(&mut self, session: SessionId, entries: &[(UnminedTxId, u32)], now: Time) {
         self.enter(now);
         let Some(peer) = self.sessions.get(&session).map(|state| state.peer) else {
-            return;
+            return self.settle();
         };
         if self.reactor.is_cooling(peer, self.now) {
-            self.settle();
-            return;
+            return self.settle();
         }
         if self.reactor.has_go(peer, session) {
             self.take_ids(session, entries);
@@ -412,9 +464,10 @@ impl RelayModel {
             // A session waiting for the go keeps its announcements to itself,
             // filtered and bounded as the pending set is, so one peer never
             // holds two shares of the table.
+            let seq = self.last_seq;
             let state = self.sessions.get_mut(&session).expect("checked above");
             for (id, size) in entries.iter().copied() {
-                state.mark_known(id);
+                state.mark_known(id, seq);
                 if self.visible.contains(&id)
                     || size > MAX_TX_BYTES
                     || state.waiting.contains_key(&id)
@@ -441,8 +494,9 @@ impl RelayModel {
         now: Time,
     ) {
         self.enter(now);
+        let seq = self.last_seq;
         let Some(state) = self.sessions.get_mut(&session) else {
-            return;
+            return self.settle();
         };
         let Some(request) = state.requests.get(&id).copied() else {
             self.violation(session, Violation::Unrequested);
@@ -480,9 +534,8 @@ impl RelayModel {
             return;
         }
         state.requests.shift_remove(&id);
-        state.mark_known(id);
+        state.mark_known(id, seq);
         self.reservations.remove(&reservation);
-        self.sizes.insert(id, size);
         let (waiter, step) = self.pool.submit(reservation, body, self.now);
         self.waiters.insert(waiter, VerdictOwner::Session(session));
         self.sessions
@@ -498,14 +551,16 @@ impl RelayModel {
     pub(crate) fn not_found(&mut self, session: SessionId, id: UnminedTxId, now: Time) {
         self.enter(now);
         let Some(state) = self.sessions.get_mut(&session) else {
-            return;
+            return self.settle();
         };
         let Some(request) = state.requests.shift_remove(&id) else {
             self.violation(session, Violation::Unrequested);
             self.settle();
             return;
         };
-        if state.take_pending(id).is_some() {
+        // An answer about an older generation leaves a newer pending entry
+        // alone.
+        if state.take_pending_of(id, request.generation).is_some() {
             self.wanted.unhold(id, request.generation);
         }
         state.mark_tried(id, request.generation);
@@ -523,15 +578,18 @@ impl RelayModel {
     pub(crate) fn get_txs(&mut self, session: SessionId, id: UnminedTxId, now: Time) {
         self.enter(now);
         let Some(state) = self.sessions.get(&session) else {
-            return;
+            return self.settle();
         };
-        if state.hello.is_none() {
+        let Some(hello) = state.hello else {
             self.violation(session, Violation::NoHelloFirst);
             self.settle();
             return;
-        }
-        // Exact ids: this compares the authorizing data too.
-        let servable = state.announced.contains(&id) && self.visible.contains(&id);
+        };
+        // Exact ids: this compares the authorizing data too. A body above the
+        // requester's limit is never sent.
+        let servable = state.announced.contains_key(&id)
+            && self.visible.contains(&id)
+            && (self.tx_size)(id) <= hello.max_tx_bytes;
         self.effects.push(if servable {
             RelayEffect::Serve { session, id }
         } else {
@@ -556,16 +614,75 @@ impl RelayModel {
         self.settle();
     }
 
-    /// The pool answers the oldest reserve call. Returns whether there was
-    /// one.
+    /// The pool processes the oldest reserve call and the caller receives
+    /// the oldest answer. Returns whether there was a call or an answer.
     pub(crate) fn answer_reserve(&mut self, now: Time) -> bool {
         self.enter(now);
-        let Some(call) = self.calls.pop_front() else {
-            return false;
-        };
-        self.complete(call);
+        let processed = self.calls.pop_front().map(|call| self.process(call));
+        let delivered = self.answers.pop_front().map(|answer| self.deliver(answer));
         self.settle();
-        true
+        processed.is_some() || delivered.is_some()
+    }
+
+    /// The pool processes the oldest reserve call. Its answer waits for
+    /// [`Self::deliver_reserve`]. Returns whether there was one.
+    pub(crate) fn process_reserve(&mut self, now: Time) -> bool {
+        self.enter(now);
+        let processed = self.calls.pop_front().map(|call| self.process(call));
+        self.settle();
+        processed.is_some()
+    }
+
+    /// The caller receives the oldest answer the pool decided. Returns
+    /// whether there was one.
+    pub(crate) fn deliver_reserve(&mut self, now: Time) -> bool {
+        self.enter(now);
+        let delivered = self.answers.pop_front().map(|answer| self.deliver(answer));
+        self.settle();
+        delivered.is_some()
+    }
+
+    /// `session` receives the oldest answer the pool decided for it, ahead
+    /// of other callers' answers. Returns whether there was one.
+    pub(crate) fn deliver_reserve_for(&mut self, session: SessionId, now: Time) -> bool {
+        self.enter(now);
+        let index = self
+            .answers
+            .iter()
+            .position(|answer| answer.call.session == session);
+        let delivered = index
+            .and_then(|index| self.answers.remove(index))
+            .map(|answer| self.deliver(answer));
+        self.settle();
+        delivered.is_some()
+    }
+
+    /// `tx-relay` receives the oldest verdict the pool decided. Returns
+    /// whether there was one.
+    pub(crate) fn deliver_verdict(&mut self, now: Time) -> bool {
+        self.enter(now);
+        let delivered = self
+            .deliveries
+            .pop_front()
+            .map(|delivery| self.verdict(delivery));
+        self.settle();
+        delivered.is_some()
+    }
+
+    /// `session` gives up a reserve call it made for `id`, before or after
+    /// the pool processed it. The claim and any probe permit go back.
+    pub(crate) fn cancel_reserve(&mut self, session: SessionId, id: UnminedTxId, now: Time) {
+        self.enter(now);
+        if let Some(reserving) = self
+            .sessions
+            .get_mut(&session)
+            .and_then(|state| state.reserving.shift_remove(&id))
+        {
+            self.wanted
+                .release(id, reserving.pending.generation, session, self.now, false);
+            self.return_probe(reserving.probe);
+        }
+        self.settle();
     }
 
     /// `session` reads the change log from its cursor, with the snapshot the
@@ -677,9 +794,15 @@ impl RelayModel {
         std::mem::take(&mut self.outside)
     }
 
-    /// Reserve calls the pool has not answered.
+    /// Reserve calls the pool has not processed, and answers the caller has
+    /// not received.
     pub(crate) fn calls_in_flight(&self) -> usize {
-        self.calls.len()
+        self.calls.len().saturating_add(self.answers.len())
+    }
+
+    /// Verdicts `tx-relay` has not received.
+    pub(crate) fn verdicts_in_flight(&self) -> usize {
+        self.deliveries.len()
     }
 
     /// The pool.
@@ -716,11 +839,6 @@ impl RelayModel {
     /// `tx-relay`'s reservations at the pool.
     pub(crate) fn reservations_held(&self) -> usize {
         self.reservations.len()
-    }
-
-    /// How many fan-out sizes the model keeps.
-    pub(crate) fn sizes_kept(&self) -> usize {
-        self.sizes.len()
     }
 
     /// The earliest time after now that something becomes due with no other
@@ -813,11 +931,8 @@ impl RelayModel {
                 Change::Removed { id, .. } => {
                     self.visible.shift_remove(&id);
                     self.hidden.remove(&id);
-                    self.sizes.remove(&id);
                 }
-                Change::Refused(id) => {
-                    self.sizes.remove(&id);
-                }
+                Change::Refused(_) => {}
             }
             self.last_seq = self.last_seq.saturating_add(1);
             if self.log.len() >= self.log_capacity {
@@ -856,12 +971,12 @@ impl RelayModel {
             // rebuilds from the snapshot. The skip set is not pruned: a
             // snapshot cannot tell a hidden transaction from a removed one.
             let visible = &self.visible;
-            state.announced.retain(|id| visible.contains(id));
+            state.announced.retain(|id, _| visible.contains(id));
             state.held.retain(|(id, _)| visible.contains(id));
             if self.pool_live {
                 for id in visible.iter().copied() {
-                    if !state.announced.contains(&id) && !state.knows(id) {
-                        state.announced.insert(id);
+                    if !state.announced.contains_key(&id) && !state.knows(id) {
+                        state.announced.insert(id, self.last_seq);
                         state.held.retain(|(held, _)| *held != id);
                         self.effects.push(RelayEffect::Advert { session, id });
                     }
@@ -878,22 +993,22 @@ impl RelayModel {
                 Change::Added(id) | Change::Revealed { id, .. } => {
                     if !self.pool_live
                         || !self.visible.contains(&id)
-                        || state.announced.contains(&id)
+                        || state.announced.contains_key(&id)
                         || state.knows(id)
                         || state.held.iter().any(|(held, _)| *held == id)
                     {
                         continue;
                     }
-                    let window = window(self.sizes.get(&id).copied());
+                    let window = window(Some((self.tx_size)(id)));
                     if rank.is_some_and(|rank| rank < window) {
-                        state.announced.insert(id);
+                        state.announced.insert(id, *seq);
                         self.effects.push(RelayEffect::Advert { session, id });
                     } else if let Some(delay) = self.advert_delay {
                         state.held.push((id, self.now.saturating_add(delay)));
                     }
                 }
                 Change::Hidden(id) => state.held.retain(|(held, _)| *held != id),
-                Change::Removed { id, .. } => state.forget(id),
+                Change::Removed { id, .. } => state.forget(id, *seq),
                 Change::Refused(_) => {}
             }
         }
@@ -905,21 +1020,56 @@ impl RelayModel {
         match effect {
             Effect::Start { job, tx, .. } => self.jobs.push((job, tx)),
             Effect::Cancel(job) => self.jobs.retain(|(running, _)| *running != job),
-            Effect::Verdict { waiter, verdict } => match self.waiters.remove(&waiter) {
-                Some(owner) => self.verdict(owner, waiter, verdict),
+            Effect::Verdict { waiter, verdict } => match self.waiters.get(&waiter).copied() {
+                Some(owner) => {
+                    self.pool_seq = self.pool_seq.saturating_add(1);
+                    let delivery = Delivery {
+                        waiter,
+                        owner,
+                        verdict,
+                        decided_at: self.tip,
+                        seq: self.pool_seq,
+                    };
+                    if self.auto_verdicts {
+                        self.verdict(delivery);
+                    } else {
+                        self.deliveries.push_back(delivery);
+                    }
+                }
                 None => self.outside.push(Effect::Verdict { waiter, verdict }),
             },
-            Effect::CancelFetch(reservation) => match self.reservations.remove(&reservation) {
-                Some((session, id)) => self.cancel_fetch(session, id, reservation),
-                None => self.outside.push(Effect::CancelFetch(reservation)),
-            },
+            Effect::CancelFetch(reservation) => {
+                if let Some((session, id)) = self.reservations.remove(&reservation) {
+                    self.cancel_fetch(session, id, reservation);
+                } else if let Some(answer) = self
+                    .answers
+                    .iter_mut()
+                    .find(|answer| answer.answer.is_ok_and(|granted| granted.id == reservation))
+                {
+                    // Granted, and cancelled before its caller heard.
+                    answer.cancelled = true;
+                } else {
+                    self.outside.push(Effect::CancelFetch(reservation));
+                }
+            }
             other => self.outside.push(other),
         }
     }
 
-    /// A verdict for one of `tx-relay`'s submissions. It was decided at the
-    /// pool's current tip.
-    fn verdict(&mut self, owner: VerdictOwner, waiter: WaiterId, verdict: ModelVerdict) {
+    /// A verdict for one of `tx-relay`'s submissions reaches its owner. The
+    /// owner may have changed since the pool decided it, when a session
+    /// ended, so it is looked up again.
+    fn verdict(&mut self, delivery: Delivery) {
+        let Delivery {
+            waiter,
+            verdict,
+            decided_at,
+            seq,
+            ..
+        } = delivery;
+        let Some(owner) = self.waiters.remove(&waiter) else {
+            return;
+        };
         let (peer, id, generation, session) = match owner {
             VerdictOwner::Session(session) => {
                 let state = self
@@ -940,25 +1090,38 @@ impl RelayModel {
                 (peer, id, generation, None)
             }
         };
-        // A verdict frees a pool slot.
-        self.wanted.room();
+        // A verdict frees a pool slot, unless a newer `NoRoom` came after it.
+        self.wanted.room(seq);
         match verdict {
-            ModelVerdict::Admitted => self.decided(id, generation),
+            ModelVerdict::Admitted => self.verdict_decides(id, generation, session),
             ModelVerdict::Rejected { charge, .. } => {
-                self.decided(id, generation);
-                if !self.visible.contains(&id) && !self.hidden.contains(&id) {
-                    self.sizes.remove(&id);
-                }
-                self.charge(peer, charge, self.tip);
+                self.verdict_decides(id, generation, session);
+                self.charge(peer, charge, decided_at);
             }
             ModelVerdict::NoRoom | ModelVerdict::LocalFault(_) => {
-                if !self.visible.contains(&id) && !self.hidden.contains(&id) {
-                    self.sizes.remove(&id);
-                }
                 if let Some(session) = session {
                     self.wanted.release(id, generation, session, self.now, true);
                 }
             }
+        }
+    }
+
+    /// A verdict decides its entry only if nobody else is fetching it. A
+    /// body from a session that ended can be decided after another
+    /// announcer took the id on, and that fetch ends on its own: the pool
+    /// answers it with the same admission, or the rejection is cached.
+    fn verdict_decides(
+        &mut self,
+        id: UnminedTxId,
+        generation: EntryGen,
+        session: Option<SessionId>,
+    ) {
+        let free = self
+            .wanted
+            .current(id, generation)
+            .is_some_and(|entry| entry.claim.is_none() || entry.claim == session);
+        if free {
+            self.decided(id, generation);
         }
     }
 
@@ -1080,14 +1243,22 @@ impl RelayModel {
             return;
         };
         let peer = state.peer;
+        let seq = self.last_seq;
         for id in self.reactor.unsettled_ids(peer) {
-            state.mark_known(id);
+            state.mark_known(id, seq);
         }
-        state.cursor = self.last_seq;
+        // A session that had the go before, such as one the pool's restart
+        // reopens, may not have read everything. It starts again from the
+        // snapshot, as a resync does.
+        let visible = &self.visible;
+        state.announced.retain(|id, _| visible.contains(id));
+        state.held.retain(|(id, _)| visible.contains(id));
+        state.cursor = seq;
         if self.pool_live {
             for id in self.visible.iter().copied() {
-                if !state.announced.contains(&id) && !state.knows(id) {
-                    state.announced.insert(id);
+                if !state.announced.contains_key(&id) && !state.knows(id) {
+                    state.announced.insert(id, seq);
+                    state.held.retain(|(held, _)| *held != id);
                     self.effects.push(RelayEffect::Advert { session, id });
                 }
             }
@@ -1101,12 +1272,13 @@ impl RelayModel {
     /// and the table.
     fn take_ids(&mut self, session: SessionId, entries: &[(UnminedTxId, u32)]) {
         let mut fresh = Vec::new();
+        let seq = self.last_seq;
         {
             let Some(state) = self.sessions.get_mut(&session) else {
                 return;
             };
             for (id, size) in entries.iter().copied() {
-                state.mark_known(id);
+                state.mark_known(id, seq);
                 if self.visible.contains(&id) || size > MAX_TX_BYTES {
                     continue;
                 }
@@ -1114,9 +1286,18 @@ impl RelayModel {
                 let already = current.is_some_and(|generation| {
                     state.holds(id, generation) || state.has_tried(id, generation)
                 });
-                let busy = state.requests.contains_key(&id)
-                    || state.reserving.contains_key(&id)
-                    || state.submissions.values().any(|(held, _)| *held == id);
+                // A request whose fetch was given up, such as one for an older
+                // generation, does not stop a fresh announcement. The id is
+                // asked for again only once that request is answered.
+                let busy = state.reserving.contains_key(&id)
+                    || state
+                        .requests
+                        .get(&id)
+                        .is_some_and(|request| request.reservation.is_some())
+                    || state
+                        .submissions
+                        .values()
+                        .any(|(held, generation)| *held == id && Some(*generation) == current);
                 if already || busy || fresh.iter().any(|(held, _)| *held == id) {
                     continue;
                 }
@@ -1156,9 +1337,11 @@ impl RelayModel {
                 state.held.drain(..).partition(|(_, at)| *at <= now);
             state.held = waiting;
             for (id, _) in due {
-                if self.visible.contains(&id) && !state.announced.contains(&id) && !state.knows(id)
+                if self.visible.contains(&id)
+                    && !state.announced.contains_key(&id)
+                    && !state.knows(id)
                 {
-                    state.announced.insert(id);
+                    state.announced.insert(id, self.last_seq);
                     self.effects.push(RelayEffect::Advert {
                         session: *session,
                         id,
@@ -1231,7 +1414,7 @@ impl RelayModel {
                     id: pending.id,
                 };
                 if self.auto_reserves {
-                    self.complete(call);
+                    self.process(call);
                     self.drain();
                 } else {
                     self.calls.push_back(call);
@@ -1240,33 +1423,82 @@ impl RelayModel {
         }
     }
 
-    /// The pool answers one reserve call.
-    fn complete(&mut self, call: Call) {
+    /// The pool processes one reserve call. With automatic reserves its
+    /// answer is received at once.
+    fn process(&mut self, call: Call) {
+        let live = self
+            .sessions
+            .get(&call.session)
+            .is_some_and(|state| state.reserving.contains_key(&call.id));
+        if !live {
+            // Its caller gave it up first, so it never reached the pool.
+            return;
+        }
+        let answer = self.pool.reserve(call.id, Intent::Fetch, self.now);
+        let step = self.pool.effects();
+        self.inbox.push_back(step);
+        self.pool_seq = self.pool_seq.saturating_add(1);
+        let answer = Answer {
+            call,
+            answer,
+            seq: self.pool_seq,
+            cancelled: false,
+        };
+        if self.auto_reserves {
+            self.deliver(answer);
+        } else {
+            self.answers.push_back(answer);
+        }
+    }
+
+    /// The caller receives the pool's answer to its reserve call.
+    fn deliver(&mut self, answer: Answer) {
+        let Answer {
+            call,
+            answer,
+            seq,
+            cancelled,
+        } = answer;
+        let session = call.session;
+        let id = call.id;
         let Some(reserving) = self
             .sessions
-            .get_mut(&call.session)
-            .and_then(|state| state.reserving.shift_remove(&call.id))
+            .get_mut(&session)
+            .and_then(|state| state.reserving.shift_remove(&id))
         else {
-            // Its session ended, so the call was dropped with it.
+            // The caller gave up the call or ended. A granted slot goes
+            // straight back.
+            if let Ok(reservation) = answer {
+                let step = self.pool.release(reservation.id, self.now);
+                self.inbox.push_back(step);
+            }
             return;
         };
         let Reserving { pending, probe } = reserving;
-        let session = call.session;
-        let id = call.id;
-        let answer = self.pool.reserve(id, Intent::Fetch, self.now);
-        let step = self.pool.effects();
-        self.inbox.push_back(step);
         let still_claimed = self
             .wanted
             .current(id, pending.generation)
             .is_some_and(|entry| entry.claim == Some(session));
         match answer {
+            Ok(reservation) if cancelled => {
+                let step = self.pool.release(reservation.id, self.now);
+                self.inbox.push_back(step);
+                if self.pool_live {
+                    self.wanted
+                        .release(id, pending.generation, session, self.now, false);
+                    self.decided(id, pending.generation);
+                } else {
+                    self.wanted
+                        .release(id, pending.generation, session, self.now, false);
+                }
+                self.return_probe(probe);
+            }
             Ok(reservation) => {
                 assert!(
                     !reservation.joined && reservation.wants_body,
                     "a fetch of an undecided id is refused, never joined"
                 );
-                self.wanted.room();
+                self.wanted.room(seq);
                 if still_claimed && self.pool_live {
                     let state = self.sessions.get_mut(&session).expect("checked above");
                     state.send(pending, reservation.id, self.now);
@@ -1275,12 +1507,15 @@ impl RelayModel {
                 } else {
                     let step = self.pool.release(reservation.id, self.now);
                     self.inbox.push_back(step);
+                    self.wanted
+                        .release(id, pending.generation, session, self.now, false);
                 }
+                self.return_probe(probe);
             }
             Err(ModelUnreserved::NoRoom) => {
                 self.wanted
                     .release(id, pending.generation, session, self.now, false);
-                self.wanted.no_room(self.now, probe);
+                self.wanted.no_room(self.now, probe, seq);
             }
             Err(ModelUnreserved::Pending) => {
                 self.wanted
@@ -1378,9 +1613,7 @@ impl RelayModel {
 
         let mut holders: HashMap<(UnminedTxId, EntryGen), usize> = HashMap::new();
         let mut reserved: HashMap<UnminedTxId, usize> = HashMap::new();
-        let mut submitted: HashSet<UnminedTxId> = HashSet::new();
         let mut pending_total = 0usize;
-        let mut claims_total = 0usize;
         for (session, state) in &self.sessions {
             let go = self.reactor.has_go(state.peer, *session);
             if go {
@@ -1416,10 +1649,6 @@ impl RelayModel {
                 );
             }
             pending_total = pending_total.saturating_add(state.pending.len());
-            claims_total = claims_total
-                .saturating_add(state.reserving.len())
-                .saturating_add(state.requests.len())
-                .saturating_add(state.submissions.len());
             for pending in &state.pending {
                 assert!(
                     !state.has_tried(pending.id, pending.generation),
@@ -1438,7 +1667,16 @@ impl RelayModel {
                     let entry = self
                         .wanted
                         .current(*id, request.generation)
-                        .expect("a live request's entry is current");
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "a live request's entry is current: {id:?} {request:?} entry {:?} pending {:?} visible {} hidden {} live {}",
+                                self.wanted.entry(*id),
+                                state.pending,
+                                self.visible.contains(id),
+                                self.hidden.contains(id),
+                                self.pool_live,
+                            )
+                        });
                     assert_eq!(
                         entry.claim,
                         Some(*session),
@@ -1446,15 +1684,14 @@ impl RelayModel {
                     );
                 }
             }
-            submitted.extend(state.submissions.values().map(|(id, _)| *id));
             for (held, _) in &state.held {
                 assert!(
-                    !state.announced.contains(held),
+                    !state.announced.contains_key(held),
                     "a held advert was not sent yet"
                 );
             }
             if state.cursor == self.last_seq && go {
-                for id in &state.announced {
+                for id in state.announced.keys() {
                     assert!(
                         self.visible.contains(id) || self.hidden.contains(id),
                         "a session that read the whole log announced only pooled ids"
@@ -1462,7 +1699,6 @@ impl RelayModel {
                 }
             }
         }
-        submitted.extend(self.reactor.all_unsettled_ids());
         for (id, count) in reserved {
             assert!(
                 count <= 1,
@@ -1491,15 +1727,16 @@ impl RelayModel {
         for (id, entry) in self.wanted.entries() {
             let counted = holders.remove(&(*id, entry.generation)).unwrap_or(0);
             assert_eq!(entry.holders, counted, "holder count of {id:?}");
-            assert!(
-                entry.holders > 0 || entry.claim.is_some(),
-                "an entry nobody holds or claims is gone"
-            );
+            assert!(entry.holders > 0, "an entry nobody holds is gone");
             if let Some(session) = entry.claim {
                 let state = self
                     .sessions
                     .get(&session)
                     .expect("a claim belongs to a live session");
+                assert!(
+                    state.holds(*id, entry.generation),
+                    "the claiming session holds the id pending"
+                );
                 let fetching = state.reserving.contains_key(id)
                     || state
                         .requests
@@ -1517,15 +1754,9 @@ impl RelayModel {
         }
         assert!(holders.is_empty(), "every pending reference has its entry");
         assert!(
-            self.wanted.len() <= pending_total.saturating_add(claims_total),
-            "the table is bounded by the pending sets and the claims"
+            self.wanted.len() <= pending_total,
+            "the table is bounded by the pending sets"
         );
-        for id in self.sizes.keys() {
-            assert!(
-                self.visible.contains(id) || self.hidden.contains(id) || submitted.contains(id),
-                "a size is kept only for a pooled or undecided submission"
-            );
-        }
     }
 }
 

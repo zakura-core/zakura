@@ -7277,10 +7277,10 @@ impl LegacyResponseReadState {
     ) -> Result<LegacyResponseItem, OutboundRequestError> {
         let mut remaining = self.active_chunk.as_slice();
         let item = match kind {
-            LegacyResponseKind::Blocks => Block::zcash_deserialize_from_slice(&mut remaining)
+            LegacyResponseKind::Blocks => Block::zcash_deserialize_bounded(&mut remaining)
                 .map(|block| LegacyResponseItem::Block(Arc::new(block))),
             LegacyResponseKind::Transactions => {
-                Transaction::zcash_deserialize_from_slice(&mut remaining)
+                Transaction::zcash_deserialize_bounded(&mut remaining)
                     .map(|transaction| LegacyResponseItem::Transaction(transaction.into()))
             }
             LegacyResponseKind::BlockHashes

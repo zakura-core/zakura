@@ -565,6 +565,22 @@ async fn each_applied_chain_event_is_reported_for_the_trace() {
         (0, 1),
         "the child is checked again"
     );
+
+    // While the pool is off, a chain event is remembered and not applied,
+    // so it writes no row, as today's pool writes none while disabled.
+    harness.active.send_replace(false);
+    harness.round_trip().await;
+    harness.mine(&[]);
+    harness.round_trip().await;
+    assert!(
+        harness
+            .tips
+            .lock()
+            .expect("no test panics holding it")
+            .try_recv()
+            .is_err(),
+        "no row for a tip the pool did not apply"
+    );
 }
 
 #[tokio::test]

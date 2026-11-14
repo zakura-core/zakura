@@ -427,7 +427,9 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 (self.machine.resync(tip, generation, now), true)
             }
         };
-        if let Some(tips) = &mut self.tips {
+        // Today's pool writes its trace row only for a tip it applies, and it
+        // applies none while it is off.
+        if let Some(tips) = self.tips.as_mut().filter(|_| self.machine.is_active()) {
             tips(&TipApplied {
                 tip: self.chain_tip,
                 reset,

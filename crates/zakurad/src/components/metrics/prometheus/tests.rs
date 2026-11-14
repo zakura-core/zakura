@@ -4,8 +4,10 @@ use std::time::{Duration, Instant};
 
 use rand_10::{rngs::StdRng, RngExt, SeedableRng};
 
+use tokio::{io::AsyncReadExt, net::TcpStream};
+
 use super::{
-    endpoint,
+    endpoint::{self, Limits},
     recorder::PrometheusRecorder,
     summary::{RollingSummary, Sketch, MAX_BUCKETS, QUANTILES, RELATIVE_ACCURACY, WINDOW_DURATION},
     text::{sanitize_description, sanitize_label_key, sanitize_label_value, sanitize_metric_name},
@@ -402,5 +404,91 @@ async fn endpoint_preserves_health_and_other_paths() {
         );
         assert!(headers.contains("content-type: text/plain\r\n"));
         assert_eq!(body, expected, "{method} {path}");
+    }
+}
+
+/// Starts an endpoint with an empty recorder, within `limits`.
+fn spawn_with_limits(limits: Limits) -> std::net::SocketAddr {
+    endpoint::spawn_with_limits(
+        "127.0.0.1:0".parse().expect("valid address"),
+        PrometheusRecorder::default(),
+        limits,
+    )
+    .expect("the endpoint starts")
+}
+
+/// Waits up to 10 seconds for the endpoint to close `stream`, and returns whether it did.
+async fn is_closed_by_endpoint(stream: &mut TcpStream) -> bool {
+    let mut buf = [0; 1024];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf)).await {
+            // The endpoint may answer a timed-out request before it closes the connection.
+            Ok(Ok(n)) if n > 0 => continue,
+            Ok(_) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn endpoint_closes_connections_that_send_no_request() {
+    let addr = spawn_with_limits(Limits {
+        header_read_timeout: Duration::from_millis(200),
+        ..Limits::DEFAULT
+    });
+
+    let mut silent = TcpStream::connect(addr)
+        .await
+        .expect("the endpoint accepts");
+
+    assert!(is_closed_by_endpoint(&mut silent).await);
+}
+
+#[tokio::test]
+async fn endpoint_closes_connections_open_too_long() {
+    let addr = spawn_with_limits(Limits {
+        connection_timeout: Duration::from_millis(200),
+        ..Limits::DEFAULT
+    });
+
+    let mut silent = TcpStream::connect(addr)
+        .await
+        .expect("the endpoint accepts");
+
+    assert!(is_closed_by_endpoint(&mut silent).await);
+}
+
+#[tokio::test]
+async fn endpoint_serves_at_most_max_connections() {
+    let addr = spawn_with_limits(Limits {
+        max_connections: 2,
+        ..Limits::DEFAULT
+    });
+
+    let first = TcpStream::connect(addr)
+        .await
+        .expect("the endpoint accepts");
+    let _second = TcpStream::connect(addr)
+        .await
+        .expect("the endpoint accepts");
+    let mut over_limit = TcpStream::connect(addr).await.expect("the OS accepts");
+    assert!(is_closed_by_endpoint(&mut over_limit).await);
+
+    // Closing a connection frees its place.
+    drop(first);
+    let client = zakura_node_services::rpc_client::RpcRequestClient::new(addr);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match client.get().await {
+            Ok(response) => {
+                assert_eq!(response.status(), 200);
+                break;
+            }
+            Err(error) if Instant::now() < deadline => {
+                tracing::debug!(?error, "endpoint has not freed the closed connection yet");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("the endpoint never freed the closed connection: {error}"),
+        }
     }
 }

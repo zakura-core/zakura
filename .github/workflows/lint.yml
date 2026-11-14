@@ -273,6 +273,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s deploy/trace-query -p 'test_*.py'
 
+      - name: Mempool self-send report tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s deploy/mempool-spam/scripts -p 'test_*.py'
+
       - name: Continuous-sync tests
         if: ${{ !cancelled() }}
         run: python3 deploy/continuous-sync/tests/test_continuous_sync.py

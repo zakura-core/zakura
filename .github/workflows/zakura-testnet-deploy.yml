@@ -31,6 +31,12 @@ on:
         required: false
         options: [auto, dual, zakura, legacy]
         default: auto
+      mempool_implementation:
+        description: "Pool override for one node; auto leaves the node on zakurad's default"
+        type: choice
+        required: false
+        options: [auto, default, classic, core]
+        default: auto
       header_sync_trace:
         description: "Write structured header/block-sync traces to the data volume"
         type: boolean
@@ -135,6 +141,7 @@ jobs:
         working-directory: deploy/deployer
         env:
           HEADER_SYNC_TRACE: ${{ inputs.header_sync_trace }}
+          MEMPOOL_IMPLEMENTATION: ${{ inputs.mempool_implementation }}
           NODE: ${{ inputs.node }}
           P2P_STACK: ${{ inputs.p2p_stack }}
           REF: ${{ inputs.ref }}
@@ -150,6 +157,17 @@ jobs:
               exit 1
             fi
             default_p2p_stack="$requested_p2p_stack"
+          fi
+
+          # A canary's pool is one node's choice. The fleet's next deploy without
+          # it puts the node back on zakurad's default.
+          mempool_implementation_line=""
+          if [ "${MEMPOOL_IMPLEMENTATION}" != "auto" ]; then
+            if [ -z "${NODE}" ]; then
+              echo "mempool_implementation overrides require one explicit node" >&2
+              exit 1
+            fi
+            mempool_implementation_line="mempool_implementation = \"${MEMPOOL_IMPLEMENTATION}\""
           fi
 
           if [ "${HEADER_SYNC_TRACE}" = "true" ] \
@@ -174,6 +192,7 @@ jobs:
           rpc_enable_cookie_auth = false
           storage_mode    = "archive"
           p2p_stack       = "${default_p2p_stack}"
+          ${mempool_implementation_line}
           metrics_endpoint = "127.0.0.1:9999"
           health_listen_addr = "127.0.0.1:8080"
           tracing_filter  = "info,zakura_network::zakura=info"

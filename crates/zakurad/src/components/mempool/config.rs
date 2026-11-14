@@ -83,6 +83,15 @@ impl Implementation {
             Self::Core => Self::Core,
         }
     }
+
+    /// The setting's name in the config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Classic => "classic",
+            Self::Core => "core",
+        }
+    }
 }
 
 impl Default for Config {

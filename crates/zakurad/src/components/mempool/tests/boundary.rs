@@ -49,7 +49,7 @@ use super::super::{
     Config, ExactTipRejectionError, Mempool, MempoolError, SameEffectsChainRejectionError,
     SameEffectsTipRejectionError,
 };
-use super::UnboxMempoolError;
+use super::{Readings, UnboxMempoolError};
 use crate::{components::sync::RecentSyncLengths, BoxError};
 
 /// A [`MockService`] standing in for the peer set.
@@ -1738,134 +1738,6 @@ async fn the_core_recovers_from_a_reset_no_later_than_todays_pool() {
     }
 }
 
-/// A recorder that keeps each counter's total and each gauge's last value,
-/// by name and labels, so a test can read what a pool emitted.
-#[derive(Clone, Default)]
-struct Readings(Arc<std::sync::Mutex<std::collections::BTreeMap<String, f64>>>);
-
-/// One counter or gauge of [`Readings`].
-struct Reading {
-    readings: Readings,
-    key: String,
-}
-
-impl Readings {
-    /// The value recorded under `key`, the metric's name followed by its
-    /// labels as `{label=value,...}`.
-    fn get(&self, key: &str) -> Option<f64> {
-        self.0
-            .lock()
-            .expect("no test panics holding it")
-            .get(key)
-            .copied()
-    }
-
-    /// Records `value` under `key`, adding it if `add`, or replacing it.
-    fn record(&self, key: &str, value: f64, add: bool) {
-        let mut readings = self.0.lock().expect("no test panics holding it");
-        let entry = readings.entry(key.to_owned()).or_default();
-        *entry = if add { *entry + value } else { value };
-    }
-
-    /// `key`'s name and labels, as [`Self::get`] reads them.
-    fn name(key: &metrics::Key) -> String {
-        let labels: Vec<String> = key
-            .labels()
-            .map(|label| format!("{}={}", label.key(), label.value()))
-            .collect();
-        if labels.is_empty() {
-            key.name().to_owned()
-        } else {
-            format!("{}{{{}}}", key.name(), labels.join(","))
-        }
-    }
-}
-
-impl metrics::CounterFn for Reading {
-    /// Adds `value` to the counter.
-    fn increment(&self, value: u64) {
-        // Test counts are far below where `f64` loses precision.
-        self.readings.record(&self.key, value as f64, true);
-    }
-
-    /// Sets the counter to `value`.
-    fn absolute(&self, value: u64) {
-        // Test counts are far below where `f64` loses precision.
-        self.readings.record(&self.key, value as f64, false);
-    }
-}
-
-impl metrics::GaugeFn for Reading {
-    /// Adds `value` to the gauge.
-    fn increment(&self, value: f64) {
-        self.readings.record(&self.key, value, true);
-    }
-
-    /// Subtracts `value` from the gauge.
-    fn decrement(&self, value: f64) {
-        self.readings.record(&self.key, -value, true);
-    }
-
-    /// Sets the gauge to `value`.
-    fn set(&self, value: f64) {
-        self.readings.record(&self.key, value, false);
-    }
-}
-
-impl metrics::Recorder for Readings {
-    /// Keeps no descriptions.
-    fn describe_counter(
-        &self,
-        _: metrics::KeyName,
-        _: Option<metrics::Unit>,
-        _: metrics::SharedString,
-    ) {
-    }
-
-    /// Keeps no descriptions.
-    fn describe_gauge(
-        &self,
-        _: metrics::KeyName,
-        _: Option<metrics::Unit>,
-        _: metrics::SharedString,
-    ) {
-    }
-
-    /// Keeps no descriptions.
-    fn describe_histogram(
-        &self,
-        _: metrics::KeyName,
-        _: Option<metrics::Unit>,
-        _: metrics::SharedString,
-    ) {
-    }
-
-    /// A counter that records under `key`.
-    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
-        metrics::Counter::from_arc(Arc::new(Reading {
-            readings: self.clone(),
-            key: Self::name(key),
-        }))
-    }
-
-    /// A gauge that records under `key`.
-    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
-        metrics::Gauge::from_arc(Arc::new(Reading {
-            readings: self.clone(),
-            key: Self::name(key),
-        }))
-    }
-
-    /// Histograms are not read.
-    fn register_histogram(
-        &self,
-        _: &metrics::Key,
-        _: &metrics::Metadata<'_>,
-    ) -> metrics::Histogram {
-        metrics::Histogram::noop()
-    }
-}
-
 /// The core only: an admission and a rejection emit today's metric names,
 /// from the adapter, the core's task and its storage. Today's pool's metrics
 /// have their own tests.
@@ -1961,6 +1833,160 @@ async fn the_verifiers_pool_handle_answers_at_once() {
             .is_some(),
         "{error:?}"
     );
+}
+
+/// A peer's refusal is counted only when its limit is the one reason. A
+/// peer at its limit that offers an id the pool holds, has rejected, or is
+/// already bringing in is not counted, whichever order each pool checks in.
+/// A fresh id is counted, under the advertiser's transport.
+async fn peer_limit_refusals_are_counted_by_cause(mode: Mode) {
+    let readings = Readings::default();
+    let _recording = metrics::set_default_local_recorder(&readings);
+    let mut harness = pool(Config::default(), Peers::Silent, mode).await;
+    harness.activate().await;
+    let mut bodies = samples(2);
+    let (pooled, rejected) = (bodies.remove(0), bodies.remove(0));
+    harness.admit(&pooled).await;
+    let receiver = harness
+        .queue_one(rejected.transaction.clone())
+        .await
+        .expect("a new body passes the first stage");
+    harness.verify(Err(TransactionError::BadBalance)).await;
+    harness
+        .outcome(receiver)
+        .await
+        .expect_err("an invalid transaction is refused");
+
+    let offer = |ids: Vec<UnminedTxId>, source: &QueueSource| Request::QueueFromPeer {
+        transactions: ids.into_iter().map(Gossip::from).collect(),
+        source: source.clone(),
+    };
+    let refused = |source: &str| {
+        readings
+            .get(&format!(
+                "mempool.full_queue.per_peer.total{{source={source}}}"
+            ))
+            .unwrap_or(0.0)
+    };
+    let peer = legacy_peer(1);
+    let held: Vec<_> = (0..MAX_INBOUND_CONCURRENCY_PER_PEER)
+        .map(unknown_id)
+        .collect();
+    harness.ask(offer(held.clone(), &peer)).await;
+    assert_eq!(refused("legacy"), 0.0, "the peer's share is not a refusal");
+
+    let known = vec![held[0], pooled.transaction.id(), rejected.transaction.id()];
+    harness.ask(offer(known, &peer)).await;
+    assert_eq!(refused("legacy"), 0.0, "known ids are not refusals");
+
+    harness.ask(offer(vec![unknown_id(50)], &peer)).await;
+    assert_eq!(refused("legacy"), 1.0, "a fresh id over the limit is");
+
+    let v2 = QueueSource::Zakura(vec![7; 32]);
+    let offered = (100..=100 + MAX_INBOUND_CONCURRENCY_PER_PEER)
+        .map(unknown_id)
+        .collect();
+    harness.ask(offer(offered, &v2)).await;
+    assert_eq!(refused("v2"), 1.0, "a v2 advertiser's refusal is its own");
+    assert_eq!(refused("legacy"), 1.0);
+}
+
+/// The core only: its size gauges are exported from the start, as zeros
+/// while it is empty, then follow what it holds.
+#[tokio::test(flavor = "current_thread")]
+async fn core_size_gauges_start_at_zero_and_follow_the_pool() {
+    let readings = Readings::default();
+    let _recording = metrics::set_default_local_recorder(&readings);
+    let mut harness = active_pool(Mode::Core).await;
+    let gauges = |readings: &Readings| {
+        ["retained", "hidden", "visible"]
+            .map(|gauge| readings.get(&format!("mempool.core.transactions.{gauge}")))
+    };
+    assert_eq!(
+        gauges(&readings),
+        [Some(0.0); 3],
+        "an empty pool exports zeros"
+    );
+
+    harness.admit(&samples(1)[0]).await;
+    harness.ids().await;
+    assert_eq!(gauges(&readings), [Some(1.0), Some(0.0), Some(1.0)]);
+}
+
+/// An id another peer's fetch already has takes none of an advertiser's
+/// five slots: with it and five fresh ids, the advertiser's five fresh ids
+/// are all fetched and nothing is refused.
+async fn a_queued_id_takes_no_peer_slot(mode: Mode) {
+    let readings = Readings::default();
+    let _recording = metrics::set_default_local_recorder(&readings);
+    let mut harness = pool(Config::default(), Peers::Silent, mode).await;
+    harness.activate().await;
+    let pending = unknown_id(0);
+    harness
+        .ask(Request::QueueFromPeer {
+            transactions: vec![pending.into()],
+            source: legacy_peer(1),
+        })
+        .await;
+    let fresh: Vec<_> = (1..=MAX_INBOUND_CONCURRENCY_PER_PEER)
+        .map(unknown_id)
+        .collect();
+    harness
+        .ask(Request::QueueFromPeer {
+            transactions: std::iter::once(pending)
+                .chain(fresh.iter().copied())
+                .map(Gossip::from)
+                .collect(),
+            source: legacy_peer(2),
+        })
+        .await;
+
+    assert_eq!(
+        readings
+            .get("mempool.full_queue.per_peer.total{source=legacy}")
+            .unwrap_or(0.0),
+        0.0,
+        "nothing was refused"
+    );
+    for id in fresh {
+        assert_eq!(
+            harness.queue_one(id).await.unbox_mempool_error(),
+            MempoolError::AlreadyQueued,
+            "each fresh id is in flight"
+        );
+    }
+}
+
+/// [`a_queued_id_takes_no_peer_slot`] against both pools, each on one
+/// thread so the test's recorder sees every task's metrics.
+mod a_queued_id_takes_no_peer_slot {
+    use super::Mode;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn classic() {
+        super::a_queued_id_takes_no_peer_slot(Mode::Classic).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn core() {
+        super::a_queued_id_takes_no_peer_slot(Mode::Core).await;
+    }
+}
+
+/// [`peer_limit_refusals_are_counted_by_cause`] against both pools, each on
+/// one thread so the test's recorder sees every task's metrics.
+mod peer_limit_refusals_are_counted_by_cause {
+    use super::Mode;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn classic() {
+        super::peer_limit_refusals_are_counted_by_cause(Mode::Classic).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn core() {
+        super::peer_limit_refusals_are_counted_by_cause(Mode::Core).await;
+    }
 }
 
 both_pools!(

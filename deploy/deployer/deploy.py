@@ -74,6 +74,9 @@ DEFAULTS = {
     "storage_mode": "archive",
     # One of: default | legacy | zakura | dual.
     "p2p_stack": "dual",
+    # Which pool the node runs: default | classic | core, rendered as
+    # [mempool] implementation. "" omits the section, so zakurad's default holds.
+    "mempool_implementation": "",
     "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
     # e.g. "127.0.0.1:8080" -> renders [health] (/healthy, /ready); "" omits it.
     # Both endpoints are unauthenticated, so keep them on loopback.
@@ -143,6 +146,7 @@ class Node:
     rpc_enable_cookie_auth: object
     storage_mode: str
     p2p_stack: str
+    mempool_implementation: str
     metrics_endpoint: str
     health_listen_addr: str
     miner_address: str
@@ -208,6 +212,23 @@ def normalize_p2p_stack(value: object, *, where: str) -> str:
             f"expected one of: default, legacy, zakura, dual"
         )
     return stack
+
+
+# Canonical names accepted by zakurad's mempool.implementation.
+MEMPOOL_IMPLEMENTATION_VALUES = {"default", "classic", "core"}
+
+
+def normalize_mempool_implementation(value: object, *, where: str) -> str:
+    """Return a node's pool setting, lowercased, or "" to leave it unset."""
+    if not isinstance(value, str):
+        raise DeployError(f"{where}: mempool_implementation must be a string")
+    implementation = value.strip().lower()
+    if implementation and implementation not in MEMPOOL_IMPLEMENTATION_VALUES:
+        raise DeployError(
+            f"{where}: unknown mempool_implementation {value!r}; "
+            f"expected one of: default, classic, core"
+        )
+    return implementation
 
 
 def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
@@ -296,6 +317,9 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             storage_mode=merged["storage_mode"],
             p2p_stack=normalize_p2p_stack(
                 merged["p2p_stack"], where=f"[[nodes]] {name}"
+            ),
+            mempool_implementation=normalize_mempool_implementation(
+                merged["mempool_implementation"], where=f"[[nodes]] {name}"
             ),
             metrics_endpoint=merged["metrics_endpoint"],
             health_listen_addr=merged["health_listen_addr"],
@@ -608,6 +632,11 @@ def render_node_config(node: Node) -> str:
     if node.internal_miner:
         mining_lines.append("internal_miner = true")
     mining_block = "[mining]\n" + "\n".join(mining_lines) + "\n" if mining_lines else ""
+    mempool_block = (
+        f'[mempool]\nimplementation = "{node.mempool_implementation}"\n'
+        if node.mempool_implementation
+        else ""
+    )
     filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zakurad default)"
     network_cache_line = (
         f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zakurad default)"
@@ -633,6 +662,7 @@ def render_node_config(node: Node) -> str:
         "METRICS_BLOCK": metrics_block,
         "HEALTH_BLOCK": health_block,
         "MINING_BLOCK": mining_block,
+        "MEMPOOL_BLOCK": mempool_block,
         "TRACING_FILTER": filter_line,
         "LOG_FILE": node.log_file,
         "RPC_BLOCK": rpc_block,

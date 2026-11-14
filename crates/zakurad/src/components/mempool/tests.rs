@@ -385,3 +385,131 @@ pub fn standardize_transaction(transaction: &mut Transaction) {
 fn standard_lock_script() -> transparent::Script {
     Address::from_pub_key_hash(NetworkKind::Mainnet, [0u8; 20]).script()
 }
+
+/// A recorder that keeps each counter's total and each gauge's last value,
+/// by name and labels, so a test can read what a pool emitted.
+#[derive(Clone, Default)]
+pub(super) struct Readings(Arc<std::sync::Mutex<std::collections::BTreeMap<String, f64>>>);
+
+/// One counter or gauge of [`Readings`].
+struct Reading {
+    readings: Readings,
+    key: String,
+}
+
+impl Readings {
+    /// The value recorded under `key`, the metric's name followed by its
+    /// labels as `{label=value,...}`.
+    pub(super) fn get(&self, key: &str) -> Option<f64> {
+        self.0
+            .lock()
+            .expect("no test panics holding it")
+            .get(key)
+            .copied()
+    }
+
+    /// Records `value` under `key`, adding it if `add`, or replacing it.
+    fn record(&self, key: &str, value: f64, add: bool) {
+        let mut readings = self.0.lock().expect("no test panics holding it");
+        let entry = readings.entry(key.to_owned()).or_default();
+        *entry = if add { *entry + value } else { value };
+    }
+
+    /// `key`'s name and labels, as [`Self::get`] reads them.
+    fn name(key: &metrics::Key) -> String {
+        let labels: Vec<String> = key
+            .labels()
+            .map(|label| format!("{}={}", label.key(), label.value()))
+            .collect();
+        if labels.is_empty() {
+            key.name().to_owned()
+        } else {
+            format!("{}{{{}}}", key.name(), labels.join(","))
+        }
+    }
+}
+
+impl metrics::CounterFn for Reading {
+    /// Adds `value` to the counter.
+    fn increment(&self, value: u64) {
+        // Test counts are far below where `f64` loses precision.
+        self.readings.record(&self.key, value as f64, true);
+    }
+
+    /// Sets the counter to `value`.
+    fn absolute(&self, value: u64) {
+        // Test counts are far below where `f64` loses precision.
+        self.readings.record(&self.key, value as f64, false);
+    }
+}
+
+impl metrics::GaugeFn for Reading {
+    /// Adds `value` to the gauge.
+    fn increment(&self, value: f64) {
+        self.readings.record(&self.key, value, true);
+    }
+
+    /// Subtracts `value` from the gauge.
+    fn decrement(&self, value: f64) {
+        self.readings.record(&self.key, -value, true);
+    }
+
+    /// Sets the gauge to `value`.
+    fn set(&self, value: f64) {
+        self.readings.record(&self.key, value, false);
+    }
+}
+
+impl metrics::Recorder for Readings {
+    /// Keeps no descriptions.
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    /// Keeps no descriptions.
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    /// Keeps no descriptions.
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    /// A counter that records under `key`.
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::from_arc(Arc::new(Reading {
+            readings: self.clone(),
+            key: Self::name(key),
+        }))
+    }
+
+    /// A gauge that records under `key`.
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::from_arc(Arc::new(Reading {
+            readings: self.clone(),
+            key: Self::name(key),
+        }))
+    }
+
+    /// Histograms are not read.
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}

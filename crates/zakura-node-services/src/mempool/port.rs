@@ -1074,6 +1074,12 @@ impl PoolHandle {
         self.snapshot.borrow().clone()
     }
 
+    /// Whether the core has stopped taking commands, so an empty answer
+    /// such as [`Self::rejected_ids`]'s may mean it never answered.
+    pub fn is_stopped(&self) -> bool {
+        self.commands.is_closed()
+    }
+
     /// A reader of the snapshot that does not keep the core running.
     pub fn reader(&self) -> PoolReader {
         PoolReader {

@@ -203,6 +203,15 @@ pub enum OutputAnswer {
     Inactive,
 }
 
+/// The pool's size, visible and hidden. See [`MempoolState::pool_counts`].
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct PoolCounts {
+    /// Every pooled transaction, visible or hidden.
+    pub retained: usize,
+    /// The pooled transactions hidden while they are checked again.
+    pub hidden: usize,
+}
+
 /// The machine's limits. Production uses the port's constants. Tests use
 /// smaller ones so a short run reaches every full state.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -954,6 +963,15 @@ impl<E: VerifyError> MempoolState<E> {
     /// What storage holds, for the pool's metrics.
     pub fn storage_stats(&self) -> StorageStats {
         self.storage.stats()
+    }
+
+    /// How many transactions the pool holds, and how many of them are hidden
+    /// while they are checked again, for the pool's metrics.
+    pub fn pool_counts(&self) -> PoolCounts {
+        PoolCounts {
+            retained: self.pool.len(),
+            hidden: self.hidden.len(),
+        }
     }
 
     /// The earliest time an input would apply a deadline, if any is set.

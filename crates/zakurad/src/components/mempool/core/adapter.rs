@@ -57,6 +57,7 @@ use super::{
             MAX_INBOUND_CONCURRENCY_PER_PEER,
         },
         peer_cooldown::PeerCooldowns,
+        peer_metrics::{count_legacy_peer_penalty, count_peer_limit_refusal, Penalty},
         pending_outputs::PendingOutputsFull,
         queue_source_log_label, start_peer_cooldown,
         storage::NonStandardTransactionError,
@@ -109,9 +110,9 @@ struct Shared {
     /// The largest body the pool takes, which today's downloader checks
     /// before a cooldown.
     max_transaction_bytes: u64,
-    /// Queued items not yet answered at their second stage, at most
-    /// [`MAX_INBOUND_CONCURRENCY`]. See [`QueueSlot`].
-    queued: std::sync::Mutex<usize>,
+    /// Queued items not yet answered at their second stage. See
+    /// [`QueueSlot`].
+    queued: std::sync::Mutex<Queued>,
     /// Undecided transactions from each peer, counted from the reservation to
     /// the verdict.
     per_peer: std::sync::Mutex<HashMap<QueueSource, usize>>,
@@ -156,7 +157,7 @@ impl CoreMempool {
                 may_cool,
                 best_tip,
                 max_transaction_bytes,
-                queued: std::sync::Mutex::new(0),
+                queued: std::sync::Mutex::new(Queued::default()),
                 per_peer: std::sync::Mutex::new(HashMap::new()),
                 read_state: std::sync::Mutex::new(read_state),
                 expose_peer_addresses,
@@ -325,56 +326,91 @@ fn peer_batch(
     // pool skips it, so it cannot take a fresh body's slot. Every other body
     // takes its slots now. Today's pool drops what it cannot queue from a
     // peer, so a body over a limit is dropped here without asking the core.
+    // One over its peer's limit alone is counted as a refusal. Unlike today's
+    // pool, this does not first ask the core whether the body is a cached
+    // rejection, since that would cost the core a command for a body it
+    // never sees. Only an unsolicited push of a rejected id from a peer at
+    // its limit is counted here and not by today's pool.
     let bodies: Vec<Staged> = bodies
         .into_iter()
         .filter(|body| snapshot.transaction(&body.id().mined_id()).is_none())
         .map(|item| Staged::new(&shared, item, &from))
         .filter(|body| match body {
-            Staged::Over { peer_full, .. } => {
-                if *peer_full {
-                    metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
+            Staged::Over {
+                id,
+                peer_full,
+                queued,
+                ..
+            } => {
+                if *peer_full && !*queued && !shared.is_pooled_now(id) {
+                    count_peer_limit_refusal(&source);
                 }
                 false
             }
             Staged::Held { .. } => true,
         })
         .collect();
+    // Today's pool checks what it already knows about each id before its
+    // limits, at no cost. Here that is one look at the snapshot and one core
+    // command for the whole batch, so a batch of known ids costs the core one
+    // command, not one for each. A pooled transaction is known by its
+    // effects, as `reserve` knows it.
+    let fresh: Vec<UnminedTxId> = ids
+        .iter()
+        .map(Gossip::id)
+        .filter(|id| snapshot.transaction(&id.mined_id()).is_none())
+        .collect();
+    // Today's pool answers an id it is bringing in as already queued when the
+    // advertisement arrives, so one queued now is never this peer's refusal,
+    // even if it is decided before the batch's task runs or while its lookup
+    // waits.
+    let queued_on_arrival = shared.queued_among(&fresh);
     // The work starts here, in a task of its own, as for `queue_request`.
     answered_by(async move {
         for body in bodies {
             let _ = body.queue(shared.clone(), from.clone()).await;
         }
-        // Today's pool checks what it already knows about each id before its
-        // limits, at no cost. Here that is one look at the snapshot and one
-        // core command for the whole batch, so a batch of known ids costs the
-        // core one command, not one for each. A pooled transaction is known
-        // by its effects, as `reserve` knows it.
-        let fresh: Vec<UnminedTxId> = ids
-            .iter()
-            .map(Gossip::id)
-            .filter(|id| snapshot.transaction(&id.mined_id()).is_none())
-            .collect();
+        // `None` if the core did not answer within [`MAX_LOOKUP_WAIT`]. The
+        // ids are then staged as if none were rejected, and none is counted
+        // as a refusal below, since none is known not to be a rejection.
         let rejected = if fresh.is_empty() {
-            Default::default()
+            Some(Default::default())
         } else {
-            rejected_ids(&shared, fresh.iter().copied().collect()).await
+            tokio::time::timeout(
+                MAX_LOOKUP_WAIT,
+                shared.handle.rejected_ids(fresh.iter().copied().collect()),
+            )
+            .await
+            .ok()
         };
+        // A stopped core's lookup answers empty without asking it.
+        let looked_up = rejected.is_some() && !shared.handle.is_stopped();
+        let rejected = rejected.unwrap_or_default();
         // The rest take their slots now, in one pass, as today's pool queues
         // a batch at once: at most the peer's limit of them, and the rest are
         // refused here, without asking the core. Slots that free up while
         // the batch is worked on take nothing more from it.
+        // An id already queued is today's `AlreadyQueued`, which a peer's
+        // batch drops, so it keeps none of the peer's slots. One queued on
+        // arrival takes none. One queued since, as by another batch, gives
+        // its slots back at once, before the next id takes any.
         let staged: Vec<Staged> = fresh
             .into_iter()
-            .filter(|id| !rejected.contains(id))
+            .filter(|id| !rejected.contains(id) && !queued_on_arrival.contains(id))
             .map(|id| Staged::new(&shared, Gossip::Id(id), &from))
             .filter(|id| match id {
-                Staged::Over { peer_full, .. } => {
-                    if *peer_full {
-                        metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
+                Staged::Over {
+                    id,
+                    peer_full,
+                    queued,
+                    ..
+                } => {
+                    if *peer_full && looked_up && !*queued && !shared.is_pooled_now(id) {
+                        count_peer_limit_refusal(&source);
                     }
                     false
                 }
-                Staged::Held { .. } => true,
+                Staged::Held { queue_slot, .. } => !queue_slot.was_queued,
             })
             .collect();
         for id in staged {
@@ -588,26 +624,26 @@ enum Staged {
         id: UnminedTxId,
         intent: Intent,
         peer_full: bool,
+        /// Whether another item with the same id held a queue slot when this
+        /// one took its own, read under the same lock: today's downloader's
+        /// already-queued check, which comes before the peer's limit.
+        queued: bool,
     },
 }
 
 impl Staged {
     /// Takes `item`'s slots now, for an item from `from`.
     fn new(shared: &Arc<Shared>, item: Gossip, from: &Option<QueueSource>) -> Self {
-        let over = |item: Gossip, peer_full| Self::Over {
+        let over = |item: Gossip, peer_full, queued| Self::Over {
             id: item.id(),
             intent: intent_of(&item),
             peer_full,
+            queued,
         };
-        let Some(queue_slot) = QueueSlot::take(shared) else {
-            return over(item, false);
-        };
-        let peer_slot = match from {
-            Some(peer) => match PeerSlot::take(shared, peer) {
-                Some(slot) => Some(slot),
-                None => return over(item, true),
-            },
-            None => None,
+        let (queue_slot, peer_slot) = match QueueSlot::take(shared, item.id(), from.as_ref()) {
+            Ok(slots) => slots,
+            Err(SlotsFull::Node) => return over(item, false, false),
+            Err(SlotsFull::Peer { queued }) => return over(item, true, queued),
         };
         Self::Held {
             item,
@@ -632,11 +668,7 @@ impl Staged {
                 peer_slot,
                 deadline,
             } => queue_held(shared, item, queue_slot, peer_slot, from, deadline).await,
-            Self::Over {
-                id,
-                intent,
-                peer_full,
-            } => known_or_full(&shared, id, intent, peer_full).await,
+            Self::Over { id, intent, .. } => known_or_full(&shared, id, intent).await,
         }
     }
 }
@@ -663,9 +695,13 @@ fn charge(
         ),
         Charge::None | Charge::Cooldown => {}
         Charge::Ban => {
-            let _ = shared
+            if shared
                 .misbehavior_sender
-                .try_send((peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
+                .try_send((peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE))
+                .is_ok()
+            {
+                count_legacy_peer_penalty(Penalty::Ban);
+            }
         }
     }
 }
@@ -796,8 +832,9 @@ impl Drop for Handoff {
     }
 }
 
-/// The first-stage answer for an item with id `id` when the node's limit,
-/// or its peer's if `peer_full`, is reached. Today's pool answers what it
+/// The first-stage answer for an item with id `id` when the node's limit is
+/// reached. A peer's batch drops its items over a limit and counts their
+/// refusals itself, so none reaches here. Today's pool answers what it
 /// already knows about an id before it checks its limits: in the pool,
 /// already queued, or a cached rejection, some of which it answers at the
 /// second stage. So the core is asked about the id alone, the body having
@@ -806,14 +843,8 @@ async fn known_or_full(
     shared: &Shared,
     id: UnminedTxId,
     intent: Intent,
-    peer_full: bool,
 ) -> Result<Receiver, BoxError> {
-    let full = || {
-        if peer_full {
-            metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
-        }
-        Err(MempoolError::FullQueue.into())
-    };
+    let full = || Err(MempoolError::FullQueue.into());
     // A lookup, bounded as one, so a stalled core cannot gather these.
     let Ok(reserved) =
         tokio::time::timeout(MAX_LOOKUP_WAIT, shared.handle.reserve(id, intent)).await
@@ -835,37 +866,103 @@ async fn known_or_full(
 /// including ones waiting for a reservation. Dropping it frees the slot.
 struct QueueSlot {
     shared: Arc<Shared>,
+    id: UnminedTxId,
+    /// Whether another slot held `id` when this one was taken.
+    was_queued: bool,
+}
+
+/// The items holding a [`QueueSlot`]: at most [`MAX_INBOUND_CONCURRENCY`] in
+/// all, and how many have each id. The ids are today's downloader's queued
+/// set, which it checks before the peer's limit. See [`Staged::Over`].
+#[derive(Debug, Default)]
+struct Queued {
+    total: usize,
+    ids: HashMap<UnminedTxId, usize>,
+}
+
+/// Why [`QueueSlot::take`] took no slots.
+#[derive(Debug)]
+enum SlotsFull {
+    /// The node has [`MAX_INBOUND_CONCURRENCY`] queued items.
+    Node,
+    /// The node had room, but the peer has
+    /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`] undecided transactions.
+    Peer {
+        /// Whether another item with the same id held a slot.
+        queued: bool,
+    },
 }
 
 impl QueueSlot {
-    /// Takes a slot, or `None` if all are in use.
-    fn take(shared: &Arc<Shared>) -> Option<Self> {
+    /// Takes a node-wide slot for an item with id `id`, and one of
+    /// `peer`'s, if it has a peer, in today's order: the node's limit, then
+    /// the peer's. Both are taken under one lock, so another caller sees the
+    /// id queued only once both are held.
+    // A poisoned lock is a broken invariant, not a refusal to report.
+    #[allow(clippy::unwrap_in_result)]
+    fn take(
+        shared: &Arc<Shared>,
+        id: UnminedTxId,
+        peer: Option<&QueueSource>,
+    ) -> Result<(Self, Option<PeerSlot>), SlotsFull> {
         let mut queued = shared
             .queued
             .lock()
             .expect("no code panics while holding the queued count");
-        if *queued >= MAX_INBOUND_CONCURRENCY {
-            set_queued_gauge(*queued);
-            return None;
+        if queued.total >= MAX_INBOUND_CONCURRENCY {
+            set_queued_gauge(queued.total);
+            return Err(SlotsFull::Node);
         }
-        *queued += 1;
-        set_queued_gauge(*queued);
-        Some(Self {
-            shared: shared.clone(),
-        })
+        let was_queued = queued.ids.contains_key(&id);
+        let peer_slot = match peer {
+            Some(peer) => {
+                // The one place both locks are held, always in this order.
+                let mut counts = shared
+                    .per_peer
+                    .lock()
+                    .expect("no code panics while holding the per-peer counts");
+                let count = counts.entry(peer.clone()).or_default();
+                if *count >= MAX_INBOUND_CONCURRENCY_PER_PEER {
+                    return Err(SlotsFull::Peer { queued: was_queued });
+                }
+                *count += 1;
+                Some(PeerSlot {
+                    shared: shared.clone(),
+                    peer: peer.clone(),
+                })
+            }
+            None => None,
+        };
+        queued.total += 1;
+        *queued.ids.entry(id).or_default() += 1;
+        set_queued_gauge(queued.total);
+        Ok((
+            Self {
+                shared: shared.clone(),
+                id,
+                was_queued,
+            },
+            peer_slot,
+        ))
     }
 }
 
 impl Drop for QueueSlot {
-    /// Frees the slot.
+    /// Frees the slot, and forgets an id no slot holds.
     fn drop(&mut self) {
         let mut queued = self
             .shared
             .queued
             .lock()
             .expect("no code panics while holding the queued count");
-        *queued = queued.saturating_sub(1);
-        set_queued_gauge(*queued);
+        queued.total = queued.total.saturating_sub(1);
+        if let Some(count) = queued.ids.get_mut(&self.id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                queued.ids.remove(&self.id);
+            }
+        }
+        set_queued_gauge(queued.total);
     }
 }
 
@@ -882,26 +979,6 @@ fn set_queued_gauge(queued: usize) {
 struct PeerSlot {
     shared: Arc<Shared>,
     peer: QueueSource,
-}
-
-impl PeerSlot {
-    /// Counts one more transaction against `peer`, or `None` if the peer
-    /// already has [`MAX_INBOUND_CONCURRENCY_PER_PEER`].
-    fn take(shared: &Arc<Shared>, peer: &QueueSource) -> Option<Self> {
-        let mut counts = shared
-            .per_peer
-            .lock()
-            .expect("no code panics while holding the per-peer counts");
-        let count = counts.entry(peer.clone()).or_default();
-        if *count >= MAX_INBOUND_CONCURRENCY_PER_PEER {
-            return None;
-        }
-        *count += 1;
-        Some(Self {
-            shared: shared.clone(),
-            peer: peer.clone(),
-        })
-    }
 }
 
 impl Drop for PeerSlot {
@@ -1092,6 +1169,37 @@ async fn bring_in(
 }
 
 impl Shared {
+    /// Which of `ids` an item holding a [`QueueSlot`] has, as of one moment.
+    ///
+    /// At most [`MAX_INBOUND_CONCURRENCY`] ids hold slots, so a batch larger
+    /// than that copies them out instead, and the lock every slot takes is
+    /// held for at most that many ids, however many a peer advertises.
+    fn queued_among(&self, ids: &[UnminedTxId]) -> std::collections::HashSet<UnminedTxId> {
+        let queued = self
+            .queued
+            .lock()
+            .expect("no code panics while holding the queued count");
+        if ids.len() <= queued.ids.len() {
+            return ids
+                .iter()
+                .filter(|id| queued.ids.contains_key(id))
+                .copied()
+                .collect();
+        }
+        let held: std::collections::HashSet<UnminedTxId> = queued.ids.keys().copied().collect();
+        drop(queued);
+        ids.iter().filter(|id| held.contains(id)).copied().collect()
+    }
+
+    /// Whether the core's latest snapshot holds `id`. A refusal counted
+    /// after a wait reads this rather than the snapshot the request began
+    /// with, since an admission is published before its queue slot is freed.
+    fn is_pooled_now(&self, id: &UnminedTxId) -> bool {
+        self.handle
+            .snapshot()
+            .is_some_and(|snapshot| snapshot.transaction(&id.mined_id()).is_some())
+    }
+
     /// Whether `snapshot` is of a tip other than the state's best tip. A
     /// state with no tip yet has nothing to be behind.
     fn is_behind(&self, snapshot: &PoolSnapshot) -> bool {
@@ -1730,6 +1838,359 @@ mod tests {
                 "the peer is banned, current: {current}"
             );
         }
+    }
+
+    /// A peer at its limit whose batch's rejection lookup the core does not
+    /// answer in time has no refusal counted, since none of its ids is known
+    /// not to be a cached rejection. The ids are still dropped, as before.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_unanswered_lookup_counts_no_refusal() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let readings = super::super::super::tests::Readings::default();
+        let _recording = metrics::set_default_local_recorder(&readings);
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
+        let _share: Vec<(QueueSlot, Option<PeerSlot>)> = (0..MAX_INBOUND_CONCURRENCY_PER_PEER)
+            .map(|n| {
+                QueueSlot::take(&core.shared, filler_id(100 + n), Some(&peer))
+                    .expect("room in the share")
+            })
+            .collect();
+        let request = tokio::spawn(core.call(Request::QueueFromPeer {
+            transactions: vec![Gossip::Id(filler_id(1))],
+            source: peer,
+        }));
+        // The core holds the lookup's reply without answering it.
+        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch looks its ids up");
+        };
+        let answer = request.await.expect("the task does not panic");
+        assert!(matches!(answer, Ok(Response::Queued(_))));
+        assert_eq!(
+            readings.get("mempool.full_queue.per_peer.total{source=legacy}"),
+            None
+        );
+        drop(reply);
+    }
+
+    /// A stopped core answers a batch's lookup empty without asking it, so
+    /// none of the batch's refusals is counted, as for a lookup it does not
+    /// answer in time.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_cores_lookup_counts_no_refusal() {
+        use zakura_node_services::mempool::port::pool_port;
+
+        let readings = super::super::super::tests::Readings::default();
+        let _recording = metrics::set_default_local_recorder(&readings);
+        let (handle, inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        drop(inbox);
+        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
+        let _share: Vec<(QueueSlot, Option<PeerSlot>)> = (0..MAX_INBOUND_CONCURRENCY_PER_PEER)
+            .map(|n| {
+                QueueSlot::take(&core.shared, filler_id(100 + n), Some(&peer))
+                    .expect("room in the share")
+            })
+            .collect();
+        let _ = core
+            .call(Request::QueueFromPeer {
+                transactions: vec![Gossip::Id(filler_id(1))],
+                source: peer,
+            })
+            .await;
+        assert_eq!(
+            readings.get("mempool.full_queue.per_peer.total{source=legacy}"),
+            None
+        );
+    }
+
+    /// An item its peer's limit refuses leaves no trace another batch could
+    /// see: its id is not queued and the node's count is unchanged, since
+    /// both slots are taken under one lock or not at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_peer_refusal_exposes_no_queued_id() {
+        use zakura_node_services::mempool::port::pool_port;
+
+        let (handle, _inbox) = pool_port();
+        let core = adapter_on(handle);
+        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
+        let _share: Vec<(QueueSlot, Option<PeerSlot>)> = (0..MAX_INBOUND_CONCURRENCY_PER_PEER)
+            .map(|n| {
+                QueueSlot::take(&core.shared, filler_id(100 + n), Some(&peer))
+                    .expect("room in the share")
+            })
+            .collect();
+        let refused = filler_id(1);
+
+        assert!(matches!(
+            QueueSlot::take(&core.shared, refused, Some(&peer)),
+            Err(SlotsFull::Peer { queued: false })
+        ));
+        assert!(core.shared.queued_among(&[refused]).is_empty());
+        assert_eq!(queued_count(&core), MAX_INBOUND_CONCURRENCY_PER_PEER);
+    }
+
+    /// A body pushed by a peer at its limit is counted as a refusal, and one
+    /// whose id another slot already holds is not, as today's pool answers
+    /// it as already queued.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_over_limit_body_is_counted_unless_its_id_is_queued() {
+        use zakura_chain::transaction::{LockTime, Transaction, UnminedTx};
+        use zakura_node_services::mempool::port::pool_port;
+
+        let readings = super::super::super::tests::Readings::default();
+        let _recording = metrics::set_default_local_recorder(&readings);
+        let (handle, inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let template = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let body = |height| {
+            let mut transaction = Transaction::clone(template.transaction());
+            if let Transaction::V1 { lock_time, .. }
+            | Transaction::V2 { lock_time, .. }
+            | Transaction::V3 { lock_time, .. }
+            | Transaction::V4 { lock_time, .. }
+            | Transaction::V5 { lock_time, .. } = &mut transaction
+            {
+                *lock_time = LockTime::Height(Height(height));
+            }
+            UnminedTx::from(transaction)
+        };
+        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
+        let _share: Vec<(QueueSlot, Option<PeerSlot>)> = (0..MAX_INBOUND_CONCURRENCY_PER_PEER)
+            .map(|n| {
+                QueueSlot::take(&core.shared, filler_id(100 + n), Some(&peer))
+                    .expect("room in the share")
+            })
+            .collect();
+        let refused = || readings.get("mempool.full_queue.per_peer.total{source=legacy}");
+        let shared = core.shared.clone();
+        let mut push = |tx: UnminedTx| {
+            core.call(Request::QueueFromPeer {
+                transactions: vec![Gossip::Tx(tx)],
+                source: peer.clone(),
+            })
+        };
+
+        let _ = push(body(1)).await;
+        assert_eq!(refused(), Some(1.0), "a fresh body over the limit");
+
+        let queued = body(2);
+        let _other = QueueSlot::take(&shared, queued.id(), None)
+            .expect("room in the node")
+            .0;
+        let _ = push(queued).await;
+        assert_eq!(refused(), Some(1.0), "a queued id's body is not counted");
+    }
+
+    /// The queued ids among a batch are found whether the batch is smaller
+    /// than the queued set, and checked under the lock, or larger, and
+    /// checked against a copy.
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_ids_are_found_in_small_and_large_batches() {
+        use zakura_node_services::mempool::port::pool_port;
+
+        let (handle, _inbox) = pool_port();
+        let core = adapter_on(handle);
+        let _held: Vec<QueueSlot> = [filler_id(1), filler_id(2), filler_id(2)]
+            .into_iter()
+            .map(|id| {
+                QueueSlot::take(&core.shared, id, None)
+                    .expect("room in the node")
+                    .0
+            })
+            .collect();
+        let small = [filler_id(2)];
+        let large: Vec<UnminedTxId> = (2..12).map(filler_id).collect();
+        let expected = |ids: &[UnminedTxId]| ids.iter().copied().collect();
+
+        assert_eq!(core.shared.queued_among(&small), expected(&small));
+        assert_eq!(core.shared.queued_among(&large), expected(&[filler_id(2)]));
+    }
+
+    /// An id another caller is bringing in when a peer's batch arrives is
+    /// not that peer's refusal, even if it is decided and frees its slot
+    /// while the batch waits on its rejection lookup: today's pool answers
+    /// it as already queued on arrival.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_id_queued_on_arrival_is_not_a_refusal() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let readings = super::super::super::tests::Readings::default();
+        let _recording = metrics::set_default_local_recorder(&readings);
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let id = filler_id(1);
+        let other_caller = QueueSlot::take(&core.shared, id, None)
+            .expect("room in the node")
+            .0;
+        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
+        let _share: Vec<(QueueSlot, Option<PeerSlot>)> = (0..MAX_INBOUND_CONCURRENCY_PER_PEER)
+            .map(|n| {
+                QueueSlot::take(&core.shared, filler_id(100 + n), Some(&peer))
+                    .expect("room in the share")
+            })
+            .collect();
+        let request = core.call(Request::QueueFromPeer {
+            transactions: vec![Gossip::Id(id)],
+            source: peer,
+        });
+        // The other caller's transaction is decided before the batch's task
+        // runs, as can happen on another thread.
+        drop(other_caller);
+        let request = tokio::spawn(request);
+        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch looks its id up");
+        };
+        let _ = reply.send(Default::default());
+        let answer = request.await.expect("the task does not panic");
+        assert!(matches!(answer, Ok(Response::Queued(_))));
+        assert_eq!(
+            readings.get("mempool.full_queue.per_peer.total{source=legacy}"),
+            None
+        );
+    }
+
+    /// An id another batch queues while this batch waits on its lookup
+    /// keeps none of this peer's slots, so the peer's fresh ids all fit and
+    /// none is refused, as today's pool, having queued the id already,
+    /// answers it as already queued.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_id_queued_during_the_lookup_keeps_no_peer_slot() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let readings = super::super::super::tests::Readings::default();
+        let _recording = metrics::set_default_local_recorder(&readings);
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let overlapping = filler_id(0);
+        let fresh: Vec<UnminedTxId> = (1..=MAX_INBOUND_CONCURRENCY_PER_PEER)
+            .map(filler_id)
+            .collect();
+        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
+        let request = tokio::spawn(
+            core.call(Request::QueueFromPeer {
+                transactions: std::iter::once(overlapping)
+                    .chain(fresh.iter().copied())
+                    .map(Gossip::Id)
+                    .collect(),
+                source: peer,
+            }),
+        );
+        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch looks its ids up");
+        };
+        // Another batch queues the overlapping id meanwhile.
+        let other_batch = QueueSlot::take(&core.shared, overlapping, None)
+            .expect("room in the node")
+            .0;
+        let _ = reply.send(Default::default());
+        for _ in &fresh {
+            let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
+                panic!("each fresh id reserves");
+            };
+            assert_ne!(tx_id, overlapping, "the queued id is not brought in again");
+            let _ = reply.send(Err(Unreserved::Pooled));
+        }
+        let answer = request.await.expect("the task does not panic");
+        assert!(matches!(answer, Ok(Response::Queued(_))));
+        assert_eq!(
+            readings.get("mempool.full_queue.per_peer.total{source=legacy}"),
+            None
+        );
+        drop(other_batch);
+    }
+
+    /// An id the core admits while a peer's batch waits on its rejection
+    /// lookup is not counted as that peer's refusal: today's pool would find
+    /// it pooled. The batch began with an empty snapshot, so the count reads
+    /// the core's latest one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_id_admitted_during_the_lookup_is_not_a_refusal() {
+        use zakura_node_services::mempool::port::{
+            pool_port, ChainTip, Generation, PoolCommand, PoolSnapshot,
+        };
+
+        let readings = super::super::super::tests::Readings::default();
+        let _recording = metrics::set_default_local_recorder(&readings);
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let admitted = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction");
+        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
+        let _share: Vec<(QueueSlot, Option<PeerSlot>)> = (0..MAX_INBOUND_CONCURRENCY_PER_PEER)
+            .map(|n| {
+                QueueSlot::take(&core.shared, filler_id(100 + n), Some(&peer))
+                    .expect("room in the share")
+            })
+            .collect();
+        let request = tokio::spawn(core.call(Request::QueueFromPeer {
+            transactions: vec![Gossip::Id(admitted.transaction.id())],
+            source: peer,
+        }));
+        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch looks its id up");
+        };
+        inbox.publish([], |last| {
+            PoolSnapshot::new(
+                ChainTip {
+                    hash: block::Hash([1; 32]),
+                    height: Height(1),
+                },
+                Generation(1),
+                last,
+                vec![admitted.clone()],
+                Default::default(),
+            )
+        });
+        let _ = reply.send(Default::default());
+        let answer = request.await.expect("the task does not panic");
+        assert!(matches!(answer, Ok(Response::Queued(_))));
+        assert_eq!(
+            readings.get("mempool.full_queue.per_peer.total{source=legacy}"),
+            None
+        );
+    }
+
+    /// The core's charges are counted under today's penalty names when
+    /// they are applied, and an exempt peer's are not, since nothing was
+    /// done to it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn applied_charges_are_counted_as_penalties() {
+        let readings = super::super::super::tests::Readings::default();
+        let _recording = metrics::set_default_local_recorder(&readings);
+        let charged = std::net::SocketAddr::from(([203, 0, 113, 9], 8233));
+        let exempt_peer = std::net::SocketAddr::from(([192, 0, 2, 1], 8233));
+        let exempt = || Exempt {
+            zcashd_compat: [exempt_peer.ip()].into_iter().collect(),
+            unconditional: Default::default(),
+        };
+        let penalties = |penalty: &str| {
+            readings.get(&format!(
+                "mempool.peer_penalty.total{{penalty={penalty},transport=legacy}}"
+            ))
+        };
+        for peer in [charged, exempt_peer] {
+            charged_by_one_push(peer, Charge::Ban, exempt(), true).await;
+            charged_by_one_push(peer, Charge::Cooldown, exempt(), true).await;
+            charged_by_one_push(peer, Charge::None, exempt(), true).await;
+        }
+        assert_eq!(penalties("ban"), Some(1.0));
+        assert_eq!(penalties("cooldown"), Some(1.0));
+        assert_eq!(penalties("disconnect"), None, "a first cooldown");
     }
 
     /// A zcashd-compat sidecar and a configured unconditional peer are never
@@ -2592,14 +3053,25 @@ mod tests {
         assert_eq!(queued_count(&core), 0, "free once the core has answered");
     }
 
+    /// A distinct id for the `n`th slot a test takes to fill the node.
+    fn filler_id(n: usize) -> UnminedTxId {
+        let mut hash = [0xf0; 32];
+        hash[..8].copy_from_slice(
+            &u64::try_from(n)
+                .expect("a test's slot count fits")
+                .to_be_bytes(),
+        );
+        UnminedTxId::Legacy(zakura_chain::transaction::Hash(hash))
+    }
+
     /// The adapter's queued count, read without holding its lock, so a
     /// failed assertion on it does not poison the lock for the slots.
     fn queued_count(core: &CoreMempool) -> usize {
-        *core
-            .shared
+        core.shared
             .queued
             .lock()
             .expect("no test panics holding the queued count")
+            .total
     }
 
     /// A snapshot at height 1 with nothing pooled, so the adapter is on.
@@ -3484,7 +3956,11 @@ mod tests {
         let (handle, _inbox) = pool_port();
         let core = adapter_on(handle);
         let full: Vec<QueueSlot> = (0..MAX_INBOUND_CONCURRENCY)
-            .map(|_| QueueSlot::take(&core.shared).expect("room for each"))
+            .map(|n| {
+                QueueSlot::take(&core.shared, filler_id(n), None)
+                    .expect("room for each")
+                    .0
+            })
             .collect();
         let id = UnminedTxId::Legacy(zakura_chain::transaction::Hash([2; 32]));
         let started = tokio::time::Instant::now();
@@ -3514,7 +3990,11 @@ mod tests {
         let mut core = adapter_on(handle);
         publish_empty(&inbox);
         let full: Vec<QueueSlot> = (0..MAX_INBOUND_CONCURRENCY)
-            .map(|_| QueueSlot::take(&core.shared).expect("room for each"))
+            .map(|n| {
+                QueueSlot::take(&core.shared, filler_id(n), None)
+                    .expect("room for each")
+                    .0
+            })
             .collect();
         // Far more ids than one-second probes fit in the deadline.
         let ids: Vec<Gossip> = (0..1_000u16)

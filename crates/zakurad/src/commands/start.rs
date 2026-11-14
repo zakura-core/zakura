@@ -721,7 +721,19 @@ impl StartCmd {
 
         // The pool is chosen once, at startup.
         let pool_implementation = config.mempool.implementation.resolve();
-        info!(?pool_implementation, "initializing mempool");
+        info!(
+            configured = config.mempool.implementation.as_str(),
+            resolved = pool_implementation.as_str(),
+            "initializing mempool"
+        );
+        // A canary's effective pool, read from its metrics rather than from
+        // a config that says `default`.
+        metrics::gauge!(
+            "mempool.implementation",
+            "implementation" => pool_implementation.as_str(),
+        )
+        .set(1.0);
+        mempool::peer_metrics::register();
         let (mempool, mempool_transaction_subscriber, verifier_pool, mempool_tasks) =
             if pool_implementation == mempool::config::Implementation::Core {
                 let chain_transitions = read_only_state_service

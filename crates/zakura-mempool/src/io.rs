@@ -53,7 +53,8 @@ use zakura_rt::{
 use crate::{
     config::Config,
     machine::{
-        Effect, JobId, Limits, MempoolState, Outcome, OutputAnswer, Step, VerifyError, WaiterId,
+        Effect, JobId, Limits, MempoolState, Outcome, OutputAnswer, PoolCounts, Step, VerifyError,
+        WaiterId,
     },
     storage::{SameEffectsTipRejectionError, StorageStats},
 };
@@ -148,6 +149,9 @@ pub struct PoolCore<E, V> {
     replies: Vec<Box<dyn FnOnce() + Send>>,
     /// What storage held when its metrics were last emitted.
     emitted: StorageStats,
+    /// The pool's size when its gauges were last emitted, or `None` before
+    /// the first emission, so an empty pool still exports zeros.
+    emitted_counts: Option<PoolCounts>,
     /// Told about each chain event the core applies. See
     /// [`Self::on_tip_applied`].
     tips: Option<Box<dyn FnMut(&TipApplied) + Send>>,
@@ -240,6 +244,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             steps: Vec::new(),
             replies: Vec::new(),
             emitted: StorageStats::default(),
+            emitted_counts: None,
             tips: None,
         }
     }
@@ -542,10 +547,27 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
         self.emit_storage_metrics();
     }
 
+    /// Emits the core's own size gauges, if they changed since the last
+    /// emission: every pooled transaction, the hidden ones, and the visible
+    /// rest that readers and templates see.
+    fn emit_pool_counts(&mut self) {
+        let counts = self.machine.pool_counts();
+        if self.emitted_counts == Some(counts) {
+            return;
+        }
+        self.emitted_counts = Some(counts);
+        // Counts this small convert to `f64` exactly.
+        metrics::gauge!("mempool.core.transactions.retained").set(counts.retained as f64);
+        metrics::gauge!("mempool.core.transactions.hidden").set(counts.hidden as f64);
+        metrics::gauge!("mempool.core.transactions.visible")
+            .set(counts.retained.saturating_sub(counts.hidden) as f64);
+    }
+
     /// Emits what storage holds under today's pool metric names, if it
     /// changed since the last emission. Counters grow by what storage counted
     /// since then.
     fn emit_storage_metrics(&mut self) {
+        self.emit_pool_counts();
         let stats = self.machine.storage_stats();
         if stats == self.emitted {
             return;

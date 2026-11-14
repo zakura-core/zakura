@@ -19,8 +19,10 @@ The cursor only advances past complete lines, so a line the writer has not
 finished is fetched again by the next poll.
 
 Rows keep the node's process-relative `ts` (microseconds since that process
-started). The mirror adds `fetched_unix`, the collector's wall clock when it
-stored the row.
+started), and nodes that write it keep `unix_us`, the node's wall clock in
+microseconds, which can be compared across nodes to within their clock offset.
+The mirror adds `fetched_unix`, the collector's wall clock when it stored the
+row.
 
 Stdlib only, so it runs on any host with Python 3.9+.
 """

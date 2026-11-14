@@ -45,6 +45,14 @@ ZECD_RPC_URL = "http://127.0.0.1:18888"
 NETWORK = "test"
 
 
+class RpcError(RuntimeError):
+    """A JSON-RPC error answer, with its code."""
+
+    def __init__(self, message: str, code: int | None):
+        super().__init__(message)
+        self.code = code
+
+
 class RunDurationElapsed(TimeoutError):
     """The configured transaction submission duration elapsed."""
 
@@ -78,7 +86,9 @@ def rpc_call(url: str, method: str, params=None, timeout=30, auth=None):
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = json.loads(response.read())
     if body.get("error"):
-        raise RuntimeError(f"{url} {method}: {body['error']}")
+        error = body["error"]
+        code = error.get("code") if isinstance(error, dict) else None
+        raise RpcError(f"{url} {method}: {error}", code)
     return body["result"]
 
 
@@ -123,18 +133,35 @@ def wait_next_block(
     raise TimeoutError(f"no new block after height {start_height}")
 
 
-def transaction_state(
-    node: dict, txid: str, deadline: float | None = None
-) -> tuple[bool, dict | None]:
+IN_POOL = "pool"
+IN_CHAIN = "chain"
+# The node answered that it holds the transaction nowhere.
+ABSENT = "absent"
+# `getrawtransaction`'s error code for a transaction a node does not know.
+RPC_NOT_FOUND = -5
+# The exit status of a run with no miss but a round no pool was seen to hold.
+EXIT_INCONCLUSIVE = 3
+
+
+def transaction_state(node: dict, txid: str, deadline: float | None = None) -> str | None:
+    """Where `node` holds `txid`: IN_POOL, IN_CHAIN once mined, ABSENT, or None
+    if its answers do not settle it.
+
+    A node that only knows the transaction from a block never showed it held
+    the transaction in its pool, so the two are told apart. ABSENT needs a
+    definite answer: the pool listing without the transaction, and the
+    lookup's "not found" error. A failed or unclear answer is None.
+    """
     try:
         if txid in rpc_call(
             node["rpc_url"], "getrawmempool", timeout=remaining_timeout(deadline, 10)
         ):
-            return True, None
+            return IN_POOL
+        listed = True
     except RunDurationElapsed:
         raise
     except Exception:  # noqa: BLE001
-        pass
+        listed = False
     try:
         tx = rpc_call(
             node["rpc_url"],
@@ -142,11 +169,22 @@ def transaction_state(
             [txid, 1],
             timeout=remaining_timeout(deadline, 10),
         )
-        return True, tx if isinstance(tx, dict) else None
     except RunDurationElapsed:
         raise
+    except RpcError as exc:
+        return ABSENT if listed and exc.code == RPC_NOT_FOUND else None
     except Exception:  # noqa: BLE001
-        return False, None
+        return None
+    # Only an answer about this transaction settles anything.
+    if not isinstance(tx, dict) or tx.get("txid") != txid:
+        return None
+    if int(tx.get("confirmations") or 0) > 0:
+        return IN_CHAIN
+    # A pooled transaction has no block. One in a side-chain block has a block
+    # hash and height -1, and shows nothing about the pool.
+    if tx.get("blockhash") is None and tx.get("height") is None:
+        return IN_POOL
+    return None
 
 
 def first_seen_matrix(
@@ -155,28 +193,57 @@ def first_seen_matrix(
     duration=30.0,
     interval=1.0,
     run_deadline: float | None = None,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], dict[str, float], list[str]]:
+    """When each node first showed `txid`: in its pool, or only once mined.
+
+    Returns two maps from node name to seconds since the poll started, and
+    the other nodes whose last answer was not a definite ABSENT, or every
+    unsettled node if the window was cut short. A node in the second map was
+    first sampled after the block, and one in the list was never definitely
+    without the transaction for the whole window, so for either, whether its
+    pool held it is unknown. Only the rest are misses.
+    """
     started = time.monotonic()
-    deadline = started + duration
-    if run_deadline is not None:
-        deadline = min(deadline, run_deadline)
-    seen: dict[str, float] = {}
-    while time.monotonic() < deadline:
-        if STOP:
-            break
+    window_end = started + duration
+    deadline = window_end if run_deadline is None else min(window_end, run_deadline)
+    in_pool: dict[str, float] = {}
+    after_mined: dict[str, float] = {}
+    last: dict[str, str | None] = {}
+    run_elapsed = False
+    while time.monotonic() < deadline and not STOP:
         for node in nodes:
-            if node["name"] in seen:
+            if node["name"] in in_pool or node["name"] in after_mined:
                 continue
             try:
-                known, _ = transaction_state(node, txid, deadline=deadline)
+                # A sample begun inside the window finishes, so the window's
+                # end never cuts its answer short. Only the run's own
+                # deadline does.
+                state = transaction_state(node, txid, deadline=run_deadline)
             except RunDurationElapsed:
-                return seen
-            if known:
-                seen[node["name"]] = round(time.monotonic() - started, 3)
-        if len(seen) == len(nodes):
+                # The interrupted sample settles nothing, whatever came before.
+                last[node["name"]] = None
+                run_elapsed = True
+                break
+            last[node["name"]] = state
+            elapsed = round(time.monotonic() - started, 3)
+            if state == IN_POOL:
+                in_pool[node["name"]] = elapsed
+            elif state == IN_CHAIN:
+                after_mined[node["name"]] = elapsed
+        if run_elapsed or len(in_pool) + len(after_mined) == len(nodes):
             break
         time.sleep(min(interval, max(0, deadline - time.monotonic())))
-    return seen
+    # A window the run's deadline or a stop cut short gave no node its full
+    # time, so no absence in it is a miss.
+    cut_short = STOP or run_elapsed or deadline < window_end
+    unobserved = [
+        node["name"]
+        for node in nodes
+        if node["name"] not in in_pool
+        and node["name"] not in after_mined
+        and (cut_short or last.get(node["name"]) != ABSENT)
+    ]
+    return in_pool, after_mined, unobserved
 
 
 def mined_state(nodes: list[dict], txid: str) -> tuple[int | None, int]:
@@ -370,7 +437,6 @@ def send_with_retry(
                 [address, amount],
                 timeout=remaining_timeout(run_deadline, 600),
             )
-            return txid, height, before, inventory_pools(deadline=run_deadline)
         except RunDurationElapsed:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -385,6 +451,16 @@ def send_with_retry(
                 }
             )
             wait_next_block(node["rpc_url"], height, run_deadline=run_deadline)
+            continue
+        # The transaction is out, so its round is graded whatever happens to
+        # the wallet inventory, which only describes the round. If the run's
+        # deadline passes now, its pools are never sampled, which makes the
+        # round inconclusive rather than lost.
+        try:
+            after = inventory_pools(deadline=run_deadline)
+        except Exception:  # noqa: BLE001
+            after = {}
+        return txid, height, before, after
     raise RuntimeError(f"sendtoaddress failed after retries: {last_error}")
 
 
@@ -406,6 +482,10 @@ def load_config(args: argparse.Namespace) -> tuple[dict, str]:
     for node in nodes:
         if not all(node.get(key) for key in ("name", "impl", "rpc_url")):
             raise SystemExit(f"node requires name, impl, and rpc_url: {node}")
+    # Sightings are kept by name, so two nodes with one name would hide one.
+    names = [node["name"] for node in nodes]
+    if len(set(names)) != len(names):
+        raise SystemExit(f"node names must be unique: {names}")
     return config, environment
 
 
@@ -435,7 +515,8 @@ def configure_paths(config: dict, out_dir: Path | None) -> Path:
     return output
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse the driver's arguments from `argv`, or the command line."""
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--environment", choices=("testnet", "mainnet"), default="testnet")
@@ -446,10 +527,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration-minutes", type=float, default=0, help="0 = unlimited")
     parser.add_argument("--matrix-secs", type=float, default=30.0)
     parser.add_argument("--drain-minutes", type=float, default=10.0)
-    parser.add_argument("--require-all-seen", action="store_true")
-    parser.add_argument("--require-mined", action="store_true")
+    # Grading is strict unless turned off, so a run that proves nothing never
+    # exits 0 by default.
+    parser.add_argument(
+        "--require-all-seen", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--require-mined", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wait-block", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.amount <= 0:
         parser.error("--amount must be positive")
     if min(args.max_rounds, args.duration_minutes, args.matrix_secs, args.drain_minutes) < 0:
@@ -521,13 +606,21 @@ def main() -> int:
                 node, args.amount, run_deadline=run_deadline
             )
             submitted_txids.append(txid)
-            seen = first_seen_matrix(
+            seen, seen_after_mined, unobserved = first_seen_matrix(
                 nodes,
                 txid,
                 duration=args.matrix_secs,
                 run_deadline=run_deadline,
             )
-            missing = [candidate["name"] for candidate in nodes if candidate["name"] not in seen]
+            # A miss needs a node's definite answer that it holds the
+            # transaction nowhere. Anything less is inconclusive.
+            missing = [
+                candidate["name"]
+                for candidate in nodes
+                if candidate["name"] not in seen
+                and candidate["name"] not in seen_after_mined
+                and candidate["name"] not in unobserved
+            ]
             log_event(
                 {
                     "event": "submitted",
@@ -539,9 +632,12 @@ def main() -> int:
                     "inventory_pre": before,
                     "inventory_post": after,
                     "first_seen": seen,
+                    "seen_after_mined": seen_after_mined,
+                    "unobserved": unobserved,
                     "missing": missing,
                     "seen_count": len(seen),
-                    "seen_all": not missing,
+                    "seen_all": len(seen) == len(nodes),
+                    "inconclusive": bool(seen_after_mined or unobserved) and not missing,
                     "send_secs": round(time.monotonic() - started, 3),
                     "wait_block": args.wait_block,
                 }
@@ -585,13 +681,31 @@ def main() -> int:
                 stop_zecd()
         report = write_reports(load_events(RUN_LOG), output)
 
-    summary = report["summary"]
-    failed_empty = (
-        args.require_all_seen or args.require_mined
-    ) and summary["submitted"] == 0
-    failed_seen = args.require_all_seen and summary["missed"] > 0
-    failed_mined = args.require_mined and summary["unconfirmed"] > 0
-    return 2 if run_error or restore_error or failed_empty or failed_seen or failed_mined else 0
+    return run_status(
+        report["summary"],
+        require_all_seen=args.require_all_seen,
+        require_mined=args.require_mined,
+        errored=bool(run_error or restore_error),
+    )
+
+
+def run_status(summary: dict, *, require_all_seen: bool, require_mined: bool, errored: bool) -> int:
+    """The process exit status for a run's report `summary`.
+
+    2 for an error or a failed requirement. With `require_all_seen`, a run
+    with no miss but a round not seen in every pool is EXIT_INCONCLUSIVE,
+    since that round is neither a pass nor a miss and is repeated. 0
+    otherwise.
+    """
+    failed_empty = (require_all_seen or require_mined) and summary["submitted"] == 0
+    failed_seen = require_all_seen and summary["missed"] > 0
+    failed_mined = require_mined and summary["unconfirmed"] > 0
+    if errored or failed_empty or failed_seen or failed_mined:
+        return 2
+    # A pass is every round seen in every pool, whatever kept a round from it.
+    if require_all_seen and summary["seen_all"] < summary["submitted"]:
+        return EXIT_INCONCLUSIVE
+    return 0
 
 
 if __name__ == "__main__":

@@ -49,9 +49,16 @@ def build_report(events: list[dict]) -> dict:
         tx["mined_height"] = drain.get("mined_height")
         tx["confirmations"] = drain.get("confirmations", 0)
         tx["mined"] = tx["confirmations"] > 0
-        missing = tx.get("missing") or [
-            name for name in node_names if name not in tx.get("first_seen", {})
-        ]
+        if "seen_after_mined" in tx:
+            missing = tx.get("missing", [])
+        else:
+            # Logged before a pool sighting was told apart from one after
+            # mining, or a definite absence from a failed answer. Such a
+            # round proves neither that every pool held the transaction nor
+            # that any missed it.
+            tx["seen_all"] = False
+            tx["inconclusive"] = True
+            missing = []
         tx["missing"] = missing
         missed_by_node.update(missing)
         seen_values = list(tx.get("first_seen", {}).values())
@@ -70,7 +77,10 @@ def build_report(events: list[dict]) -> dict:
     summary = {
         "submitted": len(submitted),
         "seen_all": sum(bool(tx.get("seen_all")) for tx in submitted),
-        "missed": sum(not tx.get("seen_all") for tx in submitted),
+        # A round where a node only showed the transaction after it was mined
+        # neither passes nor misses.
+        "inconclusive": sum(bool(tx.get("inconclusive")) for tx in submitted),
+        "missed": sum(bool(tx["missing"]) for tx in submitted),
         "mined": sum(tx["mined"] for tx in submitted),
         "unconfirmed": sum(not tx["mined"] for tx in submitted),
         "spread_p50_secs": percentile(spreads, 50),
@@ -97,6 +107,7 @@ def markdown(report: dict) -> str:
         f"- Network: `{report.get('network') or 'unknown'}`",
         f"- Submitted: **{summary['submitted']}**",
         f"- Seen on all nodes: **{summary['seen_all']}**",
+        f"- Inconclusive rounds: **{summary['inconclusive']}**",
         f"- Propagation misses: **{summary['missed']}**",
         f"- Mined after drain: **{summary['mined']}**",
         f"- Still unconfirmed: **{summary['unconfirmed']}**",

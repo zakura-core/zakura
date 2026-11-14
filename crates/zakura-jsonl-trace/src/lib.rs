@@ -171,6 +171,7 @@ impl JsonlEventEmitter {
         let event = build();
         let row = JsonlEventEnvelope {
             ts: elapsed_micros(self.started.elapsed()),
+            unix_us: unix_micros(),
             node: &self.node,
             process_trace_id: process_trace_id(),
             event: &event,
@@ -196,6 +197,7 @@ impl JsonlEventEmitter {
             "ts".to_string(),
             Value::from(elapsed_micros(self.started.elapsed())),
         );
+        row.insert("unix_us".to_string(), Value::from(unix_micros()));
         row.insert("node".to_string(), Value::String(self.node.to_string()));
         row.insert(
             "process_trace_id".to_string(),
@@ -222,6 +224,7 @@ impl Default for JsonlEventEmitter {
 #[derive(Serialize)]
 struct JsonlEventEnvelope<'a, E> {
     ts: u64,
+    unix_us: u64,
     node: &'a str,
     process_trace_id: &'static str,
     #[serde(flatten)]
@@ -230,6 +233,20 @@ struct JsonlEventEnvelope<'a, E> {
 
 fn elapsed_micros(elapsed: Duration) -> u64 {
     saturating_micros(elapsed)
+}
+
+/// Returns this host's wall clock, in microseconds since the Unix epoch, or 0
+/// if the clock is set before it.
+///
+/// `ts` cannot be compared across processes, since each counts from its own
+/// start. This can, to within the two hosts' clock offset, so two nodes' rows
+/// for one block can be subtracted.
+fn unix_micros() -> u64 {
+    saturating_micros(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default(),
+    )
 }
 
 /// Returns the instant this process created its first emitter.
@@ -872,6 +889,7 @@ mod tests {
         assert_eq!(row["value"], 7);
         assert_eq!(row["optional"], Value::Null);
         assert!(row["ts"].is_u64());
+        assert_recent_unix_us(&row);
     }
 
     #[test]
@@ -917,6 +935,15 @@ mod tests {
         assert_eq!(row["process_trace_id"], process_trace_id());
         assert_eq!(row["event"], "raw_event");
         assert!(row["ts"].is_u64());
+        assert_recent_unix_us(&row);
+    }
+
+    /// Asserts that `row` carries this host's wall clock as of now.
+    fn assert_recent_unix_us(row: &Value) {
+        let written = row["unix_us"].as_u64().expect("unix_us is an integer");
+        let now = unix_micros();
+        assert!(written <= now, "{written} is after {now}");
+        assert!(now - written < 60_000_000, "{written} is long before {now}");
     }
 
     #[test]

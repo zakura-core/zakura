@@ -239,6 +239,7 @@ class NodeBuilder:
             "rpc_enable_cookie_auth": None,
             "storage_mode": "archive",
             "p2p_stack": "dual",
+            "mempool_implementation": "",
             "metrics_endpoint": "",
             "health_listen_addr": "",
             "miner_address": "",
@@ -366,6 +367,20 @@ class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
         config = tomllib.loads(deploy.render_node_config(self.node()))
 
         self.assertNotIn("mining", config)
+
+    def test_mempool_section_renders_the_pool_choice(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            mempool_implementation="core",
+        )))
+
+        self.assertEqual(config["mempool"], {"implementation": "core"})
+
+    def test_mempool_section_omitted_when_unset(self):
+        # Unset leaves zakurad's own default in charge, so a later release
+        # that changes the default reaches the node.
+        config = tomllib.loads(deploy.render_node_config(self.node()))
+
+        self.assertNotIn("mempool", config)
 
     def test_health_renders_independently_of_metrics(self):
         config = tomllib.loads(deploy.render_node_config(self.node(
@@ -560,6 +575,35 @@ class ConfigKeyTests(unittest.TestCase):
             nodes = deploy.load_nodes(path, None)
 
             self.assertEqual(nodes[0].health_listen_addr, "127.0.0.1:8080")
+
+    def test_mempool_implementation_is_a_known_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, """
+                [defaults]
+                mempool_implementation = "Core"
+
+                [[nodes]]
+                name = "node-a"
+                ssh_string = "root@example"
+                commit = "main"
+            """.replace("                ", ""))
+
+            nodes = deploy.load_nodes(path, None)
+
+            self.assertEqual(nodes[0].mempool_implementation, "core")
+
+    def test_unknown_mempool_implementation_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, """
+                [[nodes]]
+                name = "node-a"
+                ssh_string = "root@example"
+                commit = "main"
+                mempool_implementation = "tx-relay"
+            """.replace("                ", ""))
+
+            with self.assertRaises(deploy.DeployError):
+                deploy.load_nodes(path, None)
 
     def test_testnet_parameters_is_a_known_key(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1641,6 +1641,14 @@ fn hidden_transactions_count_against_the_cost_limit() {
     );
     assert_eq!(machine.hidden().len(), 2);
     machine.assert_invariants();
+    // The size gauges count them as retained and hidden, and none visible.
+    assert_eq!(
+        machine.pool_counts(),
+        super::PoolCounts {
+            retained: 2,
+            hidden: 2
+        }
+    );
     let revalidations: Vec<super::JobId> = step
         .effects
         .iter()
@@ -1684,6 +1692,13 @@ fn hidden_transactions_count_against_the_cost_limit() {
         machine.assert_invariants();
     }
     assert_eq!(machine.visible().len(), 2);
+    assert_eq!(
+        machine.pool_counts(),
+        super::PoolCounts {
+            retained: 2,
+            hidden: 0
+        }
+    );
 
     // The same bytes are checked again, against the pool as it is now.
     assert!(

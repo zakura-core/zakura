@@ -1078,6 +1078,46 @@ async fn unconditional_peer_name_is_followed_to_a_new_address() {
     assert!(unconditional_peers.contains(ip("192.0.2.9")));
 }
 
+/// When a dial to an unconditional peer's DNS name fails, the next attempt dials the
+/// next address in the answer, and the one after the last address is the first again.
+/// Only the address dialed last is treated like a listed one.
+#[tokio::test(start_paused = true)]
+async fn unconditional_peer_name_moves_to_the_next_address_after_a_failed_dial() {
+    let _init_guard = zakura_test::init();
+
+    let config: Config =
+        toml::from_str("unconditional_peers = ['peer.example.com:18233']").unwrap();
+    let unconditional_peers = config.unconditional_peers.clone();
+    let dialer = spawn_unconditional_peer_dialer(
+        config,
+        PeerRegistry::default(),
+        UnconditionalPeerDial::Fail,
+    );
+
+    dialer.set_lookup(Some(&["192.0.2.1:18233", "192.0.2.2:18233"]));
+    dialer.wait_for_dial_after(2).await;
+    assert_eq!(
+        dialer.dial_addrs()[..3],
+        [
+            peer_addr("192.0.2.1:18233"),
+            peer_addr("192.0.2.2:18233"),
+            peer_addr("192.0.2.1:18233"),
+        ],
+        "each failed dial is followed by a dial to the next address",
+    );
+
+    dialer.set_dial(UnconditionalPeerDial::ConnectAndStayOpen);
+    dialer.wait_for_dial_after(3).await;
+    assert_eq!(dialer.dial_addrs()[3], peer_addr("192.0.2.2:18233"));
+
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+    assert!(unconditional_peers.contains(ip("192.0.2.2")));
+    assert!(
+        !unconditional_peers.contains(ip("192.0.2.1")),
+        "only the address dialed last is exempt",
+    );
+}
+
 /// The real lookup returns the addresses of a name, each with the port it was given.
 #[tokio::test]
 async fn unconditional_peer_lookup_resolves_a_name_with_its_port() {

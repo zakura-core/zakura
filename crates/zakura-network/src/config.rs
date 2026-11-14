@@ -390,9 +390,10 @@ pub struct Config {
     ///
     /// Zakura dials a DNS name in the same way. It looks the name up before each dial,
     /// and never while that peer is connected, so it follows a peer that comes back at a
-    /// new address. It dials the first address in the answer that it can dial, so list
-    /// each peer under a name of its own. That address is then treated like a listed
-    /// address in everything this setting does, until the name resolves to another one.
+    /// new address. It dials one address from the answer at a time, starting with the
+    /// first it can dial and moving to the next on each later attempt, so list each peer
+    /// under a name of its own. The address it dialed last is treated like a listed
+    /// address in everything this setting does.
     /// When a lookup fails, Zakura dials the last address again. A ban from before the
     /// name resolved to an address stays until Zakura restarts. The startup dials do not
     /// wait for the first lookup, so they keep no room for a name's address.

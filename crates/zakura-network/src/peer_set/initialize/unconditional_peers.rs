@@ -34,8 +34,9 @@ struct RedialState {
     /// [`UnconditionalPeers::dial_names`]: crate::UnconditionalPeers::dial_names
     name: Option<(usize, Arc<str>, u16)>,
 
-    /// The address Zakura dials. For a peer listed by name, this is the first address
-    /// Zakura could dial in the name's last lookup that had one, and `None` until then.
+    /// The address Zakura dials. For a peer listed by name, this is the address Zakura
+    /// picked from the name's last lookup that had one it could dial, and `None` until
+    /// then.
     addr: Option<PeerSocketAddr>,
 
     /// The earliest time of the next attempt.
@@ -269,11 +270,11 @@ fn warn_about_addrs_over_the_ip_limit(dial_addrs: &[PeerSocketAddr], config: &Co
 /// [`is_connected`]. Sends each new connection to `peerset_tx`.
 ///
 /// A peer listed by name is looked up with `lookup` before each dial, so a peer that
-/// comes back at a new address is found there. Zakura dials the first address in the
-/// answer that [`is_dialable`], and records it with
-/// [`UnconditionalPeers::set_resolved_ip`], so it is treated like a listed address. When
-/// a lookup fails or has no such address, Zakura dials the last address it had. A name
-/// is never looked up while its peer is connected.
+/// comes back at a new address is found there. Zakura dials one address in the answer
+/// that [`is_dialable`]: the one after the address it dialed last, or the first. It
+/// records that address with [`UnconditionalPeers::set_resolved_ip`], so it is treated
+/// like a listed address. When a lookup fails or has no such address, Zakura dials the
+/// last address it had. A name is never looked up while its peer is connected.
 ///
 /// An attempt that does not lead to a lasting connection doubles the peer's redial
 /// delay, from [`constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY`] up to
@@ -382,18 +383,30 @@ where
 
                     if let (Some((name_index, name, _port)), Some(lookup)) = (&peer.name, lookup) {
                         let dial_addr = lookup.and_then(|addrs| {
-                            addrs
+                            let addrs: Vec<_> = addrs
                                 .into_iter()
                                 .map(canonical_peer_addr)
-                                .find(|&addr| is_dialable(addr, &config, listen_addr))
+                                .filter(|&addr| is_dialable(addr, &config, listen_addr))
+                                .collect();
+                            // This attempt follows a failed dial or a closed connection, so
+                            // dial the address after the last one. A first address that
+                            // refuses every dial then doesn't hide the others.
+                            let next = addrs
+                                .iter()
+                                .position(|&addr| peer.addr == Some(addr))
+                                .map_or(0, |last| last + 1);
+                            addrs
+                                .get(next)
+                                .or(addrs.first())
+                                .copied()
                                 .ok_or_else(|| io::Error::other("no address that Zakura can dial"))
                         });
 
                         match dial_addr {
                             Ok(addr) if peer.addr != Some(addr) => {
-                                info!(
+                                debug!(
                                     peer = %addr.addr_label(expose_peer_addresses),
-                                    "an unconditional peer's DNS name resolved to a new address"
+                                    "dialing an unconditional peer's DNS name at another address"
                                 );
                                 peer.addr = Some(addr);
                                 // Zakura dials the address below, so exempt it before a

@@ -181,7 +181,7 @@ impl UnconditionalPeers {
     /// Returns the DNS names that Zakura dials to stay connected to its unconditional
     /// peers, with their ports, in config order.
     ///
-    /// Zakura looks a name up before each dial and dials the first address it can, see
+    /// Zakura looks a name up before each dial and dials one of its addresses, see
     /// [`set_resolved_ip`](Self::set_resolved_ip).
     pub fn dial_names(&self) -> impl Iterator<Item = (Arc<str>, u16)> + '_ {
         self.names.iter().cloned()

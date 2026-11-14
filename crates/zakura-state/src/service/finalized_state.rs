@@ -82,6 +82,9 @@ pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
 pub(super) mod header_chain;
+// The state database starts using these in the next change of this stack.
+#[allow(dead_code)]
+pub(crate) mod static_file;
 pub mod treestate_artifact;
 pub mod treestate_export;
 mod vct;

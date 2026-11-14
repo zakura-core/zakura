@@ -75,12 +75,15 @@ const ANSWER_WAIT: Duration = Duration::from_secs(10);
 const SILENCE: Duration = Duration::from_millis(300);
 
 /// Which peer set the pool talks to.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum Peers {
     /// A [`MockPeerSet`] the test answers.
     Mock,
     /// A peer set that never answers, so every fetch stays in flight.
     Silent,
+    /// A peer set that serves each of these bodies whenever it is asked for
+    /// it, and nothing else.
+    Serving(Arc<std::collections::HashMap<UnminedTxId, transaction::UnminedTx>>),
 }
 
 /// Which pool a test runs against.
@@ -198,6 +201,24 @@ async fn pool_on(
         Peers::Silent => BoxCloneSyncService::new(tower::service_fn(|_: zn::Request| {
             futures::future::pending::<Result<zn::Response, zn::BoxError>>()
         })),
+        Peers::Serving(bodies) => {
+            BoxCloneSyncService::new(tower::service_fn(move |request: zn::Request| {
+                let bodies = bodies.clone();
+                async move {
+                    let ids = match request {
+                        zn::Request::TransactionsById(ids)
+                        | zn::Request::TransactionsByIdFrom { ids, .. } => ids,
+                        _ => return futures::future::pending().await,
+                    };
+                    Ok::<_, zn::BoxError>(zn::Response::Transactions(
+                        ids.iter()
+                            .filter_map(|id| bodies.get(id).cloned())
+                            .map(|body| zn::InventoryResponse::Available((body, None)))
+                            .collect(),
+                    ))
+                }
+            }))
+        }
     };
 
     let (sync_status, syncs) = crate::components::sync::SyncStatus::new();
@@ -1546,10 +1567,10 @@ struct Recovery {
 }
 
 /// Fills `mode`'s pool with [`RECOVERY_POOL`] transactions, resets it with a
-/// network upgrade, and times its recovery. If `reannounce`, this node
-/// queues every transaction the pool lacks again until it holds them all, as
-/// peers announcing them again would, which today's pool needs: it requeues
-/// only as many as its queue holds and drops the rest.
+/// network upgrade, and times its recovery. If `reannounce`, peers announce
+/// the id of every transaction the pool lacks again until it holds them all,
+/// and the pool fetches each body from the network, which today's pool
+/// needs: it requeues only as many as its queue holds and drops the rest.
 async fn recover(mode: Mode, reannounce: bool) -> Recovery {
     use std::sync::atomic::Ordering;
 
@@ -1569,7 +1590,11 @@ async fn recover(mode: Mode, reannounce: bool) -> Recovery {
     let genesis = blocks.next().expect("the chain has a genesis block");
     let mut harness = pool_on(
         Config::default(),
-        Peers::Silent,
+        Peers::Serving(Arc::new(
+            txs.iter()
+                .map(|tx| (tx.transaction.id(), tx.transaction.clone()))
+                .collect(),
+        )),
         mode,
         Some(verifier),
         network,
@@ -1619,15 +1644,29 @@ async fn recover(mode: Mode, reannounce: bool) -> Recovery {
             .filter(|tx| ids.contains(&tx.transaction.id()))
             .count();
         if reannounce && announcing.as_ref().is_none_or(|round| round.is_finished()) {
-            let missing: Vec<Gossip> = txs
+            // Peers announce the ids the pool lacks, five to a peer as each
+            // peer's limit allows, and the pool fetches each body from the
+            // network, as after a real reset.
+            let missing: Vec<UnminedTxId> = txs
                 .iter()
-                .filter(|tx| !ids.contains(&tx.transaction.id()))
-                .map(|tx| tx.transaction.clone().into())
+                .map(|tx| tx.transaction.id())
+                .filter(|id| !ids.contains(id))
                 .collect();
-            if !missing.is_empty() {
-                let round = harness.start_call(Request::Queue(missing)).await;
+            let mut calls = Vec::new();
+            for (peer, chunk) in missing.chunks(MAX_INBOUND_CONCURRENCY_PER_PEER).enumerate() {
+                let [high, low] = u16::try_from(peer).expect("few peers").to_be_bytes();
+                calls.push(
+                    harness
+                        .start_call(Request::QueueFromPeer {
+                            transactions: chunk.iter().copied().map(Gossip::Id).collect(),
+                            source: QueueSource::LegacySocket(([10, 9, high, low], 8233).into()),
+                        })
+                        .await,
+                );
+            }
+            if !calls.is_empty() {
                 announcing = Some(tokio::spawn(async move {
-                    let _answers = round.await;
+                    let _answers = futures::future::join_all(calls).await;
                 }));
             }
         }

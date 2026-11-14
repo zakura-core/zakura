@@ -2,8 +2,10 @@
 //!
 //! These state-level fixtures reuse historical shielded descriptions with new
 //! nullifiers. Their proofs and signatures are not re-created: semantic proof
-//! verification is outside this test. Blocks enter through [`Chain::push`],
-//! with real transparent values and pool deltas, and forks through [`Chain::fork`].
+//! verification is outside this test. Blocks are added through [`Chain::push`],
+//! with real transparent values and pool deltas, and forked through [`Chain::fork`].
+//! Transparent conflicts use [`NonFinalizedState::commit_block`]; shielded
+//! conflicts fail during [`Chain::push`].
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -23,20 +25,27 @@ use zakura_chain::{
 use crate::{
     arbitrary::Prepare,
     constants::MAX_BLOCK_REORG_HEIGHT,
-    service::non_finalized_state::{Chain, NonFinalizedState},
-    tests::FakeChainHelper,
-    ContextuallyVerifiedBlock,
+    service::{
+        check,
+        finalized_state::FinalizedState,
+        non_finalized_state::{Chain, NonFinalizedState},
+    },
+    tests::{copy_block_fixture, FakeChainHelper},
+    Config, ContextuallyVerifiedBlock, ValidateContextError,
 };
 
 const REORG_DEPTH: u32 = 100;
 const FINALIZED_BEFORE_FORK: u32 = 64;
 const TRANSFER_VALUE: i64 = 1_000;
+const TRANSPARENT_TX_INDEX: usize = 1;
+const SHIELDED_TX_INDEX: usize = 2;
 
 #[test]
 fn deep_reorg_with_transparent_and_shielded_transactions() {
     let _guard = zakura_test::init();
 
     for skip_address_index in [false, true] {
+        let finalized = FinalizedState::new(&Config::ephemeral(), &Network::Mainnet).unwrap();
         let (initial, template, shielded) = fixtures(skip_address_index);
         let common_blocks = MAX_BLOCK_REORG_HEIGHT - REORG_DEPTH;
         let mut source = initial.clone();
@@ -72,6 +81,8 @@ fn deep_reorg_with_transparent_and_shielded_transactions() {
             usize::try_from(REORG_DEPTH).unwrap()
         );
         assert!(fork.eq_internal_state(&rebuilt));
+        let common_tip = rebuilt.tip_block().unwrap().clone();
+        assert_live_double_spends_rejected(&fork, &rebuilt, &shielded, &common_tip, &finalized);
 
         for record in &abandoned {
             assert_membership(&reader, record, true);
@@ -89,11 +100,19 @@ fn deep_reorg_with_transparent_and_shielded_transactions() {
             parent = block;
         }
         assert!(fork.eq_internal_state(&rebuilt));
+        assert_live_double_spends_rejected(&fork, &rebuilt, &shielded, &common_tip, &finalized);
+        assert_live_double_spends_rejected(
+            &fork,
+            &rebuilt,
+            &shielded,
+            fork.tip_block().unwrap(),
+            &finalized,
+        );
         assert!(source.eq_internal_state(&reader));
         for record in &abandoned {
             assert_membership(&reader, record, true);
-            assert!(!fork.contains_transaction(&record.transaction_hashes[1]));
-            assert!(!fork.contains_transaction(&record.transaction_hashes[2]));
+            assert!(!fork.contains_transaction(&record.transaction_hashes[TRANSPARENT_TX_INDEX]));
+            assert!(!fork.contains_transaction(&record.transaction_hashes[SHIELDED_TX_INDEX]));
         }
 
         let mut state = NonFinalizedState::new(&Network::Mainnet);
@@ -120,6 +139,134 @@ fn deep_reorg_with_transparent_and_shielded_transactions() {
             assert_membership(&reader, record, true);
             assert_membership(&before_finalization, record, true);
         }
+    }
+}
+
+/// Rejects conflicts with a live block while preserving independently built state.
+fn assert_live_double_spends_rejected(
+    chain: &Chain,
+    expected: &Chain,
+    shielded: &Transaction,
+    live: &ContextuallyVerifiedBlock,
+    finalized: &FinalizedState,
+) {
+    let parent = copy_block_fixture(&chain.tip_block().unwrap().block);
+    let (block, _) = mixed_child(&parent, shielded, MAX_BLOCK_REORG_HEIGHT + 1, 2);
+    let mut valid = Block::clone(&block);
+    let unspent = transparent::OutPoint {
+        hash: live.transaction_hashes[TRANSPARENT_TX_INDEX],
+        index: 0,
+    };
+    let Transaction::V4 { inputs, .. } =
+        Arc::make_mut(&mut valid.transactions[TRANSPARENT_TX_INDEX])
+    else {
+        panic!("the fixture has a V4 transparent transfer");
+    };
+    inputs[0] = transparent::Input::PrevOut {
+        outpoint: unspent,
+        unlock_script: transparent::Script::new(&[]),
+        sequence: u32::MAX,
+    };
+    set_merkle_root(&mut valid);
+    let prepared = Arc::new(valid.clone()).prepare();
+    let spent = check::utxo::transparent_spend(&prepared, Some(chain), &finalized.db).unwrap();
+    let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+        &Network::Mainnet,
+        prepared,
+        spent.clone(),
+    )
+    .unwrap();
+    assert!(chain.clone().push(contextual).is_ok());
+    assert!(chain.eq_internal_state(expected));
+
+    // Use the actual commit boundary for transparent rejection, before a
+    // supplied UTXO map could bypass the spent-output check in the service.
+    let mut duplicate = valid.clone();
+    let Transaction::V4 { inputs, .. } =
+        Arc::make_mut(&mut duplicate.transactions[TRANSPARENT_TX_INDEX])
+    else {
+        unreachable!("the valid candidate has a V4 transparent transfer");
+    };
+    let outpoint = *live.spent_outputs.keys().next().unwrap();
+    inputs[0] = transparent::Input::PrevOut {
+        outpoint,
+        unlock_script: transparent::Script::new(&[]),
+        sequence: u32::MAX,
+    };
+    set_merkle_root(&mut duplicate);
+    let mut state = NonFinalizedState::new(&Network::Mainnet);
+    state.insert_test_chain(Arc::new(chain.clone()));
+    let reader = state.clone();
+    assert_eq!(
+        state.commit_block(Arc::new(duplicate).prepare(), &finalized.db),
+        Err(ValidateContextError::DuplicateTransparentSpend {
+            outpoint,
+            location: "the non-finalized chain",
+        }),
+    );
+    assert_eq!(state.chain_count(), 1);
+    assert!(state.best_chain().unwrap().eq_internal_state(expected));
+    assert!(reader.best_chain().unwrap().eq_internal_state(expected));
+
+    let live_transaction = live
+        .block
+        .view()
+        .transactions()
+        .nth(SHIELDED_TX_INDEX)
+        .unwrap();
+    let Transaction::V5 {
+        sapling_shielded_data: Some(sapling),
+        orchard_shielded_data: Some(orchard),
+        ..
+    } = live_transaction
+    else {
+        panic!("the live fixture includes both shielded pools");
+    };
+    for (sapling, orchard, error) in [
+        (
+            Some(sapling.clone()),
+            None,
+            ValidateContextError::DuplicateSaplingNullifier {
+                nullifier: *live_transaction.sapling_nullifiers().next().unwrap(),
+                in_finalized_state: false,
+            },
+        ),
+        (
+            None,
+            Some(orchard.clone()),
+            ValidateContextError::DuplicateOrchardNullifier {
+                nullifier: *live_transaction.orchard_nullifiers().next().unwrap(),
+                in_finalized_state: false,
+            },
+        ),
+    ] {
+        let mut duplicate = valid.clone();
+        let Transaction::V5 {
+            sapling_shielded_data,
+            orchard_shielded_data,
+            ..
+        } = Arc::make_mut(&mut duplicate.transactions[SHIELDED_TX_INDEX])
+        else {
+            unreachable!("the valid candidate has a V5 shielded transaction");
+        };
+        if let Some(sapling) = sapling {
+            *sapling_shielded_data = Some(sapling);
+        }
+        if let Some(orchard) = orchard {
+            *orchard_shielded_data = Some(orchard);
+        }
+        set_merkle_root(&mut duplicate);
+        let prepared = Arc::new(duplicate).prepare();
+        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &Network::Mainnet,
+            prepared,
+            spent.clone(),
+        )
+        .unwrap();
+        assert_eq!(chain.clone().push(contextual).unwrap_err(), error);
+        assert!(chain.eq_internal_state(expected));
+        assert!(reader.best_chain().unwrap().eq_internal_state(expected));
+        assert_membership(chain, live, true);
     }
 }
 
@@ -273,8 +420,7 @@ fn mixed_child(
     *expiry_height = height;
     body.transactions
         .extend([Arc::new(transparent), Arc::new(shielded)]);
-    let merkle_root = body.transactions.iter().collect();
-    Arc::make_mut(&mut body.header).merkle_root = merkle_root;
+    set_merkle_root(body);
     let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
         &Network::Mainnet,
         block.clone().prepare(),
@@ -282,6 +428,11 @@ fn mixed_child(
     )
     .unwrap();
     (block, contextual)
+}
+
+fn set_merkle_root(block: &mut Block) {
+    let merkle_root = block.transactions.iter().collect();
+    Arc::make_mut(&mut block.header).merkle_root = merkle_root;
 }
 
 /// Different seeds identify different blocks; indexes distinguish their spends.

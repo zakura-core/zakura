@@ -43,8 +43,9 @@ mod tests;
 pub(crate) use backup::write_semantically_verified_backup_block;
 #[cfg(feature = "internal-bench")]
 pub use chain::{
-    benchmark_height_map, benchmark_transparent_indexes, benchmark_transparent_spend_check,
-    AllocationProbe, HeightMapBenchmarkSample, TransparentIndexBenchmarkConfig,
+    benchmark_chain_snapshot_cycle, benchmark_height_map, benchmark_transparent_indexes,
+    benchmark_transparent_spend_check, AllocationProbe, ChainSnapshotBenchmarkConfig,
+    ChainSnapshotBenchmarkSample, HeightMapBenchmarkSample, TransparentIndexBenchmarkConfig,
     TransparentIndexBenchmarkSample,
 };
 pub(crate) use chain::{Chain, SpendingTransactionId};

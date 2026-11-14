@@ -11,6 +11,7 @@ use std::{
 
 pub use zakura_sim::explore::EXPECT_VAR;
 use zakura_sim::{
+    check::PropertyOutcome,
     explore::{
         feedback::{Feedback, NewCollector},
         input_path, save_failure, save_input, traces_root, violation_panic, Bucket, Classified,
@@ -150,7 +151,7 @@ fn abandon_limit() -> usize {
 
 /// [`fuzz_one`]'s action on one classified run.
 fn act(entry: &'static HarnessEntry, input: &[u8], run: &ExploreRun, classified: &Classified) {
-    if met_expectation(entry, classified) {
+    if met_expectation(entry, run, classified) {
         return;
     }
     if classified.leaked > 0 {
@@ -337,11 +338,22 @@ fn has_trace(root: &Path, property: &str) -> bool {
 /// name and panics on an `Active` violation of that property, and returns
 /// `true` for any other run, so the caller does nothing else with it.
 /// Returns `false` when the variable is unset.
-fn met_expectation(entry: &HarnessEntry, classified: &Classified) -> bool {
+///
+/// A failing run counts when it violates the property anywhere in its
+/// report, not only first: a planted case's `also_violates` property can
+/// fire before the case's own.
+fn met_expectation(entry: &HarnessEntry, run: &ExploreRun, classified: &Classified) -> bool {
     let Some(want) = expected() else {
         return false;
     };
-    if matches!(&classified.outcome, ExploreOutcome::Fail { property } if property == want) {
+    let failed = matches!(classified.outcome, ExploreOutcome::Fail { .. });
+    let violated_want = run.report().is_some_and(|report| {
+        report.properties.iter().any(|property| {
+            property.property == want
+                && matches!(property.outcome, PropertyOutcome::Violated { .. })
+        })
+    });
+    if failed && violated_want {
         eprintln!("{HARNESS_LINE}{}", entry.name);
         panic!("{want}");
     }
@@ -389,7 +401,7 @@ fn act_fixtures(
     run: &ExploreRun,
     classified: &Classified,
 ) {
-    if met_expectation(entry, classified) {
+    if met_expectation(entry, run, classified) {
         return;
     }
     static FINDS: OnceLock<Mutex<Finds>> = OnceLock::new();

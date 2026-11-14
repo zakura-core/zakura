@@ -787,7 +787,7 @@ mod tests {
     fn mismatched_frontiers() -> DerivedFrontiers {
         let mut orchard = orchard::tree::NoteCommitmentTree::default();
         orchard
-            .append(halo2::pasta::pallas::Base::from(1u64))
+            .append(pasta_curves::pallas::Base::from(1u64))
             .expect("test tree is not full");
         DerivedFrontiers {
             sapling: Arc::new(Default::default()),

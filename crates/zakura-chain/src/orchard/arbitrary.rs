@@ -4,7 +4,7 @@ use group::{
     ff::{FromUniformBytes, PrimeField},
     CurveAffine,
 };
-use halo2::pasta::pallas;
+use pasta_curves::pallas;
 use reddsa::{orchard::SpendAuth, Signature, SigningKey, VerificationKey, VerificationKeyBytes};
 
 use proptest::{array, collection::vec, prelude::*};

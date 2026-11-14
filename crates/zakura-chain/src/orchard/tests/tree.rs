@@ -1,4 +1,4 @@
-use halo2::pasta::{group::ff::PrimeField, pallas};
+use pasta_curves::{group::ff::PrimeField, pallas};
 
 use crate::orchard::tests::vectors;
 use crate::orchard::tree::*;

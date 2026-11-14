@@ -267,8 +267,8 @@ impl<C> From<Amount<C>> for jubjub::Fr {
     }
 }
 
-impl<C> From<Amount<C>> for halo2::pasta::pallas::Scalar {
-    fn from(a: Amount<C>) -> halo2::pasta::pallas::Scalar {
+impl<C> From<Amount<C>> for pasta_curves::pallas::Scalar {
+    fn from(a: Amount<C>) -> pasta_curves::pallas::Scalar {
         // TODO: this isn't constant time -- does that matter?
         if a.0 < 0 {
             let abs_amount = i128::from(a.0)
@@ -276,9 +276,9 @@ impl<C> From<Amount<C>> for halo2::pasta::pallas::Scalar {
                 .expect("absolute i64 fits in i128");
             let abs_amount = u64::try_from(abs_amount).expect("absolute i64 fits in u64");
 
-            halo2::pasta::pallas::Scalar::from(abs_amount).neg()
+            pasta_curves::pallas::Scalar::from(abs_amount).neg()
         } else {
-            halo2::pasta::pallas::Scalar::from(
+            pasta_curves::pallas::Scalar::from(
                 u64::try_from(a.0).expect("non-negative i64 fits in u64"),
             )
         }

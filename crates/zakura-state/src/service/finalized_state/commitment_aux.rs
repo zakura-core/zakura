@@ -59,6 +59,18 @@ pub enum FinalFrontiersGenerationError {
         height: block::Height,
     },
 
+    /// A build without the `sprout` feature stopped maintaining this database's Sprout tree, so
+    /// its Sprout frontier is incomplete.
+    #[error(
+        "cannot produce final frontiers: this database stopped maintaining the Sprout note \
+         commitment tree at height {skipped_from:?}; generate them from a database synced by a \
+         build with the `sprout` feature"
+    )]
+    SproutTreeNotMaintained {
+        /// The first height committed without its Sprout note commitments.
+        skipped_from: block::Height,
+    },
+
     /// The database has no Sapling tree at the requested height.
     #[error("missing Sapling final frontier tree at height {height:?}")]
     MissingSaplingTree {
@@ -669,6 +681,9 @@ fn read_final_frontiers_at(
     let ironwood = db
         .ironwood_tree_by_height(&height)
         .ok_or(FinalFrontiersGenerationError::MissingIronwoodTree { height })?;
+    if let Some(skipped_from) = db.sprout_tree_skipped_from() {
+        return Err(FinalFrontiersGenerationError::SproutTreeNotMaintained { skipped_from });
+    }
     let sprout = db
         .sprout_tree_for_tip()
         .map_err(|error| FinalFrontiersGenerationError::MissingSproutTree { height: error.tip })?;

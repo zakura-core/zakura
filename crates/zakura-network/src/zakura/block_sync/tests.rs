@@ -22,7 +22,7 @@ use super::{
     },
     peer_registry::{OutstandingMeta, PeerRegistry},
     reactor::{
-        node_id_from_block_peer_id, BS_ACTION_CONTROL_RESERVE, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
+        BS_ACTION_CONTROL_RESERVE, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
         EMPTY_STATE_HEADER_QUIET_PERIOD, NEEDED_BLOCK_QUERY_RETRY_DELAY,
     },
     reorder::*,
@@ -1115,7 +1115,7 @@ fn persistent_body_alarm_metrics_expose_every_required_dimension() {
         .split_once("fn publish_body_unavailable_metrics")
         .expect("the body-unavailable metric publisher exists")
         .1
-        .split_once("fn node_id_from_block_peer_id")
+        .split_once("fn local_status")
         .expect("the metric publisher remains a focused function")
         .0;
     for required in [
@@ -14914,8 +14914,7 @@ async fn reactor_publishes_block_sync_candidate_gap() {
         .await
         .expect("status queues");
 
-    let peer_node_id =
-        node_id_from_block_peer_id(&peer_id).expect("test peer id is a valid node id");
+    let peer_node_id = peer_id.node_id().expect("test peer id is a valid node id");
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             candidates

@@ -395,8 +395,9 @@ pub struct Config {
     /// under a name of its own. The address it dialed last is treated like a listed
     /// address in everything this setting does.
     /// When a lookup fails, Zakura dials the last address again. A ban from before the
-    /// name resolved to an address stays until Zakura restarts. The startup dials do not
-    /// wait for the first lookup, so they keep no room for a name's address.
+    /// name resolved to an address stays until Zakura restarts, and a mempool cooldown
+    /// from before then stays until it ends. The startup dials do not wait for the first
+    /// lookup, so they keep no room for a name's address.
     ///
     /// Each dialed address adds one outbound and one inbound connection slot on top of the
     /// connection limits. Zakura dials each address on an outbound slot of its own, so a

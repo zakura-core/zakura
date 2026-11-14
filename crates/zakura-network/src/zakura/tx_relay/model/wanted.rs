@@ -32,6 +32,10 @@ pub(crate) struct Entry {
     /// When its claim was last released. A session whose own request for it
     /// timed out waits [`super::INBOUND_DELAY`] after this.
     pub(crate) released_at: Option<Time>,
+    /// When a fetch of it last ended without a body, by `NotFound` or a
+    /// missed deadline. It is ready to claim again only from then, so an id
+    /// that keeps failing queues behind work that was already waiting.
+    pub(crate) failed_at: Option<Time>,
 }
 
 /// The pool answered `NoRoom`, so nobody claims until `until`. After that
@@ -104,6 +108,7 @@ impl WantedModel {
                 retry_at: now,
                 retry_delay: None,
                 released_at: None,
+                failed_at: None,
             }
         });
         entry.holders = entry.holders.saturating_add(1);
@@ -170,6 +175,17 @@ impl WantedModel {
             entry.retry_at = now.saturating_add(delay);
         }
         self.collect(id);
+    }
+
+    /// A fetch of `id` in `generation` ended without a body at `now`.
+    pub(crate) fn fetch_failed(&mut self, id: UnminedTxId, generation: EntryGen, now: Time) {
+        if let Some(entry) = self
+            .entries
+            .get_mut(&id)
+            .filter(|entry| entry.generation == generation)
+        {
+            entry.failed_at = Some(now);
+        }
     }
 
     /// `id` is decided in `generation`: in the pool, rejected, or mined. Its

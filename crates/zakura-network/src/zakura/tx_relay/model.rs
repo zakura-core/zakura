@@ -22,8 +22,10 @@
 //! - **Claim, reserve, then ask.** A session with a free slot claims an
 //!   eligible id in its pending set, reserves a slot at the pool, and only
 //!   then sends `GetTxs`. One claim per id. The id ready longest goes
-//!   first, over every session: ready since its first announcement, or
-//!   since its retry delay ended. A slot given back is room, so it ends a
+//!   first, over every session: ready since its first announcement, the
+//!   end of its retry delay, or its last failed fetch, whichever is last.
+//!   So an id that keeps failing, whoever announces it, queues behind work
+//!   that was already waiting. A slot given back is room, so it ends a
 //!   `NoRoom` backoff, and a session waiting after its own release never
 //!   holds back others. So neither fresh ids nor retries starve
 //!   the other, and an older session cannot keep taking the room a verdict
@@ -46,8 +48,11 @@
 //!   answer while the snapshot shows an active pool waits a retry delay, so
 //!   a missed restart costs one delay.
 //! - **A rejection of a scope the pool caches settles the id for every
-//!   holder,** if it arrives on the chain it was made on, for a verdict and
-//!   a reserve answer alike. That includes one from the pool's contents,
+//!   holder,** if it arrives while the caller's snapshot shows the pool on,
+//!   at the chain generation it was made on, for a verdict and a reserve
+//!   answer alike. The snapshot is the only chain source: while the pool is
+//!   off it keeps its last generation, so a rejection arriving then only
+//!   makes the id be asked about again. That includes one from the pool's contents,
 //!   such as a conflict, which the pool also keeps until the tip changes.
 //!   The port shows no restart or cache clearing a caller can rely on
 //!   seeing, so neither is checked: as with today's rejection cache, an
@@ -328,6 +333,20 @@ struct Answer {
     stopped: bool,
 }
 
+/// A rejection `tx-relay` received, as the random run's oracle sees it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Arrival {
+    pub(crate) id: UnminedTxId,
+    /// Whether its scope is one the pool caches.
+    pub(crate) cached: bool,
+    /// The snapshot generation it was made on.
+    pub(crate) made_on: Generation,
+    /// The snapshot `tx-relay` held when it arrived: its generation, and
+    /// whether it showed the pool on.
+    pub(crate) held: Generation,
+    pub(crate) live: bool,
+}
+
 /// Who submitted a body, from which snapshot.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct Submitted {
@@ -353,11 +372,15 @@ struct Delivery {
 pub(crate) struct RelayModel {
     now: Time,
     pool: PoolModel,
-    /// The tip and stable generation the pool has applied. A verification
-    /// reports this generation as read, and a verdict is decided at this
-    /// tip.
+    /// The tip and stable generation the pool has applied, as its snapshot
+    /// shows them: frozen while the pool is off or stopped. A verification
+    /// reports this generation as read, a verdict is decided at this tip,
+    /// and late answers are confirmed against it.
     tip: Height,
     generation: Generation,
+    /// The chain the node is on, which the pool applies when it is on.
+    chain_tip: Height,
+    chain_generation: Generation,
     /// The node's best tip, which can run ahead of the pool's.
     best_tip: Height,
     /// Whether the node is close to the network's tip.
@@ -383,10 +406,8 @@ pub(crate) struct RelayModel {
     core_stopped: bool,
     /// `tx-relay` was told the core stopped, so it claims nothing more.
     stopped: bool,
-    /// Every rejection `tx-relay` received, for the random run's oracle: the
-    /// id, whether its scope is one the pool caches, the chain generation it
-    /// was made on, and the one `tx-relay` held when it arrived.
-    arrivals: Vec<(UnminedTxId, bool, Generation, Generation)>,
+    /// Every rejection `tx-relay` received, for the random run's oracle.
+    arrivals: Vec<Arrival>,
     /// Whether a body that passed the check reaches the pool at once. Off,
     /// it waits for [`Self::deliver_submit`].
     auto_submits: bool,
@@ -444,6 +465,8 @@ impl RelayModel {
             pool,
             tip: Height(100),
             generation: Generation(0),
+            chain_tip: Height(100),
+            chain_generation: Generation(0),
             best_tip: Height(100),
             current: true,
             pool_live: true,
@@ -725,6 +748,7 @@ impl RelayModel {
             }
             self.wanted
                 .release(id, request.generation, session, self.now, false);
+            self.wanted.fetch_failed(id, request.generation, self.now);
         }
         self.settle();
     }
@@ -871,10 +895,14 @@ impl RelayModel {
     /// The best chain changed and the pool applies it.
     pub(crate) fn transition(&mut self, transition: ModelTransition, now: Time) {
         self.enter(now);
-        self.tip = transition.tip;
+        self.chain_tip = transition.tip;
+        self.chain_generation = transition.generation;
         self.best_tip = transition.tip;
-        self.generation = transition.generation;
-        if !self.core_stopped {
+        // Only a live pool applies it, and only then does its snapshot show
+        // the new chain.
+        if self.pool_live && !self.core_stopped {
+            self.tip = transition.tip;
+            self.generation = transition.generation;
             let step = self.pool.transition(transition, self.now);
             self.inbox.push_back(step);
         }
@@ -884,16 +912,22 @@ impl RelayModel {
     /// Another caller, such as the legacy adapter, uses the pool. The
     /// closure returns its answer and the step that caused, including
     /// [`PoolModel::effects`] after an input with an answer of its own.
+    /// After a stop the closure never runs and the answer is `None`, as the
+    /// port answers every call `Stopped`.
     pub(crate) fn outside<R>(
         &mut self,
         now: Time,
         f: impl FnOnce(&mut PoolModel, Time) -> (R, Step),
-    ) -> R {
+    ) -> Option<R> {
         self.enter(now);
+        if self.core_stopped {
+            self.settle();
+            return None;
+        }
         let (answer, step) = f(&mut self.pool, self.now);
         self.inbox.push_back(step);
         self.settle();
-        answer
+        Some(answer)
     }
 
     /// The node fell behind the tip and the pool turned off.
@@ -947,9 +981,8 @@ impl RelayModel {
         self.settle();
     }
 
-    /// Every rejection received since the last call, as
-    /// `(id, cached scope, made on, held on arrival)`.
-    pub(crate) fn take_arrivals(&mut self) -> Vec<(UnminedTxId, bool, Generation, Generation)> {
+    /// Every rejection received since the last call.
+    pub(crate) fn take_arrivals(&mut self) -> Vec<Arrival> {
         std::mem::take(&mut self.arrivals)
     }
 
@@ -959,6 +992,8 @@ impl RelayModel {
         if self.core_stopped {
             return self.settle();
         }
+        self.tip = self.chain_tip;
+        self.generation = self.chain_generation;
         self.pool.activate(self.tip, self.generation, self.now);
         let step = self.pool.effects();
         self.inbox.push_back(step);
@@ -1443,13 +1478,15 @@ impl RelayModel {
                 // made on, settles the id when it arrives. See the module
                 // docs for why a restart or a cleared cache is not checked.
                 let remembered = !matches!(scope, RejectionScope::Uncached)
+                    && self.pool_live
                     && self.generation == submitted.chain;
-                self.arrivals.push((
+                self.arrivals.push(Arrival {
                     id,
-                    !matches!(scope, RejectionScope::Uncached),
-                    submitted.chain,
-                    self.generation,
-                ));
+                    cached: !matches!(scope, RejectionScope::Uncached),
+                    made_on: submitted.chain,
+                    held: self.generation,
+                    live: self.pool_live,
+                });
                 if remembered {
                     self.decided(id, generation);
                 } else {
@@ -1827,6 +1864,7 @@ impl RelayModel {
             }
             self.wanted
                 .release(id, generation, session, self.now, false);
+            self.wanted.fetch_failed(id, generation, self.now);
         }
         self.drain();
     }
@@ -1895,12 +1933,18 @@ impl RelayModel {
         }
     }
 
-    /// When `pending` became ready to claim: at its first announcement, or
-    /// when its retry delay ended.
+    /// When `pending` became ready to claim: at its first announcement, when
+    /// its retry delay ended, or when a fetch of it last failed, whichever
+    /// is last.
     fn ready_at(&self, pending: Pending) -> Time {
         self.wanted
             .current(pending.id, pending.generation)
-            .map_or(Time::MAX, |entry| entry.first_seen.max(entry.retry_at))
+            .map_or(Time::MAX, |entry| {
+                entry
+                    .first_seen
+                    .max(entry.retry_at)
+                    .max(entry.failed_at.unwrap_or_default())
+            })
     }
 
     /// The pool processes one reserve call. With automatic reserves its
@@ -2053,13 +2097,15 @@ impl RelayModel {
             }
             Err(ModelUnreserved::Rejected(scope)) => {
                 // The same rule as a verdict's rejection.
-                let remembered = chain_unchanged && !matches!(scope, RejectionScope::Uncached);
-                self.arrivals.push((
+                let remembered =
+                    chain_unchanged && self.pool_live && !matches!(scope, RejectionScope::Uncached);
+                self.arrivals.push(Arrival {
                     id,
-                    !matches!(scope, RejectionScope::Uncached),
-                    call.generation,
-                    self.generation,
-                ));
+                    cached: !matches!(scope, RejectionScope::Uncached),
+                    made_on: call.generation,
+                    held: self.generation,
+                    live: self.pool_live,
+                });
                 self.wanted
                     .release(id, pending.generation, session, self.now, !remembered);
                 if remembered {

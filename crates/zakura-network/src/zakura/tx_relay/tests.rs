@@ -340,7 +340,9 @@ fn a_full_pool_costs_one_probe_per_backoff() {
         Some(NO_ROOM_FIRST * 3)
     );
     // Room comes back, and the next probe gets it.
-    relay.outside(secs(2), |pool, now| ((), pool.release(held[0], now)));
+    relay.outside(secs(2), |pool, now| {
+        ((), pool.release(held[0].expect("the core runs"), now))
+    });
     relay.tick(NO_ROOM_FIRST * 3);
     assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
     // That took the last slot, so the next claim finds the pool full again.
@@ -363,7 +365,9 @@ fn an_id_another_caller_fetches_is_retried_later() {
     relay.inv(a, &[(id(1), SIZE)], secs(0));
     assert!(asks(&relay.take_effects()).is_empty());
     assert_eq!(relay.wanted().entry(id(1)).unwrap().retry_at, RETRY_FIRST);
-    relay.outside(secs(0), |pool, now| ((), pool.release(other, now)));
+    relay.outside(secs(0), |pool, now| {
+        ((), pool.release(other.expect("the core runs"), now))
+    });
     relay.tick(RETRY_FIRST);
     assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
     // A block mines it. The cancellation is tx-relay's, and nothing is
@@ -2790,7 +2794,9 @@ fn a_delayed_reserve_rejection_after_a_restart_still_settles() {
         let answer = pool.reserve(id(1), Intent::Fetch, now);
         (answer.expect("room").id, pool.effects())
     });
-    relay.outside(secs(0), |pool, now| pool.submit(other, tx(1), now));
+    relay.outside(secs(0), |pool, now| {
+        pool.submit(other.expect("the core runs"), tx(1), now)
+    });
     let rejected = Outcome::Fail {
         scope: RejectionScope::ExactTip,
         charge: Charge::None,
@@ -2830,6 +2836,68 @@ fn a_slot_given_back_ends_the_backoff_for_others() {
     // room, so B is asked for Y while A waits.
     relay.inv(a, &[(id(1), SIZE)], secs(9));
     relay.not_found(a, id(1), secs(9));
+    assert_eq!(asks(&relay.take_effects()), vec![(b, id(2))]);
+    relay.assert_invariants();
+}
+
+#[test]
+fn an_outside_call_after_a_stop_is_refused() {
+    let mut relay = relay();
+    relay.stop(secs(0));
+    let answer = relay.outside(secs(1), |pool, now| {
+        let answer = pool.reserve(id(1), Intent::Fetch, now);
+        (answer.is_ok(), pool.effects())
+    });
+    assert_eq!(answer, None);
+    assert_eq!(relay.pool().slots_in_use(), 0);
+    assert!(relay.logged().is_empty());
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_rejection_arriving_while_the_pool_is_off_settles_nothing() {
+    let mut relay = relay().with_manual_verdicts();
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(b, &[(id(1), SIZE)], secs(0));
+    relay.tx(a, id(1), tx(1), secs(0));
+    let rejected = Outcome::Fail {
+        scope: RejectionScope::ExactTip,
+        charge: Charge::None,
+    };
+    finish_all(&mut relay, &rejected, secs(0));
+    // The pool turns off and the chain moves. The snapshot keeps its last
+    // generation, so a caller cannot tell the chain moved.
+    relay.deactivate(secs(1));
+    relay.transition(mining(Vec::new()), secs(1));
+    assert!(relay.deliver_verdict(secs(2)));
+    // From an off snapshot the rejection settles nothing: both still hold
+    // the id, and once the pool is on again it is asked for.
+    let entry = relay.wanted().entry(id(1)).cloned().expect("still wanted");
+    assert!(relay.session(b).unwrap().holds(id(1), entry.generation));
+    relay.take_effects();
+    relay.activate(secs(3));
+    relay.tick(secs(4));
+    assert_eq!(asks(&relay.take_effects()).len(), 1);
+    relay.assert_invariants();
+}
+
+#[test]
+fn ids_that_keep_failing_queue_behind_waiting_work() {
+    let mut relay = RelayModel::new(PoolModel::new(Height(100), Generation(0)).with_limits(1, 1));
+    // A is asked for X, and C holds X too. B's Y finds no room.
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    let c = open(&mut relay, 3, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(c, &[(id(1), SIZE)], secs(0));
+    relay.inv(b, &[(id(2), SIZE)], secs(1));
+    relay.take_effects();
+    // A announces X again and answers `NotFound`. X failed just now, so Y,
+    // ready since earlier, gets the slot rather than C's X.
+    relay.inv(a, &[(id(1), SIZE)], secs(2));
+    relay.not_found(a, id(1), secs(2));
     assert_eq!(asks(&relay.take_effects()), vec![(b, id(2))]);
     relay.assert_invariants();
 }
@@ -3196,8 +3264,8 @@ fn settle_obligations(
     let settling: HashSet<UnminedTxId> = relay
         .take_arrivals()
         .into_iter()
-        .filter(|(_, cached, made_on, held)| *cached && made_on == held)
-        .map(|(id, ..)| id)
+        .filter(|arrival| arrival.cached && arrival.live && arrival.made_on == arrival.held)
+        .map(|arrival| arrival.id)
         .collect();
     for obligations in honest.values_mut() {
         for (id, met) in obligations.iter_mut() {

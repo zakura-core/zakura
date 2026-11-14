@@ -509,7 +509,13 @@ impl<E: Clone> Storage<E> {
         let evicted_ids = match self.make_room(&tx, &ancestors) {
             Ok(evicted_ids) => evicted_ids,
             Err(error) => {
-                self.reject_exact(unmined_tx_id, error.clone());
+                // Bodies held outside storage, hidden while they are checked
+                // again, take room but can't be evicted. So while there are
+                // any, this refusal is not remembered: once they are back, the
+                // same bytes may pay enough to evict one.
+                if self.outside_cost == 0 {
+                    self.reject_exact(unmined_tx_id, error.clone());
+                }
                 return (Err(error.into()), HashSet::new());
             }
         };

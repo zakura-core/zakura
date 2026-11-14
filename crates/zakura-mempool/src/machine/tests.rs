@@ -1651,10 +1651,18 @@ fn hidden_transactions_count_against_the_cost_limit() {
         .collect();
 
     // A new transaction finds no room: the hidden ones can't be evicted.
+    // That is not remembered, since the hidden ones were never weighed
+    // against it.
     let read = GenerationRead::Stable(Generation(1));
     assert!(
         matches!(admit(&mut machine, &txs[2], read), Verdict::Rejected(_)),
         "the pool is full of hidden transactions"
+    );
+    assert!(
+        machine
+            .rejected_ids([txs[2].id()].into_iter().collect(), base)
+            .is_empty(),
+        "a refusal while hidden transactions take room is not cached"
     );
 
     // Both pass again and are revealed.
@@ -1673,6 +1681,12 @@ fn hidden_transactions_count_against_the_cost_limit() {
         machine.assert_invariants();
     }
     assert_eq!(machine.visible().len(), 2);
+
+    // The same bytes are checked again, against the pool as it is now.
+    assert!(
+        machine.reserve(txs[2].id(), Intent::Deliver, base).is_ok(),
+        "the earlier refusal does not stand in the way"
+    );
 }
 
 /// Sol's case from M1 review round 2: a reveal that storage refuses takes its

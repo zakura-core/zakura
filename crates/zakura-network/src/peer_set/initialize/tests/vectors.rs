@@ -2718,6 +2718,51 @@ async fn listener_holds_the_seat_of_a_long_lived_peer() {
     listener.stop().await;
 }
 
+/// A held seat only refuses a peer when every other seat is taken. Peers take the free
+/// seats first.
+#[tokio::test]
+async fn listener_fills_free_seats_before_a_held_seat_refuses_a_peer() {
+    let _init_guard = zakura_test::init();
+
+    // A target size of 4 gives 12 inbound seats, so one seat can be held.
+    let Some(mut listener) = UnconditionalPeerListener::spawn("[]", &[], 4).await else {
+        return;
+    };
+    const RETURNING_PEER_IP: IpAddr = LISTENER_UNCONDITIONAL_IP;
+
+    let mut returning_peer = listener
+        .offer(RETURNING_PEER_IP)
+        .await
+        .expect("the listener has free seats");
+    returning_peer
+        .2
+        .mark_open_at(std::time::Instant::now() - constants::MIN_HELD_SEAT_CONNECTION);
+    let mut other_peers = listener.offer_until_refused(LISTENER_PUBLIC_IP).await;
+
+    // One seat is held, and two are free.
+    std::mem::drop(returning_peer);
+    other_peers.truncate(other_peers.len() - 2);
+
+    for _free_seat in 0..2 {
+        other_peers.push(
+            listener
+                .offer(LISTENER_PUBLIC_IP)
+                .await
+                .expect("a free seat is not held for anyone"),
+        );
+    }
+    assert!(
+        listener.offer(LISTENER_PUBLIC_IP).await.is_none(),
+        "only the held seat is left",
+    );
+    assert!(
+        listener.offer(RETURNING_PEER_IP).await.is_some(),
+        "the peer takes its seat back",
+    );
+
+    listener.stop().await;
+}
+
 /// A dialed unconditional peer that returns to its own slot gives up the public seat that
 /// is held for it, so other peers can take that seat.
 #[tokio::test]

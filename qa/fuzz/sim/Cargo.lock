@@ -1828,6 +1828,7 @@ dependencies = [
  "pin-project",
  "rand 0.10.3",
  "rayon",
+ "ring",
  "serde",
  "serde_json",
  "thiserror",

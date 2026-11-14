@@ -348,23 +348,26 @@ fn peer_batch(
         } else {
             rejected_ids(&shared, fresh.iter().copied().collect()).await
         };
-        let mut fresh = fresh
+        // The rest take their slots now, in one pass, as today's pool queues
+        // a batch at once: at most the peer's limit of them, and the rest are
+        // refused here, without asking the core. Slots that free up while
+        // the batch is worked on take nothing more from it.
+        let staged: Vec<Staged> = fresh
             .into_iter()
             .filter(|id| !rejected.contains(id))
-            .peekable();
-        // Once either limit is reached, the rest of the batch is refused
-        // here, as today's would refuse each item, without asking the core.
-        while let Some(id) = fresh.next() {
-            if !shared.has_room(&source) {
-                if !shared.node_has_room() {
-                    break;
+            .map(|id| Staged::new(&shared, Gossip::Id(id), &from))
+            .filter(|id| match id {
+                Staged::Over { peer_full, .. } => {
+                    if *peer_full {
+                        metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
+                    }
+                    false
                 }
-                let refused = 1 + fresh.count();
-                metrics::counter!("mempool.full_queue.per_peer.total")
-                    .increment(u64::try_from(refused).unwrap_or(u64::MAX));
-                break;
-            }
-            let _ = queue(shared.clone(), Gossip::Id(id), from.clone()).await;
+                Staged::Held { .. } => true,
+            })
+            .collect();
+        for id in staged {
+            let _ = id.queue(shared.clone(), from.clone()).await;
         }
         Ok(Response::Queued(Vec::new()))
     })
@@ -553,18 +556,6 @@ async fn answer(
             }))
         }
     })
-}
-
-/// Queues one item: reserves its slot and answers the first stage, and
-/// leaves a task that brings the body in and answers the second.
-async fn queue(
-    shared: Arc<Shared>,
-    item: Gossip,
-    from: Option<QueueSource>,
-) -> Result<Receiver, BoxError> {
-    Staged::new(&shared, item, &from)
-        .queue(shared.clone(), from)
-        .await
 }
 
 /// An item that has taken, or failed to take, its slots: the node's
@@ -812,10 +803,11 @@ async fn known_or_full(
         }
         Err(MempoolError::FullQueue.into())
     };
+    // A lookup, bounded as one, so a stalled core cannot gather these.
     let Ok(reserved) =
-        tokio::time::timeout(RATE_LIMIT_DELAY, shared.handle.reserve(id, intent)).await
+        tokio::time::timeout(MAX_LOOKUP_WAIT, shared.handle.reserve(id, intent)).await
     else {
-        return Err(timed_out());
+        return full();
     };
     match reserved {
         // A body for an id another caller is bringing in would join it.
@@ -1089,27 +1081,6 @@ async fn bring_in(
 }
 
 impl Shared {
-    /// Whether the node's limit and `peer`'s both have room for one more
-    /// item now.
-    fn has_room(&self, peer: &QueueSource) -> bool {
-        self.node_has_room()
-            && self
-                .per_peer
-                .lock()
-                .expect("no code panics while holding the per-peer counts")
-                .get(peer)
-                .is_none_or(|count| *count < MAX_INBOUND_CONCURRENCY_PER_PEER)
-    }
-
-    /// Whether the node's limit has room for one more item now.
-    fn node_has_room(&self) -> bool {
-        *self
-            .queued
-            .lock()
-            .expect("no code panics while holding the queued count")
-            < MAX_INBOUND_CONCURRENCY
-    }
-
     /// Whether `snapshot` is of a tip other than the state's best tip. A
     /// state with no tip yet has nothing to be behind.
     fn is_behind(&self, snapshot: &PoolSnapshot) -> bool {
@@ -1364,6 +1335,18 @@ mod tests {
             Some(TransactionDownloadVerifyError::InState)
         ));
         assert_eq!(started.elapsed(), Duration::ZERO, "no wait for the network");
+    }
+
+    /// Queues one item from `from` as a request would: takes its slots, then
+    /// reserves and answers its first stage.
+    async fn queue(
+        shared: Arc<Shared>,
+        item: Gossip,
+        from: Option<QueueSource>,
+    ) -> Result<Receiver, BoxError> {
+        Staged::new(&shared, item, &from)
+            .queue(shared.clone(), from)
+            .await
     }
 
     /// The adapter on `handle`, with a network that is never ready, an
@@ -3441,5 +3424,70 @@ mod tests {
             "the call dropped the request's body"
         );
         drop(unpolled);
+    }
+
+    /// A peer's batch takes at most the peer's limit of ids, in one pass, as
+    /// today's pool queues a batch at once: even when each fetch ends at
+    /// once and frees its slot, the rest of the batch is not worked through.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_peer_batch_takes_at_most_five_ids_however_fast_they_finish() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let ids: Vec<Gossip> = (0..20u8)
+            .map(|n| {
+                let mut hash = [6; 32];
+                hash[0] = n;
+                Gossip::Id(UnminedTxId::Legacy(zakura_chain::transaction::Hash(hash)))
+            })
+            .collect();
+        let request = tokio::spawn(core.call(Request::QueueFromPeer {
+            transactions: ids,
+            source: peer(),
+        }));
+        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch asks which ids are rejected");
+        };
+        let _ = reply.send(Default::default());
+        let mut reserved = 0;
+        // Each reservation is answered at once, freeing its slot.
+        while let Ok(Some(PoolCommand::Reserve { reply, .. })) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), inbox.next()).await
+        {
+            reserved += 1;
+            let _ = reply.send(Err(Unreserved::Pooled));
+        }
+        assert_eq!(reserved, MAX_INBOUND_CONCURRENCY_PER_PEER, "only five");
+        let _ = request.await;
+    }
+
+    /// An item over the node's limit asks the core about its id as a lookup,
+    /// bounded by [`MAX_LOOKUP_WAIT`], so a stalled core cannot gather these
+    /// probes, and one it does not answer is a full queue.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_over_limit_probe_ends_within_the_lookup_bound() {
+        use zakura_node_services::mempool::port::pool_port;
+
+        let (handle, _inbox) = pool_port();
+        let core = adapter_on(handle);
+        let full: Vec<QueueSlot> = (0..MAX_INBOUND_CONCURRENCY)
+            .map(|_| QueueSlot::take(&core.shared).expect("room for each"))
+            .collect();
+        let id = UnminedTxId::Legacy(zakura_chain::transaction::Hash([2; 32]));
+        let started = tokio::time::Instant::now();
+        let answer = tokio::time::timeout(
+            MAX_LOOKUP_WAIT * 2,
+            queue(core.shared.clone(), Gossip::Id(id), None),
+        )
+        .await
+        .expect("the probe ends within the lookup bound");
+        assert!(matches!(
+            answer.map_err(|error| error.downcast::<MempoolError>().map(|e| *e)),
+            Err(Ok(MempoolError::FullQueue))
+        ));
+        assert!(started.elapsed() <= MAX_LOOKUP_WAIT * 2);
+        drop(full);
     }
 }

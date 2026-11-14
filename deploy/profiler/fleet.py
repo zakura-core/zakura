@@ -433,7 +433,6 @@ def ensure_trace_config(node, nodes):
     if trace_dir_of(text) is None:
         remote(node, CLAIM_TRACE_SCRIPT, TRACE_DIR)
         start_profiler(node, TRACE_DIR, manage_traces=True)
-<<<<<<< HEAD
     else:
         install_profiler(node)
     if edited != text:
@@ -443,9 +442,6 @@ def ensure_trace_config(node, nodes):
         return f"already writes trace files to {trace_dir_of(text)} with configured peer names"
     hidden = "" if exposes_peer_addresses(edited) else "; its config keeps peer addresses hidden"
     return f"updated trace settings in {path}; they take effect when the node next starts{hidden}"
-=======
-    write_node_config(node, path, edited)
-    return f"added {' and '.join(added)} to {path}; it takes effect when the node next starts{hidden}"
 
 
 def peer_address(node):
@@ -503,7 +499,6 @@ def set_peer_names(node, nodes, private):
     if result == "unchanged":
         return f"already names its {len(peers)} fleet peers{kept}"
     return f"names its {len(peers)} fleet peers once the node next starts{kept}"
->>>>>>> b75f683fa (fix(deploy): keep private addresses out of peer names and skip bad profiler records)
 
 
 def install_profiler(node):
@@ -588,9 +583,6 @@ def main(argv=None):
     if args.step == "tunnels":
         install_tunnels(nodes)
         return 0
-<<<<<<< HEAD
-    fleet_nodes = nodes
-=======
     fleet = nodes
     private = frozenset()
     if args.step == "peer-names":
@@ -604,26 +596,16 @@ def main(argv=None):
         except (OSError, FleetError) as error:
             print(f"peer names not written: {error}", file=sys.stderr)
             return 2
->>>>>>> b75f683fa (fix(deploy): keep private addresses out of peer names and skip bad profiler records)
     if args.node:
         nodes = [node for node in nodes if node.name == args.node]
         if not nodes:
             print(f"{args.node} has no profiler in {args.config}; nothing to do")
             return 0
-<<<<<<< HEAD
-
-    def step(node):
-        if args.step == "ensure-trace-config":
-            return ensure_trace_config(node, fleet_nodes)
-        return install_profiler(node)
-
-=======
     step = {
-        "ensure-trace-config": ensure_trace_config,
+        "ensure-trace-config": lambda node: ensure_trace_config(node, fleet),
         "peer-names": lambda node: set_peer_names(node, fleet, private),
         "install": install_profiler,
     }[args.step]
->>>>>>> b75f683fa (fix(deploy): keep private addresses out of peer names and skip bad profiler records)
     return 1 if for_each_node(nodes, step) else 0
 
 

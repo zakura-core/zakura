@@ -46,7 +46,7 @@ use crate::{
         AnnouncedBlocks, CancelHeartbeatTask, Client, ClientRequest, Connection,
         ConnectionRequests, ErrorSlot, HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
     },
-    peer_registry::{sanitize_subversion, PeerRegistry},
+    peer_registry::{trace_user_agent, PeerRegistry},
     peer_set::{ConnectionTracker, InventoryChange},
     protocol::{
         external::{
@@ -1211,7 +1211,7 @@ fn record_zakura_upgrade(
     connector.trace_upgraded_peer(
         peer_id,
         &connected_addr.addr_label(expose_peer_addresses),
-        &sanitize_subversion(&connection_info.remote.user_agent),
+        &trace_user_agent(&connection_info.remote.user_agent),
         connected_addr.is_inbound(),
     );
 

@@ -15,7 +15,7 @@ use tower::{
 use crate::{
     constants::{EWMA_DECAY_TIME_NANOS, EWMA_DEFAULT_RTT},
     peer::{Client, ConnectedAddr, ConnectionInfo},
-    peer_registry::sanitize_subversion,
+    peer_registry::trace_user_agent,
     protocol::external::{canonical_socket_addr, types::PeerServices, types::Version},
 };
 
@@ -61,7 +61,7 @@ impl From<Client> for LoadTrackedClient {
 
         let request_slot = client.request_slot.clone();
         let connection_id = client.connection_id;
-        let user_agent = sanitize_subversion(&connection_info.remote.user_agent).into();
+        let user_agent = trace_user_agent(&connection_info.remote.user_agent).into();
 
         let service = PeakEwma::new(
             client,

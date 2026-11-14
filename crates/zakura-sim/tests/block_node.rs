@@ -137,6 +137,33 @@ fn the_default_scenario_converges() {
     }
 }
 
+/// Ordinary completion, without a `Teardown` step, releases the node's
+/// engine after the caller drops all prepared ports. In particular, the
+/// ports' private replies handle must not keep the serving source and its
+/// controlled service alive in a cycle.
+#[test]
+fn a_run_frees_the_node() {
+    for scenario in [
+        BlockScenario::default(),
+        BlockScenario::paused_handoffs(),
+        BlockScenario::peers_leave(),
+    ] {
+        assert!(scenario
+            .control
+            .iter()
+            .all(|step| !matches!(step.action, ControlAction::Teardown)));
+        for input in inputs(1, 64) {
+            let (_, ports) = run(&scenario, input);
+            let node = std::sync::Arc::downgrade(&ports.node);
+            drop(ports);
+            assert!(
+                node.upgrade().is_none(),
+                "nothing from the run holds the node's engine"
+            );
+        }
+    }
+}
+
 /// A node that starts with the first four of eight bodies downloads and
 /// submits only the other four, and reaches the tip.
 #[test]

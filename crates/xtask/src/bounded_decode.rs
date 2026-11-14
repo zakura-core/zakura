@@ -230,7 +230,8 @@ impl DecodeVisitor<'_> {
                     let name = ident.to_string();
                     let line = ident.span().start().line;
                     let turbofish = turbofish_after(&tokens, i);
-                    let names_unbounded_type = turbofish.as_ref().is_some_and(names_unbounded_type);
+                    let names_unbounded_type =
+                        turbofish.as_deref().is_some_and(names_unbounded_type);
                     if UNBOUNDED_FUNCTIONS.contains(&name.as_str()) {
                         match owner_before(&tokens, i).as_deref() {
                             Some(owner) if UNBOUNDED_TYPES.contains(&owner) => {
@@ -323,11 +324,11 @@ fn turbofish_after(tokens: &[TokenTree], i: usize) -> Option<Vec<TokenTree>> {
 
 /// Whether the type arguments name `Block` or `Transaction` anywhere, as in
 /// `Arc<block::Block>`.
-fn names_unbounded_type(arguments: &Vec<TokenTree>) -> bool {
+fn names_unbounded_type(arguments: &[TokenTree]) -> bool {
     arguments.iter().any(|token| match token {
         TokenTree::Ident(ident) => UNBOUNDED_TYPES.contains(&ident.to_string().as_str()),
         TokenTree::Group(group) if group.delimiter() != Delimiter::Brace => {
-            names_unbounded_type(&group.stream().into_iter().collect())
+            names_unbounded_type(&group.stream().into_iter().collect::<Vec<_>>())
         }
         _ => false,
     })
@@ -367,7 +368,8 @@ impl<'ast> Visit<'ast> for DecodeVisitor<'_> {
         // in the annotation.
         if let (syn::Pat::Type(annotated), Some(init)) = (&local.pat, &local.init) {
             if let Some(call) = inferred_decode(&init.expr) {
-                let annotation = annotated.ty.to_token_stream().into_iter().collect();
+                let annotation: Vec<TokenTree> =
+                    annotated.ty.to_token_stream().into_iter().collect();
                 if names_unbounded_type(&annotation) {
                     self.report(
                         call.method.span().start().line,

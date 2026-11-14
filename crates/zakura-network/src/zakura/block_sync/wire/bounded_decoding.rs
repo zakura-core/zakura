@@ -1,6 +1,9 @@
 use super::*;
 use crate::zakura::block_sync::reorder::BufferedBlockBody;
-use zakura_chain::{serialization::CompactSizeMessage, transaction::Transaction};
+use zakura_chain::{
+    serialization::{CompactSizeMessage, ZcashDeserialize},
+    transaction::Transaction,
+};
 use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
 
 fn block_with_many_transactions() -> Arc<block::Block> {

@@ -2,7 +2,7 @@
 
 use zakura_chain::{
     block,
-    serialization::{BytesInDisplayOrder, ZcashDeserializeInto, ZcashSerialize},
+    serialization::{BytesInDisplayOrder, ZcashSerialize},
 };
 use zakura_node_services::block_memory::BlockHandle;
 

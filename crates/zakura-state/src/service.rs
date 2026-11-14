@@ -415,6 +415,12 @@ impl Drop for ReadStateService {
 
 impl StateService {
     const PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+    /// How often the state service exports RocksDB metrics and refreshes the disk usage
+    /// estimate returned for [`ReadRequest::UsageInfo`].
+    ///
+    /// These figures are for diagnosis, not detection: slow writes show up on every commit in
+    /// `zakura.state.rocksdb.batch_commit.duration_seconds`.
+    const ROCKSDB_METRICS_EXPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
     // The 1,000-block reorg bound fits every supported usize target.
     const FAILED_ANCESTOR_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
 
@@ -677,7 +683,7 @@ impl StateService {
         // should not be what a useful thread waits behind.
         let db_for_metrics = read_service.db.clone();
         spawn_erased(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut interval = tokio::time::interval(Self::ROCKSDB_METRICS_EXPORT_INTERVAL);
             loop {
                 interval.tick().await;
 

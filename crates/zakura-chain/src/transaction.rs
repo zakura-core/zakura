@@ -7,6 +7,7 @@ use halo2::pasta::pallas;
 mod auth_digest;
 mod hash;
 mod joinsplit;
+mod librustzcash_sapling;
 mod lock_time;
 mod serialize;
 mod sighash;
@@ -1895,6 +1896,17 @@ impl Transaction {
         crate::Error,
     > {
         let branch_id = self.librustzcash_branch_id(nu)?;
+
+        // The Sapling bundle is built from the parsed fields, so its spend keys are
+        // not decompressed again; librustzcash parses the rest of the transaction.
+        if let Some((without_sapling, sapling)) = self.split_librustzcash_sapling() {
+            let data = zcash_primitives::transaction::TransactionData::read(
+                &without_sapling.zcash_serialize_to_vec()?[..],
+                branch_id,
+            )?;
+            return Ok(librustzcash_sapling::with_sapling_bundle(data, sapling));
+        }
+
         Ok(zcash_primitives::transaction::TransactionData::read(
             &self.zcash_serialize_to_vec()?[..],
             branch_id,

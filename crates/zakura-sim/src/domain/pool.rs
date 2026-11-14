@@ -101,6 +101,8 @@ pub struct PoolEvidence {
     pub logged_additions: BTreeSet<usize>,
     /// How many times a publication logged each transaction as refused.
     pub logged_refusals: std::collections::BTreeMap<usize, u64>,
+    /// Submissions answered with a refusal that must be logged.
+    pub refusals_answered: u64,
     /// The first snapshot the log did not lead to.
     pub log_mismatch: Option<String>,
     /// Reorgs that happened while the pool held visible transactions.
@@ -241,10 +243,14 @@ pub fn properties<S: HasView<View = PoolView>>() -> Vec<Property<S>> {
             status: Status::Active,
             check: check_log::<S>,
             // A patched core can drop or repeat entries, so the trigger is
-            // the first addition a publication carried or a caller learned of.
+            // the first addition or refusal a publication carried or a caller
+            // learned of.
             witness: Some(TriggerHistory::View(|view, _| {
                 let evidence = lock(view);
-                evidence.additions_seen > 0 || evidence.admitted > 0
+                evidence.additions_seen > 0
+                    || evidence.admitted > 0
+                    || !evidence.logged_refusals.is_empty()
+                    || evidence.refusals_answered > 0
             })),
         },
         Property {

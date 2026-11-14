@@ -663,6 +663,9 @@ impl Submitting<'_> {
                 verdict,
                 Verdict::LocalFault(fault) if fault != LocalFault::Deactivated
             );
+        if refused {
+            evidence.refusals_answered += 1;
+        }
         if refused
             && evidence.logged_refusals.get(&tx).copied().unwrap_or(0) == refusals_before
             && evidence.log_mismatch.is_none()

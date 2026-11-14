@@ -79,6 +79,15 @@ updates must stay on the deterministic selection grid (see
 
 The RPC modes below remain for Testnet updates and diagnostics.
 
+#### Testnet updates (Update Testnet checkpoints workflow)
+
+The [Update Testnet checkpoints workflow](https://github.com/zakura-core/zakura/actions/workflows/update-testnet-checkpoints.yml)
+runs weekly and on demand. On the `zakura-testnet-deployer` runner it runs
+`zakura-checkpoints --transport direct --addr 127.0.0.1:18232 --last-checkpoint <last height>`
+against zakura-testnet-1, checks every new hash against the other Testnet fleet nodes with
+`.github/scripts/crosscheck-checkpoints.py`, and opens or refreshes one draft PR that appends to
+`test-checkpoints.txt`. Use the manual steps below only when that workflow can't run.
+
 #### Manual Checkpoint Generation
 
 To create checkpoints, you need a synchronized instance of `zakurad` or `zcashd`.

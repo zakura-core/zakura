@@ -201,7 +201,9 @@ impl Service<Request> for CoreMempool {
                 } => peer_batch(shared, snapshot, transactions, source).boxed(),
                 request => answer(shared, snapshot, request).boxed(),
             },
-            None => async move { inactive_answer(request) }.boxed(),
+            // Answered here, so the request and any body in it are dropped
+            // in the call, as today's pool drops them.
+            None => futures::future::ready(inactive_answer(request)).boxed(),
         }
     }
 }
@@ -238,7 +240,10 @@ fn queue_request(
             Some((at, Staged::new(&shared, item, &None)))
         })
         .collect();
-    async move {
+    // The work starts here, in a task of its own, as today's pool starts its
+    // downloads in the call, so a caller that holds the response without
+    // polling it cannot hold the staged slots past their deadlines.
+    answered_by(async move {
         // Bodies holding slots go before the ones over a limit, whose probes
         // have deadlines of their own.
         let (held, over): (Vec<(usize, Staged)>, Vec<(usize, Staged)>) = bodies
@@ -260,6 +265,18 @@ fn queue_request(
                 .map(|answer| answer.expect("every item is answered"))
                 .collect(),
         ))
+    })
+}
+
+/// Runs `work` in a task of its own from now on, and returns a future of its
+/// answer, so the work does not wait for its caller to poll.
+fn answered_by(
+    work: impl Future<Output = Result<Response, BoxError>> + Send + 'static,
+) -> impl Future<Output = Result<Response, BoxError>> + Send + 'static {
+    let task = tokio::spawn(work);
+    async move {
+        task.await
+            .unwrap_or_else(|_panicked| Err("the pool core adapter's task failed".into()))
     }
 }
 
@@ -311,7 +328,8 @@ fn peer_batch(
             Staged::Held { .. } => true,
         })
         .collect();
-    async move {
+    // The work starts here, in a task of its own, as for `queue_request`.
+    answered_by(async move {
         for body in bodies {
             let _ = body.queue(shared.clone(), from.clone()).await;
         }
@@ -349,7 +367,7 @@ fn peer_batch(
             let _ = queue(shared.clone(), Gossip::Id(id), from.clone()).await;
         }
         Ok(Response::Queued(Vec::new()))
-    }
+    })
 }
 
 /// Which of `ids` the core has rejected, or none if it does not answer
@@ -3219,12 +3237,12 @@ mod tests {
     }
 
     /// A request cancelled while its reservation waits, as inbound cancels a
-    /// request after its own timeout, leaves the reservation holding the
-    /// item's node-wide slot, and a late grant is reported as failed, so
-    /// cancelled requests cannot gather work beyond the node's limit or lose
-    /// their change-stream event.
+    /// request after its own timeout, leaves its work running within the
+    /// node's limit, as today's download runs on after inbound gives up: the
+    /// reservation keeps the item's node-wide slot, and once granted the body
+    /// goes to the core.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_cancelled_request_leaves_its_reservation_counted_and_reported() {
+    async fn a_cancelled_request_leaves_its_work_running_within_the_limit() {
         use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
 
         let body = Network::Mainnet
@@ -3256,17 +3274,21 @@ mod tests {
             true,
             Default::default(),
         )));
-        let Some(PoolCommand::FetchFailed(reservation)) = inbox.next().await else {
-            panic!("the grant nobody takes is reported as failed");
+        let Some(PoolCommand::Submit {
+            reservation, reply, ..
+        }) = inbox.next().await
+        else {
+            panic!("the body goes to the core");
         };
         let _accepted = reservation.accept();
+        let _ = reply.send(Verdict::Admitted);
         for _ in 0..100 {
             if queued_count(&core) == 0 {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(queued_count(&core), 0, "free once it is reported");
+        assert_eq!(queued_count(&core), 0, "free once the core decided it");
     }
 
     /// Bodies the pool already holds are skipped before the limits, as
@@ -3321,19 +3343,20 @@ mod tests {
         assert!(inbox.try_next().is_none(), "nothing else is asked");
     }
 
-    /// A submission takes its slots in the call itself, as today's pool
-    /// queues it in the call, so a body in a future its caller has not polled
-    /// yet is already counted.
+    /// A submission takes its slots in the call itself and its work starts
+    /// there, as today's pool queues it and starts its download in the call,
+    /// so a response its caller never polls neither hides the body from the
+    /// count nor holds the slots past the work's own deadline.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_submission_takes_its_slots_in_the_call() {
-        use zakura_node_services::mempool::port::pool_port;
+    async fn a_submission_takes_its_slots_and_starts_in_the_call() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
 
         let body = Network::Mainnet
             .unmined_transactions_in_blocks(1..=1)
             .next()
             .expect("a vector transaction")
             .transaction;
-        let (handle, inbox) = pool_port();
+        let (handle, mut inbox) = pool_port();
         let mut core = adapter_on(handle);
         publish_empty(&inbox);
         let unpolled = core.call(Request::QueueFromPeer {
@@ -3341,8 +3364,12 @@ mod tests {
             source: peer(),
         });
         assert_eq!(queued_count(&core), 1, "counted before it is polled");
+        let Ok(Some(PoolCommand::Reserve { .. })) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), inbox.next()).await
+        else {
+            panic!("the work reaches the core with the response unpolled");
+        };
         drop(unpolled);
-        assert_eq!(queued_count(&core), 0, "freed with the future");
     }
 
     /// The shortcut for a body the pool holds needs a snapshot of the
@@ -3389,5 +3416,30 @@ mod tests {
                 .map_err(|error| error.downcast_ref::<MempoolError>()),
             Err(Some(MempoolError::InMempool))
         ));
+    }
+
+    /// While the pool is off, a submission is answered in the call itself,
+    /// so its body is dropped there and an unpolled response holds nothing,
+    /// as today's pool drops it in the call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_inactive_pool_drops_a_submission_in_the_call() {
+        use zakura_node_services::mempool::port::pool_port;
+
+        let body = Network::Mainnet
+            .unmined_transactions_in_blocks(1..=1)
+            .next()
+            .expect("a vector transaction")
+            .transaction;
+        let (handle, _inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        let unpolled = core.call(Request::Queue(vec![Gossip::Tx(body.clone())]));
+        // The body shares its transaction with this copy, so the copy is the
+        // only holder once the call has dropped the request's.
+        assert_eq!(
+            std::sync::Arc::strong_count(body.transaction()),
+            1,
+            "the call dropped the request's body"
+        );
+        drop(unpolled);
     }
 }

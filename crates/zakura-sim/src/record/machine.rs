@@ -637,6 +637,9 @@ pub enum ReactorReply {
     AnchorReset,
     /// The reply's blocks became current work.
     Accepted,
+    /// The reply's blocks became current work under a same-epoch authority
+    /// that replaced the query's own.
+    Rebased,
 }
 
 /// Why the action channel refused a query.
@@ -764,6 +767,7 @@ impl From<zakura_network::zakura::QueryReplyOutcome> for ReactorReply {
             Outcome::AnchorAdvanced => Self::AnchorAdvanced,
             Outcome::AnchorReset => Self::AnchorReset,
             Outcome::Accepted => Self::Accepted,
+            Outcome::Rebased => Self::Rebased,
         }
     }
 }

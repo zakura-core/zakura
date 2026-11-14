@@ -401,6 +401,10 @@ mod tests {
             best_header_hash: block::Hash([2; 32]),
             hint_revision: None,
             forced: true,
+            verified_anchor: zakura_header_chain::Frontier::new(
+                block::Height(9),
+                block::Hash([3; 32]),
+            ),
         };
         let state = ReactorSnapshot {
             pending: Some(query),

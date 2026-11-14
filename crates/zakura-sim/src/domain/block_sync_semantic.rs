@@ -176,8 +176,8 @@ where
                     exact identities; an accepted query becomes the reported pending query and \
                     advances the next ID; a refusal keeps both, and arms a retry unless the \
                     channel closed, which ends dispatch and arms nothing; a stale reply or \
-                    failure keeps the pending query; a reset, authority change, or tip reset \
-                    retires it",
+                    failure keeps the pending query; a reset, new body-work epoch, or tip reset \
+                    retires it, and a same-epoch authority change keeps it",
             kind: Kind::Safety,
             assumes: &[],
             needs: REACTOR_NEEDS,

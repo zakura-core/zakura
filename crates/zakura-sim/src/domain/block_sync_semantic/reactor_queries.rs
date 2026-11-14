@@ -12,8 +12,9 @@
 //!   becomes the pending query and advances the next ID. A refusal keeps both. A
 //!   full channel arms a retry. A closed channel ends dispatch and arms nothing.
 //!   A reply or failure that names the pending query's ID and authority
-//!   retires it, and any other keeps it, whatever its label. A reset, an
-//!   authority change and a tip reset retire it.
+//!   retires it, and any other keeps it, whatever its label. A reset, a new
+//!   body-work epoch and a tip reset retire it. A same-epoch authority change
+//!   keeps it, because its reply is still selected work.
 //! - **Facts.** Each `BlockSyncFact::Reactor` transition and its state, and each
 //!   `QueryNeededBlocks` that block storage took. The check compares one
 //!   transition with the state the previous transition reported.
@@ -166,7 +167,14 @@ impl ReactorQueries {
                     self.judge_query_state_kept(step, transition, state);
                 }
             }
-            Fact::AuthorityChanged { .. }
+            Fact::AuthorityChanged {
+                epoch_changed: false,
+                ..
+            } => self.judge_query_state_kept(step, transition, state),
+            Fact::AuthorityChanged {
+                epoch_changed: true,
+                ..
+            }
             | Fact::TipReset { .. }
             | Fact::View { reset: true, .. } => {
                 if state.pending.is_some() {
@@ -652,7 +660,7 @@ mod checker_tests {
         }
     }
 
-    /// A reset, an authority change, and a tip reset each retire the query.
+    /// A reset, a new epoch, and a tip reset each retire the query.
     #[test]
     fn checker_finds_a_superseding_transition_that_keeps_the_pending_query() {
         for superseding in [
@@ -674,5 +682,21 @@ mod checker_tests {
             history.reactor(superseding.clone(), state(Some(1), 2));
             assert_eq!(history.findings().len(), 1, "{superseding:?}");
         }
+    }
+
+    /// A same-epoch authority change keeps the pending query and the next ID.
+    #[test]
+    fn checker_finds_a_same_epoch_refresh_that_retires_the_pending_query() {
+        let refresh = Fact::AuthorityChanged {
+            authority: authority(1),
+            epoch_changed: false,
+        };
+        let mut history = accepted_first();
+        history.reactor(refresh.clone(), state(Some(1), 2));
+        assert_eq!(history.findings(), []);
+
+        let mut history = accepted_first();
+        history.reactor(refresh, state(None, 2));
+        assert_eq!(history.findings().len(), 1);
     }
 }

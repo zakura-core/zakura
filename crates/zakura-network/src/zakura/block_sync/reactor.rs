@@ -836,9 +836,18 @@ impl ReactorIO {
         view: zakura_header_chain::CommittedHeaderChainView,
     ) {
         synchronize_persisted_body_alarm(&self.registry, Some(&view));
+        // Read before the frontier advance below lets the queue drop the tip's work.
+        let verified = view.frontiers.verified_best;
+        let verified_on_selected =
+            self.resources.work_queue.hash_for_height(verified.height) == Some(verified.hash);
         let update = self
             .state
             .observe_committed_view(view, time::Instant::now());
+        if verified_on_selected
+            && !matches!(update.authority, Some(AuthorityUpdate::EpochChanged { .. }))
+        {
+            self.state.record_verified_on_selected(verified);
+        }
         if let Some(gate_change) = update.gate_change {
             self.report_transition(gate_change);
         }
@@ -1178,11 +1187,11 @@ impl ReactorIO {
         body_anchor: zakura_header_chain::Frontier,
         blocks: Vec<BlockSyncBlockMeta>,
     ) {
-        let (reply, transition) = self
-            .state
-            .complete_needed_query(query_id, scope, body_anchor);
+        let (reply, transition) =
+            self.state
+                .complete_needed_query(query_id, scope, body_anchor, &blocks);
         self.report_transition(transition);
-        let completed_query = match reply {
+        let (completed_query, scope, rebased) = match reply {
             NeededReply::Stale => {
                 metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query")
                     .increment(1);
@@ -1202,7 +1211,18 @@ impl ReactorIO {
                 self.handle_chain_tip_reset(frontiers, false).await;
                 return;
             }
-            NeededReply::Accept(query) => query,
+            NeededReply::Accept(query) => (query, scope, false),
+            NeededReply::Rebased {
+                query,
+                scope,
+                advance,
+            } => {
+                metrics::counter!("sync.block.needed_query.rebased").increment(1);
+                if let Some(frontiers) = advance {
+                    self.handle_state_frontiers_changed(frontiers).await;
+                }
+                (query, scope, true)
+            }
         };
         if completed_query.hint_revision.is_some() {
             self.resources.work_queue.refresh_size_estimates(
@@ -1214,6 +1234,9 @@ impl ReactorIO {
         }
         self.handle_needed_blocks(scope, blocks).await;
         if self.state.queries.advance_hint_refresh(&completed_query) {
+            self.query_needed_blocks_with_options(true).await;
+        } else if rebased {
+            // The new authority's forced refill waited for this read.
             self.query_needed_blocks_with_options(true).await;
         }
     }

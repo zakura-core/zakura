@@ -9,7 +9,7 @@ use zakura_chain::block;
 use zakura_rt::time::Instant;
 
 use zakura_header_chain::{
-    BodyWorkAuthority, BodyWorkEpoch, BranchId, HeaderGeneration, HeaderWorkAuthority,
+    BodyWorkAuthority, BodyWorkEpoch, BranchId, Frontier, HeaderGeneration, HeaderWorkAuthority,
     VerifiedGeneration,
 };
 
@@ -49,7 +49,9 @@ fn authority(epoch: u64) -> BodyWorkAuthority {
             branch: BranchId::new(block::Hash([4; 32]), block::Hash([5; 32])),
         },
         verified_generation: VerifiedGeneration::new(1),
-        body_work_epoch: BodyWorkEpoch::default(),
+        // Each authority is its own epoch, so a newer authority's proposal
+        // replaces the pending query rather than waiting for it.
+        body_work_epoch: BodyWorkEpoch::new(epoch),
     }
 }
 
@@ -79,6 +81,7 @@ fn replay(data: &[u8], mut after_step: impl FnMut(&mut QueryState, u8)) -> Block
                     best_header_tip: block::Height(100),
                     best_header_hash: block::Hash([choice; 32]),
                     scope: Some(authority(epoch)),
+                    verified_anchor: Frontier::new(block::Height(0), block::Hash([0; 32])),
                     diverged: false,
                     start: QueryStart::Work(WorkFacts {
                         first_unclaimed: Some(block::Height(1)),

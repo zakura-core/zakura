@@ -14,6 +14,7 @@ use zakura_header_chain::{
 };
 
 use super::*;
+use crate::zakura::block_sync::BlockSizeEstimate;
 
 /// The raw fields of one generated committed view.
 #[derive(Clone, Debug, PartialEq)]
@@ -147,12 +148,14 @@ fn committed_refill(state: &mut ReactorState, accept: bool, now: Instant) -> Ref
     refill(state, true, work(Some(1), 0, 1), accept, now)
 }
 
+/// A same-epoch authority refresh keeps the pending query, and the forced
+/// refill it asks for waits for that query instead of replacing it.
 #[test]
-fn authority_change_retires_the_pending_query_and_forces_refill() {
+fn same_epoch_authority_refresh_keeps_the_pending_query() {
     let now = Instant::now();
     let mut state = reactor_state(0, 20);
     let _ = observe(&mut state, &base_spec(), time::Instant::now());
-    expect_accepted(committed_refill(&mut state, true, now));
+    let query = expect_accepted(committed_refill(&mut state, true, now));
 
     let update = observe(
         &mut state,
@@ -165,6 +168,34 @@ fn authority_change_retires_the_pending_query_and_forces_refill() {
     assert!(matches!(
         update.authority,
         Some(AuthorityUpdate::Refreshed(_))
+    ));
+    assert_eq!(state.queries.pending(), Some(query));
+    assert!(update.forces_refill(false));
+    assert!(matches!(
+        committed_refill(&mut state, true, now),
+        Refill::Held
+    ));
+    assert_eq!(state.queries.pending(), Some(query));
+}
+
+#[test]
+fn epoch_change_retires_the_pending_query_and_forces_refill() {
+    let now = Instant::now();
+    let mut state = reactor_state(0, 20);
+    let _ = observe(&mut state, &base_spec(), time::Instant::now());
+    expect_accepted(committed_refill(&mut state, true, now));
+
+    let update = observe(
+        &mut state,
+        &Spec {
+            epoch: 1,
+            ..base_spec()
+        },
+        time::Instant::now(),
+    );
+    assert!(matches!(
+        update.authority,
+        Some(AuthorityUpdate::EpochChanged { .. })
     ));
     assert_eq!(state.queries.pending(), None);
     assert!(update.forces_refill(false));
@@ -495,7 +526,8 @@ impl Model {
             .as_ref()
             .is_none_or(|prev| authority_key(prev) != authority_key(spec));
         let authority = authority_changed.then_some(epoch_changed);
-        if authority_changed {
+        // A same-epoch refresh keeps the pending query for rebasing.
+        if authority_changed && (prev.is_none() || epoch_changed) {
             self.pending = false;
         }
         let frontiers = match prev.as_ref() {
@@ -747,4 +779,280 @@ proptest! {
             prop_assert_eq!(state.queries.hint_refresh().is_some(), model.hint_refresh);
         }
     }
+}
+
+// ---- same-epoch rebasing ----
+
+/// Missing-body metadata at `height` with `hash`.
+fn meta(height: u32, hash: block::Hash) -> BlockSyncBlockMeta {
+    BlockSyncBlockMeta {
+        height: block::Height(height),
+        hash,
+        size: BlockSizeEstimate::Unknown,
+    }
+}
+
+/// A state at verified tip 5 whose forced refill is pending under `base_spec`
+/// with verified tip 5.
+fn pending_at_tip_five() -> (ReactorState, PendingNeededQuery) {
+    let now = Instant::now();
+    let mut state = reactor_state(5, 20);
+    let _ = observe(
+        &mut state,
+        &Spec {
+            verified: 5,
+            ..base_spec()
+        },
+        time::Instant::now(),
+    );
+    let query = expect_accepted(committed_refill(&mut state, true, now));
+    assert_eq!(query.verified_anchor, frontier(5, verified_hash(5)));
+    (state, query)
+}
+
+/// Commit to verified tip `tip` in the same epoch and move the Sequencer
+/// mirror there, as the view reaction does.
+fn commit_to(state: &mut ReactorState, tip: u32) {
+    let update = observe(
+        state,
+        &Spec {
+            verified: tip,
+            verified_generation: u64::from(tip),
+            ..base_spec()
+        },
+        time::Instant::now(),
+    );
+    assert!(matches!(
+        update.authority,
+        Some(AuthorityUpdate::Refreshed(_))
+    ));
+    state.progress.verified_block_tip = block::Height(tip);
+    state.progress.verified_block_hash = verified_hash(tip);
+}
+
+/// The original bug: a commit during the read used to retire the pending query,
+/// so the reply was stale and its blocks never became work.
+#[test]
+fn a_commit_during_the_read_rebases_the_reply() {
+    let (mut state, query) = pending_at_tip_five();
+    let dispatched = query.scope;
+    commit_to(&mut state, 5);
+    let current = state.body_work_scope().expect("a committed view");
+    assert_ne!(current, dispatched);
+
+    let (reply, transition) = state.complete_needed_query(
+        query.query_id,
+        dispatched,
+        frontier(5, verified_hash(5)),
+        &[meta(6, verified_hash(6))],
+    );
+    assert_eq!(
+        reply,
+        NeededReply::Rebased {
+            query,
+            scope: current,
+            advance: None,
+        }
+    );
+    assert!(matches!(
+        transition,
+        ReactorTransition::QueryReply {
+            outcome: QueryReplyOutcome::Rebased,
+            ..
+        }
+    ));
+    assert_eq!(state.queries.pending(), None);
+}
+
+/// A read from before the commit lists the new tip's hash as selected, which
+/// proves the commit extended the selected branch.
+#[test]
+fn growth_the_read_lists_as_selected_rebases_the_reply() {
+    let (mut state, query) = pending_at_tip_five();
+    commit_to(&mut state, 7);
+    let current = state.body_work_scope().expect("a committed view");
+
+    let (reply, _) = state.complete_needed_query(
+        query.query_id,
+        query.scope,
+        frontier(5, verified_hash(5)),
+        &[
+            meta(6, verified_hash(6)),
+            meta(7, verified_hash(7)),
+            meta(8, verified_hash(8)),
+        ],
+    );
+    assert_eq!(
+        reply,
+        NeededReply::Rebased {
+            query,
+            scope: current,
+            advance: None,
+        }
+    );
+}
+
+/// Selected work that held the tip's hash when the commit arrived proves the
+/// tip is selected, even when the read no longer lists it.
+#[test]
+fn growth_that_selected_work_held_rebases_the_reply() {
+    let (mut state, query) = pending_at_tip_five();
+    commit_to(&mut state, 7);
+    state.record_verified_on_selected(frontier(7, verified_hash(7)));
+    let current = state.body_work_scope().expect("a committed view");
+
+    let (reply, _) = state.complete_needed_query(
+        query.query_id,
+        query.scope,
+        frontier(5, verified_hash(5)),
+        &[meta(8, verified_hash(8))],
+    );
+    assert_eq!(
+        reply,
+        NeededReply::Rebased {
+            query,
+            scope: current,
+            advance: None,
+        }
+    );
+}
+
+/// V12 F-292568: same-epoch verified growth on a retained fork. The read lists
+/// other hashes at the fork's heights, and no selected work held the tip. The
+/// reply must not become work above the fork tip: it is stale, and the fresh
+/// query's anchor takes the reset path.
+#[test]
+fn growth_on_a_retained_fork_does_not_rebase_the_reply() {
+    for listed in [
+        vec![meta(6, hash(0xEE, 6)), meta(7, hash(0xEE, 7))],
+        vec![meta(8, hash(0xEE, 8))],
+        Vec::new(),
+    ] {
+        let (mut state, query) = pending_at_tip_five();
+        commit_to(&mut state, 7);
+
+        let (reply, _) = state.complete_needed_query(
+            query.query_id,
+            query.scope,
+            frontier(5, verified_hash(5)),
+            &listed,
+        );
+        assert_eq!(reply, NeededReply::StaleAuthority, "{listed:?}");
+        assert_eq!(state.queries.pending(), None);
+    }
+}
+
+/// An anchor behind the dispatch anchor means state left the selected branch
+/// below it. The rebased path never resets, so the reply is stale.
+#[test]
+fn an_anchor_behind_the_dispatch_anchor_does_not_rebase_the_reply() {
+    let (mut state, query) = pending_at_tip_five();
+    commit_to(&mut state, 7);
+    state.record_verified_on_selected(frontier(7, verified_hash(7)));
+
+    let (reply, _) = state.complete_needed_query(
+        query.query_id,
+        query.scope,
+        frontier(4, verified_hash(4)),
+        &[meta(7, verified_hash(7))],
+    );
+    assert_eq!(reply, NeededReply::StaleAuthority);
+}
+
+/// State verified the selected anchor before the Sequencer mirror caught up.
+/// The reply's blocks are still work, and the reactor forwards the anchor.
+#[test]
+fn an_anchor_ahead_of_the_mirror_rebases_and_advances() {
+    let (mut state, query) = pending_at_tip_five();
+    let update = observe(
+        &mut state,
+        &Spec {
+            verified: 7,
+            verified_generation: 7,
+            ..base_spec()
+        },
+        time::Instant::now(),
+    );
+    assert!(matches!(
+        update.authority,
+        Some(AuthorityUpdate::Refreshed(_))
+    ));
+    let current = state.body_work_scope().expect("a committed view");
+
+    let (reply, _) = state.complete_needed_query(
+        query.query_id,
+        query.scope,
+        frontier(7, verified_hash(7)),
+        &[meta(8, verified_hash(8))],
+    );
+    assert_eq!(
+        reply,
+        NeededReply::Rebased {
+            query,
+            scope: current,
+            advance: Some(BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(7),
+                verified_block_hash: verified_hash(7),
+            }),
+        }
+    );
+}
+
+/// ValarDragon's P1 on the earlier fix: once the reactor reset to the fork
+/// point, each refill whose anchor is that fork point must become work. Full
+/// state still holds the fork, so its commits keep refreshing authority, and a
+/// reset on every refill would discard all body work.
+#[test]
+fn refills_after_a_fork_reset_become_work_across_commits() {
+    let (mut state, mut query) = pending_at_tip_five();
+    // The mirror sits at the fork point 5. Each commit elsewhere in full state
+    // refreshes authority without moving the selected anchor.
+    for verified_generation in [9, 10] {
+        let _ = observe(
+            &mut state,
+            &Spec {
+                verified: 5,
+                verified_generation,
+                ..base_spec()
+            },
+            time::Instant::now(),
+        );
+        let current = state.body_work_scope().expect("a committed view");
+        let (reply, _) = state.complete_needed_query(
+            query.query_id,
+            query.scope,
+            frontier(5, verified_hash(5)),
+            &[meta(6, verified_hash(6))],
+        );
+        assert_eq!(
+            reply,
+            NeededReply::Rebased {
+                query,
+                scope: current,
+                advance: None,
+            }
+        );
+        // Requery under the current authority, as the reactor does.
+        query = expect_accepted(committed_refill(&mut state, true, Instant::now()));
+    }
+}
+
+/// A commit that starts a new epoch still retires the reply's authority.
+#[test]
+fn a_new_epoch_during_the_read_leaves_the_reply_stale() {
+    let (mut state, query) = pending_at_tip_five();
+    // Write the view directly: a production epoch change also clears the query.
+    state.committed_view = Some(committed(&Spec {
+        verified: 5,
+        epoch: 1,
+        ..base_spec()
+    }));
+    let (reply, _) = state.complete_needed_query(
+        query.query_id,
+        query.scope,
+        frontier(5, verified_hash(5)),
+        &[meta(6, verified_hash(6))],
+    );
+    assert_eq!(reply, NeededReply::StaleAuthority);
 }

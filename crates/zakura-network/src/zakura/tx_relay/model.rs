@@ -253,15 +253,9 @@ struct Call {
     /// Names this call, so an old call's answer never acts on a newer call
     /// for the same id.
     call: u64,
-}
-
-/// Why the pool cancelled a reservation.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum CancelCause {
-    /// A block mined the id, at this tip.
-    Mined(Height),
-    /// The pool turned off.
-    Deactivated,
+    /// The chain generation of the snapshot the caller held when it made
+    /// the call.
+    generation: Generation,
 }
 
 /// The pool's answer to a reserve call, on its way back.
@@ -269,11 +263,9 @@ enum CancelCause {
 struct Answer {
     call: Call,
     answer: Result<ModelReservation, ModelUnreserved>,
-    /// The tip the pool decided it at.
-    decided_at: Height,
     /// The pool cancelled the granted reservation before the caller
-    /// received it, and why.
-    cancelled: Option<CancelCause>,
+    /// received it. The caller sees only the cancelled token, not why.
+    cancelled: bool,
 }
 
 /// A verdict on its way back to `tx-relay`.
@@ -308,8 +300,10 @@ pub(crate) struct RelayModel {
     /// Which session holds each of `tx-relay`'s reservations, and for which
     /// id.
     reservations: HashMap<ReservationId, (SessionId, UnminedTxId)>,
-    /// Who waits for each of `tx-relay`'s submissions.
+    /// Who waits for each of `tx-relay`'s submissions, and the chain
+    /// generation of the snapshot its submitter held when it submitted.
     waiters: HashMap<WaiterId, VerdictOwner>,
+    submitted_at: HashMap<WaiterId, Generation>,
     /// The serialized size of every transaction, which the real routine
     /// reads from the snapshot. The model's transactions carry no size, so
     /// the test gives one function for all of them.
@@ -371,6 +365,7 @@ impl RelayModel {
             next_session: 0,
             reservations: HashMap::new(),
             waiters: HashMap::new(),
+            submitted_at: HashMap::new(),
             tx_size: |_| DEFAULT_TX_BYTES,
             short_id: default_short_id,
             advert_delay: Some(ADVERT_DELAY),
@@ -530,6 +525,7 @@ impl RelayModel {
             // Late: the node stopped waiting. The body is dropped before it
             // is checked or decoded, with no penalty.
             state.requests.shift_remove(&id);
+            state.reannounced.remove(&id);
             self.settle();
             return;
         };
@@ -560,6 +556,7 @@ impl RelayModel {
         self.reservations.remove(&reservation);
         let (waiter, step) = self.pool.submit(reservation, body, self.now);
         self.waiters.insert(waiter, VerdictOwner::Session(session));
+        self.submitted_at.insert(waiter, self.generation);
         self.sessions
             .get_mut(&session)
             .expect("checked above")
@@ -581,11 +578,15 @@ impl RelayModel {
             return;
         };
         // An answer about an older generation leaves a newer pending entry
-        // alone.
-        if state.take_pending_of(id, request.generation).is_some() {
-            self.wanted.unhold(id, request.generation);
+        // alone, and so does an old answer the peer has since contradicted by
+        // announcing the id again.
+        let contradicted = state.reannounced.remove(&id);
+        if !contradicted {
+            if state.take_pending_of(id, request.generation).is_some() {
+                self.wanted.unhold(id, request.generation);
+            }
+            state.mark_tried(id, request.generation);
         }
-        state.mark_tried(id, request.generation);
         if let Some(reservation) = request.reservation {
             self.reservations.remove(&reservation);
             let step = self.pool.release(reservation, self.now);
@@ -1067,11 +1068,7 @@ impl RelayModel {
                     .find(|answer| answer.answer.is_ok_and(|granted| granted.id == reservation))
                 {
                     // Granted, and cancelled before its caller heard.
-                    answer.cancelled = Some(if self.pool_live {
-                        CancelCause::Mined(self.tip)
-                    } else {
-                        CancelCause::Deactivated
-                    });
+                    answer.cancelled = true;
                 } else {
                     self.outside.push(Effect::CancelFetch(reservation));
                 }
@@ -1113,16 +1110,29 @@ impl RelayModel {
                 (peer, id, generation, None)
             }
         };
+        let submitted_at = self
+            .submitted_at
+            .remove(&waiter)
+            .expect("every submission records its generation");
         // A verdict frees a pool slot.
         self.wanted.room();
         match verdict {
-            ModelVerdict::Admitted => self.verdict_decides(id, generation, session),
-            ModelVerdict::Rejected { charge, .. } => {
-                if self.tip == decided_at {
+            ModelVerdict::Admitted => {
+                // It settles the id only if the current snapshot holds it.
+                if self.visible.contains(&id) {
                     self.verdict_decides(id, generation, session);
                 } else if let Some(session) = session {
-                    // The tip moved past the rejection, which may be
-                    // forgotten. Another announcer may still supply it.
+                    self.wanted
+                        .release(id, generation, session, self.now, false);
+                }
+            }
+            ModelVerdict::Rejected { charge, .. } => {
+                if self.generation == submitted_at {
+                    self.verdict_decides(id, generation, session);
+                } else if let Some(session) = session {
+                    // The chain changed since the body was submitted, and the
+                    // rejection may be forgotten. Another announcer may still
+                    // supply it.
                     self.wanted.release(id, generation, session, self.now, true);
                 }
                 self.charge(peer, charge, decided_at);
@@ -1166,13 +1176,10 @@ impl RelayModel {
         };
         request.reservation = None;
         let generation = request.generation;
-        if self.pool_live {
-            // A block mined it.
-            self.decided(id, generation);
-        } else {
-            self.wanted
-                .release(id, generation, session, self.now, false);
-        }
+        // The token says only that the pool no longer needs the body, not
+        // why. The id is asked about again, and the current pool answers.
+        self.wanted
+            .release(id, generation, session, self.now, false);
     }
 
     /// `id` is decided in `generation`. Its entry leaves, and every pending
@@ -1328,6 +1335,20 @@ impl RelayModel {
                         .submissions
                         .values()
                         .any(|(held, generation)| *held == id && Some(*generation) == current);
+                // Announcing an id it already holds while a request for it is
+                // outstanding that the node stopped waiting for says it has
+                // the id now. The answer to that old request, which can
+                // arrive later on the other stream, then does not mark it
+                // tried.
+                if let Some(generation) = current {
+                    let stale_request = state
+                        .requests
+                        .get(&id)
+                        .is_some_and(|request| request.reservation.is_none());
+                    if stale_request && state.holds(id, generation) {
+                        state.reannounced.insert(id);
+                    }
+                }
                 if already || busy || fresh.iter().any(|(held, _)| *held == id) {
                     continue;
                 }
@@ -1452,6 +1473,7 @@ impl RelayModel {
                     session,
                     id: pending.id,
                     call,
+                    generation: self.generation,
                 };
                 if self.auto_reserves {
                     self.process(call);
@@ -1466,23 +1488,16 @@ impl RelayModel {
     /// The pool processes one reserve call. With automatic reserves its
     /// answer is received at once.
     fn process(&mut self, call: Call) {
-        let live = self
-            .sessions
-            .get(&call.session)
-            .and_then(|state| state.reserving.get(&call.id))
-            .is_some_and(|reserving| reserving.call == call.call);
-        if !live {
-            // Its caller gave it up first, so it never reached the pool.
-            return;
-        }
+        // A command already sent cannot be taken back, so a call its caller
+        // gave up still runs, and its answer goes nowhere. A slot it was
+        // granted is given back when that answer arrives.
         let answer = self.pool.reserve(call.id, Intent::Fetch, self.now);
         let step = self.pool.effects();
         self.inbox.push_back(step);
         let answer = Answer {
             call,
             answer,
-            decided_at: self.tip,
-            cancelled: None,
+            cancelled: false,
         };
         if self.auto_reserves {
             self.deliver(answer);
@@ -1496,7 +1511,6 @@ impl RelayModel {
         let Answer {
             call,
             answer,
-            decided_at,
             cancelled,
         } = answer;
         let session = call.session;
@@ -1522,23 +1536,23 @@ impl RelayModel {
         };
         let Reserving { pending, probe, .. } = reserving;
         let peer = self.sessions.get(&session).expect("checked above").peer;
-        // A decision about the chain holds only at the tip it was made at.
-        let tip_unchanged = self.tip == decided_at;
+        // A rejection holds only for the chain it was made on. The caller
+        // knows the generation it called at and the one it holds now, and
+        // a same-height reorg changes the generation.
+        let chain_unchanged = self.generation == call.generation;
         let still_claimed = self
             .wanted
             .current(id, pending.generation)
             .is_some_and(|entry| entry.claim == Some(session));
         match answer {
-            Ok(reservation) if cancelled.is_some() => {
+            Ok(reservation) if cancelled => {
+                // A cancelled token says nothing about why, so it decides
+                // nothing: the slot goes back and the id is asked about
+                // again, and the current pool answers.
                 let step = self.pool.release(reservation.id, self.now);
                 self.inbox.push_back(step);
                 self.wanted
                     .release(id, pending.generation, session, self.now, false);
-                // Only a mining at the tip the node still has decides the id.
-                // A cancellation because the pool turned off decides nothing.
-                if cancelled == Some(CancelCause::Mined(self.tip)) && self.pool_live {
-                    self.decided(id, pending.generation);
-                }
                 self.return_probe(probe);
             }
             Ok(reservation) => {
@@ -1574,17 +1588,20 @@ impl RelayModel {
                 self.return_probe(probe);
             }
             Err(ModelUnreserved::Pooled) => {
+                // It settles the id only if the caller's current snapshot
+                // still holds it: the pool may have restarted since.
+                let pooled = self.visible.contains(&id);
                 self.wanted
-                    .release(id, pending.generation, session, self.now, false);
-                self.decided(id, pending.generation);
+                    .release(id, pending.generation, session, self.now, !pooled);
+                if pooled {
+                    self.decided(id, pending.generation);
+                }
                 self.return_probe(probe);
             }
             Err(ModelUnreserved::Rejected(_)) => {
-                // A rejection the tip has moved past may be forgotten, so the
-                // id is asked about again instead.
                 self.wanted
-                    .release(id, pending.generation, session, self.now, !tip_unchanged);
-                if tip_unchanged {
+                    .release(id, pending.generation, session, self.now, !chain_unchanged);
+                if chain_unchanged {
                     self.decided(id, pending.generation);
                 }
                 self.return_probe(probe);
@@ -1703,6 +1720,15 @@ impl RelayModel {
             assert!(state.pending.len() <= PENDING_PER_PEER);
             assert!(state.tried.len() <= TRIED_PER_PEER);
             assert!(state.known.len() <= KNOWN_CAP);
+            for id in &state.reannounced {
+                assert!(
+                    state
+                        .requests
+                        .get(id)
+                        .is_some_and(|request| request.reservation.is_none()),
+                    "a re-announcement is noted only beside a request the node stopped waiting for"
+                );
+            }
             for key in state.timed_out.keys() {
                 assert!(
                     state.holds(key.0, key.1),

@@ -2,7 +2,7 @@
 //! session is live.
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     time::Duration,
 };
 
@@ -93,8 +93,10 @@ pub(crate) struct PeerModel {
     pub(crate) announced: HashMap<UnminedTxId, u64>,
     /// The short ids of what it announced to us or supplied, oldest first,
     /// with the change-log position when it did, to skip adverts. A removal
-    /// earlier in the log does not erase a later announcement. A collision
-    /// can only skip one advert to this peer.
+    /// earlier in the log does not erase a later announcement. The set knows
+    /// only short ids, so a collision has two costs, both limited to this
+    /// peer: one advert skipped that should have been sent, or, after one of
+    /// the colliding ids leaves the pool, one redundant advert of the other.
     pub(crate) known: VecDeque<(u64, u64)>,
     /// Adverts held for the advert delay, with when they are due.
     pub(crate) held: Vec<(UnminedTxId, Time)>,
@@ -104,6 +106,10 @@ pub(crate) struct PeerModel {
     pub(crate) waiting: IndexMap<UnminedTxId, u32>,
     /// The last change-log position this session read.
     pub(crate) cursor: u64,
+    /// Ids it announced again while an old request for them was
+    /// outstanding, so that request's `NotFound` does not mark them tried.
+    /// At most one per outstanding request.
+    pub(crate) reannounced: HashSet<UnminedTxId>,
     /// Ids dropped because the pending set was full.
     pub(crate) overflow: u64,
 }
@@ -126,6 +132,7 @@ impl PeerModel {
             held: Vec::new(),
             waiting: IndexMap::new(),
             cursor: 0,
+            reannounced: HashSet::new(),
             overflow: 0,
         }
     }

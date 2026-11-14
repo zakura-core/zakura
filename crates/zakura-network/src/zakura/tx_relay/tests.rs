@@ -548,12 +548,16 @@ fn a_mined_id_cancels_its_fetch() {
         rules_change: false,
     };
     relay.transition(block, secs(1));
-    assert!(relay.wanted().entry(id(1)).is_none());
+    // The token does not say why, so the fetch ends and the id stays wanted
+    // until the pool is asked again.
+    assert!(relay.wanted().entry(id(1)).unwrap().claim.is_none());
     assert_eq!(relay.reservations_held(), 0);
     // The request stays outstanding, and its answer is dropped.
     assert_eq!(relay.in_flight(PeerKey(1)), 1);
     relay.tx(a, id(1), tx(1), secs(2));
     assert_eq!(relay.in_flight(PeerKey(1)), 0);
+    // Asked again, the pool says a block mined it, which decides the id.
+    assert!(relay.wanted().entry(id(1)).is_none());
     assert_eq!(relay.pool().bodies_held(), 0);
     relay.assert_invariants();
 }
@@ -1615,6 +1619,188 @@ fn deadlines_keep_doubling_until_time_runs_out() {
     assert_eq!(state.requests[&id(1)].deadline, Duration::MAX);
 }
 
+/// A one-block reorg that ends at the same height.
+fn same_height_reorg(tip: u32, generation: u64) -> ModelTransition {
+    ModelTransition {
+        disconnected: 1,
+        connected: vec![ModelBlock::default()],
+        tip: Height(tip),
+        generation: Generation(generation),
+        rules_change: false,
+    }
+}
+
+#[test]
+fn a_same_height_reorg_still_counts_as_a_chain_change() {
+    let rejected = Outcome::Fail {
+        scope: RejectionScope::ExactTip,
+        charge: Charge::None,
+    };
+    // A late verdict.
+    let mut relay = relay().with_manual_verdicts();
+    let a = open(&mut relay, 1, true, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.inv(b, &[(id(1), SIZE)], secs(0));
+    relay.tx(a, id(1), tx(1), secs(0));
+    finish_all(&mut relay, &rejected, secs(0));
+    relay.transition(same_height_reorg(100, 1), secs(1));
+    assert!(relay.deliver_verdict(secs(1)));
+    let entry = relay.wanted().entry(id(1)).expect("still wanted");
+    assert!(relay.session(b).unwrap().holds(id(1), entry.generation));
+    relay.assert_invariants();
+
+    // A late cached-rejection answer.
+    let mut relay =
+        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reserves();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    while relay.answer_reserve(secs(0)) {}
+    relay.tx(a, id(1), tx(1), secs(0));
+    finish_all(&mut relay, &rejected, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(b, &[(id(1), SIZE)], secs(0));
+    assert!(relay.process_reserve(secs(0)));
+    relay.transition(same_height_reorg(100, 1), secs(1));
+    assert!(relay.deliver_reserve(secs(1)));
+    assert!(relay.wanted().entry(id(1)).is_some());
+    relay.assert_invariants();
+
+    // A grant cancelled by a block that a same-height reorg then replaced.
+    let mut relay =
+        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reserves();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    assert!(relay.process_reserve(secs(0)));
+    let block = ModelTransition {
+        disconnected: 0,
+        connected: vec![ModelBlock {
+            transactions: vec![tx(1)],
+        }],
+        tip: Height(101),
+        generation: Generation(1),
+        rules_change: false,
+    };
+    relay.transition(block, secs(1));
+    relay.transition(same_height_reorg(101, 2), secs(1));
+    assert!(relay.deliver_reserve(secs(1)));
+    while relay.answer_reserve(secs(1)) {}
+    assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
+    relay.assert_invariants();
+}
+
+#[test]
+fn an_admission_from_before_a_restart_does_not_settle_a_fresh_announcement() {
+    let mut relay = relay().with_manual_verdicts();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.take_effects();
+    relay.tx(a, id(1), tx(1), secs(0));
+    finish_all(&mut relay, &Outcome::Pass, secs(0));
+    relay.deactivate(secs(1));
+    relay.activate(secs(2));
+    let b = open(&mut relay, 2, true, secs(2));
+    relay.inv(b, &[(id(1), SIZE)], secs(2));
+    while relay.deliver_verdict(secs(2)) {}
+    // The restarted pool is empty, so the old admission settles nothing:
+    // the id stays wanted, B still holds it, and it is fetched again.
+    let entry = relay.wanted().entry(id(1)).cloned().expect("still wanted");
+    assert!(relay.session(b).unwrap().holds(id(1), entry.generation));
+    assert_eq!(asks(&relay.take_effects()), vec![(a, id(1))]);
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_call_given_up_after_it_was_sent_still_runs() {
+    let mut relay = RelayModel::new(PoolModel::new(Height(100), Generation(0)).with_limits(1, 1))
+        .with_manual_reserves();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    relay.end(a, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(b, &[(id(2), SIZE)], secs(0));
+    // A's call was already sent, so the pool runs it and takes the one slot.
+    assert!(relay.process_reserve(secs(0)));
+    assert!(relay.process_reserve(secs(0)));
+    assert_eq!(relay.pool().slots_in_use(), 1);
+    // Its answer finds nobody, and the slot goes back.
+    while relay.deliver_reserve(secs(0)) {}
+    assert_eq!(relay.pool().slots_in_use(), 0);
+    assert!(relay.wanted().in_backoff());
+    relay.tick(NO_ROOM_FIRST);
+    while relay.answer_reserve(NO_ROOM_FIRST) {}
+    assert_eq!(asks(&relay.take_effects()), vec![(b, id(2))]);
+    relay.assert_invariants();
+}
+
+#[test]
+fn an_old_answer_leaves_a_recreated_entry_alone() {
+    let mut relay =
+        RelayModel::new(PoolModel::new(Height(100), Generation(0))).with_manual_reserves();
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.inv(a, &[(id(1), SIZE)], secs(0));
+    let first = relay.wanted().entry(id(1)).unwrap().generation;
+    assert!(relay.process_reserve(secs(0)));
+    // A gives the call up, the entry goes, and B makes a new one.
+    relay.cancel_reserve(a, id(1), secs(0));
+    relay.end(a, secs(0));
+    let b = open(&mut relay, 2, true, secs(0));
+    relay.inv(b, &[(id(1), SIZE)], secs(0));
+    let second = relay.wanted().entry(id(1)).unwrap().generation;
+    assert_ne!(first, second);
+    // A's old grant arrives and changes nothing of B's.
+    assert!(relay.deliver_reserve(secs(0)));
+    assert_eq!(relay.wanted().entry(id(1)).unwrap().generation, second);
+    while relay.answer_reserve(secs(0)) {}
+    assert_eq!(asks(&relay.take_effects()), vec![(b, id(1))]);
+    relay.assert_invariants();
+}
+
+#[test]
+fn a_collision_after_a_removal_costs_one_redundant_advert() {
+    fn collide(tx_id: UnminedTxId) -> u64 {
+        let n = u64::from(u32::from_le_bytes(
+            tx_id.mined_id().0[..4].try_into().unwrap(),
+        ));
+        if n == 2 {
+            1
+        } else {
+            n
+        }
+    }
+    let mut relay = relay().with_short_id(collide);
+    let a = open(&mut relay, 1, true, secs(0));
+    relay.set_ranking(vec![a]);
+    fetch(&mut relay, a, 1, secs(0));
+    fetch(&mut relay, a, 2, secs(0));
+    assert!(adverts(&relay.take_effects()).is_empty(), "A supplied both");
+    // A block mines id 1, which erases the shared short id, and a reorg then
+    // hides and reveals id 2.
+    let block = ModelTransition {
+        disconnected: 0,
+        connected: vec![ModelBlock {
+            transactions: vec![tx(1)],
+        }],
+        tip: Height(101),
+        generation: Generation(1),
+        rules_change: false,
+    };
+    relay.transition(block, secs(1));
+    let reorg = ModelTransition {
+        disconnected: 1,
+        connected: vec![ModelBlock::default(), ModelBlock::default()],
+        tip: Height(102),
+        generation: Generation(2),
+        rules_change: false,
+    };
+    relay.transition(reorg, secs(1));
+    // A had been told nothing, so id 2's reveal is the one redundant advert.
+    finish_all(&mut relay, &Outcome::Pass, secs(1));
+    let sent: Vec<_> = adverts(&relay.take_effects());
+    assert!(sent.len() <= 1, "{sent:?}");
+    relay.assert_invariants();
+}
+
 /// The default short id of `tx_id`, as the model keeps it.
 fn short_of(tx_id: UnminedTxId) -> u64 {
     let mut short = [0u8; 8];
@@ -1997,7 +2183,10 @@ fn run(seed: u64) {
     // What each honest session announced since the last chain transition,
     // and what failed since then: the oracle, kept apart from the
     // model's own table.
-    let mut honest: HashMap<SessionId, HashSet<UnminedTxId>> = HashMap::new();
+    // An obligation is met once the id is seen in the pool, fails, or is
+    // mined after it was announced. Rejections and minings still in force
+    // when it is announced meet it at once.
+    let mut honest: HashMap<SessionId, HashMap<UnminedTxId, bool>> = HashMap::new();
     let mut failed: HashSet<UnminedTxId> = HashSet::new();
     let mut now = Duration::ZERO;
 
@@ -2024,6 +2213,7 @@ fn run(seed: u64) {
         for (job, tx_id) in relay.job_txs().to_vec() {
             let outcome = if fail_some && rng.next(5) == 0 {
                 failed.insert(tx_id);
+                FAILED_NOW.with(|now| now.borrow_mut().push(tx_id));
                 Outcome::Fail {
                     scope: RejectionScope::ExactTip,
                     charge: Charge::None,
@@ -2057,7 +2247,15 @@ fn run(seed: u64) {
                 let n = u32::try_from(rng.next(30)).unwrap();
                 relay.inv(session, &[(id(n), SIZE)], now);
                 if behaviour == Behaviour::Honest {
-                    honest.entry(session).or_default().insert(id(n));
+                    let settled = failed.contains(&id(n))
+                        || chain.iter().flatten().any(|mined| *mined == id(n))
+                        || relay.pool().visible().contains(&id(n));
+                    let met = honest
+                        .entry(session)
+                        .or_default()
+                        .entry(id(n))
+                        .or_insert(false);
+                    *met |= settled;
                 }
             }
             7 => verify(&mut relay, &mut failed, &mut rng, now, true),
@@ -2094,10 +2292,16 @@ fn run(seed: u64) {
                     rules_change: false,
                 };
                 chain.push(transactions.iter().map(|tx| tx.id).collect());
+                for mined in transactions.iter().map(|tx| tx.id) {
+                    for obligations in honest.values_mut() {
+                        if let Some(met) = obligations.get_mut(&mined) {
+                            *met = true;
+                        }
+                    }
+                }
                 relay.transition(block, now);
                 // A transition can forget rejections and take mined blocks
                 // away, so older decisions no longer settle anything.
-                honest.values_mut().for_each(HashSet::clear);
                 failed.clear();
             }
             11 => {
@@ -2116,7 +2320,6 @@ fn run(seed: u64) {
                 chain.push(Vec::new());
                 chain.push(Vec::new());
                 relay.transition(reorg, now);
-                honest.values_mut().for_each(HashSet::clear);
                 failed.clear();
             }
             9 if manual && !live.is_empty() => {
@@ -2127,6 +2330,7 @@ fn run(seed: u64) {
         }
         answer(&mut relay, &mut replies, &live, now, &mut rng);
         deliver(&mut relay, &mut replies, &live, now);
+        settle_obligations(&relay, &mut honest);
         relay.assert_invariants();
     }
 
@@ -2143,6 +2347,7 @@ fn run(seed: u64) {
         deliver(&mut relay, &mut replies, &live, now);
         verify(&mut relay, &mut failed, &mut rng, now, false);
         answer(&mut relay, &mut replies, &live, now, &mut rng);
+        settle_obligations(&relay, &mut honest);
         relay.assert_invariants();
         if !relay.jobs().is_empty() || relay.calls_in_flight() > 0 || relay.verdicts_in_flight() > 0
         {
@@ -2186,11 +2391,9 @@ fn run(seed: u64) {
             );
         }
         if *behaviour == Behaviour::Honest && relay.reactor().has_go(state.peer, *session) {
-            for announced in honest.get(session).into_iter().flatten() {
+            for (announced, met) in honest.get(session).into_iter().flatten() {
                 assert!(
-                    visible.contains(announced)
-                        || failed.contains(announced)
-                        || chain.iter().flatten().any(|mined| mined == announced),
+                    *met || visible.contains(announced),
                     "seed {seed}: {announced:?} from an honest announcer was not decided"
                 );
             }
@@ -2210,6 +2413,28 @@ fn run(seed: u64) {
             entry.claim.is_none(),
             "seed {seed}: {id:?} is still claimed"
         );
+    }
+}
+
+thread_local! {
+    /// Ids whose verification the random run failed since the last look.
+    static FAILED_NOW: std::cell::RefCell<Vec<UnminedTxId>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Meets every obligation whose id is in the pool now, or failed since the
+/// last look.
+fn settle_obligations(
+    relay: &RelayModel,
+    honest: &mut HashMap<SessionId, HashMap<UnminedTxId, bool>>,
+) {
+    let visible: HashSet<UnminedTxId> = relay.pool().visible().into_iter().collect();
+    let failed: Vec<UnminedTxId> = FAILED_NOW.with(|now| std::mem::take(&mut *now.borrow_mut()));
+    for obligations in honest.values_mut() {
+        for (id, met) in obligations.iter_mut() {
+            if visible.contains(id) || failed.contains(id) {
+                *met = true;
+            }
+        }
     }
 }
 

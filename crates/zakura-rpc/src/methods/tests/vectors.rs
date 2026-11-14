@@ -2035,6 +2035,220 @@ async fn rpc_z_get_treestate_state_failure_is_misc_error() {
     assert!(closed_rpc_tx_queue.now_or_never().is_none());
 }
 
+/// A `getblockheader` for a block that is not in the best chain must return the `zcashd` codes.
+///
+/// The header read returns [`zakura_state::BlockHeaderNotFound`] for this block. The RPC maps
+/// only this error to a not-found code: `-5` for a hash and `-8` for a height.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_get_block_header_missing_block_is_not_found() {
+    let _init_guard = zakura_test::init();
+
+    let hash = Hash([0x01; 32]);
+    let height = Height(1_000_000);
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        NoChainTip,
+        rx,
+    );
+
+    for (parameter, hash_or_height, expected_code) in [
+        (hash.to_string(), HashOrHeight::from(hash), -5),
+        (height.0.to_string(), HashOrHeight::from(height), -8),
+    ] {
+        let header_rpc = rpc.clone();
+        let header_future =
+            tokio::spawn(async move { header_rpc.get_block_header(parameter, Some(true)).await });
+
+        read_state
+            .expect_request(ReadRequest::BlockHeader(hash_or_height))
+            .await
+            .respond_error(Box::new(zakura_state::BlockHeaderNotFound {
+                hash_or_height,
+            }));
+
+        let header_response = header_future
+            .await
+            .expect("block header future should not panic")
+            .expect_err("a missing block must be an error");
+
+        assert_eq!(
+            header_response.code(),
+            ErrorCode::ServerError(expected_code).code()
+        );
+        assert_eq!(header_response.message(), "block height not in best chain");
+    }
+
+    mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+
+    // The queue task must continue to run without errors or panics.
+    assert!(rpc_tx_queue.now_or_never().is_none());
+}
+
+/// A `getblockheader` must not report a failure of the state service as a missing block.
+///
+/// Only [`zakura_state::BlockHeaderNotFound`] tells that the block is missing. All other errors
+/// from the header read are failures of the state service. The RPC returns them as `-1` with
+/// the original message. Thus the client knows that it can try the request again.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_get_block_header_state_failure_is_misc_error() {
+    let _init_guard = zakura_test::init();
+
+    let height = Height(1_000_000);
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        NoChainTip,
+        rx.clone(),
+    );
+
+    // The state service returns an error that is not `BlockHeaderNotFound`.
+    let header_future =
+        tokio::spawn(async move { rpc.get_block_header(height.0.to_string(), Some(true)).await });
+
+    read_state
+        .expect_request(ReadRequest::BlockHeader(height.into()))
+        .await
+        .respond_error(BoxError::from("state read failed"));
+
+    let header_response = header_future
+        .await
+        .expect("block header future should not panic")
+        .expect_err("a failed state read must be an error");
+
+    assert_eq!(header_response.code(), ErrorCode::ServerError(-1).code());
+    assert_eq!(header_response.message(), "state read failed");
+
+    // The buffer worker of the state service is closed, thus the request does not get to the
+    // state service.
+    let closed_read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (closed_read_state, worker) = Buffer::pair(closed_read_state, 1);
+    drop(worker);
+
+    let (closed_rpc, closed_rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        closed_read_state,
+        NoChainTip,
+        rx,
+    );
+
+    let header_response = closed_rpc
+        .get_block_header(height.0.to_string(), Some(true))
+        .await
+        .expect_err("a closed state service must be an error");
+
+    assert_eq!(header_response.code(), ErrorCode::ServerError(-1).code());
+    assert_eq!(
+        header_response.message(),
+        "buffer's worker closed unexpectedly"
+    );
+
+    mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+
+    // The queue tasks must continue to run without errors or panics.
+    assert!(rpc_tx_queue.now_or_never().is_none());
+    assert!(closed_rpc_tx_queue.now_or_never().is_none());
+}
+
+/// A `getblock` must not report a failure of the state service as a missing block.
+///
+/// With verbosity 1 or 2, `getblock` reads the header through `getblockheader`. Thus a state
+/// error that is not [`zakura_state::BlockHeaderNotFound`] must give `-1` with the original
+/// message, and a missing block must give `-5` for a hash.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_get_block_state_failure_is_misc_error() {
+    let _init_guard = zakura_test::init();
+
+    let hash = Hash([0x01; 32]);
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        NoChainTip,
+        rx,
+    );
+
+    for verbosity in [1, 2] {
+        // The state service returns an error that is not `BlockHeaderNotFound`.
+        let block_rpc = rpc.clone();
+        let block_future =
+            tokio::spawn(
+                async move { block_rpc.get_block(hash.to_string(), Some(verbosity)).await },
+            );
+
+        read_state
+            .expect_request(ReadRequest::BlockHeader(hash.into()))
+            .await
+            .respond_error(BoxError::from("state read failed"));
+
+        let block_response = block_future
+            .await
+            .expect("block future should not panic")
+            .expect_err("a failed state read must be an error");
+
+        assert_eq!(block_response.code(), ErrorCode::ServerError(-1).code());
+        assert_eq!(block_response.message(), "state read failed");
+
+        // The state service returns `BlockHeaderNotFound`.
+        let block_rpc = rpc.clone();
+        let block_future =
+            tokio::spawn(
+                async move { block_rpc.get_block(hash.to_string(), Some(verbosity)).await },
+            );
+
+        read_state
+            .expect_request(ReadRequest::BlockHeader(hash.into()))
+            .await
+            .respond_error(Box::new(zakura_state::BlockHeaderNotFound {
+                hash_or_height: hash.into(),
+            }));
+
+        let block_response = block_future
+            .await
+            .expect("block future should not panic")
+            .expect_err("a missing block must be an error");
+
+        assert_eq!(block_response.code(), ErrorCode::ServerError(-5).code());
+        assert_eq!(block_response.message(), "block height not in best chain");
+    }
+
+    mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+
+    // The queue task must continue to run without errors or panics.
+    assert!(rpc_tx_queue.now_or_never().is_none());
+}
+
 /// A `z_getsubtreesbyindex` inside a fast-synced node's absent band must fail loudly.
 ///
 /// The subtree read path returns an empty list when the starting index is absent, which is

@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-node-services/src/mempool/port.rs b/crates/zakura-node-services/src/mempool/port.rs
+index 7ea6b6424f..84b688e9ad 100644
+--- a/crates/zakura-node-services/src/mempool/port.rs
++++ b/crates/zakura-node-services/src/mempool/port.rs
+@@ -914,7 +914,15 @@ fn view(
+     // The core publishes under this lock, so the snapshot read here is the
+     // one the log's newest entry belongs to, or an older one.
+     let snapshot = snapshot.borrow().clone()?;
+-    let changes = log.between(cursor, snapshot.last_change);
++    let changes = match log.between(cursor, snapshot.last_change) {
++        ChangesSince::Entries(entries) => ChangesSince::Entries(
++            entries
++                .into_iter()
++                .filter(|entry| !matches!(entry.change, Change::Refused(_)))
++                .collect(),
++        ),
++        other => other,
++    };
+     Some(PoolView { snapshot, changes })
+ }
+ 

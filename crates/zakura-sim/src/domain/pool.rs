@@ -103,6 +103,10 @@ pub struct PoolEvidence {
     pub logged_refusals: std::collections::BTreeMap<usize, u64>,
     /// Submissions answered with a refusal that must be logged.
     pub refusals_answered: u64,
+    /// The transactions those submissions named.
+    pub refused: BTreeSet<usize>,
+    /// The transactions a reader of the log read a refusal for.
+    pub read_refusals: BTreeSet<usize>,
     /// The first snapshot the log did not lead to.
     pub log_mismatch: Option<String>,
     /// Reorgs that happened while the pool held visible transactions.
@@ -383,6 +387,19 @@ pub fn end_violations(evidence: &SharedEvidence) -> Vec<EndViolation> {
                 "{} submissions sent and {} answered",
                 evidence.submits_started, evidence.submits_answered
             ),
+        });
+    }
+    let unread: Vec<usize> = evidence
+        .refused
+        .difference(&evidence.read_refusals)
+        .copied()
+        .collect();
+    if !unread.is_empty() {
+        violations.push(EndViolation {
+            property: PropertyId::new(LOG_COMPLETE),
+            expected: "every refusal answered to a submitter reaches a reader of the log"
+                .to_owned(),
+            actual: format!("no reader read a refusal for transactions {unread:?}"),
         });
     }
     if evidence.reorgs_with_pool > 0 {

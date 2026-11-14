@@ -665,6 +665,7 @@ impl Submitting<'_> {
             );
         if refused {
             evidence.refusals_answered += 1;
+            evidence.refused.insert(tx);
         }
         if refused
             && evidence.logged_refusals.get(&tx).copied().unwrap_or(0) == refusals_before
@@ -1003,9 +1004,13 @@ async fn observe(mut handle: PoolHandle, universe: Arc<Universe>, evidence: Shar
         };
         let snapshot = view.snapshot;
         let mut problem = None;
+        let mut refused = Vec::new();
         match view.changes {
             ChangesSince::Entries(entries) => {
                 for entry in entries {
+                    if let Change::Refused(id) = entry.change {
+                        refused.extend(universe.index(id));
+                    }
                     if entry.seq.0 != cursor.0 + 1 && problem.is_none() {
                         problem = Some(format!(
                             "entry {} follows {} in the log",
@@ -1022,6 +1027,14 @@ async fn observe(mut handle: PoolHandle, universe: Arc<Universe>, evidence: Shar
                 problem = Some("the observer fell off the log".to_owned());
             }
         }
+        // The entries reach the snapshot, so a view that left off its last
+        // entries, which may change nothing a snapshot shows, is seen.
+        if cursor != snapshot.last_change && problem.is_none() {
+            problem = Some(format!(
+                "a reader's entries end at {} and its snapshot at {}",
+                cursor.0, snapshot.last_change.0
+            ));
+        }
         cursor = snapshot.last_change;
         let shown = shown(&snapshot, &universe);
         if shown != replay.visible {
@@ -1032,6 +1045,7 @@ async fn observe(mut handle: PoolHandle, universe: Arc<Universe>, evidence: Shar
         }
         let mut evidence = lock(&evidence);
         evidence.logs_checked += 1;
+        evidence.read_refusals.extend(refused);
         if evidence.log_mismatch.is_none() {
             evidence.log_mismatch = problem;
         }

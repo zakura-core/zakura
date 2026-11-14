@@ -1,0 +1,6 @@
+# Drops refusals from what a reader of the log gets, after publication
+# logged them, so the indexer misses invalidations the publication check
+# saw. Only the reader's own checks see it.
+input = "crates/zakura-sim/tests/fixtures/pool-core.bin"
+# The port's log, which readers read through.
+checks = ["crates/zakura-node-services/src/mempool"]

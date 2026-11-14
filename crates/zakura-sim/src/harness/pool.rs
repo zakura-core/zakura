@@ -605,11 +605,12 @@ impl Submitting<'_> {
     /// a ban, and a valid body the pool rejects for its own rules earns
     /// nothing. Who is charged is the caller's, which the core never knows.
     async fn submit(&self, tx: usize, reservation: Reservation) {
-        {
+        let refusals_before = {
             let mut evidence = lock(self.evidence);
             evidence.held.remove(&tx);
             evidence.submits_started += 1;
-        }
+            evidence.logged_refusals.get(&tx).copied().unwrap_or(0)
+        };
         let body = self.universe.txs[tx].transaction.clone();
         let verdict = self.handle.submit(reservation, body).await;
         let mut evidence = lock(self.evidence);
@@ -652,6 +653,22 @@ impl Submitting<'_> {
         {
             evidence.log_mismatch = Some(format!(
                 "transaction {tx} was admitted, and no publication before its verdict logged it"
+            ));
+        }
+        // Every other ending of an admission logs a refusal first, which the
+        // indexer reports as today's invalidation. A pool turning off answers
+        // without one, as today's sends none for its queue.
+        let refused = matches!(verdict, Verdict::Rejected(_))
+            || matches!(
+                verdict,
+                Verdict::LocalFault(fault) if fault != LocalFault::Deactivated
+            );
+        if refused
+            && evidence.logged_refusals.get(&tx).copied().unwrap_or(0) == refusals_before
+            && evidence.log_mismatch.is_none()
+        {
+            evidence.log_mismatch = Some(format!(
+                "transaction {tx} got {verdict:?}, and no publication before its verdict logged its refusal"
             ));
         }
     }
@@ -926,7 +943,7 @@ fn check_publication(
     }
     *last = snapshot.last_change;
     let (mut removals, mut additions) = (0, 0);
-    let mut added = Vec::new();
+    let (mut added, mut refused) = (Vec::new(), Vec::new());
     for change in batches.iter().flatten() {
         match change {
             Change::Removed { .. } => removals += 1,
@@ -934,6 +951,7 @@ fn check_publication(
                 additions += 1;
                 added.extend(universe.index(*id));
             }
+            Change::Refused(id) => refused.extend(universe.index(*id)),
             _ => {}
         }
         if let Err(error) = replay.apply(universe, *change) {
@@ -958,6 +976,9 @@ fn check_publication(
     evidence.removals_seen += removals;
     evidence.additions_seen += additions;
     evidence.logged_additions.extend(added);
+    for tx in refused {
+        *evidence.logged_refusals.entry(tx).or_default() += 1;
+    }
     if evidence.log_mismatch.is_none() {
         evidence.log_mismatch = problem;
     }

@@ -1,0 +1,25 @@
+diff --git a/crates/zakura-mempool/src/io.rs b/crates/zakura-mempool/src/io.rs
+index 7f17f01218..5b40596760 100644
+--- a/crates/zakura-mempool/src/io.rs
++++ b/crates/zakura-mempool/src/io.rs
+@@ -618,6 +618,20 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
+             return;
+         }
+         self.published = Some(now);
++        let batches: Vec<Vec<_>> = batches
++            .into_iter()
++            .map(|batch| {
++                batch
++                    .into_iter()
++                    .filter(|change| {
++                        !matches!(
++                            change,
++                            zakura_node_services::mempool::port::Change::Refused(_)
++                        )
++                    })
++                    .collect()
++            })
++            .collect();
+         let machine = &self.machine;
+         self.inbox
+             .publish_batches(batches, |last_change| machine.snapshot(last_change));

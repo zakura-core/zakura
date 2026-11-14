@@ -99,6 +99,8 @@ pub struct PoolEvidence {
     pub admitted: u64,
     /// The transactions a publication logged as added.
     pub logged_additions: BTreeSet<usize>,
+    /// How many times a publication logged each transaction as refused.
+    pub logged_refusals: std::collections::BTreeMap<usize, u64>,
     /// The first snapshot the log did not lead to.
     pub log_mismatch: Option<String>,
     /// Reorgs that happened while the pool held visible transactions.
@@ -232,7 +234,7 @@ pub fn properties<S: HasView<View = PoolView>>() -> Vec<Property<S>> {
         },
         Property {
             id: PropertyId::new(LOG_COMPLETE),
-            claim: "replaying the change log from the start leads to exactly each published snapshot's transactions, each entry is allowed by the entries before it, and an admission is logged before its verdict",
+            claim: "replaying the change log from the start leads to exactly each published snapshot's transactions, each entry is allowed by the entries before it, and an admission or a refusal is logged before its verdict",
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View],

@@ -38,6 +38,7 @@ use tracing::Instrument;
 use zakura_chain::{
     chain_tip::ChainTip,
     diagnostic::task::{CheckForPanics, WaitForPanics},
+    serialization::DateTime32,
 };
 use zakura_node_services::task::{erased, spawn_buffer};
 
@@ -616,7 +617,7 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let initial_peers = limit_initial_peers(&config, address_book_updater).await;
+    let initial_peers = limit_initial_peers(&config, &address_book_updater).await;
 
     let mut handshake_success_total: usize = 0;
     let mut handshake_error_total: usize = 0;
@@ -691,6 +692,12 @@ where
                 handshake_error_total += 1;
                 let addr_label = addr.addr_label(config.expose_peer_addresses);
 
+                // Like crawler dials, a failed startup dial must not look never-attempted,
+                // or the crawler retries it ahead of untried candidates.
+                let _ = address_book_updater
+                    .send(MetaAddr::new_errored(addr, None))
+                    .await;
+
                 // this is verbose, but it's better than just hanging with no output when there are errors
                 let mut expected_error = false;
                 if let Some(io_error) = e.downcast_ref::<tokio::io::Error>() {
@@ -750,7 +757,7 @@ where
 /// Also sends every initial peer to the `address_book_updater`.
 async fn limit_initial_peers(
     config: &Config,
-    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
 ) -> IndexSet<PeerSocketAddr> {
     let all_peers = config.initial_peers().await;
     let mut initial_peers = IndexSet::new();
@@ -764,9 +771,10 @@ async fn limit_initial_peers(
 
     // Config has validated and interleaved cached peers with shuffled seeds.
     // Feed every candidate to discovery, even beyond the startup dial limit.
+    let now = DateTime32::now();
     for peer in all_peers {
         let _ = address_book_updater
-            .send(MetaAddr::new_initial_peer(peer))
+            .send(MetaAddr::new_startup_peer(peer, now))
             .await;
         let canonical_peer = canonical_peer_addr(peer);
         if unconditional_dial_addrs.contains(&canonical_peer) {

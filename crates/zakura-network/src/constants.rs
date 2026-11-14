@@ -241,6 +241,13 @@ pub const MAX_PEER_ACTIVE_FOR_GOSSIP: Duration32 = Duration32::from_hours(3);
 /// offline peers that it constantly and uselessly retries to connect to.
 pub const MAX_RECENT_PEER_AGE: Duration32 = Duration32::from_days(3);
 
+/// How long before startup a peer from the peer cache or a DNS seed counts as last seen.
+///
+/// This is longer than [`MAX_PEER_ACTIVE_FOR_GOSSIP`], so a startup peer is not gossiped or
+/// cached until it responds, and shorter than [`MAX_RECENT_PEER_AGE`], so a startup peer
+/// whose first dial fails is retried after the usual reconnection delay.
+pub const STARTUP_PEER_LAST_SEEN_AGE: Duration32 = Duration32::from_hours(4);
+
 /// Regular interval for sending keepalive `Ping` messages to each
 /// connected peer.
 ///
@@ -591,6 +598,11 @@ mod tests {
         assert!(
             MAX_PEER_ACTIVE_FOR_GOSSIP <= MAX_RECENT_PEER_AGE,
             "we should only gossip peers we are actually willing to try ourselves"
+        );
+        assert!(
+            MAX_PEER_ACTIVE_FOR_GOSSIP < STARTUP_PEER_LAST_SEEN_AGE
+                && STARTUP_PEER_LAST_SEEN_AGE < MAX_RECENT_PEER_AGE,
+            "startup peers are retried after a failure, but not gossiped before they respond"
         );
     }
 

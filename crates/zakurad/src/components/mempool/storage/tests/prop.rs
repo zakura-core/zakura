@@ -332,6 +332,39 @@ proptest! {
 }
 
 proptest! {
+    /// Block conflicts follow the current owner after removal and clearing.
+    #[test]
+    fn block_conflicts_follow_current_spend_owners(input in any::<SpendConflictTestInput>()) {
+        let (first, second) = input.conflicting_transactions();
+        let first_id = first.transaction.id();
+        let second_id = second.transaction.id();
+        prop_assume!(first_id.mined_id() != second_id.mined_id());
+        let mut storage = Storage::new(&Config {
+            tx_cost_limit: 160_000_000,
+            ..Default::default()
+        });
+
+        storage.insert(first.clone(), Vec::new(), None).unwrap();
+        prop_assert_eq!(storage.remove_exact(&HashSet::from([first_id])), 1);
+        storage.insert(second.clone(), Vec::new(), None).unwrap();
+        let removed = storage.reject_and_remove_same_effects(
+            &HashSet::from([first_id.mined_id()]),
+            vec![first.transaction.transaction().clone()],
+        );
+        prop_assert!(removed.mined.is_empty());
+        prop_assert_eq!(removed.invalidated, HashSet::from([second_id]));
+        prop_assert_eq!(storage.transaction_count(), 0);
+
+        storage.clear();
+        storage.insert(first, Vec::new(), None).unwrap();
+        let removed = storage.reject_and_remove_same_effects(
+            &HashSet::from([second_id.mined_id()]),
+            vec![second.transaction.transaction().clone()],
+        );
+        prop_assert_eq!(removed.invalidated, HashSet::from([first_id]));
+        prop_assert_eq!(storage.transaction_count(), 0);
+    }
+
     /// Test if a transaction that has a spend conflict with a transaction already in the mempool
     /// is rejected.
     ///

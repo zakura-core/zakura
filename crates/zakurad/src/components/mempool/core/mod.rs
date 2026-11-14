@@ -165,26 +165,7 @@ pub(crate) fn start(
     // The same `mempool.jsonl` row today's pool writes for each tip it
     // applies.
     let trace = MempoolTrace(trace);
-    let core = core.on_tip_applied(move |applied| {
-        trace.tip_processed(
-            if applied.reset {
-                TipProcessing::Reset
-            } else {
-                TipProcessing::Grow
-            },
-            (applied.tip.hash, applied.tip.height),
-            applied.visible,
-            // Today's pool counts what a reset requeued, its pool and its
-            // pending downloads and verifications from before the tip, and
-            // writes zero for a tip that grew by one block.
-            if applied.reset {
-                applied.held_before
-            } else {
-                0
-            },
-            applied.took,
-        );
-    });
+    let core = core.on_tip_applied(move |applied| record_tip(&trace, applied));
     let core_task = spawn_erased(async move {
         core.run().await;
         Ok::<(), BoxError>(())
@@ -292,4 +273,76 @@ pub(crate) fn assemble(
         core,
         follower,
     })
+}
+
+/// Writes today's `mempool_tip_processed` row for a tip the core applied:
+/// a reset or a grow, the tip, the visible pool after it, and what a reset
+/// requeued. Today's pool counts as requeued its pool and its pending
+/// downloads and verifications from before the tip, and writes zero for a
+/// tip that grew by one block.
+fn record_tip(trace: &MempoolTrace, applied: &zakura_mempool::io::TipApplied) {
+    trace.tip_processed(
+        if applied.reset {
+            TipProcessing::Reset
+        } else {
+            TipProcessing::Grow
+        },
+        (applied.tip.hash, applied.tip.height),
+        applied.visible,
+        if applied.reset {
+            applied.held_before
+        } else {
+            0
+        },
+        applied.took,
+    );
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
+    use zakura_mempool::io::TipApplied;
+    use zakura_node_services::mempool::port::ChainTip;
+
+    use super::*;
+
+    /// Core mode writes today's tip row: a reset counts what the pool held
+    /// before it as requeued, and a grow writes zero.
+    #[test]
+    fn core_mode_writes_todays_tip_row() {
+        let (rows_tx, mut rows) = tokio::sync::mpsc::channel(4);
+        let trace = MempoolTrace(JsonlEventEmitter::new(JsonlTracer::new(rows_tx), "test"));
+        for (byte, reset, held_before) in [(1, true, 3), (2, false, 3)] {
+            record_tip(
+                &trace,
+                &TipApplied {
+                    tip: ChainTip {
+                        hash: block::Hash([byte; 32]),
+                        height: Height(u32::from(byte)),
+                    },
+                    reset,
+                    visible: 2,
+                    hidden: 1,
+                    held_before,
+                    took: std::time::Duration::from_millis(1),
+                },
+            );
+        }
+        let mut written = Vec::new();
+        while let Ok(row) = rows.try_recv() {
+            let row: serde_json::Value =
+                serde_json::from_slice(&row.line).expect("each trace row is JSON");
+            written.push(row);
+        }
+        assert_eq!(written.len(), 2, "one row for each tip: {written:?}");
+        for (row, (byte, action, requeued)) in
+            written.iter().zip([(1u8, "reset", 3), (2, "grow", 0)])
+        {
+            assert_eq!(row["event"], "mempool_tip_processed");
+            assert_eq!(row["action"], action);
+            assert_eq!(row["tip_hash"], block::Hash([byte; 32]).to_string());
+            assert_eq!(row["tx_count_after"], 2);
+            assert_eq!(row["requeued"], requeued, "{row}");
+        }
+    }
 }

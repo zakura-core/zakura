@@ -92,6 +92,51 @@ fn verified_ironwood_v6_tx(
 }
 
 #[test]
+fn sprout_joinsplits_are_rejected_before_eviction_and_cached() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let incumbent = factory.tx(10_000);
+    let incumbent_id = incumbent.transaction.id();
+    let incumbent_cost = incumbent.cost();
+    let mut storage = Storage::new(&config::Config {
+        tx_cost_limit: incumbent_cost,
+        ..Default::default()
+    });
+    storage.insert(incumbent, Vec::new(), None).unwrap();
+    let sprout = Network::Mainnet
+        .unmined_transactions_in_blocks(..)
+        .find(|tx| {
+            matches!(
+                tx.transaction.transaction().as_ref(),
+                Transaction::V4 {
+                    joinsplit_data: Some(_),
+                    ..
+                }
+            )
+        })
+        .expect("mainnet test vectors include V4 Sprout transfers");
+    let sprout_id = sprout.transaction.id();
+
+    assert_eq!(
+        storage.insert(sprout.clone(), Vec::new(), None),
+        Err(MempoolError::NonStandardTransaction(
+            NonStandardTransactionError::SproutJoinSplit,
+        )),
+    );
+    let cached = MempoolError::StorageExactTip(ExactTipRejectionError::FailedStandard(
+        NonStandardTransactionError::SproutJoinSplit,
+    ));
+    assert_eq!(storage.rejection_error(&sprout_id), Some(cached.clone()));
+    assert_eq!(storage.insert(sprout, Vec::new(), None), Err(cached));
+    assert_eq!(
+        storage.tx_ids().collect::<HashSet<_>>(),
+        HashSet::from([incumbent_id])
+    );
+    assert_eq!(storage.total_cost(), incumbent_cost);
+    storage.verified.assert_dependency_groups_are_bounded();
+}
+
+#[test]
 fn oversized_policy_rejection_is_cached_by_exact_id() {
     let mut storage = Storage::new(&config::Config::default());
     let transaction = Network::Mainnet

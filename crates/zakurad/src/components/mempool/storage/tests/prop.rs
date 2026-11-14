@@ -11,12 +11,9 @@ use zakura_chain::{
     amount::Amount,
     at_least_one,
     fmt::{DisplayToDebug, SummaryDebug},
-    orchard,
-    primitives::{Groth16Proof, ZkSnarkProof},
-    sapling,
+    orchard, sapling,
     serialization::AtLeastOne,
-    sprout,
-    transaction::{self, JoinSplitData, Transaction, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, Transaction, UnminedTxId, VerifiedUnminedTx},
     transparent, LedgerState,
 };
 
@@ -524,7 +521,7 @@ proptest! {
 /// an input, or a nullifier revealed by both transactions).
 #[derive(Arbitrary, Clone, Debug)]
 enum SpendConflictTestInput {
-    /// Test V4 transactions to include Sprout nullifier conflicts.
+    /// Test V4 transactions with transparent or Sapling conflicts.
     V4 {
         #[proptest(
             strategy = "Transaction::v4_strategy(LedgerState::default()).prop_map(DisplayToDebug)"
@@ -614,7 +611,6 @@ impl SpendConflictTestInput {
         };
 
         Self::remove_transparent_conflicts(&mut first, &mut second);
-        Self::remove_sprout_conflicts(&mut first, &mut second);
         Self::remove_sapling_conflicts(&mut first, &mut second);
         Self::remove_orchard_conflicts(&mut first, &mut second);
 
@@ -661,74 +657,6 @@ impl SpendConflictTestInput {
                     .map(|outpoint| !conflicts.contains(outpoint))
                     .unwrap_or(true)
             });
-        }
-    }
-
-    /// Find identical Sprout nullifiers revealed by both transactions, then remove the joinsplits
-    /// that contain them from both transactions.
-    fn remove_sprout_conflicts(first: &mut Transaction, second: &mut Transaction) {
-        let first_nullifiers: HashSet<_> = first.sprout_nullifiers().copied().collect();
-        let second_nullifiers: HashSet<_> = second.sprout_nullifiers().copied().collect();
-
-        let conflicts: HashSet<_> = first_nullifiers
-            .intersection(&second_nullifiers)
-            .copied()
-            .collect();
-
-        for transaction in [first, second] {
-            match transaction {
-                // JoinSplits with Bctv14 Proofs
-                Transaction::V2 { joinsplit_data, .. } | Transaction::V3 { joinsplit_data, .. } => {
-                    Self::remove_joinsplits_with_conflicts(joinsplit_data, &conflicts)
-                }
-
-                // JoinSplits with Groth Proofs
-                Transaction::V4 { joinsplit_data, .. } => {
-                    Self::remove_joinsplits_with_conflicts(joinsplit_data, &conflicts)
-                }
-
-                // No JoinSplits
-                Transaction::V1 { .. } | Transaction::V5 { .. } => {}
-                Transaction::V6 { .. } => {}
-            }
-        }
-    }
-
-    /// Remove from a transaction's [`JoinSplitData`] the joinsplits that contain nullifiers
-    /// present in the `conflicts` set.
-    ///
-    /// This may clear the entire Sprout joinsplit data.
-    fn remove_joinsplits_with_conflicts<P: ZkSnarkProof>(
-        maybe_joinsplit_data: &mut Option<Box<JoinSplitData<P>>>,
-        conflicts: &HashSet<sprout::Nullifier>,
-    ) {
-        let mut should_clear_joinsplit_data = false;
-
-        if let Some(joinsplit_data) = maybe_joinsplit_data.as_mut() {
-            joinsplit_data.rest.retain(|joinsplit| {
-                !joinsplit
-                    .nullifiers
-                    .iter()
-                    .any(|nullifier| conflicts.contains(nullifier))
-            });
-
-            let first_joinsplit_should_be_removed = joinsplit_data
-                .first
-                .nullifiers
-                .iter()
-                .any(|nullifier| conflicts.contains(nullifier));
-
-            if first_joinsplit_should_be_removed {
-                if joinsplit_data.rest.is_empty() {
-                    should_clear_joinsplit_data = true;
-                } else {
-                    joinsplit_data.first = joinsplit_data.rest.remove(0);
-                }
-            }
-        }
-
-        if should_clear_joinsplit_data {
-            *maybe_joinsplit_data = None;
         }
     }
 
@@ -882,7 +810,6 @@ impl SpendConflictTestInput {
 #[derive(Arbitrary, Clone, Debug)]
 enum SpendConflictForTransactionV4 {
     Transparent(Box<TransparentSpendConflict>),
-    Sprout(Box<SproutSpendConflict>),
     Sapling(Box<SaplingSpendConflict<sapling::PerSpendAnchor>>),
 }
 
@@ -898,12 +825,6 @@ enum SpendConflictForTransactionV5 {
 #[derive(Arbitrary, Clone, Debug)]
 struct TransparentSpendConflict {
     new_input: DisplayToDebug<transparent::Input>,
-}
-
-/// A conflict caused by revealing the same Sprout nullifier.
-#[derive(Arbitrary, Clone, Debug)]
-struct SproutSpendConflict {
-    new_joinsplit_data: DisplayToDebug<transaction::JoinSplitData<Groth16Proof>>,
 }
 
 /// A conflict caused by revealing the same Sapling nullifier.
@@ -925,20 +846,18 @@ impl SpendConflictForTransactionV4 {
     ///
     /// Changes the `transaction_v4` to include the spend that will result in a conflict.
     pub fn apply_to(self, transaction_v4: &mut Transaction) {
-        let (inputs, joinsplit_data, sapling_shielded_data) = match transaction_v4 {
+        let (inputs, sapling_shielded_data) = match transaction_v4 {
             Transaction::V4 {
                 inputs,
-                joinsplit_data,
                 sapling_shielded_data,
                 ..
-            } => (inputs, joinsplit_data, sapling_shielded_data),
+            } => (inputs, sapling_shielded_data),
             _ => unreachable!("incorrect transaction version generated for test"),
         };
 
         use SpendConflictForTransactionV4::*;
         match self {
             Transparent(transparent_conflict) => transparent_conflict.apply_to(inputs),
-            Sprout(sprout_conflict) => sprout_conflict.apply_to(joinsplit_data),
             Sapling(sapling_conflict) => sapling_conflict.apply_to(sapling_shielded_data),
         }
     }
@@ -975,28 +894,6 @@ impl TransparentSpendConflict {
     /// conflict with any other transaction that also has that same new input.
     pub fn apply_to(self, inputs: &mut Vec<transparent::Input>) {
         inputs.push(self.new_input.0);
-    }
-}
-
-impl SproutSpendConflict {
-    /// Apply a Sprout spend conflict.
-    ///
-    /// Ensures that a transaction's `joinsplit_data` has a nullifier used to represent a conflict.
-    /// If the transaction already has Sprout joinsplits, the first nullifier is replaced with the
-    /// new nullifier. Otherwise, a joinsplit is inserted with that new nullifier in the
-    /// transaction.
-    ///
-    /// The transaction will then conflict with any other transaction with the same new nullifier.
-    pub fn apply_to(
-        self,
-        joinsplit_data: &mut Option<Box<transaction::JoinSplitData<Groth16Proof>>>,
-    ) {
-        if let Some(existing_joinsplit_data) = joinsplit_data.as_mut() {
-            existing_joinsplit_data.first.nullifiers[0] =
-                self.new_joinsplit_data.first.nullifiers[0];
-        } else {
-            *joinsplit_data = Some(Box::new(self.new_joinsplit_data.0));
-        }
     }
 }
 

@@ -25,8 +25,11 @@
 //! reads beside its code edges (E2a), and [`state`] collects the protocol
 //! states of the feature table as those features (E2b). [`stats`] counts a
 //! fuzz process's runs for its campaign's evidence (E4b-min).
+//! [`generate`] draws inputs from a seed and runs them in this process until
+//! the first `Active` violation, without libFuzzer (mutation plan, mut-4.1).
 
 pub mod feedback;
+pub mod generate;
 mod process;
 mod save;
 pub mod state;

@@ -49,7 +49,7 @@ use super::{
         NodeStorage, Policy, PolicySource, Topology, PROBE,
     },
     header_sync::{check_service_operation_ids, Dialer},
-    Subsystem,
+    ScenarioFamily, Subsystem,
 };
 use crate::{
     domain::{
@@ -817,6 +817,19 @@ impl Subsystem for Storage {
     /// [`storage_sources`].
     fn sources() -> Sources {
         storage_sources()
+    }
+
+    /// The tagged scenarios [`Storage::draw`] picks, the semantic ones
+    /// last.
+    fn families() -> Vec<ScenarioFamily> {
+        let mut families = vec![
+            ScenarioFamily::new("stuck-floor", STUCK_FLOOR_TAG),
+            ScenarioFamily::new("paused-handoffs", PAUSED_HANDOFFS_TAG),
+            ScenarioFamily::new("above-window", ABOVE_WINDOW_TAG),
+            ScenarioFamily::new("peers-leave", PEERS_LEAVE_TAG),
+        ];
+        families.extend(BlockScenario::semantic_families());
+        families
     }
 
     /// The scenario the prefix's two bytes pick: [`STUCK_FLOOR_TAG`],

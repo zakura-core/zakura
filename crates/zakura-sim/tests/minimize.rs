@@ -301,12 +301,14 @@ fn changed_assumption_parameters_are_rejected() {
 }
 
 /// A reduction that drops the trigger task still violates the property,
-/// but without its trigger history.
+/// but without its trigger history. Its trace still records the violation.
 #[test]
 fn a_missing_witness_is_rejected() {
     let (original, _dir) = original();
     let lost = candidate(&original, &[0, 7, 0], A);
     assert_eq!(lost.status, ConfirmStatus::WitnessLost, "{lost:?}");
+    assert!(lost.status.missing_witness());
+    assert!(lost.trace.is_some(), "{lost:?}");
 }
 
 /// A run that ends at a harness failure has incomplete evidence, whatever

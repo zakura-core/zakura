@@ -1,0 +1,12 @@
+# Daily joint run. A day with no change since the last report's pin runs only
+# the suite, so a missed run costs nothing.
+[Unit]
+Description=Daily Zakura joint property and mutation run
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target

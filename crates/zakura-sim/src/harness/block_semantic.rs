@@ -24,6 +24,7 @@ use super::{
     },
     block_sync::{BlockScenario, MirrorSpec, SequencerPause},
     header_sync::Dialer,
+    ScenarioFamily,
 };
 
 /// The fuzz prefix that draws [`BlockScenario::reset_mid_flight`].
@@ -350,6 +351,19 @@ impl BlockScenario {
             sequencer_pause: Some(SequencerPause { steps: 150_000 }),
             ..BlockScenario::default()
         }
+    }
+
+    /// The semantic scenarios' tags, which [`BlockScenario::semantic_drawn`]
+    /// matches.
+    pub fn semantic_families() -> Vec<ScenarioFamily> {
+        vec![
+            ScenarioFamily::new("reset-mid-flight", RESET_MID_FLIGHT_TAG),
+            ScenarioFamily::new("reset-past-tip", RESET_PAST_TIP_TAG),
+            ScenarioFamily::new("stale-beside-current", STALE_BESIDE_CURRENT_TAG),
+            ScenarioFamily::new("capacity-release", CAPACITY_RELEASE_TAG),
+            ScenarioFamily::new("stalled-reset", STALLED_RESET_TAG),
+            ScenarioFamily::new("decoded-input-stall", DECODED_INPUT_STALL_TAG),
+        ]
     }
 
     /// The semantic scenario a fuzz input's 2-byte prefix names, if it

@@ -111,6 +111,7 @@ use crate::{
     BoxError,
 };
 
+mod lane;
 mod mutation_loop;
 mod outcome;
 mod pilot;
@@ -124,7 +125,7 @@ pub(super) mod provenance;
 #[path = "../../zakura-sim/src/planted.rs"]
 mod planted_layout;
 
-pub(super) use mutation_loop::run as mutation_loop;
+pub(super) use mutation_loop::{run as mutation_loop, triage};
 use outcome::EndOutcome;
 pub(super) use pilot::run as pilot;
 use planted_layout::PLANTED_DIR;

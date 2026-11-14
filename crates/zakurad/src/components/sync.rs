@@ -706,6 +706,10 @@ pub struct Config {
 
     /// The number of threads used to verify signatures, proofs, and other CPU-intensive code.
     ///
+    /// This sizes two pools: the global rayon pool, and the proving/verification
+    /// backend's private worker pool (Orchard proving, proof verification, and
+    /// pooled RedPallas batch verification).
+    ///
     /// If the number of threads is not configured or zero, Zebra uses the number of logical cores.
     /// If the number of logical cores can't be detected, Zebra uses one thread.
     /// For details, see [the `rayon` documentation](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.num_threads).

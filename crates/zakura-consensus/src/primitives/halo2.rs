@@ -24,7 +24,6 @@ use zcash_protocol::value::ZatBalance;
 use super::batch_control::{Batch, BatchControl, RequestWeight};
 use super::fallback::Fallback;
 use crate::{error::TransactionError, BoxError};
-use thiserror::Error;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -108,22 +107,22 @@ pub type ItemVerifyingKey = VerifyingKey;
 // against the fixed key; that is incorrect both for re-syncing pre-soft-fork Orchard blocks (whose
 // proofs only verify under the insecure key) and for NU6.3 Orchard Actions (whose cross-address
 // restriction the fixed key cannot enforce).
-/// Builds the verifying key for `version` and arms halo2's prepared
-/// fixed-base zero-check on its parameters.
+/// Builds the verifying key for `version` and arms the backend's prepared
+/// verification state.
 ///
-/// The prepared state is cached inside the key's params for the lifetime of
-/// the process (shared with clones, never serialized), so every verification
-/// under the key evaluates through it. When halo2 is built without its
-/// opt-in `orbits` feature — currently the case — or its backend declines,
-/// arming is a no-op and verification keeps the plain multiexp, so calling
-/// it unconditionally is never a pessimization.
+/// Under the sensei backend — the current build — arming warms the
+/// process-wide verifier caches shared by every key, and reports success.
+/// Under the legacy halo2 backend it arms the prepared fixed-base zero-check
+/// cached inside the key's params, a documented no-op without halo2's opt-in
+/// `orbits` feature. Either way verification stays correct without arming,
+/// so calling it unconditionally is never a pessimization.
 fn build_verifying_key(version: OrchardCircuitVersion) -> ItemVerifyingKey {
     let vk = ItemVerifyingKey::build(version);
     let prepared = vk.prepare_batch_validation();
     tracing::info!(
         ?version,
         prepared,
-        "built Orchard Action verifying key and armed its prepared zero-check",
+        "built Orchard Action verifying key and armed its prepared verification state",
     );
     vk
 }
@@ -285,31 +284,6 @@ impl QueueBatchVerify for BatchValidator<'_> {
         }: Item,
     ) -> Result<(), BatchError> {
         self.add_bundle(bundle.as_ref(), sighash.0)
-    }
-}
-
-/// An error that may occur when verifying [Halo2 proofs of Zcash Orchard Action
-/// descriptions][actions].
-///
-/// [actions]: https://zips.z.cash/protocol/protocol.pdf#actiondesc
-// TODO: if halo2::plonk::Error gets the std::error::Error trait derived on it,
-// remove this and just wrap `halo2::plonk::Error` as an enum variant of
-// `crate::transaction::Error`, which does the trait derivation via `thiserror`
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-#[allow(missing_docs)]
-pub enum Halo2Error {
-    #[error("the constraint system is not satisfied")]
-    ConstraintSystemFailure,
-    #[error("unknown Halo2 error")]
-    Other,
-}
-
-impl From<halo2::plonk::Error> for Halo2Error {
-    fn from(err: halo2::plonk::Error) -> Halo2Error {
-        match err {
-            halo2::plonk::Error::ConstraintSystemFailure => Halo2Error::ConstraintSystemFailure,
-            _ => Halo2Error::Other,
-        }
     }
 }
 

@@ -174,6 +174,11 @@ zakura-state = { path = "../zakura-state", version = "19.0.0" }
 zakura-script = { path = "../zakura-script", version = "5.0.8" }
 zcash_script = { workspace = true }
 
+# The proving/verification backend's process-wide worker configuration. The
+# crate is already in the graph through zakura-consensus and Orchard; this
+# direct dependency only adds API access.
+sensei = { workspace = true }
+
 # Only used to forward arithmetic features to Orchard's proof backend and to
 # the Pasta arithmetic the node uses directly. Cargo feature unification
 # applies them to the existing transitive dependencies.

@@ -14,8 +14,8 @@ use crate::{
     address_book_peers::AddressBookPeers,
     config::UnconditionalPeers,
     constants::{
-        DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE,
-        MIN_PEER_RECONNECTION_DELAY, MIN_REDIAL_CONNECTION,
+        DEFAULT_MAX_CONNS_PER_IP, HEARTBEAT_INTERVAL, MAX_ADDRS_IN_ADDRESS_BOOK,
+        MAX_PEER_MISBEHAVIOR_SCORE, MIN_PEER_RECONNECTION_DELAY, MIN_REDIAL_CONNECTION,
     },
     meta_addr::{MetaAddr, MetaAddrChange},
     protocol::external::types::PeerServices,
@@ -803,21 +803,23 @@ fn reconnection_peers_start_with_redial_candidates() {
     let wall_after = |after| wall_start + chrono::Duration::from_std(after).expect("short");
     let second = std::time::Duration::from_secs(1);
 
-    // Each peer connects, last responds at `MIN_REDIAL_CONNECTION` after the start of the
-    // test, and reports a shutdown a second later.
+    // Each peer connects, answers each heartbeat, last responds at `MIN_REDIAL_CONNECTION`
+    // after the start of the test, and reports a shutdown a second later.
     let closed_peer = |addr: &str, connected_for: std::time::Duration| {
         let addr = addr.parse().unwrap();
         let connected_at = MIN_REDIAL_CONNECTION - connected_for;
-        let connected = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, false)
+        let mut responded = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, false)
             .apply_to_meta_addr(None, start + connected_at, wall_after(connected_at))
             .expect("a new entry is always created");
-        let responded = MetaAddr::new_responded(addr, None)
-            .apply_to_meta_addr(
-                connected,
-                start + MIN_REDIAL_CONNECTION,
-                wall_after(MIN_REDIAL_CONNECTION),
-            )
-            .expect("the response is later than the connection");
+        let heartbeats = std::iter::successors(Some(connected_at + HEARTBEAT_INTERVAL), |at| {
+            Some(*at + HEARTBEAT_INTERVAL)
+        })
+        .take_while(|at| *at < MIN_REDIAL_CONNECTION);
+        for responded_at in heartbeats.chain([MIN_REDIAL_CONNECTION]) {
+            responded = MetaAddr::new_responded(addr, None)
+                .apply_to_meta_addr(responded, start + responded_at, wall_after(responded_at))
+                .expect("each response is later than the last");
+        }
 
         MetaAddr::new_shutdown(addr)
             .apply_to_meta_addr(

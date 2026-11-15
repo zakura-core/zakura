@@ -14,8 +14,8 @@ use zakura_chain::{
 
 use crate::{
     constants::{
-        CONCURRENT_ADDRESS_CHANGE_PERIOD, MAX_PEER_ACTIVE_FOR_GOSSIP, MIN_PEER_RECONNECTION_DELAY,
-        MIN_REDIAL_CONNECTION, REDIAL_WINDOW,
+        CONCURRENT_ADDRESS_CHANGE_PERIOD, HEARTBEAT_INTERVAL, MAX_PEER_ACTIVE_FOR_GOSSIP,
+        MIN_PEER_RECONNECTION_DELAY, MIN_REDIAL_CONNECTION, REDIAL_WINDOW,
     },
     meta_addr::MetaAddrChange,
     protocol::{external::canonical_peer_addr, types::PeerServices},
@@ -668,24 +668,32 @@ fn apply_after(
         .expect("the change is later than the entry, so it is applied")
 }
 
-/// Returns the entry of a peer that connected at `start` and last responded
-/// `connected_for` later.
+/// Returns the entry of a peer that connected at `start`, answered each heartbeat like a
+/// live connection, and last responded `connected_for` later.
 fn peer_connected_for(
     addr: PeerSocketAddr,
     is_inbound: bool,
     start: (Instant, chrono::DateTime<Utc>),
     connected_for: Duration,
 ) -> MetaAddr {
-    let connected = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, is_inbound)
+    let mut peer = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, is_inbound)
         .apply_to_meta_addr(None, start.0, start.1)
         .expect("a new entry is always created");
 
-    apply_after(
-        MetaAddr::new_responded(addr, None),
-        connected,
-        start,
-        connected_for,
-    )
+    let heartbeats = std::iter::successors(Some(HEARTBEAT_INTERVAL), |at| {
+        Some(*at + HEARTBEAT_INTERVAL)
+    })
+    .take_while(|at| *at < connected_for);
+    for responded_at in heartbeats.chain([connected_for]) {
+        peer = apply_after(
+            MetaAddr::new_responded(addr, None),
+            peer,
+            start,
+            responded_at,
+        );
+    }
+
+    peer
 }
 
 /// Only the end of a long-lived outbound connection makes a peer a redial candidate,

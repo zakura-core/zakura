@@ -677,17 +677,20 @@ async fn invalid_proof_of_work_child_does_not_start_a_recovery() {
     );
 }
 
-/// A mined header meeting the active Mainnet floor can request its missing parent.
+/// A gossiped body that forges its coinbase height cannot reach parent recovery above the
+/// Mainnet work floor, even when its header carries real work: the downloader rejects it as
+/// unbound and attributes its supplier first.
+///
+/// #1928's floor-active recovery check forged the height of a real header to place it above
+/// the floor. The height check rejects that body before the floor or recovery runs, and no Mainnet
+/// test vector exists above the floor, so floor-active recovery needs a new fixture.
 #[tokio::test]
-async fn mainnet_active_work_floor_allows_parent_recovery() {
+async fn mainnet_active_work_floor_rejects_forged_height_before_parent_recovery() {
     use crate::components::{
         auth_download_height::poison_coinbase_height,
         download_work::{has_sufficient_work, MAINNET_WORK_FLOOR_HEIGHT},
     };
 
-    // Reuse real header work without mining a new fixture. Only the unverified
-    // coinbase height changes so the body is near our mocked tip. This exercises
-    // download admission and recovery, not acceptance by the consensus verifier.
     let canonical = block_from(&zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES);
     for tip_height in [
         MAINNET_WORK_FLOOR_HEIGHT,
@@ -695,7 +698,6 @@ async fn mainnet_active_work_floor_allows_parent_recovery() {
     ] {
         let child_height = tip_height.next().unwrap();
         let child = poison_coinbase_height(&canonical, child_height);
-        let parent = child.header.previous_block_hash;
         assert_eq!(child.hash(), canonical.hash());
         assert!(has_sufficient_work(
             &Network::Mainnet,
@@ -703,22 +705,12 @@ async fn mainnet_active_work_floor_allows_parent_recovery() {
             child_height,
             child.header.difficulty_threshold,
         ));
-        assert!(zakura_consensus::proof_of_work_is_valid(
-            &child.header,
-            &Network::Mainnet,
-            &child_height,
-            &child.hash(),
-        ));
 
         let mut harness = Harness::on_network(Network::Mainnet, [child.clone()]);
         let mut tip: zs::ChainTipBlock = zs::SemanticallyVerifiedBlock::from(genesis()).into();
         tip.height = tip_height;
         tip.hash = unavailable(0xAA);
         harness._tip_sender.set_finalized_tip(tip);
-        assert_eq!(
-            harness.downloads.spawner.latest_chain_tip.best_tip_height(),
-            Some(tip_height),
-        );
         let peer = legacy(2);
 
         assert_eq!(
@@ -731,9 +723,20 @@ async fn mainnet_active_work_floor_allows_parent_recovery() {
             harness.next_request().await,
             request_from(child.hash(), peer.clone())
         );
-        assert_eq!(harness.next_request().await, request_from(parent, peer));
-        assert_eq!(harness.parent_recoveries(), 1);
-        assert!(harness.requests.try_recv().is_err());
+        let (error, _) = tokio::time::timeout(EXPECTED_WAIT, harness.downloads.next())
+            .await
+            .expect("the forged body is rejected promptly")
+            .expect("the downloads stream is open")
+            .expect_err("a forged height is rejected");
+        let unbound = error
+            .downcast_ref::<GossipedUnboundHeight>()
+            .expect("the rejection names the unbound height");
+        assert_eq!(unbound.height, Some(child_height));
+        assert!(!unbound.parent_recovery);
+        assert_eq!(harness.parent_recoveries(), 0);
+        harness
+            .assert_no_request("a forged body starts no parent recovery")
+            .await;
     }
 }
 

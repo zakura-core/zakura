@@ -202,7 +202,7 @@ impl LegacyPeerTrace {
     ) {
         self.emitter.emit_event(|| {
             let result = match result {
-                Ok(Response::Blocks(blocks)) => {
+                Ok(Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }) => {
                     let available = blocks.iter().find_map(|status| status.available());
                     let missing = blocks.iter().find_map(|status| status.missing());
 

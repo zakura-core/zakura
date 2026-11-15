@@ -259,8 +259,6 @@ fn default_cookie_file_name() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::Config;
 
     #[test]

@@ -11,8 +11,6 @@ use std::sync::{
 };
 
 use thiserror::Error;
-#[cfg(test)]
-use zakura_chain::parallel::tree::NoteCommitmentTrees;
 use zakura_chain::{
     block::{self, merkle::AuthDataRoot, Header},
     ironwood, orchard,

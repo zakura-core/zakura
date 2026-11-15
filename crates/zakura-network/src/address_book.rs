@@ -85,7 +85,9 @@ impl BannedIps {
     }
 
     /// Applies a ban and notifies readers after releasing the list lock.
-    fn insert(&self, ip: IpAddr) {
+    ///
+    /// Returns `true` if `ip` wasn't banned already.
+    fn insert(&self, ip: IpAddr) -> bool {
         let changed = {
             let mut list = self
                 .inner
@@ -98,6 +100,7 @@ impl BannedIps {
         if changed {
             self.changes.send_replace(());
         }
+        changed
     }
 
     /// Returns every banned IP address.

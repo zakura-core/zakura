@@ -10721,7 +10721,7 @@ async fn reactor_accepts_blocks_done_after_completed_range() {
 // Fanout > 1 is removed in WorkQueue (a height is taken by exactly one peer), so the
 // "in flight on another peer" scenario no longer exists. The structural property
 // — a taken (in_flight) height is not re-takable — is now covered by the
-// WorkQueue unit test `work_queue_take_dedups_a_height_across_peers`.
+// work-queue state test `adjacent_takes_by_two_peers_stay_disjoint`.
 
 #[tokio::test]
 async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer() {

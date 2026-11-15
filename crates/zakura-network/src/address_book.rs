@@ -681,13 +681,18 @@ impl AddressBook {
 
         // Then sanitize and shuffle
         let unremoved_bans = self.unremoved_bans();
-        let scored_ips = self.misbehavior.scored_ips();
-        let mut peers: Vec<MetaAddr> = peers
-            .ordered_values()
-            // Avoid responding to GetAddr requests with addresses of misbehaving peers.
-            // A ban clears the IP's score, so banned IPs need their own check.
-            .filter(|meta_addr| !is_banned_in(&unremoved_bans, meta_addr))
-            .filter(|meta_addr| !scored_ips.contains(&meta_addr.addr.ip()))
+        // Avoid responding to GetAddr requests with addresses of misbehaving peers.
+        // A ban clears the IP's score, so banned IPs need their own check. Reports wait
+        // for the score lock, so only the lookups run under it.
+        let unscored: Vec<&MetaAddr> = self.misbehavior.with_scores(|scores| {
+            peers
+                .ordered_values()
+                .filter(|meta_addr| !is_banned_in(&unremoved_bans, meta_addr))
+                .filter(|meta_addr| !scores.is_scored(meta_addr.addr.ip()))
+                .collect()
+        });
+        let mut peers: Vec<MetaAddr> = unscored
+            .into_iter()
             .filter_map(|meta_addr| meta_addr.sanitize(&self.network))
             // # Security
             //

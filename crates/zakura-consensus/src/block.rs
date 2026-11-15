@@ -71,6 +71,21 @@ pub struct SemanticBlockVerifier<S, V> {
 #[allow(missing_docs)]
 #[derive(Debug, Error)]
 pub enum VerifyBlockError {
+    /// The actual parent is not yet committed or its context is unavailable.
+    #[error("commitment context is unavailable for parent {0}")]
+    MissingParentContext(block::Hash),
+
+    /// The body height contradicts its committed parent.
+    #[error("body height {claimed:?} contradicts committed parent child height {expected:?}")]
+    ParentHeightMismatch {
+        claimed: Option<block::Height>,
+        expected: block::Height,
+    },
+
+    /// The body does not match the header commitment under its committed parent.
+    #[error("body commitment mismatch: {0}")]
+    BodyCommitment(#[source] zs::ValidateContextError),
+
     #[error("unable to verify depth for block {hash} from chain state during block verification")]
     Depth { source: BoxError, hash: block::Hash },
 
@@ -141,6 +156,11 @@ impl VerifyBlockError {
 
         match self {
             Self::Time(_) => true,
+            Self::BodyCommitment(zs::ValidateContextError::InvalidBlockCommitment(
+                block::CommitmentError::InvalidSapingRootBytes
+                | block::CommitmentError::InvalidChainHistoryActivationReserved { .. }
+                | block::CommitmentError::InvalidChainHistoryRoot { .. },
+            )) => true,
             Self::Block {
                 source:
                     BlockError::InvalidHeaderEncoding(_)
@@ -159,7 +179,14 @@ impl VerifyBlockError {
                         zs::ValidateContextError::NonSequentialBlock { .. }
                         | zs::ValidateContextError::TimeTooEarly { .. }
                         | zs::ValidateContextError::TimeTooLate { .. }
-                        | zs::ValidateContextError::InvalidDifficultyThreshold { .. },
+                        | zs::ValidateContextError::InvalidDifficultyThreshold { .. }
+                        | zs::ValidateContextError::InvalidBlockCommitment(
+                            block::CommitmentError::InvalidSapingRootBytes
+                            | block::CommitmentError::InvalidChainHistoryActivationReserved {
+                                ..
+                            }
+                            | block::CommitmentError::InvalidChainHistoryRoot { .. },
+                        ),
                     ) => true,
                     Some(error) => terminal(error.body_verification_class()),
                 }
@@ -176,8 +203,18 @@ impl VerifyBlockError {
 
         let consensus = |rule| BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(rule));
         match self {
-            Self::Depth { .. } => {
+            Self::MissingParentContext(_) | Self::Depth { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+            }
+            Self::BodyCommitment(error) => match error.body_verification_class() {
+                // The early commitment check authenticates the delivered authorization data.
+                BodyVerificationClass::PayloadMismatch(_) => {
+                    BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
+                }
+                class => class,
+            },
+            Self::ParentHeightMismatch { .. } => {
+                BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::Other("coinbase_height"))
             }
             Self::Block { source } => match source {
                 BlockError::BadMerkleRoot { .. } => BodyVerificationClass::PayloadMismatch(
@@ -257,7 +294,11 @@ impl VerifyBlockError {
         use VerifyBlockError::*;
         match self {
             Block { source } => source.misbehavior_score(),
-            Equihash { .. } | Subsidy(_) | MissingTransparentInput { .. } => 100,
+            Equihash { .. }
+            | Subsidy(_)
+            | BodyCommitment(_)
+            | ParentHeightMismatch { .. }
+            | MissingTransparentInput { .. } => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             Commit(err) => err.misbehavior_score(),
             _other => 0,
@@ -601,10 +642,61 @@ where
                     })?;
                 }
 
+                // V4 transaction IDs bind their authorizing data. A V5+ body also needs its
+                // ZIP-244 commitment, checked against the committed parent's history tree before
+                // any transaction is dispatched. The Merkle root already binds the transaction
+                // IDs, so a missing parent leaves only the authorizing data unconfirmed.
+                let context = if block.view().transactions().any(|tx| tx.version() >= 5) {
+                    let parent = block.header().previous_block_hash;
+                    let pending_parent = || VerifyBlockError::MissingParentContext(parent);
+                    let context = tokio::time::timeout(
+                        AUTH_DATA_CHECK_TIMEOUT,
+                        state_service
+                            .clone()
+                            .oneshot(zs::Request::BlockParentContext(parent)),
+                    )
+                    .await
+                    .map_err(|_| pending_parent())?
+                    .map_err(|source| {
+                        tracing::debug!(?source, ?parent, "parent context lookup failed");
+                        pending_parent()
+                    })?;
+                    let context = match context {
+                        zs::Response::BlockParentContext(Some(context))
+                            if context.parent == parent =>
+                        {
+                            context
+                        }
+                        zs::Response::BlockParentContext(_) => return Err(pending_parent()),
+                        _ => unreachable!("BlockParentContext returns parent context"),
+                    };
+                    let expected = (context.height + 1).ok_or_else(pending_parent)?;
+                    if height != expected {
+                        return Err(VerifyBlockError::ParentHeightMismatch {
+                            claimed: Some(height),
+                            expected,
+                        });
+                    }
+
+                    Some(context)
+                } else {
+                    None
+                };
+
                 // Hash each transaction's authorizing data once, for the transaction requests
                 // and the state's authorizing-data check.
                 let auth_data_digests = block.view().auth_data_digests();
                 auth_data_root = Some(auth_data_digests.root);
+                // Authenticate authorizing data before dispatching scripts or proofs.
+                if let Some(context) = context {
+                    zs::check::block_commitment_is_valid_for_chain_history(
+                        block.clone(),
+                        &network,
+                        &context.history_tree,
+                        Some(auth_data_digests.root),
+                    )
+                    .map_err(VerifyBlockError::BodyCommitment)?;
+                }
 
                 // ZIP 234 derives the block subsidy from the NSM value balance after the parent
                 // block, so a block at or above the start height needs its parent's chain

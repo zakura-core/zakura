@@ -189,7 +189,8 @@ pub const MIN_REDIAL_CONNECTION: Duration = Duration::from_secs(10 * 60);
 ///
 /// A node that restarts within this time is dialed again by the peers that were
 /// connected to it. Each redial still waits [`MIN_PEER_RECONNECTION_DELAY`] after the
-/// last one, so this allows about 2 of them and covers a restart of about 3 minutes.
+/// last one, so the peer is dialed about 2, 4 and 6 minutes after its connection ends.
+/// The last of these dials finds the window over and ends it.
 pub const REDIAL_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// Zebra rotates its peer inventory registry every time this interval elapses.

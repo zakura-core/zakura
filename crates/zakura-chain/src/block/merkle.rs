@@ -3,6 +3,7 @@
 use std::{fmt, io::Write};
 
 use hex::{FromHex, ToHex};
+use rayon::prelude::*;
 
 use crate::{
     serialization::{sha256d, BytesInDisplayOrder},
@@ -11,6 +12,9 @@ use crate::{
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
+
+/// The smallest Merkle tree level, in hashes, that is hashed on several threads.
+const PARALLEL_MERKLE_LEVEL_MIN: usize = 512;
 
 /// The root of the Bitcoin-inherited transaction Merkle tree, binding the
 /// block header to the transactions in the block.
@@ -214,14 +218,18 @@ impl std::iter::FromIterator<transaction::Hash> for Root {
     {
         let mut hashes = hashes.into_iter().map(|hash| hash.0).collect::<Vec<_>>();
         while hashes.len() > 1 {
-            hashes = hashes
-                .chunks(2)
-                .map(|chunk| match chunk {
-                    [h1, h2] => hash(h1, h2),
-                    [h1] => hash(h1, h1),
-                    _ => unreachable!("chunks(2)"),
-                })
-                .collect();
+            let pair = |chunk: &[[u8; 32]]| match chunk {
+                [h1, h2] => hash(h1, h2),
+                [h1] => hash(h1, h1),
+                _ => unreachable!("chunks(2)"),
+            };
+            // Split large levels across threads. Small levels stay on this thread, where
+            // splitting costs more than it saves.
+            hashes = if hashes.len() >= PARALLEL_MERKLE_LEVEL_MIN {
+                hashes.par_chunks(2).map(pair).collect()
+            } else {
+                hashes.chunks(2).map(pair).collect()
+            };
         }
         Self(hashes[0])
     }
@@ -423,6 +431,45 @@ mod tests {
                     .map(|tx| tx.hash())
                     .collect::<Vec<_>>()
             );
+        }
+    }
+
+    #[test]
+    fn trees_match_serial_computation_across_parallel_cutoff() {
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("the test thread pool starts");
+
+            // Cover the cutoff and levels that shrink across it, including odd levels
+            // whose last hash must be paired with itself.
+            for count in [511u32, 512, 513, 1023, 1024, 1025, 3001] {
+                let leaves: Vec<[u8; 32]> = (0..count)
+                    .map(|i| {
+                        let mut leaf = [0u8; 32];
+                        leaf[..4].copy_from_slice(&i.to_le_bytes());
+                        leaf
+                    })
+                    .collect();
+
+                let mut level = leaves.clone();
+                while level.len() > 1 {
+                    let mut next = Vec::new();
+                    for pair in level.chunks(2) {
+                        next.push(hash(&pair[0], pair.get(1).unwrap_or(&pair[0])));
+                    }
+                    level = next;
+                }
+
+                let root =
+                    pool.install(|| leaves.into_iter().map(transaction::Hash).collect::<Root>());
+                assert_eq!(
+                    root,
+                    Root(level[0]),
+                    "{count} leaves with {threads} workers"
+                );
+            }
         }
     }
 

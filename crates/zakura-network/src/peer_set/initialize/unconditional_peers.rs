@@ -292,9 +292,22 @@ fn exempt_proven_address(peer: &RedialState, peer_registry: &PeerRegistry, confi
     }) = &peer.name
     {
         let proven_addr = peer_registry.native_connection_addr(node_id).flatten();
-        config
+        let changed = config
             .unconditional_peers
             .set_resolved_ip(*index, proven_addr.map(|addr| addr.ip()));
+
+        if changed {
+            match proven_addr {
+                Some(addr) => info!(
+                    peer = %addr.addr_label(config.expose_peer_addresses),
+                    "an unconditional peer proved its pinned node ID, so its address is exempt"
+                ),
+                None => info!(
+                    "no connection proves an unconditional peer's pinned node ID now, so it \
+                     has no exempt address"
+                ),
+            }
+        }
     }
 }
 

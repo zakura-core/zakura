@@ -152,16 +152,21 @@ impl UnconditionalPeers {
     /// Records that the DNS name at `name_index` in [`dial_names`](Self::dial_names)
     /// now stands for `ip`, or for no address when `ip` is `None`. Every copy of this
     /// list then treats `ip` like a listed single address, and no longer treats the
-    /// name's previous address that way.
-    pub(crate) fn set_resolved_ip(&self, name_index: usize, ip: Option<IpAddr>) {
+    /// name's previous address that way. Returns whether the name's address changed.
+    pub(crate) fn set_resolved_ip(&self, name_index: usize, ip: Option<IpAddr>) -> bool {
         let mut resolved_ips = self
             .resolved_ips
             .write()
             .expect("resolved address lock should not be poisoned");
 
-        if let Some(resolved_ip) = resolved_ips.get_mut(name_index) {
-            *resolved_ip = ip.map(canonical_ip);
-        }
+        let Some(resolved_ip) = resolved_ips.get_mut(name_index) else {
+            return false;
+        };
+        let ip = ip.map(canonical_ip);
+        let changed = *resolved_ip != ip;
+        *resolved_ip = ip;
+
+        changed
     }
 
     /// Returns whether `ip` is in a configured address or range whose entry

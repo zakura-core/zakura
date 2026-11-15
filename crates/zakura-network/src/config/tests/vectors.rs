@@ -2163,7 +2163,8 @@ fn unconditional_peers_follow_the_resolved_addresses_of_dns_names() {
         "the other name is unchanged"
     );
 
-    peers.set_resolved_ip(0, None);
+    assert!(peers.set_resolved_ip(0, None), "the address changed");
+    assert!(!peers.set_resolved_ip(0, None), "the address is unchanged");
     assert!(
         !copy.contains(ip("192.0.2.3")),
         "a name can stand for no address"

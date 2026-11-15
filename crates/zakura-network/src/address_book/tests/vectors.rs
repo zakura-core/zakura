@@ -815,6 +815,61 @@ fn scored_peers_are_not_gossiped() {
     assert!(!is_gossiped(&address_book));
 }
 
+/// An IP that a report just banned is left out of gossip and the peer cache before the
+/// address book's next update removes its addresses.
+#[test]
+fn banned_peers_are_not_gossiped_or_cached_before_the_next_update() {
+    let _init_guard = zakura_test::init();
+
+    let banned: crate::PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
+    let other: crate::PeerSocketAddr = "192.0.2.2:8233".parse().unwrap();
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    for addr in [banned, other] {
+        address_book.update(MetaAddr::new_connected(
+            addr,
+            &PeerServices::NODE_NETWORK,
+            false,
+        ));
+        address_book.update(MetaAddr::new_responded(addr, None));
+    }
+
+    let gossiped = |address_book: &AddressBook| -> Vec<_> {
+        address_book
+            .sanitized(Utc::now())
+            .iter()
+            .map(|meta_addr| meta_addr.addr)
+            .collect()
+    };
+    let cached = |address_book: &AddressBook| -> Vec<_> {
+        address_book
+            .cacheable(Utc::now())
+            .iter()
+            .map(|meta_addr| meta_addr.addr)
+            .collect()
+    };
+    for addrs in [gossiped(&address_book), cached(&address_book)] {
+        assert!(addrs.contains(&banned) && addrs.contains(&other));
+    }
+
+    address_book
+        .misbehavior_reporter()
+        .report(banned, MAX_PEER_MISBEHAVIOR_SCORE);
+    assert!(
+        address_book.get(banned).is_some(),
+        "the ban hasn't been removed from the address book yet"
+    );
+
+    for addrs in [gossiped(&address_book), cached(&address_book)] {
+        assert!(!addrs.contains(&banned), "a banned IP is given out");
+        assert!(addrs.contains(&other), "an unbanned IP is left out");
+    }
+}
+
 /// A report bans an IP without locking the address book, and the address book's next
 /// update removes that IP's addresses.
 #[test]

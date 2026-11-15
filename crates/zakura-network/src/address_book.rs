@@ -130,6 +130,14 @@ impl BannedIps {
     }
 }
 
+/// Returns whether `meta_addr`'s IP is in `unremoved_bans`, from
+/// [`AddressBook::unremoved_bans`].
+fn is_banned_in(unremoved_bans: &Option<HashSet<IpAddr>>, meta_addr: &MetaAddr) -> bool {
+    unremoved_bans
+        .as_ref()
+        .is_some_and(|bans| bans.contains(&meta_addr.addr.ip()))
+}
+
 /// The number of peers in each [`PeerAddrState`].
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 struct StateCounts {
@@ -672,9 +680,12 @@ impl AddressBook {
         peers.insert(local_listener);
 
         // Then sanitize and shuffle
+        let unremoved_bans = self.unremoved_bans();
         let mut peers: Vec<MetaAddr> = peers
             .ordered_values()
             // Avoid responding to GetAddr requests with addresses of misbehaving peers.
+            // A ban clears the IP's score, so banned IPs need their own check.
+            .filter(|meta_addr| !is_banned_in(&unremoved_bans, meta_addr))
             .filter(|meta_addr| self.misbehavior.score(meta_addr.addr.ip()) == 0)
             .filter_map(|meta_addr| meta_addr.sanitize(&self.network))
             // # Security
@@ -704,8 +715,11 @@ impl AddressBook {
         let peers = self.peers.clone();
 
         // Get peers in preferred order, then keep the ones that recently responded
+        let unremoved_bans = self.unremoved_bans();
         let mut eligible: Vec<_> = peers
             .ordered_values()
+            // Startup dials cached peers first, so the cache must not keep a banned IP.
+            .filter(|addr| !is_banned_in(&unremoved_bans, addr))
             // # Security
             //
             // Keep only peers that responded to this node within the gossip window.
@@ -836,6 +850,18 @@ impl AddressBook {
                 "removed banned peer addresses from address book",
             );
         }
+    }
+
+    /// Returns the banned IPs that may still have addresses in `peers`, or `None` if
+    /// [`remove_banned_peers`](Self::remove_banned_peers) has removed every banned IP.
+    ///
+    /// Reads that give out addresses use this to leave out IPs banned since the last
+    /// update, because they only have `&self` and can't remove them.
+    fn unremoved_bans(&self) -> Option<HashSet<IpAddr>> {
+        self.ban_changes
+            .has_changed()
+            .unwrap_or(false)
+            .then(|| self.bans_by_ip.ips().into_iter().collect())
     }
 
     /// Returns the handle that records peer misbehavior and bans IPs in this address

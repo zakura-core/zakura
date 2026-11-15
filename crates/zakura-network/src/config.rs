@@ -58,7 +58,7 @@ mod tests;
 
 pub use cache_dir::CacheDir;
 pub use tcp_warmup::TcpWarmupConfig;
-pub use unconditional_peers::UnconditionalPeers;
+pub use unconditional_peers::{UnconditionalPeerName, UnconditionalPeers};
 
 pub(crate) use cache_dir::{
     default_network_identity_dir, zakura_discovery_sequence_file_path,
@@ -371,8 +371,9 @@ pub struct Config {
     ///
     /// Each entry is an IP address, such as `"192.0.2.1"`, an IP address and port, such
     /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, a DNS name and port, such as
-    /// `"peer.example.com:8233"`, or a CIDR range, such as `"2001:db8::/32"`. CIDR ranges
-    /// with host bits set are rejected, and a DNS name needs a port.
+    /// `"peer.example.com:8233"`, a DNS name and port pinned to the peer's node ID, such
+    /// as `"<node id>@peer.example.com:8233"`, or a CIDR range, such as `"2001:db8::/32"`.
+    /// CIDR ranges with host bits set are rejected, and a DNS name needs a port.
     /// Use this setting for peers you operate, such as your own nodes, miners, or
     /// sidecars.
     ///
@@ -400,6 +401,17 @@ pub struct Config {
     /// from before then stays until it ends. The startup dials do not wait for the first
     /// lookup, so they keep no room for a name's address.
     ///
+    /// A DNS name pinned to a node ID, the 64 hex characters that `zakura.bootstrap_peers`
+    /// entries start with, is dialed in the same way. While a P2P v2 connection proves
+    /// that the peer holds that node ID, the IP that connection was opened from is treated
+    /// like a listed address, and the peer counts as connected, wherever it is. Otherwise
+    /// the name has no such address. So a changed DNS answer, or someone else at the
+    /// peer's old address, gets nothing. Only a peer that upgrades to P2P v2 can prove its
+    /// node ID, so Zakura closes a connection to the name's address that stays on the
+    /// legacy protocol, warns, and dials the next address later. A pin needs
+    /// `p2p_stack = "dual"`, and Zakura refuses to start with one otherwise. Zakura warns
+    /// about each DNS name without a pin when it runs both stacks.
+    ///
     /// Each dialed address adds one outbound and one inbound connection slot on top of the
     /// connection limits. Zakura dials each address on an outbound slot of its own, so a
     /// full outbound peer set never blocks the dial. Its other dials leave the address the
@@ -424,7 +436,8 @@ pub struct Config {
     ///
     /// Zakura never bans a listed peer, even if it sends invalid blocks or transactions.
     /// Only list peers you trust. Whoever controls a listed DNS name, or the answers this
-    /// node gets for it, chooses an address that Zakura trusts in the same way.
+    /// node gets for it, chooses an address that Zakura trusts in the same way, unless the
+    /// name is pinned to a node ID.
     pub unconditional_peers: UnconditionalPeers,
     /// The initial peer count for full-sized or unknown-sized legacy blocks. At least 1.
     ///
@@ -1771,6 +1784,18 @@ impl<'de> Deserialize<'de> for Config {
             zakura
                 .budgeted_max_connections(&network)
                 .map_err(de::Error::custom)?;
+        }
+        // Unconditional peers are dialed on the legacy stack, and only a P2P v2
+        // connection proves a node ID, so a pin needs both stacks.
+        let runs_both_stacks = {
+            let p2p_stack = p2p_stack.resolve(&network);
+            p2p_stack.runs_legacy() && p2p_stack.runs_zakura()
+        };
+        if unconditional_peers.has_pinned_names() && !runs_both_stacks {
+            return Err(de::Error::custom(
+                "network.unconditional_peers pins a node ID, which needs both P2P stacks: \
+                 set network.p2p_stack = \"dual\"",
+            ));
         }
 
         Ok(Config {

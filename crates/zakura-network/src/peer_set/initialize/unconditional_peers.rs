@@ -27,7 +27,8 @@ use crate::{
     peer_registry::PeerRegistry,
     peer_set::ActiveConnectionCounter,
     protocol::external::{canonical_ip, canonical_peer_addr, canonical_socket_addr},
-    BoxError, Config, PeerSocketAddr,
+    zakura::ZakuraPeerId,
+    BoxError, Config, PeerSocketAddr, UnconditionalPeerName,
 };
 
 use super::DiscoveredPeer;
@@ -35,14 +36,30 @@ use super::DiscoveredPeer;
 /// The addresses that a lookup of an unconditional peer's DNS name returned.
 type Lookup = io::Result<Vec<SocketAddr>>;
 
+/// An unconditional peer listed by DNS name.
+#[derive(Debug)]
+struct NamedPeer {
+    /// The name's index in [`UnconditionalPeers::dial_names`].
+    ///
+    /// [`UnconditionalPeers::dial_names`]: crate::UnconditionalPeers::dial_names
+    index: usize,
+
+    /// The DNS name, which Zakura looks up before each dial.
+    name: Arc<str>,
+
+    /// The port that Zakura dials at the name's addresses.
+    port: u16,
+
+    /// The peer id of the name's pinned node ID, if the entry pins one. The peer counts as
+    /// connected, and its address is exempt, only while a native connection proves it.
+    node_id: Option<ZakuraPeerId>,
+}
+
 /// The redial state of one dialed unconditional peer.
 #[derive(Debug)]
 struct RedialState {
-    /// The peer's DNS name and port, if it is listed by name, with the name's index in
-    /// [`UnconditionalPeers::dial_names`]. Zakura looks the name up before each dial.
-    ///
-    /// [`UnconditionalPeers::dial_names`]: crate::UnconditionalPeers::dial_names
-    name: Option<(usize, Arc<str>, u16)>,
+    /// The peer's DNS name, if it is listed by name.
+    name: Option<NamedPeer>,
 
     /// The address Zakura dials. For a peer listed by name, this is the address Zakura
     /// picked from the name's last lookup that had one it could dial, and `None` until
@@ -68,6 +85,10 @@ struct RedialState {
     /// The address of this peer's dial in flight, if any. It counts against the per-IP
     /// limit before it finishes, see [`connections_with_dials_in_flight`].
     dialing: Option<PeerSocketAddr>,
+
+    /// Whether Zakura has warned that a connection at this pinned peer's address does not
+    /// prove its node ID, since the peer last proved it.
+    warned_unproven: bool,
 }
 
 /// A finished step of an attempt to connect to the peer at `index`.
@@ -240,6 +261,63 @@ fn is_connected(
     connections_to_ip >= max_connections_per_ip
 }
 
+/// Returns whether `peer` is connected.
+///
+/// A peer pinned to a node ID is connected while a native connection in `peer_registry`
+/// proves that ID, from any address. Any other peer is connected when [`is_connected`]
+/// says its address is.
+fn is_peer_connected(
+    peer: &RedialState,
+    peer_registry: &PeerRegistry,
+    connections: &[(PeerSocketAddr, bool)],
+    max_connections_per_ip: usize,
+) -> bool {
+    match &peer.name {
+        Some(NamedPeer {
+            node_id: Some(node_id),
+            ..
+        }) => peer_registry.native_connection_ip(node_id).is_some(),
+        _ => peer
+            .addr
+            .is_some_and(|addr| is_connected(addr, connections, max_connections_per_ip)),
+    }
+}
+
+/// Exempts the IP that the native connection proving `peer`'s pinned node ID was opened
+/// from, or no address while no connection proves it, see
+/// [`UnconditionalPeers::set_resolved_ip`]. Does nothing for a peer without a pin.
+///
+/// The redial loop calls this once per check, so the exemption follows a connection
+/// within [`constants::UNCONDITIONAL_PEER_CHECK_INTERVAL`].
+///
+/// [`UnconditionalPeers::set_resolved_ip`]: crate::UnconditionalPeers::set_resolved_ip
+fn exempt_proven_address(peer: &RedialState, peer_registry: &PeerRegistry, config: &Config) {
+    if let Some(NamedPeer {
+        index,
+        node_id: Some(node_id),
+        ..
+    }) = &peer.name
+    {
+        let proven_ip = peer_registry.native_connection_ip(node_id).flatten();
+        let changed = config
+            .unconditional_peers
+            .set_resolved_ip(*index, proven_ip);
+
+        if changed {
+            match proven_ip {
+                Some(ip) => info!(
+                    ip = ?config.expose_peer_addresses.then_some(ip),
+                    "an unconditional peer proved its pinned node ID, so its address is exempt"
+                ),
+                None => info!(
+                    "no connection proves an unconditional peer's pinned node ID now, so it \
+                     has no exempt address"
+                ),
+            }
+        }
+    }
+}
+
 /// Returns the delay before the attempt that follows `attempts` attempts without a
 /// healthy connection.
 fn redial_delay(attempts: u32) -> Duration {
@@ -289,6 +367,50 @@ fn warn_about_addrs_over_the_ip_limit(dial_addrs: &[PeerSocketAddr], config: &Co
     }
 }
 
+/// Reports that a connection at `addr`, the address of the pinned peer `peer`, does not
+/// prove its node ID: the pin is wrong, or the peer can't upgrade to P2P v2. Warns once
+/// until the peer next proves its node ID, then logs at debug.
+fn report_unproven_connection(peer: &mut RedialState, addr: PeerSocketAddr, config: &Config) {
+    let peer_label = addr.addr_label(config.expose_peer_addresses);
+
+    if !peer.warned_unproven {
+        peer.warned_unproven = true;
+        warn!(
+            peer = %peer_label,
+            "a connection at an unconditional peer's address did not prove its pinned node \
+             ID, so the address is not exempt. Check the pin, and that the peer runs P2P v2"
+        );
+    } else {
+        debug!(
+            peer = %peer_label,
+            "a connection at an unconditional peer's address did not prove its pinned node ID"
+        );
+    }
+}
+
+/// Warns about each of `names` that is not pinned to a node ID, on a node that can check
+/// one.
+///
+/// Whoever the DNS answer for such a name points to is exempt from scoring and bans, and
+/// a pin is how the operator closes that.
+fn warn_about_unpinned_names(names: &[UnconditionalPeerName], config: &Config) {
+    // This dialer runs on the legacy stack, so a node that also runs P2P v2 runs both,
+    // which a pin needs.
+    if !config.v2_p2p() {
+        return;
+    }
+
+    for name in names.iter().filter(|name| name.node_id.is_none()) {
+        let name = config.expose_peer_addresses.then(|| name.to_string());
+        warn!(
+            ?name,
+            "an unconditional peer DNS name is not pinned to a node ID, so the peer at \
+             any address its DNS answer gives is exempt from scoring and bans. Pin it as \
+             <node id>@name:port"
+        );
+    }
+}
+
 /// Dials each address in `dial_addrs` and each DNS name in the configured unconditional
 /// peers, and dials it again whenever no connection to that peer is open, see
 /// [`is_connected`]. Sends each new connection to `peerset_tx`.
@@ -299,6 +421,11 @@ fn warn_about_addrs_over_the_ip_limit(dial_addrs: &[PeerSocketAddr], config: &Co
 /// records that address with [`UnconditionalPeers::set_resolved_ip`], so it is treated
 /// like a listed address. When a lookup fails or has no such address, Zakura dials the
 /// last address it had. A name is never looked up while its peer is connected.
+///
+/// A name pinned to a node ID is dialed the same way, but its address is only exempt
+/// while a native connection proves the ID, see [`exempt_proven_address`], and its peer
+/// only counts as connected then, see [`is_peer_connected`]. A dial to it that ends in a
+/// legacy connection cannot prove the ID, so Zakura closes it instead of keeping it.
 ///
 /// An attempt that does not lead to a lasting connection doubles the peer's redial
 /// delay, from [`constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY`] up to
@@ -338,7 +465,7 @@ where
     C::Future: Send + 'static,
 {
     let expose_peer_addresses = config.expose_peer_addresses;
-    let dial_names: Vec<_> = config.unconditional_peers.dial_names().collect();
+    let dial_names: Vec<_> = config.unconditional_peers.dial_names().cloned().collect();
 
     if expose_peer_addresses {
         // `PeerSocketAddr`'s `Debug` redacts the address, so log the labels.
@@ -346,6 +473,7 @@ where
             .iter()
             .map(|addr| addr.addr_label(true))
             .collect();
+        let dial_names: Vec<_> = dial_names.iter().map(ToString::to_string).collect();
         info!(
             ?dial_addrs,
             ?dial_names,
@@ -359,17 +487,21 @@ where
         );
     }
     warn_about_addrs_over_the_ip_limit(&dial_addrs, &config);
+    warn_about_unpinned_names(&dial_names, &config);
 
     let start = Instant::now();
     let mut peers: Vec<RedialState> = dial_addrs
         .into_iter()
         .map(|addr| (None, Some(addr)))
-        .chain(
-            dial_names
-                .into_iter()
-                .enumerate()
-                .map(|(name_index, (name, port))| (Some((name_index, name, port)), None)),
-        )
+        .chain(dial_names.into_iter().enumerate().map(|(index, name)| {
+            let name = NamedPeer {
+                index,
+                name: name.name,
+                port: name.port,
+                node_id: name.node_id.map(ZakuraPeerId::from_node_id),
+            };
+            (Some(name), None)
+        }))
         .map(|(name, addr)| RedialState {
             name,
             addr,
@@ -379,6 +511,7 @@ where
             has_attempted: false,
             connected_since: None,
             dialing: None,
+            warned_unproven: false,
         })
         .collect();
 
@@ -406,15 +539,28 @@ where
                         .expect("event indexes come from the peer list, which never shrinks");
 
                     // The peer may have dialed in while this attempt waited, or a dial to
-                    // another listed address may have filled its IP.
+                    // another listed address may have filled its IP. A peer that came
+                    // back at its last address keeps that address.
+                    if is_peer_connected(
+                        peer,
+                        &peer_registry,
+                        &connections,
+                        config.max_connections_per_ip,
+                    ) {
+                        peer.is_attempting = false;
+                        continue;
+                    }
+
+                    let is_pinned = peer
+                        .name
+                        .as_ref()
+                        .is_some_and(|named| named.node_id.is_some());
+
                     let is_open = |addr: PeerSocketAddr| {
                         is_connected(addr, &connections, config.max_connections_per_ip)
                     };
 
-                    // A peer that came back at its last address keeps that address.
-                    let lookup = lookup.filter(|_| !peer.addr.is_some_and(is_open));
-
-                    if let (Some((name_index, name, _port)), Some(lookup)) = (&peer.name, lookup) {
+                    if let (Some(named), Some(lookup)) = (&peer.name, lookup) {
                         let dial_addr = lookup.and_then(|addrs| {
                             // A resolver can repeat an address, and the next address
                             // must be a different one.
@@ -445,17 +591,20 @@ where
                                 );
                                 peer.addr = Some(addr);
                                 // Zakura dials the address below, so exempt it before a
-                                // connection to it can be scored.
-                                config
-                                    .unconditional_peers
-                                    .set_resolved_ip(*name_index, addr.ip());
+                                // connection to it can be scored. A pinned name's address
+                                // waits for a connection that proves its node ID.
+                                if named.node_id.is_none() {
+                                    config
+                                        .unconditional_peers
+                                        .set_resolved_ip(named.index, Some(addr.ip()));
+                                }
                             }
                             Ok(_) => {}
                             // Keep the last address, if any: the peer may still be there.
                             // Like a failed dial, only the first failure is worth an
                             // operator's attention.
                             Err(error) => {
-                                let name = expose_peer_addresses.then_some(name);
+                                let name = expose_peer_addresses.then_some(&named.name);
                                 if peer.attempts <= 1 {
                                     info!(
                                         ?name,
@@ -476,6 +625,11 @@ where
 
                     // A name that has never resolved has no address to dial.
                     let Some(addr) = peer.addr.filter(|&addr| !is_open(addr)) else {
+                        // A pinned peer is not connected, so a connection at its address
+                        // does not prove its node ID.
+                        if let (true, Some(addr)) = (is_pinned, peer.addr) {
+                            report_unproven_connection(peer, addr, &config);
+                        }
                         peer.is_attempting = false;
                         continue;
                     };
@@ -520,7 +674,19 @@ where
                         .take()
                         .expect("every dial sets `dialing` before it starts");
 
+                    let is_pinned = peer
+                        .name
+                        .as_ref()
+                        .is_some_and(|named| named.node_id.is_some());
+
                     match result.map(|peer| *peer) {
+                        // The upgrade to P2P v2 happens inside the legacy handshake, so a
+                        // dial that ends in a legacy connection cannot prove a pinned node
+                        // ID. Dropping the client closes it, so the next attempt dials the
+                        // name's next address without this one held open.
+                        Ok((addr, _client)) if is_pinned => {
+                            report_unproven_connection(peer, addr, &config);
+                        }
                         Ok((addr, client)) => {
                             info!(
                                 peer = %addr.addr_label(expose_peer_addresses),
@@ -577,15 +743,21 @@ where
                 let connections = connections_with_dials_in_flight(&peer_registry, &peers);
 
                 for (index, peer) in peers.iter_mut().enumerate() {
+                    exempt_proven_address(peer, &peer_registry, &config);
+
                     if peer.is_attempting {
                         continue;
                     }
 
                     let now = Instant::now();
 
-                    if peer.addr.is_some_and(|addr| {
-                        is_connected(addr, &connections, config.max_connections_per_ip)
-                    }) {
+                    if is_peer_connected(
+                        peer,
+                        &peer_registry,
+                        &connections,
+                        config.max_connections_per_ip,
+                    ) {
+                        peer.warned_unproven = false;
                         let connected_since = *peer.connected_since.get_or_insert(now);
                         if now.saturating_duration_since(connected_since)
                             >= constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION
@@ -616,7 +788,7 @@ where
                     let lookup = peer
                         .name
                         .as_ref()
-                        .map(|(_name_index, name, port)| lookup(name.clone(), *port));
+                        .map(|named| lookup(named.name.clone(), named.port));
 
                     events.push(
                         async move {

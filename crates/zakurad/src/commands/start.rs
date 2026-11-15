@@ -1,8 +1,8 @@
-//! `start` subcommand - entry point for starting a zebra node
+//! `start` subcommand - entry point for starting a Zakura node
 //!
 //! ## Application Structure
 //!
-//! A zebra node consists of the following major services and tasks:
+//! A Zakura node consists of the following major services and tasks:
 //!
 //! Peers:
 //!  * Peer Connection Pool Service
@@ -47,7 +47,7 @@
 //!
 //! Block Mining:
 //!  * Internal Miner Task
-//!    * if the user has configured Zebra to mine blocks, spawns tasks to generate new blocks,
+//!    * if the user has configured Zakura to mine blocks, spawns tasks to generate new blocks,
 //!      and submits them for verification. This automatically shares these new blocks with peers.
 //!
 //! Mempool Transactions:
@@ -66,7 +66,7 @@
 //!    * answers RPC client requests using the State Service and Mempool Service
 //!    * submits client transactions to the node's mempool
 //!
-//! Zebra also has diagnostic support:
+//! Zakura also has diagnostic support:
 //! * [metrics](https://github.com/ZcashFoundation/zebra/blob/main/book/src/user/metrics.md)
 //! * [tracing](https://github.com/ZcashFoundation/zebra/blob/main/book/src/user/tracing.md)
 //!
@@ -222,7 +222,7 @@ impl Drop for NodeTasks {
 fn check_tcp_slow_start_after_idle() {}
 
 impl StartCmd {
-    /// Extra time Zebra waits for the zcashd-compat supervisor task beyond the
+    /// Extra time Zakura waits for the zcashd-compat supervisor task beyond the
     /// child's `shutdown_grace_period`. The supervisor's `terminate_child` waits
     /// the full grace period before its SIGKILL last resort, so the outer wait
     /// must be strictly longer or aborting the task races the graceful path.
@@ -275,9 +275,9 @@ impl StartCmd {
         );
     }
 
-    /// Returns the Zebra P2P address supervised zcashd should `-connect` to.
+    /// Returns the Zakura P2P address supervised zcashd should `-connect` to.
     ///
-    /// Uses `zcashd_compat.p2p_connect_addr` when set, otherwise Zebra's bound
+    /// Uses `zcashd_compat.p2p_connect_addr` when set, otherwise Zakura's bound
     /// legacy P2P listener, substituting loopback for unspecified addresses so
     /// zcashd gets a dialable target on the same host.
     fn zcashd_compat_p2p_connect_addr(
@@ -318,7 +318,7 @@ impl StartCmd {
     ///
     /// This is the configured `shutdown_grace_period` plus a fixed margin, so the
     /// supervisor task always gets to finish its own SIGTERM → grace → SIGKILL
-    /// sequence before Zebra gives up on the task.
+    /// sequence before Zakura gives up on the task.
     fn zcashd_compat_supervisor_shutdown_timeout(
         config: &ZakuradConfig,
     ) -> Option<std::time::Duration> {
@@ -1218,7 +1218,7 @@ impl StartCmd {
                     Ok(())
                 }
 
-                // And the old databases task should finish while Zebra is running.
+                // And the old databases task should finish while Zakura is running.
                 old_databases_result = &mut old_databases_task_handle_fused => {
                     old_databases_result
                         .unwrap_or_else(|_| panic!(
@@ -1240,7 +1240,7 @@ impl StartCmd {
                     },
                 };
 
-                // Stop Zebra if a task finished and returned an error,
+                // Stop Zakura if a task finished and returned an error,
                 // or if an ongoing task exited.
                 if let Err(err) = result {
                     break Err(err);
@@ -1331,7 +1331,7 @@ impl StartCmd {
         }
     }
 
-    /// Returns `false` so Zebra keeps running if zcashd-compat supervision exits unexpectedly.
+    /// Returns `false` so Zakura keeps running if zcashd-compat supervision exits unexpectedly.
     fn zcashd_compat_supervisor_should_exit(
         zcashd_compat_result: Result<Result<(), Report>, tokio::task::JoinError>,
     ) -> bool {

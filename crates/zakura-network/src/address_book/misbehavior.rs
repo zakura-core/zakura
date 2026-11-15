@@ -26,7 +26,8 @@ use crate::{
 /// a copy.
 #[derive(Clone, Debug)]
 pub struct MisbehaviorReporter {
-    /// Scores of IP addresses that have misbehaved but are not banned yet.
+    /// Scores of IP addresses that have misbehaved since they last reached the ban
+    /// threshold.
     scores: Arc<Mutex<ScoreTable>>,
 
     /// The ban list shared with the address book and the peer set.
@@ -49,10 +50,15 @@ impl MisbehaviorReporter {
 
     /// Adds `score_increment` to the misbehavior score of `addr`'s IP address, and bans
     /// the IP address if its score reaches the ban threshold.
+    ///
+    /// Reports for an IP address that is already banned are scored like any other,
+    /// rather than checked against the ban list first. Banned peers are disconnected,
+    /// so those reports only come from work that was in flight when the ban happened,
+    /// and banning the IP address again changes nothing.
     pub fn report(&self, addr: PeerSocketAddr, score_increment: u32) {
         let ip = canonical_ip(addr.ip());
 
-        if score_increment == 0 || self.bans.contains(ip) {
+        if score_increment == 0 {
             return;
         }
 
@@ -71,9 +77,8 @@ impl MisbehaviorReporter {
             .expect("score table lock should not be poisoned")
             .add(ip, score_increment);
 
-        if reached_ban_threshold {
-            // The ban list is the record of a banned IP from now on.
-            self.bans.insert(ip);
+        // The ban list is the record of a banned IP from now on.
+        if reached_ban_threshold && self.bans.insert(ip) {
             metrics::counter!("address_book.misbehavior.banned.total").increment(1);
             tracing::warn!(
                 score_increment,
@@ -84,7 +89,8 @@ impl MisbehaviorReporter {
 
     /// Returns the misbehavior score of `ip`, or zero if it has none.
     ///
-    /// A banned IP address has no score: its ban replaces it.
+    /// Reaching the ban threshold clears the score. A banned IP address only has a
+    /// score again if it is reported after its ban.
     pub fn score(&self, ip: IpAddr) -> u32 {
         self.scores
             .lock()
@@ -193,6 +199,32 @@ mod tests {
 
         assert_eq!(reporter.score(other_ip.ip()), 40);
         assert!(!reporter.is_banned(other_ip.ip()));
+    }
+
+    /// Reports that arrive after a ban keep the IP banned, and reaching the threshold
+    /// again doesn't notify ban watchers a second time.
+    #[test]
+    fn reports_after_the_ban_do_not_ban_again() {
+        let reporter = reporter();
+        let addr = peer_addr([127, 0, 0, 1], 8233);
+        let mut ban_changes = reporter.bans().subscribe();
+
+        reporter.report(addr, constants::MAX_PEER_MISBEHAVIOR_SCORE);
+        assert!(reporter.is_banned(addr.ip()));
+        assert!(ban_changes
+            .has_changed()
+            .expect("the reporter holds the sender"));
+        ban_changes.mark_unchanged();
+
+        reporter.report(addr, 1);
+        assert_eq!(reporter.score(addr.ip()), 1);
+
+        reporter.report(addr, constants::MAX_PEER_MISBEHAVIOR_SCORE);
+        assert!(reporter.is_banned(addr.ip()));
+        assert_eq!(reporter.score(addr.ip()), 0);
+        assert!(!ban_changes
+            .has_changed()
+            .expect("the reporter holds the sender"));
     }
 
     /// An IPv4-mapped IPv6 report scores and bans the canonical IPv4 address that the

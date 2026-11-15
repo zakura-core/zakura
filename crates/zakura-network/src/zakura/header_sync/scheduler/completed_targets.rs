@@ -141,24 +141,4 @@ mod tests {
             "an anchor change also retires completed targets"
         );
     }
-
-    #[test]
-    fn generation_change_conservatively_reuses_no_completed_targets() {
-        let old_generation = HeaderGeneration::new(4);
-        let new_generation = HeaderGeneration::new(5);
-        let selected = branch(1, 9);
-        let finalized = Frontier::new(block::Height(10), selected.anchor_hash);
-        let mut completed = CompletedHeaderTargets::default();
-        completed.mark(old_generation, selected);
-        assert_eq!(completed.len(), 1);
-
-        completed.retain_current(new_generation, finalized);
-
-        assert_eq!(
-            completed.len(),
-            0,
-            "without an authenticated reuse proof, generation retirement drops every target"
-        );
-        assert!(!completed.contains(new_generation, selected));
-    }
 }

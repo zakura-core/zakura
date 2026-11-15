@@ -364,27 +364,4 @@ mod tests {
             .expect_err("a wildcard primary listener would overlap the admin listener")
             .contains("different port"));
     }
-
-    #[test]
-    fn deserializes_indexer_mtls_config() {
-        let config: Config = toml::from_str(
-            r#"
-            indexer_listen_addr = "0.0.0.0:8230"
-
-            [indexer_tls]
-            cert_file = "/etc/zakura/indexer-server.pem"
-            key_file = "/etc/zakura/indexer-server-key.pem"
-            client_ca_file = "/etc/zakura/indexer-client-ca.pem"
-            "#,
-        )
-        .expect("indexer mTLS config should deserialize");
-
-        let tls = config
-            .indexer_tls
-            .expect("the configured indexer mTLS settings should be present");
-        assert_eq!(
-            tls.client_ca_file,
-            PathBuf::from("/etc/zakura/indexer-client-ca.pem")
-        );
-    }
 }

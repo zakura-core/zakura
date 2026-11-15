@@ -81,7 +81,7 @@ use std::{
 };
 
 use eyre::{eyre, Report};
-use futures::FutureExt;
+use futures::{future::OptionFuture, FutureExt};
 use tokio::{
     pin, select,
     sync::{mpsc, oneshot, watch},
@@ -1019,22 +1019,17 @@ impl StartCmd {
         };
         node_tasks.track(&syncer_task_handle);
 
-        // And finally, spawn the internal Zcash miner, if it is enabled.
-        //
-        // TODO: add a config to enable the miner rather than a feature.
+        // And finally, spawn the internal Zcash miner, if it is compiled in and enabled.
         #[cfg(feature = "internal-miner")]
-        let miner_task_handle = if config.mining.is_internal_miner_enabled() {
+        let mut miner_task_handle = config.mining.is_internal_miner_enabled().then(|| {
             info!("spawning Zcash miner");
             components::miner::spawn_init(&config.metrics, rpc_impl)
-        } else {
-            spawn_erased(std::future::pending().in_current_span())
-        };
-
+        });
         #[cfg(not(feature = "internal-miner"))]
-        // Spawn a dummy miner task which doesn't do anything and never finishes.
-        let miner_task_handle: tokio::task::JoinHandle<Result<(), Report>> =
-            spawn_erased(std::future::pending().in_current_span());
-        node_tasks.track(&miner_task_handle);
+        let mut miner_task_handle: Option<JoinHandle<Result<(), Report>>> = None;
+        if let Some(miner_task_handle) = &miner_task_handle {
+            node_tasks.track(miner_task_handle);
+        }
 
         info!("spawned initial Zakura tasks");
 
@@ -1069,7 +1064,6 @@ impl StartCmd {
         pin!(tx_gossip_task_handle);
         pin!(progress_task_handle);
         pin!(end_of_support_task_handle);
-        pin!(miner_task_handle);
 
         // startup tasks
         let BackgroundTaskHandles {
@@ -1228,7 +1222,8 @@ impl StartCmd {
                     Ok(())
                 }
 
-                miner_result = &mut miner_task_handle => miner_result
+                // Without a miner task this branch is disabled, because the future yields `None`.
+                Some(miner_result) = OptionFuture::from(miner_task_handle.as_mut()) => miner_result
                     .expect("unexpected panic in the miner task")
                     .map(|_| info!("miner task exited")),
 
@@ -1268,7 +1263,9 @@ impl StartCmd {
         tx_gossip_task_handle.abort();
         progress_task_handle.abort();
         end_of_support_task_handle.abort();
-        miner_task_handle.abort();
+        if let Some(miner_task_handle) = &miner_task_handle {
+            miner_task_handle.abort();
+        }
         if let Some(zakura_endpoint_shutdown_task) = zakura_endpoint_shutdown_task {
             zakura_endpoint_shutdown_task
                 .await

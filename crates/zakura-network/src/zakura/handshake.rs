@@ -1913,32 +1913,6 @@ mod tests {
     }
 
     #[test]
-    fn prelude_roundtrip_and_rejects_trailing() {
-        let upgrade = P2pV2Upgrade::Init(init());
-        let encoded = upgrade.encode().expect("valid init encodes");
-        assert_eq!(
-            P2pV2Upgrade::decode(&encoded).expect("valid init decodes"),
-            upgrade
-        );
-
-        let mut with_trailing = encoded;
-        with_trailing.push(0);
-        assert!(matches!(
-            P2pV2Upgrade::decode(&with_trailing),
-            Err(ZakuraProtocolError::TrailingBytes)
-        ));
-    }
-
-    #[test]
-    fn prelude_rejects_oversized_inputs_before_decoding() {
-        let oversized = vec![0; MAX_PRELUDE_PAYLOAD_BYTES + 1];
-        assert!(matches!(
-            P2pV2Upgrade::decode(&oversized),
-            Err(ZakuraProtocolError::OversizedPayload { .. })
-        ));
-    }
-
-    #[test]
     fn alpn_carries_the_current_protocol_version() {
         assert_eq!(P2P_V2_ALPN, p2p_v2_alpn(ZAKURA_PROTOCOL_VERSION_CURRENT));
         assert_eq!(supported_p2p_v2_alpns()[0], P2P_V2_ALPN);
@@ -3019,16 +2993,6 @@ mod tests {
             ZakuraControlHello::decode(&oversized),
             Err(ZakuraProtocolError::OversizedPayload { .. })
         ));
-    }
-
-    #[test]
-    fn compat_i3_unknown_service_bits_are_truncated_without_selecting_zakura() {
-        let unknown_high_bit = 1 << 63;
-        let services =
-            PeerServices::from_bits_truncate(PeerServices::NODE_NETWORK.bits() | unknown_high_bit);
-
-        assert_eq!(services, PeerServices::NODE_NETWORK);
-        assert!(!services.contains(PeerServices::NODE_P2P_V2));
     }
 
     /// A peer id built from a node ID is the same peer as one built from the

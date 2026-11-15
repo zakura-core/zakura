@@ -81,7 +81,11 @@ use std::{
 };
 
 use eyre::{eyre, Report};
-use futures::{future::OptionFuture, FutureExt};
+use futures::{
+    future::BoxFuture,
+    stream::{FuturesUnordered, StreamExt},
+    FutureExt,
+};
 use tokio::{
     pin, select,
     sync::{mpsc, oneshot, watch},
@@ -202,20 +206,86 @@ fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
     config.v2_p2p()
 }
 
+/// The tasks spawned by the `start` command, which are all aborted when this is dropped.
 #[derive(Default)]
-// Keeps track of `JoinHandle`s, and when `Drop`ped, `aborts` all of them.
-struct NodeTasks(Vec<AbortHandle>);
+struct NodeTasks {
+    /// Tasks that are only aborted on drop.
+    tracked: Vec<AbortHandle>,
+    /// Tasks whose exit stops the node.
+    supervised: Vec<AbortHandle>,
+    /// The exit statuses of the supervised tasks.
+    supervised_exits: FuturesUnordered<BoxFuture<'static, Result<(), Report>>>,
+}
 
 impl NodeTasks {
+    /// Aborts `task` when the node tasks are dropped.
     fn track<T>(&mut self, task: &JoinHandle<T>) {
-        self.0.push(task.abort_handle());
+        self.tracked.push(task.abort_handle());
+    }
+
+    /// Stops the node when `task` exits, with the status `exit_status` gives its output.
+    ///
+    /// `name` identifies the task in logs and panic messages. The task is also aborted by
+    /// [`Self::abort_supervised`], and when the node tasks are dropped.
+    fn supervise<T: Send + 'static>(
+        &mut self,
+        name: &'static str,
+        task: JoinHandle<T>,
+        exit_status: impl FnOnce(T) -> Result<(), Report> + Send + 'static,
+    ) {
+        self.supervised.push(task.abort_handle());
+        self.supervised_exits.push(
+            async move {
+                let output = task.await.unwrap_or_else(|error| {
+                    panic!("unexpected panic in the {name} task: {error:?}")
+                });
+                exit_status(output).map(|()| info!("{name} task exited"))
+            }
+            .boxed(),
+        );
+    }
+
+    /// Stops the node without an error when the server `task` exits, and logs the server's result.
+    fn supervise_server(
+        &mut self,
+        name: &'static str,
+        task: JoinHandle<Result<(), tower::BoxError>>,
+    ) {
+        self.supervise(name, task, move |server_result| {
+            info!(?server_result, "{name} server stopped");
+            Ok(())
+        });
+    }
+
+    /// Waits for a supervised task to exit, and returns its exit status.
+    ///
+    /// Returns `None` if every supervised task's exit has already been returned.
+    ///
+    /// # Panics
+    ///
+    /// If the task panicked or was aborted.
+    async fn next_supervised_exit(&mut self) -> Option<Result<(), Report>> {
+        self.supervised_exits.next().await
+    }
+
+    /// Aborts the supervised tasks.
+    fn abort_supervised(&self) {
+        self.supervised.iter().for_each(AbortHandle::abort);
     }
 }
 
 impl Drop for NodeTasks {
     fn drop(&mut self) {
-        self.0.iter().for_each(AbortHandle::abort);
+        self.tracked
+            .iter()
+            .chain(&self.supervised)
+            .for_each(AbortHandle::abort);
     }
+}
+
+/// The exit status of a task that can fail with an error other than a [`Report`].
+fn error_exit_status<E: Into<tower::BoxError>>(result: Result<(), E>) -> Result<(), Report> {
+    result.map_err(|error| eyre!(error.into()))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -754,7 +824,7 @@ impl StartCmd {
         let submit_block_channel = EarlyMinedBlockChannel::new();
 
         // Launch RPC server
-        let (rpc_impl, mut rpc_tx_queue_handle) = zakura_rpc::node::new_rpc_impl(
+        let (rpc_impl, rpc_tx_queue_handle) = zakura_rpc::node::new_rpc_impl(
             config.network.network.clone(),
             config.mining.clone(),
             config.rpc.debug_force_finished_sync,
@@ -777,7 +847,7 @@ impl StartCmd {
         let rpc_impl = rpc_impl
             .with_template_trace(template_path_trace)
             .with_local_services(config.network.handshake_services(advertised_services));
-        node_tasks.track(&rpc_tx_queue_handle);
+        node_tasks.supervise("rpc transaction queue", rpc_tx_queue_handle, Ok);
 
         let node_services = ready.as_ref().map(|_| crate::node::NodeServices {
             read_state: read_only_state_service.clone(),
@@ -787,23 +857,20 @@ impl StartCmd {
             mempool: mempool.clone(),
         });
 
-        let rpc_task_handle = if config.rpc.listen_addr.is_some() {
-            zakura_rpc::node::start_server(&rpc_impl, config.rpc.clone())
+        if config.rpc.listen_addr.is_some() {
+            let rpc_task_handle = zakura_rpc::node::start_server(&rpc_impl, config.rpc.clone())
                 .await
-                .expect("server should start")
-        } else {
-            spawn_erased(std::future::pending().in_current_span())
-        };
-        node_tasks.track(&rpc_task_handle);
+                .expect("server should start");
+            node_tasks.supervise_server("rpc", rpc_task_handle);
+        }
 
-        let admin_rpc_task_handle = if config.rpc.admin_listen_addr.is_some() {
-            zakura_rpc::node::start_admin_server(&rpc_impl, config.rpc.clone())
-                .await
-                .expect("admin server should start")
-        } else {
-            spawn_erased(std::future::pending().in_current_span())
-        };
-        node_tasks.track(&admin_rpc_task_handle);
+        if config.rpc.admin_listen_addr.is_some() {
+            let admin_rpc_task_handle =
+                zakura_rpc::node::start_admin_server(&rpc_impl, config.rpc.clone())
+                    .await
+                    .expect("admin server should start");
+            node_tasks.supervise_server("admin rpc", admin_rpc_task_handle);
+        }
 
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
@@ -838,7 +905,7 @@ impl StartCmd {
 
         // TODO: Add a shutdown signal and start the server with `serve_with_incoming_shutdown()` if
         //       any related unit tests sometimes crash with memory errors
-        let indexer_rpc_task_handle = match config.rpc.indexer_listen_addr {
+        match config.rpc.indexer_listen_addr {
             #[cfg(feature = "indexer-rpc")]
             Some(indexer_listen_addr) => {
                 info!("spawning indexer RPC server");
@@ -853,7 +920,7 @@ impl StartCmd {
                     .await
                     .map_err(|err| eyre!(err))?;
 
-                indexer_rpc_task_handle
+                node_tasks.supervise_server("indexer rpc", indexer_rpc_task_handle);
             }
             #[cfg(not(feature = "indexer-rpc"))]
             Some(_) => {
@@ -865,12 +932,8 @@ impl StartCmd {
             None => {
                 #[cfg(feature = "indexer-rpc")]
                 warn!("configure an indexer_listen_addr to start the indexer RPC server");
-                spawn_erased(
-                    std::future::pending::<Result<(), tower::BoxError>>().in_current_span(),
-                )
             }
-        };
-        node_tasks.track(&indexer_rpc_task_handle);
+        }
 
         // Start concurrent tasks which don't add load to other tasks
         info!("spawning block gossip task");
@@ -885,12 +948,20 @@ impl StartCmd {
             )
             .in_current_span(),
         );
-        node_tasks.track(&block_gossip_task_handle);
+        node_tasks.supervise(
+            "chain tip block gossip",
+            block_gossip_task_handle,
+            error_exit_status,
+        );
 
         info!("spawning mempool queue checker task");
         let mempool_queue_checker_task_handle =
             mempool::QueueChecker::spawn(mempool.clone(), mempool_verification_finished);
-        node_tasks.track(&mempool_queue_checker_task_handle);
+        node_tasks.supervise(
+            "mempool queue checker",
+            mempool_queue_checker_task_handle,
+            error_exit_status,
+        );
 
         info!("spawning mempool transaction gossip task");
         let tx_gossip_task_handle = spawn_erased(
@@ -901,7 +972,11 @@ impl StartCmd {
             )
             .in_current_span(),
         );
-        node_tasks.track(&tx_gossip_task_handle);
+        node_tasks.supervise(
+            "transaction gossip",
+            tx_gossip_task_handle,
+            error_exit_status,
+        );
 
         info!("spawning delete old databases task");
         let mut old_databases_task_handle = zakura_state::check_and_delete_old_state_databases(
@@ -922,7 +997,8 @@ impl StartCmd {
             )
             .in_current_span(),
         );
-        node_tasks.track(&progress_task_handle);
+        // The progress task runs forever, unless it panics.
+        node_tasks.supervise("chain progress", progress_task_handle, |never| never);
 
         // Start health server if configured
         info!("initializing health endpoints");
@@ -943,7 +1019,9 @@ impl StartCmd {
             sync::end_of_support::start(config.network.network.clone(), latest_chain_tip.clone())
                 .in_current_span(),
         );
-        node_tasks.track(&end_of_support_task_handle);
+        node_tasks.supervise("end of support", end_of_support_task_handle, |result| {
+            result
+        });
 
         // Give the inbound service more time to clear its queue,
         // then start concurrent tasks that can add load to the inbound service
@@ -959,7 +1037,11 @@ impl StartCmd {
             sync_status.clone(),
             chain_tip_change.clone(),
         );
-        node_tasks.track(&mempool_crawler_task_handle);
+        node_tasks.supervise(
+            "mempool crawler",
+            mempool_crawler_task_handle,
+            error_exit_status,
+        );
 
         info!("spawning syncer task");
         // In regtest, commit the genesis block directly (bypassing the syncer's genesis
@@ -1017,18 +1099,14 @@ impl StartCmd {
         } else {
             spawn_erased(syncer.sync().in_current_span())
         };
-        node_tasks.track(&syncer_task_handle);
+        node_tasks.supervise("syncer", syncer_task_handle, |result| result);
 
         // And finally, spawn the internal Zcash miner, if it is compiled in and enabled.
         #[cfg(feature = "internal-miner")]
-        let mut miner_task_handle = config.mining.is_internal_miner_enabled().then(|| {
+        if config.mining.is_internal_miner_enabled() {
             info!("spawning Zcash miner");
-            components::miner::spawn_init(&config.metrics, rpc_impl)
-        });
-        #[cfg(not(feature = "internal-miner"))]
-        let mut miner_task_handle: Option<JoinHandle<Result<(), Report>>> = None;
-        if let Some(miner_task_handle) = &miner_task_handle {
-            node_tasks.track(miner_task_handle);
+            let miner_task_handle = components::miner::spawn_init(&config.metrics, rpc_impl);
+            node_tasks.supervise("miner", miner_task_handle, |result| result);
         }
 
         info!("spawned initial Zakura tasks");
@@ -1050,20 +1128,6 @@ impl StartCmd {
         if let Some((ready, services)) = ready.zip(node_services) {
             let _ = ready.send(services);
         }
-
-        // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
-
-        // ongoing tasks
-        pin!(rpc_task_handle);
-        pin!(admin_rpc_task_handle);
-        pin!(indexer_rpc_task_handle);
-        pin!(syncer_task_handle);
-        pin!(block_gossip_task_handle);
-        pin!(mempool_crawler_task_handle);
-        pin!(mempool_queue_checker_task_handle);
-        pin!(tx_gossip_task_handle);
-        pin!(progress_task_handle);
-        pin!(end_of_support_task_handle);
 
         // startup tasks
         let BackgroundTaskHandles {
@@ -1126,37 +1190,8 @@ impl StartCmd {
                     }
                 },
 
-                rpc_join_result = &mut rpc_task_handle => {
-                    let rpc_server_result = rpc_join_result
-                        .expect("unexpected panic in the rpc task");
-                    info!(?rpc_server_result, "rpc task exited");
-                    Ok(())
-                }
-
-                admin_rpc_join_result = &mut admin_rpc_task_handle => {
-                    let admin_rpc_server_result = admin_rpc_join_result
-                        .expect("unexpected panic in the admin rpc task");
-                    info!(?admin_rpc_server_result, "admin rpc task exited");
-                    Ok(())
-                }
-
-                rpc_tx_queue_result = &mut rpc_tx_queue_handle => {
-                    rpc_tx_queue_result
-                        .expect("unexpected panic in the rpc transaction queue task");
-                    info!("rpc transaction queue task exited");
-                    Ok(())
-                }
-
-                indexer_rpc_join_result = &mut indexer_rpc_task_handle => {
-                    let indexer_rpc_server_result = indexer_rpc_join_result
-                        .expect("unexpected panic in the indexer task");
-                    info!(?indexer_rpc_server_result, "indexer rpc task exited");
-                    Ok(())
-                }
-
-                sync_result = &mut syncer_task_handle => sync_result
-                    .expect("unexpected panic in the syncer task")
-                    .map(|_| info!("syncer task exited")),
+                // An ongoing task exited. There is always a syncer task.
+                Some(supervised_exit) = node_tasks.next_supervised_exit() => supervised_exit,
 
                 blocksync_throughput_result = async {
                     blocksync_throughput_completion_rx
@@ -1169,38 +1204,6 @@ impl StartCmd {
                     Self::log_blocksync_throughput_summary(summary);
                     Ok(())
                 }
-
-                block_gossip_result = &mut block_gossip_task_handle => block_gossip_result
-                    .expect("unexpected panic in the chain tip block gossip task")
-                    .map(|_| info!("chain tip block gossip task exited"))
-                    .map_err(|e| eyre!(e)),
-
-                mempool_crawl_result = &mut mempool_crawler_task_handle => mempool_crawl_result
-                    .expect("unexpected panic in the mempool crawler")
-                    .map(|_| info!("mempool crawler task exited"))
-                    .map_err(|e| eyre!(e)),
-
-                mempool_queue_result = &mut mempool_queue_checker_task_handle => mempool_queue_result
-                    .expect("unexpected panic in the mempool queue checker")
-                    .map(|_| info!("mempool queue checker task exited"))
-                    .map_err(|e| eyre!(e)),
-
-                tx_gossip_result = &mut tx_gossip_task_handle => tx_gossip_result
-                    .expect("unexpected panic in the transaction gossip task")
-                    .map(|_| info!("transaction gossip task exited"))
-                    .map_err(|e| eyre!(e)),
-
-                // The progress task runs forever, unless it panics.
-                // So we don't need to provide an exit status for it.
-                progress_result = &mut progress_task_handle => {
-                    info!("chain progress task exited");
-                    progress_result
-                        .expect("unexpected panic in the chain progress task");
-                }
-
-                end_of_support_result = &mut end_of_support_task_handle => end_of_support_result
-                    .expect("unexpected panic in the end of support task")
-                    .map(|_| info!("end of support task exited")),
 
                 // We also expect the state checkpoint verify task to finish.
                 state_checkpoint_verify_result = &mut state_checkpoint_verify_handle_fused => {
@@ -1221,11 +1224,6 @@ impl StartCmd {
                     exit_when_task_finishes = false;
                     Ok(())
                 }
-
-                // Without a miner task this branch is disabled, because the future yields `None`.
-                Some(miner_result) = OptionFuture::from(miner_task_handle.as_mut()) => miner_result
-                    .expect("unexpected panic in the miner task")
-                    .map(|_| info!("miner task exited")),
 
                     zcashd_compat_result = &mut zcashd_compat_task_handle_fused => {
                         zcashd_compat_task_finished = true;
@@ -1252,20 +1250,8 @@ impl StartCmd {
         zakura_chain::shutdown::set_shutting_down();
 
         // ongoing tasks
-        rpc_task_handle.abort();
-        admin_rpc_task_handle.abort();
-        rpc_tx_queue_handle.abort();
+        node_tasks.abort_supervised();
         health_task_handle.abort();
-        syncer_task_handle.abort();
-        block_gossip_task_handle.abort();
-        mempool_crawler_task_handle.abort();
-        mempool_queue_checker_task_handle.abort();
-        tx_gossip_task_handle.abort();
-        progress_task_handle.abort();
-        end_of_support_task_handle.abort();
-        if let Some(miner_task_handle) = &miner_task_handle {
-            miner_task_handle.abort();
-        }
         if let Some(zakura_endpoint_shutdown_task) = zakura_endpoint_shutdown_task {
             zakura_endpoint_shutdown_task
                 .await

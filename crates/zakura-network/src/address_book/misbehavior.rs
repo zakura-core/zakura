@@ -92,6 +92,18 @@ impl MisbehaviorReporter {
             .get(canonical_ip(ip))
     }
 
+    /// Runs `f` with read access to every misbehavior score, under one lock.
+    ///
+    /// Use this to check many addresses at once. Reports wait while `f` runs, so keep
+    /// it to score lookups. `f` must not report misbehavior: the lock is not reentrant.
+    pub(crate) fn with_scores<T>(&self, f: impl FnOnce(&Scores<'_>) -> T) -> T {
+        let table = self
+            .scores
+            .lock()
+            .expect("score table lock should not be poisoned");
+        f(&Scores { table: &table })
+    }
+
     /// Returns the ban list this reporter bans IP addresses in.
     pub(crate) fn bans(&self) -> BannedIps {
         self.bans.clone()
@@ -100,6 +112,19 @@ impl MisbehaviorReporter {
     /// Returns whether `ip` is banned.
     pub fn is_banned(&self, ip: IpAddr) -> bool {
         self.bans.contains(ip)
+    }
+}
+
+/// Read access to the misbehavior scores, from [`MisbehaviorReporter::with_scores`].
+pub(crate) struct Scores<'a> {
+    /// The locked score table.
+    table: &'a ScoreTable,
+}
+
+impl Scores<'_> {
+    /// Returns whether `ip` has a misbehavior score.
+    pub(crate) fn is_scored(&self, ip: IpAddr) -> bool {
+        self.table.get(canonical_ip(ip)) != 0
     }
 }
 
@@ -210,6 +235,27 @@ mod tests {
 
         reporter.report(mapped, constants::MAX_PEER_MISBEHAVIOR_SCORE);
         assert!(reporter.is_banned(Ipv4Addr::LOCALHOST.into()));
+    }
+
+    /// Score lookups match the canonical IP of a scored address, and miss IPs whose
+    /// ban cleared their score.
+    #[test]
+    fn with_scores_looks_up_canonical_scored_ips() {
+        let reporter = reporter();
+        let localhost = Ipv4Addr::new(127, 0, 0, 1);
+        let mapped = PeerSocketAddr::from(SocketAddr::new(localhost.to_ipv6_mapped().into(), 8233));
+        let banned = peer_addr([127, 0, 0, 2], 8233);
+        let unscored = peer_addr([127, 0, 0, 3], 8233);
+
+        reporter.report(mapped, 1);
+        reporter.report(banned, constants::MAX_PEER_MISBEHAVIOR_SCORE);
+
+        reporter.with_scores(|scores| {
+            assert!(scores.is_scored(localhost.into()));
+            assert!(scores.is_scored(mapped.ip()));
+            assert!(!scores.is_scored(banned.ip()));
+            assert!(!scores.is_scored(unscored.ip()));
+        });
     }
 
     /// Reports from many threads at once all count: none of them is dropped.

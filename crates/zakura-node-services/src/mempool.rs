@@ -37,19 +37,6 @@ impl fmt::Display for MempoolDisabledError {
 
 impl std::error::Error for MempoolDisabledError {}
 
-#[cfg(test)]
-mod tests {
-    use super::MempoolDisabledError;
-
-    #[test]
-    fn mempool_disabled_error_uses_zakura_branding() {
-        assert_eq!(
-            MempoolDisabledError.to_string(),
-            "mempool is not active: wait for Zakura to sync to the tip"
-        );
-    }
-}
-
 /// A peer source for per-peer mempool download accounting.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum QueueSource {

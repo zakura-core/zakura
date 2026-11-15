@@ -407,8 +407,9 @@ pub struct Config {
     /// like a listed address, and the peer counts as connected, wherever it is. Otherwise
     /// the name has no such address. So a changed DNS answer, or someone else at the
     /// peer's old address, gets nothing. Only a peer that upgrades to P2P v2 can prove its
-    /// node ID, so a pin needs `p2p_stack = "dual"`, and Zakura refuses to start with one
-    /// otherwise. Zakura warns
+    /// node ID, so Zakura closes a connection to the name's address that stays on the
+    /// legacy protocol, warns, and dials the next address later. A pin needs
+    /// `p2p_stack = "dual"`, and Zakura refuses to start with one otherwise. Zakura warns
     /// about each DNS name without a pin when it runs both stacks.
     ///
     /// Each dialed address adds one outbound and one inbound connection slot on top of the

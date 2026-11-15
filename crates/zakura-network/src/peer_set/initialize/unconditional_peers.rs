@@ -367,6 +367,27 @@ fn warn_about_addrs_over_the_ip_limit(dial_addrs: &[PeerSocketAddr], config: &Co
     }
 }
 
+/// Reports that a connection at `addr`, the address of the pinned peer `peer`, does not
+/// prove its node ID: the pin is wrong, or the peer can't upgrade to P2P v2. Warns once
+/// until the peer next proves its node ID, then logs at debug.
+fn report_unproven_connection(peer: &mut RedialState, addr: PeerSocketAddr, config: &Config) {
+    let peer_label = addr.addr_label(config.expose_peer_addresses);
+
+    if !peer.warned_unproven {
+        peer.warned_unproven = true;
+        warn!(
+            peer = %peer_label,
+            "a connection at an unconditional peer's address did not prove its pinned node \
+             ID, so the address is not exempt. Check the pin, and that the peer runs P2P v2"
+        );
+    } else {
+        debug!(
+            peer = %peer_label,
+            "a connection at an unconditional peer's address did not prove its pinned node ID"
+        );
+    }
+}
+
 /// Warns about each of `names` that is not pinned to a node ID, on a node that can check
 /// one.
 ///
@@ -403,7 +424,8 @@ fn warn_about_unpinned_names(names: &[UnconditionalPeerName], config: &Config) {
 ///
 /// A name pinned to a node ID is dialed the same way, but its address is only exempt
 /// while a native connection proves the ID, see [`exempt_proven_address`], and its peer
-/// only counts as connected then, see [`is_peer_connected`].
+/// only counts as connected then, see [`is_peer_connected`]. A dial to it that ends in a
+/// legacy connection cannot prove the ID, so Zakura closes it instead of keeping it.
 ///
 /// An attempt that does not lead to a lasting connection doubles the peer's redial
 /// delay, from [`constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY`] up to
@@ -529,6 +551,11 @@ where
                         continue;
                     }
 
+                    let is_pinned = peer
+                        .name
+                        .as_ref()
+                        .is_some_and(|named| named.node_id.is_some());
+
                     let is_open = |addr: PeerSocketAddr| {
                         is_connected(addr, &connections, config.max_connections_per_ip)
                     };
@@ -599,27 +626,9 @@ where
                     // A name that has never resolved has no address to dial.
                     let Some(addr) = peer.addr.filter(|&addr| !is_open(addr)) else {
                         // A pinned peer is not connected, so a connection at its address
-                        // does not prove its node ID: the pin is wrong, or the peer can't
-                        // upgrade to P2P v2.
-                        if let (Some(NamedPeer { node_id: Some(_), .. }), Some(addr)) =
-                            (&peer.name, peer.addr)
-                        {
-                            let peer_label = addr.addr_label(expose_peer_addresses);
-                            if !peer.warned_unproven {
-                                peer.warned_unproven = true;
-                                warn!(
-                                    peer = %peer_label,
-                                    "an unconditional peer's address is connected without \
-                                     proving its pinned node ID, so it is not exempt. Check \
-                                     the pin, and that the peer runs P2P v2"
-                                );
-                            } else {
-                                debug!(
-                                    peer = %peer_label,
-                                    "an unconditional peer's address is connected without \
-                                     proving its pinned node ID"
-                                );
-                            }
+                        // does not prove its node ID.
+                        if let (true, Some(addr)) = (is_pinned, peer.addr) {
+                            report_unproven_connection(peer, addr, &config);
                         }
                         peer.is_attempting = false;
                         continue;
@@ -665,7 +674,19 @@ where
                         .take()
                         .expect("every dial sets `dialing` before it starts");
 
+                    let is_pinned = peer
+                        .name
+                        .as_ref()
+                        .is_some_and(|named| named.node_id.is_some());
+
                     match result.map(|peer| *peer) {
+                        // The upgrade to P2P v2 happens inside the legacy handshake, so a
+                        // dial that ends in a legacy connection cannot prove a pinned node
+                        // ID. Dropping the client closes it, so the next attempt dials the
+                        // name's next address without this one held open.
+                        Ok((addr, _client)) if is_pinned => {
+                            report_unproven_connection(peer, addr, &config);
+                        }
                         Ok((addr, client)) => {
                             info!(
                                 peer = %addr.addr_label(expose_peer_addresses),

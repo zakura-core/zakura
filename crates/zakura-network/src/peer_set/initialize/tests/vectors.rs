@@ -1345,6 +1345,47 @@ async fn pinned_unconditional_peer_exempts_the_address_of_the_connection_that_pr
     );
 }
 
+/// A dial to a pinned name that ends in a legacy connection cannot prove its node ID, so
+/// Zakura closes it instead of sending it to the peer set, and dials the name's next
+/// address on its next attempt. A name whose addresses never prove the ID holds no
+/// connections open.
+#[tokio::test(start_paused = true)]
+async fn pinned_unconditional_peer_name_closes_legacy_connections() {
+    let _init_guard = zakura_test::init();
+
+    let (node_id, _peer_id) = test_node_id();
+    let config: Config = toml::from_str(&format!(
+        "p2p_stack = 'dual'\nunconditional_peers = ['{node_id}@peer.example.com:18233']"
+    ))
+    .unwrap();
+    let mut dialer = spawn_unconditional_peer_dialer(
+        config,
+        PeerRegistry::default(),
+        UnconditionalPeerDial::ConnectThenClose,
+    );
+
+    dialer.set_lookup(Some(&[
+        "192.0.2.1:18233",
+        "192.0.2.2:18233",
+        "192.0.2.3:18233",
+    ]));
+    dialer.wait_for_dial_after(2).await;
+
+    assert_eq!(
+        dialer.dial_addrs()[..3],
+        [
+            peer_addr("192.0.2.1:18233"),
+            peer_addr("192.0.2.2:18233"),
+            peer_addr("192.0.2.3:18233"),
+        ],
+        "each attempt dials the next address",
+    );
+    assert!(
+        dialer.peerset_rx.try_recv().is_err(),
+        "no legacy connection reaches the peer set",
+    );
+}
+
 /// Returns a valid node ID in its text form, and the peer id of that node ID.
 fn test_node_id() -> (&'static str, ZakuraPeerId) {
     let (node_id, _addr) = DEFAULT_ZAKURA_BOOTSTRAP_PEERS[0]

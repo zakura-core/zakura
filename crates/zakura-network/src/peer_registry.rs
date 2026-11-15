@@ -102,6 +102,29 @@ impl PeerRegistry {
             .collect()
     }
 
+    /// Returns the remote address of the authenticated native connection of `peer_id`.
+    ///
+    /// Returns `None` when no native connection proves `peer_id`, and `Some(None)` when
+    /// one does but carries no legacy handshake metadata, such as a connection that
+    /// started on the native stack.
+    pub(crate) fn native_connection_addr(
+        &self,
+        peer_id: &ZakuraPeerId,
+    ) -> Option<Option<PeerSocketAddr>> {
+        let state = self
+            .inner
+            .lock()
+            .expect("peer registry mutex is never poisoned");
+        let conn_id = *state.native_conn_ids.get(peer_id)?;
+
+        Some(
+            state
+                .active_connections
+                .get(&ConnectionKey::Native(peer_id.clone(), conn_id))
+                .map(|peer| peer.addr),
+        )
+    }
+
     /// Register one legacy connection until the returned guard drops.
     pub(crate) fn register_legacy(
         &self,

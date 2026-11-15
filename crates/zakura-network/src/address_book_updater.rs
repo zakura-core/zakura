@@ -108,7 +108,7 @@ impl AddressBookUpdater {
                 let dns_names: Vec<_> = config
                     .unconditional_peers
                     .dial_names()
-                    .map(|(name, port)| format!("{name}:{port}"))
+                    .map(ToString::to_string)
                     .collect();
                 info!(
                     ?unconditional_peers,

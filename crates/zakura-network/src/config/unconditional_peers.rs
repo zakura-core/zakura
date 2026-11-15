@@ -1,12 +1,14 @@
 //! Unconditional peer configuration for zakura-network.
 
 use std::{
+    fmt,
     net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
 };
 
 use ipnet::IpNet;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use zakura_quic::NodeId;
 
 use crate::{
     protocol::external::{canonical_ip, canonical_peer_addr},
@@ -28,7 +30,8 @@ use crate::{
 ///
 /// A DNS name stands for the one address that its dialer last resolved it to, see
 /// [`set_resolved_ip`](Self::set_resolved_ip). That address is treated like a listed
-/// single address until the name resolves to another one.
+/// single address until the name resolves to another one. A name can be pinned to a
+/// node ID, such as `<node id>@peer.example.com:8233`, see [`UnconditionalPeerName`].
 ///
 /// The list is cheap to clone, so every component that needs it can hold a copy. Every
 /// copy sees the latest resolved addresses.
@@ -37,8 +40,8 @@ pub struct UnconditionalPeers {
     /// The configured addresses and ranges, in config order.
     entries: Arc<[Entry]>,
 
-    /// The configured DNS names and their ports, in config order.
-    names: Arc<[(Arc<str>, u16)]>,
+    /// The configured DNS names, in config order.
+    names: Arc<[UnconditionalPeerName]>,
 
     /// The canonical address that each name in `names` last resolved to, if any. It is
     /// only read when `names` is not empty.
@@ -54,6 +57,33 @@ impl PartialEq for UnconditionalPeers {
 }
 
 impl Eq for UnconditionalPeers {}
+
+/// A DNS name in [`UnconditionalPeers`], with its port and its pinned node ID, if any.
+///
+/// The address of a pinned name is only treated like a listed address while a P2P v2
+/// connection proves that the peer there holds the key of `node_id`. An unpinned name
+/// trusts its DNS answer: whoever is at that address is exempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnconditionalPeerName {
+    /// The DNS name.
+    pub name: Arc<str>,
+
+    /// The port that Zakura dials at each address of the name.
+    pub port: u16,
+
+    /// The node ID that the peer at the name's address must prove, if the entry pins one.
+    pub node_id: Option<NodeId>,
+}
+
+/// Writes the name in its config form, such as `<node id>@peer.example.com:8233`.
+impl fmt::Display for UnconditionalPeerName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(node_id) = self.node_id {
+            write!(f, "{node_id}@")?;
+        }
+        write!(f, "{}:{}", self.name, self.port)
+    }
+}
 
 /// One configured unconditional peer entry.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -120,16 +150,17 @@ impl UnconditionalPeers {
     }
 
     /// Records that the DNS name at `name_index` in [`dial_names`](Self::dial_names)
-    /// now resolves to `ip`. Every copy of this list then treats `ip` like a listed
-    /// single address, and no longer treats the name's previous address that way.
-    pub(crate) fn set_resolved_ip(&self, name_index: usize, ip: IpAddr) {
+    /// now stands for `ip`, or for no address when `ip` is `None`. Every copy of this
+    /// list then treats `ip` like a listed single address, and no longer treats the
+    /// name's previous address that way.
+    pub(crate) fn set_resolved_ip(&self, name_index: usize, ip: Option<IpAddr>) {
         let mut resolved_ips = self
             .resolved_ips
             .write()
             .expect("resolved address lock should not be poisoned");
 
         if let Some(resolved_ip) = resolved_ips.get_mut(name_index) {
-            *resolved_ip = Some(canonical_ip(ip));
+            *resolved_ip = ip.map(canonical_ip);
         }
     }
 
@@ -179,12 +210,17 @@ impl UnconditionalPeers {
     }
 
     /// Returns the DNS names that Zakura dials to stay connected to its unconditional
-    /// peers, with their ports, in config order.
+    /// peers, in config order.
     ///
     /// Zakura looks a name up before each dial and dials one of its addresses, see
     /// [`set_resolved_ip`](Self::set_resolved_ip).
-    pub fn dial_names(&self) -> impl Iterator<Item = (Arc<str>, u16)> + '_ {
-        self.names.iter().cloned()
+    pub fn dial_names(&self) -> impl Iterator<Item = &UnconditionalPeerName> {
+        self.names.iter()
+    }
+
+    /// Returns whether any DNS name is pinned to a node ID.
+    pub(crate) fn has_pinned_names(&self) -> bool {
+        self.names.iter().any(|name| name.node_id.is_some())
     }
 
     /// Returns the addresses Zakura dials to stay connected to its unconditional peers.
@@ -251,12 +287,17 @@ impl FromIterator<IpNet> for UnconditionalPeers {
     }
 }
 
-/// Parses a DNS name with a non-zero port, such as `peer.example.com:8233`.
-fn parse_name(entry: &str) -> Option<(Arc<str>, u16)> {
+/// Parses a DNS name with a non-zero port, such as `peer.example.com:8233`, pinned to
+/// `node_id` if it is given.
+fn parse_name(entry: &str, node_id: Option<NodeId>) -> Option<UnconditionalPeerName> {
     let (name, port) = entry.rsplit_once(':')?;
     let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
 
-    is_dns_name(name).then(|| (name.into(), port))
+    is_dns_name(name).then(|| UnconditionalPeerName {
+        name: name.into(),
+        port,
+        node_id,
+    })
 }
 
 /// Returns whether `name` is a DNS name: dot-separated labels of ASCII letters, digits
@@ -328,11 +369,10 @@ impl Serialize for UnconditionalPeers {
     {
         // Addresses and ranges come first, then DNS names.
         serializer.collect_seq(
-            self.entries.iter().map(format_entry).chain(
-                self.names
-                    .iter()
-                    .map(|(name, port)| format!("{name}:{port}")),
-            ),
+            self.entries
+                .iter()
+                .map(format_entry)
+                .chain(self.names.iter().map(UnconditionalPeerName::to_string)),
         )
     }
 }
@@ -346,16 +386,31 @@ impl<'de> Deserialize<'de> for UnconditionalPeers {
         let mut names = Vec::new();
 
         for entry in Vec::<String>::deserialize(deserializer)? {
-            if let Some(entry) = parse_entry(&entry) {
+            if let Some((node_id, name)) = entry.split_once('@') {
+                let node_id = node_id.parse().map_err(|error| {
+                    de::Error::custom(format!(
+                        "invalid node ID in network.unconditional_peers entry {entry:?}: {error}"
+                    ))
+                })?;
+                let name = parse_name(name, Some(node_id)).ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "invalid network.unconditional_peers entry {entry:?}: a node ID \
+                         can only pin a DNS name with a port, such as \
+                         <node id>@peer.example.com:8233"
+                    ))
+                })?;
+                names.push(name);
+            } else if let Some(entry) = parse_entry(&entry) {
                 entries.push(entry);
-            } else if let Some(name) = parse_name(&entry) {
+            } else if let Some(name) = parse_name(&entry, None) {
                 names.push(name);
             } else {
                 return Err(de::Error::custom(format!(
                     "invalid network.unconditional_peers entry {entry:?}: expected an IP \
-                     address, an IP address or DNS name with a port, or a canonical CIDR \
-                     range without host bits, such as 192.0.2.1, 192.0.2.1:8233, \
-                     peer.example.com:8233 or 2001:db8::/32"
+                     address, an IP address or DNS name with a port, a DNS name with a port \
+                     and a node ID, or a canonical CIDR range without host bits, such as \
+                     192.0.2.1, 192.0.2.1:8233, peer.example.com:8233, \
+                     <node id>@peer.example.com:8233 or 2001:db8::/32"
                 )));
             }
         }

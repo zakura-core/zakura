@@ -1203,7 +1203,7 @@ async fn pinned_unconditional_peer_name_is_exempt_only_while_its_node_id_is_prov
 
     // The connection upgrades to P2P v2, which proves the node ID, and the legacy
     // connection closes.
-    peer_registry.register_native_connection(peer_id.clone(), 1);
+    peer_registry.register_native_connection(peer_id.clone(), 1, Some(ip("192.0.2.1")));
     assert!(peer_registry.attach_native_metadata(
         peer_id.clone(),
         1,
@@ -1272,6 +1272,7 @@ async fn pinned_unconditional_peer_name_is_not_held_by_another_peer_at_its_addre
 #[tokio::test(start_paused = true)]
 async fn pinned_unconditional_peer_is_followed_to_the_address_that_proves_it() {
     let _init_guard = zakura_test::init();
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
 
     let (node_id, peer_id) = test_node_id();
     let config: Config = toml::from_str(&format!(
@@ -1280,7 +1281,7 @@ async fn pinned_unconditional_peer_is_followed_to_the_address_that_proves_it() {
     .unwrap();
     let unconditional_peers = config.unconditional_peers.clone();
     let peer_registry = PeerRegistry::default();
-    peer_registry.register_native_connection(peer_id.clone(), 1);
+    peer_registry.register_native_connection(peer_id.clone(), 1, Some(ip("198.51.100.7")));
     assert!(peer_registry.attach_native_metadata(
         peer_id,
         1,
@@ -1298,9 +1299,50 @@ async fn pinned_unconditional_peer_is_followed_to_the_address_that_proves_it() {
 
     assert_eq!(dialer.dial_addrs(), vec![], "a proven peer is not dialed");
     assert_eq!(dialer.lookups(), 0, "a proven peer is not looked up");
-    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
     assert!(unconditional_peers.contains(ip("198.51.100.7")));
     assert!(!unconditional_peers.contains(ip("192.0.2.1")));
+}
+
+/// A peer at a pinned name's address that only relays the upgrade, by advertising the
+/// real peer's node ID and P2P v2 address, gains nothing. The exempt address is the one
+/// the P2P v2 connection that proved the node ID comes from.
+#[tokio::test(start_paused = true)]
+async fn pinned_unconditional_peer_exempts_the_address_of_the_connection_that_proves_it() {
+    let _init_guard = zakura_test::init();
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+
+    let (node_id, peer_id) = test_node_id();
+    let config: Config = toml::from_str(&format!(
+        "p2p_stack = 'dual'\nunconditional_peers = ['{node_id}@peer.example.com:18233']"
+    ))
+    .unwrap();
+    let unconditional_peers = config.unconditional_peers.clone();
+    let peer_registry = PeerRegistry::default();
+    let dialer = spawn_unconditional_peer_dialer(
+        config,
+        peer_registry.clone(),
+        UnconditionalPeerDial::ConnectAndStayOpen,
+    );
+
+    dialer.set_lookup(Some(&["192.0.2.1:18233"]));
+    dialer.wait_for_dial_after(0).await;
+
+    // The legacy upgrade came from the relay at 192.0.2.1, but the P2P v2 connection
+    // reached the real peer at 203.0.113.9.
+    peer_registry.register_native_connection(peer_id.clone(), 1, Some(ip("203.0.113.9")));
+    assert!(peer_registry.attach_native_metadata(
+        peer_id,
+        1,
+        connected_peer(peer_addr("192.0.2.1:18233"), false),
+        true,
+    ));
+    tokio::time::sleep(constants::UNCONDITIONAL_PEER_CHECK_INTERVAL * 2).await;
+
+    assert!(unconditional_peers.contains(ip("203.0.113.9")));
+    assert!(
+        !unconditional_peers.contains(ip("192.0.2.1")),
+        "the relay's address is not exempt",
+    );
 }
 
 /// Returns a valid node ID in its text form, and the peer id of that node ID.

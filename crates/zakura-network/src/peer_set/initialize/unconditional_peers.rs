@@ -276,16 +276,19 @@ fn is_peer_connected(
         Some(NamedPeer {
             node_id: Some(node_id),
             ..
-        }) => peer_registry.native_connection_addr(node_id).is_some(),
+        }) => peer_registry.native_connection_ip(node_id).is_some(),
         _ => peer
             .addr
             .is_some_and(|addr| is_connected(addr, connections, max_connections_per_ip)),
     }
 }
 
-/// Exempts the address of the native connection that proves `peer`'s pinned node ID, or
-/// no address while no connection proves it, see
+/// Exempts the IP that the native connection proving `peer`'s pinned node ID was opened
+/// from, or no address while no connection proves it, see
 /// [`UnconditionalPeers::set_resolved_ip`]. Does nothing for a peer without a pin.
+///
+/// The redial loop calls this once per check, so the exemption follows a connection
+/// within [`constants::UNCONDITIONAL_PEER_CHECK_INTERVAL`].
 ///
 /// [`UnconditionalPeers::set_resolved_ip`]: crate::UnconditionalPeers::set_resolved_ip
 fn exempt_proven_address(peer: &RedialState, peer_registry: &PeerRegistry, config: &Config) {
@@ -295,15 +298,15 @@ fn exempt_proven_address(peer: &RedialState, peer_registry: &PeerRegistry, confi
         ..
     }) = &peer.name
     {
-        let proven_addr = peer_registry.native_connection_addr(node_id).flatten();
+        let proven_ip = peer_registry.native_connection_ip(node_id).flatten();
         let changed = config
             .unconditional_peers
-            .set_resolved_ip(*index, proven_addr.map(|addr| addr.ip()));
+            .set_resolved_ip(*index, proven_ip);
 
         if changed {
-            match proven_addr {
-                Some(addr) => info!(
-                    peer = %addr.addr_label(config.expose_peer_addresses),
+            match proven_ip {
+                Some(ip) => info!(
+                    ip = ?config.expose_peer_addresses.then_some(ip),
                     "an unconditional peer proved its pinned node ID, so its address is exempt"
                 ),
                 None => info!(

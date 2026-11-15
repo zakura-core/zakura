@@ -402,12 +402,13 @@ pub struct Config {
     /// lookup, so they keep no room for a name's address.
     ///
     /// A DNS name pinned to a node ID, the 64 hex characters that `zakura.bootstrap_peers`
-    /// entries start with, is dialed in the same way. Its address is only treated like a
-    /// listed address while a P2P v2 connection proves that the peer holds that node ID,
-    /// and the peer only counts as connected then, from whatever address it uses. So a
-    /// changed DNS answer, or someone else at the peer's old address, gets nothing. Only a
-    /// peer that upgrades to P2P v2 can prove its node ID, so a pin needs
-    /// `p2p_stack = "dual"`, and Zakura refuses to start with one otherwise. Zakura warns
+    /// entries start with, is dialed in the same way. While a P2P v2 connection proves
+    /// that the peer holds that node ID, the IP that connection was opened from is treated
+    /// like a listed address, and the peer counts as connected, wherever it is. Otherwise
+    /// the name has no such address. So a changed DNS answer, or someone else at the
+    /// peer's old address, gets nothing. Only a peer that upgrades to P2P v2 can prove its
+    /// node ID, so a pin needs `p2p_stack = "dual"`, and Zakura refuses to start with one
+    /// otherwise. Zakura warns
     /// about each DNS name without a pin when it runs both stacks.
     ///
     /// Each dialed address adds one outbound and one inbound connection slot on top of the

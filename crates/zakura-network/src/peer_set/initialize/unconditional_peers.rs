@@ -85,6 +85,10 @@ struct RedialState {
     /// The address of this peer's dial in flight, if any. It counts against the per-IP
     /// limit before it finishes, see [`connections_with_dials_in_flight`].
     dialing: Option<PeerSocketAddr>,
+
+    /// Whether Zakura has warned that a connection at this pinned peer's address does not
+    /// prove its node ID, since the peer last proved it.
+    warned_unproven: bool,
 }
 
 /// A finished step of an attempt to connect to the peer at `index`.
@@ -482,6 +486,7 @@ where
             has_attempted: false,
             connected_since: None,
             dialing: None,
+            warned_unproven: false,
         })
         .collect();
 
@@ -591,17 +596,19 @@ where
                     // A name that has never resolved has no address to dial.
                     let Some(addr) = peer.addr.filter(|&addr| !is_open(addr)) else {
                         // A pinned peer is not connected, so a connection at its address
-                        // does not prove its node ID. The attempt after the first dial is
-                        // the first that can find that connection.
+                        // does not prove its node ID: the pin is wrong, or the peer can't
+                        // upgrade to P2P v2.
                         if let (Some(NamedPeer { node_id: Some(_), .. }), Some(addr)) =
                             (&peer.name, peer.addr)
                         {
                             let peer_label = addr.addr_label(expose_peer_addresses);
-                            if peer.attempts <= 2 {
-                                info!(
+                            if !peer.warned_unproven {
+                                peer.warned_unproven = true;
+                                warn!(
                                     peer = %peer_label,
                                     "an unconditional peer's address is connected without \
-                                     proving its pinned node ID, so it is not exempt"
+                                     proving its pinned node ID, so it is not exempt. Check \
+                                     the pin, and that the peer runs P2P v2"
                                 );
                             } else {
                                 debug!(
@@ -726,6 +733,7 @@ where
                         &connections,
                         config.max_connections_per_ip,
                     ) {
+                        peer.warned_unproven = false;
                         let connected_since = *peer.connected_since.get_or_insert(now);
                         if now.saturating_duration_since(connected_since)
                             >= constants::UNCONDITIONAL_PEER_HEALTHY_CONNECTION

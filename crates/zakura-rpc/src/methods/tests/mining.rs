@@ -273,12 +273,13 @@ fn mining_rpc(
     (rpc, sender, verifier)
 }
 
-/// How long a slow mempool fetch from [`counting_mining_rpc`] lasts. It outlasts the
-/// refresh deadline in `long_poll_refresh_deadline_survives_slow_mempool_fetch`.
-const SLOW_MEMPOOL_FETCH: Duration = Duration::from_secs(5);
+/// Test only: how long the fake mempool in [`counting_mining_rpc`] takes to answer when
+/// asked to be slow. It isn't a node setting. It must outlast the refresh deadline in
+/// `long_poll_refresh_deadline_survives_slow_mempool_fetch`.
+const TEST_SLOW_MEMPOOL_FETCH: Duration = Duration::from_secs(5);
 
 /// Returns a mining RPC whose state reads come from `info`, with its tip sender, a count of
-/// chain info reads, and a flag that makes the next mempool fetch last [`SLOW_MEMPOOL_FETCH`].
+/// chain info reads, and a flag that makes the next mempool fetch last [`TEST_SLOW_MEMPOOL_FETCH`].
 fn counting_mining_rpc(
     info: watch::Receiver<GetBlockTemplateChainInfo>,
 ) -> (
@@ -313,7 +314,7 @@ fn counting_mining_rpc(
         let slow = slow.swap(false, Ordering::SeqCst);
         async move {
             if slow {
-                tokio::time::sleep(SLOW_MEMPOOL_FETCH).await;
+                tokio::time::sleep(TEST_SLOW_MEMPOOL_FETCH).await;
             }
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
                 transactions: vec![],
@@ -1044,7 +1045,7 @@ fn long_poll_refresh_deadline_survives_slow_mempool_fetch() {
         assert!(futures::poll!(&mut request).is_pending());
         let reads_before_expiry = read_count.load(Ordering::SeqCst);
         info_tx.send_replace(minimum.clone());
-        tokio::time::advance(SLOW_MEMPOOL_FETCH + Duration::from_millis(1)).await;
+        tokio::time::advance(TEST_SLOW_MEMPOOL_FETCH + Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut request).is_pending());
         assert!(
             read_count.load(Ordering::SeqCst) > reads_before_expiry,

@@ -780,8 +780,20 @@ async fn trusted_http_rejects_malformed_bytes_and_preserves_validation_after_cli
     let submission = tokio::spawn(submit(relay.rpc, relay.auth.clone(), bytes.clone(), true));
     relay.gate.entered().await;
     assert_eq!(
-        relay.submit(bytes.clone(), true).await,
+        relay
+            .submit(faulty_body(&block).zcash_serialize_to_vec().unwrap(), true)
+            .await,
         "duplicate-inconclusive"
+    );
+    assert_eq!(
+        relay
+            .pending
+            .get(block.hash())
+            .unwrap()
+            .zcash_serialize_to_vec()
+            .unwrap(),
+        bytes,
+        "a concurrent duplicate must not replace the owner's body"
     );
     submission.abort();
     relay.gate.release();

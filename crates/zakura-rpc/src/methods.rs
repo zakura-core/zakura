@@ -1990,12 +1990,8 @@ where
         submission: MinedBlockSubmission,
     ) -> Result<SubmitBlockResponse> {
         let chain_error = match block_verifier_router_response {
-            // Currently, this match arm returns `null` (Accepted) for blocks committed
-            // to any chain, but Accepted is only for blocks in the best chain.
-            //
-            // TODO (#5487):
-            // - Inconclusive: check if the block is on a side-chain
-            // The difference is important to miners, because they want to mine on the best chain.
+            // Acceptance means local commitment, including a side chain. It does not
+            // promise best-chain selection or delivery to any peer.
             Ok(hash) => {
                 tracing::info!(
                     ?hash,

@@ -91,9 +91,9 @@ increase it. The balance itself holds no spendable value and does not contribute
 monetary pool totals.
 
 At the reissuance start height, the bonus becomes
-`ceil(D(parent) * 1375 / 10_000_000_000)`. The fraction is fixed on every network,
-including configured networks with different halving intervals. Each fork uses
-its own parent balance.
+`ceil(D(parent) * floor(6_931_680_000 / H) / 10_000_000_000)`, where `H` is the
+network's post-NU7 halving interval (ZIP 237). The numerator is 1375 on Mainnet and
+the default Testnet. Each fork uses its own parent balance.
 Contextual validation rejects negative balances from NU7 onward. The stored type remains
 signed because a chain can run ahead of its schedule before NU7.
 
@@ -157,7 +157,7 @@ backup or repair the identified corruption before retrying startup.
 
 The tests cover aggregate fee rounding, fee activation before reissuance, coinbase
 claims and template fees, the resulting NSM contribution, schedule sums, the seed and
-its rollback, the fixed NU7 fraction, its half-life over 5,040,000 blocks,
+its rollback, the interval-dependent NU7 fraction, its half-life over 5,040,000 blocks,
 termination from a small balance, transfers through every monetary
 pool, reductions in issued value, contextual rejection from NU7, independent
 non-finalized forks, finalized rollback, replay, alternate branches, restart,

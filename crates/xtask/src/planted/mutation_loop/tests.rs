@@ -1,10 +1,7 @@
 //! The loop runner's classes on synthetic runs, its run failures, and its
 //! report's schema. No test builds the simulator.
 
-use std::{collections::BTreeMap, fs, path::Path, process::Command};
-
-#[cfg(unix)]
-use std::time::Duration;
+use std::{collections::BTreeMap, fs, path::Path, process::Command, time::Duration};
 
 #[cfg(unix)]
 use super::run_measured;
@@ -978,25 +975,14 @@ fn a_child_reports_its_exit_or_its_deadline() {
     assert_eq!(ended, Ended::TimedOut);
 }
 
-/// `--planted` refuses a nested case rather than drop its `set`: the loop
-/// would count a catch of the case's property alone, with a member held, as
-/// killed by the named rule.
+/// `--planted` reads a case's property from its path.
 #[test]
-fn planted_cases_refuse_a_nested_set() {
+fn planted_cases_read_their_property() {
     let repo = tempfile::tempdir().unwrap();
     let case = repo.path().join("qa/planted/race/lost-update");
     fs::create_dir_all(&case).unwrap();
-    fs::write(case.join("nested.patch"), "").unwrap();
-    fs::write(
-        case.join("nested.toml"),
-        "input = \"in.bin\"\nset = [\"race/other\"]\n",
-    )
-    .unwrap();
-    let error =
-        planted_cases(repo.path(), &["race".to_owned()]).expect_err("a nested case is refused");
-    assert!(error.to_string().contains("`set`"), "{error}");
-
-    fs::write(case.join("nested.toml"), "input = \"in.bin\"\n").unwrap();
+    fs::write(case.join("plain.patch"), "").unwrap();
+    fs::write(case.join("plain.toml"), "input = \"in.bin\"\n").unwrap();
     let cases = planted_cases(repo.path(), &["race".to_owned()]).unwrap();
     assert_eq!(cases.len(), 1);
     assert_eq!(cases[0].property, "race/lost-update");

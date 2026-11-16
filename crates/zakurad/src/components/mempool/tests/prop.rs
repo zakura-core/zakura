@@ -585,9 +585,9 @@ fn setup(
         sync_status,
         latest_chain_tip,
         chain_tip_change,
-        tokio::sync::mpsc::channel(1).0,
+        crate::components::test_misbehavior::reporter(),
         Vec::new(),
-        zn::UnconditionalPeerSet::default(),
+        zn::UnconditionalPeers::default(),
     );
 
     let mut transaction_receiver = mempool_transaction_subscriber.subscribe();

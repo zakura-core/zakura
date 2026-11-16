@@ -26,9 +26,7 @@ use crate::{
         stall_tracker::FIND_RESPONSE_STALL_THRESHOLD,
     },
     protocol::external::{types::Version, InventoryHash},
-    unconditional_peer_set::UnconditionalPeerSet,
     BannedIps, BoxError, PeerSocketAddr, PeerSource, Request, Response, SharedPeerError,
-    UnconditionalPeers,
 };
 
 use super::{PeerSetBuilder, PeerVersions};
@@ -103,39 +101,6 @@ fn disconnect_request_cancels_busy_peer_without_banning() {
         assert!(!peers.cancel_handles.contains_key(&busy_addr));
         assert!(!peers.ready_services.contains_key(&busy_addr));
         assert!(!peers.bans.contains(busy_addr.ip()));
-    });
-}
-
-/// A disconnect request leaves an unconditional peer connected, even one that a DNS
-/// answer made unconditional after the peer set was built, as an answer can while the
-/// request waits for the peer set.
-#[test]
-fn disconnect_request_keeps_a_peer_that_became_unconditional() {
-    let (runtime, _init_guard) = zakura_test::init_async();
-    let _guard = runtime.enter();
-    let versions = PeerVersions {
-        peer_versions: vec![CURRENT_NETWORK_PROTOCOL_VERSION; 2],
-    };
-    let (discovered, _handles) = versions.mock_peer_discovery();
-    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
-    let (unconditional_peers, resolved_peers) =
-        UnconditionalPeerSet::new(UnconditionalPeers::default());
-    runtime.block_on(async move {
-        let (mut peers, _guard) = PeerSetBuilder::new()
-            .with_discover(discovered)
-            .with_minimum_peer_version(minimum)
-            .with_unconditional_peers(unconditional_peers)
-            .max_conns_per_ip(2)
-            .build();
-        peers.ready().await.unwrap();
-        assert_eq!(peers.ready_services.len(), 2);
-        let addr = *peers.ready_services.keys().next().unwrap();
-
-        resolved_peers.publish([addr.ip()]);
-        peers.call(Request::DisconnectPeer(addr)).await.unwrap();
-
-        assert!(peers.ready_services.contains_key(&addr));
-        assert_eq!(peers.ready_services.len(), 2);
     });
 }
 
@@ -1884,10 +1849,8 @@ async fn driver_prunes_banned_and_outdated_peers_while_idle() {
             .wait_for(|peers| peers.len() == 1)
             .await
             .unwrap();
-        book.update(crate::meta_addr::MetaAddrChange::UpdateMisbehavior {
-            addr: address,
-            score_increment: crate::constants::MAX_PEER_MISBEHAVIOR_SCORE,
-        });
+        book.misbehavior_reporter()
+            .report(address, crate::constants::MAX_PEER_MISBEHAVIOR_SCORE);
         assert!(bans.contains(address.ip()));
         adverts
             .peers
@@ -2461,10 +2424,8 @@ async fn driver_refresh_retries_a_revoked_advertisement_on_a_later_peer() {
         assert_eq!(advert.hash, hash);
         // The peer is banned before its connection writes the inventory, so the connection
         // rejects the advertisement and the peer set drops the connection.
-        book.update(crate::meta_addr::MetaAddrChange::UpdateMisbehavior {
-            addr: revoked_addr,
-            score_increment: crate::constants::MAX_PEER_MISBEHAVIOR_SCORE,
-        });
+        book.misbehavior_reporter()
+            .report(revoked_addr, crate::constants::MAX_PEER_MISBEHAVIOR_SCORE);
         assert!(bans.contains(revoked_addr.ip()));
         advert
             .result

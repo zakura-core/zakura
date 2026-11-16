@@ -2447,7 +2447,6 @@ fn planted_repo() -> (
         witness: crate::planted::Witness::Input(PathBuf::from("in/x.bin")),
         checks: Vec::new(),
         also_violates: vec!["p/also".to_owned()],
-        set: Vec::new(),
         target: None,
         no_target: None,
     };
@@ -2503,8 +2502,8 @@ fn a_listed_case_resolves_to_its_planted_case() {
 
 /// The list rejects a case with no planted patch, an unknown or
 /// harness-less target, a property that isn't the case's, a target that
-/// runs another harness, a case listed twice, a typed or nested case, and
-/// an empty list.
+/// runs another harness, a case listed twice, a typed case, and an empty
+/// list.
 #[test]
 fn the_feedback_list_rejects_bad_cases() {
     let (dir, planted, targets) = planted_repo();
@@ -2515,11 +2514,6 @@ fn the_feedback_list_rejects_bad_cases() {
             scenario: PathBuf::from("s.json"),
             plan: PathBuf::from("s.plan"),
         },
-        ..planted.clone()
-    };
-    let nested = crate::planted::Case {
-        also_violates: Vec::new(),
-        set: vec!["p/broader".to_owned()],
         ..planted.clone()
     };
     let good = entry("p/q/name", "p/q", "t_one");
@@ -2551,7 +2545,6 @@ fn the_feedback_list_rejects_bad_cases() {
         ),
         (vec![good.clone(), good.clone()], &planted, "listed twice"),
         (vec![good.clone()], &typed, "a typed case has no fuzz input"),
-        (vec![good.clone()], &nested, "nested case"),
         (Vec::new(), &planted, "the list names no case"),
     ] {
         let error = feedback::resolve(root, &entries, std::slice::from_ref(planted), &targets)

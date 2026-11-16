@@ -839,7 +839,7 @@ fn first_prepare_outcome(report: &RunReport) -> Option<String> {
         })
 }
 
-/// C1's history: the live budget ends after the release's wake opens and
+/// The history where the live budget ends after the release's wake opens and
 /// before its cached-pass refill. The drain finishes the round: the wake concludes
 /// and holds, and only then, past the wake's deadline, does `mirror-1`'s
 /// held prepare run, so the run ends with nothing held.

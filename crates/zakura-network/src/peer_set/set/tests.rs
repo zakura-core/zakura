@@ -32,7 +32,6 @@ use crate::{
     peer::{ClientTestHarness, LoadTrackedClient, MinimumPeerVersion},
     peer_set::{set::MorePeers, InventoryChange, PeerSet},
     protocol::external::types::Version,
-    unconditional_peer_set::UnconditionalPeerSet,
     AddressBook, BannedIps, Config, PeerSocketAddr,
 };
 
@@ -128,7 +127,6 @@ struct PeerSetBuilder<D, C> {
     minimum_peer_version: Option<MinimumPeerVersion<C>>,
     max_conns_per_ip: Option<usize>,
     block_gossip_peer_ips: Vec<IpAddr>,
-    unconditional_peers: UnconditionalPeerSet,
 }
 
 impl PeerSetBuilder<(), ()> {
@@ -151,7 +149,6 @@ impl<D, C> PeerSetBuilder<D, C> {
             minimum_peer_version: self.minimum_peer_version,
             max_conns_per_ip: self.max_conns_per_ip,
             block_gossip_peer_ips: self.block_gossip_peer_ips,
-            unconditional_peers: self.unconditional_peers,
         }
     }
 
@@ -170,7 +167,6 @@ impl<D, C> PeerSetBuilder<D, C> {
             minimum_peer_version: self.minimum_peer_version,
             max_conns_per_ip: self.max_conns_per_ip,
             block_gossip_peer_ips,
-            unconditional_peers: self.unconditional_peers,
         }
     }
 
@@ -186,7 +182,6 @@ impl<D, C> PeerSetBuilder<D, C> {
             minimum_peer_version: self.minimum_peer_version,
             max_conns_per_ip: self.max_conns_per_ip,
             block_gossip_peer_ips: self.block_gossip_peer_ips,
-            unconditional_peers: self.unconditional_peers,
         }
     }
 
@@ -205,7 +200,6 @@ impl<D, C> PeerSetBuilder<D, C> {
             minimum_peer_version: Some(minimum_peer_version),
             max_conns_per_ip: self.max_conns_per_ip,
             block_gossip_peer_ips: self.block_gossip_peer_ips,
-            unconditional_peers: self.unconditional_peers,
         }
     }
 
@@ -226,18 +220,6 @@ impl<D, C> PeerSetBuilder<D, C> {
             minimum_peer_version: self.minimum_peer_version,
             max_conns_per_ip: Some(max_conns_per_ip),
             block_gossip_peer_ips: self.block_gossip_peer_ips,
-            unconditional_peers: self.unconditional_peers,
-        }
-    }
-
-    /// Use the provided unconditional peers when constructing the [`PeerSet`] instance.
-    pub fn with_unconditional_peers(
-        self,
-        unconditional_peers: UnconditionalPeerSet,
-    ) -> PeerSetBuilder<D, C> {
-        PeerSetBuilder {
-            unconditional_peers,
-            ..self
         }
     }
 }
@@ -283,7 +265,6 @@ where
             handle_rx,
             inv_stream,
             bans,
-            self.unconditional_peers,
             address_metrics,
             minimum_peer_version,
             max_conns_per_ip,

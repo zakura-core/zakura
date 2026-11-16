@@ -243,12 +243,6 @@ impl HighestCompletedCheckpointTracker {
         }
     }
 
-    /// Test-only: clear published progress the same way reconstruction failure does.
-    #[cfg(test)]
-    pub(crate) fn clear_published_for_test(&mut self) {
-        self.replace_state(TrackerState::default());
-    }
-
     fn replace_state(&mut self, state: TrackerState) {
         let changed = self.state.current != state.current;
         self.state = state;

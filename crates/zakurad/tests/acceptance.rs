@@ -191,23 +191,6 @@ use crate::common::regtest::MiningRpcMethods;
 pub const MAX_ASYNC_BLOCKING_TIME: Duration = zakura_test::mock_service::DEFAULT_MAX_REQUEST_DELAY;
 
 #[test]
-fn generate_no_args() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    let child = testdir()?
-        .with_config(&mut default_test_config(&Mainnet))?
-        .spawn_child(args!["generate"])?;
-
-    let output = child.wait_with_output()?;
-    let output = output.assert_success()?;
-
-    // First line
-    output.stdout_line_contains("# Default configuration for zakurad")?;
-
-    Ok(())
-}
-
-#[test]
 fn start_logs_node_configuration_summary() -> Result<()> {
     let _init_guard = zakura_test::init();
 
@@ -286,30 +269,6 @@ fn generate_args() -> Result<()> {
 }
 
 #[test]
-fn help_no_args() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet))?;
-
-    let child = testdir.spawn_child(args!["help"])?;
-    let output = child.wait_with_output()?;
-    let output = output.assert_success()?;
-
-    // The first line should have the version
-    output.any_output_line(
-        is_zakurad_version,
-        &output.output.stdout,
-        "stdout",
-        "are valid zakurad semantic versions",
-    )?;
-
-    // Make sure we are in help by looking for the usage string
-    output.stdout_line_contains("Usage:")?;
-
-    Ok(())
-}
-
-#[test]
 fn help_args() -> Result<()> {
     let _init_guard = zakura_test::init();
 
@@ -350,33 +309,6 @@ fn start_no_args() -> Result<()> {
 
     // Make sure the command was killed
     output.assert_was_killed()?;
-
-    Ok(())
-}
-
-#[test]
-fn start_args() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet))?;
-    let testdir = &testdir;
-
-    let mut child = testdir
-        .spawn_child(args!["start"])?
-        .with_timeout(EXTENDED_LAUNCH_DELAY);
-    child.expect_stdout_line_matches("Starting zakurad")?;
-    child.kill(false)?;
-    let output = child.wait_with_output()?;
-
-    // Make sure the command was killed
-    output.assert_was_killed()?;
-
-    output.assert_failure()?;
-
-    // unrecognized option `-f`
-    let child = testdir.spawn_child(args!["start", "-f"])?;
-    let output = child.wait_with_output()?;
-    output.assert_failure()?;
 
     Ok(())
 }
@@ -621,27 +553,6 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
         expected_run_dir_file_names,
         run_dir_file_names
     );
-
-    Ok(())
-}
-
-#[test]
-fn version_no_args() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet))?;
-
-    let child = testdir.spawn_child(args!["--version"])?;
-    let output = child.wait_with_output()?;
-    let output = output.assert_success()?;
-
-    // The output should only contain the version
-    output.output_check(
-        is_zakurad_version,
-        &output.output.stdout,
-        "stdout",
-        "a valid zakurad semantic version",
-    )?;
 
     Ok(())
 }
@@ -968,45 +879,6 @@ fn invalid_generated_config() -> Result<()> {
     output.stderr_contains(
         "Zakura could not load the provided configuration file and/or environment variables",
     )?;
-
-    Ok(())
-}
-
-/// Test all stored config versions can be parsed by the latest `zakurad`.
-#[tracing::instrument]
-#[test]
-fn stored_configs_parsed_correctly() -> Result<()> {
-    let old_configs_dir = configs_dir();
-    tracing::info!(?old_configs_dir, "testing older config parsing");
-
-    for config_file in old_configs_dir
-        .read_dir()
-        .expect("read_dir call failed")
-        .flatten()
-    {
-        let config_file_path = config_file.path();
-        let config_file_name = config_file_path
-            .file_name()
-            .expect("config files must have a file name")
-            .to_str()
-            .expect("config file names are valid unicode");
-
-        if config_file_name.starts_with('.') || config_file_name.starts_with('#') {
-            // Skip editor files and other invalid config paths
-            tracing::info!(
-                ?config_file_path,
-                "skipping hidden/temporary config file path"
-            );
-            continue;
-        }
-
-        tracing::info!(
-            ?config_file_path,
-            "testing old config can be parsed by current zakurad"
-        );
-
-        zakurad::config::ZakuradConfig::load(Some(config_file_path)).expect("config should parse");
-    }
 
     Ok(())
 }

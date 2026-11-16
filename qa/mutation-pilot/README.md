@@ -195,8 +195,8 @@ campaign runs a handful of inputs.
 
 `cargo xtask planted pilot feedback` reads the list and checks each case: its
 patch must exist, its property must be the case's directory, and its target
-must run its input's harness. A case listed twice, a typed case and a nested
-case fail. The runner then builds the runner tree's `HEAD`, as
+must run its input's harness. A case listed twice and a typed case fail. The
+runner then builds the runner tree's `HEAD`, as
 `planted --targets` does: each original campaign runs `HEAD`, and each
 mutant runs `HEAD` with the case's patch. The list's cases come from the
 runner's tree. The list and each case's `.toml` must match `HEAD`, and

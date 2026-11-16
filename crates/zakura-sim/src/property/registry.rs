@@ -114,12 +114,6 @@ impl<A: Checker, B: Checker> Checker for Tee<A, B> {
         self.1.step_loop_violation(violation);
     }
 
-    /// True only if both stop at it. Asks both.
-    fn stops(&mut self, property: &str) -> bool {
-        let first = self.0.stops(property);
-        self.1.stops(property) && first
-    }
-
     /// `.0`'s open checks, then `.1`'s.
     fn unfinished(&self) -> Unfinished {
         let mut open = self.0.unfinished().open;
@@ -521,7 +515,7 @@ impl<S: HasView> RegistryChecker<S> {
     /// Records `found` as the registered property's with its ID, at the
     /// run's last step, `last`, beside any violation it already has. A step
     /// finding and an end finding of one ID are both kept, and so are two
-    /// end findings of one ID (C12). A harness whose end replay finds a
+    /// end findings of one ID. A harness whose end replay finds a
     /// step's break again leaves it out itself
     /// ([`HasView::end_violations`]).
     fn end_violation(&mut self, found: EndViolation, last: u64) {
@@ -694,15 +688,6 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     /// False while a declared `BoundedAdversary` assumption doesn't hold.
     fn bounds_livelock(&mut self) -> bool {
         !self.bounded || (self.holds)(&self.handle, Assume::BoundedAdversary)
-    }
-
-    /// False for a registered property that isn't `Active`, whose
-    /// violations are only recorded.
-    fn stops(&mut self, property: &str) -> bool {
-        self.properties
-            .iter()
-            .find(|registered| registered.id.as_str() == property)
-            .is_none_or(|registered| registered.status == Status::Active)
     }
 
     /// Records `violation` as the registered property's with its ID, once.

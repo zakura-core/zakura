@@ -11,6 +11,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from dataclasses import replace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -102,6 +103,31 @@ class TraceConfigTests(unittest.TestCase):
         self.assertEqual(edited.replace(added, "", 1), DUAL_CONFIG)
         self.assertIn("[network.zakura]\n" + added + 'listen_addr = "0.0.0.0:8234"', edited)
         self.assertEqual(fleet.trace_dir_of(edited), "/mnt/data/zakura-traces")
+
+    def test_peer_names_use_typed_addresses_and_preserve_other_settings(self):
+        nodes = load(NODE_LIST)
+        edited = fleet.with_trace_peer_names(DUAL_CONFIG, nodes[1], nodes)
+        expected = tomllib.loads(DUAL_CONFIG)
+        expected["network"]["zakura"]["trace_peer_names"] = {"192.0.2.1": "us-east-0"}
+        self.assertEqual(tomllib.loads(edited), expected)
+        self.assertEqual(fleet.with_trace_peer_names(edited, nodes[1], nodes), edited)
+
+    def test_existing_peer_names_including_an_empty_mapping_are_preserved(self):
+        nodes = load(NODE_LIST)
+        for mapping in ('{}', '{ "2001:db8::9" = "my-node" }'):
+            own = DUAL_CONFIG.replace("[network.zakura]", f"[network.zakura]\ntrace_peer_names = {mapping}")
+            self.assertEqual(fleet.with_trace_peer_names(own, nodes[1], nodes), own)
+
+    def test_ipv6_addresses_and_quoted_names_are_written_as_valid_toml(self):
+        nodes = load(NODE_LIST.replace("192.0.2.1", "2001:db8::9"))
+        nodes[0] = replace(nodes[0], name='a"quoted\\node')
+        edited = fleet.with_trace_peer_names(LEGACY_CONFIG, nodes[1], nodes)
+        self.assertEqual(tomllib.loads(edited)["network"]["zakura"]["trace_peer_names"], {"2001:db8::9": nodes[0].name})
+
+    def test_a_hostname_cannot_be_silently_used_as_an_ip_address(self):
+        nodes = load(NODE_LIST.replace("192.0.2.1", "example.com"))
+        with self.assertRaisesRegex(fleet.FleetError, "must name an IP"):
+            fleet.with_trace_peer_names(DUAL_CONFIG, nodes[1], nodes)
 
     def test_a_config_without_the_section_gets_it_at_the_end(self):
         edited = fleet.with_trace_dir(LEGACY_CONFIG)
@@ -275,6 +301,7 @@ class StepTests(unittest.TestCase):
         self.archives = []
         self.managed = False
         self.install_error = None
+        self.write_error = None
         self.steps = []
         self.real_remote = fleet.remote
         fleet.remote = self.fake_remote
@@ -287,8 +314,14 @@ class StepTests(unittest.TestCase):
         if script.startswith("cat "):
             return self.config
         if script == fleet.WRITE_CONFIG_SCRIPT:
+            if self.write_error:
+                raise fleet.FleetError(self.write_error)
             self.assertEqual(arguments, ("/etc/zakura/zakura.toml", hashlib.sha256(stdin).hexdigest()))
             self.config = stdin.decode()
+            return ""
+        if script == fleet.REMOVE_PEER_NAMES_SCRIPT:
+            self.assertEqual(arguments, (self.node.service_name,))
+            self.assertIn("trace_peer_names", tomllib.loads(self.config)["network"]["zakura"])
             return ""
         if script == fleet.CLAIM_TRACE_SCRIPT:
             self.assertEqual(arguments, (fleet.TRACE_DIR,))
@@ -305,32 +338,48 @@ class StepTests(unittest.TestCase):
         raise AssertionError(f"unexpected remote script: {script[:40]}")
 
     def test_the_trace_setting_is_written_once(self):
-        first = fleet.ensure_trace_config(self.node)
-        self.assertIn("added trace_dir to /etc/zakura/zakura.toml", first)
+        first = fleet.ensure_trace_config(self.node, load(NODE_LIST))
+        self.assertIn("updated trace settings in /etc/zakura/zakura.toml", first)
         self.assertEqual(fleet.trace_dir_of(self.config), fleet.TRACE_DIR)
         written = self.config
-        self.assertIn("already writes trace files to /mnt/data/zakura-traces", fleet.ensure_trace_config(self.node))
+        self.assertIn("already writes trace files to /mnt/data/zakura-traces", fleet.ensure_trace_config(self.node, load(NODE_LIST)))
         self.assertEqual(self.config, written)
+        self.assertLess(self.steps.index(fleet.WRITE_CONFIG_SCRIPT), self.steps.index(fleet.REMOVE_PEER_NAMES_SCRIPT))
         self.assertLess(self.steps.index(fleet.INSTALL_SCRIPT), self.steps.index(fleet.WRITE_CONFIG_SCRIPT))
 
     def test_a_failed_install_leaves_new_trace_writes_disabled_and_can_be_retried(self):
         self.install_error = "perf is not installed on this node"
         with self.assertRaisesRegex(fleet.FleetError, "perf is not installed"):
-            fleet.ensure_trace_config(self.node)
+            fleet.ensure_trace_config(self.node, load(NODE_LIST))
         self.assertEqual(self.config, DUAL_CONFIG)
         self.assertNotIn(fleet.WRITE_CONFIG_SCRIPT, self.steps)
+        self.assertNotIn(fleet.REMOVE_PEER_NAMES_SCRIPT, self.steps)
         self.install_error = None
-        fleet.ensure_trace_config(self.node)
+        fleet.ensure_trace_config(self.node, load(NODE_LIST))
         self.assertEqual(fleet.trace_dir_of(self.config), fleet.TRACE_DIR)
+
+    def test_a_failed_config_write_keeps_the_old_environment_override(self):
+        self.write_error = "config did not arrive whole"
+        with self.assertRaisesRegex(fleet.FleetError, "did not arrive whole"):
+            fleet.ensure_trace_config(self.node, load(NODE_LIST))
+        self.assertEqual(self.config, DUAL_CONFIG)
+        self.assertNotIn(fleet.REMOVE_PEER_NAMES_SCRIPT, self.steps)
+
+    def test_a_single_node_deploy_still_names_the_other_fleet_nodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "nodes.toml"
+            config.write_text(NODE_LIST)
+            self.assertEqual(fleet.main(["ensure-trace-config", "--config", str(config), "--node", self.node.name]), 0)
+        self.assertEqual(tomllib.loads(self.config)["network"]["zakura"]["trace_peer_names"], {"192.0.2.1": "us-east-0"})
 
     def test_a_retention_readiness_failure_also_prevents_enabling_traces(self):
         self.install_error = "the profiler did not confirm trace retention"
         with self.assertRaisesRegex(fleet.FleetError, "did not confirm trace retention"):
-            fleet.ensure_trace_config(self.node)
+            fleet.ensure_trace_config(self.node, load(NODE_LIST))
         self.assertEqual(self.config, DUAL_CONFIG)
 
     def test_the_profiler_is_pointed_at_the_trace_directory_in_the_node_s_config(self):
-        fleet.ensure_trace_config(self.node)
+        fleet.ensure_trace_config(self.node, load(NODE_LIST))
         self.assertEqual(fleet.install_profiler(self.node), "profiler running, reading /mnt/data/zakura-traces")
         sent = self.archives[-1]
         drop_in = tarfile.open(fileobj=io.BytesIO(sent)).extractfile("node.conf").read().decode()
@@ -338,7 +387,7 @@ class StepTests(unittest.TestCase):
 
     def test_a_preexisting_default_trace_setting_does_not_grant_rotation_permission(self):
         self.config = fleet.with_trace_dir(DUAL_CONFIG)
-        fleet.ensure_trace_config(self.node)
+        fleet.ensure_trace_config(self.node, load(NODE_LIST))
         self.assertFalse(self.managed)
         fleet.install_profiler(self.node)
         sent = self.archives[-1]

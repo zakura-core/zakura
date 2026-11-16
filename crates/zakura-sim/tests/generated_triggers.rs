@@ -1,4 +1,4 @@
-//! C7: the generated templates' trigger histories, on scripted logs. A
+//! The generated templates' trigger histories, on scripted logs. A
 //! receiver template's trigger is the node judging a frame its row's rule
 //! covers, with the template's label, and a sender template's is the node
 //! sending a frame of the exchange its rule guards.

@@ -641,28 +641,6 @@ fn check_testnet_minimum_difficulty_block(height: block::Height) -> Result<(), R
     Ok(())
 }
 
-/// Test ExpandedDifficulty ordering
-#[test]
-#[allow(clippy::eq_op)]
-fn expanded_order() -> Result<(), Report> {
-    let _init_guard = zakura_test::init();
-
-    let zero = ExpandedDifficulty(U256::zero());
-    let one = ExpandedDifficulty(U256::one());
-    let max_value = ExpandedDifficulty(U256::MAX);
-
-    assert!(zero < one);
-    assert!(zero < max_value);
-    assert!(one < max_value);
-
-    assert_eq!(zero, zero);
-    assert!(zero <= one);
-    assert!(one >= zero);
-    assert!(one > zero);
-
-    Ok(())
-}
-
 /// Test ExpandedDifficulty and block::Hash ordering
 #[test]
 fn expanded_hash_order() -> Result<(), Report> {

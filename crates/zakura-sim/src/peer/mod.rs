@@ -402,7 +402,7 @@ impl Slot {
 /// Offers each peer's next scripted action, as `peer:<name>:<action>`,
 /// while that peer is ready for it.
 ///
-/// It's the peers' evidence source too (C11): what [`WireEvidence`] logs
+/// It's the peers' evidence source too: what [`WireEvidence`] logs
 /// from their records is checked through a checkpoint, as the taps' events
 /// are, so a record the run never placed, or a placed observation that
 /// didn't reach the run's log, fails the run.
@@ -1919,7 +1919,7 @@ mod tests {
         }
     }
 
-    /// C11: the peers' evidence sits behind a checkpoint. A run whose peers
+    /// The peers' evidence sits behind a checkpoint. A run whose peers
     /// recorded nothing ends cleanly. A record still waiting for its
     /// connection's registration when the run ends idle can never be placed,
     /// so it fails the run as `UnplacedRecords`. A record pushed after the

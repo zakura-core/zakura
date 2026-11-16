@@ -66,7 +66,8 @@ use crate::{
 /// Version 39 adds the adversary act observations `acts-scripted`,
 /// `act-ran` and `act-skipped`.
 /// Version 40 adds a node frame's `exchange`.
-/// Version 41 adds `meta.draft`, a run's `Draft` override.
+/// Version 41 adds `meta.draft`, a run's `Draft` override. No run writes it
+/// now, and a trace that names it no longer reads.
 /// Version 42 adds `meta.plan`, the Plan bytes or script a run took its
 /// choices from when no `input.bin` did.
 /// Version 43 types `NotApplicable`'s reason, adds `drain-bound`.
@@ -338,7 +339,7 @@ pub trait RecordSink {
 /// `record` writes and `replay` compares its own with.
 pub const FULL_REPORT_FILE: &str = "full-report.json";
 
-/// A run's full report (C8): every property's outcome with every violation,
+/// A run's full report: every property's outcome with every violation,
 /// in report order, and the harness's evidence snapshot at the run's end.
 /// The `end` record keeps only outcomes, since violations grow with the
 /// run, so this is what a later judge reads instead of rerunning.

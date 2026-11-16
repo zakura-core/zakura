@@ -89,7 +89,7 @@ pub(super) fn read(repo_root: &Path) -> Result<(Vec<u8>, List), BoxError> {
 /// patch changes, and each hash is of the file in `repo_root`.
 ///
 /// Fails on a case listed twice, one with no planted patch, one whose
-/// property isn't its planted case's, a nested case, a typed case, a
+/// property isn't its planted case's, a typed case, a
 /// target that isn't a fuzz target, and a target that runs another harness
 /// than the case's input.
 pub(super) fn resolve(
@@ -115,13 +115,6 @@ pub(super) fn resolve(
             return Err(format!(
                 "{id}: lists property {}, but the planted case violates {}",
                 entry.property, found.property
-            )
-            .into());
-        }
-        if !found.set.is_empty() {
-            return Err(format!(
-                "{id}: a nested case's catch needs its whole set, which a campaign's first \
-                 finding needn't show"
             )
             .into());
         }

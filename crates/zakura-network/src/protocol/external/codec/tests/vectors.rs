@@ -3,6 +3,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::LazyLock;
 
+use crate::meta_addr::MetaAddr;
 use chrono::DateTime;
 use futures::prelude::*;
 
@@ -63,6 +64,37 @@ fn version_message_round_trip() {
     });
 
     assert_eq!(*v, v_parsed);
+}
+
+/// Pruned and v2 hints survive both version and address-gossip wire encodings.
+#[tokio::test]
+async fn pruned_services_round_trip_in_version_and_address_messages() {
+    use tokio_util::codec::{FramedRead, FramedWrite};
+    let services =
+        PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED | PeerServices::NODE_P2P_V2;
+    let Message::Version(mut version) = VERSION_TEST_VECTOR.clone() else {
+        unreachable!()
+    };
+    version.services = services;
+    version.address_from = AddrInVersion::new(version.address_from.addr(), services);
+    version.address_recv = AddrInVersion::new(version.address_recv.addr(), services);
+    let addr = MetaAddr::new_gossiped_meta_addr(
+        "192.0.2.1:8233".parse().unwrap(),
+        services,
+        version.timestamp.try_into().unwrap(),
+    );
+    for message in [Message::Version(version), Message::Addr(vec![addr])] {
+        let mut bytes = Vec::new();
+        let mut writer = FramedWrite::new(&mut bytes, Codec::builder().finish());
+        writer.send(message.clone()).await.unwrap();
+        drop(writer);
+        let decoded = FramedRead::new(Cursor::new(bytes), Codec::builder().finish())
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, message);
+    }
 }
 
 /// Check that version deserialization rejects out-of-range timestamps with
@@ -231,6 +263,61 @@ fn reject_message_extra_data_round_trip() {
     });
 
     assert_eq!(v, v_parsed);
+}
+
+/// Block and transaction messages over `MAX_BLOCK_BYTES` fit in a protocol message,
+/// but are rejected before their bodies are parsed.
+#[test]
+fn oversized_block_and_tx_messages_are_rejected() {
+    use tokio_util::codec::{FramedRead, FramedWrite};
+
+    let _init_guard = zakura_test::init();
+
+    let max = usize::try_from(zakura_chain::block::MAX_BLOCK_BYTES).unwrap();
+    let body = vec![0; max + 1];
+    assert!(body.len() <= MAX_PROTOCOL_MESSAGE_LEN);
+
+    let codec = Codec::builder()
+        .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+        .finish();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        assert!(matches!(
+            codec.read_block(&mut body.as_slice()),
+            Err(Error::Parse("block is larger than MAX_BLOCK_BYTES"))
+        ));
+        assert!(matches!(
+            codec.read_tx(&mut body.as_slice()),
+            Err(Error::Parse("transaction is larger than MAX_BLOCK_BYTES"))
+        ));
+    });
+
+    // A real block one transaction over the limit is rejected end to end.
+    let block = zakura_chain::block::tests::generate::oversized_multi_transaction_block();
+    let msg_bytes = zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let mut bytes = Vec::new();
+        FramedWrite::new(
+            &mut bytes,
+            Codec::builder()
+                .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+                .finish(),
+        )
+        .send(Message::Block(std::sync::Arc::new(block).into()))
+        .await
+        .expect("an oversized block still fits in a protocol message");
+        bytes
+    });
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let mut fr = FramedRead::new(
+            Cursor::new(&msg_bytes),
+            Codec::builder()
+                .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+                .finish(),
+        );
+        assert!(matches!(
+            fr.next().await.expect("a message is available"),
+            Err(Error::Parse("block is larger than MAX_BLOCK_BYTES"))
+        ));
+    });
 }
 
 #[test]

@@ -1610,7 +1610,12 @@ mod tests {
             Some(Verdict::TargetMisses { .. })
         ));
         write_status("patched", serde_json::json!("active"));
-        assert!(through_target(root, root, root, &case, "target", "h").is_err());
+        let error = through_target(root, root, root, &case, "target", "h").unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotADirectory,
+            "Active confirmation must reach its output directory, not skip or fail parsing",
+        );
     }
 
     #[test]

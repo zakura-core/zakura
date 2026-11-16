@@ -76,7 +76,7 @@ sapling-crypto = { workspace = true }
 zakura-assets = { workspace = true }
 zakura-node-services = { path = "../zakura-node-services", version = "5.2.3" }
 zakura-chain = { path = "../zakura-chain", version = "16.0.0", features = ["async-error"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.1" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.2" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 
 
@@ -93,7 +93,7 @@ libc = { workspace = true }
 zakura-node-services = { path = "../zakura-node-services", version = "5.2.3", features = ["test-support"] }
 tempfile = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.1", features = ["test-support"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.2", features = ["test-support"] }
 eyre = { workspace = true }
 
 toml = { workspace = true, features = ["display"] }

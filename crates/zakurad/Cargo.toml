@@ -153,13 +153,13 @@ zakura-checkpoints = [
 [dependencies]
 zakura-chain = { path = "../zakura-chain", version = "16.0.0" }
 zakura-consensus = { path = "../zakura-consensus", version = "17.0.2" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.1" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.2" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "18.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.2.3" }
 zakura-rpc = { path = "../zakura-rpc", version = "18.0.1", default-features = false }
 zakura-state = { path = "../zakura-state", version = "18.0.0" }
-zakura-script = { path = "../zakura-script", version = "5.0.7" }
+zakura-script = { path = "../zakura-script", version = "5.0.8" }
 zcash_script = { workspace = true }
 
 # Only used to forward arithmetic features through Orchard and Halo 2. Cargo
@@ -234,7 +234,7 @@ proptest-derive = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "16.0.0", features = ["proptest-impl"] }
 zakura-consensus = { path = "../zakura-consensus", version = "17.0.2", features = ["proptest-impl"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.1", features = ["test-support"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.2", features = ["test-support"] }
 zakura-network = { path = "../zakura-network", version = "18.0.0", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "18.0.0", features = ["proptest-impl"] }
 zakura-rpc = { path = "../zakura-rpc", version = "18.0.1", default-features = false, features = ["proptest-impl"] }

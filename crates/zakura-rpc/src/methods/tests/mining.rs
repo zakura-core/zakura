@@ -273,8 +273,13 @@ fn mining_rpc(
     (rpc, sender, verifier)
 }
 
+/// Test only: how long the fake mempool in [`counting_mining_rpc`] takes to answer when
+/// asked to be slow. It isn't a node setting. It must outlast the refresh deadline in
+/// `long_poll_refresh_deadline_survives_slow_mempool_fetch`.
+const TEST_SLOW_MEMPOOL_FETCH: Duration = Duration::from_secs(5);
+
 /// Returns a mining RPC whose state reads come from `info`, with its tip sender, a count of
-/// chain info reads, and a flag that makes the next mempool fetch last one mempool poll interval.
+/// chain info reads, and a flag that makes the next mempool fetch last [`TEST_SLOW_MEMPOOL_FETCH`].
 fn counting_mining_rpc(
     info: watch::Receiver<GetBlockTemplateChainInfo>,
 ) -> (
@@ -309,7 +314,7 @@ fn counting_mining_rpc(
         let slow = slow.swap(false, Ordering::SeqCst);
         async move {
             if slow {
-                tokio::time::sleep(Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL)).await;
+                tokio::time::sleep(TEST_SLOW_MEMPOOL_FETCH).await;
             }
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
                 transactions: vec![],
@@ -928,17 +933,17 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
             tokio::pin!(request);
             assert!(futures::poll!(&mut request).is_pending());
             let reads = read_count.load(Ordering::SeqCst);
-            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::time::advance(Duration::from_millis(1500)).await;
             assert!(futures::poll!(&mut request).is_pending());
             assert_eq!(read_count.load(Ordering::SeqCst), reads);
         }
 
-        // Start within one mempool polling interval of the difficulty timeout,
+        // Minimum difficulty becomes valid within one second, before the next mempool poll,
         // so a fresh state read proves the time-limit timer woke this request.
         let clock = DateTime32::now();
         let mut standard = chain_info(300_000, 1, 0);
         standard.cur_time = clock;
-        standard.max_time = clock.checked_add(Duration32::from_seconds(3)).unwrap();
+        standard.max_time = clock;
         let gap: Duration32 = NetworkUpgrade::minimum_difficulty_spacing_for_height(
             &network(),
             standard.tip_height.next().unwrap(),
@@ -969,9 +974,6 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
         let reads_before_expiry = read_count.load(Ordering::SeqCst);
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(futures::poll!(&mut request).is_pending());
-        assert_eq!(read_count.load(Ordering::SeqCst), reads_before_expiry);
 
         let mut minimum = standard.clone();
         minimum.cur_time = standard
@@ -984,7 +986,7 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
             .unwrap();
         minimum.expected_difficulty = network().target_difficulty_limit().to_compact();
         info_tx.send_replace(minimum.clone());
-        tokio::time::advance(Duration::from_secs(3) + Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(1) + Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut request).is_pending());
         assert!(
             read_count.load(Ordering::SeqCst) > reads_before_expiry,
@@ -1043,10 +1045,7 @@ fn long_poll_refresh_deadline_survives_slow_mempool_fetch() {
         assert!(futures::poll!(&mut request).is_pending());
         let reads_before_expiry = read_count.load(Ordering::SeqCst);
         info_tx.send_replace(minimum.clone());
-        tokio::time::advance(
-            Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL) + Duration::from_millis(1),
-        )
-        .await;
+        tokio::time::advance(TEST_SLOW_MEMPOOL_FETCH + Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut request).is_pending());
         assert!(
             read_count.load(Ordering::SeqCst) > reads_before_expiry,
@@ -1070,7 +1069,7 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         let clock = DateTime32::now();
         let mut original = chain_info(3_000_000, 1, 0);
         original.cur_time = clock;
-        original.max_time = clock.checked_add(Duration32::from_seconds(10)).unwrap();
+        original.max_time = clock.checked_add(Duration32::from_seconds(7)).unwrap();
         original.min_time = original
             .max_time
             .checked_sub(Duration32::from_seconds(90 * 60 - 1))
@@ -1128,15 +1127,16 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         info_tx.send_replace(sampled.clone());
         assert!(futures::poll!(&mut request).is_pending());
 
-        // Four seconds remain after the fetch. Starting that wait before the fetch
-        // would already have expired it and forced a premature replacement.
-        tokio::time::advance(Duration::from_secs(3)).await;
+        // One second remains after the fetch, less than the mempool poll interval.
+        // Starting that wait before the fetch would already have expired it and
+        // forced a premature replacement.
+        tokio::time::advance(Duration::from_millis(500)).await;
         assert!(futures::poll!(&mut request).is_pending());
         assert_eq!(read_count.load(Ordering::SeqCst), reads_before_deadline);
 
         sampled.cur_time = sampled.max_time;
         info_tx.send_replace(sampled);
-        tokio::time::advance(Duration::from_secs(1) + Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_millis(500) + Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut request).is_pending());
         assert!(read_count.load(Ordering::SeqCst) > reads_before_deadline);
         tokio::time::resume();

@@ -56,6 +56,10 @@ struct ReadCall {
     state: ReadState,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "ReadCall is already boxed; keeping its initial request inline avoids a second allocation"
+)]
 enum ReadState {
     /// Not polled yet. A read dropped here never reaches storage.
     Unsubmitted(Option<BlockRangeRead>),

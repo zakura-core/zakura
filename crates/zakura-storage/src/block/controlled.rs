@@ -1750,6 +1750,10 @@ impl Future for NextAction<'_> {
 }
 
 /// Where a completion's reply went.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a completion's temporary reply stays inline to avoid allocating for each read result"
+)]
 enum Reply {
     /// To the handle, which took it or was closed.
     Handle(bool),

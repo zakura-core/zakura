@@ -73,7 +73,7 @@ pub enum RecordError {
     /// property, or the property has no trigger-history check.
     Witness(WitnessError),
     /// The run wrote its `end` record but sent no full report, so its
-    /// violations and stores would be lost (C8). A harness run always sends
+    /// violations and stores would be lost. A harness run always sends
     /// one, so a sink that wraps another without forwarding it does this.
     NoReport,
     /// The run [`crate::trace::record_failure`] was handed doesn't violate
@@ -265,7 +265,7 @@ pub(crate) fn write_trace<T>(
         report,
     } = sink;
     // Beside the trace, so a judge reads every violation and the stores
-    // without rerunning (C8). A run that never reached its end sends none.
+    // without rerunning. A run that never reached its end sends none.
     // The `end` record is written only once the report is, so a recording
     // that fails here leaves an incomplete trace, never a complete one
     // without its report.
@@ -379,7 +379,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
-    /// C8: a run that wrote its `end` record but sent no full report fails
+    /// A run that wrote its `end` record but sent no full report fails
     /// the recording, and leaves its trace without the `end` record, so a
     /// sink that loses the report can't leave a trace that looks complete
     /// without it.

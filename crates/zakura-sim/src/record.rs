@@ -339,7 +339,7 @@ pub trait RecordSink {
 /// `record` writes and `replay` compares its own with.
 pub const FULL_REPORT_FILE: &str = "full-report.json";
 
-/// A run's full report (C8): every property's outcome with every violation,
+/// A run's full report: every property's outcome with every violation,
 /// in report order, and the harness's evidence snapshot at the run's end.
 /// The `end` record keeps only outcomes, since violations grow with the
 /// run, so this is what a later judge reads instead of rerunning.

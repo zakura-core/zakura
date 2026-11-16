@@ -66,7 +66,7 @@ fn broken_by(template: Template) -> Option<Label> {
 
 /// True if `entries` reach sender template `id`'s trigger history over the
 /// streams of `layout`: the node sending a frame of the exchange its rule
-/// guards (C7), not just any frame of the row.
+/// guards, not just any frame of the row.
 ///
 /// - `sender-within-limit` and `sender-cadence`: a frame the node sent on
 ///   the row.

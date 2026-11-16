@@ -162,7 +162,7 @@ const TARGET_CHILD: Duration = Duration::from_secs(300);
 
 /// The longest one `zakura-sim` run of a case may take: a baseline, patched
 /// or campaign recording, or a fresh replay. A run past it is killed and
-/// never counts as a catch (C4).
+/// never counts as a catch.
 const RUN_DEADLINE: Duration = Duration::from_secs(900);
 
 /// The interrupt flag of a case's runs, which nothing sets: only the pilot
@@ -860,7 +860,7 @@ fn check_case(
     }
     let patched = target.join(PROFILE).join("zakura-sim");
     // The patched builds reuse the target directory, so a catch counts only
-    // from a binary built from this case's patched checkout (C5).
+    // from a binary built from this case's patched checkout.
     if let Err(why) = built_from(&patched, worktree)? {
         return Ok(Verdict::StaleBinary(why));
     }
@@ -1330,7 +1330,7 @@ fn input_args(input: &Located) -> Result<Vec<OsString>, BoxError> {
 
 /// `verdict`, unless it's a catch and `replay`, the fresh replay of the
 /// patched run's trace, says why it missed: then [`Verdict::ReplayMisses`].
-/// Every catch replays, a fuzz input's and a typed case's alike (C4).
+/// Every catch replays, a fuzz input's and a typed case's alike.
 fn fresh_replay(
     verdict: Verdict,
     replay: impl FnOnce() -> Result<Option<String>, BoxError>,
@@ -1978,7 +1978,7 @@ mod tests {
         assert_eq!(fs::read(&built).expect("the build is kept"), b"binary");
     }
 
-    /// C5: a binary counts only for the checkout it embeds the digest of.
+    /// A binary counts only for the checkout it embeds the digest of.
     /// A patch that changes the checkout makes the earlier build stale, and
     /// a checkout whose digest git can't compute matches no binary, not even
     /// one that embeds the `unknown` marker.
@@ -2368,7 +2368,7 @@ mod tests {
     }
 
     /// A catch, a fuzz input's or a typed case's, passes only if its
-    /// fresh replay matches (C4). A miss is its own verdict, and an
+    /// fresh replay matches. A miss is its own verdict, and an
     /// uncaught case never replays.
     #[test]
     fn every_catch_needs_its_fresh_replay() {
@@ -2500,7 +2500,7 @@ mod tests {
         assert!(why.contains("ran past its deadline"), "{why}");
     }
 
-    /// C4: every run of a case has a deadline. A patched recording that
+    /// Every run of a case has a deadline. A patched recording that
     /// hangs is killed at it, ends `Killed`, and never counts as a catch.
     #[cfg(unix)]
     #[test]

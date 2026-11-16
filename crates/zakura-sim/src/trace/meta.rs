@@ -54,7 +54,7 @@ pub struct MetaRecord {
     pub input: Option<InputRef>,
     /// The Plan the run took its choices from when no `input.bin` did: Plan
     /// bytes or a scripted [`crate::Plan`], by digest, so a tool can bind
-    /// the trace to the committed Plan it ran (C18). `None` for a run of a
+    /// the trace to the committed Plan it ran. `None` for a run of a
     /// full fuzz input, which `input` names, and for a trace no Plan
     /// produced, such as a replay's.
     #[serde(default, skip_serializing_if = "Option::is_none")]

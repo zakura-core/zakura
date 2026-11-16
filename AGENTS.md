@@ -7,6 +7,7 @@
 
 - Keep changes focused and avoid unrelated refactors.
 - Run formatting and the checks relevant to the code you changed.
+- Keep Python dependency manifests, lockfiles, and virtual environments under scripts/ rather than the repository root, and run the required Python dependency-security check whenever Python code changes.
 - For fixes, explain the root cause, how the solution addresses it, and how the tests exercise the affected behavior.
 
 ## Project Structure & Module Organization
@@ -167,6 +168,7 @@ S::Future: Send + 'static,
 - Use `TrustedPreallocate` for deserializing collections from untrusted sources
 - Bound all loops/allocations over attacker-controlled data
 - Validate at system boundaries (network, RPC, disk)
+- Decode blocks and transactions from peers and RPC clients with `zcash_deserialize_bounded`; the plain parsers don't enforce the block size limit. `cargo xtask check-bounded-decode` enforces this in `zakura-network` and `zakura-rpc`.
 
 ### Performance
 

@@ -161,7 +161,7 @@ jobs:
               --base-version "$base_version" \
               --release-tag "$RELEASE_TAG"
           )"; then
-            echo "::warning title=Release level advisory::The requested tag is below the changelog-derived release level; continuing temporarily."
+            echo "::warning title=Release level advisory::The requested tag is below the release level the changelog requires; continuing temporarily."
           fi
           if ! READY_URL="$LATEST_URL" python3 .github/scripts/release_state.py ready \
             --state "$RUNNER_TEMP/readiness-state"; then

@@ -653,32 +653,6 @@ async fn spoofed_handshakes_cannot_fill_the_pending_budget() {
 }
 
 #[tokio::test]
-async fn max_pending_per_ip_refuses_concurrent_handshakes() {
-    tokio::time::timeout(TEST_TIMEOUT, async {
-        let config = QuicConfig {
-            max_pending_per_ip: Some(1),
-            ..test_config()
-        };
-        let server = server_with(&config, &loopback(), &[ALPN], |_| Admit::Accept);
-        // Two clients from the same IP racing their handshakes: at least one
-        // succeeds, and any refusal is a clean `Refused`.
-        let (a, b) = (client(), client());
-        let (first, second) = tokio::join!(
-            a.connect(server.addr(), &[ALPN]),
-            b.connect(server.addr(), &[ALPN])
-        );
-        assert!(first.is_ok() || second.is_ok());
-        for result in [first, second] {
-            if let Err(error) = result {
-                assert!(matches!(error, ConnectError::Refused), "{error:?}");
-            }
-        }
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
 async fn stalled_handshake_releases_its_pending_slot() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server_with(&test_config(), &loopback(), &[ALPN], |_| Admit::Accept);

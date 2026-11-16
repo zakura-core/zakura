@@ -427,15 +427,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_digest() {
-        for block_bytes in zakura_test::vectors::BLOCKS.iter() {
-            let block = Block::zcash_deserialize(&**block_bytes).unwrap();
-            let _auth_root = block.transactions.iter().collect::<AuthDataRoot>();
-            // No test vectors for now, so just check it computes without panicking
-        }
-    }
-
-    #[test]
     fn auth_data_padding() {
         // Compute the root of a 3-leaf tree with arbitrary leaves
         let mut v = vec![

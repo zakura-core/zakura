@@ -11,6 +11,293 @@ independently.
 
 ## [Unreleased]
 
+## [1.8.9] - 2026-11-16
+
+### Added
+
+- `network.unconditional_peers` now also takes a DNS name with a port, such as
+  `"peer.example.com:8233"`. Zakura looks the name up before each dial, and
+  never while that peer is connected, so it follows a peer that comes back at a
+  new address without a config change or a restart. It dials one address from
+  the answer at a time, starting with the first it can dial and moving to the
+  next on each later attempt, so each peer needs a name of its own. The address
+  it dialed last is treated like a listed address. When a lookup fails, Zakura
+  dials the last address again. A name without a port fails config load
+  ([#2478](https://github.com/zakura-core/zakura/pull/2478)).
+- A listener now keeps the inbound seat of a peer that was connected for 2
+  hours reserved for that peer's IP for 3 minutes after the connection
+  closes, so a node that restarts can reconnect to a full listener. At most a
+  tenth of the inbound limit is held at once. The new counters
+  `peer.inbound.held_seats.held`, `peer.inbound.held_seats.taken_back` and
+  `peer.inbound.held_seats.refused` count the holds
+  ([#2493](https://github.com/zakura-core/zakura/pull/2493)).
+- A node now dials a peer before other candidates for 5 minutes after an
+  outbound connection to it that was open for 10 minutes ends, so a node that
+  restarts gets back the peers that had dialed it. Each redial still waits the
+  119 s reconnection delay. The new counters
+  `address_book.redial.started.total` and
+  `address_book.redial.reconnected.total` count these peers
+  ([#2497](https://github.com/zakura-core/zakura/pull/2497)).
+- A DNS name in `network.unconditional_peers` can be pinned to the peer's node
+  ID, such as `"<node id>@peer.example.com:8233"`. The name's address is then
+  only exempt from scoring and bans while a P2P v2 connection proves that node
+  ID, so a changed DNS answer, or someone else at the peer's old address, gets
+  no exemption. A connection to the name that stays on the legacy protocol
+  can't prove the node ID, so Zakura closes it. A pin needs
+  `network.p2p_stack = "dual"`, and config load fails
+  without it. A node that runs both stacks warns about each unpinned name
+  ([#2505](https://github.com/zakura-core/zakura/pull/2505)).
+
+### Changed
+
+- Reduced state-service overhead when processing new blocks by comparing the
+  verified best chain by block hash instead of copying every retained header
+  reference
+  ([#1444](https://github.com/zakura-core/zakura/pull/1444)).
+- Blocks and transactions from peers and RPC requests that are larger than the
+  2,000,000-byte block size limit are now rejected before they are parsed,
+  including legacy `block` and `tx` messages whose bodies exceed the limit
+  ([#1491](https://github.com/zakura-core/zakura/pull/1491)).
+- `zakura-chain`: the block and transaction parsers no longer enforce the block
+  size limit. Decode untrusted input with the new `Block::zcash_deserialize_bounded`
+  and `Transaction::zcash_deserialize_bounded`. `ZcashReader::with_limit` is
+  removed ([#1491](https://github.com/zakura-core/zakura/pull/1491)).
+- Builds without the `sprout` feature no longer build the Sprout note
+  commitment tree. The first block whose Sprout commitments they skip marks
+  the database, and a build with `sprout` refuses to open a marked database
+  until its tip is past NU7 and the last checkpoint. The state database
+  format moves to 31.0.0; existing databases are reused in place, and older
+  releases cannot open them
+  ([#2204](https://github.com/zakura-core/zakura/pull/2204)).
+- `getblocktemplate` builds a template for a miner paid to a transparent
+  address without handing the build to another thread, which removes a wait
+  that was longer than the build itself when a new block arrives. Templates
+  that need a proof for a shielded miner reward are built as before, and
+  templates are still built one at a time
+  ([#2342](https://github.com/zakura-core/zakura/pull/2342)).
+- Reduced CPU use at the chain tip by no longer re-checking the keys of
+  already authenticated peers on every peer-discovery message
+  ([#2407](https://github.com/zakura-core/zakura/pull/2407)).
+- Reduced CPU use under transaction load by no longer copying the chain tip
+  block's transaction list on every chain tip read
+  ([#2419](https://github.com/zakura-core/zakura/pull/2419)).
+- Reduced the CPU a node at the chain tip spends on each new block by no longer
+  visiting every block and every index partition when it copies its in-memory
+  chains ([#2433](https://github.com/zakura-core/zakura/pull/2433)).
+- Peer misbehavior reports on the legacy P2P stack are no longer batched or
+  dropped. Scores add up per IP address across ports, and a peer is banned as
+  soon as its score reaches the threshold, instead of up to five seconds
+  later. Previously, reports that arrived while the address book was busy
+  could be lost, so some misbehaving peers were never banned. The new
+  `address_book.misbehavior.banned.total` metric counts bans
+  ([#2444](https://github.com/zakura-core/zakura/pull/2444)).
+- `zakura-network`: misbehavior reporting moves to a new `MisbehaviorReporter`.
+  `zakura_network::init` and `init_with_zakura` return it instead of an
+  `mpsc::Sender<(PeerSocketAddr, u32)>`, and the handshake builder takes it
+  with `with_misbehavior` instead of `with_bans`. `MetaAddr::misbehavior`,
+  `MetaAddr::new_misbehavior`, `MetaAddrChange::UpdateMisbehavior` and
+  `MetaAddrChange::misbehavior_score` are gone
+  ([#2444](https://github.com/zakura-core/zakura/pull/2444)).
+
+<!-- release-readiness: allow-patch; reason: The release owner approved v1.8.9 as a patch. Node operators get backwards-compatible additions and behavior changes, and library crates keep independent SemVer bumps for their API changes. -->
+- `zcash.net.peers.cache` no longer has a `remote_ip` label: each peer cache
+  write adds the number of cached peers to one series per cache file. The
+  per-address series grew with uptime and were never removed, so long-running
+  nodes served a much larger metrics page. Update dashboards and alerts that
+  select or group this metric by `remote_ip`
+  ([#2477](https://github.com/zakura-core/zakura/pull/2477)).
+- `zakura-rpc`: the indexer client's `BlockAndHash::decode` and
+  `BlockAndHeight::decode` now reject blocks larger than the 2,000,000-byte
+  block size limit before parsing them
+  ([#2489](https://github.com/zakura-core/zakura/pull/2489)).
+- Reduced CPU use during block sync by no longer re-checking the keys of
+  already authenticated peers each time block-sync candidates are published
+  ([#2490](https://github.com/zakura-core/zakura/pull/2490)).
+- A long-polling `getblocktemplate` request now checks the mempool every
+  2 seconds instead of every 5, so new transactions reach miners' templates
+  sooner ([#2526](https://github.com/zakura-core/zakura/pull/2526)).
+
+### Fixed
+
+- The inbound service now answers an empty `getheaders` request with an empty
+  `headers` message instead of no reply, so a zcashd-compat sidecar peer no
+  longer times out and churns through reconnects at tip-parity
+  ([#1180](https://github.com/zakura-core/zakura/pull/1180)).
+- Fixed `getblockheader` and `getblock` (verbosity 1 and 2), so that they do
+  not report a failure of the state service as a missing block. They now
+  return -1 with the original error message. A block that is not in the best
+  chain still gives -5 for a hash and -8 for a height
+  ([#2482](https://github.com/zakura-core/zakura/pull/2482)).
+- Extended the bundled Testnet checkpoints past NU7 activation to height
+  4,618,666, so default builds without the `sprout` feature can sync Testnet
+  from genesis again ([#2494](https://github.com/zakura-core/zakura/pull/2494)).
+
+### Security
+
+- The Prometheus metrics endpoint now serves at most 16 connections at once,
+  closes connections that send no request headers within 30 seconds or stay
+  open longer than 120 seconds, and waits before retrying failed accepts, so
+  idle clients can no longer exhaust the node's file descriptors
+  ([#1615](https://github.com/zakura-core/zakura/pull/1615)).
+
+## [1.8.8] - 2026-11-14
+
+### Added
+
+- With `network.zakura.trace_dir` set, legacy peer connections write
+  `legacy_gossip.jsonl`: each block announcement sent to a peer, the peer's
+  request for that block, and the block being sent to it or found missing.
+  They also write the announcements each peer sends, up to 16 a minute for
+  each connection. Requests for blocks this node did not announce to that
+  peer are not written, so what a peer sends cannot make the file grow
+  without bound. Rows never hold a peer's address. The `ZAKURA_TRACE_PEER_NAMES`
+  environment variable (`name=ip` pairs separated by commas) names the peers an
+  operator wants to tell apart
+  ([#2446](https://github.com/zakura-core/zakura/pull/2446)).
+
+### Changed
+
+- `network.unconditional_peers` now also keeps its peers connected. Zakura
+  dials every entry that names one address, and dials it again whenever no
+  connection to that peer is open in either direction. An entry can give the
+  port to dial, such as `"192.0.2.1:8233"`. An entry without a port is dialed
+  on the network's default port, and a CIDR range is only dialed when it covers
+  a single address. Each dialed address adds one outbound and one inbound
+  connection slot on top of the connection limits. The inbound slots are a pool
+  that only listed peers can use, so a node whose other inbound slots are full
+  still accepts a listed peer that dials it. One IP holds at most
+  `max_connections_per_ip` of these slots. Zakura's other outbound dials leave
+  a listed address's IP the room the listed peer needs. Zakura also
+  lets these peers reconnect inbound without its usual wait between connections
+  from one IP. IP addresses that an existing config
+  already lists start being dialed after the upgrade, and a listed peer that
+  accepts no connections costs one failed dial every ten minutes once its delay
+  has grown
+  ([#2389](https://github.com/zakura-core/zakura/pull/2389)).
+- Start up to 50 legacy startup peer connection attempts at once, and start the
+  next one as soon as an attempt completes, instead of spacing attempts 100 ms
+  apart. The total startup peer target and per-IP limits still apply
+  ([#2396](https://github.com/zakura-core/zakura/pull/2396)).
+- Reduced the CPU a node spends keeping its peer address metrics up to date,
+  which was the largest single CPU cost of an idle node at the chain tip
+  ([#2409](https://github.com/zakura-core/zakura/pull/2409)).
+- Reduced CPU use when encoding blocks and transactions with Orchard, Ironwood
+  or Sapling bundles, and when serving blocks to peers, by no longer copying
+  each bundle before writing it
+  ([#2421](https://github.com/zakura-core/zakura/pull/2421)).
+- Legacy connections now reuse recently calculated large-block checksums,
+  reducing repeated hashing when several peers request the same block.
+  Concurrent sends can still each calculate a checksum before it is remembered
+  ([#2424](https://github.com/zakura-core/zakura/pull/2424)).
+- The `error` label of `zakura.net.in.errors` and the `reason` label of
+  `mempool.failed.verify.tasks.total` now name the error kind, such as `io`,
+  `parse`, `invalid` or `download_failed`, instead of the full error message.
+  Peers could otherwise create an unbounded number of metric series. Update
+  dashboards and alerts that match full error messages on these labels
+  ([#2439](https://github.com/zakura-core/zakura/pull/2439)).
+- The start time in a trace row's `process_trace_id` is now the moment the
+  row's `ts` counts from, so adding the two gives the row's wall-clock time.
+  Before, the two were read at different moments and could be seconds apart
+  ([#2446](https://github.com/zakura-core/zakura/pull/2446)).
+- With `[network.zakura] trace_dir` set, `zakurad` now moves to the file at a
+  trace table's path within about a second when its own file was renamed,
+  deleted or replaced, so trace files can be rotated by renaming them without
+  losing rows
+  ([#2449](https://github.com/zakura-core/zakura/pull/2449)).
+- The continuous profiler finishes reading a renamed trace table across bounded
+  reads before switching files, truncating it, or rotating again, preserving rows
+  in large backlogs even while the node is delayed before opening a replacement.
+- Legacy P2P message checksums are calculated with `ring`'s SHA-256, which
+  uses the vector instructions of CPUs that lack SHA instructions. On such a
+  mainnet node, serving old blocks to syncing peers used 32% less CPU per MB
+  and one connection delivered blocks about 50% faster. Checksum values are
+  unchanged
+  ([#2450](https://github.com/zakura-core/zakura/pull/2450)).
+- Calculate block-header hashes, transaction Merkle-tree hashes, and transaction
+  IDs for versions one through four with `ring`, preserving the existing hash
+  values ([#2457](https://github.com/zakura-core/zakura/pull/2457)).
+- Made Sprout JoinSplit proof and signature verification opt-in with the `sprout`
+  Cargo feature. Builds using post-NU7 snapshots do not need it; verifying
+  pre-NU7 blocks above the last checkpoint, including Testnet sync from genesis
+  with the current checkpoints, requires `--features sprout`
+  ([#2466](https://github.com/zakura-core/zakura/pull/2466)).
+- Sped up mempool cleanup after new blocks by finding conflicting transactions
+  through spend-owner indexes instead of scanning the entire pool
+  ([#2467](https://github.com/zakura-core/zakura/pull/2467)).
+- Sped up mempool expiry cleanup after new blocks by indexing expiry heights
+  instead of scanning transactions that are not due to expire
+  ([#2468](https://github.com/zakura-core/zakura/pull/2468)).
+- Reduced mempool cleanup work after new blocks by batching transaction removals,
+  dependency-order updates and metric reports while retaining unmined children
+  of confirmed transactions
+  ([#2469](https://github.com/zakura-core/zakura/pull/2469)).
+- Sped up pending transaction gossip cleanup after mining or invalidation by
+  removing changed IDs directly instead of scanning the advertisement backlog
+  ([#2470](https://github.com/zakura-core/zakura/pull/2470)).
+- Removed the retired Sprout nullifier index from mempool storage. Sprout
+  JoinSplits are now rejected by mempool policy even on custom pre-NU7 networks;
+  historical block verification remains available with the `sprout` feature
+  ([#2471](https://github.com/zakura-core/zakura/pull/2471)).
+- Reduced mempool ordering maintenance during admission and block cleanup by
+  caching ordering scores and refreshing only surviving transactions whose
+  priorities change
+  ([#2473](https://github.com/zakura-core/zakura/pull/2473)).
+- Reduced how often the state service exports RocksDB metrics from every 30
+  seconds to every 5 minutes. The `zakura.state.rocksdb.*` gauges and the
+  `size_on_disk` RPC estimate now refresh at that interval
+  ([#2475](https://github.com/zakura-core/zakura/pull/2475)).
+- Retained the approved v1.8.8 node patch version for the pending operational,
+  performance, tracing, and build changes. Builds that verify pre-NU7 blocks
+  above the last checkpoint still require the documented `sprout` feature
+  ([#2466](https://github.com/zakura-core/zakura/pull/2466),
+  [#2479](https://github.com/zakura-core/zakura/pull/2479)).
+
+<!-- release-readiness: allow-patch; reason: The release owner approved the pending node operational, performance, tracing, and documented Sprout build-feature changes for v1.8.8. Library-only API cleanup is excluded from the node changelog and retains independent crate SemVer checks. -->
+
+### Fixed
+
+- Scale NU7 reissuance to custom halving intervals so compatible Zebra and Zakura nodes
+  calculate the same subsidy. Existing custom NU7 chains need coordinated deployment
+  and a reset or explicit migration if they used the previous payout rule
+  ([#1591](https://github.com/zakura-core/zakura/pull/1591)).
+- Restored `NODE_NETWORK` advertising for pruned nodes so peers can discover,
+  reconnect to, and download recent blocks from them. Pruned nodes additionally
+  advertise an experimental `NODE_PRUNED` flag. While an updated node is still
+  syncing, it downloads blocks from peers without the flag and waits for one of
+  them when they are all busy. It asks a pruned peer only when it is connected
+  to no such peer, or when those peers leave block requests unanswered. It
+  sends `getblocks` to peers without the flag too, because pruned peers leave
+  a `getblocks` for deleted blocks unanswered. Near
+  the network tip it treats pruned peers like any other peer. `getnetworkinfo`
+  now reports the node's actual
+  `localservices`, including these flags
+  ([#2382](https://github.com/zakura-core/zakura/pull/2382)).
+- Cancel spawned legacy handshakes when their caller is dropped, so a connection
+  timeout releases the stream and connection reservation immediately
+  ([#2396](https://github.com/zakura-core/zakura/pull/2396)).
+- A restarted node now dials the peers in its legacy peer cache when every seed
+  DNS lookup fails, instead of retrying DNS forever without connecting
+  ([#2399](https://github.com/zakura-core/zakura/pull/2399)).
+- The legacy peer cache now keeps only peers that responded to this node in
+  the last 3 hours, not addresses learned from gossip, so a restart spends its
+  first connection attempts on peers that recently accepted a connection
+  ([#2404](https://github.com/zakura-core/zakura/pull/2404)).
+- Restored the published consensus crate's Halo2 error type and conversion,
+  preserving compatibility with its current stable release
+  ([#2413](https://github.com/zakura-core/zakura/pull/2413)).
+- Read gossip trace peer names from `network.zakura.trace_peer_names` instead
+  of an environment variable that could prevent the node from starting. The
+  fleet installer writes the mapping and removes the obsolete environment
+  override after verifying the configuration
+  ([#2474](https://github.com/zakura-core/zakura/pull/2474)).
+
+### Security
+
+- A legacy peer's `getblocks` reply to a `FindBlocks` request now keeps at
+  most 500 block hashes, the most `zakurad` and zcashd serve, so one peer can
+  no longer make the syncer process up to 50,000 hashes per response
+  ([#2437](https://github.com/zakura-core/zakura/pull/2437)).
+
 ## [1.8.7] - 2026-11-12
 
 ### Added

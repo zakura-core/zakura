@@ -1,5 +1,9 @@
 //! Randomised property tests for the finalized state.
 
+// Several fast-sync tests here are built around the Sprout tree and need the `sprout` feature.
+// Without it, imports only they use are unused.
+#![cfg_attr(not(feature = "sprout"), allow(unused_imports))]
+
 use std::{
     collections::HashMap,
     env,
@@ -46,11 +50,13 @@ use crate::{
 };
 
 use super::super::{
-    commitment_aux, export_frontier_grid_to, serve_block_roots,
-    vct::validate_final_frontiers_bytes, verify_subtrees_against_stored, CheckpointVerifiedBlock,
-    DiskWriteBatch, FinalizedState, FrontierArtifact, FrontierEntry, FrontierGridExportError,
-    GridSpacing, VctAuxiliaryWindow, VctSuccessorWitness,
+    commitment_aux, export_frontier_grid_to, serve_block_roots, verify_subtrees_against_stored,
+    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState, FrontierArtifact, FrontierEntry,
+    FrontierGridExportError, GridSpacing, VctAuxiliaryWindow, VctSuccessorWitness,
 };
+
+#[cfg(feature = "sprout")]
+use super::super::vct::validate_final_frontiers_bytes;
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
 
@@ -226,6 +232,7 @@ fn enable_vct_test_fixture_source_with_handoff(
 /// The contextual anchor check does not verify proofs, so the original BCTV14 proof is replaced
 /// with a correctly sized placeholder Groth16 proof. Proof verification belongs to semantic
 /// verification and is deliberately outside this state-anchor regression.
+#[cfg(feature = "sprout")]
 fn v4_transaction_with_interstitial_anchor(old_anchor_tree: &SproutTree) -> Arc<Transaction> {
     let source = zakura_test::vectors::BLOCK_MAINNET_396_BYTES
         .zcash_deserialize_into::<Block>()
@@ -321,6 +328,8 @@ fn vct_test_network() -> Network {
         .expect("failed to build configured network")
 }
 
+// Generates final frontiers, which needs the Sprout tree.
+#[cfg(feature = "sprout")]
 #[test]
 fn vct_generated_final_frontier_bytes_are_node_loader_compatible() -> Result<()> {
     let _init_guard = zakura_test::init();
@@ -917,6 +926,8 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
 /// The committer returns `VctSuppliedRootAwaitingSuccessor` and leaves the database untouched.
 /// The committer accepts the same height after the test buffers a successor.
 /// A trusted local fixture remains exempt from this requirement.
+// Counts the Sprout commitments a retried fast-sync commit appends.
+#[cfg(feature = "sprout")]
 #[test]
 #[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and inserts roots by height
 fn vct_untrusted_source_defers_unverifiable_tip_root_until_successor() -> Result<()> {
@@ -1441,6 +1452,8 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
 /// height, marks the database fast-synced, guards historical per-height tree reads
 /// below the handoff, and leaves the tip treestate (which post-checkpoint semantic
 /// verification resumes from) byte-identical to the legacy recompute.
+// Checks the Sprout tree that fast sync rebuilds up to the handoff.
+#[cfg(feature = "sprout")]
 #[test]
 #[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] and the fixture by height
 fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
@@ -2489,6 +2502,8 @@ fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()>
 /// This is coverage the existing equivalence test lacks: there the roots are captured
 /// from the committer's inline-returned trees, here they come from the **DB read path**
 /// a serving node runs. No networking and no DB-format change.
+// Generates final frontiers, which needs the Sprout tree.
+#[cfg(feature = "sprout")]
 #[test]
 #[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] (the look-ahead) and by height
 fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {

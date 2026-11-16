@@ -336,6 +336,7 @@ where
             request_slot: Default::default(),
             peer_registry_updater: None,
             connection_info,
+            connection_id: 0,
             shutdown_tx: Some(shutdown_sender),
             server_tx: client_request_sender,
             block_advert_tx: block_advert_sender,

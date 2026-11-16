@@ -180,6 +180,19 @@ pub const CONCURRENT_ADDRESS_CHANGE_PERIOD: Duration = Duration::from_secs(5);
 /// specific manner that matches up with this math.
 pub const MIN_PEER_RECONNECTION_DELAY: Duration = Duration::from_secs(59 + 20 + 20 + 20);
 
+/// How long an outbound connection must have responded for its peer to be dialed before
+/// other candidates after the connection ends, see `MetaAddr::is_redialed_first`.
+pub const MIN_REDIAL_CONNECTION: Duration = Duration::from_secs(10 * 60);
+
+/// How long after its last response a peer with a long-lived outbound connection is
+/// dialed before other candidates.
+///
+/// A node that restarts within this time is dialed again by the peers that were
+/// connected to it. Each redial still waits [`MIN_PEER_RECONNECTION_DELAY`] after the
+/// last one, so the peer is dialed about 2, 4 and 6 minutes after its connection ends.
+/// The last of these dials finds the window over and ends it.
+pub const REDIAL_WINDOW: Duration = Duration::from_secs(5 * 60);
+
 /// Zebra rotates its peer inventory registry every time this interval elapses.
 ///
 /// After 2 of these intervals, Zebra's local available and missing inventory entries expire.
@@ -309,6 +322,21 @@ pub const UNCONDITIONAL_PEER_HEALTHY_CONNECTION: Duration = Duration::from_secs(
 /// The inbound interval is much longer than the outbound interval, because Zebra does not
 /// control the selection or reconnections of inbound peers.
 pub const MIN_INBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long an inbound connection must have been open for the listener to hold its seat
+/// after it closes, see `peer_set::initialize::held_seats::HeldSeats`.
+///
+/// Short connections, such as crawlers and monitors, hold no seat, and a peer that the
+/// listener kept this long was not dropped or banned in that time.
+pub const MIN_HELD_SEAT_CONNECTION: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// How long the listener holds the seat of a long-lived inbound peer after its connection
+/// closes, so the peer can take it back after a restart.
+pub const HELD_SEAT_DURATION: Duration = Duration::from_secs(3 * 60);
+
+/// The listener holds at most its inbound connection limit divided by this number of
+/// seats at once.
+pub const HELD_SEAT_LIMIT_DIVISOR: usize = 10;
 
 /// The minimum time between _failed_ inbound peer connections, implemented by
 /// `peer_set::initialize::accept_inbound_connections`.
@@ -526,6 +554,14 @@ pub static INITIAL_MIN_NETWORK_PROTOCOL_VERSION: LazyLock<HashMap<NetworkKind, V
 /// [RFC 1123: Requirements for Internet Hosts] <https://tools.ietf.org/rfcmarkup?doc=1123>
 /// [6.1.3.3  Efficient Resource Usage] <https://tools.ietf.org/rfcmarkup?doc=1123#page-77>
 pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most system resolver calls for the DNS names of unconditional peers that can be
+/// running at once.
+///
+/// A lookup normally ends within [`DNS_LOOKUP_TIMEOUT`], so this only limits a config
+/// with more names than this looking them up in the same instant, and a resolver whose
+/// calls do not return. Lookups beyond the limit fail, and are retried with backoff.
+pub const MAX_UNCONDITIONAL_PEER_LOOKUPS_IN_FLIGHT: usize = 32;
 
 #[cfg(test)]
 mod tests {

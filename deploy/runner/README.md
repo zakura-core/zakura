@@ -18,11 +18,11 @@ serves both the existing fleet dashboard and a narrow public API:
 - `GET /data` retains the existing fleet dashboard and watchdog response.
 - `GET /node/<name>` serves the per-node detail page.
 - `GET /data/node/<name>` returns that node's detail payload.
-- `GET /profile/<name>` serves the CPU flame graphs of a node that runs the
-  [continuous profiler](../profiler/README.md), and `GET /profile/<name>/api/...`
-  forwards the page's requests to it. A node has one when its entry sets
-  `monitor = { profiler_url = "http://host:port" }`; the fleet table marks it
-  "profiled".
+- For a node that runs the [continuous profiler](../profiler/README.md) (its entry
+  sets `monitor = { profiler_url = "http://host:port" }`), the fleet table marks
+  it "profiled" and its node page adds a "CPU profile" section, whose requests
+  `GET /profile/<name>/api/...` forwards to the profiler. `GET /profile/<name>`
+  redirects to `/node/<name>#profile`.
 
 The public Ironwood response is unavailable with HTTP `503` if the service
 cannot verify a matching network, Ironwood pool, tip, or source client, or if
@@ -57,6 +57,101 @@ The probe collects a redacted tail of the node's `ERROR`/`WARN` log lines, but
 the page does not serve it unless the dashboard runs with `--expose-logs`. These
 dashboards are public and unauthenticated, so log text stays off by default even
 though peer addresses are already redacted on the node.
+
+### Block Propagation
+
+On a fleet whose nodes run the continuous profiler (`deploy/profiler/`), the
+dashboard also serves `/propagation`: for each recent block, when each node
+first heard of it and from which of our nodes or from outside, how long it
+then waited to ask, downloaded, verified, committed and told its peers, and
+every announcement between two of our nodes. Below that are medians per node
+and per pair of nodes over the blocks shown. The fleet page links to it, and
+every node name on it links to that node's own page (`/node/<name>`).
+Selecting a block in the list of recent blocks shows its path and puts it in
+the page address (`/propagation#block=<hash>`), which then leads to that block
+for as long as the nodes still report it.
+
+`/propagation/data` is the same as JSON. The dashboard asks each node's
+profiler for its recent blocks (`/api/propagation`) at most once every 10
+seconds, and `propagation.py` joins them by block hash on one time axis that
+starts when the first node heard of the block. A node that did not answer is
+listed as unreachable and the rest are still joined. Coverage counts include only
+configured profiled nodes. A block can be absent even when its profiler answers;
+only blocks recorded by every profiled node contribute to the complete-coverage
+timing summary.
+
+Times come from each node's own clock. The page shows each node's clock error
+as its time service reports it and marks a time between two nodes that is smaller than
+their combined error. A node whose trace clock disagrees with its log by more
+than 50 ms, as builds before the trace clock fix do, is placed by its log
+instead and marked.
+
+The page also says who served each block. In the selected block's table every
+node has a "Downloaded from" column, and its "First heard from" column names
+the outside peer that announced the block first when the node has written that
+connection's address (in a request it sent the same connection, matched by the
+connection's number). "Slowest downloads" lists the 50 slowest
+single attempts over the blocks shown, with the node that made it, the peer,
+its software, the block and its size; selecting one shows its block. "Peers
+outside the fleet" has one row per outside IP address, slowest first: its
+software (`/Zakura:1.8.7/` reads "Zakura 1.8.7", and zcashd's `/MagicBean:6.2.0/`
+reads "zcashd 6.2.0"), which of our nodes
+downloaded from it, how many attempts were recorded and how many legacy attempts
+failed, and the median, 9-in-10 and slowest time of the ones that delivered a block.
+"By software" groups the same downloads by the exact software name each peer
+sent, most peers first, with each version's peer count and the times of all its
+downloads.
+
+A peer is one of four kinds. One of our nodes, recognised by its Zakura label
+or by the address the node list reaches it at, is shown by name. A peer whose
+address the node did not record reads "address hidden": that is every peer
+until a node runs a build that writes download rows and has restarted with
+`expose_peer_addresses` on (`deploy/profiler/README.md`). A peer whose address
+is on the dashboard's private list (below) reads "private peer". Any other is
+an outside peer, shown by IP address.
+
+A peer's software is the name it sent in the legacy handshake. A peer that
+sent an empty name reads "no name sent". A Zakura peer the node dialled
+directly, without a legacy handshake first, sends no name at all and gets no
+upgrade row, so its downloads read "address hidden" and "Zakura, version not
+recorded".
+
+Limits: a legacy download time is in whole milliseconds and includes any wait
+behind other requests on the same connection. A peer that connects to us does
+so from a temporary port, so peers are told apart by IP address alone and two
+nodes behind one address are one row.
+
+The failure column is explicitly **Legacy failures**. Zakura downloads are recorded
+when a body arrives, so zero does not establish that a Zakura peer had no failed
+requests. Its existing range-unavailable event describes an entire request, which
+can include bodies already delivered; expanding it into per-block failures would
+overcount. Timeouts and range endings need request-level correlation before they
+can contribute comparable failure counts.
+
+**Private addresses.** The addresses in
+`/etc/zakura-mainnet-dashboard/private/addresses.json` are never shown. The
+list exists only on the dashboard host, so that is where they are dropped:
+when the nodes' records are joined, a download from such an address keeps its
+time and loses its address, its software and its Zakura label, however the
+node wrote the address (with a port, or as IPv4 inside IPv6). If the list is
+required and cannot be read, `/propagation/data` answers 503 and serves
+nothing. Like every JSON response, the result then passes the dashboard's
+address filter. The privacy check that runs after a Mac dashboard deploy
+(`audit_public_privacy` in `deploy/deployer/zakura-mac-cranelift-manager.py`)
+fetches `/propagation` and `/propagation/data` and fails if the address
+appears. Like the other fleet pages, both need the dashboard password when one
+is set. Anything new that shows peer addresses must do the same three things:
+drop the private ones where the list is, refuse to serve without it, and be
+added to that check.
+
+Legacy announcements between our nodes are only visible when the nodes run a
+build that writes `legacy_gossip.jsonl` and know each other's names
+(`fleet.py peer-names`). Without those, a legacy node still appears with its
+own stage times, and its source shows as outside the fleet.
+
+`propagation.py`, `propagation.html`, and the shared `peer_addresses.py` are
+installed beside `zakura-cluster-status.py`; the dashboard loads them only when a node in its
+list has a `profiler_url`.
 
 ### Tip Agreement and Orphan Pairs
 

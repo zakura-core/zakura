@@ -201,6 +201,7 @@ def dashboard_session():
 
 def audit_public_privacy():
     """Fail if the private Mac address appears anywhere a dashboard visitor can read."""
+    import urllib.error
     import urllib.request
     import urllib.parse
     from html.parser import HTMLParser
@@ -218,11 +219,20 @@ def audit_public_privacy():
                 self.sources.append(dict(attrs)['src'])
     base = 'https://' + STATUS_DASHBOARD_HOST
     cookie = dashboard_session()
-    routes = ['/', '/node/mac-os-cranelift', '/data', '/data/node/mac-os-cranelift', '/ironwood-status.json']
+    # The cluster view lists the peers our nodes downloaded blocks from by address. The
+    # dashboard serves it only when the fleet's nodes run profilers.
+    cluster_view = ['/propagation', '/propagation/data']
+    routes = ['/', '/node/mac-os-cranelift', '/data', '/data/node/mac-os-cranelift', '/ironwood-status.json',
+              *cluster_view]
     for route in routes:
         url = urllib.parse.urljoin(base, route)
-        with urllib.request.urlopen(urllib.request.Request(url, headers={'Cookie': cookie}), timeout=15) as response:
-            payload = response.read(8 * 1024 * 1024 + 1)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={'Cookie': cookie}), timeout=15) as response:
+                payload = response.read(8 * 1024 * 1024 + 1)
+        except urllib.error.HTTPError as error:
+            if route in cluster_view and error.code == 404:
+                continue
+            raise
         if len(payload) > 8 * 1024 * 1024:
             raise ValueError('public privacy audit response too large')
         text = payload.decode()

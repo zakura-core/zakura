@@ -1,6 +1,7 @@
 //! Compact block relay message encodings, limits, and short IDs.
 
 use zakura_chain::{
+    block::Block,
     transaction::{self, AuthDigest, WtxId},
     transparent,
 };

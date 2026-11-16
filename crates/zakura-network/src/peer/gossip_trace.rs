@@ -229,7 +229,8 @@ impl PeerGossipTrace {
         }
     }
 
-    /// Our announcement of the block `hash` was written to the peer.
+    /// Our announcement of the block `hash`, an `inv` or a `cmpctblock`, was written to the
+    /// peer.
     pub(crate) fn block_inv_sent(&self, hash: block::Hash) {
         let announced = self.remembered(|exchanges| {
             exchanges.announce(hash);

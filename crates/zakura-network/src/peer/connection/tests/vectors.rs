@@ -2275,11 +2275,7 @@ fn block_advert(
     crate::peer::block_gossip::BlockAdvert,
     tokio::sync::oneshot::Receiver<Result<(), crate::peer::block_gossip::BlockAdvertError>>,
 ) {
-    let (result, delivery) = tokio::sync::oneshot::channel();
-    (
-        crate::peer::block_gossip::BlockAdvert { hash, result },
-        delivery,
-    )
+    crate::peer::block_gossip::BlockAdvert::new(hash, crate::peer::block_gossip::compact_slots())
 }
 
 /// Block adverts bypass pending responses without replacing their handlers or closing the client.

@@ -113,10 +113,11 @@ async fn block_advert_is_written_before_a_queued_warmup_ping() {
     let (chunk, _warmup) = warmup_chunk(Nonce(3), 1000);
     warmup_tx.try_send(chunk).unwrap();
     let hash = block::Hash([7; 32]);
-    let (result, _delivery) = tokio::sync::oneshot::channel();
-    advert_tx
-        .try_send(crate::peer::block_gossip::BlockAdvert { hash, result })
-        .unwrap();
+    let (advert, _delivery) = crate::peer::block_gossip::BlockAdvert::new(
+        hash,
+        crate::peer::block_gossip::compact_slots(),
+    );
+    advert_tx.try_send(advert).unwrap();
 
     let connection = tokio::spawn(connection.run(peer_rx));
 

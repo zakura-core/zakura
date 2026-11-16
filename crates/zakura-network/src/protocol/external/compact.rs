@@ -17,7 +17,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use siphasher::sip::SipHasher24;
 
 use zakura_chain::{
-    block::{self, Block, MAX_BLOCK_BYTES},
+    block::{self, BlockRef, MAX_BLOCK_BYTES},
     serialization::{
         CompactSizeMessage, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashReader,
         ZcashSerialize,
@@ -153,30 +153,30 @@ impl ShortIdKeys {
 impl CompactBlock {
     /// Returns the compact form of `block`, with only its coinbase transaction prefilled.
     ///
+    /// Takes a borrowed block, so a block whose owner tracks its memory lends no shared
+    /// handles. The message holds copies of the header and the coinbase transaction.
+    ///
     /// Choose `nonce` uniformly at random for each message. Fails if the block has no coinbase
     /// transaction first or exceeds the ZIP's limits.
-    pub fn from_block(block: &Block, nonce: u64) -> Result<Self, SerializationError> {
-        check_count(block.transactions.len())?;
+    pub fn from_block(block: &BlockRef, nonce: u64) -> Result<Self, SerializationError> {
+        check_count(block.transactions().len())?;
         check_block_bytes(block.zcash_serialized_size())?;
-        let (coinbase, others) =
-            block
-                .transactions
-                .split_first()
-                .ok_or(SerializationError::Parse(
-                    "compact block has no transactions",
-                ))?;
+        let mut transactions = block.transactions();
+        let coinbase = transactions.next().ok_or(SerializationError::Parse(
+            "compact block has no transactions",
+        ))?;
 
-        let keys = ShortIdKeys::new(&block.header, nonce);
+        let header = block.header();
+        let keys = ShortIdKeys::new(header, nonce);
         let compact = Self {
-            header: block.header.clone(),
+            header: Arc::new(*header),
             nonce,
-            short_ids: others
-                .iter()
-                .map(|transaction| keys.short_id(transaction.as_ref().into()))
+            short_ids: transactions
+                .map(|transaction| keys.short_id(transaction.into()))
                 .collect(),
             prefilled: vec![PrefilledTransaction {
                 index: 0,
-                transaction: coinbase.clone(),
+                transaction: Arc::new(coinbase.clone()),
             }],
         };
         compact.validate()?;

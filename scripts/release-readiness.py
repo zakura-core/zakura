@@ -25,13 +25,6 @@ MAINNET_TARGET_SPACINGS = ((0, 150), (653_600, 75), (3_543_405, 25))
 # after the committed checkpoint.
 EOS_FLOOR_DAYS = 3
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MINOR_CATEGORIES = {"Added", "Changed", "Deprecated", "Removed"}
-PATCH_WAIVABLE_CATEGORIES = {"Added", "Changed"}
-PATCH_WAIVER_PREFIX = "<!-- release-readiness: allow-patch"
-PATCH_WAIVER = re.compile(
-    r"<!--\s*release-readiness:\s*allow-patch\s*;\s*reason:\s*(?P<reason>[^<>]*\S)\s*-->",
-    re.IGNORECASE,
-)
 NETWORK_UPGRADE = re.compile(r"\b(?:mainnet\s+)?network upgrade\b", re.IGNORECASE)
 VERSION = re.compile(
     r"^(?P<major>0|[1-9][0-9]*)\."
@@ -121,36 +114,11 @@ def changelog_context(
     }
 
 
-def patch_waiver_reason(entries: dict[str, list[str]]) -> str | None:
-    combined = "\n".join(body for bodies in entries.values() for body in bodies)
-    markers = list(PATCH_WAIVER.finditer(combined))
-    if PATCH_WAIVER_PREFIX in combined.lower() and not markers:
-        raise ReadinessError(
-            "allow-patch waiver must use "
-            "'<!-- release-readiness: allow-patch; reason: ... -->'"
-        )
-    if len(markers) > 1:
-        raise ReadinessError("release changelog must contain at most one allow-patch waiver")
-    if not markers:
-        return None
-
-    non_waivable = sorted(
-        MINOR_CATEGORIES.intersection(entries) - PATCH_WAIVABLE_CATEGORIES
-    )
-    if non_waivable:
-        raise ReadinessError(
-            "allow-patch waiver cannot cover changelog categories: "
-            + ", ".join(non_waivable)
-        )
-    return " ".join(markers[0].group("reason").split())
-
-
 def minimum_release(
     base: Version, target: Version, entries: dict[str, list[str]]
 ) -> tuple[str, CoreVersion, list[str]]:
     categories = sorted(entries)
     combined = "\n".join(body for bodies in entries.values() for body in bodies)
-    patch_waiver = release_patch_waiver(base, target, entries)
 
     # Later candidates and the stable release keep the core chosen by the
     # first candidate. New entries during the candidate cycle are folded into
@@ -162,15 +130,11 @@ def minimum_release(
             )
         return "continuation", base.core, categories
 
+    # Only a Mainnet network upgrade forces a release level. Choosing between
+    # a patch and a minor release is left to the release owner.
     if NETWORK_UPGRADE.search(combined):
         level = "major"
         minimum = CoreVersion(base.core.major + 1, 0, 0)
-    elif patch_waiver is not None:
-        level = "patch"
-        minimum = CoreVersion(base.core.major, base.core.minor, base.core.patch + 1)
-    elif MINOR_CATEGORIES.intersection(entries):
-        level = "minor"
-        minimum = CoreVersion(base.core.major, base.core.minor + 1, 0)
     else:
         level = "patch"
         minimum = CoreVersion(base.core.major, base.core.minor, base.core.patch + 1)
@@ -178,7 +142,7 @@ def minimum_release(
     if target.core < minimum:
         raise ReadinessError(
             f"target {target.core} is below the {minimum} {level} floor "
-            f"required by changelog categories: {', '.join(categories) or 'none'}"
+            "required by a Mainnet network upgrade entry"
         )
     if target.core <= base.core:
         raise ReadinessError(
@@ -186,19 +150,6 @@ def minimum_release(
         )
 
     return level, minimum, categories
-
-
-def release_patch_waiver(
-    base: Version, target: Version, entries: dict[str, list[str]]
-) -> str | None:
-    """Apply the approved node-only exception for the stable v1.8.6 release."""
-    if base == parse_version("1.8.5") and target == parse_version("1.8.6"):
-        return (
-            "The release owner approved v1.8.6 as a patch, including the documented "
-            "removal of historical treestate commands from default builds and unused "
-            "Sprout library types. Library crates retain independent SemVer bumps."
-        )
-    return patch_waiver_reason(entries)
 
 
 def version_report(repo_root: Path, base_version: str, release_tag: str) -> dict[str, object]:
@@ -214,7 +165,6 @@ def version_report(repo_root: Path, base_version: str, release_tag: str) -> dict
         "minimum_level": level,
         "minimum_version": str(minimum),
         "categories": categories,
-        "patch_waiver_reason": release_patch_waiver(base, target, entries),
         "changelog": context,
     }
 
@@ -300,29 +250,15 @@ def height_report(
 
 
 class SelfTests(unittest.TestCase):
-    def test_approved_stable_patch_allows_documented_removals(self) -> None:
-        level, minimum, _ = minimum_release(
-            parse_version("1.8.5"),
-            parse_version("1.8.6"),
-            {"Removed": ["- Removed debug commands from default builds."]},
-        )
-        self.assertEqual((level, str(minimum)), ("patch", "1.8.6"))
-
-    def test_patch_exception_does_not_apply_to_other_releases(self) -> None:
-        for base, target in (("1.8.5", "1.8.6-rc0"), ("1.8.5", "1.8.7"), ("1.8.6", "1.8.7")):
-            with self.subTest(base=base, target=target):
-                with self.assertRaisesRegex(ReadinessError, "minor floor"):
-                    minimum_release(
-                        parse_version(base), parse_version(target),
-                        {"Removed": ["- Removed a command."]},
-                    )
-
-    def test_patch_exception_preserves_network_upgrade_floor(self) -> None:
-        with self.assertRaisesRegex(ReadinessError, "major floor"):
-            minimum_release(
-                parse_version("1.8.5"), parse_version("1.8.6"),
-                {"Added": ["- Added the Mainnet Network Upgrade."]},
-            )
+    def test_changelog_categories_allow_patch_target(self) -> None:
+        for category in ("Added", "Changed", "Deprecated", "Removed", "Fixed", "Security"):
+            with self.subTest(category=category):
+                level, minimum, _ = minimum_release(
+                    parse_version("1.8.8"),
+                    parse_version("1.8.9"),
+                    {category: ["- Changed an API."]},
+                )
+                self.assertEqual((level, str(minimum)), ("patch", "1.8.9"))
 
     def test_assembled_untagged_section_still_sets_release_floor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -333,7 +269,7 @@ class SelfTests(unittest.TestCase):
                 "## [Unreleased]\n\n"
                 "## [1.0.6-rc0] - 2026-08-01\n\n"
                 "### Added\n\n"
-                "- Added an RPC.\n\n"
+                "- Added the Mainnet Network Upgrade.\n\n"
                 "## [1.0.5] - 2026-07-27\n\n"
                 "### Fixed\n\n"
                 "- Fixed an older bug.\n"
@@ -343,85 +279,12 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(context["latest_version"], "1.0.6-rc0")
             self.assertEqual(context["unreleased_categories"], [])
             self.assertEqual(context["pending_fragments"], 0)
-            with self.assertRaisesRegex(ReadinessError, "minor floor"):
+            with self.assertRaisesRegex(ReadinessError, "major floor"):
                 minimum_release(
                     parse_version("1.0.5"),
                     parse_version("1.0.6-rc0"),
                     entries,
                 )
-
-    def test_minor_category_rejects_patch_target(self) -> None:
-        with self.assertRaisesRegex(ReadinessError, "minor floor"):
-            minimum_release(
-                parse_version("1.0.5"),
-                parse_version("1.0.6-rc0"),
-                {"Added": ["- Added an RPC."]},
-            )
-
-    def test_explained_waiver_allows_patch_for_added_and_changed(self) -> None:
-        level, minimum, _ = minimum_release(
-            parse_version("1.0.5"),
-            parse_version("1.0.6"),
-            {
-                "Added": [
-                    "<!-- release-readiness: allow-patch; reason: "
-                    "All additions are backwards compatible. -->\n"
-                    "- Added an API."
-                ],
-                "Changed": ["- Raised a compatible operational limit."],
-            },
-        )
-        self.assertEqual((level, str(minimum)), ("patch", "1.0.6"))
-
-    def test_waiver_requires_an_explanation(self) -> None:
-        with self.assertRaisesRegex(ReadinessError, "must use"):
-            minimum_release(
-                parse_version("1.0.5"),
-                parse_version("1.0.6"),
-                {
-                    "Added": [
-                        "<!-- release-readiness: allow-patch -->\n"
-                        "- Added an API."
-                    ]
-                },
-            )
-
-    def test_waiver_cannot_cover_deprecated_or_removed_entries(self) -> None:
-        with self.assertRaisesRegex(ReadinessError, "cannot cover.*Removed"):
-            minimum_release(
-                parse_version("1.0.5"),
-                parse_version("1.0.6"),
-                {
-                    "Added": [
-                        "<!-- release-readiness: allow-patch; reason: "
-                        "The addition is backwards compatible. -->\n"
-                        "- Added an API."
-                    ],
-                    "Removed": ["- Removed an API."],
-                },
-            )
-
-    def test_waiver_cannot_bypass_network_upgrade_major_floor(self) -> None:
-        with self.assertRaisesRegex(ReadinessError, "major floor"):
-            minimum_release(
-                parse_version("1.4.2"),
-                parse_version("1.4.3"),
-                {
-                    "Added": [
-                        "<!-- release-readiness: allow-patch; reason: "
-                        "The API addition is backwards compatible. -->\n"
-                        "- Added the Mainnet Network Upgrade."
-                    ]
-                },
-            )
-
-    def test_fixed_category_allows_patch_target(self) -> None:
-        level, minimum, _ = minimum_release(
-            parse_version("1.0.5"),
-            parse_version("1.0.6-rc0"),
-            {"Fixed": ["- Fixed a bug."]},
-        )
-        self.assertEqual((level, str(minimum)), ("patch", "1.0.6"))
 
     def test_network_upgrade_requires_major_target(self) -> None:
         with self.assertRaisesRegex(ReadinessError, "major floor"):

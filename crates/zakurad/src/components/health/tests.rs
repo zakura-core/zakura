@@ -69,6 +69,25 @@ async fn http_get(addr: SocketAddr, path: &str) -> Option<(u16, String)> {
 }
 
 #[tokio::test]
+async fn disabled_endpoint_spawns_no_task() {
+    let (_chain_tip_metrics_sender, chain_tip_metrics_receiver) = ChainTipMetrics::channel();
+
+    let health_endpoint = init(
+        Config::default(),
+        Network::Mainnet,
+        chain_tip_metrics_receiver,
+        MockSyncStatus::default(),
+        peers_with_count(1),
+    )
+    .await;
+
+    assert!(
+        health_endpoint.is_none(),
+        "the health endpoint is disabled unless a listen address is configured",
+    );
+}
+
+#[tokio::test]
 async fn healthy_and_ready_ok() {
     // Happy-path coverage: peers, sync status, lag, and tip age are all within
     // thresholds, so both endpoints return 200.
@@ -79,15 +98,15 @@ async fn healthy_and_ready_ok() {
     let (chain_tip_metrics_sender, chain_tip_metrics_receiver) = ChainTipMetrics::channel();
     let _ = chain_tip_metrics_sender.send(ChainTipMetrics::new(Instant::now(), Some(0)));
 
-    let (task, addr_opt) = init(
+    let (task, addr) = init(
         cfg,
         Network::Mainnet,
         chain_tip_metrics_receiver,
         sync_status,
         peers_with_count(1),
     )
-    .await;
-    let addr = addr_opt.expect("server bound addr");
+    .await
+    .expect("the health endpoint is configured");
 
     let (status_h, body_h) = http_get(addr, "/healthy").await.unwrap();
     assert_eq!(status_h, 200, "healthy response: {}", body_h);
@@ -113,8 +132,8 @@ async fn not_ready_when_syncing_or_lagging() {
         sync_status,
         peers_with_count(1),
     )
-    .await;
-    let addr_syncing = addr_syncing.expect("addr");
+    .await
+    .expect("the health endpoint is configured");
     let (status_syncing, body_syncing) = http_get(addr_syncing, "/ready").await.unwrap();
     assert_eq!(status_syncing, 503, "body: {}", body_syncing);
     assert!(body_syncing.contains("syncing"));
@@ -131,8 +150,8 @@ async fn not_ready_when_syncing_or_lagging() {
         sync_status,
         peers_with_count(1),
     )
-    .await;
-    let addr_lagging = addr_lagging.expect("addr");
+    .await
+    .expect("the health endpoint is configured");
     let (status_lagging, body_lagging) = http_get(addr_lagging, "/ready").await.unwrap();
     assert_eq!(status_lagging, 503, "body: {}", body_lagging);
     assert!(body_lagging.contains("lag=5"));
@@ -157,15 +176,15 @@ async fn not_ready_when_tip_is_too_old() {
         Some(0),
     ));
 
-    let (task, addr_opt) = init(
+    let (task, addr) = init(
         cfg,
         Network::Mainnet,
         chain_tip_metrics_receiver,
         sync_status,
         peers_with_count(1),
     )
-    .await;
-    let addr = addr_opt.expect("addr");
+    .await
+    .expect("the health endpoint is configured");
 
     let (status, body) = http_get(addr, "/ready").await.unwrap();
     assert_eq!(status, 503, "body: {}", body);
@@ -187,15 +206,15 @@ async fn rate_limiting_drops_bursts() {
     let (chain_tip_metrics_sender, chain_tip_metrics_receiver) = ChainTipMetrics::channel();
     let _ = chain_tip_metrics_sender.send(ChainTipMetrics::new(Instant::now(), Some(0)));
 
-    let (task, addr_opt) = init(
+    let (task, addr) = init(
         cfg,
         Network::Mainnet,
         chain_tip_metrics_receiver,
         sync_status,
         peers_with_count(1),
     )
-    .await;
-    let addr = addr_opt.expect("addr");
+    .await
+    .expect("the health endpoint is configured");
 
     let (first_status, first_body) = http_get(addr, "/healthy").await.unwrap();
     assert_eq!(first_status, 200, "first response: {}", first_body);

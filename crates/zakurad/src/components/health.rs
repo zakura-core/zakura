@@ -106,8 +106,8 @@ impl ChainTipMetrics {
 
 /// Starts the health server if `listen_addr` is configured.
 ///
-/// Returns a task handle and the bound socket address. When disabled, returns a
-/// pending task and `None` for the address.
+/// Returns the server's task handle and its bound socket address, or `None` if
+/// the server is disabled.
 ///
 /// The server accepts HTTP/1.1 requests on a dedicated TCP listener and serves
 /// two endpoints: `/healthy` and `/ready`.
@@ -121,14 +121,12 @@ pub async fn init<AddressBook, SyncStatus>(
     chain_tip_metrics_receiver: watch::Receiver<ChainTipMetrics>,
     sync_status: SyncStatus,
     address_book: AddressBook,
-) -> (JoinHandle<()>, Option<SocketAddr>)
+) -> Option<(JoinHandle<()>, SocketAddr)>
 where
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
-    let Some(listen_addr) = config.listen_addr else {
-        return (spawn_erased(std::future::pending()), None);
-    };
+    let listen_addr = config.listen_addr?;
 
     info!("opening health endpoint at {listen_addr}...",);
 
@@ -166,7 +164,7 @@ where
         }
     });
 
-    (task, Some(local))
+    Some((task, local))
 }
 
 async fn handle_request<SyncStatus>(

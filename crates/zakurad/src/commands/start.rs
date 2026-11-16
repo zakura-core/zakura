@@ -82,7 +82,7 @@ use std::{
 
 use eyre::{eyre, Report};
 use futures::{
-    future::BoxFuture,
+    future::{BoxFuture, OptionFuture},
     stream::{FuturesUnordered, StreamExt},
     FutureExt,
 };
@@ -1002,7 +1002,7 @@ impl StartCmd {
 
         // Start health server if configured
         info!("initializing health endpoints");
-        let (health_task_handle, _) = health::init(
+        let health_task_handle = health::init(
             config.health.clone(),
             config.network.network.clone(),
             chain_tip_metrics_receiver,
@@ -1010,8 +1010,11 @@ impl StartCmd {
             address_book.clone(),
         )
         .boxed()
-        .await;
-        node_tasks.track(&health_task_handle);
+        .await
+        .map(|(health_task_handle, _listen_addr)| health_task_handle);
+        if let Some(health_task_handle) = &health_task_handle {
+            node_tasks.track(health_task_handle);
+        }
 
         // Spawn never ending end of support task.
         info!("spawning end of support checking task");
@@ -1113,14 +1116,12 @@ impl StartCmd {
 
         let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
         let mut zcashd_compat_task_handle =
-            if let Some(supervisor_config) = zcashd_compat_supervisor_config {
+            zcashd_compat_supervisor_config.map(|supervisor_config| {
                 spawn_erased(
                     zcashd_compat::run_supervisor(supervisor_config, zcashd_compat_shutdown_rx)
                         .in_current_span(),
                 )
-            } else {
-                spawn_erased(std::future::pending().in_current_span())
-            };
+            });
         // The supervisor may own a child after this point, so shutdown must
         // await cleanup. Do not add a yield between the spawn and this marker.
         shutdown_cleanup_required.cancel();
@@ -1147,8 +1148,11 @@ impl StartCmd {
         // Wait for tasks to finish
         let mut zcashd_compat_task_finished = false;
         let exit_status = {
-            let zcashd_compat_task_handle_fused = (&mut zcashd_compat_task_handle).fuse();
-            pin!(zcashd_compat_task_handle_fused);
+            // Without a supervisor task this yields `None` once, which disables its branch.
+            // Fusing it stops a finished or missing supervisor task from being polled again.
+            let zcashd_compat_task_exit =
+                OptionFuture::from(zcashd_compat_task_handle.as_mut()).fuse();
+            pin!(zcashd_compat_task_exit);
 
             loop {
                 let mut exit_when_task_finishes = true;
@@ -1225,7 +1229,7 @@ impl StartCmd {
                     Ok(())
                 }
 
-                    zcashd_compat_result = &mut zcashd_compat_task_handle_fused => {
+                    Some(zcashd_compat_result) = &mut zcashd_compat_task_exit => {
                         zcashd_compat_task_finished = true;
                         exit_when_task_finishes =
                             Self::zcashd_compat_supervisor_should_exit(zcashd_compat_result);
@@ -1251,42 +1255,52 @@ impl StartCmd {
 
         // ongoing tasks
         node_tasks.abort_supervised();
-        health_task_handle.abort();
+        if let Some(health_task_handle) = &health_task_handle {
+            health_task_handle.abort();
+        }
         if let Some(zakura_endpoint_shutdown_task) = zakura_endpoint_shutdown_task {
             zakura_endpoint_shutdown_task
                 .await
                 .expect("unexpected panic in the Zakura endpoint shutdown task");
         }
-        if zcashd_compat_task_finished {
-            debug!("zcashd-compat supervisor task already exited before shutdown");
-        } else if let Some(zcashd_compat_shutdown_timeout) = zcashd_compat_shutdown_timeout {
-            info!(
-                ?zcashd_compat_shutdown_timeout,
-                "requesting zcashd-compat supervisor shutdown"
-            );
-            if zcashd_compat_shutdown_tx.send(true).is_err() {
-                warn!("zcashd-compat supervisor shutdown request was not delivered");
+        match (
+            zcashd_compat_task_handle.as_mut(),
+            zcashd_compat_shutdown_timeout,
+        ) {
+            (None, _) => {}
+            (Some(_), _) if zcashd_compat_task_finished => {
+                debug!("zcashd-compat supervisor task already exited before shutdown");
             }
-            if tokio::time::timeout(
-                zcashd_compat_shutdown_timeout,
-                &mut zcashd_compat_task_handle,
-            )
-            .await
-            .is_err()
-            {
-                warn!(
+            (Some(zcashd_compat_task_handle), Some(zcashd_compat_shutdown_timeout)) => {
+                info!(
                     ?zcashd_compat_shutdown_timeout,
-                    "zcashd-compat supervisor did not finish before shutdown timeout; \
-                     abandoning child process handle"
+                    "requesting zcashd-compat supervisor shutdown"
                 );
-                // The supervisor spawns zcashd without kill_on_drop, so this
-                // abort abandons an already-signalled child rather than
-                // SIGKILLing it mid-flush.
+                if zcashd_compat_shutdown_tx.send(true).is_err() {
+                    warn!("zcashd-compat supervisor shutdown request was not delivered");
+                }
+                if tokio::time::timeout(
+                    zcashd_compat_shutdown_timeout,
+                    &mut *zcashd_compat_task_handle,
+                )
+                .await
+                .is_err()
+                {
+                    warn!(
+                        ?zcashd_compat_shutdown_timeout,
+                        "zcashd-compat supervisor did not finish before shutdown timeout; \
+                         abandoning child process handle"
+                    );
+                    // The supervisor spawns zcashd without kill_on_drop, so this
+                    // abort abandons an already-signalled child rather than
+                    // SIGKILLing it mid-flush.
+                    zcashd_compat_task_handle.abort();
+                }
+            }
+            (Some(zcashd_compat_task_handle), None) => {
+                debug!("aborting zcashd-compat supervisor task without managed child shutdown");
                 zcashd_compat_task_handle.abort();
             }
-        } else {
-            debug!("aborting zcashd-compat supervisor task without managed child shutdown");
-            zcashd_compat_task_handle.abort();
         }
 
         // startup tasks

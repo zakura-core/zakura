@@ -14,12 +14,16 @@ runs:
         python-version: '3.12'
         enable-cache: 'false'
         activate-environment: ${{ inputs.group != '' }}
+        working-directory: scripts
+        venv-path: ${{ github.workspace }}/scripts/.venv
     - name: Install Python
       shell: bash
+      working-directory: scripts
       run: uv python install 3.12
     - name: Install the selected dependency group
       if: inputs.group != ''
       shell: bash
+      working-directory: scripts
       env:
         DEPENDENCY_GROUP: ${{ inputs.group }}
       run: uv sync --locked --no-build --only-group "$DEPENDENCY_GROUP"

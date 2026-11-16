@@ -4,8 +4,8 @@ on:
   push:
     branches: [main]
     paths:
-      - pyproject.toml
-      - uv.lock
+      - scripts/pyproject.toml
+      - scripts/uv.lock
       - .github/actions/setup-python/**
       - "**.md"
       - ".github/lychee.toml"
@@ -14,8 +14,8 @@ on:
       - ".github/workflows/docs-check.yml"
   pull_request:
     paths:
-      - pyproject.toml
-      - uv.lock
+      - scripts/pyproject.toml
+      - scripts/uv.lock
       - .github/actions/setup-python/**
       - "**.md"
       - ".github/lychee.toml"

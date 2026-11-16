@@ -5,8 +5,8 @@ on:
     branches: [main, "feat/**", "split/**", "adam/**", "release/**"]
     paths:
       - "**/*.py"
-      - pyproject.toml
-      - uv.lock
+      - scripts/pyproject.toml
+      - scripts/uv.lock
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
@@ -36,8 +36,8 @@ on:
     branches: [main, "feat/**", "release/**"]
     paths:
       - "**/*.py"
-      - pyproject.toml
-      - uv.lock
+      - scripts/pyproject.toml
+      - scripts/uv.lock
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"

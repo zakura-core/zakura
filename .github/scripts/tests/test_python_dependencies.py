@@ -16,6 +16,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[3]
+PYTHON_PROJECT = ROOT / "scripts"
 SETUP = "./.github/actions/setup-python"
 
 
@@ -25,7 +26,7 @@ def read_yaml(path):
 
 
 class DependencyPolicyTests(unittest.TestCase):
-    def test_only_root_manifests_are_allowed(self):
+    def test_only_scripts_manifests_are_allowed(self):
         paths = subprocess.check_output(
             ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
             cwd=ROOT,
@@ -43,19 +44,19 @@ class DependencyPolicyTests(unittest.TestCase):
                 for pattern in ("*requirements*.txt", "*requirements*.in", "*constraints*.txt", "*constraints*.in", "*.py.lock")
             )
             if is_manifest:
-                self.assertIn(relative, {"pyproject.toml", "uv.lock"}, relative)
+                self.assertIn(relative, {"scripts/pyproject.toml", "scripts/uv.lock"}, relative)
             if path.suffix == ".py":
                 self.assertFalse(any(line.startswith("# /// script") for line in (ROOT / path).read_text().splitlines()), relative)
 
     def test_all_dependencies_have_reviewable_sources_and_hashes(self):
-        manifest = tomllib.loads((ROOT / "pyproject.toml").read_text())
+        manifest = tomllib.loads((PYTHON_PROJECT / "pyproject.toml").read_text())
         config = manifest["tool"]["uv"]
         self.assertEqual(config["default-groups"], [])
         self.assertFalse(config["package"])
         self.assertNotIn("sources", config)
         self.assertNotIn("index", config)
         self.assertNotIn("audit", config, "Audit exclusions require an explicit policy change")
-        for package in tomllib.loads((ROOT / "uv.lock").read_text())["package"]:
+        for package in tomllib.loads((PYTHON_PROJECT / "uv.lock").read_text())["package"]:
             if package["name"] == manifest["project"]["name"]:
                 self.assertEqual(package["source"], {"virtual": "."})
                 continue
@@ -75,6 +76,20 @@ class DependencyPolicyTests(unittest.TestCase):
         setup = read_yaml(ROOT / ".github/actions/setup-python/action.yml")
         commands = "\n".join(step.get("run", "") for step in setup["runs"]["steps"])
         self.assertIn('uv sync --locked --no-build --only-group "$DEPENDENCY_GROUP"', commands)
+        for step in setup["runs"]["steps"]:
+            if "run" in step:
+                self.assertEqual(step["working-directory"], "scripts")
+            else:
+                self.assertEqual(step["with"]["working-directory"], "scripts")
+                self.assertEqual(step["with"]["venv-path"], "${{ github.workspace }}/scripts/.venv")
+
+    def test_python_artifacts_stay_out_of_the_repository_root(self):
+        for name in ("pyproject.toml", "uv.lock", ".venv", "__pycache__"):
+            self.assertFalse((ROOT / name).exists(), name)
+        updates = read_yaml(ROOT / ".github/dependabot.yml")["updates"]
+        python_updates = [entry for entry in updates if entry["package-ecosystem"] == "uv"]
+        self.assertEqual(len(python_updates), 1)
+        self.assertEqual(python_updates[0]["directory"], "/scripts")
 
     def test_security_gate_cannot_be_skipped(self):
         workflow = read_yaml(ROOT / ".github/workflows/tests-unit.yml")
@@ -101,7 +116,7 @@ class DependencyPolicyTests(unittest.TestCase):
         self.assertNotIn("environment", promotion["jobs"]["python-security"])
 
     def test_python_and_manifest_changes_trigger_checks(self):
-        samples = ("tool.py", "scripts/tool.py", ".github/scripts/tool.py", "deploy/new/tool.py", "pyproject.toml", "uv.lock")
+        samples = ("tool.py", "scripts/tool.py", ".github/scripts/tool.py", "deploy/new/tool.py", "scripts/pyproject.toml", "scripts/uv.lock")
         for filename, events in (("tests-unit.yml", ("push",)), ("lint.yml", ("push", "pull_request"))):
             workflow = read_yaml(ROOT / ".github/workflows" / filename)
             for event in events:
@@ -153,9 +168,10 @@ class AuditIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.project = Path(self.temporary.name)
+        self.project = Path(self.temporary.name) / "scripts"
+        self.project.mkdir()
         for name in ("pyproject.toml", "uv.lock"):
-            shutil.copyfile(ROOT / name, self.project / name)
+            shutil.copyfile(PYTHON_PROJECT / name, self.project / name)
 
     def audit(self, server, platform="x86_64-unknown-linux-gnu", *, frozen=False):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -222,8 +238,7 @@ class AuditIntegrationTests(unittest.TestCase):
     def test_stale_lock_fails_the_local_security_command(self):
         manifest = self.project / "pyproject.toml"
         manifest.write_text(manifest.read_text().replace('name = "zakura-python-tools"', 'name = "changed-tools"'))
-        scripts = self.project / "scripts"
-        scripts.mkdir()
+        scripts = self.project
         shutil.copyfile(ROOT / "scripts/check-python-dependencies.sh", scripts / "check-python-dependencies.sh")
         result = subprocess.run(
             ["bash", str(scripts / "check-python-dependencies.sh")], text=True,
@@ -234,8 +249,7 @@ class AuditIntegrationTests(unittest.TestCase):
         self.assertNotIn("Auditing Python", result.stdout)
 
     def test_local_command_preserves_failure_and_checks_every_target(self):
-        scripts = self.project / "scripts"
-        scripts.mkdir()
+        scripts = self.project
         shutil.copyfile(ROOT / "scripts/check-python-dependencies.sh", scripts / "check-python-dependencies.sh")
         binary = self.project / "bin"
         binary.mkdir()

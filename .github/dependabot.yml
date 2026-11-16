@@ -1,7 +1,7 @@
 version: 2
 updates:
   - package-ecosystem: uv
-    directory: "/"
+    directory: "/scripts"
     schedule:
       interval: weekly
       day: wednesday

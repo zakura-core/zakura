@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Audit every dependency group for the platforms used by CI and developers.
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
 uv lock --check --no-build
 

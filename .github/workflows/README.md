@@ -17,8 +17,10 @@ All automation runs on GitHub Actions. It falls into four domains:
 
 ## Python dependencies
 
-All Python packages are declared in the root `pyproject.toml` and resolved into
-one `uv.lock`. Use uv 0.11.8 and Python 3.12. The `release` group contains the
+All Python packages are declared in `scripts/pyproject.toml` and resolved into
+one `scripts/uv.lock`. Virtual environments live in `scripts/.venv`, keeping
+Python tooling artifacts out of the repository root. Use uv 0.11.8 and Python
+3.12. The `release` group contains the
 storage client; `test` includes it and the YAML test parser; `docs` contains
 codespell. Standard-library-only services still run with their system Python.
 
@@ -26,14 +28,14 @@ From the repository root:
 
 ```bash
 # Install a complete, locked test environment, without building source packages.
-uv sync --locked --no-build --only-group test
-source .venv/bin/activate
+uv sync --project scripts --locked --no-build --only-group test
+source scripts/.venv/bin/activate
 
 # Add a direct dependency to its owning group, then review both changed files.
-uv add --group test 'package-name==reviewed-version'
+uv add --project scripts --group test 'package-name==reviewed-version'
 
 # Update a transitive package without upgrading unrelated packages.
-uv lock --upgrade-package package-name
+uv lock --project scripts --upgrade-package package-name
 
 # Audit every group for Linux and macOS on both supported architectures.
 bash scripts/check-python-dependencies.sh
@@ -43,7 +45,7 @@ For a pinned direct dependency, update its version with `uv add --group` rather
 than only updating the lock. Use `--only-group release` or `--only-group docs`
 for those consumers. Switching groups removes packages outside the selection.
 Do not add separate requirements files, inline script dependencies, or unpinned
-installation commands. Dependabot maintains the root uv project weekly, with a
+installation commands. Dependabot maintains the uv project under `scripts/` weekly, with a
 seven-day cooldown for routine updates and at most two open update PRs.
 
 The required `test success` check includes Python dependency security on every

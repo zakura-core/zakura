@@ -12,8 +12,8 @@ on:
     branches: [main]
     paths:
       - "**/*.py"
-      - pyproject.toml
-      - uv.lock
+      - scripts/pyproject.toml
+      - scripts/uv.lock
       - .github/actions/setup-python/**
       - scripts/check-python-dependencies.sh
       - "**/*.rs"

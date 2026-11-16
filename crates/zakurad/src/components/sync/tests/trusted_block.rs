@@ -1062,6 +1062,11 @@ async fn trusted_block_is_relayed_before_real_validation_and_commits_afterward()
     };
     assert_eq!(fetched.zcash_serialize_to_vec().unwrap(), bytes);
     assert_eq!(
+        relay.template().await.header.previous_block_hash,
+        relay.network.genesis_hash(),
+        "a pending trusted block cannot become a template parent"
+    );
+    assert_eq!(
         relay
             .pending
             .get(block.hash())

@@ -12,6 +12,11 @@ on:
   push:
     branches: [main]
     paths:
+      - "**/*.py"
+      - pyproject.toml
+      - uv.lock
+      - .github/actions/setup-python/**
+      - scripts/check-python-dependencies.sh
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
@@ -65,6 +70,33 @@ env:
   COLORBT_SHOW_HIDDEN: 1
 
 jobs:
+  python-security:
+    name: Python dependency security
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+        with:
+          group: test
+      - name: Check dependency policy and audit failures
+        run: python3 -m unittest discover -s scripts/tests -p 'test_python_dependencies.py'
+      - name: Audit every Python dependency group
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: bash scripts/check-python-dependencies.sh 2>&1 | tee "$RUNNER_TEMP/python-audit.txt"
+      - name: Preserve the audit report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-dependency-audit
+          path: ${{ runner.temp }}/python-audit.txt
+          if-no-files-found: warn
+
   # Decide whether this change can affect generated or historical zakurad
   # configuration. Scheduled runs have no source change to check, while manual
   # runs explicitly request the complete workflow.
@@ -913,6 +945,7 @@ jobs:
     # See "Cancelled runs" in .github/workflows/README.md.
     if: ${{ !cancelled() || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     needs:
+      - python-security
       - temporary-unit-tests
       - changes
       - build-tests

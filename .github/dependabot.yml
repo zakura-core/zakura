@@ -1,5 +1,16 @@
 version: 2
 updates:
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: wednesday
+      timezone: America/New_York
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 2
+    labels:
+      - "C-exclude-from-changelog"
   # Rust section
   - package-ecosystem: cargo
     directory: "/"

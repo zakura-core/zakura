@@ -7,6 +7,7 @@
 
 - Keep changes focused and avoid unrelated refactors.
 - Run formatting and the checks relevant to the code you changed.
+- Keep all repository-managed Python dependencies in the root pyproject.toml and uv.lock, and run the required Python dependency-security check whenever Python code changes.
 - For fixes, explain the root cause, how the solution addresses it, and how the tests exercise the affected behavior.
 
 ## Project Structure & Module Organization

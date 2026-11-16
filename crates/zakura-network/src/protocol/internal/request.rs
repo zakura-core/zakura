@@ -5,6 +5,7 @@ use zakura_chain::{
     block,
     transaction::{UnminedTx, UnminedTxId},
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use super::super::types::Nonce;
 use crate::{zakura::ZakuraPeerId, PeerSocketAddr};
@@ -253,6 +254,27 @@ pub enum Request {
     /// Returns [`Response::Nil`](super::Response::Nil).
     PushTransaction(UnminedTx, Option<PeerSource>),
 
+    /// A block that a remote peer pushed to us, without advertising it first.
+    ///
+    /// Connections create this request from an unsolicited `block` message and send it to the
+    /// inbound service, which verifies the block as if it had downloaded it. Nodes push only
+    /// blocks they mined: see [`Request::AdvertiseMinedBlock`].
+    ///
+    /// The second field is the peer that pushed the block. Used by the inbound block
+    /// downloader to enforce its per-peer queue cap.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::Nil`](super::Response::Nil).
+    PushBlock(
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "any::<std::sync::Arc<block::Block>>().prop_map(Into::into)")
+        )]
+        BlockHandle,
+        Option<PeerSource>,
+    ),
+
     /// Advertise a set of unmined transactions to all peers.
     ///
     /// Both Zebra and zcashd sometimes advertise multiple transactions at once.
@@ -312,6 +334,8 @@ pub enum Request {
     /// Advertise a locally mined block, prioritizing measured heartbeat RTT.
     /// Every fourth advertisement goes to a random remaining peer instead.
     /// Legacy gossip holds a bounded number of slots through block uploads.
+    /// In the initial group, legacy gossip pushes the block to peers that accept pushes,
+    /// then advertises it: see [`Request::PushBlock`].
     /// Native gossip uses its existing broadcast policy.
     AdvertiseMinedBlock(AdvertisedBlock),
 
@@ -353,6 +377,7 @@ impl fmt::Display for Request {
             ),
 
             Request::PushTransaction(_, _) => "PushTransaction".to_string(),
+            Request::PushBlock(block, _) => format!("PushBlock({})", block.hash()),
             Request::AdvertiseTransactionIds(ids, _) => {
                 format!("AdvertiseTransactionIds({})", ids.len())
             }
@@ -382,6 +407,7 @@ impl Request {
             Request::FindHeaders { .. } => "FindHeaders",
 
             Request::PushTransaction(_, _) => "PushTransaction",
+            Request::PushBlock(_, _) => "PushBlock",
             Request::AdvertiseTransactionIds(_, _) => "AdvertiseTransactionIds",
 
             Request::AdvertiseBlock(_, _)

@@ -875,6 +875,10 @@ impl Service<zn::Request> for Inbound {
                 block_downloads.download_and_verify(block.hash, advertiser);
                 async { Ok(zn::Response::Nil) }.boxed()
             }
+            zn::Request::PushBlock(block, source) => {
+                block_downloads.verify_pushed(block, source);
+                async { Ok(zn::Response::Nil) }.boxed()
+            }
             // The size of this response is limited by the `Connection` state machine in the network layer
             zn::Request::MempoolTransactionIds => {
                 mempool.clone().oneshot(mempool::Request::TransactionIds).map_ok(|resp| match resp {

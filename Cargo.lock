@@ -3039,6 +3039,7 @@ dependencies = [
  "rand 0.10.2",
  "rayon",
  "ring",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

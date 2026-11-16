@@ -147,6 +147,9 @@ pub fn pre_reset_commit() -> StorageScenario {
             Some(Trigger::Committed(Select::nth(OpKind::Apply, 1))),
         )],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -204,6 +207,9 @@ pub fn fork_stale_apply() -> StorageScenario {
         },
         controls: Vec::new(),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -229,6 +235,9 @@ pub fn reset_inside_status_floor() -> StorageScenario {
             ),
         ],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 

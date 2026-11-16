@@ -1,0 +1,179 @@
+{
+  "node": {
+    "main": 2,
+    "fork": null
+  },
+  "mirrors": [
+    {
+      "chain": {
+        "main": 3,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 4,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 5,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 6,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 7,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 8,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 9,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 10,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 11,
+        "fork": null
+      },
+      "dialer": "mirror"
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": []
+  },
+  "controls": [
+    {
+      "peer": "mirror-4",
+      "action": "relink",
+      "when": {
+        "retired": "mirror-0"
+      }
+    },
+    {
+      "peer": "mirror-5",
+      "action": "relink",
+      "when": {
+        "retired": "mirror-1"
+      }
+    },
+    {
+      "peer": "mirror-6",
+      "action": "relink",
+      "when": {
+        "retired": "mirror-2"
+      }
+    },
+    {
+      "peer": "mirror-7",
+      "action": "relink",
+      "when": {
+        "retired": "mirror-3"
+      }
+    },
+    {
+      "peer": "mirror-8",
+      "action": "relink",
+      "when": {
+        "retired": "mirror-4"
+      }
+    },
+    {
+      "peer": "mirror-0",
+      "action": "relink",
+      "when": {
+        "virtual-time": 180000
+      }
+    },
+    {
+      "peer": "mirror-1",
+      "action": "relink",
+      "when": {
+        "virtual-time": 180000
+      }
+    },
+    {
+      "peer": "mirror-2",
+      "action": "relink",
+      "when": {
+        "virtual-time": 180000
+      }
+    }
+  ],
+  "node_settings": {
+    "max_inbound_peers": 4,
+    "max_outbound_peers": 0,
+    "max_unproductive_header_requests": 1,
+    "unproductive_peer_cooldown_ms": 120000
+  },
+  "page_delays": [
+    {
+      "mirror": "mirror-0",
+      "by_ms": 40000
+    },
+    {
+      "mirror": "mirror-1",
+      "by_ms": 40000
+    },
+    {
+      "mirror": "mirror-2",
+      "by_ms": 40000
+    },
+    {
+      "mirror": "mirror-3",
+      "by_ms": 40000
+    },
+    {
+      "mirror": "mirror-4",
+      "by_ms": 40000
+    },
+    {
+      "mirror": "mirror-5",
+      "by_ms": 40000
+    },
+    {
+      "mirror": "mirror-6",
+      "by_ms": 40000
+    },
+    {
+      "mirror": "mirror-7",
+      "by_ms": 40000
+    },
+    {
+      "mirror": "mirror-8",
+      "by_ms": 40000
+    }
+  ],
+  "budget": 80000
+}

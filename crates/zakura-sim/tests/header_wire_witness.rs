@@ -229,6 +229,18 @@ fn applies(report: &RunReport, id: &str, what: impl std::fmt::Debug) {
     }
 }
 
+/// Requires `session/honest-never-punished` to apply and hold in `report`.
+/// Its trigger history reads the harness's view, which a finished report
+/// doesn't carry, so this reads the property's outcome. The trigger itself
+/// is judged where the view is, as its planted case records it.
+fn honest_holds(report: &RunReport, what: impl std::fmt::Debug) {
+    let outcome = outcome(report, HONEST_NEVER_PUNISHED);
+    assert!(
+        matches!(outcome, PropertyOutcome::Held { applicable } if *applicable > 0),
+        "{what:?}: {HONEST_NEVER_PUNISHED}: {outcome:?}"
+    );
+}
+
 /// Every generated ID `header-sync/wire` registers, in order.
 fn generated() -> Vec<String> {
     HeaderWire::properties()
@@ -287,7 +299,7 @@ fn witnessed(report: &RunReport, witness: impl std::fmt::Debug, ids: &[String]) 
         applies(report, covered, &witness);
     }
     applies(report, &id("conformant-never-closes"), &witness);
-    applies(report, HONEST_NEVER_PUNISHED, &witness);
+    honest_holds(report, &witness);
     for suffix in UNREACHED {
         assert_eq!(
             *outcome(report, &id(suffix)),
@@ -534,7 +546,7 @@ fn honest_peer_never_punished() {
             let report = run_plan(&scenario, plan);
             assert_eq!(report.end.harness, None, "{name}: {:?}", report.end);
             assert_eq!(report.end.violation, None, "{name}: {:?}", report.end);
-            applies(&report, HONEST_NEVER_PUNISHED, name);
+            honest_holds(&report, name);
             let honest = honest_connections(&report, &scenario);
             assert!(!honest.is_empty(), "{name}: no honest peer connected");
             for entry in report.log.entries() {
@@ -893,4 +905,114 @@ fn scripted_punishments_of_an_honest_peer_violate_honest_never_punished() {
         "a punishment with no transport row is missing evidence: {:?}",
         report.end
     );
+}
+
+/// A scripted history as a harness, with peer 0 marked `HonestPeer`, so a
+/// witness test judges `session/honest-never-punished`, whose trigger reads
+/// the view, on it.
+struct HonestScript;
+
+/// [`HonestScript`]'s histories.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+enum Punished {
+    /// The node reports a `Misbehavior` against honest peer 0's connection
+    /// before it judges any frame there.
+    BeforeJudging,
+    /// The node fault-closes honest peer 0's connection before it judges any
+    /// frame there.
+    ClosedBeforeJudging,
+    /// The node judges peer 0's conformant frame, and punishes no one.
+    Judged,
+}
+
+impl Punished {
+    /// The history, one batch per step.
+    fn script(self) -> Vec<Vec<Observation>> {
+        match self {
+            Punished::BeforeJudging => vec![
+                vec![registered()],
+                vec![Observation::Misbehavior { connection: 1 }],
+            ],
+            Punished::ClosedBeforeJudging => {
+                vec![vec![registered()], vec![closed("ordered_read_rejected")]]
+            }
+            Punished::Judged => {
+                let [frame, judged] = labelled(Label::Conformant);
+                vec![vec![registered()], vec![frame], vec![judged]]
+            }
+        }
+    }
+}
+
+impl HasView for HonestScript {
+    type View = MarkedView;
+
+    /// Peer 0, the one honest peer.
+    fn view(&self) -> MarkedView {
+        MarkedView([0].into())
+    }
+}
+
+impl Subsystem for HonestScript {
+    const NAME: &'static str = "test/honest-script";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Punished;
+    type Prepared = ();
+
+    fn config(_: &Punished) -> zakura_sim::RunConfig {
+        support::config(1, 1_000)
+    }
+
+    /// Nothing to set up.
+    fn prepare(_: &Punished) {}
+
+    fn build(sim: &mut zakura_sim::Sim, history: &Punished, (): ()) -> Self {
+        support::script::feed(sim, history.script());
+        HonestScript
+    }
+
+    fn sources() -> zakura_sim::property::Sources {
+        let mut observed = OBSERVED.to_vec();
+        observed.push(Source::View);
+        zakura_sim::property::Sources::observed(&observed)
+    }
+
+    fn assumptions(_: &Punished) -> Assumptions<Self> {
+        Assumptions::declare(vec![AssumeRecord {
+            assume: Assume::HonestPeer,
+            params: serde_json::json!({ "peers": ["peer-0"] }),
+        }])
+    }
+
+    fn properties() -> Vec<Property<Self>> {
+        vec![honest_never_punished()]
+    }
+
+    fn draw(_: &[u8]) -> Punished {
+        Punished::Judged
+    }
+}
+
+/// The witness judge counts a punishment of an honest peer before the node
+/// judged any frame on its connection as `session/honest-never-punished`'s
+/// trigger history, so that catch isn't lost: a `Misbehavior` and a fault
+/// close, each before any `FrameJudged`. A judged frame with no punishment
+/// still reaches it on a holding history.
+#[test]
+fn a_punishment_before_any_judgement_reaches_the_honest_trigger() {
+    let judged = |history, expect| {
+        zakura_sim::witness::witness::<HonestScript>(
+            zakura_sim::witness::WitnessScenario {
+                scenario: history,
+                input: Plan::from_fuzz(&[1; 64]),
+            },
+            HONEST_NEVER_PUNISHED,
+            expect,
+        )
+    };
+    for history in [Punished::BeforeJudging, Punished::ClosedBeforeJudging] {
+        assert_eq!(judged(history, Expect::Violated), Ok(()), "{history:?}");
+    }
+    assert_eq!(judged(Punished::Judged, Expect::Holds), Ok(()));
 }

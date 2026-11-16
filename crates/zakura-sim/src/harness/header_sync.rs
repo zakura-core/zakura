@@ -87,7 +87,7 @@ use crate::{
         header_sync_progress::{bounded_adversary_progress, recovery_deadline},
         session::{honest_never_punished, HonestPeers},
     },
-    observe::StorageFact,
+    observe::{ReactorFact, StorageFact},
     peer::{
         adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, peer_id, Dialer as PeerDialer,
         PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask,
@@ -2400,7 +2400,8 @@ pub const FAMILY: &str = "header-sync";
 /// [`OUTSTANDING_WORK_BOUNDED`], whose tap only the storage harness
 /// watches, then
 /// [`HEADER_FAULT_PENALIZED`], then header sync's generated receiver and
-/// sender properties (M5-Q13), then `session/honest-never-punished`, then
+/// sender properties (M5-Q13), each judged by its trigger history, then
+/// `session/honest-never-punished`, then
 /// `header-sync/honest-progress` (hdr-8), which only the
 /// [`progress_fixture`] can apply. Header sync's adapter observes none of the downstream templates' effects, so it
 /// registers none of them. `header-sync/storage` doesn't register
@@ -2410,11 +2411,24 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     let mut properties = storage_properties();
     properties.retain(|property| property.id.as_str() != OUTSTANDING_WORK_BOUNDED);
     properties.push(header_fault_penalized());
-    properties.extend(table_properties(FAMILY, &RegtestMessage::LAYOUT));
-    properties.extend(sender_properties(FAMILY, &RegtestMessage::LAYOUT));
+    let generated = table_properties(FAMILY, &RegtestMessage::LAYOUT)
+        .into_iter()
+        .chain(sender_properties(FAMILY, &RegtestMessage::LAYOUT))
+        .map(|property| Property {
+            witness: Some(TriggerHistory::LogOf(generated_trigger)),
+            ..property
+        });
+    properties.extend(generated);
     properties.push(honest_never_punished());
     properties.push(crate::domain::header_sync_progress::honest_progress());
     properties
+}
+
+/// Whether `log` reaches the trigger history of header sync's generated
+/// property `id`, over the layout [`wire_properties`] registers it from
+/// ([`crate::table::generated_trigger`]).
+fn generated_trigger(id: &PropertyId, log: &ObservationLog) -> bool {
+    crate::table::generated_trigger(&RegtestMessage::LAYOUT, id, log)
 }
 
 /// The mirror `scenario`'s `Recover` step names, if it has one.
@@ -2497,7 +2511,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
             needs: &[Source::View],
             status: Status::Active,
             check: check_direct_dispatch::<S>,
-            witness: None,
+            witness: Some(TriggerHistory::View(storage_call_dispatched)),
         },
         chunk_budget_bound(),
         teardown_returns_baseline(),
@@ -2610,6 +2624,35 @@ fn check_direct_dispatch<S: HasView<View = StorageView>>(cx: &mut CheckCtx<'_, S
     } else {
         Verdict::Holds
     }
+}
+
+/// [`DIRECT_DISPATCH`]'s trigger: a reactor dispatched a storage call,
+/// either to the node's port, whose header storage logs a submission tagged
+/// with a call the reactor's tap logged dispatching, or to its action
+/// channel, which sets the dispatch guard's flag. So the rule had a call to
+/// judge. The publisher's submissions carry no reactor call, so serving
+/// headers alone meets nothing here.
+fn storage_call_dispatched(view: &StorageView, log: &ObservationLog) -> bool {
+    if view.direct_dispatch_broken {
+        return true;
+    }
+    let dispatched: BTreeSet<u64> = log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Reactor {
+                event: ReactorFact::Dispatched { call, .. },
+                ..
+            } => Some(*call),
+            _ => None,
+        })
+        .collect();
+    log.entries().iter().any(|entry| {
+        matches!(
+            operation_fact(HEADER_SERVICE, &entry.obs),
+            Some(StorageFact::Submitted { call: Some(call), .. }) if dispatched.contains(call)
+        )
+    })
 }
 
 /// [`HEADER_FAULT_PENALIZED`], active.

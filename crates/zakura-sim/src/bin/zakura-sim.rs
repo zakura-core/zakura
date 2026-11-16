@@ -2,10 +2,10 @@
 //!
 //! ```text
 //! zakura-sim record --sim <name> --input <file> --out <dir>
-//!     [--witness <property> --expect <holds|violated|applicable|violated-set>
+//!     [--witness <property> --expect <holds|violated|applicable>
 //!     [--also-violates <ids>]] [--draft <ids>]
 //! zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>
-//!     [--witness <property> --expect <holds|violated|applicable|violated-set>
+//!     [--witness <property> --expect <holds|violated|applicable>
 //!     [--also-violates <ids>]] [--draft <ids>]
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
 //!     [--report <file>]
@@ -109,10 +109,10 @@ mod cli {
         let mut text = String::from(
             "Usage:\n  \
              zakura-sim record --sim <name> --input <file> --out <dir>\n      \
-             [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
+             [--witness <property> --expect <holds|violated|applicable>\n      \
              [--also-violates <ids>]] [--draft <ids>]\n  \
              zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>\n      \
-             [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
+             [--witness <property> --expect <holds|violated|applicable>\n      \
              [--also-violates <ids>]] [--draft <ids>]\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n      \
              [--report <file>]\n  \
@@ -144,8 +144,7 @@ mod cli {
              It takes a full fuzz input or a typed scenario and its Plan bytes alike.\n\
              `--also-violates` lists, comma-separated, properties a `violated` witness\n\
              test or `confirm` expects violated beside the property, as a planted bug's\n\
-             co-violations. Under `violated-set` each of them must be violated, as a\n\
-             nested case's exact set.\n\
+             co-violations.\n\
              `--draft` lists, comma-separated, properties the run checks as Draft\n\
              whatever their status, as a planted case's Draft run does. The trace's\n\
              meta records them, and `replay` applies them too.\n\
@@ -332,12 +331,10 @@ mod cli {
         };
         let also_violates: Vec<String> = match (&witness, flags.also_violates) {
             (_, None) => Vec::new(),
-            (Some((_, Expect::Violated | Expect::ViolatedSet)), Some(ids)) => {
-                ids.split(',').map(str::to_owned).collect()
-            }
+            (Some((_, Expect::Violated)), Some(ids)) => ids.split(',').map(str::to_owned).collect(),
             (_, Some(_)) => {
                 return Err(Error::Usage(
-                    "--also-violates needs --expect violated or violated-set".to_owned(),
+                    "--also-violates needs --expect violated".to_owned(),
                 ))
             }
         };

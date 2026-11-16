@@ -428,8 +428,6 @@ fn judge(
             | WitnessError::Outcome(_)
             | WitnessError::Unrelated { .. }
             | WitnessError::UnrelatedIncomplete { .. }
-            | WitnessError::SetMember { .. }
-            | WitnessError::Unjoined { .. }
             | WitnessError::Fixed { .. }
             | WitnessError::ChangedFailure => ConfirmStatus::Nondeterministic,
         };

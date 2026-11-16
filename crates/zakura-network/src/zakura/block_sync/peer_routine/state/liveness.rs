@@ -131,7 +131,7 @@ impl PeerState {
     }
 }
 
-pub(in super::super) fn no_progress_response(allow_no_progress_park: bool) -> NoProgressResponse {
+fn no_progress_response(allow_no_progress_park: bool) -> NoProgressResponse {
     if allow_no_progress_park {
         NoProgressResponse::Park
     } else {

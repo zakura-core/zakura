@@ -280,6 +280,20 @@ impl ZakuraDb {
             return Err(StateInitError::VctSproutHistoryUnrepairable);
         }
 
+        // A build without the `sprout` feature may have stopped maintaining the Sprout tree. A
+        // build with it would check pre-NU7 JoinSplits against that incomplete tree, so it
+        // refuses the database until nothing reads the Sprout tree again.
+        if shielded::MAINTAINS_SPROUT_TREE {
+            if let Some(skipped_from) = db.sprout_tree_skipped_from() {
+                if !db.sprout_tree_is_no_longer_read(network) {
+                    return Err(StateInitError::SproutTreeNotMaintained {
+                        path: db.path().to_owned(),
+                        skipped_from,
+                    });
+                }
+            }
+        }
+
         // A test build can persist NU7 history snapshots that this build cannot read.
         // Reject that local incompatibility before format checks or state reads.
         if let Err(

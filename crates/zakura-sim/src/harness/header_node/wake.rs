@@ -470,7 +470,7 @@ mod tests {
         )
     }
 
-    /// C21: two wakes one boundary opened, for two peers' sessions, that
+    /// Two wakes one boundary opened, for two peers' sessions, that
     /// nothing answers are two violations of `capacity-release-wakes`,
     /// which expire together at quiescence, and the report keeps both,
     /// each naming its own session.

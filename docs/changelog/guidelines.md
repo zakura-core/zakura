@@ -71,6 +71,11 @@ the pending fragments. The `C-exclude-from-changelog` label remains useful
 release metadata, but does not replace the explicit fragment for Rust or
 `Cargo.toml` PRs.
 
+A revert of an unreleased PR deletes that PR's fragment along with its change
+and adds its own fragment. The check allows the deletion when one of the PR's
+commits names, in git's `This reverts commit <sha>.` line, the commit that
+added the fragment.
+
 Run `./scripts/changelog.py check` locally. CI validates the syntax and checks
 that the fragment filename matches the PR number. The concise format reference
 is in
@@ -94,28 +99,10 @@ is in
 - A change to a node tunable parameter gets a row in `docs/changelog/params.md` _in
   addition to_ a changelog entry when it is user-visible.
 
-`Added` and `Changed` entries normally require a minor `zakura` release. A
-release may intentionally keep a patch version when every such entry is
-backwards compatible and the release team records one explanation in a
-fragment, inside a category section after its list item:
-
-```markdown
-<!-- release-readiness: allow-patch; reason: All additions and behavior changes are backwards compatible. -->
-```
-
-The waiver applies to the node release level only; changed library crates still
-receive their independently required SemVer bumps. It cannot waive
-`Deprecated`, `Removed`, or Mainnet network-upgrade entries.
-Use this marker for future patch approvals rather than adding version-specific
-exceptions to the release scripts. It covers the current pending release and
-is assembled with its changelog entries; a later release needs its own approval.
-
-For the stable v1.8.6 release from v1.8.5 only, the release owner approved a
-node patch exception that includes the documented removal of historical
-treestate commands from default builds and unused Sprout library types.
-The commands remain available with `debug-commands`. This exception does not
-apply to other release versions, lower library SemVer requirements, or waive
-the Mainnet network-upgrade major-version floor.
+The release owner chooses the `zakura` patch or minor level. Release
+preparation only enforces a major release for a Mainnet network upgrade.
+Changed library crates still receive their independently required SemVer
+bumps.
 
 ## Library crates
 

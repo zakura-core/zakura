@@ -700,7 +700,7 @@ fn known_violation_does_not_stop_the_run() {
 /// A violation the view reports only at the run's end counts against its
 /// property, at the run's last step, and an ID nothing registered is
 /// ignored. A property already violated at a step keeps that violation
-/// first, and the end finding beside it (C12).
+/// first, and the end finding beside it.
 #[test]
 fn an_end_violation_counts_beside_earlier_violations() {
     let bumps = |twice: bool| {
@@ -762,7 +762,7 @@ fn end_finding(property: PropertyId, expected: &str, actual: &str) -> EndViolati
     }
 }
 
-/// C12: the registry keeps every end finding beside the violations the
+/// The registry keeps every end finding beside the violations the
 /// steps found: a step finding and an end finding of one ID, two end
 /// findings of one ID, even in the same words, since distinct breaks can
 /// share them, and an `Active` and a `Known` property's end findings at one

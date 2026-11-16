@@ -62,7 +62,6 @@ impl<V> Chunk<V> {
         self.occupied == 0
     }
 
-    #[cfg(test)]
     fn len(&self) -> usize {
         // The cast is lossless: a `u64` has at most 64 set bits.
         self.occupied.count_ones() as usize
@@ -162,27 +161,34 @@ impl<V: PartialEq> PartialEq for HeightMap<V> {
 impl<V: Eq> Eq for HeightMap<V> {}
 
 impl<V> HeightMap<V> {
-    pub(super) fn get(&self, height: &Height) -> Option<&V> {
+    pub(crate) fn get(&self, height: &Height) -> Option<&V> {
         self.chunks.get(&chunk_id(*height))?.get(height)
     }
-    #[cfg(test)]
-    pub(super) fn first_key_value(&self) -> Option<(&Height, &V)> {
+    pub(crate) fn contains_key(&self, height: &Height) -> bool {
+        self.get(height).is_some()
+    }
+    pub(crate) fn first_key_value(&self) -> Option<(&Height, &V)> {
         self.chunks.first_key_value()?.1.first()
     }
-    pub(super) fn last_key_value(&self) -> Option<(&Height, &V)> {
+    pub(crate) fn last_key_value(&self) -> Option<(&Height, &V)> {
         self.chunks.last_key_value()?.1.last()
     }
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.chunks.values().map(|chunk| chunk.len()).sum()
     }
-    #[cfg(test)]
-    pub(super) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
     #[cfg(test)]
-    pub(super) fn iter(&self) -> impl DoubleEndedIterator<Item = (&Height, &V)> {
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = (&Height, &V)> {
         self.chunks.values().flat_map(|chunk| chunk.iter())
+    }
+    /// Returns the values in height order.
+    pub(crate) fn values(&self) -> impl DoubleEndedIterator<Item = &V> {
+        self.chunks
+            .values()
+            .flat_map(|chunk| chunk.iter())
+            .map(|(_, value)| value)
     }
     /// Returns entries in height order within `bounds`.
     ///
@@ -190,7 +196,7 @@ impl<V> HeightMap<V> {
     ///
     /// Panics if the start exceeds the end, or if equal bounds are both excluded,
     /// even when the map is empty.
-    pub(super) fn range<R: RangeBounds<Height>>(
+    pub(crate) fn range<R: RangeBounds<Height>>(
         &self,
         bounds: R,
     ) -> impl DoubleEndedIterator<Item = (&Height, &V)> {
@@ -213,6 +219,19 @@ impl<V> HeightMap<V> {
             .range((chunk_bound(&start), chunk_bound(&end)))
             .flat_map(|(_, chunk)| chunk.iter())
             .filter(move |(height, _)| (start, end).contains(*height))
+    }
+}
+
+impl<V> std::ops::Index<&Height> for HeightMap<V> {
+    type Output = V;
+
+    /// Returns the value at `height`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no entry at `height`.
+    fn index(&self, height: &Height) -> &V {
+        self.get(height).expect("no entry found for height")
     }
 }
 

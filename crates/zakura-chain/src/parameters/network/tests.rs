@@ -817,7 +817,7 @@ fn default_testnet_nsm_reissuance_boundary() {
             i64::try_from(reserve).expect("the reference reserve fits the amount range"),
         )
         .expect("the reference reserve is non-negative");
-        let bonus = reissuance_bonus(reserve).expect("the reference bonus is valid");
+        let bonus = reissuance_bonus(reserve, &network).expect("the reference bonus is valid");
         let scheduled = halving_block_subsidy(height, &network).expect("valid subsidy");
         assert_eq!(bonus < scheduled, is_crossing);
     }
@@ -973,15 +973,32 @@ fn nsm_crossing_includes_only_the_permitted_run() {
         (threshold + 2 * subsidy + 1, None),
     ] {
         assert_eq!(
-            first_nsm_crossing_in_subsidy_run(10, 12, 0, subsidy, reserve),
+            first_nsm_crossing_in_subsidy_run(
+                10,
+                12,
+                0,
+                subsidy,
+                reserve,
+                BLOCK_SUBSIDY_FRACTION_NUMERATOR
+            ),
             Ok(expected)
         );
     }
     assert_eq!(
-        first_nsm_crossing_in_subsidy_run(10, 9, 0, subsidy, threshold),
+        first_nsm_crossing_in_subsidy_run(
+            10,
+            9,
+            0,
+            subsidy,
+            threshold,
+            BLOCK_SUBSIDY_FRACTION_NUMERATOR
+        ),
         Ok(None)
     );
-    assert_eq!(first_nsm_crossing_in_subsidy_run(10, 12, 0, 0, 0), Ok(None));
+    assert_eq!(
+        first_nsm_crossing_in_subsidy_run(10, 12, 0, 0, 0, BLOCK_SUBSIDY_FRACTION_NUMERATOR),
+        Ok(None)
+    );
 }
 
 proptest::proptest! {
@@ -1209,20 +1226,20 @@ proptest::proptest! {
         supply_before_first in 0u128..1_000_000,
         subsidy in 1u128..1_000_000,
         excess_reserve in 0u128..100_000_000,
+        numerator in 1u128..=1_155_280_000,
     ) {
         use crate::parameters::subsidy::{
             first_nsm_crossing_in_subsidy_run, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
-            BLOCK_SUBSIDY_FRACTION_NUMERATOR,
         };
 
         let run_end = first + run_length;
         let threshold = (subsidy - 1) * BLOCK_SUBSIDY_FRACTION_DENOMINATOR
-            / BLOCK_SUBSIDY_FRACTION_NUMERATOR;
+            / numerator;
         let max_money = supply_before_first + threshold + excess_reserve;
         let expected = (first..=run_end).find(|height| {
             let issued_in_run = u128::from(*height - first) * subsidy;
             let reserve = max_money.saturating_sub(supply_before_first + issued_in_run);
-            let reference_subsidy = (reserve * BLOCK_SUBSIDY_FRACTION_NUMERATOR)
+            let reference_subsidy = (reserve * numerator)
                 .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
 
             reference_subsidy < subsidy
@@ -1233,6 +1250,7 @@ proptest::proptest! {
             supply_before_first,
             subsidy,
             max_money,
+            numerator,
         )
         .expect("generated arithmetic fits");
 
@@ -1317,8 +1335,9 @@ fn block_subsidy_fraction_halves_the_balance_over_one_interval() {
     let mut remaining =
         Amount::<NonNegative>::try_from(initial).expect("100 ZEC is a valid amount");
     for _ in 0..5_040_000 {
-        remaining = (remaining - reissuance_bonus(remaining).expect("valid bonus"))
-            .expect("the bonus never exceeds the remaining balance");
+        remaining = (remaining
+            - reissuance_bonus(remaining, &Network::Mainnet).expect("valid bonus"))
+        .expect("the bonus never exceeds the remaining balance");
     }
 
     let half = initial / 2;
@@ -1390,7 +1409,8 @@ fn reissuance_bonus_rounding_boundaries() {
         (10_000_000_000 + 1, 1_376),
         (MAX_MONEY, 288_750_000),
     ] {
-        let actual = reissuance_bonus(Amount::try_from(balance).unwrap()).unwrap();
+        let actual =
+            reissuance_bonus(Amount::try_from(balance).unwrap(), &Network::Mainnet).unwrap();
         assert_eq!(i64::from(actual), expected, "balance {balance}");
     }
 }
@@ -1425,7 +1445,7 @@ proptest::proptest! {
         let numerator = i128::try_from(BLOCK_SUBSIDY_FRACTION_NUMERATOR).unwrap();
         let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
         let expected = (i128::from(balance) * numerator + denominator - 1) / denominator;
-        let actual = reissuance_bonus(Amount::try_from(balance).unwrap()).unwrap();
+        let actual = reissuance_bonus(Amount::try_from(balance).unwrap(), &Network::Mainnet).unwrap();
         proptest::prop_assert_eq!(i128::from(i64::from(actual)), expected);
         proptest::prop_assert!(i64::from(actual) <= balance);
         proptest::prop_assert!(balance == 0 || i64::from(actual) > 0);
@@ -1619,7 +1639,7 @@ fn reissuance_activation_and_rounding_boundary_matrix() {
                         scheduled
                     );
                 }
-                let numerator = 1_375;
+                let numerator = 8_022_777;
                 // The largest deficit that still rounds up to a one-zatoshi bonus.
                 let boundary = i64::try_from(10_000_000_000 / numerator).unwrap();
                 for deficit in [

@@ -44,7 +44,7 @@ use crate::{
         OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     peer::address_is_valid_for_outbound_connections,
-    protocol::external::{canonical_peer_addr, canonical_socket_addr},
+    protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
     zakura::ZakuraConfig,
     BoxError, PeerSocketAddr,
 };
@@ -58,7 +58,7 @@ mod tests;
 
 pub use cache_dir::CacheDir;
 pub use tcp_warmup::TcpWarmupConfig;
-pub use unconditional_peers::UnconditionalPeers;
+pub use unconditional_peers::{UnconditionalPeerName, UnconditionalPeers};
 
 pub(crate) use cache_dir::{
     default_network_identity_dir, zakura_discovery_sequence_file_path,
@@ -353,12 +353,14 @@ pub struct Config {
 
     /// Exposes legacy peer IP addresses in peer activity logs and structured trace files.
     /// This includes connected peers and candidate or address book entries.
-    /// Seed and peer-cache Prometheus metrics also use this setting for `remote_ip` labels.
+    /// The `zcash.net.peers.initial` Prometheus metric also uses this setting for its
+    /// `remote_ip` labels.
     ///
     /// Literal addresses supplied in the node configuration can appear in startup logs and
     /// `seed` labels regardless of this setting.
     /// If `trace_dir` is configured in `[network.zakura]`, legacy sync diagnostics can write
-    /// unredacted addresses to `legacy_sync.jsonl`.
+    /// unredacted addresses to `legacy_sync.jsonl`, and every legacy block and header request
+    /// is written with its peer's address to `legacy_peer_request.jsonl`.
     ///
     /// # Security
     ///
@@ -369,8 +371,10 @@ pub struct Config {
     /// Peers that Zakura never scores or bans, and keeps connected where it can.
     ///
     /// Each entry is an IP address, such as `"192.0.2.1"`, an IP address and port, such
-    /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, or a CIDR range, such as
-    /// `"2001:db8::/32"`. CIDR ranges with host bits set are rejected.
+    /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, a DNS name and port, such as
+    /// `"peer.example.com:8233"`, a DNS name and port pinned to the peer's node ID, such
+    /// as `"<node id>@peer.example.com:8233"`, or a CIDR range, such as `"2001:db8::/32"`.
+    /// CIDR ranges with host bits set are rejected, and a DNS name needs a port.
     /// Use this setting for peers you operate, such as your own nodes, miners, or
     /// sidecars.
     ///
@@ -386,6 +390,28 @@ pub struct Config {
     /// no connections fails quietly, and each failure doubles the delay before the next
     /// dial, up to ten minutes. Zakura keeps at most `max_connections_per_ip` connections
     /// to one IP, so it does not dial further entries on that IP.
+    ///
+    /// Zakura dials a DNS name in the same way. It looks the name up before each dial,
+    /// and never while that peer is connected, so it follows a peer that comes back at a
+    /// new address. It dials one address from the answer at a time, starting with the
+    /// first it can dial and moving to the next on each later attempt, so list each peer
+    /// under a name of its own. The address it dialed last is treated like a listed
+    /// address in everything this setting does.
+    /// When a lookup fails, Zakura dials the last address again. A ban from before the
+    /// name resolved to an address stays until Zakura restarts, and a mempool cooldown
+    /// from before then stays until it ends. The startup dials do not wait for the first
+    /// lookup, so they keep no room for a name's address.
+    ///
+    /// A DNS name pinned to a node ID, the 64 hex characters that `zakura.bootstrap_peers`
+    /// entries start with, is dialed in the same way. While a P2P v2 connection proves
+    /// that the peer holds that node ID, the IP that connection was opened from is treated
+    /// like a listed address, and the peer counts as connected, wherever it is. Otherwise
+    /// the name has no such address. So a changed DNS answer, or someone else at the
+    /// peer's old address, gets nothing. Only a peer that upgrades to P2P v2 can prove its
+    /// node ID, so Zakura closes a connection to the name's address that stays on the
+    /// legacy protocol, warns, and dials the next address later. A pin needs
+    /// `p2p_stack = "dual"`, and Zakura refuses to start with one otherwise. Zakura warns
+    /// about each DNS name without a pin when it runs both stacks.
     ///
     /// Each dialed address adds one outbound and one inbound connection slot on top of the
     /// connection limits. Zakura dials each address on an outbound slot of its own, so a
@@ -410,7 +436,9 @@ pub struct Config {
     /// # Security
     ///
     /// Zakura never bans a listed peer, even if it sends invalid blocks or transactions.
-    /// Only list peers you trust.
+    /// Only list peers you trust. Whoever controls a listed DNS name, or the answers this
+    /// node gets for it, chooses an address that Zakura trusts in the same way, unless the
+    /// name is pinned to a node ID.
     pub unconditional_peers: UnconditionalPeers,
     /// The initial peer count for full-sized or unknown-sized legacy blocks. At least 1.
     ///
@@ -508,7 +536,8 @@ impl Config {
     }
 
     /// The maximum number of connections that Zakura opens to stay connected to its
-    /// [`unconditional_peers`](Self::unconditional_peers): one for each dialed address.
+    /// [`unconditional_peers`](Self::unconditional_peers): one for each dialed address
+    /// or DNS name.
     ///
     /// These connections are counted separately from
     /// [`peerset_outbound_connection_limit`](Self::peerset_outbound_connection_limit), so
@@ -948,14 +977,15 @@ impl Config {
                     "updated cached peer IP addresses"
                 );
 
-                for ip in &selected_peers {
-                    metrics::counter!(
-                        "zcash.net.peers.cache",
-                        "cache" => peer_cache_file.display().to_string(),
-                        "remote_ip" => ip.addr_label(self.expose_peer_addresses)
-                    )
-                    .increment(1);
-                }
+                // Count the cached peers per cache file. A per-address label would add a series
+                // for every peer ever cached, and the exporter never removes them.
+                metrics::counter!(
+                    "zcash.net.peers.cache",
+                    "cache" => peer_cache_file.display().to_string(),
+                )
+                .increment(
+                    u64::try_from(selected_peers.len()).expect("a peer address count fits in u64"),
+                );
 
                 Ok(())
             }
@@ -1011,6 +1041,16 @@ impl Config {
     /// mutually capable peers to the Zakura upgrade hook.
     pub fn v2_p2p(&self) -> bool {
         self.p2p_stack.resolve(&self.network).runs_zakura()
+    }
+
+    /// Returns the services sent in the legacy handshake for the node's own `services`: those
+    /// services with [`PeerServices::NODE_P2P_V2`] set exactly when [`v2_p2p`](Self::v2_p2p) is.
+    pub fn handshake_services(&self, mut services: PeerServices) -> PeerServices {
+        services.remove(PeerServices::NODE_P2P_V2);
+        if self.v2_p2p() {
+            services |= PeerServices::NODE_P2P_V2;
+        }
+        services
     }
 
     /// Builds a network config for tests with [`p2p_stack`](Self::p2p_stack) pinned to
@@ -1745,6 +1785,18 @@ impl<'de> Deserialize<'de> for Config {
             zakura
                 .budgeted_max_connections(&network)
                 .map_err(de::Error::custom)?;
+        }
+        // Unconditional peers are dialed on the legacy stack, and only a P2P v2
+        // connection proves a node ID, so a pin needs both stacks.
+        let runs_both_stacks = {
+            let p2p_stack = p2p_stack.resolve(&network);
+            p2p_stack.runs_legacy() && p2p_stack.runs_zakura()
+        };
+        if unconditional_peers.has_pinned_names() && !runs_both_stacks {
+            return Err(de::Error::custom(
+                "network.unconditional_peers pins a node ID, which needs both P2P stacks: \
+                 set network.p2p_stack = \"dual\"",
+            ));
         }
 
         Ok(Config {

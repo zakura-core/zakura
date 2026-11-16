@@ -349,7 +349,7 @@ where
     }
 }
 
-/// Return a [`VerifiedUnminedTx`] strategy with outputs and inputs adjusted to pass standardness.
+/// Returns a [`VerifiedUnminedTx`] strategy adjusted to pass standardness.
 pub fn standard_verified_unmined_tx_strategy() -> BoxedStrategy<VerifiedUnminedTx> {
     any::<Transaction>()
         .prop_map(|mut transaction| {
@@ -364,8 +364,16 @@ pub fn standard_verified_unmined_tx_strategy() -> BoxedStrategy<VerifiedUnminedT
         .boxed()
 }
 
-/// Mutate a transaction so its transparent inputs/outputs pass standardness checks.
+/// Adjusts transaction data to pass mempool standardness checks.
 pub fn standardize_transaction(transaction: &mut Transaction) {
+    match transaction {
+        Transaction::V2 { joinsplit_data, .. } | Transaction::V3 { joinsplit_data, .. } => {
+            *joinsplit_data = None;
+        }
+        Transaction::V4 { joinsplit_data, .. } => *joinsplit_data = None,
+        Transaction::V1 { .. } | Transaction::V5 { .. } | Transaction::V6 { .. } => {}
+    }
+
     let lock_script = standard_lock_script();
     let output_value = Amount::<NonNegative>::try_from(10_000).expect("valid amount");
 

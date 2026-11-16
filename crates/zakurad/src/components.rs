@@ -15,6 +15,9 @@ pub mod tokio;
 pub mod tracing;
 pub mod zcashd_compat;
 
+#[cfg(test)]
+pub(crate) mod test_misbehavior;
+
 #[cfg(feature = "internal-miner")]
 pub mod miner;
 

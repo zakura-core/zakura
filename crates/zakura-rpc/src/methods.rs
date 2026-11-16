@@ -65,9 +65,7 @@ use zakura_chain::{
         },
         ConsensusBranchId, Network, NetworkUpgrade,
     },
-    serialization::{
-        BytesInDisplayOrder, Duration32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
-    },
+    serialization::{BytesInDisplayOrder, Duration32, ZcashDeserialize, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, SerializedTransaction, Transaction, UnminedTx},
     transparent::{self, Address, OutputIndex},
@@ -124,7 +122,7 @@ use types::{
         proposal::proposal_block_from_template,
         trace::{next_request_id, BuildTimes, MiningTemplateTrace, WaitReason},
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
-        GetBlockTemplateParameters, GetBlockTemplateResponse,
+        GetBlockTemplateParameters, GetBlockTemplateResponse, TemplateBuildWork,
     },
     get_blockchain_info::GetBlockchainInfoBalance,
     get_mempool_info::GetMempoolInfoResponse,
@@ -1060,6 +1058,9 @@ where
     /// The estimated last height this release supports, if enforced.
     end_of_support_height: Option<Height>,
 
+    /// The services this node sends in its legacy P2P handshake, reported by `getnetworkinfo`.
+    local_services: PeerServices,
+
     // Services
     //
     /// A handle to the mempool service.
@@ -1364,6 +1365,7 @@ where
             .field("user_agent", &self.user_agent)
             .field("network", &self.network)
             .field("debug_force_finished_sync", &self.debug_force_finished_sync)
+            .field("local_services", &self.local_services)
             .field("getblocktemplate", &self.gbt)
             .finish()
     }
@@ -1430,6 +1432,7 @@ where
             debug_force_finished_sync,
             rpc_surface: RpcSurface::Full,
             end_of_support_height: None,
+            local_services: PeerServices::NODE_NETWORK,
             mempool: mempool.clone(),
             state: state.clone(),
             read_state: read_state.clone(),
@@ -1497,7 +1500,8 @@ where
         }
     }
 
-    /// Builds proofs on the blocking pool and maps construction or worker failures to RPC errors.
+    /// Builds a template, on the blocking pool when it needs a proof, and maps construction or
+    /// worker failures to RPC errors.
     ///
     /// Also returns how long the build waited to start and how long it ran.
     #[allow(clippy::too_many_arguments)]
@@ -1530,13 +1534,21 @@ where
             return Ok((template, times));
         }
 
+        let work = match (&precomputed_coinbase, chain_info.tip_height.next()) {
+            (None, Ok(height)) => {
+                TemplateBuildWork::for_coinbase(&self.network, height, miner_params)
+            }
+            // A coinbase that is already built leaves no proof to create, and neither does a
+            // parent with no next height, which the build rejects.
+            _ => TemplateBuildWork::ProofFree,
+        };
         let network = self.network.clone();
         let miner_params = miner_params.clone();
         let chain_info = chain_info.clone();
         let requested = std::time::Instant::now();
         let (template, times) = self
             .gbt
-            .run_template_build(move || {
+            .run_template_build(work, move || {
                 let started = std::time::Instant::now();
                 let template = BlockTemplateResponse::new_internal(
                     &network,
@@ -2051,6 +2063,15 @@ where
         self
     }
 
+    /// Sets the services reported by `getnetworkinfo`, which must be the services this node sends
+    /// in its legacy P2P handshake.
+    ///
+    /// When unset, `getnetworkinfo` reports [`PeerServices::NODE_NETWORK`].
+    pub fn with_local_services(mut self, local_services: PeerServices) -> Self {
+        self.local_services = local_services;
+        self
+    }
+
     /// Sets the end-of-support height reported by `getdeprecationinfo`.
     ///
     /// When unset, or set to `None`, the RPC omits `end_of_service`.
@@ -2384,8 +2405,9 @@ where
         // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/rawtransaction.cpp#L1259-L1260>
         let raw_transaction_bytes = Vec::from_hex(raw_transaction_hex)
             .map_error(server::error::LegacyCode::Deserialization)?;
-        let raw_transaction = Transaction::zcash_deserialize(&*raw_transaction_bytes)
-            .map_error(server::error::LegacyCode::Deserialization)?;
+        let raw_transaction =
+            Transaction::zcash_deserialize_bounded(&mut raw_transaction_bytes.as_slice())
+                .map_error(server::error::LegacyCode::Deserialization)?;
 
         let transaction_hash = raw_transaction.hash();
 
@@ -2689,38 +2711,41 @@ where
                 // Reference for the legacy error code:
                 // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
                 .map_error(server::error::LegacyCode::InvalidParameter)?;
+        let response = match self
+            .read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if is_read_capacity_refusal(&*error) => {
+                // A capacity refusal says nothing about the block, so the caller can retry.
+                return Err(ErrorObject::new(
+                    server::error::LegacyCode::OutOfMemory,
+                    "state read capacity is temporarily exhausted, retry later",
+                ));
+            }
+            Err(error) if error.is::<zakura_state::BlockHeaderNotFound>() => {
+                return Err("block height not in best chain").map_error(
+                    // ## Compatibility with `zcashd`.
+                    //
+                    // Since this function is reused by getblock(), we return the errors
+                    // expected by it (they differ whether a hash or a height was passed).
+                    if hash_or_height.hash().is_some() {
+                        server::error::LegacyCode::InvalidAddressOrKey
+                    } else {
+                        server::error::LegacyCode::InvalidParameter
+                    },
+                );
+            }
+            Err(error) => return Err(error).map_misc_error(),
+        };
         let zakura_state::ReadResponse::BlockHeader {
             header,
             hash,
             height,
             next_block_hash,
-        } = self
-            .read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
-            .await
-            .map_err(|error| {
-                if is_read_capacity_refusal(&*error) {
-                    // A capacity refusal says nothing about the block, so the caller can retry.
-                    ErrorObject::new(
-                        server::error::LegacyCode::OutOfMemory,
-                        "state read capacity is temporarily exhausted, retry later",
-                    )
-                } else {
-                    // ## Compatibility with `zcashd`.
-                    //
-                    // Since this function is reused by getblock(), we return the errors
-                    // expected by it (they differ whether a hash or a height was passed).
-                    ErrorObject::new(
-                        if hash_or_height.hash().is_some() {
-                            server::error::LegacyCode::InvalidAddressOrKey
-                        } else {
-                            server::error::LegacyCode::InvalidParameter
-                        },
-                        "block height not in best chain",
-                    )
-                }
-            })?
+        } = response
         else {
             panic!("unexpected response to BlockHeader request")
         };
@@ -3711,7 +3736,8 @@ where
                     // seconds if the miner mines to a shielded address, and we want to return fast
                     // when the tip changes.
                     let precompute_coinbase = |network, height, params| {
-                        self.gbt.run_template_build(move || {
+                        let work = TemplateBuildWork::for_coinbase(&network, height, &params);
+                        self.gbt.run_template_build(work, move || {
                             TransactionTemplate::new_coinbase(
                                 &network,
                                 height,
@@ -3951,7 +3977,7 @@ where
             .decode_submitted(&block_bytes)
         {
             Some(block) => block,
-            None => match block_bytes.zcash_deserialize_into::<Block>() {
+            None => match Block::zcash_deserialize_bounded(&mut block_bytes.as_slice()) {
                 Ok(block) => Arc::new(block),
                 Err(error) => {
                     tracing::info!(
@@ -4110,8 +4136,7 @@ where
 
         let protocol_version = zakura_network::constants::CURRENT_NETWORK_PROTOCOL_VERSION.0;
 
-        // TODO: return actual supported local services when Zebra exposes them
-        let local_services = format!("{:016x}", PeerServices::NODE_NETWORK);
+        let local_services = format!("{:016x}", self.local_services);
 
         // Deprecated: zcashd always returns 0.
         let timeoffset = 0;

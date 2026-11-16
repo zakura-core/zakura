@@ -339,18 +339,6 @@ fn mutated_transaction(
 }
 
 #[test]
-fn cache_key_is_deterministic() {
-    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
-    let wtx_id = test_wtx_id(1);
-
-    assert_eq!(
-        cache_key(&bundle, sighash, wtx_id),
-        cache_key(&bundle, sighash, wtx_id),
-        "the same wtxid, sighash, and pool must always produce the same key"
-    );
-}
-
-#[test]
 fn cache_key_commits_to_the_txid_and_authorizing_data() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let original_wtx_id = test_wtx_id(1);

@@ -148,15 +148,16 @@ impl Fixture {
                 .verified
                 .insert(tx, spent, &mut self.storage.pending_outputs, None)
                 .unwrap();
-            let affected = self.storage.verified.dependency_group([id]);
-            self.storage.verified.remove_ordering_candidates(&affected);
+            self.storage
+                .verified
+                .remove_ordering_candidate(id, self.storage.verified.transactions[&id].time);
             self.storage
                 .verified
                 .transactions
                 .get_mut(&id)
                 .unwrap()
                 .time = time;
-            self.storage.verified.insert_ordering_candidates(&affected);
+            self.storage.verified.insert_ordering_candidate(id);
         }
         assert_eq!(self.storage.total_cost(), before_cost);
         elapsed

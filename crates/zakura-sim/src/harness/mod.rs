@@ -19,7 +19,6 @@ pub mod discovery;
 pub mod discovery_machine;
 pub mod discovery_service;
 pub mod fixtures;
-pub mod header_acceptance;
 pub mod header_node;
 pub mod header_sync;
 pub mod header_work;
@@ -136,6 +135,15 @@ pub trait Subsystem: HasView + Sized + 'static {
     /// fuzz input.
     fn draw(prefix: &[u8]) -> Self::Scenario;
 
+    /// The scenario families `draw` picks by a tag at the prefix's start,
+    /// such as a saved scenario's two bytes. A uniform draw almost never
+    /// writes a tag, so `zakura-sim generate` writes each family's tag on a
+    /// share of its runs. Every tag `draw` matches must be listed, and a
+    /// draw that matches none lists none, the default.
+    fn families() -> Vec<ScenarioFamily> {
+        Vec::new()
+    }
+
     /// Whether this generator reads `prefix`, exactly
     /// [`Subsystem::SCENARIO_BYTES`] long, as its own rather than drawing a
     /// fallback scenario for it, as `draw` does for another generator's
@@ -153,6 +161,26 @@ pub trait Subsystem: HasView + Sized + 'static {
             "{} migrates no generator-{generator} input",
             Self::NAME
         ))
+    }
+}
+
+/// One scenario family a harness's draw picks by a tag
+/// ([`Subsystem::families`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScenarioFamily {
+    /// The family's name, as `zakura-sim generate` reports it.
+    pub name: &'static str,
+    /// The bytes at the prefix's start that pick it.
+    pub tag: Vec<u8>,
+}
+
+impl ScenarioFamily {
+    /// The family `tag` picks, named `name`.
+    pub fn new(name: &'static str, tag: impl Into<Vec<u8>>) -> Self {
+        ScenarioFamily {
+            name,
+            tag: tag.into(),
+        }
     }
 }
 
@@ -285,7 +313,6 @@ pub fn meta<S: Subsystem>(scenario: &S::Scenario) -> Result<MetaRecord, HarnessE
         rng: RNG.to_owned(),
         fixtures: Vec::new(),
         properties: registered::<S>(),
-        draft: draft(),
         input: None,
         plan: None,
         derived_from: None,
@@ -358,48 +385,7 @@ pub(crate) fn registry<S: Subsystem>() -> Registry<S> {
         },
     ];
     properties.extend(S::properties());
-    let draft = draft();
-    for property in &mut properties {
-        if draft.iter().any(|id| id == property.id.as_str()) {
-            property.status = Status::Draft;
-        }
-    }
     Registry::new(properties).unwrap_or_else(|error| panic!("{}: {error}", S::NAME))
-}
-
-thread_local! {
-    /// The run configuration [`with_draft`] sets.
-    static DRAFT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Runs `f` with every property in `ids` checked as `Draft`, whatever its
-/// registered status (C9), as a planted case's `Draft` run needs: no
-/// member's `Active` violation stops the run, so it runs to its end and
-/// keeps every member's violations. Every registry `f` builds applies it,
-/// and every `meta` record it writes names it in `meta.draft`, so a replay
-/// of the trace, which applies `meta.draft` the same way, rebuilds the run.
-/// The setting ends with `f`, even if `f` panics.
-pub fn with_draft<T>(ids: &[String], f: impl FnOnce() -> T) -> T {
-    /// Puts the earlier setting back when dropped.
-    struct Restore(Vec<String>);
-
-    impl Drop for Restore {
-        /// Restores the setting `with_draft` replaced.
-        fn drop(&mut self) {
-            DRAFT.with(|draft| *draft.borrow_mut() = std::mem::take(&mut self.0));
-        }
-    }
-
-    let mut sorted = ids.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let _restore = Restore(DRAFT.with(|draft| draft.replace(sorted)));
-    f()
-}
-
-/// The IDs [`with_draft`] set, sorted, or none outside it.
-pub fn draft() -> Vec<String> {
-    DRAFT.with(|draft| draft.borrow().clone())
 }
 
 /// Checks [`NO_TASK_PANIC`]: violated at a step where a task panicked.
@@ -477,6 +463,8 @@ pub struct HarnessEntry {
     pub run_bytes: fn(&[u8], &mut dyn RecordSink, Option<&mut dyn Checker>) -> ExploreRun,
     /// [`Subsystem::accepts`].
     pub accepts: fn(&[u8]) -> bool,
+    /// [`Subsystem::families`]. A machine has none.
+    pub families: fn() -> Vec<ScenarioFamily>,
     /// [`Subsystem::migrate`].
     pub migrate: fn(&[u8], u32) -> Result<Vec<u8>, String>,
 }
@@ -547,6 +535,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         witness: witness_value::<S>,
         run_bytes: explore::run_bytes::<S>,
         accepts: S::accepts,
+        families: S::families,
         migrate: S::migrate,
     }
 }
@@ -760,11 +749,6 @@ impl Checker for Dyn<'_> {
     /// Forwards to the checker.
     fn step_loop_violation(&mut self, violation: &Violation) {
         self.0.step_loop_violation(violation);
-    }
-
-    /// Forwards to the checker.
-    fn stops(&mut self, property: &str) -> bool {
-        self.0.stops(property)
     }
 
     /// Forwards to the checker.

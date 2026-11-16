@@ -24,7 +24,7 @@ mod tests;
 pub use tests::{replay_request_lifecycle_bytes, RequestLifecycleReplaySummary};
 
 #[cfg(test)]
-pub(super) use liveness::{liveness_grace_allowed, no_progress_response};
+pub(super) use liveness::liveness_grace_allowed;
 pub(super) use liveness::{LivenessDecision, NoProgressResponse};
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub(super) use requests::check_requested_hash;

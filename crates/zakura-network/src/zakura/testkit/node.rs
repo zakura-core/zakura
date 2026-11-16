@@ -490,7 +490,11 @@ impl ZakuraTestNodeBuilder {
         } else {
             self.service.unwrap_or_else(|| Arc::new(recorder.clone()))
         };
-        let network = Config::default().network;
+        let network = self
+            .header_sync
+            .as_ref()
+            .map(|startup| startup.network.clone())
+            .unwrap_or_else(|| Config::default().network);
         let handshake_config = ZakuraHandshakeConfig::for_network(&network);
         let mut advertised_services = crate::zakura::discovery::default_advertised_services();
         advertised_services.extend(self.extra_advertised_services.clone());

@@ -2670,6 +2670,7 @@ dependencies = [
 name = "zakura"
 version = "1.8.9"
 dependencies = [
+ "base64",
  "bytes",
  "chrono",
  "clap",

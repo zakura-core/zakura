@@ -70,6 +70,7 @@ pub mod rpc_logger;
 pub mod rpc_metrics;
 pub mod rpc_service;
 pub mod rpc_tracing;
+pub(crate) mod trusted_block;
 
 #[cfg(test)]
 mod tests;
@@ -229,6 +230,7 @@ impl RpcServer {
         );
         conf.admin_listen_addr = None;
         conf.enable_cookie_auth = true;
+        conf.enable_trusted_block_submission = false;
         conf.tls = None;
 
         Self::start_inner(rpc, conf, RpcSurface::Full, OPENED_ADMIN_RPC_ENDPOINT_MSG).await
@@ -269,14 +271,16 @@ impl RpcServer {
         // as a hex string (2x MAX_BLOCK_BYTES) plus a small JSON-RPC wrapper.
         let max_request_body_size = (MAX_BLOCK_BYTES as usize) * 2 + 1024;
 
-        let http_middleware_layer = if conf.enable_cookie_auth {
+        let auth_cookie = if conf.enable_cookie_auth {
             let cookie = Cookie::default();
             cookie::write_to_disk(&cookie, &conf.cookie_dir, Some(&conf.cookie_file_name))
                 .expect("Zakura must be able to write the auth cookie to the disk");
-            HttpRequestMiddlewareLayer::new(Some(cookie), max_request_body_size)
+            Some(cookie)
         } else {
-            HttpRequestMiddlewareLayer::new(None, max_request_body_size)
+            None
         };
+        let http_middleware_layer =
+            HttpRequestMiddlewareLayer::new(auth_cookie.clone(), max_request_body_size);
         // Credential-free admin methods trust the network boundary, which a local browser
         // is already inside.
         let http_middleware_layer = if surface == RpcSurface::WithAdmin {
@@ -286,6 +290,14 @@ impl RpcServer {
         };
 
         let max_response_body_size = conf.max_response_body_size;
+        let trusted_submit: Option<trusted_block::Submit> =
+            conf.enable_trusted_block_submission.then(|| {
+                let rpc = rpc.clone();
+                std::sync::Arc::new(move |bytes: Bytes| -> trusted_block::SubmissionFuture {
+                    let rpc = rpc.clone();
+                    Box::pin(async move { rpc.submit_trusted_block(&bytes).await })
+                }) as trusted_block::Submit
+            });
         let rpc_service = RpcLoggerMiddleware::new(
             FixRpcResponseMiddleware::new(RpcMetricsMiddleware::new(RpcTracingMiddleware::new(
                 RpcService::new(rpc, enabled_methods, max_response_body_size),
@@ -299,6 +311,9 @@ impl RpcServer {
                 MAX_RPC_BATCH_REQUESTS,
                 max_response_body_size,
             ));
+
+        let service =
+            trusted_block::TrustedBlockHttpService::new(service, auth_cookie, trusted_submit);
 
         if let Some(tls) = conf.tls.clone() {
             let tls_config = load_tls_config(&tls)?;

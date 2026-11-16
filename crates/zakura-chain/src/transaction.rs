@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, fmt, iter, sync::Arc};
 
-use halo2::pasta::pallas;
+use pasta_curves::pallas;
 
 mod auth_digest;
 mod hash;

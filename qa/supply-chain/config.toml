@@ -503,9 +503,9 @@ criteria = "safe-to-deploy"
 notes = "Common v5.4.0 release (zakura-sapling-crypto 5.4.0); carry the existing exact-version audit backlog forward. Direct package review remains pending; this is not an audit certification."
 
 [[exemptions.zakura-sensei]]
-version = "0.1.2"
+version = "0.1.3"
 criteria = "safe-to-deploy"
-notes = "Common v5.4.0 release (zakura-sensei 0.1.2); carry the existing exact-version audit backlog forward. Direct package review remains pending; this is not an audit certification."
+notes = "Standalone zakura-sensei 0.1.3 release adopted by the Orchard sensei backend switch (#2236); carry the existing exact-version audit backlog forward. Direct package review remains pending; this is not an audit certification."
 
 [[exemptions.zakura-sensei-artifacts]]
 version = "0.2.0"

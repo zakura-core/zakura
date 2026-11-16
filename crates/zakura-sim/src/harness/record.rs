@@ -72,15 +72,8 @@ pub enum RecordError {
     /// The witness test couldn't run: the harness doesn't register the
     /// property, or the property has no trigger-history check.
     Witness(WitnessError),
-    /// The run's `Draft` override ([`super::with_draft`]) names a property
-    /// the harness doesn't register, or overrides a machine harness, whose
-    /// one property can't run as `Draft`. Nothing was written.
-    UnregisteredDraft {
-        /// The property.
-        property: String,
-    },
     /// The run wrote its `end` record but sent no full report, so its
-    /// violations and stores would be lost (C8). A harness run always sends
+    /// violations and stores would be lost. A harness run always sends
     /// one, so a sink that wraps another without forwarding it does this.
     NoReport,
     /// The run [`crate::trace::record_failure`] was handed doesn't violate
@@ -115,12 +108,6 @@ impl fmt::Display for RecordError {
             RecordError::Witness(error) => write!(f, "the witness test can't run: {error}"),
             RecordError::NoReport => {
                 f.write_str("the run ended but sent no full report for full-report.json")
-            }
-            RecordError::UnregisteredDraft { property } => {
-                write!(
-                    f,
-                    "the Draft override names {property}, which the harness can't check as Draft"
-                )
             }
             RecordError::NotViolated { property } => {
                 write!(f, "the run doesn't violate {property}")
@@ -238,12 +225,6 @@ pub(crate) fn write_trace<T>(
     out: &Path,
     run: impl FnOnce(&Value, PlanInput, &mut dyn RecordSink) -> Result<T, RecordError>,
 ) -> Result<(Trace, T), RecordError> {
-    if let Some(property) = super::draft()
-        .into_iter()
-        .find(|id| harness.machine || harness.status(id).is_none())
-    {
-        return Err(RecordError::UnregisteredDraft { property });
-    }
     let mut meta = (harness.meta)(scenario).map_err(RecordError::Harness)?;
     meta.derived_from = derived_from;
     // A full input names its Plan bytes through `input`.
@@ -284,7 +265,7 @@ pub(crate) fn write_trace<T>(
         report,
     } = sink;
     // Beside the trace, so a judge reads every violation and the stores
-    // without rerunning (C8). A run that never reached its end sends none.
+    // without rerunning. A run that never reached its end sends none.
     // The `end` record is written only once the report is, so a recording
     // that fails here leaves an incomplete trace, never a complete one
     // without its report.
@@ -398,7 +379,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
-    /// C8: a run that wrote its `end` record but sent no full report fails
+    /// A run that wrote its `end` record but sent no full report fails
     /// the recording, and leaves its trace without the `end` record, so a
     /// sink that loses the report can't leave a trace that looks complete
     /// without it.

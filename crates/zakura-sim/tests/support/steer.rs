@@ -229,12 +229,6 @@ impl Checker for Pair<'_> {
         self.1.step_loop_violation(violation);
     }
 
-    /// True only if both stop at it. Asks both.
-    fn stops(&mut self, property: &str) -> bool {
-        let first = self.0.stops(property);
-        self.1.stops(property) && first
-    }
-
     /// The first's open checks, then the second's.
     fn unfinished(&self) -> zakura_sim::Unfinished {
         let mut open = self.0.unfinished().open;

@@ -144,7 +144,7 @@ fn recording_plan_bytes_writes_no_input() {
     assert_eq!(trace.meta.scenario, scenario);
     assert_eq!(trace.meta.input, None);
     assert!(!dir.path().join(INPUT_FILE).exists());
-    // C18: the meta names the Plan bytes it ran.
+    // The meta names the Plan bytes it ran.
     assert_eq!(trace.meta.plan, Some(PlanRef::bytes(&BYTES[1..])));
 
     // The same run from a full input differs only in meta.input, which
@@ -159,7 +159,7 @@ fn recording_plan_bytes_writes_no_input() {
     assert_eq!(from_input.meta.plan, None);
 }
 
-/// C18: a scripted Plan records like Plan bytes, its trace names the script
+/// A scripted Plan records like Plan bytes, its trace names the script
 /// by digest, and the trace replays Exact. Another Plan for the same
 /// scenario names another digest, so a tool can tell the two apart.
 #[test]

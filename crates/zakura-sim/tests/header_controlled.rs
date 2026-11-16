@@ -1162,7 +1162,7 @@ fn storage_delivered_anywhere_but_the_run_log_ends_the_run() {
     }
 }
 
-/// C1: the run holds each evidence source's checkpoint, so a wrapper that
+/// The run holds each evidence source's checkpoint, so a wrapper that
 /// skips one observation ends the run at that boundary, whether it's the
 /// setup, an interior step or the final step.
 #[test]
@@ -1191,7 +1191,7 @@ fn a_skipped_observation_ends_the_run_there() {
     }
 }
 
-/// C1: storage registers its checkpoint when it's created, so one the run
+/// Storage registers its checkpoint when it's created, so one the run
 /// never gets as a source still fails the run at setup, rather than
 /// leaving its evidence unchecked.
 #[test]

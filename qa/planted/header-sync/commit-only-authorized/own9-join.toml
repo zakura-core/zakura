@@ -1,0 +1,13 @@
+# The handler hands a reopened header session the session ID of the
+# generation that exited before it, while the transport still reports the
+# reopened session's own ID and generation. The session view's own-9 join
+# then finds the second admission's Session row names another session, and
+# records it as an `AuthorityRule::Provenance` finding, the required
+# failure. The input is the saved reopen Plan, whose peer finishes its
+# header stream once both subscriptions end, so the node reopens it on the
+# same connection.
+input = "crates/zakura-sim/tests/fixtures/header-wire-reopen.bin"
+# The reactor and the subscriber decide when both subscriptions end, and so
+# when the peer finishes its stream and the node reopens it, so a change
+# there can move the input off the reopen.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

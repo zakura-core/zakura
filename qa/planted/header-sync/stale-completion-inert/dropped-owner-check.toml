@@ -1,0 +1,17 @@
+# Drops the owner and call checks from the prepare handler's
+# `settles_round`, so a stale prepare settles whatever round its peer is
+# preparing from the same source. The required failure is
+# `StaleCompletionEffect`: the stale prepare's handler returns the budget
+# of its peer's current round, not its own. The input is the churn
+# witness: each mirror closes and relinks once its prepare is submitted,
+# and the prepares are held until all six are submitted, so a relinked
+# mirror's new round is preparing when its old prepare completes.
+# Besides reactor.rs, which the patch changes, the queue and the
+# subscriber decide when a relinked mirror's round reaches its prepare. A
+# change there can move the witness off its stale prepare.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.json"
+plan = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.plan"

@@ -1,12 +1,14 @@
 //! Unconditional peer configuration for zakura-network.
 
 use std::{
+    fmt,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use ipnet::IpNet;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use zakura_quic::NodeId;
 
 use crate::{
     protocol::external::{canonical_ip, canonical_peer_addr},
@@ -21,106 +23,150 @@ use crate::{
 /// An IPv4 entry also matches the IPv4-mapped IPv6 form of the same address, and the
 /// reverse.
 ///
-/// Every entry is exempt from scoring and bans. An entry that names one address or one
-/// DNS name is also dialed, see [`dial_addrs`](Self::dial_addrs) and
-/// [`dial_hosts`](Self::dial_hosts). A range of several addresses has no single address
+/// Every entry is exempt from scoring and bans. An entry that names one address is also
+/// dialed, see [`dial_addrs`](Self::dial_addrs), and so is a DNS name, see
+/// [`dial_names`](Self::dial_names). A range of several addresses has no single address
 /// to dial.
 ///
-/// This type holds the configured entries only. A DNS name's exemption covers the
-/// addresses it resolves to while the node runs, which
-/// [`UnconditionalPeerSet`](crate::UnconditionalPeerSet) tracks.
+/// A DNS name stands for the one address that its dialer last resolved it to, see
+/// [`set_resolved_ip`](Self::set_resolved_ip). That address is treated like a listed
+/// single address until the name resolves to another one. A name can be pinned to a
+/// node ID, such as `<node id>@peer.example.com:8233`, see [`UnconditionalPeerName`].
 ///
-/// The list is cheap to clone, so every component that needs it can hold a copy.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The list is cheap to clone, so every component that needs it can hold a copy. Every
+/// copy sees the latest resolved addresses.
+#[derive(Clone, Debug, Default)]
 pub struct UnconditionalPeers {
-    /// The configured entries, in config order.
+    /// The configured addresses and ranges, in config order.
     entries: Arc<[Entry]>,
+
+    /// The configured DNS names, in config order.
+    names: Arc<[UnconditionalPeerName]>,
+
+    /// The canonical address that each name in `names` last resolved to, if any. It is
+    /// only read when `names` is not empty.
+    resolved_ips: Arc<RwLock<Vec<Option<IpAddr>>>>,
+}
+
+/// Two lists are equal when they have the same configured entries, whatever their names
+/// have resolved to.
+impl PartialEq for UnconditionalPeers {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries && self.names == other.names
+    }
+}
+
+impl Eq for UnconditionalPeers {}
+
+/// A DNS name in [`UnconditionalPeers`], with its port and its pinned node ID, if any.
+///
+/// The address of a pinned name is only treated like a listed address while a P2P v2
+/// connection proves that the peer there holds the key of `node_id`. An unpinned name
+/// trusts its DNS answer: whoever is at that address is exempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnconditionalPeerName {
+    /// The DNS name.
+    pub name: Arc<str>,
+
+    /// The port that Zakura dials at each address of the name.
+    pub port: u16,
+
+    /// The node ID that the peer at the name's address must prove, if the entry pins one.
+    pub node_id: Option<NodeId>,
+}
+
+/// Writes the name in its config form, such as `<node id>@peer.example.com:8233`.
+impl fmt::Display for UnconditionalPeerName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(node_id) = self.node_id {
+            write!(f, "{node_id}@")?;
+        }
+        write!(f, "{}:{}", self.name, self.port)
+    }
 }
 
 /// One configured unconditional peer entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Entry {
-    /// An IP address or a range of them.
-    Net {
-        /// The addresses this entry matches. A single address is a full-length range.
-        net: IpNet,
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Entry {
+    /// The addresses this entry matches. A single address is a full-length range.
+    net: IpNet,
 
-        /// The port to dial, if the entry gives one. Only a single address can have
-        /// a port.
-        port: Option<u16>,
+    /// The port to dial, if the entry gives one. Only a single address can have a port.
+    port: Option<u16>,
 
-        /// Whether this node can dial the entry, see
-        /// [`UnconditionalPeers::leave_out_undialable`]. A configured entry starts out
-        /// dialable.
-        is_dialable: bool,
-    },
-
-    /// A DNS name, which is resolved again on every dial.
-    Host {
-        /// The name, in lower case.
-        name: Arc<str>,
-
-        /// The port to dial.
-        port: u16,
-    },
+    /// Whether this node can dial the entry, see
+    /// [`UnconditionalPeers::leave_out_undialable`]. A configured entry starts out
+    /// dialable.
+    is_dialable: bool,
 }
 
 impl Entry {
-    /// Returns the range this entry matches, if it is an address or a range.
-    fn net(&self) -> Option<&IpNet> {
-        match self {
-            Entry::Net { net, .. } => Some(net),
-            Entry::Host { .. } => None,
-        }
-    }
-
-    /// Returns whether this entry names one address, rather than a range of them or a
-    /// DNS name.
+    /// Returns whether this entry names one address, rather than a range of them.
     fn is_single_address(&self) -> bool {
-        match self {
-            Entry::Net { net, .. } => net.prefix_len() == net.max_prefix_len(),
-            Entry::Host { .. } => false,
-        }
+        self.net.prefix_len() == self.net.max_prefix_len()
     }
 
-    /// Returns whether Zakura dials this entry: it names one DNS name, or one address
-    /// that this node can dial.
+    /// Returns whether Zakura dials this entry: it names one address, which this node
+    /// can dial.
     fn is_dialed(&self) -> bool {
-        match self {
-            Entry::Net { is_dialable, .. } => self.is_single_address() && *is_dialable,
-            Entry::Host { .. } => true,
-        }
+        self.is_single_address() && self.is_dialable
     }
 
-    /// Returns the canonical address Zakura dials for an entry that names one address,
-    /// on `default_port` unless the entry gives its own port.
-    fn dial_addr(&self, default_port: u16) -> Option<PeerSocketAddr> {
-        match self {
-            Entry::Net { net, port, .. } if self.is_single_address() => Some(canonical_peer_addr(
-                SocketAddr::new(net.addr(), port.unwrap_or(default_port)),
-            )),
-            Entry::Net { .. } | Entry::Host { .. } => None,
-        }
+    /// Returns the canonical address Zakura dials for this entry, on `default_port`
+    /// unless the entry gives its own port.
+    fn dial_addr(&self, default_port: u16) -> PeerSocketAddr {
+        canonical_peer_addr(SocketAddr::new(
+            self.net.addr(),
+            self.port.unwrap_or(default_port),
+        ))
     }
 }
 
 impl UnconditionalPeers {
-    /// Returns whether `ip` is in any configured address or range.
-    ///
-    /// The addresses that configured DNS names resolve to are not known here, see
-    /// [`UnconditionalPeerSet::contains`](crate::UnconditionalPeerSet::contains).
+    /// Returns whether `ip` is in any configured address or range, or is the address
+    /// that a configured DNS name last resolved to.
     pub fn contains(&self, ip: IpAddr) -> bool {
-        self.contains_in(ip, |_entry| true)
+        self.contains_in(ip, |_entry| true) || self.is_resolved_ip(ip)
     }
 
-    /// Returns whether `ip` is the address of an entry that names one address, which
-    /// Zakura dials. An address that is only in a configured range is not, and nor is
-    /// one that [`leave_out_undialable`](Self::leave_out_undialable) left out.
-    ///
-    /// The addresses that configured DNS names resolve to are not known here, see
-    /// [`UnconditionalPeerSet::is_kept_connected`](crate::UnconditionalPeerSet::is_kept_connected).
+    /// Returns whether `ip` is an address that Zakura dials: the address of an entry
+    /// that names one address, or the address that a configured DNS name last resolved
+    /// to. An address that is only in a configured range is not, and nor is one that
+    /// [`leave_out_undialable`](Self::leave_out_undialable) left out.
     pub fn is_dial_address(&self, ip: IpAddr) -> bool {
-        self.contains_in(ip, Entry::is_dialed)
+        self.contains_in(ip, Entry::is_dialed) || self.is_resolved_ip(ip)
+    }
+
+    /// Returns whether `ip` is the address that a configured DNS name last resolved to.
+    ///
+    /// A list without DNS names returns false without taking the lock.
+    fn is_resolved_ip(&self, ip: IpAddr) -> bool {
+        !self.names.is_empty()
+            && self
+                .resolved_ips
+                .read()
+                .expect("resolved address lock should not be poisoned")
+                .contains(&Some(canonical_ip(ip)))
+    }
+
+    /// Records that the DNS name at `name_index` in [`dial_names`](Self::dial_names)
+    /// now stands for `ip`, or for no address when `ip` is `None`. Every copy of this
+    /// list then treats `ip` like a listed single address, and no longer treats the
+    /// name's previous address that way. Returns whether the name's address changed.
+    pub(crate) fn set_resolved_ip(&self, name_index: usize, ip: Option<IpAddr>) -> bool {
+        let mut resolved_ips = self
+            .resolved_ips
+            .write()
+            .expect("resolved address lock should not be poisoned");
+
+        let Some(resolved_ip) = resolved_ips.get_mut(name_index) else {
+            return false;
+        };
+        let ip = ip.map(canonical_ip);
+        let changed = *resolved_ip != ip;
+        *resolved_ip = ip;
+
+        changed
     }
 
     /// Returns whether `ip` is in a configured address or range whose entry
@@ -135,35 +181,51 @@ impl UnconditionalPeers {
         self.entries
             .iter()
             .filter(|entry| is_included(entry))
-            .filter_map(Entry::net)
-            .any(|net| net.contains(&ip) || mapped_ip.is_some_and(|ip| net.contains(&ip)))
+            .any(|entry| {
+                entry.net.contains(&ip)
+                    || mapped_ip.is_some_and(|mapped_ip| entry.net.contains(&mapped_ip))
+            })
     }
 
     /// Returns the number of configured entries.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.names.len()
     }
 
     /// Returns whether no entries are configured.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.names.is_empty()
     }
 
     /// Returns the configured addresses and ranges, without their ports.
     pub fn iter(&self) -> impl Iterator<Item = &IpNet> {
-        self.entries.iter().filter_map(Entry::net)
+        self.entries.iter().map(|entry| &entry.net)
     }
 
-    /// Returns the most connections Zakura opens to stay connected to these peers: one
-    /// for each entry that [`dial_addrs`](Self::dial_addrs) or
-    /// [`dial_hosts`](Self::dial_hosts) can return.
+    /// Returns the most peers that Zakura dials: the most addresses that
+    /// [`dial_addrs`](Self::dial_addrs) can return, plus one for each DNS name.
     ///
-    /// This counts entries, so it never allocates.
+    /// This counts every entry that Zakura dials, so it never allocates.
     pub fn dial_limit(&self) -> usize {
         self.entries
             .iter()
             .filter(|entry| entry.is_dialed())
             .count()
+            + self.names.len()
+    }
+
+    /// Returns the DNS names that Zakura dials to stay connected to its unconditional
+    /// peers, in config order.
+    ///
+    /// Zakura looks a name up before each dial and dials one of its addresses, see
+    /// [`set_resolved_ip`](Self::set_resolved_ip).
+    pub fn dial_names(&self) -> impl Iterator<Item = &UnconditionalPeerName> {
+        self.names.iter()
+    }
+
+    /// Returns whether any DNS name is pinned to a node ID.
+    pub(crate) fn has_pinned_names(&self) -> bool {
+        self.names.iter().any(|name| name.node_id.is_some())
     }
 
     /// Returns the addresses Zakura dials to stay connected to its unconditional peers.
@@ -174,14 +236,10 @@ impl UnconditionalPeers {
     /// addresses is never dialed. Addresses are canonical, in config order, with
     /// duplicates removed.
     pub fn dial_addrs(&self, default_port: u16) -> Vec<PeerSocketAddr> {
-        let mut dial_addrs = Vec::new();
+        let mut dial_addrs = Vec::with_capacity(self.dial_limit());
 
-        for addr in self
-            .entries
-            .iter()
-            .filter(|entry| entry.is_dialed())
-            .filter_map(|entry| entry.dial_addr(default_port))
-        {
+        for entry in self.entries.iter().filter(|entry| entry.is_dialed()) {
+            let addr = entry.dial_addr(default_port);
             if !dial_addrs.contains(&addr) {
                 dial_addrs.push(addr);
             }
@@ -190,35 +248,13 @@ impl UnconditionalPeers {
         dial_addrs
     }
 
-    /// Returns the DNS names Zakura dials to stay connected to its unconditional peers,
-    /// each with its port.
-    ///
-    /// Names are in lower case, in config order, with duplicates removed.
-    pub fn dial_hosts(&self) -> Vec<(Arc<str>, u16)> {
-        let mut dial_hosts = Vec::new();
-
-        for entry in self.entries.iter() {
-            let Entry::Host { name, port } = entry else {
-                continue;
-            };
-            let host = (name.clone(), *port);
-
-            if !dial_hosts.contains(&host) {
-                dial_hosts.push(host);
-            }
-        }
-
-        dial_hosts
-    }
-
     /// Returns these peers with every entry that names one address `is_dialable` rejects,
     /// such as this node's own listener, left out of dialing.
     ///
     /// Such an entry stays exempt from scoring and bans, see [`contains`](Self::contains),
     /// but [`is_dial_address`](Self::is_dial_address), [`dial_addrs`](Self::dial_addrs)
     /// and [`dial_limit`](Self::dial_limit) leave it out, so nothing keeps room for a
-    /// peer that Zakura never dials. The config serializes as before. A DNS name's
-    /// addresses are checked when it is looked up.
+    /// peer that Zakura never dials. The config serializes as before.
     pub(crate) fn leave_out_undialable(
         &self,
         default_port: u16,
@@ -228,15 +264,14 @@ impl UnconditionalPeers {
             entries: self
                 .entries
                 .iter()
-                .map(|entry| match entry {
-                    Entry::Net { net, port, .. } => Entry::Net {
-                        net: *net,
-                        port: *port,
-                        is_dialable: entry.dial_addr(default_port).is_none_or(&is_dialable),
-                    },
-                    Entry::Host { .. } => entry.clone(),
+                .map(|entry| Entry {
+                    is_dialable: !entry.is_single_address()
+                        || is_dialable(entry.dial_addr(default_port)),
+                    ..*entry
                 })
                 .collect(),
+            names: self.names.clone(),
+            resolved_ips: self.resolved_ips.clone(),
         }
     }
 }
@@ -246,45 +281,27 @@ impl FromIterator<IpNet> for UnconditionalPeers {
         Self {
             entries: iter
                 .into_iter()
-                .map(|net| Entry::Net {
+                .map(|net| Entry {
                     net: net.trunc(),
                     port: None,
                     is_dialable: true,
                 })
                 .collect(),
+            ..Self::default()
         }
     }
 }
 
-/// Parses an IP address or a DNS name with a non-zero port, an IP address, or a CIDR
-/// range.
-fn parse_entry(entry: &str) -> Option<Entry> {
-    if let Ok(addr) = entry.parse::<SocketAddr>() {
-        return (addr.port() != 0).then(|| Entry::Net {
-            net: IpNet::from(addr.ip()),
-            port: Some(addr.port()),
-            is_dialable: true,
-        });
-    }
-
-    let net = entry
-        .parse::<IpNet>()
-        .ok()
-        .or_else(|| entry.parse::<IpAddr>().ok().map(IpNet::from));
-    if let Some(net) = net {
-        return (net == net.trunc()).then_some(Entry::Net {
-            net,
-            port: None,
-            is_dialable: true,
-        });
-    }
-
+/// Parses a DNS name with a non-zero port, such as `peer.example.com:8233`, pinned to
+/// `node_id` if it is given.
+fn parse_name(entry: &str, node_id: Option<NodeId>) -> Option<UnconditionalPeerName> {
     let (name, port) = entry.rsplit_once(':')?;
     let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
 
-    is_dns_name(name).then(|| Entry::Host {
-        name: name.to_ascii_lowercase().into(),
+    is_dns_name(name).then(|| UnconditionalPeerName {
+        name: name.into(),
         port,
+        node_id,
     })
 }
 
@@ -300,8 +317,6 @@ fn is_dns_name(name: &str) -> bool {
     /// The longest label of a DNS name.
     const MAX_LABEL_LEN: usize = 63;
 
-    // The dot of an absolute name ends it without starting a label. The name keeps it,
-    // so the lookup stays absolute.
     let name = name.strip_suffix('.').unwrap_or(name);
 
     let is_label = |label: &str| {
@@ -321,21 +336,34 @@ fn is_dns_name(name: &str) -> bool {
             .is_some_and(|last| !last.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+/// Parses an IP address, an IP address with a non-zero port, or a CIDR range.
+fn parse_entry(entry: &str) -> Option<Entry> {
+    if let Ok(addr) = entry.parse::<SocketAddr>() {
+        return (addr.port() != 0).then(|| Entry {
+            net: IpNet::from(addr.ip()),
+            port: Some(addr.port()),
+            is_dialable: true,
+        });
+    }
+
+    entry
+        .parse::<IpNet>()
+        .ok()
+        .or_else(|| entry.parse::<IpAddr>().ok().map(IpNet::from))
+        .filter(|net| *net == net.trunc())
+        .map(|net| Entry {
+            net,
+            port: None,
+            is_dialable: true,
+        })
+}
+
 /// Formats an entry, writing a full-length range as a plain IP address.
 fn format_entry(entry: &Entry) -> String {
-    match entry {
-        Entry::Net {
-            net,
-            port: Some(port),
-            ..
-        } => SocketAddr::new(net.addr(), *port).to_string(),
-        Entry::Net {
-            net, port: None, ..
-        } if entry.is_single_address() => net.addr().to_string(),
-        Entry::Net {
-            net, port: None, ..
-        } => net.to_string(),
-        Entry::Host { name, port } => format!("{name}:{port}"),
+    match entry.port {
+        Some(port) => SocketAddr::new(entry.net.addr(), port).to_string(),
+        None if entry.is_single_address() => entry.net.addr().to_string(),
+        None => entry.net.to_string(),
     }
 }
 
@@ -344,7 +372,13 @@ impl Serialize for UnconditionalPeers {
     where
         S: Serializer,
     {
-        serializer.collect_seq(self.entries.iter().map(format_entry))
+        // Addresses and ranges come first, then DNS names.
+        serializer.collect_seq(
+            self.entries
+                .iter()
+                .map(format_entry)
+                .chain(self.names.iter().map(UnconditionalPeerName::to_string)),
+        )
     }
 }
 
@@ -353,20 +387,43 @@ impl<'de> Deserialize<'de> for UnconditionalPeers {
     where
         D: Deserializer<'de>,
     {
-        let entries = Vec::<String>::deserialize(deserializer)?
-            .iter()
-            .map(|entry| {
-                parse_entry(entry).ok_or_else(|| {
-                    de::Error::custom(format!(
-                        "invalid network.unconditional_peers entry {entry:?}: expected an IP \
-                         address, an IP address or DNS name with a port, or a canonical CIDR \
-                         range without host bits, such as 192.0.2.1, 192.0.2.1:8233, \
-                         peer.example.com:8233 or 2001:db8::/32"
-                    ))
-                })
-            })
-            .collect::<Result<_, _>>()?;
+        let mut entries = Vec::new();
+        let mut names = Vec::new();
 
-        Ok(Self { entries })
+        for entry in Vec::<String>::deserialize(deserializer)? {
+            if let Some((node_id, name)) = entry.split_once('@') {
+                let node_id = node_id.parse().map_err(|error| {
+                    de::Error::custom(format!(
+                        "invalid node ID in network.unconditional_peers entry {entry:?}: {error}"
+                    ))
+                })?;
+                let name = parse_name(name, Some(node_id)).ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "invalid network.unconditional_peers entry {entry:?}: a node ID \
+                         can only pin a DNS name with a port, such as \
+                         <node id>@peer.example.com:8233"
+                    ))
+                })?;
+                names.push(name);
+            } else if let Some(entry) = parse_entry(&entry) {
+                entries.push(entry);
+            } else if let Some(name) = parse_name(&entry, None) {
+                names.push(name);
+            } else {
+                return Err(de::Error::custom(format!(
+                    "invalid network.unconditional_peers entry {entry:?}: expected an IP \
+                     address, an IP address or DNS name with a port, a DNS name with a port \
+                     and a node ID, or a canonical CIDR range without host bits, such as \
+                     192.0.2.1, 192.0.2.1:8233, peer.example.com:8233, \
+                     <node id>@peer.example.com:8233 or 2001:db8::/32"
+                )));
+            }
+        }
+
+        Ok(Self {
+            resolved_ips: Arc::new(RwLock::new(vec![None; names.len()])),
+            entries: entries.into(),
+            names: names.into(),
+        })
     }
 }

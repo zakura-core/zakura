@@ -48,7 +48,7 @@ pub use date_time::{DateTime32, Duration32};
 pub use display_order::BytesInDisplayOrder;
 pub use error::SerializationError;
 pub use read_zcash::ReadZcashExt;
-pub use reader::{LimitedReader, ZcashReader};
+pub use reader::ZcashReader;
 pub use write_zcash::WriteZcashExt;
 pub(crate) use zcash_deserialize::compile_deserialize_entry_points_here;
 pub use zcash_deserialize::{

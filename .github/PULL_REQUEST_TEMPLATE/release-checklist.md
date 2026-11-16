@@ -15,7 +15,7 @@ For performance and security, every release should carry a current Mainnet check
 - [ ] Run the [Update Mainnet release state workflow](https://github.com/zakura-core/zakura/actions/workflows/update-release-state.yml) from `main`. It imports the newest publisher bundle and opens or updates a draft PR (it exits green with no PR when the committed state is already current).
 - [ ] Review and merge that draft PR: the diff is append-only over the committed checkpoint list; spot-check a few new heights and the terminal hash against an independent node or explorer.
 - [ ] `make pre-release` verifies the committed pairing and rejects pre-pipeline `legacy-bootstrap` state; for an emergency release with a broken publisher, export `ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=1` locally, check the `allow_bootstrap_release_state` input when dispatching the Create release workflow, and note it in the release PR.
-- [ ] Testnet checkpoints are still updated manually when needed, per [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/crates/zakura-utils/README.md#zakura-checkpoints).
+- [ ] Run the [Update Testnet checkpoints workflow](https://github.com/zakura-core/zakura/actions/workflows/update-testnet-checkpoints.yml) from `main` (it also runs weekly). Merge its draft PR, or confirm the run summary says there are no new checkpoints. The Testnet list must end above the latest activated Testnet network upgrade, or default builds can't sync Testnet from genesis.
 
 # Curated Dependency Updates
 
@@ -141,14 +141,10 @@ version.
 cargo release version --verbose --execute --allow-branch '*' -p zakura patch # [ major | minor ]
 ```
 
-The preparation workflow rejects a requested tag below the conservative
-release level implied by the pending changelog: `Added`, `Changed`,
-`Deprecated`, or `Removed` entries require at least a minor release; a
-Mainnet network upgrade requires a major release; otherwise the floor is a
-patch release. The documented, explained `allow-patch` waiver can lower
-backwards-compatible `Added` and `Changed` entries to the patch floor without
-changing independently required library crate bumps. It never silently changes
-the requested tag.
+The preparation workflow rejects a requested tag below a major release when
+the pending changelog has a Mainnet network-upgrade entry. Otherwise any tag
+above the base version passes, and the patch or minor choice is the release
+owner's. It never silently changes the requested tag.
 
 - [ ] Generate and commit the stored config for the new version — the
       `last_config_is_stored` acceptance test derives the expected filename

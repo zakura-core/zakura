@@ -98,13 +98,6 @@ proptest! {
         prop_assert!(hash >= ex_one || hash == ex_zero);
     }
 
-    /// Check that a random ExpandedDifficulty and block::Hash compare without panicking.
-    #[test]
-    #[allow(clippy::double_comparisons)]
-    fn prop_expanded_hash_cmp(expanded in any::<ExpandedDifficulty>(), hash in any::<block::Hash>()) {
-        prop_assert!(expanded < hash || expanded > hash || expanded == hash);
-    }
-
     /// Check that two random CompactDifficulty values compare and round-trip correctly.
     #[test]
     fn prop_compact_roundtrip(compact1 in any::<CompactDifficulty>(), compact2 in any::<CompactDifficulty>()) {

@@ -233,9 +233,29 @@ refuses to start zcashd-compat mode with the `"zakura"`-only setting. The
 `"dual"` setting also enables the experimental Zakura P2P v2 stack, but the
 zcashd sidecar still connects over Zakura's legacy listener.
 
-Pruned storage is supported for the fronting Zakura. When zcashd-compat is
-enabled, Zakura advertises `NODE_NETWORK` even in pruned mode so that the
-sidecar can sync. Pruning still limits which block bodies Zakura can serve:
+Pruned storage is supported for the fronting Zakura. All Zakura nodes advertise
+`NODE_NETWORK`, including pruned nodes with or without zcashd-compat enabled,
+so peers can discover, reconnect to, and download recent blocks from them.
+Pruned nodes also advertise the experimental `NODE_PRUNED` flag (bit 25).
+While an updated Zakura node is still syncing, it prefers peers that do not
+advertise that flag, whatever their other service bits. When those peers are
+all busy, its requests wait for one of them instead of going to a pruned peer.
+A zcashd sidecar that has no block the node lacks does not count as such a
+peer. Peers that have left a
+block request unanswered are skipped when another candidate is available, so
+responsive pruned peers can serve retries during catch-up. A successful block
+response restores the peer's eligibility; if every candidate has left a block
+unanswered, all remain eligible. A peer that advertised the block,
+or a block's known source, keeps priority. Near the network tip, pruned peers
+are treated like any other peer, because they keep the recent blocks.
+While syncing, `getblocks` requests prefer the same peers, because a pruned
+node only advertises blocks it can serve and leaves a `getblocks` from below
+its retained range unanswered. `getheaders` requests go to any peer, since
+pruned nodes keep every header.
+Older clients continue to use `NODE_NETWORK`.
+The pruned flag describes storage mode; it guarantees neither a particular
+retention window nor that the peer is synced.
+Pruning still limits which block bodies Zakura can serve:
 zcashd's current chainstate must be recent enough that every block it still
 needs is inside Zakura's configured retention window. The default and minimum
 retention on Mainnet and Testnet is 10,000 blocks, and operators can configure

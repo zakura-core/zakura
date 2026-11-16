@@ -582,7 +582,7 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
 
 /// True if `log` reaches the trigger history of the generated property
 /// `id` over the streams of `layout`, the layout its harness registered the
-/// property from (C7). A harness attaches it as
+/// property from. A harness attaches it as
 /// [`TriggerHistory::LogOf`](crate::property::TriggerHistory::LogOf), through
 /// a function that names its layout. An ID that isn't generated, or whose
 /// stream isn't in `layout`, never reaches it.

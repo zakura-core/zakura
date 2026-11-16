@@ -1035,7 +1035,7 @@ fn cache_reuse_requires_every_intermediate_major_upgrade() {
         .expect("fixture moves to the older version directory");
     assert_eq!(
         DiskDb::try_reusing_previous_db_after_major_upgrade(
-            &[30],
+            &[30, 31],
             &current,
             &config,
             STATE_DATABASE_KIND,
@@ -1048,7 +1048,7 @@ fn cache_reuse_requires_every_intermediate_major_upgrade() {
     assert!(!current_path.exists());
     assert_eq!(
         DiskDb::try_reusing_previous_db_after_major_upgrade(
-            &[29, 30],
+            &[29, 30, 31],
             &current,
             &config,
             STATE_DATABASE_KIND,

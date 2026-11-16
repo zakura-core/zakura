@@ -36,6 +36,7 @@ use zakura_test::mock_service::{MockService, PanicAssertion};
 use crate::components::{
     mempool::{self, *},
     sync::{RecentSyncLengths, SyncStatus},
+    test_misbehavior::{self, reported_score},
 };
 
 /// A [`MockService`] representing the network service.
@@ -631,8 +632,8 @@ async fn transaction_data_failure_bans_peer_without_a_current_tip() {
     let network = Network::Mainnet;
     let (mut mempool, mut peer_set, _state, _tip, mut tx_verifier, mut recent_syncs, _receiver) =
         setup(&network, u64::MAX, true).await;
-    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
-    mempool.misbehavior_sender = misbehavior_sender;
+    let misbehavior = test_misbehavior::reporter();
+    mempool.misbehavior = misbehavior.clone();
     mempool.enable(&mut recent_syncs).await;
     assert!(!mempool.is_current_enough_for_mempool());
 
@@ -645,8 +646,8 @@ async fn transaction_data_failure_bans_peer_without_a_current_tip() {
     .await;
 
     assert_eq!(
-        misbehavior_receiver.try_recv(),
-        Ok((test_peer(), zn::constants::MAX_PEER_MISBEHAVIOR_SCORE))
+        reported_score(&misbehavior, test_peer()),
+        zn::constants::MAX_PEER_MISBEHAVIOR_SCORE
     );
     assert!(!mempool
         .peer_cooldowns
@@ -659,8 +660,8 @@ async fn repeated_cooldown_disconnects_peer_without_banning() {
     let network = Network::Mainnet;
     let (mut mempool, mut peer_set, _state, _tip, mut tx_verifier, mut recent_syncs, _receiver) =
         setup(&network, u64::MAX, true).await;
-    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
-    mempool.misbehavior_sender = misbehavior_sender;
+    let misbehavior = test_misbehavior::reporter();
+    mempool.misbehavior = misbehavior.clone();
     // Cooldowns only start when the mempool's validation context is current.
     let _chain_tip_sender = mempool.use_current_chain_tip(&network);
     mempool.enable(&mut recent_syncs).await;
@@ -688,110 +689,7 @@ async fn repeated_cooldown_disconnects_peer_without_banning() {
     assert!(mempool
         .peer_cooldowns
         .is_cooling_down(test_peer().ip(), Instant::now()));
-    assert_eq!(
-        misbehavior_receiver.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    );
-}
-
-/// A cooldown that an address has from before it became an unconditional peer does
-/// not hold back its transactions. A DNS name can resolve to an address with one.
-#[tokio::test(flavor = "multi_thread")]
-async fn earlier_cooldown_does_not_hold_back_an_unconditional_peer() {
-    let network = Network::Mainnet;
-    let transaction = network
-        .unmined_transactions_in_blocks(2..)
-        .next()
-        .expect("mainnet test vectors contain an unmined transaction")
-        .transaction
-        .clone();
-    let tx_id = transaction.id();
-    let config: zn::Config =
-        toml::from_str(&format!("unconditional_peers = ['{}']", test_peer().ip())).unwrap();
-
-    for is_unconditional in [false, true] {
-        let unconditional_peers = if is_unconditional {
-            config.unconditional_peers.clone()
-        } else {
-            zn::UnconditionalPeers::default()
-        };
-        let (mut mempool, _peer_set, _state, _tip, mut tx_verifier, mut recent_syncs, _receiver) =
-            setup_with_unconditional_peers(
-                &network,
-                mempool::Config::default(),
-                true,
-                unconditional_peers.into(),
-            )
-            .await;
-        mempool.enable(&mut recent_syncs).await;
-
-        mempool
-            .peer_cooldowns
-            .record_invalid_transaction(test_peer().ip(), Instant::now());
-
-        mempool
-            .ready()
-            .await
-            .expect("mempool service becomes ready")
-            .call(Request::QueueFromPeer {
-                transactions: vec![transaction.clone().into()],
-                source: QueueSource::LegacySocket(test_peer().remove_socket_addr_privacy()),
-            })
-            .await
-            .expect("mempool service answers the pushed transaction");
-
-        if is_unconditional {
-            tx_verifier
-                .expect_request_that(|request| {
-                    matches!(
-                        request,
-                        tx::Request::Mempool { transaction, .. } if transaction.id() == tx_id
-                    )
-                })
-                .await
-                .respond(Err(TransactionError::NoInputs));
-        } else {
-            tx_verifier.expect_no_requests().await;
-        }
-    }
-}
-
-/// A repeated cooldown does not disconnect a peer that became unconditional after the
-/// mempool checked it, as when a listed DNS name resolves to it in between.
-#[tokio::test(flavor = "multi_thread")]
-async fn cooldown_disconnect_skips_a_peer_that_became_unconditional() {
-    let network = Network::Mainnet;
-    let tx_id = network
-        .unmined_transactions_in_blocks(2..)
-        .next()
-        .expect("mainnet test vectors contain an unmined transaction")
-        .transaction
-        .id();
-    let config: zn::Config =
-        toml::from_str(&format!("unconditional_peers = ['{}']", test_peer().ip())).unwrap();
-    let (mempool, mut peer_set, _state, _tip, _tx_verifier, _recent_syncs, _receiver) =
-        setup_with_unconditional_peers(
-            &network,
-            mempool::Config::default(),
-            true,
-            config.unconditional_peers.into(),
-        )
-        .await;
-
-    // The peer's first cooldown has already ended, so this one would disconnect it.
-    mempool.peer_cooldowns.record_invalid_transaction(
-        test_peer().ip(),
-        Instant::now() - peer_cooldown::BASE_COOLDOWN - Duration::from_secs(1),
-    );
-    start_peer_cooldown(
-        &mempool.peer_cooldowns,
-        &mempool.outbound,
-        test_peer(),
-        tx_id,
-        false,
-    );
-
-    peer_set.expect_no_requests().await;
+    assert_eq!(reported_score(&misbehavior, test_peer()), 0);
 }
 
 /// Pushes an early Mainnet transaction from [`test_peer`], fails its
@@ -1117,15 +1015,9 @@ async fn peer_penalties_with_unconditional(
         mut tx_verifier,
         mut recent_syncs,
         _mempool_transaction_receiver,
-    ) = setup_with_unconditional_peers(
-        network,
-        mempool::Config::default(),
-        true,
-        unconditional_peers.clone().into(),
-    )
-    .await;
-    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
-    mempool.misbehavior_sender = misbehavior_sender;
+    ) = setup_with_mempool_config(network, mempool::Config::default(), true).await;
+    let misbehavior = test_misbehavior::reporter();
+    mempool.misbehavior = misbehavior.clone();
     // An expired prior cooldown would make the next penalty disconnect the peer.
     // Trusted peers must bypass that escalation as well as the first cooldown.
     if unconditional_peers.contains(peer.ip()) {
@@ -1134,6 +1026,7 @@ async fn peer_penalties_with_unconditional(
             Instant::now() - peer_cooldown::BASE_COOLDOWN - Duration::from_secs(1),
         );
     }
+    mempool.unconditional_peers = unconditional_peers;
     mempool.zcashd_compat_peer_ips = [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter().collect();
     // Cooldowns only start when the mempool's validation context is current.
     let _chain_tip_sender = mempool.use_current_chain_tip(network);
@@ -1182,13 +1075,12 @@ async fn peer_penalties_with_unconditional(
     let cooling_down = mempool
         .peer_cooldowns
         .is_cooling_down(peer.ip(), std::time::Instant::now());
-    let banned = match misbehavior_receiver.try_recv() {
-        Ok((banned_peer, score)) => {
-            assert_eq!(banned_peer, peer);
+    let banned = match reported_score(&misbehavior, peer) {
+        0 => false,
+        score => {
             assert_eq!(score, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
             true
         }
-        Err(_) => false,
     };
 
     peer_set.expect_no_requests().await;
@@ -1243,8 +1135,8 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
         mut recent_syncs,
         _mempool_transaction_receiver,
     ) = setup_with_mempool_config(&network, mempool_config, true).await;
-    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
-    mempool.misbehavior_sender = misbehavior_sender;
+    let misbehavior = test_misbehavior::reporter();
+    mempool.misbehavior = misbehavior.clone();
     // Cooldowns only start when the mempool's validation context is current.
     let _chain_tip_sender = mempool.use_current_chain_tip(&network);
     mempool.enable(&mut recent_syncs).await;
@@ -1369,10 +1261,7 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
         .any(|(request, _)| request.id() == later_transaction.id()));
     peer_set.expect_no_requests().await;
 
-    assert!(matches!(
-        misbehavior_receiver.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
+    assert_eq!(reported_score(&misbehavior, peer_addr), 0);
     Ok(())
 }
 
@@ -3989,14 +3878,14 @@ fn pick_transaction_with_prevout(network: &Network) -> VerifiedUnminedTx {
     network
         .unmined_transactions_in_blocks(..)
         .find(|transaction| {
-            transaction
-                .transaction
-                .transaction()
-                .inputs()
-                .iter()
-                .any(|input| matches!(input, transparent::Input::PrevOut { .. }))
+            let transaction = transaction.transaction.transaction();
+            !transaction.has_sprout_joinsplit_data()
+                && transaction
+                    .inputs()
+                    .iter()
+                    .any(|input| matches!(input, transparent::Input::PrevOut { .. }))
         })
-        .expect("missing non-coinbase transaction")
+        .expect("test vectors contain a non-Sprout transaction with a transparent input")
 }
 
 /// The height at which the network returned by [`nu_activation_test_network`] activates NU5.
@@ -4124,31 +4013,6 @@ async fn setup_with_mempool_config(
     RecentSyncLengths,
     tokio::sync::broadcast::Receiver<MempoolChange>,
 ) {
-    setup_with_unconditional_peers(
-        network,
-        mempool_config,
-        should_commit_genesis_block,
-        zn::UnconditionalPeerSet::default(),
-    )
-    .await
-}
-
-/// Create a new [`Mempool`] instance using mocked services, which never penalizes
-/// `unconditional_peers`.
-async fn setup_with_unconditional_peers(
-    network: &Network,
-    mempool_config: mempool::Config,
-    should_commit_genesis_block: bool,
-    unconditional_peers: zn::UnconditionalPeerSet,
-) -> (
-    Mempool,
-    MockPeerSet,
-    StateService,
-    ChainTipChange,
-    MockTxVerifier,
-    RecentSyncLengths,
-    tokio::sync::broadcast::Receiver<MempoolChange>,
-) {
     let peer_set = MockService::build().for_unit_tests();
 
     // UTXO verification doesn't matter here.
@@ -4177,9 +4041,9 @@ async fn setup_with_unconditional_peers(
         sync_status,
         latest_chain_tip,
         chain_tip_change.clone(),
-        tokio::sync::mpsc::channel(1).0,
+        test_misbehavior::reporter(),
         Vec::new(),
-        unconditional_peers,
+        zn::UnconditionalPeers::default(),
     );
 
     let mut mempool_transaction_receiver = mempool_transaction_subscriber.subscribe();

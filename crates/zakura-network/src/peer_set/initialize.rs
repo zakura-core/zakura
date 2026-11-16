@@ -22,7 +22,7 @@ use futures::{
 use indexmap::IndexSet;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc, oneshot},
+    sync::broadcast,
     time::Instant,
 };
 use tokio_stream::wrappers::IntervalStream;
@@ -42,7 +42,7 @@ use zakura_chain::{
 use zakura_node_services::task::{erased, spawn_buffer};
 
 use crate::{
-    address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
+    address_book_updater::AddressBookUpdater,
     constants,
     meta_addr::{MetaAddr, MetaAddrChange},
     peer::{
@@ -53,20 +53,21 @@ use crate::{
     peer_registry::PeerRegistry,
     peer_set::{set::MorePeers, ActiveConnectionCounter, CandidateSet, ConnectionTracker, PeerSet},
     protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
-    unconditional_peer_set::UnconditionalPeerSet,
     zakura::{CustomService, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup},
-    AddressBook, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
+    AddressBook, BannedIps, BoxError, Config, MisbehaviorReporter, PeerSocketAddr, Request,
+    Response,
 };
 
 #[cfg(test)]
 mod tests;
 
+mod held_seats;
 mod recent_by_ip;
 mod unconditional_peers;
 
 use unconditional_peers::{
-    keep_unconditional_peers_connected, leave_out_undialable_unconditional_peers, resolve_host,
-    unconditional_peer_dial_targets,
+    keep_unconditional_peers_connected, leave_out_undialable_unconditional_peers, lookup_host,
+    unconditional_peer_dial_addrs,
 };
 
 /// A successful outbound peer connection attempt or inbound connection handshake.
@@ -78,50 +79,6 @@ use unconditional_peers::{
 /// - The connection limits don't include failed connections
 /// - tower::Discover interprets an error as stream termination
 type DiscoveredPeer = (PeerSocketAddr, peer::Client);
-
-/// How often accumulated peer misbehavior reports are sent to the address book.
-///
-/// Batching caps address book queue and mutex pressure at one flush per
-/// interval, no matter how fast peers send invalid blocks or transactions.
-/// Five seconds keeps ban-threshold score application prompt; do not remove the
-/// batching to make bans immediate.
-const MISBEHAVIOR_BATCH_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Batches peer misbehavior reports before forwarding them to the address book updater.
-async fn batch_misbehavior_reports(
-    mut misbehavior_rx: mpsc::Receiver<(PeerSocketAddr, u32)>,
-    address_book_updater: mpsc::Sender<MetaAddrChange>,
-) {
-    let mut misbehaviors: HashMap<PeerSocketAddr, u32> = HashMap::new();
-    // Coalesce repeated reports so invalid blocks or transactions cannot turn
-    // every report into address book queue and mutex pressure.
-    let mut flush_timer = IntervalStream::new(tokio::time::interval_at(
-        Instant::now() + MISBEHAVIOR_BATCH_INTERVAL,
-        MISBEHAVIOR_BATCH_INTERVAL,
-    ));
-
-    loop {
-        tokio::select! {
-            msg = misbehavior_rx.recv() => match msg {
-                Some((peer_addr, score_increment)) => *misbehaviors
-                    .entry(peer_addr)
-                    .or_default()
-                    += score_increment,
-                None => break,
-            },
-
-            _ = flush_timer.next() => {
-                for (addr, score_increment) in misbehaviors.drain() {
-                    let _ = address_book_updater
-                        .send(MetaAddr::new_misbehavior(addr, score_increment))
-                        .await;
-                }
-            },
-        };
-    }
-
-    tracing::warn!("exiting misbehavior update batch task");
-}
 
 /// Initialize a peer set, using a network `config`, `inbound_service`,
 /// and `latest_chain_tip`.
@@ -165,14 +122,14 @@ pub async fn init<S, C>(
 ) -> (
     BoxCloneSyncService<Request, Response, BoxError>,
     Arc<std::sync::Mutex<AddressBook>>,
-    mpsc::Sender<(PeerSocketAddr, u32)>,
+    MisbehaviorReporter,
 )
 where
     S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + Sync + 'static,
     S::Future: Send + 'static,
     C: ChainTip + Clone + Send + Sync + 'static,
 {
-    let (peer_set, address_book, misbehavior_tx, _zakura_endpoint) = init_with_zakura_header_sync(
+    let (peer_set, address_book, misbehavior, _zakura_endpoint) = init_with_zakura_header_sync(
         config,
         inbound_service,
         latest_chain_tip,
@@ -183,7 +140,7 @@ where
     )
     .await;
 
-    (peer_set, address_book, misbehavior_tx)
+    (peer_set, address_book, misbehavior)
 }
 
 /// Initialize a peer set and optionally expose a real-driver Zakura header-sync endpoint.
@@ -199,7 +156,7 @@ pub async fn init_with_zakura_header_sync<S, C>(
 ) -> (
     BoxCloneSyncService<Request, Response, BoxError>,
     Arc<std::sync::Mutex<AddressBook>>,
-    mpsc::Sender<(PeerSocketAddr, u32)>,
+    MisbehaviorReporter,
     Option<ZakuraEndpoint>,
 )
 where
@@ -219,8 +176,8 @@ where
     )
     .await
     .map(
-        |(peer_set, address_book, misbehavior_tx, zakura_endpoint, _block_adverts)| {
-            (peer_set, address_book, misbehavior_tx, zakura_endpoint)
+        |(peer_set, address_book, misbehavior, zakura_endpoint, _block_adverts)| {
+            (peer_set, address_book, misbehavior, zakura_endpoint)
         },
     )
     .expect("Zakura endpoint should start when P2P v2 is enabled")
@@ -241,7 +198,7 @@ pub async fn init_with_zakura<S, C>(
     (
         BoxCloneSyncService<Request, Response, BoxError>,
         Arc<std::sync::Mutex<AddressBook>>,
-        mpsc::Sender<(PeerSocketAddr, u32)>,
+        MisbehaviorReporter,
         Option<ZakuraEndpoint>,
         BoxCloneService<Request, Response, BoxError>,
     ),
@@ -287,29 +244,19 @@ where
         .as_ref()
         .map(|endpoint| endpoint.background_shutdown_token().drop_guard());
 
-    let (unconditional_peers, resolved_unconditional_peers) =
-        UnconditionalPeerSet::new(config.unconditional_peers.clone());
-
-    let (address_book, bans, address_book_updater, address_metrics, address_book_updater_guard) =
-        AddressBookUpdater::spawn_with_peer_registry(
-            &config,
-            listen_addr,
-            advertised_services,
-            peer_registry.clone(),
-            unconditional_peers.clone(),
-        );
-
-    let (misbehavior_tx, misbehavior_rx) = mpsc::channel(
-        // Leave enough room for a misbehaviour update on every peer connection
-        // before the channel is drained.
-        config
-            .peerset_total_connection_limit()
-            .max(MIN_CHANNEL_SIZE),
+    let (
+        address_book,
+        misbehavior,
+        address_book_updater,
+        address_metrics,
+        address_book_updater_guard,
+    ) = AddressBookUpdater::spawn_with_peer_registry(
+        &config,
+        listen_addr,
+        advertised_services,
+        peer_registry.clone(),
     );
-
-    tokio::spawn(erased(
-        batch_misbehavior_reports(misbehavior_rx, address_book_updater.clone()).in_current_span(),
-    ));
+    let bans = misbehavior.bans();
 
     // Create a broadcast channel for peer inventory advertisements.
     // If it reaches capacity, this channel drops older inventory advertisements.
@@ -353,7 +300,7 @@ where
             .with_latest_chain_tip(latest_chain_tip.clone())
             .with_peer_registry(peer_registry.clone())
             .with_protected_peer_ips(protected_peer_ips)
-            .with_bans(bans.clone())
+            .with_misbehavior(misbehavior.clone())
             .with_tcp_warmup(peer::TcpWarmup::spawn(
                 config.tcp_warmup.clone(),
                 latest_chain_tip.clone(),
@@ -402,7 +349,6 @@ where
         handle_rx,
         inv_receiver,
         bans.clone(),
-        unconditional_peers.clone(),
         address_metrics,
         MinimumPeerVersion::new(latest_chain_tip, &config.network),
         None,
@@ -433,30 +379,22 @@ where
             constants::MIN_INBOUND_PEER_CONNECTION_INTERVAL,
             listen_handshaker,
             peerset_tx.clone(),
-            bans.clone(),
+            bans,
             block_gossip_peer_ips,
-            unconditional_peers,
         );
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             listen_fut.in_current_span(),
         ))));
 
         // 2. Unconditional peers, which are dialed again whenever they are not connected.
-        let unconditional_dial_targets = unconditional_peer_dial_targets(&config, listen_addr);
-        let (first_name_addrs_tx, first_name_addrs_rx) = oneshot::channel();
-        if unconditional_dial_targets.is_empty() {
-            // Nothing will look a name up, so the startup dials need not wait.
-            std::mem::drop(first_name_addrs_tx);
-        } else {
+        let unconditional_dial_addrs = unconditional_peer_dial_addrs(&config, listen_addr);
+        if config.unconditional_peer_connection_limit() > 0 {
             let unconditional_peers_fut = keep_unconditional_peers_connected(
                 config.clone(),
+                unconditional_dial_addrs,
                 listen_addr,
-                unconditional_dial_targets,
+                lookup_host,
                 peer_registry,
-                resolved_unconditional_peers,
-                first_name_addrs_tx,
-                bans,
-                tower::service_fn(resolve_host),
                 outbound_connector.clone(),
                 peerset_tx.clone(),
             );
@@ -466,22 +404,11 @@ where
         }
 
         // 3. Initial peers, specified in the config and cached on disk.
-        let first_name_addrs = async move {
-            tokio::time::timeout(
-                constants::UNCONDITIONAL_PEER_STARTUP_LOOKUP_WAIT,
-                first_name_addrs_rx,
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
-        };
         let initial_peers_fut = add_initial_peers(
             config.clone(),
             outbound_connector.clone(),
             peerset_tx.clone(),
             address_book_updater.clone(),
-            first_name_addrs,
         );
         let initial_peers_join =
             AbortOnDropHandle::new(tokio::spawn(erased(initial_peers_fut.in_current_span())));
@@ -616,7 +543,7 @@ where
     Ok((
         peer_set,
         address_book,
-        misbehavior_tx,
+        misbehavior,
         returned_zakura_endpoint,
         block_adverts,
     ))
@@ -626,19 +553,12 @@ where
 /// disk cache initial peers, then send the resulting peer connections over `peerset_tx`.
 ///
 /// Also sends every initial peer address to the `address_book_updater`.
-#[instrument(skip(
-    config,
-    outbound_connector,
-    peerset_tx,
-    address_book_updater,
-    first_name_addrs
-))]
+#[instrument(skip(config, outbound_connector, peerset_tx, address_book_updater))]
 async fn add_initial_peers<S>(
     config: Config,
     outbound_connector: S,
     mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-    first_name_addrs: impl Future<Output = Vec<Vec<PeerSocketAddr>>> + Send,
 ) -> Result<ActiveConnectionCounter, BoxError>
 where
     S: Service<
@@ -650,7 +570,7 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let initial_peers = limit_initial_peers(&config, address_book_updater, first_name_addrs).await;
+    let initial_peers = limit_initial_peers(&config, address_book_updater).await;
 
     let mut handshake_success_total: usize = 0;
     let mut handshake_error_total: usize = 0;
@@ -777,34 +697,23 @@ where
 ///
 /// Returns the first candidates in the order provided by [`Config::initial_peers`],
 /// skipping the addresses of dialed unconditional peers, which have slots of their own,
-/// and addresses that exceed the per-IP connection limit. Each dialed address counts
-/// against the limit of its IP, and each listed name against the limit of every IP it
-/// resolved to, since it can be dialed at any of them, so a startup dial never takes the
-/// room they need. `first_name_addrs` gives each name's addresses, and is awaited along
-/// with the seed lookups. Skipped addresses do not consume a startup slot; later
-/// candidates can fill it.
+/// and addresses that exceed the per-IP connection limit. Each dialed unconditional peer
+/// counts against the limit of its IP, so a startup dial never takes the room it needs.
+/// Skipped addresses do not consume a startup slot; later candidates can fill it.
 ///
 /// Also sends every initial peer to the `address_book_updater`.
 async fn limit_initial_peers(
     config: &Config,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-    first_name_addrs: impl Future<Output = Vec<Vec<PeerSocketAddr>>>,
 ) -> IndexSet<PeerSocketAddr> {
-    let (all_peers, name_addrs) = future::join(config.initial_peers(), first_name_addrs).await;
+    let all_peers = config.initial_peers().await;
     let mut initial_peers = IndexSet::new();
-    let mut unconditional_dial_addrs = config
+    let unconditional_dial_addrs = config
         .unconditional_peers
         .dial_addrs(config.network.default_port());
     let mut selected_per_ip = HashMap::new();
     for addr in &unconditional_dial_addrs {
         *selected_per_ip.entry(addr.ip()).or_insert(0) += 1;
-    }
-    for addrs in name_addrs {
-        let ips: HashSet<IpAddr> = addrs.iter().map(|addr| addr.ip()).collect();
-        for ip in ips {
-            *selected_per_ip.entry(ip).or_insert(0) += 1;
-        }
-        unconditional_dial_addrs.extend(addrs);
     }
 
     // Config has validated and interleaved cached peers with shuffled seeds.
@@ -896,8 +805,7 @@ const MIN_INBOUND_ACCEPT_BURST_INTERVAL: Duration = Duration::from_millis(100);
 /// A bounded accept burst drains connections that are already queued by the
 /// kernel. Without it, the normal one-second handshake pacing can keep a full
 /// listen backlog from ever reaching a configured local sidecar connection.
-#[allow(clippy::too_many_arguments)]
-#[instrument(skip(config, listener, handshaker, peerset_tx, unconditional_peers), fields(listener_addr = ?listener.local_addr()))]
+#[instrument(skip(config, listener, handshaker, peerset_tx), fields(listener_addr = ?listener.local_addr()))]
 async fn accept_inbound_connections<S>(
     config: Config,
     listener: TcpListener,
@@ -906,7 +814,6 @@ async fn accept_inbound_connections<S>(
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     bans: BannedIps,
     zcashd_compat_peer_ips: Vec<IpAddr>,
-    unconditional_peers: UnconditionalPeerSet,
 ) -> Result<(), BoxError>
 where
     S: Service<peer::HandshakeRequest<TcpStream>, Response = peer::Client, Error = BoxError>
@@ -915,6 +822,7 @@ where
 {
     let mut recent_inbound_connections =
         recent_by_ip::RecentByIp::new(None, Some(config.max_connections_per_ip));
+    let mut held_seats = held_seats::HeldSeats::new(config.peerset_inbound_connection_limit());
 
     let mut active_inbound_connections = ActiveConnectionCounter::new_counter_with(
         config.peerset_inbound_connection_limit(),
@@ -980,7 +888,13 @@ where
                 continue;
             }
 
-            let active_public_inbound_connections = active_inbound_connections.update_count();
+            let now = Instant::now();
+            let active_public_inbound_connections = active_inbound_connections
+                .update_count_with_closed(|closed| {
+                    if !bans.contains(closed.ip) {
+                        held_seats.hold(closed, now);
+                    }
+                });
             let active_zcashd_compat_inbound_connections =
                 active_zcashd_compat_connections.update_count();
             let active_unconditional_inbound_connections =
@@ -989,12 +903,20 @@ where
                 active_public_inbound_connections + active_zcashd_compat_inbound_connections;
             let canonical_ip = canonical_socket_addr(addr.remove_socket_addr_privacy()).ip();
             let is_zcashd_compat_peer = zcashd_compat_peer_ips.contains(&canonical_ip);
+            // A full listener keeps the seats of long-lived peers that just left for
+            // those peers, so a peer that restarts finds its seat free when it dials back.
+            held_seats.release_banned(|ip| bans.contains(ip));
+            let seats_held_for_others = held_seats.held_for_others(canonical_ip, now);
+            let is_refused_for_held_seats = active_public_inbound_connections
+                < public_inbound_connection_limit
+                && active_public_inbound_connections + seats_held_for_others
+                    >= public_inbound_connection_limit;
             let connection_tracker = if is_zcashd_compat_peer
                 && active_zcashd_compat_inbound_connections < zcashd_compat_reserved_slots
                 && active_total_inbound_connections < config.peerset_inbound_connection_limit()
             {
                 active_zcashd_compat_connections.track_connection()
-            } else if unconditional_peers.is_kept_connected(addr.ip())
+            } else if config.unconditional_peers.is_dial_address(addr.ip())
                 && active_unconditional_inbound_connections
                     < config.unconditional_peer_connection_limit()
                 && active_unconditional_connections.connections_from(canonical_ip)
@@ -1005,22 +927,30 @@ where
                 // at most `max_connections_per_ip` of them, so it cannot take the slot of
                 // another listed peer. A peer that gets no slot here competes for a public
                 // slot, and waits like any other.
+                //
+                // The peer is back, so it needs no public seat that is held for it.
+                held_seats.release(canonical_ip);
                 active_unconditional_connections.track_connection_from(canonical_ip)
             } else if is_zcashd_compat_peer
-                || active_public_inbound_connections >= public_inbound_connection_limit
+                || active_public_inbound_connections + seats_held_for_others
+                    >= public_inbound_connection_limit
                 || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
                 || recent_inbound_connections.is_past_limit_or_add(addr.ip())
             {
                 // A zcashd-compat peer never takes a public slot. Otherwise there are too
-                // many open inbound connections or pending handshakes already.
+                // many open inbound connections, pending handshakes or held seats already.
                 // Close the connection.
+                if is_refused_for_held_seats && !is_zcashd_compat_peer {
+                    metrics::counter!("peer.inbound.held_seats.refused").increment(1);
+                }
                 std::mem::drop(tcp_stream);
                 // Allow invalid connections to be cleared quickly,
                 // but still put a limit on our CPU and network usage from failed connections.
                 tokio::time::sleep(constants::MIN_INBOUND_PEER_FAILED_CONNECTION_INTERVAL).await;
                 continue;
             } else {
-                active_inbound_connections.track_connection()
+                held_seats.release(canonical_ip);
+                active_inbound_connections.track_connection_from(canonical_ip)
             };
             debug!(
                 inbound_connections = ?active_total_inbound_connections,

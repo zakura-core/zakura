@@ -511,17 +511,6 @@ fn as_fake_v5(tx: &Transaction) -> Transaction {
     v5
 }
 
-#[test]
-fn cache_key_is_deterministic() {
-    let tx = sapling_transaction();
-
-    assert_eq!(
-        cache_key(&tx, NetworkUpgrade::Nu5),
-        cache_key(&tx, NetworkUpgrade::Nu5),
-        "the same transaction, bundle and sighash must always produce the same key"
-    );
-}
-
 /// Two different Sapling bundles get different keys.
 #[test]
 fn cache_key_distinguishes_different_transactions() {

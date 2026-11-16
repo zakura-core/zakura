@@ -1,6 +1,6 @@
 //! Fixed test vectors for the address book.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use chrono::Utc;
 use tracing::Span;
@@ -14,13 +14,12 @@ use crate::{
     address_book_peers::AddressBookPeers,
     config::UnconditionalPeers,
     constants::{
-        DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE,
-        MIN_PEER_RECONNECTION_DELAY,
+        DEFAULT_MAX_CONNS_PER_IP, HEARTBEAT_INTERVAL, MAX_ADDRS_IN_ADDRESS_BOOK,
+        MAX_PEER_MISBEHAVIOR_SCORE, MIN_PEER_RECONNECTION_DELAY, MIN_REDIAL_CONNECTION,
     },
     meta_addr::{MetaAddr, MetaAddrChange},
     protocol::external::types::PeerServices,
-    unconditional_peer_set::UnconditionalPeerSet,
-    AddressBook, BannedIps,
+    AddressBook,
 };
 
 /// Cache ranking uses measured RTT, retaining book order for measured ties.
@@ -72,9 +71,46 @@ fn peer_cache_ranks_by_rtt_with_stable_ties() {
     );
 }
 
-/// Gossip-only peers have no measured preference and do not keep a fixed cache prefix.
+/// A gossiped last seen time does not make a peer cacheable: only this node's own
+/// responses show that an address is a reachable listener.
 #[test]
-fn peer_cache_shuffles_unmeasured_gossip() {
+fn peer_cache_excludes_gossip_only_peers() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let responded = "127.0.0.1:8233".parse().unwrap();
+    let gossiped = "127.0.0.2:8233".parse().unwrap();
+    book.update(MetaAddr::new_responded(responded, None));
+    book.update(
+        MetaAddr::new_gossiped_meta_addr(gossiped, PeerServices::NODE_NETWORK, DateTime32::now())
+            .new_gossiped_change()
+            .unwrap(),
+    );
+
+    let cached: Vec<_> = book
+        .cacheable(Utc::now())
+        .iter()
+        .map(|peer| peer.addr)
+        .collect();
+    assert_eq!(cached, vec![responded]);
+
+    let later = Utc::now()
+        + chrono::Duration::from(crate::constants::MAX_PEER_ACTIVE_FOR_GOSSIP)
+        + chrono::Duration::seconds(1);
+    assert!(
+        book.cacheable(later).is_empty(),
+        "a response older than the cache window is not cached"
+    );
+}
+
+/// Peers without a measured RTT have no trusted preference and do not keep a fixed
+/// cache prefix.
+#[test]
+fn peer_cache_shuffles_unmeasured_peers() {
     let _init_guard = zakura_test::init();
     let mut book = AddressBook::new(
         "0.0.0.0:0".parse().unwrap(),
@@ -91,11 +127,7 @@ fn peer_cache_shuffles_unmeasured_gossip() {
     for ip in 1..=8 {
         let addr = std::net::SocketAddr::from(([127, 0, 0, ip], 8233)).into();
         expected.insert(addr);
-        book.update(
-            MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, DateTime32::now())
-                .new_gossiped_change()
-                .unwrap(),
-        );
+        book.update(MetaAddr::new_responded(addr, None));
     }
     let mut orders = std::collections::HashSet::new();
     for _ in 0..16 {
@@ -114,8 +146,35 @@ fn peer_cache_shuffles_unmeasured_gossip() {
     // Sixteen identical independent shuffles of eight peers have probability (8!)^-15.
     assert!(
         orders.len() > 1,
-        "unmeasured gossip must not retain deterministic priority"
+        "unmeasured peers must not retain deterministic priority"
     );
+}
+
+/// Both service flags preserve discovery, restart caching, and outbound eligibility.
+#[test]
+fn pruned_peers_remain_dialable_cacheable_and_gossipable() {
+    let _init_guard = zakura_test::init();
+    let mut book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    let addr = "192.0.2.1:8233".parse().unwrap();
+    let services = PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED;
+    book.update(MetaAddr::new_connected(addr, &services, false));
+    book.update(MetaAddr::new_responded(addr, None));
+    let peer = book.get(addr).unwrap();
+    assert!(peer.last_known_info_is_valid_for_outbound(&Mainnet));
+    assert_eq!(peer.sanitize(&Mainnet).unwrap().services, Some(services));
+    assert!(book
+        .cacheable(Utc::now())
+        .iter()
+        .any(|peer| peer.addr == addr));
+    assert!(book
+        .sanitized(Utc::now())
+        .iter()
+        .any(|peer| peer.addr == addr && peer.services == Some(services)));
 }
 
 /// Known non-nodes remain recorded at runtime but are not saved for restart.
@@ -264,10 +323,7 @@ fn misbehavior_ban_removes_all_addresses_for_ip() {
     let bans = address_book.bans();
     assert_eq!(address_metrics.borrow_and_update().num_addresses, 3);
 
-    address_book.update(MetaAddrChange::UpdateMisbehavior {
-        addr: banned_addr,
-        score_increment: MAX_PEER_MISBEHAVIOR_SCORE,
-    });
+    report_misbehavior(&mut address_book, banned_addr, MAX_PEER_MISBEHAVIOR_SCORE);
     address_book.peers.assert_consistent();
 
     assert!(
@@ -362,10 +418,7 @@ fn address_metrics_count_peers_by_state() {
         .is_empty());
 
     // A banned peer leaves the address book and its state's count.
-    address_book.update(MetaAddrChange::UpdateMisbehavior {
-        addr: responded_a,
-        score_increment: MAX_PEER_MISBEHAVIOR_SCORE,
-    });
+    report_misbehavior(&mut address_book, responded_a, MAX_PEER_MISBEHAVIOR_SCORE);
     address_book.peers.assert_consistent();
 
     let metrics = address_book.address_metrics(Utc::now());
@@ -561,44 +614,6 @@ fn reconnection_peers_leave_out_dialed_unconditional_peer_ips() {
     );
 }
 
-/// The crawler's candidates also leave out the IPs that listed names resolve to, as
-/// soon as the names' lookups publish them, see
-/// [`reconnection_peers_leave_out_dialed_unconditional_peer_ips`].
-#[test]
-fn reconnection_peers_leave_out_resolved_unconditional_peer_ips() {
-    let resolved: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
-    let same_ip: crate::PeerSocketAddr = "127.0.0.1:18233".parse().unwrap();
-    let other: crate::PeerSocketAddr = "127.0.0.3:8233".parse().unwrap();
-
-    let (unconditional_peers, resolved_peers) =
-        UnconditionalPeerSet::new(UnconditionalPeers::default());
-    let addrs = [resolved, same_ip, other]
-        .map(|addr| {
-            MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, DateTime32::MIN)
-        })
-        .to_vec();
-    let address_book = AddressBook::new_with_addrs(
-        "0.0.0.0:0".parse().unwrap(),
-        &Mainnet,
-        DEFAULT_MAX_CONNS_PER_IP,
-        MAX_ADDRS_IN_ADDRESS_BOOK,
-        Span::current(),
-        addrs,
-    )
-    .with_unconditional_peers(unconditional_peers);
-
-    let candidates = || -> std::collections::HashSet<_> {
-        address_book
-            .reconnection_peers(Instant::now(), Utc::now())
-            .map(|peer| peer.addr)
-            .collect()
-    };
-    assert_eq!(candidates().len(), 3, "no name has resolved yet");
-
-    resolved_peers.publish([resolved.ip()]);
-    assert_eq!(candidates(), std::collections::HashSet::from([other]));
-}
-
 /// Helper: build an address book with `unconditional_peers`, containing a
 /// responded entry for each of `addrs`.
 fn address_book_with_unconditional_peers(
@@ -639,26 +654,22 @@ fn unconditional_peer_misbehavior_is_ignored() {
         address_book_with_unconditional_peers(&["127.0.0.1/32"], &[unconditional_addr, other_addr]);
     let bans = address_book.bans();
 
-    let updated = address_book.update(MetaAddr::new_misbehavior(
+    report_misbehavior(
+        &mut address_book,
         unconditional_addr,
         MAX_PEER_MISBEHAVIOR_SCORE,
-    ));
+    );
     address_book.peers.assert_consistent();
 
-    assert_eq!(updated, None, "the misbehavior report should be dropped");
     assert!(!bans.contains(unconditional_addr.ip()));
     assert_eq!(
         address_book
-            .get(unconditional_addr)
-            .expect("unconditional peer should stay in the address book")
-            .misbehavior(),
+            .misbehavior_reporter()
+            .score(unconditional_addr.ip()),
         0,
     );
 
-    address_book.update(MetaAddr::new_misbehavior(
-        other_addr,
-        MAX_PEER_MISBEHAVIOR_SCORE,
-    ));
+    report_misbehavior(&mut address_book, other_addr, MAX_PEER_MISBEHAVIOR_SCORE);
 
     assert!(
         bans.contains(other_addr.ip()),
@@ -666,170 +677,6 @@ fn unconditional_peer_misbehavior_is_ignored() {
     );
     assert!(address_book.get(other_addr).is_none());
     assert!(address_book.get(unconditional_addr).is_some());
-}
-
-/// The address book ignores misbehavior reports for the addresses that an unconditional
-/// peer's name resolves to, and stops when the name moves away from an address.
-#[test]
-fn unconditional_peer_misbehavior_is_ignored_at_resolved_addresses() {
-    let addr: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
-
-    let (unconditional_peers, resolved_peers) =
-        UnconditionalPeerSet::new(UnconditionalPeers::default());
-    let mut address_book =
-        AddressBook::new("0.0.0.0:0".parse().unwrap(), &Mainnet, 2, Span::current())
-            .with_unconditional_peers(unconditional_peers);
-    let bans = address_book.bans();
-
-    // The name resolves to the address.
-    resolved_peers.publish([addr.ip()]);
-    assert!(address_book.unconditional_peers().contains(addr.ip()));
-
-    let updated = address_book.update(MetaAddr::new_misbehavior(addr, MAX_PEER_MISBEHAVIOR_SCORE));
-    assert_eq!(updated, None, "the misbehavior report should be dropped");
-    assert!(!bans.contains(addr.ip()));
-
-    // The name moves to another address.
-    resolved_peers.publish(["127.0.0.2".parse().unwrap()]);
-    assert!(!address_book.unconditional_peers().contains(addr.ip()));
-
-    address_book.update(MetaAddr::new_misbehavior(addr, MAX_PEER_MISBEHAVIOR_SCORE));
-    assert!(
-        bans.contains(addr.ip()),
-        "an address that the name left is banned like any other"
-    );
-}
-
-/// A ban that races with a new exemption is dropped.
-///
-/// A name lookup can exempt an address after the address book accepted the report that
-/// bans it, and before the ban lands. The ban then sees the exemption, so the address
-/// is not left banned until a later lookup works.
-#[test]
-fn ban_that_races_with_a_new_exemption_is_dropped() {
-    let addr: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
-
-    let (unconditional_peers, resolved_peers) =
-        UnconditionalPeerSet::new(UnconditionalPeers::default());
-    let mut address_book =
-        AddressBook::new("0.0.0.0:0".parse().unwrap(), &Mainnet, 2, Span::current())
-            .with_unconditional_peers(unconditional_peers);
-    address_book.update(gossiped_change(
-        addr,
-        PeerServices::NODE_NETWORK,
-        DateTime32::MIN,
-    ));
-    address_book.update(MetaAddr::new_reconnect(addr));
-    address_book.update(MetaAddr::new_responded(addr, None));
-    let bans = address_book.bans();
-
-    // While the test reads the ban list, the report can pass the exemption check, and
-    // then has to wait before it bans the address.
-    let ban_list = bans
-        .inner
-        .read()
-        .expect("ban list lock should not be poisoned");
-
-    let mut address_book = std::thread::scope(|scope| {
-        let report = scope.spawn(move || {
-            let updated =
-                address_book.update(MetaAddr::new_misbehavior(addr, MAX_PEER_MISBEHAVIOR_SCORE));
-            (address_book, updated)
-        });
-
-        // Wait until the report is waiting to ban the address, which is after its
-        // exemption check. A waiting writer keeps new readers out of the ban list.
-        let start = Instant::now();
-        while bans.inner.try_read().is_ok() {
-            assert!(
-                start.elapsed() < Duration::from_secs(30),
-                "the report never waited for the ban list"
-            );
-            std::thread::yield_now();
-        }
-
-        // The name resolves to the address, and the ban list is free again.
-        resolved_peers.publish([addr.ip()]);
-        drop(ban_list);
-
-        let (address_book, updated) = report.join().expect("the report does not panic");
-        assert_eq!(updated, None);
-        address_book
-    });
-
-    assert!(!bans.contains(addr.ip()));
-    assert!(
-        address_book.get(addr).is_some(),
-        "the peer stays in the address book"
-    );
-}
-
-/// `exempt_and_lift` makes its exemption while it holds the ban list, so no ban can land
-/// between the exemption and the lifted bans.
-#[test]
-fn exemption_is_made_while_bans_are_lifted() {
-    let ip = "127.0.0.1".parse().unwrap();
-    let bans = BannedIps::with_banned_ip(ip);
-
-    let mut exempted = false;
-    bans.exempt_and_lift(
-        || {
-            assert!(
-                bans.inner.try_read().is_err(),
-                "the ban list is locked during the exemption"
-            );
-            exempted = true;
-        },
-        [ip],
-    );
-
-    assert!(exempted);
-    assert!(!bans.contains(ip));
-}
-
-/// Lifting a ban removes the IP from the ban list, and leaves the list able to ban it
-/// again.
-#[test]
-fn lifted_ban_can_be_applied_again() {
-    let ip = "127.0.0.1".parse().unwrap();
-    let other_ip = "127.0.0.2".parse().unwrap();
-
-    let bans = BannedIps::with_banned_ip(ip);
-    bans.insert(other_ip);
-
-    bans.remove(ip);
-    assert!(!bans.contains(ip));
-    assert!(bans.contains(other_ip), "other bans stay in place");
-
-    // Lifting a ban that is not there changes nothing.
-    bans.remove(ip);
-    assert!(bans.contains(other_ip));
-
-    bans.insert(ip);
-    assert!(bans.contains(ip));
-}
-
-/// A ban that was lifted and applied again is as new as its second application, so a
-/// full ban list evicts older bans first.
-#[test]
-fn lifted_ban_keeps_no_place_in_the_eviction_order() {
-    let ip = |host: u32| std::net::IpAddr::from(std::net::Ipv4Addr::from(host));
-
-    // Ban 1 is the oldest, until it is lifted and applied again.
-    let bans = BannedIps::default();
-    bans.insert(ip(1));
-    bans.insert(ip(2));
-    bans.remove(ip(1));
-    bans.insert(ip(1));
-
-    // Fill the list, then add one more ban, which evicts the oldest.
-    let max_banned_ips = u32::try_from(crate::constants::MAX_BANNED_IPS).unwrap();
-    for host in 3..=max_banned_ips + 1 {
-        bans.insert(ip(host));
-    }
-
-    assert!(!bans.contains(ip(2)), "the oldest ban is evicted");
-    assert!(bans.contains(ip(1)), "the ban that was applied again stays");
 }
 
 /// Repeated sub-threshold misbehavior reports for an unconditional peer never
@@ -843,18 +690,18 @@ fn unconditional_peer_misbehavior_does_not_accumulate() {
     let bans = address_book.bans();
 
     for _ in 0..10 {
-        address_book.update(MetaAddr::new_misbehavior(
+        report_misbehavior(
+            &mut address_book,
             unconditional_addr,
             MAX_PEER_MISBEHAVIOR_SCORE / 2,
-        ));
+        );
     }
 
     assert!(!bans.contains(unconditional_addr.ip()));
     assert_eq!(
         address_book
-            .get(unconditional_addr)
-            .expect("unconditional peer should stay in the address book")
-            .misbehavior(),
+            .misbehavior_reporter()
+            .score(unconditional_addr.ip()),
         0,
     );
 }
@@ -871,18 +718,13 @@ fn unconditional_peer_ranges_match_inner_and_mapped_addresses() {
         address_book_with_unconditional_peers(&["127.0.0.0/30"], &[inner_addr, outer_addr]);
     let bans = address_book.bans();
 
-    address_book.update(MetaAddr::new_misbehavior(
-        inner_addr,
-        MAX_PEER_MISBEHAVIOR_SCORE,
-    ));
-    address_book.update(MetaAddr::new_misbehavior(
+    report_misbehavior(&mut address_book, inner_addr, MAX_PEER_MISBEHAVIOR_SCORE);
+    report_misbehavior(
+        &mut address_book,
         mapped_inner_addr,
         MAX_PEER_MISBEHAVIOR_SCORE,
-    ));
-    address_book.update(MetaAddr::new_misbehavior(
-        outer_addr,
-        MAX_PEER_MISBEHAVIOR_SCORE,
-    ));
+    );
+    report_misbehavior(&mut address_book, outer_addr, MAX_PEER_MISBEHAVIOR_SCORE);
 
     assert!(!bans.contains(inner_addr.ip()));
     assert!(!bans.contains(mapped_inner_addr.ip()));
@@ -932,4 +774,203 @@ fn disconnected_inbound_endpoint_is_not_dialed_or_cached() {
         );
         assert_eq!(cached, !is_inbound, "inbound {is_inbound}: cacheable");
     }
+}
+
+/// A peer whose long-lived outbound connection ended is the next reconnection candidate
+/// once the reconnection delay is over, ahead of addresses that were never tried. A peer
+/// whose connection was short waits behind them.
+#[test]
+fn reconnection_peers_start_with_redial_candidates() {
+    let _init_guard = zakura_test::init();
+
+    let start = Instant::now();
+    let wall_start = Utc::now();
+    let wall_after = |after| wall_start + chrono::Duration::from_std(after).expect("short");
+    let second = std::time::Duration::from_secs(1);
+
+    // Each peer connects, answers each heartbeat, last responds at `MIN_REDIAL_CONNECTION`
+    // after the start of the test, and reports a shutdown a second later.
+    let closed_peer = |addr: &str, connected_for: std::time::Duration| {
+        let addr = addr.parse().unwrap();
+        let connected_at = MIN_REDIAL_CONNECTION - connected_for;
+        let mut responded = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, false)
+            .apply_to_meta_addr(None, start + connected_at, wall_after(connected_at))
+            .expect("a new entry is always created");
+        let heartbeats = std::iter::successors(Some(connected_at + HEARTBEAT_INTERVAL), |at| {
+            Some(*at + HEARTBEAT_INTERVAL)
+        })
+        .take_while(|at| *at < MIN_REDIAL_CONNECTION);
+        for responded_at in heartbeats.chain([MIN_REDIAL_CONNECTION]) {
+            responded = MetaAddr::new_responded(addr, None)
+                .apply_to_meta_addr(responded, start + responded_at, wall_after(responded_at))
+                .expect("each response is later than the last");
+        }
+
+        MetaAddr::new_shutdown(addr)
+            .apply_to_meta_addr(
+                responded,
+                start + MIN_REDIAL_CONNECTION + second,
+                wall_after(MIN_REDIAL_CONNECTION + second),
+            )
+            .expect("the shutdown is later than the response")
+    };
+
+    let redial = closed_peer("127.0.0.1:1", MIN_REDIAL_CONNECTION);
+    let short_lived = closed_peer("127.0.0.2:2", MIN_REDIAL_CONNECTION - second);
+    let never_attempted = MetaAddr::new_gossiped_meta_addr(
+        "127.0.0.3:3".parse().unwrap(),
+        PeerServices::NODE_NETWORK,
+        DateTime32::now(),
+    );
+
+    let address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        [never_attempted, short_lived, redial],
+    );
+
+    let closed_for = |closed_for| {
+        let after = MIN_REDIAL_CONNECTION + second + closed_for;
+
+        address_book
+            .reconnection_peers(start + after, wall_after(after))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        closed_for(MIN_PEER_RECONNECTION_DELAY - second),
+        [never_attempted],
+        "a closed peer waits for the reconnection delay like any other"
+    );
+    assert_eq!(
+        closed_for(MIN_PEER_RECONNECTION_DELAY + second),
+        [redial, never_attempted, short_lived],
+    );
+}
+
+/// Reports misbehavior for `addr`, then removes the addresses of any IP that the report
+/// banned and publishes metrics, as the address book's next update would.
+fn report_misbehavior(address_book: &mut AddressBook, addr: crate::PeerSocketAddr, score: u32) {
+    address_book.misbehavior_reporter().report(addr, score);
+    address_book.remove_banned_peers();
+    address_book.publish_metrics();
+}
+
+/// A peer with a misbehavior score below the ban threshold is left out of the addresses
+/// the node gossips.
+#[test]
+fn scored_peers_are_not_gossiped() {
+    let _init_guard = zakura_test::init();
+
+    let addr: crate::PeerSocketAddr = "1.2.3.4:8233".parse().unwrap();
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    address_book.update(
+        MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, DateTime32::now())
+            .new_gossiped_change()
+            .expect("a gossiped address with a valid last seen time is a change"),
+    );
+
+    let is_gossiped = |address_book: &AddressBook| {
+        address_book
+            .sanitized(Utc::now())
+            .iter()
+            .any(|meta_addr| meta_addr.addr == addr)
+    };
+    assert!(is_gossiped(&address_book));
+
+    address_book.misbehavior_reporter().report(addr, 1);
+    assert!(!is_gossiped(&address_book));
+}
+
+/// An IP that a report just banned is left out of gossip and the peer cache before the
+/// address book's next update removes its addresses.
+#[test]
+fn banned_peers_are_not_gossiped_or_cached_before_the_next_update() {
+    let _init_guard = zakura_test::init();
+
+    let banned: crate::PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
+    let other: crate::PeerSocketAddr = "192.0.2.2:8233".parse().unwrap();
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    for addr in [banned, other] {
+        address_book.update(MetaAddr::new_connected(
+            addr,
+            &PeerServices::NODE_NETWORK,
+            false,
+        ));
+        address_book.update(MetaAddr::new_responded(addr, None));
+    }
+
+    let gossiped = |address_book: &AddressBook| -> Vec<_> {
+        address_book
+            .sanitized(Utc::now())
+            .iter()
+            .map(|meta_addr| meta_addr.addr)
+            .collect()
+    };
+    let cached = |address_book: &AddressBook| -> Vec<_> {
+        address_book
+            .cacheable(Utc::now())
+            .iter()
+            .map(|meta_addr| meta_addr.addr)
+            .collect()
+    };
+    for addrs in [gossiped(&address_book), cached(&address_book)] {
+        assert!(addrs.contains(&banned) && addrs.contains(&other));
+    }
+
+    address_book
+        .misbehavior_reporter()
+        .report(banned, MAX_PEER_MISBEHAVIOR_SCORE);
+    assert!(
+        address_book.get(banned).is_some(),
+        "the ban hasn't been removed from the address book yet"
+    );
+
+    for addrs in [gossiped(&address_book), cached(&address_book)] {
+        assert!(!addrs.contains(&banned), "a banned IP is given out");
+        assert!(addrs.contains(&other), "an unbanned IP is left out");
+    }
+}
+
+/// A report bans an IP without locking the address book, and the address book's next
+/// update removes that IP's addresses.
+#[test]
+fn next_update_removes_addresses_banned_by_a_report() {
+    let _init_guard = zakura_test::init();
+
+    let banned: crate::PeerSocketAddr = "1.2.3.4:8233".parse().unwrap();
+    let other: crate::PeerSocketAddr = "1.2.3.5:8233".parse().unwrap();
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    address_book.update(MetaAddr::new_initial_peer(banned));
+
+    address_book
+        .misbehavior_reporter()
+        .report(banned, MAX_PEER_MISBEHAVIOR_SCORE);
+    assert!(
+        address_book.get(banned).is_some(),
+        "the report itself doesn't lock the address book"
+    );
+
+    address_book.update(MetaAddr::new_initial_peer(other));
+    address_book.peers.assert_consistent();
+    assert!(address_book.get(banned).is_none());
+    assert!(address_book.get(other).is_some());
 }

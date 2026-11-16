@@ -116,13 +116,7 @@ fn spawn_initial(
     let (peer_tx, peer_rx) = mpsc::channel(256);
     let (book_tx, book_rx) = tokio_mpsc::channel(256);
     (
-        tokio::spawn(add_initial_peers(
-            config,
-            connector,
-            peer_tx,
-            book_tx,
-            futures::future::ready(Vec::new()),
-        )),
+        tokio::spawn(add_initial_peers(config, connector, peer_tx, book_tx)),
         peer_rx,
         book_rx,
     )

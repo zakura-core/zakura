@@ -7,14 +7,16 @@ use zakura_chain::parameters::subsidy::FundingStreamReceiver::{self, *};
 /// When long polling, the amount of time we wait between mempool queries.
 /// (And sync status queries, which we do right before mempool queries.)
 ///
-/// State tip changes make long polling return immediately. But miners can re-use old work
-/// with an old set of transactions, so they don't need to know about mempool changes immediately.
+/// State tip changes make long polling return immediately. Mempool changes are only seen at
+/// this interval, so a transaction that arrives just after a check misses templates until the
+/// next one. Two seconds matches the mempool's transaction gossip batch interval, so a miner's
+/// work lags the mempool by about one gossip batch.
 ///
 /// Sync status changes are rare, and the blocks they download cause a chain tip change anyway.
 ///
 /// `zcashd` waits 10 seconds between checking the state
 /// <https://github.com/zcash/zcash/blob/420f8dfe38fd6b2465a665324366c2ae14aa98f4/src/rpc/mining.cpp#L626>
-pub const MEMPOOL_LONG_POLL_INTERVAL: u64 = 5;
+pub const MEMPOOL_LONG_POLL_INTERVAL: u64 = 2;
 
 /// The maximum number of times `getblocktemplate` rebuilds a template that was
 /// superseded by a tip, parent selection, or rejection revision change.

@@ -1,0 +1,17 @@
+# The header publisher's stop asserts that every subscription already
+# ended. That doesn't hold when a subscriber leaves mid-subscription, so
+# the session's publisher task panics as its session ends. The reactor
+# isn't the task that panics: a reactor that unwinds fails the run as the
+# tap's `ReactorGone`, never as this ID. The required failure is
+# `sim/no-task-panic`'s, at the step the first subscriber's session ends.
+# The input is the committed serving-churn fixture: the node serves four
+# mirrors, and each closes its connection once the node completes a read
+# for it, then relinks. The panic comes as the closed session's publisher
+# stops, and its unwind drops what the publisher held, so nothing else
+# the node owes changes.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-serving-churn.json"
+plan = "crates/zakura-sim/tests/fixtures/header-outstanding-serving-churn.plan"

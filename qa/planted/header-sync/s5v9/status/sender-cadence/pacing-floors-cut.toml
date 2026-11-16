@@ -1,0 +1,19 @@
+# Cuts both of the node's `Status` pacing floors to a millisecond: the
+# reactor's publication floor, at which an unchanged status is now
+# republished too, and the cadence sender's send interval for the row.
+# The node then sends `Status` far faster than the peer's bucket of 602
+# frames refills, one every 500 ms, so the peer's models label its 604th
+# frame over cadence. Its input is a quiet session: an honest peer
+# holding the node's 50 headers dials it, so neither side subscribes and
+# the node sends only `Status`. A run needs about 78,000 steps to send
+# that many, so the scenario names a 120,000-step budget, and
+# `header-sync/s5v9/status/sender-cadence` is the only ID it breaks.
+# Besides the files the patch changes, the rest of these decide when the
+# node publishes and how its frames reach the wire. A change there can
+# move the input off its frame.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation"]
+
+[typed]
+harness = "header-sync/wire"
+scenario = "crates/zakura-sim/tests/fixtures/header-wire-planted-status-cadence.json"
+plan = "crates/zakura-sim/tests/fixtures/header-wire-default.plan"

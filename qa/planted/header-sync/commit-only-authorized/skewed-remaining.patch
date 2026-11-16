@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index 519a229164..8022d02c87 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -316,7 +316,8 @@ impl HeaderCountReservation {
+         let rest = policy::reservation_after_page(self.remaining(), owned).ok_or(())?;
+         let budget = &self.0.budget;
+         let lease = sim_arg!(budget.consume(owned, owned); self.0.tag.as_ref().map(|tag| tag.id))?;
+-        self.0.remaining.store(rest, AtomicOrdering::SeqCst);
++        // Mutation: the reservation keeps one header fewer than the page left.
++        self.0.remaining.store(rest.saturating_sub(1), AtomicOrdering::SeqCst);
+         Ok(lease)
+     }
+ }

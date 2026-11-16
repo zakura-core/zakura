@@ -1,0 +1,22 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+index 380293f644..74c64e5549 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+@@ -475,14 +475,13 @@ impl SubscriberState {
+         if outcome.initial_target_tip_hash != live.target {
+             return Err(SubscriberFault::Target);
+         }
+-        if !is_legal(
++        // Mutation: an outcome outside its window is no longer refused.
++        let _ = is_legal(
+             outcome.outcome,
+             live.pages > 0,
+             live.reached,
+             live.close_sent,
+-        ) {
+-            return Err(SubscriberFault::OutcomeWindow(outcome.outcome));
+-        }
++        );
+         tools.claim_end(&live.id)?;
+         #[cfg(any(test, zakura_sim))]
+         if let Some(tap) = &self.credit {

@@ -66,7 +66,8 @@ use crate::{
 /// Version 39 adds the adversary act observations `acts-scripted`,
 /// `act-ran` and `act-skipped`.
 /// Version 40 adds a node frame's `exchange`.
-/// Version 41 adds `meta.draft`, a run's `Draft` override.
+/// Version 41 adds `meta.draft`, a run's `Draft` override. No run writes it
+/// now, and a trace that names it no longer reads.
 /// Version 42 adds `meta.plan`, the Plan bytes or script a run took its
 /// choices from when no `input.bin` did.
 /// Version 43 types `NotApplicable`'s reason, adds `drain-bound`.

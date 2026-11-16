@@ -367,14 +367,6 @@ pub trait Checker {
     /// records this one itself.
     fn step_loop_violation(&mut self, _violation: &Violation) {}
 
-    /// Whether a violation of `property` the step loop itself finds, such
-    /// as `sim/no-livelock`'s, ends the run: true unless the checker
-    /// registers it with a status that only records violations, such as a
-    /// `Draft` override. The default is true.
-    fn stops(&mut self, _property: &str) -> bool {
-        true
-    }
-
     /// The checks still open now, which the drain keeps running for.
     fn unfinished(&self) -> Unfinished;
 }
@@ -533,11 +525,6 @@ impl<C: Checker + ?Sized> Checker for Box<C> {
     /// Forwards to the checker.
     fn step_loop_violation(&mut self, violation: &Violation) {
         (**self).step_loop_violation(violation);
-    }
-
-    /// Forwards to the checker.
-    fn stops(&mut self, property: &str) -> bool {
-        (**self).stops(property)
     }
 
     /// Forwards to the checker.

@@ -301,7 +301,7 @@ mod tests {
             .collect()
     }
 
-    /// C21: a teardown read that breaks several claim rules reports each,
+    /// A teardown read that breaks several claim rules reports each,
     /// in the module doc's order, not just the first. Each rule alone
     /// breaks only itself, and a clean read breaks none.
     #[test]

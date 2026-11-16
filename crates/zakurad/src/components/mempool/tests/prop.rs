@@ -585,7 +585,7 @@ fn setup(
         sync_status,
         latest_chain_tip,
         chain_tip_change,
-        tokio::sync::mpsc::channel(1).0,
+        crate::components::test_misbehavior::reporter(),
         Vec::new(),
         zn::UnconditionalPeers::default(),
     );

@@ -278,6 +278,10 @@ by the maintenance tool described in §16.
   transactions. VCT therefore appends each block's Sprout commitments after all retryable
   peer-root checks pass, writes every changed `root → frontier` entry, and verifies the
   locally reconstructed root against the embedded frontier at handoff.
+  A build without the `sprout` feature refuses every JoinSplit, so it neither reconstructs
+  Sprout nor checks the embedded Sprout frontier. Its first block with Sprout commitments
+  marks the database (`ZakuraDb::sprout_tree_skipped_from`), and a build with `sprout`
+  refuses that database until its tip is past NU7 and the last checkpoint.
 - **Ironwood** is carried the same way as Sapling/Orchard, and is authenticated at the
   handoff (§7) against the supplied Ironwood root before it is written as the tip treestate.
   The on-disk byte format is backward compatible: the Ironwood tree is a 4th length-prefixed

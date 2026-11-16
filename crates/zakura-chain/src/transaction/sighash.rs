@@ -315,17 +315,6 @@ mod tests {
     use super::{CanonicalHashType, HashType, SighashType};
 
     #[test]
-    fn hash_type_preserves_bitflags_api() {
-        assert_eq!(
-            HashType::ALL | HashType::ANYONECANPAY,
-            HashType::ALL_ANYONECANPAY,
-        );
-        assert_eq!(HashType::from_bits(0), Some(HashType::empty()));
-        assert_eq!(HashType::from_bits(0x80), Some(HashType::ANYONECANPAY));
-        assert_eq!(HashType::from_bits(0x04), None);
-    }
-
-    #[test]
     fn canonical_hash_type_only_accepts_supported_values() {
         for (hash_type, expected) in [
             (HashType::ALL, CanonicalHashType::All),

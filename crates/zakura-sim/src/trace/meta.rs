@@ -50,17 +50,11 @@ pub struct MetaRecord {
     pub fixtures: Vec<BlobRef>,
     /// Every property the run checks.
     pub properties: Vec<PropertyRef>,
-    /// The properties the run checks as `Draft` whatever their registered
-    /// status, sorted: the run configuration a planted case's `Draft` run
-    /// records ([`crate::harness::with_draft`]), so a replay applies it too.
-    /// Each one's status in `properties` reads `draft`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub draft: Vec<String>,
     /// `input.bin`, when input bytes produced the run.
     pub input: Option<InputRef>,
     /// The Plan the run took its choices from when no `input.bin` did: Plan
     /// bytes or a scripted [`crate::Plan`], by digest, so a tool can bind
-    /// the trace to the committed Plan it ran (C18). `None` for a run of a
+    /// the trace to the committed Plan it ran. `None` for a run of a
     /// full fuzz input, which `input` names, and for a trace no Plan
     /// produced, such as a replay's.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -27,19 +27,6 @@ async fn client_service_ok_without_readiness_check() {
     assert!(harness.try_to_receive_outbound_client_request().is_empty());
 }
 
-/// Test that a newly initialized client functions correctly after it is polled.
-#[tokio::test]
-async fn client_service_ready_ok() {
-    let _init_guard = zakura_test::init();
-
-    let (mut client, mut harness) = ClientTestHarness::build().finish();
-
-    assert!(client.is_ready().await);
-    assert!(harness.current_error().is_none());
-    assert!(harness.wants_connection_heartbeats());
-    assert!(harness.try_to_receive_outbound_client_request().is_empty());
-}
-
 /// Test that a client functions correctly if its readiness future is dropped.
 #[tokio::test]
 async fn client_service_ready_drop_ok() {

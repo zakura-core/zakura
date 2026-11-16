@@ -65,7 +65,9 @@
 //!   ZIP 218 disallows JoinSplits from NU7 onward, so post-NU7 snapshots do not
 //!   need it. Enable it to fully verify pre-NU7 blocks above the last checkpoint.
 //!   Builds without it stall on such a block that has a JoinSplit, rather than
-//!   rejecting it. Disabled by default.
+//!   rejecting it. Builds without it also stop maintaining the Sprout note
+//!   commitment tree, and a build with it then refuses that database until its
+//!   tip is past NU7 and the last checkpoint. Disabled by default.
 //!
 //! ### Metrics
 //!

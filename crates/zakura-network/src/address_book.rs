@@ -24,8 +24,11 @@ use crate::{
     AddressBookPeers, PeerAddrState, PeerSocketAddr,
 };
 
+mod misbehavior;
 #[cfg(test)]
 mod tests;
+
+pub use misbehavior::MisbehaviorReporter;
 
 /// Read-only access to currently banned peer IP addresses.
 #[derive(Clone, Debug)]
@@ -82,7 +85,9 @@ impl BannedIps {
     }
 
     /// Applies a ban and notifies readers after releasing the list lock.
-    fn insert(&self, ip: IpAddr) {
+    ///
+    /// Returns `true` if `ip` wasn't banned already.
+    fn insert(&self, ip: IpAddr) -> bool {
         let changed = {
             let mut list = self
                 .inner
@@ -95,6 +100,18 @@ impl BannedIps {
         if changed {
             self.changes.send_replace(());
         }
+        changed
+    }
+
+    /// Returns every banned IP address.
+    fn ips(&self) -> Vec<IpAddr> {
+        self.inner
+            .read()
+            .expect("ban list lock should not be poisoned")
+            .insertion_order
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// Returns whether `ip` is currently banned.
@@ -111,9 +128,23 @@ impl BannedIps {
     #[cfg(test)]
     pub(crate) fn with_banned_ip(ip: IpAddr) -> Self {
         let bans = Self::default();
-        bans.insert(ip);
+        bans.ban(ip);
         bans
     }
+
+    /// Bans `ip` in this list and every clone of it.
+    #[cfg(test)]
+    pub(crate) fn ban(&self, ip: IpAddr) {
+        self.insert(ip);
+    }
+}
+
+/// Returns whether `meta_addr`'s IP is in `unremoved_bans`, from
+/// [`AddressBook::unremoved_bans`].
+fn is_banned_in(unremoved_bans: &Option<HashSet<IpAddr>>, meta_addr: &MetaAddr) -> bool {
+    unremoved_bans
+        .as_ref()
+        .is_some_and(|bans| bans.contains(&meta_addr.addr.ip()))
 }
 
 /// The number of peers in each [`PeerAddrState`].
@@ -366,11 +397,16 @@ pub struct AddressBook {
     /// A list of banned addresses, with the time they were banned.
     bans_by_ip: BannedIps,
 
+    /// Changes to `bans_by_ip` that the address book hasn't removed from `peers` yet.
+    ban_changes: watch::Receiver<()>,
+
+    /// The misbehavior scores of peer IP addresses, which ban them in `bans_by_ip`.
+    misbehavior: MisbehaviorReporter,
+
     /// Peer IP addresses and ranges that are never scored or banned.
     ///
-    /// The address book drops misbehavior changes for these peers, and leaves the IPs
-    /// that Zakura dials to stay connected to them out of
-    /// [`reconnection_peers`](Self::reconnection_peers).
+    /// The address book leaves the IPs that Zakura dials to stay connected to them out
+    /// of [`reconnection_peers`](Self::reconnection_peers).
     unconditional_peers: UnconditionalPeers,
 
     /// The local listener address.
@@ -465,6 +501,7 @@ impl AddressBook {
 
         // Avoid initiating outbound handshakes when max_connections_per_ip is 1.
         let should_limit_outbound_conns_per_ip = max_connections_per_ip == 1;
+        let bans_by_ip = BannedIps::default();
         let mut new_book = AddressBook {
             peers: AddressBookIndex::default(),
             local_listener: canonical_socket_addr(local_listener),
@@ -482,7 +519,12 @@ impl AddressBook {
             address_metrics_update_count: 0,
             last_address_log: None,
             most_recent_by_ip: should_limit_outbound_conns_per_ip.then(HashMap::new),
-            bans_by_ip: Default::default(),
+            ban_changes: bans_by_ip.subscribe(),
+            misbehavior: MisbehaviorReporter::new(
+                bans_by_ip.clone(),
+                UnconditionalPeers::default(),
+            ),
+            bans_by_ip,
             unconditional_peers: UnconditionalPeers::default(),
         };
 
@@ -512,6 +554,8 @@ impl AddressBook {
         mut self,
         unconditional_peers: UnconditionalPeers,
     ) -> Self {
+        self.misbehavior =
+            MisbehaviorReporter::new(self.bans_by_ip.clone(), unconditional_peers.clone());
         self.unconditional_peers = unconditional_peers;
         self
     }
@@ -645,8 +689,19 @@ impl AddressBook {
         peers.insert(local_listener);
 
         // Then sanitize and shuffle
-        let mut peers: Vec<MetaAddr> = peers
-            .ordered_values()
+        let unremoved_bans = self.unremoved_bans();
+        // Avoid responding to GetAddr requests with addresses of misbehaving peers.
+        // A ban clears the IP's score, so banned IPs need their own check. Reports wait
+        // for the score lock, so only the lookups run under it.
+        let unscored: Vec<&MetaAddr> = self.misbehavior.with_scores(|scores| {
+            peers
+                .ordered_values()
+                .filter(|meta_addr| !is_banned_in(&unremoved_bans, meta_addr))
+                .filter(|meta_addr| !scores.is_scored(meta_addr.addr.ip()))
+                .collect()
+        });
+        let mut peers: Vec<MetaAddr> = unscored
+            .into_iter()
             .filter_map(|meta_addr| meta_addr.sanitize(&self.network))
             // # Security
             //
@@ -675,8 +730,11 @@ impl AddressBook {
         let peers = self.peers.clone();
 
         // Get peers in preferred order, then keep the ones that recently responded
+        let unremoved_bans = self.unremoved_bans();
         let mut eligible: Vec<_> = peers
             .ordered_values()
+            // Startup dials cached peers first, so the cache must not keep a banned IP.
+            .filter(|addr| !is_banned_in(&unremoved_bans, addr))
             // # Security
             //
             // Keep only peers that responded to this node within the gossip window.
@@ -780,9 +838,58 @@ impl AddressBook {
         updated
     }
 
+    /// Removes the addresses of IPs banned since the last call.
+    ///
+    /// Misbehavior reports ban IPs without locking the address book, so the address book
+    /// removes their addresses the next time it is updated.
+    fn remove_banned_peers(&mut self) {
+        if !self.ban_changes.has_changed().unwrap_or(false) {
+            return;
+        }
+        self.ban_changes.mark_unchanged();
+
+        let removed_before = self.peers.len();
+        for banned_ip in self.bans_by_ip.ips() {
+            // `most_recent_by_ip` is only populated when `max_connections_per_ip == 1`.
+            if let Some(most_recent_by_ip) = self.most_recent_by_ip.as_mut() {
+                most_recent_by_ip.remove(&banned_ip);
+            }
+            self.peers.remove_ip(banned_ip);
+        }
+
+        if self.peers.len() != removed_before {
+            self.address_metrics_dirty = true;
+            debug!(
+                removed_peers = removed_before - self.peers.len(),
+                total_peers = self.peers.len(),
+                "removed banned peer addresses from address book",
+            );
+        }
+    }
+
+    /// Returns the banned IPs that may still have addresses in `peers`, or `None` if
+    /// [`remove_banned_peers`](Self::remove_banned_peers) has removed every banned IP.
+    ///
+    /// Reads that give out addresses use this to leave out IPs banned since the last
+    /// update, because they only have `&self` and can't remove them.
+    fn unremoved_bans(&self) -> Option<HashSet<IpAddr>> {
+        self.ban_changes
+            .has_changed()
+            .unwrap_or(false)
+            .then(|| self.bans_by_ip.ips().into_iter().collect())
+    }
+
+    /// Returns the handle that records peer misbehavior and bans IPs in this address
+    /// book's ban list.
+    pub fn misbehavior_reporter(&self) -> MisbehaviorReporter {
+        self.misbehavior.clone()
+    }
+
     /// Apply `change` without immediately publishing address book metrics.
     #[allow(clippy::unwrap_in_result)]
     fn update_inner(&mut self, change: MetaAddrChange) -> Option<MetaAddr> {
+        self.remove_banned_peers();
+
         let addr_label = change.addr().addr_label(self.expose_peer_addresses);
 
         if self.bans_by_ip.contains(change.addr().ip()) {
@@ -791,18 +898,6 @@ impl AddressBook {
                 ?change,
                 "attempted to add a banned peer addr to address book"
             );
-            return None;
-        }
-
-        if matches!(change, MetaAddrChange::UpdateMisbehavior { .. })
-            && self.unconditional_peers.contains(change.addr().ip())
-        {
-            debug!(
-                peer = %addr_label,
-                score_increment = change.misbehavior_score(),
-                "ignored misbehavior report for an unconditional peer"
-            );
-            metrics::counter!("address_book.misbehavior.unconditional_ignored.total").increment(1);
             return None;
         }
 
@@ -826,37 +921,6 @@ impl AddressBook {
         );
 
         if let Some(updated) = updated {
-            if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
-                // Ban and skip outbound connections with excessively misbehaving peers.
-                let banned_ip = updated.addr.ip();
-                debug_assert!(
-                    !self.unconditional_peers.contains(banned_ip),
-                    "unconditional peers must never be banned"
-                );
-                self.bans_by_ip.insert(banned_ip);
-
-                // `most_recent_by_ip` is only populated when
-                // `max_connections_per_ip == 1`. The ban path runs for any
-                // configured value, so we must guard the optional cache rather
-                // than unwrap it.
-                if let Some(most_recent_by_ip) = self.most_recent_by_ip.as_mut() {
-                    most_recent_by_ip.remove(&banned_ip);
-                }
-
-                self.peers.remove_ip(banned_ip);
-                self.address_metrics_dirty = true;
-
-                warn!(
-                    peer = %addr_label,
-                    ?updated,
-                    total_peers = self.peers.len(),
-                    recent_peers = self.recently_live_peers(chrono_now).len(),
-                    "banned ip and removed banned peer addresses from address book",
-                );
-
-                return None;
-            }
-
             // Ignore invalid outbound addresses.
             // (Inbound connections can be monitored via Zebra's metrics.)
             if !updated.address_is_valid_for_outbound(&self.network) {
@@ -876,6 +940,14 @@ impl AddressBook {
 
             self.peers.insert(updated);
             self.address_metrics_dirty = true;
+
+            let was_redialed_first = previous.is_some_and(|previous| previous.is_redialed_first());
+            if updated.is_redialed_first() && !was_redialed_first {
+                metrics::counter!("address_book.redial.started.total").increment(1);
+            } else if was_redialed_first && matches!(change, MetaAddrChange::UpdateConnected { .. })
+            {
+                metrics::counter!("address_book.redial.reconnected.total").increment(1);
+            }
 
             // Add the address to `most_recent_by_ip` if it sent the most recent
             // response Zebra has received from this IP.
@@ -1033,6 +1105,11 @@ impl AddressBook {
     pub fn clone_with_fresh_bans_for_benchmark(&self) -> Self {
         let mut address_book = self.clone();
         address_book.bans_by_ip = BannedIps::default();
+        address_book.ban_changes = address_book.bans_by_ip.subscribe();
+        address_book.misbehavior = MisbehaviorReporter::new(
+            address_book.bans_by_ip.clone(),
+            address_book.unconditional_peers.clone(),
+        );
         address_book
     }
 
@@ -1262,6 +1339,8 @@ impl Clone for AddressBook {
             last_address_log: None,
             most_recent_by_ip: self.most_recent_by_ip.clone(),
             bans_by_ip: self.bans_by_ip.clone(),
+            ban_changes: self.ban_changes.clone(),
+            misbehavior: self.misbehavior.clone(),
             unconditional_peers: self.unconditional_peers.clone(),
         }
     }

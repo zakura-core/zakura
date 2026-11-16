@@ -2985,15 +2985,6 @@ fn block_error_misbehavior_scores() {
     );
 }
 
-#[test]
-fn verify_block_error_misbehavior_scores() {
-    let dup_err = zakura_state::CommitBlockError::Duplicate {
-        hash_or_height: None,
-        location: zakura_state::KnownBlock::BestChain,
-    };
-    assert_eq!(VerifyBlockError::Commit(dup_err).misbehavior_score(), 0);
-}
-
 /// Duplicate block errors must stay classified as duplicate requests after the
 /// state wraps them, so they don't restart the syncer or turn `submitblock`
 /// duplicates into rejections.

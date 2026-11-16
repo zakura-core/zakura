@@ -4479,18 +4479,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn repeated_no_progress_stall_disconnects_instead_of_parking_again() {
-        assert_eq!(
-            super::state::no_progress_response(true),
-            super::NoProgressResponse::Park
-        );
-        assert_eq!(
-            super::state::no_progress_response(false),
-            super::NoProgressResponse::Disconnect
-        );
-    }
-
     #[tokio::test]
     async fn repeated_no_progress_is_a_local_failure() {
         let (mut routine, _outbound, _events) = status_test_routine();

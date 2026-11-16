@@ -108,14 +108,15 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.8.7 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.8.9 zakura
 ```
 
 Sprout JoinSplit proof and signature verification is disabled by default. When
 bootstrapping from a [snapshot](https://zakura.com/snapshots/), choose one at or
-after NU7 activation for your network. To fully verify pre-NU7 blocks above the
-last checkpoint, including Testnet sync from genesis with the current
-checkpoints, enable the `sprout` Cargo feature:
+after NU7 activation for your network. The bundled Mainnet and Testnet
+checkpoints cover NU7 activation, so syncing either network from genesis does
+not need it. To fully verify pre-NU7 blocks above the last checkpoint, such as
+on a custom Testnet, enable the `sprout` Cargo feature:
 
 ```sh
 cargo build --locked --release --package zakura --features sprout

@@ -15,6 +15,57 @@ All automation runs on GitHub Actions. It falls into four domains:
 > No workflow uses GCP. Node-fleet automation targets DigitalOcean and a fixed set of
 > SSH-reachable hosts instead.
 
+## Python dependencies
+
+All Python packages are declared in `scripts/pyproject.toml` and resolved into
+one `scripts/uv.lock`. Virtual environments live in `scripts/.venv`, keeping
+Python tooling artifacts out of the repository root. Use uv 0.11.8 and Python
+3.12. The `release` group contains the
+storage client; `test` includes it and the YAML test parser; `docs` contains
+codespell. Standard-library-only services still run with their system Python.
+
+From the repository root:
+
+```bash
+# Install a complete, locked test environment, without building source packages.
+uv sync --project scripts --locked --no-build --only-group test
+source scripts/.venv/bin/activate
+
+# Add a direct dependency to its owning group, then review both changed files.
+uv add --project scripts --group test 'package-name==reviewed-version'
+
+# Update a transitive package without upgrading unrelated packages.
+uv lock --project scripts --upgrade-package package-name
+
+# Audit every group for Linux and macOS on both supported architectures.
+bash scripts/check-python-dependencies.sh
+```
+
+For a pinned direct dependency, update its version with `uv add --group` rather
+than only updating the lock. Use `--only-group release` or `--only-group docs`
+for those consumers. Switching groups removes packages outside the selection.
+Do not add separate requirements files, inline script dependencies, or unpinned
+installation commands. Dependabot maintains the uv project under `scripts/` weekly, with a
+seven-day cooldown for routine updates and at most two open update PRs.
+
+The required `test success` check includes Python dependency security on every
+PR and merge-queue entry, on Python or dependency changes pushed to `main`, and
+nightly. The audit and policy tests remain required in temporary CI mode.
+Python-only changes do not enable Rust builds through the unit workflow's change
+detector. Existing CI alerts cover failures on `main` and nightly runs.
+Release-state promotion also requires an audit of the same workflow commit,
+without exposing storage credentials to that job.
+
+The audit fails on vulnerabilities, stale locks, or advisory-service errors and
+uploads its console report even on failure. No advisories are ignored. uv's
+audit command is experimental in the pinned version; dependency-policy tests
+exercise its real OSV interface against a local service, including transitive
+vulnerabilities, platform markers, and service outages. This version conservatively
+audits all reachable locked packages even when target selectors are supplied.
+Tool upgrades must keep
+those tests passing. Hashes and known-vulnerability checks do not establish that
+a package is free of undiscovered bugs or malicious behavior.
+
 ## Merge-gating CI
 
 These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**`, and (where noted) in the merge queue. `merge_group` triggers ignore path filters, so queued merges are always revalidated against the latest `main`.
@@ -22,7 +73,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 | Workflow | What it does | Triggers |
 | --- | --- | --- |
 | `lint.yml` | Clippy, rustfmt, `cargo deny`, feature checks. A nightly scheduled run adds the expensive non-gating unused-deps lint. | PR/push on lint-relevant paths; merge queue; nightly; manual |
-| `tests-unit.yml` | Unit-test suite via `cargo nextest` on an OS matrix. Nightly run covers release mode. Also runs `scripts/check-crate-publish-graph.sh` so a skipped dependent whose crates.io index manifest still pins an old major cannot merge, and, nightly and on manual dispatch only, lints and tests `zakura-rt`, `zakura-scheduler`, `zakura-sim` and `zakura-network`'s header-sync scheduler tests under `--cfg zakura_sim`, checks the planted bypass patches under `qa/planted/` and confirms each one on a fuzz target's harness through that target, and runs the `zakura-rt` and `zakura-scheduler` sim tests in release mode and under AddressSanitizer. No simulator job runs on pull requests or pushes. | Every PR (self-gated by a `changes` job); push on Rust-relevant paths; merge queue; nightly; manual |
+| `tests-unit.yml` | Unit-test suite via `cargo nextest` on an OS matrix. Nightly run covers release mode. Also runs `scripts/check-crate-publish-graph.sh` so a skipped dependent whose crates.io index manifest still pins an old major cannot merge, and, nightly and on manual dispatch only, lints and tests `zakura-rt`, `zakura-scheduler`, `zakura-sim` and `zakura-network`'s header-sync scheduler tests under `--cfg zakura_sim`, checks the planted bypass patches under `qa/planted/` and confirms each one on a fuzz target's harness through that target, and runs the `zakura-rt` and `zakura-scheduler` sim tests in release mode and under AddressSanitizer. No simulator job runs on pull requests or pushes. | Every PR (self-gated by a `changes` job); push on Rust/Python/dependency paths; merge queue; nightly; manual |
 | `test-crates.yml` | Builds each workspace crate standalone under its feature combinations. | PR/push on crate-relevant paths; merge queue; manual |
 | `semver-checks.yml` | Runs semver checks for affected publishable crates. | Every PR; push on semver-relevant paths; merge queue; manual |
 | `test-docker.yml` | Builds the production runtime image once, then smoke-tests its packaged binaries, privilege drop, default startup, and combined config overrides. | PR/push on Cargo, Docker, `zakurad`, or runtime-config paths; weekly; manual |

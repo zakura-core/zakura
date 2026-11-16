@@ -1,0 +1,22 @@
+diff --git a/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs b/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs
+index 18524ca569..2c05b3f02a 100644
+--- a/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs
++++ b/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs
+@@ -537,11 +537,14 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
+         while self.ended.len() > self.limits.max_live() {
+             self.ended.pop_front();
+         }
+-        Ok(SubscriptionEnded {
++        let ended = SubscriptionEnded {
+             pages: subscribed.pages,
+             close_sent: subscribed.close_sent,
+-            received: subscribed.received,
+-        })
++            received: subscribed.received.clone(),
++        };
++        // Mutation: the table keeps the subscription its outcome ended.
++        self.live.insert(key.clone(), subscribed);
++        Ok(ended)
+     }
+ 
+     /// The cursors of `key`'s received pages the handler hasn't accepted,

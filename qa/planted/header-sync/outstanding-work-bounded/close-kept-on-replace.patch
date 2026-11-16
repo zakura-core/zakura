@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+index 4ba2e67b9f..f7ce3d50e6 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+@@ -138,8 +138,7 @@ impl ReactorState {
+     /// The replaced session's pending `Close` dies with it. The peer's pending
+     /// locator read stays pending until its storage operation settles.
+     pub(super) fn admit_session(&mut self, peer: &ZakuraPeerId, now: Instant) -> bool {
+-        self.close_deadlines.remove(peer);
+-        self.pending_closes.remove(peer);
++        // Mutation: a replaced session's close entries stay.
+         self.bump_scheduling_revision();
+         let previous = self.peers.insert(peer.clone(), PeerSchedule::default());
+         let replaced = previous.is_some();

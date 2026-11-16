@@ -28,6 +28,9 @@
 //! Each row also lists the retained production bypasses under
 //! `qa/planted/` whose committed input runs on the target's harness. `cargo
 //! xtask planted --targets` runs each one through its target.
+//!
+//! The report also lists each harness no target runs, with its
+//! `[[missing-target]]` row, so it accounts for every harness.
 
 use std::{
     fs,
@@ -50,17 +53,18 @@ use crate::{
         ProcessExit, ProcessFailure, Worker, ABANDON_LIMIT_VAR, EXPECT_VAR,
     },
     harness::{HarnessEntry, HARNESSES, NO_TASK_PANIC},
+    planted::{self, PLANTED_DIR},
     seed::{self, sha256, Seed},
     sim::NO_LIVELOCK,
-    suite::{SuiteFile, PLANTED_DIR, SIM_FUZZ_PACKAGE, SUITE_FILE},
+    suite::{MissingTarget, SuiteFile, SIM_FUZZ_PACKAGE, SUITE_FILE},
     trace::ARTIFACTS_VAR,
 };
 
 /// The report's file in the output directory.
 pub const READINESS_FILE: &str = "readiness.json";
 
-/// The report's format version.
-pub const READINESS_VERSION: u32 = 1;
+/// The report's format version. Version 2 adds the missing targets.
+pub const READINESS_VERSION: u32 = 2;
 
 /// The properties every harness checks. A target whose seeds apply only
 /// these runs no property of its own harness.
@@ -210,6 +214,10 @@ pub struct Readiness {
     pub sanitizer: String,
     /// One row per target, in `qa/suite.toml`'s order.
     pub targets: Vec<TargetReadiness>,
+    /// Each harness no target runs, with its `[[missing-target]]` row, in
+    /// `qa/suite.toml`'s order. [`Readiness::not_ready`] doesn't count
+    /// them, since the suite accounts for each.
+    pub missing_targets: Vec<MissingTarget>,
 }
 
 impl Readiness {
@@ -423,47 +431,59 @@ pub fn max_len(args: &[String]) -> Option<usize> {
 }
 
 /// The retained production bypasses under `repo`'s `qa/planted/` whose
-/// committed input is one of `seeds`, by the input's path.
+/// committed input is one of `seeds`, by the input's path. A typed case
+/// names no fuzz input, so no target runs it. A case naming neither an
+/// input nor a typed case, or both, is an error, as `cargo xtask planted`
+/// reports it.
 pub fn bypasses(repo: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> {
     #[derive(Deserialize)]
     struct CaseFile {
-        input: PathBuf,
+        input: Option<PathBuf>,
+        typed: Option<toml::Table>,
     }
     let mut cases = Vec::new();
     let root = repo.join(PLANTED_DIR);
-    for family in sorted(&root)? {
-        for property in sorted(&family)? {
-            for case in sorted(&property)? {
-                if case.extension().is_none_or(|extension| extension != "toml") {
-                    continue;
-                }
-                let text = fs::read_to_string(&case)
-                    .map_err(|error| format!("reading {}: {error}", case.display()))?;
-                let file: CaseFile = toml::from_str(&text)
-                    .map_err(|error| format!("parsing {}: {error}", case.display()))?;
-                let input = repo.join(&file.input);
-                if !seeds.iter().any(|seed| same_file(&seed.path, &input)) {
-                    continue;
-                }
-                let id = property
-                    .strip_prefix(&root)
-                    .map_err(|_| format!("{} is outside {PLANTED_DIR}", property.display()))?;
-                cases.push(BypassCase {
-                    property: id.to_string_lossy().into_owned(),
-                    patch: Path::new(PLANTED_DIR)
-                        .join(id)
-                        .join(case.with_extension("patch").file_name().unwrap_or_default()),
-                });
+    let case_files = match planted::files(&root, "toml") {
+        Ok(files) => files,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("listing {error}")),
+    };
+    for case in case_files {
+        let text = fs::read_to_string(&case)
+            .map_err(|error| format!("reading {}: {error}", case.display()))?;
+        let file: CaseFile = toml::from_str(&text)
+            .map_err(|error| format!("parsing {}: {error}", case.display()))?;
+        let input = match (file.input, file.typed) {
+            (Some(input), None) => repo.join(input),
+            (None, Some(_)) => continue,
+            (input, _) => {
+                return Err(format!(
+                    "{}: a case names either `input` or `[typed]`, and this names {}",
+                    case.display(),
+                    if input.is_some() { "both" } else { "neither" }
+                ))
             }
+        };
+        if !seeds.iter().any(|seed| same_file(&seed.path, &input)) {
+            continue;
         }
+        let property = planted::property_id(&root, &case)
+            .ok_or_else(|| format!("{} isn't under a property", case.display()))?;
+        cases.push(BypassCase {
+            patch: Path::new(PLANTED_DIR)
+                .join(&property)
+                .join(case.with_extension("patch").file_name().unwrap_or_default()),
+            property,
+        });
     }
     Ok(cases)
 }
 
 /// Checks each target `options` names, calls `checked` with each row as
-/// it's done, writes the report into `options.out`, and returns it. Fails
-/// only if the checker itself can't go on, such as on an output directory
-/// that isn't empty.
+/// it's done, writes the report into `options.out`, and returns it. The
+/// report lists every missing target, whichever targets `options` names.
+/// Fails only if the checker itself can't go on, such as on an output
+/// directory that isn't empty.
 pub fn check_targets(
     options: &TargetsOptions,
     mut checked: impl FnMut(&TargetReadiness),
@@ -496,6 +516,7 @@ pub fn check_targets(
         version: READINESS_VERSION,
         sanitizer: options.sanitizer.clone(),
         targets: Vec::new(),
+        missing_targets: suite.missing_target.clone(),
     };
     for target in declared
         .iter()

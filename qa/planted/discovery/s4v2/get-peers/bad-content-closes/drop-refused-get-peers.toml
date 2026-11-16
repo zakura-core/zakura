@@ -1,0 +1,10 @@
+# Discovery drops a `GetPeers` its codec refuses instead of closing. The
+# scenario's peer sends a `GetPeers` with limit 0.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/get-peers/bad-content-closes/drop-refused-get-peers.scenario.json"
+plan = "qa/planted/discovery/s4v2/get-peers/bad-content-closes/drop-refused-get-peers.plan.bin"

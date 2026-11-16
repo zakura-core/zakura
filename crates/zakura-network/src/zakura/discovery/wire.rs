@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use zakura_chain::primitives::ed25519::Signature;
 use zakura_quic::NodeId;
 
 use super::protocol::{
@@ -571,7 +570,7 @@ fn write_record(record: &ZakuraNodeRecord, out: &mut Vec<u8>) -> Result<(), Wire
     }
     // The body cap fits in u32.
     out[length_at..length_at + 4].copy_from_slice(&(body_len as u32).to_le_bytes());
-    out.extend_from_slice(&record.signature.to_bytes());
+    out.extend_from_slice(&record.signature);
     Ok(())
 }
 
@@ -623,7 +622,7 @@ fn read_record(reader: &mut BoundedReader<'_>) -> Result<ZakuraNodeRecord, WireE
         .ok_or(WireError::OutOfRange("record body length"))?;
     let mut body = BoundedReader::new(reader.bytes(body_len, "record body")?);
     let body = read_record_body(&mut body)?;
-    let signature = Signature::from(reader.array::<SIGNATURE_BYTES>("record signature")?);
+    let signature = reader.array::<SIGNATURE_BYTES>("record signature")?;
     Ok(ZakuraNodeRecord { body, signature })
 }
 

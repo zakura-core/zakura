@@ -1,0 +1,11 @@
+# The engine port answers every continuation-locator read with no
+# locator, though its selected path always holds the finalized anchor,
+# so the reactor drops each offer's unstarted work. The reactor, the
+# queue and the storage adapter decide when the witness's reads run, so a
+# change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

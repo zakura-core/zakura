@@ -1066,10 +1066,4 @@ where
             .map(|hash| (*hash, states.get(hash).and_then(|state| state.height)))
             .collect()
     }
-
-    /// Returns true if there are no in-flight download and verify tasks.
-    #[allow(dead_code)]
-    pub fn is_empty(&mut self) -> bool {
-        self.pending.is_empty()
-    }
 }

@@ -1,0 +1,30 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
+index 59651731cf..edf9fc9905 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
+@@ -363,12 +363,14 @@ impl PublisherState {
+             .collect();
+         due.into_iter()
+             .filter_map(|(id, outcome)| {
+-                let subscription = self.subscriptions.remove(&id)?;
++                // Mutation: ending keeps the subscription in the state's map.
++                let subscription = self.subscriptions.get(&id)?;
++                let (reached, target) = (subscription.reached(), subscription.fixed.target);
+                 debug_assert!(
+                     is_legal(
+                         outcome,
+                         self.pages_sent(&id),
+-                        subscription.reached(),
++                        reached,
+                         self.publications.is_closing(&id),
+                     ),
+                     "the publisher queued {outcome:?} outside its window"
+@@ -377,7 +379,7 @@ impl PublisherState {
+                 self.in_progress.take_if(|job| job.subscription == id);
+                 self.terminals.push_back(Terminal {
+                     id,
+-                    target: subscription.fixed.target,
++                    target,
+                     outcome,
+                     slot,
+                 });

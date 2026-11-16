@@ -1,0 +1,12 @@
+# Takes an ordinary prepared target and drops its peer instead of applying
+# it: the reactor ends the prepare's retained headers and disconnects the
+# session. The honest peer never closed its own connection, so the
+# membership the property assumes still holds, and the successor's
+# obligation runs to its 30-second deadline with the node's tip at 50. The
+# input is the progress fixture's saved Plan, where the node reads the
+# peer's Status, prepares the successor and, unpatched, applies it at once.
+input = "crates/zakura-sim/tests/fixtures/header-wire-honest-progress.bin"
+# Besides reactor.rs, which the patch changes, the rest of header sync
+# decides whether the successor is offered, located and prepared. A change
+# there can move the input off its prepare.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

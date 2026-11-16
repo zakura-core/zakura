@@ -112,6 +112,7 @@ impl OrderedUtxo {
     }
 
     /// Create a new ordered UTXO from a UTXO and transaction index.
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub fn from_utxo(utxo: Utxo, tx_index_in_block: usize) -> OrderedUtxo {
         OrderedUtxo {
             utxo,

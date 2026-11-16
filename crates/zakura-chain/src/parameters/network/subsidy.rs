@@ -493,6 +493,9 @@ pub enum SubsidyError {
     )]
     NegativeNsmValueBalance,
 
+    #[error("NU7 halving interval must produce a positive reissuance fraction")]
+    InvalidReissuanceFraction,
+
     #[error("addition of amounts overflowed")]
     Overflow,
 
@@ -574,17 +577,21 @@ pub fn halving(height: Height, network: &Network) -> u32 {
 /// [halving-preserving NSM draft]: https://github.com/zcash/zips/blob/60720df9e971e19d8b6f67f1869426d78c96d250/zips/draft-judah-nsm-halving-preserving-issuance.md
 pub const LN2_SCALED: u128 = 6_931_680_000;
 
-/// The numerator of the [halving-preserving NSM draft]'s `BLOCK_SUBSIDY_FRACTION` from NU7.
-///
-/// ZIP 218 reduces the target spacing from 75 to 25 seconds, tripling the number
-/// of blocks in the same four-year payout half-life. This is
-/// `floor(LN2_SCALED / 5_040_000)`. The fraction is fixed on every network,
-/// including custom networks with shorter or longer scheduled halving intervals.
-/// Reissuance always uses the NU7 payout rate; future spacing changes must
-/// explicitly revisit this constant.
-///
-/// [halving-preserving NSM draft]: https://github.com/zcash/zips/blob/60720df9e971e19d8b6f67f1869426d78c96d250/zips/draft-judah-nsm-halving-preserving-issuance.md
+/// The NU7 subsidy fraction numerator on Mainnet and default Testnet.
 pub const BLOCK_SUBSIDY_FRACTION_NUMERATOR: u128 = 1_375;
+
+/// Returns `floor(LN2_SCALED / H)`, where `H` is the network's NU7 halving interval.
+///
+/// Returns an error if the interval would round the numerator to zero.
+pub fn block_subsidy_fraction_numerator(network: &Network) -> Result<u128, SubsidyError> {
+    let interval = u128::try_from(network.post_blossom_halving_interval())
+        .map_err(|_| SubsidyError::InvalidReissuanceFraction)?
+        * u128::from(NU7_POW_TARGET_SPACING_RATIO);
+    LN2_SCALED
+        .checked_div(interval)
+        .filter(|numerator| *numerator > 0)
+        .ok_or(SubsidyError::InvalidReissuanceFraction)
+}
 
 /// The denominator of the [halving-preserving NSM draft]'s `BLOCK_SUBSIDY_FRACTION`.
 ///
@@ -646,6 +653,7 @@ pub(crate) fn nsm_reissuance_crossing_height(
         supply_before_first,
         subsidy,
         max_money,
+        block_subsidy_fraction_numerator(network)?,
     )?
     .map(Height))
 }
@@ -659,6 +667,7 @@ pub(super) fn first_nsm_crossing_in_subsidy_run(
     supply_before_first: u128,
     subsidy: u128,
     max_money: u128,
+    numerator: u128,
 ) -> Result<Option<u32>, SubsidyError> {
     if first > run_end || subsidy == 0 {
         return Ok(None);
@@ -670,7 +679,8 @@ pub(super) fn first_nsm_crossing_in_subsidy_run(
         .checked_sub(1)
         .and_then(|subsidy| subsidy.checked_mul(BLOCK_SUBSIDY_FRACTION_DENOMINATOR))
         .ok_or(SubsidyError::Overflow)?
-        / BLOCK_SUBSIDY_FRACTION_NUMERATOR;
+        .checked_div(numerator)
+        .ok_or(SubsidyError::InvalidReissuanceFraction)?;
     let reserve = max_money.saturating_sub(supply_before_first);
     let blocks_until_crossing = reserve.saturating_sub(max_reserve).div_ceil(subsidy);
     let crossing = u128::from(first)
@@ -745,9 +755,12 @@ pub fn parent_nsm_value_balance(
 /// Applies the [halving-preserving NSM draft] reissuance fraction to `amount`, rounding up.
 ///
 /// [halving-preserving NSM draft]: https://github.com/zcash/zips/blob/60720df9e971e19d8b6f67f1869426d78c96d250/zips/draft-judah-nsm-halving-preserving-issuance.md
-fn reissuance_amount(amount: Amount<NonNegative>) -> Result<Amount<NonNegative>, SubsidyError> {
+fn reissuance_amount(
+    amount: Amount<NonNegative>,
+    network: &Network,
+) -> Result<Amount<NonNegative>, SubsidyError> {
     let subsidy = amount_to_u128(amount)
-        .checked_mul(BLOCK_SUBSIDY_FRACTION_NUMERATOR)
+        .checked_mul(block_subsidy_fraction_numerator(network)?)
         .ok_or(SubsidyError::Overflow)?
         .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
 
@@ -763,7 +776,7 @@ fn reissuance_amount(amount: Amount<NonNegative>) -> Result<Amount<NonNegative>,
 /// The halving schedule keeps issuing new ZEC. The bonus reissues value removed from
 /// circulation. This helper does not check the reissuance activation height;
 /// callers must gate its use and supply the balance from the actual parent.
-/// It always uses the fixed NU7 fraction, even for a pre-activation balance.
+/// It uses the network's NU7 halving interval, even for a pre-activation balance.
 /// A zero balance pays zero; a positive balance pays at least one zatoshi and
 /// never more than that balance.
 ///
@@ -773,8 +786,9 @@ fn reissuance_amount(amount: Amount<NonNegative>) -> Result<Amount<NonNegative>,
 /// [halving-preserving NSM draft]: https://github.com/zcash/zips/blob/60720df9e971e19d8b6f67f1869426d78c96d250/zips/draft-judah-nsm-halving-preserving-issuance.md
 pub fn reissuance_bonus(
     nsm_value_balance: Amount<NonNegative>,
+    network: &Network,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
-    reissuance_amount(nsm_value_balance)
+    reissuance_amount(nsm_value_balance, network)
 }
 
 /// Returns `ExpectedIssuedSupply(height)` from zips#1354: the total block subsidy the
@@ -935,7 +949,7 @@ pub fn block_subsidy(
         let nsm_value_balance = nsm_value_balance.ok_or(SubsidyError::MissingNsmValueBalance)?;
 
         let halving_subsidy = halving_block_subsidy(height, net)?;
-        let bonus = reissuance_bonus(nsm_value_balance)?;
+        let bonus = reissuance_bonus(nsm_value_balance, net)?;
 
         return Ok((halving_subsidy + bonus)?);
     }

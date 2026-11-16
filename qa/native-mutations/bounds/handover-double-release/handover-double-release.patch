@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs b/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
+index 6a670ea4af..02ccfe9c28 100644
+--- a/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
++++ b/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
+@@ -91,8 +91,10 @@ pub(super) struct DecodedHandoffCharge {
+ 
+ impl DecodedHandoffCharge {
+     /// End this owner's release obligation, because a new [`SequencedBody`] takes it.
+-    pub(super) fn hand_over(mut self) {
+-        self.decoded_bytes = 0;
++    pub(super) fn hand_over(self) {
++        // Mutation: the handoff charge still releases on drop, though the
++        // queued body now owns the same decoded bytes.
++        drop(self);
+     }
+ }
+ 

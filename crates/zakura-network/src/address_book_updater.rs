@@ -11,12 +11,12 @@ use tracing::{Level, Span};
 
 use crate::{
     address_book::AddressMetrics, meta_addr::MetaAddrChange, peer_registry::PeerRegistry,
-    types::PeerServices, AddressBook, BannedIps, BoxError, Config,
+    types::PeerServices, AddressBook, BoxError, Config, MisbehaviorReporter,
 };
 
 type SpawnedAddressBook = (
     Arc<std::sync::Mutex<AddressBook>>,
-    BannedIps,
+    MisbehaviorReporter,
     mpsc::Sender<MetaAddrChange>,
     watch::Receiver<AddressMetrics>,
     JoinHandle<Result<(), BoxError>>,
@@ -42,7 +42,7 @@ impl AddressBookUpdater {
     ///
     /// Returns handles for:
     /// - the address book,
-    /// - the shared list of banned peer IP addresses,
+    /// - the misbehavior reporter, which shares the address book's list of banned peer IPs,
     /// - the transmission channel for address book update events,
     /// - a watch channel for address book metrics, and
     /// - the address book updater task join handle.
@@ -55,7 +55,7 @@ impl AddressBookUpdater {
         advertised_services: PeerServices,
     ) -> (
         Arc<std::sync::Mutex<AddressBook>>,
-        BannedIps,
+        MisbehaviorReporter,
         mpsc::Sender<MetaAddrChange>,
         watch::Receiver<AddressMetrics>,
         JoinHandle<Result<(), BoxError>>,
@@ -102,9 +102,17 @@ impl AddressBookUpdater {
         .with_unconditional_peers(config.unconditional_peers.clone());
         if !config.unconditional_peers.is_empty() {
             if config.expose_peer_addresses {
-                let unconditional_peers: Vec<_> = config.unconditional_peers.iter().collect();
+                // Two entries with different ports name the same address.
+                let unconditional_peers: std::collections::BTreeSet<_> =
+                    config.unconditional_peers.iter().collect();
+                let dns_names: Vec<_> = config
+                    .unconditional_peers
+                    .dial_names()
+                    .map(ToString::to_string)
+                    .collect();
                 info!(
                     ?unconditional_peers,
+                    ?dns_names,
                     "ignoring misbehavior reports from unconditional peers"
                 );
             } else {
@@ -120,8 +128,8 @@ impl AddressBookUpdater {
         let address_metrics = address_book.address_metrics_watcher();
 
         // The updater needs mutable address-book access, while peer networking
-        // only needs read-only ban checks. Both handles share the ban list lock.
-        let bans = address_book.bans();
+        // only reports misbehavior and checks bans. Both share the ban list lock.
+        let misbehavior = address_book.misbehavior_reporter();
         let address_book = Arc::new(std::sync::Mutex::new(address_book));
 
         let worker_address_book = address_book.clone();
@@ -160,7 +168,7 @@ impl AddressBookUpdater {
 
         (
             address_book,
-            bans,
+            misbehavior,
             worker_tx,
             address_metrics,
             address_book_updater_task_handle,

@@ -15,7 +15,7 @@ For performance and security, every release should carry a current Mainnet check
 - [ ] Run the [Update Mainnet release state workflow](https://github.com/zakura-core/zakura/actions/workflows/update-release-state.yml) from `main`. It imports the newest publisher bundle and opens or updates a draft PR (it exits green with no PR when the committed state is already current).
 - [ ] Review and merge that draft PR: the diff is append-only over the committed checkpoint list; spot-check a few new heights and the terminal hash against an independent node or explorer.
 - [ ] `make pre-release` verifies the committed pairing and rejects pre-pipeline `legacy-bootstrap` state; for an emergency release with a broken publisher, export `ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=1` locally, check the `allow_bootstrap_release_state` input when dispatching the Create release workflow, and note it in the release PR.
-- [ ] Testnet checkpoints are still updated manually when needed, per [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/crates/zakura-utils/README.md#zakura-checkpoints).
+- [ ] Run the [Update Testnet checkpoints workflow](https://github.com/zakura-core/zakura/actions/workflows/update-testnet-checkpoints.yml) from `main` (it also runs weekly). Merge its draft PR, or confirm the run summary says there are no new checkpoints. The Testnet list must end above the latest activated Testnet network upgrade, or default builds can't sync Testnet from genesis.
 
 # Curated Dependency Updates
 
@@ -58,7 +58,9 @@ PR. To prepare them for assembly:
 
 Do not copy GitHub draft release notes or edit the shared `[Unreleased]`
 section. The version-aware assembly runs after all package version bumps below.
-Release Drafter remains responsible for the separate GitHub release-note draft.
+The GitHub release notes are drafted from the assembled section after
+publication, by the
+[Release notes workflow](https://github.com/zakura-core/zakura/blob/main/.github/release-notes/README.md).
 
 ## README
 
@@ -139,14 +141,10 @@ version.
 cargo release version --verbose --execute --allow-branch '*' -p zakura patch # [ major | minor ]
 ```
 
-The preparation workflow rejects a requested tag below the conservative
-release level implied by the pending changelog: `Added`, `Changed`,
-`Deprecated`, or `Removed` entries require at least a minor release; a
-Mainnet network upgrade requires a major release; otherwise the floor is a
-patch release. The documented, explained `allow-patch` waiver can lower
-backwards-compatible `Added` and `Changed` entries to the patch floor without
-changing independently required library crate bumps. It never silently changes
-the requested tag.
+The preparation workflow rejects a requested tag below a major release when
+the pending changelog has a Mainnet network-upgrade entry. Otherwise any tag
+above the base version passes, and the patch or minor choice is the release
+owner's. It never silently changes the requested tag.
 
 - [ ] Generate and commit the stored config for the new version — the
       `last_config_is_stored` acceptance test derives the expected filename
@@ -275,8 +273,8 @@ is a manual release judgment.
 <summary>Optional: calculate the release tagging height</summary>
 
 - Find where the Zcash blockchain tip is now by using a [Zcash Block Explorer](https://mainnet.zcashexplorer.app/) or other tool.
-- Add `1152` blocks for each day until the release
-- For example, if the release is in 3 days, add `1152 * 3` to the current Mainnet block height
+- Add `3456` blocks for each day until the release: Mainnet has 25-second blocks since NU7
+- For example, if the release is in 3 days, add `3456 * 3` to the current Mainnet block height
 
 </details>
 
@@ -310,10 +308,11 @@ then builds and verifies the assets without creating a tag.
       `release` environment deployment when the script announces it. The
       workflow publishes a complete pre-release and creates the protected
       tag as its final step.
-- [ ] Review and update the new release description against the final changelog
-      you created, starting just _after_ the title `## [Zakura ...` of the
-      current version and ending just _before_ the title of the previous
-      release.
+- [ ] Review the notes that the
+      [Release notes workflow](https://github.com/zakura-core/zakura/actions/workflows/release-notes.yml)
+      drafts in place of the placeholder description a few minutes after
+      publication, and edit them on the release page as needed. If its run
+      failed, re-run it, or dispatch it with the tag.
 
 ## Test the Pre-Release
 

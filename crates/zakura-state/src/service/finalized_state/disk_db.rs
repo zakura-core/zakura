@@ -136,6 +136,10 @@ pub struct DiskDb {
     /// applying any format changes that may have been required.
     finished_format_upgrades: Arc<AtomicBool>,
 
+    /// Set by the first instance that runs the shutdown format check.
+    /// Every instance that shuts down the shared database would otherwise run it.
+    shutdown_format_check_claimed: Arc<AtomicBool>,
+
     // Owned State
     //
     // Everything contained in this state must be shared by all clones, or read-only.
@@ -833,6 +837,16 @@ impl DiskDb {
             .store(true, atomic::Ordering::SeqCst);
     }
 
+    /// Returns true for the first caller across all clones of this database, and false after.
+    ///
+    /// The shutdown format check calls this so that it runs once per database, not once per
+    /// instance that shuts the database down.
+    pub(crate) fn claim_shutdown_format_check(&self) -> bool {
+        !self
+            .shutdown_format_check_claimed
+            .swap(true, atomic::Ordering::SeqCst)
+    }
+
     /// Returns true if the `finished_format_upgrades` flag has been set to true to
     /// indicate that Zebra has finished applying any required db format upgrades.
     pub fn finished_format_upgrades(&self) -> bool {
@@ -877,7 +891,30 @@ impl DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
-        self.zs_range_iter_with_direction(cf, range, false)
+        self.zs_range_iter_with_direction(cf, range, false, None)
+    }
+
+    /// Returns a forward iterator over the items in `cf` in `range`, like
+    /// [`Self::zs_forward_range_iter`], that fetches up to `read_ahead_bytes` of the range
+    /// from disk at a time instead of one small block per read.
+    ///
+    /// Use this for a scan that reads a whole bounded range of large values. RocksDB does
+    /// not read past the end of `range`, so a short range costs no extra disk reads.
+    ///
+    /// Holding this iterator open might delay block commit transactions.
+    pub fn zs_forward_range_iter_with_read_ahead<C, K, V, R>(
+        &self,
+        cf: &C,
+        range: R,
+        read_ahead_bytes: usize,
+    ) -> impl Iterator<Item = (K, V)> + '_
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk,
+        R: RangeBounds<K>,
+    {
+        self.zs_range_iter_with_direction(cf, range, false, Some(read_ahead_bytes))
     }
 
     /// Returns a reverse iterator over the items in `cf` in `range`.
@@ -894,7 +931,7 @@ impl DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
-        self.zs_range_iter_with_direction(cf, range, true)
+        self.zs_range_iter_with_direction(cf, range, true, None)
     }
 
     /// Returns an iterator over the items in `cf` in `range`.
@@ -902,12 +939,17 @@ impl DiskDb {
     /// RocksDB iterators are ordered by increasing key bytes by default.
     /// Otherwise, if `reverse` is `true`, the iterator is ordered by decreasing key bytes.
     ///
+    /// With `read_ahead_bytes`, the scan fetches that much of the range from disk at a time.
+    /// Without it, RocksDB starts with single blocks and reads ahead only after two
+    /// sequential reads.
+    ///
     /// Holding this iterator open might delay block commit transactions.
     fn zs_range_iter_with_direction<C, K, V, R>(
         &self,
         cf: &C,
         range: R,
         reverse: bool,
+        read_ahead_bytes: Option<usize>,
     ) -> impl Iterator<Item = (K, V)> + '_
     where
         C: rocksdb::AsColumnFamilyRef,
@@ -932,7 +974,10 @@ impl DiskDb {
         let range = (start_bound, end_bound);
 
         let mode = Self::zs_iter_mode(&range, reverse);
-        let opts = Self::zs_iter_opts(&range);
+        let mut opts = Self::zs_iter_opts(&range);
+        if let Some(read_ahead_bytes) = read_ahead_bytes {
+            opts.set_readahead_size(read_ahead_bytes);
+        }
 
         // Reading multiple items from iterators has caused database hangs,
         // in previous RocksDB versions
@@ -1222,6 +1267,7 @@ impl DiskDb {
                     db: Arc::new(db),
                     _secondary_dir: secondary_dir,
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
+                    shutdown_format_check_claimed: Arc::new(AtomicBool::new(false)),
                     cached_size: Arc::new(AtomicU64::new(0)),
                     retained_block_height: tokio::sync::watch::channel(Height::MIN).0,
                 };
@@ -1767,28 +1813,12 @@ impl DiskDb {
                 DiskDb::IDEAL_OPEN_FILE_LIMIT
             );
         } else if cfg!(windows) {
-            // This log is verbose during tests.
-            #[cfg(not(test))]
             info!(
                 min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
                 ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
                 "assuming the open file limit is high enough for Zakura",
             );
-            #[cfg(test)]
-            debug!(
-                min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
-                ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
-                "assuming the open file limit is high enough for Zakura",
-            );
         } else {
-            #[cfg(not(test))]
-            debug!(
-                ?current_limit,
-                min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
-                ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
-                "the open file limit is high enough for Zakura",
-            );
-            #[cfg(test)]
             debug!(
                 ?current_limit,
                 min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
@@ -1846,15 +1876,7 @@ impl DiskDb {
                     ephemeral_note = " and removing ephemeral files";
                 }
 
-                // This log is verbose during tests.
-                #[cfg(not(test))]
                 info!(
-                    ?path,
-                    "forcing shutdown{} of a state database with multiple active instances",
-                    ephemeral_note,
-                );
-                #[cfg(test)]
-                debug!(
                     ?path,
                     "forcing shutdown{} of a state database with multiple active instances",
                     ephemeral_note,
@@ -2011,11 +2033,7 @@ impl DiskDb {
 
         let path = self.path();
 
-        // This log is verbose during tests.
-        #[cfg(not(test))]
         info!(?path, "removing temporary database files");
-        #[cfg(test)]
-        debug!(?path, "removing temporary database files");
 
         // We'd like to use `rocksdb::Env::mem_env` for ephemeral databases,
         // but the Zcash blockchain might not fit in memory. So we just
@@ -2032,15 +2050,7 @@ impl DiskDb {
         let result = std::fs::remove_dir_all(path);
 
         if result.is_err() {
-            // This log is verbose during tests.
-            #[cfg(not(test))]
             info!(
-                ?result,
-                ?path,
-                "removing temporary database files caused an error",
-            );
-            #[cfg(test)]
-            debug!(
                 ?result,
                 ?path,
                 "removing temporary database files caused an error",

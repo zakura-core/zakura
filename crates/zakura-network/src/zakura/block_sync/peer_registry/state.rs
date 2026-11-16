@@ -19,6 +19,8 @@ use zakura_chain::block;
 use zakura_header_chain::{BodyWorkAuthority, BodyWorkOwner, SourceId};
 use zakura_rt::{collections::HashMap, time::Instant};
 
+#[cfg(any(test, zakura_sim))]
+use super::super::block_sync_observe::{BlockEvent, ObserverSlot, RegistryWriter};
 use super::{
     super::{
         config::{
@@ -46,9 +48,65 @@ pub use tests::{
 #[derive(Debug, Default)]
 pub(super) struct PeerTable {
     peers: HashMap<ZakuraPeerId, Entry>,
+    /// Receives each gated write that lands on another generation's entry,
+    /// in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    observer: ObserverSlot,
+}
+
+/// Reports a generation-gated write from `generation` that is about to land
+/// on `entry`, if another generation owns the entry. Each gated writer calls
+/// it from the statement that writes, past its gate.
+#[cfg(any(test, zakura_sim))]
+fn report_stale_write(
+    observer: &ObserverSlot,
+    peer: &ZakuraPeerId,
+    writer: RegistryWriter,
+    generation: u64,
+    entry: &Entry,
+) {
+    if entry.generation != generation {
+        observe!(
+            observer,
+            BlockEvent::StaleRegistryWrite {
+                peer: peer.clone(),
+                writer,
+                generation,
+                entry_generation: entry.generation,
+                landed: true,
+            }
+        );
+    }
 }
 
 impl PeerTable {
+    /// This table, reporting stale gated writes to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn set_observer(&mut self, observer: ObserverSlot) {
+        self.observer = observer;
+    }
+
+    /// Reports a generation-gated write from `generation` that `writer`
+    /// attempts on the peer's entry, before its gate, if another generation
+    /// owns the entry. A gate that refuses it leaves this the only report.
+    #[cfg(any(test, zakura_sim))]
+    fn report_stale_attempt(&self, peer: &ZakuraPeerId, writer: RegistryWriter, generation: u64) {
+        if let Some(entry) = self.peers.get(peer) {
+            if entry.generation != generation {
+                observe!(
+                    self.observer,
+                    BlockEvent::StaleRegistryWrite {
+                        peer: peer.clone(),
+                        writer,
+                        generation,
+                        entry_generation: entry.generation,
+                        landed: false,
+                    }
+                );
+            }
+        }
+    }
+
     pub(super) fn get(&self, peer: &ZakuraPeerId) -> Option<&Entry> {
         self.peers.get(peer)
     }
@@ -66,11 +124,21 @@ impl PeerTable {
         generation: u64,
         outbound: crate::zakura::regulation::SlotBudget,
     ) {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::AttachOutbound, generation);
         if let Some(entry) = self
             .peers
             .get_mut(peer)
             .filter(|entry| entry.generation == generation)
         {
+            #[cfg(any(test, zakura_sim))]
+            report_stale_write(
+                &self.observer,
+                peer,
+                RegistryWriter::AttachOutbound,
+                generation,
+                entry,
+            );
             entry.outbound = Some(outbound);
         }
     }
@@ -118,11 +186,21 @@ impl PeerTable {
 
     /// Mark `generation`'s session closed. A newer generation is left open.
     pub(super) fn close_session(&mut self, peer: &ZakuraPeerId, generation: u64) {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::CloseSession, generation);
         if let Some(entry) = self
             .peers
             .get_mut(peer)
             .filter(|entry| entry.generation == generation)
         {
+            #[cfg(any(test, zakura_sim))]
+            report_stale_write(
+                &self.observer,
+                peer,
+                RegistryWriter::CloseSession,
+                generation,
+                entry,
+            );
             entry.session_closed = true;
         }
     }
@@ -154,12 +232,22 @@ impl PeerTable {
         generation: u64,
         status: BlockSyncStatus,
     ) -> bool {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::UpsertStatus, generation);
         let Some(entry) = self.peers.get_mut(peer) else {
             return false;
         };
         if entry.generation != generation {
             return false;
         }
+        #[cfg(any(test, zakura_sim))]
+        report_stale_write(
+            &self.observer,
+            peer,
+            RegistryWriter::UpsertStatus,
+            generation,
+            entry,
+        );
         let eligibility_changed = !entry.received_status
             || entry.servable_low != status.servable_low
             || entry.servable_high != status.servable_high;
@@ -180,8 +268,18 @@ impl PeerTable {
         generation: u64,
         claims: impl IntoIterator<Item = (block::Height, OutstandingMeta)>,
     ) {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::InsertOutstanding, generation);
         if let Some(entry) = self.peers.get_mut(peer) {
             if entry.generation == generation {
+                #[cfg(any(test, zakura_sim))]
+                report_stale_write(
+                    &self.observer,
+                    peer,
+                    RegistryWriter::InsertOutstanding,
+                    generation,
+                    entry,
+                );
                 entry.outstanding.extend(claims);
             }
         }
@@ -196,12 +294,22 @@ impl PeerTable {
         owner: BodyWorkOwner,
         heights: impl IntoIterator<Item = block::Height>,
     ) {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::RemoveOutstanding, generation);
         let Some(entry) = self.peers.get_mut(peer) else {
             return;
         };
         if entry.generation != generation {
             return;
         }
+        #[cfg(any(test, zakura_sim))]
+        report_stale_write(
+            &self.observer,
+            peer,
+            RegistryWriter::RemoveOutstanding,
+            generation,
+            entry,
+        );
         for height in heights {
             if entry.outstanding.get(&height).map(|meta| meta.owner) == Some(owner) {
                 entry.outstanding.remove(&height);
@@ -215,10 +323,22 @@ impl PeerTable {
         peer: &ZakuraPeerId,
         generation: u64,
     ) -> Option<BTreeMap<block::Height, OutstandingMeta>> {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::TakeOutstanding, generation);
         self.peers
             .get_mut(peer)
             .filter(|entry| entry.generation == generation)
-            .map(|entry| std::mem::take(&mut entry.outstanding))
+            .map(|entry| {
+                #[cfg(any(test, zakura_sim))]
+                report_stale_write(
+                    &self.observer,
+                    peer,
+                    RegistryWriter::TakeOutstanding,
+                    generation,
+                    entry,
+                );
+                std::mem::take(&mut entry.outstanding)
+            })
     }
 
     /// Publish the owning generation's slot diagnostics. Returns whether the
@@ -230,12 +350,22 @@ impl PeerTable {
         generation: u64,
         slots: SlotDiagnostics,
     ) -> bool {
+        #[cfg(any(test, zakura_sim))]
+        self.report_stale_attempt(peer, RegistryWriter::PublishSlots, generation);
         let Some(entry) = self.peers.get_mut(peer) else {
             return false;
         };
         if entry.generation != generation {
             return false;
         }
+        #[cfg(any(test, zakura_sim))]
+        report_stale_write(
+            &self.observer,
+            peer,
+            RegistryWriter::PublishSlots,
+            generation,
+            entry,
+        );
         let ranking_changed = entry.slots.bbr_rtprop_ms != slots.bbr_rtprop_ms
             || (entry.slots.available_slots > 0) != (slots.available_slots > 0);
         entry.slots = slots;

@@ -105,7 +105,7 @@ fn validate_retention_references(
         .unwrap_or_default();
     let trust_anchor_digest = context.config.trust_anchor_digest();
     for reference in context.retention_references {
-        let authenticated = authority.authorizes_retention_reference(*reference)
+        let authenticated = !retention_reference_needs_lease(*reference, context)
             || leases.iter().any(|lease| {
                 lease.parent().hash == *reference
                     && lease.is_coherent(context.config.network(), trust_anchor_digest)
@@ -116,6 +116,20 @@ fn validate_retention_references(
         }
     }
     Ok(())
+}
+
+/// Returns whether `hash` is a retention reference that only a validation lease can authenticate.
+///
+/// The authority vouches for most references itself. One it does not vouch for is accepted only
+/// with an authorized lease rooted at that reference.
+pub(super) fn retention_reference_needs_lease(
+    hash: block::Hash,
+    context: &TransitionContext<'_>,
+) -> bool {
+    context.retention_references.contains(&hash)
+        && !context
+            .full_state_authority
+            .is_some_and(|authority| authority.authorizes_retention_reference(hash))
 }
 
 /// Validate snapshot and persisted metadata against the active configuration.

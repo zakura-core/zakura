@@ -1512,3 +1512,112 @@ async fn finished_workers_settle_before_the_round_starts() {
     // runtime's end drops the node instead.
     drop(io);
 }
+
+// #645: an attempt dials every IP a record lists in one IPv6 /64, so an
+// unreachable one doesn't hide the rest, but reserves the /64 once: the key
+// the supervisor's per-IP cap counts, and at most one registration.
+#[tokio::test(start_paused = true)]
+async fn addresses_in_one_ipv6_slash_64_reserve_one_host() {
+    let addr = |ip: &str| SocketAddr::new(ip.parse().expect("test address parses"), 8233);
+    let ip = |ip: &str| -> IpAddr { ip.parse().expect("test address parses") };
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let record = candidate(
+        node_id(1),
+        vec![
+            addr("2001:db8:a:b::1"),
+            addr("2001:db8:a:b::2"),
+            addr("2001:db8:a:c::1"),
+        ],
+    );
+    let addresses = state.candidate_addresses(&record, Instant::now());
+    assert_eq!(
+        addresses
+            .iter()
+            .map(|address| address.ip)
+            .collect::<Vec<_>>(),
+        vec![
+            ip("2001:db8:a:b::1"),
+            ip("2001:db8:a:b::2"),
+            ip("2001:db8:a:c::1")
+        ]
+    );
+    let attempt = state
+        .record_attempt(
+            node_id(1),
+            addresses.iter().map(|address| address.ip).collect(),
+        )
+        .expect("an idle dialer records the attempt");
+    assert_eq!(state.in_flight_dials_to(ip("2001:db8:a:b::ffff")), 1);
+    assert_eq!(state.in_flight_dials_to(ip("2001:db8:a:c::ffff")), 1);
+    assert_eq!(state.in_flight_dials_to(ip("2001:db8:a:d::1")), 0);
+    assert!(state.complete(attempt, DiscoveryDialResult::Failed, None, Instant::now()));
+    assert_eq!(state.in_flight_dials_to(ip("2001:db8:a:b::1")), 0);
+}
+
+// A failed address backs off only itself, so the next round tries the next
+// address in the same /64 instead of skipping the whole host.
+#[tokio::test(start_paused = true)]
+async fn a_failed_address_leaves_the_rest_of_its_slash_64_dialable() {
+    let addr = |ip: &str| SocketAddr::new(ip.parse().expect("test address parses"), 8233);
+    let ip = |ip: &str| -> IpAddr { ip.parse().expect("test address parses") };
+    let node = node_id(1);
+    let now = Instant::now();
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let record = candidate(node, vec![addr("2001:db8:a:b::1"), addr("2001:db8:a:b::2")]);
+
+    settle(
+        &mut state,
+        node,
+        &[ip("2001:db8:a:b::1")],
+        None,
+        DiscoveryDialResult::Failed,
+        now,
+    );
+    assert_eq!(
+        state.candidate_addresses(&record, now),
+        vec![CandidateAddress {
+            addr: addr("2001:db8:a:b::2"),
+            ip: ip("2001:db8:a:b::2"),
+        }]
+    );
+
+    // Once both fail, the host yields nothing until a backoff expires.
+    settle(
+        &mut state,
+        node,
+        &[ip("2001:db8:a:b::2")],
+        None,
+        DiscoveryDialResult::Failed,
+        now,
+    );
+    assert!(state.candidate_addresses(&record, now).is_empty());
+}
+
+// The dial a round builds for that record holds both addresses of the /64,
+// and its reservation names each IP so the attempt can back each one off.
+#[tokio::test(start_paused = true)]
+async fn a_round_dials_every_ip_of_a_slash_64() {
+    let addr = |ip: &str| SocketAddr::new(ip.parse().expect("test address parses"), 8233);
+    let supervisor = ZakuraSupervisorHandle::new(16);
+    let state = CandidateDialerState::new(DIAL_BACKOFF);
+    let record = candidate(
+        node_id(1),
+        vec![addr("2001:db8:a:b::1"), addr("2001:db8:a:b::2")],
+    );
+    let (node_addr, reserved) =
+        discovery_node_addr_with_reserved_ip_capacity(&supervisor, &state, &record, Instant::now())
+            .expect("an empty supervisor accepts the host");
+    assert_eq!(
+        node_addr.direct.to_vec(),
+        vec![addr("2001:db8:a:b::1"), addr("2001:db8:a:b::2")]
+    );
+    assert_eq!(
+        reserved,
+        vec![
+            "2001:db8:a:b::1"
+                .parse::<IpAddr>()
+                .expect("test address parses"),
+            "2001:db8:a:b::2".parse().expect("test address parses"),
+        ]
+    );
+}

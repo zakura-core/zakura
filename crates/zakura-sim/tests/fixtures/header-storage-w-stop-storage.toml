@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-stop-storage.bin`, a fuzz-12 item 7 witness whose run
+# shows StopDroppedApply. Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "aa3d7d3ffeee8e188db2e2b280fd7309380b9c610ddf17e9c4597c42b08f5076"
+scenario_sha256 = "7ee3683ff5f236f0872bb376311b8fab10b99a481b1d4650eeb785c16de74d19"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

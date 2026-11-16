@@ -4,7 +4,9 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
-use zakura_node_services::block_memory::{BlockHandle, HeaderHandle, TransactionHandle};
+use zakura_node_services::block_memory::{
+    BlockHandle, HeaderHandle, OwnedRawBlock, OwnedRawTransaction, TransactionHandle,
+};
 
 use chrono::{DateTime, Utc};
 
@@ -520,6 +522,10 @@ pub enum ReadResponse {
     /// serialized size.
     BlockAndSize(Option<(BlockHandle, usize)>),
 
+    /// Response to [`ReadRequest::RawBlock`] with the specified block's
+    /// Zcash consensus serialization.
+    RawBlock(Option<OwnedRawBlock>),
+
     /// The response to a `BlockHeader` request.
     BlockHeader {
         /// The header of the requested block
@@ -535,8 +541,13 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::Transaction`] with the specified transaction.
     Transaction(Option<MinedTx>),
 
-    /// Response to [`ReadRequest::AnyChainTransaction`] with the specified transaction.
-    AnyChainTransaction(Option<AnyTx>),
+    /// Response to [`ReadRequest::AnyChainTransaction`] with the specified
+    /// transaction and its Zcash consensus serialization.
+    AnyChainTransaction(Option<(AnyTx, OwnedRawTransaction)>),
+
+    /// Response to [`ReadRequest::AnyChainRawTransaction`] with the specified
+    /// transaction's Zcash consensus serialization.
+    RawTransaction(Option<OwnedRawTransaction>),
 
     /// Response to [`ReadRequest::TransactionIdsForBlock`],
     /// with an list of transaction hashes in block order,
@@ -547,6 +558,10 @@ pub enum ReadResponse {
     /// transaction hashes in block order and a flag indicating if the block is
     /// in the best chain, or `None` if the block was not found.
     AnyChainTransactionIdsForBlock(Option<(Arc<[transaction::Hash]>, bool)>),
+
+    /// Response to [`ReadRequest::MinedTransactionIds`], with the requested
+    /// transaction IDs that are mined in the best chain.
+    MinedTransactionIds(HashSet<transaction::Hash>),
 
     /// Response to [`ReadRequest::SpendingTransactionId`],
     /// with an list of transaction hashes in block order,
@@ -806,6 +821,8 @@ impl TryFrom<ReadResponse> for Response {
 
             ReadResponse::Depth(_)
             | ReadResponse::Transaction(_)
+            | ReadResponse::RawBlock(_)
+            | ReadResponse::RawTransaction(_)
             | ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
@@ -813,6 +830,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
+            | ReadResponse::MinedTransactionIds(_)
             | ReadResponse::SaplingTree(_)
             | ReadResponse::OrchardTree(_)
             | ReadResponse::IronwoodTree(_)

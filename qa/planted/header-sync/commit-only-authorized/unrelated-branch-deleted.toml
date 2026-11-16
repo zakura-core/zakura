@@ -1,0 +1,12 @@
+# The engine installs an apply's transition and also drops a held side
+# branch's tip that no fixture selects, keeping the selected chain right.
+# The witness holds two forks, so the second fork's apply finds the first
+# held beside it. The reactor, the queue, the storage adapter and the
+# engine decide how the witness's rounds apply, so a change there can move
+# the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/transition", "crates/zakura-header-chain/src/graph"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

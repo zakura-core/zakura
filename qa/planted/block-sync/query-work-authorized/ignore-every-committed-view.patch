@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/reactor.rs b/crates/zakura-network/src/zakura/block_sync/reactor.rs
+index 94d42410cd..a90413b159 100644
+--- a/crates/zakura-network/src/zakura/block_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/block_sync/reactor.rs
+@@ -835,6 +835,10 @@ impl ReactorIO {
+         &mut self,
+         view: zakura_header_chain::CommittedHeaderChainView,
+     ) {
++        // Drop every committed view, so the reactor keeps its startup authority.
++        if !view.frontiers.header_best.hash.0.is_empty() {
++            return;
++        }
+         synchronize_persisted_body_alarm(&self.registry, Some(&view));
+         let update = self
+             .state

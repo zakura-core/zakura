@@ -1,0 +1,42 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 147b4442fc..40ea596950 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -3020,7 +3020,14 @@ impl HeaderSyncReactor {
+         self.state.clear_request_deadline(peer);
+         let reserved = self.peer_work_queue.reserved_header_count(peer);
+         let owned = self.peer_work_queue.owned_header_count(peer);
+-        if let Some(active) = self.peer_work_queue.remove(peer) {
++        // Mutation: a disconnect returns the round's capacity but keeps its
++        // queue entry, so its slot stays with the departed session.
++        let removed = if terminal_outcome == HeaderRequestTerminal::Disconnected {
++            self.peer_work_queue.keep_entry(peer)
++        } else {
++            self.peer_work_queue.remove(peer)
++        };
++        if let Some(active) = removed {
+             observe!(self, ReactorEvent::retired(&active, terminal_outcome));
+             self.emit_request_terminal(&active, terminal_outcome);
+             self.cancel_active_request(&active);
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index 439b3ac2fb..92c5afda9b 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -728,6 +728,17 @@ impl PeerWorkQueue {
+         removed
+     }
+ 
++    /// Mutation: `remove`, keeping the entry.
++    pub(in crate::zakura::header_sync) fn keep_entry(
++        &mut self,
++        peer: &ZakuraPeerId,
++    ) -> Option<ActiveHeaderRequest> {
++        self.release_capacity(peer);
++        #[cfg(any(test, zakura_sim))]
++        self.report_released(peer);
++        self.policy.active(peer).cloned()
++    }
++
+     pub(in crate::zakura::header_sync) fn remove_owner(
+         &mut self,
+         owner: HeaderSyncWorkOwner,

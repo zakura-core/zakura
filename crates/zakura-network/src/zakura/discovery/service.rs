@@ -418,7 +418,7 @@ impl Service for DiscoveryService {
         else {
             return;
         };
-        let Some(peer_node_id) = node_id_from_peer_id(&peer.id) else {
+        let Some(peer_node_id) = peer.id.node_id() else {
             // A peer id that is not a 32-byte node id cannot be a discovery
             // author; drop the stream without registering an exchange.
             return;
@@ -583,6 +583,9 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         connection_cancel.clone(),
         close_cause.clone(),
     );
+    // Before the queries attach their precheck, which lets the reader read.
+    #[cfg(any(test, zakura_sim))]
+    serving.observe(&recv);
     let answers = serving.answers_written();
     let queries = Queries::new(
         query_pool,
@@ -891,14 +894,18 @@ impl DiscoverySink {
     }
 }
 
-/// Returns the node id encoded by a discovery peer id, if it is a 32-byte
-/// node id.
-fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
-    let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
-    NodeId::from_bytes(&bytes).ok()
+#[cfg(zakura_sim)]
+impl DiscoveryService {
+    /// Names the services whose sessions keep a connection open, as
+    /// zakurad's registry does, for a simulator node that builds its own
+    /// registry.
+    pub fn with_connection_owners(self, owners: Vec<Arc<dyn Service>>) -> Self {
+        self.set_connection_owners(owners);
+        self
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests {
     use std::{
         collections::HashMap,
@@ -1022,6 +1029,7 @@ mod tests {
             Some(anchor),
             ZakuraHeaderSyncConfig::default(),
             LOCAL_MAX_MESSAGE_BYTES,
+            crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         spawn_header_sync_reactor(startup).map_err(Into::into)
     }
@@ -1696,7 +1704,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let connection_cancel = CancellationToken::new();
         let close_cause = CloseCause::new();
-        let peer_node_id = node_id_from_peer_id(&peer_id).expect("test peer ids are node ids");
+        let peer_node_id = peer_id.node_id().expect("test peer ids are node ids");
         let states = Arc::new(StdMutex::new(DiscoverySessionStates::default()));
         let slot = SessionSlot {
             states: states.clone(),

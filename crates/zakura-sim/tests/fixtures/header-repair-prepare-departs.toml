@@ -1,0 +1,20 @@
+# The committed fuzz input `header-repair-prepare-departs.bin`: the harness that runs it, the
+# generator version it was built for, and its SHA-256. Its first byte
+# picks the repair fixture, then come the Plan bytes.
+harness = "header-sync/repair"
+generator = 2
+sha256 = "2792685c653fbfd8add18b144cd48c9a17abe36a8992c3247bf21d9509cb7a72"
+scenario_sha256 = "04166e1434c1c0ea065f729f404082f4ee8615e98e56648009ed8bd2e70c46b5"
+source = "crates/zakura-sim/tests/header_repair.rs"
+
+[[witness]]
+property = "header-sync/stale-completion-inert"
+expect = "holds"
+
+[[witness]]
+property = "header-sync/commit-only-authorized"
+expect = "holds"
+
+[[witness]]
+property = "header-sync/outstanding-work-bounded"
+expect = "holds"

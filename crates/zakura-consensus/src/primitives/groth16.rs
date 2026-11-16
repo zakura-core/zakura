@@ -18,11 +18,9 @@ use super::batch_control::RequestWeight;
 use super::fallback::BoxedError;
 
 use zakura_chain::{
-    primitives::{
-        ed25519::{self, VerificationKeyBytes},
-        Groth16Proof,
-    },
+    primitives::Groth16Proof,
     sprout::{JoinSplit, Nullifier, RandomSeed},
+    transaction::JoinSplitPubKey,
 };
 
 use crate::BoxError;
@@ -109,7 +107,7 @@ pub(super) fn h_sig(
     random_seed: &RandomSeed,
     nf1: &Nullifier,
     nf2: &Nullifier,
-    joinsplit_pub_key: &VerificationKeyBytes,
+    joinsplit_pub_key: &JoinSplitPubKey,
 ) -> [u8; 32] {
     let h_sig: [u8; 32] = blake2b_simd::Params::new()
         .hash_length(32)
@@ -145,7 +143,7 @@ impl Item {
     #[allow(clippy::needless_borrow)]
     pub fn from_joinsplit(
         joinsplit: &JoinSplit<Groth16Proof>,
-        joinsplit_pub_key: &ed25519::VerificationKeyBytes,
+        joinsplit_pub_key: &JoinSplitPubKey,
     ) -> Result<Self, TransactionError> {
         let rt: [u8; 32] = joinsplit.anchor.into();
         let mac1: [u8; 32] = (&joinsplit.vmacs[0]).into();

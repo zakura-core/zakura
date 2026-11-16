@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use zakura_chain::block;
 use zakura_header_chain::{Frontier, HeaderGeneration, HeaderWorkAuthority, SourceId};
 use zakura_rt::time::Instant;
 
@@ -755,7 +756,13 @@ impl OwnerModel {
                         last,
                         count,
                         complete,
-                    } => self.finish_page(live, *last, *count, *complete, *max_header_count, out),
+                        links,
+                    } => {
+                        if !is_path(*after_hash, links, *last, *count) {
+                            return Err(HeadError::Unexpected);
+                        }
+                        self.finish_page(live, *last, *count, *complete, *max_header_count, out)
+                    }
                     _ => Err(HeadError::Unexpected),
                 }
             }
@@ -986,7 +993,12 @@ impl OwnerModel {
                 else {
                     return Err(HeadError::Unexpected);
                 };
-                if *lease != next.key || target.hash != target_tip_hash {
+                // Storage starts a path at one of the locators it was given,
+                // or refuses with `NoLocatorIntersection`.
+                if *lease != next.key
+                    || target.hash != target_tip_hash
+                    || !locators.contains(&common_ancestor.hash)
+                {
                     return Err(HeadError::Unexpected);
                 }
                 registry.lease(next, None, out);
@@ -1172,4 +1184,23 @@ fn expect_result(result: &ResultIdentity, expected: &ResultIdentity) -> Result<(
     } else {
         Err(HeadError::Unexpected)
     }
+}
+
+/// True if `links`, each read header's hash and its parent's, are `count`
+/// headers each the child of the one before, the first of `after`, and the
+/// last `last`'s, or `after` itself for an empty page.
+fn is_path(
+    after: block::Hash,
+    links: &[(block::Hash, block::Hash)],
+    last: Frontier,
+    count: u32,
+) -> bool {
+    let mut parent = after;
+    for &(header, of) in links {
+        if of != parent {
+            return false;
+        }
+        parent = header;
+    }
+    usize::try_from(count).is_ok_and(|count| count == links.len()) && parent == last.hash
 }

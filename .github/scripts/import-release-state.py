@@ -20,6 +20,10 @@ PROVENANCE = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-v
 SUBTREES = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin")
 EOS_FILE = Path("crates/zakurad/src/components/sync/end_of_support.rs")
 EOS_PATTERN = re.compile(r"(ESTIMATED_RELEASE_HEIGHT: u32 = )([0-9_]+)")
+# Three days of 25-second blocks: the floor `eos_floor` in
+# scripts/release-readiness.py computes past NU7 activation, where every bundle
+# height is. Its self-test keeps the two equal.
+EOS_FLOOR_BLOCKS = 10_368
 SUBTREE_BUNDLE_NAME = "mainnet-treestate-subtrees.bin"
 FRONTIER_GRID_BUNDLE_NAME = "mainnet-frontier-grid.bin"
 # magic, version, network, grid spacing, last checkpoint, entry count.
@@ -355,7 +359,7 @@ def import_bundle(
         if match is None:
             raise BundleImportError(f"cannot find ESTIMATED_RELEASE_HEIGHT in {EOS_FILE}")
         current_eos = int(match.group(2).replace("_", ""))
-        eos_floor = bundle_height + 3456
+        eos_floor = bundle_height + EOS_FLOOR_BLOCKS
         if current_eos < eos_floor:
             formatted = f"{eos_floor:_}"
             eos_path.write_text(
@@ -457,7 +461,7 @@ def _self_test() -> int:
                 json.loads((self.root / PROVENANCE).read_text())["finalized_height"],
                 2,
             )
-            self.assertIn("3_458", (self.root / EOS_FILE).read_text())
+            self.assertIn(f"{2 + EOS_FLOOR_BLOCKS:_}", (self.root / EOS_FILE).read_text())
             self.assertFalse(import_bundle(self.root, self.bundle, self.resolution)["has_changes"])
 
         def test_rewritten_history_is_rejected(self) -> None:

@@ -27,7 +27,9 @@
 //! property, panics a task, or ends at a harness failure is rejected.
 //!
 //! A default pick is the Plan's round-robin pick, and a default draw is the
-//! one an exhausted input gets. Every other pick or draw is non-default.
+//! one an exhausted input gets. A recovery pick or draw, which the recovery
+//! policy makes, counts as default too, since no byte made it. Every other
+//! pick or draw is non-default.
 //! Each accepted candidate has fewer non-default picks and draws than the
 //! one before, so the passes end. Only a pass 4 that reaches a fixed point
 //! shows that each remaining non-default pick is needed.
@@ -35,7 +37,8 @@
 //! The shrinker never changes the original trace. It writes into its output
 //! directory:
 //!
-//! - `original/`: a copy of the original trace;
+//! - `original/`: a copy of the original trace, with its full report if it
+//!   has one;
 //! - `best-plan.json`: the best candidate's choices as a scripted [`Plan`],
 //!   rewritten after each accepted candidate, so an interrupted or killed
 //!   shrink keeps it;
@@ -58,8 +61,8 @@ use serde_json::Value;
 use super::{
     failure::{on_new_thread, replay_on_new_thread},
     meta::{Derivation, DerivationTool},
-    read::refuse_symlinked_dir,
-    ReadError, ReplayError, Trace, BLOBS_DIR, INPUT_FILE, TRACE_FILE,
+    read::{read_bounded, refuse_symlinked_dir},
+    ReadError, ReplayError, Trace, BLOBS_DIR, INPUT_FILE, MAX_REPORT_BYTES, TRACE_FILE,
 };
 pub use crate::plan::Candidate;
 use crate::{
@@ -67,7 +70,7 @@ use crate::{
     plan::{By, SkipScript},
     record::{
         machine::{MachineFailure, MachineScenario, MachineStep},
-        DrawRecord, EndRecord, Record, StepRecord,
+        DrawRecord, EndRecord, Record, StepRecord, FULL_REPORT_FILE,
     },
     witness::{Expect, WitnessError},
     Category, MemorySink, Plan, PlanChoice, PlanInput,
@@ -437,6 +440,20 @@ fn prepare_out(out: &Path, trace: &Trace) -> Result<(), ShrinkError> {
     if trace.meta.input.is_some() {
         fs::copy(trace.dir.join(INPUT_FILE), original.join(INPUT_FILE))?;
     }
+    // The recording's full report, every violation and its stores, goes
+    // with it, so a replay of the original still compares them.
+    // Pass 1's replay already refused a report `read_bounded` refuses, so
+    // only a file changed since can fail here.
+    let report =
+        read_bounded(&trace.dir.join(FULL_REPORT_FILE), MAX_REPORT_BYTES).map_err(|error| {
+            match error {
+                ReadError::Io(error) => ShrinkError::Io(error),
+                other => ShrinkError::Io(io::Error::other(other.to_string())),
+            }
+        })?;
+    if let Some(report) = report {
+        fs::write(original.join(FULL_REPORT_FILE), report)?;
+    }
     // Blobs found in the committed store instead stay there.
     for blob in &trace.meta.fixtures {
         let from = trace.dir.join(BLOBS_DIR).join(&blob.sha256);
@@ -521,7 +538,8 @@ fn non_default(init: &[DrawRecord], steps: &[StepRecord]) -> u64 {
 /// draw with a bound other than 1, except the drain's picks, which take
 /// round-robin without reading the script. A default choice between two
 /// others is a [`PlanChoice::Default`] entry, and defaults after the last
-/// other choice need none.
+/// other choice need none. A recovery choice counts as a default: none is
+/// followed by a bytes choice, since recovery stops reading the script.
 fn script(init: &[DrawRecord], steps: &[StepRecord], drained: u64) -> Plan {
     let mut choices = Vec::new();
     let mut defaults = 0;
@@ -533,7 +551,7 @@ fn script(init: &[DrawRecord], steps: &[StepRecord], drained: u64) -> Plan {
             ));
             choices.push(choice);
         }
-        By::Default => defaults += 1,
+        By::Default | By::Recovery => defaults += 1,
         By::Forced => {}
     };
     let value = |draw: &DrawRecord| PlanChoice::Draw(draw.value);
@@ -853,6 +871,7 @@ impl Shrinker<'_> {
                 PlanInput::Skip(SkipScript::new(init, steps)),
                 &property,
                 Expect::Violated,
+                &[],
                 &mut sink,
             );
             let clean = sink
@@ -995,7 +1014,8 @@ fn rerecord(
             plan: &plan,
             derived_from: Some(&derivation),
         };
-        let recorded = harness::record_witness(harness, what, &out, &property, Expect::Violated);
+        let recorded =
+            harness::record_witness(harness, what, &out, &property, Expect::Violated, &[]);
         let clean = matches!(&recorded, Ok((trace, _))
             if trace.end.as_ref().is_some_and(|end| end.cleanup.leaked == 0));
         (recorded, clean)

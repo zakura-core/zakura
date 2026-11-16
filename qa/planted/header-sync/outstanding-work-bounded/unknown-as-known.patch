@@ -1,0 +1,18 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 3df7185a65..3edc7d6d87 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2374,11 +2374,8 @@ impl HeaderSyncReactor {
+             self.peer_work_queue.remove_unstarted(&peer);
+             return;
+         };
+-        if locator
+-            .entries()
+-            .iter()
+-            .any(|entry| entry.hash == target_tip_hash)
+-        {
++        // Mutation: any locator counts its target as already known.
++        if !locator.entries().is_empty() {
+             // The target is already in the local DAG, so no other peer needs to fetch it.
+             self.state
+                 .completed_targets

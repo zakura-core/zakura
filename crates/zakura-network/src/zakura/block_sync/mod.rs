@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zakura_chain::{
     block,
-    serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
+    serialization::{SerializationError, ZcashSerialize},
 };
 use zakura_rt::{
     collections::{HashMap, HashSet},
@@ -61,7 +61,7 @@ mod service;
 mod source;
 mod state;
 mod status;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests;
 mod trace;
 mod wire;

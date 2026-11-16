@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
-index 8498490dde..b886be9bcf 100644
+index 7c0526fc60..34bf3f6ad2 100644
 --- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
-@@ -587,7 +587,7 @@ impl PeerWorkQueue {
+@@ -719,7 +719,7 @@ impl PeerWorkQueue {
          &mut self,
          peer: &ZakuraPeerId,
      ) -> Option<ActiveHeaderRequest> {
@@ -10,4 +10,4 @@ index 8498490dde..b886be9bcf 100644
 +        // Mutation: the removal skips the capacity release entirely.
          #[cfg(any(test, zakura_sim))]
          self.report_released(peer);
-         self.policy.remove(peer)
+         let removed = self.policy.remove(peer);

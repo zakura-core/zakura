@@ -1,13 +1,13 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-index fda0a9c4a4..fd77545d66 100644
+index dfc9b363cb..8bb6c31765 100644
 --- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-@@ -681,6 +681,18 @@ impl HeaderSyncReactor {
-     }
- 
-     fn handle_port_completion(&mut self, outcome: StorageOutcome) {
-+        // Mutation: a completion that carries retained headers is forgotten,
-+        // so it's never handled and its leases never return.
+@@ -929,6 +929,18 @@ impl HeaderSyncReactor {
+             metrics::counter!("sync.header.port.unknown_settlement").increment(1);
+             return;
+         }
++        // Mutation: a settled completion that carries retained headers is
++        // forgotten, so it's never handled and its leases never return.
 +        if matches!(
 +            &outcome,
 +            StorageOutcome::Completed {
@@ -18,6 +18,6 @@ index fda0a9c4a4..fd77545d66 100644
 +            std::mem::forget(outcome);
 +            return;
 +        }
-         #[cfg(any(test, zakura_sim))]
-         let panicked = matches!(outcome, StorageOutcome::Panicked(_));
-         let call = match &outcome {
+         caused!(
+             self,
+             ReactorCause::Completion { call: call.number },

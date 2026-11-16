@@ -1,0 +1,12 @@
+# The reactor accepts a round's last staged cursor once the round is
+# prepared, before its apply runs, instead of in the apply's Applied
+# result. The acceptance comes outside any apply call's completion. The
+# reactor, the subscriber and the queue decide how the witness's rounds
+# start, stage, prepare and apply, so a change there can move the witness
+# off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-multi-page-sync.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-multi-page-sync.plan"

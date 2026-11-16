@@ -1,0 +1,10 @@
+# The node sends its `Hello` 64 more times at once, past the peer's bucket. The
+# scenario is the honest exchange.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/hello/sender-cadence/repeat-hello.scenario.json"
+plan = "qa/planted/discovery/s4v2/hello/sender-cadence/repeat-hello.plan.bin"

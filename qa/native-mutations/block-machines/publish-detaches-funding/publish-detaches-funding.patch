@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/work_queue/request_write.rs b/crates/zakura-network/src/zakura/block_sync/work_queue/request_write.rs
+index dd23b9eeac..5e6388d09e 100644
+--- a/crates/zakura-network/src/zakura/block_sync/work_queue/request_write.rs
++++ b/crates/zakura-network/src/zakura/block_sync/work_queue/request_write.rs
+@@ -352,7 +352,8 @@ impl UnpublishedRequest {
+                 return None;
+             }
+             let funded_bytes = funding.bytes();
+-            if inner.funding.merge(&mut funding).is_err() {
++            let mut detached = claim.work.budget.empty_reservation();
++            if detached.merge(&mut funding).is_err() {
+                 return None;
+             }
+             let transferred = inner.state.publish_claim(&claim.items);

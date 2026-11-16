@@ -1,0 +1,159 @@
+# Drafts the notes of a published release from its CHANGELOG.md section, in the
+# fixed layout described in .github/release-notes/README.md.
+#
+# It only replaces the placeholder body that create-release.yml publishes, so
+# notes someone has already edited are kept unless a dispatch sets `overwrite`.
+# Dispatch it to redraft a release, or with `dry_run` to only see the draft in
+# the run summary.
+name: Release notes
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Published release tag, for example v1.8.6"
+        required: true
+        type: string
+      overwrite:
+        description: "Also replace notes that are not the Create release placeholder, including edited notes"
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: "Only show the drafted notes in the run summary"
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: release-notes-${{ github.event.release.tag_name || inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    name: Draft release notes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Reads the tag and the release; the OpenAI key never shares a job with write access.
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+    outputs:
+      release_id: ${{ steps.release.outputs.release_id }}
+      body_sha256: ${{ steps.release.outputs.body_sha256 }}
+      placeholder: ${{ steps.release.outputs.placeholder }}
+    steps:
+      - name: Check the release tag
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error title=Release notes::${RELEASE_TAG@Q} is not a release tag."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # The changelog and support-window sources come from the tag itself, so a
+      # dispatch from main drafts exactly what the release shipped.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Read the published release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${REPOSITORY}/releases/tags/${RELEASE_TAG}" > "$RUNNER_TEMP/release.json"
+          jq -j '.body // ""' "$RUNNER_TEMP/release.json" > "$RUNNER_TEMP/release-body.md"
+          placeholder=false
+          if python3 .github/scripts/release_notes.py is-placeholder "$RUNNER_TEMP/release-body.md"; then
+            placeholder=true
+          fi
+          {
+            echo "release_id=$(jq -r '.id' "$RUNNER_TEMP/release.json")"
+            echo "published_at=$(jq -r '.published_at' "$RUNNER_TEMP/release.json")"
+            echo "body_sha256=$(sha256sum "$RUNNER_TEMP/release-body.md" | cut -d ' ' -f 1)"
+            echo "placeholder=${placeholder}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Draft the notes with OpenAI
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          RELEASE_REVIEW_MODELS: ${{ vars.RELEASE_REVIEW_MODELS }}
+          PUBLISHED_AT: ${{ steps.release.outputs.published_at }}
+        run: >-
+          python3 .github/scripts/release_notes.py generate
+          --tag "$RELEASE_TAG"
+          --source-dir release-source
+          --published-at "$PUBLISHED_AT"
+          --output "$RUNNER_TEMP/release-notes/notes.md"
+          --summary "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
+        with:
+          name: release-notes-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-notes/notes.md
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Update the release
+    needs: draft
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Editing a release body needs contents: write. This job runs no repository code.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 #v8.0.2
+        with:
+          name: release-notes-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-notes
+
+      - name: Replace the placeholder notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
+          DRAFTED_BODY_SHA256: ${{ needs.draft.outputs.body_sha256 }}
+          PLACEHOLDER: ${{ needs.draft.outputs.placeholder }}
+          OVERWRITE: ${{ inputs.overwrite && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "$PLACEHOLDER" != "true" ] && [ "$OVERWRITE" != "true" ]; then
+            echo "::notice title=Release notes kept::${RELEASE_TAG} already has notes. The draft is in the run summary; dispatch with overwrite to replace them."
+            echo "Kept the existing ${RELEASE_TAG} notes. The draft is in the **Draft release notes** job summary." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Skip the update if anyone edited the notes while the draft was written.
+          current_sha256="$(
+            gh api "repos/${REPOSITORY}/releases/${RELEASE_ID}" \
+              | jq -j '.body // ""' | sha256sum | cut -d ' ' -f 1
+          )"
+          if [ "$current_sha256" != "$DRAFTED_BODY_SHA256" ]; then
+            echo "::notice title=Release notes kept::${RELEASE_TAG} notes changed while the draft was written; dispatch again to replace them."
+            echo "Kept the ${RELEASE_TAG} notes, which changed while the draft was written." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          html_url="$(
+            jq -n --rawfile body "$RUNNER_TEMP/release-notes/notes.md" '{body: $body}' \
+              | gh api --method PATCH "repos/${REPOSITORY}/releases/${RELEASE_ID}" \
+                  --input - --jq '.html_url'
+          )"
+          echo "Updated the ${RELEASE_TAG} notes: ${html_url}" | tee -a "$GITHUB_STEP_SUMMARY"

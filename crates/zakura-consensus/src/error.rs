@@ -150,11 +150,22 @@ pub enum TransactionError {
     #[error("Groth16 proof is malformed: {0}")]
     MalformedGroth16(String),
 
+    /// This build cannot verify Sprout JoinSplit proofs or signatures, because it was compiled
+    /// without the `sprout` feature.
+    ///
+    /// This is a local capability limit, not a consensus verdict: the transaction may be
+    /// valid. ZIP 218 disallows JoinSplits from NU7 onward, so only pre-NU7 transactions
+    /// above the last checkpoint can reach it.
+    #[error("Sprout JoinSplit verification is not built: rebuild with the `sprout` feature")]
+    SproutVerifierNotBuilt,
+
     #[error(
         "Sprout joinSplitSig MUST represent a valid signature under joinSplitPubKey of dataToBeSigned: {0}"
     )]
+    // The message of an `ed25519_zebra::Error`, which only builds with the `sprout` feature
+    // have.
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
-    Ed25519(#[from] zakura_chain::primitives::ed25519::Error),
+    Ed25519(String),
 
     #[error("Sapling bindingSig MUST represent a valid signature under the transaction binding validating key bvk of SigHash: {0}")]
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
@@ -368,8 +379,9 @@ impl From<BoxError> for TransactionError {
             Err(e) => err = e,
         }
 
-        match err.downcast::<zakura_chain::primitives::ed25519::Error>() {
-            Ok(e) => return TransactionError::Ed25519(*e),
+        #[cfg(feature = "sprout")]
+        match err.downcast::<ed25519_zebra::Error>() {
+            Ok(e) => return TransactionError::Ed25519(e.to_string()),
             Err(e) => err = e,
         }
         match err.downcast::<zakura_chain::primitives::redjubjub::Error>() {
@@ -460,6 +472,11 @@ impl TransactionError {
             Self::SmallOrder => consensus("transaction.small_order"),
             Self::Groth16(_) => consensus("transaction.groth16"),
             Self::MalformedGroth16(_) => consensus("transaction.malformed_groth16"),
+            // Retryable so a build without Sprout stalls on a valid pre-NU7 JoinSplit
+            // block instead of durably recording that block as invalid.
+            Self::SproutVerifierNotBuilt => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
             Self::Ed25519(_) => consensus("transaction.ed25519"),
             Self::RedJubjub(_) => consensus("transaction.redjubjub"),
             Self::RedPallas(_) => consensus("transaction.redpallas"),
@@ -624,12 +641,14 @@ mod tests {
             TransactionError::Script(zakura_script::Error::ScriptInvalid)
         );
 
-        let ed25519_error: BoxError =
-            Box::new(zakura_chain::primitives::ed25519::Error::InvalidSignature);
-        assert_eq!(
-            TransactionError::from(ed25519_error),
-            TransactionError::Ed25519(zakura_chain::primitives::ed25519::Error::InvalidSignature)
-        );
+        #[cfg(feature = "sprout")]
+        {
+            let ed25519_error: BoxError = Box::new(ed25519_zebra::Error::InvalidSignature);
+            assert_eq!(
+                TransactionError::from(ed25519_error),
+                TransactionError::Ed25519(ed25519_zebra::Error::InvalidSignature.to_string())
+            );
+        }
 
         let redjubjub_error: BoxError =
             Box::new(zakura_chain::primitives::redjubjub::Error::InvalidSignature);
@@ -654,7 +673,7 @@ mod tests {
             TransactionError::Script(zakura_script::Error::ScriptInvalid),
             TransactionError::SaplingVerificationFailed,
             TransactionError::Halo2VerificationFailed,
-            TransactionError::Ed25519(zakura_chain::primitives::ed25519::Error::InvalidSignature),
+            TransactionError::Ed25519("invalid signature".to_owned()),
             TransactionError::RedJubjub(
                 zakura_chain::primitives::redjubjub::Error::InvalidSignature,
             ),

@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/regulation/serve/capacity.rs b/crates/zakura-network/src/zakura/regulation/serve/capacity.rs
+index 03630e6e15..730e7b0c3f 100644
+--- a/crates/zakura-network/src/zakura/regulation/serve/capacity.rs
++++ b/crates/zakura-network/src/zakura/regulation/serve/capacity.rs
+@@ -308,7 +308,8 @@ impl ServeCapacity {
+         #[cfg(any(test, zakura_sim))]
+         let (mut removed, mut removed_live) = (Vec::new(), Vec::new());
+         peers.retain(|peer, budgets| {
+-            let keep = budgets.execution.is_alive();
++            // Mutation: a lookup keeps expired peers' budgets.
++            let keep = budgets.execution.is_alive() || true;
+             // Each removal, with its liveness at its own decision, since
+             // the other entries' checks are scheduling points.
+             #[cfg(any(test, zakura_sim))]

@@ -1,0 +1,13 @@
+# The queue and both reactor guards admit one slot past the 16-slot bound.
+# The fixture's 17 mirrors each advertise 235 headers per response, so 17
+# rounds' reservations fit the 4,000-header chunk budget and the slot cap
+# is the only guard that holds the 17th offer back. With it gone the queue
+# holds 17 slots. The reactor, the queue and the subscriber decide how
+# rounds are offered and reserved, so a change there can move the witness
+# off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-slot-limit.json"
+plan = "crates/zakura-sim/tests/fixtures/header-outstanding-slot-limit.plan"

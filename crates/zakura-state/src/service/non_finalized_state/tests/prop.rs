@@ -238,7 +238,7 @@ fn forked_equals_pushed_genesis() -> Result<()> {
         // This check is redundant, but it's useful for debugging.
         prop_assert_eq!(forked.blocks.len(), partial_chain.blocks.len());
 
-        for (height, forked_block) in &forked.blocks {
+        for (height, forked_block) in forked.blocks.iter() {
             let original_block = full_chain
                 .blocks
                 .get(height)
@@ -682,8 +682,8 @@ fn different_blocks_different_chains() -> Result<()> {
                 chain1.tx_loc_by_hash.clone_from(&chain2.tx_loc_by_hash);
 
                 // transparent UTXOs
-                chain1.created_utxos.clone_from(&chain2.created_utxos);
                 chain1.spent_utxos.clone_from(&chain2.spent_utxos);
+                chain1.transparent_transfers_by_height = chain2.transparent_transfers_by_height.clone();
 
                 // note commitment trees
                 chain1.sprout_trees_by_anchor.clone_from(&chain2.sprout_trees_by_anchor);

@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-competing-mirrors.bin`: the harness that runs it, the
+# generator version it was built for, and its SHA-256. Its 344-byte
+# prefix is the scenario's canonical encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "0598f5633b923ec80fb820dcc762eafd2e6d2d6424f248af38ca1a822d402504"
+scenario_sha256 = "5d7f02f157a3f5cdd4a968e7ed6539a2c5596e4811a5504772fe54b4e8bf638d"
+source = "crates/zakura-sim/tests/header_storage_seeds.rs"

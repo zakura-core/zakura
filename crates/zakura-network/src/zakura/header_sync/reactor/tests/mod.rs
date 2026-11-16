@@ -207,6 +207,7 @@ fn startup(shutdown: CancellationToken) -> HeaderSyncStartup {
         Some(anchor),
         ZakuraHeaderSyncConfig::default(),
         LOCAL_MAX_MESSAGE_BYTES,
+        crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
     );
     startup.shutdown = shutdown;
     startup

@@ -1,0 +1,14 @@
+# Drops the session's live queries and their reservations when the initial
+# wait times out. The input's Plan delivers the held Peers after that, so
+# the reader's precheck refuses it as unsolicited and the node closes the
+# connection with a fault cause.
+input = "crates/zakura-sim/tests/fixtures/discovery-wire-late-response.bin"
+# Besides peer.rs and requester.rs, which the patch changes, the rest of
+# discovery and the Zakura transport under it decide when the Peers arrives
+# and when the reader reads it. A change there can move the input off the
+# late window.
+checks = ["crates/zakura-network/src/zakura"]
+# The late Peers is conformant, so its fault close also breaks
+# `conformant-never-closes`. The runner expects that co-violation on the
+# committed input and on campaign inputs.
+also_violates = ["discovery/s4v2/conformant-never-closes"]

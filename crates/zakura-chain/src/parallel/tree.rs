@@ -56,16 +56,40 @@ pub enum NoteCommitmentTreeError {
     Ironwood(ironwood::tree::NoteCommitmentTreeError),
 }
 
+/// Whether a tree update also appends the block's Sprout note commitments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SproutTreeUpdate {
+    Update,
+    Skip,
+}
+
 impl NoteCommitmentTrees {
     /// Updates the note commitment trees using the transactions in `block`,
     /// then re-calculates the cached tree roots, using parallel `rayon` threads.
     ///
     /// If any of the tree updates cause an error,
     /// it will be returned at the end of the parallel batches.
-    #[allow(clippy::unwrap_in_result)]
     pub fn update_trees_parallel(
         &mut self,
         block: &crate::block::BlockRef,
+    ) -> Result<(), NoteCommitmentTreeError> {
+        self.update_trees(block, SproutTreeUpdate::Update)
+    }
+
+    /// Like [`update_trees_parallel`](Self::update_trees_parallel), but leaves the Sprout
+    /// tree unchanged, for a caller that does not maintain it.
+    pub fn update_trees_parallel_without_sprout(
+        &mut self,
+        block: &crate::block::BlockRef,
+    ) -> Result<(), NoteCommitmentTreeError> {
+        self.update_trees(block, SproutTreeUpdate::Skip)
+    }
+
+    #[allow(clippy::unwrap_in_result)]
+    fn update_trees(
+        &mut self,
+        block: &crate::block::BlockRef,
+        sprout: SproutTreeUpdate,
     ) -> Result<(), NoteCommitmentTreeError> {
         let height = block
             .coinbase_height()
@@ -117,7 +141,9 @@ impl NoteCommitmentTrees {
             }
         });
 
-        self.update_sprout_tree(block)?;
+        if sprout == SproutTreeUpdate::Update {
+            self.update_sprout_tree(block)?;
+        }
 
         if let Some(sapling_result) = sapling_result {
             let (sapling, subtree_root) = sapling_result?;
@@ -292,6 +318,41 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn update_without_sprout_leaves_only_the_sprout_tree_unchanged() {
+        let first_joinsplit: Block = zakura_test::vectors::BLOCK_MAINNET_396_BYTES
+            .zcash_deserialize_into()
+            .expect("Mainnet block 396 deserializes");
+        let block = Arc::new(first_joinsplit);
+
+        let mut with_sprout = NoteCommitmentTrees::default();
+        with_sprout
+            .update_trees_parallel(&block)
+            .expect("the full update succeeds");
+        let mut without_sprout = NoteCommitmentTrees::default();
+        without_sprout
+            .update_trees_parallel_without_sprout(&block)
+            .expect("the update without Sprout succeeds");
+
+        assert_eq!(
+            without_sprout.sprout,
+            NoteCommitmentTrees::default().sprout,
+            "the Sprout tree is unchanged"
+        );
+        assert_ne!(
+            with_sprout.sprout, without_sprout.sprout,
+            "the block grows the Sprout tree"
+        );
+        assert_eq!(
+            NoteCommitmentTrees {
+                sprout: with_sprout.sprout.clone(),
+                ..without_sprout
+            },
+            with_sprout,
+            "every other tree matches the full update"
+        );
+    }
 
     #[test]
     fn selective_sprout_update_skips_empty_blocks_and_matches_legacy_update() {

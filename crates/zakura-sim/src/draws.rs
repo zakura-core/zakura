@@ -4,7 +4,7 @@
 //! to pick, and releases it before any task code runs, so a task can draw
 //! while [`Scheduler::run`](zakura_scheduler::Scheduler::run) is active.
 
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, panic::Location, rc::Rc};
 
 use zakura_scheduler::{Draw, DrawKind, Scheduler, TaskId};
 
@@ -40,6 +40,9 @@ pub(crate) struct Choices {
     draws: Vec<DrawRecord>,
     /// How many draws each owner has taken of each kind.
     ordinals: BTreeMap<(String, &'static str), u32>,
+    /// How many draws each owner has taken of each kind at each call site
+    /// since recovery started. Empty before it.
+    sites: BTreeMap<(String, &'static str, &'static Location<'static>), u32>,
 }
 
 impl Choices {
@@ -50,6 +53,7 @@ impl Choices {
             owner: Owner::Setup,
             draws: Vec::new(),
             ordinals: BTreeMap::new(),
+            sites: BTreeMap::new(),
         }
     }
 
@@ -98,9 +102,22 @@ impl Choices {
         *n = n.saturating_add(1);
         let ordinal = *n;
         let identity = format!("{owner}:{kind}#{ordinal}");
+        // Once recovering, the default rotates per call site, so a task that
+        // alternates two `select!` sites can't give each the same start
+        // every time. The recorded identity keeps the per-kind ordinal.
+        let rotation = if self.decider.recovering() {
+            let n = self
+                .sites
+                .entry((owner.clone(), kind, draw.site))
+                .or_insert(0);
+            *n = n.saturating_add(1);
+            *n
+        } else {
+            ordinal
+        };
         let answer = self
             .decider
-            .draw(&identity, draw.bound, ordinal)
+            .draw(&identity, draw.bound, rotation)
             .map_err(HarnessFailure::Plan)?;
         self.draws.push(DrawRecord {
             draw: identity,

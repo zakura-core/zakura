@@ -344,7 +344,7 @@ impl Requester {
 
 #[cfg(test)]
 mod tests {
-    use tokio_util::sync::CancellationToken;
+    use zakura_rt::sync::CancellationToken;
 
     use super::*;
     use crate::zakura::{

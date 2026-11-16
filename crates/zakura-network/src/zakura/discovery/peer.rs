@@ -25,13 +25,13 @@ use std::{sync::Arc, time::Duration};
 use zakura_quic::NodeId;
 use zakura_rt::sync::{CancellationToken, Mutex, MutexGuard, Notify, PoisonError};
 
+#[cfg(any(test, zakura_sim))]
+pub use state::DISCOVERY_INITIAL_EXCHANGE_TIMEOUT;
 use state::{
     Close, CloseReason, InitialWait, Ownership, PeerInput, PeerOutput, PeerState, SessionCharge,
 };
 #[cfg(test)]
-pub(super) use state::{
-    ExchangeProgress, DISCOVERY_ANSWER_WRITE_DEADLINE, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
-};
+pub(super) use state::{ExchangeProgress, DISCOVERY_ANSWER_WRITE_DEADLINE};
 
 use super::{
     protocol::{

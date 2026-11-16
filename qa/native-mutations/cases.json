@@ -154,5 +154,547 @@
     "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_transactions_keep_shared_admission_through_clones_and_database_drop",
     "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
     "required_failure": "A returned copy carries no standalone charge."
+  },
+  {
+    "patch": "bounds/budget-ignores-charges/budget-ignores-charges.patch",
+    "entry": "bounds",
+    "property": "block-sync/reserved-byte-bound",
+    "witness": {
+      "test": "paused_handoffs_pass_m_plus_2b_within_the_handoff_allowance",
+      "test_target": "block_resource_properties"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "bounds/wide-floor-lane/wide-floor-lane.patch",
+    "entry": "bounds",
+    "property": "block-sync/reserved-byte-bound",
+    "witness": {
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-floor-lane-race.bin"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "bounds/lookahead-gate-off/lookahead-gate-off.patch",
+    "entry": "bounds",
+    "property": "block-sync/retained-byte-bound",
+    "witness": {
+      "planted": "qa/planted/block-sync/retained-byte-bound/wide-commit-window.toml"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "bounds/lookahead-gate-off/lookahead-gate-off.patch",
+    "entry": "bounds",
+    "property": "block-sync/lookahead-overshoot-bound",
+    "witness": {
+      "planted": "qa/planted/block-sync/lookahead-overshoot-bound/omit-outstanding-estimates.toml"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "bounds/handover-double-release/handover-double-release.patch",
+    "entry": "bounds",
+    "property": "block-sync/input-decoded-bound",
+    "witness": {
+      "planted": "qa/planted/block-sync/input-decoded-bound/no-room-check.toml"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "teardown/admitted-keeps-setup-slot/admitted-keeps-setup-slot.patch",
+    "entry": "teardown",
+    "property": "block-sync/teardown-returns-baseline",
+    "witness": {
+      "planted": "qa/planted/block-sync/teardown-returns-baseline/kept-session-sender.toml"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "teardown/drop-keeps-direction-slot/drop-keeps-direction-slot.patch",
+    "entry": "teardown",
+    "property": "block-sync/teardown-returns-baseline",
+    "witness": {
+      "planted": "qa/planted/block-sync/teardown-returns-baseline/kept-session-sender.toml"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "budget-ledgers-agree/receipt-keeps-pooled-charge/receipt-keeps-pooled-charge.patch",
+    "entry": "budget-ledgers-agree",
+    "property": "block-sync/budget-ledgers-agree",
+    "witness": {
+      "test": "the_handoff_input_holds_budget_ledgers_agree",
+      "test_target": "block_resource_properties"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "budget-ledgers-agree/return-keeps-funding/return-keeps-funding.patch",
+    "entry": "budget-ledgers-agree",
+    "property": "block-sync/budget-ledgers-agree",
+    "witness": {
+      "planted": "qa/planted/block-sync/teardown-returns-baseline/skip-return-on-drop.toml"
+    },
+    "fault_class": "resource-lifetime",
+    "also_violates": [
+      "block-sync/teardown-returns-baseline"
+    ]
+  },
+  {
+    "patch": "payload-inventory-agrees/keep-raw-ignored/keep-raw-ignored.patch",
+    "entry": "payload-inventory-agrees",
+    "property": "block-sync/payload-inventory-agrees",
+    "witness": {
+      "planted": "qa/planted/block-sync/submit-only-requested/height-only.toml"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "payload-inventory-agrees/stale-policy-decoded-size/stale-policy-decoded-size.patch",
+    "entry": "payload-inventory-agrees",
+    "property": "block-sync/payload-inventory-agrees",
+    "witness": {
+      "planted": "qa/planted/block-sync/submit-only-requested/height-only.toml"
+    },
+    "fault_class": "stale-result"
+  },
+  {
+    "patch": "stale-completion/mismatch-finishes-current/mismatch-finishes-current.patch",
+    "entry": "stale-completion",
+    "property": "block-sync/stale-completion-inert",
+    "witness": {
+      "planted": "qa/planted/block-sync/stale-completion-inert/release-by-height.toml"
+    },
+    "fault_class": "ownership"
+  },
+  {
+    "patch": "stale-completion/mismatch-resubmits-current/mismatch-resubmits-current.patch",
+    "entry": "stale-completion",
+    "property": "block-sync/stale-completion-inert",
+    "witness": {
+      "planted": "qa/planted/block-sync/stale-completion-inert/release-by-height.toml"
+    },
+    "fault_class": "ownership"
+  },
+  {
+    "patch": "wakes/detached-finish-keeps-slot/detached-finish-keeps-slot.patch",
+    "entry": "wakes",
+    "property": "block-sync/capacity-release-wakes",
+    "witness": {
+      "planted": "qa/planted/block-sync/capacity-release-wakes/stale-completion-no-wake.toml"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "wakes/judged-owner-epoch/judged-owner-epoch.patch",
+    "entry": "wakes",
+    "property": "block-sync/capacity-release-wakes",
+    "witness": {
+      "planted": "qa/planted/block-sync/capacity-release-wakes/stale-completion-no-wake.toml"
+    },
+    "fault_class": "stale-result"
+  },
+  {
+    "patch": "wakes/detached-release-unreported/detached-release-unreported.patch",
+    "entry": "wakes",
+    "property": "block-sync/capacity-release-wakes",
+    "witness": {
+      "planted": "qa/planted/block-sync/capacity-release-wakes/stale-completion-no-wake.toml"
+    },
+    "fault_class": "wakeup"
+  },
+  {
+    "patch": "submit-only-requested/stale-body-credits-current-owner/stale-body-credits-current-owner.patch",
+    "entry": "block-sync-table",
+    "property": "block-sync/s6v3/block/receiver-work-authorized",
+    "witness": {
+      "test": "the_stale_request_body_input_holds_receiver_work_authorized",
+      "test_target": "block_table"
+    },
+    "fault_class": "ownership"
+  },
+  {
+    "patch": "submit-only-requested/competing-receipt-any-hash/competing-receipt-any-hash.patch",
+    "entry": "block-sync-table",
+    "property": "block-sync/s6v3/block/receiver-work-authorized",
+    "witness": {
+      "test": "old_chain_bodies_after_a_reset_hold_receiver_work_authorized",
+      "test_target": "block_table"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "detached-submission-bounded/mismatched-completion-inert/mismatched-completion-inert.patch",
+    "entry": "detached-submission-bounded",
+    "property": "block-sync/detached-submission-bounded",
+    "witness": {
+      "planted": "qa/planted/block-sync/detached-submission-bounded/keep-detached-after-verdict.toml"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "detached-submission-bounded/reactor-drops-stale-verdict/reactor-drops-stale-verdict.patch",
+    "entry": "detached-submission-bounded",
+    "property": "block-sync/detached-submission-bounded",
+    "witness": {
+      "planted": "qa/planted/block-sync/detached-submission-bounded/keep-detached-after-verdict.toml"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "detached-submission-bounded/reset-rolls-back-submissions/reset-rolls-back-submissions.patch",
+    "entry": "detached-submission-bounded",
+    "property": "block-sync/detached-submission-bounded",
+    "witness": {
+      "planted": "qa/planted/block-sync/detached-submission-bounded/forget-on-reset.toml"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "block-machines/stale-owner-returns-replacement/stale-owner-returns-replacement.patch",
+    "entry": "block-machines",
+    "property": "block/work-ownership",
+    "witness": {
+      "planted": "qa/planted/block/work-ownership/missing-published-charge.toml"
+    },
+    "fault_class": "ownership"
+  },
+  {
+    "patch": "block-machines/reset-skips-revocation/reset-skips-revocation.patch",
+    "entry": "block-machines",
+    "property": "block/work-ownership",
+    "witness": {
+      "planted": "qa/planted/block/work-ownership/missing-published-charge.toml"
+    },
+    "fault_class": "wakeup"
+  },
+  {
+    "patch": "block-machines/received-height-returns-to-pending/received-height-returns-to-pending.patch",
+    "entry": "block-machines",
+    "property": "block/work-ownership",
+    "witness": {
+      "planted": "qa/planted/block/work-ownership/missing-published-charge.toml"
+    },
+    "fault_class": "stale-result"
+  },
+  {
+    "patch": "block-machines/failure-skips-retry-gate/failure-skips-retry-gate.patch",
+    "entry": "block-machines",
+    "property": "block/reactor-policy",
+    "witness": {
+      "planted": "qa/planted/block/reactor-policy/refusal-consumes-query-id.toml"
+    },
+    "fault_class": "queue-refusal"
+  },
+  {
+    "patch": "block-machines/reset-keeps-pending-query/reset-keeps-pending-query.patch",
+    "entry": "block-machines",
+    "property": "block/reactor-policy",
+    "witness": {
+      "planted": "qa/planted/block/reactor-policy/refusal-consumes-query-id.toml"
+    },
+    "fault_class": "stale-result"
+  },
+  {
+    "patch": "block-machines/authority-change-keeps-pending-query/authority-change-keeps-pending-query.patch",
+    "entry": "block-machines",
+    "property": "block/reactor-policy",
+    "witness": {
+      "planted": "qa/planted/block/reactor-policy/refusal-consumes-query-id.toml"
+    },
+    "fault_class": "stale-result"
+  },
+  {
+    "patch": "block-machines/reset-keeps-released-funding/reset-keeps-released-funding.patch",
+    "entry": "block-machines",
+    "property": "block/work-funding",
+    "witness": {
+      "planted": "qa/planted/block/work-funding/lost-reservation-release.toml"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "block-machines/receipt-funding-stays-pooled/receipt-funding-stays-pooled.patch",
+    "entry": "block-machines",
+    "property": "block/work-funding",
+    "witness": {
+      "planted": "qa/planted/block/work-funding/lost-reservation-release.toml"
+    },
+    "fault_class": "ownership"
+  },
+  {
+    "patch": "block-machines/publish-detaches-funding/publish-detaches-funding.patch",
+    "entry": "block-machines",
+    "property": "block/work-funding",
+    "witness": {
+      "planted": "qa/planted/block/work-funding/lost-reservation-release.toml"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "block-machines/pipeline-limit-checks-prior-use/pipeline-limit-checks-prior-use.patch",
+    "entry": "block-machines",
+    "property": "block/decoded-retention",
+    "witness": {
+      "planted": "qa/planted/block/decoded-retention/missing-admission.toml"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "block-machines/closed-pool-admits/closed-pool-admits.patch",
+    "entry": "block-machines",
+    "property": "block/decoded-retention",
+    "witness": {
+      "planted": "qa/planted/block/decoded-retention/missing-admission.toml"
+    },
+    "fault_class": "queue-refusal"
+  },
+  {
+    "patch": "block-machines/close-erases-charges/close-erases-charges.patch",
+    "entry": "block-machines",
+    "property": "block/decoded-retention",
+    "witness": {
+      "planted": "qa/planted/block/decoded-retention/missing-admission.toml"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "discovery-machines/eviction-keeps-relay-attribution/eviction-keeps-relay-attribution.patch",
+    "entry": "discovery-machines",
+    "property": "discovery/record-book",
+    "witness": {
+      "planted": "qa/planted/discovery/record-book/skip-book-eviction.toml"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "discovery-machines/eviction-ignores-expiry/eviction-ignores-expiry.patch",
+    "entry": "discovery-machines",
+    "property": "discovery/record-book",
+    "witness": {
+      "planted": "qa/planted/discovery/record-book/skip-book-eviction.toml"
+    },
+    "fault_class": "resource-lifetime"
+  },
+  {
+    "patch": "discovery-machines/expired-record-keeps-ordering/expired-record-keeps-ordering.patch",
+    "entry": "discovery-machines",
+    "property": "discovery/record-book",
+    "witness": {
+      "planted": "qa/planted/discovery/record-book/skip-book-eviction.toml"
+    },
+    "fault_class": "stale-result"
+  },
+  {
+    "patch": "discovery-machines/replayed-record-keeps-confirmation/replayed-record-keeps-confirmation.patch",
+    "entry": "discovery-machines",
+    "property": "discovery/record-book",
+    "witness": {
+      "planted": "qa/planted/discovery/record-book/skip-book-eviction.toml"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "discovery-machines/replacement-keeps-old-session/replacement-keeps-old-session.patch",
+    "entry": "discovery-machines",
+    "property": "discovery/session-installation",
+    "witness": {
+      "planted": "qa/planted/discovery/session-installation/install-superseded-result.toml"
+    },
+    "fault_class": "stale-result"
+  },
+  {
+    "patch": "discovery-machines/record-hint-keeps-expired-summaries/record-hint-keeps-expired-summaries.patch",
+    "entry": "discovery-machines",
+    "property": "discovery/session-installation",
+    "witness": {
+      "planted": "qa/planted/discovery/session-installation/install-superseded-result.toml"
+    },
+    "fault_class": "stale-result"
+  },
+  {
+    "patch": "verification-capacity/full-slots-verify-unreserved/full-slots-verify-unreserved.patch",
+    "entry": "verification-capacity",
+    "property": "discovery/verification-capacity",
+    "witness": {
+      "planted": "qa/planted/discovery/verification-capacity/release-before-install.toml"
+    },
+    "fault_class": "queue-refusal"
+  },
+  {
+    "patch": "verification-capacity/reserve-grows-when-full/reserve-grows-when-full.patch",
+    "entry": "verification-capacity",
+    "property": "discovery/verification-capacity",
+    "witness": {
+      "planted": "qa/planted/discovery/verification-capacity/release-before-install.toml"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "wakes/notify-before-answer-record/notify-before-answer-record.patch",
+    "entry": "wakes",
+    "property": "discovery/wait-complete-wakes",
+    "witness": {
+      "test": "discovery_wait_complete_check_inside_final_mark",
+      "test_target": "witness"
+    },
+    "fault_class": "wakeup"
+  },
+  {
+    "patch": "shared-wire-path/protocol-reject-keeps-connection/protocol-reject-keeps-connection.patch",
+    "entry": "shared-wire-path",
+    "table": "block-sync/s6v3",
+    "property": "block-sync/s6v3/status/bad-content-closes",
+    "witness": {
+      "test": "each_probe_fault_reaches_its_exact_id",
+      "test_target": "block_table"
+    },
+    "fault_class": "fault-isolation"
+  },
+  {
+    "patch": "shared-wire-path/protocol-reject-keeps-connection/protocol-reject-keeps-connection.patch",
+    "entry": "shared-wire-path",
+    "table": "discovery/s4v2",
+    "property": "discovery/s4v2/hello/bad-content-closes",
+    "witness": {
+      "test": "hello_acts_apply_in_their_witnesses",
+      "test_target": "discovery_wire_witness"
+    },
+    "fault_class": "fault-isolation"
+  },
+  {
+    "patch": "shared-wire-path/reserved-flags-ignored/reserved-flags-ignored.patch",
+    "entry": "shared-wire-path",
+    "table": "block-sync/s6v3",
+    "property": "block-sync/s6v3/status/reserved-flags-closes",
+    "witness": {
+      "test": "each_probe_fault_reaches_its_exact_id",
+      "test_target": "block_table"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "shared-wire-path/reserved-flags-ignored/reserved-flags-ignored.patch",
+    "entry": "shared-wire-path",
+    "table": "discovery/s4v2",
+    "property": "discovery/s4v2/hello/reserved-flags-closes",
+    "witness": {
+      "test": "hello_acts_apply_in_their_witnesses",
+      "test_target": "discovery_wire_witness"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "shared-wire-path/cadence-exhaustion-throttles/cadence-exhaustion-throttles.patch",
+    "entry": "shared-wire-path",
+    "table": "discovery/s4v2",
+    "property": "discovery/s4v2/hello/cadence-never-closes",
+    "witness": {
+      "test": "hello_acts_apply_in_their_witnesses",
+      "test_target": "discovery_wire_witness"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch",
+    "entry": "shared-wire-path",
+    "table": "discovery/s4v2",
+    "property": "discovery/s4v2/undeclared-type-closes",
+    "witness": {
+      "test": "hello_acts_apply_in_their_witnesses",
+      "test_target": "discovery_wire_witness"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "block-sync-table/owe-largest-response/owe-largest-response.patch",
+    "entry": "block-sync-table",
+    "property": "block-sync/s6v3/block/receiver-work-authorized",
+    "witness": {
+      "test": "faults_inside_the_nodes_exchange_reach_their_exact_ids",
+      "test_target": "block_table"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "block-sync-table/accept-any-ending/accept-any-ending.patch",
+    "entry": "block-sync-table",
+    "property": "block-sync/s6v3/blocks-done/bad-content-closes",
+    "witness": {
+      "test": "faults_inside_the_nodes_exchange_reach_their_exact_ids",
+      "test_target": "block_table"
+    },
+    "fault_class": "stale-result"
+  },
+  {
+    "patch": "block-sync-table/admit-overlapping-range/admit-overlapping-range.patch",
+    "entry": "block-sync-table",
+    "property": "block-sync/s6v3/get-blocks/receiver-serving-bounded",
+    "witness": {
+      "test": "each_probe_fault_reaches_its_exact_id",
+      "test_target": "block_table"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "block-sync-table/enforce-double-limit/enforce-double-limit.patch",
+    "entry": "block-sync-table",
+    "property": "block-sync/s6v3/get-blocks/receiver-serving-bounded",
+    "witness": {
+      "test": "requests_past_twice_the_serving_limit_reach_over_margin",
+      "test_target": "block_table"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "block-sync-table/ignore-peer-inflight-limit/ignore-peer-inflight-limit.patch",
+    "entry": "block-sync-table",
+    "property": "block-sync/s6v3/get-blocks/sender-within-limit",
+    "witness": {
+      "test": "faults_inside_the_nodes_exchange_reach_their_exact_ids",
+      "test_target": "block_table"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "discovery-table/admit-zero-peer-limit/admit-zero-peer-limit.patch",
+    "entry": "discovery-table",
+    "property": "discovery/s4v2/get-peers/bad-content-closes",
+    "witness": {
+      "test": "get_peers_acts_apply_in_their_witnesses",
+      "test_target": "discovery_wire_witness"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "discovery-table/admit-repeated-wanted-service/admit-repeated-wanted-service.patch",
+    "entry": "discovery-table",
+    "property": "discovery/s4v2/get-services/bad-content-closes",
+    "witness": {
+      "test": "get_services_acts_apply_in_their_witnesses",
+      "test_target": "discovery_wire_witness"
+    },
+    "fault_class": "boundary-accounting"
+  },
+  {
+    "patch": "discovery-table/wants-every-service/wants-every-service.patch",
+    "entry": "discovery-table",
+    "property": "discovery/s4v2/services/sender-within-owed",
+    "witness": {
+      "test": "answers_within_their_requests_hold_sender_within_owed",
+      "test_target": "discovery_wire_witness"
+    },
+    "fault_class": "request-authorization"
+  },
+  {
+    "patch": "discovery-table/wants-unnamed-services/wants-unnamed-services.patch",
+    "entry": "discovery-table",
+    "property": "discovery/s4v2/services/sender-within-owed",
+    "witness": {
+      "test": "answers_within_their_requests_hold_sender_within_owed",
+      "test_target": "discovery_wire_witness"
+    },
+    "fault_class": "request-authorization"
   }
 ]

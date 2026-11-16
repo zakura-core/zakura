@@ -321,6 +321,9 @@ fn in_flight_tally_underflow_latches_a_fault() {
     );
 }
 
+// `publish_fixture` lives in the request-write tests, which don't build
+// under `zakura_sim`.
+#[cfg(not(zakura_sim))]
 #[test]
 fn ledger_fault_closes_admission_under_the_lock_and_stays_closed() {
     let budget = crate::zakura::transport::ByteBudget::new(1_000);

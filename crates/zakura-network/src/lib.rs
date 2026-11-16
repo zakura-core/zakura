@@ -130,6 +130,12 @@
 // Long Tower service and future types are routine in this crate, and factoring
 // them into type aliases would not make the code clearer.
 #![allow(clippy::type_complexity)]
+// Most unit tests and the testkit's test stack name tokio's types, so they
+// don't build under `zakura_sim`. The helpers they share go unused there.
+#![cfg_attr(
+    all(zakura_sim, any(test, feature = "zakura-testkit")),
+    allow(dead_code, unused_imports)
+)]
 
 #[macro_use]
 extern crate pin_project;
@@ -178,9 +184,9 @@ pub use crate::{
 };
 
 pub use crate::{
-    address_book::{AddressBook, BannedIps},
+    address_book::{AddressBook, BannedIps, MisbehaviorReporter},
     address_book_peers::AddressBookPeers,
-    config::{CacheDir, Config, P2pStack, UnconditionalPeers},
+    config::{CacheDir, Config, P2pStack, UnconditionalPeerName, UnconditionalPeers},
     meta_addr::{PeerAddrState, PeerSocketAddr},
     peer::{
         Client, ConnectedAddr, ConnectionInfo, HandshakeError, NotFoundClass, PeerError,

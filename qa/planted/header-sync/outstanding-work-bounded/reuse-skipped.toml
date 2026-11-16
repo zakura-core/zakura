@@ -1,0 +1,12 @@
+# A serving lookup builds fresh budgets for its peer even when the old ones
+# are still alive, so a relinked session serves apart from its earlier
+# work's budgets while the pruning stays honest. A peer in the churn
+# witness relinks while its earlier work still holds them. The service and
+# the publishers decide when the witness's lookups run, so a change there
+# can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation/serve"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.json"
+plan = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.plan"

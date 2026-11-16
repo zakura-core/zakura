@@ -19,6 +19,12 @@ use zakura_chain::{
     serialization::Duration32,
 };
 
+/// The largest padding a `ping` can carry: the protocol message limit minus the 8-byte nonce.
+/// Peers disconnect on a larger message.
+// The message limit is 2 MiB, so the cast to u32 is lossless.
+pub const MAX_PING_PADDING: u32 =
+    (zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN - 8) as u32;
+
 /// A multiplier used to calculate the inbound connection limit for the peer set,
 ///
 /// When it starts up, Zebra opens [`crate::Config::peerset_initial_target_size`]
@@ -84,20 +90,25 @@ pub const OUTBOUND_PEER_LIMIT_DIVISOR: usize = 2;
 pub const DEFAULT_MAX_CONNS_PER_IP: usize = 1;
 
 /// The default initial peer count for a full-sized or unknown-sized block.
-pub const DEFAULT_ADVERT_WINDOW_MIN: usize = 32;
+pub const DEFAULT_ADVERT_WINDOW_FULL_BLOCK: usize = 32;
 
 /// The default initial peer count for a small block.
-pub const DEFAULT_ADVERT_WINDOW_MAX: usize = 64;
+pub const DEFAULT_ADVERT_WINDOW_SMALL_BLOCK: usize = 64;
 
-/// The default block size that gets the maximum advert window, 100 KiB.
+/// The default block size at and below which a block gets the small-block advert window, 100 KiB.
 ///
 /// This will be used as `Config.advert_window_small_size_bytes` if it is not configured.
 pub const DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES: u64 = 102_400;
 
-/// The default block size that gets the minimum advert window, 1.5 MiB.
+/// The default block size at and above which a block gets the full-block advert window, 1.5 MiB.
 ///
 /// This will be used as `Config.advert_window_full_size_bytes` if it is not configured.
 pub const DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES: u64 = 1_572_864;
+
+/// The default delay before announcing a block to peers outside the initial group.
+///
+/// This will be used as `Config.advert_delay` if it is not configured.
+pub const DEFAULT_ADVERT_DELAY: Duration = Duration::from_millis(500);
 
 /// The default peerset target size.
 ///
@@ -168,6 +179,19 @@ pub const CONCURRENT_ADDRESS_CHANGE_PERIOD: Duration = Duration::from_secs(5);
 /// connector actually setting up channels and these heartbeats in a
 /// specific manner that matches up with this math.
 pub const MIN_PEER_RECONNECTION_DELAY: Duration = Duration::from_secs(59 + 20 + 20 + 20);
+
+/// How long an outbound connection must have responded for its peer to be dialed before
+/// other candidates after the connection ends, see `MetaAddr::is_redialed_first`.
+pub const MIN_REDIAL_CONNECTION: Duration = Duration::from_secs(10 * 60);
+
+/// How long after its last response a peer with a long-lived outbound connection is
+/// dialed before other candidates.
+///
+/// A node that restarts within this time is dialed again by the peers that were
+/// connected to it. Each redial still waits [`MIN_PEER_RECONNECTION_DELAY`] after the
+/// last one, so the peer is dialed about 2, 4 and 6 minutes after its connection ends.
+/// The last of these dials finds the window over and ends it.
+pub const REDIAL_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// Zebra rotates its peer inventory registry every time this interval elapses.
 ///
@@ -247,6 +271,42 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(59);
 /// It also enforces a minimum per-peer reconnection interval, and filters failed outbound peers.
 pub const MIN_OUTBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The maximum number of concurrent legacy connection attempts to initial peers at startup.
+///
+/// Each completed attempt immediately admits the next initial peer, so startup is not paced by
+/// [`MIN_OUTBOUND_PEER_CONNECTION_INTERVAL`]. `peerset_initial_target_size` still bounds the total
+/// number of startup attempts.
+pub const INITIAL_PEER_DIAL_CONCURRENCY: usize = 50;
+
+/// How often Zakura checks whether each dialed unconditional peer is still connected.
+///
+/// A peer that is no longer connected is dialed again within this interval, unless it
+/// is waiting out a redial delay.
+pub const UNCONDITIONAL_PEER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The shortest delay between two dials to the same unconditional peer.
+///
+/// Each further dial that does not lead to a lasting connection doubles the delay, up to
+/// [`MAX_UNCONDITIONAL_PEER_REDIAL_DELAY`].
+pub const MIN_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(1);
+
+/// The longest delay between two dials to the same unconditional peer, before jitter.
+pub const MAX_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(10 * 60);
+
+/// The longest random delay that Zakura adds before it dials an unconditional peer
+/// again.
+///
+/// Two nodes that list each other would otherwise redial at the same moment after
+/// their connection drops, and each could keep the dial that the other one drops.
+/// The delay must be much longer than a round trip between two such nodes.
+pub const MAX_UNCONDITIONAL_PEER_REDIAL_JITTER: Duration = Duration::from_secs(2);
+
+/// How long a connection to an unconditional peer must last to reset its redial delay.
+///
+/// A peer that keeps dropping new connections is dialed at the maximum delay, instead of
+/// in a tight loop.
+pub const UNCONDITIONAL_PEER_HEALTHY_CONNECTION: Duration = Duration::from_secs(60);
+
 /// The minimum time between _successful_ inbound peer connections, implemented by
 /// `peer_set::initialize::accept_inbound_connections`.
 ///
@@ -262,6 +322,21 @@ pub const MIN_OUTBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_milli
 /// The inbound interval is much longer than the outbound interval, because Zebra does not
 /// control the selection or reconnections of inbound peers.
 pub const MIN_INBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long an inbound connection must have been open for the listener to hold its seat
+/// after it closes, see `peer_set::initialize::held_seats::HeldSeats`.
+///
+/// Short connections, such as crawlers and monitors, hold no seat, and a peer that the
+/// listener kept this long was not dropped or banned in that time.
+pub const MIN_HELD_SEAT_CONNECTION: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// How long the listener holds the seat of a long-lived inbound peer after its connection
+/// closes, so the peer can take it back after a restart.
+pub const HELD_SEAT_DURATION: Duration = Duration::from_secs(3 * 60);
+
+/// The listener holds at most its inbound connection limit divided by this number of
+/// seats at once.
+pub const HELD_SEAT_LIMIT_DIVISOR: usize = 10;
 
 /// The minimum time between _failed_ inbound peer connections, implemented by
 /// `peer_set::initialize::accept_inbound_connections`.
@@ -427,9 +502,10 @@ pub const MIN_PEER_SET_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// disconnected and banned.
 pub const MAX_PEER_MISBEHAVIOR_SCORE: u32 = 100;
 
-/// The most block hashes a Zakura native `FindBlocks` response may carry.
+/// The most block hashes a `FindBlocks` response may carry.
 ///
-/// A zakurad responder sends at most `MAX_FIND_BLOCK_HASHES_RESULTS` from
+/// Zakura native requesters reject longer responses, and legacy `inv` responses
+/// are truncated to this length. A zakurad responder sends at most `MAX_FIND_BLOCK_HASHES_RESULTS` from
 /// `zakura-state`; zakurad checks at compile time that the two match.
 pub const MAX_FIND_BLOCKS_RESPONSE_HASHES: usize = 500;
 
@@ -478,6 +554,14 @@ pub static INITIAL_MIN_NETWORK_PROTOCOL_VERSION: LazyLock<HashMap<NetworkKind, V
 /// [RFC 1123: Requirements for Internet Hosts] <https://tools.ietf.org/rfcmarkup?doc=1123>
 /// [6.1.3.3  Efficient Resource Usage] <https://tools.ietf.org/rfcmarkup?doc=1123#page-77>
 pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most system resolver calls for the DNS names of unconditional peers that can be
+/// running at once.
+///
+/// A lookup normally ends within [`DNS_LOOKUP_TIMEOUT`], so this only limits a config
+/// with more names than this looking them up in the same instant, and a resolver whose
+/// calls do not return. Lookups beyond the limit fail, and are retried with backoff.
+pub const MAX_UNCONDITIONAL_PEER_LOOKUPS_IN_FLIGHT: usize = 32;
 
 #[cfg(test)]
 mod tests {

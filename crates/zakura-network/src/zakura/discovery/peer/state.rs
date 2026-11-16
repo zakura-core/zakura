@@ -18,8 +18,7 @@ use super::super::{
 const _: () = assert!(SEND_INTERVAL.as_secs() <= DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs() / 2);
 
 /// Maximum time discovery waits for first-party exchange responses before releasing the session.
-pub(in crate::zakura::discovery) const DISCOVERY_INITIAL_EXCHANGE_TIMEOUT: Duration =
-    Duration::from_secs(2);
+pub const DISCOVERY_INITIAL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long closing a discovery-only connection waits for this node's admitted
 /// answers and the peer's delivered answers and `Hello`. Each is small and needs
 /// only free output or a verification slot, so a peer that reads its stream gets

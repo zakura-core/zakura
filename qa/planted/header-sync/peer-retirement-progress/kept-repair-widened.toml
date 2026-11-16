@@ -1,0 +1,15 @@
+# A replacement keeps every round with a call in flight, not just a body
+# repair's. The input relinks `mirror-0` while its first apply is held, so
+# the ordinary round in `Applying` keeps its slot under the replaced
+# session past the unit that admitted the new one, which only a kept
+# repair may do.
+# Besides reactor.rs, which the patch changes, the queue decides the
+# round's phase and which slots it lists, and the session readers decide
+# when the relink's admission lands. A change there can move the input off
+# its replacement while applying.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-retire-applying-relink.json"
+plan = "crates/zakura-sim/tests/fixtures/header-retire-applying-relink.plan"

@@ -46,6 +46,7 @@ fn the_close_relink_input_holds_teardown_returns_baseline() {
         Plan::from_fuzz(plan),
         TEARDOWN_RETURNS_BASELINE,
         Expect::Holds,
+        &[],
         &mut MemorySink::default(),
     );
     assert_eq!(result, Ok(()));

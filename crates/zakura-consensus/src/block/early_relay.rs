@@ -1,8 +1,8 @@
 //! Early block relay: serves one verified tip child to negotiated peers before its commit ends.
 //!
-//! Legacy peers that both set the `NODE_EARLY_BLOCK_RELAY` service bit can receive a block's
-//! inventory and body while this node's contextual commit is still running. Zebra's Ándale
-//! release negotiates the same service bit.
+//! Legacy peers that both set the `NODE_COMPACT_BLOCKS` service bit can receive a block's
+//! inventory and body while this node's contextual commit is still running. The draft Compact
+//! Block Relay ZIP (zcash/zips#1429) defines this behavior, and Zebra implements it.
 //!
 //! This node publishes a block only after full semantic verification, including proofs and
 //! signatures, and after state confirms that the block extends the selected tip with the
@@ -73,7 +73,7 @@ struct Inner {
 
 /// The early-relay cache shared by the block verifier, the inbound service, and block gossip.
 ///
-/// Only a node with `network.experimental_early_block_relay` enabled creates one.
+/// Only a node with `network.compact_block_relay` enabled creates one.
 #[derive(Clone, Debug)]
 pub struct EarlyRelay(Arc<Inner>);
 

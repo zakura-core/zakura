@@ -21,7 +21,9 @@ mod label;
 mod subscription;
 
 pub use cadence::{CadenceModel, Charge};
-pub use consequence::{consequence, is_fault_cause, Consequence, FAULT_CAUSES};
+pub use consequence::{
+    consequence, is_fault_cause, is_rate_limit_cause, Consequence, FAULT_CAUSES, RATE_LIMIT_CAUSES,
+};
 pub use exchange::{ExchangeModel, Owed};
 pub use frame::{FrameHeader, FrameModel, ReaderEnd};
 pub use label::{Direction, Label, LabelOutcome, LabelledFrame, Labels};

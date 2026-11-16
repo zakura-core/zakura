@@ -40,7 +40,7 @@ use crate::zakura::{
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod model;
 mod state;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use model::{replay_candidate_dial_bytes, CandidateDialReplaySummary};
@@ -366,8 +366,9 @@ async fn admit_dial_round(
     admitted
 }
 
-/// Returns the addresses of `candidate` to dial and the canonical IPs they
-/// reserve: the addresses `state` allows whose IPs the supervisor accepts.
+/// Returns the addresses of `candidate` to dial and their canonical IPs, whose
+/// admission hosts the attempt reserves: the addresses `state` allows whose
+/// hosts the supervisor accepts.
 fn discovery_node_addr_with_reserved_ip_capacity(
     supervisor: &ZakuraSupervisorHandle,
     state: &CandidateDialerState,

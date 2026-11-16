@@ -1,0 +1,11 @@
+# A prepare is dispatched without retaining its round's headers, so the
+# next unit of work holds a pending prepare that holds no headers, and the
+# ledger finds the call never held them. The reactor and the queue decide
+# when the witness's rounds prepare, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

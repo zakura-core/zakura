@@ -201,11 +201,19 @@ fn a_close_refused_by_a_full_queue_waits_to_start_its_deadline() {
 async fn lifecycle_admission_reserves_disconnect_capacity() {
     let (sender, mut receiver) = crate::zakura::header_sync::events::LifecycleSender::channel(1);
     let (send, _outbound) = framed_channel(8);
-    let first =
-        PeerSession::from_parts_with_session_id(peer(), 7, send.clone(), CancellationToken::new());
-    let rejected =
-        PeerSession::from_parts_with_session_id(peer(), 8, send, CancellationToken::new());
+    let session = |session_id| {
+        PeerSession::from_parts_with_session_id(
+            peer(),
+            session_id,
+            send.clone(),
+            CancellationToken::new(),
+        )
+    };
+    let first = session(7);
+    let replacement = session(8);
+    let rejected = session(9);
     let first_ack = sender.send(Event::PeerConnected(first.clone())).unwrap();
+    let _replacement_ack = sender.send(Event::PeerConnected(replacement)).unwrap();
     assert!(sender.send(Event::PeerConnected(rejected.clone())).is_err());
     assert!(rejected.cancel_token().is_cancelled());
     sender
@@ -219,12 +227,164 @@ async fn lifecycle_admission_reserves_disconnect_capacity() {
     assert!(matches!(connected.event, Event::PeerConnected(_)));
     connected.applied.send(()).unwrap();
     first_ack.await.unwrap();
+    let replaced = receiver.recv().await.unwrap();
+    assert!(matches!(replaced.event, Event::PeerConnected(_)));
     let disconnected = receiver.recv().await.unwrap();
     assert!(matches!(
         disconnected.event,
         Event::PeerDisconnected { session_id: 7, .. }
     ));
     assert!(receiver.try_recv().is_err());
+}
+
+/// Counts the counters a block registers, by name.
+#[derive(Default)]
+struct CounterNames(std::sync::Mutex<Vec<String>>);
+
+impl metrics::Recorder for CounterNames {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        self.0
+            .lock()
+            .expect("the test recorder is never poisoned")
+            .push(key.name().to_owned());
+        metrics::Counter::noop()
+    }
+
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// A session refused because the lifecycle queue is full is counted, so a
+/// reactor that falls behind shows up. One refused after the reactor shut
+/// down is not, since every shutdown closes the queue.
+#[test]
+fn a_full_lifecycle_queue_counts_its_refusals() {
+    const REFUSED: &str = "sync.header.peer.lifecycle_refused.total";
+    let (sender, receiver) = crate::zakura::header_sync::events::LifecycleSender::channel(1);
+    let (send, _outbound) = framed_channel(8);
+    let session = |session_id| {
+        PeerSession::from_parts_with_session_id(
+            peer(),
+            session_id,
+            send.clone(),
+            CancellationToken::new(),
+        )
+    };
+    let recorder = CounterNames::default();
+    let refused = |recorder: &CounterNames| {
+        recorder
+            .0
+            .lock()
+            .expect("the test recorder is never poisoned")
+            .iter()
+            .filter(|name| *name == REFUSED)
+            .count()
+    };
+
+    metrics::with_local_recorder(&recorder, || {
+        let _first = sender.send(Event::PeerConnected(session(7))).unwrap();
+        let _replacement = sender.send(Event::PeerConnected(session(8))).unwrap();
+        assert_eq!(refused(&recorder), 0);
+        assert!(sender.send(Event::PeerConnected(session(9))).is_err());
+    });
+    assert_eq!(refused(&recorder), 1);
+
+    drop(receiver);
+    let after_shutdown = session(10);
+    metrics::with_local_recorder(&recorder, || {
+        assert!(sender
+            .send(Event::PeerConnected(after_shutdown.clone()))
+            .is_err());
+    });
+    assert!(after_shutdown.cancel_token().is_cancelled());
+    assert_eq!(refused(&recorder), 1);
+}
+
+/// With one admissible peer, an ended session's teardown can still be queued
+/// when the peer reconnects, or a replacement can arrive while the session it
+/// replaces is live. Either new session is admitted.
+#[tokio::test]
+async fn one_overlapping_generation_fits_the_lifecycle_queue() {
+    let (sender, mut receiver) = crate::zakura::header_sync::events::LifecycleSender::channel(1);
+    let (send, _outbound) = framed_channel(8);
+    let session = |session_id| {
+        PeerSession::from_parts_with_session_id(
+            peer(),
+            session_id,
+            send.clone(),
+            CancellationToken::new(),
+        )
+    };
+    let first = session(7);
+    sender.send(Event::PeerConnected(first)).unwrap();
+    let connected = receiver.recv().await.unwrap();
+    assert!(matches!(connected.event, Event::PeerConnected(_)));
+
+    let replacement = session(8);
+    sender
+        .send(Event::PeerConnected(replacement.clone()))
+        .expect("a replacement fits while the session it replaces is live");
+    assert!(!replacement.cancel_token().is_cancelled());
+    let connected = receiver.recv().await.unwrap();
+    assert!(matches!(connected.event, Event::PeerConnected(_)));
+    sender
+        .send(Event::PeerDisconnected {
+            peer: peer(),
+            session_id: 7,
+            reason: "replaced",
+        })
+        .unwrap();
+    sender
+        .send(Event::PeerDisconnected {
+            peer: peer(),
+            session_id: 8,
+            reason: "test",
+        })
+        .unwrap();
+    let ended = receiver.recv().await.unwrap();
+    assert!(matches!(
+        ended.event,
+        Event::PeerDisconnected { session_id: 7, .. }
+    ));
+
+    let reconnect = session(9);
+    sender
+        .send(Event::PeerConnected(reconnect.clone()))
+        .expect("a reconnect fits while the ended session's teardown is queued");
+    assert!(!reconnect.cancel_token().is_cancelled());
 }
 
 /// Actual service replacement and pre-acknowledgement cancellation reclaim lifecycle slots.
@@ -294,4 +454,170 @@ async fn service_teardown_reclaims_lifecycle_capacity() {
         }
         assert!(connected, "admission leaked at generation {generation}");
     }
+}
+
+/// The service's `Status` cadence map keeps one key per connection, as
+/// `ReactorEvent::ServiceSizes` reports it: adding connections 7 and 8 for
+/// one peer holds both, removing connection 7 leaves 8's, and removing 8
+/// leaves none. The transport's `remove_peer` is the map's only removal,
+/// which the simulator's storage harness can't drive, so this is its check.
+#[tokio::test]
+async fn remove_peer_drops_only_its_connections_cadence() {
+    use crate::zakura::header_sync::observe::{HeaderSyncObserver, ObserverSlot};
+    use crate::zakura::header_sync::service::HeaderSyncService;
+    use crate::zakura::{
+        transport::ServiceStream, CloseCause, Peer, Service, ServicePeerDirection,
+    };
+
+    /// Records each cadence report. Its capacity handle shares the record,
+    /// since the service reports through that handle.
+    #[derive(Clone, Debug, Default)]
+    struct Cadences(Arc<std::sync::Mutex<Vec<Vec<(ZakuraPeerId, u64)>>>>);
+
+    impl HeaderSyncObserver for Cadences {
+        fn observe(&self, event: ReactorEvent) {
+            if let ReactorEvent::ServiceSizes { cadences } = event {
+                self.0
+                    .lock()
+                    .expect("no test panics while holding it")
+                    .push(cadences);
+            }
+        }
+
+        fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
+            Some(Arc::new(self.clone()))
+        }
+    }
+
+    let cadences = Arc::new(Cadences::default());
+    let mut startup = startup(CancellationToken::new());
+    startup.observer = ObserverSlot(Some(cadences.clone()));
+    let (handle, _actions, _reactor) = build_header_sync_reactor(startup).unwrap();
+    let service = HeaderSyncService::new(handle.clone());
+    let mut streams = Vec::new();
+    for connection in [7, 8] {
+        let (incoming, recv) = framed_channel(8);
+        let (send, outgoing) = framed_channel(8);
+        let cancel = CancellationToken::new();
+        service.add_peer(Peer::new_with_service_streams(
+            connection,
+            peer(),
+            None,
+            crate::zakura::ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+            [(
+                crate::zakura::header_sync::ZAKURA_STREAM_HEADER_SYNC,
+                ServiceStream::new(connection, 9, recv, send, cancel.clone()),
+            )]
+            .into(),
+            CancellationToken::new(),
+            CloseCause::new(),
+        ));
+        streams.push((incoming, outgoing));
+    }
+    let last = || {
+        cadences
+            .0
+            .lock()
+            .expect("no test panics while holding it")
+            .last()
+            .cloned()
+            .expect("the service reported its cadences")
+    };
+    assert_eq!(last(), [(peer(), 7), (peer(), 8)]);
+    service.remove_peer(&peer(), 7);
+    assert_eq!(last(), [(peer(), 8)]);
+    service.remove_peer(&peer(), 8);
+    assert_eq!(last(), []);
+}
+
+/// A session the lifecycle queue has no room for is cancelled before the
+/// reactor sees it, after its publisher handed its token over
+/// (`HeaderSyncObserver::session_cancel`). One configured peer gives the
+/// queue `LIFECYCLE_SLOTS_PER_PEER` slots, and each session reserves two for
+/// its admission and teardown, so with the reactor not running the session
+/// past those slots has its token cancelled and the earlier ones don't.
+#[tokio::test]
+async fn a_session_without_lifecycle_room_has_its_token_cancelled() {
+    use crate::zakura::header_sync::observe::{HeaderSyncObserver, ObserverSlot};
+    use crate::zakura::header_sync::service::HeaderSyncService;
+    use crate::zakura::{
+        transport::ServiceStream, CloseCause, Peer, Service, ServicePeerDirection,
+    };
+
+    /// Keeps each session's token. Its capacity handle shares the record,
+    /// since the publisher hands its token through that handle.
+    #[derive(Clone, Debug, Default)]
+    struct Tokens(Arc<std::sync::Mutex<Vec<(u64, CancellationToken)>>>);
+
+    impl HeaderSyncObserver for Tokens {
+        fn observe(&self, _event: ReactorEvent) {}
+
+        fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
+            Some(Arc::new(self.clone()))
+        }
+
+        fn session_cancel(&self, _peer: &ZakuraPeerId, session_id: u64, cancel: CancellationToken) {
+            self.0
+                .lock()
+                .expect("no test panics while holding it")
+                .push((session_id, cancel));
+        }
+    }
+
+    let tokens = Arc::new(Tokens::default());
+    let mut startup = startup(CancellationToken::new());
+    startup.config.peer_limits.max_inbound_peers = 1;
+    startup.config.peer_limits.max_outbound_peers = 0;
+    startup.observer = ObserverSlot(Some(tokens.clone()));
+    let (handle, _actions, _reactor) = build_header_sync_reactor(startup).unwrap();
+    let service = HeaderSyncService::new(handle.clone());
+    let mut streams = Vec::new();
+    // Distinct peers, so no session replaces another.
+    let admitted = crate::zakura::header_sync::events::LIFECYCLE_SLOTS_PER_PEER / 2;
+    let sessions: Vec<(u64, ZakuraPeerId)> = (0..=admitted)
+        .map(|n| {
+            let byte = u8::try_from(0x71 + n).expect("the test has few sessions");
+            let peer = ZakuraPeerId::new(vec![byte; 32])
+                .expect("the test peer ID has the required length");
+            // Widening usize to u64 is lossless on supported targets.
+            (7 + n as u64, peer)
+        })
+        .collect();
+    for (connection, peer) in sessions.clone() {
+        let (incoming, recv) = framed_channel(8);
+        let (send, outgoing) = framed_channel(8);
+        let cancel = CancellationToken::new();
+        service.add_peer(Peer::new_with_service_streams(
+            connection,
+            peer,
+            None,
+            crate::zakura::ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+            [(
+                crate::zakura::header_sync::ZAKURA_STREAM_HEADER_SYNC,
+                ServiceStream::new(connection, 9, recv, send, cancel.clone()),
+            )]
+            .into(),
+            CancellationToken::new(),
+            CloseCause::new(),
+        ));
+        streams.push((incoming, outgoing));
+    }
+    // Each publisher hands its token over as it's spawned.
+    let mut cancelled: Vec<(u64, bool)> = tokens
+        .0
+        .lock()
+        .expect("no test panics while holding it")
+        .iter()
+        .map(|(session_id, cancel)| (*session_id, cancel.is_cancelled()))
+        .collect();
+    cancelled.sort_unstable();
+    // Widening usize to u64 is lossless on supported targets.
+    let shed = 7 + admitted as u64;
+    let expected: Vec<(u64, bool)> = sessions
+        .iter()
+        .map(|(session_id, _)| (*session_id, *session_id == shed))
+        .collect();
+    assert_eq!(cancelled, expected);
 }

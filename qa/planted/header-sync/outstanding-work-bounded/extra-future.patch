@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 9f71e35495..67caad0409 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -950,6 +950,9 @@ impl HeaderSyncReactor {
+             StorageOutcome::Completed { call, .. } => *call,
+             StorageOutcome::Panicked(context) => context.call,
+         };
++        // Mutation: each completion leaves a never-ready future behind.
++        self.pending_port_operations
++            .push(Box::pin(std::future::pending::<StorageOutcome>()), false);
+         if !self.state.calls.settle(call) {
+             tracing::error!(
+                 ?call,

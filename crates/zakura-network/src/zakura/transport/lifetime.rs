@@ -505,6 +505,19 @@ impl ConnectionResources {
         self.receive_window
     }
 
+    /// A probe of this connection's gates and of `quic`, the connection's
+    /// QUIC load.
+    #[cfg(zakura_sim)]
+    pub(crate) fn probe(&self, quic: zakura_quic::LoadProbe) -> super::ConnectionProbe {
+        super::ConnectionProbe::new(
+            quic,
+            self.receive_window,
+            self.gates
+                .iter()
+                .map(|(kind, gates)| (*kind, &gates.raw.budget, &gates.output.budget)),
+        )
+    }
+
     /// Count one stream that entered setup, before its kind is known.
     pub(crate) fn owner(&self) -> OwnerGuard {
         self.owners.enter(OwnerPhase::Setup)

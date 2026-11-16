@@ -18,9 +18,10 @@
 //! The transport caps those live connections, admitted or not (ADM-12).
 //! `max_pending_handshakes` of them are headroom for handshakes not yet
 //! admitted and extra address attempts of one dial, and the node admits the
-//! rest. Half the headroom, rounded up, is a dial reserve that inbound attempts
-//! can't take, so peers that churn inbound connections can't stop this node's
-//! own dials. A closed connection releases its stream buffers and moves to a
+//! rest. Inbound attempts may hold only their connection and handshake shares
+//! of those slots, and a dial reserve sized for one full discovery record stays
+//! out of their reach, so peers that churn inbound connections can't stop this
+//! node's own dials (see `ZakuraLocalLimits::quic_bind_config`). A closed connection releases its stream buffers and moves to a
 //! separate closing allowance of [`ZAKURA_CLOSING_CONNECTIONS_PER_LIVE`] per
 //! live slot (ADM-13). Its queued datagrams count against its socket's queue,
 //! so the budget charges closing slots nothing more.
@@ -271,8 +272,9 @@ mod tests {
 
     use super::*;
     use crate::zakura::{
-        discovery::discovery_dial_slot_limit, ZakuraConfig, DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_MAX_CONNECTIONS, HEADER_SYNC_BUDGET,
+        discovery::{discovery_dial_slot_limit, MAX_DIRECT_ADDRS_PER_RECORD},
+        ZakuraConfig, DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_MAX_CONNECTIONS,
+        HEADER_SYNC_BUDGET,
     };
     use crate::{zakura::ZakuraLocalLimits, Config};
 
@@ -472,21 +474,79 @@ mod tests {
         assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(30));
     }
 
-    /// A single handshake of headroom still keeps one slot for dials, so
-    /// inbound attempts on several sockets can't take every live slot.
+    /// The dial reserve fits one dial of a full discovery record whenever
+    /// the slots inbound can't hold allow it, and is always at least one slot
+    /// so inbound attempts on several sockets can't take every live slot.
     #[test]
-    fn the_dial_reserve_is_at_least_one_slot() {
-        for (pending, reserve) in [(1, 1), (2, 1), (3, 2), (32, 16)] {
+    fn the_dial_reserve_fits_one_full_record() {
+        for (connections, pending, reserve) in [
+            (92, 32, 8),
+            (92, 1, 8),
+            (92, 0, 8),
+            (8, 4, 3),
+            (4, 1, 1),
+            (1, 1, 1),
+        ] {
             let mut config = Config::default();
+            config.zakura.max_connections = connections;
             config.zakura.max_pending_handshakes = pending;
             let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
-            assert_eq!(bind.dial_reserve, reserve, "{pending} pending handshakes");
+            assert_eq!(
+                bind.dial_reserve, reserve,
+                "{connections} connections, {pending} pending handshakes"
+            );
         }
-        // Zero is treated as one.
-        let mut config = Config::default();
-        config.zakura.max_pending_handshakes = 0;
-        let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
-        assert_eq!(bind.dial_reserve, 1);
+    }
+
+    /// #2254: the transport counts inbound peers' live slots up to their
+    /// connection and handshake shares, so with inbound full, discovery still
+    /// has room for every outbound connection the admission semaphore leaves,
+    /// once the dial reserve has its full record. Before, inbound could hold
+    /// 92 of the default 107 discovery slots and leave discovery 15 of its 23.
+    #[test]
+    fn discovery_keeps_the_outbound_share_with_inbound_full() {
+        for max_connections in 1..=160 {
+            for max_pending_handshakes in 1..=64 {
+                let mut config = Config::default();
+                config.zakura.max_connections = max_connections;
+                config.zakura.max_pending_handshakes = max_pending_handshakes;
+                let limits = ZakuraLocalLimits::from_config(&config);
+                let bind = limits.quic_bind_config(Vec::new());
+                let label =
+                    format!("{max_connections} connections, {max_pending_handshakes} handshakes");
+                let inbound_full = bind.max_inbound_connections.expect("Zakura caps inbound");
+                assert_eq!(
+                    inbound_full,
+                    limits.max_inbound_connections() + limits.max_inbound_handshakes(),
+                    "{label}"
+                );
+                // With inbound at its cap, discovery stops only at the reserve.
+                let discovery =
+                    (bind.max_connections - bind.dial_reserve).saturating_sub(inbound_full);
+                let outbound_share = limits.max_connections - limits.max_inbound_connections();
+                let handshake_reserve =
+                    limits.max_pending_handshakes - limits.max_inbound_handshakes();
+                if handshake_reserve >= MAX_DIRECT_ADDRS_PER_RECORD {
+                    assert!(discovery >= outbound_share, "{label}");
+                }
+                let outbound_slots = bind.max_connections - inbound_full;
+                assert_eq!(
+                    bind.dial_reserve,
+                    outbound_slots.clamp(1, MAX_DIRECT_ADDRS_PER_RECORD),
+                    "{label}"
+                );
+            }
+        }
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        let bind = limits.quic_bind_config(Vec::new());
+        assert_eq!(
+            (
+                bind.max_connections,
+                bind.dial_reserve,
+                bind.max_inbound_connections
+            ),
+            (124, 8, Some(93))
+        );
     }
 
     #[test]

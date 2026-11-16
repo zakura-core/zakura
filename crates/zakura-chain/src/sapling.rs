@@ -31,3 +31,19 @@ pub use shielded_data::{
     AnchorVariant, FieldNotPresent, PerSpendAnchor, SharedAnchor, ShieldedData, TransferData,
 };
 pub use spend::{Spend, SpendPrefixInTransactionV5};
+
+/// Returns true if every encoding is a canonical, non-small-order Jubjub point:
+/// the check [`ValueCommitment::is_valid_not_small_order`] and
+/// [`keys::EphemeralPublicKey::is_valid_not_small_order`] run on one encoding.
+///
+/// The points are decompressed together, so their field inversions are batched
+/// into one. Each square root is still computed separately.
+pub(crate) fn all_valid_not_small_order(encodings: impl Iterator<Item = [u8; 32]>) -> bool {
+    jubjub::AffinePoint::batch_from_bytes(encodings)
+        .into_iter()
+        .all(|point| {
+            point
+                .into_option()
+                .is_some_and(|point| !bool::from(point.is_small_order()))
+        })
+}

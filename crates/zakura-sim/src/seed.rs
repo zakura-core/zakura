@@ -45,6 +45,10 @@ pub const SEED_EXTENSION: &str = "bin";
 /// The extension of a seed's sidecar.
 pub const SIDECAR_EXTENSION: &str = "toml";
 
+/// The directory beside a seed set that keeps each migrated seed's source,
+/// as `<sha256>.bin`, so the seed check can migrate it again.
+pub const SOURCES_DIR: &str = "sources";
+
 /// The versions that fix what `entry`'s fuzz input means, as `KEY=VALUE`
 /// pairs in a stable order: the harness, its generator, its scenario prefix
 /// length, and the trace format and contract versions. A campaign keys its
@@ -112,6 +116,24 @@ pub struct Sidecar {
     /// The property witnesses the seed carries. None by default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub witness: Vec<SeedWitness>,
+    /// The seed this one was migrated from, for a seed carried to a new
+    /// generator with its meaning kept. None by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<DerivedFrom>,
+}
+
+/// The seed a migrated seed came from: its file's SHA-256 and the generator
+/// it was built for. The source is kept as `<sha256>.bin` in the
+/// [`SOURCES_DIR`] beside the seed, and the seed check migrates it again
+/// with the harness's [`Subsystem::migrate`](crate::harness::Subsystem::migrate),
+/// which must give the seed's own input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedFrom {
+    /// The source file's SHA-256, in hex.
+    pub sha256: String,
+    /// The generator the source was built for.
+    pub generator: u32,
 }
 
 /// [`Sidecar::required`]'s default.
@@ -181,6 +203,14 @@ pub enum SeedError {
     },
     /// Two witnesses name the same property.
     DuplicateWitness(String),
+    /// A migrated seed's `derived_from` doesn't name its source: a
+    /// generator that isn't older than the seed's, a digest that isn't 64
+    /// hex digits or is the seed's own, no kept source with that digest, or
+    /// a source that doesn't migrate to the seed.
+    Derived(String),
+    /// The seed's prefix is for another generator than the harness's, so the
+    /// harness would draw a fallback scenario for it.
+    OtherGenerator,
 }
 
 impl fmt::Display for SeedError {
@@ -240,6 +270,12 @@ impl fmt::Display for SeedError {
             SeedError::DuplicateWitness(property) => {
                 write!(f, "two witnesses name `{property}`")
             }
+            SeedError::Derived(why) => write!(f, "the seed's `derived_from` {why}"),
+            SeedError::OtherGenerator => write!(
+                f,
+                "the seed's prefix is for another generator, so the harness draws its fallback \
+                 scenario"
+            ),
         }
     }
 }
@@ -506,6 +542,9 @@ fn validate(entry: &HarnessEntry, path: &Path, sidecar: &Sidecar) -> Result<Vec<
             input
         }
     };
+    if !entry.accepts_input(&input) {
+        return Err(SeedError::OtherGenerator);
+    }
     let decoded = decode(entry, &input)?;
     if !sidecar.scenario_sha256.eq_ignore_ascii_case(&decoded) {
         return Err(SeedError::Scenario {
@@ -515,6 +554,44 @@ fn validate(entry: &HarnessEntry, path: &Path, sidecar: &Sidecar) -> Result<Vec<
     }
     if sidecar.source.trim().is_empty() {
         return Err(SeedError::NoSource);
+    }
+    if let Some(from) = &sidecar.derived_from {
+        if from.generator >= sidecar.generator {
+            return Err(SeedError::Derived(format!(
+                "names generator {}, not one older than the seed's {}",
+                from.generator, sidecar.generator
+            )));
+        }
+        if from.sha256.len() != 64 || !from.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(SeedError::Derived(format!(
+                "names `{}`, not a SHA-256 in hex",
+                from.sha256
+            )));
+        }
+        if from.sha256.eq_ignore_ascii_case(&sidecar.sha256) {
+            return Err(SeedError::Derived("names the seed itself".to_owned()));
+        }
+        let name = format!("{}.{SEED_EXTENSION}", from.sha256.to_ascii_lowercase());
+        let kept = path.with_file_name(SOURCES_DIR).join(name);
+        let source = fs::read(&kept).map_err(|error| {
+            SeedError::Derived(format!(
+                "names no kept source at {}: {error}",
+                kept.display()
+            ))
+        })?;
+        if !sha256(&source).eq_ignore_ascii_case(&from.sha256) {
+            return Err(SeedError::Derived(format!(
+                "names {}, whose digest isn't its name",
+                kept.display()
+            )));
+        }
+        let migrated = (entry.migrate)(&source, from.generator).map_err(SeedError::Derived)?;
+        if migrated != input {
+            return Err(SeedError::Derived(format!(
+                "names a source that migrates to other bytes than the seed's, {}",
+                kept.display()
+            )));
+        }
     }
     let mut seen = Vec::new();
     for witness in &sidecar.witness {

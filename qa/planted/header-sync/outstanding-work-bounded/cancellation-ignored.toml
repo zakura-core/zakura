@@ -1,0 +1,11 @@
+# The publisher drops its cancellation arm, so it stays parked after its
+# session's token is cancelled. Under fresh-identity churn the run comes to
+# rest with publishers still running whose tokens are cancelled. The reactor, the service and
+# the publisher decide when the witness's sessions end, so a change there
+# can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.json"
+plan = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.plan"

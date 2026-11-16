@@ -11,7 +11,7 @@ reactor reports no permits, and the ownership ledger doesn't count them.
 The witness is `the_probe_matches_the_accounting_through_close_relink_and_shutdown`
 in `crates/zakura-sim/tests/header_node_capacity.rs`. The node takes two
 locator reads before its shutdown.
-The reactor tap finds `TeardownLocatorPermits: the stopped reactor is gone
+The reactor tap finds `TeardownLocatorPermits: the reactor is gone
 with 14 of 16 locator permits free, and storage holds 0`, which violates
 `header-sync/teardown-returns-baseline` at node settlement. It stays a native
 mutation, since no committed input can shut the node down until the storage

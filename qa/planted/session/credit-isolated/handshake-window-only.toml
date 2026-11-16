@@ -1,0 +1,8 @@
+# Never widens the connection's QUIC receive window past the handshake
+# window: every service's frames share the control stream's 64 KiB of
+# connection-level credit. The input's block bodies fill it while block
+# sync holds them, so the mirror blocks on connection credit.
+input = "crates/zakura-sim/tests/fixtures/sync-wire-saturated.bin"
+# Besides handler.rs, which the patch changes, the connection's resources
+# set the window, and zakura-quic applies it and holds credit for grants.
+checks = ["crates/zakura-network/src/zakura/transport/lifetime.rs", "crates/zakura-quic/src"]

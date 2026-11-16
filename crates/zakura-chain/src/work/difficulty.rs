@@ -70,6 +70,7 @@ mod tests;
 pub struct CompactDifficulty(pub(crate) u32);
 
 /// An invalid CompactDifficulty value, for testing.
+#[cfg(any(test, feature = "proptest-impl"))]
 pub const INVALID_COMPACT_DIFFICULTY: CompactDifficulty = CompactDifficulty(u32::MAX);
 
 /// A 256-bit unsigned "expanded difficulty" value.

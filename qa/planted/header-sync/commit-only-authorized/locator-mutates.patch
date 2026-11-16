@@ -1,0 +1,40 @@
+diff --git a/crates/zakura-header-chain/src/transition/engine/mod.rs b/crates/zakura-header-chain/src/transition/engine/mod.rs
+index 50346354a1..44e7039e64 100644
+--- a/crates/zakura-header-chain/src/transition/engine/mod.rs
++++ b/crates/zakura-header-chain/src/transition/engine/mod.rs
+@@ -355,6 +355,20 @@ impl HeaderChainEngine {
+         Ok(())
+     }
+ 
++    /// Mutation: a locator read drops an eligible side tip, leaving the
++    /// selected path, and so the locator it gives, as they were.
++    pub fn planted_corrupt(&mut self) {
++        let selected = self.metadata.frontiers.header_best.hash;
++        let side = self
++            .graph
++            .eligible_header_tips()
++            .into_iter()
++            .find(|tip| tip.hash != selected);
++        if let Some(side) = side {
++            let _ = self.graph.remove_header_leaf(side.hash);
++        }
++    }
++
+     /// Return the private identity of this exact in-memory source revision.
+     pub(crate) fn transition_source(&self) -> EngineTransitionSource {
+         EngineTransitionSource {
+diff --git a/crates/zakura-storage/src/header/adapter.rs b/crates/zakura-storage/src/header/adapter.rs
+index 0b178bb334..6a808dfde0 100644
+--- a/crates/zakura-storage/src/header/adapter.rs
++++ b/crates/zakura-storage/src/header/adapter.rs
+@@ -646,7 +646,9 @@ impl EnginePort {
+         ),
+         PortError,
+     > {
+-        let engine = self.engine();
++        let mut engine = self.engine();
++        // Mutation: the read changes the engine's durable state.
++        engine.planted_corrupt();
+         let snapshot = engine.snapshot();
+         let locator = HeaderLocator::for_selected_path(&snapshot, |height| {
+             let projection = engine.selected_projection();

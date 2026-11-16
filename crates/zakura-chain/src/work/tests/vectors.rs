@@ -17,15 +17,6 @@ const EQUIHASH_SOLUTION_BLOCK_OFFSET: usize = equihash::Solution::INPUT_LENGTH +
 const BLOCK_HEADER_LENGTH: usize = EQUIHASH_SOLUTION_BLOCK_OFFSET + 3 + equihash::SOLUTION_SIZE;
 
 #[test]
-fn compact_difficulty_consensus_bytes_round_trip() {
-    let bytes = [0x01, 0x02, 0x03, 0x04];
-    assert_eq!(
-        difficulty::CompactDifficulty::from_le_bytes(bytes).to_le_bytes(),
-        bytes
-    );
-}
-
-#[test]
 fn validate_shape_checks_the_solution_against_the_network() {
     let regtest = Network::new_regtest(Default::default());
 

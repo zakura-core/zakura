@@ -102,13 +102,16 @@ impl NodeView {
                 self.queued.objects = self.queued.objects.saturating_sub(1);
                 self.queued.bytes = self.queued.bytes.saturating_sub(bytes);
             }
-            // The checkpoint itself is read by the caller, and the rest are
-            // the peer's subscriptions on the node.
+            // The checkpoint itself is read by the caller, the next four are
+            // the peer's subscriptions on the node, and the last two are the
+            // node's serving.
             TransitionFact::HeaderChecked { .. }
             | TransitionFact::PublicationEnded { .. }
             | TransitionFact::OpenApplied { .. }
             | TransitionFact::CloseApplied { .. }
-            | TransitionFact::GrantApplied { .. } => {}
+            | TransitionFact::GrantApplied { .. }
+            | TransitionFact::CommitmentCounted { .. }
+            | TransitionFact::CommitmentReleased { .. } => {}
         }
         Ok(())
     }
@@ -179,6 +182,23 @@ pub(crate) enum Stage {
     Checkpoint,
     /// Judged at `frame-read`.
     Frame,
+}
+
+/// The stage that judges a discovery frame the peer's models labelled
+/// `label` (disc-3.1). A stateless fault is decided by its header. So is
+/// an `Unsolicited` or `OverOwed` response, by its type and declared length
+/// against the exchanges open on the stream, where the node's response
+/// precheck and claim refuse it. Everything else is judged at `frame-read`.
+pub(crate) fn discovery_stage(label: Label) -> Stage {
+    match label {
+        Label::UndeclaredType
+        | Label::ReservedFlags
+        | Label::ShortPayload
+        | Label::LongPayload
+        | Label::Unsolicited
+        | Label::OverOwed => Stage::Header,
+        _ => Stage::Frame,
+    }
 }
 
 /// The stage a frame with `header` on a reader of `rules` waits for, and

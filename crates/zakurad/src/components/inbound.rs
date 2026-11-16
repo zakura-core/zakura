@@ -287,8 +287,8 @@ pub struct InboundSetupData {
     /// The network whose target spacing scales the gossip lookahead window.
     pub network: Network,
 
-    /// A channel to send misbehavior reports to the [`AddressBook`].
-    pub misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
+    /// Scores peer misbehavior, and bans peers whose score reaches the ban threshold.
+    pub misbehavior: zn::MisbehaviorReporter,
 }
 
 /// Tracks the internal state of the [`Inbound`] service during setup.
@@ -332,8 +332,8 @@ pub enum Setup {
         /// A service that manages cached blockchain state.
         state: State,
 
-        /// A channel to send misbehavior reports to the [`AddressBook`].
-        misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
+        /// Scores peer misbehavior, and bans peers whose score reaches the ban threshold.
+        misbehavior: zn::MisbehaviorReporter,
     },
 
     /// Temporary state used in the inbound service's internal initialization code.
@@ -491,7 +491,7 @@ impl Service<zn::Request> for Inbound {
                         state,
                         latest_chain_tip,
                         network,
-                        misbehavior_sender,
+                        misbehavior,
                     } = setup_data;
 
                     let cached_peer_addr_response = CachedPeerAddrResponse::new(address_book);
@@ -512,7 +512,7 @@ impl Service<zn::Request> for Inbound {
                         block_downloads,
                         mempool,
                         state,
-                        misbehavior_sender,
+                        misbehavior,
                     }
                 }
                 Err(TryRecvError::Empty) => {
@@ -548,7 +548,7 @@ impl Service<zn::Request> for Inbound {
                 mut block_downloads,
                 mempool,
                 state,
-                misbehavior_sender,
+                misbehavior,
             } => {
                 // # Correctness
                 //
@@ -574,10 +574,8 @@ impl Service<zn::Request> for Inbound {
                     // the two decisions are the same decision.
                     if let Some(mismatch) = err.downcast_ref::<GossipedTipChildHeightMismatch>() {
                         if let Some(advertiser_addr) = advertiser_addr {
-                            let _ = misbehavior_sender.try_send((
-                                advertiser_addr,
-                                zn::constants::MAX_PEER_MISBEHAVIOR_SCORE,
-                            ));
+                            misbehavior
+                                .report(advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
                         }
 
                         // A failed parent recovery is left to the syncer. A re-request would
@@ -591,7 +589,8 @@ impl Service<zn::Request> for Inbound {
                     }
 
                     if let Some(update) = block_misbehavior(err, advertiser_addr) {
-                        let _ = misbehavior_sender.try_send(update);
+                        let (addr, score) = update;
+                        misbehavior.report(addr, score);
                     }
                 }
 
@@ -602,7 +601,7 @@ impl Service<zn::Request> for Inbound {
                     block_downloads,
                     mempool,
                     state,
-                    misbehavior_sender,
+                    misbehavior,
                 }
             }
         };
@@ -639,7 +638,7 @@ impl Service<zn::Request> for Inbound {
                 block_downloads,
                 mempool,
                 state,
-                misbehavior_sender: _,
+                misbehavior: _,
             } => (cached_peer_addr_response, block_downloads, mempool, state),
             _ => {
                 debug!("ignoring request from remote peer during setup");
@@ -715,13 +714,16 @@ impl Service<zn::Request> for Inbound {
                         )
                         .await
                         {
-                            Ok(block) => Some(block),
+                            // Measure each found block once; both size limits below use it.
+                            Ok(block) => Some(block.map(|block| {
+                                let size = block.zcash_serialized_size();
+                                (block, size)
+                            })),
                             Err(error) if is_read_capacity_refusal(&*error) => None,
                             Err(error) => return Err(error),
                         };
-                        if let Some(Some(block)) = &block {
-                            state_lookup_bytes = state_lookup_bytes
-                                .saturating_add(block.zcash_serialized_size());
+                        if let Some(Some((_, size))) = &block {
+                            state_lookup_bytes = state_lookup_bytes.saturating_add(*size);
                         }
                         lookup_results.push((index, hash, block));
                     }
@@ -742,10 +744,8 @@ impl Service<zn::Request> for Inbound {
                             continue;
                         };
                         match block {
-                            Some(block) => {
-                                // If checking the serialized size of the block performs badly,
-                                // return the size from the state using a wrapper type.
-                                total_size += block.zcash_serialized_size();
+                            Some((block, size)) => {
+                                total_size += size;
 
                                 blocks.push(Available((block, None)))
                             },
@@ -842,7 +842,9 @@ impl Service<zn::Request> for Inbound {
             zn::Request::FindHeaders { known_blocks, stop } => {
                 let request = zs::Request::FindBlockHeaders { known_blocks, stop };
                 state.clone().oneshot(request).map_ok(|resp| match resp {
-                    zs::Response::BlockHeaders(headers) if headers.is_empty() => zn::Response::Nil,
+                    // Always reply, even with no headers: `getheaders` requires a
+                    // `headers` message, and `Nil` (which sends nothing) leaves a
+                    // zcashd-compat sidecar's request pending so it never syncs (#198).
                     zs::Response::BlockHeaders(headers) => zn::Response::BlockHeaders(headers),
                     _ => unreachable!("zakura-state should always respond to a `FindBlockHeaders` request with a `BlockHeaders` response"),
                 })

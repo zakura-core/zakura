@@ -47,6 +47,18 @@ fn peer_addr(port: u16) -> PeerSocketAddr {
 }
 
 #[test]
+fn serialization_error_metric_labels_ignore_details() {
+    for detail in ["first error detail", "second error detail"] {
+        let error = SerializationError::from(std::io::Error::other(detail));
+        assert_eq!(serialization_error_metric_label(&error), "io");
+        assert_eq!(
+            serialization_error_metric_label(&SerializationError::Parse(detail)),
+            "parse",
+        );
+    }
+}
+
+#[test]
 fn connected_addr_labels_require_explicit_opt_in() {
     let peer = ConnectedAddr::new_outbound_direct(
         "192.0.2.1:8233".parse().expect("valid test peer address"),
@@ -83,25 +95,14 @@ fn diagnostic_remote_addr_excludes_proxy_connection_identifiers() {
 
 #[test]
 fn noncanonical_shielded_proof_size_gets_ban_score() {
-    let addr = peer_addr(8233);
-    let change = inbound_error_address_change(
-        addr,
-        PeerServices::NODE_NETWORK,
-        &SerializationError::NonCanonicalShieldedProofSize,
-    );
-
-    assert_eq!(change.addr(), addr);
     assert_eq!(
-        change.misbehavior_score(),
+        inbound_error_misbehavior_score(&SerializationError::NonCanonicalShieldedProofSize),
         constants::MAX_PEER_MISBEHAVIOR_SCORE
     );
-
-    let ordinary_parser_error = inbound_error_address_change(
-        addr,
-        PeerServices::NODE_NETWORK,
-        &SerializationError::Parse("test parser error"),
+    assert_eq!(
+        inbound_error_misbehavior_score(&SerializationError::Parse("test parser error")),
+        0
     );
-    assert_eq!(ordinary_parser_error.misbehavior_score(), 0);
 }
 
 fn test_config(p2p_stack: P2pStack) -> Config {
@@ -118,6 +119,19 @@ fn upgraded_outcome() -> ZakuraUpgradeOutcome {
 async fn negotiate_test_pair(
     local_config: Config,
     remote_config: Config,
+) -> (Arc<ConnectionInfo>, Arc<ConnectionInfo>) {
+    let local_services = local_config.handshake_services(PeerServices::NODE_NETWORK);
+    let remote_services = remote_config.handshake_services(PeerServices::NODE_NETWORK);
+    negotiate_test_pair_with_services(local_config, local_services, remote_config, remote_services)
+        .await
+}
+
+/// Like [`negotiate_test_pair`], with each end advertising exactly the given services.
+async fn negotiate_test_pair_with_services(
+    local_config: Config,
+    local_services: PeerServices,
+    remote_config: Config,
+    remote_services: PeerServices,
 ) -> (Arc<ConnectionInfo>, Arc<ConnectionInfo>) {
     let (local_stream, remote_stream) = duplex(16 * 1024);
     let mut local_conn = Framed::new(
@@ -140,9 +154,6 @@ async fn negotiate_test_pair(
     let local_min_version = MinimumPeerVersion::new(NoChainTip, &local_config.network);
     let remote_min_version = MinimumPeerVersion::new(NoChainTip, &remote_config.network);
 
-    let local_services = configured_advertised_services(&local_config, PeerServices::NODE_NETWORK);
-    let remote_services =
-        configured_advertised_services(&remote_config, PeerServices::NODE_NETWORK);
     let local_user_agent = TEST_LOCAL_USER_AGENT.to_string();
     let remote_user_agent = TEST_REMOTE_USER_AGENT.to_string();
 
@@ -782,11 +793,9 @@ async fn timed_out_initiator_upgrade_does_not_leak_upgrade_dial() {
 async fn p2p_v2_service_bit_advertisement_preserves_user_agent() {
     let _init_guard = zakura_test::init();
 
-    assert!(!configured_advertised_services(
-        &test_config(P2pStack::Legacy),
-        PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2,
-    )
-    .contains(PeerServices::NODE_P2P_V2));
+    assert!(!test_config(P2pStack::Legacy)
+        .handshake_services(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2)
+        .contains(PeerServices::NODE_P2P_V2));
 
     let (disabled_peer_seen_by_enabled, enabled_peer_seen_by_disabled) =
         negotiate_test_pair(test_config(P2pStack::Dual), test_config(P2pStack::Legacy)).await;
@@ -923,6 +932,19 @@ fn p2p_v2_upgrade_requires_local_enable_and_remote_service_bit() {
     assert!(should_attempt_zakura_upgrade(
         &test_config(P2pStack::Dual),
         &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2),
+    ));
+    // The compact blocks bit neither starts nor blocks the upgrade.
+    assert!(!should_attempt_zakura_upgrade(
+        &test_config(P2pStack::Dual),
+        &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_COMPACT_BLOCKS),
+    ));
+    assert!(should_attempt_zakura_upgrade(
+        &test_config(P2pStack::Dual),
+        &connection_info(
+            PeerServices::NODE_NETWORK
+                | PeerServices::NODE_P2P_V2
+                | PeerServices::NODE_COMPACT_BLOCKS
+        ),
     ));
 }
 
@@ -1114,41 +1136,257 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
     assert_eq!(remote_counter.update_count(), 0);
 }
 
-/// Early block relay is on for a connection only when both ends advertise the service bit.
+/// Early block relay is on for a connection only when both ends advertise
+/// [`PeerServices::NODE_COMPACT_BLOCKS`].
 #[tokio::test]
-async fn early_block_relay_requires_both_ends_to_opt_in() {
+async fn early_block_relay_requires_both_ends_to_advertise_compact_blocks() {
     let _init_guard = zakura_test::init();
 
-    let config = |enabled| Config {
-        experimental_early_block_relay: enabled,
-        ..test_config(P2pStack::Legacy)
+    let services = |enabled: bool| {
+        if enabled {
+            PeerServices::NODE_NETWORK | PeerServices::NODE_COMPACT_BLOCKS
+        } else {
+            PeerServices::NODE_NETWORK
+        }
     };
+    let config = || test_config(P2pStack::Legacy);
 
-    assert!(
-        !configured_advertised_services(&config(false), PeerServices::NODE_NETWORK)
-            .contains(PeerServices::NODE_EARLY_BLOCK_RELAY)
-    );
-    // A caller-supplied bit cannot enable the feature without the config.
-    assert!(!configured_advertised_services(
-        &config(false),
-        PeerServices::NODE_NETWORK | PeerServices::NODE_EARLY_BLOCK_RELAY,
-    )
-    .contains(PeerServices::NODE_EARLY_BLOCK_RELAY));
-    assert!(
-        configured_advertised_services(&config(true), PeerServices::NODE_NETWORK)
-            .contains(PeerServices::NODE_EARLY_BLOCK_RELAY)
-    );
-
-    let (local, remote) = negotiate_test_pair(config(true), config(true)).await;
+    let (local, remote) =
+        negotiate_test_pair_with_services(config(), services(true), config(), services(true))
+            .await;
     assert!(local.early_block_relay);
     assert!(remote.early_block_relay);
 
     for (local_enabled, remote_enabled) in [(true, false), (false, true), (false, false)] {
-        let (local, remote) =
-            negotiate_test_pair(config(local_enabled), config(remote_enabled)).await;
+        let (local, remote) = negotiate_test_pair_with_services(
+            config(),
+            services(local_enabled),
+            config(),
+            services(remote_enabled),
+        )
+        .await;
         assert!(
             !local.early_block_relay && !remote.early_block_relay,
-            "one-sided opt-in ({local_enabled}, {remote_enabled}) must keep committed relay",
+            "one-sided support ({local_enabled}, {remote_enabled}) must keep committed relay",
         );
     }
+}
+
+/// Pruned peers (bit 25, the bit Zebra 7.1.0-alpha.0 used for early relay) never negotiate
+/// early block relay.
+#[tokio::test]
+async fn pruned_peers_do_not_negotiate_early_block_relay() {
+    let _init_guard = zakura_test::init();
+
+    let pruned = PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED;
+    let (local, remote) = negotiate_test_pair_with_services(
+        test_config(P2pStack::Legacy),
+        pruned,
+        test_config(P2pStack::Legacy),
+        pruned,
+    )
+    .await;
+    assert!(!local.early_block_relay && !remote.early_block_relay);
+}
+/// A peer's announcement of one block is traced under the peer's name. An `inv` that names
+/// several blocks answers a query, and one that names only transactions is not about a block,
+/// so neither is traced.
+#[tokio::test]
+async fn only_a_single_block_inv_is_traced_as_an_announcement() {
+    use crate::peer::gossip_trace::tests::test_trace;
+
+    let blocks: Vec<_> = (1..=3).map(|byte| block::Hash([byte; 32])).collect();
+    let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
+    let (trace, mut written) = test_trace(&[("127.0.0.1", "us-0")]);
+    let connected_addr = ConnectedAddr::new_inbound_direct(peer_addr(38233));
+
+    for message in [
+        Message::Inv(vec![InventoryHash::Block(blocks[0])]),
+        Message::Inv(
+            blocks[1..]
+                .iter()
+                .copied()
+                .map(InventoryHash::Block)
+                .collect(),
+        ),
+        Message::Inv(vec![transaction]),
+        Message::GetData(vec![InventoryHash::Block(blocks[0])]),
+    ] {
+        register_inventory_status(
+            Ok(message),
+            connected_addr,
+            broadcast::channel(16).0,
+            AnnouncedBlocks::default(),
+            trace.for_peer(&connected_addr),
+        )
+        .await
+        .expect("the filter passes the message through");
+    }
+
+    let rows = written.take();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["event"], "block_inv_received");
+    assert_eq!(rows[0]["hash"], blocks[0].to_string());
+    assert_eq!(rows[0]["peer_name"], "us-0");
+}
+
+/// Every inbound block `inv` records an announcement, whatever its shape, and `notfound`
+/// withdraws one. Unlike the inventory registry, this covers solicited multi-block `inv`s and
+/// connections without a transient address.
+#[tokio::test]
+async fn inbound_invs_record_announced_blocks() {
+    let blocks: Vec<_> = (1..=4).map(|byte| block::Hash([byte; 32])).collect();
+    let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
+
+    for (addressed, message, expected) in [
+        (
+            true,
+            Message::Inv(vec![InventoryHash::Block(blocks[0])]),
+            vec![blocks[0]],
+        ),
+        (
+            true,
+            Message::Inv(
+                blocks[..3]
+                    .iter()
+                    .copied()
+                    .map(InventoryHash::Block)
+                    .collect(),
+            ),
+            blocks[..3].to_vec(),
+        ),
+        (
+            true,
+            Message::Inv(vec![InventoryHash::Block(blocks[3]), transaction]),
+            vec![blocks[3]],
+        ),
+        (true, Message::Inv(vec![transaction]), Vec::new()),
+        (
+            // An isolated connection has no transient address, but still has announcements.
+            false,
+            Message::Inv(vec![InventoryHash::Block(blocks[0])]),
+            vec![blocks[0]],
+        ),
+    ] {
+        let connected_addr = if addressed {
+            ConnectedAddr::new_inbound_direct(peer_addr(38233))
+        } else {
+            ConnectedAddr::new_isolated()
+        };
+        let announced = AnnouncedBlocks::default();
+        let returned = register_inventory_status(
+            Ok(message.clone()),
+            connected_addr,
+            broadcast::channel(16).0,
+            announced.clone(),
+            Default::default(),
+        )
+        .await
+        .expect("the filter passes the message through");
+        assert_eq!(returned, message);
+        for block in &blocks {
+            assert_eq!(
+                announced.announced(*block),
+                expected.contains(block),
+                "{message:?} recorded {block:?} incorrectly"
+            );
+        }
+    }
+
+    // A `notfound` withdraws the peer's claim, so the block is advertised to it again.
+    let announced = AnnouncedBlocks::default();
+    announced.record(blocks.iter().copied());
+    register_inventory_status(
+        Ok(Message::NotFound(vec![
+            InventoryHash::Block(blocks[0]),
+            transaction,
+        ])),
+        ConnectedAddr::new_inbound_direct(peer_addr(38233)),
+        broadcast::channel(16).0,
+        announced.clone(),
+        Default::default(),
+    )
+    .await
+    .expect("the filter passes the message through");
+    assert!(!announced.announced(blocks[0]));
+    assert!(blocks[1..].iter().all(|block| announced.announced(*block)));
+}
+
+/// A body request contradicts only the requested blocks' earlier announcements.
+#[tokio::test]
+async fn body_requests_withdraw_only_requested_block_announcements() {
+    let blocks = [block::Hash([41; 32]), block::Hash([42; 32])];
+    let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
+    for connected_addr in [
+        ConnectedAddr::new_inbound_direct(peer_addr(38233)),
+        ConnectedAddr::new_isolated(),
+    ] {
+        for items in [
+            vec![],
+            vec![transaction],
+            vec![InventoryHash::Block(blocks[0])],
+            vec![InventoryHash::Block(blocks[0]), transaction],
+            blocks.iter().copied().map(InventoryHash::Block).collect(),
+        ] {
+            let announced = AnnouncedBlocks::default();
+            announced.record(blocks);
+            let message = Message::GetData(items.clone());
+            let returned = register_inventory_status(
+                Ok(message.clone()),
+                connected_addr,
+                broadcast::channel(16).0,
+                announced.clone(),
+                Default::default(),
+            )
+            .await
+            .expect("the filter passes the request through");
+            assert_eq!(returned, message);
+            for hash in blocks {
+                assert_eq!(
+                    announced.announced(hash),
+                    !items.contains(&InventoryHash::Block(hash)),
+                    "a body request withdraws only the requested block: {message:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Cancelling a connector also cancels its spawned handshake before the timeout.
+#[tokio::test]
+async fn dropping_handshake_future_releases_stream_and_tracker() {
+    use tokio::io::AsyncReadExt;
+
+    let _init_guard = zakura_test::init();
+    let (book_tx, _book_rx) = tokio::sync::mpsc::channel(10);
+    let mut handshake =
+        test_handshake_without_zakura_connector(test_config(P2pStack::Legacy), book_tx);
+    let (local_stream, mut remote_stream) = duplex(16 * 1024);
+    let mut counter = ActiveConnectionCounter::new_counter();
+    tokio::time::pause();
+    let started_at = Instant::now();
+    let attempt = handshake.call(HandshakeRequest {
+        data_stream: local_stream,
+        connected_addr: ConnectedAddr::new_outbound_direct(peer_addr(8233)),
+        connection_tracker: counter.track_connection(),
+    });
+
+    // Seeing the version bytes proves the inner task is running and blocked on its peer.
+    timeout(constants::HANDSHAKE_TIMEOUT / 2, remote_stream.read_u8())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(counter.update_count(), 1);
+    drop(attempt);
+
+    let mut remaining = Vec::new();
+    timeout(
+        constants::HANDSHAKE_TIMEOUT / 2,
+        remote_stream.read_to_end(&mut remaining),
+    )
+    .await
+    .expect("cancellation closes the stream without waiting for handshake timeout")
+    .unwrap();
+    assert_eq!(counter.update_count(), 0);
+    assert_eq!(Instant::now(), started_at);
 }

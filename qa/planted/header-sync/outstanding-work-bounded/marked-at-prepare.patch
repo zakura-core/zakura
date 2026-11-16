@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 8fdd735649..c18bf66f6c 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2160,6 +2160,12 @@ impl HeaderSyncReactor {
+         }
+         match result {
+             HeaderTargetPreparationResult::Prepared(target) => {
++                // Mutation: a prepared target is marked completed before
++                // its apply.
++                let authority = owner.header_authority();
++                self.state
++                    .completed_targets
++                    .mark(authority.header_generation, authority.branch);
+                 if target.owner() != owner || target.source() != source {
+                     end_retained(&mut retained, HeaderWorkEnd::OwnerMismatch);
+                     return;

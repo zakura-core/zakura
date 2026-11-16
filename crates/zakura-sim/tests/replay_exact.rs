@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zakura_scheduler::{SchedulerConfig, SimInstant};
+use zakura_sim::NaReason;
 use zakura_sim::{
     action::Boundary,
     harness::{self, entry, HarnessEntry, RecordInput, Subsystem},
@@ -410,7 +411,8 @@ fn equivalent_build_rejects_changed_results() {
 
     let dir = violating_race();
     edit(dir.path(), |lines| {
-        lines.last_mut().unwrap()["end"]["properties"][0]["outcome"] = json!("not-applicable");
+        lines.last_mut().unwrap()["end"]["properties"][0]["outcome"] =
+            json!({"not-applicable": {"reason": "never-applied"}});
     });
     assert_eq!(nondeterministic(dir.path()), (steps, "end.properties"));
 }
@@ -629,6 +631,17 @@ impl ActionSource for Duplicates {
             event: "once".into(),
         });
     }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The [`Duplicates`] source alone.
@@ -730,6 +743,17 @@ impl ActionSource for Clock {
             source: "clock".into(),
             event,
         });
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 
@@ -850,6 +874,17 @@ impl ActionSource for Effects {
                 event,
             });
         }
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 
@@ -1178,6 +1213,7 @@ fn work_machine_records_and_replays_without_transport() {
         PlanInput::Bytes(Vec::new()),
         "block/work-ownership",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1303,6 +1339,7 @@ fn decoded_retention_replays_final_holders_in_a_fresh_process() {
         PlanInput::Bytes(Vec::new()),
         "block/decoded-retention",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1380,10 +1417,11 @@ fn decoded_retention_preserves_short_inputs_and_requires_a_live_witness() {
             PlanInput::Bytes(Vec::new()),
             "block/decoded-retention",
             zakura_sim::witness::Expect::Holds,
+            &[],
             &mut zakura_sim::NullSink,
         ),
         Err(zakura_sim::witness::WitnessError::Outcome(
-            PropertyOutcome::NotApplicable
+            PropertyOutcome::not_applicable(NaReason::NeverApplied)
         ))
     );
 }
@@ -1411,6 +1449,7 @@ fn work_funding_records_and_replays_retained_runtime_owners() {
         PlanInput::Bytes(Vec::new()),
         "block/work-funding",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1488,10 +1527,11 @@ fn work_funding_preserves_short_inputs_and_observes_drain() {
             PlanInput::Bytes(Vec::new()),
             "block/work-funding",
             zakura_sim::witness::Expect::Holds,
+            &[],
             &mut zakura_sim::NullSink
         ),
         Err(zakura_sim::witness::WitnessError::Outcome(
-            PropertyOutcome::NotApplicable
+            PropertyOutcome::not_applicable(NaReason::NeverApplied)
         ))
     );
 }
@@ -1548,6 +1588,7 @@ fn reactor_machine_records_and_replays_without_transport() {
         PlanInput::Bytes(Vec::new()),
         "header/reactor-policy",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1593,6 +1634,7 @@ fn publisher_machine_records_and_replays_without_transport() {
         PlanInput::Bytes(Vec::new()),
         name,
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1657,6 +1699,7 @@ fn reactor_machine_records_and_replays_query_identities() {
         PlanInput::Bytes(Vec::new()),
         "block/reactor-policy",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1708,6 +1751,47 @@ fn reactor_machine_records_and_replays_query_identities() {
 }
 
 const DISCOVERY_BOOK_INPUT: &[u8] = include_bytes!("fixtures/discovery-record-book.bin");
+
+/// The committed record-book input is the witness `zakura-network` encodes
+/// under the current decoder.
+#[test]
+fn discovery_book_input_is_the_encoded_witness() {
+    assert_eq!(
+        DISCOVERY_BOOK_INPUT,
+        zakura_network::zakura::discovery_book_witness_bytes(),
+        "the committed input changed; regenerate it with regenerate_discovery_book_input if \
+         that's intended"
+    );
+}
+
+/// Rewrites `fixtures/discovery-record-book.{bin,toml}` from the witness
+/// `zakura-network` encodes. Run it with `RUSTFLAGS="--cfg zakura_sim" cargo
+/// test -p zakura-sim --test replay_exact -- --ignored
+/// regenerate_discovery_book_input`.
+#[test]
+#[ignore = "rewrites the committed input"]
+fn regenerate_discovery_book_input() {
+    let entry = harness::find("discovery/record-book").unwrap();
+    let input = zakura_network::zakura::discovery_book_witness_bytes();
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-record-book");
+    std::fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
+    let sidecar = format!(
+        "harness = \"{harness}\"\n\
+         generator = {generator}\n\
+         sha256 = \"{digest}\"\n\
+         scenario_sha256 = \"{scenario}\"\n\
+         source = \"crates/zakura-sim/tests/replay_exact.rs\"\n\
+         \n\
+         [[witness]]\n\
+         property = \"{harness}\"\n\
+         expect = \"holds\"\n",
+        harness = entry.name,
+        generator = entry.generator,
+        digest = zakura_sim::seed::sha256(&input),
+        scenario = zakura_sim::seed::scenario_sha256(&(entry.draw)(&input)),
+    );
+    std::fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
+}
 const DISCOVERY_STATE_INPUT: &[u8] = include_bytes!("fixtures/discovery-session-installation.bin");
 
 #[test]
@@ -1743,11 +1827,12 @@ fn discovery_book_records_and_replays_signed_samples() {
         PlanInput::Bytes(Vec::new()),
         "discovery/record-book",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
-    assert_eq!(trace.meta.generator, 2);
-    assert_eq!(trace.steps.len(), DISCOVERY_BOOK_INPUT.len() / 4);
+    assert_eq!(trace.meta.generator, 3);
+    assert_eq!(trace.steps.len(), DISCOVERY_BOOK_INPUT.len() / 2);
     assert!(trace
         .steps
         .iter()
@@ -1767,11 +1852,11 @@ fn discovery_book_records_and_replays_signed_samples() {
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
     // The property applies from the first step whose prefix reaches the
-    // trigger, so 13 of the input's 20 steps count.
-    assert_eq!(trace.steps.len(), 20);
+    // trigger, step 8's replacement, so 11 of the input's 18 steps count.
+    assert_eq!(trace.steps.len(), 18);
     assert_eq!(
         report.properties[0].outcome,
-        PropertyOutcome::Held { applicable: 13 }
+        PropertyOutcome::Held { applicable: 11 }
     );
     replay_in_child(dir.path());
 
@@ -1800,6 +1885,7 @@ fn discovery_state_records_and_replays_installations() {
         PlanInput::Bytes(Vec::new()),
         "discovery/session-installation",
         zakura_sim::witness::Expect::Holds,
+        &[],
         &mut zakura_sim::NullSink,
     )
     .unwrap();
@@ -1821,15 +1907,19 @@ fn discovery_state_records_and_replays_installations() {
 
 #[test]
 fn discovery_machines_preserve_empty_and_short_inputs() {
-    for name in ["discovery/record-book", "discovery/session-installation"] {
-        for input in [&[][..], &[0, 0][..], &[0; 512][..]] {
+    // The record book reads two bytes per operation, and the session owner four.
+    for (name, width) in [
+        ("discovery/record-book", 2),
+        ("discovery/session-installation", 4),
+    ] {
+        for input in [&[][..], &[0][..], &[0, 0][..], &[0; 512][..]] {
             let entry = harness::find(name).unwrap();
             let dir = record(entry, input);
             let trace = open(dir.path());
             let mut sink = zakura_sim::MemorySink::default();
             let explored = (entry.run_bytes)(input, &mut sink, None);
             assert_eq!(explored.scenario.unwrap(), trace.meta.scenario);
-            assert_eq!(trace.steps.len(), input.len().div_ceil(4));
+            assert_eq!(trace.steps.len(), input.len().div_ceil(width));
             assert!(replayed(dir.path(), ReplayOptions::default())
                 .unwrap()
                 .verified());

@@ -1,0 +1,11 @@
+# The node reserves the largest `Peers` whatever limit its `GetPeers` asks for.
+# The scenario's node asks for one record, and its peer answers with two
+# validly signed records, one byte over the cap of one.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/peers/over-owed-closes/reserve-largest-peers.scenario.json"
+plan = "qa/planted/discovery/s4v2/peers/over-owed-closes/reserve-largest-peers.plan.bin"

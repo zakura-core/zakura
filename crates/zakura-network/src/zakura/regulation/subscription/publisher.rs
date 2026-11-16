@@ -135,6 +135,13 @@ impl PublicationSlots {
     pub(crate) fn held(&self) -> usize {
         self.capacity - self.budget.available()
     }
+
+    /// [`Self::held`], read with no simulator preemption point, for an
+    /// observer's report.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn peek_held(&self) -> usize {
+        self.capacity - self.budget.peek_available()
+    }
 }
 
 /// A terminal outcome's reserved output, and the subscription's slot.

@@ -1,0 +1,26 @@
+diff --git a/crates/zakura-network/src/zakura/transport/pipe.rs b/crates/zakura-network/src/zakura/transport/pipe.rs
+index 89fda81f26..9054b4ea5a 100644
+--- a/crates/zakura-network/src/zakura/transport/pipe.rs
++++ b/crates/zakura-network/src/zakura/transport/pipe.rs
+@@ -525,8 +525,8 @@ pub(crate) fn spawn_supervised_peer_task_unboxed(
+ /// `Result` to inspect.
+ pub(crate) fn handle_pipe_exit(
+     service: &'static str,
+-    connection_cancel: &CancellationToken,
+-    close_cause: &CloseCause,
++    _connection_cancel: &CancellationToken,
++    _close_cause: &CloseCause,
+     result: Result<(), SinkReject>,
+ ) {
+     match result {
+@@ -537,8 +537,8 @@ pub(crate) fn handle_pipe_exit(
+                 service,
+                 "Zakura stream rejected protocol-invalid frame"
+             );
+-            close_cause.record("service_protocol_reject");
+-            connection_cancel.cancel();
++            // The stream's own teardown stops this service. The connection
++            // stays up for the peer's other services.
+         }
+         Err(SinkReject::Local(error)) => {
+             tracing::debug!(?error, service, "Zakura stream stopped on local error");

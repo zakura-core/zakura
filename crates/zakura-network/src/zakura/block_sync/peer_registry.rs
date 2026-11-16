@@ -271,6 +271,21 @@ impl PeerRegistry {
         }
     }
 
+    /// This registry, reporting each generation-gated write that lands on
+    /// another generation's entry to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn with_observer(
+        mut self,
+        observer: super::block_sync_observe::ObserverSlot,
+    ) -> Self {
+        self.peers
+            .get_mut()
+            .expect("peer registry mutex is never poisoned")
+            .state
+            .set_observer(observer);
+        self
+    }
+
     pub(super) fn eligible_sources(
         &self,
         height: block::Height,

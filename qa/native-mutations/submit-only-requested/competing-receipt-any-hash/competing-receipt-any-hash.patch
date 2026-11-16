@@ -1,0 +1,30 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
+index e3144b596f..9d33a807ec 100644
+--- a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
++++ b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
+@@ -1241,7 +1241,9 @@ impl PeerRoutine {
+     /// budget.
+     fn accept_unmatched_queued_body(&mut self, body: ReceivedBody) -> bool {
+         let (height, hash, serialized_bytes) = (body.height, body.hash, body.serialized_bytes);
+-        if self.io.work.hash_for_height(height) != Some(hash) {
++        // The transport already authorized this body for its exchange, so any
++        // wanted height may take it.
++        if self.io.work.hash_for_height(height).is_none() {
+             return false;
+         }
+         if !self.state.serves(height) {
+diff --git a/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs b/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
+index 2a6e606b45..ba50ed5eed 100644
+--- a/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
+@@ -747,8 +747,9 @@ impl WorkQueueState {
+         let owner = self
+             .in_flight
+             .get(&height)
+-            .filter(|item| !item.provisional && item.hash == hash)?
++            .filter(|item| !item.provisional)?
+             .owner?;
++        let _ = hash;
+         self.end_reservation_at_receipt(owner, height, true)
+             .map(|charge| (owner, charge))
+     }

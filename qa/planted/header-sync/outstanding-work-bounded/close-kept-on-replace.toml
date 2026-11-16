@@ -1,0 +1,10 @@
+# Admitting a peer's new session keeps the replaced session's close
+# deadline and pending close, so the next unit of work holds a close entry
+# for a session that isn't admitted. The reactor decides when the witness's
+# sessions are replaced, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-relinked-mid-round.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-relinked-mid-round.plan"

@@ -840,12 +840,10 @@ async fn adapter_deadlines_match_the_contract() {
         .any(|outcome| outcome == Outcome::Fault(zakura_storage::header::Fault::LocalResource)));
 }
 
-/// `vct_repair_context` agrees: both answer `Stale`. The simulator always
-/// does. Production refuses any repair above the checkpoint ceiling, which
-/// `zakurad` sets to height 0 on Regtest, so on Regtest it always does too.
-/// Expected difference: on a network with checkpoints, production can
-/// resolve a repair that the simulator still answers `Stale`. Fixtures are
-/// Regtest only.
+/// `vct_repair_context` agrees: both answer `Stale`. Each refuses any
+/// repair above its checkpoint ceiling, which `zakurad` sets to height 0 on
+/// Regtest and the simulator keeps at 0 unless a fixture raises it, so on
+/// Regtest both always do.
 #[tokio::test]
 async fn vct_repair_context_matches_on_regtest() {
     let network = HeaderFixture::regtest().network().clone();

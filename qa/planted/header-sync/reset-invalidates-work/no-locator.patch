@@ -1,0 +1,19 @@
+diff --git a/crates/zakura-storage/src/header/adapter.rs b/crates/zakura-storage/src/header/adapter.rs
+index 083d00b2da..b4305b940c 100644
+--- a/crates/zakura-storage/src/header/adapter.rs
++++ b/crates/zakura-storage/src/header/adapter.rs
+@@ -972,9 +972,12 @@ impl EnginePort {
+         let (mut effects, mut locator_read, mut refusal) = (Effects::default(), None, None);
+         let reply = match request {
+             HeaderRequest::ContinuationLocator => HeaderReply::ContinuationLocator(
+-                self.locator().map(|(locator, generation, finalized)| {
++                self.locator().map(|(_locator, generation, finalized)| {
+                     locator_read = Some((generation, finalized));
+-                    Some(locator)
++                    // Mutation: the engine port answers every locator read
++                    // with no locator, though its selected path holds the
++                    // finalized anchor.
++                    None
+                 }),
+             ),
+             HeaderRequest::VctRepairContext { owner, height } => {

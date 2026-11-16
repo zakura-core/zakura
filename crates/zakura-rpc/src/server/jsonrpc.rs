@@ -3,7 +3,7 @@
 //! Requests are parsed and responses are encoded exactly like `jsonrpsee` 0.26, which Zakura used
 //! before, so clients see the same bytes. `server/tests/wire.rs` checks this.
 
-use std::{borrow::Cow, fmt, io, marker::PhantomData};
+use std::{borrow::Cow, cell::Cell, fmt, io, marker::PhantomData};
 
 use serde::{
     de::{self, DeserializeOwned, Deserializer, Unexpected, Visitor},
@@ -14,6 +14,40 @@ use serde_json::value::RawValue;
 
 /// The result of an RPC method.
 pub type RpcResult<T> = Result<T, ErrorObject>;
+
+thread_local! {
+    /// Whether this thread is serializing a method's result into its response.
+    static IS_WRITING_RESULT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the value being serialized on this thread is a method's result, going into its
+/// response.
+///
+/// Responses are written by `serde_json`'s own serializer, which copies a [`RawValue`] to the
+/// output as it is. Other serializers treat a `RawValue` as an ordinary struct, so a `Serialize`
+/// implementation can only hand over finished JSON while this returns true.
+pub(crate) fn is_writing_result() -> bool {
+    IS_WRITING_RESULT.get()
+}
+
+/// Marks this thread as serializing a method's result, until this guard is dropped.
+struct WritingResult {
+    was_writing_result: bool,
+}
+
+impl WritingResult {
+    fn start() -> Self {
+        Self {
+            was_writing_result: IS_WRITING_RESULT.replace(true),
+        }
+    }
+}
+
+impl Drop for WritingResult {
+    fn drop(&mut self) {
+        IS_WRITING_RESULT.set(self.was_writing_result);
+    }
+}
 
 /// A JSON-RPC 2.0 error object, serialized as `{"code": ..., "message": ...}`.
 ///
@@ -580,27 +614,18 @@ pub struct MethodResponse {
     is_notification: bool,
 }
 
-/// A response, which is serialized with its members in `jsonrpsee`'s order.
-struct Response<'a, T> {
+/// An error response, which is serialized with its members in `jsonrpsee`'s order.
+struct ErrorResponse<'a> {
     id: &'a Id<'a>,
-    payload: Payload<'a, T>,
+    error: WireError<'a>,
 }
 
-/// The result or error of a response.
-enum Payload<'a, T> {
-    Result(&'a T),
-    Error(WireError<'a>),
-}
-
-impl<T: Serialize> Serialize for Response<'_, T> {
+impl Serialize for ErrorResponse<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut response = serializer.serialize_struct("Response", 3)?;
         response.serialize_field("jsonrpc", &TwoPointZero)?;
         response.serialize_field("id", self.id)?;
-        match &self.payload {
-            Payload::Result(result) => response.serialize_field("result", result)?,
-            Payload::Error(error) => response.serialize_field("error", error)?,
-        }
+        response.serialize_field("error", &self.error)?;
         response.end()
     }
 }
@@ -610,20 +635,54 @@ impl MethodResponse {
     ///
     /// A response longer than `max_response_size` bytes is replaced by an error.
     pub fn response<T: Serialize>(id: Id, result: &RpcResult<T>, max_response_size: usize) -> Self {
-        let (payload, error_code) = match result {
-            Ok(result) => (Payload::Result(result), None),
-            Err(error) => (
-                Payload::Error(WireError {
-                    code: error.code,
-                    message: &error.message,
-                    data: None,
-                }),
-                Some(error.code),
-            ),
-        };
+        // Only the result's own serialization depends on `T`. Every method's response shares the
+        // envelope and error handling in `encode_bounded`, which is compiled once.
+        match result {
+            Ok(result) => Self::encode_bounded(id, None, max_response_size, &mut |writer| {
+                let _writing_result = WritingResult::start();
+                serde_json::to_writer(writer, result)
+            }),
+            Err(error) => {
+                Self::encode_bounded(id, Some(error.code), max_response_size, &mut |writer| {
+                    serde_json::to_writer(
+                        writer,
+                        &WireError {
+                            code: error.code,
+                            message: &error.message,
+                            data: None,
+                        },
+                    )
+                })
+            }
+        }
+    }
 
+    /// Returns a response with `id` whose `result` member, or whose `error` member if
+    /// `error_code` is set, is the JSON that `write_member` writes.
+    ///
+    /// A response longer than `max_response_size` bytes is replaced by an error.
+    fn encode_bounded(
+        id: Id,
+        error_code: Option<i32>,
+        max_response_size: usize,
+        write_member: &mut dyn FnMut(&mut BoundedWriter) -> serde_json::Result<()>,
+    ) -> Self {
         let mut writer = BoundedWriter::new(max_response_size);
-        match serde_json::to_writer(&mut writer, &Response { id: &id, payload }) {
+        let member: &[u8] = if error_code.is_some() {
+            br#","error":"#
+        } else {
+            br#","result":"#
+        };
+        // The same bytes `serde_json` writes for a `Response` struct with these fields.
+        let written = (|| {
+            write_bytes(&mut writer, br#"{"jsonrpc":"2.0","id":"#)?;
+            serde_json::to_writer(&mut writer, &id)?;
+            write_bytes(&mut writer, member)?;
+            write_member(&mut writer)?;
+            write_bytes(&mut writer, b"}")
+        })();
+
+        match written {
             Ok(()) => Self {
                 json: writer.into_json(),
                 error_code,
@@ -683,11 +742,8 @@ impl MethodResponse {
 
     fn encode_error(id: &Id, error: WireError) -> Self {
         let code = error.code;
-        let json = serde_json::value::to_raw_value(&Response::<()> {
-            id,
-            payload: Payload::Error(error),
-        })
-        .expect("error responses only contain strings and integers");
+        let json = serde_json::value::to_raw_value(&ErrorResponse { id, error })
+            .expect("error responses only contain strings and integers");
 
         Self {
             json,
@@ -806,6 +862,11 @@ impl BoundedWriter {
         let json = String::from_utf8(self.buf).expect("serde_json writes UTF-8");
         RawValue::from_string(json).expect("serde_json writes valid JSON")
     }
+}
+
+/// Writes `bytes` to `writer`, failing as `serde_json` does when the response limit is exceeded.
+fn write_bytes(mut writer: &mut BoundedWriter, bytes: &[u8]) -> serde_json::Result<()> {
+    io::Write::write_all(&mut writer, bytes).map_err(serde_json::Error::io)
 }
 
 impl io::Write for &mut BoundedWriter {

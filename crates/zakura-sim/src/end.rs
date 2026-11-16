@@ -4,6 +4,7 @@ use std::fmt;
 
 use crate::{check::Violation, PlanError};
 use serde::{Deserialize, Serialize};
+use zakura_scheduler::Status;
 
 /// A failure of the simulation itself, not of the code under test.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,7 +35,9 @@ pub enum HarnessFailure {
     /// steps. That code is harness code, so it must not consume the plan.
     DrawOutsideStep,
     /// Nothing is enabled, yet the scheduler says the run can go on, as when a
-    /// source's deadline blocks time while it offers no action.
+    /// source's deadline blocks time while it offers no action, or when a
+    /// task is ready with no worker for it while a check is still open,
+    /// which the end can't conclude against the node.
     StuckWithoutAction {
         /// The scheduler's status.
         status: &'static str,
@@ -92,6 +95,15 @@ pub enum HarnessFailure {
         /// What was wrong, led by the failure's name, such as
         /// `BoundarySkipped`.
         detail: String,
+    },
+    /// The drain reached its step bound with work still enabled, a time
+    /// advance included, so it never reached a dry end that could judge
+    /// what was open. That covers a node task that spins with nothing open,
+    /// which `sim/no-livelock` doesn't check in the drain.
+    DrainBound {
+        /// The first open check, as `<property> <subject>`, or else the first
+        /// enabled action: a ready task, a recovery action or the advance.
+        open: String,
     },
     /// A tapped reactor caught one of its port calls panicking, which no
     /// run expects. It outranks any evidence failure of the same step,
@@ -167,6 +179,12 @@ impl fmt::Display for HarnessFailure {
             HarnessFailure::SourceEvidence { source, detail } => {
                 write!(f, "{source}'s evidence failed: {detail}")
             }
+            HarnessFailure::DrainBound { open } => {
+                write!(
+                    f,
+                    "drain-bound: the drain reached its step bound with {open} unfinished"
+                )
+            }
             HarnessFailure::ReactorPortPanicked { source, call } => {
                 write!(f, "{source}'s port call {call} panicked")
             }
@@ -193,9 +211,12 @@ pub enum IdleStatus {
 pub enum Outcome {
     /// A property was violated.
     Violation,
-    /// The step budget ran out, and the drain followed.
+    /// The live phase ended, at its step budget or idle with work the drain
+    /// could still resolve, and the drain followed and ran dry. A drain cut
+    /// off at its bound is [`HarnessFailure::DrainBound`] instead.
     Budget,
-    /// Nothing was enabled.
+    /// Nothing was enabled in the live phase, and nothing was left for the
+    /// drain to resolve.
     Idle {
         /// What the scheduler reported.
         status: IdleStatus,
@@ -210,7 +231,8 @@ pub enum Outcome {
 pub struct Drain {
     /// Steps the drain took.
     pub steps: u64,
-    /// True if it stopped at its bound with tasks still ready.
+    /// True if it stopped at its bound with work still enabled, which ends
+    /// the run at [`HarnessFailure::DrainBound`].
     pub exhausted: bool,
 }
 
@@ -227,4 +249,33 @@ pub struct RunEnd {
     pub drain: Option<Drain>,
     /// The failure, for [`Outcome::Harness`].
     pub harness: Option<HarnessFailure>,
+    /// The scheduler's status where the run ran dry, with nothing left to
+    /// step: an [`Outcome::Idle`] end's, or a [`Outcome::Budget`] end's
+    /// after its drain ran dry. `None` for any other end. A dry drain can
+    /// end worker-starved, deadlocked, or waiting on a timer past the
+    /// harness timer cap, so a check that needs every task at rest reads
+    /// [`Self::at_rest`], not the outcome.
+    pub rest: Option<Status>,
+}
+
+impl RunEnd {
+    /// Whether the run ran dry with the scheduler at rest ([`at_rest`]).
+    pub fn at_rest(&self) -> bool {
+        self.rest.is_some_and(at_rest)
+    }
+}
+
+/// Whether a scheduler at `status` has come to rest, so a check may judge
+/// what the node left undone: every task finished, waits outside the
+/// scheduler or on a timer, or is deadlocked. No worker count unsticks a
+/// deadlock, and a lost wake shows up as one, so it's a settled end the
+/// node owns. A worker-starved scheduler isn't at rest: it has a ready
+/// task that more workers would run, so what that task would do next is
+/// still owed. Work the harness holds is caught before either, as
+/// stranded source work. Every check that judges rest asks this.
+pub fn at_rest(status: Status) -> bool {
+    matches!(
+        status,
+        Status::Quiescent | Status::WaitingOnExternal | Status::WaitingOnTime | Status::Deadlock
+    )
 }

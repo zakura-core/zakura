@@ -1,0 +1,22 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 147b4442fc..b8df1eff18 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -596,17 +596,6 @@ impl HeaderSyncReactor {
+             zakura_rt::select! {
+                 biased;
+                 _ = self.startup.shutdown.cancelled() => break HeaderRequestTerminal::Shutdown,
+-                completion = async {
+-                    if self.pending_port_operations.is_empty() {
+-                        std::future::pending().await
+-                    } else {
+-                        self.pending_port_operations.next().await
+-                    }
+-                } => {
+-                    if let Some(completion) = completion {
+-                        self.handle_port_completion(completion);
+-                    }
+-                }
+                 permit = locator_capacity.acquire_owned(), if self.locator_capacity_waiting => {
+                     caused!(self, ReactorCause::Capacity, {
+                         drop(permit.expect("the locator semaphore is never closed"));

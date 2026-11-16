@@ -269,6 +269,7 @@ impl VerifiedBundles {
     ///
     /// [`Cached::clear`] is the only caller; benchmarks and tests use it to start from a cold
     /// cache. Forgetting a key only costs a re-verification, so this is always safe.
+    #[cfg(any(test, feature = "internal-bench"))]
     fn clear(&mut self) {
         self.keys.clear();
         self.insertion_order.clear();
@@ -368,6 +369,7 @@ impl<S> Cached<S> {
     /// This exists for [`clear_shielded_verification_caches`](super::clear_shielded_verification_caches),
     /// which benchmarks call to measure verification rather than cache hits. Forgetting a key
     /// only costs a re-verification, so calling it can never accept an unverified bundle.
+    #[cfg(any(test, feature = "internal-bench"))]
     pub(super) fn clear(&self) {
         self.verified
             .lock()

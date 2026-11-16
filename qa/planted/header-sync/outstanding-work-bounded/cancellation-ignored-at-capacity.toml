@@ -1,0 +1,14 @@
+# The publisher drops its cancellation arm, as cancellation-ignored does,
+# on the plan's second run: 11 mirrors below the node, serving reads held
+# so 8 fill the node's execution slots, and mirrors 1 to 3 closed and
+# relinked while their page jobs wait for node execution. Their cancelled
+# publishers stay parked, so the run comes to rest with them still running
+# under cancelled tokens. The service, the publishers and the serving
+# capacity decide which page jobs wait, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation/serve"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-serving-replaced.json"
+plan = "crates/zakura-sim/tests/fixtures/header-outstanding-serving-replaced.plan"

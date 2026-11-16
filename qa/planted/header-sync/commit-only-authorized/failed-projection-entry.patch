@@ -1,0 +1,39 @@
+diff --git a/crates/zakura-header-chain/src/transition/engine/mod.rs b/crates/zakura-header-chain/src/transition/engine/mod.rs
+index 50346354a1..6a2c81a35e 100644
+--- a/crates/zakura-header-chain/src/transition/engine/mod.rs
++++ b/crates/zakura-header-chain/src/transition/engine/mod.rs
+@@ -355,6 +355,16 @@ impl HeaderChainEngine {
+         Ok(())
+     }
+ 
++    /// Mutation: corrupts one part of the durable state.
++    pub fn planted_corrupt(&mut self) {
++        // Mutation: an interior entry of the selected projection names
++        // another header.
++        if self.selected_projection.len() > 2 {
++            let at = self.selected_projection.len() - 2;
++            self.selected_projection[at].hash = block::Hash([0xee; 32]);
++        }
++    }
++
+     /// Return the private identity of this exact in-memory source revision.
+     pub(crate) fn transition_source(&self) -> EngineTransitionSource {
+         EngineTransitionSource {
+diff --git a/crates/zakura-storage/src/header/adapter.rs b/crates/zakura-storage/src/header/adapter.rs
+index 0b178bb334..f9fa744bf4 100644
+--- a/crates/zakura-storage/src/header/adapter.rs
++++ b/crates/zakura-storage/src/header/adapter.rs
+@@ -873,6 +873,13 @@ impl EnginePort {
+         engine
+             .install_committed_transition(transition)
+             .map_err(|error| local_resource(owner, Some(Box::new(error))))?;
++        // Mutation: a node round's apply corrupts the engine after its
++        // install. The fixture's own preload, under its fixed source,
++        // applies faithfully.
++        if source != SourceId::from_digest([7; 32]) {
++            engine.planted_corrupt();
++            return Err(local_resource(owner, None));
++        }
+         let updates = hint_updates(&engine, hints);
+         self.publish_locked(after, effect, updates);
+         drop(engine);

@@ -332,7 +332,7 @@ fn check_into(out: &Path, dir: &str, input: &[u8], property: &str) -> Value {
     let confirm_dir = out.join(dir).join("confirm");
     fs::create_dir_all(&confirm_dir).unwrap();
     fs::write(out.join(dir).join("input.bin"), input).unwrap();
-    let confirmation = confirm(&PLANTED, input, property, &confirm_dir).unwrap();
+    let confirmation = confirm(&PLANTED, input, property, &[], &confirm_dir).unwrap();
     write_json(&confirm_dir.join(CONFIRMATION_FILE), &confirmation);
     let trace = confirmation
         .trace

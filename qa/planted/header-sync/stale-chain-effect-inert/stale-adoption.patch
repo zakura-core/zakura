@@ -1,0 +1,51 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index d72b51d16b..ea2fd92517 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -295,6 +295,8 @@ fn build_header_sync_reactor(
+         state: ReactorState::new(Instant::now()),
+         peer_work_queue: PeerWorkQueue::default(),
+         last_snapshot_refresh_trace_at: Cell::new(None),
++        saved_snapshot: None,
++        install_saved: false,
+         #[cfg(any(test, zakura_sim))]
+         cause: ReactorCause::Idle,
+     };
+@@ -358,6 +360,8 @@ struct HeaderSyncReactor {
+     state: ReactorState,
+     peer_work_queue: PeerWorkQueue,
+     last_snapshot_refresh_trace_at: Cell<Option<Instant>>,
++    saved_snapshot: Option<zakura_header_chain::EngineSnapshot>,
++    install_saved: bool,
+     /// The unit of work the reactor is in, as `caused!` sets it.
+     #[cfg(any(test, zakura_sim))]
+     cause: ReactorCause,
+@@ -881,6 +885,12 @@ impl HeaderSyncReactor {
+     }
+ 
+     fn refresh_committed_snapshot(&mut self) {
++        if std::mem::take(&mut self.install_saved) {
++            if let Some(saved) = self.saved_snapshot.take() {
++                self.observe_latest_committed_snapshot(saved);
++                return;
++            }
++        }
+         let latest_snapshot = self
+             .startup
+             .committed_snapshots
+@@ -1834,6 +1844,7 @@ impl HeaderSyncReactor {
+         result: HeaderTargetAdmissionResult,
+         mut retained: Option<RetainedHeaders>,
+     ) {
++        self.install_saved = true;
+         self.finish_vct_local_operation(owner, HeaderTargetPhase::Applying);
+         end_retained(&mut retained, HeaderWorkEnd::Stale);
+         let settles_round = self.peer_work_queue.active(&peer).is_some_and(|active| {
+@@ -2130,6 +2141,7 @@ impl HeaderSyncReactor {
+                     self.peer_work_queue.begin_apply(&peer),
+                     "the exact preparing request passed the completion gate"
+                 );
++                self.saved_snapshot = self.committed_snapshot.clone();
+                 let dispatch = self.dispatch_holding(
+                     HeaderPortOperation::ApplyHeaderTarget {
+                         purpose: purpose.clone(),

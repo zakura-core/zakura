@@ -1,0 +1,17 @@
+# Discovery's reader closes a peer that empties the `get-services` cadence bucket,
+# with a fault cause. The scenario's peer sends `GetServices`, each once the node answered the last,
+# until one finds the bucket empty. The honest node only traces that frame.
+# Besides the file the patch changes, the rest of discovery and the reader's
+# read path decide whether the frame reaches the close.
+checks = [
+    "crates/zakura-network/src/zakura/discovery",
+    "crates/zakura-network/src/zakura/handler.rs",
+]
+# The peer's frames are conformant, so the close also breaks
+# `conformant-never-closes`. The runner expects that co-violation.
+also_violates = ["discovery/s4v2/conformant-never-closes"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/get-services/cadence-never-closes/close-on-empty-get-services-bucket.scenario.json"
+plan = "qa/planted/discovery/s4v2/get-services/cadence-never-closes/close-on-empty-get-services-bucket.plan.bin"

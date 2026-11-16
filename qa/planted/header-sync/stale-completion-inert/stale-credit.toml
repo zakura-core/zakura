@@ -1,0 +1,8 @@
+# A stale prepare's handler grants its peer's live session more credit. The
+# input's prepare ends after its round retired, while the same peer's next
+# round's subscription has a grant due.
+input = "crates/zakura-sim/tests/fixtures/header-storage-stale-prepare.bin"
+# Besides reactor.rs, which the patch changes, the queue and the subscriber
+# decide when a round retires mid-prepare and whether a grant is due. A
+# change there can move the input off its stale prepare.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

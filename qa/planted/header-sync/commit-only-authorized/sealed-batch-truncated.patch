@@ -1,0 +1,19 @@
+diff --git a/crates/zakura-storage/src/header/adapter.rs b/crates/zakura-storage/src/header/adapter.rs
+index 307b230923..0f38df4e38 100644
+--- a/crates/zakura-storage/src/header/adapter.rs
++++ b/crates/zakura-storage/src/header/adapter.rs
+@@ -731,7 +731,13 @@ impl EnginePort {
+                 Some(Box::new(error)),
+             ))
+         })?;
+-        let headers: Vec<_> = entries.iter().map(|entry| entry.header.clone()).collect();
++        let mut headers: Vec<_> = entries.iter().map(|entry| entry.header.clone()).collect();
++        // Mutation: preparation seals a node round's batch without its last
++        // header, keeping owner, parent and target. The fixture's own
++        // preload, under its fixed source, seals faithfully.
++        if headers.len() > 1 && source != SourceId::from_digest([7; 32]) {
++            headers.pop();
++        }
+         let batch = zakura_header_chain::prepare_headers(
+             HeaderBatchInput::new(&headers),
+             common_ancestor,

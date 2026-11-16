@@ -554,6 +554,19 @@ pub struct HeaderSyncService {
 }
 
 impl HeaderSyncService {
+    /// Reports `cadences`, the cadence map as it stands, to the reactor
+    /// observer's capacity handle, if there is one
+    /// ([`super::observe::ReactorEvent::ServiceSizes`]).
+    #[cfg(any(test, zakura_sim))]
+    fn report_cadences(&self, cadences: &HashMap<(ZakuraPeerId, ZakuraConnId), StatusCadence>) {
+        let Some(observer) = &self.header_sync.credit_observer else {
+            return;
+        };
+        let mut keys: Vec<(ZakuraPeerId, u64)> = cadences.keys().cloned().collect();
+        keys.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()).then(a.1.cmp(&b.1)));
+        observer.observe(super::observe::ReactorEvent::ServiceSizes { cadences: keys });
+    }
+
     /// Builds the service that admits header-sync sessions for the reactor
     /// behind `header_sync`, with no sync-lifecycle gate.
     pub fn new(header_sync: HeaderSyncHandle) -> Self {
@@ -748,6 +761,7 @@ impl Service for HeaderSyncService {
             }
         }
 
+        #[cfg(not(any(test, zakura_sim)))]
         let status = self
             .status_cadences
             .lock()
@@ -755,6 +769,21 @@ impl Service for HeaderSyncService {
             .entry((peer_id.clone(), conn_id))
             .or_insert_with(|| Arc::new(StdMutex::new(CadenceSender::new())))
             .clone();
+        // The same insert, reported under the same lock, since a simulated
+        // lock is a scheduling point.
+        #[cfg(any(test, zakura_sim))]
+        let status = {
+            let mut cadences = self
+                .status_cadences
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let status = cadences
+                .entry((peer_id.clone(), conn_id))
+                .or_insert_with(|| Arc::new(StdMutex::new(CadenceSender::new())))
+                .clone();
+            self.report_cadences(&cadences);
+            status
+        };
         let header_bytes = header_sync_header_bytes_for_network(&self.header_sync.network);
         // The reader checks each page and outcome header against the
         // subscription before it reads the payload.
@@ -783,7 +812,10 @@ impl Service for HeaderSyncService {
             session_id,
             send,
             service_cancel_token.clone(),
-        ); recv.stream_tap().map(|tap| RegulationTap::new(tap.clone(), |id| *id)));
+        ); (
+            recv.stream_tap().map(|tap| RegulationTap::new(tap.clone(), |id| *id)),
+            self.header_sync.credit_tap(&peer_id, session_id),
+        ));
 
         let admitted = self.header_sync.connect_session(session.clone());
         let handle = self.header_sync.clone();
@@ -878,10 +910,21 @@ impl Service for HeaderSyncService {
     }
 
     fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
+        #[cfg(not(any(test, zakura_sim)))]
         self.status_cadences
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&(peer.clone(), conn_id));
+        // The same removal, reported under the same lock.
+        #[cfg(any(test, zakura_sim))]
+        {
+            let mut cadences = self
+                .status_cadences
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            cadences.remove(&(peer.clone(), conn_id));
+            self.report_cadences(&cadences);
+        }
         let Some((key, _)) = self.sessions.get(peer) else {
             return;
         };
@@ -917,7 +960,7 @@ fn spawn_publisher(
     session_id: u64,
     send: FramedSend,
     cancel: CancellationToken,
-    #[cfg(any(test, zakura_sim))] tap: Option<RegulationTap<u64>>,
+    #[cfg(any(test, zakura_sim))] tap: (Option<RegulationTap<u64>>, Option<super::v9::CreditTap>),
 ) -> (Publisher, JoinHandle<()>) {
     let port = header_sync.port.clone();
     let push = header_sync.serving.push(peer);

@@ -11,6 +11,7 @@ pub mod zip317;
 mod tests;
 
 pub(crate) mod prepared_candidates;
+pub(crate) mod trace;
 use prepared_candidates::PreparedCandidateResolver;
 
 use std::{
@@ -40,7 +41,7 @@ use zakura_chain::{
         subsidy::{is_zip234_active, parent_nsm_value_balance},
         Network,
     },
-    serialization::{DateTime32, ZcashDeserializeInto},
+    serialization::DateTime32,
     transaction::VerifiedUnminedTx,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty},
 };
@@ -61,7 +62,9 @@ use crate::{
         mining::{ZAKURA_COINBASE_MARKER, ZAKURA_COINBASE_SEPARATOR},
     },
     methods::types::{
-        default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
+        default_roots::DefaultRoots,
+        long_poll::LongPollId,
+        transaction::{coinbase_needs_proof, TransactionTemplate},
     },
     server::error::{LegacyCode, MapError, OkOrError},
     EarlyMinedBlock, EarlyMinedBlockChannel, PendingBlockRegistry,
@@ -89,6 +92,37 @@ const MAX_PREPARED_WORK_IDS: usize = 64;
 const MAX_TEMPLATE_BUILDS: usize = 1;
 /// Bound admission waits without cancelling an already running proof.
 const TEMPLATE_BUILD_WAIT: Duration = Duration::from_secs(30);
+
+/// The work a template build does, which decides where it runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TemplateBuildWork {
+    /// No proof is created, so the build takes well under a millisecond and runs where it
+    /// was asked for.
+    ///
+    /// Handing so short a build to another thread costs more than the build: the thread has
+    /// to be found and scheduled while the node is busy with the block that prompted the
+    /// template.
+    ProofFree,
+
+    /// A proof is created for a shielded miner reward, which takes seconds, so the build runs
+    /// on a blocking thread.
+    Proof,
+}
+
+impl TemplateBuildWork {
+    /// Returns the work of a build that creates the coinbase at `height` for this miner.
+    pub(crate) fn for_coinbase(
+        net: &Network,
+        height: block::Height,
+        miner_params: &MinerParams,
+    ) -> Self {
+        if coinbase_needs_proof(net, height, miner_params) {
+            Self::Proof
+        } else {
+            Self::ProofFree
+        }
+    }
+}
 
 /// Rejections for the current template parent. Overflow fails closed until the tip changes.
 #[derive(Clone, Debug, Default)]
@@ -530,8 +564,9 @@ impl BlockTemplateResponse {
         let (mempool_tx_templates, mempool_txs): (Vec<_>, Vec<_>) =
             mempool_txs.into_iter().map(|tx| ((&tx).into(), tx)).unzip();
 
-        // Transaction selection returns transactions in an arbitrary order,
-        // but Zebra's snapshot tests expect the same order every time.
+        // Production keeps the selection order, which is deterministic and puts
+        // parents before children. Tests re-sort by dependency depth, then hash,
+        // so snapshot tests do not change when the selection order does.
         //
         // # Correctness
         //
@@ -841,6 +876,9 @@ where
 
     /// Stops speculative preparation for a parent whose template missed its deadline.
     pub(crate) speculation_breaker: SpeculationBreaker,
+
+    /// Records the stages of each template this handler returns.
+    pub(crate) trace: trace::MiningTemplateTrace,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -873,6 +911,7 @@ where
             template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),
             template_rejections: watch::channel(TemplateRejections::default()).0,
             speculation_breaker: SpeculationBreaker::default(),
+            trace: trace::MiningTemplateTrace::default(),
         }
     }
 
@@ -881,9 +920,13 @@ where
         self.pending_blocks = pending_blocks;
     }
 
-    /// Runs bounded proof work off the async worker, retaining capacity across cancellation.
+    /// Runs one template build at a time across RPC clones, where its `work` belongs.
+    ///
+    /// A proof build runs off the async worker and keeps its capacity until it finishes, even
+    /// if the caller stops waiting for it.
     pub(crate) async fn run_template_build<T: Send + 'static>(
         &self,
+        work: TemplateBuildWork,
         build: impl FnOnce() -> T + Send + 'static,
     ) -> RpcResult<T> {
         let permit = tokio::time::timeout(
@@ -899,13 +942,30 @@ where
         })?
         .map_misc_error()?;
 
-        tokio::task::spawn_blocking(move || {
-            // Dropping the RPC future cannot release capacity while this job still owns work.
-            let _permit = permit;
-            build()
-        })
-        .await
-        .map_misc_error()
+        match work {
+            TemplateBuildWork::ProofFree => {
+                let _permit = permit;
+                // A panic becomes an RPC error, as it does when the build runs on a blocking
+                // thread.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(build))
+                    .map_err(|panic| {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .map(ToString::to_string)
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_default();
+                        format!("mining template construction panicked: {message}")
+                    })
+                    .map_misc_error()
+            }
+            TemplateBuildWork::Proof => tokio::task::spawn_blocking(move || {
+                // Dropping the RPC future cannot release capacity while this job still owns work.
+                let _permit = permit;
+                build()
+            })
+            .await
+            .map_misc_error(),
+        }
     }
 
     pub(crate) fn reserve_mined_submission(
@@ -1052,7 +1112,7 @@ where
 {
     check_synced_to_tip(net, latest_chain_tip)?;
 
-    let block: Block = match block_proposal_bytes.zcash_deserialize_into() {
+    let block = match Block::zcash_deserialize_bounded(&mut block_proposal_bytes.as_slice()) {
         Ok(block) => block,
         Err(parse_error) => {
             tracing::info!(
@@ -1202,8 +1262,6 @@ where
         .oneshot(mempool::Request::FullTransactions)
         .await
         .map_err(|error| ErrorObject::new(0, error.to_string()))?;
-
-    // TODO: Order transactions in block templates based on their dependencies
 
     let mempool::Response::FullTransactions {
         transactions,

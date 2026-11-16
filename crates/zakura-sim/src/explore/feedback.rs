@@ -62,7 +62,10 @@ pub const FEEDBACK_BACKEND: &str = "libfuzzer-extra-counters";
 /// - 1: [`Probe`]'s features (E2a).
 /// - 2: adds the protocol-state features at [`super::state`]'s index layout
 ///   (E2b).
-pub const FEEDBACK_VERSION: u32 = 2;
+/// - 3: adds fuzz-12's hold, header lease level, fork work and recovery
+///   conditions features.
+/// - 4: adds fuzz-13's conformant crossing feature.
+pub const FEEDBACK_VERSION: u32 = 4;
 
 /// How many features the counters hold: every [`Feature`] index.
 pub const FEATURES: usize = 1 << 16;
@@ -270,6 +273,11 @@ impl Checker for Collecting {
     /// Passes the events on.
     fn observe_events(&mut self, events: &[CheckEvent]) {
         self.collect.observe_events(events, self.map);
+    }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> crate::Unfinished {
+        crate::Unfinished::default()
     }
 }
 

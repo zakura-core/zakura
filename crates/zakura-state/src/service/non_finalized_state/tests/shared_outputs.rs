@@ -73,16 +73,19 @@ fn snapshots_share_outputs_without_sharing_spend_or_branch_membership() {
     let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
         &Network::Mainnet,
         child.clone().prepare(),
-        HashMap::from([(outpoint, parent.created_utxos[&outpoint].as_ref().clone())]),
+        HashMap::from([(
+            outpoint,
+            parent.created_ordered_utxo(&outpoint).unwrap().clone(),
+        )]),
     )
     .expect("the supplied spent output gives the fixture's value balance");
     let spent_chain = parent
         .clone()
         .push(contextual)
         .expect("the child updates the chain");
-    assert!(Arc::ptr_eq(
-        &parent.created_utxos[&outpoint],
-        &spent_chain.created_utxos[&outpoint]
+    assert!(std::ptr::eq(
+        parent.created_ordered_utxo(&outpoint).unwrap(),
+        spent_chain.created_ordered_utxo(&outpoint).unwrap()
     ));
     assert!(parent.unspent_utxos().contains_key(&outpoint));
     assert!(!spent_chain.unspent_utxos().contains_key(&outpoint));
@@ -104,9 +107,9 @@ fn snapshots_share_outputs_without_sharing_spend_or_branch_membership() {
         .fork(block.hash())
         .expect("the parent is in the chain");
     assert!(fork.eq_internal_state(&parent));
-    assert!(Arc::ptr_eq(
-        &fork.created_utxos[&outpoint],
-        &parent.created_utxos[&outpoint]
+    assert!(std::ptr::eq(
+        fork.created_ordered_utxo(&outpoint).unwrap(),
+        parent.created_ordered_utxo(&outpoint).unwrap()
     ));
 
     let (mut rolled_back, invalidated) = spent_chain
@@ -128,7 +131,7 @@ fn snapshots_share_outputs_without_sharing_spend_or_branch_membership() {
 fn finalization_and_owned_queries_preserve_other_snapshot_payloads() {
     let (mut chain, block, outpoint) = funded_chain();
     let snapshot = chain.clone();
-    let payload = Arc::downgrade(&chain.created_utxos[&outpoint]);
+    let payload = Arc::downgrade(&chain.blocks.values().next().unwrap().new_outputs);
     let expected = chain.created_utxo(&outpoint).expect("the output exists");
     let mut returned_output = snapshot.created_utxo(&outpoint).expect("the output exists");
     returned_output.output.lock_script = transparent::Script::new(&[0x52]);
@@ -159,6 +162,7 @@ fn finalization_and_owned_queries_preserve_other_snapshot_payloads() {
         payload.upgrade().is_some(),
         "the old snapshot still owns the payload"
     );
+    drop(finalized);
     drop(snapshot);
     assert!(
         payload.upgrade().is_none(),
@@ -198,4 +202,13 @@ fn snapshots_share_block_records_until_their_last_owner_drops() {
         root.upgrade().is_none(),
         "the record is released with its last owner"
     );
+}
+
+#[test]
+fn known_transaction_with_missing_output_index_returns_none() {
+    let (chain, _, mut outpoint) = funded_chain();
+    assert!(chain.created_ordered_utxo(&outpoint).is_some());
+    outpoint.index = u32::MAX;
+    assert!(chain.created_ordered_utxo(&outpoint).is_none());
+    assert!(chain.created_utxo(&outpoint).is_none());
 }

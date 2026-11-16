@@ -2,7 +2,11 @@
 # generator version it was built for, and its SHA-256. Its 344-byte
 # prefix is the scenario's canonical encoding, then 1,024 Plan bytes.
 harness = "header-sync/storage"
-generator = 2
-sha256 = "4b244109cfd1c5d014c42663ab11b039adaaa75d251e2d83a225a575840df098"
+generator = 3
+sha256 = "fd392e8b5826a3f6502066d2e83ae80444cc5f8143d1a56dec95a1743e3c3f8a"
 scenario_sha256 = "7d19cae100e11259f61d92ceb821694ddcea307fd003986493da404e5e7e6427"
 source = "crates/zakura-sim/tests/header_storage_seeds.rs"
+
+[derived_from]
+sha256 = "4b244109cfd1c5d014c42663ab11b039adaaa75d251e2d83a225a575840df098"
+generator = 2

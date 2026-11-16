@@ -30,7 +30,7 @@ use crate::zakura::{
 mod plan;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use plan::{replay_block_fill_bytes, BlockFillReplaySummary};
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests;
 
 use plan::{RetryDeadlines, RetryFact, TakePlan};

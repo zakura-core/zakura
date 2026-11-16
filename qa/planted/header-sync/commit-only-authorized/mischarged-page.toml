@@ -1,0 +1,11 @@
+# The subscription primitive charges each claimed page one byte less than
+# the page carries, while the subscriber's cursor counts the page whole.
+# The reactor, the subscriber, the subscription primitive and the queue
+# decide how the witness's rounds start, stage and are credited, so a
+# change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation/subscription"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

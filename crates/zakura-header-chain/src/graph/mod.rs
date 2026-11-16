@@ -388,6 +388,50 @@ pub struct MemHeaderStore {
     consensus_invalid_body_tombstones: HashMap<block::Hash, ConsensusInvalidBodyTombstone>,
 }
 
+/// Every field of a [`MemHeaderStore`], for a test or the simulator to
+/// compare two states whole.
+#[cfg(any(test, feature = "test-support", zakura_sim))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct GraphState {
+    pub graph_revision: GraphRevision,
+    pub finalized_frontier: Frontier,
+    pub preferred_header_tip: Option<Frontier>,
+    pub nodes: HashMap<block::Hash, HeaderNode>,
+    pub children: HashMap<block::Hash, HashSet<block::Hash>>,
+    pub heights: HashMap<block::Height, HashSet<block::Hash>>,
+    pub eligible_header_tips: HashSet<block::Hash>,
+    pub consensus_invalid_body_tombstones: HashMap<block::Hash, ConsensusInvalidBodyTombstone>,
+}
+
+#[cfg(any(test, feature = "test-support", zakura_sim))]
+impl MemHeaderStore {
+    /// A copy of every field. The store is destructured with no `..`, so a
+    /// field added later fails to compile here until it's classified.
+    pub fn state(&self) -> GraphState {
+        let MemHeaderStore {
+            graph_revision,
+            finalized_frontier,
+            preferred_header_tip,
+            nodes,
+            children,
+            heights,
+            eligible_header_tips,
+            consensus_invalid_body_tombstones,
+        } = self;
+        GraphState {
+            graph_revision: *graph_revision,
+            finalized_frontier: *finalized_frontier,
+            preferred_header_tip: *preferred_header_tip,
+            nodes: nodes.clone(),
+            children: children.clone(),
+            heights: heights.clone(),
+            eligible_header_tips: eligible_header_tips.clone(),
+            consensus_invalid_body_tombstones: consensus_invalid_body_tombstones.clone(),
+        }
+    }
+}
+
 impl MemHeaderStore {
     /// Construct a store rooted at one trusted, already-validated work origin.
     pub fn new(

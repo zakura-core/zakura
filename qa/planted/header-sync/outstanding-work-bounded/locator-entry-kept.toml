@@ -1,0 +1,11 @@
+# Settling a locator read returns its scope but keeps its tracker entry,
+# so under fresh-identity churn the next unit of work lists a read whose
+# call already ended. The
+# reactor and the queue decide when the witness's calls and rounds run, so
+# a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.json"
+plan = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.plan"

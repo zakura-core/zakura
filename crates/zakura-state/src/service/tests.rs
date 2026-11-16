@@ -3952,6 +3952,17 @@ async fn rejected_checkpoint_body_fails_descendants_with_a_retryable_error() {
 /// Opens an ephemeral NU5-from-height-1 Regtest state with genesis committed, which accepts
 /// semantically verified blocks from height 1.
 async fn nu5_state_with_genesis() -> (StateService, Network, Arc<Block>) {
+    let (state, _, network, genesis) = nu5_state_with_genesis_and_config(Config::ephemeral()).await;
+    (state, network, genesis)
+}
+
+/// Like [`nu5_state_with_genesis`], with `config` instead of the default ephemeral config.
+///
+/// Also returns the latest chain tip. The chain tip channel keeps a published tip only while it
+/// has a receiver, so a test that checks tips must hold this one.
+async fn nu5_state_with_genesis_and_config(
+    config: Config,
+) -> (StateService, crate::LatestChainTip, Network, Arc<Block>) {
     use zakura_chain::parameters::testnet::{ConfiguredActivationHeights, RegtestParameters};
 
     let network = Network::new_regtest(RegtestParameters {
@@ -3961,10 +3972,13 @@ async fn nu5_state_with_genesis() -> (StateService, Network, Arc<Block>) {
         },
         ..Default::default()
     });
-    let crate::InitializedState { mut state, .. } =
-        StateService::new(Config::ephemeral(), &network, Height(0), 0)
-            .await
-            .expect("the ephemeral state opens");
+    let crate::InitializedState {
+        mut state,
+        latest_chain_tip,
+        ..
+    } = StateService::new(config, &network, Height(0), 0)
+        .await
+        .expect("the ephemeral state opens");
     let genesis = block::genesis::regtest_genesis_block();
     timeout(
         Duration::from_secs(10),
@@ -3975,7 +3989,90 @@ async fn nu5_state_with_genesis() -> (StateService, Network, Arc<Block>) {
     .await
     .expect("the genesis commit completes")
     .expect("genesis commits");
-    (state, network, genesis)
+    (state, latest_chain_tip, network, genesis)
+}
+
+/// The block writer traces each committed block that becomes the best tip, and tells an
+/// extension from a reorg.
+#[tokio::test(flavor = "multi_thread")]
+async fn writer_traces_committed_blocks_that_become_the_best_tip() {
+    let _init_guard = zakura_test::init();
+    let trace_dir = tempfile::tempdir().expect("the trace directory is created");
+    let (mut state, latest_chain_tip, network, genesis) =
+        nu5_state_with_genesis_and_config(Config {
+            trace_dir: Some(trace_dir.path().to_owned()),
+            ..Config::ephemeral()
+        })
+        .await;
+    async fn commit(state: &mut StateService, block: Arc<Block>) {
+        timeout(
+            Duration::from_secs(10),
+            state.oneshot(Request::CommitSemanticallyVerifiedBlock(block.prepare())),
+        )
+        .await
+        .expect("the commit completes")
+        .expect("the block commits");
+    }
+
+    // `best` extends the finalized genesis tip.
+    let best = nu5_child_of_genesis(&network, &genesis, Vec::new());
+    commit(&mut state, best.clone()).await;
+
+    // `side` has the same work as `best`, but arrived later and has a lower hash, so it loses
+    // every tie-break and the tip stays at `best`.
+    let side = best
+        .make_fake_siblings(8)
+        .into_iter()
+        .find(|sibling| sibling.hash().0 < best.hash().0)
+        .expect("a sibling nonce gives a lower hash");
+    commit(&mut state, side.clone()).await;
+    assert_eq!(latest_chain_tip.best_tip_hash(), Some(best.hash()));
+
+    // `side_child` makes the side chain heavier, so the tip moves to it.
+    let side_history_root = state
+        .read_service
+        .latest_non_finalized_state()
+        .find_chain(|chain| chain.non_finalized_tip_hash() == side.hash())
+        .expect("the side chain is in the non-finalized state")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the side chain has a history root");
+    let side_child = nu5_child(&network, &side, Height(2), &side_history_root, Vec::new());
+    commit(&mut state, side_child.clone()).await;
+    assert_eq!(latest_chain_tip.best_tip_hash(), Some(side_child.hash()));
+
+    let path = trace_dir.path().join("chain_tip.jsonl");
+    let rows: Vec<serde_json::Value> = timeout(Duration::from_secs(10), async {
+        loop {
+            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            let rows: Vec<serde_json::Value> = contents
+                .split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+                .map(|line| serde_json::from_str(line).expect("each trace row is JSON"))
+                .collect();
+            if rows.len() >= 2 {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the trace writer flushes both rows");
+
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let hash = |block: &Arc<Block>| block.hash().to_string();
+    for (row, tip, height, prev, kind) in [
+        (&rows[0], &best, 1, &genesis, "extend"),
+        (&rows[1], &side_child, 2, &best, "reorg"),
+    ] {
+        assert_eq!(row["event"], "tip_published");
+        assert_eq!(row["tip_height"], height);
+        assert_eq!(row["tip_hash"], hash(tip));
+        assert_eq!(row["prev_tip_hash"], hash(prev));
+        assert_eq!(row["kind"], kind);
+        assert!(row["queue_us"].is_u64(), "{row}");
+        assert!(row["commit_us"].is_u64(), "{row}");
+    }
 }
 
 /// Builds a height-1 child of `genesis` with a v5 coinbase followed by `extra`, whose header
@@ -4012,7 +4109,12 @@ fn nu5_child(
 
     let mut child = parent.make_fake_child();
     let block = Arc::make_mut(&mut child);
-    let coinbase = transaction_to_fake_v5(&block.transactions[0], network, height);
+    let mut coinbase = transaction_to_fake_v5(&block.transactions[0], network, height);
+    // A v5 parent's coinbase passes through unchanged, and its transaction ID does not commit
+    // to the coinbase height, so the expiry height keeps each coinbase ID unique in a chain.
+    if let transaction::Transaction::V5 { expiry_height, .. } = &mut coinbase {
+        *expiry_height = height;
+    }
     block.transactions = std::iter::once(coinbase)
         .chain(extra)
         .map(Arc::new)

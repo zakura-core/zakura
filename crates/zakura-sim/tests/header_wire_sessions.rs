@@ -18,15 +18,14 @@ use zakura_sim::{
     harness::{
         self,
         header_node::{
-            policy::{Allow, Hold, OpKind, Select, Trigger},
             session::{EndCheck, Retirement, SessionEvidence, SessionFact},
             Chain, Policy,
         },
         header_sync::{HeaderWire, WireScenario},
-        record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem,
+        record, run_prepared, wire_plans, HarnessEntry, HarnessError, RecordInput, Subsystem,
     },
     peer::{
-        honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
+        honest::{HonestSpec, SubscribeSpec},
         PeerAction, PeerSpec,
     },
     record::RecordSink,
@@ -79,38 +78,12 @@ fn redial_witness() -> WireScenario {
     }
 }
 
-/// The two-generation witness: the node dials `peer-0`, both subscribe, and
-/// the peer finishes its header stream once both subscriptions end, so the
-/// node reopens it on the same connection. The node's next locator is held,
-/// so its second subscription doesn't race the finish.
+/// The two-generation witness, the saved Plan `reopen`
+/// ([`wire_plans::reopen_scenario`]): the node dials `peer-0`, both
+/// subscribe, and the peer finishes its header stream once both
+/// subscriptions end, so the node reopens it on the same connection.
 fn reopen_witness() -> WireScenario {
-    let subscribe = SubscribeSpec {
-        start: 0,
-        open: CreditSpec {
-            objects: 250,
-            bytes: 65_750,
-        },
-        grants: GrantPolicy::Immediate,
-    };
-    WireScenario {
-        node: Chain::main(50),
-        peers: vec![honest(
-            PeerSpec::listening(),
-            120,
-            Some(subscribe),
-            vec![PeerAction::FinishHeader],
-        )],
-        policy: Policy {
-            holds: vec![Hold {
-                select: Select::nth(OpKind::Locator, 2),
-                until: Trigger::VirtualTime(3_600_000),
-                then: vec![Allow::Engine],
-                deadline_ms: None,
-            }],
-            ..Policy::converging()
-        },
-        ..WireScenario::default()
-    }
+    wire_plans::reopen_scenario()
 }
 
 /// Each admission in `facts`: its session ID, the session it replaced and
@@ -151,8 +124,10 @@ fn retired(facts: &[SessionFact], session_id: u64) -> Option<Retirement> {
 /// A close then a redial: each connection's session is joined to its own
 /// own-9 row and generation, and the second replaces nothing, because the
 /// node refuses a newcomer for a live identity and so tears the first
-/// connection down before the second registers. That teardown retires the
-/// first session.
+/// connection down before the second registers. own-9 retires the first
+/// session by whichever lands first, its generation's exit after the peer
+/// closes the stream or the connection's teardown. The schedule decides
+/// which, so either counts.
 #[test]
 fn a_close_and_redial_joins_each_connection_once() {
     for input in inputs(3, 16_384) {
@@ -166,9 +141,11 @@ fn a_close_and_redial_joins_each_connection_once() {
         for (session_id, _, origin) in [first, second] {
             assert_eq!(origin.generation, session_id, "{facts:#?}");
         }
-        assert_eq!(
-            retired(&facts, first.0),
-            Some(Retirement::TornDown),
+        assert!(
+            matches!(
+                retired(&facts, first.0),
+                Some(Retirement::TornDown | Retirement::GenerationExited)
+            ),
             "{facts:#?}"
         );
         assert_eq!(end, EndCheck::Complete, "{facts:#?}");

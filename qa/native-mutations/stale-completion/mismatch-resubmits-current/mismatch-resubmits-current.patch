@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs b/crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs
+index dd7a39f803..c6c92ab00f 100644
+--- a/crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs
+@@ -852,6 +852,12 @@ impl SequencerState {
+             let released = self
+                 .sequencer
+                 .finish_submission(owner, source, token, height, hash);
++            // The older verifier call may have made the current submission at
++            // this height a duplicate: roll it back, so the refill below
++            // dispatches it again under a fresh token.
++            if released {
++                self.sequencer.unsubmit(height, applying_token);
++            }
+             // A scope transition can detach an older checkpoint submission and
+             // install a newer submission for the same height. When the newer
+             // request makes the old verifier call finish as a duplicate, the

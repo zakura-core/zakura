@@ -8,7 +8,7 @@ mod support;
 
 use std::process::{Command, Output};
 
-use support::inputs;
+use support::{inputs, storage_witnesses};
 use tempfile::TempDir;
 use zakura_sim::{
     harness::{
@@ -34,7 +34,11 @@ fn node_step(action: ControlAction, when: Option<Trigger>) -> ControlStep {
 
 /// A mirror holding `chain`.
 fn mirror(chain: Chain, dialer: Dialer) -> MirrorSpec {
-    MirrorSpec { chain, dialer }
+    MirrorSpec {
+        chain,
+        dialer,
+        max_headers_per_response: None,
+    }
 }
 
 /// Runs `scenario` under `input`, which must end without a violation or
@@ -108,35 +112,9 @@ fn picked(report: &RunReport, action: &str) -> Vec<u64> {
         .collect()
 }
 
-/// The node at A3 syncing from `mirror-0` at A6. The first prepare is held
-/// until the node resets, and the reset invalidates the node's tip once
-/// that prepare is submitted. Once the prepare completes, a reconsider
-/// restores the tip, so the node can still take the mirror's chain.
+/// [`storage_witnesses::reset_held_prepare`].
 fn reset_held_prepare() -> StorageScenario {
-    StorageScenario {
-        node: Chain::main(3),
-        mirrors: vec![mirror(Chain::main(6), Dialer::Mirror)],
-        policy: Policy {
-            holds: vec![Hold {
-                select: Select::nth(OpKind::Prepare, 1),
-                until: Trigger::Reset("node".to_owned()),
-                then: vec![Allow::Engine],
-                deadline_ms: None,
-            }],
-            ..Policy::converging()
-        },
-        controls: vec![
-            node_step(
-                ControlAction::Reset(Reset::Invalidate { depth: 0 }),
-                Some(Trigger::Submitted(Select::nth(OpKind::Prepare, 1))),
-            ),
-            node_step(
-                ControlAction::Reset(Reset::Reconsider),
-                Some(Trigger::Completed(Select::nth(OpKind::Prepare, 1))),
-            ),
-        ],
-        weights: Default::default(),
-    }
+    storage_witnesses::reset_held_prepare()
 }
 
 /// A prepare held across an invalidation of the node's tip completes after
@@ -185,36 +163,9 @@ fn a_held_prepare_completes_in_the_reset_generation() {
     }
 }
 
-/// The node at A2 syncing from `mirror-0` at A6. The first apply is held
-/// until the node resets, and the reset invalidates the node's tip once
-/// that apply is submitted, so the held apply's headers extend an
-/// invalidated header. Once the apply completes, a reconsider restores
-/// the tip.
+/// [`storage_witnesses::reset_held_apply`].
 fn reset_held_apply() -> StorageScenario {
-    StorageScenario {
-        node: Chain::main(2),
-        mirrors: vec![mirror(Chain::main(6), Dialer::Mirror)],
-        policy: Policy {
-            holds: vec![Hold {
-                select: Select::nth(OpKind::Apply, 1),
-                until: Trigger::Reset("node".to_owned()),
-                then: vec![Allow::Engine],
-                deadline_ms: None,
-            }],
-            ..Policy::converging()
-        },
-        controls: vec![
-            node_step(
-                ControlAction::Reset(Reset::Invalidate { depth: 0 }),
-                Some(Trigger::Submitted(Select::nth(OpKind::Apply, 1))),
-            ),
-            node_step(
-                ControlAction::Reset(Reset::Reconsider),
-                Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
-            ),
-        ],
-        weights: Default::default(),
-    }
+    storage_witnesses::reset_held_apply()
 }
 
 /// An apply held across an invalidation of its parent completes after the
@@ -557,15 +508,30 @@ fn a_release_of_a_missing_hold_is_refused() {
     Storage::prepare(&scenario);
 }
 
-/// Generator 2 encodes none of the new control steps or `released`.
+/// Generator 3 encodes resets, releases and `released`, and a storage stop
+/// after a shutdown, so each round-trips through its canonical prefix. A
+/// storage stop with no shutdown before it is out of the static order.
+/// `released_read`'s release waits on an `all` trigger, which no grammar
+/// has, so its round trip uses the release alone.
 #[test]
-fn the_grammar_cant_encode_resets_releases_or_stops() {
-    assert!(grammar::encode(&reset_held_prepare()).is_err());
-    assert!(grammar::encode(&released_read()).is_err());
+fn the_grammar_encodes_resets_releases_and_stops() {
+    let mut release = released_read();
+    for step in &mut release.controls {
+        step.when = None;
+    }
     let mut stop = released_read();
     stop.policy.holds.clear();
-    stop.controls = vec![node_step(ControlAction::StopStorage, None)];
-    assert!(grammar::encode(&stop).is_err());
+    stop.controls = vec![
+        node_step(ControlAction::Shutdown, None),
+        node_step(ControlAction::StopStorage, None),
+    ];
+    for scenario in [reset_held_prepare(), release, stop.clone()] {
+        let prefix = grammar::encode(&scenario).unwrap();
+        assert_eq!(grammar::decode(&prefix).unwrap(), scenario);
+    }
+    stop.controls.remove(0);
+    let refused = grammar::encode(&stop).expect_err("a stop needs a shutdown");
+    assert!(refused.to_string().contains("out of order"), "{refused}");
 }
 
 /// The failure a step after the node's shutdown gives, as `ControlFailed`

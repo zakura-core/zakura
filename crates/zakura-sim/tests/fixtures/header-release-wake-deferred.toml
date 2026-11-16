@@ -1,0 +1,12 @@
+# The committed fuzz input `header-release-wake-deferred.bin`: the harness that runs it, the
+# generator version it was built for, and its SHA-256. Its first byte
+# picks the wake fixture, then come the Plan bytes.
+harness = "header-sync/release-wake"
+generator = 1
+sha256 = "2792685c653fbfd8add18b144cd48c9a17abe36a8992c3247bf21d9509cb7a72"
+scenario_sha256 = "dd5aa1af078b77bab6e631d3d267c24c5db786f32b78ea00bd1188919596348e"
+source = "crates/zakura-sim/tests/header_release_wake.rs"
+
+[[witness]]
+property = "header-sync/capacity-release-wakes"
+expect = "holds"

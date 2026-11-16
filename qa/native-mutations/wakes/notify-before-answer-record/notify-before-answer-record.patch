@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/peer.rs b/crates/zakura-network/src/zakura/discovery/peer.rs
+index 835cf127f0..9cf9cacc91 100644
+--- a/crates/zakura-network/src/zakura/discovery/peer.rs
++++ b/crates/zakura-network/src/zakura/discovery/peer.rs
+@@ -78,8 +78,8 @@ impl SharedPeerState {
+ 
+     /// Records an imported answer to this session's query.
+     pub(super) fn record_answer(&self, answer: &AdmittedAnswer) {
+-        self.lock().record_answer(answer);
+         self.0.progressed.notify_waiters();
++        self.lock().record_answer(answer);
+     }
+ 
+     /// The exchange progress, for tests that check what a handler recorded.

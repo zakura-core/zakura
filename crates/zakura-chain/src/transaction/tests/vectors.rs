@@ -611,9 +611,19 @@ fn deserialize_large_transaction() {
     // Check that the transaction is oversized.
     assert!(tx_data.len() > MAX_BLOCK_BYTES as usize);
 
-    // The deserialization should fail because the transaction is too big.
+    // Untrusted decoding rejects it before parsing, because it is too big.
+    let mut input = &tx_data[..];
+    assert!(matches!(
+        Transaction::zcash_deserialize_bounded(&mut input),
+        Err(SerializationError::Parse(
+            "transaction is larger than MAX_BLOCK_BYTES"
+        ))
+    ));
+    assert_eq!(input.len(), tx_data.len(), "nothing should be parsed");
+
+    // The parser itself does not enforce the size limit.
     Transaction::zcash_deserialize(&tx_data[..])
-        .expect_err("transaction should not deserialize due to its size");
+        .expect("the parser should not enforce the size limit");
 }
 
 // Transaction V5 test vectors
@@ -2418,7 +2428,7 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
         block::Height,
         orchard::{
             keys::EphemeralPublicKey, tree, Action, AuthorizedAction, EncryptedNote, Flags,
-            NoteCommitment, Nullifier, ShieldedData, ValueCommitment, WrappedNoteKey,
+            Nullifier, ShieldedData, ValueCommitment, WrappedNoteKey,
         },
         primitives::Halo2Proof,
         serialization::ZcashSerialize,
@@ -2436,7 +2446,7 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
         // rk = identity point — this is the vulnerability trigger.
         rk: [0u8; 32].into(),
         // cm_x is the x-coordinate of the note commitment.
-        cm_x: NoteCommitment(pallas::Affine::identity()).extract_x(),
+        cm_x: pallas::Base::zero(),
         // ephemeral_key must be non-identity; use the generator.
         ephemeral_key: EphemeralPublicKey(pallas::Affine::generator()),
         enc_ciphertext: EncryptedNote([0u8; 580]),

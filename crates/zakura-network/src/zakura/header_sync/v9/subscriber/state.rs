@@ -19,7 +19,7 @@ use super::{
     Admitted, Ended, Seal, SubscribeError, SubscriberFault,
 };
 #[cfg(any(test, zakura_sim))]
-use crate::zakura::header_sync::observe::{CreditKind, ReactorEvent};
+use crate::zakura::header_sync::observe::{CreditKind, ReactorEvent, SubscriberChange};
 use crate::zakura::transport::sim_chain;
 use crate::zakura::{
     header_sync::{scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, wire::AuxSchema},
@@ -113,17 +113,31 @@ impl SubscriberState {
         }
     }
 
-    /// Report the credit `update` gives, if anything observes it.
+    /// Report the credit `update` gives to the live subscription, with the
+    /// subscription primitive's `totals` after it, if anything observes it.
     #[cfg(any(test, zakura_sim))]
-    fn report_credit(&self, kind: CreditKind, update: &SubscribeHeaders) {
+    fn report_credit(
+        &self,
+        totals: crate::zakura::header_sync::observe::CreditTotals,
+        kind: CreditKind,
+        update: &SubscribeHeaders,
+    ) {
         if let Some(tap) = &self.credit {
             tap.observer.observe(ReactorEvent::CreditIssued {
                 kind,
                 peer: tap.peer.clone(),
                 session_id: tap.session_id,
-                subscription: update.subscription_id,
+                // The state's own ID, which the built update must match.
+                subscription: self.live.as_ref().map_or(0, |live| live.id),
                 objects: update.added_credit.objects,
                 bytes: update.added_credit.bytes,
+                update: Box::new(update.clone()),
+                target_height: self
+                    .live
+                    .as_ref()
+                    .filter(|live| live.id == update.subscription_id)
+                    .map_or(block::Height(0), |live| live.target_height),
+                totals,
             });
         }
     }
@@ -253,12 +267,19 @@ impl SubscriberState {
 
     /// Make `plan` the live subscription once the tools recorded its
     /// `update`, and return the `Open` to write.
-    pub(super) fn opened(&mut self, plan: OpenPlan, update: Update<Cursor>) -> SubscribeHeaders {
+    /// The subscription primitive's `totals` after it recorded the `Open`
+    /// come with it in test and simulator builds, read under the same lock.
+    pub(super) fn opened(
+        &mut self,
+        plan: OpenPlan,
+        update: Update<Cursor>,
+        #[cfg(any(test, zakura_sim))] totals: crate::zakura::header_sync::observe::CreditTotals,
+    ) -> SubscribeHeaders {
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let message = plan.live.message(Operation::Open, update);
         self.live = Some(plan.live);
         #[cfg(any(test, zakura_sim))]
-        self.report_credit(CreditKind::Open, &message);
+        self.report_credit(totals, CreditKind::Open, &message);
         message
     }
 
@@ -269,7 +290,12 @@ impl SubscriberState {
             return false;
         }
         self.live = None;
-        tools.retract(&id)
+        let retracted = tools.retract(&id);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.credit {
+            serving(tap, tools, id, SubscriberChange::Retract);
+        }
+        retracted
     }
 
     /// Check a decoded page against its subscription, spend its exact credit
@@ -388,6 +414,38 @@ impl SubscriberState {
         } else {
             tools.claim_page(&live.id, count, payload_len, cursor)?;
         }
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.credit {
+            // Read from the page itself, apart from the count and hash
+            // the cursor was built from.
+            // Widening usize to u64 is lossless on supported targets.
+            let entries = page.entries.len() as u64;
+            let last = page
+                .entries
+                .last()
+                .map_or(parent.hash, |entry| entry.header.hash());
+            let height = u64::from(parent.height.0).saturating_add(entries);
+            // The cursor the primitive stored, not the one handed to it.
+            let stored = *tools
+                .received(&live.id)
+                .expect("the live subscription is in the tools");
+            tap.observer.observe(ReactorEvent::CursorClaimed {
+                peer: tap.peer.clone(),
+                session_id: tap.session_id,
+                subscription: live.id,
+                through: Frontier::new(stored.height, stored.hash),
+                headers: stored.headers,
+                bytes: stored.bytes,
+                page_last: Frontier::new(
+                    block::Height(u32::try_from(height).unwrap_or(u32::MAX)),
+                    last,
+                ),
+                page_headers: entries,
+                page_bytes: payload_len as u64,
+                totals: totals(tools, live.id),
+            });
+            serving(tap, tools, live.id, SubscriberChange::Claim);
+        }
         live.pages += 1;
         live.reached |= page.reaches_initial_target;
         Ok(Admitted {
@@ -426,6 +484,10 @@ impl SubscriberState {
             return Err(SubscriberFault::OutcomeWindow(outcome.outcome));
         }
         tools.claim_end(&live.id)?;
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.credit {
+            serving(tap, tools, live.id, SubscriberChange::Outcome);
+        }
         let live = self.live.take().expect("the live subscription matched");
         Ok(Ended {
             id: live.id,
@@ -456,6 +518,27 @@ impl SubscriberState {
         }
         tools.accept(&id, cursor)?;
         live.accepted = *cursor;
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.credit {
+            let stored = *tools
+                .accepted(&id)
+                .expect("the subscription just accepted a cursor");
+            tap.observer.observe(ReactorEvent::CursorsAccepted {
+                peer: tap.peer.clone(),
+                session_id: tap.session_id,
+                subscription: id,
+                through: Frontier::new(cursor.height, cursor.hash),
+                headers: cursor.headers,
+                bytes: cursor.bytes,
+                stored: (
+                    Frontier::new(stored.height, stored.hash),
+                    stored.headers,
+                    stored.bytes,
+                ),
+                totals: totals(tools, id),
+            });
+            serving(tap, tools, id, SubscriberChange::Accept);
+        }
         Ok(self.grant_due(tools, staging))
     }
 
@@ -519,7 +602,11 @@ impl SubscriberState {
         let update = tools.grant(&live.id, added).ok()?;
         // A tail expression in release builds, as before the report.
         sim_chain!(Some(live.message(Operation::Grant, update))
-            => inspect(|message| self.report_credit(CreditKind::Grant, message)))
+        => inspect(|message| self.report_credit(
+            totals(tools, live.id),
+            CreditKind::Grant,
+            message,
+        )))
     }
 
     /// Record a `Close` in `tools` and return it to write.
@@ -530,7 +617,18 @@ impl SubscriberState {
         let live = self.live.as_mut().ok_or(SubscribeRefused::Unknown)?;
         let update = tools.close(&live.id)?;
         live.close_sent = true;
-        Ok(live.message(Operation::Close, update))
+        let message = live.message(Operation::Close, update);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.credit {
+            tap.observer.observe(ReactorEvent::CloseBuilt {
+                peer: tap.peer.clone(),
+                session_id: tap.session_id,
+                subscription: live.id,
+                update: Box::new(message.clone()),
+                totals: totals(tools, live.id),
+            });
+        }
+        Ok(message)
     }
 
     /// The live subscription's ID, if there is one.
@@ -576,5 +674,49 @@ impl Live {
             added_credit: update.added,
             tree_aux_schema: self.schema,
         }
+    }
+}
+
+/// Reports `id`'s subscriber-side containers to `tap`
+/// ([`ReactorEvent::SubscriberServing`]), right after `change` changed
+/// them.
+#[cfg(any(test, zakura_sim))]
+pub(super) fn serving(
+    tap: &super::CreditTap,
+    tools: &Subscriptions<u64, Cursor>,
+    id: u64,
+    change: SubscriberChange,
+) {
+    let (unaccepted, ended) = tools.unaccepted(&id);
+    tap.observer.observe(ReactorEvent::SubscriberServing {
+        peer: tap.peer.clone(),
+        session_id: tap.session_id,
+        subscription: id,
+        change,
+        unaccepted: unaccepted.map(|unaccepted| {
+            unaccepted
+                .iter()
+                .map(|cursor| Frontier::new(cursor.height, cursor.hash))
+                .collect()
+        }),
+        live: tools.len(),
+        ended,
+    });
+}
+
+/// `tools`' credit totals for subscription `id`, or zeros if it holds none.
+#[cfg(any(test, zakura_sim))]
+pub(super) fn totals(
+    tools: &Subscriptions<u64, Cursor>,
+    id: u64,
+) -> crate::zakura::header_sync::observe::CreditTotals {
+    let (granted, consumed) = tools.credit(&id).map_or(Default::default(), |credit| {
+        (credit.granted(), credit.consumed())
+    });
+    crate::zakura::header_sync::observe::CreditTotals {
+        granted_headers: granted.objects,
+        granted_bytes: granted.bytes,
+        consumed_headers: consumed.objects,
+        consumed_bytes: consumed.bytes,
     }
 }

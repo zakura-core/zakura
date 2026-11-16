@@ -67,12 +67,14 @@ fn request(kind: OpKind, session: u64) -> StorageRequest {
             headers: 1,
             work: None,
             first: None,
+            hashes: Vec::new(),
         },
         OpKind::Apply => StorageRequest::ApplyHeaderTarget {
             owner: owner(session),
             source: "aa".to_owned(),
             parent: None,
             target: "11".to_owned(),
+            hashes: None,
         },
         other => panic!("these tests don't submit {other:?}"),
     }

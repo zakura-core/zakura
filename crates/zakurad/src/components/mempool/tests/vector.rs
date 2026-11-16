@@ -28,6 +28,7 @@ use zakura_chain::{
     transparent::{self, OutPoint},
 };
 use zakura_consensus::transaction as tx;
+use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
 use zakura_node_services::mempool::QueueSource;
 use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
@@ -35,6 +36,7 @@ use zakura_test::mock_service::{MockService, PanicAssertion};
 use crate::components::{
     mempool::{self, *},
     sync::{RecentSyncLengths, SyncStatus},
+    test_misbehavior::{self, reported_score},
 };
 
 /// A [`MockService`] representing the network service.
@@ -307,13 +309,13 @@ fn transaction_data_failures_ban_every_version() {
 /// its upgrade, and the verifier rejects a mismatch before these checks.
 #[test]
 fn upgrade_dependent_failures_ban_only_v5_and_later() {
-    use zakura_chain::primitives::{ed25519, reddsa, redjubjub};
+    use zakura_chain::primitives::{reddsa, redjubjub};
 
     for error in [
         TransactionError::Script(zakura_script::Error::ScriptInvalid),
         TransactionError::SaplingVerificationFailed,
         TransactionError::Halo2VerificationFailed,
-        TransactionError::Ed25519(ed25519::Error::InvalidSignature),
+        TransactionError::Ed25519("invalid signature".to_owned()),
         TransactionError::RedJubjub(redjubjub::Error::InvalidSignature),
         TransactionError::RedPallas(reddsa::Error::InvalidSignature),
         TransactionError::DisabledAddToOrchardPool,
@@ -630,8 +632,8 @@ async fn transaction_data_failure_bans_peer_without_a_current_tip() {
     let network = Network::Mainnet;
     let (mut mempool, mut peer_set, _state, _tip, mut tx_verifier, mut recent_syncs, _receiver) =
         setup(&network, u64::MAX, true).await;
-    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
-    mempool.misbehavior_sender = misbehavior_sender;
+    let misbehavior = test_misbehavior::reporter();
+    mempool.misbehavior = misbehavior.clone();
     mempool.enable(&mut recent_syncs).await;
     assert!(!mempool.is_current_enough_for_mempool());
 
@@ -644,8 +646,8 @@ async fn transaction_data_failure_bans_peer_without_a_current_tip() {
     .await;
 
     assert_eq!(
-        misbehavior_receiver.try_recv(),
-        Ok((test_peer(), zn::constants::MAX_PEER_MISBEHAVIOR_SCORE))
+        reported_score(&misbehavior, test_peer()),
+        zn::constants::MAX_PEER_MISBEHAVIOR_SCORE
     );
     assert!(!mempool
         .peer_cooldowns
@@ -658,8 +660,8 @@ async fn repeated_cooldown_disconnects_peer_without_banning() {
     let network = Network::Mainnet;
     let (mut mempool, mut peer_set, _state, _tip, mut tx_verifier, mut recent_syncs, _receiver) =
         setup(&network, u64::MAX, true).await;
-    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
-    mempool.misbehavior_sender = misbehavior_sender;
+    let misbehavior = test_misbehavior::reporter();
+    mempool.misbehavior = misbehavior.clone();
     // Cooldowns only start when the mempool's validation context is current.
     let _chain_tip_sender = mempool.use_current_chain_tip(&network);
     mempool.enable(&mut recent_syncs).await;
@@ -687,10 +689,7 @@ async fn repeated_cooldown_disconnects_peer_without_banning() {
     assert!(mempool
         .peer_cooldowns
         .is_cooling_down(test_peer().ip(), Instant::now()));
-    assert_eq!(
-        misbehavior_receiver.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    );
+    assert_eq!(reported_score(&misbehavior, test_peer()), 0);
 }
 
 /// Pushes an early Mainnet transaction from [`test_peer`], fails its
@@ -1017,8 +1016,8 @@ async fn peer_penalties_with_unconditional(
         mut recent_syncs,
         _mempool_transaction_receiver,
     ) = setup_with_mempool_config(network, mempool::Config::default(), true).await;
-    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
-    mempool.misbehavior_sender = misbehavior_sender;
+    let misbehavior = test_misbehavior::reporter();
+    mempool.misbehavior = misbehavior.clone();
     // An expired prior cooldown would make the next penalty disconnect the peer.
     // Trusted peers must bypass that escalation as well as the first cooldown.
     if unconditional_peers.contains(peer.ip()) {
@@ -1076,13 +1075,12 @@ async fn peer_penalties_with_unconditional(
     let cooling_down = mempool
         .peer_cooldowns
         .is_cooling_down(peer.ip(), std::time::Instant::now());
-    let banned = match misbehavior_receiver.try_recv() {
-        Ok((banned_peer, score)) => {
-            assert_eq!(banned_peer, peer);
+    let banned = match reported_score(&misbehavior, peer) {
+        0 => false,
+        score => {
             assert_eq!(score, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
             true
         }
-        Err(_) => false,
     };
 
     peer_set.expect_no_requests().await;
@@ -1137,8 +1135,8 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
         mut recent_syncs,
         _mempool_transaction_receiver,
     ) = setup_with_mempool_config(&network, mempool_config, true).await;
-    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
-    mempool.misbehavior_sender = misbehavior_sender;
+    let misbehavior = test_misbehavior::reporter();
+    mempool.misbehavior = misbehavior.clone();
     // Cooldowns only start when the mempool's validation context is current.
     let _chain_tip_sender = mempool.use_current_chain_tip(&network);
     mempool.enable(&mut recent_syncs).await;
@@ -1263,10 +1261,7 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
         .any(|(request, _)| request.id() == later_transaction.id()));
     peer_set.expect_no_requests().await;
 
-    assert!(matches!(
-        misbehavior_receiver.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
+    assert_eq!(reported_score(&misbehavior, peer_addr), 0);
     Ok(())
 }
 
@@ -2667,7 +2662,7 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
 
     // Don't commit the mainnet genesis block; we commit the generated chain instead.
     let (
-        mut mempool,
+        mempool,
         mut peer_set,
         mut state_service,
         mut chain_tip_change,
@@ -2675,6 +2670,9 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
         mut recent_syncs,
         _mempool_transaction_receiver,
     ) = setup(&network, u64::MAX, false).await;
+    let (trace_tx, mut trace_rx) = tokio::sync::mpsc::channel(16);
+    let mut mempool =
+        mempool.with_trace(JsonlEventEmitter::new(JsonlTracer::new(trace_tx), "test"));
 
     // Commit the chain up to (but not including) the NU5 reset boundary. These commits are the
     // genesis reset followed by plain `Grow`s, leaving the tip at `NU5_ACTIVATION_TEST_HEIGHT - 2`.
@@ -2795,8 +2793,12 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
 
     // Commit the next block (a plain `Grow`). This increases the tip height past the expected
     // tip height that the tx was verified at, so the mempool must re-verify it.
-    commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, grow_block)
-        .await;
+    commit_block_and_wait_for_tip_change(
+        &mut state_service,
+        &mut chain_tip_change,
+        grow_block.clone(),
+    )
+    .await;
 
     // Query the mempool to make it poll tx_downloads.pending and try reverifying transactions
     // because the tip height has changed.
@@ -2806,6 +2808,29 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     // no transactions were inserted in the mempool.
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
     assert_eq!(mempool.storage().transaction_count(), 0);
+
+    // The trace records the reset that re-queued the transaction, then the grow.
+    let mut rows = Vec::new();
+    while let Ok(written) = trace_rx.try_recv() {
+        let row: serde_json::Value =
+            serde_json::from_slice(&written.line).expect("each trace row is JSON");
+        rows.push(row);
+    }
+    for (block, action, requeued) in [(&reset_block, "reset", 1), (&grow_block, "grow", 0)] {
+        let row = rows
+            .iter()
+            .find(|row| row["tip_hash"] == block.hash().to_string())
+            .unwrap_or_else(|| panic!("no row for {}: {rows:?}", block.hash()));
+        assert_eq!(row["event"], "mempool_tip_processed");
+        assert_eq!(row["action"], action);
+        assert_eq!(
+            row["tip_height"],
+            block.coinbase_height().expect("the block has a height").0
+        );
+        assert_eq!(row["tx_count_after"], 0);
+        assert_eq!(row["requeued"], requeued);
+        assert!(row["process_us"].is_u64(), "{row}");
+    }
 
     Ok(())
 }
@@ -3853,14 +3878,14 @@ fn pick_transaction_with_prevout(network: &Network) -> VerifiedUnminedTx {
     network
         .unmined_transactions_in_blocks(..)
         .find(|transaction| {
-            transaction
-                .transaction
-                .transaction()
-                .inputs()
-                .iter()
-                .any(|input| matches!(input, transparent::Input::PrevOut { .. }))
+            let transaction = transaction.transaction.transaction();
+            !transaction.has_sprout_joinsplit_data()
+                && transaction
+                    .inputs()
+                    .iter()
+                    .any(|input| matches!(input, transparent::Input::PrevOut { .. }))
         })
-        .expect("missing non-coinbase transaction")
+        .expect("test vectors contain a non-Sprout transaction with a transparent input")
 }
 
 /// The height at which the network returned by [`nu_activation_test_network`] activates NU5.
@@ -4016,7 +4041,7 @@ async fn setup_with_mempool_config(
         sync_status,
         latest_chain_tip,
         chain_tip_change.clone(),
-        tokio::sync::mpsc::channel(1).0,
+        test_misbehavior::reporter(),
         Vec::new(),
         zn::UnconditionalPeers::default(),
     );

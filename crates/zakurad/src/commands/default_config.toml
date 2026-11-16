@@ -65,18 +65,17 @@ optimistic_block_inventory = true
 
 [network]
 # Announce to the initial group immediately, then everyone else after one delay.
-# The delay grows from min to max between the block-size thresholds below.
-# Zero delays announce to all peers immediately, regardless of block size.
-advert_delay_min = "0s"
-advert_delay_max = "0s"
+# The initial group shrinks from the small-block to the full-block window between
+# the block-size thresholds below. Zero delay announces to all peers immediately.
+advert_delay = "500ms"
+advert_window_full_block = 32
 advert_window_full_size_bytes = 1572864
-advert_window_max = 64
-advert_window_min = 32
+advert_window_small_block = 64
 advert_window_small_size_bytes = 102400
 cache_dir = true
 crawl_new_peer_interval = "1m 1s"
 expose_peer_addresses = false
-experimental_early_block_relay = false
+compact_block_relay = false
 identity_dir = "@NETWORK_IDENTITY_DIR@"
 initial_mainnet_peers = [
     "dnsseed.str4d.xyz:8233",
@@ -101,6 +100,18 @@ p2p_stack = "default"
 peerset_initial_target_size = 100
 unconditional_peers = []
 
+# Warm each new legacy TCP connection with a few padded pings, so that its first
+# full block does not wait for TCP slow start. Needs
+# net.ipv4.tcp_slow_start_after_idle = 0.
+[network.tcp_warmup]
+chunk_timeout = "5s"
+enabled = false
+first_chunk_bytes = 14000
+max_chunk_bytes = 2097144
+max_concurrent = 16
+peer_cooldown = "1day"
+tip_quiet = "2s"
+
 [network.zakura]
 bootstrap_peers = [
     "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
@@ -121,6 +132,8 @@ message_rate_per_second = 2048
 nat_traversal = false
 peer_memory_budget_bytes = 16106127360
 stream_open_rate_per_second = 32
+# Optional IP-to-name labels for peers in gossip traces.
+trace_peer_names = {}
 
 [network.zakura.quic]
 ack_frequency = false
@@ -144,6 +157,10 @@ send_window_bytes = 33554432
 stream_receive_window_bytes = 16777216
 
 [rpc]
+# Takes effect when enable_cookie_auth = false. The administrator is expected
+# to have correctly configured firewall rules restricting access to trusted clients.
+# Requests from web browsers (with an Origin header) are rejected.
+allow_unauthenticated_admin = false
 cookie_dir = "@RPC_COOKIE_DIR@"
 cookie_file_name = ".cookie"
 debug_force_finished_sync = false

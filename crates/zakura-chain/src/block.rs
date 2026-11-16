@@ -52,6 +52,7 @@ pub use commitment::{
 pub use hash::Hash;
 pub use header::{BlockTimeError, CountedHeader, Header, ZCASH_BLOCK_VERSION};
 pub use height::{Height, HeightDiff, TryIntoHeight};
+pub(crate) use serialize::check_max_block_bytes;
 pub use serialize::{SerializedBlock, MAX_BLOCK_BYTES};
 
 /// Re-assert the signed Zcash block-header version rule on an in-memory header.
@@ -160,6 +161,12 @@ impl BlockRef {
         &self,
     ) -> impl ExactSizeIterator<Item = &Transaction> + DoubleEndedIterator {
         self.0.transactions.iter().map(Arc::as_ref)
+    }
+
+    /// Borrow a transaction by its block-order index in constant time, without
+    /// cloning its shared handle. Returns `None` if the index is out of bounds.
+    pub fn transaction_at(&self, index: usize) -> Option<&Transaction> {
+        self.0.transactions.get(index).map(Arc::as_ref)
     }
 
     /// Number of allocated slots in the transaction vector.

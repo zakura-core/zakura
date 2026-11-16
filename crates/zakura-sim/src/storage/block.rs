@@ -32,7 +32,7 @@ use crate::{
         BlockOperation, BlockStorageState, BodyAvailability, BodyScope, StorageFact,
         StorageRequest, StorageResult, StorageState,
     },
-    ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
+    ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, Sim,
 };
 
 /// The service name in identities and observations.
@@ -105,6 +105,45 @@ fn outcome(code: u64) -> Option<BlockOutcome> {
 pub(crate) fn decode(local: u64) -> (OpId, BlockOutcome) {
     let outcome = outcome(local % CODES).expect("indices come from `enabled`, which codes them");
     (OpId(local / CODES), outcome)
+}
+
+/// Whether `outcome` is the success of an operation whose legal outcomes
+/// now are `legal`: an answer, an admission, an applied record, a served
+/// read or a commit, and a duplicate where a commit isn't legal.
+/// Convergence policies and the drain offer only this.
+pub(crate) fn succeeds(legal: &[BlockOutcome], outcome: BlockOutcome) -> bool {
+    let success = |outcome: &BlockOutcome| {
+        matches!(
+            outcome,
+            BlockOutcome::Answer
+                | BlockOutcome::Admit
+                | BlockOutcome::Apply
+                | BlockOutcome::Serve
+                | BlockOutcome::Verdict(Verdict::Committed)
+        )
+    };
+    success(&outcome)
+        || (outcome == BlockOutcome::Verdict(Verdict::Duplicate) && !legal.iter().any(success))
+}
+
+/// Whether operation `id` is a submission whose parent is another
+/// submission still queued or admitted, whose commit could make `id`'s own
+/// commit legal.
+fn parent_pending(state: &OwnerState, id: OpId) -> bool {
+    let Some(RequestIdentity::Submit { parent, .. }) = state
+        .operations
+        .iter()
+        .find(|op| op.id == id)
+        .map(|op| &op.request)
+    else {
+        return false;
+    };
+    state.operations.iter().any(|op| {
+        matches!(
+            op.stage,
+            OperationStage::Queued | OperationStage::Admitted { .. }
+        ) && op.request.submitted_hash() == Some(*parent)
+    })
 }
 
 /// Block storage driven by the run. Dropping it shuts the service down,
@@ -468,6 +507,69 @@ impl ActionSource for BlockStorage {
         }
     }
 
+    /// Each pending operation's success ([`succeeds`]) where it's legal.
+    /// Where it isn't, and no pending parent can make it legal, such as an
+    /// admitted child whose parent failed, the contract's first legal
+    /// retryable verdict, which ends the operation without a commit.
+    fn recovery(&self, _: SimInstant, out: &mut RecoveryOffer) {
+        let pending = self.service.pending();
+        if pending.is_empty() {
+            return;
+        }
+        let state = self.service.owner_state();
+        for op in pending {
+            let mut chosen: Vec<BlockOutcome> = op
+                .enabled
+                .iter()
+                .copied()
+                .filter(|outcome| succeeds(&op.enabled, *outcome))
+                .collect();
+            if chosen.is_empty() && !parent_pending(&state, op.id) {
+                chosen.extend(op.enabled.iter().copied().find(|outcome| {
+                    matches!(outcome, BlockOutcome::Verdict(Verdict::Retryable(_)))
+                }));
+            }
+            for outcome in chosen {
+                out.actions.push((
+                    Identity::storage(&self.label, op.id.0, &outcome.name()),
+                    op.id.0 * CODES + code(outcome),
+                ));
+            }
+        }
+    }
+
+    /// Nothing: the service has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// While recovery offers nothing, the first pending operation, preferring
+    /// one with no legal outcome at all. While it offers something, a
+    /// completion can still free the rest: the driver it occupies, the
+    /// apply room it holds, or the parent it commits.
+    fn holds_work(&self) -> Option<String> {
+        let mut offered = RecoveryOffer::default();
+        // Block operations have no time gates, so any instant gives the same
+        // offer.
+        self.recovery(SimInstant::ZERO, &mut offered);
+        if !offered.actions.is_empty() {
+            return None;
+        }
+        let pending = self.service.pending();
+        pending
+            .iter()
+            .find(|op| op.enabled.is_empty())
+            .or_else(|| pending.first())
+            .map(|op| {
+                format!(
+                    "{} operation {} ({}, {:?}) has no recovery completion: {:?}",
+                    self.label,
+                    op.id.0,
+                    op.op.name(),
+                    op.stage,
+                    op.enabled
+                )
+            })
+    }
+
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         // As `HeaderStorage::observe`: only the run holding the checkpoint
         // checks what this delivers.
@@ -526,7 +628,7 @@ mod tests {
 
     use zakura_storage::block::controlled::OpId;
 
-    use super::{code, decode, outcome, CODES};
+    use super::{code, decode, outcome, succeeds, CODES};
 
     /// Every outcome the contract lists has its own code, which decodes
     /// back to it.
@@ -548,6 +650,24 @@ mod tests {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes, (0..18).collect::<Vec<_>>(), "every code is in use");
+    }
+
+    /// The drain's success rule: an answer, admission, applied record,
+    /// served read or commit, and a duplicate only where no commit is
+    /// legal. A failure or a retryable verdict is never a success.
+    #[test]
+    fn a_duplicate_succeeds_only_where_a_commit_is_illegal() {
+        let (committed, duplicate) = (
+            outcome(6).expect("code 6 is a commit"),
+            outcome(7).expect("code 7 is a duplicate"),
+        );
+        assert!(succeeds(&[committed, duplicate], committed));
+        assert!(!succeeds(&[committed, duplicate], duplicate));
+        assert!(succeeds(&[duplicate], duplicate));
+        let retryable = outcome(12).expect("code 12 is retryable");
+        assert!(!succeeds(&[retryable], retryable));
+        let fail = outcome(1).expect("code 1 is a failure");
+        assert!(!succeeds(&[fail], fail));
     }
 
     /// Each outcome's name in its action identity, by code. A renamed

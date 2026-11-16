@@ -11,9 +11,9 @@
 //!
 //! Each operation runs when its future is first polled, atomically under the
 //! engine and lease locks. [`super::controlled`] runs the same operations
-//! when the run completes them instead. `vct_repair_context` is
-//! narrower than production: it always answers `Stale`, since a simulation
-//! has no repair to resolve. Retained paths follow [`super::lease`].
+//! when the run completes them instead. A VCT repair's context and its
+//! apply-time checks follow production's, in [`repair`]. Retained paths
+//! follow [`super::lease`].
 //!
 //! The port also holds full state, the committed blocks, and publishes a
 //! `CommittedHeaderChainView` after every engine commit, as zakura-state
@@ -39,9 +39,8 @@ use zakura_header_chain::{
     HeaderGeneration, HeaderId, HeaderInsertionFacts, HeaderLocator, HeaderRule, HeaderRules,
     HeaderSyncWorkOwner, HeaderValidationCheck, HeaderValidationFacts, HeaderValidationSource,
     HeaderViolation, InsertHeaders, InvalidTransitionEvidence, MemHeaderStore, RuleId, SourceId,
-    StateVersion, StoreError, TargetCompletion, TransitionContext, TransitionEffect,
-    TransitionEvent, TransitionFailure, TransitionInput, TrustedAnchor, ValidationLease,
-    VerifiedGeneration,
+    StateVersion, StoreError, TransitionContext, TransitionEffect, TransitionEvent,
+    TransitionFailure, TransitionInput, TrustedAnchor, ValidationLease, VerifiedGeneration,
 };
 use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, AdapterKey, ApplyHeaderTargetOutcome, ApplyHeaderTargetReply,
@@ -60,6 +59,7 @@ use crate::full_state::{
 
 mod full_state;
 pub use full_state::{Applied, Installed};
+mod repair;
 
 use super::{
     evidence::{LeaseFact, LeaseKey, ResultIdentity, SignalClass},
@@ -94,6 +94,14 @@ pub struct EnginePort {
     /// [`Self::preload_blocks`]. Set once, and never across a run's
     /// scheduling points, so a plain atomic suffices.
     block_service: AtomicBool,
+    /// The highest checkpoint's height, which no VCT repair passes, as
+    /// zakura-state's `max_checkpoint_height`.
+    checkpoint_ceiling: block::Height,
+    /// Each snapshot sent on the selected-chain watch since the last
+    /// [`Self::take_publications`], in order, for the simulator's
+    /// publication rule. A std lock, held only to push or take.
+    #[cfg(zakura_sim)]
+    publications: StdMutex<Vec<EngineSnapshot>>,
 }
 
 impl EnginePort {
@@ -162,6 +170,10 @@ impl EnginePort {
             full_state: StdMutex::new(VerifiedChain::new(fixture.genesis_block())),
             views: StdMutex::new(views),
             block_service: AtomicBool::new(false),
+            // `zakurad` sets it to 0 on Regtest, so no repair resolves.
+            checkpoint_ceiling: block::Height(0),
+            #[cfg(zakura_sim)]
+            publications: StdMutex::default(),
         }
     }
 
@@ -192,6 +204,14 @@ impl EnginePort {
         self
     }
 
+    /// The port, resolving VCT repairs up to `ceiling`, as a node whose
+    /// highest checkpoint is there does. A new port's ceiling is 0, as
+    /// `zakurad` sets it on Regtest, so it resolves none.
+    pub fn with_checkpoint_ceiling(mut self, ceiling: block::Height) -> Self {
+        self.checkpoint_ceiling = ceiling;
+        self
+    }
+
     /// The key that seals this port's targets and path handles. The
     /// operation lifecycle checks requests against it.
     pub fn adapter_key(&self) -> &AdapterKey {
@@ -201,6 +221,18 @@ impl EnginePort {
     /// The latest committed snapshot.
     pub fn snapshot(&self) -> EngineSnapshot {
         self.engine().snapshot()
+    }
+
+    /// The engine's whole durable state, for the simulator to judge an
+    /// execution against.
+    #[cfg(zakura_sim)]
+    pub fn durable_state(&self) -> zakura_header_chain::DurableState {
+        self.engine().durable_state()
+    }
+
+    /// The selected chain, from the finalized anchor to the selected tip.
+    pub fn selected_path(&self) -> Vec<zakura_header_chain::Frontier> {
+        self.engine().selected_projection().to_vec()
     }
 
     /// Locks the engine. A panic while it was held can't leave it half
@@ -780,16 +812,23 @@ impl EnginePort {
         let branch = owner.header_authority().branch;
         let stale = || Arc::new(HeaderChainError::stale_target(ErrorSubject::Branch(branch)));
         let insert = target.into_insert(&self.key).map_err(|_| stale())?;
-        // A repair completion needs a resolved repair context, which this
-        // adapter never gives, so production's re-derivation would mismatch.
-        if matches!(
-            insert.completion,
-            TargetCompletion::SelectedAuxiliaryRepair { .. }
-        ) {
-            return Err(stale());
-        }
         let (source, target_tip_hash) = (insert.source, insert.target_tip_hash);
         let mut engine = self.engine();
+        match repair::check_insert(&engine, self.config.limits, &insert) {
+            Ok(()) => {}
+            Err(repair::Refusal::Stale) => return Err(stale()),
+            Err(repair::Refusal::Failure(failure)) => {
+                return Err(classify_apply_failure(
+                    failure,
+                    source,
+                    owner,
+                    target_tip_hash,
+                ))
+            }
+            Err(repair::Refusal::Store(error)) => {
+                return Err(local_resource(owner, Some(Box::new(error))))
+            }
+        }
         let before = engine.snapshot();
         let mut parents = vec![insert.parent_hash];
         if branch.anchor_hash != before.frontiers.finalized.hash
@@ -906,6 +945,35 @@ impl EnginePort {
 }
 
 impl EnginePort {
+    /// The repair context for `owner` at `height`, as zakura-state resolves
+    /// it ([`repair::context`]). An incoherent engine is unavailable, as
+    /// production's read error is.
+    fn repair_context(
+        &self,
+        owner: BodyWorkOwner,
+        height: block::Height,
+    ) -> Result<VctRepairContextReply, PortError> {
+        // A repair past the ceiling, or at genesis, which is always
+        // finalized, is stale whatever the engine holds, so it answers
+        // without the lock, whose taking is a scheduling point in a run, and
+        // a port at the default ceiling schedules as before.
+        if height > self.checkpoint_ceiling || height == block::Height(0) {
+            return Ok(VctRepairContextReply::Stale);
+        }
+        let engine = self.engine();
+        match repair::context(
+            &engine,
+            self.config.limits,
+            owner,
+            height,
+            self.checkpoint_ceiling,
+        ) {
+            Ok(Some(context)) => Ok(VctRepairContextReply::Resolved(context)),
+            Ok(None) => Ok(VctRepairContextReply::Stale),
+            Err(error) => Err(unavailable(error)),
+        }
+    }
+
     /// Runs `request` against the engine now and returns its reply, the
     /// lease registry's effects for the caller to fire once it holds no
     /// lock, and the reply's typed identity. Both this port and
@@ -921,8 +989,8 @@ impl EnginePort {
                     Some(locator)
                 }),
             ),
-            HeaderRequest::VctRepairContext { .. } => {
-                HeaderReply::VctRepairContext(Ok(VctRepairContextReply::Stale))
+            HeaderRequest::VctRepairContext { owner, height } => {
+                HeaderReply::VctRepairContext(self.repair_context(owner, height))
             }
             HeaderRequest::AcquireHeaderPath(request) => {
                 let reply;
@@ -1035,12 +1103,41 @@ impl EnginePort {
             )
         };
         if let Some(selected) = self.selected_sender() {
-            selected.send_replace(Some(snapshot));
+            selected.send_replace(Some(self.published(snapshot)));
         }
         if let Some(views) = views {
             views.send_replace(Some(view.clone()));
         }
         view
+    }
+
+    /// Hands back `snapshot`, which the caller sends on the selected-chain
+    /// watch, and in a simulator build records it for `take_publications`
+    /// first. The record is the sent value
+    /// itself, so a send that's skipped or sends something else can't leave
+    /// a record that says otherwise. Reading the watch back would add a
+    /// scheduling point.
+    fn published(&self, snapshot: EngineSnapshot) -> EngineSnapshot {
+        #[cfg(zakura_sim)]
+        self.publications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(snapshot.clone());
+        snapshot
+    }
+
+    /// Every snapshot this port sent on its selected-chain watch since the
+    /// last call, oldest first: what each committed transition published,
+    /// as the simulator's publication rule judges it. A shut-down watch
+    /// sends nothing, so it records nothing.
+    #[cfg(zakura_sim)]
+    pub fn take_publications(&self) -> Vec<EngineSnapshot> {
+        std::mem::take(
+            &mut *self
+                .publications
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// A clone of the selected-chain watch's sender, or `None` once

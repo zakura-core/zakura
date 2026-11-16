@@ -3,7 +3,7 @@
 
 use super::Trace;
 use crate::{
-    record::{EndRecord, InitRecord, StepRecord},
+    record::{EndRecord, FullReport, InitRecord, StepRecord},
     Record, RecordSink,
 };
 
@@ -30,6 +30,8 @@ pub(crate) struct VerifySink<'t> {
     keep: bool,
     /// Every record received, in order, if `keep` is set.
     pub(crate) kept: Vec<Record>,
+    /// The replay's full report, once the run sends it.
+    pub(crate) report: Option<FullReport>,
 }
 
 impl<'t> VerifySink<'t> {
@@ -45,6 +47,7 @@ impl<'t> VerifySink<'t> {
             end: None,
             keep,
             kept: Vec::new(),
+            report: None,
         }
     }
 
@@ -80,6 +83,11 @@ impl RecordSink for VerifySink<'_> {
             // A run never emits `meta`; the trace writer adds it.
             Record::Meta(_) => {}
         }
+    }
+
+    /// Keeps the replay's report, for comparison with the recording's.
+    fn report(&mut self, report: &FullReport) {
+        self.report = Some(report.clone());
     }
 }
 

@@ -1,0 +1,10 @@
+# A storage call dropped before it completes never returns the headers it
+# holds. Only header sync's node teardown drops a call unfinished, so only
+# its teardown loses the return. The input stops the node while header
+# storage holds its first prepare, and the stopped reactor is gone with
+# that prepare's headers still owned. `teardown-query` and
+# `teardown-submission` stop the node after header sync has finished, so
+# header sync holds no call there. The reactor and the queue decide when
+# a round prepares, so a change there can move the input off it.
+input = "crates/zakura-sim/tests/fixtures/sync-storage-teardown-headers.bin"
+checks = ["crates/zakura-network/src/zakura/header_sync"]

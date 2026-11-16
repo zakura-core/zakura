@@ -1057,21 +1057,6 @@ mod bbr_tests {
     }
 
     #[test]
-    fn probe_rtt_collapses_cwnd_for_a_slow_peer() {
-        // The headline case: a peer whose RTprop inflated under a deep queue. ProbeRtt
-        // forces the cwnd to min_cwnd while it drains, regardless of the (stale, large)
-        // BDP estimate — this is the slow-peer collapse the trace analysis motivated.
-        let cfg = bbr_test_config();
-        let min_cwnd = usize::try_from(cfg.bbr_min_cwnd).unwrap();
-        let mut bbr = BbrState::new(&cfg);
-        let t0 = Instant::now();
-        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
-        let t1 = t0 + Duration::from_millis(1_100);
-        record_delivery(&mut bbr, t1, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
-        assert_eq!(bbr.effective_cwnd(), min_cwnd);
-    }
-
-    #[test]
     fn timeout_dip_applies_in_probe_bw_but_is_suppressed_in_probe_rtt() {
         let cfg = bbr_test_config();
         let min_cwnd = usize::try_from(cfg.bbr_min_cwnd).unwrap();

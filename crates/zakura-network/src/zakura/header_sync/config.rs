@@ -34,6 +34,10 @@ pub struct ZakuraHeaderSyncConfig {
     ///
     /// Discovery applies dial backoff only after a failed dial.
     /// The cooldown prevents an immediate redial after a successful dial ends in eviction.
+    /// The node holds one cooldown per header peer it can admit at once (inbound plus outbound
+    /// [`peer_limits`](Self::peer_limits), clamped to the node's admitted connections), and at
+    /// least a few. When more peers than that fault within one cooldown, the cooldown that ends
+    /// first ends early. The duration is an upper bound.
     /// Set this value to zero to allow immediate readmission.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub unproductive_peer_cooldown: Duration,

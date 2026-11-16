@@ -1,0 +1,10 @@
+# Takes an ordinary prepared target and skips its apply: the reactor ends
+# the prepare's retained headers and returns, so the honest peer's one
+# successor never reaches storage and the node's tip stays at 50. The input
+# is the progress fixture's saved Plan, where the node reads the peer's
+# Status, prepares the successor and, unpatched, applies it at once.
+input = "crates/zakura-sim/tests/fixtures/header-wire-honest-progress.bin"
+# Besides reactor.rs, which the patch changes, the rest of header sync
+# decides whether the successor is offered, located and prepared. A change
+# there can move the input off its prepare.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

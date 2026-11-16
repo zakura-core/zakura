@@ -1,0 +1,11 @@
+# A serving lookup skips its pruning, so the peer-budget map keeps expired
+# identities' budgets while every counter stays right. A peer departs in
+# the churn witness and a later serving lookup keeps its expired entry.
+# The service and the publishers decide when the witness's lookups run, so
+# a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation/serve"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.json"
+plan = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.plan"

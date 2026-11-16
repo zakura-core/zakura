@@ -1,0 +1,28 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 9f71e35495..0d90516c40 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -1100,20 +1100,9 @@ impl HeaderSyncReactor {
+             )
+         });
+         let replaces_existing_peer = self.sessions.contains_key(&peer);
+-        let mut unanswered_budget = None;
+-        if replaces_existing_peer && !owns_local_repair_operation {
+-            // A receiving request's deadline is reset by each page, so it
+-            // still measures how long the peer has left the request unanswered.
+-            let now = Instant::now();
+-            unanswered_budget = self
+-                .peer_work_queue
+-                .active(&peer)
+-                .is_some_and(|active| active.phase == HeaderTargetPhase::Receiving)
+-                .then(|| self.state.request_deadlines.get(&peer).copied())
+-                .flatten()
+-                .map(|deadline| deadline.saturating_duration_since(now));
+-            self.retire_peer_work(&peer, HeaderRequestTerminal::SessionReplaced);
+-        }
++        // Mutation: a replacement leaves the old session's work in place.
++        let _ = (replaces_existing_peer, owns_local_repair_operation);
++        let unanswered_budget: Option<std::time::Duration> = None;
+         let replaced_schedule = self.state.admit_session(&peer, Instant::now());
+         if let Some(budget) = unanswered_budget {
+             self.state.carry_replaced_request_budget(&peer, budget);

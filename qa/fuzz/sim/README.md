@@ -22,7 +22,7 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
 ```
 
 `sim-fuzz.yml` runs each mapped target for two minutes nightly, or on a
-manual dispatch. That run is a smoke: it shows each target still builds and
+manual dispatch, and `block_sync_storage` on its seeds alone. That run is a smoke: it shows each target still builds and
 runs, and isn't meant to find bugs. [Long runs](#long-runs) covers the long
 campaigns. It caches `corpus/<target>/` under the target's name and a digest of
 its harness's `cargo xtask sim-versions` output, adds the harness's committed seeds, and replays that corpus in a
@@ -35,13 +35,40 @@ whose target has no harness or no campaign.
 - `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
   encodes the scenario in the action grammar of
   `zakura_sim::harness::header_sync::grammar`. A prefix whose first byte
-  isn't the harness's generator, 2, runs the default scenario. Pass
+  isn't the harness's generator, 3, runs the default scenario. Pass
   `-max_len=4096`, the input size the grammar is built for, and
   `-len_control=0`. A run takes tens to hundreds of milliseconds, so
   libFuzzer's default length control keeps mutations inside the prefix for
   hours. Its committed seeds,
   `crates/zakura-sim/tests/fixtures/header-storage-*.bin`, each use part of
   the grammar and carry Plan bytes past the prefix.
+- `sync_storage` runs `sync/storage`, header sync and block sync on one
+  node over one engine. Its two-byte prefix picks a saved scenario, or the
+  default one, so the target fuzzes each scenario's schedule. Its committed
+  seeds are `crates/zakura-sim/tests/fixtures/sync-storage-*.bin`.
+- `sync_wire` runs `sync/wire`, `sync/storage`'s node and mirrors on
+  simulated QUIC behind real handlers, so header sync, block sync and
+  discovery share each connection. Its two-byte prefix picks a saved
+  scenario (`0xFC`), fuzz-13's combined actions (`0xFB`, then a byte of
+  actions: the mirrors' fork at one stage of the block pipeline, a
+  connection replacement, and a read stall), or the honest scenario. Its
+  committed seeds are `crates/zakura-sim/tests/fixtures/sync-wire-*.bin`.
+- `block_sync_storage` runs `block-sync/storage`, a block-sync node on
+  controlled block storage with mirror peers. Its two-byte prefix picks a
+  saved scenario or the default one. A generated run takes about 96 s and
+  needs about 7 GB, so its suite row sets `-rss_limit_mb=8192` and a
+  one-second smoke and scheduled campaign. libFuzzer runs the whole corpus
+  before it checks `-max_total_time`, so those runs replay the seeds and
+  generate nothing. Long runs search it. Its committed seeds are
+  `crates/zakura-sim/tests/fixtures/block-sync-*.bin`.
+- `discovery_wire` runs `discovery/wire`, the discovery node behind its
+  real transport on simulated QUIC. Its two-byte prefix picks a saved
+  Plan's scenario or the default one. Its committed seeds are
+  `crates/zakura-sim/tests/fixtures/discovery-wire-*.bin`.
+- `header_sync_wire` runs `header-sync/wire`, the header-sync node behind
+  its real transport on simulated QUIC. Its two-byte prefix picks a saved
+  Plan's scenario or the default one. Its committed seeds are
+  `crates/zakura-sim/tests/fixtures/header-wire-*.bin`.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 - `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only
@@ -88,7 +115,8 @@ action channel, reply routes, and shutdown have witnesses in `zakura-network`.
 
 `discovery_record_book` and `discovery_session_installation` use the shared trace
 and replay pipeline without starting QUIC. Each consumes at most 512 causal
-bytes under its own decoder-v2 identity. They compare the real owner with its
+bytes, the record book under decoder v3 with two bytes per operation and the
+session owner under decoder v2 with four. They compare the real owner with its
 independent model after each completed operation. The tests
 `book_trace_reports_exact_install_replacement_and_eviction` and
 `session_trace_separates_stale_results_and_retained_hints` show that each witness
@@ -352,10 +380,13 @@ must name the harness the table maps it to, so a target whose
 It prints each target's status, the harness's own properties that applied
 and those that didn't, the optional seeds it quarantined, and the retained
 bypasses under `qa/planted/` whose input runs on the harness, or that there
-are none. `<dir>/readiness.json` holds the same report, with each built
-target's commit, dirty state and toolchain from its build identity, and
-`<dir>/<target>/` holds the binary, the seeds, the log and the stats. The
-command exits 0 only if every target is `ready`. A seed run shows that a
+are none. It then prints each harness that no target runs, with the reason
+its `[[missing-target]]` row in `qa/suite.toml` gives, so the report
+accounts for every harness. `<dir>/readiness.json` holds the same report,
+with each built target's commit, dirty state and toolchain from its build
+identity, and its `missing_targets` list. `<dir>/<target>/` holds the
+binary, the seeds, the log and the stats. The command exits 0 only if every
+target is `ready`. A missing target doesn't fail it. A seed run shows that a
 target builds and runs its harness. It says nothing about how well the
 target searches.
 
@@ -372,8 +403,9 @@ source digest. It prints each target's bypasses, or that it has none.
 The nightly `zakura_sim targets` job in `tests-unit.yml` runs
 `cargo xtask sim-targets`. It also runs on manual dispatch, never on pull
 requests. `planted --targets` rebuilds the patched `zakura-sim` and target
-for each case, which takes hours over the whole catalogue, so it runs on a
-remote host, as [Long runs](#long-runs) says.
+for each case, which takes hours over the whole catalogue, so the nightly
+`zakura_sim planted targets` job runs it in shards, as
+[Long runs](#long-runs) says.
 
 ## Seeds
 
@@ -383,6 +415,14 @@ version, the file's SHA-256, the SHA-256 of the scenario the seed decodes to,
 the test or plan the seed comes from, and the property witnesses it carries.
 A `kind = "plan"` seed holds Plan bytes alone, and its `prefix` gives the
 scenario prefix, such as a saved Plan's tag, that encodes its scenario.
+A seed carried to a new generator with its meaning kept names its source in
+a `[derived_from]` table: the source file's SHA-256 and the generator it was
+built for. The source is kept as `sources/<sha256>.bin` beside the seed, and
+the seed check migrates it again with the harness's own migration, which
+must give the seed's input. The `header-sync/storage` seeds were migrated
+from generator 2 this way, by `grammar::migrate`. A seed whose prefix is for
+another generator than its harness's is rejected, even when the harness
+would draw a fallback scenario for it.
 
 `cargo xtask sim-seeds` validates every seed against the current generators.
 A required seed that fails, such as one built for an older generator or one
@@ -541,17 +581,22 @@ only from a target with a collector.
 ## Long runs
 
 The nightly CI jobs smoke the simulator's long checks. `sim-fuzz.yml` fuzzes
-each target for two minutes. The `zakura_sim planted` job in `tests-unit.yml`
-runs one of seven shards of `qa/planted/`, picked by the UTC weekday, with
-`cargo xtask planted --shard <index>/7`, so each case runs once a week. A
+each target for two minutes, and runs `block_sync_storage` on its seeds
+alone. The `zakura_sim planted` job in `tests-unit.yml`
+splits `qa/planted/` into fourteen shards. Each night its two parts run the
+two shards the UTC weekday picks, with `cargo xtask planted --shard
+<index>/14`, so each case runs once a week. A
 case's shard follows from its position in path order. Adding or removing a
 case moves every later case to another shard, so across that change a case
 can run on two nights in a row or wait up to 13 nights. A shard that holds no
 case fails the run. Each shard has its own failure issue,
-`[nightly] zakura_sim planted shard <index>/7 failed`, and only a passing run
-of that shard closes it, so a pass of another shard can't close it. A remote
-host runs the rest, including `cargo xtask planted --targets`, and its results
-never block a pull request. No CI job runs `planted --targets`.
+`[nightly] zakura_sim planted shard <index>/14 failed`, and only a passing run
+of that shard closes it, so a pass of another shard can't close it. The
+`zakura_sim planted targets` job splits the cases that `--targets` keeps the
+same way, and runs `cargo xtask planted --targets --shard <index>/14`. Its
+failure issue for each shard is
+`[nightly] zakura_sim planted targets shard <index>/14 failed`. A remote
+host runs the rest, and its results never block a pull request.
 
 `scripts/sim-long-runs.sh` runs them from a checkout on that host. Each run
 writes under its own directory, `<out>/<UTC time>-<commit>/`. It runs

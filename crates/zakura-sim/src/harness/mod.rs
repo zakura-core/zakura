@@ -17,6 +17,7 @@ pub mod block_work;
 pub mod coverage;
 pub mod discovery;
 pub mod discovery_machine;
+pub mod discovery_service;
 pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;
@@ -25,6 +26,8 @@ pub mod machine;
 pub mod policy;
 mod record;
 pub mod scenario;
+pub mod sync;
+pub mod sync_wire;
 pub mod wire_node;
 pub mod wire_plans;
 
@@ -38,7 +41,7 @@ pub(crate) use record::write_trace;
 pub use record::{record, record_witness, RecordError, RecordInput, WITNESS_FILE};
 
 use crate::{
-    check::{Checker, Phase, PropertyReport, StepCtx, Violation},
+    check::{Checker, Phase, PropertyReport, StepCtx, Unfinished, Violation},
     end::{HarnessFailure, Outcome, RunEnd},
     explore::{self, ExploreRun},
     net::Net,
@@ -47,7 +50,7 @@ use crate::{
         Assume, Assumptions, CheckCtx, CheckEvent, HasView, Kind, Property, PropertyId, Registry,
         RegistryChecker, Source, Sources, Status, Tee, Verdict,
     },
-    record::{CONTRACT_VERSION, FORMAT_VERSION},
+    record::{FullReport, CONTRACT_VERSION, FORMAT_VERSION},
     sim::NO_LIVELOCK,
     trace::{
         meta::{BudgetRecord, PropertyRef, SchedulerRecord, RNG},
@@ -131,6 +134,54 @@ pub trait Subsystem: HasView + Sized + 'static {
     /// Decodes a scenario from exactly [`Subsystem::SCENARIO_BYTES`] bytes of
     /// fuzz input.
     fn draw(prefix: &[u8]) -> Self::Scenario;
+
+    /// The scenario families `draw` picks by a tag at the prefix's start,
+    /// such as a saved scenario's two bytes. A uniform draw almost never
+    /// writes a tag, so `zakura-sim generate` writes each family's tag on a
+    /// share of its runs. Every tag `draw` matches must be listed, and a
+    /// draw that matches none lists none, the default.
+    fn families() -> Vec<ScenarioFamily> {
+        Vec::new()
+    }
+
+    /// Whether this generator reads `prefix`, exactly
+    /// [`Subsystem::SCENARIO_BYTES`] long, as its own rather than drawing a
+    /// fallback scenario for it, as `draw` does for another generator's
+    /// prefix. Every prefix by default.
+    fn accepts(_prefix: &[u8]) -> bool {
+        true
+    }
+
+    /// Carries a full fuzz input built for an older `generator` to this one
+    /// with its meaning kept, as a seed's `derived_from` claims it was. Fails
+    /// by default: a harness that never changed its generator migrates
+    /// nothing.
+    fn migrate(_source: &[u8], generator: u32) -> Result<Vec<u8>, String> {
+        Err(format!(
+            "{} migrates no generator-{generator} input",
+            Self::NAME
+        ))
+    }
+}
+
+/// One scenario family a harness's draw picks by a tag
+/// ([`Subsystem::families`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScenarioFamily {
+    /// The family's name, as `zakura-sim generate` reports it.
+    pub name: &'static str,
+    /// The bytes at the prefix's start that pick it.
+    pub tag: Vec<u8>,
+}
+
+impl ScenarioFamily {
+    /// The family `tag` picks, named `name`.
+    pub fn new(name: &'static str, tag: impl Into<Vec<u8>>) -> Self {
+        ScenarioFamily {
+            name,
+            tag: tag.into(),
+        }
+    }
 }
 
 /// Why a harness couldn't run a scenario.
@@ -216,17 +267,21 @@ pub(crate) fn run_reading<S: Subsystem, T: 'static>(
     sim.on_end({
         let this = Rc::clone(&this);
         let read_out = Rc::clone(&read_out);
-        move |end, properties, log| *read_out.borrow_mut() = Some(read(&this, end, properties, log))
+        move |end, properties, log| {
+            let snapshot = this.snapshot();
+            *read_out.borrow_mut() = Some((read(&this, end, properties, log), snapshot));
+        }
     });
     let mut checker = registry_checker(&this, assumptions);
     let report = match extra {
         Some(extra) => sim.run(&mut Tee(Dyn(&mut *checker), Dyn(extra)), sink),
         None => sim.run(&mut *checker, sink),
     };
-    let read = read_out
+    let (read, snapshot) = read_out
         .borrow_mut()
         .take()
         .expect("`Sim::run` runs its end hooks once");
+    sink.report(&FullReport::new(&report.properties, snapshot));
     // The harness outlives the run, so production tasks never see their
     // handles close mid-run.
     drop(checker);
@@ -259,6 +314,7 @@ pub fn meta<S: Subsystem>(scenario: &S::Scenario) -> Result<MetaRecord, HarnessE
         fixtures: Vec::new(),
         properties: registered::<S>(),
         input: None,
+        plan: None,
         derived_from: None,
     })
 }
@@ -405,24 +461,40 @@ pub struct HarnessEntry {
     /// [`explore::run_bytes`]: a full fuzz input, the sink, and an extra
     /// checker.
     pub run_bytes: fn(&[u8], &mut dyn RecordSink, Option<&mut dyn Checker>) -> ExploreRun,
+    /// [`Subsystem::accepts`].
+    pub accepts: fn(&[u8]) -> bool,
+    /// [`Subsystem::families`]. A machine has none.
+    pub families: fn() -> Vec<ScenarioFamily>,
+    /// [`Subsystem::migrate`].
+    pub migrate: fn(&[u8], u32) -> Result<Vec<u8>, String>,
 }
 
 /// [`HarnessEntry::witness`]: the serialized scenario, the input, the
-/// property, the expectation and the sink.
+/// property, the expectation, the expected co-violations and the sink.
 pub type WitnessFn =
-    fn(&Value, PlanInput, &str, Expect, &mut dyn RecordSink) -> Result<(), WitnessError>;
+    fn(&Value, PlanInput, &str, Expect, &[String], &mut dyn RecordSink) -> Result<(), WitnessError>;
 
 impl HarnessEntry {
     /// The scenario that the full fuzz `input`'s prefix decodes to.
     pub fn scenario(&self, input: &[u8]) -> Value {
+        (self.draw)(&self.prefix(input))
+    }
+
+    /// Whether the harness's generator reads the full fuzz `input`'s prefix
+    /// as its own ([`Subsystem::accepts`]).
+    pub fn accepts_input(&self, input: &[u8]) -> bool {
+        (self.accepts)(&self.prefix(input))
+    }
+
+    /// The prefix `draw` reads from the full fuzz `input`: a machine's whole
+    /// input, else its first `scenario_bytes`, with missing bytes read as 0.
+    fn prefix(&self, input: &[u8]) -> Vec<u8> {
         let prefix = &input[..input.len().min(self.scenario_bytes)];
-        if self.machine || prefix.len() == self.scenario_bytes {
-            (self.draw)(prefix)
-        } else {
-            let mut padded = prefix.to_vec();
+        let mut padded = prefix.to_vec();
+        if !self.machine {
             padded.resize(self.scenario_bytes, 0);
-            (self.draw)(&padded)
         }
+        padded
     }
 
     /// Property `id`'s status in this harness, as the explorer's classifier
@@ -462,6 +534,9 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         properties: registered::<S>,
         witness: witness_value::<S>,
         run_bytes: explore::run_bytes::<S>,
+        accepts: S::accepts,
+        families: S::families,
+        migrate: S::migrate,
     }
 }
 
@@ -487,8 +562,15 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<discovery::WaitComplete>(),
     entry::<header_sync::Smoke>(),
     entry::<header_sync::Storage>(),
+    entry::<header_sync::ReleaseWake>(),
+    entry::<header_sync::Liveness>(),
+    entry::<header_sync::Flood>(),
+    entry::<header_sync::RepairHarness>(),
     entry::<block_sync::Storage>(),
     entry::<header_sync::HeaderWire>(),
+    entry::<discovery_service::DiscoveryWire>(),
+    entry::<sync::SyncStorage>(),
+    entry::<sync_wire::SyncWire>(),
 ];
 
 /// The harness named `name`.
@@ -529,11 +611,12 @@ fn witness_value<S: Subsystem>(
     input: PlanInput,
     property: &str,
     expect: Expect,
+    also_violates: &[String],
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
     let scenario = scenario::<S>(value)
         .map_err(|error| WitnessError::UnsupportedScenario(error.to_string()))?;
-    witness_into::<S>(&scenario, input, property, expect, sink)
+    witness_into::<S>(&scenario, input, property, expect, also_violates, sink)
 }
 
 /// [`HarnessEntry::draw`] for `S`.
@@ -666,5 +749,10 @@ impl Checker for Dyn<'_> {
     /// Forwards to the checker.
     fn step_loop_violation(&mut self, violation: &Violation) {
         self.0.step_loop_violation(violation);
+    }
+
+    /// Forwards to the checker.
+    fn unfinished(&self) -> Unfinished {
+        self.0.unfinished()
     }
 }

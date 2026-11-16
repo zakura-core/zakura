@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/completed_targets.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/completed_targets.rs
+index 28835728cb..d62f87dcf1 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/completed_targets.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/completed_targets.rs
+@@ -44,8 +44,8 @@ impl CompletedHeaderTargets {
+         generation: HeaderGeneration,
+         finalized: Frontier,
+     ) {
+-        self.0
+-            .retain(|key| key.generation == generation && key.branch.anchor_hash == finalized.hash);
++        // Mutation: adoption keeps every completed target.
++        let _ = (generation, finalized);
+     }
+ 
+     /// Every completed target, by generation and branch, sorted.

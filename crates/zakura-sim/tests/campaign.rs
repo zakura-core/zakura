@@ -1476,10 +1476,14 @@ fn template_counts() -> Counts {
     let mut applied = PropertyCounts::new(PropertyStatus::Active);
     applied.held = 2;
     applied.evaluations = 5;
-    applied.inconclusive.insert("assumption-lost".to_owned(), 1);
+    applied
+        .not_applicable
+        .insert("assumption-lost".to_owned(), 1);
     applied.violated = 1;
     let mut unapplied = PropertyCounts::new(PropertyStatus::Draft);
-    unapplied.not_applicable = 3;
+    unapplied
+        .not_applicable
+        .insert("never-applied".to_owned(), 3);
     Counts {
         runs: 3,
         outcomes: [("clean".to_owned(), 2), ("fail".to_owned(), 1)].into(),
@@ -1644,7 +1648,10 @@ fn evidence_sums_each_workers_processes() {
     assert_eq!(applied.assumption_losses(), 2);
     assert_eq!(applied.violated, 2);
     assert_eq!(applied.status, PropertyStatus::Active);
-    assert_eq!(totals.properties["p/unapplied"].not_applicable, 6);
+    assert_eq!(
+        totals.properties["p/unapplied"].not_applicable,
+        [("never-applied".to_owned(), 6)].into()
+    );
     assert_eq!(
         totals.properties["p/unapplied"].status,
         PropertyStatus::Draft
@@ -1676,7 +1683,7 @@ fn evidence_sums_each_workers_processes() {
         "budget exits: 2; drains exhausted: 2",
         "cleanup: abandoned 2 (4 tasks leaked), unwound 2, panicked 2, unwind failures 2",
         "features: 3 distinct (feature/budget 1, feature/request-reset 1, other 1)",
-        "property p/applied [active]: held 4 (10 evaluations), not applicable 0, inconclusive 2 \
+        "property p/applied [active]: held 4 (10 evaluations), not applicable 2 \
          (assumption-lost 2), assumption losses 2, violated 2",
         &unapplied_line,
     ] {

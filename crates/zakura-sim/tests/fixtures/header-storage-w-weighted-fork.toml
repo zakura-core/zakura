@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-weighted-fork.bin`, a fuzz-12 item 7 witness whose run
+# shows ForkWork { earlier: 5, later: 3, work: Greater }. Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "0a47c0a0afb101d6c5da0cf93aab4bddab5a625404b07cb7d154b85ad1dc4031"
+scenario_sha256 = "91cbeab4b3fc095a32b7fa8244c2ddc77a7354126789a592bc1cfa5d0251cedc"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

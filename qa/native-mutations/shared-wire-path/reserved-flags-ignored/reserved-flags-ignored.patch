@@ -1,0 +1,46 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/regulated/live_requester.rs b/crates/zakura-network/src/zakura/block_sync/regulated/live_requester.rs
+index 8aa43a503b..52c134a480 100644
+--- a/crates/zakura-network/src/zakura/block_sync/regulated/live_requester.rs
++++ b/crates/zakura-network/src/zakura/block_sync/regulated/live_requester.rs
+@@ -227,8 +227,7 @@ impl LiveRequester {
+         }
+         let rule = MessageRule::find(RULES, frame.message_type)
+             .ok_or_else(|| SinkReject::protocol("unknown GetBlocks message"))?;
+-        if frame.flags != 0
+-            || frame.payload.len() < rule.payload.min()
++        if frame.payload.len() < rule.payload.min()
+             || frame.payload.len() > rule.payload.max()
+             || frame.payload.first().copied().map(u16::from) != Some(frame.message_type)
+         {
+diff --git a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
+index 3d5746878a..ca873c396d 100644
+--- a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
++++ b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
+@@ -177,10 +177,9 @@ impl<'a> FrameFilter<'a> {
+         let rule = MessageRule::find(rules, message_type)
+             .filter(|rule| self.reader.admits(rule.role))
+             .ok_or(FrameRejection::UnknownMessageType)?;
+-        // No native message defines a flag bit.
+-        if flags != 0 {
+-            return Err(FrameRejection::ReservedFlags);
+-        }
++        // Flag bits are reserved for future extensions; a reader that doesn't
++        // know one ignores it.
++        let _ = flags;
+         if payload_len < rule.payload.min() {
+             return Err(FrameRejection::PayloadTooShort {
+                 min: rule.payload.min(),
+diff --git a/crates/zakura-network/src/zakura/wire_codec/message.rs b/crates/zakura-network/src/zakura/wire_codec/message.rs
+index dae342d1c3..50dacbd1e4 100644
+--- a/crates/zakura-network/src/zakura/wire_codec/message.rs
++++ b/crates/zakura-network/src/zakura/wire_codec/message.rs
+@@ -79,9 +79,6 @@ pub fn encode_frame<M: WireMessage>(message: &M) -> Result<Frame, M::Error> {
+ /// A reader's frame filter already checked the header. This function checks
+ /// it again because tests and in-process channels hand frames to it directly.
+ pub fn decode_frame<M: WireMessage>(frame: &Frame) -> Result<M, M::Error> {
+-    if frame.flags != 0 {
+-        return Err(WireError::ReservedFlags(frame.flags).into());
+-    }
+     let rule = rule_for::<M>(frame.message_type)?;
+     check_payload_len(rule, frame.payload.len())?;
+     let mut reader = BoundedReader::new(&frame.payload);

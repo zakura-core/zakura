@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-fault-prepare-local-resource.bin`, a fuzz-12 item 7 witness whose run
+# shows Failed(Prepare, "local-resource"). Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "fc44de8f79e8feca66d8baf3fb64f83f2b129b14f16a045887fa27593ea88ac4"
+scenario_sha256 = "fe5d0e44e4286f979d90f8daf7d4a70fd5158011e65750fb3fef49195b331c9d"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

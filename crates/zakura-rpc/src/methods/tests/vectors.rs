@@ -283,6 +283,34 @@ async fn rpc_getinfo() {
     assert!(rpc_tx_queue_task_result.is_none());
 }
 
+/// `getnetworkinfo` reports the services the node sends in its handshake, such as the pruned hint.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getnetworkinfo_reports_configured_local_services() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        NoChainTip,
+        rx,
+    );
+
+    let rpc = rpc.with_local_services(PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED);
+    let network_info = rpc
+        .get_network_info()
+        .await
+        .expect("getnetworkinfo should succeed");
+
+    assert_eq!(network_info.local_services, "0000000002000001");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getdeprecationinfo_uses_latest_checkpoint_without_tip() {
     let _init_guard = zakura_test::init();
@@ -1082,7 +1110,7 @@ async fn rpc_getblock() {
 }
 
 /// A header read refused for lack of capacity reports a retryable error, not a missing
-/// block. Other state errors keep the `zcashd` missing-block error.
+/// block. A block that is not in the best chain keeps the `zcashd` missing-block error.
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblockheader_reports_read_capacity_refusal_as_retryable() {
     let _init_guard = zakura_test::init();
@@ -1106,7 +1134,9 @@ async fn rpc_getblockheader_reports_read_capacity_refusal_as_retryable() {
             crate::server::error::LegacyCode::OutOfMemory,
         ),
         (
-            BoxError::from("block is missing"),
+            BoxError::from(zakura_state::BlockHeaderNotFound {
+                hash_or_height: Height(1).into(),
+            }),
             crate::server::error::LegacyCode::InvalidParameter,
         ),
     ] {
@@ -1318,9 +1348,9 @@ async fn rpc_getblock_missing_error() {
 
     // Make the mock service respond with no block
     let response_handler = read_state
-        .expect_request(zakura_state::ReadRequest::Block(Height(0).into()))
+        .expect_request(zakura_state::ReadRequest::RawBlock(Height(0).into()))
         .await;
-    response_handler.respond(zakura_state::ReadResponse::Block(None));
+    response_handler.respond(zakura_state::ReadResponse::RawBlock(None));
 
     let block_response = block_future.await.expect("block future should not panic");
     let block_response =
@@ -2005,6 +2035,220 @@ async fn rpc_z_get_treestate_state_failure_is_misc_error() {
     // The queue tasks must continue to run without errors or panics.
     assert!(rpc_tx_queue.now_or_never().is_none());
     assert!(closed_rpc_tx_queue.now_or_never().is_none());
+}
+
+/// A `getblockheader` for a block that is not in the best chain must return the `zcashd` codes.
+///
+/// The header read returns [`zakura_state::BlockHeaderNotFound`] for this block. The RPC maps
+/// only this error to a not-found code: `-5` for a hash and `-8` for a height.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_get_block_header_missing_block_is_not_found() {
+    let _init_guard = zakura_test::init();
+
+    let hash = Hash([0x01; 32]);
+    let height = Height(1_000_000);
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        NoChainTip,
+        rx,
+    );
+
+    for (parameter, hash_or_height, expected_code) in [
+        (hash.to_string(), HashOrHeight::from(hash), -5),
+        (height.0.to_string(), HashOrHeight::from(height), -8),
+    ] {
+        let header_rpc = rpc.clone();
+        let header_future =
+            tokio::spawn(async move { header_rpc.get_block_header(parameter, Some(true)).await });
+
+        read_state
+            .expect_request(ReadRequest::BlockHeader(hash_or_height))
+            .await
+            .respond_error(Box::new(zakura_state::BlockHeaderNotFound {
+                hash_or_height,
+            }));
+
+        let header_response = header_future
+            .await
+            .expect("block header future should not panic")
+            .expect_err("a missing block must be an error");
+
+        assert_eq!(
+            header_response.code(),
+            ErrorCode::ServerError(expected_code).code()
+        );
+        assert_eq!(header_response.message(), "block height not in best chain");
+    }
+
+    mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+
+    // The queue task must continue to run without errors or panics.
+    assert!(rpc_tx_queue.now_or_never().is_none());
+}
+
+/// A `getblockheader` must not report a failure of the state service as a missing block.
+///
+/// Only [`zakura_state::BlockHeaderNotFound`] tells that the block is missing. All other errors
+/// from the header read are failures of the state service. The RPC returns them as `-1` with
+/// the original message. Thus the client knows that it can try the request again.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_get_block_header_state_failure_is_misc_error() {
+    let _init_guard = zakura_test::init();
+
+    let height = Height(1_000_000);
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        NoChainTip,
+        rx.clone(),
+    );
+
+    // The state service returns an error that is not `BlockHeaderNotFound`.
+    let header_future =
+        tokio::spawn(async move { rpc.get_block_header(height.0.to_string(), Some(true)).await });
+
+    read_state
+        .expect_request(ReadRequest::BlockHeader(height.into()))
+        .await
+        .respond_error(BoxError::from("state read failed"));
+
+    let header_response = header_future
+        .await
+        .expect("block header future should not panic")
+        .expect_err("a failed state read must be an error");
+
+    assert_eq!(header_response.code(), ErrorCode::ServerError(-1).code());
+    assert_eq!(header_response.message(), "state read failed");
+
+    // The buffer worker of the state service is closed, thus the request does not get to the
+    // state service.
+    let closed_read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (closed_read_state, worker) = Buffer::pair(closed_read_state, 1);
+    drop(worker);
+
+    let (closed_rpc, closed_rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        closed_read_state,
+        NoChainTip,
+        rx,
+    );
+
+    let header_response = closed_rpc
+        .get_block_header(height.0.to_string(), Some(true))
+        .await
+        .expect_err("a closed state service must be an error");
+
+    assert_eq!(header_response.code(), ErrorCode::ServerError(-1).code());
+    assert_eq!(
+        header_response.message(),
+        "buffer's worker closed unexpectedly"
+    );
+
+    mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+
+    // The queue tasks must continue to run without errors or panics.
+    assert!(rpc_tx_queue.now_or_never().is_none());
+    assert!(closed_rpc_tx_queue.now_or_never().is_none());
+}
+
+/// A `getblock` must not report a failure of the state service as a missing block.
+///
+/// With verbosity 1 or 2, `getblock` reads the header through `getblockheader`. Thus a state
+/// error that is not [`zakura_state::BlockHeaderNotFound`] must give `-1` with the original
+/// message, and a missing block must give `-5` for a hash.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_get_block_state_failure_is_misc_error() {
+    let _init_guard = zakura_test::init();
+
+    let hash = Hash([0x01; 32]);
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        NoChainTip,
+        rx,
+    );
+
+    for verbosity in [1, 2] {
+        // The state service returns an error that is not `BlockHeaderNotFound`.
+        let block_rpc = rpc.clone();
+        let block_future =
+            tokio::spawn(
+                async move { block_rpc.get_block(hash.to_string(), Some(verbosity)).await },
+            );
+
+        read_state
+            .expect_request(ReadRequest::BlockHeader(hash.into()))
+            .await
+            .respond_error(BoxError::from("state read failed"));
+
+        let block_response = block_future
+            .await
+            .expect("block future should not panic")
+            .expect_err("a failed state read must be an error");
+
+        assert_eq!(block_response.code(), ErrorCode::ServerError(-1).code());
+        assert_eq!(block_response.message(), "state read failed");
+
+        // The state service returns `BlockHeaderNotFound`.
+        let block_rpc = rpc.clone();
+        let block_future =
+            tokio::spawn(
+                async move { block_rpc.get_block(hash.to_string(), Some(verbosity)).await },
+            );
+
+        read_state
+            .expect_request(ReadRequest::BlockHeader(hash.into()))
+            .await
+            .respond_error(Box::new(zakura_state::BlockHeaderNotFound {
+                hash_or_height: hash.into(),
+            }));
+
+        let block_response = block_future
+            .await
+            .expect("block future should not panic")
+            .expect_err("a missing block must be an error");
+
+        assert_eq!(block_response.code(), ErrorCode::ServerError(-5).code());
+        assert_eq!(block_response.message(), "block height not in best chain");
+    }
+
+    mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+
+    // The queue task must continue to run without errors or panics.
+    assert!(rpc_tx_queue.now_or_never().is_none());
 }
 
 /// A `z_getsubtreesbyindex` inside a fast-synced node's absent band must fail loudly.
@@ -3454,9 +3698,9 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
 
     const BALANCE: i64 = 400_000_000;
 
-    // Compute the fixed NU7 ceiling payout independently of the production helper.
+    // Compute the Regtest NU7 ceiling payout independently of the production helper.
     let bonus = |balance: i64| {
-        i64::try_from((i128::from(balance.max(0)) * 1_375 + 9_999_999_999) / 10_000_000_000)
+        i64::try_from((i128::from(balance.max(0)) * 8_022_777 + 9_999_999_999) / 10_000_000_000)
             .expect("the bonus fits in i64")
     };
 
@@ -3776,6 +4020,174 @@ async fn long_poll_from_old_tip_does_not_wait_for_mempool() {
     );
     assert_eq!(new_template.submit_old, Some(false));
     drop(mempool_tip);
+}
+
+/// The `mining_template` trace records each returned template and each new tip a request sees,
+/// under that request's ID.
+#[tokio::test]
+async fn template_trace_records_the_tip_to_template_path() {
+    let _init_guard = zakura_test::init();
+    let old_tip = Hash([1; 32]);
+    let new_tip = Hash([2; 32]);
+    let old_height = NetworkUpgrade::Nu5.activation_height(&Mainnet).unwrap();
+    let new_height = old_height.next().unwrap();
+
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(old_height);
+    tip_sender.send_best_tip_hash(old_tip);
+    tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+
+    // The mempool stays at the old tip, and counts its requests.
+    let (mempool_calls, mut calls) = tokio::sync::watch::channel(0);
+    let mempool = tower::service_fn(move |_| {
+        mempool_calls.send_modify(|calls| *calls += 1);
+        async move {
+            Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                transactions: vec![],
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: old_tip,
+            })
+        }
+    });
+    let old_chain_info = GetBlockTemplateChainInfo {
+        value_pools: Default::default(),
+        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+        tip_height: old_height,
+        tip_hash: old_tip,
+        cur_time: 1654008617.into(),
+        min_time: 1654008606.into(),
+        max_time: 1654008728.into(),
+        chain_history_root: fake_history_tree(&Mainnet).hash(),
+    };
+    let (chain_info, chain_info_rx) = tokio::sync::watch::channel(old_chain_info);
+    let read_state = tower::service_fn(move |request| {
+        let chain_info = chain_info_rx.borrow().clone();
+        async move {
+            Ok::<_, BoxError>(match request {
+                ReadRequest::ChainInfo => ReadResponse::ChainInfo(chain_info),
+                other => unreachable!("unexpected read request: {other:?}"),
+            })
+        }
+    });
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    // Background preparation is not under test: answer it without rejecting the template.
+    let verifier = tower::service_fn(|_| async {
+        Err::<Hash, BoxError>("verifier unavailable in this test".into())
+    });
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = TestRpcImpl::new_for_tests(
+        Mainnet,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Main,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "template trace test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        Buffer::new(verifier, 1),
+        sync,
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+    let (trace_tx, mut trace_rx) = tokio::sync::mpsc::channel(16);
+    let rpc = rpc.with_template_trace(zakura_jsonl_trace::JsonlEventEmitter::new(
+        zakura_jsonl_trace::JsonlTracer::new(trace_tx),
+        "test",
+    ));
+    let long_poll_params = |template: &BlockTemplateResponse| {
+        Some(GetBlockTemplateParameters::new(
+            GetBlockTemplateRequestMode::Template,
+            None,
+            vec![],
+            Some(template.long_poll_id),
+            None,
+        ))
+    };
+
+    let initial = rpc
+        .get_block_template(None)
+        .await
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+
+    // A long poll waits on the old tip until a block lands.
+    let long_poll = tokio::spawn({
+        let rpc = rpc.clone();
+        let params = long_poll_params(&initial);
+        async move { rpc.get_block_template(params).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), calls.wait_for(|calls| *calls >= 2))
+        .await
+        .expect("the long poll fetches the mempool before it waits")
+        .unwrap();
+    chain_info.send_modify(|info| {
+        info.tip_height = new_height;
+        info.tip_hash = new_tip;
+    });
+    tip_sender.send_best_tip_height(new_height);
+    tip_sender.send_best_tip_hash(new_tip);
+    let woken = tokio::time::timeout(Duration::from_secs(2), long_poll)
+        .await
+        .expect("the new tip wakes the long poll")
+        .unwrap()
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+
+    // A long poll that names the old tip answers at once.
+    let stale = rpc
+        .get_block_template(long_poll_params(&initial))
+        .await
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+
+    let mut rows = Vec::new();
+    while let Ok(written) = trace_rx.try_recv() {
+        assert_eq!(written.file_name, "mining_template.jsonl");
+        let row: serde_json::Value =
+            serde_json::from_slice(&written.line).expect("each trace row is JSON");
+        rows.push(row);
+    }
+    assert_eq!(rows.len(), 5, "{rows:#?}");
+
+    let full = &rows[0];
+    assert_eq!(full["event"], "gbt_full_returned");
+    assert_eq!(full["tip_hash"], old_tip.to_string());
+    assert_eq!(full["work_id"], initial.work_id.as_str());
+    assert_eq!(full["tx_count"], 0);
+    assert_eq!(full["wait_reason"], "immediate");
+    for field in ["selection_us", "permit_wait_us", "build_us", "total_us"] {
+        assert!(full[field].is_u64(), "{field}: {full}");
+    }
+
+    for (rows, template) in [(&rows[1..3], &woken), (&rows[3..5], &stale)] {
+        let (woke, empty) = (&rows[0], &rows[1]);
+        assert_eq!(woke["event"], "gbt_tip_woke");
+        assert_eq!(woke["tip_height"], new_height.0);
+        assert_eq!(woke["tip_hash"], new_tip.to_string());
+        assert_eq!(empty["event"], "gbt_empty_returned");
+        assert_eq!(empty["request_id"], woke["request_id"]);
+        assert_ne!(empty["request_id"], full["request_id"]);
+        assert_eq!(empty["tip_hash"], new_tip.to_string());
+        assert_eq!(empty["work_id"], template.work_id.as_str());
+        assert!(empty["permit_wait_us"].is_u64(), "{empty}");
+        assert!(empty["build_us"].is_u64(), "{empty}");
+        assert!(template.transactions.is_empty());
+    }
+    assert_ne!(rows[1]["request_id"], rows[3]["request_id"]);
 }
 
 #[tokio::test]

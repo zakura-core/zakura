@@ -411,6 +411,7 @@ fn block_gossip_skips_busy_outdated_peers() {
                 sender,
                 address: None,
                 uploads: Default::default(),
+                announced: Default::default(),
                 registry: None,
                 version: Version(1),
                 sidecar: false,
@@ -1849,10 +1850,8 @@ async fn driver_prunes_banned_and_outdated_peers_while_idle() {
             .wait_for(|peers| peers.len() == 1)
             .await
             .unwrap();
-        book.update(crate::meta_addr::MetaAddrChange::UpdateMisbehavior {
-            addr: address,
-            score_increment: crate::constants::MAX_PEER_MISBEHAVIOR_SCORE,
-        });
+        book.misbehavior_reporter()
+            .report(address, crate::constants::MAX_PEER_MISBEHAVIOR_SCORE);
         assert!(bans.contains(address.ip()));
         adverts
             .peers
@@ -2426,10 +2425,8 @@ async fn driver_refresh_retries_a_revoked_advertisement_on_a_later_peer() {
         assert_eq!(advert.hash, hash);
         // The peer is banned before its connection writes the inventory, so the connection
         // rejects the advertisement and the peer set drops the connection.
-        book.update(crate::meta_addr::MetaAddrChange::UpdateMisbehavior {
-            addr: revoked_addr,
-            score_increment: crate::constants::MAX_PEER_MISBEHAVIOR_SCORE,
-        });
+        book.misbehavior_reporter()
+            .report(revoked_addr, crate::constants::MAX_PEER_MISBEHAVIOR_SCORE);
         assert!(bans.contains(revoked_addr.ip()));
         advert
             .result

@@ -1,0 +1,9 @@
+# Keeps the body-work epoch when a header write replaces the selected
+# branch, so the engine publishes a view whose selection left the old
+# branch under the same epoch. The input forks the mirrors' chain once the
+# node holds four bodies, and the node's header sync carries the fork to the
+# engine.
+input = "crates/zakura-sim/tests/fixtures/sync-storage-reorg.bin"
+# Besides write_set.rs, which the patch changes, the rest of the planner
+# decides the effect a header write has on body work.
+checks = ["crates/zakura-header-chain/src/transition/planner"]

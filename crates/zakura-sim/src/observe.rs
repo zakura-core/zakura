@@ -199,6 +199,13 @@ pub enum Observation {
         /// frame to an empty bucket: its charge returned
         /// [`crate::model::Charge::Exhausted`].
         exhausted: bool,
+        /// The exchange or subscription the frame names, in the key space
+        /// of [`Observation::PeerFrame`]'s `exchange`: header sync's
+        /// subscription ID. `None` for a frame whose message names none,
+        /// such as a status or a discovery message, whose exchanges run in
+        /// order on their stream.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exchange: Option<u64>,
     },
     /// The node's reader reached the bytes it needs to judge the peer's
     /// frame `seq`. A frame the reader hasn't reached has no judgement.
@@ -356,6 +363,26 @@ pub enum Observation {
         /// What happened.
         event: TransportFact,
     },
+    /// One event a peer's transport reported through its tap (sim-9.3), in
+    /// the order the transport reported it. A peer tap logs no session
+    /// rows, so the node's properties never read a peer's connections as
+    /// the node's.
+    PeerTransport {
+        /// The tap's registration index among the run's peer transport
+        /// taps, an index space of its own.
+        instance: u64,
+        /// The event's number, from 1 per tap.
+        seq: u64,
+        /// The peer's name, such as `mirror-0`.
+        peer: String,
+        /// The connection's registration ID in the peer's supervisor, or
+        /// `None` for an event the transport reports before registration.
+        connection: Option<u64>,
+        /// The remote address the connection was admitted from.
+        remote: String,
+        /// What happened.
+        event: TransportFact,
+    },
     /// The identity map placed a service session the node admitted: the
     /// connection from its `registered` event, the peer that bound the
     /// connection's remote address, and the stream from its `admitted`
@@ -385,6 +412,9 @@ pub enum Observation {
         /// The frame's position among the peer's writes on the stream, from
         /// 0.
         seq: u64,
+        /// The run's [`crate::net::WireOrder`] stamp, taken as `write_all`
+        /// returned.
+        order: u64,
     },
     /// A scripted peer closed its connection with `Conn::close`, so its
     /// close is on its way and nothing it sends on the connection follows
@@ -395,6 +425,33 @@ pub enum Observation {
         connection: u64,
         /// The QUIC stream of the peer's header stream then.
         quic_stream: u64,
+    },
+    /// Every adversary act the run's peer scripts hold, in script order,
+    /// peer by peer. Logged at setup, so a witness test can tell which acts
+    /// never ran.
+    ActsScripted {
+        /// The acts' names.
+        acts: Vec<String>,
+    },
+    /// A scripted adversary's act ran: the peer wrote its frames.
+    ActRan {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream of the peer's header stream then.
+        quic_stream: u64,
+        /// The act's name.
+        act: String,
+    },
+    /// A scripted adversary's act was skipped: its precondition held when
+    /// the Plan offered it and no longer did when the peer ran it, so it
+    /// sent nothing. A witness test fails on it, since its act never ran.
+    ActSkipped {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream of the peer's header stream then.
+        quic_stream: u64,
+        /// The act's name.
+        act: String,
     },
     /// A scripted peer read and decoded one frame the node wrote.
     PeerReceived {
@@ -411,6 +468,10 @@ pub enum Observation {
         payload: u64,
         /// The credit an update adds, for an `Open` or `Grant`.
         credit: Option<PeerCredit>,
+        /// The run's [`crate::net::WireOrder`] stamp, taken as the peer's
+        /// reader finished reading the frame, which can be well before the
+        /// peer's main task records it.
+        order: u64,
     },
     /// An event from a test-only fake action source.
     Fake {
@@ -842,6 +903,10 @@ pub enum StorageRequest {
         /// The first header, `common_ancestor`'s child on the target's
         /// branch. `None` for a request with no headers.
         first: Option<StoragePoint>,
+        /// Every header's hash, in the order the request sends them. Kept
+        /// view-side and off the trace, whose format pinned traces fix.
+        #[serde(skip)]
+        hashes: Vec<String>,
     },
     /// `apply_header_target`.
     ApplyHeaderTarget {
@@ -853,6 +918,10 @@ pub enum StorageRequest {
         parent: Option<String>,
         /// The target.
         target: String,
+        /// The sealed insertion's header hashes, in order, if this port
+        /// sealed the target. Kept view-side and off the trace.
+        #[serde(skip)]
+        hashes: Option<Vec<String>>,
     },
     /// `selected_chain_contains`.
     SelectedChainContains {
@@ -951,6 +1020,10 @@ pub enum StorageResult {
     Locator {
         /// Its first entry, the selected tip.
         tip: StoragePoint,
+        /// Every entry's hash, in order, the tip first. Kept view-side and
+        /// off the trace, whose format pinned traces fix.
+        #[serde(skip)]
+        hashes: Vec<String>,
         /// The header generation it was read at.
         header_generation: u64,
         /// The finalized anchor it was read at.
@@ -959,7 +1032,12 @@ pub enum StorageResult {
     /// No locator.
     NoLocator,
     /// A resolved VCT repair context.
-    VctResolved,
+    VctResolved {
+        /// The context's locator entry. Kept view-side and off the trace,
+        /// where the variant reads as before.
+        #[serde(skip)]
+        locator: Option<StoragePoint>,
+    },
     /// A stale VCT repair context.
     VctStale,
     /// A leased path.
@@ -1355,6 +1433,20 @@ pub enum BlockSyncFact {
         /// `inbound` or `outbound`.
         direction: String,
     },
+    /// A generation-gated peer-registry write met an entry another routine
+    /// generation owns: its attempt, before the gate, or its landing.
+    StaleRegistryWrite {
+        /// The entry's peer.
+        peer: String,
+        /// The writer, as the peer registry's method names it.
+        writer: String,
+        /// The generation the write came from.
+        generation: u64,
+        /// The generation that owns the entry.
+        entry_generation: u64,
+        /// Whether the write landed.
+        landed: bool,
+    },
     /// A routine took frame `seq` from its stream and is about to judge it.
     FrameJudged {
         /// The sending peer.
@@ -1434,6 +1526,14 @@ pub enum BlockSyncFact {
         /// The body work epoch the sequencer applied when it judged the
         /// body, or `None` before it had one.
         scope_epoch: Option<u64>,
+    },
+    /// The sequencer took a new body-work epoch, after it reset the work
+    /// queue above the verified tip and reauthorized its queued work.
+    EpochApplied {
+        /// The new epoch.
+        epoch: u64,
+        /// The verified tip it resets body work above.
+        verified_tip: u32,
     },
     /// A serving response took its execution lease, or released it.
     ServingLease {
@@ -1734,6 +1834,49 @@ pub(crate) fn transport_entries<'o>(
         .collect()
 }
 
+/// The events that peer transport tap `instance` logged in
+/// `observations`, in order.
+pub(crate) fn peer_transport_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+    instance: u64,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::PeerTransport { instance: index, .. } if *index == instance
+            )
+        })
+        .collect()
+}
+
+/// The entries the scripted peers' evidence logged in `observations`, in
+/// order: what [`crate::evidence::EvidenceKind::Peer`] covers. A run's peers
+/// share one checkpoint, so it names no instance.
+pub(crate) fn peer_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::PeerFrame { .. }
+                    | Observation::PeerWritten { .. }
+                    | Observation::PeerReceived { .. }
+                    | Observation::PeerClosed { .. }
+                    | Observation::NodeFrame { .. }
+                    | Observation::FrameJudged { .. }
+                    | Observation::ConnectionClosed { .. }
+                    | Observation::Misbehavior { .. }
+                    | Observation::ActRan { .. }
+                    | Observation::ActSkipped { .. }
+            )
+        })
+        .collect()
+}
+
 /// The events that reactor tap `instance` logged in `observations`, in
 /// order.
 pub(crate) fn reactor_entries<'o>(
@@ -1936,6 +2079,9 @@ pub enum TransportFact {
         seq: u64,
         /// The frame's message type.
         message_type: u16,
+        /// The run's [`crate::net::WireOrder`] stamp, taken when the tap's
+        /// observer heard of the write, before it buffered the event.
+        order: u64,
     },
     /// The node decided to close the connection: its first recorded close
     /// cause, or `None` for a cancellation with no cause recorded first.
@@ -1952,6 +2098,49 @@ pub enum TransportFact {
         /// The step.
         step: SessionStepFact,
     },
+    /// The ID both ends of the connection derive from its TLS handshake, as
+    /// hex. A tap that samples loads logs it right after `registered`, so a
+    /// check joins the node's and a peer's rows of one connection.
+    SharedId {
+        /// The ID.
+        id: String,
+    },
+    /// The connection's transport resources changed since the tap's last
+    /// sample of them (sim-9.3). The tap samples after every step, so a
+    /// change and its reversal within one step go unseen. QUIC's load
+    /// snapshot lags by up to its publish interval.
+    Load {
+        /// The QUIC receive window the connection set for its kinds, before
+        /// credit holds.
+        receive_window: u64,
+        /// `DATA_BLOCKED` frames the remote sent: times it found itself
+        /// blocked on this end's connection-level receive credit.
+        data_blocked: u64,
+        /// `STREAM_DATA_BLOCKED` frames the remote sent.
+        stream_data_blocked: u64,
+        /// Stream bytes this end's writers queued that QUIC hasn't accepted.
+        queued_send_bytes: u64,
+        /// Streams whose writes wait on flow control or the send window.
+        send_blocked_streams: u64,
+        /// Each negotiated kind's frame gates.
+        kinds: Vec<KindLoad>,
+    },
+}
+
+/// One stream kind's frame gates on one connection, in
+/// [`TransportFact::Load`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct KindLoad {
+    /// The stream kind.
+    pub kind: u16,
+    /// Raw inbound frame bytes the kind's frames hold.
+    pub raw_held: u64,
+    /// The raw gate's capacity, as the gate reports it.
+    pub raw_capacity: u64,
+    /// Queued output frame bytes the kind's frames hold.
+    pub output_held: u64,
+    /// The output gate's capacity, as the gate reports it.
+    pub output_capacity: u64,
 }
 
 /// A service session's lifecycle step, in [`TransportFact::SessionLifecycle`].
@@ -2116,6 +2305,21 @@ pub enum TransitionFact {
         objects: u32,
         /// Bytes the grant adds.
         bytes: u32,
+    },
+    /// The node's serving counted the commitment of a request it admits,
+    /// before it checked the count against the margin.
+    CommitmentCounted {
+        /// The request's position among the stream's reads, if it was
+        /// tagged.
+        seq: Option<u64>,
+        /// The request row's message type.
+        message_type: u16,
+    },
+    /// The node's serving released one commitment of a request row: the
+    /// request's ending entered the output, or the request was dropped.
+    CommitmentReleased {
+        /// The request row's message type.
+        message_type: u16,
     },
 }
 

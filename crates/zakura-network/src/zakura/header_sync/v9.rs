@@ -10,7 +10,7 @@ mod publisher;
 mod subscriber;
 mod wire;
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 pub(crate) use publisher::FakePort;
 pub(crate) use publisher::{LeaseOwner, PageLimits, Publisher};
 #[cfg(any(test, zakura_sim))]
@@ -128,7 +128,7 @@ impl Status {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod conformance_tests;
 #[cfg(test)]
 pub(crate) mod test_support;

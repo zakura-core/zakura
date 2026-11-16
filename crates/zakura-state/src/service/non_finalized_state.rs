@@ -29,10 +29,8 @@ use crate::{
     SemanticallyVerifiedBlock, ValidateContextError, WatchReceiver,
 };
 
-mod address_transfers;
 mod backup;
 mod chain;
-mod created_utxos;
 mod proposal_results;
 mod shared_map;
 
@@ -42,12 +40,15 @@ pub(crate) use backup::MIN_DURATION_BETWEEN_BACKUP_UPDATES;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use address_transfers::AddressTransfers;
 pub(crate) use backup::write_semantically_verified_backup_block;
 #[cfg(feature = "internal-bench")]
-pub use chain::{benchmark_height_map, HeightMapBenchmarkSample};
+pub use chain::{
+    benchmark_chain_snapshot_cycle, benchmark_height_map, benchmark_transparent_indexes,
+    benchmark_transparent_spend_check, AllocationProbe, ChainSnapshotBenchmarkConfig,
+    ChainSnapshotBenchmarkSample, HeightMapBenchmarkSample, TransparentIndexBenchmarkConfig,
+    TransparentIndexBenchmarkSample,
+};
 pub(crate) use chain::{Chain, SpendingTransactionId};
-pub(crate) use created_utxos::CreatedUtxos;
 use proposal_results::{NotPrepared, PreparedProposal, ProposalResults};
 pub(crate) use shared_map::SharedMap;
 
@@ -873,7 +874,11 @@ impl NonFinalizedState {
     /// when there is one, so this skips looking every spent output up again. The caller takes
     /// that result and records the chain this returns, because only the caller knows which parent
     /// chain identity it can offer a later solved block.
-    #[tracing::instrument(level = "debug", skip(self, finalized_state, new_chain))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, new_chain, prepared, finalized_state, contextual_metrics, cached_spends),
+        fields(height = ?prepared.height, hash = %prepared.hash)
+    )]
     fn validate_and_commit(
         &self,
         new_chain: Arc<Chain>,
@@ -887,13 +892,8 @@ impl NonFinalizedState {
         let transparent_spend_start = Instant::now();
         let spent_utxos = match cached_spends {
             Some(spent_utxos) => Ok(spent_utxos),
-            None => check::utxo::transparent_spend(
-                &prepared,
-                &new_chain.created_utxos,
-                &new_chain.spent_utxos,
-                finalized_state,
-            )
-            .map(Arc::new),
+            None => check::utxo::transparent_spend(&prepared, Some(&new_chain), finalized_state)
+                .map(Arc::new),
         };
         contextual_metrics.record_duration(
             "state.contextual.transparent_spend.duration_seconds",

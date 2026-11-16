@@ -3,13 +3,13 @@
 use std::{
     cmp::min,
     io::{self, Cursor, Read, Write},
-    time::Duration,
 };
 
 use blake2b_simd::Params as Blake2bParams;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
-use zakura_rt::{collections::HashMap, time::Instant};
+use zakura_quic::{NodeId, KEY_LENGTH};
+use zakura_rt::collections::HashMap;
 
 use zakura_chain::{parameters::Network, serialization::ZcashSerialize};
 
@@ -146,38 +146,96 @@ pub(crate) fn frame_cap_carries_payload(max_frame_bytes: u32) -> bool {
 }
 
 /// A bounded authenticated Zakura peer identity.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+///
+/// Equality and hashing look only at the encoded bytes, so a peer id built
+/// from a [`NodeId`] equals one built from the same bytes.
+#[derive(Clone)]
 #[cfg_attr(
     any(test, feature = "proptest-impl"),
     derive(proptest_derive::Arbitrary)
 )]
-pub struct ZakuraPeerId(Vec<u8>);
+pub struct ZakuraPeerId {
+    bytes: Vec<u8>,
+    /// The node ID the bytes encode, kept when the peer id was built from an
+    /// already validated [`NodeId`], so [`Self::node_id`] doesn't check the
+    /// key again.
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(value = "None"))]
+    node_id: Option<NodeId>,
+}
 
 impl ZakuraPeerId {
     /// Creates a peer id after applying the Zakura node-id bound.
     pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, ZakuraProtocolError> {
         let bytes = bytes.into();
         validate_bounded_bytes(&bytes, MAX_IROH_NODE_ID_BYTES, "iroh node id")?;
-        Ok(Self(bytes))
+        Ok(Self {
+            bytes,
+            node_id: None,
+        })
+    }
+
+    /// Creates the peer id of a native peer from its node ID, such as the one
+    /// the TLS handshake proved for a connection.
+    ///
+    /// The peer id keeps `node_id`, so [`Self::node_id`] returns it without
+    /// checking the key again.
+    pub fn from_node_id(node_id: NodeId) -> Self {
+        Self {
+            bytes: node_id.as_bytes().to_vec(),
+            node_id: Some(node_id),
+        }
     }
 
     /// Returns the encoded peer id bytes.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
+    }
+
+    /// Returns the node ID these bytes encode, or `None` when they aren't a
+    /// valid node ID, such as a legacy peer's address-derived id.
+    ///
+    /// A peer id built by [`Self::from_node_id`] returns its node ID directly.
+    /// Otherwise this runs the full key check of [`NodeId::from_bytes`].
+    pub fn node_id(&self) -> Option<NodeId> {
+        if let Some(node_id) = self.node_id {
+            return Some(node_id);
+        }
+        let bytes: &[u8; KEY_LENGTH] = self.bytes.as_slice().try_into().ok()?;
+        NodeId::from_bytes(bytes).ok()
     }
 
     /// Returns a stable fixed-width identity for scheduler and state ownership.
     pub fn digest(&self) -> [u8; 32] {
-        if let Ok(digest) = <[u8; 32]>::try_from(self.0.as_slice()) {
+        if let Ok(digest) = <[u8; 32]>::try_from(self.bytes.as_slice()) {
             return digest;
         }
         let hash = Blake2bParams::new()
             .hash_length(32)
             .personal(b"ZakuraPeerId-v1")
-            .hash(&self.0);
+            .hash(&self.bytes);
         hash.as_bytes()
             .try_into()
             .expect("the peer identity digest has the configured 32-byte length")
+    }
+}
+
+impl PartialEq for ZakuraPeerId {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for ZakuraPeerId {}
+
+impl std::hash::Hash for ZakuraPeerId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.bytes.hash(state);
+    }
+}
+
+impl std::fmt::Debug for ZakuraPeerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ZakuraPeerId").field(&self.bytes).finish()
     }
 }
 
@@ -1351,88 +1409,6 @@ impl Frame {
     }
 }
 
-/// A pending inbound Iroh upgrade that must match a legacy prelude.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingUpgrade {
-    /// Expected initiator peer id.
-    pub expected_peer_id: ZakuraPeerId,
-    /// Selected Zakura protocol.
-    pub selected_zakura_protocol: u16,
-    /// Initiator upgrade nonce.
-    pub initiator_upgrade_nonce: [u8; 32],
-    /// Responder upgrade nonce.
-    pub responder_upgrade_nonce: [u8; 32],
-    /// Legacy upgrade transcript hash.
-    pub legacy_upgrade_transcript: [u8; 32],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PendingUpgradeEntry {
-    pending: PendingUpgrade,
-    expires_at: Instant,
-}
-
-/// A small bounded pending-upgrade registry keyed by authenticated Iroh id.
-#[derive(Debug)]
-pub struct PendingUpgradeRegistry {
-    entries: HashMap<ZakuraPeerId, PendingUpgradeEntry>,
-    max_entries: usize,
-    ttl: Duration,
-}
-
-impl PendingUpgradeRegistry {
-    /// Creates a bounded pending-upgrade registry.
-    pub fn new(max_entries: usize, ttl: Duration) -> Self {
-        Self {
-            entries: HashMap::new(),
-            max_entries,
-            ttl,
-        }
-    }
-
-    /// Inserts an expected pending upgrade.
-    pub fn insert(
-        &mut self,
-        now: Instant,
-        pending: PendingUpgrade,
-    ) -> Result<(), ZakuraRejectReason> {
-        self.prune_expired(now);
-        if self.entries.len() >= self.max_entries
-            && !self.entries.contains_key(&pending.expected_peer_id)
-        {
-            return Err(ZakuraRejectReason::ResourceLimit);
-        }
-        self.entries.insert(
-            pending.expected_peer_id.clone(),
-            PendingUpgradeEntry {
-                pending,
-                expires_at: now + self.ttl,
-            },
-        );
-        Ok(())
-    }
-
-    /// Takes and consumes a matching pending upgrade, if one exists and has not expired.
-    pub fn take(&mut self, now: Instant, peer_id: &ZakuraPeerId) -> Option<PendingUpgrade> {
-        self.prune_expired(now);
-        self.entries.remove(peer_id).map(|entry| entry.pending)
-    }
-
-    /// Returns the number of live pending entries.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Returns true if there are no live pending entries.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    fn prune_expired(&mut self, now: Instant) {
-        self.entries.retain(|_, entry| entry.expires_at > now);
-    }
-}
-
 /// A tiny authenticated-peer registry used by the Zakura supervisor.
 #[derive(Debug, Default)]
 pub struct ZakuraPeerSupervisor {
@@ -1471,25 +1447,6 @@ impl ZakuraPeerSupervisor {
     /// Removes an authenticated peer registration.
     pub fn deregister_authenticated(&mut self, peer_id: &ZakuraPeerId) {
         self.peers.remove(peer_id);
-    }
-}
-
-impl PendingUpgrade {
-    /// Creates a pending upgrade with an unset expiration.
-    pub fn new(
-        expected_peer_id: ZakuraPeerId,
-        selected_zakura_protocol: u16,
-        initiator_upgrade_nonce: [u8; 32],
-        responder_upgrade_nonce: [u8; 32],
-        legacy_upgrade_transcript: [u8; 32],
-    ) -> Self {
-        Self {
-            expected_peer_id,
-            selected_zakura_protocol,
-            initiator_upgrade_nonce,
-            responder_upgrade_nonce,
-            legacy_upgrade_transcript,
-        }
     }
 }
 
@@ -1953,32 +1910,6 @@ mod tests {
             max_control_frame_bytes: 1024,
             max_open_streams: 8,
         }
-    }
-
-    #[test]
-    fn prelude_roundtrip_and_rejects_trailing() {
-        let upgrade = P2pV2Upgrade::Init(init());
-        let encoded = upgrade.encode().expect("valid init encodes");
-        assert_eq!(
-            P2pV2Upgrade::decode(&encoded).expect("valid init decodes"),
-            upgrade
-        );
-
-        let mut with_trailing = encoded;
-        with_trailing.push(0);
-        assert!(matches!(
-            P2pV2Upgrade::decode(&with_trailing),
-            Err(ZakuraProtocolError::TrailingBytes)
-        ));
-    }
-
-    #[test]
-    fn prelude_rejects_oversized_inputs_before_decoding() {
-        let oversized = vec![0; MAX_PRELUDE_PAYLOAD_BYTES + 1];
-        assert!(matches!(
-            P2pV2Upgrade::decode(&oversized),
-            Err(ZakuraProtocolError::OversizedPayload { .. })
-        ));
     }
 
     #[test]
@@ -2535,10 +2466,10 @@ mod tests {
         assert!(oversized.encode(16).is_err());
     }
 
-    /// T.upgrade.init: the prelude cap applies before any decode, an identity list
-    /// has its own cap, and pending slots refuse a new peer without growing.
+    /// T.upgrade.init: the prelude cap applies before any decode, and an identity list
+    /// has its own cap.
     #[test]
-    fn row_upgrade_init_bounds_its_pending_slot_and_prelude() {
+    fn row_upgrade_init_bounds_its_prelude() {
         assert!(matches!(
             P2pV2Upgrade::decode(&vec![INIT_DISCRIMINATOR; MAX_PRELUDE_PAYLOAD_BYTES + 1]),
             Err(ZakuraProtocolError::OversizedPayload { .. })
@@ -2546,29 +2477,11 @@ mod tests {
         let mut too_long = init();
         too_long.iroh_relay_hint = Some(vec![1; MAX_IROH_RELAY_HINT_BYTES + 1]);
         assert!(P2pV2Upgrade::Init(too_long).encode().is_err());
-
-        let now = Instant::now();
-        let pending = |byte| {
-            let peer_id = ZakuraPeerId::new(vec![byte; 32]).unwrap();
-            PendingUpgrade::new(peer_id, 1, [1; 32], [2; 32], [3; 32])
-        };
-        let mut registry = PendingUpgradeRegistry::new(1, Duration::from_secs(1));
-        registry.insert(now, pending(7)).expect("under cap");
-        registry
-            .insert(now, pending(7))
-            .expect("the same peer replaces its own slot");
-        assert_eq!(registry.len(), 1);
-        assert_eq!(
-            registry.insert(now, pending(8)),
-            Err(ZakuraRejectReason::ResourceLimit)
-        );
-        assert_eq!(registry.len(), 1);
     }
 
-    /// T.upgrade.reject: a reject is fixed-size, and settling its attempt consumes the
-    /// pending slot once.
+    /// T.upgrade.reject: a reject is fixed-size.
     #[test]
-    fn row_upgrade_reject_settles_its_attempt_once() {
+    fn row_upgrade_reject_is_fixed_size() {
         let reject = P2pV2Upgrade::Reject(P2pV2UpgradeReject {
             magic: init().magic,
             prelude_version: init().prelude_version,
@@ -2578,19 +2491,6 @@ mod tests {
         assert_eq!(P2pV2Upgrade::decode(&encoded).unwrap(), reject);
         encoded.push(0);
         assert!(P2pV2Upgrade::decode(&encoded).is_err());
-
-        let now = Instant::now();
-        let peer_id = ZakuraPeerId::new(vec![7; 32]).unwrap();
-        let mut registry = PendingUpgradeRegistry::new(1, Duration::from_secs(1));
-        registry
-            .insert(
-                now,
-                PendingUpgrade::new(peer_id.clone(), 1, [1; 32], [2; 32], [3; 32]),
-            )
-            .expect("under cap");
-        assert!(registry.take(now, &peer_id).is_some());
-        assert!(registry.take(now, &peer_id).is_none());
-        assert!(registry.is_empty());
     }
 
     /// T.control.hello: the control cap applies before any decode, and an identity
@@ -2672,27 +2572,6 @@ mod tests {
         assert!(Frame::decode(&short, 16).is_err());
 
         assert!(Frame::decode(&frame_sample().encode(1024).unwrap(), 1024).is_ok());
-    }
-
-    #[test]
-    fn pending_upgrade_registry_matches_and_expires_by_peer_id() {
-        let now = Instant::now();
-        let peer_id = ZakuraPeerId::new(vec![7; 32]).unwrap();
-        let pending = PendingUpgrade::new(peer_id.clone(), 1, [1; 32], [2; 32], [3; 32]);
-        let mut registry = PendingUpgradeRegistry::new(1, Duration::from_secs(1));
-
-        registry.insert(now, pending).expect("under cap");
-        assert_eq!(registry.len(), 1);
-        assert!(registry
-            .take(now + Duration::from_millis(500), &peer_id)
-            .is_some());
-        assert!(registry.is_empty());
-
-        let pending = PendingUpgrade::new(peer_id.clone(), 1, [1; 32], [2; 32], [3; 32]);
-        registry.insert(now, pending).expect("under cap");
-        assert!(registry
-            .take(now + Duration::from_secs(2), &peer_id)
-            .is_none());
     }
 
     #[test]
@@ -3116,13 +2995,39 @@ mod tests {
         ));
     }
 
+    /// A peer id built from a node ID is the same peer as one built from the
+    /// node ID's bytes, and both hand back that node ID.
     #[test]
-    fn compat_i3_unknown_service_bits_are_truncated_without_selecting_zakura() {
-        let unknown_high_bit = 1 << 63;
-        let services =
-            PeerServices::from_bits_truncate(PeerServices::NODE_NETWORK.bits() | unknown_high_bit);
+    fn peer_id_from_node_id_matches_peer_id_from_its_bytes() {
+        use std::hash::{BuildHasher, RandomState};
 
-        assert_eq!(services, PeerServices::NODE_NETWORK);
-        assert!(!services.contains(PeerServices::NODE_P2P_V2));
+        let node_id = zakura_quic::NodeSecretKey::generate().public();
+        let from_node_id = ZakuraPeerId::from_node_id(node_id);
+        let from_bytes =
+            ZakuraPeerId::new(node_id.as_bytes().to_vec()).expect("32 bytes is a valid peer id");
+
+        assert_eq!(from_node_id, from_bytes);
+        let hasher = RandomState::new();
+        assert_eq!(hasher.hash_one(&from_node_id), hasher.hash_one(&from_bytes));
+        assert_eq!(format!("{from_node_id:?}"), format!("{from_bytes:?}"));
+        assert_eq!(from_node_id.as_bytes(), node_id.as_bytes());
+        assert_eq!(from_node_id.node_id(), Some(node_id));
+        assert_eq!(from_bytes.node_id(), Some(node_id));
+    }
+
+    /// Peer id bytes that aren't a valid node ID have no node ID.
+    #[test]
+    fn peer_id_without_a_valid_key_has_no_node_id() {
+        let not_a_point = (0..=u8::MAX)
+            .map(|byte| [byte; 32])
+            .find(|bytes| NodeId::from_bytes(bytes).is_err())
+            .expect("some repeated byte is not a curve point");
+        let not_a_point =
+            ZakuraPeerId::new(not_a_point.to_vec()).expect("32 bytes is a valid peer id");
+        let legacy =
+            ZakuraPeerId::new(vec![1, 2, 3]).expect("a short legacy id is a valid peer id");
+
+        assert_eq!(not_a_point.node_id(), None);
+        assert_eq!(legacy.node_id(), None);
     }
 }

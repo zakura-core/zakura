@@ -1,0 +1,11 @@
+# A one-header page serves a sibling of its header, on another fork from
+# the same cursor: the same parent and fields, a different nonce. On the
+# served-one-header witness the node's only page links and declares right,
+# and its header isn't the one storage read. The page publisher decides
+# what a page holds, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync/v9"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-served-one-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-served-one-header.plan"

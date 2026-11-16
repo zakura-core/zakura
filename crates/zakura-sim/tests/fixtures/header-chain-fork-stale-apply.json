@@ -1,0 +1,52 @@
+{
+  "node": {
+    "main": 2,
+    "fork": null
+  },
+  "mirrors": [
+    {
+      "chain": {
+        "main": 6,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 2,
+        "fork": {
+          "branch": 1,
+          "len": 4
+        }
+      },
+      "dialer": "mirror"
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": [
+      {
+        "select": {
+          "kind": "apply",
+          "nth": 1,
+          "session": null,
+          "held": false
+        },
+        "until": {
+          "completed": {
+            "kind": "apply",
+            "nth": 2,
+            "session": null,
+            "held": false
+          }
+        },
+        "then": [
+          "engine"
+        ],
+        "deadline_ms": null
+      }
+    ]
+  },
+  "controls": []
+}

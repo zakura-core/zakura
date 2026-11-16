@@ -77,7 +77,11 @@ fn requests(report: &RunReport) -> Vec<StorageRequest> {
 
 /// A mirror holding `chain`.
 fn mirror(chain: Chain, dialer: Dialer) -> MirrorSpec {
-    MirrorSpec { chain, dialer }
+    MirrorSpec {
+        chain,
+        dialer,
+        max_headers_per_response: None,
+    }
 }
 
 /// The hex peer identity of the actor whose key is `seed` repeated, as
@@ -276,6 +280,17 @@ impl ActionSource for Facts {
             fact: fact.storage(),
         });
     }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The storage harness's properties on a [`Plant`] instead of a node, so a
@@ -300,6 +315,19 @@ impl HasView for Planted {
             capacity: Default::default(),
             claims: Default::default(),
             rounds: Default::default(),
+            stale_calls: Default::default(),
+            wake: Default::default(),
+            hold_wake: Default::default(),
+            ends: Default::default(),
+            stamps: Default::default(),
+            round_life: Default::default(),
+            retirement: Default::default(),
+            chain_effect: Default::default(),
+            authority: Default::default(),
+            outstanding: Default::default(),
+            recovery: Default::default(),
+            fork_choice: Default::default(),
+            publication: Default::default(),
         }
     }
 }

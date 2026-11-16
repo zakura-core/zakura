@@ -6,7 +6,8 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{
     client::conn::http1,
-    header::{AUTHORIZATION, CONTENT_TYPE, HOST},
+    header::{AUTHORIZATION, CONTENT_TYPE, HOST, ORIGIN},
+    http::request::Builder,
     Request, StatusCode,
 };
 use hyper_util::rt::TokioIo;
@@ -67,6 +68,29 @@ impl HttpConnection {
         if let Some(authorization) = authorization {
             request = request.header(AUTHORIZATION, authorization);
         }
+        self.send(request, body).await
+    }
+
+    /// Sends `body` the way a web page at `origin` can without a CORS preflight: a `POST`
+    /// with a `text/plain` content type and the `Origin` header browsers add.
+    pub(super) async fn post_from_browser(
+        &mut self,
+        body: impl Into<String>,
+        origin: &str,
+    ) -> hyper::Result<(StatusCode, String)> {
+        let request = Request::post("/")
+            .header(HOST, &self.host)
+            .header(CONTENT_TYPE, "text/plain;charset=UTF-8")
+            .header(ORIGIN, origin);
+        self.send(request, body).await
+    }
+
+    /// Sends `request` with `body` and returns the response status and body.
+    async fn send(
+        &mut self,
+        request: Builder,
+        body: impl Into<String>,
+    ) -> hyper::Result<(StatusCode, String)> {
         let request = request
             .body(Full::new(Bytes::from(body.into())))
             .expect("the request is valid");

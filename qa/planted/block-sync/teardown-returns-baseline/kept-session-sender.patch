@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/regulated/serving.rs b/crates/zakura-network/src/zakura/block_sync/regulated/serving.rs
+--- a/crates/zakura-network/src/zakura/block_sync/regulated/serving.rs
++++ b/crates/zakura-network/src/zakura/block_sync/regulated/serving.rs
+@@ -92,6 +92,12 @@ impl<S: Source + ?Sized> Produce for Server<S> {
+         if lease.is_cancelled() {
+             return Err(ServeEnd::Cancelled);
+         }
++        // Mutation: one clone of the session's sender, taken to serve
++        // height 1, outlives the response, so the session's slot never
++        // returns.
++        if range.start().0 == 1 {
++            std::mem::forget(self.session.clone());
++        }
+         let read_range = range.truncated(self.max_blocks);
+         let result = self
+             .source

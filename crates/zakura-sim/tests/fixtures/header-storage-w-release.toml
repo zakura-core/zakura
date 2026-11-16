@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-release.bin`, a fuzz-12 item 7 witness whose run
+# shows ReleasedRead. Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "3e04d2aec256f12f7a9b04cedf3615ab463db9fad5deb81dace6e031bc1f1d25"
+scenario_sha256 = "5ae11c1fbfb4ad490215fc32a517bed78f1eb77763093e847e5504548335c85a"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

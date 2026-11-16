@@ -1,0 +1,41 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/admission.rs b/crates/zakura-network/src/zakura/block_sync/admission.rs
+index d95a5eb2e4..a92b17c790 100644
+--- a/crates/zakura-network/src/zakura/block_sync/admission.rs
++++ b/crates/zakura-network/src/zakura/block_sync/admission.rs
+@@ -303,10 +303,9 @@ pub(super) fn retain_received_body(
+     height: block::Height,
+     bytes: u64,
+ ) -> bool {
+-    height <= commit_window_top(verified_tip)
+-        || (retained_blocks < LOOKAHEAD_BLOCK_HARD_CAP
+-            && bytes <= limit.saturating_sub(retained_bytes)
+-            && retained_bytes <= limit)
++    // Mutation: the look-ahead limit no longer gates retention either.
++    let _ = (limit, verified_tip, retained_bytes, bytes, height);
++    retained_blocks < LOOKAHEAD_BLOCK_HARD_CAP
+ }
+ 
+ /// Plans one contiguous take starting at `start_height`: the single authority for
+@@ -353,19 +352,11 @@ pub(super) fn admit(
+             snapshot.budget_available.min(response_byte_cap),
+         )
+     } else {
+-        if lookahead_over_budget(config, &snapshot) {
+-            return AdmissionOutcome::LookaheadAtCap;
+-        }
+-        let remaining_wire_bytes = remaining_lookahead_wire_bytes(config, &snapshot);
+-        if remaining_wire_bytes == 0 {
+-            return AdmissionOutcome::LookaheadAtCap;
+-        }
++        // Mutation: the look-ahead limit no longer gates above-window requests.
++        let _ = (config, lookahead_over_budget, remaining_lookahead_wire_bytes);
+         (
+             servable_high,
+-            snapshot
+-                .budget_available
+-                .min(remaining_wire_bytes)
+-                .min(response_byte_cap),
++            snapshot.budget_available.min(response_byte_cap),
+         )
+     };
+ 

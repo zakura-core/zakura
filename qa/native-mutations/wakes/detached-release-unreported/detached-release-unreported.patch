@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer.rs b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
+index c4e5029d18..45d84cd188 100644
+--- a/crates/zakura-network/src/zakura/block_sync/sequencer.rs
++++ b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
+@@ -972,7 +972,8 @@ impl Sequencer {
+                 .saturating_sub(decoded_attributed_memory_bytes);
+         }
+         self.decrement_submitted_apply(height, hash);
+-        true
++        // Only an attached submission held a slot that waiting work can use.
++        !detached
+     }
+ 
+     /// Finish a submission whose body must remain attached until a later

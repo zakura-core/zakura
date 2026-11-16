@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use zakura_rt::{sync::atomic::AtomicU64, task::yield_now};
 use zakura_scheduler::SchedulerConfig;
+use zakura_sim::NaReason;
 use zakura_sim::{
     explore::{
         abandon_limit, classify, classify_process,
@@ -155,10 +156,10 @@ impl Subsystem for Results {
         match case {
             HARNESS_CASE => scheduler.spawn_root("bad:name", async {}),
             ABANDON_CASE | ACTIVE_ABANDON_CASE => scheduler.spawn_root("spinner", async {
-                // Nothing ever stores, and every load is a point, so
-                // cleanup gets stuck and shutdown abandons the run.
-                let flag = AtomicU64::new(0);
-                while flag.load(zakura_rt::sync::atomic::Ordering::SeqCst) == 0 {}
+                // It waits for good, so the run ends dry, and spins once
+                // shutdown drops it.
+                let _spin = SpinOnDrop;
+                std::future::pending::<()>().await;
             }),
             ABORT_CASE => scheduler.spawn_root("tick", async {
                 yield_now().await;
@@ -214,6 +215,11 @@ impl Checker for ViolatesAtEnd {
             },
         )]
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
 /// Runs `case` through `run_bytes` as the fuzz loop does, with
@@ -253,6 +259,20 @@ fn from_trace(exit: ProcessExit, stderr: &[u8], dir: &Path) -> ProcessClassified
 /// The variable that makes [`results_child`] run a case, as
 /// `<mode>:<directory>`.
 const CHILD: &str = "ZAKURA_SIM_RESULTS_CHILD";
+
+/// Spins once dropped. Nothing ever stores, and every load is a point, so
+/// the shutdown that drops it gets stuck, and abandons the run. A task that
+/// spun live would instead keep its drain from running dry, which fails the
+/// run as `DrainBound`.
+struct SpinOnDrop;
+
+impl Drop for SpinOnDrop {
+    /// Spins on a value no one sets.
+    fn drop(&mut self) {
+        let flag = AtomicU64::new(0);
+        while flag.load(zakura_rt::sync::atomic::Ordering::SeqCst) == 0 {}
+    }
+}
 
 /// Runs a case when run as the child, and does nothing otherwise.
 ///
@@ -703,15 +723,18 @@ fn stats_count_each_part_of_a_run() {
     assert_eq!(
         counts.ends,
         map(&[
-            ("budget", 1),
             ("harness", 1),
+            ("idle/deadlock", 1),
             ("idle/quiescent", 2),
             (NOT_RUN, 1),
             ("violation", 1)
         ])
     );
-    assert_eq!(counts.budget_exits(), 1);
-    assert_eq!(counts.drains_exhausted, 1, "the spinner outlasts the drain");
+    assert_eq!(counts.budget_exits(), 0);
+    assert_eq!(
+        counts.drains_exhausted, 0,
+        "the spinner waits, so no drain runs"
+    );
     assert_eq!(
         counts.cleanup,
         CleanupCounts {
@@ -726,14 +749,17 @@ fn stats_count_each_part_of_a_run() {
     let property = |id: &str| &counts.properties[id];
     assert_eq!(property(ACTIVE).violated, 1);
     assert_eq!(property(ACTIVE).held, 3, "clean, known and abandoned runs");
-    assert_eq!(property(ACTIVE).inconclusive, harness_failed);
+    assert_eq!(property(ACTIVE).not_applicable, harness_failed);
     assert_eq!(property(KNOWN).violated, 1);
     assert_eq!(property(KNOWN).held, 3, "clean, active and abandoned runs");
     assert_eq!(property(DRAFT).violated, 0);
     assert_eq!(property(DRAFT).held, 4);
-    assert_eq!(property(DRAFT).inconclusive, harness_failed);
+    assert_eq!(property(DRAFT).not_applicable, harness_failed);
     for id in [ACTIVE, KNOWN, DRAFT] {
-        assert_eq!(property(id).not_applicable, 0, "{id}");
+        assert!(
+            !property(id).not_applicable.contains_key("never-applied"),
+            "{id}"
+        );
         assert!(property(id).evaluations >= property(id).held, "{id}");
         assert!(property(id).applied(), "{id}");
     }
@@ -752,16 +778,17 @@ fn stats_count_property_outcomes_cleanup_and_features() {
     let Ok(report) = &mut run.result else {
         panic!("the clean case runs: {:?}", run.result.err());
     };
-    let inconclusive = |reason: &str| PropertyOutcome::Inconclusive {
-        reason: reason.to_owned(),
-    };
+    let na = PropertyOutcome::not_applicable;
     report.properties = vec![
         PropertyReport::new("x/held", PropertyOutcome::Held { applicable: 4 }),
         PropertyReport::new("x/held-zero", PropertyOutcome::Held { applicable: 0 }),
-        PropertyReport::new("x/na", PropertyOutcome::NotApplicable),
-        PropertyReport::new("x/lost", inconclusive("assumption-lost")),
-        PropertyReport::new("x/never", inconclusive("assumptions-never-held")),
-        PropertyReport::new("x/open", inconclusive("obligation-open")),
+        PropertyReport::new(
+            "x/na",
+            PropertyOutcome::not_applicable(NaReason::NeverApplied),
+        ),
+        PropertyReport::new("x/lost", na(NaReason::AssumptionLost)),
+        PropertyReport::new("x/never", na(NaReason::AssumptionsNeverHeld)),
+        PropertyReport::new("x/open", na(NaReason::NodeStopped)),
     ];
     report.cleanup.unwound = 2;
     report.cleanup.panicked = 1;
@@ -788,12 +815,12 @@ fn stats_count_property_outcomes_cleanup_and_features() {
     assert!(property("x/held").applied());
     assert_eq!(property("x/held-zero").held, 2);
     assert!(!property("x/held-zero").applied());
-    assert_eq!(property("x/na").not_applicable, 2);
+    assert_eq!(property("x/na").not_applicable["never-applied"], 2);
     assert!(!property("x/na").applied());
     assert_eq!(property("x/lost").assumption_losses(), 2);
     assert_eq!(property("x/never").assumption_losses(), 2);
     assert_eq!(property("x/open").assumption_losses(), 0);
-    assert_eq!(property("x/open").inconclusive["obligation-open"], 2);
+    assert_eq!(property("x/open").not_applicable["node-stopped"], 2);
     assert_eq!(
         counts.cleanup,
         CleanupCounts {
@@ -866,7 +893,25 @@ fn a_recorder_marks_its_file_complete_only_at_finish() {
     assert_eq!(last.counts.runs, 3);
 
     let text = fs::read_to_string(&path).unwrap();
-    fs::write(&path, text.replace("\"version\": 1", "\"version\": 0")).unwrap();
+    let current = format!("\"version\": {STATS_VERSION}");
+    assert!(text.contains(&current), "{text}");
+    fs::write(&path, text.replace(&current, "\"version\": 0")).unwrap();
     let refused = ProcessStats::read(&path).unwrap_err();
     assert!(refused.contains("stats version 0"), "{refused}");
+
+    // Terra 2, round 7: a version 1 file, whose property counts had a
+    // number for `not_applicable` and an `inconclusive` count, is refused
+    // for its version, not left unreadable.
+    let old = r#"{"version": 1, "harness": "h", "pid": 7, "started_unix": 0,
+        "written_unix": 0, "complete": true, "counts": {"runs": 1, "outcomes": {},
+        "ends": {}, "drains_exhausted": 0, "cleanup": {"abandoned": 0,
+        "leaked_tasks": 0, "unwound": 0, "panicked": 0, "unwind_failures": 0},
+        "properties": {"p": {"status": "active", "held": 0, "evaluations": 0,
+        "not_applicable": 1, "inconclusive": 0, "violated": 0}}, "features": {}}}"#;
+    fs::write(&path, old).unwrap();
+    let refused = ProcessStats::read(&path).unwrap_err();
+    assert!(
+        refused.contains("stats version 1") && refused.contains("unsupported"),
+        "{refused}"
+    );
 }

@@ -13,72 +13,31 @@ use std::{
     process::{Command, Output},
 };
 
-use support::inputs;
+use support::{inputs, storage_witnesses};
 use tempfile::TempDir;
 use zakura_chain::work::difficulty::U256;
 use zakura_sim::{
     harness::{
-        header_node::{Chain, Fork, Policy},
-        header_sync::{grammar, Dialer, MirrorSpec, Storage, StorageScenario, Weights},
+        header_sync::{grammar, Storage, StorageScenario},
         run_prepared, Subsystem,
     },
     observe::{StorageFact, StorageRequest},
     MemorySink, Observation, PlanInput, RunReport,
 };
 
-/// A mirror holding `len` headers on `branch`, forked from genesis.
-fn fork(branch: u8, len: u32) -> MirrorSpec {
-    MirrorSpec {
-        chain: Chain {
-            main: 0,
-            fork: Some(Fork { branch, len }),
-        },
-        dialer: Dialer::Mirror,
-    }
-}
-
-/// The node at genesis, `mirror-0` on `len_1` headers of branch 1 and
-/// `mirror-1` on `len_2` headers of branch 2, under `weights`.
-fn scenario(len_1: u32, len_2: u32, weights: Weights) -> StorageScenario {
-    StorageScenario {
-        node: Chain::default(),
-        mirrors: vec![fork(1, len_1), fork(2, len_2)],
-        weights,
-        policy: Policy::converging(),
-        controls: Vec::new(),
-    }
-}
-
-/// Equal work at equal length: four headers on each branch, both at
-/// weight 1.
+/// [`storage_witnesses::equal_forks`].
 fn equal() -> StorageScenario {
-    scenario(
-        4,
-        4,
-        Weights {
-            branch_1: 1,
-            branch_2: 1,
-        },
-    )
+    storage_witnesses::equal_forks()
 }
 
-/// A longer branch with more work: five unweighted headers on branch 1,
-/// three on branch 2.
+/// [`storage_witnesses::longer_fork`].
 fn longer() -> StorageScenario {
-    scenario(5, 3, Weights::default())
+    storage_witnesses::longer_fork()
 }
 
-/// A shorter weighted branch with more work than a longer one: five
-/// unweighted headers on branch 1, three at weight 2 on branch 2.
+/// [`storage_witnesses::weighted_fork`].
 fn weighted() -> StorageScenario {
-    scenario(
-        5,
-        3,
-        Weights {
-            branch_1: 0,
-            branch_2: 2,
-        },
-    )
+    storage_witnesses::weighted_fork()
 }
 
 /// Runs `scenario` under `input`, which must end without a violation or
@@ -329,9 +288,12 @@ fn a_weight_above_three_is_refused() {
     Storage::prepare(&scenario);
 }
 
-/// Generator 2 has no branch weights, so it can't encode one.
+/// Generator 3 encodes branch weights, so each witness round-trips
+/// through its canonical prefix.
 #[test]
-fn the_grammar_cant_encode_a_weight() {
-    assert!(grammar::encode(&weighted()).is_err());
-    assert!(grammar::encode(&longer()).is_ok());
+fn the_grammar_encodes_the_weighted_witnesses() {
+    for scenario in [equal(), longer(), weighted()] {
+        let prefix = grammar::encode(&scenario).unwrap();
+        assert_eq!(grammar::decode(&prefix).unwrap(), scenario);
+    }
 }

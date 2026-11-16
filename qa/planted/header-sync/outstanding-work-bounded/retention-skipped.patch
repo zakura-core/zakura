@@ -1,0 +1,20 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
+index cafdee5a52..e36d9de528 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
+@@ -460,8 +460,13 @@ impl HeaderSyncReactor {
+         // Retain the holder's headers while `action` still lends its peer ID,
+         // before the call takes `action`.
+         let mut retained = match &action {
+-            HeaderPortOperation::PrepareHeaderTarget { peer, .. }
+-            | HeaderPortOperation::ApplyHeaderTarget { peer, .. } => {
++            HeaderPortOperation::PrepareHeaderTarget { .. } => {
++                // Mutation: a prepare goes ahead without retaining its
++                // round's headers.
++                drop(held);
++                None
++            }
++            HeaderPortOperation::ApplyHeaderTarget { peer, .. } => {
+                 let retained = self.retain_for_call(peer, held, call);
+                 if let Some(retained) = &retained {
+                     self.peer_work_queue.bind_call(peer, retained.work());

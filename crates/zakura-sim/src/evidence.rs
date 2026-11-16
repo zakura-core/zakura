@@ -7,7 +7,8 @@
 //! requires, at setup and after every step, that the checkpoint names that
 //! step and that the run's own log holds exactly what it records. Storage
 //! sources, reactor taps, block-sync taps and transport taps are checked the
-//! same way, each through its [`LiveEvidence`].
+//! same way, each through its [`LiveEvidence`], and so is the scripted
+//! peers' evidence ([`EvidenceKind::Peer`]).
 
 use std::{cell::RefCell, rc::Rc, sync::Weak};
 
@@ -16,7 +17,10 @@ use zakura_storage::{
 };
 
 use crate::{
-    observe::{block_sync_entries, reactor_entries, storage_entries, transport_entries},
+    observe::{
+        block_sync_entries, peer_entries, peer_transport_entries, reactor_entries, storage_entries,
+        transport_entries,
+    },
     Observation,
 };
 
@@ -48,8 +52,10 @@ pub(crate) trait LiveEvidence {
 
     /// Why the publisher's evidence would be incomplete if the run ended
     /// at `end`, as a failure detail, beyond [`health`](LiveEvidence::health).
-    /// A run that ends idle or at its budget checks it once, before it
-    /// reports its properties. None by default.
+    /// A run that doesn't end at a harness failure checks it once, before it
+    /// reports its properties. A violation ends a run early on purpose, so a
+    /// source leaves out what only a run that went on would have finished.
+    /// None by default.
     fn unfinished(&self, _end: &crate::RunEnd) -> Option<&'static str> {
         None
     }
@@ -116,6 +122,21 @@ pub(crate) enum EvidenceKind {
         /// The node's name.
         node: String,
     },
+    /// A transport tap on the peer named `peer`, a display label only.
+    PeerTransport {
+        /// The peer's name.
+        peer: String,
+    },
+    /// The scripted peers' records of the node named `node`, a display label
+    /// only, as their wire evidence places and projects them
+    /// ([`crate::peer::PeerControl`]): every `PeerFrame`, `PeerWritten`,
+    /// `PeerReceived`, `PeerClosed` and `NodeFrame`, and the `FrameJudged`,
+    /// `ConnectionClosed` and `Misbehavior` the node's evidence means. A
+    /// run's peers share one.
+    Peer {
+        /// The node's name.
+        node: String,
+    },
 }
 
 impl EvidenceKind {
@@ -143,6 +164,8 @@ impl EvidenceKind {
             EvidenceKind::Reactor { .. } => reactor_entries(observations, instance),
             EvidenceKind::BlockSync { .. } => block_sync_entries(observations, instance),
             EvidenceKind::Transport { .. } => transport_entries(observations, instance),
+            EvidenceKind::PeerTransport { .. } => peer_transport_entries(observations, instance),
+            EvidenceKind::Peer { .. } => peer_entries(observations),
         }
     }
 
@@ -153,6 +176,8 @@ impl EvidenceKind {
             EvidenceKind::Reactor { node } => format!("reactor:{node}#{instance}"),
             EvidenceKind::BlockSync { node } => format!("block-sync:{node}#{instance}"),
             EvidenceKind::Transport { node } => format!("transport:{node}#{instance}"),
+            EvidenceKind::PeerTransport { peer } => format!("peer-transport:{peer}#{instance}"),
+            EvidenceKind::Peer { node } => format!("peer:{node}#{instance}"),
         }
     }
 
@@ -167,11 +192,18 @@ impl EvidenceKind {
             },
             EvidenceKind::Reactor { .. }
             | EvidenceKind::BlockSync { .. }
-            | EvidenceKind::Transport { .. } => Words {
+            | EvidenceKind::Transport { .. }
+            | EvidenceKind::PeerTransport { .. } => Words {
                 source: "tap",
                 publisher: "tap",
                 entries: "events",
                 refused: "the tap refused an emission outside its run",
+            },
+            EvidenceKind::Peer { .. } => Words {
+                source: "peer evidence",
+                publisher: "peers",
+                entries: "records",
+                refused: "a peer recorded outside its run",
             },
         }
     }

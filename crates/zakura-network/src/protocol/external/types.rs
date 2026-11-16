@@ -141,18 +141,23 @@ bitflags! {
         /// does not provide network services.
         const NODE_NETWORK = 1;
 
+        /// NODE_COMPACT_BLOCKS means that the node supports compact block relay and early block
+        /// relay, as defined in the draft Compact Block Relay ZIP (zcash/zips#1429).
+        ///
+        /// Both features run only on connections where both ends set this bit. Zebra uses the
+        /// same bit, so negotiated Zakura and Zebra peers interoperate.
+        const NODE_COMPACT_BLOCKS = 1 << 16;
+
         /// NODE_P2P_V2 means that the node can speak the experimental Zakura P2P v2 stack.
         ///
         /// This bit is in the temporary experiment range until a permanent service bit is assigned.
         const NODE_P2P_V2 = 1 << 24;
 
-        /// NODE_EARLY_BLOCK_RELAY means that the node relays and accepts tip blocks before their
-        /// full validation finishes, on connections where both ends set this bit.
+        /// NODE_PRUNED indicates that historical block bodies may have been pruned.
         ///
-        /// Zebra's Ándale release uses the same bit, so negotiated Zakura and Zebra peers
-        /// interoperate. This bit is in the temporary experiment range until a permanent
-        /// service bit is assigned.
-        const NODE_EARLY_BLOCK_RELAY = 1 << 25;
+        /// This experimental storage-mode hint accompanies `NODE_NETWORK` for compatibility
+        /// with older peers. It promises no particular retention window or current tip height.
+        const NODE_PRUNED = 1 << 25;
     }
 }
 
@@ -360,10 +365,11 @@ mod test {
         let _init_guard = zakura_test::init();
 
         assert_eq!(PeerServices::NODE_P2P_V2.bits(), 1 << 24);
-        assert_eq!(PeerServices::NODE_EARLY_BLOCK_RELAY.bits(), 1 << 25);
+        assert_eq!(PeerServices::NODE_COMPACT_BLOCKS.bits(), 1 << 16);
 
         let decoded =
-            PeerServices::from_bits_truncate(PeerServices::NODE_NETWORK.bits() | (1 << 26));
+            PeerServices::from_bits_truncate(PeerServices::NODE_NETWORK.bits() | (1 << 27));
         assert_eq!(decoded, PeerServices::NODE_NETWORK);
+        assert_eq!(PeerServices::NODE_PRUNED.bits(), 1 << 25);
     }
 }

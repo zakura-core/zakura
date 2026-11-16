@@ -10,12 +10,13 @@ use support::{
     script::{run_under, Node, OBSERVED},
 };
 use zakura_network::zakura::{testkit::regulation::TEST_FAMILY, Stream};
+use zakura_sim::NaReason;
 use zakura_sim::{
     model::Label,
     observe::StreamId,
     property::Property,
     table::{sender_properties, table_properties, GeneratedId, Template},
-    Observation, PropertyOutcome, RunReport,
+    Observation, PropertyOutcome, RunReport, Violation,
 };
 
 /// The `feed` stream: the `watch` subscription, its `item` pages and its
@@ -84,6 +85,7 @@ fn node_frame(stream: Stream, seq: u64, row: &str, label: Label, exhausted: bool
         rule_stream: id(stream),
         label,
         exhausted,
+        exchange: None,
     }
 }
 
@@ -102,7 +104,12 @@ fn held(report: &RunReport, id: &str) -> bool {
 }
 
 fn not_applicable(report: &RunReport, id: &str) -> bool {
-    matches!(outcome(report, id), PropertyOutcome::NotApplicable)
+    matches!(
+        outcome(report, id),
+        PropertyOutcome::NotApplicable {
+            reason: NaReason::NeverApplied
+        }
+    )
 }
 
 /// The property that stopped the run, if any.
@@ -212,6 +219,33 @@ fn unsolicited_responses_fail_by_row() {
     ]);
     assert_eq!(stopped_by(&second_ending), Some(ENDS));
     assert!(not_applicable(&second_ending, ANSWERS));
+}
+
+/// Two requests past the limit at one step are two violations, each
+/// naming its own frame, and the report keeps both.
+#[test]
+fn every_sender_violation_at_a_step_is_reported() {
+    let report = run_script(vec![vec![
+        sent(TEST_STREAM, 0, "get", Label::OverMargin),
+        sent(TEST_STREAM, 1, "get", Label::OverMargin),
+    ]]);
+    assert_eq!(stopped_by(&report), Some(LIMIT));
+    let limit = report
+        .properties
+        .iter()
+        .find(|r| r.property == LIMIT)
+        .expect("registered");
+    let found = |seq: u64| Violation {
+        property: LIMIT.to_owned(),
+        step: 1,
+        witness: vec![1],
+        expected: format!(
+            "connection 1's s65v2/get frame {seq} from the node is conformant under \
+             sender-within-limit"
+        ),
+        actual: "the peer's models labelled it OverMargin".to_owned(),
+    };
+    assert_eq!(limit.violations, [found(0), found(1)]);
 }
 
 /// An `Open` past `max_live` breaks `sender-within-live`, and a page past

@@ -802,6 +802,21 @@ impl ActionSource for Rewrite {
         }
         Ok(())
     }
+
+    /// Forwards to `inner`.
+    fn recovery(&self, now: SimInstant, out: &mut zakura_sim::RecoveryOffer) {
+        self.inner.recovery(now, out);
+    }
+
+    /// Forwards to `inner`.
+    fn enter_drain(&mut self, log: &mut ObservationLog) {
+        self.inner.enter_drain(log);
+    }
+
+    /// Forwards to `inner`.
+    fn holds_work(&self) -> Option<String> {
+        self.inner.holds_work()
+    }
 }
 
 /// Runs a transport tap, wrapped to apply `edit` to what it delivers, on
@@ -826,6 +841,7 @@ fn tap_run(edit: fn(Vec<Observation>) -> Vec<Observation>) -> RunReport {
         reporter.observe(TransportEvent::Registered {
             conn_id: 1,
             remote: peer_addr(0, 0),
+            shared_id: [0; 16],
         });
         reporter.observe(TransportEvent::Admitted {
             conn_id: 1,

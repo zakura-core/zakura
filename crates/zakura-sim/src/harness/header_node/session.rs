@@ -47,7 +47,7 @@
 //!   its generation's `generation-exited`, or its connection's `torn-down`.
 //!   [`SessionEvidence::end_check`] judges it once the run ends. A run that
 //!   ends idle with one open never will retire it, which is a leak. A run
-//!   that stopped first, at its budget included, is inconclusive. That rule
+//!   that stopped first, at its budget included, stays open. That rule
 //!   never breaks the run itself.
 //!
 //! The view freezes with the run's log, before the scheduler's shutdown
@@ -64,15 +64,14 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use zakura_header_chain::{BodyWorkOwner, HeaderSyncWorkOwner};
 use zakura_network::zakura::{
-    observe::{PortCall, ReactorEvent, RequestRef},
-    ServicePeerDirection, SessionOrigin, SessionStep, TransportEvent, ZakuraPeerId,
-    ZAKURA_STREAM_HEADER_SYNC,
+    observe::ReactorEvent, ServicePeerDirection, SessionOrigin, SessionStep, TransportEvent,
+    ZakuraPeerId, ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_rt::sim::RunId;
+use zakura_scheduler::Status as SchedulerStatus;
 
-use crate::{peer::peer_of, IdleStatus, Outcome, RunEnd};
+use crate::{peer::peer_of, property::EndedBy, RunEnd};
 
 /// One session or link fact about the node under test, in run order. Peers
 /// are named as the scenario names them.
@@ -163,7 +162,7 @@ pub enum EndCheck {
     Unretired(Vec<(String, u64)>),
     /// The run stopped, or hasn't ended, before own-9 retired these
     /// sessions.
-    Inconclusive(Vec<(String, u64)>),
+    Open(Vec<(String, u64)>),
 }
 
 /// A run's session view, shared by the node's tap and the topology's links.
@@ -189,12 +188,6 @@ struct SessionLedger {
     links: HashMap<u64, Link>,
     /// Each session that left the reactor's view, by peer and session ID.
     departed: HashSet<(ZakuraPeerId, u64)>,
-    /// Each live auxiliary repair with a dispatched call: its peer, and
-    /// whether that call is its apply.
-    repairs: HashMap<BodyWorkOwner, (ZakuraPeerId, bool)>,
-    /// The repairs that were preparing when their session left, each allowed
-    /// one apply.
-    kept: HashSet<BodyWorkOwner>,
     /// Own-9's facts, once the transport reports here.
     own9: Option<Own9>,
     /// Set once the run's log froze. Nothing changes the view after that.
@@ -203,6 +196,13 @@ struct SessionLedger {
     idle: Option<bool>,
     /// The first rule the run broke.
     broken: Option<String>,
+    /// The identity mismatches not yet drained: an admission whose peer,
+    /// direction or session ID isn't its link's or transport row's, which
+    /// `header-sync/commit-only-authorized` claims.
+    claims: Vec<String>,
+    /// Whether an identity join was made since the last drain, which makes
+    /// `header-sync/commit-only-authorized` applicable.
+    identity_joined: bool,
 }
 
 /// Own-9's facts about the node's sessions, as its transport reported them,
@@ -250,6 +250,9 @@ struct Link {
     direction: ServicePeerDirection,
     admitted: bool,
     closed: bool,
+    /// Whether the harness closed it itself
+    /// ([`SessionEvidence::harness_closed`]).
+    closed_by_harness: bool,
 }
 
 impl SessionEvidence {
@@ -315,7 +318,9 @@ impl SessionEvidence {
             return;
         };
         match event {
-            TransportEvent::Registered { conn_id, remote } => {
+            TransportEvent::Registered {
+                conn_id, remote, ..
+            } => {
                 ledger.registered(*conn_id, *remote);
             }
             TransportEvent::Admitted {
@@ -340,23 +345,20 @@ impl SessionEvidence {
         }
     }
 
-    /// Records whether the run ended idle: with every task finished or
-    /// waiting outside the scheduler, and nothing enabled. Nothing can
-    /// retire a session after that. A drain after the budget runs only
-    /// ready tasks and fires no timer, so a session whose retirement waits
-    /// on one could still retire, and that end doesn't count.
+    /// Records whether the run ran dry idle: at rest
+    /// ([`RunEnd::at_rest`]) with no timer pending, live or after a drain. Nothing can retire a
+    /// session after that. A drain fires a timer alone only within the
+    /// harness timer cap ([`crate::RunConfig::harness_timer_cap`]), so a dry
+    /// drain can leave a later timer pending, and a session whose
+    /// retirement waits on one could still retire. That end doesn't count.
     pub fn end(&self, end: &RunEnd) {
-        self.ledger().idle = Some(matches!(
-            end.outcome,
-            Outcome::Idle {
-                status: IdleStatus::Quiescent | IdleStatus::WaitingOnExternal
-            }
-        ));
+        self.ledger().idle =
+            Some(end.at_rest() && end.rest != Some(SchedulerStatus::WaitingOnTime));
     }
 
     /// Whether own-9 retired every session that left the reactor's view:
     /// [`EndCheck::Unretired`] if the run ended idle with one open, and
-    /// [`EndCheck::Inconclusive`] if it stopped first or hasn't ended.
+    /// [`EndCheck::Open`] if it stopped first or hasn't ended.
     pub fn end_check(&self) -> EndCheck {
         let ledger = self.ledger();
         let open: Vec<(String, u64)> = ledger
@@ -370,7 +372,7 @@ impl SessionEvidence {
         } else if ledger.idle == Some(true) {
             EndCheck::Unretired(open)
         } else {
-            EndCheck::Inconclusive(open)
+            EndCheck::Open(open)
         }
     }
 
@@ -404,6 +406,7 @@ impl SessionEvidence {
             direction,
             admitted: false,
             closed: false,
+            closed_by_harness: false,
         };
         if ledger.links.insert(connection, link).is_some() {
             ledger.break_rule(format!(
@@ -429,6 +432,40 @@ impl SessionEvidence {
             .push(SessionFact::LinkClosed { peer, connection });
     }
 
+    /// Records that the harness closed the link on `connection` itself, as a
+    /// script, relink or shutdown does. A service that cancels a link's
+    /// token reaches [`SessionEvidence::link_closed`] alone.
+    pub(crate) fn harness_closed(&self, connection: u64) {
+        if let Some(mut ledger) = self.live() {
+            if let Some(link) = ledger.links.get_mut(&connection) {
+                link.closed_by_harness = true;
+            }
+        }
+    }
+
+    /// Who ended the session `session_id` ([`EndedBy`]): the environment if
+    /// the harness closed the link that carries it, or linked its peer again
+    /// since, so the new session replaces it. Anything else is the node's,
+    /// including a session no harness link carries.
+    pub fn ended_by(&self, session_id: u64) -> EndedBy {
+        let ledger = self.ledger();
+        let Some(link) = ledger
+            .links
+            .values()
+            .find(|link| link.session_id == session_id)
+        else {
+            return EndedBy::Node;
+        };
+        let relinked = ledger.links.values().any(|other| {
+            other.peer == link.peer && other.origin.connection > link.origin.connection
+        });
+        if link.closed_by_harness || relinked {
+            EndedBy::Environment
+        } else {
+            EndedBy::Node
+        }
+    }
+
     /// Feeds one of the reactor's events, keeping the session facts and
     /// checking both rules. Events neither rule reads, and every event once
     /// the view froze, are ignored, so a tap feeds every event.
@@ -443,9 +480,51 @@ impl SessionEvidence {
         self.ledger().broken.clone()
     }
 
+    /// The identity mismatches found since the last call: admissions whose
+    /// peer, direction or session ID isn't the one their link's origin or
+    /// transport row carries. The service builds each `PeerSession` itself,
+    /// so such a mismatch is a production defect with every fact truthful.
+    pub(crate) fn take_claims(&self) -> Vec<String> {
+        std::mem::take(&mut self.ledger().claims)
+    }
+
+    /// Whether an admission's identity was joined to its link or transport
+    /// row since the last call, mismatched or not.
+    pub(crate) fn take_joined(&self) -> bool {
+        std::mem::take(&mut self.ledger().identity_joined)
+    }
+
     /// Every fact so far, in order.
     pub fn facts(&self) -> Vec<SessionFact> {
         self.ledger().facts.clone()
+    }
+
+    /// Whether the node's membership is `peer` alone: own-9 has a `Session`
+    /// row for `peer`'s header session, every row is `peer`'s, and the
+    /// reactor admitted only `peer`'s sessions. A row comes before the
+    /// reactor's admission and before any frame its stream reads. `false`
+    /// without own-9's facts.
+    ///
+    /// Only the environment can add another peer, so this stops holding
+    /// only when it does. A session the node ends, refuses, retires or opens
+    /// again, a generation it exits and a connection it tears down all leave
+    /// it holding, since those are the node's own ends ([`EndedBy`]). The
+    /// caller checks the environment's other end of the membership, `peer`'s
+    /// own close.
+    pub fn stable_membership(&self, peer: &str) -> bool {
+        let ledger = self.ledger();
+        let Some(own9) = &ledger.own9 else {
+            return false;
+        };
+        let is_peer = |row: &Row| row.peer.as_deref() == Some(peer);
+        own9.rows
+            .iter()
+            .any(|row| is_peer(row) && row.kind == ZAKURA_STREAM_HEADER_SYNC)
+            && own9.rows.iter().all(is_peer)
+            && ledger.facts.iter().all(|fact| match fact {
+                SessionFact::SessionAdmitted { peer: admitted, .. } => admitted == peer,
+                _ => true,
+            })
     }
 }
 
@@ -540,9 +619,8 @@ impl SessionLedger {
             );
     }
 
-    /// Records `peer`'s session `session_id` as gone from the reactor's view,
-    /// keeping one apply for each of its repairs that was preparing. Under
-    /// own-9, it's retired at once if own-9 already retired its generation
+    /// Records `peer`'s session `session_id` as gone from the reactor's view.
+    /// Under own-9, it's retired at once if own-9 already retired its generation
     /// or connection, and left open otherwise.
     fn depart(&mut self, peer: &ZakuraPeerId, session_id: u64) {
         if !self.departed.insert((peer.clone(), session_id)) {
@@ -571,19 +649,6 @@ impl SessionLedger {
                 }
             }
         }
-        let preparing = self
-            .repairs
-            .iter()
-            .filter(|(owner, (of, applying))| {
-                owner.session_id() == session_id && of == peer && !applying
-            })
-            .map(|(owner, _)| *owner);
-        self.kept.extend(preparing);
-    }
-
-    /// Whether `peer`'s session `session_id` left the reactor's view.
-    fn departed(&self, peer: &ZakuraPeerId, session_id: u64) -> bool {
-        self.departed.contains(&(peer.clone(), session_id))
     }
 
     /// Checks `admitted`'s session against the link its origin names.
@@ -606,9 +671,15 @@ impl SessionLedger {
                  {origin:?}, which names no link"
             ));
         };
-        let mismatch = if link.origin != origin {
-            Some(format!("origin {:?}", link.origin))
-        } else if link.peer != *peer {
+        if link.origin != origin {
+            return Err(format!(
+                "SessionJoin: the node admitted session {session_id} from {name}, {direction:?}, \
+                 with origin {origin:?}, but its link has origin {:?}",
+                link.origin
+            ));
+        }
+        self.identity_joined = true;
+        let mismatch = if link.peer != *peer {
             Some(format!("peer {}", link.name))
         } else if link.direction != direction {
             Some(format!("direction {:?}", link.direction))
@@ -618,10 +689,11 @@ impl SessionLedger {
             None
         };
         if let Some(expected) = mismatch {
-            return Err(format!(
-                "SessionJoin: the node admitted session {session_id} from {name}, {direction:?}, \
-                 with origin {origin:?}, but its link has {expected}"
-            ));
+            let detail = format!(
+                "CommitOnlyAuthorized: the node admitted session {session_id} from {name}, \
+                 {direction:?}, with origin {origin:?}, but its link has {expected}"
+            );
+            self.claims.push(detail);
         }
         if std::mem::replace(&mut link.admitted, true) {
             return Err(format!(
@@ -671,19 +743,31 @@ impl SessionLedger {
                 rows.len()
             ));
         };
-        let mismatch = if row.kind != ZAKURA_STREAM_HEADER_SYNC {
-            Some(format!("kind {}", row.kind))
-        } else if row.peer.as_deref() != Some(name.as_str()) {
-            Some(format!("peer {:?}", row.peer))
+        if row.kind != ZAKURA_STREAM_HEADER_SYNC {
+            return Err(format!(
+                "Own9Join: {admitted} on connection {connection}'s stream {quic_stream}, but its \
+                 Session row has kind {}",
+                row.kind
+            ));
+        }
+        let Some(row_peer) = row.peer.as_deref() else {
+            return Err(format!(
+                "Own9Join: {admitted} on connection {connection}'s stream {quic_stream}, but its \
+                 Session row names no scripted peer"
+            ));
+        };
+        self.identity_joined = true;
+        let mismatch = if row_peer != name {
+            Some(format!("peer {row_peer}"))
         } else if row.session_id != session_id {
             Some(format!("session {}", row.session_id))
         } else {
             None
         };
         if let Some(expected) = mismatch {
-            return Err(format!(
-                "Own9Join: {admitted} on connection {connection}'s stream {quic_stream}, but its \
-                 Session row has {expected}"
+            self.claims.push(format!(
+                "CommitOnlyAuthorized: {admitted} on connection {connection}'s stream \
+                 {quic_stream}, but its Session row has {expected}"
             ));
         }
         let installs = own9
@@ -698,9 +782,9 @@ impl SessionLedger {
             ));
         }
         if generation != session_id {
-            return Err(format!(
-                "Own9Join: {admitted} as generation {generation}, but the handler installs each \
-                 generation under its session ID"
+            self.claims.push(format!(
+                "CommitOnlyAuthorized: {admitted} as generation {generation}, but the handler \
+                 installs each generation under its session ID"
             ));
         }
         own9.origins.insert((peer.clone(), session_id), origin);
@@ -799,61 +883,6 @@ impl SessionLedger {
                     reason: (*reason).to_owned(),
                 });
                 self.depart(peer, *session_id);
-            }
-            ReactorEvent::Started { request, .. } => {
-                if self.departed(&request.peer, request.session_id) {
-                    let why = format!(
-                        "DepartedSessionWork: request {} started for {}'s session {}, after it \
-                         left the reactor's view",
-                        request.request_id,
-                        self.name(&request.peer),
-                        request.session_id
-                    );
-                    self.break_rule(why);
-                }
-            }
-            ReactorEvent::Retired {
-                request:
-                    RequestRef {
-                        owner: HeaderSyncWorkOwner::BodyRepair(repair),
-                        ..
-                    },
-                ..
-            } => {
-                self.repairs.remove(repair);
-                self.kept.remove(repair);
-            }
-            ReactorEvent::Dispatched {
-                op:
-                    PortCall::Prepare {
-                        peer,
-                        owner: HeaderSyncWorkOwner::BodyRepair(repair),
-                        ..
-                    },
-                ..
-            } => {
-                self.repairs.insert(*repair, (peer.clone(), false));
-            }
-            ReactorEvent::Dispatched {
-                call,
-                op: PortCall::Apply { peer, owner, .. },
-            } => {
-                let kept = match owner {
-                    HeaderSyncWorkOwner::Header(_) => false,
-                    HeaderSyncWorkOwner::BodyRepair(repair) => {
-                        self.repairs.insert(*repair, (peer.clone(), true));
-                        self.kept.remove(repair)
-                    }
-                };
-                if !kept && self.departed(peer, owner.session_id()) {
-                    let why = format!(
-                        "DepartedSessionWork: call {call} applies {}'s session {}, after it left \
-                         the reactor's view",
-                        self.name(peer),
-                        owner.session_id()
-                    );
-                    self.break_rule(why);
-                }
             }
             _ => {}
         }

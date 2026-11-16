@@ -1,0 +1,15 @@
+# The cached-pass budget's refill no longer adds a pass. The input's idle
+# mirror spends the 32-pass burst first, so the pass the release wants is
+# deferred, and every later turn defers it again by one more refill
+# interval. The waiting offer's locator read never reaches storage, and
+# the property's deadline, one refill after the wake opened, passes. The
+# violation comes at the first step whose clock is past that deadline.
+# The fixture lets `mirror-1`'s held prepare run only after that step, so
+# that release can't hide the bug, and a run that goes on past the
+# violation ends with nothing held.
+input ="crates/zakura-sim/tests/fixtures/header-release-wake-deferred.bin"
+# Besides state.rs, which the patch changes, the reactor's loop and its
+# scheduling key decide how many passes the relinks buy and when the
+# release's pass is wanted. A change there can move the input off its
+# deferred pass.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

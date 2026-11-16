@@ -362,6 +362,21 @@ proptest! {
 
             check_err_code(rpc_rsp, ErrorCode::ServerError(-5))?;
 
+            // And the unknown TXID with verbosity 0, which reads the raw transaction.
+            let mempool_query = mempool
+                .expect_request(mempool::Request::TransactionsByMinedId([unknown_txid].into()))
+                .map_ok(|r| r.respond(mempool::Response::Transactions(vec![])));
+
+            let state_query = state
+                .expect_request(zakura_state::ReadRequest::AnyChainRawTransaction(unknown_txid))
+                .map_ok(|r| r.respond(zakura_state::ReadResponse::RawTransaction(None)));
+
+            let rpc_query = rpc.get_raw_transaction(unknown_txid.encode_hex(), Some(0), None);
+
+            let (rpc_rsp, _, _) = tokio::join!(rpc_query, mempool_query, state_query);
+
+            check_err_code(rpc_rsp, ErrorCode::ServerError(-5))?;
+
             // The queue task should continue without errors or panics
             prop_assert!(mempool_tx_queue.now_or_never().is_none());
 
@@ -860,8 +875,9 @@ proptest! {
                 .respond(response);
 
             // the runner will also query the state again for the transaction
-            let expected_request = zakura_state::ReadRequest::Transaction(transaction_hash);
-            let response = zakura_state::ReadResponse::Transaction(None);
+            let expected_request =
+                zakura_state::ReadRequest::MinedTransactionIds([transaction_hash].into());
+            let response = zakura_state::ReadResponse::MinedTransactionIds(HashSet::new());
 
             state
                 .expect_request(expected_request)
@@ -942,18 +958,16 @@ proptest! {
                 .await?
                 .respond(response);
 
-            // the runner will also query the state again for each transaction
-            for _tx in txs.clone() {
-                let response = zakura_state::ReadResponse::Transaction(None);
+            // the runner will also query the state again for all transactions at once
+            let expected_request = zakura_state::ReadRequest::MinedTransactionIds(
+                txs.iter().map(|tx| tx.hash()).collect(),
+            );
+            let response = zakura_state::ReadResponse::MinedTransactionIds(HashSet::new());
 
-                // we use `expect_request_that` because we can't guarantee the state request order
-                state
-                    .expect_request_that(|request| {
-                        matches!(request, zakura_state::ReadRequest::Transaction(_))
-                    })
-                    .await?
-                    .respond(response);
-            }
+            state
+                .expect_request(expected_request)
+                .await?
+                .respond(response);
 
             // each transaction will be retried
             for tx in txs.clone() {

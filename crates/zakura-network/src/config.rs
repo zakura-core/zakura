@@ -1,7 +1,7 @@
 //! Configuration for Zakura's network communication.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     io::{self, ErrorKind},
     net::{IpAddr, SocketAddr},
@@ -12,6 +12,7 @@ use std::{
 };
 
 use indexmap::IndexSet;
+use rand_10::seq::SliceRandom;
 use serde::{
     de::{self, value::MapAccessDeserializer, IntoDeserializer, MapAccess, Visitor},
     Deserialize, Deserializer, Serialize, Serializer,
@@ -35,25 +36,29 @@ use zakura_chain::{
 
 use crate::{
     constants::{
-        DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES, DEFAULT_ADVERT_WINDOW_MAX,
-        DEFAULT_ADVERT_WINDOW_MIN, DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
-        DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
-        DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
-        MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
+        DEFAULT_ADVERT_DELAY, DEFAULT_ADVERT_WINDOW_FULL_BLOCK,
+        DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES, DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
+        DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES, DEFAULT_CRAWL_NEW_PEER_INTERVAL,
+        DEFAULT_MAX_CONNS_PER_IP, DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT,
+        INBOUND_PEER_LIMIT_MULTIPLIER, MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR,
+        OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
-    protocol::external::{canonical_peer_addr, canonical_socket_addr},
+    peer::address_is_valid_for_outbound_connections,
+    protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
     zakura::ZakuraConfig,
     BoxError, PeerSocketAddr,
 };
 
 mod cache_dir;
+mod tcp_warmup;
 mod unconditional_peers;
 
 #[cfg(test)]
 mod tests;
 
 pub use cache_dir::CacheDir;
-pub use unconditional_peers::UnconditionalPeers;
+pub use tcp_warmup::TcpWarmupConfig;
+pub use unconditional_peers::{UnconditionalPeerName, UnconditionalPeers};
 
 pub(crate) use cache_dir::{
     default_network_identity_dir, zakura_discovery_sequence_file_path,
@@ -224,8 +229,9 @@ pub struct Config {
     ///
     /// The peer cache is a list of the addresses of some recently useful peers.
     ///
-    /// For privacy reasons, the cache does *not* include any other information about peers,
-    /// such as when they were connected to the node.
+    /// Line order preserves measured RTT preference; unmeasured peers are shuffled.
+    /// Individual RTT measurements and connection timestamps are not stored, but
+    /// cooperating endpoints can observe their relative startup dial order.
     ///
     /// Deleting or modifying the peer cache can impact your node's:
     /// - reliability: if DNS or the Zcash DNS seeders are unavailable or broken
@@ -347,7 +353,8 @@ pub struct Config {
 
     /// Exposes legacy peer IP addresses in peer activity logs and structured trace files.
     /// This includes connected peers and candidate or address book entries.
-    /// Seed and peer-cache Prometheus metrics also use this setting for `remote_ip` labels.
+    /// The `zcash.net.peers.initial` Prometheus metric also uses this setting for its
+    /// `remote_ip` labels.
     ///
     /// Literal addresses supplied in the node configuration can appear in startup logs and
     /// `seed` labels regardless of this setting.
@@ -360,42 +367,96 @@ pub struct Config {
     /// to logs, trace directories, and downstream monitoring systems.
     pub expose_peer_addresses: bool,
 
-    /// Peer IP addresses and CIDR ranges that Zakura never scores or bans.
+    /// Peers that Zakura never scores or bans, and keeps connected where it can.
     ///
-    /// Each entry is an IP address, such as `"192.0.2.1"`, or a CIDR range, such as
-    /// `"2001:db8::/32"`. CIDR ranges with host bits set are rejected.
+    /// Each entry is an IP address, such as `"192.0.2.1"`, an IP address and port, such
+    /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, a DNS name and port, such as
+    /// `"peer.example.com:8233"`, a DNS name and port pinned to the peer's node ID, such
+    /// as `"<node id>@peer.example.com:8233"`, or a CIDR range, such as `"2001:db8::/32"`.
+    /// CIDR ranges with host bits set are rejected, and a DNS name needs a port.
+    /// Use this setting for peers you operate, such as your own nodes, miners, or
+    /// sidecars.
+    ///
     /// Zakura ignores misbehavior reports for these peers, so their
-    /// misbehavior score stays at zero and Zakura never bans their IP address. Use this
-    /// setting for peers you operate, such as your own nodes, miners, or sidecars, so
-    /// that tip lag, upgrade boundaries, or bugs cannot get them banned.
+    /// misbehavior score stays at zero and Zakura never bans their IP address. Tip lag,
+    /// upgrade boundaries, or bugs cannot get them banned. This also exempts them from
+    /// mempool cooldowns and their disconnects.
     ///
-    /// This setting exempts peers from misbehavior scores, bans, and mempool
-    /// cooldowns and their disconnects. Zakura still applies connection limits to these
-    /// peers, and still disconnects them on protocol
-    /// errors or inbound overload.
+    /// Zakura also dials every entry that names one address, and dials it again whenever
+    /// no connection to that peer is open, in either direction. An entry without a port
+    /// is dialed on the network's default port. A CIDR range is only dialed when it
+    /// covers a single address, such as `"192.0.2.1/32"`. A dial to a peer that accepts
+    /// no connections fails quietly, and each failure doubles the delay before the next
+    /// dial, up to ten minutes. Zakura keeps at most `max_connections_per_ip` connections
+    /// to one IP, so it does not dial further entries on that IP.
     ///
-    /// Entries match legacy peer IP addresses. An IPv4 entry also matches the
-    /// IPv4-mapped IPv6 form of the same address. The default is empty.
+    /// Zakura dials a DNS name in the same way. It looks the name up before each dial,
+    /// and never while that peer is connected, so it follows a peer that comes back at a
+    /// new address. It dials one address from the answer at a time, starting with the
+    /// first it can dial and moving to the next on each later attempt, so list each peer
+    /// under a name of its own. The address it dialed last is treated like a listed
+    /// address in everything this setting does.
+    /// When a lookup fails, Zakura dials the last address again. A ban from before the
+    /// name resolved to an address stays until Zakura restarts, and a mempool cooldown
+    /// from before then stays until it ends. The startup dials do not wait for the first
+    /// lookup, so they keep no room for a name's address.
+    ///
+    /// A DNS name pinned to a node ID, the 64 hex characters that `zakura.bootstrap_peers`
+    /// entries start with, is dialed in the same way. While a P2P v2 connection proves
+    /// that the peer holds that node ID, the IP that connection was opened from is treated
+    /// like a listed address, and the peer counts as connected, wherever it is. Otherwise
+    /// the name has no such address. So a changed DNS answer, or someone else at the
+    /// peer's old address, gets nothing. Only a peer that upgrades to P2P v2 can prove its
+    /// node ID, so Zakura closes a connection to the name's address that stays on the
+    /// legacy protocol, warns, and dials the next address later. A pin needs
+    /// `p2p_stack = "dual"`, and Zakura refuses to start with one otherwise. Zakura warns
+    /// about each DNS name without a pin when it runs both stacks.
+    ///
+    /// Each dialed address adds one outbound and one inbound connection slot on top of the
+    /// connection limits. Zakura dials each address on an outbound slot of its own, so a
+    /// full outbound peer set never blocks the dial. Its other dials leave the address the
+    /// room it needs under `max_connections_per_ip`: the startup dials to seed and cached
+    /// peers leave it out and count it against its IP's limit, and the crawler never
+    /// dials its IP. The inbound slots are a pool that only dialed addresses
+    /// can use, so a node whose other inbound slots are full still accepts a listed peer
+    /// that dials it, unless connections from listed peers already fill the pool. One IP
+    /// holds at most `max_connections_per_ip` of the pool's slots. A connection in the
+    /// pool also skips the wait that Zakura imposes between inbound connections from one
+    /// IP, so a listed peer can reconnect at once. A peer that is only in a range of
+    /// several addresses gets none of this, and nor does an entry that Zakura cannot
+    /// dial, such as its own listener.
+    /// Zakura still applies the per-IP connection limit to these peers, and still
+    /// disconnects them on protocol errors or inbound overload.
+    ///
+    /// Entries match legacy peer IP addresses, and only the legacy P2P stack dials them.
+    /// An IPv4 entry also matches the IPv4-mapped IPv6 form of the same address. The
+    /// default is empty.
     ///
     /// # Security
     ///
     /// Zakura never bans a listed peer, even if it sends invalid blocks or transactions.
-    /// Only list peers you trust.
+    /// Only list peers you trust. Whoever controls a listed DNS name, or the answers this
+    /// node gets for it, chooses an address that Zakura trusts in the same way, unless the
+    /// name is pinned to a node ID.
     pub unconditional_peers: UnconditionalPeers,
     /// The initial peer count for full-sized or unknown-sized legacy blocks. At least 1.
     ///
-    /// The count grows linearly to `advert_window_max` as block size falls to
+    /// The count grows linearly to `advert_window_small_block` as block size falls to
     /// `advert_window_small_size_bytes`. Sidecars receive inventory immediately outside
     /// this group. All remaining peers receive inventory after the configured delay.
     ///
-    /// Experimental.
-    pub advert_window_min: usize,
-
-    /// The initial peer count for blocks at or below `advert_window_small_size_bytes`.
-    /// Must be at least `advert_window_min`.
+    /// The previous name `advert_window_min` still loads.
     ///
     /// Experimental.
-    pub advert_window_max: usize,
+    pub advert_window_full_block: usize,
+
+    /// The initial peer count for blocks at or below `advert_window_small_size_bytes`.
+    /// Must be at least `advert_window_full_block`.
+    ///
+    /// The previous name `advert_window_max` still loads.
+    ///
+    /// Experimental.
+    pub advert_window_small_block: usize,
 
     /// The size at or below which broadcasts use the largest initial group and shortest delay.
     /// Must be below `advert_window_full_size_bytes`.
@@ -409,42 +470,42 @@ pub struct Config {
     /// Experimental.
     pub advert_window_full_size_bytes: u64,
 
-    /// Experimental: negotiate early block relay with legacy peers that also enable it.
+    /// Enables compact block relay and early block relay with legacy peers that support them.
     ///
-    /// Both ends advertise service bit 25 ([`PeerServices::NODE_EARLY_BLOCK_RELAY`]), which
-    /// Zebra's Ándale release uses for the same capability. On a negotiated connection, this node
-    /// advertises and serves a tip child after full semantic verification, before its contextual
-    /// commit finishes. It also stops scoring a negotiated peer for a block that later fails
+    /// Both features follow the draft Compact Block Relay ZIP (zcash/zips#1429), which Zebra
+    /// implements. They are negotiated together on service bit 16
+    /// ([`PeerServices::NODE_COMPACT_BLOCKS`]). On a negotiated connection, this node advertises
+    /// and serves a tip child after full semantic verification, before its contextual commit
+    /// finishes. It also stops scoring a negotiated peer for a block that later fails
     /// transaction or contextual validation, once the block's header and commitments check out
     /// against a committed parent.
     ///
     /// Connections without the bit, and the Zakura P2P v2 stack, keep committed-block relay.
-    /// The bit is in the temporary experiment range: enable it only among coordinated peers.
+    /// Defaults to off.
     ///
-    /// [`PeerServices::NODE_EARLY_BLOCK_RELAY`]: crate::PeerServices::NODE_EARLY_BLOCK_RELAY
-    pub experimental_early_block_relay: bool,
-    /// The delay before announcing small blocks to peers outside the initial group.
-    ///
-    /// The delay grows linearly to `advert_delay_max` between the configured size thresholds.
-    /// Each broadcast measures this delay once from its start, independently of peer requests
-    /// and uploads. Zero announces to every peer immediately. Defaults to zero.
-    ///
-    /// Experimental.
-    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
-    pub advert_delay_min: Duration,
+    /// [`PeerServices::NODE_COMPACT_BLOCKS`]: crate::PeerServices::NODE_COMPACT_BLOCKS
+    pub compact_block_relay: bool,
 
-    /// The delay before announcing full-sized or unknown-sized blocks to remaining peers.
+    /// The delay before announcing a block to peers outside the initial group.
     ///
-    /// Must be at least `advert_delay_min`. Defaults to zero until measurements justify a
-    /// nonzero default. Delaying inventory can reduce redundant requests but does not bound
-    /// concurrent body writes.
-    /// The delay shares the daemon's [`crate::constants::BLOCK_GOSSIP_TIMEOUT`] budget with
-    /// peer discovery and delivery tracking. A delay that exhausts that budget can prevent
+    /// The block size sets the initial group's size, not this delay. Each broadcast measures the
+    /// delay once from its start, independently of peer requests and uploads. Zero announces to
+    /// every peer immediately. Defaults to 500 ms.
+    ///
+    /// Delaying inventory can reduce redundant requests but does not bound concurrent body
+    /// writes. The delay shares the daemon's [`crate::constants::BLOCK_GOSSIP_TIMEOUT`] budget
+    /// with peer discovery and delivery tracking. A delay that exhausts that budget can prevent
     /// announcements to the remaining peers.
     ///
+    /// The previous name `advert_delay_max` still loads, and applies only when `advert_delay`
+    /// is unset. The previous `advert_delay_min` is ignored.
+    ///
     /// Experimental.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
-    pub advert_delay_max: Duration,
+    pub advert_delay: Duration,
+
+    /// Settings for warming new legacy TCP connections with padded pings.
+    pub tcp_warmup: TcpWarmupConfig,
 }
 
 impl Config {
@@ -476,7 +537,9 @@ impl Config {
             / OUTBOUND_PEER_LIMIT_DIVISOR
     }
 
-    /// The maximum number of inbound connections that Zakura will accept at the same time.
+    /// The maximum number of inbound connections that Zakura will accept at the same time,
+    /// besides the slots of dialed unconditional peers, see
+    /// [`unconditional_peer_connection_limit`](Self::unconditional_peer_connection_limit).
     /// When this limit is reached, Zakura drops new inbound connections,
     /// without handshaking on them.
     ///
@@ -487,10 +550,29 @@ impl Config {
         self.peerset_initial_target_size * INBOUND_PEER_LIMIT_MULTIPLIER
     }
 
+    /// The maximum number of connections that Zakura opens to stay connected to its
+    /// [`unconditional_peers`](Self::unconditional_peers): one for each dialed address
+    /// or DNS name.
+    ///
+    /// These connections are counted separately from
+    /// [`peerset_outbound_connection_limit`](Self::peerset_outbound_connection_limit), so
+    /// a full outbound peer set never blocks them. The inbound listener adds as many
+    /// slots outside
+    /// [`peerset_inbound_connection_limit`](Self::peerset_inbound_connection_limit), as a
+    /// pool that only these peers can use.
+    pub fn unconditional_peer_connection_limit(&self) -> usize {
+        self.unconditional_peers.dial_limit()
+    }
+
     /// The maximum number of inbound and outbound connections that Zakura will have
     /// at the same time.
+    ///
+    /// Each dialed unconditional peer has two slots here, one outbound and one inbound,
+    /// although with the default `max_connections_per_ip` it uses one at a time.
     pub fn peerset_total_connection_limit(&self) -> usize {
-        self.peerset_outbound_connection_limit() + self.peerset_inbound_connection_limit()
+        self.peerset_outbound_connection_limit()
+            + self.peerset_inbound_connection_limit()
+            + 2 * self.unconditional_peer_connection_limit()
     }
 
     /// The most bytes that TCP decoders can hold for incomplete messages across every
@@ -516,29 +598,79 @@ impl Config {
 
     /// Resolve initial seed peer IP addresses, based on the configured network,
     /// and load cached peers from disk, if available.
+    /// Alternates cached peers in saved RTT order with shuffled seed peers,
+    /// starting with a cached peer unless the startup budget is one, in which case
+    /// a seed gets the sole slot when available, even if it is also cached.
+    /// With larger budgets, shared addresses keep their cache position.
+    /// An exhausted list yields the rest of the other list.
+    ///
+    /// Loads the cache while seeds resolve. When the cache has valid peers, a
+    /// restart dials them after one round of seed lookups, even if every seed
+    /// lookup fails. Seed lookups only retry until they succeed when there are
+    /// no valid cached peers.
     ///
     /// # Panics
     ///
     /// If a configured address is an invalid [`SocketAddr`] or DNS name.
-    pub async fn initial_peers(&self) -> HashSet<PeerSocketAddr> {
-        // TODO: do DNS and disk in parallel if startup speed becomes important
-        let dns_peers = Config::resolve_peers(
-            &self.initial_peer_hostnames().iter().cloned().collect(),
-            self.expose_peer_addresses,
+    pub async fn initial_peers(&self) -> IndexSet<PeerSocketAddr> {
+        let hostnames: HashSet<String> = self.initial_peer_hostnames().iter().cloned().collect();
+        let (dns_peers, disk_peers) = futures::future::join(
+            Config::resolve_peers_once(&hostnames, self.expose_peer_addresses),
+            self.load_valid_peer_cache(),
         )
         .await;
+        let dns_peers = if dns_peers.is_empty() && disk_peers.is_empty() {
+            Config::resolve_peers(&hostnames, self.expose_peer_addresses).await
+        } else {
+            dns_peers
+        };
+
+        // Validate seeds before shuffling, without preferring any listening port.
+        let mut valid_seeds = Vec::new();
+        for addr in dns_peers {
+            match address_is_valid_for_outbound_connections(addr, self.network.clone()) {
+                Ok(()) => valid_seeds.push(addr),
+                Err(error) => info!(
+                    peer = %addr.addr_label(self.expose_peer_addresses),
+                    ?error,
+                    "invalid initial peer from DNS seeder or configured IP address",
+                ),
+            }
+        }
+        let mut dns_peers = valid_seeds;
+        dns_peers.shuffle(&mut rand_10::rng());
 
         if self.network.is_regtest() {
-            // Only return local peer addresses and skip loading the peer cache on Regtest.
+            // Only return local peer addresses. Regtest never loads the peer cache.
             dns_peers
                 .into_iter()
                 .filter(PeerSocketAddr::is_localhost)
                 .collect()
         } else {
-            // Ignore disk errors because the cache is optional and the method already logs them.
-            let disk_peers = self.load_peer_cache().await.unwrap_or_default();
-
-            dns_peers.into_iter().chain(disk_peers).collect()
+            // With one slot, seed membership must survive even if a seed is cached.
+            // Otherwise remove overlap so a duplicate cannot consume a seed turn.
+            if self.peerset_initial_target_size != 1 {
+                dns_peers.retain(|addr| !disk_peers.contains(addr));
+            }
+            let mut cached = disk_peers.into_iter();
+            let mut seeds = dns_peers.into_iter();
+            let mut initial_peers = IndexSet::new();
+            loop {
+                match (cached.next(), seeds.next()) {
+                    (None, None) => break,
+                    (cached, seed) => {
+                        // A cached peer must not permanently own the only outbound slot.
+                        if self.peerset_initial_target_size == 1 {
+                            initial_peers.extend(seed);
+                            initial_peers.extend(cached);
+                        } else {
+                            initial_peers.extend(cached);
+                            initial_peers.extend(seed);
+                        }
+                    }
+                }
+            }
+            initial_peers
         }
     }
 
@@ -551,8 +683,6 @@ impl Config {
         peers: &HashSet<String>,
         expose_peer_addresses: bool,
     ) -> HashSet<PeerSocketAddr> {
-        use futures::stream::StreamExt;
-
         if peers.is_empty() {
             warn!(
                 "no initial peers in the network config. \
@@ -568,14 +698,7 @@ impl Config {
             // no peers in the combined list. DNS failures are correlated, so all
             // peers can fail DNS, leaving Zakura with a small list of custom IP
             // address peers. Individual retries avoid this issue.
-            let peer_addresses = peers
-                .iter()
-                .map(|s| {
-                    Config::resolve_host(s, MAX_SINGLE_SEED_PEER_DNS_RETRIES, expose_peer_addresses)
-                })
-                .collect::<futures::stream::FuturesUnordered<_>>()
-                .concat()
-                .await;
+            let peer_addresses = Config::resolve_peers_once(peers, expose_peer_addresses).await;
 
             if peer_addresses.is_empty() {
                 tracing::info!(
@@ -589,6 +712,54 @@ impl Config {
                 return peer_addresses;
             }
         }
+    }
+
+    /// Concurrently resolves `peers` into zero or more IP addresses, making one
+    /// round of lookups with a timeout of a few seconds on each DNS request.
+    ///
+    /// Returns an empty set if every lookup fails or times out.
+    async fn resolve_peers_once(
+        peers: &HashSet<String>,
+        expose_peer_addresses: bool,
+    ) -> HashSet<PeerSocketAddr> {
+        use futures::stream::StreamExt;
+
+        peers
+            .iter()
+            .map(|s| {
+                Config::resolve_host(s, MAX_SINGLE_SEED_PEER_DNS_RETRIES, expose_peer_addresses)
+            })
+            .collect::<futures::stream::FuturesUnordered<_>>()
+            .concat()
+            .await
+    }
+
+    /// Loads cached peers from disk, keeping only addresses valid for outbound
+    /// connections on the configured network.
+    ///
+    /// Returns an empty set on Regtest, when the cache is disabled or missing,
+    /// or when it can't be read. Read errors are logged by
+    /// [`load_peer_cache`](Self::load_peer_cache).
+    async fn load_valid_peer_cache(&self) -> IndexSet<PeerSocketAddr> {
+        if self.network.is_regtest() {
+            return IndexSet::new();
+        }
+
+        let mut disk_peers = self.load_peer_cache().await.unwrap_or_default();
+        disk_peers.retain(|addr| {
+            match address_is_valid_for_outbound_connections(*addr, self.network.clone()) {
+                Ok(_) => true,
+                Err(error) => {
+                    info!(
+                        peer = %addr.addr_label(self.expose_peer_addresses),
+                        ?error,
+                        "invalid initial peer from disk cache",
+                    );
+                    false
+                }
+            }
+        });
+        disk_peers
     }
 
     /// Resolves `host` into zero or more IP addresses, retrying up to
@@ -647,11 +818,7 @@ impl Config {
             Ok(Ok(ip_addrs)) => {
                 let ip_addrs: Vec<PeerSocketAddr> = ip_addrs.map(canonical_peer_addr).collect();
 
-                // This log is needed for user debugging, but it's annoying during tests.
-                #[cfg(not(test))]
                 info!(seed = ?host, remote_ip_count = ?ip_addrs.len(), "resolved seed peer IP addresses");
-                #[cfg(test)]
-                debug!(seed = ?host, remote_ip_count = ?ip_addrs.len(), "resolved seed peer IP addresses");
 
                 for ip in &ip_addrs {
                     // Count each initial peer, recording the seed config and resolved IP address.
@@ -687,10 +854,10 @@ impl Config {
         }
     }
 
-    /// Returns the addresses in the peer list cache file, if available.
-    pub async fn load_peer_cache(&self) -> io::Result<HashSet<PeerSocketAddr>> {
+    /// Returns the addresses in cache line order, keeping the first occurrence of duplicates.
+    pub async fn load_peer_cache(&self) -> io::Result<IndexSet<PeerSocketAddr>> {
         let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(&self.network) else {
-            return Ok(HashSet::new());
+            return Ok(IndexSet::new());
         };
 
         let peer_list = match fs::read_to_string(&peer_cache_file).await {
@@ -698,7 +865,7 @@ impl Config {
             Err(peer_list_error) => {
                 // We expect that the cache will be missing for new Zakura installs
                 if peer_list_error.kind() == ErrorKind::NotFound {
-                    return Ok(HashSet::new());
+                    return Ok(IndexSet::new());
                 } else {
                     info!(
                         ?peer_list_error,
@@ -709,9 +876,9 @@ impl Config {
             }
         };
 
-        // Skip and log addresses that don't parse, and automatically deduplicate using the HashSet.
+        // Skip and log addresses that don't parse, and automatically deduplicate using the IndexSet.
         // (These issues shouldn't happen unless users modify the file.)
-        let peer_list: HashSet<PeerSocketAddr> = peer_list
+        let peer_list: IndexSet<PeerSocketAddr> = peer_list
             .lines()
             .filter_map(|peer| {
                 peer.parse()
@@ -726,15 +893,7 @@ impl Config {
             })
             .collect();
 
-        // This log is needed for user debugging, but it's annoying during tests.
-        #[cfg(not(test))]
         info!(
-            cached_ip_count = ?peer_list.len(),
-            ?peer_cache_file,
-            "loaded cached peer IP addresses"
-        );
-        #[cfg(test)]
-        debug!(
             cached_ip_count = ?peer_list.len(),
             ?peer_cache_file,
             "loaded cached peer IP addresses"
@@ -758,13 +917,16 @@ impl Config {
     }
 
     /// Atomically writes a new `peer_list` to the peer list cache file, if configured.
+    /// Retains insertion order within the per-IP connection limit, then truncates
+    /// the least-preferred tail at the cache limit.
     /// If the list is empty, keeps the previous cache file.
     ///
     /// Also creates the peer cache directory, if it doesn't already exist.
     ///
     /// Atomic writes avoid corrupting the cache if Zakura panics or crashes, or if multiple Zakura
     /// instances try to read and write the same cache file.
-    pub async fn update_peer_cache(&self, peer_list: HashSet<PeerSocketAddr>) -> io::Result<()> {
+    #[cfg(test)]
+    pub async fn update_peer_cache(&self, peer_list: IndexSet<PeerSocketAddr>) -> io::Result<()> {
         let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(&self.network) else {
             return Ok(());
         };
@@ -783,28 +945,33 @@ impl Config {
     /// Replaces the peer cache, including when all previous peers have been banned.
     pub(crate) async fn write_peer_cache(
         &self,
-        peer_list: HashSet<PeerSocketAddr>,
+        peer_list: IndexSet<PeerSocketAddr>,
     ) -> io::Result<()> {
         let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(&self.network) else {
             return Ok(());
         };
 
+        let mut selected_per_ip = HashMap::new();
         let selected_peers: Vec<PeerSocketAddr> = peer_list
             .iter()
+            .filter(|peer| {
+                let count = selected_per_ip.entry(peer.ip()).or_insert(0);
+                if *count >= self.max_connections_per_ip {
+                    return false;
+                }
+                *count += 1;
+                true
+            })
             .take(MAX_PEER_DISK_CACHE_SIZE)
             .copied()
             .collect();
 
         // Turn IP addresses into unredacted strings so they remain reconnectable.
-        let mut peer_list: Vec<String> = selected_peers
+        let peer_list: Vec<String> = selected_peers
             .iter()
             .map(|peer| peer.remove_socket_addr_privacy().to_string())
             .collect();
-        // # Privacy
-        //
-        // Sort to destroy any peer order, which could leak peer connection times.
-        // (Currently the HashSet argument does this as well.)
-        peer_list.sort_unstable();
+        // Preserve RTT preference in line order so startup dials faster peers first.
         // Make a newline-separated list
         let peer_data = peer_list.join("\n");
 
@@ -825,14 +992,15 @@ impl Config {
                     "updated cached peer IP addresses"
                 );
 
-                for ip in &selected_peers {
-                    metrics::counter!(
-                        "zcash.net.peers.cache",
-                        "cache" => peer_cache_file.display().to_string(),
-                        "remote_ip" => ip.addr_label(self.expose_peer_addresses)
-                    )
-                    .increment(1);
-                }
+                // Count the cached peers per cache file. A per-address label would add a series
+                // for every peer ever cached, and the exporter never removes them.
+                metrics::counter!(
+                    "zcash.net.peers.cache",
+                    "cache" => peer_cache_file.display().to_string(),
+                )
+                .increment(
+                    u64::try_from(selected_peers.len()).expect("a peer address count fits in u64"),
+                );
 
                 Ok(())
             }
@@ -888,6 +1056,16 @@ impl Config {
     /// mutually capable peers to the Zakura upgrade hook.
     pub fn v2_p2p(&self) -> bool {
         self.p2p_stack.resolve(&self.network).runs_zakura()
+    }
+
+    /// Returns the services sent in the legacy handshake for the node's own `services`: those
+    /// services with [`PeerServices::NODE_P2P_V2`] set exactly when [`v2_p2p`](Self::v2_p2p) is.
+    pub fn handshake_services(&self, mut services: PeerServices) -> PeerServices {
+        services.remove(PeerServices::NODE_P2P_V2);
+        if self.v2_p2p() {
+            services |= PeerServices::NODE_P2P_V2;
+        }
+        services
     }
 
     /// Builds a network config for tests with [`p2p_stack`](Self::p2p_stack) pinned to
@@ -1053,13 +1231,13 @@ impl Default for Config {
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
             expose_peer_addresses: false,
             unconditional_peers: UnconditionalPeers::default(),
-            advert_window_min: DEFAULT_ADVERT_WINDOW_MIN,
-            advert_window_max: DEFAULT_ADVERT_WINDOW_MAX,
+            advert_window_full_block: DEFAULT_ADVERT_WINDOW_FULL_BLOCK,
+            advert_window_small_block: DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
             advert_window_small_size_bytes: DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
             advert_window_full_size_bytes: DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
-            experimental_early_block_relay: false,
-            advert_delay_min: Duration::ZERO,
-            advert_delay_max: Duration::ZERO,
+            compact_block_relay: false,
+            advert_delay: DEFAULT_ADVERT_DELAY,
+            tcp_warmup: TcpWarmupConfig::default(),
         }
     }
 }
@@ -1261,16 +1439,34 @@ struct DConfig {
     unconditional_peers: UnconditionalPeers,
     /// `None` if the config does not set it, so [`resolve_advert_windows`] can derive it from
     /// the other bound.
-    advert_window_min: Option<usize>,
-    /// `None` if the config does not set it. See `advert_window_min`.
-    advert_window_max: Option<usize>,
+    #[serde(alias = "advert_window_min")]
+    advert_window_full_block: Option<usize>,
+    /// `None` if the config does not set it. See `advert_window_full_block`.
+    #[serde(alias = "advert_window_max")]
+    advert_window_small_block: Option<usize>,
     advert_window_small_size_bytes: u64,
     advert_window_full_size_bytes: u64,
-    experimental_early_block_relay: bool,
-    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
-    advert_delay_min: Duration,
-    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
-    advert_delay_max: Duration,
+    compact_block_relay: bool,
+    /// `None` if the config does not set it, so the delay falls back to `advert_delay_max`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "zakura_chain::serialization::serde_adapters::optional_duration"
+    )]
+    advert_delay: Option<Duration>,
+    /// The previous name of `advert_delay`, used only when `advert_delay` is unset.
+    ///
+    /// Not a serde alias: the node loader merges sources by key name, so an old file key plus
+    /// an `advert_delay` environment override would otherwise fail as a duplicate field.
+    #[serde(
+        skip_serializing,
+        with = "zakura_chain::serialization::serde_adapters::optional_duration"
+    )]
+    advert_delay_max: Option<Duration>,
+    /// Ignored. Versions before the single `advert_delay` interpolated the delay from this value
+    /// for small blocks.
+    #[serde(skip_serializing)]
+    advert_delay_min: Option<de::IgnoredAny>,
+    tcp_warmup: TcpWarmupConfig,
 }
 
 impl Default for DConfig {
@@ -1295,13 +1491,15 @@ impl Default for DConfig {
             max_connections_per_ip: Some(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
             unconditional_peers: config.unconditional_peers,
-            advert_window_min: None,
-            advert_window_max: None,
+            advert_window_full_block: None,
+            advert_window_small_block: None,
             advert_window_small_size_bytes: config.advert_window_small_size_bytes,
             advert_window_full_size_bytes: config.advert_window_full_size_bytes,
-            experimental_early_block_relay: config.experimental_early_block_relay,
-            advert_delay_min: config.advert_delay_min,
-            advert_delay_max: config.advert_delay_max,
+            compact_block_relay: config.compact_block_relay,
+            advert_delay: None,
+            advert_delay_max: None,
+            advert_delay_min: None,
+            tcp_warmup: config.tcp_warmup,
         }
     }
 }
@@ -1372,13 +1570,13 @@ impl From<Config> for DConfig {
             max_connections_per_ip,
             expose_peer_addresses,
             unconditional_peers,
-            advert_window_min,
-            advert_window_max,
+            advert_window_full_block,
+            advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
-            experimental_early_block_relay,
-            advert_delay_min,
-            advert_delay_max,
+            compact_block_relay,
+            advert_delay,
+            tcp_warmup,
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -1421,13 +1619,15 @@ impl From<Config> for DConfig {
             max_connections_per_ip: Some(max_connections_per_ip),
             expose_peer_addresses,
             unconditional_peers,
-            advert_window_min: Some(advert_window_min),
-            advert_window_max: Some(advert_window_max),
+            advert_window_full_block: Some(advert_window_full_block),
+            advert_window_small_block: Some(advert_window_small_block),
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
-            experimental_early_block_relay,
-            advert_delay_min,
-            advert_delay_max,
+            compact_block_relay,
+            advert_delay: Some(advert_delay),
+            advert_delay_max: None,
+            advert_delay_min: None,
+            tcp_warmup,
         }
     }
 }
@@ -1456,27 +1656,32 @@ impl<'de> Deserialize<'de> for Config {
             max_connections_per_ip,
             expose_peer_addresses,
             unconditional_peers,
-            advert_window_min,
-            advert_window_max,
+            advert_window_full_block,
+            advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
-            experimental_early_block_relay,
-            advert_delay_min,
+            compact_block_relay,
+            advert_delay,
             advert_delay_max,
+            advert_delay_min: _,
+            tcp_warmup,
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
-        let (advert_window_min, advert_window_max) =
-            resolve_advert_windows(advert_window_min, advert_window_max);
+        let advert_delay = advert_delay
+            .or(advert_delay_max)
+            .unwrap_or(DEFAULT_ADVERT_DELAY);
+        let (advert_window_full_block, advert_window_small_block) =
+            resolve_advert_windows(advert_window_full_block, advert_window_small_block);
         validate_advert_fanout(
-            advert_window_min,
-            advert_window_max,
+            advert_window_full_block,
+            advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
-            advert_delay_min,
-            advert_delay_max,
+            advert_delay,
         )
         .map_err(de::Error::custom)?;
+        tcp_warmup.validate().map_err(de::Error::custom)?;
 
         let network = match (dnetwork, testnet_parameters) {
             (DNetwork::ConfiguredTestnet(params), None) => {
@@ -1602,6 +1807,18 @@ impl<'de> Deserialize<'de> for Config {
                 .budgeted_max_connections(&network)
                 .map_err(de::Error::custom)?;
         }
+        // Unconditional peers are dialed on the legacy stack, and only a P2P v2
+        // connection proves a node ID, so a pin needs both stacks.
+        let runs_both_stacks = {
+            let p2p_stack = p2p_stack.resolve(&network);
+            p2p_stack.runs_legacy() && p2p_stack.runs_zakura()
+        };
+        if unconditional_peers.has_pinned_names() && !runs_both_stacks {
+            return Err(de::Error::custom(
+                "network.unconditional_peers pins a node ID, which needs both P2P stacks: \
+                 set network.p2p_stack = \"dual\"",
+            ));
+        }
 
         Ok(Config {
             listen_addr: canonical_socket_addr(listen_addr),
@@ -1619,41 +1836,49 @@ impl<'de> Deserialize<'de> for Config {
             max_connections_per_ip,
             expose_peer_addresses,
             unconditional_peers,
-            advert_window_min,
-            advert_window_max,
+            advert_window_full_block,
+            advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
-            experimental_early_block_relay,
-            advert_delay_min,
-            advert_delay_max,
+            compact_block_relay,
+            advert_delay,
+            tcp_warmup,
         })
     }
 }
 
-/// Resolves omitted initial-group bounds without changing explicitly configured values.
-fn resolve_advert_windows(min: Option<usize>, max: Option<usize>) -> (usize, usize) {
-    match (min, max) {
-        (Some(min), Some(max)) => (min, max),
-        (Some(min), None) => (min, DEFAULT_ADVERT_WINDOW_MAX.max(min)),
-        (None, Some(max)) => (DEFAULT_ADVERT_WINDOW_MIN.min(max), max),
-        (None, None) => (DEFAULT_ADVERT_WINDOW_MIN, DEFAULT_ADVERT_WINDOW_MAX),
+/// Resolves omitted initial-group windows without changing explicitly configured values.
+fn resolve_advert_windows(full_block: Option<usize>, small_block: Option<usize>) -> (usize, usize) {
+    match (full_block, small_block) {
+        (Some(full_block), Some(small_block)) => (full_block, small_block),
+        (Some(full_block), None) => (
+            full_block,
+            DEFAULT_ADVERT_WINDOW_SMALL_BLOCK.max(full_block),
+        ),
+        (None, Some(small_block)) => (
+            DEFAULT_ADVERT_WINDOW_FULL_BLOCK.min(small_block),
+            small_block,
+        ),
+        (None, None) => (
+            DEFAULT_ADVERT_WINDOW_FULL_BLOCK,
+            DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
+        ),
     }
 }
 
 /// Checks the block advert fan-out settings.
 fn validate_advert_fanout(
-    advert_window_min: usize,
-    advert_window_max: usize,
+    advert_window_full_block: usize,
+    advert_window_small_block: usize,
     advert_window_small_size_bytes: u64,
     advert_window_full_size_bytes: u64,
-    advert_delay_min: Duration,
-    advert_delay_max: Duration,
+    advert_delay: Duration,
 ) -> Result<(), String> {
-    if advert_window_min == 0 || advert_window_min > advert_window_max {
+    if advert_window_full_block == 0 || advert_window_full_block > advert_window_small_block {
         return Err(format!(
-            "advert_window_min and advert_window_max must satisfy \
-             1 <= advert_window_min <= advert_window_max, \
-             got {advert_window_min} and {advert_window_max}"
+            "advert_window_full_block and advert_window_small_block must satisfy \
+             1 <= advert_window_full_block <= advert_window_small_block, \
+             got {advert_window_full_block} and {advert_window_small_block}"
         ));
     }
     if advert_window_small_size_bytes >= advert_window_full_size_bytes {
@@ -1662,14 +1887,11 @@ fn validate_advert_fanout(
              got {advert_window_small_size_bytes} and {advert_window_full_size_bytes}"
         ));
     }
-    if advert_delay_min > advert_delay_max {
-        return Err("advert_delay_min must not exceed advert_delay_max".to_owned());
-    }
     if std::time::Instant::now()
-        .checked_add(advert_delay_max)
+        .checked_add(advert_delay)
         .is_none()
     {
-        return Err("advert_delay_max exceeds the monotonic clock range".to_owned());
+        return Err("advert_delay exceeds the monotonic clock range".to_owned());
     }
     Ok(())
 }

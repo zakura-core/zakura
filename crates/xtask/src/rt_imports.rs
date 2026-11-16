@@ -130,7 +130,7 @@ const THREAD_ITEMS: [&str; 7] = [
 /// interface watcher reads the host's interfaces through `getifaddrs`, but it
 /// starts only for a wildcard socket, and `bind_with` refuses one inside a
 /// simulated run.
-const ALLOWED: [(&str, &str, &str); 32] = [
+const ALLOWED: [(&str, &str, &str); 38] = [
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",
@@ -247,6 +247,36 @@ const ALLOWED: [(&str, &str, &str); 32] = [
         RESOURCE_PROBE,
     ),
     (
+        "crates/zakura-network/src/zakura/transport/probe.rs",
+        "std::sync::Weak",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-network/src/zakura/transport/probe.rs",
+        "std::sync::Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-network/src/zakura/transport/probe.rs",
+        "Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-quic/src/probe.rs",
+        "std::sync::Weak",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-quic/src/probe.rs",
+        "std::sync::Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-quic/src/probe.rs",
+        "Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
+    (
         "crates/zakura-network/src/zakura/transport/observe.rs",
         "std::sync::Mutex",
         TRANSPORT_TAP,
@@ -324,6 +354,13 @@ const TRANSPORT_TAP: &str = "the transport observer's own state, which must add 
 const RESOURCE_PROBE: &str = "the header resource probe's handles, which a boundary \
      read upgrades and so must take no scheduling point, not code under test";
 
+/// Why the transport probes may use std's `Weak`. They compile only under
+/// `cfg(zakura_sim)`, and read only inside a boundary read, which
+/// `zakura_rt`'s `Weak::upgrade` would fail with its preemption point.
+const TRANSPORT_PROBE: &str = "a transport probe's handles to a connection's gates and \
+     load: a simulated run's boundary read upgrades them, so they must take no scheduling \
+     point, and they are harness code, not code under test";
+
 const MISSING_NAME: &str = "a zakura_rt name (add one if it's missing)";
 
 const MODULE_IMPORT: &str = "zakura_rt names, imported by item";
@@ -370,14 +407,24 @@ pub fn check(repo_root: &Path) -> Result<(), BoxError> {
     .into())
 }
 
-#[derive(Default)]
 struct Findings {
     files: usize,
     violations: Vec<Violation>,
     allowances_used: [bool; ALLOWED.len()],
 }
 
-fn parse_file(repo_root: &Path, path: &Path) -> Result<syn::File, BoxError> {
+// Std derives `Default` only for arrays of at most 32 elements.
+impl Default for Findings {
+    fn default() -> Self {
+        Findings {
+            files: 0,
+            violations: Vec::new(),
+            allowances_used: [false; ALLOWED.len()],
+        }
+    }
+}
+
+pub(crate) fn parse_file(repo_root: &Path, path: &Path) -> Result<syn::File, BoxError> {
     let relative = relative_path(repo_root, path);
     let source = fs::read_to_string(path).map_err(|e| format!("{relative}: {e}"))?;
     syn::parse_file(&source).map_err(|e| {
@@ -386,7 +433,7 @@ fn parse_file(repo_root: &Path, path: &Path) -> Result<syn::File, BoxError> {
     })
 }
 
-fn relative_path(repo_root: &Path, path: &Path) -> String {
+pub(crate) fn relative_path(repo_root: &Path, path: &Path) -> String {
     path.strip_prefix(repo_root)
         .unwrap_or(path)
         .to_string_lossy()
@@ -470,7 +517,7 @@ fn check_child_modules(
     Ok(())
 }
 
-fn module_file(repo_root: &Path, dir: &Path, name: &str) -> Result<PathBuf, BoxError> {
+pub(crate) fn module_file(repo_root: &Path, dir: &Path, name: &str) -> Result<PathBuf, BoxError> {
     [
         dir.join(format!("{name}.rs")),
         dir.join(name).join("mod.rs"),
@@ -487,7 +534,7 @@ fn module_file(repo_root: &Path, dir: &Path, name: &str) -> Result<PathBuf, BoxE
 }
 
 /// Whether a `cfg` attribute compiles the item only in tests.
-fn is_test_only(attrs: &[Attribute]) -> bool {
+pub(crate) fn is_test_only(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| {
         attr.path().is_ident("cfg")
             && attr
@@ -1095,7 +1142,7 @@ fn expr_path_segments(expr: &syn::ExprPath) -> Option<(Vec<String>, bool)> {
     Some((idents(&mut segments), path.leading_colon.is_some()))
 }
 
-fn item_attrs(item: &Item) -> Option<&[Attribute]> {
+pub(crate) fn item_attrs(item: &Item) -> Option<&[Attribute]> {
     Some(match item {
         Item::Const(item) => &item.attrs,
         Item::Enum(item) => &item.attrs,

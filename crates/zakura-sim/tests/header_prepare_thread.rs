@@ -32,6 +32,7 @@ fn preparation_never_starts_the_rayon_pool() {
         mirrors: vec![MirrorSpec {
             chain: Chain::main(160),
             dialer: Dialer::Mirror,
+            max_headers_per_response: None,
         }],
         ..StorageScenario::default()
     };

@@ -28,13 +28,13 @@ use zakura_network::zakura::{MessageRole, MessageRule, Stream};
 
 use crate::{
     downstream,
-    model::{consequence, is_fault_cause, Consequence, Label},
+    model::{consequence, is_fault_cause, is_rate_limit_cause, Consequence, Label},
     observe::{Entry, StreamId},
     property::{
         Cardinality, CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId,
         Source, Status, Subject, Verdict,
     },
-    sender, Observation,
+    sender, Observation, ObservationLog,
 };
 
 /// What a generated property claims.
@@ -71,6 +71,9 @@ pub enum Template {
     /// Per response row that ends its exchange: the node ends only an open
     /// exchange, so it ends each at most once.
     SenderEndsOnce,
+    /// Per response row that answers a request: the node's answer carries
+    /// only what the peer's request asked for.
+    SenderWithinOwed,
     /// Per subscription row: the node's live subscriptions stay within
     /// `max_live`.
     SenderWithinLive,
@@ -96,6 +99,7 @@ impl Template {
             Template::SenderWithinLimit => "sender-within-limit".to_owned(),
             Template::SenderAnswersOpen => "sender-answers-open".to_owned(),
             Template::SenderEndsOnce => "sender-ends-once".to_owned(),
+            Template::SenderWithinOwed => "sender-within-owed".to_owned(),
             Template::SenderWithinLive => "sender-within-live".to_owned(),
             Template::SenderWithinCredit => "sender-within-credit".to_owned(),
             Template::SenderCadence => "sender-cadence".to_owned(),
@@ -114,6 +118,7 @@ impl Template {
             "sender-within-limit" => Some(Template::SenderWithinLimit),
             "sender-answers-open" => Some(Template::SenderAnswersOpen),
             "sender-ends-once" => Some(Template::SenderEndsOnce),
+            "sender-within-owed" => Some(Template::SenderWithinOwed),
             "sender-within-live" => Some(Template::SenderWithinLive),
             "sender-within-credit" => Some(Template::SenderWithinCredit),
             "sender-cadence" => Some(Template::SenderCadence),
@@ -153,6 +158,9 @@ impl Template {
                 "the node responds only within an exchange the peer opened"
             }
             Template::SenderEndsOnce => "the node ends only an open exchange, so each at most once",
+            Template::SenderWithinOwed => {
+                "the node's answer carries only what the peer's request asked for"
+            }
             Template::SenderWithinLive => "the node's live subscriptions stay within max_live",
             Template::SenderWithinCredit => {
                 "the node's pages stay within the credit the peer granted"
@@ -169,6 +177,7 @@ impl Template {
             Template::SenderWithinLimit
             | Template::SenderAnswersOpen
             | Template::SenderEndsOnce
+            | Template::SenderWithinOwed
             | Template::SenderWithinLive
             | Template::SenderWithinCredit
             | Template::SenderCadence => &[Source::Frames],
@@ -196,6 +205,7 @@ impl Template {
             | Template::SenderWithinLimit
             | Template::SenderAnswersOpen
             | Template::SenderEndsOnce
+            | Template::SenderWithinOwed
             | Template::SenderWithinLive
             | Template::SenderWithinCredit
             | Template::SenderCadence => Kind::Safety,
@@ -409,6 +419,40 @@ pub fn sender_properties<S: HasView>(family: &'static str, streams: &[Stream]) -
     properties
 }
 
+/// The `sender-within-owed` property of each response row in `streams` that
+/// answers a request, not a subscription. Only a family whose sender adapter
+/// knows what each of the peer's requests asked for, and labels an answer
+/// past it `OverOwed`, registers these: discovery's.
+pub fn sender_owed_properties<S: HasView>(
+    family: &'static str,
+    streams: &[Stream],
+) -> Vec<Property<S>> {
+    let mut properties = Vec::new();
+    for stream in streams {
+        let Some(rules) = stream.messages else {
+            continue;
+        };
+        for rule in rules {
+            let MessageRole::Response { request, .. } = rule.role else {
+                continue;
+            };
+            if !answers_request(streams, request) {
+                continue;
+            }
+            properties.push(generated(GeneratedId {
+                family,
+                stream: StreamId {
+                    kind: stream.kind,
+                    version: stream.version,
+                },
+                row: Some(rule.name),
+                template: Template::SenderWithinOwed,
+            }));
+        }
+    }
+    properties
+}
+
 /// True if `rule` declares a cadence.
 fn has_cadence(rule: &MessageRule) -> bool {
     match rule.role {
@@ -522,6 +566,7 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         Template::SenderWithinLimit
         | Template::SenderAnswersOpen
         | Template::SenderEndsOnce
+        | Template::SenderWithinOwed
         | Template::SenderWithinLive
         | Template::SenderWithinCredit
         | Template::SenderCadence => {
@@ -533,6 +578,200 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     }
 }
 
+/// True if `log` reaches the trigger history of the generated property
+/// `id` over the streams of `layout`, the layout its harness registered the
+/// property from. A harness attaches it as
+/// [`TriggerHistory::LogOf`](crate::property::TriggerHistory::LogOf), through
+/// a function that names its layout. An ID that isn't generated, or whose
+/// stream isn't in `layout`, never reaches it.
+///
+/// A receiver template's trigger is the node judging a frame its row's rule
+/// covers, with the template's label: a `<label>-closes` ID's label on its
+/// row (any row for `undeclared-type`), a conformant frame on the stream for
+/// `conformant-never-closes`, a frame into an empty cadence bucket on the row
+/// for `cadence-never-closes`, any frame on the row for
+/// `receiver-work-authorized` and `receiver-serving-bounded`, and a page of
+/// the subscription on a connection the node granted it credit on for
+/// `receiver-credit-conserved`, where the grant's key is the page's. A
+/// sender template's is in [`sender::trigger`].
+pub fn generated_trigger(layout: &[Stream], id: &PropertyId, log: &ObservationLog) -> bool {
+    let Some(id) = GeneratedId::parse(id.as_str()) else {
+        return false;
+    };
+    if stream_of(layout, id.stream).is_none() {
+        return false;
+    }
+    let entries = log.entries();
+    match id.template {
+        Template::SenderWithinResponseQuantity
+        | Template::SenderWithinLimit
+        | Template::SenderAnswersOpen
+        | Template::SenderEndsOnce
+        | Template::SenderWithinOwed
+        | Template::SenderWithinLive
+        | Template::SenderWithinCredit
+        | Template::SenderCadence => sender::trigger(layout, &id, entries),
+        Template::ConformantNeverCloses
+        | Template::Closes(_)
+        | Template::CadenceNeverCloses
+        | Template::WorkAuthorized
+        | Template::CreditConserved
+        | Template::ServingBounded => entries.iter().enumerate().any(|(at, entry)| {
+            let Observation::FrameJudged {
+                connection,
+                stream,
+                quic_stream,
+                seq,
+            } = entry.obs
+            else {
+                return false;
+            };
+            let before = &entries[..at];
+            // What came before the peer sent the frame, which `sent`
+            // checked appears exactly once.
+            let sent_before = before
+                .iter()
+                .rposition(|entry| {
+                    matches!(&entry.obs, Observation::PeerFrame {
+                        connection: c,
+                        stream: s,
+                        quic_stream: q,
+                        seq: n,
+                        ..
+                    } if (*c, *s, *q, *n) == (connection, stream, quic_stream, seq))
+                })
+                .map_or(before, |sent_at| &before[..sent_at]);
+            sent(before, connection, stream, quic_stream, seq)
+                .is_ok_and(|frame| receiver_reached(layout, &id, sent_before, connection, &frame))
+        }),
+    }
+}
+
+/// True if `frame`, which the node judged on `connection` and the peer sent
+/// after `before`, reaches receiver template `id`'s trigger, as
+/// [`generated_trigger`] says. A credit grant must come before the page.
+fn receiver_reached(
+    layout: &[Stream],
+    id: &GeneratedId<'_>,
+    before: &[Entry],
+    connection: u64,
+    frame: &Sent<'_>,
+) -> bool {
+    let on_row = frame.rule_stream == id.stream && frame.row == id.row;
+    match id.template {
+        Template::Closes(label) => {
+            frame.label == label
+                && frame.rule_stream == id.stream
+                && (label == Label::UndeclaredType || frame.row == id.row)
+        }
+        Template::ConformantNeverCloses => {
+            frame.stream == id.stream && frame.label == Label::Conformant
+        }
+        Template::CadenceNeverCloses => {
+            frame.stream == id.stream && frame.row == id.row && frame.exhausted
+        }
+        Template::WorkAuthorized | Template::ServingBounded => on_row,
+        Template::CreditConserved => {
+            let Some(subscription) = id.row else {
+                return false;
+            };
+            is_page_of(
+                layout,
+                (frame.rule_stream, frame.row, frame.label),
+                (id.stream, subscription),
+            ) && before.iter().any(|entry| {
+                matches!(&entry.obs, Observation::CreditGranted {
+                    connection: c,
+                    subscription: granted,
+                    exchange,
+                    ..
+                } if *c == connection
+                    && Some(*exchange) == frame.exchange
+                    && granted.stream == id.stream
+                    && granted.row == subscription)
+            })
+        }
+        _ => false,
+    }
+}
+
+/// The stream of `layout` with ID `id`.
+fn stream_of(layout: &[Stream], id: StreamId) -> Option<&Stream> {
+    layout
+        .iter()
+        .find(|stream| stream.kind == id.kind && stream.version == id.version)
+}
+
+/// True if a frame whose rule is `row` on `rule_stream`, labelled `label`,
+/// is a page of the subscription row `subscription` of `layout`: a response
+/// row that doesn't end the exchange, whose request is that subscription as
+/// [`rule_row`] resolves it, or the subscription row itself for a page past
+/// its credit, which that row enforces. An ending, such as header sync's
+/// `headers-outcome`, spends no credit, so it's no page.
+pub(crate) fn is_page_of(
+    layout: &[Stream],
+    (rule_stream, row, label): (StreamId, Option<&str>, Label),
+    (stream, subscription): (StreamId, &str),
+) -> bool {
+    let Some(row) = row else {
+        return false;
+    };
+    if (rule_stream, row) == (stream, subscription) {
+        return label == Label::OverCredit;
+    }
+    let Some(frame_stream) = stream_of(layout, rule_stream) else {
+        return false;
+    };
+    let Some(rule) = frame_stream
+        .messages
+        .and_then(|rules| rules.iter().find(|rule| rule.name == row))
+    else {
+        return false;
+    };
+    if !matches!(
+        rule.role,
+        MessageRole::Response {
+            ends_exchange: false,
+            ..
+        }
+    ) {
+        return false;
+    }
+    let (enforced_on, enforced) = rule_row(layout, frame_stream, rule, Label::OverCredit);
+    (enforced_on.kind, enforced_on.version) == (stream.kind, stream.version)
+        && enforced.name == subscription
+}
+
+/// The request row of `layout` that the response row `row` on `stream`
+/// answers, as [`rule_row`] finds it: on `stream` first, then on the rest of
+/// the layout. `None` for a row that isn't a response.
+pub(crate) fn request_of(
+    layout: &[Stream],
+    stream: StreamId,
+    row: &str,
+) -> Option<(StreamId, &'static str)> {
+    let frame_stream = stream_of(layout, stream)?;
+    let rule = frame_stream
+        .messages?
+        .iter()
+        .find(|rule| rule.name == row)?;
+    let MessageRole::Response { request, .. } = rule.role else {
+        return None;
+    };
+    std::iter::once(frame_stream)
+        .chain(layout)
+        .find_map(|stream| {
+            let found = MessageRule::find(stream.messages?, request)?;
+            Some((
+                StreamId {
+                    kind: stream.kind,
+                    version: stream.version,
+                },
+                found.name,
+            ))
+        })
+}
+
 /// One frame a peer sent.
 #[derive(Clone, Copy, Debug)]
 struct Sent<'a> {
@@ -541,6 +780,8 @@ struct Sent<'a> {
     rule_stream: StreamId,
     label: Label,
     exhausted: bool,
+    /// The exchange or subscription it names, if any.
+    exchange: Option<u64>,
 }
 
 /// The frame `seq` the peer sent on `connection`, `stream` and
@@ -564,6 +805,7 @@ fn sent(
             rule_stream,
             label,
             exhausted,
+            exchange,
             ..
         } if (*c, *s, *quic, *q) == (connection, stream, quic_stream, seq) => Some(Sent {
             stream,
@@ -571,6 +813,7 @@ fn sent(
             rule_stream: *rule_stream,
             label: *label,
             exhausted: *exhausted,
+            exchange: *exchange,
         }),
         _ => None,
     });
@@ -601,6 +844,15 @@ fn judged(entries: &[Entry], connection: u64) -> Result<Vec<Sent<'_>>, String> {
             _ => None,
         })
         .collect()
+}
+
+/// True if the node judged a frame on `connection` in `entries` whose label
+/// isn't `Conformant`, which justifies a punishment after it, or the first
+/// judged frame's missing evidence.
+pub(crate) fn judged_nonconformant(entries: &[Entry], connection: u64) -> Result<bool, String> {
+    Ok(judged(entries, connection)?
+        .iter()
+        .any(|frame| frame.label != Label::Conformant))
 }
 
 /// True if `entries` hold a close of `connection`, with any cause.
@@ -723,12 +975,17 @@ fn check_closes<S: HasView>(
 /// `conformant-never-closes` and `cadence-never-closes`. The property
 /// applies at each step where the node judges a frame on the ID's stream
 /// for which `applies` holds. At each fault close or `Misbehavior` on a
-/// connection with such a frame, if every frame the node judged on that
+/// connection with such a frame, and for `cadence-never-closes` at each
+/// rate-limit close too, if every frame the node judged on that
 /// connection before the punishment, on any stream, is `Conformant`, the
 /// punishment is a violation. A fault on a sibling stream justifies it, but
 /// only one judged before it. For `conformant-never-closes`, a punishment
 /// before the node judged any frame on the connection is a violation too.
 /// Every unjustified punishment at the step is a violation of its own.
+///
+/// A rate-limit close names no stream, so this assumes the connection
+/// carries no stream without a table, whose own message bucket can justify
+/// that close ([`crate::model::RATE_LIMIT_CAUSES`]).
 fn check_never_closes<S: HasView>(
     cx: &mut CheckCtx<'_, S>,
     id: &GeneratedId<'_>,
@@ -759,7 +1016,11 @@ fn check_never_closes<S: HasView>(
                 }
                 continue;
             }
-            Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+            Observation::ConnectionClosed { connection, cause }
+                if is_fault_cause(cause)
+                    || (id.template == Template::CadenceNeverCloses
+                        && is_rate_limit_cause(cause)) =>
+            {
                 (*connection, format!("a close with cause {cause}"))
             }
             Observation::Misbehavior { connection } => (*connection, "a Misbehavior".to_owned()),

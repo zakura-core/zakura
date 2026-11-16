@@ -4,13 +4,10 @@
 //! and buffer growth. Complete block fixtures must still decode to the same
 //! values as before, leaving any bytes after the block unread.
 
-use std::{
-    io::{self, Read},
-    sync::Arc,
-};
+use std::{io::Read, sync::Arc};
 
 use crate::{
-    block::{Block, CountedHeader, Hash},
+    block::{Block, CountedHeader, Hash, MAX_BLOCK_BYTES},
     parameters::Network,
     primitives::{Groth16Proof, Halo2Proof},
     serialization::{
@@ -45,7 +42,6 @@ fn header_minimum_allows_every_supported_network() {
         assert!(encoded.len() >= 178);
         let mut bytes = encoded.as_slice();
         let headers = ZcashReader::from_slice(&mut bytes)
-            .with_limit(u64::MAX)
             .read_external_count::<Arc<CountedHeader>>(1)
             .unwrap();
         assert_eq!(*headers[0], header);
@@ -62,66 +58,6 @@ fn header_minimum_allows_every_supported_network() {
         Err(SerializationError::Parse("Vector exceeds available input"))
     ));
     assert_eq!(bytes.len(), 177);
-}
-
-#[test]
-fn nested_limits_preserve_available_bytes_and_advance_the_parent() {
-    let mut bytes = &[1, 2, 3, 4][..];
-    let mut reader = ZcashReader::from_slice(&mut bytes);
-    {
-        let mut child = reader.with_limit(2);
-        assert_eq!(child.remaining_bytes(), Some(2));
-        assert!(child.read_bytes(3).is_err());
-        assert_eq!(child.remaining_bytes(), Some(2));
-        assert_eq!(child.read_bytes(2).unwrap(), [1, 2]);
-        assert_eq!(child.remaining_bytes(), Some(0));
-    }
-    assert_eq!(reader.remaining_bytes(), Some(2));
-    assert_eq!(reader.read_bytes(2).unwrap(), [3, 4]);
-    assert!(bytes.is_empty());
-
-    let mut stream = ZcashReader::from_stream(io::Cursor::new([1, 2]));
-    assert_eq!(stream.with_limit(100).remaining_bytes(), None);
-}
-
-#[test]
-fn nested_limits_restore_the_enclosing_limit_less_what_was_read() {
-    let mut bytes = &[1, 2, 3, 4, 5, 6][..];
-    let mut reader = ZcashReader::from_slice(&mut bytes);
-    let mut outer = reader.with_limit(5);
-    {
-        let mut inner = outer.with_limit(2);
-        assert_eq!(inner.remaining_bytes(), Some(2));
-        assert_eq!(inner.read_bytes(2).unwrap(), [1, 2]);
-        assert!(inner.read_bytes(1).is_err());
-    }
-    assert_eq!(outer.remaining_bytes(), Some(3));
-    assert!(outer.read_bytes(4).is_err());
-    assert_eq!(outer.read_bytes(3).unwrap(), [3, 4, 5]);
-    drop(outer);
-    assert_eq!(reader.remaining_bytes(), Some(1));
-    assert_eq!(reader.read_bytes(1).unwrap(), [6]);
-}
-
-#[test]
-fn limits_stop_stream_reads_including_nested_values() {
-    let mut stream = ZcashReader::from_stream(io::Cursor::new([1, 2, 3]));
-    let mut buf = [0; 3];
-    {
-        let mut limited = stream.with_limit(2);
-        assert_eq!(limited.read(&mut buf).unwrap(), 2);
-        assert_eq!(limited.read(&mut buf).unwrap(), 0);
-    }
-    assert_eq!(stream.read(&mut buf).unwrap(), 1);
-
-    // Stream decoders read nested values through the limited reader too.
-    let mut stream = ZcashReader::from_stream(io::Cursor::new([0; 32]));
-    assert!(stream.with_limit(31).read_value::<Hash>().is_err());
-    let mut stream = ZcashReader::from_stream(io::Cursor::new([0; 32]));
-    assert_eq!(
-        stream.with_limit(32).read_value::<Hash>().unwrap(),
-        Hash([0; 32])
-    );
 }
 
 #[test]
@@ -271,4 +207,50 @@ fn bounded_collection_growth_never_requests_more_than_the_declared_count() {
             "count {count}: {allocations:?}"
         );
     }
+}
+
+#[test]
+fn untrusted_blocks_and_transactions_over_the_size_limit_are_rejected_before_parsing() {
+    let max = usize::try_from(MAX_BLOCK_BYTES).unwrap();
+    let data = vec![0; max + 1];
+
+    let mut input = data.as_slice();
+    assert!(matches!(
+        Block::zcash_deserialize_bounded(&mut input),
+        Err(SerializationError::Parse(
+            "block is larger than MAX_BLOCK_BYTES"
+        ))
+    ));
+    assert_eq!(input.len(), data.len());
+
+    let mut input = data.as_slice();
+    assert!(matches!(
+        Transaction::zcash_deserialize_bounded(&mut input),
+        Err(SerializationError::Parse(
+            "transaction is larger than MAX_BLOCK_BYTES"
+        ))
+    ));
+    assert_eq!(input.len(), data.len());
+
+    // At the limit, the size check passes and the parser decides.
+    for result in [
+        Block::zcash_deserialize_bounded(&mut &data[..max]).map(|_| ()),
+        Transaction::zcash_deserialize_bounded(&mut &data[..max]).map(|_| ()),
+    ] {
+        assert!(!matches!(
+            result,
+            Err(SerializationError::Parse(
+                "block is larger than MAX_BLOCK_BYTES"
+                    | "transaction is larger than MAX_BLOCK_BYTES"
+            ))
+        ));
+    }
+
+    // Unread bytes after the value are left for the caller, as with
+    // `zcash_deserialize_from_slice`.
+    let mut data = zakura_test::vectors::DUMMY_TX1.to_vec();
+    data.extend([1, 2, 3]);
+    let mut input = data.as_slice();
+    Transaction::zcash_deserialize_bounded(&mut input).unwrap();
+    assert_eq!(input, [1, 2, 3]);
 }

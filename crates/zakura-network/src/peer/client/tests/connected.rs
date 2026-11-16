@@ -48,10 +48,10 @@ pub(crate) struct ConnectedClient {
 }
 
 impl ConnectedClient {
-    /// Spawns a connection to a mocked remote peer at `addr`, and returns its client.
+    /// Spawns a connection with the remote services supplied by its simulated handshake.
     ///
     /// Must be called inside a Tokio runtime.
-    pub fn spawn(addr: PeerSocketAddr) -> Self {
+    pub fn spawn_with_services(addr: PeerSocketAddr, services: PeerServices) -> Self {
         let inbound_service = MockService::build().for_unit_tests();
         let (server_tx, server_rx) = mpsc::channel(0);
         let (block_advert_tx, block_advert_rx) =
@@ -70,7 +70,6 @@ impl ConnectedClient {
         let peer_tx = peer_tx.sink_map_err(error_converter);
         let (peer_inbound, peer_rx) = mpsc::channel(16);
 
-        let services = PeerServices::NODE_NETWORK;
         let remote = VersionMessage {
             version: CURRENT_NETWORK_PROTOCOL_VERSION,
             services,
@@ -97,6 +96,7 @@ impl ConnectedClient {
             ConnectionRequests {
                 client_rx: server_rx,
                 block_advert_rx,
+                warmup_rx: tokio::sync::mpsc::channel(1).1,
                 minimum_peer_version: MinimumPeerVersion::new(NoChainTip, &Network::Mainnet),
                 bans: Default::default(),
             },
@@ -121,6 +121,7 @@ impl ConnectedClient {
         });
 
         let client = Client {
+            announced_blocks: Default::default(),
             block_uploads,
             request_slot,
             peer_registry_updater: None,

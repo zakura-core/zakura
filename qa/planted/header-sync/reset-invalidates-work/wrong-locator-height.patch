@@ -1,0 +1,19 @@
+diff --git a/crates/zakura-header-chain/src/discovery/mod.rs b/crates/zakura-header-chain/src/discovery/mod.rs
+index cdaecbeffd..62fa6c283d 100644
+--- a/crates/zakura-header-chain/src/discovery/mod.rs
++++ b/crates/zakura-header-chain/src/discovery/mod.rs
+@@ -586,7 +586,13 @@ impl HeaderLocator {
+             let hash = selected_hash(height)?.ok_or(StoreError::Incoherent(
+                 "selected locator height is absent from the selected projection",
+             ))?;
+-            let frontier = Frontier::new(height, hash);
++            // Mutation: the entry one below the tip keeps its hash but
++            // names the height below it.
++            let frontier = if offset == 1 {
++                Frontier::new(block::Height(height.0.saturating_sub(1)), hash)
++            } else {
++                Frontier::new(height, hash)
++            };
+             if let Some(existing) = entries.iter().find(|entry| entry.hash == hash) {
+                 if *existing != frontier {
+                     return Err(StoreError::Incoherent(

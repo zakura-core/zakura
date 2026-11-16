@@ -11,6 +11,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use zakura_rt::{collections::HashMap, sync::Mutex, task, time};
 use zakura_scheduler::SimInstant;
+use zakura_sim::NaReason;
 use zakura_sim::{
     fake::FakeStorage,
     harness::{run_harness, Subsystem},
@@ -43,7 +44,7 @@ enum Name {
 type Facts = Vec<(u64, Name)>;
 
 /// One step of the harness's task.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Act {
     /// Records a view-side fact.
     Fact(Name),
@@ -58,6 +59,9 @@ enum Act {
     Store,
     /// Breaks the harness's evidence in this way.
     Break(Broken),
+    /// Spawns a holder that yields holding a lock and two waiters that park
+    /// on it, one per worker, so the holder is ready with no worker.
+    Starve,
 }
 
 /// How a harness's evidence breaks. Each way, its view panics if read.
@@ -184,6 +188,31 @@ impl Subsystem for Stamped {
         let task_broken = Rc::clone(&broken);
         let storage = FakeStorage::new("store", Duration::from_millis(1));
         sim.add_source(Box::new(storage.clone()));
+        // `Starve`'s tasks: a holder that takes a lock and yields holding
+        // it, and two waiters that park on it once it's held, one per
+        // worker.
+        let starve = zakura_rt::sync::CancellationToken::new();
+        if script.acts.contains(&Act::Starve) {
+            let lock = Rc::new(Mutex::new(()));
+            let held = zakura_rt::sync::CancellationToken::new();
+            let (start, taken, holder_lock) = (starve.clone(), held.clone(), Rc::clone(&lock));
+            sim.scheduler().spawn_root("holder", async move {
+                start.cancelled().await;
+                #[allow(clippy::await_holding_lock)]
+                {
+                    let _guard = holder_lock.lock().expect("no task panics holding it");
+                    taken.cancel();
+                    task::yield_now().await;
+                }
+            });
+            for _ in 0..2 {
+                let (held, lock) = (held.clone(), Rc::clone(&lock));
+                sim.scheduler().spawn_root("waiter", async move {
+                    held.cancelled().await;
+                    drop(lock.lock().expect("no task panics holding it"));
+                });
+            }
+        }
         sim.scheduler().spawn_root("stamper", async move {
             for act in acts {
                 match act {
@@ -198,6 +227,7 @@ impl Subsystem for Stamped {
                     Act::Point => drop(lock.lock().expect("no task panics holding it")),
                     Act::Store => drop(storage.submit().await),
                     Act::Break(how) => task_broken.set(Some(how)),
+                    Act::Starve => starve.cancel(),
                 }
             }
         });
@@ -480,6 +510,41 @@ fn a_lost_deferred_timer_violates_at_the_next_timer() {
     assert_eq!(violation.witness, [1, violation.step]);
 }
 
+/// Sol 1, round 4: a deferred deadline doesn't pass while a task is ready
+/// with no worker for it. The clock stays, and the run fails as stuck
+/// rather than expire the obligation against the node.
+#[test]
+fn a_deferred_deadline_does_not_pass_while_a_task_is_starved() {
+    let script = Script {
+        acts: vec![Fact(Wait), Fact(Defer(1)), Act::Starve],
+        budget: 50,
+        drain: 10,
+        release_at_end: false,
+    };
+    let report = match run_harness::<Stamped>(
+        &script,
+        Plan::from_fuzz(&[]),
+        &mut MemorySink::default(),
+        None,
+    ) {
+        Ok(report) => report,
+        Err(zakura_sim::harness::HarnessError::Run { report, .. }) => *report,
+        Err(error) => panic!("the harness builds: {error}"),
+    };
+    assert_eq!(
+        report.end.harness,
+        Some(zakura_sim::HarnessFailure::StuckWithoutAction {
+            status: "worker-starved"
+        }),
+        "{:?}",
+        report.end
+    );
+    assert_eq!(
+        outcome(&report, SERVED),
+        PropertyOutcome::not_applicable(NaReason::HarnessFailed)
+    );
+}
+
 /// Keeps the lifecycle points it's handed.
 #[derive(Default)]
 struct Points(Vec<Lifecycle>);
@@ -502,22 +567,25 @@ impl Checker for Points {
             _ => None,
         }));
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
-/// If the deferred timer is lost and nothing else is armed, the run ends
-/// idle before the deferred instant. Time can't reach it then, so the
-/// obligation violates at the run's end instead of staying open, and its
-/// expiry reaches the checkers after the registry.
+/// If the deferred timer is lost and nothing else is armed, the live phase
+/// goes idle before the deferred instant. The open obligation sends the run
+/// into the drain, whose clock moves just past the deadline, where the
+/// obligation expires as a step's finding, and its expiry reaches the
+/// checkers after the registry.
 #[test]
-fn a_deferral_with_nothing_armed_violates_when_the_run_goes_idle() {
+fn a_deferral_with_nothing_armed_violates_at_its_deadline_in_the_drain() {
     let mut points = Points::default();
     let report = run_checked(&[Fact(Wait), Fact(Defer(1))], 50, Some(&mut points));
     assert_eq!(points.0.last(), Some(&Lifecycle::Expired), "{:?}", points.0);
-    assert!(
-        matches!(report.end.outcome, Outcome::Idle { .. }),
-        "{:?}",
-        report.end
-    );
+    assert_eq!(report.end.outcome, Outcome::Violation, "{:?}", report.end);
+    assert!(report.end.drain.is_some(), "{:?}", report.end);
     assert!(violated(&report, SERVED), "{:?}", report.properties);
     let served = report
         .properties
@@ -528,10 +596,9 @@ fn a_deferral_with_nothing_armed_violates_when_the_run_goes_idle() {
         served.violations[0].expected,
         r#"Owner("w") discharged by its deferred deadline, 1000000 ns"#
     );
-    assert_eq!(
-        served.violations[0].actual,
-        "the run went idle at 0 ns with it still open"
-    );
+    assert_eq!(served.violations[0].actual, "still open at 1000001 ns");
+    // A step found it, not the run's end.
+    assert_eq!(served.end_found, 0, "{served:?}");
 }
 
 /// While the task waits on storage, the scheduler alone looks deadlocked,
@@ -570,15 +637,32 @@ fn an_overdue_deferral_expires_before_later_facts() {
     }
 }
 
-/// A run cut off while the obligation is deferred is inconclusive.
+/// A budget that ends while the obligation is deferred leaves it to the
+/// drain, whose clock reaches the task's timer at the deadline, where the
+/// discharge is in time.
 #[test]
-fn a_run_cut_off_while_deferred_is_inconclusive() {
+fn the_drain_discharges_an_obligation_deferred_at_the_budget() {
     let report = run_for(&[Fact(Wait), Fact(Defer(1)), Sleep(1), Fact(Done)], 1);
+    assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
+    assert!(
+        matches!(outcome(&report, SERVED), PropertyOutcome::Held { .. }),
+        "{:?}",
+        outcome(&report, SERVED)
+    );
+}
+
+/// A deferred deadline earlier than every timer and boundary is reached
+/// first: the drain's clock lands just past it, and the obligation expires
+/// there, before the task's later timer could discharge it.
+#[test]
+fn the_drain_reaches_a_deferred_deadline_before_a_later_timer() {
+    let report = run_for(&[Fact(Wait), Fact(Defer(1)), Sleep(5), Fact(Done)], 1);
+    assert_eq!(report.end.outcome, Outcome::Violation, "{:?}", report.end);
+    let violation = report.end.violation.as_ref().expect("it violated");
+    assert_eq!(violation.property, SERVED);
     assert_eq!(
-        outcome(&report, SERVED),
-        PropertyOutcome::Inconclusive {
-            reason: "obligation-open".to_owned()
-        }
+        report.picks.last().map(|pick| pick.identity.as_str()),
+        Some("advance-time:1000001")
     );
 }
 
@@ -614,8 +698,10 @@ fn a_view_trigger_history_is_judged_on_the_final_view() {
 }
 
 /// A trigger that only the scheduler's shutdown reaches isn't the judged
-/// run's. The run ends with the task stopped at a lock, and shutdown
-/// resumes it to its poll boundary, past the wait it records next.
+/// run's. The run is cut with the task stopped at a lock and no drain to
+/// resume it, which fails it at the drain's bound, so the wait it would
+/// record next never counts, though shutdown resumes it to its poll
+/// boundary.
 #[test]
 fn a_trigger_only_shutdown_reaches_is_lost() {
     let cut = WitnessScenario::<Stamped> {
@@ -627,9 +713,12 @@ fn a_trigger_only_shutdown_reaches_is_lost() {
         },
         input: Plan::from_fuzz(&[]),
     };
-    assert_eq!(
-        witness(cut, SERVED, Expect::Holds),
-        Err(WitnessError::LostTriggerHistory)
+    assert!(
+        matches!(
+            witness(cut, SERVED, Expect::Holds),
+            Err(WitnessError::HarnessEnd(failure)) if failure.starts_with("drain-bound:")
+        ),
+        "the cut fails at the drain's bound"
     );
 }
 
@@ -674,7 +763,9 @@ fn the_view_is_read_only_for_a_fitting_report() {
             UNDECLARED,
             Expect::Holds
         ),
-        Err(WitnessError::Outcome(PropertyOutcome::NotApplicable))
+        Err(WitnessError::Outcome(PropertyOutcome::not_applicable(
+            NaReason::Undeclared
+        )))
     );
     assert!(matches!(
         witness(

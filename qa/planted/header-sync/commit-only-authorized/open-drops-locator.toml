@@ -1,0 +1,11 @@
+# The subscriber's built Open replaces its second locator with another hash,
+# keeping the first, so the start cursor still matches. The reactor's own
+# copy of the locator stays right.
+# The reactor, the subscriber and the queue decide how the witness's rounds
+# start and stage, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

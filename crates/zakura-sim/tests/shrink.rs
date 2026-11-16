@@ -22,7 +22,7 @@ use zakura_sim::{
     action::Boundary,
     harness::{self, entry, run_harness, HarnessEntry, RecordInput, Subsystem},
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Status, TriggerHistory, Verdict},
-    record::{DrawRecord, Record, StepRecord},
+    record::{DrawRecord, Record, StepRecord, FULL_REPORT_FILE},
     trace::{
         replay_explained_with, replay_with,
         shrink::{
@@ -214,6 +214,17 @@ impl ActionSource for Owners {
                 });
             }
         }
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 
@@ -501,10 +512,15 @@ fn padded_stale_owner_shrinks_to_its_witness() {
     let derived = reduced.meta.derived_from.as_ref().unwrap();
     assert_eq!(derived.trace, original.id);
 
-    // The output keeps the original, the best plan and the reduction log.
+    // The output keeps the original, with its full report, the best plan
+    // and the reduction log.
     assert_eq!(
         std::fs::read(out.path().join(ORIGINAL_DIR).join(TRACE_FILE)).unwrap(),
         std::fs::read(dir.path().join(TRACE_FILE)).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(out.path().join(ORIGINAL_DIR).join(FULL_REPORT_FILE)).unwrap(),
+        std::fs::read(dir.path().join(FULL_REPORT_FILE)).unwrap()
     );
     let best: Plan =
         serde_json::from_slice(&std::fs::read(out.path().join(BEST_PLAN_FILE)).unwrap()).unwrap();
@@ -830,6 +846,17 @@ impl ActionSource for Clock {
             source: "clock".into(),
             event,
         });
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
     }
 }
 

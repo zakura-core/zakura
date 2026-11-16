@@ -12,7 +12,7 @@ use std::{
 
 use futures::FutureExt;
 use proptest::prelude::*;
-use tokio_util::sync::CancellationToken;
+use zakura_rt::sync::CancellationToken;
 
 use super::*;
 use crate::zakura::{

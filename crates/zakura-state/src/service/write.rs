@@ -33,7 +33,7 @@ use zakura_header_chain::{
 
 use crate::{
     constants::MAX_BLOCK_REORG_HEIGHT,
-    request::FinalizableBlock,
+    request::{ContextuallyVerifiedBlock, FinalizableBlock},
     service::{
         check,
         finalized_state::{
@@ -61,9 +61,11 @@ use crate::service::{
     non_finalized_state::Chain,
 };
 
+mod chain_tip_trace;
 mod vct_authentication_sweep;
 mod vct_write_retry;
 
+use chain_tip_trace::ChainTipTrace;
 use vct_authentication_sweep::{recover_commit_boundary, VctAuthenticationSweeper};
 use vct_write_retry::{VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager};
 pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
@@ -1046,16 +1048,25 @@ impl HeaderChainWriter {
 }
 
 fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
+    verified_blocks(state).map(verified_header_ref).collect()
+}
+
+/// The best chain's blocks, lowest height first, without copying their headers.
+fn verified_blocks(
+    state: &NonFinalizedState,
+) -> impl DoubleEndedIterator<Item = &Arc<ContextuallyVerifiedBlock>> + '_ {
     state
         .best_chain()
         .into_iter()
         .flat_map(|chain| chain.blocks.values())
-        .map(|block| VerifiedHeaderRef {
-            height: block.height,
-            hash: block.hash,
-            header: block.header.clone(),
-        })
-        .collect()
+}
+
+fn verified_header_ref(block: &Arc<ContextuallyVerifiedBlock>) -> VerifiedHeaderRef {
+    VerifiedHeaderRef {
+        height: block.height,
+        hash: block.hash,
+        header: block.header.clone(),
+    }
 }
 
 fn verified_headers(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
@@ -1218,19 +1229,25 @@ fn full_state_evidence(
     EvidenceId::from_digest(hasher.finalize().into())
 }
 
-fn classify_verified_change<'a>(
-    old_path: &[VerifiedHeaderRef],
-    new_path: &'a [VerifiedHeaderRef],
-) -> (VerifiedChangeCause, &'a [VerifiedHeaderRef]) {
-    let grows = new_path.len() > old_path.len()
-        && new_path
-            .iter()
-            .zip(old_path)
-            .all(|(new, old)| new.hash == old.hash);
-    if grows {
-        (VerifiedChangeCause::Grow, &new_path[old_path.len()..])
+/// Classifies a verified-path change from the old and new path hashes, lowest height first.
+///
+/// Returns the index in the new path where the changed suffix starts.
+fn classify_verified_change(
+    old_path: impl Iterator<Item = block::Hash>,
+    mut new_path: impl Iterator<Item = block::Hash>,
+) -> (VerifiedChangeCause, usize) {
+    // The path grows when the old path is a strict prefix of the new one.
+    let mut old_len = 0;
+    for old in old_path {
+        if new_path.next() != Some(old) {
+            return (VerifiedChangeCause::Reset, 0);
+        }
+        old_len += 1;
+    }
+    if new_path.next().is_some() {
+        (VerifiedChangeCause::Grow, old_len)
     } else {
-        (VerifiedChangeCause::Reset, new_path)
+        (VerifiedChangeCause::Reset, 0)
     }
 }
 
@@ -1241,8 +1258,6 @@ fn verified_request(
     accepted: Frontier,
 ) -> Result<(EvidenceId, Vec<VerifiedHeaderRef>, TransitionRequest), HeaderChainStoreError> {
     let snapshot = writer.runtime.publisher().snapshot();
-    let old_path = verified_path(before);
-    let new_path = verified_path(after);
     let old_frontier = verified_frontier(before, snapshot.frontiers.finalized);
     if old_frontier != snapshot.frontiers.verified_best {
         return Err(HeaderChainStoreError::VerifiedFrontierMismatch {
@@ -1250,12 +1265,19 @@ fn verified_request(
             actual: snapshot.frontiers.verified_best,
         });
     }
-    let best_changed =
-        old_path.last().map(|header| header.hash) != new_path.last().map(|header| header.hash);
+    // Compare hashes in place: copying every retained header reference is most of this cost.
+    let best_changed = verified_blocks(before).next_back().map(|block| block.hash)
+        != verified_blocks(after).next_back().map(|block| block.hash);
     let event_path;
     let event = if best_changed {
-        let (cause, changed_path) = classify_verified_change(&old_path, &new_path);
-        event_path = changed_path.to_vec();
+        let (cause, changed_start) = classify_verified_change(
+            verified_blocks(before).map(|block| block.hash),
+            verified_blocks(after).map(|block| block.hash),
+        );
+        event_path = verified_blocks(after)
+            .skip(changed_start)
+            .map(verified_header_ref)
+            .collect::<Vec<_>>();
         let evidence = full_state_evidence(
             match cause {
                 VerifiedChangeCause::Grow => b"grow",
@@ -1376,7 +1398,6 @@ fn commit_contextual_finalization(
         .snapshot()
         .frontiers
         .verified_best;
-    let new_verified_path = verified_path(&staged);
     finalized_state.commit_finalized_direct_with(
         finalizable,
         prev_note_commitment_trees,
@@ -1386,7 +1407,8 @@ fn commit_contextual_finalization(
             PreparedFullStateTransition::new(
                 evidence,
                 old_frontier,
-                new_verified_path,
+                // Finalization keeps the selected verified tip, so the verified suffix is empty.
+                Vec::new(),
                 staged,
                 Some(batch),
                 request,
@@ -1777,6 +1799,8 @@ struct WriteBlockWorkerTask {
     /// or reorg.
     non_finalized_write_update_sender: UnboundedSender<NonFinalizedWriteUpdate>,
     chain_tip_sender: ChainTipSender,
+    /// Records each committed block that becomes the best tip.
+    chain_tip_trace: ChainTipTrace,
     non_finalized_state_sender: watch::Sender<NonFinalizedState>,
     vct_root_repair_sender: watch::Sender<VctRootRepairStatus>,
     /// Notifies contextual readers after each block commit, rejection, or reconsideration.
@@ -2106,6 +2130,8 @@ impl BlockWriteSender {
         let admission_sender = block_commit_sender.clone();
         let task_failure = Arc::new(BlockWriteFailure::default());
         let worker_task_failure = task_failure.clone();
+        // The trace writer runs on the caller's runtime, because the writer thread has none.
+        let chain_tip_trace = ChainTipTrace::new(finalized_state.db.config().trace_dir.clone());
 
         let span = Span::current();
         let task = std::thread::spawn(move || {
@@ -2119,6 +2145,7 @@ impl BlockWriteSender {
                         invalid_block_reset_sender,
                         non_finalized_write_update_sender,
                         chain_tip_sender,
+                        chain_tip_trace,
                         non_finalized_state_sender,
                         vct_root_repair_sender,
                         block_commit_sender,
@@ -2459,6 +2486,7 @@ impl WriteBlockWorkerTask {
             invalid_block_reset_sender,
             non_finalized_write_update_sender,
             chain_tip_sender,
+            chain_tip_trace,
             non_finalized_state_sender,
             vct_root_repair_sender,
             block_commit_sender,
@@ -3247,7 +3275,9 @@ impl WriteBlockWorkerTask {
                 continue;
             };
 
-            let writer_queue_duration = queued_at.elapsed().as_secs_f64();
+            let writer_started = Instant::now();
+            let writer_queue = writer_started.saturating_duration_since(queued_at);
+            let writer_queue_duration = writer_queue.as_secs_f64();
             metrics::histogram!("state.block_writer.queue.duration_seconds")
                 .record(writer_queue_duration);
             let is_mined = admission.is_some();
@@ -3413,6 +3443,8 @@ impl WriteBlockWorkerTask {
                 .borrow()
                 .evicted_blocks(non_finalized_state);
 
+            let prev_tip_hash = chain_tip_sender.best_tip_hash();
+
             // Committing blocks to the finalized state keeps the same chain,
             // so we can update the chain seen by the rest of the application now.
             //
@@ -3426,6 +3458,17 @@ impl WriteBlockWorkerTask {
                 backup_dir_path.as_deref(),
                 Some(committed_announcement),
             );
+
+            // A committed block is a chain tip, so the best tip changes only to this block.
+            if non_finalized_state.best_tip() == Some((child_height, child_hash)) {
+                chain_tip_trace.tip_published(
+                    (child_height, child_hash),
+                    parent_hash,
+                    prev_tip_hash,
+                    writer_queue,
+                    writer_started.elapsed(),
+                );
+            }
 
             notify_block_committed(block_commit_sender, child_hash);
 

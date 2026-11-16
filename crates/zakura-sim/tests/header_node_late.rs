@@ -30,6 +30,8 @@ use support::inputs;
 use zakura_header_chain::{Frontier, VctRootRepairState, VctRootRepairStatus};
 use zakura_sim::{
     check::after_step,
+    domain::header_sync::STALE_COMPLETION_INERT,
+    harness::header_node::stale::{StaleWindow, Staleness},
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
@@ -45,7 +47,7 @@ use zakura_sim::{
         run_prepared, Subsystem,
     },
     observe::{ReactorCall, ReactorFact, StorageFact, StorageRequest, StorageResult, WorkOwner},
-    Checker, MemorySink, Observation, PlanInput, RunConfig, RunReport, Sim,
+    Checker, MemorySink, Observation, PlanInput, PropertyOutcome, RunConfig, RunReport, Sim,
 };
 use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture, Fault, Outcome};
 
@@ -141,6 +143,28 @@ fn run(scenario: &Budgeted, input: PlanInput) -> (RunReport, Ports) {
     (report, ports)
 }
 
+/// [`run`], but a run whose drain its bound cuts off gives its report too,
+/// for a test that judges only the live phase.
+fn run_to_any_drain(scenario: &Budgeted, input: PlanInput) -> (RunReport, Ports) {
+    let ports = Late::prepare(scenario);
+    let report = match zakura_sim::harness::run_prepared::<Late>(
+        scenario,
+        ports.clone(),
+        input,
+        &mut MemorySink::default(),
+        None,
+    ) {
+        Ok(report) => report,
+        Err(zakura_sim::harness::HarnessError::Run {
+            failure: zakura_sim::HarnessFailure::DrainBound { .. },
+            report,
+        }) => *report,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    (report, ports)
+}
+
 /// What a checker saw of the node's port after each step, from step 0.
 #[derive(Clone, Copy, Debug)]
 struct Seen {
@@ -215,6 +239,26 @@ impl Watch {
     }
 }
 
+/// The stale calls `ports`' tap found in `report`'s run, after checking that
+/// `header-sync/stale-completion-inert` applied and held there: a prepare or
+/// apply ended stale, and each one's handler ran to `Handled` with no
+/// effect on other work.
+fn stale_completion_held(report: &RunReport, ports: &Ports) -> Vec<StaleWindow> {
+    let windows = ports.stale_calls.windows();
+    assert!(!windows.is_empty(), "no call ended stale");
+    assert!(windows.iter().all(|window| window.handled), "{windows:?}");
+    let outcome = report
+        .properties
+        .iter()
+        .find(|property| property.property == STALE_COMPLETION_INERT)
+        .map(|property| &property.outcome);
+    assert!(
+        matches!(outcome, Some(PropertyOutcome::Held { .. })),
+        "{outcome:?}"
+    );
+    windows
+}
+
 /// The reactor's request timeout in a production startup, which every
 /// node's startup keeps.
 fn request_timeout() -> Duration {
@@ -231,6 +275,7 @@ fn request_timeout() -> Duration {
         Some((anchor.height, anchor.hash)),
         zakura_network::zakura::ZakuraHeaderSyncConfig::default(),
         zakura_network::zakura::LOCAL_MAX_MESSAGE_BYTES,
+        zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
     )
     .request_timeout
 }
@@ -978,6 +1023,8 @@ fn old_apply_failure_leaves_the_applying_replacement_alone() {
     );
     for input in inputs(16, 256) {
         let (report, ports) = run(&scenario, input);
+        let stale = stale_completion_held(&report, &ports);
+        assert!(stale.iter().any(|window| window.apply), "{stale:?}");
         let history = History::new(&report, initial_generation(&ports));
         let ops = history.ops();
         let completions = history.completions();
@@ -1212,6 +1259,9 @@ fn prepare_completed_after_replacement_is_inert() {
     let timeout = request_timeout();
     for input in inputs(16, 256) {
         let (report, ports) = run(&scenario, input);
+        // The admission that replaces session 1 retires its round first.
+        let stale = stale_completion_held(&report, &ports);
+        assert!(stale.iter().any(|window| !window.apply), "{stale:?}");
         let history = History::new(&report, initial_generation(&ports));
         let ops = history.ops();
         let completions = history.completions();
@@ -1309,6 +1359,7 @@ fn stale_publisher_release_never_frees_a_replacement_lease() {
             mirrors: vec![MirrorSpec {
                 chain: Chain::default(),
                 dialer: Dialer::Node,
+                max_headers_per_response: None,
             }],
             policy: Policy {
                 holds: vec![
@@ -1441,6 +1492,11 @@ fn stale_publisher_release_never_frees_a_replacement_lease() {
 /// outnumber the late completions so far. Some waiting peer's offer is
 /// refused for capacity before the first late completion, and that peer's
 /// later locator is submitted after it, then paired at its own receipt.
+///
+/// These are live-phase claims. In the drain, with every locator completing
+/// at once, the reactor and its 17 publishers work through about 16,000
+/// steps per millisecond of cached-pass refill, so the drain reaches its
+/// bound, a `DrainBound` failure this test doesn't judge.
 #[test]
 fn locator_permits_wait_for_accepted_work() {
     let scenario = Budgeted {
@@ -1453,6 +1509,7 @@ fn locator_permits_wait_for_accepted_work() {
                         fork: Some(Fork { branch, len: 1 }),
                     },
                     dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
                 })
                 .collect(),
             policy: Policy {
@@ -1477,7 +1534,7 @@ fn locator_permits_wait_for_accepted_work() {
         workers: storage_config().scheduler.workers,
     };
     for input in inputs(8, 256) {
-        let (report, ports) = run(&scenario, input);
+        let (report, ports) = run_to_any_drain(&scenario, input);
         let history = History::new(&report, initial_generation(&ports));
         let ops = history.ops();
         let is_locator = |id: &u64| ops.get(id).is_some_and(|op| op.kind == OpKind::Locator);
@@ -1487,7 +1544,13 @@ fn locator_permits_wait_for_accepted_work() {
         let (mut first_drop, mut late, mut after_drop) = (None, 0, 0);
         let mut first_late = None;
         let mut saturated = false;
-        let facts: Vec<_> = history.facts().collect();
+        // The live phase's facts: the drain retires the holds these claims
+        // are about.
+        let live = report.end.steps - report.end.drain.map_or(0, |drain| drain.steps);
+        let facts: Vec<_> = history
+            .facts()
+            .filter(|(line, ..)| line.step <= live)
+            .collect();
         for (index, (line, seq, fact)) in facts.iter().enumerate() {
             match fact {
                 StorageFact::PermitTaken { id } => {
@@ -1545,12 +1608,26 @@ fn locator_permits_wait_for_accepted_work() {
             !waiting.is_empty(),
             "no offer waited before the first late completion"
         );
+        // A live claim, so the resumed locator is one the live phase both
+        // submitted and saw the call end with, not one the drain finished.
+        let live_submitted: BTreeSet<u64> = facts
+            .iter()
+            .filter_map(|(_, _, fact)| match fact {
+                StorageFact::Submitted { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
         let resumed = history.calls().into_values().any(|call| match call {
             Call {
                 port: ReactorCall::Locator { peer, .. },
-                ended: Some((.., Some(op))),
+                ended: Some((ended, _, _, Some(op))),
                 ..
-            } => waiting.contains(peer.as_str()) && ops[&op].seq > first_late,
+            } => {
+                waiting.contains(peer.as_str())
+                    && ops[&op].seq > first_late
+                    && live_submitted.contains(&op)
+                    && history.lines[ended].step <= live
+            }
             _ => false,
         });
         assert!(
@@ -1756,6 +1833,13 @@ fn held_prepare_outlives_its_retired_owner() {
         let (watch, mut checker) = Watch::new(ports.node.clone());
         let report = run_on(&scenario, &ports, input, &mut checker);
         drop(checker);
+        let stale = stale_completion_held(&report, &ports);
+        assert!(
+            stale
+                .iter()
+                .any(|window| !window.apply && window.why == Staleness::RoundRetired),
+            "{stale:?}"
+        );
         let history = History::new(&report, initial_generation(&ports));
         let ops = history.ops();
         let prepare = nth(&ops, OpKind::Prepare, 1).expect("the node prepared");

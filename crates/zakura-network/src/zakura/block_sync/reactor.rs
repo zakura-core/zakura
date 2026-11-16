@@ -16,7 +16,6 @@ use state::{
 };
 use std::num::NonZeroU64;
 use zakura_node_services::task::spawn_erased_named;
-use zakura_quic::NodeId;
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 mod state;
@@ -223,7 +222,10 @@ pub fn spawn_block_sync_reactor(
     let sequencer_input_decoded_attributed_memory_bytes = Arc::new(AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
     // Shared peer facts are also the exact per-supplier body-retry admission gate.
-    let registry = Arc::new(PeerRegistry::new());
+    let registry = PeerRegistry::new();
+    #[cfg(any(test, zakura_sim))]
+    let registry = registry.with_observer(startup.observer.clone());
+    let registry = Arc::new(registry);
     registry.retain_body_retry_scope(initial_body_scope);
     synchronize_persisted_body_alarm(&registry, committed_view.as_ref());
     let mut retry_jitter_seed = [0u8; 32];
@@ -735,7 +737,7 @@ impl ReactorIO {
                         return None;
                     }
                 }
-                node_id_from_block_peer_id(&peer_id)
+                peer_id.node_id()
             })
             .collect();
         admitted_node_ids.sort_unstable();
@@ -1529,7 +1531,7 @@ impl ReactorIO {
         let started = Instant::now();
         let error = match session.offer_status(status) {
             Ok(StatusSend::Queued) => {
-                delivery.queued(status);
+                delivery.queued(status, now);
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
                 self.trace_status_sent(peer, reason, sent);
                 return true;
@@ -1537,7 +1539,7 @@ impl ReactorIO {
             // The connection's cadence allows the next Status later.
             // Legal pacing is not queue pressure.
             Ok(StatusSend::Deferred(at)) => {
-                delivery.deferred_until(at);
+                delivery.deferred_until(status, now, at);
                 self.trace_message_sent(peer, &msg, "deferred", started.elapsed());
                 return false;
             }
@@ -1884,11 +1886,6 @@ fn cancel_expired_floor_claims(
         }
         cancelled(&claim, released);
     }
-}
-
-pub(super) fn node_id_from_block_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
-    let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
-    NodeId::from_bytes(&bytes).ok()
 }
 
 fn elapsed_ms_u64(duration: Duration) -> u64 {

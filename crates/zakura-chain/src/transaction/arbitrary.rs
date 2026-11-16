@@ -23,7 +23,8 @@ use crate::{
 use itertools::Itertools;
 
 use super::{
-    FieldNotPresent, JoinSplitData, LockTime, Memo, Transaction, UnminedTx, VerifiedUnminedTx,
+    FieldNotPresent, JoinSplitData, JoinSplitPubKey, JoinSplitSig, LockTime, Transaction,
+    UnminedTx, VerifiedUnminedTx,
 };
 
 /// The maximum number of arbitrary transactions, inputs, or outputs.
@@ -518,22 +519,6 @@ impl Transaction {
     }
 }
 
-impl Arbitrary for Memo {
-    type Parameters = ();
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        (vec(any::<u8>(), 512))
-            .prop_map(|v| {
-                let mut bytes = [0; 512];
-                bytes.copy_from_slice(v.as_slice());
-                Memo(Box::new(bytes))
-            })
-            .boxed()
-    }
-
-    type Strategy = BoxedStrategy<Self>;
-}
-
 /// Generates arbitrary [`LockTime`]s.
 impl Arbitrary for LockTime {
     type Parameters = ();
@@ -569,8 +554,8 @@ impl<P: ZkSnarkProof + Arbitrary + 'static> Arbitrary for JoinSplitData<P> {
             .prop_map(|(first, rest, pub_key_bytes, sig_bytes)| Self {
                 first,
                 rest,
-                pub_key: ed25519_zebra::VerificationKeyBytes::from(pub_key_bytes),
-                sig: ed25519_zebra::Signature::from({
+                pub_key: JoinSplitPubKey(pub_key_bytes),
+                sig: JoinSplitSig({
                     let mut b = [0u8; 64];
                     b.copy_from_slice(sig_bytes.as_slice());
                     b

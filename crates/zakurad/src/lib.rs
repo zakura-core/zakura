@@ -59,6 +59,16 @@
 //! features](https://doc.rust-lang.org/cargo/reference/features.html#command-line-feature-options)
 //! are available at compile time:
 //!
+//! ### Verification
+//!
+//! * `sprout`: opt in to Sprout JoinSplit proof and signature verification.
+//!   ZIP 218 disallows JoinSplits from NU7 onward, so post-NU7 snapshots do not
+//!   need it. Enable it to fully verify pre-NU7 blocks above the last checkpoint.
+//!   Builds without it stall on such a block that has a JoinSplit, rather than
+//!   rejecting it. Builds without it also stop maintaining the Sprout note
+//!   commitment tree, and a build with it then refuses that database until its
+//!   tip is past NU7 and the last checkpoint. Disabled by default.
+//!
 //! ### Metrics
 //!
 //! * `prometheus`: export metrics to prometheus.
@@ -115,6 +125,11 @@
 
 #[macro_use]
 extern crate tracing;
+
+// Keep the build-only dependency explicit: it builds the checkpoint utility
+// for acceptance tests, and the feature forwards that utility's build flag.
+#[cfg(any(test, feature = "zakura-checkpoints"))]
+extern crate zakura_utils as _;
 
 /// Error type alias to make working with tower traits easier.
 ///

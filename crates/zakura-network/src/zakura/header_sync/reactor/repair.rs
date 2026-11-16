@@ -513,8 +513,9 @@ impl HeaderSyncReactor {
                     // its place at the front of every candidate list and fail the same send
                     // forever, so the remaining candidates still get their turn.
                     VctRepairRetryAttribution::Local => RepairAttempt::SendFailed { local: true },
-                    VctRepairRetryAttribution::Stale => {
-                        unreachable!("ordered-send failures cannot report a stale state episode")
+                    VctRepairRetryAttribution::Stale
+                    | VctRepairRetryAttribution::CarriedTimeout => {
+                        unreachable!("ordered-send failures report neither a stale state episode nor a timeout")
                     }
                 };
             }
@@ -589,8 +590,11 @@ impl HeaderSyncReactor {
                     .expect("the repair request was just started")
             )
         );
-        self.state
-            .arm_request_deadline(peer.clone(), Instant::now(), self.startup.request_timeout);
+        self.state.arm_started_request_deadline(
+            peer.clone(),
+            Instant::now(),
+            self.startup.request_timeout,
+        );
         metrics::counter!("sync.header.vct.repair.requested.total").increment(1);
         metrics::counter!("sync.header.vct.repair.requested.headers")
             .increment(u64::from(request_count));

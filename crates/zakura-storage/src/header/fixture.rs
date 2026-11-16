@@ -13,11 +13,12 @@ use std::{num::NonZeroU64, sync::Arc};
 use chrono::{DateTime, Utc};
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block},
+    ironwood, orchard,
     parameters::Network,
     work::difficulty::{CompactDifficulty, U256},
 };
 use zakura_header_chain::{
-    EngineSnapshot, Frontier, HeaderWorkAuthority, SourceId, TargetCompletion,
+    EngineSnapshot, Frontier, HeaderWorkAuthority, SourceId, TargetCompletion, TreeAuxRecordV1,
 };
 use zakura_node_services::header_chain::{PrepareHeaderTarget, TargetEntry};
 
@@ -220,6 +221,42 @@ impl HeaderFixture {
                 common_ancestor: parent,
             },
         }
+    }
+
+    /// The fixture's tree auxiliary record for the header at `height`. Its
+    /// Sapling count is made up, since admission authenticates none of it,
+    /// and differs by height. Regtest activates neither NU5 nor NU6.3 at a
+    /// fixture height, so its Orchard and Ironwood fields and its auth data
+    /// root take the defaults the wire codec requires before them.
+    pub fn tree_aux(&self, height: block::Height) -> TreeAuxRecordV1 {
+        TreeAuxRecordV1 {
+            height,
+            sapling_root: Default::default(),
+            orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+            ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
+            sapling_tx_count: u64::from(height.0),
+            orchard_tx_count: 0,
+            ironwood_tx_count: 0,
+            auth_data_root: [0; 32].into(),
+        }
+    }
+
+    /// `request` with each entry carrying the fixture's record for its
+    /// height ([`Self::tree_aux`]), as a supplier that has the header's
+    /// tree roots sends it.
+    pub fn with_tree_aux(&self, mut request: PrepareHeaderTarget) -> PrepareHeaderTarget {
+        let parent = request.common_ancestor.height.0;
+        let mut entries = request.entries.into_vec();
+        for (offset, entry) in (1..).zip(&mut entries) {
+            let height = parent
+                .checked_add(offset)
+                .expect("fixture heights stay small");
+            entry.tree_aux = Some(self.tree_aux(block::Height(height)));
+        }
+        request.entries = entries
+            .try_into()
+            .expect("the request's own entries fit the transition cap");
+        request
     }
 }
 

@@ -1,0 +1,18 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/protocol.rs b/crates/zakura-network/src/zakura/discovery/protocol.rs
+index c60b86a718..e625ca708e 100644
+--- a/crates/zakura-network/src/zakura/discovery/protocol.rs
++++ b/crates/zakura-network/src/zakura/discovery/protocol.rs
+@@ -1098,9 +1098,10 @@ pub(super) fn hello_verdict(error: &DiscoveryBookError) -> RecordVerdict {
+             | DiscoveryRecordError::WrongNetwork
+             | DiscoveryRecordError::WrongChain
+             | DiscoveryRecordError::IncompatibleProtocol => RecordVerdict::Disconnect,
+-            DiscoveryRecordError::Expired | DiscoveryRecordError::FarFutureExpiry => {
+-                RecordVerdict::Drop
+-            }
++            // Planted bypass: the node closes on an expired `Hello`, which a
++            // conformant peer may send.
++            DiscoveryRecordError::Expired => RecordVerdict::Disconnect,
++            DiscoveryRecordError::FarFutureExpiry => RecordVerdict::Drop,
+         },
+         DiscoveryBookError::MismatchedConnectedPeerRecord => RecordVerdict::Disconnect,
+         DiscoveryBookError::SelfRecord

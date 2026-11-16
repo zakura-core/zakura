@@ -1,6 +1,6 @@
 [package]
 name = "zakura-chain"
-version = "13.0.1"
+version = "16.0.0"
 authors.workspace = true
 description = "Core Zcash data structures for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -26,6 +26,7 @@ json-conversion = [
 
 # Async error handling convenience traits
 async-error = [
+    "dep:futures",
     "tokio/rt",
 ]
 
@@ -35,6 +36,7 @@ internal-miner = ["equihash/solver"]
 # Test-only features
 
 proptest-impl = [
+    "dep:futures",
     "proptest",
     "proptest-derive",
     "rand_chacha_10",
@@ -62,6 +64,7 @@ rand_core = { workspace = true, features = ["getrandom"] }
 rand_chacha_10 = { workspace = true, optional = true }
 rand_core_10 = { workspace = true, optional = true }
 ripemd = { workspace = true }
+ring = { workspace = true }
 # Matches version used by hdwallet
 secp256k1 = { workspace = true, features = ["serde"] }
 sha2 = { workspace = true, features = ["compress"] }
@@ -92,13 +95,12 @@ hex = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["serde_derive", "rc"] }
 
 # Processing
-futures = { workspace = true }
+futures = { workspace = true, optional = true }
 itertools = { workspace = true }
 rayon = { workspace = true }
 ref-cast = { workspace = true }
 
 # ZF deps
-ed25519-zebra = { workspace = true }
 redjubjub = { workspace = true }
 reddsa = { workspace = true }
 
@@ -116,6 +118,7 @@ zakura-test = { path = "../zakura-test/", version = "4.0.0", optional = true }
 bounded-vec = { version = "0.9.0", features = ["serde"] }
 
 [dev-dependencies]
+futures = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 
@@ -139,6 +142,11 @@ zakura-test = { path = "../zakura-test/", version = "4.0.0" }
 
 [[bench]]
 name = "block"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "block_encoding"
 harness = false
 required-features = ["bench"]
 

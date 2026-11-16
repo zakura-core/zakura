@@ -1,0 +1,14 @@
+# The reactor saves its adopted snapshot when it dispatches an apply, and
+# installs that saved snapshot in the refresh after the apply's completion
+# instead of reading its committed watch. The witness's apply commits with
+# its reply held across a reset the reactor adopts, so the refresh moves
+# the reactor's adoption back below the reset's.
+# The reactor and the queue decide when the apply's reply is handled
+# against the reset's adoption, so a change there can move the witness
+# off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-chain-pre-reset-commit.json"
+plan = "crates/zakura-sim/tests/fixtures/header-chain-pre-reset-commit.plan"

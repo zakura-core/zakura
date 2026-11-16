@@ -1,0 +1,19 @@
+diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
+index aea707b24c..2755665b04 100644
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -2698,6 +2698,14 @@ fn admit_inbound_message(
+                 None,
+             );
+         }
++        // Planted bypass: discovery's reader closes a peer that empties the
++        // `hello` cadence bucket, with a fault cause.
++        if charge == CadenceCharge::Exhausted
++            && rules == crate::zakura::discovery::wire::RULES
++            && rule.name == "hello"
++        {
++            return InboundMessageAdmission::Oversize;
++        }
+         return InboundMessageAdmission::Admit;
+     }
+ 

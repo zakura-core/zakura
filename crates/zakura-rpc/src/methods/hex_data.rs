@@ -1,10 +1,22 @@
-//! Deserializes hex-encoded inputs such as the one required
-//! for the `submitblock` RPC method.
+//! Hex encoding for byte payloads in RPC requests and responses, such as the
+//! blocks in `submitblock` and the transactions in `getblocktemplate`.
+//!
+//! Payloads are megabytes of hex, and the `hex` crate's byte-at-a-time codec
+//! took milliseconds per block. This module uses the SIMD codec from
+//! `const-hex`, while keeping the inputs it accepts and the errors it reports
+//! identical to the `hex` crate's.
+//!
+//! Use it with `#[serde(with = "...::hex_data")]` only for types whose hex form
+//! is their raw bytes in order. Hashes display reversed bytes through their
+//! `hex::ToHex` implementations, so they keep `#[serde(with = "hex")]`.
 
 use std::fmt;
 
 use hex::FromHexError;
-use serde::{de, Deserializer};
+use serde::{de, ser, Deserializer, Serialize, Serializer};
+use serde_json::value::RawValue;
+
+use crate::server::jsonrpc::is_writing_result;
 
 #[cfg(test)]
 mod tests;
@@ -12,54 +24,66 @@ mod tests;
 /// Deserialize hex-encoded strings to bytes.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HexData(
-    #[serde(serialize_with = "hex::serialize", deserialize_with = "deserialize")] pub Vec<u8>,
+    #[serde(serialize_with = "serialize", deserialize_with = "deserialize")] pub Vec<u8>,
 );
 
-/// Maps each ASCII byte to its hex digit value, or `u8::MAX` for a non-hex byte.
-const DECODE: [u8; 256] = {
-    let mut table = [u8::MAX; 256];
-    let mut digit = 0;
-    while digit < 16 {
-        // `digit` is below 16, so it fits in a byte and the lowercase digit is ASCII.
-        let lower = b"0123456789abcdef"[digit];
-        table[lower as usize] = digit as u8;
-        if digit >= 10 {
-            table[b'A' as usize + digit - 10] = digit as u8;
-        }
-        digit += 1;
-    }
-    table
-};
+/// Encodes bytes as lowercase hex, like `hex::encode`.
+pub(crate) fn encode(bytes: impl AsRef<[u8]>) -> String {
+    const_hex::encode(bytes)
+}
 
-/// Decodes hex with a lookup table, returning the same errors as [`hex::FromHex`].
+/// Decodes upper or lower case hex, accepting and rejecting exactly the inputs
+/// `hex::FromHex` does, with the same errors.
+pub(crate) fn decode(hex: &[u8]) -> Result<Vec<u8>, FromHexError> {
+    // `const-hex` strips an optional `0x` prefix, which the `hex` crate rejects.
+    // Report the error `hex` does: an odd length first, then the `x`.
+    if hex.len().is_multiple_of(2) && matches!(hex, [b'0', b'x' | b'X', ..]) {
+        return Err(FromHexError::InvalidHexCharacter {
+            c: char::from(hex[1]),
+            index: 1,
+        });
+    }
+    const_hex::decode(hex).map_err(|error| match error {
+        const_hex::FromHexError::InvalidHexCharacter { c, index } => {
+            FromHexError::InvalidHexCharacter { c, index }
+        }
+        const_hex::FromHexError::OddLength => FromHexError::OddLength,
+        const_hex::FromHexError::InvalidStringLength => FromHexError::InvalidStringLength,
+    })
+}
+
+/// Serializes bytes as a hex string, like `hex::serialize`.
 ///
-/// Submitted blocks are megabytes of hex, and the `hex` crate's decoder took tens of
-/// milliseconds per block on the `submitblock` path.
-fn decode(hex: &[u8]) -> Result<Vec<u8>, FromHexError> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(FromHexError::OddLength);
+/// In a method's response, the string is written as finished JSON. Hex has no characters that
+/// JSON escapes, and looking for them one byte at a time took as long as the rest of a full block
+/// template's encoding.
+pub(crate) fn serialize<S, T>(bytes: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: AsRef<[u8]>,
+{
+    if !is_writing_result() {
+        return serializer.serialize_str(&encode(bytes));
     }
 
-    let mut decoded = vec![0; hex.len() / 2];
-    for (index, (pair, byte)) in hex.as_chunks::<2>().0.iter().zip(&mut decoded).enumerate() {
-        let high = DECODE[usize::from(pair[0])];
-        let low = DECODE[usize::from(pair[1])];
-        if high == u8::MAX || low == u8::MAX {
-            let offset = usize::from(high != u8::MAX);
-            return Err(FromHexError::InvalidHexCharacter {
-                c: char::from(pair[offset]),
-                index: index * 2 + offset,
-            });
-        }
-        *byte = (high << 4) | low;
-    }
-    Ok(decoded)
+    let bytes = bytes.as_ref();
+    let mut json = vec![b'"'; bytes.len() * 2 + 2];
+    let hex = json
+        .get_mut(1..=bytes.len() * 2)
+        .expect("the buffer holds the hex between two quotes");
+    const_hex::encode_to_slice(bytes, hex).map_err(ser::Error::custom)?;
+
+    let json = std::str::from_utf8(&json).map_err(ser::Error::custom)?;
+    serde_json::from_str::<&RawValue>(json)
+        .map_err(ser::Error::custom)?
+        .serialize(serializer)
 }
 
 /// Deserializes a hex string into bytes, like `hex::deserialize`.
-fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+pub(crate) fn deserialize<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
+    T: From<Vec<u8>>,
 {
     struct HexVisitor;
 
@@ -75,5 +99,5 @@ where
         }
     }
 
-    deserializer.deserialize_str(HexVisitor)
+    deserializer.deserialize_str(HexVisitor).map(T::from)
 }

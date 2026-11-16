@@ -1,0 +1,11 @@
+# An apply names another source than the prepare that sealed its target,
+# with the right owner and target.
+# The reactor, the queue and the storage port decide how the witness's
+# rounds stage, prepare and apply, so a change there can move the witness
+# off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

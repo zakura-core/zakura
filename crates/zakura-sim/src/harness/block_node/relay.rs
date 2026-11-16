@@ -352,6 +352,7 @@ impl Labeller {
                 rule_stream: stream(),
                 label,
                 exhausted: extra.exhausted,
+                exchange: None,
             },
         };
         (obs, extra)

@@ -822,6 +822,63 @@ async fn a_retention_deferral_retires_a_request_another_peer_already_answered() 
     .await;
 }
 
+/// Another peer's body ends this routine's request reservation, and the
+/// request keeps the height. The routine's snapshot omits the height, because
+/// the budget no longer counts it (zakura-core/zakura#2265's
+/// `sync-wire-combined-reorg-request-stall` seed).
+#[tokio::test]
+async fn a_snapshot_omits_a_height_another_peer_answered() {
+    use super::super::block_sync_observe::{BlockEvent, BlockSyncObserver, ObserverSlot};
+
+    #[derive(Debug, Default)]
+    struct Snapshots(std::sync::Mutex<Vec<Vec<(block::Height, bool)>>>);
+    impl BlockSyncObserver for Snapshots {
+        fn observe(&self, event: BlockEvent) {
+            if let BlockEvent::Routine(snapshot) = event {
+                let heights = snapshot
+                    .requests
+                    .iter()
+                    .flat_map(|request| &request.heights)
+                    .map(|height| (height.height, height.received))
+                    .collect();
+                self.0.lock().unwrap().push(heights);
+            }
+        }
+    }
+
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let height = block.coinbase_height().unwrap();
+    let (routine, mut outbound, _pool, _connection, _events) = requester_routine(block.hash());
+    let snapshots = Arc::new(Snapshots::default());
+    let mut routine = routine.with_observer(ObserverSlot(Some(snapshots.clone())));
+    routine.try_fill();
+    next_sent(&mut outbound).await;
+    routine.observe_owners(false);
+    let owner = routine
+        .state
+        .window
+        .outstanding
+        .first()
+        .unwrap()
+        .request
+        .owner;
+    let released = routine
+        .io
+        .work
+        .begin_competing_receipt(owner, height)
+        .unwrap()
+        .expect("the request still owns its reserved height");
+    drop(released);
+    routine.observe_owners(false);
+
+    assert_eq!(routine.state.window.outstanding.len(), 1);
+    assert_eq!(
+        *snapshots.0.lock().unwrap(),
+        [vec![(height, false)], vec![]],
+        "the first snapshot lists the charged height, the second omits it"
+    );
+}
+
 /// A peer that keeps the receive arm ready cannot postpone the deadline for an
 /// ending it withholds after sending every body.
 #[tokio::test(start_paused = true)]

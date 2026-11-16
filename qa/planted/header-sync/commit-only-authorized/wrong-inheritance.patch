@@ -1,0 +1,86 @@
+diff --git a/crates/zakura-header-chain/src/graph/mod.rs b/crates/zakura-header-chain/src/graph/mod.rs
+index 3fb67ac561..9d147ea227 100644
+--- a/crates/zakura-header-chain/src/graph/mod.rs
++++ b/crates/zakura-header-chain/src/graph/mod.rs
+@@ -1259,6 +1259,13 @@ impl MemHeaderStore {
+         Ok(deleted)
+     }
+ 
++    /// Mutation helper: points `hash`'s inherited ineligibility at `from`.
++    pub(crate) fn planted_inherit(&mut self, hash: block::Hash, from: block::Hash) {
++        if let Some(node) = self.nodes.get_mut(&hash) {
++            node.eligibility.inherited_from = Some(from);
++        }
++    }
++
+     pub(crate) fn remove_header_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError> {
+         let node = self
+             .nodes
+diff --git a/crates/zakura-header-chain/src/transition/engine/mod.rs b/crates/zakura-header-chain/src/transition/engine/mod.rs
+index 50346354a1..003ce7e098 100644
+--- a/crates/zakura-header-chain/src/transition/engine/mod.rs
++++ b/crates/zakura-header-chain/src/transition/engine/mod.rs
+@@ -355,6 +355,22 @@ impl HeaderChainEngine {
+         Ok(())
+     }
+ 
++    /// Mutation: a header that inherits ineligibility names the finalized
++    /// anchor as its source instead of its ineligible parent, so it stays
++    /// ineligible with the wrong source.
++    pub fn planted_corrupt(&mut self) {
++        let anchor = self.metadata.frontiers.finalized.hash;
++        let wrong: Vec<block::Hash> = self
++            .graph
++            .header_nodes()
++            .filter(|node| node.eligibility.inherited_from.is_some())
++            .map(|node| node.hash)
++            .collect();
++        for hash in wrong {
++            self.graph.planted_inherit(hash, anchor);
++        }
++    }
++
+     /// Return the private identity of this exact in-memory source revision.
+     pub(crate) fn transition_source(&self) -> EngineTransitionSource {
+         EngineTransitionSource {
+diff --git a/crates/zakura-storage/src/header/adapter.rs b/crates/zakura-storage/src/header/adapter.rs
+index 0b178bb334..ee3d06b5be 100644
+--- a/crates/zakura-storage/src/header/adapter.rs
++++ b/crates/zakura-storage/src/header/adapter.rs
+@@ -873,6 +873,12 @@ impl EnginePort {
+         engine
+             .install_committed_transition(transition)
+             .map_err(|error| local_resource(owner, Some(Box::new(error))))?;
++        // Mutation: a node round's apply corrupts the engine after its
++        // install. The fixture's own preload, under its fixed source,
++        // applies faithfully.
++        if source != SourceId::from_digest([7; 32]) {
++            engine.planted_corrupt();
++        }
+         let updates = hint_updates(&engine, hints);
+         self.publish_locked(after, effect, updates);
+         drop(engine);
+diff --git a/crates/zakura-storage/src/header/adapter/full_state.rs b/crates/zakura-storage/src/header/adapter/full_state.rs
+index 203b713b5a..e853202e9b 100644
+--- a/crates/zakura-storage/src/header/adapter/full_state.rs
++++ b/crates/zakura-storage/src/header/adapter/full_state.rs
+@@ -217,14 +217,17 @@ impl EnginePort {
+         let mut authority = PreparedAuthority::for_event(&request.event)?;
+         authority.retention_references = tips.clone();
+         authority.verified_tip = Some(verified);
+-        self.apply_locked(
++        let applied = self.apply_locked(
+             &mut engine,
+             request,
+             &authority,
+             &tips,
+             Some(verified),
+             || {},
+-        )
++        );
++        // Mutation: an operator reset corrupts the engine after it commits.
++        engine.planted_corrupt();
++        applied
+     }
+ 
+     /// Whether an operator invalidation of `target` is in force. See

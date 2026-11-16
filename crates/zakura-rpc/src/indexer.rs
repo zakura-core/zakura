@@ -2,7 +2,7 @@
 
 use zakura_chain::{
     block,
-    serialization::{BytesInDisplayOrder, ZcashDeserializeInto, ZcashSerialize},
+    serialization::{BytesInDisplayOrder, ZcashSerialize},
 };
 use zakura_node_services::block_memory::BlockHandle;
 
@@ -55,6 +55,16 @@ impl BlockAndHash {
         }
     }
 
+    /// Creates a new [`BlockAndHash`] from a block's hash and its Zcash
+    /// consensus serialization, without decoding the block.
+    pub fn from_serialized(hash: block::Hash, data: Vec<u8>) -> Self {
+        BlockAndHash {
+            hash: hash.bytes_in_display_order().to_vec(),
+            data,
+            receipt_order: None,
+        }
+    }
+
     /// Try to convert a [`BlockAndHash`] into a tuple of a decoded block and hash.
     pub fn decode(self) -> Option<(block::Block, block::Hash)> {
         self.hash
@@ -68,8 +78,7 @@ impl BlockAndHash {
             })
             .ok()
             .and_then(|hash| {
-                self.data
-                    .zcash_deserialize_into()
+                block::Block::zcash_deserialize_bounded(&mut self.data.as_slice())
                     .map_err(|err| tracing::warn!(?err, "failed to deserialize block",))
                     .ok()
                     .and_then(|block: block::Block| {
@@ -97,8 +106,7 @@ impl BlockAndHeight {
             })
             .ok()
             .and_then(|height| {
-                self.data
-                    .zcash_deserialize_into()
+                block::Block::zcash_deserialize_bounded(&mut self.data.as_slice())
                     .map_err(|err| tracing::warn!(?err, "failed to deserialize block",))
                     .ok()
                     .zip(Some(height))

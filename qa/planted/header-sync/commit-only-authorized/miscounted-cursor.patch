@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+index 9e66052092..bb96b4086c 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+@@ -389,7 +389,9 @@ impl SubscriberState {
+             height: block::Height(height),
+             hash: last_hash,
+             headers: consumed.objects.saturating_add(u64::from(count)),
+-            bytes: consumed.bytes.saturating_add(payload_len as u64),
++            // Mutation: the recorded cursor counts one byte more than the
++            // pages consumed.
++            bytes: consumed.bytes.saturating_add(payload_len as u64) + 1,
+         };
+         if transport_admits {
+             tools.claim_admitted_page(&live.id, count, payload_len, cursor)?;

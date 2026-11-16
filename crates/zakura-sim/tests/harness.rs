@@ -8,6 +8,7 @@ use std::{cell::Cell, collections::BTreeSet, path::Path, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zakura_rt::{task::yield_now, time::sleep};
+use zakura_sim::NaReason;
 use zakura_sim::{
     check::{self, StepCtx, Violation},
     harness::{
@@ -85,13 +86,18 @@ fn a_scenario_that_does_not_fit_is_refused() {
 /// What [`Probe`]'s one task does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Behavior {
-    /// Yields forever, so the clock never moves.
+    /// Yields [`SPIN_YIELDS`] times, past the budget, so the clock never
+    /// moves, then finishes in the drain.
     Spin,
     /// Sleeps forever, 1 ms at a time.
     Sleep,
     /// Panics on its first poll.
     Panic,
 }
+
+/// How often [`Behavior::Spin`] yields: past [`Probe`]'s 1,000-step budget,
+/// and within its 100-step drain.
+const SPIN_YIELDS: u32 = 1_050;
 
 /// One task that behaves as the scenario says, under a scenario that
 /// declares `BoundedAdversary`.
@@ -111,10 +117,13 @@ impl Subsystem for Probe {
     type Scenario = Behavior;
     type Prepared = ();
 
+    /// No harness timer cap, so the drain doesn't follow the sleeper's
+    /// timers once nothing is open.
     fn config(_: &Behavior) -> RunConfig {
         RunConfig {
             budget: 1_000,
             drain_bound: 100,
+            harness_timer_cap: Duration::ZERO,
             ..RunConfig::default()
         }
     }
@@ -126,9 +135,11 @@ impl Subsystem for Probe {
         let behavior = *behavior;
         sim.scheduler().spawn_root("probe", async move {
             match behavior {
-                Behavior::Spin => loop {
-                    yield_now().await;
-                },
+                Behavior::Spin => {
+                    for _ in 0..SPIN_YIELDS {
+                        yield_now().await;
+                    }
+                }
                 Behavior::Sleep => loop {
                     sleep(Duration::from_millis(1)).await;
                 },
@@ -257,9 +268,7 @@ fn livelock_waits_for_its_assumption() {
     assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
     assert_eq!(
         *outcome(&report, NO_LIVELOCK),
-        PropertyOutcome::Inconclusive {
-            reason: "assumptions-never-held".to_owned()
-        }
+        PropertyOutcome::not_applicable(NaReason::AssumptionsNeverHeld)
     );
 }
 

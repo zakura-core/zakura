@@ -18,7 +18,7 @@ use zakura_rt::{
 };
 
 use super::{DiscoveryDialResult, ZAKURA_DISCOVERY_DIAL_INTERVAL};
-use crate::zakura::{canonical_ip, discovery::ZakuraDiscoveryDialCandidate};
+use crate::zakura::{admission_host, canonical_ip, discovery::ZakuraDiscoveryDialCandidate};
 
 /// The identity of one candidate dial attempt.
 ///
@@ -124,14 +124,16 @@ pub(super) fn classify_dial(
 pub(super) struct CandidateAddress {
     /// The address to dial.
     pub(super) addr: SocketAddr,
-    /// The canonical IP that the reservation counts.
+    /// The address's canonical IP. Failure backoff counts the IP itself, and
+    /// the reservation counts its admission host (see [`admission_host`]).
     pub(super) ip: IpAddr,
 }
 
 #[derive(Debug)]
 struct InFlightDial {
     sequence: u64,
-    /// The IPs this attempt reserved when the dialer recorded it.
+    /// The canonical IPs this attempt dialed when the dialer recorded it. It
+    /// reserved each of their admission hosts once.
     reserved_ips: Vec<IpAddr>,
 }
 
@@ -142,8 +144,10 @@ struct InFlightDial {
 /// it advertises. Keying failure backoff by IP alone would let an attacker sign
 /// throwaway node ids that all advertise an honest peer's IP and, by failing
 /// those dials, back that IP off for every legitimate candidate that shares it.
-/// The in-flight reservation cap (`in_flight_by_ip`) stays IP-scoped because it
-/// bounds a real local resource (concurrent dials to one address).
+/// It keys the exact canonical IP, so a failing address doesn't back off the
+/// other addresses of its IPv6 /64. Only the in-flight reservation cap
+/// (`in_flight_by_ip`) keys the [`admission_host`], because it mirrors the
+/// supervisor's per-host connection cap.
 #[derive(Copy, Clone, Debug)]
 struct DiscoveryIpBackoff {
     failure_count: u32,
@@ -162,7 +166,7 @@ pub(super) struct CandidateDialerState {
     backoff_max: Duration,
     /// At most one attempt per node.
     in_flight: HashMap<NodeId, InFlightDial>,
-    /// The number of in-flight attempts that reserved each canonical IP.
+    /// The number of in-flight attempts that reserved each admission host.
     in_flight_by_ip: HashMap<IpAddr, usize>,
     backoff_by_node_ip: HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
     /// The earliest time the next round may start, or `None` before the
@@ -218,23 +222,27 @@ impl CandidateDialerState {
         self.in_flight.keys().copied().collect()
     }
 
-    /// Returns the number of in-flight attempts that reserved `ip`.
-    ///
-    /// `ip` must be canonical, as [`CandidateAddress::ip`] is.
+    /// Returns the number of in-flight attempts that reserved `ip`'s
+    /// admission host.
     pub(super) fn in_flight_dials_to(&self, ip: IpAddr) -> usize {
-        self.in_flight_by_ip.get(&ip).copied().unwrap_or_default()
+        self.in_flight_by_ip
+            .get(&admission_host(ip))
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Returns the addresses of `candidate` that the dialer may reserve at
     /// `now`, before the supervisor's per-IP check.
     ///
-    /// The endpoint starts one handshake per address, but the reservation
-    /// counts one per IP. Dialing only the first address of each IP, in the
-    /// candidate's order, keeps the two equal, so a record can't list many
-    /// ports on one IP to multiply handshakes past the per-IP cap. The book
-    /// orders a candidate's addresses dialed first, then confirmed, then the
-    /// rest, each group in record order. An IP in backoff for this node yields
-    /// no address.
+    /// Dialing only the first address of each IP, in the candidate's order,
+    /// keeps a record from listing many ports on one IP to multiply
+    /// handshakes. Distinct IPs in one IPv6 /64 are each dialed, so one
+    /// unreachable address doesn't hide the rest, but the attempt reserves
+    /// their /64 once, since it can register at most one connection. A record
+    /// lists at most `MAX_DIRECT_ADDRS_PER_RECORD` addresses. The book orders a
+    /// candidate's addresses dialed first, then confirmed, then the rest, each
+    /// group in record order. An IP in backoff for this node yields no
+    /// address.
     pub(super) fn candidate_addresses(
         &self,
         candidate: &ZakuraDiscoveryDialCandidate,
@@ -263,8 +271,9 @@ impl CandidateDialerState {
             .is_some_and(|backoff| now < backoff.retry_at)
     }
 
-    /// Records an attempt to `node_id` that reserves `reserved_ips`, the
-    /// canonical IPs the supervisor accepted.
+    /// Records an attempt to `node_id` that dials `reserved_ips`, the
+    /// canonical IPs the supervisor accepted, and reserves their admission
+    /// hosts.
     ///
     /// Returns `None`, and records nothing, when `reserved_ips` is empty or
     /// the node already has an attempt in flight.
@@ -290,10 +299,10 @@ impl CandidateDialerState {
         Some(DialAttemptKey { node_id, sequence })
     }
 
-    /// Counts one more in-flight attempt on each of `ips`.
+    /// Counts one more in-flight attempt on each admission host among `ips`.
     fn reserve(&mut self, ips: &[IpAddr]) {
-        for ip in ips {
-            let count = self.in_flight_by_ip.entry(*ip).or_default();
+        for host in admission_hosts(ips) {
+            let count = self.in_flight_by_ip.entry(host).or_default();
             *count = count
                 .checked_add(1)
                 .expect("attempts in flight fit usize: each node has at most one");
@@ -328,16 +337,16 @@ impl CandidateDialerState {
                     .map_or(after_limit, |at| at.max(after_limit)),
             );
         }
-        for ip in &attempt.reserved_ips {
+        for host in admission_hosts(&attempt.reserved_ips) {
             let count = self
                 .in_flight_by_ip
-                .get_mut(ip)
-                .expect("an in-flight attempt keeps a count on each IP it reserved");
+                .get_mut(&host)
+                .expect("an in-flight attempt keeps a count on each host it reserved");
             *count = count
                 .checked_sub(1)
                 .expect("a kept count includes this attempt");
             if *count == 0 {
-                self.in_flight_by_ip.remove(ip);
+                self.in_flight_by_ip.remove(&host);
             }
         }
         self.apply_backoff(key.node_id, &attempt.reserved_ips, admitted_ip, result, now);
@@ -389,6 +398,19 @@ impl CandidateDialerState {
             DiscoveryDialResult::LocalResourceLimit => {}
         }
     }
+}
+
+/// The distinct admission hosts of `ips`, in first-seen order. An attempt
+/// reserves each host once however many of its addresses it dials.
+fn admission_hosts(ips: &[IpAddr]) -> Vec<IpAddr> {
+    let mut hosts = Vec::with_capacity(ips.len());
+    for ip in ips {
+        let host = admission_host(*ip);
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
 }
 
 fn discovery_ip_dial_backoff(

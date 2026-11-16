@@ -148,16 +148,30 @@ test_harness!(
     "test/spinner",
     |sim| {
         sim.scheduler().spawn_root("spinner", async {
-            // Nothing ever stores, and every load is a point, so cleanup
-            // gets stuck and shutdown abandons the run.
-            let flag = AtomicU64::new(0);
-            while flag.load(SeqCst) == 0 {}
+            // It waits for good, so the run ends dry, and spins once
+            // shutdown drops it.
+            let _spin = SpinOnDrop;
+            std::future::pending::<()>().await;
         });
     },
     Vec::new()
 );
 
 static SPINNER: HarnessEntry = entry::<Spinner>();
+
+/// Spins once dropped. Nothing ever stores, and every load is a point, so
+/// the shutdown that drops it gets stuck, and abandons the run. A task that
+/// spun live would instead keep its drain from running dry, which fails the
+/// run as `DrainBound`.
+struct SpinOnDrop;
+
+impl Drop for SpinOnDrop {
+    /// Spins on a value no one sets.
+    fn drop(&mut self) {
+        let flag = AtomicU64::new(0);
+        while flag.load(SeqCst) == 0 {}
+    }
+}
 
 /// `input`'s scenario prefix, zero-padded, as `run_bytes` draws it.
 fn prefix(entry: &HarnessEntry, input: &[u8]) -> Vec<u8> {
@@ -316,6 +330,7 @@ fn synthetic(
             }),
             drain: None,
             harness,
+            rest: None,
         },
         properties,
         cleanup: CleanupReport {
@@ -504,6 +519,11 @@ impl Checker for ViolatesAtEnd {
             },
         )]
     }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
 }
 
 #[test]
@@ -609,9 +629,13 @@ fn committed_input_records_and_classifies() {
     assert_eq!(fast.report().unwrap().properties, report.properties);
 }
 
-#[test]
-fn a_violation_only_an_extra_checker_reports_keeps_its_scenario() {
-    let mut extra = zakura_sim::check::after_step(|cx: &StepCtx<'_>| {
+/// A checker whose step finds `test/extra` violated and whose end reports
+/// nothing, so only `end.violation` names the property. A closure checker
+/// can't stand in, since it reports every property its step found violated.
+struct ViolatesUnreported;
+
+impl Checker for ViolatesUnreported {
+    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
         Some(Violation {
             property: "test/extra".to_owned(),
             step: cx.step,
@@ -619,7 +643,22 @@ fn a_violation_only_an_extra_checker_reports_keeps_its_scenario() {
             expected: "nothing".to_owned(),
             actual: "a step".to_owned(),
         })
-    });
+    }
+
+    /// Nothing, so no report names the step's finding.
+    fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        Vec::new()
+    }
+
+    /// Nothing: it keeps no obligations.
+    fn unfinished(&self) -> zakura_sim::Unfinished {
+        zakura_sim::Unfinished::default()
+    }
+}
+
+#[test]
+fn a_violation_only_an_extra_checker_reports_keeps_its_scenario() {
+    let mut extra = ViolatesUnreported;
     let run = (PENDING.run_bytes)(&[], &mut NullSink, Some(&mut extra));
     let report = run.report().expect("the harness ran the scenario");
     assert_eq!(

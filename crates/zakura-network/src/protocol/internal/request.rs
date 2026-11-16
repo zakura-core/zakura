@@ -136,7 +136,7 @@ pub enum Request {
     /// Request block data by hashes on a connection that negotiated early block relay.
     ///
     /// Only the connection creates this request, for an inbound `getdata` from a peer that set
-    /// [`PeerServices::NODE_EARLY_BLOCK_RELAY`](crate::PeerServices::NODE_EARLY_BLOCK_RELAY)
+    /// [`PeerServices::NODE_COMPACT_BLOCKS`](crate::PeerServices::NODE_COMPACT_BLOCKS)
     /// while this node set it too. The inbound service may serve early-relay bodies before
     /// their contextual commit; it must never serve them for [`Request::BlocksByHash`].
     /// Outbound callers use [`Request::BlocksByHash`].

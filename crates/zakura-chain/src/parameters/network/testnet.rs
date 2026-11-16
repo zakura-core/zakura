@@ -74,6 +74,7 @@ pub struct ConfiguredFundingStreamRecipient {
 impl ConfiguredFundingStreamRecipient {
     /// Creates a new [`ConfiguredFundingStreamRecipient`] with the provided receiver and default
     /// values for other fields.
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub fn new_for(receiver: FundingStreamReceiver) -> Self {
         use FundingStreamReceiver::*;
         match receiver {
@@ -295,6 +296,7 @@ impl ConfiguredFundingStreams {
     /// # Panics
     ///
     /// If `height_range` is None.
+    #[cfg(test)]
     pub fn into_funding_streams_unchecked(self) -> FundingStreams {
         let height_range = self.height_range.expect("must have height range");
         let recipients = self
@@ -1292,6 +1294,10 @@ impl ParametersBuilder {
     /// builder to a configured [`Network::Testnet`].
     pub fn to_network(self) -> Result<Network, ParametersBuilderError> {
         let network = self.to_network_unchecked();
+        if NetworkUpgrade::Nu7.activation_height(&network).is_some() {
+            super::subsidy::block_subsidy_fraction_numerator(&network)
+                .map_err(|_| ParametersBuilderError::InvalidReissuanceFraction)?;
+        }
 
         // Final check that the configured funding streams will be valid for these Testnet parameters.
         // The network holds the height ranges after NU7 moves the inherited ones.

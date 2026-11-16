@@ -715,6 +715,29 @@ impl WorkQueue {
             .collect()
     }
 
+    /// Return the entries whose height the queue no longer charges to their
+    /// owner, checked under one queue lock: another owner holds the height,
+    /// or the item is `answered_elsewhere`, because another attempt's body
+    /// ended the owner's reservation. The owner's request still claims an
+    /// answered height, because its peer still owes the body, but the budget
+    /// no longer counts it.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn uncharged<T: Copy>(
+        &self,
+        entries: &[(block::Height, T)],
+        owner_of: impl Fn(&T) -> zakura_header_chain::BodyWorkOwner,
+    ) -> Vec<(block::Height, T)> {
+        let inner = self.lock();
+        entries
+            .iter()
+            .filter(|(height, entry)| {
+                inner.state.owner_for_height(*height) != Some(owner_of(entry))
+                    || inner.state.answered_elsewhere(*height)
+            })
+            .copied()
+            .collect()
+    }
+
     pub(super) fn pending_contains(&self, height: block::Height) -> bool {
         self.lock().state.pending_contains(height)
     }

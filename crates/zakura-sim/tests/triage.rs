@@ -198,10 +198,10 @@ impl Subsystem for Triage {
                 std::process::exit(0);
             }),
             ABANDON_CASE => scheduler.spawn_root("spinner", async {
-                // Nothing ever stores, and every load is a point, so
-                // cleanup gets stuck and shutdown abandons the run.
-                let flag = AtomicU64::new(0);
-                while flag.load(zakura_rt::sync::atomic::Ordering::SeqCst) == 0 {}
+                // It waits for good, so the run ends dry, and spins once
+                // shutdown drops it.
+                let _spin = SpinOnDrop;
+                std::future::pending::<()>().await;
             }),
             _ => scheduler.spawn_root("tick", async {
                 for _ in 0..3 {
@@ -243,6 +243,20 @@ const CHILD: &str = "ZAKURA_SIM_TRIAGE_CHILD";
 
 /// The trace directory [`triage_child`] records to.
 static RECORD_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Spins once dropped. Nothing ever stores, and every load is a point, so
+/// the shutdown that drops it gets stuck, and abandons the run. A task that
+/// spun live would instead keep its drain from running dry, which fails the
+/// run as `DrainBound`.
+struct SpinOnDrop;
+
+impl Drop for SpinOnDrop {
+    /// Spins on a value no one sets.
+    fn drop(&mut self) {
+        let flag = AtomicU64::new(0);
+        while flag.load(zakura_rt::sync::atomic::Ordering::SeqCst) == 0 {}
+    }
+}
 
 /// Records or replays when run as a child, and does nothing otherwise.
 ///

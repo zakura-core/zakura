@@ -9,7 +9,7 @@ struct Hex<T>(T);
 
 impl<T: AsRef<[u8]>> Serialize for Hex<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        hex::serialize(&self.0, serializer)
+        super::hex_data::serialize(&self.0, serializer)
     }
 }
 

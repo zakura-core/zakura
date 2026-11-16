@@ -376,23 +376,22 @@ impl Drop for ReadStateService {
         // TODO: move this into a try_shutdown() method
         if let Some(block_write_task) = self.block_write_task.take() {
             if let Some(block_write_task_handle) = Arc::into_inner(block_write_task) {
+                // This state owns the last reference to the thread, so it waits for the block
+                // write task before shutting the database down. The task's own shutdown then
+                // runs the format check after its last commit.
+                // (We'd also like to abort the thread, but std::thread::JoinHandle can't do that.)
+
+                info!("waiting for the block write task to finish");
+                let block_write_task_result = block_write_task_handle.join();
+
                 // We're the last database user, so we can tell it to shut down (blocking):
-                // - flushes the database to disk, and
+                // - flushes the database to disk, even if the block write task panicked or
+                //   returned early without shutting the database down, and
                 // - drops the database, which cleans up any database tasks correctly.
                 self.db.shutdown(true);
 
-                // This state owns the last reference to the thread.
-                // The state can wait for the block write task and then check for panics.
-                // (We'd also like to abort the thread, but std::thread::JoinHandle can't do that.)
-
-                // This log is verbose during tests.
-                #[cfg(not(test))]
-                info!("waiting for the block write task to finish");
-                #[cfg(test)]
-                debug!("waiting for the block write task to finish");
-
                 // TODO: move this into a check_for_panics() method
-                match block_write_task_handle.join() {
+                match block_write_task_result {
                     Err(thread_panic) => std::panic::resume_unwind(thread_panic),
                     Ok(write::BlockWriteTaskExit::HeaderChainAttachmentFailed(error)) => {
                         tracing::error!(?error, "block write task stopped during header attachment")
@@ -416,6 +415,12 @@ impl Drop for ReadStateService {
 
 impl StateService {
     const PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+    /// How often the state service exports RocksDB metrics and refreshes the disk usage
+    /// estimate returned for [`ReadRequest::UsageInfo`].
+    ///
+    /// These figures are for diagnosis, not detection: slow writes show up on every commit in
+    /// `zakura.state.rocksdb.batch_commit.duration_seconds`.
+    const ROCKSDB_METRICS_EXPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
     // The 1,000-block reorg bound fits every supported usize target.
     const FAILED_ANCESTOR_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
 
@@ -448,6 +453,7 @@ impl StateService {
                         // This database cannot be repaired, and the generic hint below would
                         // send the operator looking at permissions and disk space instead.
                         error @ (StateInitError::VctSproutHistoryUnrepairable
+                        | StateInitError::SproutTreeNotMaintained { .. }
                         | StateInitError::TransparentIndexesMissingInArchiveMode {
                             ..
                         }) => {
@@ -667,13 +673,32 @@ impl StateService {
         tracing::info!("cached state consensus branch is valid: no legacy chain found");
         timer.finish_desc("legacy chain check");
 
-        // Spawn a background task to periodically export RocksDB metrics to Prometheus
+        // Spawn a background task to periodically export RocksDB metrics to Prometheus.
+        //
+        // # Performance
+        //
+        // The export reads database sizes from RocksDB synchronously, which takes milliseconds
+        // on a large database. It runs on the blocking pool, so it never holds an async worker
+        // thread. We have observed stalls when threads on critical paths, such as block
+        // processing, wait for a thread switch, and this less important read of the state
+        // should not be what a useful thread waits behind.
         let db_for_metrics = read_service.db.clone();
         spawn_erased(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut interval = tokio::time::interval(Self::ROCKSDB_METRICS_EXPORT_INTERVAL);
             loop {
                 interval.tick().await;
-                db_for_metrics.export_metrics();
+
+                // Waiting for each export to finish means two exports never run at once.
+                let db = db_for_metrics.clone();
+                let export = tokio::task::spawn_blocking(move || db.export_metrics());
+
+                if let Err(error) = export.await {
+                    // A cancelled export means the runtime is shutting down, which is expected.
+                    if error.is_panic() {
+                        tracing::warn!(?error, "RocksDB metrics export panicked, stopping it");
+                    }
+                    return;
+                }
             }
         });
 
@@ -3015,7 +3040,7 @@ impl Service<ReadRequest> for ReadStateService {
                 ))
             }
 
-            // Used by the get_block (raw) RPC and the StateService.
+            // Used by the indexer and the StateService.
             ReadRequest::Block(hash_or_height) => Ok(ReadResponse::Block(read::block(
                 state.latest_best_chain(),
                 &state.db,
@@ -3028,10 +3053,17 @@ impl Service<ReadRequest> for ReadStateService {
                 hash_or_height,
             )?)),
 
-            // Used by the get_block (raw) RPC and the StateService.
+            // Used by the get_block (verbose) RPC.
             ReadRequest::BlockAndSize(hash_or_height) => Ok(ReadResponse::BlockAndSize(
                 read::block_and_size(state.latest_best_chain(), &state.db, hash_or_height)?,
             )),
+
+            // Used by the get_block (raw) RPC.
+            ReadRequest::RawBlock(hash_or_height) => Ok(ReadResponse::RawBlock(read::raw_block(
+                state.latest_best_chain(),
+                &state.db,
+                hash_or_height,
+            )?)),
 
             // Used by the get_block (verbose) RPC and the StateService.
             ReadRequest::BlockHeader(hash_or_height) => {
@@ -3077,6 +3109,15 @@ impl Service<ReadRequest> for ReadStateService {
                 )?))
             }
 
+            // Used by the get_raw_transaction (raw) RPC.
+            ReadRequest::AnyChainRawTransaction(hash) => {
+                Ok(ReadResponse::RawTransaction(read::any_raw_transaction(
+                    state.latest_non_finalized_state().chain_iter(),
+                    &state.db,
+                    hash,
+                )?))
+            }
+
             // Used by the getblock (verbose) RPC.
             ReadRequest::TransactionIdsForBlock(hash_or_height) => Ok(
                 ReadResponse::TransactionIdsForBlock(read::transaction_hashes_for_block(
@@ -3095,6 +3136,11 @@ impl Service<ReadRequest> for ReadStateService {
                     ),
                 ))
             }
+
+            // Used by the RPC retry queue.
+            ReadRequest::MinedTransactionIds(hashes) => Ok(ReadResponse::MinedTransactionIds(
+                read::mined_transaction_ids(state.latest_best_chain(), &state.db, &hashes),
+            )),
 
             #[cfg(feature = "indexer")]
             ReadRequest::SpendingTransactionId(spend) => Ok(ReadResponse::TransactionId(

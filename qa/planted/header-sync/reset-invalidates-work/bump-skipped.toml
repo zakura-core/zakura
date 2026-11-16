@@ -1,0 +1,13 @@
+# The planner keeps the header generation when a commit only changes
+# selection or validation, as an operator invalidation does, and its
+# generation self-check expects the same, so the reset still commits. The
+# witness's invalidation then leaves the generation where it was.
+# The queue, the reactor and the planner decide when the witness's round
+# starts and retires around the reset, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-header-chain/src/transition", "crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-held-apply.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-held-apply.plan"

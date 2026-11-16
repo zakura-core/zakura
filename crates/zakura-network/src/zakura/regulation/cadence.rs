@@ -41,7 +41,7 @@ use crate::zakura::{
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod fuzz;
-#[cfg(test)]
+#[cfg(all(test, not(zakura_sim)))]
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use fuzz::{replay_cadence_bytes, CadenceReplaySummary};
@@ -277,6 +277,9 @@ struct Slot<M> {
     last_sent: Option<Instant>,
     /// Alive while this row's last frame waits for its transport write.
     unwritten: zakura_rt::sync::Weak<()>,
+    /// The sender's copy of the receiver's bucket for this row, charged for
+    /// every frame queued, so an early send can stay within it.
+    mirror: Bucket,
 }
 
 /// Why a message could not go to the [`CadenceSender`].
@@ -321,6 +324,7 @@ impl<M: WireMessage> CadenceSender<M, RealClock> {
 
 impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
     pub(crate) fn with_clock(clock: C) -> Self {
+        let now = clock.now();
         let slots = M::RULES
             .iter()
             .filter_map(|rule| {
@@ -330,6 +334,7 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
                     latest: None,
                     last_sent: None,
                     unwritten: zakura_rt::sync::Weak::new(),
+                    mirror: Bucket::new(cadence, now),
                 })
             })
             .collect();
@@ -352,6 +357,7 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
     ///
     /// A value whose previous frame is still unwritten is due as soon as that
     /// write finishes; poll [`Self::send_due`] again after writes progress.
+    #[cfg(test)]
     pub(crate) fn next_due(&self) -> Option<Instant> {
         self.slots
             .iter()
@@ -398,6 +404,51 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
         send_slot(slot, now, send)
     }
 
+    /// Try to queue the latest value of `message_type`'s row before its send
+    /// interval has passed.
+    ///
+    /// The receiver only observes a row's bucket (capacity, one token per
+    /// refill interval), so a sender may go faster than `send_interval` while
+    /// it keeps tokens in that bucket. This sends early only if at least
+    /// `min_gap` passed since the row's last frame and the sender's copy of the
+    /// receiver's bucket keeps more than `reserve` tokens, so bursts after an
+    /// outage, which the bucket is sized for, still fit. Otherwise it behaves
+    /// as [`Self::send_row`], except that a deferral ends as soon as an early
+    /// send would be allowed: after `min_gap`, or once the bucket refills
+    /// above `reserve`, if either comes before the send interval.
+    pub(crate) fn send_row_early(
+        &mut self,
+        message_type: u16,
+        send: &FramedSend,
+        min_gap: Duration,
+        reserve: u32,
+    ) -> Result<RowSend, CadenceSendError>
+    where
+        M::Error: std::fmt::Debug,
+    {
+        let now = self.clock.now();
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.message_type == message_type)
+            .ok_or(CadenceSendError::NoCadence { message_type })?;
+        slot.mirror.refill(now);
+        let gap_ends = slot.last_sent.map_or(now, |last| last + min_gap);
+        let tokens_at = if slot.mirror.tokens > reserve {
+            now
+        } else {
+            slot.mirror.last_refill + slot.mirror.cadence.refill_interval
+        };
+        let early_at = gap_ends.max(tokens_at);
+        if early_at <= now {
+            return send_slot_at(slot, now, send, true);
+        }
+        Ok(match send_slot(slot, now, send)? {
+            RowSend::DeferredUntil(due) => RowSend::DeferredUntil(due.min(early_at)),
+            other => other,
+        })
+    }
+
     /// Queue every due value on `send` without waiting.
     ///
     /// Returns the number of frames queued. A full queue leaves the value
@@ -436,15 +487,15 @@ impl<M> Slot<M> {
     /// Why this row cannot queue its value at `now`, if it cannot.
     ///
     /// `unwritten` reports whether the row's previous frame still waits for
-    /// its transport write.
-    fn hold(&self, now: Instant, unwritten: bool) -> Option<RowSend> {
+    /// its transport write. An `early` send ignores the send interval.
+    fn hold(&self, now: Instant, unwritten: bool, early: bool) -> Option<RowSend> {
         if self.latest.is_none() {
             return Some(RowSend::Idle);
         }
         if let Some(due) = self
             .last_sent
             .map(|last| last + self.send_interval)
-            .filter(|due| *due > now)
+            .filter(|due| !early && *due > now)
         {
             return Some(RowSend::DeferredUntil(due));
         }
@@ -457,7 +508,16 @@ fn send_slot<M: WireMessage>(
     now: Instant,
     send: &FramedSend,
 ) -> Result<RowSend, CadenceSendError> {
-    if let Some(hold) = slot.hold(now, slot.unwritten.strong_count() > 0) {
+    send_slot_at(slot, now, send, false)
+}
+
+fn send_slot_at<M: WireMessage>(
+    slot: &mut Slot<M>,
+    now: Instant,
+    send: &FramedSend,
+    early: bool,
+) -> Result<RowSend, CadenceSendError> {
+    if let Some(hold) = slot.hold(now, slot.unwritten.strong_count() > 0, early) {
         return Ok(hold);
     }
     let reserved = match send.try_reserve_guarded() {
@@ -476,5 +536,7 @@ fn send_slot<M: WireMessage>(
     slot.unwritten = zakura_rt::sync::downgrade(&written);
     reserved.send(frame, FrameGuard::new(written));
     slot.last_sent = Some(now);
+    slot.mirror.refill(now);
+    slot.mirror.tokens = slot.mirror.tokens.saturating_sub(1);
     Ok(RowSend::Queued)
 }

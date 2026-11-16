@@ -836,6 +836,9 @@ pub type OwnedHeader = OwnedPayload<Header>;
 /// One block's serialized bytes copied from disk.
 pub type OwnedRawBlock = OwnedPayload<Vec<u8>>;
 
+/// One transaction's serialized bytes copied from disk.
+pub type OwnedRawTransaction = OwnedPayload<Vec<u8>>;
+
 /// Reports the memory a decoded read result retains, including its inline size.
 pub trait DecodedSize {
     /// Attributed bytes retained by this payload.

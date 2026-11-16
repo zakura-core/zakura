@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/peer.rs b/crates/zakura-network/src/zakura/header_sync/peer.rs
+index 338c3d497c..bd596c6b6e 100644
+--- a/crates/zakura-network/src/zakura/header_sync/peer.rs
++++ b/crates/zakura-network/src/zakura/header_sync/peer.rs
+@@ -103,9 +103,11 @@ fn admit<const HEADER_BYTES: usize>(
+         Message::Headers(page) => {
+             check_records(&page, &handle.network)
+                 .map_err(|error| violation(handle, session, "malformed_message", error))?;
++            // Mutation: the page reaches the subscriber a byte shorter than
++            // it arrived.
+             let admitted = session
+                 .subscriber()
+-                .receive_page(&page, payload_len)
++                .receive_page(&page, payload_len.saturating_sub(1))
+                 .map_err(|fault| violation(handle, session, fault.label(), fault))?;
+             PeerInput::Page { page, admitted }
+         }

@@ -78,7 +78,8 @@ class DependencyPolicyTests(unittest.TestCase):
 
     def test_security_gate_cannot_be_skipped(self):
         workflow = read_yaml(ROOT / ".github/workflows/tests-unit.yml")
-        self.assertNotIn("paths", workflow["on"]["pull_request"])
+        for restriction in ("paths", "paths-ignore", "branches", "branches-ignore"):
+            self.assertNotIn(restriction, workflow["on"]["pull_request"])
         self.assertIn("merge_group", workflow["on"])
         self.assertIn("schedule", workflow["on"])
         job = workflow["jobs"]["python-security"]

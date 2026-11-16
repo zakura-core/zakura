@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{header_fuzz::PINNED_NIGHTLY, sim::SIM_RUSTFLAGS, BoxError};
+use crate::{header_fuzz::PINNED_NIGHTLY, planted::PROFILE, sim::SIM_RUSTFLAGS, BoxError};
 
 /// The fuzz package's metadata table that maps each target to the
 /// registered harness it runs.
@@ -527,8 +527,11 @@ fn wrapper_failed(
 }
 
 /// `cargo build` of `repo_root`'s `zakura-sim` binary, with the simulator's
-/// flags, in `target`. Like [`FuzzBuild::command`], it warns rather than
-/// fails on warnings (`crate::planted::cargo_sim` says why).
+/// flags and the planted profile (`crate::planted::PROFILE`), in `target`.
+/// An unoptimized `zakura-sim confirm` of a `block-sync/storage` input can
+/// take six times as long, past the confirmation's child limit. Like
+/// [`FuzzBuild::command`], it warns rather than fails on warnings
+/// (`crate::planted::cargo_sim` says why).
 fn sim_build(repo_root: &Path, target: &Path) -> Command {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = Command::new(cargo);
@@ -538,6 +541,7 @@ fn sim_build(repo_root: &Path, target: &Path) -> Command {
         .env("CARGO_BUILD_WARNINGS", "warn")
         .arg("build")
         .arg("--locked")
+        .args(["--profile", PROFILE])
         .arg("--manifest-path")
         .arg(repo_root.join("Cargo.toml"))
         .args(["-p", "zakura-sim", "--bin", "zakura-sim"]);
@@ -582,7 +586,7 @@ fn build_tools(
     let bin = request.out.join(BIN_DIR);
     fs::create_dir_all(&bin)?;
     let sim = bin.join("zakura-sim");
-    fs::copy(sim_target.join("debug").join("zakura-sim"), &sim)?;
+    fs::copy(sim_target.join(PROFILE).join("zakura-sim"), &sim)?;
     let tmin_binary = fuzz_binary(&fuzz_target, &request.target)?;
     let fuzz = bin.join(&request.target);
     fs::copy(&tmin_binary, &fuzz)?;

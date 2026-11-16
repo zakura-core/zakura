@@ -2017,7 +2017,7 @@ mod tests {
         );
         let built = confirm_builds(&work)
             .join("sim")
-            .join("debug")
+            .join(PROFILE)
             .join("zakura-sim");
         fs::create_dir_all(built.parent().expect("a parent")).expect("the directory is created");
         fs::write(&built, "binary").expect("the build is written");

@@ -1199,12 +1199,13 @@ fn tool_builds_override_denied_warnings() {
         target_dir: PathBuf::from("target"),
         sanitizer: Sanitizer::Address,
     };
-    for command in [
-        sim_build(Path::new("repo"), Path::new("target")),
-        fuzz.command("build"),
-    ] {
-        assert_eq!(warnings(&command), Some(OsString::from("warn")));
+    let sim = sim_build(Path::new("repo"), Path::new("target"));
+    for command in [&sim, &fuzz.command("build")] {
+        assert_eq!(warnings(command), Some(OsString::from("warn")));
     }
+    // An unoptimized `zakura-sim` outruns the child limit.
+    let args: Vec<_> = sim.get_args().collect();
+    assert!(args.windows(2).any(|pair| pair == ["--profile", PROFILE]));
 }
 
 /// A target's runs take its `qa/suite.toml` row's arguments and

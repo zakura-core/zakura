@@ -2,7 +2,7 @@ use eyre::eyre;
 use tokio_util::sync::CancellationToken;
 use zakura_chain::block;
 
-use super::{supervise_block_sync_driver, StartCmd};
+use super::{error_exit_status, supervise_block_sync_driver, NodeTasks, StartCmd};
 use crate::components::zcashd_compat;
 use crate::config::ZakuradConfig;
 use zakura_network::types::PeerServices;
@@ -446,4 +446,114 @@ async fn requested_shutdown_suppresses_block_sync_driver_fatal_event() {
         None,
         "requested shutdown closes the channel without a fatal event",
     );
+}
+
+/// Spawns a task that never finishes, and a receiver that errors once the task is aborted.
+fn spawn_until_aborted() -> (
+    tokio::task::JoinHandle<Result<(), eyre::Report>>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (held_by_task, aborted) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _held_by_task = held_by_task;
+        std::future::pending().await
+    });
+    (task, aborted)
+}
+
+async fn assert_aborted(aborted: tokio::sync::oneshot::Receiver<()>) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), aborted)
+        .await
+        .expect("an aborted task drops its sender")
+        .expect_err("the task never sends");
+}
+
+#[tokio::test]
+async fn supervised_task_exit_is_reported_with_its_exit_status() {
+    let mut node_tasks = NodeTasks::default();
+    assert!(
+        node_tasks.next_supervised_exit().await.is_none(),
+        "no task is supervised yet",
+    );
+
+    let (still_running, _aborted) = spawn_until_aborted();
+    node_tasks.supervise("still running", still_running, |result| result);
+    node_tasks.supervise("clean exit", tokio::spawn(async {}), Ok);
+    node_tasks
+        .next_supervised_exit()
+        .await
+        .expect("the clean exit task is supervised")
+        .expect("a clean exit is not a node failure");
+
+    node_tasks.supervise(
+        "failing",
+        tokio::spawn(async { Err(std::io::Error::other("task failed")) }),
+        error_exit_status,
+    );
+    let error = node_tasks
+        .next_supervised_exit()
+        .await
+        .expect("the failing task is supervised")
+        .expect_err("a task error is a node failure");
+    assert_eq!(error.to_string(), "task failed");
+}
+
+#[tokio::test]
+async fn server_error_does_not_fail_the_node() {
+    let mut node_tasks = NodeTasks::default();
+    node_tasks.supervise_server(
+        "test",
+        tokio::spawn(async { Err(tower::BoxError::from("server failed")) }),
+    );
+
+    node_tasks
+        .next_supervised_exit()
+        .await
+        .expect("the server task is supervised")
+        .expect("a server error stops the node without an error");
+}
+
+#[tokio::test]
+#[should_panic(expected = "unexpected panic in the panicking task")]
+async fn supervised_task_panic_is_propagated() {
+    let mut node_tasks = NodeTasks::default();
+    node_tasks.supervise(
+        "panicking",
+        tokio::spawn(async { panic!("task panicked") }),
+        Ok,
+    );
+
+    let _ = node_tasks.next_supervised_exit().await;
+}
+
+#[tokio::test]
+async fn abort_supervised_leaves_tracked_tasks_running_until_drop() {
+    let mut node_tasks = NodeTasks::default();
+    let (supervised, supervised_aborted) = spawn_until_aborted();
+    let (tracked, mut tracked_aborted) = spawn_until_aborted();
+    node_tasks.supervise("supervised", supervised, |result| result);
+    node_tasks.track(&tracked);
+
+    node_tasks.abort_supervised();
+    assert_aborted(supervised_aborted).await;
+    assert!(
+        matches!(
+            tracked_aborted.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "a tracked task keeps running after the supervised tasks are aborted",
+    );
+
+    drop(node_tasks);
+    assert_aborted(tracked_aborted).await;
+}
+
+#[tokio::test]
+async fn dropping_node_tasks_aborts_supervised_tasks() {
+    let mut node_tasks = NodeTasks::default();
+    let (supervised, supervised_aborted) = spawn_until_aborted();
+    node_tasks.supervise("supervised", supervised, |result| result);
+
+    drop(node_tasks);
+    assert_aborted(supervised_aborted).await;
 }

@@ -58,9 +58,10 @@ impl From<Client> for LoadTrackedClient {
             registry: client.peer_registry_updater.clone(),
             version: connection_info.remote.version,
             sidecar: false,
-            accepts_block_push: super::block_gossip::accepts_block_push(
-                &connection_info.remote.user_agent,
-            ),
+            accepts_block_push: connection_info
+                .remote
+                .services
+                .contains(PeerServices::NODE_BLOCK_PUSH),
         };
 
         let request_slot = client.request_slot.clone();

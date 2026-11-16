@@ -126,26 +126,6 @@ impl AdvertFanout {
     }
 }
 
-/// The first Zakura release that verifies blocks pushed to it.
-///
-/// Earlier releases drop pushed blocks, so a push to them only wastes the upload.
-const FIRST_BLOCK_PUSH_RELEASE: semver::Version = semver::Version::new(1, 8, 10);
-
-/// Whether a peer whose handshake sent `user_agent` verifies blocks pushed to it.
-///
-/// A peer qualifies if its user agent names a Zakura release at or after
-/// [`FIRST_BLOCK_PUSH_RELEASE`]. Other peers never get a pushed block.
-///
-/// The user agent is unauthenticated. A peer that claims a newer release than it runs drops the
-/// pushed block, but it still requests the block from the `inv` that follows the push.
-pub(crate) fn accepts_block_push(user_agent: &str) -> bool {
-    user_agent
-        .strip_prefix("/Zakura:")
-        .and_then(|release| release.strip_suffix('/'))
-        .and_then(|release| release.parse::<semver::Version>().ok())
-        .is_some_and(|release| release >= FIRST_BLOCK_PUSH_RELEASE)
-}
-
 /// Every this many selected recipients, a random peer replaces the next-lowest RTT.
 ///
 /// Random peers keep the initial group from depending entirely on the lowest RTTs.
@@ -362,7 +342,9 @@ pub(crate) struct BlockGossipPeer {
     pub(crate) version: Version,
     /// Configured sidecars may wait for a busy connection to write inventory.
     pub(crate) sidecar: bool,
-    /// Whether the peer verifies blocks pushed to it. See [`accepts_block_push`].
+    /// Whether the peer's handshake advertised [`PeerServices::NODE_BLOCK_PUSH`].
+    ///
+    /// [`PeerServices::NODE_BLOCK_PUSH`]: crate::PeerServices::NODE_BLOCK_PUSH
     pub(crate) accepts_block_push: bool,
 }
 
@@ -2017,24 +1999,6 @@ mod tests {
                 peer
             })
             .collect()
-    }
-
-    #[test]
-    fn block_push_requires_a_zakura_release_with_the_fixed_receiver() {
-        for (user_agent, accepts) in [
-            ("/Zakura:1.8.10/", true),
-            ("/Zakura:1.8.11/", true),
-            ("/Zakura:1.9.0/", true),
-            ("/Zakura:2.0.0-rc.1/", true),
-            ("/Zakura:1.8.9/", false),
-            ("/Zakura:1.8.10-rc.1/", false),
-            ("/Zakura:1.8.10", false),
-            ("/Zebra:4.0.0/", false),
-            ("/MagicBean:6.10.0/", false),
-            ("test", false),
-        ] {
-            assert_eq!(accepts_block_push(user_agent), accepts, "{user_agent}");
-        }
     }
 
     /// A mined block is pushed only to the initial group's peers that accept pushes.

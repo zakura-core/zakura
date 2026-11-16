@@ -920,6 +920,40 @@ fn p2p_v2_upgrade_requires_local_enable_and_remote_service_bit() {
         &test_config(P2pStack::Dual),
         &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2),
     ));
+
+    // Another service bit neither starts nor blocks the upgrade.
+    assert!(!should_attempt_zakura_upgrade(
+        &test_config(P2pStack::Dual),
+        &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_BLOCK_PUSH),
+    ));
+    assert!(should_attempt_zakura_upgrade(
+        &test_config(P2pStack::Dual),
+        &connection_info(
+            PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2 | PeerServices::NODE_BLOCK_PUSH
+        ),
+    ));
+}
+
+/// The handshake advertises `NODE_BLOCK_PUSH` on every P2P stack, and sets `NODE_P2P_V2` only
+/// from the stack.
+#[test]
+fn block_push_service_bit_is_independent_of_the_p2p_stack() {
+    let _init_guard = zakura_test::init();
+
+    for stack in [P2pStack::Legacy, P2pStack::Zakura, P2pStack::Dual] {
+        let config = test_config(stack);
+        let services =
+            config.handshake_services(PeerServices::NODE_NETWORK | PeerServices::NODE_BLOCK_PUSH);
+        assert!(
+            services.contains(PeerServices::NODE_BLOCK_PUSH),
+            "{stack:?}"
+        );
+        assert_eq!(
+            services.contains(PeerServices::NODE_P2P_V2),
+            config.v2_p2p(),
+            "{stack:?}"
+        );
+    }
 }
 
 /// A configured inbound peer is recognized as protected, including when it

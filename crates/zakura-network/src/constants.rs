@@ -326,8 +326,9 @@ pub const MIN_INBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_secs(1
 /// How long an inbound connection must have been open for the listener to hold its seat
 /// after it closes, see `peer_set::initialize::held_seats::HeldSeats`.
 ///
-/// Short connections, such as crawlers and monitors, hold no seat.
-pub const MIN_HELD_SEAT_CONNECTION: Duration = Duration::from_secs(10 * 60);
+/// Short connections, such as crawlers and monitors, hold no seat, and a peer that the
+/// listener kept this long was not dropped or banned in that time.
+pub const MIN_HELD_SEAT_CONNECTION: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// How long the listener holds the seat of a long-lived inbound peer after its connection
 /// closes, so the peer can take it back after a restart.

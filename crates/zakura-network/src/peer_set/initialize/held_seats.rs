@@ -1,6 +1,8 @@
 //! Inbound seats that the listener holds for peers that just left.
 
-use std::{collections::HashMap, net::IpAddr, time::Instant};
+use std::{collections::HashMap, net::IpAddr};
+
+use tokio::time::Instant;
 
 use crate::{constants, peer_set::limit::ClosedConnection};
 

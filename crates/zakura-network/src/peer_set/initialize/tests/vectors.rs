@@ -3152,9 +3152,8 @@ async fn listener_holds_the_seat_of_a_long_lived_peer() {
         .offer(RETURNING_PEER_IP)
         .await
         .expect("the listener has free seats");
-    returning_peer
-        .2
-        .mark_open_at(std::time::Instant::now() - constants::MIN_HELD_SEAT_CONNECTION);
+    returning_peer.2.mark_open();
+    age_open_connections().await;
     let mut other_peers = listener.offer_until_refused(LISTENER_PUBLIC_IP).await;
     assert_eq!(other_peers.len(), listener.inbound_limit - 1);
 
@@ -3198,9 +3197,8 @@ async fn listener_fills_free_seats_before_a_held_seat_refuses_a_peer() {
         .offer(RETURNING_PEER_IP)
         .await
         .expect("the listener has free seats");
-    returning_peer
-        .2
-        .mark_open_at(std::time::Instant::now() - constants::MIN_HELD_SEAT_CONNECTION);
+    returning_peer.2.mark_open();
+    age_open_connections().await;
     let mut other_peers = listener.offer_until_refused(LISTENER_PUBLIC_IP).await;
 
     // One seat is held, and two are free.
@@ -3243,9 +3241,8 @@ async fn listener_releases_the_held_seat_of_an_unconditional_peer_that_returns()
         .offer(LISTENER_UNCONDITIONAL_IP)
         .await
         .expect("the listener has free public seats");
-    public_seat
-        .2
-        .mark_open_at(std::time::Instant::now() - constants::MIN_HELD_SEAT_CONNECTION);
+    public_seat.2.mark_open();
+    age_open_connections().await;
     std::mem::drop(own_slot);
     std::mem::drop(public_seat);
 
@@ -3260,6 +3257,14 @@ async fn listener_releases_the_held_seat_of_an_unconditional_peer_that_returns()
     );
 
     listener.stop().await;
+}
+
+/// Advances the test clock by [`constants::MIN_HELD_SEAT_CONNECTION`], so that the
+/// connections that are open now are long-lived when they close.
+async fn age_open_connections() {
+    tokio::time::pause();
+    tokio::time::advance(constants::MIN_HELD_SEAT_CONNECTION).await;
+    tokio::time::resume();
 }
 
 /// One IP holds at most `max_connections_per_ip` of the inbound slots that dialed

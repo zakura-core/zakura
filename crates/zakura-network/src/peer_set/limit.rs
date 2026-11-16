@@ -3,15 +3,9 @@
 //! These types can be used to count any kind of active resource.
 //! But they are currently used to track the number of open connections.
 
-use std::{
-    collections::HashMap,
-    fmt,
-    net::IpAddr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, fmt, net::IpAddr, sync::Arc, time::Duration};
 
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::Instant};
 
 /// A signal sent by a [`Connection`][1] when it opens or closes.
 ///
@@ -244,16 +238,10 @@ impl ConnectionTracker {
     /// Sends a notification to the status notification channel to count the connection as open, and
     /// marks this [`ConnectionTracker`] as having sent that open notification to avoid double-counting.
     pub fn mark_open(&mut self) {
-        self.mark_open_at(Instant::now());
-    }
-
-    /// Like [`mark_open`](Self::mark_open), for a connection that opened at `opened_at`.
-    /// Tests use it to make a connection long-lived without waiting.
-    pub(crate) fn mark_open_at(&mut self, opened_at: Instant) {
         if !self.has_marked_open {
             let _ = self.status_notification_tx.send(ConnectionStatus::Opened);
             self.has_marked_open = true;
-            self.opened_at = Some(opened_at);
+            self.opened_at = Some(Instant::now());
         }
     }
 

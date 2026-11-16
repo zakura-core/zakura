@@ -888,7 +888,7 @@ where
                 continue;
             }
 
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             let active_public_inbound_connections = active_inbound_connections
                 .update_count_with_closed(|closed| held_seats.hold(closed, now));
             let active_zcashd_compat_inbound_connections =

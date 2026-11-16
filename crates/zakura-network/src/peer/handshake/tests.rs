@@ -22,7 +22,7 @@ use crate::{
 };
 use tokio::io::duplex;
 use tower::ServiceExt;
-use zakura_chain::{block, chain_tip::NoChainTip};
+use zakura_chain::{block, chain_tip::NoChainTip, serialization::ZcashDeserializeInto};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 static TEST_ZAKURA_SECRET_KEY_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -1310,6 +1310,27 @@ async fn inbound_invs_record_announced_blocks() {
     .expect("the filter passes the message through");
     assert!(!announced.announced(blocks[0]));
     assert!(blocks[1..].iter().all(|block| announced.announced(*block)));
+}
+
+/// A peer that sent a block body has the block, whether or not it announced it first, so block
+/// gossip never advertises the block back to its supplier.
+#[tokio::test]
+async fn a_received_block_body_counts_as_an_announcement() {
+    let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .as_slice()
+        .zcash_deserialize_into()
+        .expect("test vector decodes");
+    let announced = AnnouncedBlocks::default();
+    register_inventory_status(
+        Ok(Message::Block(block.clone().into())),
+        ConnectedAddr::new_isolated(),
+        broadcast::channel(16).0,
+        announced.clone(),
+        Default::default(),
+    )
+    .await
+    .expect("the filter passes the message through");
+    assert!(announced.announced(block.hash()));
 }
 
 /// A body request contradicts only the requested blocks' earlier announcements.

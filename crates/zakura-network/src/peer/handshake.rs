@@ -2056,10 +2056,12 @@ fn serialization_error_metric_label(error: &SerializationError) -> &'static str 
 
 /// Register any advertised or missing inventory in `msg` for `connected_addr`.
 ///
-/// Also records the blocks this peer announces in `announced_blocks`, so block gossip can skip
-/// a peer that already has the block. Unlike the inventory registry, this covers every block
-/// `inv`, solicited or not, and connections without a transient address. Requests for block
-/// bodies withdraw the peer's earlier claim to have those blocks.
+/// Also records the blocks this peer announces or sends in `announced_blocks`, so block gossip
+/// can skip a peer that already has the block. Unlike the inventory registry, this covers every
+/// block `inv`, solicited or not, and connections without a transient address. A peer that sent
+/// a block body, including one this node requested during sync, is never advertised that block
+/// again, so early block relay doesn't echo a block to its supplier. Requests for block bodies
+/// withdraw the peer's earlier claim to have those blocks.
 ///
 /// An `inv` that names exactly one block is a new block announcement, and is written to
 /// `gossip_trace`. One that names several is the answer to a query.
@@ -2077,6 +2079,7 @@ pub(crate) async fn register_inventory_status(
                 gossip_trace.block_inv_received(hash);
             }
         }
+        Ok(Message::Block(block)) => announced_blocks.record([block.hash()]),
         // A request for the body or a missing response contradicts an earlier announcement.
         Ok(Message::GetData(items) | Message::NotFound(items)) => {
             announced_blocks.forget(items.iter().filter_map(InventoryHash::block_hash));

@@ -20,7 +20,7 @@ use std::{
 
 use futures::{future::BoxFuture, FutureExt, StreamExt};
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{mpsc, oneshot, watch, Semaphore},
     time::{sleep_until, timeout, Instant},
 };
 use zakura_chain::{block, chain_tip::ChainTip};
@@ -36,16 +36,50 @@ use crate::{
 /// Pending block adverts per connection. Slow peers can catch up through later tip gossip.
 pub(crate) const BLOCK_ADVERT_QUEUE: usize = 4;
 
-/// A block `inv` for one connection to write, separately from its ordinary requests.
+/// The most connections that announce one broadcast's block with `cmpctblock`.
 ///
-/// The connection answers `result` once the local write completes, even while another request
-/// is awaiting its response. A successful result does not mean the peer received the `inv`.
+/// Every other connection announces it with `inv`.
+pub(crate) const COMPACT_ANNOUNCEMENTS_PER_BLOCK: usize = 3;
+
+/// A block announcement for one connection to write, separately from its ordinary requests.
+///
+/// The connection writes a `cmpctblock` if it can, and an `inv` otherwise. It answers `result`
+/// once the local write completes, even while another request is awaiting its response. A
+/// successful result does not mean the peer received the announcement.
 #[derive(Debug)]
 pub(crate) struct BlockAdvert {
     /// The block to advertise.
     pub(crate) hash: block::Hash,
+    /// The `cmpctblock` announcements this broadcast has left, shared by its connections.
+    ///
+    /// A connection forgets the permit of each `cmpctblock` it writes.
+    pub(crate) compact_slots: Arc<Semaphore>,
     /// Receives the outcome of the local write.
     pub(crate) result: oneshot::Sender<Result<(), BlockAdvertError>>,
+}
+
+impl BlockAdvert {
+    /// Returns an advert for `hash` that its broadcast's other connections share
+    /// `compact_slots` with, and the receiver for its write result.
+    pub(crate) fn new(
+        hash: block::Hash,
+        compact_slots: Arc<Semaphore>,
+    ) -> (Self, oneshot::Receiver<Result<(), BlockAdvertError>>) {
+        let (result, written) = oneshot::channel();
+        (
+            Self {
+                hash,
+                compact_slots,
+                result,
+            },
+            written,
+        )
+    }
+}
+
+/// Returns the `cmpctblock` announcements of one new broadcast.
+pub(crate) fn compact_slots() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(COMPACT_ANNOUNCEMENTS_PER_BLOCK))
 }
 
 /// Why a connection did not write a block advert.
@@ -255,7 +289,8 @@ impl BlockUploads {
         }
     }
 
-    /// Start tracking requests once the connection writes this advertisement's inventory.
+    /// Start tracking requests once the connection writes this advertisement's `inv` or
+    /// `cmpctblock`.
     pub(crate) fn advertised(&self, hash: block::Hash) {
         let uploads = self.0.lock().expect("block upload mutex is never poisoned");
         if let Some(upload) = uploads.active.get(&hash).and_then(Weak::upgrade) {
@@ -263,10 +298,17 @@ impl BlockUploads {
         }
     }
 
+    /// Records the peer's request for the block `hash`.
+    ///
+    /// The request is a `getdata` for the block, or a `getblocktxn` for the transactions the
+    /// peer could not find after our `cmpctblock`. Either one counts as the request that the
+    /// advert's tracking waits for.
     pub(crate) fn requested(&self, hash: block::Hash) {
         self.update(hash, UploadState::Requested(Instant::now()));
     }
 
+    /// Records the completed write of the requested block, or of the `blocktxn` that answers
+    /// the peer's `getblocktxn`.
     pub(crate) fn written(&self, hash: block::Hash) {
         self.update(hash, UploadState::Written(Instant::now()));
     }
@@ -361,7 +403,10 @@ impl BlockGossipPeer {
     /// upload failed or did not finish in time.
     #[cfg(test)]
     pub(crate) async fn advertise(self, hash: block::Hash) -> bool {
-        matches!(self.advertise_outcome(hash).await, AdvertOutcome::Sent)
+        matches!(
+            self.advertise_outcome(hash, compact_slots()).await,
+            AdvertOutcome::Sent
+        )
     }
 
     /// Advertises the block and distinguishes authorization revocation from delivery failure.
@@ -369,7 +414,13 @@ impl BlockGossipPeer {
     /// An announcement may suppress a new advert but cannot replace an active upload's outcome
     /// or one this connection already delivered. A retry after a joined upload failed still
     /// advertises: the peer's claim does not satisfy the delivery this broadcast owes.
-    async fn advertise_outcome(self, hash: block::Hash) -> AdvertOutcome {
+    ///
+    /// `compact_slots` holds the broadcast's remaining `cmpctblock` announcements.
+    async fn advertise_outcome(
+        self,
+        hash: block::Hash,
+        compact_slots: Arc<Semaphore>,
+    ) -> AdvertOutcome {
         if self.can_skip_advert(hash) {
             metrics::counter!("peer.block_gossip.advert_skipped", "when" => "fan_out").increment(1);
             return AdvertOutcome::Skipped;
@@ -399,8 +450,7 @@ impl BlockGossipPeer {
             while progress.changed().await.is_ok() {}
             retried = true;
         };
-        let (result, written) = oneshot::channel();
-        let advert = BlockAdvert { hash, result };
+        let (advert, written) = BlockAdvert::new(hash, compact_slots);
         // A sidecar learns the tip only from inventory, so it waits for its busy connection.
         // Other connections have a shorter inventory-write timeout.
         let inventory_wait = if self.sidecar {
@@ -498,10 +548,13 @@ pub(crate) fn broadcast_block(
     }
     let sidecars = initial.iter().take_while(|peer| peer.sidecar).count();
     let delayed = initial.split_off(sidecars.saturating_add(window).min(initial.len()));
+    // The initial group writes first, so it usually takes every `cmpctblock` announcement.
+    let compact_slots = compact_slots();
     async move {
         let advertise = |peers: Vec<BlockGossipPeer>| {
+            let compact_slots = compact_slots.clone();
             futures::stream::iter(peers)
-                .map(move |peer| peer.advertise_outcome(hash))
+                .map(move |peer| peer.advertise_outcome(hash, compact_slots.clone()))
                 .buffer_unordered(usize::MAX)
         };
         let delayed = futures::stream::once(async move {
@@ -2156,9 +2209,9 @@ mod tests {
             let (peer, mut receiver) = peer();
 
             let hash = block::Hash([62; 32]);
-            let first = tokio::spawn(peer.clone().advertise_outcome(hash));
+            let first = tokio::spawn(peer.clone().advertise_outcome(hash, compact_slots()));
             let advert = receiver.recv().await.unwrap();
-            let second = tokio::spawn(peer.advertise_outcome(hash));
+            let second = tokio::spawn(peer.advertise_outcome(hash, compact_slots()));
             tokio::task::yield_now().await;
             advert
                 .result
@@ -2379,7 +2432,7 @@ mod tests {
 
         let (peer, mut receiver) = peer();
         // The advert is selected before the announcement, and written after it.
-        let advert = peer.clone().advertise_outcome(hash);
+        let advert = peer.clone().advertise_outcome(hash, compact_slots());
         peer.announced.record([hash]);
         assert!(matches!(advert.await, AdvertOutcome::Skipped));
         assert!(receiver.try_recv().is_err());

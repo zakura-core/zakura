@@ -930,6 +930,12 @@ where
             let receive_slot = compact_relay::acquire_receive_slot(receive_slots);
             tokio::pin!(receive_slot);
 
+            // A sent compact block is released when its retention ends, even on an idle
+            // connection.
+            self.compact.expire();
+            let compact_expiry = compact_relay::sleep_until_expiry(self.compact.expiry());
+            tokio::pin!(compact_expiry);
+
             self.update_state_metrics(None);
 
             // Each way out of a client request reaches this point before the next one
@@ -1000,6 +1006,7 @@ where
                     // the wire, and which costs it one unsolicited `inv` later.
                     let incoming = tokio::select! {
                         biased;
+                        _ = &mut compact_expiry => continue,
                         Ok(()) = self.compact_receive_rx.changed(), if compact_negotiated => continue,
                         permit = &mut receive_slot, if awaits_receive_slot => {
                             self.set_compact_receive(Some(permit)).await;
@@ -1081,6 +1088,7 @@ where
                     // connection to be:
                     // - cancellation, then
                     // - timeout, then
+                    // - sent compact block expiry, then
                     // - compact block source selection changes, then
                     // - peer messages, then
                     // - block adverts, then
@@ -1135,6 +1143,7 @@ where
                             };
                             continue;
                         }
+                        _ = &mut compact_expiry => continue,
                         Ok(()) = self.compact_receive_rx.changed(), if compact_negotiated => continue,
                         permit = &mut receive_slot, if awaits_receive_slot => {
                             self.set_compact_receive(Some(permit)).await;
@@ -1280,8 +1289,15 @@ where
             .filter(|waited| *waited >= WAITING_ADVERT_PRIORITY_DELAY)
     }
 
-    /// Writes a block advert's `inv`, after rechecking the peer's live authorization, and
-    /// acknowledges it once the local write completes.
+    /// Writes a block advert's `cmpctblock` or `inv`, after rechecking the peer's live
+    /// authorization, and acknowledges it once the local write completes.
+    ///
+    /// A `cmpctblock` goes first when [`Self::compact_advert`] builds one and the broadcast
+    /// has a `cmpctblock` announcement left. A written `cmpctblock` holds its block to serve
+    /// `getblocktxn`, and counts as the advert, the same as an `inv`.
+    ///
+    /// Writes nothing if the advertiser stopped waiting for the result, which also happens
+    /// when an early-relay block is withdrawn.
     ///
     /// `overdue_wait` is how long the queue had waited when this turn decided that the advert
     /// goes before the next peer message, or `None` when it goes out in a gap between them.
@@ -1312,26 +1328,59 @@ where
         )
         .increment(1);
 
+        // The broadcast's permit is taken only once the `cmpctblock` is built, so a connection
+        // that falls back to `inv` leaves it to another connection.
+        let mut announcement_slot = None;
+        let compact = if advert.compact_slots.available_permits() > 0 {
+            self.compact_advert(advert.hash).await.filter(|_| {
+                announcement_slot = Arc::clone(&advert.compact_slots).try_acquire_owned().ok();
+                announcement_slot.is_some()
+            })
+        } else {
+            None
+        };
+        let message = compact.as_ref().map_or_else(
+            || Message::Inv(vec![InventoryHash::Block(advert.hash)]),
+            |compact| compact.message.clone(),
+        );
+
         let address = self.connection_info.connected_addr.get_transient_addr();
         let version = self.connection_info.remote.version;
         let minimum = &mut self.minimum_peer_version;
         let bans = &self.bans;
+        let result = &advert.result;
+        let mut canceled = false;
         let delivery = self
             .peer_tx
-            .send_authorized(
-                Message::Inv(vec![InventoryHash::Block(advert.hash)]),
-                || {
-                    version >= minimum.current()
-                        && !address.is_some_and(|addr| bans.contains(addr.ip()))
-                },
-            )
+            .send_authorized(message, || {
+                canceled = result.is_closed();
+                !canceled
+                    && version >= minimum.current()
+                    && !address.is_some_and(|addr| bans.contains(addr.ip()))
+            })
             .await;
         match delivery {
             Ok(true) => {
-                // Mark the write before reading the peer's next message, which can be its getdata.
+                if let Some(compact) = compact {
+                    self.compact.mark_sent(compact);
+                }
+                // The written `cmpctblock` uses up the broadcast's permit.
+                if let Some(slot) = announcement_slot {
+                    slot.forget();
+                }
+                // Mark the write before reading the peer's next message, which can be its
+                // getdata or getblocktxn.
                 self.block_uploads.advertised(advert.hash);
                 self.gossip_trace.block_inv_sent(advert.hash);
                 let _ = advert.result.send(Ok(()));
+            }
+            Ok(false) if canceled => {
+                metrics::counter!("peer.canceled").increment(1);
+                metrics::counter!(
+                    "zakura.net.out.requests.canceled",
+                    "command" => "AdvertiseBlock",
+                )
+                .increment(1);
             }
             Ok(false) => {
                 debug!(hash = ?advert.hash, "not advertising block: peer authorization was revoked");
@@ -1805,11 +1854,14 @@ where
                 self.compact.received_send_compact(announce, version);
                 Consumed
             }
-            // Compact block announcements and recovery aren't used yet. The codec drops these
-            // messages unless they were negotiated, so a peer that sends them is not misbehaving.
-            Message::CompactBlock(_)
-            | Message::GetBlockTransactions(_)
-            | Message::BlockTransactions(_) => {
+            // The codec drops `getblocktxn` unless the connection negotiated compact blocks.
+            Message::GetBlockTransactions(ref request) => {
+                self.serve_compact_transactions(request).await;
+                Consumed
+            }
+            // Receiving compact blocks isn't used yet. The codec drops these messages unless
+            // they were negotiated, so a peer that sends them is not misbehaving.
+            Message::CompactBlock(_) | Message::BlockTransactions(_) => {
                 debug!(%msg, "ignoring compact block relay message");
                 Unused
             }
@@ -2341,8 +2393,10 @@ where
         self.block_advert_rx.close();
         self.block_uploads.disconnected();
         self.request_slot.set_busy(true);
-        // A failed connection can't receive announcements, even if closing its writer stalls.
+        // A failed connection can't receive announcements or serve `getblocktxn`, so it
+        // releases its slots, even if closing its writer stalls.
         self.compact.receive_permit = None;
+        self.compact.clear_sent();
 
         // Update the shared error slot
         //

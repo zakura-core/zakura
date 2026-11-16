@@ -1,17 +1,36 @@
-//! Tests for compact block relay negotiation and high-bandwidth source slots.
+//! Tests for compact block relay negotiation, high-bandwidth source slots, `cmpctblock`
+//! announcements, and `getblocktxn` serving.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use futures::{channel::mpsc, sink::SinkMapErr, StreamExt};
-use tokio::sync::{watch, Semaphore};
+use futures::{channel::mpsc, sink::SinkMapErr, SinkExt, StreamExt};
+use indexmap::IndexSet;
+use tokio::sync::{oneshot, watch, Semaphore};
 
-use zakura_chain::serialization::SerializationError;
-use zakura_test::mock_service::{MockService, PanicAssertion};
+use zakura_chain::{
+    block::{self, Block, MAX_BLOCK_BYTES},
+    serialization::{SerializationError, ZcashDeserializeInto, ZcashSerialize},
+};
+use zakura_test::{
+    mock_service::{MockService, PanicAssertion},
+    vectors::{BLOCK_MAINNET_1687107_BYTES, BLOCK_MAINNET_1_BYTES},
+};
 
+use super::super::compact_relay::RETENTION;
 use crate::{
-    peer::{connection::Connection, ClientRequest},
-    protocol::external::Message,
-    Request, Response,
+    peer::{
+        block_gossip::{
+            compact_slots, BlockAdvert, BlockAdvertError, BlockGossipPeer, BlockUploads,
+            BLOCK_ADVERT_QUEUE, BLOCK_REQUEST_WAIT, COMPACT_ANNOUNCEMENTS_PER_BLOCK,
+        },
+        connection::Connection,
+        ClientRequest, ErrorSlot,
+    },
+    protocol::external::{
+        compact::{BlockTransactions, BlockTransactionsRequest, CompactBlock},
+        InventoryHash, Message,
+    },
+    InventoryResponse, Request, Response,
 };
 
 /// A test connection with a mock inbound service and a channel peer writer.
@@ -253,4 +272,553 @@ async fn received_sendcmpct_sets_send_for_version_1_only() {
         error_slot.try_get_error().is_none(),
         "sendcmpct is not misbehavior"
     );
+}
+
+/// A running connection that negotiated compact blocks, and the channels that drive it and
+/// observe its announcements.
+struct AnnouncingConnection {
+    /// The connection's peer message sender.
+    peer_tx: mpsc::Sender<Result<Message, SerializationError>>,
+    /// The connection's client request sender. The connection shuts down if it is dropped.
+    _client_tx: mpsc::Sender<ClientRequest>,
+    /// The connection's inbound service.
+    inbound: MockService<Request, Response, PanicAssertion>,
+    /// The messages the connection writes to its peer.
+    outbound: mpsc::Receiver<Message>,
+    /// The connection's block advert queue.
+    adverts: tokio::sync::mpsc::Sender<BlockAdvert>,
+    /// The connection's upload tracking.
+    uploads: BlockUploads,
+    /// The slots that bound decoded bodies, in place of the global ones.
+    slots: Arc<Semaphore>,
+    /// The connection's error.
+    error_slot: ErrorSlot,
+    /// The connection task.
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// The decoded body slots of a test connection, as many as the global ones.
+const TEST_SLOTS: usize = 6;
+
+impl AnnouncingConnection {
+    /// Starts a negotiated connection. If `send` is true, the peer then asks for version 1
+    /// `cmpctblock` announcements.
+    async fn start(send: bool) -> Self {
+        let (mut connection, client_tx, inbound, mut outbound, error_slot) =
+            super::new_early_relay_test_connection::<PanicAssertion>();
+        let slots = Arc::new(Semaphore::new(TEST_SLOTS));
+        connection.compact.slots = slots.clone();
+        let (adverts, advert_rx) = tokio::sync::mpsc::channel(BLOCK_ADVERT_QUEUE);
+        connection.block_advert_rx = advert_rx;
+        let uploads = connection.block_uploads.clone();
+        let (mut peer_tx, peer_rx) = mpsc::channel(4);
+        let task = tokio::spawn(connection.run(peer_rx));
+
+        assert_eq!(outbound.next().await, Some(sendcmpct(false)));
+        if send {
+            peer_tx
+                .send(Ok(sendcmpct(true)))
+                .await
+                .expect("the connection is open");
+            settle().await;
+        }
+
+        Self {
+            peer_tx,
+            _client_tx: client_tx,
+            inbound,
+            outbound,
+            adverts,
+            uploads,
+            slots,
+            error_slot,
+            task,
+        }
+    }
+
+    /// Queues an advert for `hash` that shares `compact_slots` with its broadcast, and returns
+    /// the receiver for its write result.
+    fn advertise(
+        &self,
+        hash: block::Hash,
+        compact_slots: Arc<Semaphore>,
+    ) -> oneshot::Receiver<Result<(), BlockAdvertError>> {
+        let (advert, written) = BlockAdvert::new(hash, compact_slots);
+        self.adverts
+            .try_send(advert)
+            .expect("the advert queue has room");
+        written
+    }
+
+    /// Answers the connection's early-relay request for `block` with the block.
+    async fn serve_early_block(&mut self, block: &Arc<Block>) {
+        self.inbound
+            .expect_request(Request::EarlyBlocksByHash(IndexSet::from([block.hash()])))
+            .await
+            .respond(Response::Blocks(vec![InventoryResponse::Available((
+                block.clone().into(),
+                None,
+            ))]));
+    }
+
+    /// Announces `block` with `cmpctblock`, and returns the message.
+    async fn announce_compact(&mut self, block: &Arc<Block>) -> Arc<CompactBlock> {
+        let written = self.advertise(block.hash(), compact_slots());
+        self.serve_early_block(block).await;
+        let Message::CompactBlock(compact) = self.next_written().await else {
+            panic!("the connection announces the block with cmpctblock");
+        };
+        assert!(matches!(written.await, Ok(Ok(()))));
+        compact
+    }
+
+    /// Sends `message` from the peer.
+    async fn receive(&mut self, message: Message) {
+        self.peer_tx
+            .send(Ok(message))
+            .await
+            .expect("the connection is open");
+    }
+
+    /// Returns the next message the connection writes to its peer.
+    async fn next_written(&mut self) -> Message {
+        self.outbound
+            .next()
+            .await
+            .expect("the running connection keeps its peer writer open")
+    }
+
+    /// Asserts that the connection has written nothing it hasn't already returned.
+    async fn assert_nothing_written(&mut self) {
+        settle().await;
+        assert!(
+            self.outbound.try_recv().is_err(),
+            "the connection wrote an unexpected message"
+        );
+    }
+
+    /// Waits until `permits` decoded body slots are free. The connection builds `cmpctblock`
+    /// on a blocking thread, so yielding to it is not enough.
+    async fn wait_for_free_slots(&self, permits: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.slots.available_permits() != permits {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the connection releases its slot");
+    }
+
+    /// Asserts that the connection is still open.
+    fn assert_open(&self) {
+        assert!(
+            self.error_slot.try_get_error().is_none(),
+            "the connection is open"
+        );
+    }
+}
+
+impl Drop for AnnouncingConnection {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Returns a block whose `cmpctblock` is smaller than the block.
+fn block_with_transactions() -> Arc<Block> {
+    let block: Arc<Block> = BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("the test vector is a valid block");
+    assert!(
+        block.transactions.len() >= 4,
+        "the tests request several transactions"
+    );
+    block
+}
+
+/// Returns a block with only a coinbase transaction, whose `cmpctblock` is larger than the
+/// block.
+fn coinbase_only_block() -> Arc<Block> {
+    let block: Arc<Block> = BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("the test vector is a valid block");
+    assert_eq!(block.transactions.len(), 1);
+    block
+}
+
+/// Returns a block `inv` for `hash`.
+fn inv(hash: block::Hash) -> Message {
+    Message::Inv(vec![InventoryHash::Block(hash)])
+}
+
+/// Returns a `getblocktxn` for `indexes` of the block `hash`.
+fn getblocktxn(hash: block::Hash, indexes: Vec<usize>) -> Message {
+    Message::GetBlockTransactions(BlockTransactionsRequest {
+        block_hash: hash,
+        indexes,
+    })
+}
+
+/// Returns the `blocktxn` that answers a request for `indexes` of `block`.
+fn blocktxn(block: &Block, indexes: &[usize]) -> Message {
+    Message::BlockTransactions(BlockTransactions {
+        block_hash: block.hash(),
+        transactions: indexes
+            .iter()
+            .map(|index| block.transactions[*index].clone())
+            .collect(),
+    })
+}
+
+/// A peer that asked for `cmpctblock` gets one with the coinbase transaction prefilled and a
+/// short ID for each other transaction. The connection holds the block in a decoded body slot,
+/// and the write uses up one of the broadcast's announcements.
+#[tokio::test]
+async fn send_peer_gets_cmpctblock_with_coinbase_prefilled() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let mut connection = AnnouncingConnection::start(true).await;
+    let announcements = compact_slots();
+    let written = connection.advertise(block.hash(), announcements.clone());
+    connection.serve_early_block(&block).await;
+
+    let Message::CompactBlock(compact) = connection.next_written().await else {
+        panic!("the connection announces the block with cmpctblock");
+    };
+    assert!(matches!(written.await, Ok(Ok(()))));
+    assert_eq!(compact.block_hash(), block.hash());
+    assert_eq!(compact.prefilled.len(), 1);
+    assert_eq!(compact.prefilled[0].index, 0);
+    assert_eq!(compact.prefilled[0].transaction, block.transactions[0]);
+    assert_eq!(compact.short_ids.len(), block.transactions.len() - 1);
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS - 1);
+    assert_eq!(
+        announcements.available_permits(),
+        COMPACT_ANNOUNCEMENTS_PER_BLOCK - 1
+    );
+    connection.assert_nothing_written().await;
+    connection.assert_open();
+}
+
+/// A peer that did not ask for `cmpctblock` gets an `inv`, without an early-relay request.
+#[tokio::test]
+async fn non_send_peer_gets_inv() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let mut connection = AnnouncingConnection::start(false).await;
+    let written = connection.advertise(block.hash(), compact_slots());
+
+    assert_eq!(connection.next_written().await, inv(block.hash()));
+    assert!(matches!(written.await, Ok(Ok(()))));
+    connection.inbound.expect_no_requests().await;
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS);
+}
+
+/// A broadcast without announcements left goes as an `inv`, without an early-relay request.
+#[tokio::test]
+async fn broadcast_without_announcements_left_gets_inv() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let mut connection = AnnouncingConnection::start(true).await;
+    let written = connection.advertise(block.hash(), Arc::new(Semaphore::new(0)));
+
+    assert_eq!(connection.next_written().await, inv(block.hash()));
+    assert!(matches!(written.await, Ok(Ok(()))));
+    connection.inbound.expect_no_requests().await;
+}
+
+/// A block that the inbound service doesn't return for an early-relay request, or an inbound
+/// error, goes as an `inv` and releases the slot.
+#[tokio::test]
+async fn missing_early_block_gets_inv() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let mut connection = AnnouncingConnection::start(true).await;
+    let request = Request::EarlyBlocksByHash(IndexSet::from([block.hash()]));
+
+    let written = connection.advertise(block.hash(), compact_slots());
+    connection
+        .inbound
+        .expect_request(request.clone())
+        .await
+        .respond(Response::Blocks(vec![InventoryResponse::Missing(
+            block.hash(),
+        )]));
+    assert_eq!(connection.next_written().await, inv(block.hash()));
+    assert!(matches!(written.await, Ok(Ok(()))));
+
+    let written = connection.advertise(block.hash(), compact_slots());
+    connection
+        .inbound
+        .expect_request(request)
+        .await
+        .respond_error("inbound service failed".into());
+    assert_eq!(connection.next_written().await, inv(block.hash()));
+    assert!(matches!(written.await, Ok(Ok(()))));
+
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS);
+    connection.assert_open();
+}
+
+/// A block whose `cmpctblock` is not smaller than the block goes as an `inv`, and releases
+/// the slot.
+#[tokio::test]
+async fn compact_form_that_is_not_smaller_gets_inv() {
+    let _init_guard = zakura_test::init();
+
+    let block = coinbase_only_block();
+    let mut connection = AnnouncingConnection::start(true).await;
+    let announcements = compact_slots();
+    let written = connection.advertise(block.hash(), announcements.clone());
+    connection.serve_early_block(&block).await;
+
+    assert_eq!(connection.next_written().await, inv(block.hash()));
+    assert!(matches!(written.await, Ok(Ok(()))));
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS);
+    assert_eq!(
+        announcements.available_permits(),
+        COMPACT_ANNOUNCEMENTS_PER_BLOCK,
+        "an inv leaves the broadcast's announcement to another connection"
+    );
+}
+
+/// An advert whose result receiver closes while the connection builds its `cmpctblock` writes
+/// nothing. The early-relay task closes it when it withdraws the block.
+#[tokio::test]
+async fn closed_advert_result_writes_nothing() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let mut connection = AnnouncingConnection::start(true).await;
+    let announcements = compact_slots();
+    let written = connection.advertise(block.hash(), announcements.clone());
+    let early_request = connection
+        .inbound
+        .expect_request(Request::EarlyBlocksByHash(IndexSet::from([block.hash()])))
+        .await;
+    drop(written);
+    early_request.respond(Response::Blocks(vec![InventoryResponse::Available((
+        block.clone().into(),
+        None,
+    ))]));
+
+    connection.wait_for_free_slots(TEST_SLOTS).await;
+    connection.assert_nothing_written().await;
+    assert_eq!(
+        announcements.available_permits(),
+        COMPACT_ANNOUNCEMENTS_PER_BLOCK
+    );
+    connection.assert_open();
+
+    // The connection holds no block, so it announces the next one with `cmpctblock`.
+    connection.announce_compact(&block).await;
+}
+
+/// While the connection holds a sent block, it announces the next block with `inv`.
+#[tokio::test]
+async fn second_advert_while_holding_a_block_gets_inv() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let next = block::Hash([9; 32]);
+    let mut connection = AnnouncingConnection::start(true).await;
+    connection.announce_compact(&block).await;
+
+    let written = connection.advertise(next, compact_slots());
+    assert_eq!(connection.next_written().await, inv(next));
+    assert!(matches!(written.await, Ok(Ok(()))));
+    connection.inbound.expect_no_requests().await;
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS - 1);
+}
+
+/// The connection answers `getblocktxn` for the sent block with the requested transactions,
+/// in the requested order.
+#[tokio::test]
+async fn getblocktxn_is_served_for_the_requested_indexes() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let mut connection = AnnouncingConnection::start(true).await;
+    connection.announce_compact(&block).await;
+
+    for indexes in [vec![1, 3], vec![], vec![0, 2]] {
+        connection
+            .receive(getblocktxn(block.hash(), indexes.clone()))
+            .await;
+        assert_eq!(connection.next_written().await, blocktxn(&block, &indexes));
+    }
+    connection.inbound.expect_no_requests().await;
+    connection.assert_open();
+}
+
+/// The connection ignores `getblocktxn` for another block, with an out-of-range index, or with
+/// indexes that do not strictly increase. None of them is misbehavior.
+#[tokio::test]
+async fn invalid_getblocktxn_is_ignored_without_a_penalty() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let count = block.transactions.len();
+    let mut connection = AnnouncingConnection::start(true).await;
+    connection.announce_compact(&block).await;
+
+    for request in [
+        getblocktxn(block::Hash([9; 32]), vec![1]),
+        getblocktxn(block.hash(), vec![count]),
+        getblocktxn(block.hash(), vec![1, usize::MAX]),
+        getblocktxn(block.hash(), vec![2, 1]),
+        getblocktxn(block.hash(), vec![1, 1]),
+    ] {
+        connection.receive(request).await;
+        connection.assert_nothing_written().await;
+        connection.assert_open();
+    }
+
+    // The connection still serves a valid request.
+    connection.receive(getblocktxn(block.hash(), vec![1])).await;
+    assert_eq!(connection.next_written().await, blocktxn(&block, &[1]));
+}
+
+/// Repeated `getblocktxn` requests for one announcement share a block's worth of bytes, and
+/// each request costs its overhead, even an empty one. The connection ignores the request that
+/// would exceed them, without a penalty.
+#[tokio::test]
+async fn getblocktxn_byte_budget_spans_repeated_requests() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let (largest, size) = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.zcash_serialized_size())
+        .enumerate()
+        .max_by_key(|(_, size)| *size)
+        .expect("the block has transactions");
+    // A request costs the block hash, a one-byte index count, and its transactions.
+    let overhead = 32 + 1;
+    let cost = overhead + size;
+    let budget = usize::try_from(MAX_BLOCK_BYTES).expect("2,000,000 fits in usize");
+    let mut connection = AnnouncingConnection::start(true).await;
+    connection.announce_compact(&block).await;
+
+    for _ in 0..budget / cost {
+        connection
+            .receive(getblocktxn(block.hash(), vec![largest]))
+            .await;
+        assert_eq!(
+            connection.next_written().await,
+            blocktxn(&block, &[largest])
+        );
+    }
+    connection
+        .receive(getblocktxn(block.hash(), vec![largest]))
+        .await;
+    connection.assert_nothing_written().await;
+
+    for _ in 0..budget % cost / overhead {
+        connection.receive(getblocktxn(block.hash(), vec![])).await;
+        assert_eq!(connection.next_written().await, blocktxn(&block, &[]));
+    }
+    connection.receive(getblocktxn(block.hash(), vec![])).await;
+    connection.assert_nothing_written().await;
+    connection.assert_open();
+}
+
+/// After its retention ends, the connection releases the sent block's slot, even while idle,
+/// and ignores `getblocktxn` for it.
+#[tokio::test(start_paused = true)]
+async fn sent_block_expires_after_retention() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let mut connection = AnnouncingConnection::start(true).await;
+    connection.announce_compact(&block).await;
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS - 1);
+
+    tokio::time::advance(RETENTION - Duration::from_millis(1)).await;
+    settle().await;
+    assert_eq!(
+        connection.slots.available_permits(),
+        TEST_SLOTS - 1,
+        "the connection holds the block until its retention ends"
+    );
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    settle().await;
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS);
+
+    connection.receive(getblocktxn(block.hash(), vec![1])).await;
+    connection.assert_nothing_written().await;
+    connection.assert_open();
+
+    // The connection holds no block, so it announces the next one with `cmpctblock`.
+    connection.announce_compact(&block).await;
+}
+
+/// A served `getblocktxn` counts as the peer's request for the advertised block. The advert
+/// then succeeds once the `blocktxn` write completes, before its wait for a request ends.
+#[tokio::test(start_paused = true)]
+async fn served_getblocktxn_counts_as_the_block_request() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let mut connection = AnnouncingConnection::start(true).await;
+    let gossip = gossip_peer(&connection);
+    let start = tokio::time::Instant::now();
+    let advert = tokio::spawn(gossip.advertise(block.hash()));
+    connection.serve_early_block(&block).await;
+    assert!(matches!(
+        connection.next_written().await,
+        Message::CompactBlock(_)
+    ));
+
+    connection.receive(getblocktxn(block.hash(), vec![1])).await;
+    assert_eq!(connection.next_written().await, blocktxn(&block, &[1]));
+    assert!(advert.await.expect("the advert task does not panic"));
+    assert!(
+        start.elapsed() < BLOCK_REQUEST_WAIT,
+        "the blocktxn write ends the advert's tracking"
+    );
+}
+
+/// A `blocktxn` write that doesn't finish before the sent block expires fails the connection,
+/// and the advert's upload with it.
+#[tokio::test(start_paused = true)]
+async fn stalled_blocktxn_write_fails_the_connection_and_the_upload() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let mut connection = AnnouncingConnection::start(true).await;
+    let gossip = gossip_peer(&connection);
+    let advert = tokio::spawn(gossip.advertise(block.hash()));
+    connection.serve_early_block(&block).await;
+    assert!(matches!(
+        connection.next_written().await,
+        Message::CompactBlock(_)
+    ));
+
+    // The test peer writer finishes a write only when the test reads it, so the `blocktxn`
+    // write stalls. Without the request, the advert would succeed once its request wait ends.
+    connection.receive(getblocktxn(block.hash(), vec![1])).await;
+    assert!(!advert.await.expect("the advert task does not panic"));
+    assert!(connection.error_slot.try_get_error().is_some());
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS);
+}
+
+/// Returns the gossip peer that advertises blocks through `connection`.
+fn gossip_peer(connection: &AnnouncingConnection) -> BlockGossipPeer {
+    BlockGossipPeer {
+        announced: Default::default(),
+        sender: connection.adverts.clone(),
+        address: None,
+        uploads: connection.uploads.clone(),
+        registry: None,
+        version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        sidecar: false,
+        early_block_relay: true,
+    }
 }

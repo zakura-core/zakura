@@ -340,6 +340,7 @@ where
             shutdown_tx: Some(shutdown_sender),
             server_tx: client_request_sender,
             block_advert_tx: block_advert_sender,
+            compact_receive_tx: tokio::sync::watch::channel(None).0,
             inv_collector: inv_sender,
             error_slot: error_slot.clone(),
             connection_task,

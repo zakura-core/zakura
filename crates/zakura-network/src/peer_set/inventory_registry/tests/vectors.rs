@@ -1,13 +1,15 @@
 //! Fixed test vectors for the inventory registry.
 
-use std::{cmp::min, net::SocketAddr};
+use std::{cmp::min, net::SocketAddr, sync::Arc};
+
+use tokio::sync::{watch, Semaphore};
 
 use zakura_chain::{block, serialization::AtLeastOne, transaction};
 
 use crate::{
     peer_set::inventory_registry::{
-        tests::new_inv_registry, InventoryChange, InventoryMarker, InventoryStatus,
-        MAX_INV_PER_MAP, MAX_PEERS_PER_INV,
+        tests::new_inv_registry, InventoryChange, InventoryMarker, InventoryRegistry,
+        InventoryStatus, MAX_COMPACT_SOURCES, MAX_INV_PER_MAP, MAX_PEERS_PER_INV,
     },
     protocol::external::InventoryHash,
     PeerSocketAddr,
@@ -323,4 +325,166 @@ fn multi_change_caps_before_collecting() {
         assert_eq!(kept.len(), MAX_INV_PER_MAP);
         assert!(kept.as_vec().capacity() <= 2 * MAX_INV_PER_MAP);
     }
+}
+
+/// Registers `count` compact block sources, and returns their peers and source watches.
+fn add_compact_sources(
+    registry: &mut InventoryRegistry,
+    count: u8,
+) -> (
+    Vec<PeerSocketAddr>,
+    Vec<watch::Receiver<Option<Arc<Semaphore>>>>,
+) {
+    (1..=count)
+        .map(|ip| {
+            let peer: PeerSocketAddr = SocketAddr::from(([127, 0, 0, ip], 8233)).into();
+            let (sender, receiver) = watch::channel(None);
+            registry.add_compact_source(peer, sender);
+            (peer, receiver)
+        })
+        .unzip()
+}
+
+/// Returns which sources are selected as high-bandwidth sources.
+fn selected(sources: &[watch::Receiver<Option<Arc<Semaphore>>>]) -> Vec<bool> {
+    sources
+        .iter()
+        .map(|source| source.borrow().is_some())
+        .collect()
+}
+
+/// Registers an `Available` status for the block `hash` from `peer`.
+fn announce(registry: &mut InventoryRegistry, hash: block::Hash, peer: PeerSocketAddr) {
+    registry.register(InventoryStatus::new_available(
+        InventoryHash::Block(hash),
+        peer,
+    ));
+}
+
+/// The first three sources are selected in registration order, and share one set of three
+/// slots.
+#[tokio::test]
+async fn compact_sources_are_capped_at_three() {
+    let (mut registry, _inv_stream_tx) = new_inv_registry();
+    let (_peers, sources) = add_compact_sources(&mut registry, 6);
+
+    registry.select_compact_sources(None, |_| true);
+
+    assert_eq!(selected(&sources), [true, true, true, false, false, false]);
+    let slots: Vec<Arc<Semaphore>> = sources[..3]
+        .iter()
+        .map(|source| source.borrow().clone().expect("the source is selected"))
+        .collect();
+    assert!(slots.iter().all(|slot| Arc::ptr_eq(slot, &slots[0])));
+    assert_eq!(slots[0].available_permits(), MAX_COMPACT_SOURCES);
+}
+
+/// The first peer to announce a new best tip moves to the front, and the last selected source
+/// is demoted.
+#[tokio::test]
+async fn first_announcer_of_new_tip_moves_to_front() {
+    let (mut registry, _inv_stream_tx) = new_inv_registry();
+    let (peers, sources) = add_compact_sources(&mut registry, 4);
+    registry.select_compact_sources(None, |_| true);
+
+    let tip = block::Hash([1; 32]);
+    announce(&mut registry, tip, peers[3]);
+    announce(&mut registry, tip, peers[1]);
+    registry.select_compact_sources(Some(tip), |_| true);
+
+    assert_eq!(selected(&sources), [true, true, false, true]);
+}
+
+/// The previous interval holds earlier announcements, so it is searched before the current one.
+#[tokio::test]
+async fn first_announcer_is_searched_in_the_previous_interval_first() {
+    let (mut registry, _inv_stream_tx) = new_inv_registry();
+    let (peers, sources) = add_compact_sources(&mut registry, 5);
+    registry.select_compact_sources(None, |_| true);
+
+    let tip = block::Hash([1; 32]);
+    announce(&mut registry, tip, peers[3]);
+    registry.rotate();
+    announce(&mut registry, tip, peers[4]);
+    registry.select_compact_sources(Some(tip), |_| true);
+
+    assert_eq!(selected(&sources), [true, true, false, true, false]);
+}
+
+/// A peer whose announcement became `Missing` gets no credit, and a `Missing` status in the
+/// previous interval does not hide an announcement in the current one.
+#[tokio::test]
+async fn missing_status_is_not_an_announcement() {
+    let (mut registry, _inv_stream_tx) = new_inv_registry();
+    let (peers, sources) = add_compact_sources(&mut registry, 5);
+    registry.select_compact_sources(None, |_| true);
+
+    let tip = block::Hash([1; 32]);
+    registry.register(InventoryStatus::new_missing(
+        InventoryHash::Block(tip),
+        peers[0],
+    ));
+    announce(&mut registry, tip, peers[3]);
+    registry.register(InventoryStatus::new_missing(
+        InventoryHash::Block(tip),
+        peers[3],
+    ));
+    registry.rotate();
+    announce(&mut registry, tip, peers[4]);
+    registry.select_compact_sources(Some(tip), |_| true);
+
+    assert_eq!(selected(&sources), [true, true, false, false, true]);
+}
+
+/// Selection with an unchanged best tip keeps the order, even if another peer is now the first
+/// announcer of that tip.
+#[tokio::test]
+async fn unchanged_tip_keeps_the_order() {
+    let (mut registry, _inv_stream_tx) = new_inv_registry();
+    let (peers, sources) = add_compact_sources(&mut registry, 5);
+
+    let tip = block::Hash([1; 32]);
+    announce(&mut registry, tip, peers[3]);
+    registry.select_compact_sources(Some(tip), |_| true);
+    assert_eq!(selected(&sources), [true, true, false, true, false]);
+
+    // Two rotations forget the first announcement.
+    registry.rotate();
+    registry.rotate();
+    announce(&mut registry, tip, peers[4]);
+    registry.select_compact_sources(Some(tip), |_| true);
+
+    assert_eq!(selected(&sources), [true, true, false, true, false]);
+}
+
+/// A disconnected peer loses its selection and its candidacy, and the next candidate is
+/// selected.
+#[tokio::test]
+async fn disconnected_source_is_demoted_and_removed() {
+    let (mut registry, _inv_stream_tx) = new_inv_registry();
+    let (peers, sources) = add_compact_sources(&mut registry, 4);
+    registry.select_compact_sources(None, |_| true);
+
+    let disconnected = peers[0];
+    registry.select_compact_sources(None, |peer| *peer != disconnected);
+    assert_eq!(selected(&sources), [false, true, true, true]);
+
+    // The removed peer stays removed when the predicate would accept it again.
+    let tip = block::Hash([1; 32]);
+    announce(&mut registry, tip, disconnected);
+    registry.select_compact_sources(Some(tip), |_| true);
+    assert_eq!(selected(&sources), [false, true, true, true]);
+}
+
+/// A source whose connection closed its watch is removed, and the next candidate is selected.
+#[tokio::test]
+async fn closed_source_watch_is_removed() {
+    let (mut registry, _inv_stream_tx) = new_inv_registry();
+    let (_peers, mut sources) = add_compact_sources(&mut registry, 4);
+    registry.select_compact_sources(None, |_| true);
+
+    drop(sources.remove(1));
+    registry.select_compact_sources(None, |_| true);
+
+    assert_eq!(selected(&sources), [true, true, true]);
 }

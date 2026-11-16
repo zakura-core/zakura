@@ -91,12 +91,14 @@ impl ConnectedClient {
         });
         let addr_label = connection_info.connected_addr.get_transient_addr_label();
 
+        let (compact_receive_tx, compact_receive_rx) = tokio::sync::watch::channel(None);
         let connection = Connection::new(
             inbound_service.clone(),
             ConnectionRequests {
                 client_rx: server_rx,
                 block_advert_rx,
                 warmup_rx: tokio::sync::mpsc::channel(1).1,
+                compact_receive_rx,
                 minimum_peer_version: MinimumPeerVersion::new(NoChainTip, &Network::Mainnet),
                 bans: Default::default(),
             },
@@ -129,6 +131,7 @@ impl ConnectedClient {
             shutdown_tx: Some(shutdown_tx),
             server_tx,
             block_advert_tx,
+            compact_receive_tx,
             inv_collector: broadcast::channel(16).0,
             error_slot,
             connection_task,

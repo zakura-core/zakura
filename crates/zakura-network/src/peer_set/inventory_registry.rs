@@ -4,18 +4,19 @@
 
 use std::{
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
 use futures::{FutureExt, Stream, StreamExt};
 use indexmap::IndexMap;
 use tokio::{
-    sync::broadcast,
+    sync::{broadcast, watch, Semaphore},
     time::{self, Instant},
 };
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, IntervalStream};
 
-use zakura_chain::serialization::AtLeastOne;
+use zakura_chain::{block, serialization::AtLeastOne};
 
 use crate::{
     constants::INVENTORY_ROTATION_INTERVAL,
@@ -67,6 +68,11 @@ pub const MAX_INV_PER_MAP: usize = 1000;
 // TODO: split this into available (25) and missing (70)
 pub const MAX_PEERS_PER_INV: usize = 70;
 
+/// The maximum number of peers this node asks to announce new blocks with `cmpctblock`.
+///
+/// The draft Compact Block Relay ZIP and Zebra both use three high-bandwidth peers.
+const MAX_COMPACT_SOURCES: usize = 3;
+
 /// A peer inventory status, which tracks a hash for both available and missing inventory.
 pub type InventoryStatus<T> = InventoryResponse<T, T>;
 
@@ -108,6 +114,23 @@ pub struct InventoryRegistry {
 
     /// Whether peer address labels in logs are unredacted.
     expose_peer_addresses: bool,
+
+    /// Connections that negotiated compact blocks, ordered by their most recent first
+    /// announcement of a new best tip. The first [`MAX_COMPACT_SOURCES`] are high-bandwidth
+    /// sources.
+    ///
+    /// Each watch holds `Some(slots)` while its connection is a high-bandwidth source, and
+    /// `None` otherwise.
+    compact_sources: IndexMap<PeerSocketAddr, watch::Sender<Option<Arc<Semaphore>>>>,
+
+    /// The best tip that the last compact source selection credited to its first announcer.
+    compact_tip: Option<block::Hash>,
+
+    /// The permits that high-bandwidth sources hold.
+    ///
+    /// A demoted connection keeps its permit until it writes `sendcmpct(0, 1)`. So at most
+    /// [`MAX_COMPACT_SOURCES`] peers send this node `cmpctblock` announcements at any time.
+    compact_receive_slots: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for InventoryRegistry {
@@ -223,7 +246,76 @@ impl InventoryRegistry {
             inv_stream: BroadcastStream::new(inv_stream).boxed(),
             interval: IntervalStream::new(interval),
             expose_peer_addresses,
+            compact_sources: IndexMap::new(),
+            compact_tip: None,
+            compact_receive_slots: Arc::new(Semaphore::new(MAX_COMPACT_SOURCES)),
         }
+    }
+
+    /// Registers the connection to `peer`, which negotiated compact blocks, as a candidate
+    /// high-bandwidth source. `slots` is the connection's watch of its source status.
+    ///
+    /// A new candidate goes last. A new connection from a known `peer` keeps the old
+    /// connection's place.
+    pub(super) fn add_compact_source(
+        &mut self,
+        peer: PeerSocketAddr,
+        slots: watch::Sender<Option<Arc<Semaphore>>>,
+    ) {
+        self.compact_sources.insert(peer, slots);
+    }
+
+    /// Selects up to [`MAX_COMPACT_SOURCES`] high-bandwidth compact block sources.
+    ///
+    /// When `best_tip` changes, the first peer that announced it moves to the front. Then this
+    /// removes candidates whose peer is no longer `connected` or whose connection closed its
+    /// watch, and tells each remaining connection whether it is a source.
+    pub(super) fn select_compact_sources(
+        &mut self,
+        best_tip: Option<block::Hash>,
+        connected: impl Fn(&PeerSocketAddr) -> bool,
+    ) {
+        if self.compact_tip != best_tip {
+            self.compact_tip = best_tip;
+            if let Some(index) = best_tip
+                .and_then(|hash| self.first_announcer(hash))
+                .and_then(|peer| self.compact_sources.get_index_of(&peer))
+            {
+                self.compact_sources.move_index(index, 0);
+            }
+        }
+
+        self.compact_sources.retain(|peer, slots| {
+            let retain = connected(peer) && !slots.is_closed();
+            if !retain {
+                slots.send_replace(None);
+            }
+            retain
+        });
+
+        for (index, slots) in self.compact_sources.values().enumerate() {
+            let selected = index < MAX_COMPACT_SOURCES;
+            slots.send_if_modified(|current| {
+                if current.is_some() == selected {
+                    return false;
+                }
+                *current = selected.then(|| self.compact_receive_slots.clone());
+                true
+            });
+        }
+    }
+
+    /// Returns the first peer with an `Available` status for the block `hash`, looking in the
+    /// previous interval before the current one.
+    ///
+    /// Each status map keeps its peers in the order they first reported `hash`.
+    fn first_announcer(&self, hash: block::Hash) -> Option<PeerSocketAddr> {
+        let hash = InventoryHash::Block(hash);
+        [self.prev.get(&hash), self.current.get(&hash)]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find_map(|(peer, status)| status.is_available().then_some(*peer))
     }
 
     /// Returns an iterator over addrs of peers that have recently advertised `hash` in their inventory.

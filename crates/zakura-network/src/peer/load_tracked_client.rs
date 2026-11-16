@@ -42,6 +42,10 @@ pub struct LoadTrackedClient {
     /// The metadata for the connected peer `service`.
     connection_info: Arc<ConnectionInfo>,
 
+    /// A copy of the client's compact block source watch, because [`PeakEwma`] does not
+    /// expose the inner client.
+    compact_receive_tx: tokio::sync::watch::Sender<Option<Arc<tokio::sync::Semaphore>>>,
+
     /// A process-local identifier for correlating privacy-preserving peer traces.
     trace_id: u64,
 }
@@ -62,6 +66,7 @@ impl From<Client> for LoadTrackedClient {
         };
 
         let request_slot = client.request_slot.clone();
+        let compact_receive_tx = client.compact_receive_tx.clone();
 
         let service = PeakEwma::new(
             client,
@@ -75,6 +80,7 @@ impl From<Client> for LoadTrackedClient {
             service,
             request_slot,
             connection_info,
+            compact_receive_tx,
             // Wrap-around is unreachable for a process-local u64 counter.
             trace_id: NEXT_PEER_TRACE_ID.fetch_add(1, Ordering::Relaxed),
         }
@@ -130,6 +136,16 @@ impl LoadTrackedClient {
     /// so a peer that withholds blocks can't win every retry while other advertisers are busy.
     pub(crate) fn is_preferred_block_source(&self) -> bool {
         self.can_send_request_now() && !self.has_unanswered_block_request()
+    }
+
+    /// Returns the watch that tells the connection whether it is a high-bandwidth compact block
+    /// source, if the connection negotiated compact blocks.
+    pub(crate) fn compact_source(
+        &self,
+    ) -> Option<&tokio::sync::watch::Sender<Option<Arc<tokio::sync::Semaphore>>>> {
+        self.connection_info
+            .early_block_relay
+            .then_some(&self.compact_receive_tx)
     }
 
     /// Retrieve the peer's self-reported chain height from its handshake.

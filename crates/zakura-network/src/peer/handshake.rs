@@ -1802,6 +1802,8 @@ where
                 tokio::sync::mpsc::channel(super::block_gossip::BLOCK_ADVERT_QUEUE);
             let (warmup_tx, warmup_rx) =
                 tokio::sync::mpsc::channel(super::tcp_warmup::WARMUP_QUEUE);
+            // The peer set selects high-bandwidth compact block sources through this watch.
+            let (compact_receive_tx, compact_receive_rx) = tokio::sync::watch::channel(None);
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let error_slot = ErrorSlot::default();
 
@@ -1945,6 +1947,7 @@ where
                     client_rx: server_rx,
                     block_advert_rx,
                     warmup_rx,
+                    compact_receive_rx,
                     minimum_peer_version,
                     bans,
                 },
@@ -2005,6 +2008,7 @@ where
                 shutdown_tx: Some(shutdown_tx),
                 server_tx,
                 block_advert_tx,
+                compact_receive_tx,
                 inv_collector,
                 error_slot,
                 connection_task,

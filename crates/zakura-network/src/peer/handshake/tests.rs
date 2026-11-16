@@ -1354,6 +1354,51 @@ async fn a_received_block_body_counts_as_an_announcement() {
     assert!(announced.announced(block.hash()));
 }
 
+/// A `cmpctblock` announces its block like a one-block `inv`: it registers the block as
+/// available from the peer, so the peer set routes the download to the peer holding the
+/// `cmpctblock`. It also records the announcement, so block gossip never echoes the block, and
+/// traces it.
+#[tokio::test]
+async fn a_cmpctblock_registers_its_block_as_available() {
+    use crate::peer::gossip_trace::tests::test_trace;
+    use crate::protocol::external::compact::CompactBlock;
+
+    let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .as_slice()
+        .zcash_deserialize_into()
+        .expect("test vector decodes");
+    let message = Message::CompactBlock(Arc::new(
+        CompactBlock::from_block(&block, 7).expect("the block fits"),
+    ));
+    let addr = peer_addr(38233);
+    let connected_addr = ConnectedAddr::new_inbound_direct(addr);
+    let (inv_collector, mut inventory) = broadcast::channel(16);
+    let announced = AnnouncedBlocks::default();
+    let (trace, mut written) = test_trace(&[("127.0.0.1", "us-0")]);
+
+    let returned = register_inventory_status(
+        Ok(message.clone()),
+        connected_addr,
+        inv_collector,
+        announced.clone(),
+        trace.for_peer(&connected_addr),
+    )
+    .await
+    .expect("the filter passes the message through");
+
+    assert_eq!(returned, message);
+    assert_eq!(
+        inventory.try_recv().expect("the block is registered"),
+        InventoryChange::new_available(InventoryHash::Block(block.hash()), addr),
+    );
+    assert!(inventory.try_recv().is_err(), "one change is registered");
+    assert!(announced.announced(block.hash()));
+    let rows = written.take();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["event"], "block_inv_received");
+    assert_eq!(rows[0]["hash"], block.hash().to_string());
+}
+
 /// A body request contradicts only the requested blocks' earlier announcements.
 #[tokio::test]
 async fn body_requests_withdraw_only_requested_block_announcements() {

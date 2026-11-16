@@ -4,10 +4,18 @@
 //!
 //! A connection announces a block with `cmpctblock` when the peer asked for version 1
 //! announcements, and then holds the block for [`RETENTION`] to serve the peer's
-//! `getblocktxn`. It holds at most one sent block, and each held block takes a permit from
-//! the global [`SLOTS`].
+//! `getblocktxn`.
+//!
+//! A connection that receives a `cmpctblock` screens its header, holds it, and starts the
+//! block's download from this peer. The download rebuilds the block from mempool
+//! transactions, asks the peer for the missing ones with `getblocktxn`, and falls back to a
+//! full `getdata` on any failure. A failure never scores the peer.
+//!
+//! A connection holds at most one sent, one received, and one reconstructed block, each for
+//! [`RETENTION`]. Each held block takes a permit from the global [`SLOTS`].
 
 use std::{
+    collections::HashSet,
     sync::{Arc, LazyLock},
     time::Duration,
 };
@@ -16,7 +24,7 @@ use futures::Sink;
 use indexmap::IndexSet;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
-    time::{sleep_until, timeout, timeout_at, Instant},
+    time::{sleep, sleep_until, timeout, timeout_at, Instant},
 };
 use tower::{Service, ServiceExt};
 
@@ -27,12 +35,12 @@ use zakura_chain::{
 };
 use zakura_node_services::block_memory::BlockHandle;
 
-use super::Connection;
+use super::{Connection, Handler, State};
 use crate::{
     constants::REQUEST_TIMEOUT,
     protocol::{
         external::{
-            compact::{BlockTransactions, BlockTransactionsRequest, CompactBlock},
+            compact::{BlockTransactions, BlockTransactionsRequest, CompactBlock, Reconstruction},
             Message,
         },
         internal::InventoryResponse,
@@ -49,9 +57,15 @@ const COMPACT_VERSION: u64 = 1;
 /// three sent and three received bodies.
 static SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(6)));
 
-/// How long a connection holds a block it announced with `cmpctblock`, to serve the peer's
-/// `getblocktxn`.
+/// How long a connection holds a sent, received, or reconstructed block.
+///
+/// A sent block serves the peer's `getblocktxn`. A received `cmpctblock` waits for the
+/// downloader's request. A reconstructed block answers a second downloader of the same block.
+/// A connection also screens at most one received `cmpctblock` per [`RETENTION`].
 pub(super) const RETENTION: Duration = Duration::from_secs(15);
+
+/// How long a connection waits for the peer's `blocktxn` before it downloads the full block.
+pub(super) const RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The `blocktxn` bytes a connection sends for one `cmpctblock` announcement.
 // 2,000,000 fits in the usize of every supported target.
@@ -68,6 +82,30 @@ struct SentBlock {
     /// serialization.
     transaction_sizes: Vec<usize>,
     /// The connection serves `getblocktxn` for this block until this time.
+    until: Instant,
+    /// The global [`SLOTS`] permit this block holds.
+    _slot: OwnedSemaphorePermit,
+}
+
+/// A `cmpctblock` this connection received and screened, held until the downloader requests
+/// its block.
+#[derive(Debug)]
+struct ReceivedBlock {
+    compact: Arc<CompactBlock>,
+    hash: block::Hash,
+    /// The connection drops this announcement at this time.
+    until: Instant,
+    /// The global [`SLOTS`] permit this announcement holds. Its reconstruction keeps it.
+    slot: OwnedSemaphorePermit,
+}
+
+/// A block this connection rebuilt from a received `cmpctblock` and checked, held to answer
+/// another request for it.
+#[derive(Debug)]
+struct ReconstructedBlock {
+    block: BlockHandle,
+    hash: block::Hash,
+    /// The connection drops this block at this time.
     until: Instant,
     /// The global [`SLOTS`] permit this block holds.
     _slot: OwnedSemaphorePermit,
@@ -107,6 +145,16 @@ pub(super) struct CompactRelay {
     ///
     /// Every request charges its overhead, so repeated or empty requests use up the budget.
     recovery_bytes_left: usize,
+
+    /// The `cmpctblock` this connection last received and screened, until the downloader
+    /// requests its block or [`RETENTION`] ends.
+    received: Option<ReceivedBlock>,
+
+    /// The block this connection last rebuilt and checked, until [`RETENTION`] ends.
+    reconstructed: Option<ReconstructedBlock>,
+
+    /// When this connection last screened a received `cmpctblock`.
+    last_received: Option<Instant>,
 }
 
 impl Default for CompactRelay {
@@ -117,6 +165,9 @@ impl Default for CompactRelay {
             slots: SLOTS.clone(),
             sent: None,
             recovery_bytes_left: 0,
+            received: None,
+            reconstructed: None,
+            last_received: None,
         }
     }
 }
@@ -153,16 +204,94 @@ impl CompactRelay {
         self.sent = None;
     }
 
-    /// Releases the sent block and its slot once [`RETENTION`] has ended.
+    /// Releases every held block and its slot.
+    pub(super) fn clear_held(&mut self) {
+        self.sent = None;
+        self.received = None;
+        self.reconstructed = None;
+    }
+
+    /// Releases each held block and its slot once its [`RETENTION`] has ended.
     pub(super) fn expire(&mut self) {
-        if self.expiry().is_some_and(|until| until <= Instant::now()) {
-            self.clear_sent();
+        let now = Instant::now();
+        if self.sent.as_ref().is_some_and(|sent| sent.until <= now) {
+            self.sent = None;
+        }
+        if self
+            .received
+            .as_ref()
+            .is_some_and(|received| received.until <= now)
+        {
+            self.received = None;
+        }
+        if self
+            .reconstructed
+            .as_ref()
+            .is_some_and(|reconstructed| reconstructed.until <= now)
+        {
+            self.reconstructed = None;
         }
     }
 
-    /// Returns when the sent block expires, if this connection holds one.
+    /// Returns when the first held block expires, if this connection holds any.
     pub(super) fn expiry(&self) -> Option<Instant> {
-        self.sent.as_ref().map(|sent| sent.until)
+        [
+            self.sent.as_ref().map(|sent| sent.until),
+            self.received.as_ref().map(|received| received.until),
+            self.reconstructed
+                .as_ref()
+                .map(|reconstructed| reconstructed.until),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Returns whether this connection screens a received `cmpctblock`: it holds no received
+    /// block, and it screened none in the last [`RETENTION`].
+    ///
+    /// Call [`Self::expire`] first.
+    fn may_receive(&self) -> bool {
+        self.received.is_none()
+            && self
+                .last_received
+                .is_none_or(|last| last.elapsed() >= RETENTION)
+    }
+
+    /// Returns the block that a request for `hashes` downloads through compact block relay:
+    /// the one hash, if it names the received or reconstructed block.
+    ///
+    /// The match can name an expired block. The download expires held blocks first, and then
+    /// requests an expired block with `getdata`.
+    pub(super) fn held_download(&self, hashes: &IndexSet<block::Hash>) -> Option<block::Hash> {
+        if hashes.len() != 1 {
+            return None;
+        }
+        let hash = hashes.first()?;
+        let received = self.received.as_ref().map(|received| received.hash);
+        let reconstructed = self
+            .reconstructed
+            .as_ref()
+            .map(|reconstructed| reconstructed.hash);
+        (received == Some(*hash) || reconstructed == Some(*hash)).then_some(*hash)
+    }
+}
+
+/// Returns the request timeout for `handler`: [`RECOVERY_TIMEOUT`] while it waits for
+/// `blocktxn`, and [`REQUEST_TIMEOUT`] otherwise.
+pub(super) fn response_timeout(handler: &Handler) -> Duration {
+    if matches!(handler, Handler::CompactBlock { .. }) {
+        RECOVERY_TIMEOUT
+    } else {
+        REQUEST_TIMEOUT
+    }
+}
+
+/// Returns the handler that waits for the full block `hash` after a `getdata`.
+fn full_block_handler(hash: block::Hash) -> Handler {
+    Handler::BlocksByHash {
+        pending_hashes: HashSet::from([hash]),
+        blocks: Vec::with_capacity(1),
     }
 }
 
@@ -273,14 +402,8 @@ where
     /// Any error, timeout, or missing block returns `None`, because the advert can still go
     /// as an `inv`.
     async fn early_block(&mut self, hash: block::Hash) -> Option<BlockHandle> {
-        let request = Request::EarlyBlocksByHash(IndexSet::from([hash]));
-        let response = timeout(REQUEST_TIMEOUT, async {
-            self.svc.ready().await.ok()?.call(request).await.ok()
-        })
-        .await
-        .ok()
-        .flatten()?;
-        response
+        self.compact_query(Request::EarlyBlocksByHash(IndexSet::from([hash])))
+            .await?
             .block_statuses()?
             .iter()
             .find_map(|status| match status {
@@ -376,6 +499,303 @@ where
                 self.compact.clear_sent();
                 self.fail_with(error).await;
             }
+        }
+    }
+
+    /// Sends a compact block relay `request` to the inbound service, and returns its response
+    /// if it answers within [`REQUEST_TIMEOUT`].
+    ///
+    /// Returns `None` on an error or timeout. Neither one scores the peer, because compact
+    /// block relay falls back to an `inv` or a full block download.
+    async fn compact_query(&mut self, request: Request) -> Option<Response> {
+        timeout(REQUEST_TIMEOUT, async {
+            self.svc.ready().await.ok()?.call(request).await.ok()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Handles the peer's `cmpctblock`, then starts the block's download with an inbound
+    /// `AdvertiseBlock`, as for an `inv`.
+    ///
+    /// The connection holds the `cmpctblock` for the download if:
+    /// - it holds no received block, and screened none in the last [`RETENTION`];
+    /// - the inbound service passes the header screen; and
+    /// - a global slot is free.
+    ///
+    /// Every screen starts the cooldown, whatever its result. A screening failure is not
+    /// misbehavior. A connection that did not negotiate compact blocks ignores the message.
+    pub(super) async fn receive_compact(&mut self, compact: Arc<CompactBlock>) {
+        if !self.connection_info.early_block_relay {
+            debug!("ignoring cmpctblock: compact blocks were not negotiated");
+            return;
+        }
+        self.compact.expire();
+        let hash = compact.block_hash();
+        if self.compact.may_receive() {
+            self.compact.last_received = Some(Instant::now());
+            let screened = matches!(
+                self.compact_query(Request::CheckCompactHeader(compact.clone()))
+                    .await,
+                Some(Response::Nil)
+            );
+            if !screened {
+                debug!("not holding cmpctblock: its header failed screening");
+            } else if let Ok(slot) = Arc::clone(&self.compact.slots).try_acquire_owned() {
+                self.compact.received = Some(ReceivedBlock {
+                    compact,
+                    hash,
+                    until: Instant::now() + RETENTION,
+                    slot,
+                });
+            } else {
+                debug!("not holding cmpctblock: no decoded body slot is free");
+            }
+        } else {
+            debug!("not screening cmpctblock: this peer sent one within the retention time");
+        }
+
+        let source = self
+            .connection_info
+            .connected_addr
+            .get_transient_addr()
+            .map(Into::into);
+        self.drive_peer_request(Request::AdvertiseBlock(hash.into(), source))
+            .await;
+    }
+
+    /// Returns the handler for a request for the block `hash`, which
+    /// [`CompactRelay::held_download`] matched.
+    ///
+    /// Answers at once from a reconstructed block. Rebuilds a received block from mempool
+    /// transactions, and writes `getblocktxn` if some are missing. Writes a full `getdata` in
+    /// any other case, or if reconstruction fails.
+    ///
+    /// Fails only if a write fails, or if the peer lost its authorization.
+    pub(super) async fn download_block(&mut self, hash: block::Hash) -> Result<Handler, PeerError> {
+        self.compact.expire();
+        if let Some(reconstructed) = self
+            .compact
+            .reconstructed
+            .as_ref()
+            .filter(|reconstructed| reconstructed.hash == hash)
+        {
+            let block = reconstructed.block.clone();
+            return Ok(self.compact_response(block));
+        }
+        if let Some(received) = self
+            .compact
+            .received
+            .take_if(|received| received.hash == hash)
+        {
+            if let Some(handler) = self.reconstruct(received).await? {
+                return Ok(handler);
+            }
+        }
+        self.send_download_request(Message::GetData(vec![hash.into()]))
+            .await?;
+        Ok(full_block_handler(hash))
+    }
+
+    /// Rebuilds the `received` block from mempool transactions.
+    ///
+    /// Returns the response handler if the block is complete, or the handler that waits for
+    /// `blocktxn` after writing `getblocktxn` for the missing transactions. Returns `None` if
+    /// the inbound service fails, or if reconstruction or its checks fail.
+    async fn reconstruct(&mut self, received: ReceivedBlock) -> Result<Option<Handler>, PeerError> {
+        let ReceivedBlock {
+            compact,
+            hash,
+            until: _,
+            slot,
+        } = received;
+        let Some(Response::CompactBlockTransactions(candidates)) = self
+            .compact_query(Request::CompactBlockTransactions(compact.clone()))
+            .await
+        else {
+            debug!("downloading the full block: no compact block candidates");
+            return Ok(None);
+        };
+        let Ok((Ok(reconstruction), slot)) =
+            tokio::task::spawn_blocking(move || (compact.reconstruct(candidates), slot)).await
+        else {
+            debug!("downloading the full block: the cmpctblock could not be rebuilt");
+            return Ok(None);
+        };
+
+        let indexes = reconstruction.missing_indexes();
+        if indexes.is_empty() {
+            let complete = BlockTransactions {
+                block_hash: hash,
+                transactions: Vec::new(),
+            };
+            let block = self.finish_compact(reconstruction, complete, slot).await;
+            return Ok(block.map(|block| self.compact_response(block)));
+        }
+
+        self.send_download_request(Message::GetBlockTransactions(BlockTransactionsRequest {
+            block_hash: hash,
+            indexes,
+        }))
+        .await?;
+        Ok(Some(Handler::CompactBlock {
+            reconstruction,
+            slot,
+        }))
+    }
+
+    /// Writes `message`, a request for a block's transactions, after rechecking the peer's
+    /// live authorization immediately before the write.
+    ///
+    /// Fails if the write fails, or if the peer's version is now below the minimum or its IP
+    /// is now banned.
+    async fn send_download_request(&mut self, message: Message) -> Result<(), PeerError> {
+        let address = self.connection_info.connected_addr.get_transient_addr();
+        let version = self.connection_info.remote.version;
+        let minimum = &mut self.minimum_peer_version;
+        let bans = &self.bans;
+        let authorized = self
+            .peer_tx
+            .send_authorized(message, || {
+                version >= minimum.current()
+                    && !address.is_some_and(|addr| bans.contains(addr.ip()))
+            })
+            .await?;
+        if authorized {
+            Ok(())
+        } else {
+            Err(PeerError::ConnectionDropped)
+        }
+    }
+
+    /// Returns the handler that answers a block request with the reconstructed `block`, and
+    /// charges its decoded bytes until the client takes the response.
+    ///
+    /// The delivery marks the response as early relay, so the block verifier does not score
+    /// this peer for a later transaction or contextual failure.
+    fn compact_response(&mut self, block: BlockHandle) -> Handler {
+        self.charge_response_payload(block.decoded_bytes());
+        let source = self.connection_info.connected_addr.get_transient_addr();
+        Handler::Finished(Ok(Response::Blocks(vec![InventoryResponse::Available((
+            block, source,
+        ))])))
+    }
+
+    /// Fills the missing transactions of `reconstruction` from `response`, and checks the
+    /// rebuilt block with the inbound service.
+    ///
+    /// On success, holds the block for [`RETENTION`] with `slot`, so another request for it is
+    /// answered at once, and returns it. Returns `None` if the block does not match the
+    /// announcement. A short ID can match the wrong transaction, so a mismatch is not
+    /// misbehavior.
+    async fn finish_compact(
+        &mut self,
+        reconstruction: Reconstruction,
+        response: BlockTransactions,
+        slot: OwnedSemaphorePermit,
+    ) -> Option<BlockHandle> {
+        let hash = reconstruction.block_hash();
+        let (block, slot) =
+            tokio::task::spawn_blocking(move || (reconstruction.finish(response), slot))
+                .await
+                .ok()?;
+        let Ok(block) = block else {
+            debug!("downloading the full block: the blocktxn does not fill the cmpctblock");
+            return None;
+        };
+        if !matches!(
+            self.compact_query(Request::CheckCompactBlock(block.clone()))
+                .await,
+            Some(Response::Nil)
+        ) {
+            debug!("downloading the full block: the rebuilt block failed its checks");
+            return None;
+        }
+
+        let block = BlockHandle::from(block);
+        self.compact.reconstructed = Some(ReconstructedBlock {
+            block: block.clone(),
+            hash,
+            until: Instant::now() + RETENTION,
+            _slot: slot,
+        });
+        Some(block)
+    }
+
+    /// Handles the peer's `blocktxn`, which finishes the reconstruction the pending request
+    /// waits for.
+    ///
+    /// Ignores a `blocktxn` unless the pending request waits for the transactions of its
+    /// block. Downloads the full block if the transactions do not finish a block that passes
+    /// its checks.
+    pub(super) async fn receive_compact_transactions(&mut self, response: BlockTransactions) {
+        let hash = response.block_hash;
+        let State::AwaitingResponse { handler, .. } = &mut self.state else {
+            debug!("ignoring blocktxn: no request is pending");
+            return;
+        };
+        if !matches!(
+            handler,
+            Handler::CompactBlock { reconstruction, .. } if reconstruction.block_hash() == hash
+        ) {
+            debug!("ignoring blocktxn: the pending request does not wait for it");
+            return;
+        }
+        let Handler::CompactBlock {
+            reconstruction,
+            slot,
+        } = std::mem::replace(handler, Handler::Finished(Ok(Response::Nil)))
+        else {
+            unreachable!("the pending request waits for this block's transactions");
+        };
+        self.clear_compact_recovery();
+
+        match self.finish_compact(reconstruction, response, slot).await {
+            Some(block) => {
+                let response = self.compact_response(block);
+                if let State::AwaitingResponse { handler, .. } = &mut self.state {
+                    *handler = response;
+                }
+            }
+            None => self.fallback_compact(hash).await,
+        }
+    }
+
+    /// Writes a full `getdata` for the block `hash` after a failed or late recovery, and waits
+    /// for the block for [`REQUEST_TIMEOUT`]. A failed write fails the connection.
+    pub(super) async fn fallback_compact(&mut self, hash: block::Hash) {
+        self.clear_compact_recovery();
+        if let Err(error) = self
+            .send_download_request(Message::GetData(vec![hash.into()]))
+            .await
+        {
+            self.fail_with(error).await;
+            return;
+        }
+        if let State::AwaitingResponse { handler, .. } = &mut self.state {
+            *handler = full_block_handler(hash);
+            self.request_timer = Some(Box::pin(sleep(REQUEST_TIMEOUT)));
+        }
+    }
+}
+
+impl<S, Tx, C> Connection<S, Tx, C>
+where
+    Tx: Sink<Message, Error = SerializationError> + Unpin,
+{
+    /// Tells the codec that no `blocktxn` is expected, before the connection drops or replaces
+    /// a handler that waits for one.
+    pub(super) fn clear_compact_recovery(&self) {
+        if let Some(recovery) = &self.compact_recovery {
+            recovery.send_replace(None);
+        }
+    }
+
+    /// Tells the codec to accept a `blocktxn` for `hash` until `deadline`.
+    pub(super) fn expect_compact_recovery(&self, hash: block::Hash, deadline: Instant) {
+        if let Some(recovery) = &self.compact_recovery {
+            recovery.send_replace(Some((hash, deadline)));
         }
     }
 }

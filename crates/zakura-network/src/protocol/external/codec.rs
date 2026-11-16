@@ -283,8 +283,6 @@ impl Codec {
 
     /// Accept a `blocktxn` message only while `recovery` holds the hash and deadline of the
     /// connection's outstanding `getblocktxn` request.
-    // Nothing sends `getblocktxn` yet, so only tests set a recovery request.
-    #[allow(dead_code)]
     pub(crate) fn reconfigure_compact_recovery(
         &mut self,
         recovery: watch::Receiver<Option<(block::Hash, Instant)>>,

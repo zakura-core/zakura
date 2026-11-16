@@ -648,6 +648,12 @@ impl StartCmd {
             .network
             .compact_block_relay
             .then(|| zakura_consensus::EarlyRelay::new(latest_chain_tip.clone()));
+        let compact_relay = config.network.compact_block_relay.then(|| {
+            inbound::compact::CompactRelay::new(
+                config.network.network.clone(),
+                tower::util::BoxCloneSyncService::new(read_only_state_service.clone()),
+            )
+        });
         let inbound = LoadShed::new(spawn_buffer(
             Timeout::new(
                 Inbound::new(
@@ -658,7 +664,8 @@ impl StartCmd {
                     setup_rx,
                 )
                 .with_pending_blocks(pending_blocks.clone())
-                .with_early_relay(early_relay.clone()),
+                .with_early_relay(early_relay.clone())
+                .with_compact_relay(compact_relay),
                 MAX_INBOUND_RESPONSE_TIME,
             ),
             inbound::downloads::MAX_INBOUND_CONCURRENCY,

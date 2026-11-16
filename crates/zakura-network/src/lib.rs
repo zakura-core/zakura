@@ -198,7 +198,7 @@ pub use crate::{
         external::{
             compact::{
                 BlockTransactions, BlockTransactionsRequest, CompactBlock, PrefilledTransaction,
-                ShortId, ShortIdKeys, MAX_COMPACT_TRANSACTIONS,
+                Reconstruction, ShortId, ShortIdKeys, MAX_COMPACT_TRANSACTIONS,
             },
             Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE,
         },

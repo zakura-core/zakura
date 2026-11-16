@@ -225,6 +225,7 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
     Ok(())
 }
 
+mod compact;
 mod fake_peer_set;
 mod real_peer_set;
 

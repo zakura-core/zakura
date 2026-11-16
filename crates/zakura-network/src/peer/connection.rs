@@ -20,7 +20,7 @@ use zakura_node_services::block_memory::BlockHandle;
 use futures::{future::Either, prelude::*};
 use rand_10::{rng as thread_rng, seq::SliceRandom, RngExt};
 use tokio::{
-    sync::Semaphore,
+    sync::{watch, OwnedSemaphorePermit, Semaphore},
     time::{sleep, Sleep},
 };
 use tower::{Service, ServiceExt};
@@ -50,7 +50,7 @@ use crate::{
     },
     peer_set::ConnectionTracker,
     protocol::{
-        external::{types::Nonce, InventoryHash, Message},
+        external::{compact::Reconstruction, types::Nonce, InventoryHash, Message},
         internal::{InventoryResponse, Request, Response},
     },
     BannedIps, BoxError, PeerSocketAddr, MAX_TX_INV_IN_SENT_MESSAGE,
@@ -80,6 +80,13 @@ pub(super) enum Handler {
         pending_hashes: HashSet<block::Hash>,
         blocks: Vec<BlockHandle>,
     },
+    /// Waits for the peer's `blocktxn`, which fills the missing transactions of a block that
+    /// this connection is rebuilding from a received `cmpctblock`.
+    CompactBlock {
+        reconstruction: Reconstruction,
+        /// The global decoded body slot that the received `cmpctblock` took.
+        slot: OwnedSemaphorePermit,
+    },
     TransactionsById {
         pending_ids: HashSet<UnminedTxId>,
         transactions: Vec<UnminedTx>,
@@ -106,6 +113,10 @@ impl fmt::Display for Handler {
                 pending_hashes.len(),
                 blocks.len()
             ),
+
+            Handler::CompactBlock { reconstruction, .. } => {
+                format!("CompactBlock {{ hash: {} }}", reconstruction.block_hash())
+            }
 
             Handler::TransactionsById {
                 pending_ids,
@@ -134,6 +145,7 @@ impl Handler {
             Handler::FindHeaders => "FindHeaders".into(),
 
             Handler::BlocksByHash { .. } => "BlocksByHash".into(),
+            Handler::CompactBlock { .. } => "CompactBlock".into(),
             Handler::TransactionsById { .. } => "TransactionsById".into(),
 
             Handler::MempoolTransactionIds => "MempoolTransactionIds".into(),
@@ -686,6 +698,12 @@ where
     /// The compact block relay state of a connection that negotiated compact blocks.
     compact: compact_relay::CompactRelay,
 
+    /// Tells the codec which `blocktxn` this connection waits for, and until when.
+    ///
+    /// It holds `Some((hash, deadline))` only while the pending request waits for the
+    /// transactions of block `hash`. Only a connection that negotiated compact blocks has it.
+    compact_recovery: Option<watch::Sender<Option<(block::Hash, tokio::time::Instant)>>>,
+
     /// Live authorization, rechecked immediately before advert writes.
     minimum_peer_version: MinimumPeerVersion<C>,
     bans: BannedIps,
@@ -843,6 +861,7 @@ where
             pending_warmup: None,
             compact_receive_rx,
             compact: Default::default(),
+            compact_recovery: None,
             minimum_peer_version,
             bans,
             error_slot,
@@ -865,6 +884,16 @@ where
         gossip_trace: super::gossip_trace::PeerGossipTrace,
     ) -> Self {
         self.gossip_trace = gossip_trace;
+        self
+    }
+
+    /// Makes this connection tell its codec through `compact_recovery` which `blocktxn` it
+    /// waits for.
+    pub(super) fn with_compact_recovery(
+        mut self,
+        compact_recovery: Option<watch::Sender<Option<(block::Hash, tokio::time::Instant)>>>,
+    ) -> Self {
+        self.compact_recovery = compact_recovery;
         self
     }
 }
@@ -1107,10 +1136,22 @@ where
                             // The client receiver was dropped, so we don't need to send on `tx` here.
                             trace!(parent: &span, "client request was cancelled");
                             self.record_unanswered_block_request();
+                            self.clear_compact_recovery();
                             self.state = State::AwaitingRequest;
                             continue;
                         }
                         _ = timer_ref => {
+                            // A late `blocktxn` downloads the full block instead.
+                            if let State::AwaitingResponse {
+                                handler: Handler::CompactBlock { reconstruction, .. },
+                                ..
+                            } = &self.state
+                            {
+                                trace!(parent: &span, "compact block recovery timed out");
+                                let hash = reconstruction.block_hash();
+                                self.fallback_compact(hash).await;
+                                continue;
+                            }
                             trace!(parent: &span, "client request timed out");
                             self.record_unanswered_block_request();
                             let e = PeerError::ConnectionReceiveTimeout;
@@ -1468,7 +1509,13 @@ where
                 | AdvertiseMinedBlock(_)
                 | AdvertiseEarlyBlock(_),
             ) => Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService))),
-            (_, EarlyBlocksByHash(_)) => Ok(Handler::Finished(Err(PeerError::InboundOnlyRequest))),
+            (
+                _,
+                EarlyBlocksByHash(_)
+                | CheckCompactHeader(_)
+                | CompactBlockTransactions(_)
+                | CheckCompactBlock(_),
+            ) => Ok(Handler::Finished(Err(PeerError::InboundOnlyRequest))),
             (Failed, request) => panic!(
                 "failed connection cannot handle new request: {:?}, client_receiver: {:?}",
                 request,
@@ -1513,6 +1560,15 @@ where
                     .map(|()| Handler::Ping { nonce, ping_sent_at })
             }
 
+            (AwaitingRequest, BlocksByHash(hashes) | BlocksByHashFrom { hashes, .. })
+                if self.compact.held_download(&hashes).is_some() =>
+            {
+                let hash = self
+                    .compact
+                    .held_download(&hashes)
+                    .expect("the guard matched a held block");
+                self.download_block(hash).await
+            }
             (AwaitingRequest, BlocksByHash(hashes) | BlocksByHashFrom { hashes, .. }) => {
                 self
                     .peer_tx
@@ -1615,8 +1671,12 @@ where
         // Update the connection state with a new handler, or fail with an error.
         match new_handler {
             Ok(handler) => {
+                let timer = sleep(compact_relay::response_timeout(&handler));
+                if let Handler::CompactBlock { reconstruction, .. } = &handler {
+                    self.expect_compact_recovery(reconstruction.block_hash(), timer.deadline());
+                }
                 self.state = AwaitingResponse { handler, span, tx };
-                self.request_timer = Some(Box::pin(sleep(constants::REQUEST_TIMEOUT)));
+                self.request_timer = Some(Box::pin(timer));
             }
             Err(error) => {
                 let error = SharedPeerError::from(error);
@@ -1859,11 +1919,15 @@ where
                 self.serve_compact_transactions(request).await;
                 Consumed
             }
-            // Receiving compact blocks isn't used yet. The codec drops these messages unless
-            // they were negotiated, so a peer that sends them is not misbehaving.
-            Message::CompactBlock(_) | Message::BlockTransactions(_) => {
-                debug!(%msg, "ignoring compact block relay message");
-                Unused
+            // The codec drops `cmpctblock` unless this connection asked for announcements.
+            Message::CompactBlock(ref compact) => {
+                self.receive_compact(compact.clone()).await;
+                Consumed
+            }
+            // The codec drops `blocktxn` unless this connection waits for it.
+            Message::BlockTransactions(response) => {
+                self.receive_compact_transactions(response).await;
+                return None;
             }
         };
 
@@ -2085,6 +2149,9 @@ where
         // TODO: split response handler into its own method
         match rsp.clone() {
             Response::Nil => { /* generic success, do nothing */ }
+            Response::CompactBlockTransactions(_) => {
+                error!("inbound service answered a peer message with compact block candidates");
+            }
             Response::Peers(addrs) => {
                 if let Err(e) = self.peer_tx.send(Message::Addr(addrs)).await {
                     self.fail_with(e).await;
@@ -2396,7 +2463,8 @@ where
         // A failed connection can't receive announcements or serve `getblocktxn`, so it
         // releases its slots, even if closing its writer stalls.
         self.compact.receive_permit = None;
-        self.compact.clear_sent();
+        self.compact.clear_held();
+        self.clear_compact_recovery();
 
         // Update the shared error slot
         //

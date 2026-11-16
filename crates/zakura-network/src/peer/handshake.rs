@@ -1790,6 +1790,12 @@ where
             bare_codec.reconfigure_version(connection_info.negotiated_version);
             bare_codec.reconfigure_full_body_len();
             bare_codec.reconfigure_compact_blocks(connection_info.early_block_relay);
+            // The connection tells the codec which `blocktxn` it waits for through this watch.
+            let compact_recovery = connection_info.early_block_relay.then(|| {
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                bare_codec.reconfigure_compact_recovery(receiver);
+                sender
+            });
 
             debug!("constructing client, spawning server");
 
@@ -1959,7 +1965,8 @@ where
                 alternate_addrs.collect(),
                 inbound_budget,
             )
-            .with_gossip_trace(gossip_trace);
+            .with_gossip_trace(gossip_trace)
+            .with_compact_recovery(compact_recovery);
 
             let block_uploads = server.block_uploads.clone();
             let request_slot = server.request_slot.clone();
@@ -2065,6 +2072,10 @@ fn serialization_error_metric_label(error: &SerializationError) -> &'static str 
 
 /// Register any advertised or missing inventory in `msg` for `connected_addr`.
 ///
+/// A `cmpctblock` announces its block like a one-block `inv`, so the peer set routes the
+/// block's download to this peer, which holds the `cmpctblock` to rebuild it. The codec drops
+/// `cmpctblock` on connections that didn't negotiate compact blocks.
+///
 /// Also records the blocks this peer announces or sends in `announced_blocks`, so block gossip
 /// can skip a peer that already has the block. Unlike the inventory registry, this covers every
 /// block `inv`, solicited or not, and connections without a transient address. A peer that sent
@@ -2072,8 +2083,8 @@ fn serialization_error_metric_label(error: &SerializationError) -> &'static str 
 /// again, so early block relay doesn't echo a block to its supplier. Requests for block bodies
 /// withdraw the peer's earlier claim to have those blocks.
 ///
-/// An `inv` that names exactly one block is a new block announcement, and is written to
-/// `gossip_trace`. One that names several is the answer to a query.
+/// An `inv` that names exactly one block, or a `cmpctblock`, is a new block announcement, and is
+/// written to `gossip_trace`. An `inv` that names several blocks is the answer to a query.
 pub(crate) async fn register_inventory_status(
     msg: Result<Message, SerializationError>,
     connected_addr: ConnectedAddr,
@@ -2088,6 +2099,11 @@ pub(crate) async fn register_inventory_status(
                 gossip_trace.block_inv_received(hash);
             }
         }
+        Ok(Message::CompactBlock(compact)) => {
+            let hash = compact.block_hash();
+            announced_blocks.record([hash]);
+            gossip_trace.block_inv_received(hash);
+        }
         Ok(Message::Block(block)) => announced_blocks.record([block.hash()]),
         // A request for the body or a missing response contradicts an earlier announcement.
         Ok(Message::GetData(items) | Message::NotFound(items)) => {
@@ -2097,6 +2113,14 @@ pub(crate) async fn register_inventory_status(
     }
 
     match (&msg, connected_addr.get_transient_addr()) {
+        (Ok(Message::CompactBlock(compact)), Some(transient_addr)) => {
+            debug!("registering compact block announcement for peer");
+            // Ignore channel errors that should only happen during shutdown.
+            let _ = inv_collector.send(InventoryChange::new_available(
+                InventoryHash::Block(compact.block_hash()),
+                transient_addr,
+            ));
+        }
         (Ok(Message::Inv(advertised)), Some(transient_addr)) => {
             // We ignore inventory messages with more than one
             // block, because they are most likely replies to a

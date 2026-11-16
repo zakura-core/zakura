@@ -551,3 +551,197 @@ fn response_transaction_bytes_are_limited() {
     };
     assert!(too_many.zcash_serialize_to_vec().is_err());
 }
+
+/// Returns the `blocktxn` response with `block`'s transactions at `indexes`.
+fn response(block: &Block, indexes: &[usize]) -> BlockTransactions {
+    BlockTransactions {
+        block_hash: block.hash(),
+        transactions: indexes
+            .iter()
+            .map(|index| block.transactions[*index].clone())
+            .collect(),
+    }
+}
+
+/// Returns `block`'s transactions after the coinbase transaction, as mempool transactions.
+fn mempool_transactions(block: &Block) -> Vec<UnminedTx> {
+    block.transactions[1..].iter().map(Into::into).collect()
+}
+
+#[test]
+fn matching_ids_require_unique_short_ids() {
+    let block = block(&BLOCK_MAINNET_1687107_BYTES);
+    let mut compact = CompactBlock::from_block(&block, 11).unwrap();
+    let ids: Vec<UnminedTxId> = block.transactions[1..]
+        .iter()
+        .map(|transaction| transaction.as_ref().into())
+        .collect();
+    let unrelated = UnminedTxId::from(block.transactions[0].as_ref());
+
+    // Every block transaction matches, repeats count once, and other IDs never match.
+    let mempool = ids.iter().chain(&ids).copied().chain([unrelated]);
+    assert_eq!(
+        compact.matching_ids(mempool),
+        ids.iter().copied().collect::<HashSet<_>>()
+    );
+
+    // Two different IDs with one short ID match nothing. A real 48-bit collision is too
+    // expensive to find, so the test pairs the IDs with short IDs directly.
+    let short_id = compact.short_ids[0];
+    assert_eq!(
+        compact.unique_matches([(short_id, ids[0]), (short_id, ids[0])]),
+        HashMap::from([(short_id, ids[0])])
+    );
+    assert!(compact
+        .unique_matches([(short_id, ids[0]), (short_id, ids[1]), (short_id, ids[0])])
+        .is_empty());
+
+    // A short ID that appears twice in the message matches nothing.
+    compact.short_ids[1] = short_id;
+    let matches = compact.matching_ids(ids.iter().copied());
+    assert!(!matches.contains(&ids[0]));
+    assert!(!matches.contains(&ids[1]));
+    assert_eq!(matches.len(), ids.len() - 2);
+}
+
+#[test]
+fn reconstruction_with_every_transaction_finishes_without_recovery() {
+    let block = block(&BLOCK_MAINNET_1687107_BYTES);
+    let compact = Arc::new(CompactBlock::from_block(&block, 12).unwrap());
+
+    // Duplicate and unrelated candidates are ignored.
+    let mut candidates = mempool_transactions(&block);
+    candidates.push(candidates[0].clone());
+    candidates.push(UnminedTx::from(&block.transactions[0]));
+    let reconstruction = compact.reconstruct(candidates).unwrap();
+
+    assert!(reconstruction.missing_indexes().is_empty());
+    assert_eq!(reconstruction.block_hash(), block.hash());
+    let rebuilt = reconstruction.finish(response(&block, &[])).unwrap();
+    assert_eq!(*rebuilt, block);
+}
+
+#[test]
+fn partial_reconstruction_finishes_with_recovered_transactions() {
+    let block = block(&BLOCK_MAINNET_1687107_BYTES);
+    let last = block.transactions.len() - 1;
+    assert!(
+        last >= 3,
+        "the test needs at least three non-coinbase transactions"
+    );
+    let compact = CompactBlock::from_block(&block, 13).unwrap();
+
+    let reconstruction = Arc::new(compact.clone())
+        .reconstruct(vec![(&block.transactions[2]).into()])
+        .unwrap();
+    let missing: Vec<usize> = (1..=last).filter(|index| *index != 2).collect();
+    assert_eq!(reconstruction.missing_indexes(), missing);
+    let rebuilt = reconstruction.finish(response(&block, &missing)).unwrap();
+    assert_eq!(*rebuilt, block);
+
+    // A prefilled transaction is placed without a candidate or a recovery.
+    let mut prefilled = compact;
+    prefilled.short_ids.remove(last - 1);
+    prefilled.prefilled.push(PrefilledTransaction {
+        index: last,
+        transaction: block.transactions[last].clone(),
+    });
+    let reconstruction = Arc::new(prefilled).reconstruct(Vec::new()).unwrap();
+    let missing: Vec<usize> = (1..last).collect();
+    assert_eq!(reconstruction.missing_indexes(), missing);
+    let rebuilt = reconstruction.finish(response(&block, &missing)).unwrap();
+    assert_eq!(*rebuilt, block);
+}
+
+#[test]
+fn finish_rejects_a_wrong_hash_count_or_short_id() {
+    let block = block(&BLOCK_MAINNET_1687107_BYTES);
+    let compact = Arc::new(CompactBlock::from_block(&block, 14).unwrap());
+    let all: Vec<usize> = (1..block.transactions.len()).collect();
+    let reconstruct = || compact.clone().reconstruct(Vec::new()).unwrap();
+
+    let mut wrong_hash = response(&block, &all);
+    wrong_hash.block_hash = block::Hash([0; 32]);
+    assert_parse_error(reconstruct().finish(wrong_hash), "another block");
+
+    let too_few = response(&block, &all[1..]);
+    assert_parse_error(reconstruct().finish(too_few), "wrong number");
+
+    let mut too_many = response(&block, &all);
+    too_many.transactions.push(block.transactions[1].clone());
+    assert_parse_error(reconstruct().finish(too_many), "wrong number");
+
+    let mut swapped = response(&block, &all);
+    swapped.transactions.swap(0, 1);
+    assert_parse_error(reconstruct().finish(swapped), "short ID");
+
+    let mut changed = response(&block, &all);
+    changed.transactions[1] = with_unlock_script(&block.transactions[2], &[2]);
+    assert_parse_error(reconstruct().finish(changed), "short ID");
+}
+
+#[test]
+fn reconstruction_enforces_the_block_size_limit() {
+    let limit = usize::try_from(MAX_BLOCK_BYTES).unwrap();
+    let mut block = block(&BLOCK_MAINNET_1687107_BYTES);
+    block.transactions.truncate(2);
+    let base = block.transactions[1].clone();
+    // Keep the script length's `CompactSize` the same size in both cases.
+    let transaction_overhead =
+        with_unlock_script(&base, &[0; 100_000]).zcash_serialized_size() - 100_000;
+    let overhead = block.header.zcash_serialized_size()
+        + compact_size(2).len()
+        + block.transactions[0].zcash_serialized_size()
+        + transaction_overhead;
+
+    for (size, fits) in [(limit, true), (limit + 1, false)] {
+        block.transactions[1] = with_unlock_script(&base, &vec![0; size - overhead]);
+        assert_eq!(block.zcash_serialized_size(), size);
+
+        // `from_block` rejects an oversized block, so build the announcement directly.
+        let mut compact = CompactBlock {
+            header: block.header.clone(),
+            nonce: 15,
+            short_ids: Vec::new(),
+            prefilled: vec![PrefilledTransaction {
+                index: 0,
+                transaction: block.transactions[0].clone(),
+            }],
+        };
+        compact.short_ids.push(
+            compact
+                .keys()
+                .short_id(block.transactions[1].as_ref().into()),
+        );
+        let compact = Arc::new(compact);
+
+        let recovered = compact
+            .clone()
+            .reconstruct(Vec::new())
+            .unwrap()
+            .finish(response(&block, &[1]));
+        let local = compact
+            .reconstruct(vec![(&block.transactions[1]).into()])
+            .and_then(|reconstruction| reconstruction.finish(response(&block, &[])));
+        for result in [recovered, local] {
+            if fits {
+                assert_eq!(*result.unwrap(), block);
+            } else {
+                assert_parse_error(result, "exceed the block size limit");
+            }
+        }
+    }
+}
+
+#[test]
+fn reconstruction_rejects_too_many_candidate_bytes() {
+    let block = block(&BLOCK_MAINNET_1687107_BYTES);
+    let compact = Arc::new(CompactBlock::from_block(&block, 16).unwrap());
+    let half = usize::try_from(MAX_BLOCK_BYTES).unwrap() / 2;
+    let large = UnminedTx::from(with_unlock_script(&block.transactions[1], &vec![0; half]));
+
+    assert_parse_error(
+        compact.reconstruct(vec![large.clone(), large]),
+        "exceed the block size limit",
+    );
+}

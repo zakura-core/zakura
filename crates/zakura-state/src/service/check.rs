@@ -137,8 +137,8 @@ where
     C: IntoIterator,
     C::Item: Borrow<block::Header>,
 {
-    block_is_valid_for_recent_chain_data(
-        &semantically_verified.block,
+    header_is_valid_for_recent_chain_data(
+        semantically_verified.block.header(),
         semantically_verified.height,
         network,
         finalized_tip_height,
@@ -147,9 +147,13 @@ where
     )
 }
 
-/// Checks the recent-chain rules required for prepared mined-block relay.
-pub(crate) fn block_is_valid_for_recent_chain_data<C>(
-    candidate_block: &block::BlockRef,
+/// Checks that `candidate_header` at `candidate_height` is contextually valid for `network`:
+/// it is not orphaned, its height is one more than `parent_height`, and its difficulty and time
+/// are valid against `relevant_headers`.
+///
+/// The relevant headers are the candidate's ancestors, starting with its parent.
+pub(crate) fn header_is_valid_for_recent_chain_data<C>(
+    candidate_header: &block::Header,
     candidate_height: block::Height,
     network: &Network,
     finalized_tip_height: Option<block::Height>,
@@ -213,11 +217,15 @@ where
     let relevant_data = relevant_headers
         .iter()
         .map(|header| (header.borrow().difficulty_threshold, header.borrow().time));
-    let difficulty_adjustment =
-        AdjustedDifficulty::new_from_block(candidate_block, network, relevant_data)
-            .map_err(|_| ValidateContextError::NotReadyToBeCommitted)?;
+    let difficulty_adjustment = AdjustedDifficulty::new_from_header_time(
+        candidate_header.time,
+        parent_height,
+        network,
+        relevant_data,
+    )
+    .map_err(|_| ValidateContextError::NotReadyToBeCommitted)?;
     check::difficulty_threshold_and_time_are_valid(
-        candidate_block.header().difficulty_threshold,
+        candidate_header.difficulty_threshold,
         difficulty_adjustment,
     )?;
 

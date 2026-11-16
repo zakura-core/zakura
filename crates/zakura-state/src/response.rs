@@ -691,6 +691,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::CheckAuthDataCommitment`].
     AuthDataCommitment(AuthDataCommitment),
 
+    /// Response to [`ReadRequest::CheckBestTipHeader`] when the header passes.
+    ValidBestTipHeader,
+
     /// Response to [`ReadRequest::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
     BestChainNextMedianTimePast(DateTime32),
@@ -853,7 +856,8 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::MissingBlockBodyMetadata(_)
             | ReadResponse::Blocks(_)
             | ReadResponse::NonFinalizedBlocksListener(_)
-            | ReadResponse::IsTransparentOutputSpent(_) => {
+            | ReadResponse::IsTransparentOutputSpent(_)
+            | ReadResponse::ValidBestTipHeader => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
 

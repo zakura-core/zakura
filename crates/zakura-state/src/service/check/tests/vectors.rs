@@ -270,8 +270,8 @@ fn block_daa_enforces_the_post_nu7_context() {
     header.difficulty_threshold = expected;
     candidate.header = Arc::new(header);
 
-    block_is_valid_for_recent_chain_data(
-        &candidate,
+    header_is_valid_for_recent_chain_data(
+        &candidate.header,
         candidate_height,
         &network,
         Some(block::Height(0)),
@@ -285,8 +285,8 @@ fn block_daa_enforces_the_post_nu7_context() {
     header.difficulty_threshold = compact(0x1e0af369);
     wrong_window_candidate.header = Arc::new(header);
     assert!(matches!(
-        block_is_valid_for_recent_chain_data(
-            &wrong_window_candidate,
+        header_is_valid_for_recent_chain_data(
+            &wrong_window_candidate.header,
             candidate_height,
             &network,
             Some(block::Height(0)),

@@ -5,24 +5,31 @@
 //! already has, and asks for the rest with `getblocktxn`, which the sender answers with
 //! `blocktxn`. Peers send these messages only after both set `NODE_COMPACT_BLOCKS`.
 //!
-//! This module defines the messages, their encodings, the ZIP's limits, and short IDs. Short
-//! IDs commit to a transaction's wtxid for v5 and later transactions, so a match can still be
-//! the wrong transaction: a receiver must check a rebuilt block's commitments before using it.
+//! This module defines the messages, their encodings, the ZIP's limits, short IDs, and block
+//! reconstruction. Short IDs commit to a transaction's wtxid for v5 and later transactions, so a
+//! match can still be the wrong transaction: a receiver must check a rebuilt block's commitments
+//! before using it.
 //!
 //! [zcash/zips#1429]: https://github.com/zcash/zips/pull/1429
 
-use std::{hash::Hasher, io, sync::Arc};
+use std::{
+    collections::{hash_map::Entry, HashMap, HashSet},
+    hash::Hasher,
+    io,
+    sync::Arc,
+};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use siphasher::sip::SipHasher24;
 
 use zakura_chain::{
-    block::{self, BlockRef, MAX_BLOCK_BYTES},
+    block::{self, Block, BlockRef, MAX_BLOCK_BYTES},
     serialization::{
         CompactSizeMessage, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashReader,
         ZcashSerialize,
     },
-    transaction::{Transaction, UnminedTxId, MIN_TRANSPARENT_TX_SIZE},
+    transaction::{Transaction, UnminedTx, UnminedTxId, MIN_TRANSPARENT_TX_SIZE},
+    transparent,
 };
 
 #[cfg(test)]
@@ -103,6 +110,26 @@ pub struct BlockTransactions {
 
     /// The requested transactions, in the order they were requested.
     pub transactions: Vec<Arc<Transaction>>,
+}
+
+/// A [`CompactBlock`] with the transactions this node already had placed in their slots.
+///
+/// A short ID can match the wrong transaction, so a finished block can still differ from the
+/// announced one. Callers must check the block's Merkle root and authorizing-data commitment
+/// before using it.
+#[derive(Debug)]
+pub struct Reconstruction {
+    /// The announcement this reconstruction rebuilds.
+    compact: Arc<CompactBlock>,
+
+    /// The block's transactions in block order, with `None` in each missing slot.
+    transactions: Vec<Option<Arc<Transaction>>>,
+
+    /// The index and short ID of each missing slot, in block order.
+    missing: Vec<(usize, ShortId)>,
+
+    /// The serialized size of the header, the transaction count, and the placed transactions.
+    block_bytes: usize,
 }
 
 /// The SipHash-2-4 keys of one [`CompactBlock`]'s short IDs.
@@ -250,6 +277,154 @@ impl CompactBlock {
         ShortIdKeys::new(&self.header, self.nonce)
     }
 
+    /// Returns the height in the coinbase transaction, which [`Self::validate`] requires as
+    /// the first prefilled transaction.
+    ///
+    /// Returns `None` if the first prefilled transaction has no coinbase input.
+    pub fn coinbase_height(&self) -> Option<block::Height> {
+        self.prefilled
+            .first()
+            .and_then(|coinbase| coinbase.transaction.inputs().first())
+            .and_then(|input| match input {
+                transparent::Input::Coinbase { height, .. } => Some(*height),
+                _ => None,
+            })
+    }
+
+    /// Returns the IDs in `mempool_ids` that each match exactly one of this message's short IDs.
+    ///
+    /// A short ID that appears more than once in the message matches nothing. A short ID that
+    /// two different IDs in `mempool_ids` share matches nothing. Repeats of one ID count once.
+    ///
+    /// Hashes every ID, so callers with a large mempool run it on a blocking task.
+    pub fn matching_ids(
+        &self,
+        mempool_ids: impl IntoIterator<Item = UnminedTxId>,
+    ) -> HashSet<UnminedTxId> {
+        let keys = self.keys();
+        self.unique_matches(mempool_ids.into_iter().map(|id| (keys.short_id(id), id)))
+            .into_values()
+            .collect()
+    }
+
+    /// Returns each of this message's short IDs that exactly one ID in `ids` matches, with
+    /// that ID. `ids` pairs each ID with its short ID.
+    ///
+    /// Follows the uniqueness rules of [`Self::matching_ids`].
+    fn unique_matches(
+        &self,
+        ids: impl IntoIterator<Item = (ShortId, UnminedTxId)>,
+    ) -> HashMap<ShortId, UnminedTxId> {
+        enum Match {
+            Missing,
+            Unique(UnminedTxId),
+            Ambiguous,
+        }
+
+        let mut matches = HashMap::with_capacity(self.short_ids.len());
+        for short_id in &self.short_ids {
+            match matches.entry(*short_id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Match::Missing);
+                }
+                Entry::Occupied(mut entry) => {
+                    entry.insert(Match::Ambiguous);
+                }
+            }
+        }
+        for (short_id, id) in ids {
+            if let Some(matched) = matches.get_mut(&short_id) {
+                match matched {
+                    Match::Missing => *matched = Match::Unique(id),
+                    Match::Unique(previous) if *previous != id => *matched = Match::Ambiguous,
+                    Match::Unique(_) | Match::Ambiguous => {}
+                }
+            }
+        }
+
+        matches
+            .into_iter()
+            .filter_map(|(short_id, matched)| match matched {
+                Match::Unique(id) => Some((short_id, id)),
+                Match::Missing | Match::Ambiguous => None,
+            })
+            .collect()
+    }
+
+    /// Places the prefilled transactions and the `candidates` that match a short ID, following
+    /// the uniqueness rules of [`Self::matching_ids`].
+    ///
+    /// `candidates` must come from this node's mempool, which measured each one's size. Fails if
+    /// the announcement breaks the ZIP's rules, there are more than
+    /// [`MAX_COMPACT_TRANSACTIONS`] candidates, or the candidates or the placed transactions
+    /// exceed the block size limit.
+    ///
+    /// Hashes every candidate ID, so callers run it on a blocking task.
+    pub fn reconstruct(
+        self: Arc<Self>,
+        candidates: Vec<UnminedTx>,
+    ) -> Result<Reconstruction, SerializationError> {
+        self.validate()?;
+        check_count(candidates.len())?;
+        candidates.iter().try_fold(0, |bytes, candidate| {
+            add_block_bytes(bytes, candidate.size())
+        })?;
+
+        let keys = self.keys();
+        let candidates: Vec<(ShortId, UnminedTx)> = candidates
+            .into_iter()
+            .map(|candidate| (keys.short_id(candidate.id()), candidate))
+            .collect();
+        let matches = self.unique_matches(
+            candidates
+                .iter()
+                .map(|(short_id, candidate)| (*short_id, candidate.id())),
+        );
+        let mut bodies: HashMap<ShortId, UnminedTx> = HashMap::with_capacity(matches.len());
+        for (short_id, candidate) in candidates {
+            if matches.get(&short_id) == Some(&candidate.id()) {
+                bodies.entry(short_id).or_insert(candidate);
+            }
+        }
+
+        let count = self.transaction_count();
+        let mut block_bytes = add_block_bytes(
+            self.header.zcash_serialized_size(),
+            CompactSizeMessage::try_from(count)?.zcash_serialized_size(),
+        )?;
+        let mut transactions = vec![None; count];
+        for prefilled in &self.prefilled {
+            block_bytes =
+                add_block_bytes(block_bytes, prefilled.transaction.zcash_serialized_size())?;
+            // `validate` checked that each prefilled index is less than `count`.
+            transactions[prefilled.index] = Some(prefilled.transaction.clone());
+        }
+
+        // `validate` checked that the short IDs fill exactly the slots the prefilled
+        // transactions leave, in block order.
+        let mut missing = Vec::new();
+        let open_slots = transactions
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_none());
+        for ((index, slot), short_id) in open_slots.zip(&self.short_ids) {
+            match bodies.remove(short_id) {
+                Some(body) => {
+                    block_bytes = add_block_bytes(block_bytes, body.size())?;
+                    *slot = Some(body.transaction().clone());
+                }
+                None => missing.push((index, *short_id)),
+            }
+        }
+
+        Ok(Reconstruction {
+            compact: self,
+            transactions,
+            missing,
+            block_bytes,
+        })
+    }
+
     /// Returns the bytes the ZIP's size bound counts before the prefilled transactions: the
     /// header, the `CompactSize` encoding of the transaction `count`, and 54 bytes for each
     /// short ID. Fails if they exceed the block size limit.
@@ -317,6 +492,68 @@ impl CompactBlock {
 
         compact.validate()?;
         Ok(compact)
+    }
+}
+
+impl Reconstruction {
+    /// Returns the absolute indexes of the missing transactions, in block order.
+    ///
+    /// A `getblocktxn` request for these indexes recovers them.
+    pub fn missing_indexes(&self) -> Vec<usize> {
+        self.missing.iter().map(|(index, _)| *index).collect()
+    }
+
+    /// Returns the hash of the block being rebuilt.
+    pub fn block_hash(&self) -> block::Hash {
+        self.compact.block_hash()
+    }
+
+    /// Fills the missing slots with the transactions in `response`, and returns the block.
+    ///
+    /// An empty `response` finishes a reconstruction with no missing transactions. Fails if
+    /// `response` is for another block, has a different number of transactions than
+    /// [`Self::missing_indexes`], has a transaction whose short ID doesn't match its slot, or
+    /// makes the block exceed the block size limit. A failure means the caller downloads the
+    /// whole block; it says nothing about the peer.
+    ///
+    /// Doesn't check the Merkle root or the authorizing-data commitment. Measures and hashes
+    /// each recovered transaction, so callers run it on a blocking task.
+    pub fn finish(mut self, response: BlockTransactions) -> Result<Arc<Block>, SerializationError> {
+        if response.block_hash != self.block_hash() {
+            return Err(SerializationError::Parse(
+                "compact recovery response is for another block",
+            ));
+        }
+        if response.transactions.len() != self.missing.len() {
+            return Err(SerializationError::Parse(
+                "compact recovery response has the wrong number of transactions",
+            ));
+        }
+
+        let keys = self.compact.keys();
+        for ((index, short_id), transaction) in self.missing.iter().zip(response.transactions) {
+            self.block_bytes =
+                add_block_bytes(self.block_bytes, transaction.zcash_serialized_size())?;
+            if keys.short_id(transaction.as_ref().into()) != *short_id {
+                return Err(SerializationError::Parse(
+                    "compact recovery transaction does not match its short ID",
+                ));
+            }
+            // `reconstruct` took each missing index from the slots.
+            self.transactions[*index] = Some(transaction);
+        }
+
+        let transactions = self
+            .transactions
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(SerializationError::Parse(
+                "compact reconstruction left a transaction missing",
+            ))?;
+        Ok(Arc::new(Block {
+            header: self.compact.header.clone(),
+            transactions,
+        }))
     }
 }
 

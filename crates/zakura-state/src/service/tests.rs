@@ -1136,6 +1136,115 @@ fn prepared_relay_preflight_rejects_a_forged_commitment() {
     ));
 }
 
+impl Fixture {
+    /// Runs the best-tip header check for `child`'s header at `height`.
+    fn check_best_tip_header(&self, child: &Block, height: Height) -> Result<(), BoxError> {
+        super::check_best_tip_header_for_state(
+            &self.network,
+            &self.non_finalized,
+            &self.finalized.db,
+            &child.header,
+            height,
+        )
+    }
+
+    /// Returns a child of the best tip with the expected difficulty and a time one target
+    /// spacing after the tip.
+    fn valid_tip_child(&self) -> (Arc<Block>, Height) {
+        use zakura_header_chain::{AdjustedDifficulty, POW_ADJUSTMENT_BLOCK_SPAN};
+
+        let tip = self.parent.clone();
+        let tip_height = tip.coinbase_height().expect("the tip has a height");
+        let mut child = tip.make_fake_child();
+        let height = child.coinbase_height().expect("the child has a height");
+        let time =
+            tip.header.time + NetworkUpgrade::target_spacing_for_height(&self.network, height);
+        let relevant_data =
+            super::any_ancestor_blocks(&self.non_finalized, &self.finalized.db, tip.hash())
+                .take(POW_ADJUSTMENT_BLOCK_SPAN)
+                .map(|block| {
+                    let header = *block.unwrap().view().header();
+                    (header.difficulty_threshold, header.time)
+                });
+        let expected = AdjustedDifficulty::new_from_header_time(
+            time,
+            tip_height,
+            &self.network,
+            relevant_data,
+        )
+        .expect("the context derives an expected target")
+        .expected_difficulty_threshold();
+        let header = Arc::make_mut(&mut Arc::make_mut(&mut child).header);
+        header.time = time;
+        header.difficulty_threshold = expected;
+
+        (child, height)
+    }
+}
+
+#[test]
+fn best_tip_header_check_accepts_a_valid_tip_child() {
+    let _init_guard = zakura_test::init();
+    let fixture = Fixture::with_difficulty_context();
+    let (child, height) = fixture.valid_tip_child();
+
+    fixture
+        .check_best_tip_header(&child, height)
+        .expect("a valid child of the best tip passes");
+}
+
+#[test]
+fn best_tip_header_check_rejects_a_parent_that_is_not_the_best_tip() {
+    let _init_guard = zakura_test::init();
+    let fixture = Fixture::with_side_chain();
+    let child = fixture.parent.make_fake_child();
+    let height = child.coinbase_height().expect("the child has a height");
+
+    let error = fixture
+        .check_best_tip_header(&child, height)
+        .expect_err("a child of a side chain fails");
+
+    assert_eq!(error.to_string(), "header does not extend the best tip");
+}
+
+#[test]
+fn best_tip_header_check_rejects_a_wrong_height() {
+    let _init_guard = zakura_test::init();
+    let fixture = Fixture::with_difficulty_context();
+    let (child, height) = fixture.valid_tip_child();
+
+    for wrong_height in [
+        (height - 1).expect("the child is above genesis"),
+        (height + 1).expect("the child is below the maximum height"),
+    ] {
+        let error = fixture
+            .check_best_tip_header(&child, wrong_height)
+            .expect_err("a height other than the tip height plus one fails");
+
+        assert!(matches!(
+            error.downcast_ref::<ValidateContextError>(),
+            Some(ValidateContextError::NonSequentialBlock { .. })
+        ));
+    }
+}
+
+#[test]
+fn best_tip_header_check_rejects_a_bad_difficulty() {
+    let _init_guard = zakura_test::init();
+    let fixture = Fixture::with_difficulty_context();
+    let (child, height) = fixture.valid_tip_child();
+    let child = child.set_work(1);
+
+    let error = fixture
+        .check_best_tip_header(&child, height)
+        .expect_err("an easier claimed target fails");
+
+    assert!(matches!(
+        error.downcast_ref::<ValidateContextError>(),
+        Some(ValidateContextError::InvalidDifficultyThreshold { .. })
+    ));
+}
+
 /// A full orphan queue must not strand the descendants that are waiting on the very block
 /// that would release them.
 ///

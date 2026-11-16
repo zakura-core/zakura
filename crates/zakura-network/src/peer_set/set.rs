@@ -1927,8 +1927,11 @@ where
             | Request::AdvertiseMinedBlock(_)
             | Request::AdvertiseEarlyBlock(_) => self.route_block_broadcast(req),
 
-            // Only an inbound connection creates this request.
-            Request::EarlyBlocksByHash(_) => {
+            // Only an inbound connection creates these requests.
+            Request::EarlyBlocksByHash(_)
+            | Request::CheckCompactHeader(_)
+            | Request::CompactBlockTransactions(_)
+            | Request::CheckCompactBlock(_) => {
                 async { Err(SharedPeerError::from(PeerError::InboundOnlyRequest).into()) }.boxed()
             }
 

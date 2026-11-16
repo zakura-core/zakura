@@ -114,6 +114,12 @@ pub(super) fn coinbase_is_first(block: &BlockRef) -> Result<CoinbaseSummary<'_>,
     })
 }
 
+/// Checks that `block` has exactly one coinbase transaction, and that it is the first
+/// transaction, like [`coinbase_is_first`].
+pub fn coinbase_position_is_valid(block: &BlockRef) -> Result<(), BlockError> {
+    coinbase_is_first(block).map(|_| ())
+}
+
 /// Rejects transparent outputs spent by different transactions in the same block.
 ///
 /// This depends only on transaction IDs, so callers must establish the block's Merkle

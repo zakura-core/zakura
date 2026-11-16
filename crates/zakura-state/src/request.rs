@@ -2390,6 +2390,21 @@ pub enum ReadRequest {
     /// Returns [`ReadResponse::AuthDataCommitment`].
     CheckAuthDataCommitment(BlockCommitmentData),
 
+    /// Checks that `header` extends the best tip at `height`, and that its difficulty and time
+    /// are valid against the best tip's difficulty context.
+    ///
+    /// Compact block relay screens a `cmpctblock` header with this request before it spends
+    /// work on the block's transactions. The check doesn't cover proof of work or the header's
+    /// commitments, and it records nothing.
+    ///
+    /// Returns [`ReadResponse::ValidBestTipHeader`], or an error if the header fails.
+    CheckBestTipHeader {
+        /// The header to check.
+        header: Arc<block::Header>,
+        /// The height the block's coinbase transaction claims.
+        height: block::Height,
+    },
+
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
     /// Returns [`ReadResponse::BestChainNextMedianTimePast`] when successful.
@@ -2522,6 +2537,7 @@ impl ReadRequest {
                 "check_prepared_mined_relay_eligibility"
             }
             ReadRequest::CheckAuthDataCommitment(_) => "check_auth_data_commitment",
+            ReadRequest::CheckBestTipHeader { .. } => "check_best_tip_header",
             ReadRequest::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             ReadRequest::BestChainBlockHash(_) => "best_chain_block_hash",
             #[cfg(feature = "indexer")]

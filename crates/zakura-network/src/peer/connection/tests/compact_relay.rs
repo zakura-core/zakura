@@ -1,5 +1,5 @@
 //! Tests for compact block relay negotiation, high-bandwidth source slots, `cmpctblock`
-//! announcements, and `getblocktxn` serving.
+//! announcements, `getblocktxn` serving, and receiving and rebuilding `cmpctblock`.
 
 use std::{sync::Arc, time::Duration};
 
@@ -10,27 +10,29 @@ use tokio::sync::{oneshot, watch, Semaphore};
 use zakura_chain::{
     block::{self, Block, MAX_BLOCK_BYTES},
     serialization::{SerializationError, ZcashDeserializeInto, ZcashSerialize},
+    transaction::UnminedTx,
 };
 use zakura_test::{
     mock_service::{MockService, PanicAssertion},
     vectors::{BLOCK_MAINNET_1687107_BYTES, BLOCK_MAINNET_1_BYTES},
 };
 
-use super::super::compact_relay::RETENTION;
+use super::super::compact_relay::{RECOVERY_TIMEOUT, RETENTION};
 use crate::{
+    constants::REQUEST_TIMEOUT,
     peer::{
         block_gossip::{
             compact_slots, BlockAdvert, BlockAdvertError, BlockGossipPeer, BlockUploads,
             BLOCK_ADVERT_QUEUE, BLOCK_REQUEST_WAIT, COMPACT_ANNOUNCEMENTS_PER_BLOCK,
         },
         connection::Connection,
-        ClientRequest, ErrorSlot,
+        ClientRequest, ConnectedAddr, ErrorSlot,
     },
     protocol::external::{
         compact::{BlockTransactions, BlockTransactionsRequest, CompactBlock},
         InventoryHash, Message,
     },
-    InventoryResponse, Request, Response,
+    InventoryResponse, PeerSocketAddr, PeerSource, Request, Response, SharedPeerError,
 };
 
 /// A test connection with a mock inbound service and a channel peer writer.
@@ -821,4 +823,597 @@ fn gossip_peer(connection: &AnnouncingConnection) -> BlockGossipPeer {
         sidecar: false,
         early_block_relay: true,
     }
+}
+
+/// How long a receiving test waits for the connection to write or answer, so a broken
+/// connection fails the test instead of hanging it.
+const TEST_WAIT: Duration = Duration::from_secs(60);
+
+/// The address of the peer in the receiving tests.
+fn receiving_peer_addr() -> PeerSocketAddr {
+    "127.0.0.1:8233"
+        .parse::<std::net::SocketAddr>()
+        .expect("the literal is a socket address")
+        .into()
+}
+
+/// The codec's view of the `blocktxn` a connection waits for.
+type RecoveryWatch = watch::Receiver<Option<(block::Hash, tokio::time::Instant)>>;
+
+/// A running connection that negotiated compact blocks and receives `cmpctblock`, and the
+/// channels that drive and observe it.
+struct ReceivingConnection {
+    /// The connection's peer message sender.
+    peer_tx: mpsc::Sender<Result<Message, SerializationError>>,
+    /// The connection's client request sender.
+    client_tx: mpsc::Sender<ClientRequest>,
+    /// The connection's inbound service.
+    inbound: MockService<Request, Response, PanicAssertion>,
+    /// The messages the connection writes to its peer.
+    outbound: mpsc::Receiver<Message>,
+    /// The `blocktxn` the connection tells its codec to accept.
+    recovery: RecoveryWatch,
+    /// The slots that bound decoded bodies, in place of the global ones.
+    slots: Arc<Semaphore>,
+    /// The connection's error.
+    error_slot: ErrorSlot,
+    /// The connection task.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ReceivingConnection {
+    /// Starts a negotiated connection to [`receiving_peer_addr`].
+    async fn start() -> Self {
+        let (mut connection, client_tx, inbound, mut outbound, error_slot) =
+            super::new_early_relay_test_connection::<PanicAssertion>();
+        Arc::make_mut(&mut connection.connection_info).connected_addr =
+            ConnectedAddr::new_outbound_direct(receiving_peer_addr());
+        let slots = Arc::new(Semaphore::new(TEST_SLOTS));
+        connection.compact.slots = slots.clone();
+        let (recovery_tx, recovery) = watch::channel(None);
+        connection = connection.with_compact_recovery(Some(recovery_tx));
+        let (peer_tx, peer_rx) = mpsc::channel(4);
+        let task = tokio::spawn(connection.run(peer_rx));
+        assert_eq!(outbound.next().await, Some(sendcmpct(false)));
+
+        Self {
+            peer_tx,
+            client_tx,
+            inbound,
+            outbound,
+            recovery,
+            slots,
+            error_slot,
+            task,
+        }
+    }
+
+    /// Sends `message` from the peer.
+    async fn receive(&mut self, message: Message) {
+        self.peer_tx
+            .send(Ok(message))
+            .await
+            .expect("the connection is open");
+    }
+
+    /// Sends `compact` from the peer, and answers the header screen with a pass if `screened`.
+    /// Then expects the download to start with this peer as its source.
+    async fn receive_screened(&mut self, compact: &Arc<CompactBlock>, screened: bool) {
+        self.receive(Message::CompactBlock(compact.clone())).await;
+        let screen = self
+            .inbound
+            .expect_request(Request::CheckCompactHeader(compact.clone()))
+            .await;
+        if screened {
+            screen.respond(Response::Nil);
+        } else {
+            screen.respond_error("the header failed screening".into());
+        }
+        self.expect_advertise(compact.block_hash()).await;
+    }
+
+    /// Expects the inbound request that starts the download of `hash` from this peer.
+    async fn expect_advertise(&mut self, hash: block::Hash) {
+        self.inbound
+            .expect_request(Request::AdvertiseBlock(
+                hash.into(),
+                Some(PeerSource::LegacySocket(receiving_peer_addr())),
+            ))
+            .await
+            .respond(Response::Nil);
+    }
+
+    /// Sends the downloader's request for the block `hash` from this peer, and returns the
+    /// receiver for its response.
+    async fn request_block(
+        &mut self,
+        hash: block::Hash,
+    ) -> futures::channel::oneshot::Receiver<Result<Response, SharedPeerError>> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.client_tx
+            .send(ClientRequest {
+                request: Request::BlocksByHashFrom {
+                    hashes: IndexSet::from([hash]),
+                    source: receiving_peer_addr().into(),
+                },
+                tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: tracing::Span::current(),
+            })
+            .await
+            .expect("the connection is open");
+        rx
+    }
+
+    /// Answers the connection's mempool request for `compact` with `candidates`.
+    async fn serve_candidates(&mut self, compact: &Arc<CompactBlock>, candidates: Vec<UnminedTx>) {
+        self.inbound
+            .expect_request(Request::CompactBlockTransactions(compact.clone()))
+            .await
+            .respond(Response::CompactBlockTransactions(candidates));
+    }
+
+    /// Answers the connection's check of the rebuilt `block` with a pass if `passes`.
+    async fn check_block(&mut self, block: &Arc<Block>, passes: bool) {
+        let check = self
+            .inbound
+            .expect_request(Request::CheckCompactBlock(block.clone()))
+            .await;
+        if passes {
+            check.respond(Response::Nil);
+        } else {
+            check.respond_error("the rebuilt block failed its checks".into());
+        }
+    }
+
+    /// Returns the next message the connection writes to its peer.
+    async fn next_written(&mut self) -> Message {
+        tokio::time::timeout(TEST_WAIT, self.outbound.next())
+            .await
+            .expect("the connection writes a message")
+            .expect("the running connection keeps its peer writer open")
+    }
+
+    /// Asserts that the connection has written nothing it hasn't already returned.
+    async fn assert_nothing_written(&mut self) {
+        settle().await;
+        assert!(
+            self.outbound.try_recv().is_err(),
+            "the connection wrote an unexpected message"
+        );
+    }
+
+    /// Waits until `permits` decoded body slots are free.
+    async fn wait_for_free_slots(&self, permits: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.slots.available_permits() != permits {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the connection releases its slot");
+    }
+
+    /// Asserts that the connection is still open.
+    fn assert_open(&self) {
+        assert!(
+            self.error_slot.try_get_error().is_none(),
+            "the connection is open"
+        );
+    }
+}
+
+impl Drop for ReceivingConnection {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Returns the `cmpctblock` that announces `block`.
+fn compact_block(block: &Arc<Block>) -> Arc<CompactBlock> {
+    Arc::new(CompactBlock::from_block(block, 0x0123_4567_89ab_cdef).expect("the block fits"))
+}
+
+/// Returns the transactions of `block` except the coinbase and those at `missing`, as
+/// mempool candidates.
+fn candidates_except(block: &Block, missing: &[usize]) -> Vec<UnminedTx> {
+    block
+        .transactions
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(index, _)| !missing.contains(index))
+        .map(|(_, transaction)| transaction.clone().into())
+        .collect()
+}
+
+/// Returns the response that delivers `block` from the receiving peer.
+fn early_block_response(block: &Arc<Block>) -> Response {
+    Response::EarlyBlocks(vec![InventoryResponse::Available((
+        block.clone().into(),
+        Some(receiving_peer_addr()),
+    ))])
+}
+
+/// Returns the successful response that `response` receives.
+async fn answer(
+    response: futures::channel::oneshot::Receiver<Result<Response, SharedPeerError>>,
+) -> Response {
+    tokio::time::timeout(TEST_WAIT, response)
+        .await
+        .expect("the connection answers in time")
+        .expect("the connection answers")
+        .expect("the request succeeds")
+}
+
+/// Returns a `getdata` for the block `hash`.
+fn getdata(hash: block::Hash) -> Message {
+    Message::GetData(vec![InventoryHash::Block(hash)])
+}
+
+/// A `cmpctblock` that passes screening takes a decoded body slot, and starts the download
+/// with this peer as its source.
+#[tokio::test]
+async fn screened_cmpctblock_is_held_and_advertised_from_this_peer() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let compact = compact_block(&block);
+    let mut connection = ReceivingConnection::start().await;
+
+    connection.receive_screened(&compact, true).await;
+    settle().await;
+
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS - 1);
+    connection.assert_nothing_written().await;
+    connection.assert_open();
+}
+
+/// A `cmpctblock` that fails screening holds no slot, and starts the download as an `inv`
+/// would. The connection then downloads the full block, without a penalty.
+#[tokio::test]
+async fn failed_screen_becomes_a_plain_advertise() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let compact = compact_block(&block);
+    let mut connection = ReceivingConnection::start().await;
+
+    connection.receive_screened(&compact, false).await;
+    settle().await;
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS);
+
+    let response = connection.request_block(block.hash()).await;
+    assert_eq!(connection.next_written().await, getdata(block.hash()));
+    connection
+        .receive(Message::Block(block.clone().into()))
+        .await;
+    assert_eq!(answer(response).await, early_block_response(&block));
+    connection.inbound.expect_no_requests().await;
+    connection.assert_open();
+}
+
+/// A connection without a free decoded body slot advertises a screened `cmpctblock` without
+/// holding it.
+#[tokio::test]
+async fn screened_cmpctblock_without_a_free_slot_is_not_held() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let compact = compact_block(&block);
+    let mut connection = ReceivingConnection::start().await;
+    let held = Arc::clone(&connection.slots)
+        .try_acquire_many_owned(TEST_SLOTS.try_into().expect("6 fits in u32"))
+        .expect("the slots are free");
+
+    connection.receive_screened(&compact, true).await;
+    drop(held);
+
+    let _response = connection.request_block(block.hash()).await;
+    assert_eq!(connection.next_written().await, getdata(block.hash()));
+    connection.inbound.expect_no_requests().await;
+}
+
+/// A second `cmpctblock` within [`RETENTION`] of a screen is not screened, and becomes a plain
+/// advertise. The cooldown starts even when the screen fails.
+#[tokio::test(start_paused = true)]
+async fn second_cmpctblock_within_retention_is_a_plain_advertise() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let compact = compact_block(&block);
+    let mut connection = ReceivingConnection::start().await;
+
+    connection.receive_screened(&compact, false).await;
+
+    tokio::time::advance(RETENTION - Duration::from_millis(1)).await;
+    connection
+        .receive(Message::CompactBlock(compact.clone()))
+        .await;
+    connection.expect_advertise(block.hash()).await;
+    settle().await;
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS);
+
+    // The cooldown has ended, so the connection screens the next one.
+    tokio::time::advance(Duration::from_millis(1)).await;
+    connection.receive_screened(&compact, true).await;
+    settle().await;
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS - 1);
+    connection.assert_open();
+}
+
+/// A held `cmpctblock` that the mempool fills answers the download with the rebuilt block,
+/// without writing `getdata`. The connection keeps the rebuilt block, and answers a second
+/// request for it at once.
+#[tokio::test]
+async fn full_reconstruction_answers_without_getdata() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let compact = compact_block(&block);
+    let mut connection = ReceivingConnection::start().await;
+    connection.receive_screened(&compact, true).await;
+
+    let response = connection.request_block(block.hash()).await;
+    connection
+        .serve_candidates(&compact, candidates_except(&block, &[]))
+        .await;
+    connection.check_block(&block, true).await;
+    assert_eq!(answer(response).await, early_block_response(&block));
+    connection.assert_nothing_written().await;
+    assert_eq!(
+        connection.slots.available_permits(),
+        TEST_SLOTS - 1,
+        "the rebuilt block keeps the received block's slot"
+    );
+
+    // A second downloader gets the held block without any inbound request or write.
+    let response = connection.request_block(block.hash()).await;
+    assert_eq!(answer(response).await, early_block_response(&block));
+    connection.inbound.expect_no_requests().await;
+    connection.assert_nothing_written().await;
+    connection.assert_open();
+}
+
+/// A held `cmpctblock` with transactions missing from the mempool writes `getblocktxn` for
+/// them, and tells the codec to accept the matching `blocktxn` for [`RECOVERY_TIMEOUT`]. The
+/// matching `blocktxn` finishes the download.
+#[tokio::test]
+async fn partial_reconstruction_recovers_missing_transactions() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let compact = compact_block(&block);
+    let missing = [1, 3];
+    let mut connection = ReceivingConnection::start().await;
+    connection.receive_screened(&compact, true).await;
+
+    let response = connection.request_block(block.hash()).await;
+    connection
+        .serve_candidates(&compact, candidates_except(&block, &missing))
+        .await;
+    let requested = tokio::time::Instant::now();
+    assert_eq!(
+        connection.next_written().await,
+        getblocktxn(block.hash(), missing.to_vec())
+    );
+    // The connection sets the watch right after its write completes.
+    settle().await;
+    let (hash, deadline) = connection
+        .recovery
+        .borrow()
+        .expect("the connection waits for blocktxn");
+    assert_eq!(hash, block.hash());
+    assert!(deadline >= requested + RECOVERY_TIMEOUT);
+    assert!(deadline <= tokio::time::Instant::now() + RECOVERY_TIMEOUT);
+
+    connection.receive(blocktxn(&block, &missing)).await;
+    connection.check_block(&block, true).await;
+    assert_eq!(answer(response).await, early_block_response(&block));
+    assert_eq!(*connection.recovery.borrow(), None);
+    connection.assert_nothing_written().await;
+    connection.assert_open();
+}
+
+/// A `blocktxn` for another block leaves the pending recovery waiting, without a penalty.
+#[tokio::test]
+async fn blocktxn_for_another_block_is_ignored() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let compact = compact_block(&block);
+    let mut connection = ReceivingConnection::start().await;
+    connection.receive_screened(&compact, true).await;
+
+    let mut response = connection.request_block(block.hash()).await;
+    connection
+        .serve_candidates(&compact, candidates_except(&block, &[2]))
+        .await;
+    assert_eq!(
+        connection.next_written().await,
+        getblocktxn(block.hash(), vec![2])
+    );
+
+    connection
+        .receive(Message::BlockTransactions(BlockTransactions {
+            block_hash: block::Hash([9; 32]),
+            transactions: vec![block.transactions[2].clone()],
+        }))
+        .await;
+    connection.inbound.expect_no_requests().await;
+    connection.assert_nothing_written().await;
+    assert!(matches!(response.try_recv(), Ok(None)));
+    assert!(connection.recovery.borrow().is_some());
+
+    connection.receive(blocktxn(&block, &[2])).await;
+    connection.check_block(&block, true).await;
+    assert_eq!(answer(response).await, early_block_response(&block));
+    connection.assert_open();
+}
+
+/// A recovery that times out after [`RECOVERY_TIMEOUT`] downloads the full block from the same
+/// peer, without failing the request.
+#[tokio::test(start_paused = true)]
+async fn recovery_timeout_falls_back_to_getdata() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let compact = compact_block(&block);
+    let mut connection = ReceivingConnection::start().await;
+    connection.receive_screened(&compact, true).await;
+
+    let mut response = connection.request_block(block.hash()).await;
+    connection
+        .serve_candidates(&compact, candidates_except(&block, &[2]))
+        .await;
+    assert_eq!(
+        connection.next_written().await,
+        getblocktxn(block.hash(), vec![2])
+    );
+    let requested = tokio::time::Instant::now();
+
+    assert_eq!(connection.next_written().await, getdata(block.hash()));
+    let waited = requested.elapsed();
+    assert!(waited >= RECOVERY_TIMEOUT, "{waited:?}");
+    assert!(waited < REQUEST_TIMEOUT, "{waited:?}");
+    assert_eq!(*connection.recovery.borrow(), None);
+    assert!(matches!(response.try_recv(), Ok(None)));
+    // The fallback releases the received block's slot.
+    connection.wait_for_free_slots(TEST_SLOTS).await;
+
+    connection
+        .receive(Message::Block(block.clone().into()))
+        .await;
+    assert_eq!(answer(response).await, early_block_response(&block));
+    connection.assert_open();
+}
+
+/// A rebuilt block that fails its checks downloads the full block from the same peer. A short
+/// ID can match the wrong transaction, so the failure is not misbehavior.
+#[tokio::test]
+async fn failed_block_check_falls_back_to_getdata() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let compact = compact_block(&block);
+    let mut connection = ReceivingConnection::start().await;
+    connection.receive_screened(&compact, true).await;
+
+    let response = connection.request_block(block.hash()).await;
+    connection
+        .serve_candidates(&compact, candidates_except(&block, &[]))
+        .await;
+    connection.check_block(&block, false).await;
+    assert_eq!(connection.next_written().await, getdata(block.hash()));
+    connection.wait_for_free_slots(TEST_SLOTS).await;
+
+    connection
+        .receive(Message::Block(block.clone().into()))
+        .await;
+    assert_eq!(answer(response).await, early_block_response(&block));
+    connection.assert_open();
+}
+
+/// A recovered block that fails its checks downloads the full block from the same peer.
+#[tokio::test]
+async fn failed_recovered_block_check_falls_back_to_getdata() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let compact = compact_block(&block);
+    let mut connection = ReceivingConnection::start().await;
+    connection.receive_screened(&compact, true).await;
+
+    let mut response = connection.request_block(block.hash()).await;
+    connection
+        .serve_candidates(&compact, candidates_except(&block, &[2]))
+        .await;
+    assert_eq!(
+        connection.next_written().await,
+        getblocktxn(block.hash(), vec![2])
+    );
+    connection.receive(blocktxn(&block, &[2])).await;
+    connection.check_block(&block, false).await;
+
+    assert_eq!(connection.next_written().await, getdata(block.hash()));
+    assert_eq!(*connection.recovery.borrow(), None);
+    assert!(matches!(response.try_recv(), Ok(None)));
+    connection
+        .receive(Message::Block(block.clone().into()))
+        .await;
+    assert_eq!(answer(response).await, early_block_response(&block));
+    connection.assert_open();
+}
+
+/// A connection that didn't negotiate compact blocks ignores `cmpctblock`, without an inbound
+/// request or a penalty.
+#[tokio::test]
+async fn non_negotiated_connection_ignores_cmpctblock() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let (mut connection, _client_tx, mut inbound, _outbound, error_slot) =
+        super::new_test_connection::<PanicAssertion>();
+
+    let unused = tokio::time::timeout(
+        TEST_WAIT,
+        connection.handle_message_as_request(Message::CompactBlock(compact_block(&block))),
+    )
+    .await
+    .expect("the connection ignores the message without an inbound request");
+
+    assert_eq!(unused, None);
+    inbound.expect_no_requests().await;
+    assert!(error_slot.try_get_error().is_none());
+    assert_eq!(connection.compact.expiry(), None);
+}
+
+/// After its retention ends, the connection releases a received block's slot, and downloads
+/// the full block.
+#[tokio::test(start_paused = true)]
+async fn received_block_expires_after_retention() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let compact = compact_block(&block);
+    let mut connection = ReceivingConnection::start().await;
+    connection.receive_screened(&compact, true).await;
+    settle().await;
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS - 1);
+
+    tokio::time::advance(RETENTION).await;
+    settle().await;
+    assert_eq!(connection.slots.available_permits(), TEST_SLOTS);
+
+    let _response = connection.request_block(block.hash()).await;
+    assert_eq!(connection.next_written().await, getdata(block.hash()));
+    connection.inbound.expect_no_requests().await;
+}
+
+/// Shutting down a connection that waits for `blocktxn` tells the codec to stop accepting it,
+/// and releases the slot.
+#[tokio::test]
+async fn shutdown_clears_the_recovery() {
+    let _init_guard = zakura_test::init();
+
+    let block = block_with_transactions();
+    let compact = compact_block(&block);
+    let mut connection = ReceivingConnection::start().await;
+    connection.receive_screened(&compact, true).await;
+    let _response = connection.request_block(block.hash()).await;
+    connection
+        .serve_candidates(&compact, candidates_except(&block, &[2]))
+        .await;
+    assert_eq!(
+        connection.next_written().await,
+        getblocktxn(block.hash(), vec![2])
+    );
+    settle().await;
+    assert!(connection.recovery.borrow().is_some());
+
+    // Closing the peer stream fails the connection.
+    connection.peer_tx.close_channel();
+    connection.wait_for_free_slots(TEST_SLOTS).await;
+    assert_eq!(*connection.recovery.borrow(), None);
 }

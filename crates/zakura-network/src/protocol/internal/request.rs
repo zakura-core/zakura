@@ -1,12 +1,12 @@
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 use indexmap::IndexSet;
 use zakura_chain::{
-    block,
+    block::{self, Block},
     transaction::{UnminedTx, UnminedTxId},
 };
 
-use super::super::types::Nonce;
+use super::super::{external::compact::CompactBlock, types::Nonce};
 use crate::{zakura::ZakuraPeerId, PeerSocketAddr};
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -352,6 +352,47 @@ pub enum Request {
     ///
     /// Returns [`Response::TransactionIds`](super::Response::TransactionIds).
     MempoolTransactionIds,
+
+    /// Screen the header of a `cmpctblock` before any reconstruction work.
+    ///
+    /// Only a connection that negotiated compact block relay creates this request, and only the
+    /// inbound service answers it. The header passes if its parent is the best tip, NU5 is
+    /// active at the coinbase height, and its proof of work, difficulty, and time are valid.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::Nil`](super::Response::Nil) if the header passes, and an error
+    /// otherwise. An error means the connection falls back to downloading the whole block;
+    /// it says nothing about the peer.
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
+    CheckCompactHeader(Arc<CompactBlock>),
+
+    /// Screen the header of a `cmpctblock` like [`Request::CheckCompactHeader`], then return the
+    /// mempool transactions that match its short IDs.
+    ///
+    /// Only a connection that negotiated compact block relay creates this request, and only the
+    /// inbound service answers it.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::CompactBlockTransactions`](super::Response::CompactBlockTransactions),
+    /// or an error that means the connection falls back to downloading the whole block.
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
+    CompactBlockTransactions(Arc<CompactBlock>),
+
+    /// Check that a block rebuilt from a `cmpctblock` matches its header's commitments.
+    ///
+    /// Only a connection that negotiated compact block relay creates this request, and only the
+    /// inbound service answers it. The block passes if its coinbase is first, its Merkle root and
+    /// authorizing-data commitment match the header, and it extends the best tip.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::Nil`](super::Response::Nil) if the block passes, and an error
+    /// otherwise. An error means the connection falls back to downloading the whole block;
+    /// it says nothing about the peer.
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
+    CheckCompactBlock(Arc<Block>),
 }
 
 impl fmt::Display for Request {
@@ -396,6 +437,11 @@ impl fmt::Display for Request {
             Request::AdvertiseMinedBlock(_) => "AdvertiseMinedBlock".to_string(),
             Request::AdvertiseEarlyBlock(_) => "AdvertiseEarlyBlock".to_string(),
             Request::MempoolTransactionIds => "MempoolTransactionIds".to_string(),
+            Request::CheckCompactHeader(_) => "CheckCompactHeader".to_string(),
+            Request::CompactBlockTransactions(compact) => {
+                format!("CompactBlockTransactions({})", compact.short_ids.len())
+            }
+            Request::CheckCompactBlock(_) => "CheckCompactBlock".to_string(),
         })
     }
 }
@@ -425,6 +471,9 @@ impl Request {
             | Request::AdvertiseMinedBlock(_) => "AdvertiseBlock",
             Request::AdvertiseEarlyBlock(_) => "AdvertiseEarlyBlock",
             Request::MempoolTransactionIds => "MempoolTransactionIds",
+            Request::CheckCompactHeader(_) => "CheckCompactHeader",
+            Request::CompactBlockTransactions(_) => "CompactBlockTransactions",
+            Request::CheckCompactBlock(_) => "CheckCompactBlock",
         }
     }
 

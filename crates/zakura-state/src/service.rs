@@ -3636,6 +3636,18 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::PreparedMinedRelayEligibility(eligibility))
             }
 
+            ReadRequest::CheckBestTipHeader { header, height } => {
+                check_best_tip_header_for_state(
+                    &state.network,
+                    &state.latest_non_finalized_state(),
+                    &state.db,
+                    &header,
+                    height,
+                )?;
+
+                Ok(ReadResponse::ValidBestTipHeader)
+            }
+
             ReadRequest::CheckAuthDataCommitment(commitment) => {
                 let latest_non_finalized_state = state.latest_non_finalized_state();
                 Ok(ReadResponse::AuthDataCommitment(
@@ -3845,39 +3857,14 @@ fn check_prepared_mined_relay_eligibility_for_state(
         commitment.auth_data_root,
     )?;
 
-    // Take only the headers `block_is_valid_for_recent_chain_data` reads. The
-    // iterator walks to genesis, so collecting it would load every ancestor
-    // header to check the most recent difficulty-adjustment span of them. The
-    // candidate block's upgrade selects that span.
-    let relevant_headers =
-        any_chain_ancestor_iter::<block::Header>(non_finalized_state, db, parent_hash);
-    let parent_height = relevant_headers.height;
-    let Some(context_height) = parent_height.and_then(|parent_height| parent_height.next().ok())
-    else {
-        return Ok(PreparedMinedRelayEligibility::Unavailable);
-    };
-    let relevant_headers = check::difficulty_context(network, context_height, relevant_headers);
-    let Some(parent_height) = parent_height.filter(|_| !relevant_headers.is_empty()) else {
+    let Some(context) = ParentContext::read(network, non_finalized_state, db, parent_hash) else {
         return Ok(PreparedMinedRelayEligibility::Unavailable);
     };
     let candidate_height = commitment
         .block
         .coinbase_height()
         .ok_or(crate::ValidateContextError::NotReadyToBeCommitted)?;
-    let finalized_tip_height = db.finalized_tip_height().or_else(|| {
-        // The headers are contiguous and end at the lowest context height.
-        let lowest_offset = HeightDiff::try_from(relevant_headers.len() - 1)
-            .expect("the difficulty context length fits in HeightDiff");
-        parent_height - lowest_offset
-    });
-    check::block_is_valid_for_recent_chain_data(
-        &commitment.block,
-        candidate_height,
-        network,
-        finalized_tip_height,
-        Some(parent_height),
-        relevant_headers,
-    )?;
+    context.check_child_header(commitment.block.header(), candidate_height, network)?;
 
     if network.disable_pow() {
         return Ok(PreparedMinedRelayEligibility::Unavailable);
@@ -3888,6 +3875,96 @@ fn check_prepared_mined_relay_eligibility_for_state(
         Ok(PreparedMinedRelayEligibility::Authorized)
     } else {
         Ok(PreparedMinedRelayEligibility::CommitFirst)
+    }
+}
+
+/// Checks that `header` at `height` extends the best tip of `non_finalized_state` and `db`, and
+/// that its difficulty and time are valid against the best tip's difficulty context.
+///
+/// Doesn't check proof of work or the header's commitments.
+fn check_best_tip_header_for_state(
+    network: &Network,
+    non_finalized_state: &NonFinalizedState,
+    db: &ZakuraDb,
+    header: &block::Header,
+    height: block::Height,
+) -> Result<(), BoxError> {
+    let parent_hash = header.previous_block_hash;
+    let best_tip_hash = read::best_tip(non_finalized_state, db).map(|(_, hash)| hash);
+    if best_tip_hash != Some(parent_hash) {
+        return Err("header does not extend the best tip".into());
+    }
+    let context = ParentContext::read(network, non_finalized_state, db, parent_hash)
+        .ok_or("state has no difficulty context for the best tip")?;
+    context.check_child_header(header, height, network)?;
+
+    Ok(())
+}
+
+/// The recent-chain context that a child of one parent block is checked against.
+struct ParentContext {
+    /// The parent's height.
+    parent_height: block::Height,
+
+    /// The finalized tip's height, or the lowest height in `relevant_headers` if the finalized
+    /// state is empty.
+    finalized_tip_height: Option<block::Height>,
+
+    /// The headers of the parent and its ancestors, newest first, as many as a child's
+    /// difficulty check reads.
+    relevant_headers: Vec<zakura_node_services::block_memory::HeaderHandle>,
+}
+
+impl ParentContext {
+    /// Reads the context for a child of `parent_hash`.
+    ///
+    /// Returns `None` if the state doesn't have the parent, or the parent is the maximum height.
+    fn read(
+        network: &Network,
+        non_finalized_state: &NonFinalizedState,
+        db: &ZakuraDb,
+        parent_hash: block::Hash,
+    ) -> Option<Self> {
+        // Take only the headers the difficulty check reads. The iterator walks to genesis, so
+        // collecting it would load every ancestor header. The child's upgrade selects the span.
+        let ancestors =
+            any_chain_ancestor_iter::<block::Header>(non_finalized_state, db, parent_hash);
+        let parent_height = ancestors.height?;
+        let child_height = parent_height.next().ok()?;
+        let relevant_headers = check::difficulty_context(network, child_height, ancestors);
+        if relevant_headers.is_empty() {
+            return None;
+        }
+        let finalized_tip_height = db.finalized_tip_height().or_else(|| {
+            // The headers are contiguous and end at the lowest context height.
+            let lowest_offset = HeightDiff::try_from(relevant_headers.len() - 1)
+                .expect("the difficulty context length fits in HeightDiff");
+            parent_height - lowest_offset
+        });
+
+        Some(Self {
+            parent_height,
+            finalized_tip_height,
+            relevant_headers,
+        })
+    }
+
+    /// Checks that `header` at `height` is a valid child for this context: its height is one
+    /// more than the parent's, and its difficulty and time are valid.
+    fn check_child_header(
+        self,
+        header: &block::Header,
+        height: block::Height,
+        network: &Network,
+    ) -> Result<(), crate::ValidateContextError> {
+        check::header_is_valid_for_recent_chain_data(
+            header,
+            height,
+            network,
+            self.finalized_tip_height,
+            Some(self.parent_height),
+            self.relevant_headers,
+        )
     }
 }
 

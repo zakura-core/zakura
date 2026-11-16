@@ -17,9 +17,10 @@ use std::{
     process::{Command, Output},
 };
 
-use support::inputs;
+use support::{byte_inputs, inputs};
 use tempfile::TempDir;
 use zakura_sim::{
+    domain::cross::HEADER_REORG_RETIRES_BLOCK_WORK,
     harness::{
         run_prepared,
         sync::{SavedSync, SyncPorts, SyncScenario, SyncStorage},
@@ -268,4 +269,112 @@ fn regenerate_saved_scenarios() {
         )
         .expect("the fixture directory exists");
     }
+}
+
+/// The committed input of `sync/header-reorg-retires-block-work`'s planted
+/// case: the saved `reorg` scenario under a fuzz Plan whose run delivers an
+/// old-epoch body after the sequencer applied the new epoch.
+const REORG_STALE_BODY: &str = "sync-storage-reorg-stale-body";
+
+/// How many fuzz Plans [`regenerate_reorg_stale_body_input`] tries.
+const REGENERATE_CANDIDATES: usize = 64;
+
+/// Checks that `input` fills the stale-body input's role, or returns why it
+/// falls short. Its run must hold every property, apply
+/// `sync/header-reorg-retires-block-work`, and have the sequencer refuse an
+/// older epoch's body after it applied a newer one. That refused body is
+/// the one `accept-stale-scope-bodies.patch` buffers instead.
+fn stale_body_shortfall(input: &[u8]) -> Result<(), String> {
+    let (prefix, plan) = input.split_at(SyncStorage::SCENARIO_BYTES);
+    let scenario = SyncStorage::draw(prefix);
+    let ports = SyncStorage::prepare(&scenario);
+    let mut sink = MemorySink::default();
+    let report = run_prepared::<SyncStorage>(
+        &scenario,
+        ports.clone(),
+        Plan::from_fuzz(plan),
+        &mut sink,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(violation) = &report.end.violation {
+        return Err(format!("the run violated {violation:?}"));
+    }
+    if let Some(violated) = report
+        .properties
+        .iter()
+        .find(|property| matches!(property.outcome, PropertyOutcome::Violated { .. }))
+    {
+        return Err(format!("{} was violated", violated.property));
+    }
+    let applied = report.properties.iter().any(|property| {
+        property.property == HEADER_REORG_RETIRES_BLOCK_WORK
+            && matches!(property.outcome, PropertyOutcome::Held { applicable } if applicable > 0)
+    });
+    if !applied {
+        return Err(format!("{HEADER_REORG_RETIRES_BLOCK_WORK} never applied"));
+    }
+    if !ports.cross.borrow().saw_stale_body_refused {
+        return Err("the sequencer refused no old-epoch body under a newer epoch".to_owned());
+    }
+    Ok(())
+}
+
+/// The stale-body input runs the saved `reorg` scenario and still makes
+/// the sequencer refuse an old-epoch body, so a block-sync change that
+/// moves it off that order fails here instead of weakening the planted
+/// case. Rerun [`regenerate_reorg_stale_body_input`] when it does.
+#[test]
+fn the_stale_body_input_refuses_an_old_epoch_body() {
+    let input = fs::read(fixtures().join(format!("{REORG_STALE_BODY}.bin"))).unwrap();
+    assert_eq!(
+        SyncStorage::draw(&input[..SyncStorage::SCENARIO_BYTES]),
+        SavedSync::Reorg.scenario()
+    );
+    if let Err(shortfall) = stale_body_shortfall(&input) {
+        panic!("{shortfall}");
+    }
+}
+
+/// Rewrites the stale-body input with the first of
+/// [`REGENERATE_CANDIDATES`] fuzz Plans, after the `reorg` tag, that fills
+/// its role ([`stale_body_shortfall`]), and its sidecar's SHA-256 to match.
+/// Then `cargo xtask planted sync/header-reorg-retires-block-work` shows
+/// that `accept-stale-scope-bodies.patch` is still caught. Run it with
+/// `RUSTFLAGS="--cfg zakura_sim" cargo test --profile planted -p zakura-sim
+/// --test sync_harness -- --ignored regenerate_reorg_stale_body_input
+/// --nocapture`.
+#[test]
+#[ignore = "rewrites the committed input"]
+#[allow(clippy::print_stdout)]
+fn regenerate_reorg_stale_body_input() {
+    let tag = SavedSync::Reorg.tag();
+    let chosen = byte_inputs(REGENERATE_CANDIDATES, 16_384)
+        .into_iter()
+        .enumerate()
+        .map(|(index, plan)| (index, [&tag[..], &plan].concat()))
+        .find(|(index, input)| {
+            let result = stale_body_shortfall(input);
+            println!("{REORG_STALE_BODY}: candidate {index}: {result:?}");
+            result.is_ok()
+        })
+        .map(|(_, input)| input)
+        .unwrap_or_else(|| {
+            panic!("none of {REGENERATE_CANDIDATES} candidates fills the input's role")
+        });
+    let base = fixtures().join(REORG_STALE_BODY);
+    fs::write(base.with_extension("bin"), &chosen).expect("the fixture directory exists");
+    let sidecar = base.with_extension("toml");
+    let text = fs::read_to_string(&sidecar).expect("the input has a sidecar");
+    let text: String = text
+        .lines()
+        .map(|line| {
+            if line.starts_with("sha256 = ") {
+                format!("sha256 = \"{}\"\n", seed::sha256(&chosen))
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    fs::write(&sidecar, text).expect("the sidecar is writable");
 }

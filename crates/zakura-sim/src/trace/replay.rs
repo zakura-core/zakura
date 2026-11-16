@@ -274,19 +274,7 @@ fn replay_on<'h>(
         });
     }
     let harness = harness()?;
-    // The recording's `Draft` override is run configuration: the rebuilt
-    // meta and the run both apply it, as `record` did.
-    let draft = &trace.meta.draft;
-    if let Some(property) = draft
-        .iter()
-        .find(|id| harness.machine || harness.status(id).is_none())
-    {
-        return Err(ReplayError::UnsupportedScenario {
-            what: format!("meta.draft names {property}, which the harness can't check as Draft"),
-        });
-    }
-    let rebuilt =
-        harness::with_draft(draft, || (harness.meta)(&trace.meta.scenario)).map_err(unsupported)?;
+    let rebuilt = (harness.meta)(&trace.meta.scenario).map_err(unsupported)?;
     if let Some(field) = meta_difference(&trace.meta, &rebuilt) {
         return Err(ReplayError::UnsupportedScenario {
             what: format!("the harness describes this scenario with a different {field}"),
@@ -306,9 +294,7 @@ fn replay_on<'h>(
         .map_err(ReplayError::Io)?;
 
     let mut sink = VerifySink::new(trace, kept.is_some());
-    let run = harness::with_draft(draft, || {
-        (harness.run)(&trace.meta.scenario, PlanInput::Trace(script), &mut sink)
-    });
+    let run = (harness.run)(&trace.meta.scenario, PlanInput::Trace(script), &mut sink);
     let (mut report, failure) = match run {
         Ok(report) => (report, None),
         Err(HarnessError::Run { failure, report }) => (*report, Some(failure)),
@@ -478,7 +464,6 @@ fn meta_difference(recorded: &MetaRecord, rebuilt: &MetaRecord) -> Option<&'stat
         rng,
         fixtures: _,
         properties,
-        draft,
         input: _,
         plan: _,
         derived_from: _,
@@ -493,7 +478,6 @@ fn meta_difference(recorded: &MetaRecord, rebuilt: &MetaRecord) -> Option<&'stat
         ("meta.budget", *budget == rebuilt.budget),
         ("meta.rng", *rng == rebuilt.rng),
         ("meta.properties", *properties == rebuilt.properties),
-        ("meta.draft", *draft == rebuilt.draft),
     ]
     .into_iter()
     .find_map(|(field, same)| (!same).then_some(field))

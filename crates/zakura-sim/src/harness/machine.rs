@@ -134,15 +134,6 @@ impl HasView for Handle {
     }
 }
 
-/// Every source `machine`'s property needs, for hdr-14's missing-source
-/// keys.
-pub(crate) fn needs(machine: &Machine) -> Vec<Source> {
-    properties(machine)
-        .iter()
-        .flat_map(|property| property.needs.iter().copied())
-        .collect()
-}
-
 fn properties(machine: &Machine) -> Vec<Property<Handle>> {
     vec![Property {
         id: PropertyId::new(machine.name),
@@ -226,7 +217,6 @@ pub fn meta(machine: &Machine, value: &Value) -> Result<MetaRecord, HarnessError
         rng: RNG.into(),
         fixtures: Vec::new(),
         properties: registered(machine),
-        draft: Vec::new(),
         input: None,
         plan: None,
         derived_from: None,

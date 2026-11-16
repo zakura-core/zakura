@@ -2,11 +2,11 @@
 //!
 //! ```text
 //! zakura-sim record --sim <name> --input <file> --out <dir>
-//!     [--witness <property> --expect <holds|violated|applicable|violated-set>
-//!     [--also-violates <ids>]] [--draft <ids>]
+//!     [--witness <property> --expect <holds|violated|applicable>
+//!     [--also-violates <ids>]]
 //! zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>
-//!     [--witness <property> --expect <holds|violated|applicable|violated-set>
-//!     [--also-violates <ids>]] [--draft <ids>]
+//!     [--witness <property> --expect <holds|violated|applicable>
+//!     [--also-violates <ids>]]
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
 //!     [--report <file>]
 //! zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]
@@ -109,11 +109,11 @@ mod cli {
         let mut text = String::from(
             "Usage:\n  \
              zakura-sim record --sim <name> --input <file> --out <dir>\n      \
-             [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
-             [--also-violates <ids>]] [--draft <ids>]\n  \
+             [--witness <property> --expect <holds|violated|applicable>\n      \
+             [--also-violates <ids>]]\n  \
              zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>\n      \
-             [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
-             [--also-violates <ids>]] [--draft <ids>]\n  \
+             [--witness <property> --expect <holds|violated|applicable>\n      \
+             [--also-violates <ids>]]\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n      \
              [--report <file>]\n  \
              zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n  \
@@ -144,11 +144,7 @@ mod cli {
              It takes a full fuzz input or a typed scenario and its Plan bytes alike.\n\
              `--also-violates` lists, comma-separated, properties a `violated` witness\n\
              test or `confirm` expects violated beside the property, as a planted bug's\n\
-             co-violations. Under `violated-set` each of them must be violated, as a\n\
-             nested case's exact set.\n\
-             `--draft` lists, comma-separated, properties the run checks as Draft\n\
-             whatever their status, as a planted case's Draft run does. The trace's\n\
-             meta records them, and `replay` applies them too.\n\
+             co-violations.\n\
              `record` writes the run's full report, every violation and the harness's\n\
              evidence snapshot, to full-report.json beside the trace. `replay` compares its\n\
              own with it, and `--report` writes the replay's to a file.\n\
@@ -262,7 +258,6 @@ mod cli {
         witness: Option<String>,
         expect: Option<String>,
         also_violates: Option<String>,
-        draft: Option<String>,
     }
 
     /// `record`: runs one input on a harness and writes the trace.
@@ -332,36 +327,28 @@ mod cli {
         };
         let also_violates: Vec<String> = match (&witness, flags.also_violates) {
             (_, None) => Vec::new(),
-            (Some((_, Expect::Violated | Expect::ViolatedSet)), Some(ids)) => {
-                ids.split(',').map(str::to_owned).collect()
-            }
+            (Some((_, Expect::Violated)), Some(ids)) => ids.split(',').map(str::to_owned).collect(),
             (_, Some(_)) => {
                 return Err(Error::Usage(
-                    "--also-violates needs --expect violated or violated-set".to_owned(),
+                    "--also-violates needs --expect violated".to_owned(),
                 ))
             }
         };
-        let draft: Vec<String> = flags
-            .draft
-            .map(|ids| ids.split(',').map(str::to_owned).collect())
-            .unwrap_or_default();
         let Some((property, expect)) = witness else {
-            let trace = harness::with_draft(&draft, || harness::record(entry, what, &out))
+            let trace = harness::record(entry, what, &out)
                 .map_err(|error| Error::Failed(error.to_string()))?;
             print_trace(&trace, &out);
             return Ok(());
         };
-        let (trace, result) = harness::with_draft(&draft, || {
+        let (trace, result) =
             harness::record_witness(entry, what, &out, &property, expect, &also_violates)
-        })
-        .map_err(|error| Error::Failed(error.to_string()))?;
+                .map_err(|error| Error::Failed(error.to_string()))?;
         print_trace(&trace, &out);
         let error = result.as_ref().err().map(ToString::to_string);
         let file = json!({
             "property": property,
             "expect": expect.name(),
             "also_violates": also_violates,
-            "draft": draft,
             "passed": result.is_ok(),
             "error": error,
         });
@@ -1284,7 +1271,6 @@ mod cli {
                 "--witness" => flags.witness.replace(value).is_some(),
                 "--expect" => flags.expect.replace(value).is_some(),
                 "--also-violates" => flags.also_violates.replace(value).is_some(),
-                "--draft" => flags.draft.replace(value).is_some(),
                 _ => return Err(Error::Usage(format!("unknown flag `{flag}`"))),
             };
             if slot_taken {

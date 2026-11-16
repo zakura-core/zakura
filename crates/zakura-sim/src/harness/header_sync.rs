@@ -2734,7 +2734,7 @@ fn check_header_fault_penalized<S: HasView<View = StorageView>>(
 /// the whole run again, so it finds every break the step check already
 /// reported too. Each of those is left out once, by its words, which name
 /// its operation ([`FaultEvidence::reported`]), so each break is reported
-/// once (C12).
+/// once.
 fn fault_end_violations(faults: &FaultEvidence, log: &ObservationLog) -> Vec<EndViolation> {
     let mut reported = faults.reported();
     faults

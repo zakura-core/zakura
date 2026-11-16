@@ -632,19 +632,8 @@ pub(super) fn planted_cases(
         }
         matched.extend(prefixes.iter().filter(|prefix| selects(prefix, &path)));
         let case_file = patch.with_extension("toml");
-        let CaseFile {
-            also_violates, set, ..
-        } = toml::from_str(&fs::read_to_string(&case_file)?)
+        let CaseFile { also_violates, .. } = toml::from_str(&fs::read_to_string(&case_file)?)
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
-        // The loop's classes judge one property beside `also_violates`, so
-        // a nested case's exact set would be silently ignored.
-        if !set.is_empty() {
-            return Err(format!(
-                "{}: the loop doesn't judge a nested case's `set`; `cargo xtask planted` does",
-                case_file.display()
-            )
-            .into());
-        }
         cases.push(LoopCase {
             label: relative_label(repo_root, &patch),
             listed_in: case_file.clone(),

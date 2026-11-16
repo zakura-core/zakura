@@ -78,7 +78,7 @@ fn record_a_plan_against_a_scenario() {
     assert!(!out.join(INPUT_FILE).exists());
 }
 
-/// C18: `record --script` runs a scripted Plan against a scenario, its
+/// `record --script` runs a scripted Plan against a scenario, its
 /// trace names the script by digest, and `replay` reruns it Exact.
 #[test]
 fn record_a_script_against_a_scenario() {

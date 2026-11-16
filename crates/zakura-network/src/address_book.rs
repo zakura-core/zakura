@@ -935,6 +935,14 @@ impl AddressBook {
             self.peers.insert(updated);
             self.address_metrics_dirty = true;
 
+            let was_redialed_first = previous.is_some_and(|previous| previous.is_redialed_first());
+            if updated.is_redialed_first() && !was_redialed_first {
+                metrics::counter!("address_book.redial.started.total").increment(1);
+            } else if was_redialed_first && matches!(change, MetaAddrChange::UpdateConnected { .. })
+            {
+                metrics::counter!("address_book.redial.reconnected.total").increment(1);
+            }
+
             // Add the address to `most_recent_by_ip` if it sent the most recent
             // response Zebra has received from this IP.
             if self.should_update_most_recent_by_ip(updated) {

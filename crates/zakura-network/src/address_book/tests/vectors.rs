@@ -14,8 +14,8 @@ use crate::{
     address_book_peers::AddressBookPeers,
     config::UnconditionalPeers,
     constants::{
-        DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE,
-        MIN_PEER_RECONNECTION_DELAY,
+        DEFAULT_MAX_CONNS_PER_IP, HEARTBEAT_INTERVAL, MAX_ADDRS_IN_ADDRESS_BOOK,
+        MAX_PEER_MISBEHAVIOR_SCORE, MIN_PEER_RECONNECTION_DELAY, MIN_REDIAL_CONNECTION,
     },
     meta_addr::{MetaAddr, MetaAddrChange},
     protocol::external::types::PeerServices,
@@ -774,6 +774,81 @@ fn disconnected_inbound_endpoint_is_not_dialed_or_cached() {
         );
         assert_eq!(cached, !is_inbound, "inbound {is_inbound}: cacheable");
     }
+}
+
+/// A peer whose long-lived outbound connection ended is the next reconnection candidate
+/// once the reconnection delay is over, ahead of addresses that were never tried. A peer
+/// whose connection was short waits behind them.
+#[test]
+fn reconnection_peers_start_with_redial_candidates() {
+    let _init_guard = zakura_test::init();
+
+    let start = Instant::now();
+    let wall_start = Utc::now();
+    let wall_after = |after| wall_start + chrono::Duration::from_std(after).expect("short");
+    let second = std::time::Duration::from_secs(1);
+
+    // Each peer connects, answers each heartbeat, last responds at `MIN_REDIAL_CONNECTION`
+    // after the start of the test, and reports a shutdown a second later.
+    let closed_peer = |addr: &str, connected_for: std::time::Duration| {
+        let addr = addr.parse().unwrap();
+        let connected_at = MIN_REDIAL_CONNECTION - connected_for;
+        let mut responded = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, false)
+            .apply_to_meta_addr(None, start + connected_at, wall_after(connected_at))
+            .expect("a new entry is always created");
+        let heartbeats = std::iter::successors(Some(connected_at + HEARTBEAT_INTERVAL), |at| {
+            Some(*at + HEARTBEAT_INTERVAL)
+        })
+        .take_while(|at| *at < MIN_REDIAL_CONNECTION);
+        for responded_at in heartbeats.chain([MIN_REDIAL_CONNECTION]) {
+            responded = MetaAddr::new_responded(addr, None)
+                .apply_to_meta_addr(responded, start + responded_at, wall_after(responded_at))
+                .expect("each response is later than the last");
+        }
+
+        MetaAddr::new_shutdown(addr)
+            .apply_to_meta_addr(
+                responded,
+                start + MIN_REDIAL_CONNECTION + second,
+                wall_after(MIN_REDIAL_CONNECTION + second),
+            )
+            .expect("the shutdown is later than the response")
+    };
+
+    let redial = closed_peer("127.0.0.1:1", MIN_REDIAL_CONNECTION);
+    let short_lived = closed_peer("127.0.0.2:2", MIN_REDIAL_CONNECTION - second);
+    let never_attempted = MetaAddr::new_gossiped_meta_addr(
+        "127.0.0.3:3".parse().unwrap(),
+        PeerServices::NODE_NETWORK,
+        DateTime32::now(),
+    );
+
+    let address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        [never_attempted, short_lived, redial],
+    );
+
+    let closed_for = |closed_for| {
+        let after = MIN_REDIAL_CONNECTION + second + closed_for;
+
+        address_book
+            .reconnection_peers(start + after, wall_after(after))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        closed_for(MIN_PEER_RECONNECTION_DELAY - second),
+        [never_attempted],
+        "a closed peer waits for the reconnection delay like any other"
+    );
+    assert_eq!(
+        closed_for(MIN_PEER_RECONNECTION_DELAY + second),
+        [redial, never_attempted, short_lived],
+    );
 }
 
 /// Reports misbehavior for `addr`, then removes the addresses of any IP that the report

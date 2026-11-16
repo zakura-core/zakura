@@ -210,6 +210,15 @@ pub struct MetaAddr {
     /// See the [`MetaAddr::last_failure`] method for details.
     last_failure: Option<Instant>,
 
+    /// When this peer's latest connection finished its handshake.
+    ///
+    /// Compared with `last_response`, this is how long that connection lasted. See
+    /// [`MetaAddr::is_redialed_first`] for what a long connection earns the peer.
+    ///
+    /// Dropped at this entry's first change after [`constants::REDIAL_WINDOW`] without a
+    /// response.
+    connected_since: Option<DateTime32>,
+
     /// The outcome of our most recent communication attempt with this peer.
     //
     // TODO: move the time and services fields into PeerAddrState?
@@ -340,6 +349,7 @@ impl MetaAddr {
             ping_sent_at: None,
             last_attempt: None,
             last_failure: None,
+            connected_since: None,
             last_connection_state: NeverAttemptedGossiped,
             is_inbound: false,
         }
@@ -576,6 +586,38 @@ impl MetaAddr {
         }
     }
 
+    /// Returns true if this peer is dialed before the candidates that are not
+    /// `Responded`, because its long-lived outbound connection ended a short time ago.
+    ///
+    /// A node that restarts has free inbound slots, but other nodes take them within
+    /// minutes. A peer whose connection responded for
+    /// [`constants::MIN_REDIAL_CONNECTION`] is redialed first until
+    /// [`constants::REDIAL_WINDOW`] after its last response, so it is dialed again while
+    /// the restarted node still has room.
+    ///
+    /// This reads the entry's own times, and not a report from the connection, because a
+    /// connection's tasks can be stopped before they report that it ended.
+    ///
+    /// # Security
+    ///
+    /// A peer only earns this by keeping a connection open, and each redial still waits
+    /// [`constants::MIN_PEER_RECONNECTION_DELAY`]. So it is dialed no more often than a
+    /// peer that stays connected, and it cannot earn it by dropping connections.
+    pub fn is_redialed_first(&self) -> bool {
+        let (Some(connected_since), Some(last_response)) =
+            (self.connected_since, self.last_response)
+        else {
+            return false;
+        };
+
+        self.last_connection_state != PeerAddrState::Responded
+            && !self.is_inbound
+            && last_response
+                .saturating_duration_since(connected_since)
+                .to_std()
+                >= constants::MIN_REDIAL_CONNECTION
+    }
+
     /// Have we recently had a failed connection to this peer?
     ///
     /// Returns `true` if this peer has recently failed.
@@ -732,6 +774,7 @@ impl MetaAddr {
             ping_sent_at: None,
             last_attempt: None,
             last_failure: None,
+            connected_since: None,
             last_connection_state: NeverAttemptedGossiped,
             is_inbound: false,
         })
@@ -899,6 +942,22 @@ impl MetaAddrChange {
         }
     }
 
+    /// Returns when the peer's latest connection started, after this change is applied
+    /// to `previous` at `now`. See [`MetaAddr::connected_since`].
+    fn connected_since(&self, previous: &MetaAddr, now: DateTime32) -> Option<DateTime32> {
+        if let UpdateConnected { .. } = self {
+            return Some(now);
+        }
+
+        let is_within_redial_window = previous.last_response.is_some_and(|last_response| {
+            now.saturating_duration_since(last_response).to_std() < constants::REDIAL_WINDOW
+        });
+
+        previous
+            .connected_since
+            .filter(|_connected_since| is_within_redial_window)
+    }
+
     /// Return the peer connection state for this change.
     pub fn peer_addr_state(&self) -> PeerAddrState {
         match self {
@@ -927,6 +986,10 @@ impl MetaAddrChange {
             ping_sent_at: self.ping_sent_at(),
             last_attempt: self.last_attempt(instant_now),
             last_failure: self.last_failure(instant_now),
+            connected_since: match self {
+                UpdateConnected { .. } => Some(local_now),
+                _ => None,
+            },
             last_connection_state: self.peer_addr_state(),
             is_inbound: self.is_inbound(),
         }
@@ -961,6 +1024,7 @@ impl MetaAddrChange {
             ping_sent_at: None,
             last_attempt: None,
             last_failure: None,
+            connected_since: None,
             last_connection_state: self.peer_addr_state(),
             is_inbound: self.is_inbound(),
         }
@@ -1115,6 +1179,7 @@ impl MetaAddrChange {
                 ping_sent_at: None,
                 last_attempt: None,
                 last_failure: None,
+                connected_since: None,
                 last_connection_state: self.peer_addr_state(),
                 is_inbound: previous.is_inbound || self.is_inbound(),
             })
@@ -1144,6 +1209,7 @@ impl MetaAddrChange {
                 // These are monotonic times, we already checked the responses are in order.
                 last_attempt: self.last_attempt(instant_now).or(previous.last_attempt),
                 last_failure: self.last_failure(instant_now).or(previous.last_failure),
+                connected_since: self.connected_since(&previous, local_now),
                 // Replace the state with the updated state.
                 last_connection_state: self.peer_addr_state(),
                 is_inbound: previous.is_inbound || self.is_inbound(),
@@ -1154,7 +1220,8 @@ impl MetaAddrChange {
 
 impl Ord for MetaAddr {
     /// `MetaAddr`s are sorted in approximate reconnection attempt order, but
-    /// with `Responded` peers sorted first as a group.
+    /// with `Responded` peers sorted first as a group, then peers that are being
+    /// redialed.
     ///
     /// But this order should not be used for reconnection attempts: use
     /// [`reconnection_peers`] instead.
@@ -1167,7 +1234,15 @@ impl Ord for MetaAddr {
         use std::net::IpAddr::{V4, V6};
         use Ordering::*;
 
-        // First, try states that are more likely to work
+        // Keep `Responded` peers first as a group, because the address book reads them as
+        // a prefix of this order.
+        let responded_first = (self.last_connection_state != PeerAddrState::Responded)
+            .cmp(&(other.last_connection_state != PeerAddrState::Responded));
+
+        // Then, try peers whose long-lived connection ended a short time ago.
+        let redial_first = other.is_redialed_first().cmp(&self.is_redialed_first());
+
+        // Then, try states that are more likely to work
         let more_reliable_state = self.last_connection_state.cmp(&other.last_connection_state);
 
         // Keep valid addresses before invalid ones, without ranking their ports.
@@ -1240,7 +1315,9 @@ impl Ord for MetaAddr {
         };
         let port_tie_breaker = self.addr.port().cmp(&other.addr.port());
 
-        more_reliable_state
+        responded_first
+            .then(redial_first)
+            .then(more_reliable_state)
             .then(more_likely_valid)
             .then(older_attempt)
             .then(older_failure)

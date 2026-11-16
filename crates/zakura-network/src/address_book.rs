@@ -128,8 +128,14 @@ impl BannedIps {
     #[cfg(test)]
     pub(crate) fn with_banned_ip(ip: IpAddr) -> Self {
         let bans = Self::default();
-        bans.insert(ip);
+        bans.ban(ip);
         bans
+    }
+
+    /// Bans `ip` in this list and every clone of it.
+    #[cfg(test)]
+    pub(crate) fn ban(&self, ip: IpAddr) {
+        self.insert(ip);
     }
 }
 

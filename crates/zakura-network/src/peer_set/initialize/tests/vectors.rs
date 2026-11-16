@@ -3136,6 +3136,174 @@ async fn listener_keeps_an_unconditional_peer_slot_after_its_connection_closes()
     listener.stop().await;
 }
 
+/// A full listener holds the seat of a long-lived peer that leaves. Another peer cannot
+/// take it, and the peer that left can. A short-lived peer's seat is not held.
+#[tokio::test]
+async fn listener_holds_the_seat_of_a_long_lived_peer() {
+    let _init_guard = zakura_test::init();
+
+    // A target size of 4 gives 12 inbound seats, so one seat can be held.
+    let Some(mut listener) = UnconditionalPeerListener::spawn("[]", &[], 4).await else {
+        return;
+    };
+    const RETURNING_PEER_IP: IpAddr = LISTENER_UNCONDITIONAL_IP;
+
+    let mut returning_peer = listener
+        .offer(RETURNING_PEER_IP)
+        .await
+        .expect("the listener has free seats");
+    returning_peer.2.mark_open();
+    age_open_connections().await;
+    let mut other_peers = listener.offer_until_refused(LISTENER_PUBLIC_IP).await;
+    assert_eq!(other_peers.len(), listener.inbound_limit - 1);
+
+    // The other peers are short-lived, so the next peer takes a seat that one leaves.
+    other_peers.pop();
+    other_peers.push(
+        listener
+            .offer(RETURNING_PEER_IP)
+            .await
+            .expect("a short-lived peer's seat is not held"),
+    );
+
+    std::mem::drop(returning_peer);
+    assert!(
+        listener.offer(LISTENER_PUBLIC_IP).await.is_none(),
+        "another peer cannot take the held seat",
+    );
+    let returned_peer = listener.offer(RETURNING_PEER_IP).await;
+    assert!(returned_peer.is_some(), "the peer takes its seat back");
+    assert!(
+        listener.offer(LISTENER_PUBLIC_IP).await.is_none(),
+        "the listener is full again",
+    );
+
+    listener.stop().await;
+}
+
+/// A held seat only refuses a peer when every other seat is taken. Peers take the free
+/// seats first.
+#[tokio::test]
+async fn listener_fills_free_seats_before_a_held_seat_refuses_a_peer() {
+    let _init_guard = zakura_test::init();
+
+    // A target size of 4 gives 12 inbound seats, so one seat can be held.
+    let Some(mut listener) = UnconditionalPeerListener::spawn("[]", &[], 4).await else {
+        return;
+    };
+    const RETURNING_PEER_IP: IpAddr = LISTENER_UNCONDITIONAL_IP;
+
+    let mut returning_peer = listener
+        .offer(RETURNING_PEER_IP)
+        .await
+        .expect("the listener has free seats");
+    returning_peer.2.mark_open();
+    age_open_connections().await;
+    let mut other_peers = listener.offer_until_refused(LISTENER_PUBLIC_IP).await;
+
+    // One seat is held, and two are free.
+    std::mem::drop(returning_peer);
+    other_peers.truncate(other_peers.len() - 2);
+
+    for _free_seat in 0..2 {
+        other_peers.push(
+            listener
+                .offer(LISTENER_PUBLIC_IP)
+                .await
+                .expect("a free seat is not held for anyone"),
+        );
+    }
+    assert!(
+        listener.offer(LISTENER_PUBLIC_IP).await.is_none(),
+        "only the held seat is left",
+    );
+    assert!(
+        listener.offer(RETURNING_PEER_IP).await.is_some(),
+        "the peer takes its seat back",
+    );
+
+    listener.stop().await;
+}
+
+/// A dialed unconditional peer that returns to its own slot gives up the public seat that
+/// is held for it, so other peers can take that seat.
+#[tokio::test]
+async fn listener_releases_the_held_seat_of_an_unconditional_peer_that_returns() {
+    let _init_guard = zakura_test::init();
+
+    let Some(mut listener) = UnconditionalPeerListener::spawn("['::1']", &[], 4).await else {
+        return;
+    };
+
+    // The peer fills its own slot, so its second connection takes a public seat.
+    let own_slot = listener.offer(LISTENER_UNCONDITIONAL_IP).await;
+    let mut public_seat = listener
+        .offer(LISTENER_UNCONDITIONAL_IP)
+        .await
+        .expect("the listener has free public seats");
+    public_seat.2.mark_open();
+    age_open_connections().await;
+    std::mem::drop(own_slot);
+    std::mem::drop(public_seat);
+
+    let _returned_peer = listener
+        .offer(LISTENER_UNCONDITIONAL_IP)
+        .await
+        .expect("the peer's own slot is free");
+    assert_eq!(
+        listener.offer_until_refused(LISTENER_PUBLIC_IP).await.len(),
+        listener.inbound_limit,
+        "no public seat is held for a peer that is back",
+    );
+
+    listener.stop().await;
+}
+
+/// A listener holds no seat for a peer that is banned, even when the ban comes after
+/// the peer's connection closed.
+#[tokio::test]
+async fn listener_releases_the_held_seat_of_a_banned_peer() {
+    let _init_guard = zakura_test::init();
+
+    // A target size of 4 gives 12 inbound seats, so one seat can be held.
+    let Some(mut listener) = UnconditionalPeerListener::spawn("[]", &[], 4).await else {
+        return;
+    };
+    const BANNED_PEER_IP: IpAddr = LISTENER_UNCONDITIONAL_IP;
+
+    let mut banned_peer = listener
+        .offer(BANNED_PEER_IP)
+        .await
+        .expect("the listener has free seats");
+    banned_peer.2.mark_open();
+    age_open_connections().await;
+    let mut other_peers = listener.offer_until_refused(LISTENER_PUBLIC_IP).await;
+
+    std::mem::drop(banned_peer);
+    assert!(
+        listener.offer(LISTENER_PUBLIC_IP).await.is_none(),
+        "the seat is held while the peer is not banned",
+    );
+
+    listener.bans.ban(BANNED_PEER_IP);
+    other_peers.push(
+        listener
+            .offer(LISTENER_PUBLIC_IP)
+            .await
+            .expect("a banned peer's seat is not held"),
+    );
+
+    listener.stop().await;
+}
+
+/// Advances the test clock by [`constants::MIN_HELD_SEAT_CONNECTION`], so that the
+/// connections that are open now are long-lived when they close.
+async fn age_open_connections() {
+    tokio::time::pause();
+    tokio::time::advance(constants::MIN_HELD_SEAT_CONNECTION).await;
+    tokio::time::resume();
+}
+
 /// One IP holds at most `max_connections_per_ip` of the inbound slots that dialed
 /// unconditional peers share, so one listed peer cannot take another's slot. Its slots
 /// are free for it again once its connections close.
@@ -4578,6 +4746,9 @@ struct UnconditionalPeerListener {
     /// The peer changes that the listener sends to the peer set.
     _peerset_rx: mpsc::Receiver<DiscoveredPeer>,
 
+    /// The listener's ban list.
+    bans: BannedIps,
+
     /// The listener task.
     listen_task_handle: JoinHandle<Result<(), BoxError>>,
 }
@@ -4658,13 +4829,14 @@ impl UnconditionalPeerListener {
         // Room for every peer change that a test can cause.
         let (peerset_tx, peerset_rx) =
             mpsc::channel::<DiscoveredPeer>(config.peerset_total_connection_limit() * 4);
+        let bans = BannedIps::default();
         let listen_task_handle = tokio::spawn(accept_inbound_connections(
             config,
             tcp_listener,
             MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
             tower::util::BoxCloneService::new(open_inbound_handshaker),
             peerset_tx,
-            BannedIps::default(),
+            bans.clone(),
             zcashd_compat_peer_ips
                 .iter()
                 .map(|ip| ip.parse().expect("test address parses"))
@@ -4676,6 +4848,7 @@ impl UnconditionalPeerListener {
             inbound_limit,
             accepted_rx,
             _peerset_rx: peerset_rx,
+            bans,
             listen_task_handle,
         })
     }

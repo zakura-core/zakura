@@ -160,7 +160,10 @@ const CAMPAIGN_INPUTS: usize = 32;
 const CAMPAIGN_INPUT_BYTES: usize = 64;
 
 /// The longest one child of a confirmation through a fuzz target may run.
-const TARGET_CHILD: Duration = Duration::from_secs(300);
+/// The target runs under ASan, and a lost-wakeup bypass shows only once its
+/// run drains: `capacity-release-wakes/stale-completion-no-wake`'s input
+/// takes about 11 minutes on an M-series Mac, and longer on CI's runners.
+const TARGET_CHILD: Duration = Duration::from_secs(1800);
 
 /// The longest one `zakura-sim` run of a case may take: a baseline, patched
 /// or campaign recording, or a fresh replay. A run past it is killed and

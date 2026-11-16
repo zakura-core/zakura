@@ -47,7 +47,9 @@ pub mod error;
 pub mod router;
 pub mod transaction;
 
-pub use block::check::proof_of_work_is_valid;
+pub use block::check::{
+    coinbase_position_is_valid, merkle_root_validity, proof_of_work_is_valid, time_is_valid_at,
+};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use block::check::difficulty_is_valid;

@@ -45,6 +45,7 @@ use super::sync::{BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT};
 use InventoryResponse::*;
 
 mod cached_peer_addr_response;
+pub mod compact;
 pub(crate) mod downloads;
 
 use cached_peer_addr_response::CachedPeerAddrResponse;

@@ -611,17 +611,6 @@ pub(super) fn run(
     Ok(())
 }
 
-/// The index [`run`] gives case `name` of `property` when it runs that
-/// property without `--targets`: its position among the property's cases
-/// in path order, which names its `case-<index>` directory.
-pub(super) fn case_index(repo_root: &Path, property: &str, name: &str) -> Result<usize, BoxError> {
-    cases(repo_root)?
-        .into_iter()
-        .filter(|case| case.property == property)
-        .position(|case| case.patch.file_stem().and_then(|stem| stem.to_str()) == Some(name))
-        .ok_or_else(|| format!("{property}/{name} has no planted case").into())
-}
-
 /// Every case under `repo_root`'s [`PLANTED_DIR`], in path order.
 fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
     let root = repo_root.join(PLANTED_DIR);

@@ -57,7 +57,7 @@
 //! that a simulator fuzz target runs, as the fuzz package's
 //! `[package.metadata.zakura-sim.targets]` table maps them, and prints
 //! each target's cases, or that it has none. After step 3 it also confirms
-//! each patched input through its target in fresh processes, as
+//! each Active patched input through its target in fresh processes, as
 //! `cargo xtask sim-minimize` confirms an original: the patched target must
 //! crash with the case's property alone and name the harness,
 //! `zakura-sim confirm` must find the property's trigger history, and a
@@ -65,7 +65,10 @@
 //! `zakura-sim` and the target in `target/planted/confirm-builds/`, outside
 //! the scratch worktree, so later cases and runs reuse the builds, and both
 //! binaries must embed the patched checkout's source digest. A check that
-//! fails is its own failure, never a catch.
+//! fails is its own failure, never a catch. Draft and Known properties do
+//! not crash the target: their target confirmation is explicitly skipped,
+//! retaining the witness, campaign and Exact replay checks above. A patch
+//! that changes the property status fails instead of bypassing confirmation.
 //!
 //! `--shard <index>/<count>` runs only every `count`th case in path order,
 //! starting at position `index`. It picks from the cases that the property
@@ -965,6 +968,32 @@ fn target_of(harnesses: &BTreeMap<String, Option<String>>, harness: &str) -> Opt
         .map(|(target, _)| target.clone())
 }
 
+/// The trace metadata's property status. Unknown forms fail closed.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+enum TargetPropertyStatus {
+    Active,
+    Draft,
+    Known { issue: u32 },
+}
+
+/// Reads the case's status from a recorded trace, refusing missing or
+/// duplicate registrations rather than treating them as non-Active.
+fn target_property_status(trace: &str, property: &str) -> Result<TargetPropertyStatus, BoxError> {
+    let first: Value = serde_json::from_str(trace.lines().next().ok_or("the trace is empty")?)?;
+    let properties = first["meta"]["properties"]
+        .as_array()
+        .ok_or("the trace metadata has no properties")?;
+    let mut matching = properties.iter().filter(|entry| entry["id"] == property);
+    let entry = matching
+        .next()
+        .ok_or("the trace metadata omits the property")?;
+    if matching.next().is_some() {
+        return Err("the trace metadata repeats the property".into());
+    }
+    Ok(serde_json::from_value(entry["status"].clone())?)
+}
+
 /// Confirms `case`'s committed input in the patched `worktree` through the
 /// fuzz target `target`, which runs `harness`, in fresh processes, with
 /// [`sim_minimize::confirm`]: the target must crash with the case's
@@ -976,7 +1005,9 @@ fn target_of(harnesses: &BTreeMap<String, Option<String>>, harness: &str) -> Opt
 /// The builds are reused, so both pinned binaries must also name the
 /// patched source: each embeds the source digest that `zakura-sim`'s build
 /// script computed, and the digest must be the patched worktree's
-/// ([`names_source`]). `None` if every check passed.
+/// ([`names_source`]). `None` if every check passed, or target confirmation
+/// was explicitly skipped for a non-Active property. Both recordings must
+/// agree on status, so a patch cannot demote an Active property to skip it.
 fn through_target(
     worktree: &Path,
     builds: &Path,
@@ -985,6 +1016,28 @@ fn through_target(
     target: &str,
     harness: &str,
 ) -> Result<Option<Verdict>, BoxError> {
+    let baseline = target_property_status(
+        &fs::read_to_string(scratch.join("baseline/trace.jsonl"))?,
+        &case.property,
+    )?;
+    let patched = target_property_status(
+        &fs::read_to_string(scratch.join("patched/trace.jsonl"))?,
+        &case.property,
+    )?;
+    if baseline != patched {
+        return Ok(Some(Verdict::TargetMisses {
+            target: target.to_owned(),
+            why: format!("the patch changed the property status: {baseline:?} -> {patched:?}"),
+        }));
+    }
+    if patched != TargetPropertyStatus::Active {
+        println!(
+            "{} {}: target confirmation skipped for {target}: {patched:?} properties do not crash; witness, campaign and Exact replay passed",
+            case.property,
+            case.patch.display(),
+        );
+        return Ok(None);
+    }
     let Witness::Input(input) = &case.witness else {
         unreachable!("`run` gives a typed case no target");
     };
@@ -1505,6 +1558,82 @@ mod tests {
     use super::*;
 
     const ID: &str = "discovery/wait-complete-wakes";
+
+    /// Draft/Known catches keep their simulator evidence without asking a
+    /// non-crashing target to crash. Active catches still enter confirmation,
+    /// and a patched demotion cannot bypass it.
+    #[test]
+    fn target_confirmation_respects_status_without_allowing_demotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let case = Case {
+            property: ID.to_owned(),
+            patch: "bypass.patch".into(),
+            witness: Witness::Input("input.bin".into()),
+            checks: Vec::new(),
+            also_violates: Vec::new(),
+            target: Some("target".to_owned()),
+        };
+        for subdir in ["baseline", "patched"] {
+            fs::create_dir(root.join(subdir)).unwrap();
+        }
+        // Entering Active confirmation tries to replace this output path.
+        // A file in place of its directory fails before launching any build.
+        fs::write(root.join("target"), "not a directory").unwrap();
+        let write_status = |subdir: &str, status: Value| {
+            fs::write(
+                root.join(subdir).join("trace.jsonl"),
+                serde_json::json!({"meta": {"properties": [{"id": ID, "status": status}]}})
+                    .to_string(),
+            )
+            .unwrap();
+        };
+        for status in [
+            serde_json::json!("draft"),
+            serde_json::json!({"known": {"issue": 42}}),
+        ] {
+            write_status("baseline", status.clone());
+            write_status("patched", status);
+            assert_eq!(
+                through_target(root, root, root, &case, "target", "h").unwrap(),
+                None
+            );
+        }
+        write_status("baseline", serde_json::json!("active"));
+        assert!(matches!(
+            through_target(root, root, root, &case, "target", "h").unwrap(),
+            Some(Verdict::TargetMisses { why, .. }) if why.contains("changed the property status")
+        ));
+        write_status("patched", serde_json::json!("draft"));
+        assert!(matches!(
+            through_target(root, root, root, &case, "target", "h").unwrap(),
+            Some(Verdict::TargetMisses { .. })
+        ));
+        write_status("patched", serde_json::json!("active"));
+        assert!(through_target(root, root, root, &case, "target", "h").is_err());
+    }
+
+    #[test]
+    fn target_status_rejects_missing_duplicate_and_unknown_metadata() {
+        for trace in [
+            "",
+            r#"{"end":{}}"#,
+            r#"{"meta":{"properties":[]}}"#,
+            r#"{"meta":{"properties":[{"id":"p"}]}}"#,
+            r#"{"meta":{"properties":[{"id":"p","status":"future"}]}}"#,
+            r#"{"meta":{"properties":[{"id":"p","status":"draft"},{"id":"p","status":"active"}]}}"#,
+        ] {
+            assert!(target_property_status(trace, "p").is_err(), "{trace}");
+        }
+        assert_eq!(
+            target_property_status(
+                r#"{"meta":{"properties":[{"id":"p","status":"active"}]}}"#,
+                "p"
+            )
+            .unwrap(),
+            TargetPropertyStatus::Active,
+        );
+    }
 
     /// An `end` line with `violation`, and `reports` as (property, outcome
     /// JSON) pairs.

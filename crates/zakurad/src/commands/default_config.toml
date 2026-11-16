@@ -131,6 +131,8 @@ message_rate_per_second = 2048
 nat_traversal = false
 peer_memory_budget_bytes = 16106127360
 stream_open_rate_per_second = 32
+# Optional IP-to-name labels for peers in gossip traces.
+trace_peer_names = {}
 
 [network.zakura.quic]
 ack_frequency = false

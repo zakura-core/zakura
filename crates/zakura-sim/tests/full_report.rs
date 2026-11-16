@@ -1,4 +1,4 @@
-//! C8: `record` keeps a run's full report beside its trace, every
+//! `record` keeps a run's full report beside its trace, every
 //! violation and the harness's evidence snapshot, and `replay` sends its
 //! own and refuses a recording whose report differs.
 #![cfg(zakura_sim)]

@@ -169,6 +169,10 @@ pub enum RejectionError {
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum NonStandardTransactionError {
+    /// Sprout is retired from the mempool, including on pre-NU7 networks.
+    #[error("Sprout JoinSplits are not accepted in the mempool")]
+    SproutJoinSplit,
+
     #[error(
         "transaction is {actual_bytes} bytes, exceeding the configured mempool maximum of {max_bytes} bytes"
     )]
@@ -313,6 +317,12 @@ impl Storage {
 
         let transaction = tx.transaction.transaction().as_ref();
         let spent_outputs = &tx.spent_outputs;
+
+        // NU7 excludes versions 1-4. Keep Sprout out of storage even on custom
+        // pre-NU7 networks, so conflict tracking needs no Sprout index.
+        if transaction.has_sprout_joinsplit_data() {
+            return self.reject_non_standard(tx, NonStandardTransactionError::SproutJoinSplit);
+        }
 
         for input in transaction.inputs() {
             let unlock_script = match input {
@@ -666,11 +676,6 @@ impl Storage {
         self.verified.remove_all(tx_ids).len()
     }
 
-    /// Clears a list of mined transaction ids from the verified set's tracked transaction dependencies.
-    pub fn clear_mined_dependencies(&mut self, mined_ids: &HashSet<transaction::Hash>) {
-        self.verified.clear_mined_dependencies(mined_ids);
-    }
-
     /// Reject and remove transactions from the mempool via non-malleable [`transaction::Hash`].
     /// - For v5 transactions, transactions are matched by TXID,
     ///   using only the non-malleable transaction ID.
@@ -690,51 +695,11 @@ impl Storage {
         mined_ids: &HashSet<transaction::Hash>,
         transactions: Vec<impl AsRef<Transaction>>,
     ) -> RemovedTransactionIds {
-        let removed_mined = self.verified.remove_all(mined_ids.iter().copied());
+        let removed_mined = self.verified.remove_mined(mined_ids);
 
-        let spent_outpoints: HashSet<_> = transactions
+        let duplicate_spend_ids: HashSet<_> = transactions
             .iter()
-            .flat_map(|tx| tx.as_ref().spent_outpoints())
-            .collect();
-        let sprout_nullifiers: HashSet<_> = transactions
-            .iter()
-            .flat_map(|transaction| transaction.as_ref().sprout_nullifiers())
-            .collect();
-        let sapling_nullifiers: HashSet<_> = transactions
-            .iter()
-            .flat_map(|transaction| transaction.as_ref().sapling_nullifiers())
-            .collect();
-        let orchard_nullifiers: HashSet<_> = transactions
-            .iter()
-            .flat_map(|transaction| transaction.as_ref().orchard_nullifiers())
-            .collect();
-        let ironwood_nullifiers: HashSet<_> = transactions
-            .iter()
-            .flat_map(|transaction| transaction.as_ref().ironwood_nullifiers())
-            .collect();
-
-        let duplicate_spend_ids: HashSet<_> = self
-            .verified
-            .transactions()
-            .values()
-            .map(|tx| (tx.transaction.id(), tx.transaction.transaction()))
-            .filter_map(|(tx_id, tx)| {
-                (tx.spent_outpoints()
-                    .any(|outpoint| spent_outpoints.contains(&outpoint))
-                    || tx
-                        .sprout_nullifiers()
-                        .any(|nullifier| sprout_nullifiers.contains(nullifier))
-                    || tx
-                        .sapling_nullifiers()
-                        .any(|nullifier| sapling_nullifiers.contains(nullifier))
-                    || tx
-                        .orchard_nullifiers()
-                        .any(|nullifier| orchard_nullifiers.contains(nullifier))
-                    || tx
-                        .ironwood_nullifiers()
-                        .any(|nullifier| ironwood_nullifiers.contains(nullifier)))
-                .then_some(tx_id)
-            })
+            .flat_map(|tx| self.verified.conflicting_ids(tx.as_ref()))
             .collect();
 
         let removed_duplicate_spend = self
@@ -1050,15 +1015,7 @@ impl Storage {
         &mut self,
         tip_height: zakura_chain::block::Height,
     ) -> HashSet<UnminedTxId> {
-        let mut tx_ids = HashSet::new();
-
-        for (&tx_id, tx) in self.transactions() {
-            if let Some(expiry_height) = tx.transaction.transaction().expiry_height() {
-                if tip_height >= expiry_height {
-                    tx_ids.insert(tx_id);
-                }
-            }
-        }
+        let tx_ids: HashSet<_> = self.verified.expired_transaction_ids(tip_height).collect();
 
         // Expiry height is effecting data, so match by non-malleable TXID.
         let removed_tx_ids = self.verified.remove_all(tx_ids.iter().copied());

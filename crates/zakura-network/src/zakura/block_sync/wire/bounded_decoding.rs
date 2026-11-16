@@ -1,6 +1,9 @@
 use super::*;
 use crate::zakura::block_sync::reorder::BufferedBlockBody;
-use zakura_chain::{serialization::CompactSizeMessage, transaction::Transaction};
+use zakura_chain::{
+    serialization::{CompactSizeMessage, ZcashDeserialize},
+    transaction::Transaction,
+};
 use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
 
 fn block_with_many_transactions() -> Arc<block::Block> {
@@ -68,4 +71,21 @@ fn buffered_replay_keeps_the_same_transaction_allocation_bound() {
         replayed.transaction_capacity(),
         replayed.view().transactions().len()
     );
+}
+
+impl DecodedBlockPayload {
+    /// The payload a peer routine keeps after it decodes `block` from a `Block` message.
+    pub(in crate::zakura::block_sync) fn of_block(block: &Arc<block::Block>) -> Self {
+        let payload = BlockSyncMessage::Block(block.clone())
+            .encode()
+            .expect("a test block encodes within the block-sync message limits");
+        decode_block_payload(payload)
+            .expect("an encoded test block decodes")
+            .1
+    }
+
+    /// A weak handle on the payload's bytes, which dies when every holder has released them.
+    pub(in crate::zakura::block_sync) fn downgrade(&self) -> std::sync::Weak<[u8]> {
+        Arc::downgrade(&self.0)
+    }
 }

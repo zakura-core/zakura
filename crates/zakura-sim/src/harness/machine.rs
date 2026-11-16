@@ -95,6 +95,7 @@ macro_rules! machine_entry {
                 $crate::harness::machine::run_bytes(&$machine, bytes, sink, extra)
             },
             accepts: |_| true,
+            families: Vec::new,
             migrate: |_, generator| {
                 Err(format!(
                     "{} migrates no generator-{generator} input",
@@ -131,15 +132,6 @@ impl HasView for Handle {
             .as_ref()
             .map_or(Capture::Missing, |(step, _)| Capture::AfterStep(*step))
     }
-}
-
-/// Every source `machine`'s property needs, for hdr-14's missing-source
-/// keys.
-pub(crate) fn needs(machine: &Machine) -> Vec<Source> {
-    properties(machine)
-        .iter()
-        .flat_map(|property| property.needs.iter().copied())
-        .collect()
 }
 
 fn properties(machine: &Machine) -> Vec<Property<Handle>> {
@@ -225,7 +217,6 @@ pub fn meta(machine: &Machine, value: &Value) -> Result<MetaRecord, HarnessError
         rng: RNG.into(),
         fixtures: Vec::new(),
         properties: registered(machine),
-        draft: Vec::new(),
         input: None,
         plan: None,
         derived_from: None,

@@ -7,7 +7,7 @@ use std::{
     process::{Command, ExitStatus},
 };
 
-mod header_acceptance;
+mod bounded_decode;
 mod header_conformance;
 mod header_fuzz;
 mod planted;
@@ -90,6 +90,15 @@ fn try_main() -> Result<(), BoxError> {
 
             rpc_artifacts::check(&repo_root()?)
         }
+        Some("check-bounded-decode") => {
+            if args.next().is_some() {
+                return Err(Box::new(UsageError(
+                    "`cargo xtask check-bounded-decode` does not accept arguments",
+                )));
+            }
+
+            bounded_decode::check(&repo_root()?)
+        }
         Some("check-rt-imports") => {
             if args.next().is_some() {
                 return Err(Box::new(UsageError(
@@ -108,6 +117,10 @@ fn try_main() -> Result<(), BoxError> {
             if args.peek().map(String::as_str) == Some("loop") {
                 args.next();
                 return planted::mutation_loop(&repo_root()?, args);
+            }
+            if args.peek().map(String::as_str) == Some("triage") {
+                args.next();
+                return planted::triage(&repo_root()?, args);
             }
             let mut changed_since = None;
             let mut property = None;
@@ -153,7 +166,6 @@ fn try_main() -> Result<(), BoxError> {
                 targets,
             )
         }
-        Some("header-acceptance") => header_acceptance::run(&repo_root()?, args),
         Some("record") => sim::run(&repo_root()?, "record", args),
         Some("replay") => sim::run(&repo_root()?, "replay", args),
         Some("shrink") => sim::run(&repo_root()?, "shrink", args),
@@ -377,6 +389,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "  cargo xtask generate-rpc-artifacts")?;
     writeln!(output, "  cargo xtask check-rpc-artifacts")?;
     writeln!(output, "  cargo xtask check-rt-imports")?;
+    writeln!(output, "  cargo xtask check-bounded-decode")?;
     writeln!(
         output,
         "  cargo xtask planted [--shard <index>/<count>] [--changed-since <rev>] [--targets] [<property-id>]"
@@ -385,9 +398,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "  cargo xtask planted pilot (sensitivity|discovery) --out <dir> [--work <dir>]"
     )?;
+    writeln!(output, "      [--only <case-id>]... [--seed <n>]...")?;
     writeln!(
         output,
-        "  cargo xtask planted loop --out <dir> [--work <dir>] [--cases <dir>] [--planted <prefix>]..."
+        "  cargo xtask planted loop (--out <dir> | --list) [--work <dir>] [--cases <dir>] [--planted <prefix>]..."
     )?;
     writeln!(
         output,
@@ -395,9 +409,8 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "  cargo xtask header-acceptance [--out <dir>] [--deadline-secs <n>]"
+        "  cargo xtask planted triage --report <file> [--out <file>]"
     )?;
-    writeln!(output, "      [--only <case-id>]... [--seed <n>]...")?;
     writeln!(
         output,
         "  cargo xtask record --sim <name> (--input <file> | --scenario <json> --plan <file>) --out <dir>"
@@ -529,7 +542,18 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "remote host: each mutant's named witness, classified from zakura-sim's end records,"
     )?;
-    writeln!(output, "into --out/report.json.")?;
+    writeln!(
+        output,
+        "into --out/report.json. With --list, it prints the cases it selects and runs nothing."
+    )?;
+    writeln!(
+        output,
+        "`planted triage` applies qa/native-mutations/triage.toml afresh to a loop report,"
+    )?;
+    writeln!(
+        output,
+        "or to a merge of several, and writes it to --out or back in place."
+    )?;
     writeln!(output)?;
     writeln!(
         output,

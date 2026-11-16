@@ -47,6 +47,7 @@ use crate::{
             legacy_trace::LegacySyncTrace,
             SyncStatus,
         },
+        test_misbehavior::{self, reported_score},
         ChainSync,
     },
     config::ZakuradConfig,
@@ -1474,8 +1475,8 @@ fn invalid_ancestor_does_not_score_descendant_advertiser() {
         _state_service,
         _mock_chain_tip_sender,
     ) = setup_chain_sync();
-    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(2);
-    chain_sync.misbehavior_sender = misbehavior_tx;
+    let misbehavior = test_misbehavior::reporter();
+    chain_sync.misbehavior = misbehavior.clone();
 
     let parent_advertiser: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
     let child_advertiser: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
@@ -1503,8 +1504,8 @@ fn invalid_ancestor_does_not_score_descendant_advertiser() {
         .handle_block_response(Err(parent_response))
         .is_err());
     assert_eq!(
-        misbehavior_rx.try_recv(),
-        Ok((parent_advertiser, 100)),
+        reported_score(&misbehavior, parent_advertiser),
+        100,
         "the peer that served the invalid block must be scored"
     );
 
@@ -1524,11 +1525,9 @@ fn invalid_ancestor_does_not_score_descendant_advertiser() {
     assert!(chain_sync
         .handle_block_response(Err(child_response))
         .is_err());
-    assert!(
-        matches!(
-            misbehavior_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ),
+    assert_eq!(
+        reported_score(&misbehavior, child_advertiser),
+        0,
         "the different peer that served the descendant must not be scored"
     );
 }
@@ -1546,8 +1545,8 @@ fn far_ahead_block_does_not_score_serving_peer() {
         _state_service,
         _mock_chain_tip_sender,
     ) = setup_chain_sync();
-    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(2);
-    chain_sync.misbehavior_sender = misbehavior_tx;
+    let misbehavior = test_misbehavior::reporter();
+    chain_sync.misbehavior = misbehavior.clone();
 
     let serving_peer: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
 
@@ -1561,11 +1560,9 @@ fn far_ahead_block_does_not_score_serving_peer() {
         chain_sync.handle_block_response(Err(far_ahead)).is_ok(),
         "a far-ahead block is dropped without restarting sync"
     );
-    assert!(
-        matches!(
-            misbehavior_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ),
+    assert_eq!(
+        reported_score(&misbehavior, serving_peer),
+        0,
         "the peer that served a far-ahead block we requested must not be scored"
     );
 
@@ -1579,8 +1576,8 @@ fn far_ahead_block_does_not_score_serving_peer() {
         .handle_block_response(Err(invalid_height))
         .is_ok());
     assert_eq!(
-        misbehavior_rx.try_recv(),
-        Ok((serving_peer, 100)),
+        reported_score(&misbehavior, serving_peer),
+        100,
         "a block with no valid height is still the serving peer's fault"
     );
 }
@@ -1656,7 +1653,7 @@ async fn request_genesis_accepts_duplicate_finalized_genesis() -> Result<(), cra
         ..Default::default()
     };
     let (mock_chain_tip, _mock_chain_tip_sender) = MockChainTip::new();
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let misbehavior = test_misbehavior::reporter();
     let (mut chain_sync, _sync_status) = ChainSync::new(
         &config,
         Height(0),
@@ -1664,7 +1661,7 @@ async fn request_genesis_accepts_duplicate_finalized_genesis() -> Result<(), cra
         verifier_service,
         state_service,
         mock_chain_tip,
-        misbehavior_tx,
+        misbehavior,
     );
 
     tokio::time::timeout(Duration::from_secs(2), chain_sync.request_genesis())
@@ -2272,8 +2269,8 @@ async fn utxo_timeout_preserves_parent_commit_in_sync_round() -> Result<(), crat
 #[tokio::test]
 async fn proven_missing_input_scores_supplier_without_timeout_retries() {
     let (mut chain_sync, _, _, mut peers, _, _) = setup_chain_sync();
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-    chain_sync.misbehavior_sender = sender;
+    let misbehavior = test_misbehavior::reporter();
+    chain_sync.misbehavior = misbehavior.clone();
     let supplier: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
     let hash = block::Hash([0xCC; 32]);
     let error = BlockDownloadVerifyError::Invalid {
@@ -2294,7 +2291,7 @@ async fn proven_missing_input_scores_supplier_without_timeout_retries() {
         .handle_block_response_with_missing_retry(Err(error))
         .await
         .is_err());
-    assert_eq!(receiver.try_recv(), Ok((supplier, 100)));
+    assert_eq!(reported_score(&misbehavior, supplier), 100);
     assert!(chain_sync.verify_timeout_retry_counts.is_empty());
     assert_eq!(chain_sync.utxo_race_drops, 0);
     peers.expect_no_requests().await;
@@ -2315,8 +2312,8 @@ fn parent_unavailable(hash: block::Hash, parent: block::Hash) -> BlockDownloadVe
 #[tokio::test]
 async fn unavailable_parent_drops_block_without_restart() {
     let (mut chain_sync, _, _, mut peers, mut state, _) = setup_chain_sync();
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-    chain_sync.misbehavior_sender = sender;
+    let misbehavior = test_misbehavior::reporter();
+    chain_sync.misbehavior = misbehavior.clone();
     let hash = block::Hash([0xCC; 32]);
     let parent = block::Hash([0xAA; 32]);
     chain_sync.utxo_race_drops = 1;
@@ -2337,7 +2334,11 @@ async fn unavailable_parent_drops_block_without_restart() {
         );
         response.expect("an unavailable parent does not restart sync");
     }
-    assert!(receiver.try_recv().is_err(), "the supplier is not scored");
+    assert_eq!(
+        reported_score(&misbehavior, "127.0.0.1:8233".parse().unwrap()),
+        0,
+        "the supplier is not scored"
+    );
     assert!(chain_sync.verify_timeout_retry_counts.is_empty());
     assert_eq!(chain_sync.utxo_race_drops, 1);
     peers.expect_no_requests().await;
@@ -3540,7 +3541,7 @@ fn setup_chain_sync_with_options(
 
     let (mock_chain_tip, mock_chain_tip_sender) = MockChainTip::new();
 
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let misbehavior = test_misbehavior::reporter();
     let (chain_sync, sync_status) = ChainSync::new(
         &config,
         max_checkpoint_height,
@@ -3548,7 +3549,7 @@ fn setup_chain_sync_with_options(
         block_verifier_router.clone(),
         state_service.clone(),
         mock_chain_tip,
-        misbehavior_tx,
+        misbehavior,
     );
 
     (
@@ -4098,8 +4099,8 @@ async fn parent_wait_times_out_when_the_state_is_never_ready() {
 #[tokio::test]
 async fn unconfirmed_binding_drops_block_without_restart_or_score() {
     let (mut chain_sync, _, _verifier, mut peers, mut state, _tip) = setup_chain_sync();
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-    chain_sync.misbehavior_sender = sender;
+    let misbehavior = test_misbehavior::reporter();
+    chain_sync.misbehavior = misbehavior.clone();
     let hash = block::Hash([0xCC; 32]);
     let parent = block::Hash([0xAA; 32]);
     let error = BlockDownloadVerifyError::Invalid {
@@ -4120,7 +4121,11 @@ async fn unconfirmed_binding_drops_block_without_restart_or_score() {
         .handle_block_response_with_missing_retry(Err(error))
         .await
         .expect("an unconfirmed binding does not restart sync");
-    assert!(receiver.try_recv().is_err(), "the supplier is not scored");
+    assert_eq!(
+        reported_score(&misbehavior, "127.0.0.1:8233".parse().unwrap()),
+        0,
+        "the supplier is not scored"
+    );
     assert!(chain_sync.verify_timeout_retry_counts.is_empty());
     assert_eq!(chain_sync.utxo_race_drops, 0);
     peers.expect_no_requests().await;
@@ -4325,10 +4330,8 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
                     verifier.expect_no_requests().await;
 
                     let (mut syncer, _, _, _, _, _) = setup_chain_sync();
-                    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
-                    syncer.misbehavior_sender = misbehavior_tx;
+                    // The error names no peer, so there is no peer to score.
                     syncer.handle_block_response(Err(error)).unwrap();
-                    assert!(misbehavior_rx.try_recv().is_err());
                 }
             }
         }
@@ -4349,8 +4352,8 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
             _mock_chain_tip_sender,
         ) = setup_chain_sync();
 
-        let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
-        chain_sync.misbehavior_sender = misbehavior_tx;
+        let misbehavior = test_misbehavior::reporter();
+        chain_sync.misbehavior = misbehavior.clone();
 
         let block_hash = block::Hash::from([0xAB; 32]);
         let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
@@ -4419,8 +4422,8 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
         result?;
 
         assert_eq!(
-            misbehavior_rx.recv().await,
-            Some((addr, 100)),
+            reported_score(&misbehavior, addr),
+            100,
             "the supplier of a poisoned body must be scored for a ban"
         );
         assert_eq!(
@@ -4468,8 +4471,8 @@ async fn rejected_body_descendant_requeues_without_scoring() -> Result<(), crate
         _mock_chain_tip_sender,
     ) = setup_chain_sync();
 
-    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
-    chain_sync.misbehavior_sender = misbehavior_tx;
+    let misbehavior = test_misbehavior::reporter();
+    chain_sync.misbehavior = misbehavior.clone();
 
     let block_hash = block::Hash::from([0xAC; 32]);
     let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
@@ -4494,8 +4497,9 @@ async fn rejected_body_descendant_requeues_without_scoring() -> Result<(), crate
     let (result, chain_sync) = requeue.await.expect("the retry task should not panic");
     result?;
 
-    assert!(
-        misbehavior_rx.try_recv().is_err(),
+    assert_eq!(
+        reported_score(&misbehavior, addr),
+        0,
         "the supplier of a descendant did not cause its ancestor's failure"
     );
     assert_eq!(
@@ -4679,7 +4683,7 @@ fn lookahead_limit_at(network: &Network, max_checkpoint_height: Height, tip: Hei
     let (chain_tip, chain_tip_sender) = MockChainTip::new();
     chain_tip_sender.send_best_tip_height(tip);
 
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let misbehavior = test_misbehavior::reporter();
     let (chain_sync, _sync_status): (TestChainSync, _) = ChainSync::new(
         &config,
         max_checkpoint_height,
@@ -4687,7 +4691,7 @@ fn lookahead_limit_at(network: &Network, max_checkpoint_height: Height, tip: Hei
         MockService::build().for_unit_tests(),
         MockService::build().for_unit_tests(),
         chain_tip,
-        misbehavior_tx,
+        misbehavior,
     );
 
     chain_sync.lookahead_limit(0)

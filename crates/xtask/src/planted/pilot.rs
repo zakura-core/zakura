@@ -42,7 +42,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -61,7 +60,7 @@ use super::{
 use crate::{
     run_command,
     sim::SIM_RUSTFLAGS,
-    sim_minimize::{install_interrupt_handler, run_child, ChildEnd, INTERRUPTED},
+    sim_minimize::{install_interrupt_handler, ChildEnd, INTERRUPTED},
     BoxError, UsageError,
 };
 
@@ -69,34 +68,21 @@ mod classify;
 #[cfg(test)]
 mod tests;
 
+use super::lane::{
+    self, confirm_and_replay, run_lane_child, sim_build_failure, BuildFailure, CampaignBounds,
+    CampaignFacts, Confirm, LaneError, LaneSpec,
+};
+#[cfg(test)]
+use super::lane::{
+    campaign_facts, confirmed_trace, failure_kind, fuzz_build_failure, start_args,
+    stop_on_interrupt, ConfirmedTrace, Failure,
+};
 use classify::{
-    CampaignFacts, Class, Classified, DiscoveryRun, NoCampaign, Recorded, SensitivityRun, Summary,
-    TraceFacts,
+    Class, Classified, DiscoveryRun, NoCampaign, Recorded, SensitivityRun, Summary, TraceFacts,
 };
 
 /// The catalogue, relative to the repository root.
 const CATALOGUE: &str = "qa/mutation-pilot/catalogue.json";
-
-/// How long past its exploration budget a campaign's `start` may run, for
-/// its startup, snapshot and end record, before the runner kills it.
-const CAMPAIGN_GRACE: Duration = Duration::from_secs(300);
-
-/// The file `zakura-sim confirm` writes into its `--out`.
-const CONFIRMATION_FILE: &str = "confirmation.json";
-
-/// The variable the fuzz target's filter reads. A discovery campaign runs
-/// without it, so every property's violation counts.
-const EXPECT_VAR: &str = "ZAKURA_SIM_EXPECT";
-
-/// The sanitizer option variables a campaign's manifest records. A
-/// discovery campaign runs without them.
-const SANITIZER_VARS: &[&str] = &[
-    "ASAN_OPTIONS",
-    "LSAN_OPTIONS",
-    "MSAN_OPTIONS",
-    "TSAN_OPTIONS",
-    "UBSAN_OPTIONS",
-];
 
 /// The witness trace's build fields a mutant shares with the original: all
 /// but `dirty`, `source` and the binary's digest.
@@ -165,15 +151,9 @@ struct FuzzInputs {
 struct Bounds {
     corpus: PathBuf,
     seeds: Vec<u32>,
-    seconds_per_seed: u64,
-    workers: usize,
-    max_len: u64,
-    input_timeout_seconds: u64,
-    rss_limit_mb: u64,
-    max_restarts: u64,
-    abandon_limit: u64,
-    feedback: String,
-    sanitizer: String,
+    /// What each campaign runs with.
+    #[serde(flatten)]
+    campaign: CampaignBounds,
 }
 
 /// The catalogue's confirmation bounds.
@@ -628,14 +608,19 @@ fn sensitivity_case(
                     planted_verdict(&case.property, &[], &recorded.run),
                     Verdict::Caught(_)
                 ) {
-                    run.confirmation = Some(confirm_and_replay(
-                        &sim,
-                        &case.harness,
-                        &tree.join(&case.witness),
-                        &case.property,
-                        &dir.join("confirmation"),
-                        child,
-                    )?);
+                    run.confirmation = Some(
+                        confirm_and_replay(
+                            &|| Command::new(&sim),
+                            &case.harness,
+                            &tree.join(&case.witness),
+                            &case.property,
+                            &[],
+                            Confirm::Witness,
+                            &dir.join("confirmation"),
+                            child,
+                        )?
+                        .map(drop),
+                    );
                 }
                 run.mutant = Some(Ok(recorded));
                 Ok::<_, BoxError>(())
@@ -932,14 +917,19 @@ fn discovery_case(
                     Ok(facts) => {
                         run.patch = Some(Ok(()));
                         if let Some(input) = &facts.intended_input {
-                            run.confirmation = Some(confirm_and_replay(
-                                &sim,
-                                &case.harness,
-                                &lane_dir.join("store").join(input),
-                                &case.property,
-                                &lane_dir.join("confirmation"),
-                                child,
-                            )?);
+                            run.confirmation = Some(
+                                confirm_and_replay(
+                                    &|| Command::new(&sim),
+                                    &case.harness,
+                                    &lane_dir.join("store").join(input),
+                                    &case.property,
+                                    &[],
+                                    Confirm::Witness,
+                                    &lane_dir.join("confirmation"),
+                                    child,
+                                )?
+                                .map(drop),
+                            );
                         }
                         run.mutant = Some(Ok(facts));
                         *store = lane_dir
@@ -995,64 +985,11 @@ fn fuzz_build_failed(
     }
 }
 
-/// Why a build failed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum BuildFailure {
-    /// The source is invalid: the compiler rejected it with an error at a
-    /// source location, or a mutant's patch doesn't apply or changes files
-    /// it doesn't declare. For a mutant, it's an invalid mutant.
-    Rejected(String),
-    /// The build failed without a compile error, such as a compiler killed
-    /// for memory, a full disk or a failed link. It's a harness failure.
-    Broken(String),
-}
-
-impl BuildFailure {
-    /// The failure of `what`'s build, said in words.
-    fn of(&self, what: &str) -> BuildFailure {
-        match self {
-            BuildFailure::Rejected(why) => {
-                BuildFailure::Rejected(format!("{what} doesn't compile: {why}"))
-            }
-            BuildFailure::Broken(why) => {
-                BuildFailure::Broken(format!("{what}'s build broke: {why}"))
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for BuildFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BuildFailure::Rejected(why) | BuildFailure::Broken(why) => f.write_str(why),
-        }
-    }
-}
-
-/// Why a campaign lane has no facts.
-#[derive(Debug)]
-enum LaneError {
-    /// The fuzz target didn't build.
-    Build(BuildFailure),
-    /// The campaign didn't leave the records the runner reads.
-    Run(String),
-    /// `campaign start` ran past its deadline, or a campaign process died
-    /// from a signal.
-    Killed(String),
-}
-
-impl std::fmt::Display for LaneError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LaneError::Build(failure) => failure.fmt(f),
-            LaneError::Run(why) | LaneError::Killed(why) => f.write_str(why),
-        }
-    }
-}
-
 /// Builds `case`'s fuzz target with `sim` in `fuzz_target`, and runs one
 /// campaign on it with the catalogue's bounds and `seed`, from `corpus`, in
-/// a fresh store under `dir`. Reads what the store's records show.
+/// a fresh store under `dir` ([`lane::campaign_lane`]). Reads what the
+/// store's records show, and whether the run's build pairs with the
+/// catalogue's.
 #[allow(clippy::too_many_arguments)]
 fn campaign_lane(
     sim: &Path,
@@ -1064,171 +1001,29 @@ fn campaign_lane(
     corpus: &Path,
     mutated: bool,
 ) -> Result<Result<CampaignFacts, LaneError>, BoxError> {
-    let store = dir.join("store");
-    if store.exists() {
-        return Err(format!("{} isn't a fresh store", store.display()).into());
-    }
-    fs::create_dir_all(dir)?;
-    let bounds = &catalogue.discovery;
-    let mut build = Command::new(sim);
-    build
-        .args(["campaign", "build", "--store"])
-        .arg(&store)
-        .args([
-            "--target",
-            &case.target,
-            "--sanitizer",
-            &bounds.sanitizer,
-            "--target-dir",
-        ])
-        .arg(fuzz_target)
-        // Uncolored diagnostics, which `fuzz_build_failure` reads.
-        .env("CARGO_TERM_COLOR", "never");
-    let log = dir.join("build.log");
-    match run_pilot_child(&mut build, &log, None)? {
-        ChildEnd::Exited(0) => {}
-        end => {
-            let why = format!("`zakura-sim campaign build` {end}; see {}", log.display());
-            let text = fs::read(&log).unwrap_or_default();
-            return Ok(Err(LaneError::Build(fuzz_build_failure(
-                end,
-                &String::from_utf8_lossy(&text),
-                why,
-            ))));
-        }
-    }
-    let Some(build_digest) = only_entry(&store.join("builds"))? else {
-        return Ok(Err(LaneError::Run(
-            "the store holds no single build".to_owned(),
-        )));
-    };
     let name =
         format!("{}-{}", if mutated { &case.id } else { &case.target }, seed).replace('/', "-");
-    let mut start = Command::new(sim);
-    start.args(start_args(
-        bounds,
-        &name,
-        &case.harness,
-        &build_digest,
+    let spec = LaneSpec {
+        target: &case.target,
+        harness: &case.harness,
+        name: &name,
         seed,
         corpus,
-        &store,
-    ));
-    start.env_remove(EXPECT_VAR);
-    for var in SANITIZER_VARS {
-        start.env_remove(var);
-    }
-    let log = dir.join("start.log");
-    let deadline = Duration::from_secs(bounds.seconds_per_seed) + CAMPAIGN_GRACE;
-    // `start` exits 1 for any run that isn't complete, as a run a finding
-    // stopped, so the store's records decide. A run past the deadline, or
-    // one a signal killed, may have left records, but it didn't finish.
-    match run_pilot_child(&mut start, &log, Some(deadline))? {
-        ChildEnd::TimedOut => {
-            return Ok(Err(LaneError::Killed(format!(
-                "`zakura-sim campaign start` ran past {} s; see {}",
-                deadline.as_secs(),
-                log.display()
-            ))))
-        }
-        end @ ChildEnd::Signaled(_) => {
-            return Ok(Err(LaneError::Killed(format!(
-                "`zakura-sim campaign start` {end}; see {}",
-                log.display()
-            ))))
-        }
-        _ => {}
-    }
-    let Some(manifest_file) = only_entry(&store.join("manifests"))? else {
-        return Ok(Err(LaneError::Run(format!(
-            "the store holds no single run manifest; see {}",
-            log.display()
-        ))));
     };
-    let run = manifest_file.trim_end_matches(".json").to_owned();
-    let manifest: Value =
-        serde_json::from_slice(&fs::read(store.join("manifests").join(&manifest_file))?)?;
-    let initial = manifest
-        .get("initial_snapshot")
-        .and_then(Value::as_str)
-        .ok_or("the manifest names no initial snapshot")?;
-    let snapshot: Value = serde_json::from_slice(&fs::read(
-        store.join("snapshots").join(initial).join("snapshot.json"),
-    )?)?;
-    let initial_inputs = snapshot
-        .get("inputs")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    let end: Option<Value> = fs::read(store.join("runs").join(&run).join("end.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let evidence_file = dir.join("evidence.json");
-    let mut evidence = Command::new(sim);
-    evidence
-        .args(["campaign", "evidence", "--store"])
-        .arg(&store)
-        .args(["--run", &run, "--out"])
-        .arg(&evidence_file);
-    let log = dir.join("evidence.log");
-    let evidence = match run_pilot_child(&mut evidence, &log, None)? {
-        ChildEnd::Exited(0) => serde_json::from_slice::<Value>(&fs::read(&evidence_file)?)?,
-        end @ ChildEnd::Signaled(_) => {
-            return Ok(Err(LaneError::Killed(format!(
-                "`zakura-sim campaign evidence` {end}; see {}",
-                log.display()
-            ))))
-        }
-        end => {
-            return Ok(Err(LaneError::Run(format!(
-                "`zakura-sim campaign evidence` {end}; see {}",
-                log.display()
-            ))))
-        }
-    };
-    let mut facts = campaign_facts(&case.property, end.as_ref(), &evidence, initial_inputs);
-    let expected = expected_fuzz_identity(catalogue, case);
-    let actual = manifest.pointer("/build/identity").unwrap_or(&Value::Null);
-    facts.unpaired = paired_identity(&expected, actual, FUZZ_FIELDS, mutated);
-    Ok(Ok(facts))
-}
-
-/// `campaign start`'s arguments for one lane: every bound and the seed come
-/// from the catalogue, so paired campaigns differ only in `store`, `name`
-/// and `build`.
-fn start_args(
-    bounds: &Bounds,
-    name: &str,
-    harness: &str,
-    build: &str,
-    seed: u32,
-    corpus: &Path,
-    store: &Path,
-) -> Vec<OsString> {
-    let mut args: Vec<OsString> = ["campaign", "start", "--store"]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
-    args.push(store.into());
-    for (flag, value) in [
-        ("--campaign", name.to_owned()),
-        ("--sim", harness.to_owned()),
-        ("--build", build.to_owned()),
-        ("--seconds", bounds.seconds_per_seed.to_string()),
-        ("--workers", bounds.workers.to_string()),
-        ("--seed", seed.to_string()),
-        ("--max-len", bounds.max_len.to_string()),
-        ("--timeout", bounds.input_timeout_seconds.to_string()),
-        ("--rss-limit-mb", bounds.rss_limit_mb.to_string()),
-        ("--max-restarts", bounds.max_restarts.to_string()),
-        ("--abandon-limit", bounds.abandon_limit.to_string()),
-        ("--feedback", bounds.feedback.clone()),
-    ] {
-        args.push(flag.into());
-        args.push(value.into());
-    }
-    args.push("--fixtures".into());
-    args.push(corpus.into());
-    args
+    Ok(lane::campaign_lane(
+        &|| Command::new(sim),
+        dir,
+        fuzz_target,
+        &spec,
+        &catalogue.discovery.campaign,
+        lane::start_deadline(&catalogue.discovery.campaign),
+    )?
+    .map(|campaign| {
+        let mut facts = campaign.facts(&case.property);
+        let expected = expected_fuzz_identity(catalogue, case);
+        facts.unpaired = paired_identity(&expected, &campaign.identity, FUZZ_FIELDS, mutated);
+        facts
+    }))
 }
 
 /// The fuzz build identity the catalogue pins for `case`'s target, with
@@ -1280,211 +1075,6 @@ fn paired_identity(
             differ.join(", ")
         )
     })
-}
-
-/// What a saved failure file is, from its path in the store.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Failure {
-    /// An input saved as a violation of this property, under an
-    /// `active`, `known` or `draft` bucket.
-    Violation(String),
-    /// libFuzzer's crash input, which a saved violation may explain.
-    Crash,
-    /// libFuzzer's timeout input: a worker ran past its input timeout.
-    Timeout,
-    /// Any other failure: a harness failure, crash, abandoned run,
-    /// nondeterministic rerun or run without an end that the target saved,
-    /// and a libFuzzer OOM or leak.
-    Other,
-    /// A file that goes with a saved input, such as its trace.
-    Companion,
-}
-
-/// What the store file at `path` is. A worker's target saves inputs as
-/// `.../sim/inputs/<bucket>/[<property>/]<sha256>.bin`, and libFuzzer saves
-/// `.../artifacts/<kind>-<sha1>`.
-fn failure_kind(path: &str) -> Failure {
-    let segments: Vec<&str> = path.split('/').collect();
-    let inputs = segments
-        .windows(2)
-        .position(|pair| matches!(pair[0], "sim" | "compact-sim") && pair[1] == "inputs");
-    if let Some(at) = inputs {
-        return match &segments[at + 2..] {
-            [bucket, property @ .., _input]
-                if matches!(*bucket, "active" | "known" | "draft") && !property.is_empty() =>
-            {
-                Failure::Violation(property.join("/"))
-            }
-            _ => Failure::Other,
-        };
-    }
-    let artifact = segments
-        .iter()
-        .rev()
-        .nth(1)
-        .is_some_and(|dir| matches!(*dir, "artifacts" | "compact-artifacts"));
-    match segments.last() {
-        Some(file) if artifact && file.starts_with("crash-") => Failure::Crash,
-        Some(file) if artifact && file.starts_with("timeout-") => Failure::Timeout,
-        Some(_) if artifact => Failure::Other,
-        _ => Failure::Companion,
-    }
-}
-
-/// What a campaign's end record `end` and `evidence` show about
-/// `property`, for a run whose initial snapshot held `initial_inputs`.
-fn campaign_facts(
-    property: &str,
-    end: Option<&Value>,
-    evidence: &Value,
-    initial_inputs: usize,
-) -> CampaignFacts {
-    let mut violated = BTreeSet::new();
-    let (mut failures, mut killed, mut crashes, mut intended_input) =
-        (Vec::new(), Vec::new(), Vec::new(), None);
-    let records = end
-        .and_then(|end| end.get("failures"))
-        .and_then(Value::as_array);
-    for path in records
-        .into_iter()
-        .flatten()
-        .filter_map(|record| record.get("path").and_then(Value::as_str))
-    {
-        match failure_kind(path) {
-            Failure::Violation(violation) => {
-                if violation == property && intended_input.is_none() {
-                    intended_input = Some(path.to_owned());
-                }
-                violated.insert(violation);
-            }
-            Failure::Crash => crashes.push(path.to_owned()),
-            Failure::Timeout => killed.push(path.to_owned()),
-            Failure::Other => failures.push(path.to_owned()),
-            Failure::Companion => {}
-        }
-    }
-    if violated.is_empty() {
-        killed.extend(crashes);
-    }
-    let counts = |totals: &str, field: &str| {
-        evidence
-            .pointer(&format!("/{totals}/properties"))
-            .and_then(|properties| properties.get(property))
-            .and_then(|counts| counts.get(field))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-    };
-    CampaignFacts {
-        status: evidence
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("none")
-            .to_owned(),
-        initial_inputs,
-        violated: violated.into_iter().collect(),
-        failures,
-        killed,
-        incomplete: evidence
-            .get("incomplete")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .map(Value::to_string)
-            .collect(),
-        applied: evidence
-            .get("unapplied")
-            .and_then(Value::as_array)
-            .is_some_and(|unapplied| !unapplied.iter().any(|id| id.as_str() == Some(property))),
-        runs: evidence
-            .pointer("/totals/runs")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        applicable_runs: counts("complete_totals", "held") + counts("complete_totals", "violated"),
-        millis: end
-            .and_then(|end| end.get("workers"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|worker| worker.get("millis").and_then(Value::as_u64))
-            .sum(),
-        intended_input,
-        unpaired: None,
-    }
-}
-
-/// Confirms `input`'s violation of `property` on `harness` with `sim` in a
-/// fresh process, then replays the confirmed trace in another, writing
-/// under `dir`. Each child gets `child`.
-fn confirm_and_replay(
-    sim: &Path,
-    harness: &str,
-    input: &Path,
-    property: &str,
-    dir: &Path,
-    child: Duration,
-) -> Result<Result<(), String>, BoxError> {
-    let confirm_dir = dir.join("confirm");
-    let mut confirm = Command::new(sim);
-    confirm
-        .args(["confirm", "--sim", harness, "--input"])
-        .arg(input)
-        .args(["--property", property, "--out"])
-        .arg(&confirm_dir);
-    let ended = run_pilot_child(&mut confirm, &dir.join("confirm.log"), Some(child))?;
-    let confirmation = fs::read(confirm_dir.join(CONFIRMATION_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-    let trace = match confirmed_trace(ended, confirmation.as_ref()) {
-        Ok(trace) => confirm_dir.join(trace),
-        Err(why) => return Ok(Err(why)),
-    };
-    let log = dir.join("replay.log");
-    let mut replay = Command::new(sim);
-    replay.arg("replay").arg(&trace);
-    Ok(match run_pilot_child(&mut replay, &log, Some(child))? {
-        ChildEnd::Exited(0) => Ok(()),
-        end => Err(format!(
-            "the confirmed trace doesn't replay Exact: `zakura-sim replay` {end}; see {}",
-            log.display()
-        )),
-    })
-}
-
-/// The confirmed trace's directory, relative to the confirmation's, from a
-/// `zakura-sim confirm` that ended `ended` and wrote `confirmation`, or why
-/// it didn't confirm.
-fn confirmed_trace(ended: ChildEnd, confirmation: Option<&Value>) -> Result<PathBuf, String> {
-    let Some(confirmation) = confirmation else {
-        return Err(format!(
-            "`zakura-sim confirm` {ended} without a confirmation"
-        ));
-    };
-    let status = confirmation
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("missing");
-    let detail = confirmation
-        .get("detail")
-        .and_then(Value::as_str)
-        .map_or_else(String::new, |detail| format!(": {detail}"));
-    match status {
-        "confirmed" if ended == ChildEnd::Exited(0) => {}
-        "witness-lost" | "witness-unsupported" => {
-            return Err(format!(
-                "missing witness: the fresh confirmation is {status}{detail}"
-            ))
-        }
-        status => {
-            return Err(format!(
-                "the fresh confirmation is {status}{detail}; `zakura-sim confirm` {ended}"
-            ))
-        }
-    }
-    confirmation
-        .get("trace")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| "the confirmation names no trace".to_owned())
 }
 
 /// Reads a trace's `meta` and `end` records for `property`.
@@ -1680,7 +1270,7 @@ fn build_sim(
         tree.display(),
         log.display()
     );
-    Ok(match run_pilot_child(&mut cargo, log, None)? {
+    Ok(match run_lane_child(&mut cargo, log, None)? {
         ChildEnd::Exited(0) => Ok(target.join("debug").join("zakura-sim")),
         end => {
             let why = format!("`cargo build` {end}; see {}", log.display());
@@ -1688,109 +1278,6 @@ fn build_sim(
             Err(sim_build_failure(end, &String::from_utf8_lossy(&text), why))
         }
     })
-}
-
-/// What a failed `cargo build --message-format=json` that ended `end` and
-/// wrote `log` shows, with `why` as its reason. It's a compile error only if
-/// cargo exited with a code, rather than a signal, and rustc reported an
-/// error at a source location in a path package. A full disk, a killed
-/// compiler or a failed link reports no source location.
-pub(super) fn sim_build_failure(end: ChildEnd, log: &str, why: String) -> BuildFailure {
-    let located = log
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|message| {
-            message.get("reason").and_then(Value::as_str) == Some("compiler-message")
-                && message
-                    .get("package_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| id.contains("path+file://"))
-        })
-        .filter_map(|message| message.get("message").cloned())
-        .find(|message| {
-            message.get("level").and_then(Value::as_str) == Some("error")
-                && message
-                    .get("spans")
-                    .and_then(Value::as_array)
-                    .is_some_and(|spans| !spans.is_empty())
-        })
-        .map(|message| {
-            let text = message.get("message").and_then(Value::as_str);
-            let at = message
-                .pointer("/spans/0/file_name")
-                .and_then(Value::as_str);
-            let line = message
-                .pointer("/spans/0/line_start")
-                .and_then(Value::as_u64);
-            format!(
-                "{} at {}:{}",
-                text.unwrap_or("an error"),
-                at.unwrap_or("?"),
-                line.unwrap_or(0)
-            )
-        });
-    compile_error_or_broken(end, located, why)
-}
-
-/// What a failed `zakura-sim campaign build` that ended `end` and wrote
-/// `log` shows, with `why` as its reason. The pinned simulator runs `cargo
-/// fuzz build`, which writes no JSON messages, so the signal is rustc's
-/// rendered diagnostic: an `error` line whose next line gives its `-->`
-/// source location. A full disk, a killed compiler, a failed link or an
-/// internal compiler error renders none.
-fn fuzz_build_failure(end: ChildEnd, log: &str, why: String) -> BuildFailure {
-    let lines: Vec<&str> = log.lines().collect();
-    let located = lines.windows(2).find_map(|pair| {
-        let at = pair[1].trim_start().strip_prefix("--> ")?;
-        is_rustc_error(pair[0]).then(|| format!("{} at {at}", pair[0].trim_end()))
-    });
-    compile_error_or_broken(end, located, why)
-}
-
-/// True if `line` heads a rustc error, such as `error[E0308]: mismatched
-/// types` or `error: cannot find value`, but not an internal compiler
-/// error.
-fn is_rustc_error(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("error") else {
-        return false;
-    };
-    let rest = match rest.strip_prefix("[E") {
-        Some(code) => match code.split_once(']') {
-            Some((digits, rest)) if digits.bytes().all(|b| b.is_ascii_digit()) => rest,
-            _ => return false,
-        },
-        None => rest,
-    };
-    rest.starts_with(": ") && !rest.starts_with(": internal compiler error")
-}
-
-/// A rejected build if the build exited with a nonzero code and the
-/// compiler `located` an error, otherwise a broken one.
-fn compile_error_or_broken(end: ChildEnd, located: Option<String>, why: String) -> BuildFailure {
-    match (end, located) {
-        (ChildEnd::Exited(code), Some(error)) if code != 0 => {
-            BuildFailure::Rejected(format!("{error}; {why}"))
-        }
-        _ => BuildFailure::Broken(why),
-    }
-}
-
-/// Runs `command` with [`run_child`] and the flag that the pilot's signal
-/// handler sets. An interrupt kills the child's group and stops the pilot.
-fn run_pilot_child(
-    command: &mut Command,
-    log: &Path,
-    deadline: Option<Duration>,
-) -> Result<ChildEnd, BoxError> {
-    stop_on_interrupt(run_child(command, log, deadline, &INTERRUPTED)?)
-}
-
-/// `end`, or the error that stops the pilot if an interrupt ended the child.
-fn stop_on_interrupt(end: ChildEnd) -> Result<ChildEnd, BoxError> {
-    match end {
-        ChildEnd::Interrupted => Err(INTERRUPTED_ERROR.into()),
-        end => Ok(end),
-    }
 }
 
 /// The error that stops the pilot if `interrupt` is set. A signal from the
@@ -1836,21 +1323,6 @@ fn clean(repo_root: &Path, tree: &Path, builds: &[&Path]) -> Option<String> {
         }
     }
     (!failed.is_empty()).then(|| failed.join("; "))
-}
-
-/// The name of the only entry in `dir`, or `None` if it holds none or
-/// several.
-fn only_entry(dir: &Path) -> Result<Option<String>, BoxError> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Ok(None);
-    };
-    let names = entries
-        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-        .collect::<Result<Vec<String>, std::io::Error>>()?;
-    Ok(match names.as_slice() {
-        [name] => Some(name.clone()),
-        _ => None,
-    })
 }
 
 /// Creates `dir`, or fails if it already holds anything: a run never

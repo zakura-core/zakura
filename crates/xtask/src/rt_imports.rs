@@ -424,7 +424,7 @@ impl Default for Findings {
     }
 }
 
-fn parse_file(repo_root: &Path, path: &Path) -> Result<syn::File, BoxError> {
+pub(crate) fn parse_file(repo_root: &Path, path: &Path) -> Result<syn::File, BoxError> {
     let relative = relative_path(repo_root, path);
     let source = fs::read_to_string(path).map_err(|e| format!("{relative}: {e}"))?;
     syn::parse_file(&source).map_err(|e| {
@@ -433,7 +433,7 @@ fn parse_file(repo_root: &Path, path: &Path) -> Result<syn::File, BoxError> {
     })
 }
 
-fn relative_path(repo_root: &Path, path: &Path) -> String {
+pub(crate) fn relative_path(repo_root: &Path, path: &Path) -> String {
     path.strip_prefix(repo_root)
         .unwrap_or(path)
         .to_string_lossy()
@@ -517,7 +517,7 @@ fn check_child_modules(
     Ok(())
 }
 
-fn module_file(repo_root: &Path, dir: &Path, name: &str) -> Result<PathBuf, BoxError> {
+pub(crate) fn module_file(repo_root: &Path, dir: &Path, name: &str) -> Result<PathBuf, BoxError> {
     [
         dir.join(format!("{name}.rs")),
         dir.join(name).join("mod.rs"),
@@ -534,7 +534,7 @@ fn module_file(repo_root: &Path, dir: &Path, name: &str) -> Result<PathBuf, BoxE
 }
 
 /// Whether a `cfg` attribute compiles the item only in tests.
-fn is_test_only(attrs: &[Attribute]) -> bool {
+pub(crate) fn is_test_only(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| {
         attr.path().is_ident("cfg")
             && attr
@@ -1142,7 +1142,7 @@ fn expr_path_segments(expr: &syn::ExprPath) -> Option<(Vec<String>, bool)> {
     Some((idents(&mut segments), path.leading_colon.is_some()))
 }
 
-fn item_attrs(item: &Item) -> Option<&[Attribute]> {
+pub(crate) fn item_attrs(item: &Item) -> Option<&[Attribute]> {
     Some(match item {
         Item::Const(item) => &item.attrs,
         Item::Enum(item) => &item.attrs,

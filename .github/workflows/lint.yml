@@ -4,6 +4,9 @@ on:
   pull_request:
     branches: [main, "feat/**", "split/**", "adam/**", "release/**"]
     paths:
+      - "**/*.py"
+      - scripts/pyproject.toml
+      - scripts/uv.lock
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
@@ -32,6 +35,9 @@ on:
   push:
     branches: [main, "feat/**", "release/**"]
     paths:
+      - "**/*.py"
+      - scripts/pyproject.toml
+      - scripts/uv.lock
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
@@ -149,6 +155,9 @@ jobs:
       - name: Check v2 P2P runtime imports
         if: ${{ !cancelled() }}
         run: cargo xtask check-rt-imports
+      - name: Check peer and RPC code decodes blocks with the size limit
+        if: ${{ !cancelled() }}
+        run: cargo xtask check-bounded-decode
 
   # NOTE: per-crate default / no-default-features checks moved to
   # `test-crates.yml`, which runs `cargo hack check --workspace` (and again with
@@ -218,9 +227,11 @@ jobs:
       - name: zcashd compat manifest resolver tests
         if: ${{ !cancelled() }}
         run: bash scripts/tests/test_resolve_zcashd_compat_manifest.sh
-      - name: Install the pinned release-state test client
+      - name: Install the locked Python test dependencies
         if: ${{ !cancelled() }}
-        run: python3 -m pip install --disable-pip-version-check -r .github/scripts/requirements-release-state.txt
+        uses: ./.github/actions/setup-python
+        with:
+          group: test
       - name: Release-state asset pin tests
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s .github/scripts -p 'test_*release_state*.py'
@@ -247,9 +258,7 @@ jobs:
 
       - name: CI alert tests
         if: ${{ !cancelled() }}
-        run: |
-          python3 -m pip install --disable-pip-version-check -r .github/workflows/scripts/requirements-ci-alerts.txt
-          python3 .github/workflows/scripts/test_ci_alert.py
+        run: python3 .github/workflows/scripts/test_ci_alert.py
 
       - name: Read-only release review tests
         if: ${{ !cancelled() }}
@@ -284,6 +293,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           python3 deploy/runner/test_zakura_cluster_status.py
+          python3 deploy/runner/test_propagation.py
           python3 deploy/runner/test_zakura_cluster_watchdog.py
           python3 -m unittest discover -s deploy/runner -p 'test_nu7_*.py'
 

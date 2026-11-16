@@ -6,12 +6,16 @@ on:
   # that touch no test-relevant files. This keeps the `test success` required
   # check reporting on every PR instead of sitting in "Expected" forever.
   pull_request:
-    branches: [main, "feat/**", "split/**", "adam/**", "release/**"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
   push:
     branches: [main]
     paths:
+      - "**/*.py"
+      - scripts/pyproject.toml
+      - scripts/uv.lock
+      - .github/actions/setup-python/**
+      - scripts/check-python-dependencies.sh
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
@@ -65,6 +69,33 @@ env:
   COLORBT_SHOW_HIDDEN: 1
 
 jobs:
+  python-security:
+    name: Python dependency security
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+        with:
+          group: test
+      - name: Check dependency policy and audit failures
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_python_dependencies.py'
+      - name: Audit every Python dependency group
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: bash scripts/check-python-dependencies.sh 2>&1 | tee "$RUNNER_TEMP/python-audit.txt"
+      - name: Preserve the audit report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-dependency-audit
+          path: ${{ runner.temp }}/python-audit.txt
+          if-no-files-found: warn
+
   # Decide whether this change can affect generated or historical zakurad
   # configuration. Scheduled runs have no source change to check, while manual
   # runs explicitly request the complete workflow.
@@ -382,13 +413,13 @@ jobs:
           cargo test --locked -p zakura-chain balance_ignores_transfers
           cargo test --locked -p zakura-state balance_rollback_replay_and_fork_equivalence
 
-  sprout-disabled:
-    name: consensus without sprout
+  sprout-enabled:
+    name: consensus and state with sprout
     needs: changes
-    # zakurad enables `sprout` by default, and workspace feature unification
-    # turns it on for zakura-consensus in the shared archive. Test the
-    # consensus crate on its own, where `sprout` is off, so the disabled path
-    # keeps coverage.
+    # The shared archive now tests the default build without `sprout`. Opt in
+    # here so historical JoinSplit proof and signature verification, and the
+    # Sprout note commitment tree that zakura-state maintains for it, keep
+    # coverage alongside the default paths.
     if: vars.TEMPORARY_PR_CI != 'true' && (needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request')
     permissions:
       contents: read
@@ -402,8 +433,10 @@ jobs:
         with:
           toolchain: stable
       - uses: ./.github/actions/setup-zakura-build
-      - name: Test zakura-consensus without Sprout verification
-        run: cargo test --locked -p zakura-consensus
+      - name: Test zakura-consensus with Sprout verification
+        run: cargo test --locked -p zakura-consensus --features sprout
+      - name: Test zakura-state with the Sprout note commitment tree
+        run: cargo test --locked -p zakura-state --features sprout
 
   network-dependent:
     name: network-dependent acceptance tests
@@ -911,13 +944,14 @@ jobs:
     # See "Cancelled runs" in .github/workflows/README.md.
     if: ${{ !cancelled() || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     needs:
+      - python-security
       - temporary-unit-tests
       - changes
       - build-tests
       - unit-tests
       - zakura-config
       - extended-reissuance-properties
-      - sprout-disabled
+      - sprout-enabled
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
@@ -943,7 +977,7 @@ jobs:
         with:
           jobs: ${{ toJSON(needs) }}
           # These jobs are skipped outside their event or changed-path scope:
-          # build-tests / unit-tests / sprout-disabled / network-dependent skip on pull requests
+          # build-tests / unit-tests / sprout-enabled / network-dependent skip on pull requests
           # that touch no test-relevant paths (unit-tests and zakura-config
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
@@ -953,7 +987,7 @@ jobs:
           # this status and reaches report-nightly-result. sim-planted and
           # sim-planted-targets report to one failure issue per shard instead.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: temporary-unit-tests, check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, sprout-disabled, network-dependent, publish-graph, sim-build, sim-sanitizers, sim-feedback, sim-targets, zakura-testkit
+          allowed-skips: temporary-unit-tests, check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, sprout-enabled, network-dependent, publish-graph, sim-build, sim-sanitizers, sim-feedback, sim-targets, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

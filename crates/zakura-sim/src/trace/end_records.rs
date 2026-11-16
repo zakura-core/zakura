@@ -16,12 +16,17 @@
 //! one judgement ([`WitnessRecord`]). A witness test judges its run after
 //! the run ends, so its `witness` file follows the run's `end` file on the
 //! same thread.
+//!
+//! A caller that runs many runs and wants only one of their records, such
+//! as `zakura-sim generate`, takes a [`hold`] for the length of its search.
+//! While any hold lives, [`dir`] names no directory, so no run writes a
+//! record. The caller then writes the record it keeps with [`write_end_to`].
 
 use std::{
     env, fs,
     path::{Path, PathBuf},
     process,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     thread,
 };
 
@@ -35,6 +40,29 @@ pub const END_RECORDS_VAR: &str = "ZAKURA_SIM_END_RECORDS";
 
 /// The next file's number within this process.
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// How many [`Hold`]s live in this process.
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// While it lives, no run in this process writes an end record or a
+/// witness judgement to [`dir`] ([`hold`]).
+#[derive(Debug)]
+#[must_use = "the hook resumes as soon as the hold drops"]
+pub struct Hold(());
+
+impl Drop for Hold {
+    /// Releases the hold.
+    fn drop(&mut self) {
+        HELD.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Stops every run in this process, on any thread, from writing records
+/// until the returned [`Hold`] drops.
+pub fn hold() -> Hold {
+    HELD.fetch_add(1, Ordering::SeqCst);
+    Hold(())
+}
 
 /// Whether the run reached the property's trigger history, as a witness
 /// judgement found it.
@@ -67,8 +95,11 @@ pub struct WitnessRecord {
 }
 
 /// The directory [`END_RECORDS_VAR`] names, or `None` when it's unset or
-/// empty.
+/// empty, or while a [`hold`] lives.
 pub fn dir() -> Option<PathBuf> {
+    if HELD.load(Ordering::SeqCst) > 0 {
+        return None;
+    }
     env::var_os(END_RECORDS_VAR)
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
@@ -79,6 +110,16 @@ pub(crate) fn write_end(end: &EndRecord) {
     if let Some(dir) = dir() {
         write(&dir, "end", json!(end));
     }
+}
+
+/// Writes `end` to `dir`, whatever [`END_RECORDS_VAR`] says and whether or
+/// not a [`hold`] lives, under the same name and form as [`write_end`].
+///
+/// # Panics
+///
+/// If the file can't be written, as [`write_end`].
+pub fn write_end_to(dir: &Path, end: &EndRecord) {
+    write(dir, "end", json!(end));
 }
 
 /// Writes `witness` to [`dir`], if the variable names one.

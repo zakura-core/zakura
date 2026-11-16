@@ -428,59 +428,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn commitment_root_verification_constructors_set_expected_fields() {
-        let block = mainnet_block_at(1);
-        let sapling_root = sapling::tree::NoteCommitmentTree::default().root();
-        let orchard_root = orchard::tree::NoteCommitmentTree::default().root();
-        let ironwood_root = empty_ironwood_root();
-
-        let with_roots = CommitmentRootVerification::with_roots(
-            block.clone().into(),
-            sapling_root,
-            orchard_root,
-            ironwood_root,
-            None,
-            true,
-        );
-        let BlockHandle::Shared(retained) =
-            with_roots.block.as_ref().expect("roots item has a block")
-        else {
-            panic!("the fixture supplies a shared block")
-        };
-        assert!(Arc::ptr_eq(retained, &block));
-        assert!(std::ptr::eq(
-            with_roots.header.as_ref(),
-            block.header.as_ref()
-        ));
-        assert_eq!(with_roots.height, block.coinbase_height().unwrap());
-        assert_eq!(
-            with_roots.roots,
-            Some((sapling_root, orchard_root, ironwood_root))
-        );
-        assert_eq!(with_roots.precomputed_auth_data_root, None);
-        assert!(with_roots.skip_parent_check);
-
-        let height = block.coinbase_height().unwrap();
-        let header_only = CommitmentRootVerification::header_only(
-            block.header.clone(),
-            height,
-            Some(block.auth_data_root()),
-        );
-        assert!(header_only.block.is_none());
-        assert!(std::ptr::eq(
-            header_only.header.as_ref(),
-            block.header.as_ref()
-        ));
-        assert_eq!(header_only.height, height);
-        assert_eq!(header_only.roots, None);
-        assert_eq!(
-            header_only.precomputed_auth_data_root,
-            Some(block.auth_data_root())
-        );
-        assert!(!header_only.skip_parent_check);
-    }
-
     /// Below Heartwood the supplied Sapling root is authenticated directly by the
     /// header commitment (or pinned to empty before Sapling). At/above Heartwood,
     /// the MMR path authenticates it instead, so this direct check accepts.

@@ -1,0 +1,20 @@
+# One joint property and mutation run (mutation plan, mut-4.6): pin
+# origin/main, run the planted sim suite, run the mutation loop with
+# generator lanes on what changed, and diff the report against the last one.
+# See README.md.
+[Unit]
+Description=Zakura joint property and mutation run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Sets ZAKURA_MUTATION_CHECKOUT, ZAKURA_MUTATION_STATE, PATH and
+# ZAKURA_MUTATION_ARGS, the routine's budget flags. install.sh writes it.
+EnvironmentFile=/etc/zakura-mutation-joint.env
+ExecStart=/usr/bin/python3 ${ZAKURA_MUTATION_CHECKOUT}/scripts/mutation_joint_run.py routine --checkout ${ZAKURA_MUTATION_CHECKOUT} --state ${ZAKURA_MUTATION_STATE} $ZAKURA_MUTATION_ARGS
+# A first run covers every case and takes most of a day. The loop caps each
+# witness and search with its own systemd-run scope, so this unit sets no
+# MemoryMax of its own.
+TimeoutStartSec=36h
+Nice=10

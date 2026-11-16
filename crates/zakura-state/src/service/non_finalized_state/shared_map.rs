@@ -9,13 +9,25 @@ use std::{
 #[cfg(test)]
 mod tests;
 
-// Bound snapshot cloning to 256 Arc increments. Writes copy only touched partitions.
+/// The number of hash partitions in a [`SharedMap`]. Writes copy only touched partitions.
 pub(super) const PARTITIONS: usize = 256;
+
+/// The number of partition groups. A snapshot shares all of them through one pointer, and a
+/// write copies the group list and the touched group: two lists of 16 pointers, instead of
+/// one list of 256 for every snapshot.
+const GROUPS: usize = 16;
+
+/// The number of partitions in each group.
+const PARTITIONS_PER_GROUP: usize = PARTITIONS / GROUPS;
+
+type Partition<K, V> = Arc<HashMap<K, V>>;
+type Group<K, V> = Arc<[Partition<K, V>; PARTITIONS_PER_GROUP]>;
 
 /// A partitioned hash map with independent snapshots.
 ///
-/// Cloning shares partitions. The first write to a shared partition clones its
-/// entries, leaving other snapshots unchanged.
+/// Cloning shares every partition through one pointer. The first write to a shared
+/// partition clones its entries and the two pointer lists above it, leaving other snapshots
+/// unchanged.
 ///
 /// Insertions replace existing values and return the previous value.
 /// Equality compares contents; iteration order is unspecified.
@@ -23,19 +35,42 @@ pub(super) const PARTITIONS: usize = 256;
 pub(crate) struct SharedMap<K, V> {
     // Clones must keep this seed so each key stays in the same partition.
     partition_hasher: RandomState,
-    partitions: Vec<Arc<HashMap<K, V>>>,
+    /// The partitions, in groups of consecutive partition indexes.
+    groups: Arc<[Group<K, V>; GROUPS]>,
     len: usize,
 }
 
 impl<K, V> Default for SharedMap<K, V> {
     fn default() -> Self {
         // Empty slots share one allocation until their first write.
-        let empty_partition = Arc::new(HashMap::new());
+        let empty_partition: Partition<K, V> = Arc::new(HashMap::new());
+        let empty_group: Group<K, V> = Arc::new(std::array::from_fn(|_| empty_partition.clone()));
         Self {
             partition_hasher: RandomState::new(),
-            partitions: vec![empty_partition; PARTITIONS],
+            groups: Arc::new(std::array::from_fn(|_| empty_group.clone())),
             len: 0,
         }
+    }
+}
+
+impl<K, V> SharedMap<K, V> {
+    /// Returns the entries of partition `partition`.
+    fn partition(&self, partition: usize) -> &HashMap<K, V> {
+        &self.groups[partition / PARTITIONS_PER_GROUP][partition % PARTITIONS_PER_GROUP]
+    }
+
+    /// Returns every partition, in partition index order.
+    fn partitions(&self) -> impl Iterator<Item = &Partition<K, V>> {
+        self.groups.iter().flat_map(|group| group.iter())
+    }
+}
+
+impl<K: Clone, V: Clone> SharedMap<K, V> {
+    /// Returns the entries of partition `partition` for a write, first copying what other
+    /// snapshots share: the group list, the partition's group, and the partition's entries.
+    fn partition_mut(&mut self, partition: usize) -> &mut HashMap<K, V> {
+        let group = &mut Arc::make_mut(&mut self.groups)[partition / PARTITIONS_PER_GROUP];
+        Arc::make_mut(&mut Arc::make_mut(group)[partition % PARTITIONS_PER_GROUP])
     }
 }
 
@@ -48,7 +83,7 @@ impl<K: Eq + Hash, V> SharedMap<K, V> {
     }
 
     pub(crate) fn get(&self, key: &K) -> Option<&V> {
-        self.partitions[self.partition_index(key)].get(key)
+        self.partition(self.partition_index(key)).get(key)
     }
 
     pub(crate) fn contains_key(&self, key: &K) -> bool {
@@ -63,9 +98,8 @@ impl<K: Eq + Hash, V> SharedMap<K, V> {
     /// Returns how many partitions `self` and `other` share without a copy.
     #[cfg(test)]
     pub(crate) fn shared_partitions(&self, other: &Self) -> usize {
-        self.partitions
-            .iter()
-            .zip(&other.partitions)
+        self.partitions()
+            .zip(other.partitions())
             .filter(|(mine, theirs)| Arc::ptr_eq(mine, theirs))
             .count()
     }
@@ -76,16 +110,14 @@ impl<K: Eq + Hash, V> SharedMap<K, V> {
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.partitions
-            .iter()
-            .flat_map(|partition| partition.iter())
+        self.partitions().flat_map(|partition| partition.iter())
     }
 }
 
 impl<K: Eq + Hash + Clone, V: Clone> SharedMap<K, V> {
     pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
         let partition = self.partition_index(&key);
-        let previous = Arc::make_mut(&mut self.partitions[partition]).insert(key, value);
+        let previous = self.partition_mut(partition).insert(key, value);
         if previous.is_none() {
             self.len += 1;
         }
@@ -100,25 +132,27 @@ impl<K: Eq + Hash + Clone, V: Clone> SharedMap<K, V> {
         partition: usize,
         mut keep: impl FnMut(&K, &V) -> bool,
     ) {
-        if self.partitions[partition]
+        if self
+            .partition(partition)
             .iter()
             .all(|(key, value)| keep(key, value))
         {
             return;
         }
-        let entries = Arc::make_mut(&mut self.partitions[partition]);
+        let entries = self.partition_mut(partition);
         let before = entries.len();
         entries.retain(|key, value| keep(key, value));
-        self.len -= before - entries.len();
+        let removed = before - entries.len();
+        self.len -= removed;
     }
 
     pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
         let partition = self.partition_index(key);
         // Avoid copying a shared partition when the key is absent.
-        if !self.partitions[partition].contains_key(key) {
+        if !self.partition(partition).contains_key(key) {
             return None;
         }
-        let removed = Arc::make_mut(&mut self.partitions[partition]).remove(key);
+        let removed = self.partition_mut(partition).remove(key);
         if removed.is_some() {
             self.len -= 1;
         }

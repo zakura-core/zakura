@@ -149,12 +149,9 @@ impl Sidecar {
     /// design and stays out of the seed corpus. An `expect` that isn't an
     /// expectation expects no violation; [`load`] rejects it anyway.
     pub fn expects_violation(&self) -> bool {
-        self.witness.iter().any(|witness| {
-            matches!(
-                witness.expect.parse(),
-                Ok(Expect::Violated | Expect::ViolatedSet)
-            )
-        })
+        self.witness
+            .iter()
+            .any(|witness| matches!(witness.expect.parse(), Ok(Expect::Violated)))
     }
 }
 

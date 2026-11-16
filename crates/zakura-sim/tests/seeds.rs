@@ -187,13 +187,6 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-storage-triggers" | "header-storage-stale-prepare" => {
             value(StorageScenario::triggers())
         }
-        // The stale-prepare seed less its last control step, which never
-        // runs (`tests/header_storage_seeds.rs`).
-        "header-storage-stale-prepare-steps" => {
-            let mut scenario = StorageScenario::triggers();
-            scenario.controls.pop();
-            value(scenario)
-        }
         "header-storage-locator-dropped" => value(storage_witnesses::dropped_locator()),
         "header-storage-apply-at-close" => value(storage_witnesses::apply_at_close()),
         "header-storage-competing-mirrors" => value(storage_witnesses::competing_mirrors()),
@@ -264,15 +257,9 @@ fn planted_inputs_carry_their_witnesses() {
         );
         let table: toml::Table = toml::from_str(&fs::read_to_string(case).unwrap())
             .unwrap_or_else(|error| panic!("{}: {error}", case.display()));
-        // A typed case runs a committed scenario, not a seed, under its
-        // Plan bytes or its scripted Plan.
+        // A typed case runs a committed scenario, not a seed.
         if let Some(typed) = table.get("typed").and_then(toml::Value::as_table) {
-            let plans: Vec<&str> = ["plan", "script"]
-                .into_iter()
-                .filter(|file| typed.contains_key(*file))
-                .collect();
-            assert_eq!(plans.len(), 1, "{}: {plans:?}", case.display());
-            for file in ["scenario", plans[0]] {
+            for file in ["scenario", "plan"] {
                 let path = typed[file].as_str().unwrap();
                 assert!(root.join(path).is_file(), "{}: no {path}", case.display());
             }

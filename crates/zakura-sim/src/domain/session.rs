@@ -16,7 +16,7 @@ use crate::{
         Assume, CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory,
         Verdict,
     },
-    FindingSubject, Observation, ObservationLog,
+    Observation, ObservationLog,
 };
 
 /// A peer the scenario marks `HonestPeer` is never punished.
@@ -124,18 +124,17 @@ where
             violations.push((
                 format!("honest peer-{peer}'s connection {connection} is never punished"),
                 punishment,
-                FindingSubject::punishment(entries, at, connection),
             ));
         }
     }
     let mut violations = violations.into_iter();
-    let Some((expected, actual, subject)) = violations.next() else {
+    let Some((expected, actual)) = violations.next() else {
         return verdict;
     };
-    for (expected, actual, subject) in violations {
-        cx.record_violation_about(expected, actual, subject);
+    for (expected, actual) in violations {
+        cx.record_violation(expected, actual);
     }
-    cx.violated_about(expected, actual, subject)
+    cx.violated(expected, actual)
 }
 
 /// The scenario peer that binds `remote`, if any.

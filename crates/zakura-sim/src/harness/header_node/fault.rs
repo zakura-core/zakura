@@ -35,6 +35,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     rc::Rc,
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -44,9 +45,7 @@ use super::{
 };
 use crate::{
     observe::{Entry, ReactorFact, StorageFact, StorageRequest, StorageResult},
-    refs::{CallRef, Ref},
     storage::{Blame, FaultAttributions, HEADER_SERVICE},
-    stores::{debug_snapshot, EvidenceStores, Guard, Registered, Snapshot},
     Observation, RunEnd,
 };
 
@@ -413,11 +412,8 @@ impl Judge {
             ReactorFact::CallEnded { call, end, .. } if end == "dropped" => {
                 self.dropped.insert(*call);
                 let dropped_failed = &mut self.dropped_failed;
-                let dropping = CallRef { call: *call };
                 self.failed.retain(|op, (request, _)| {
-                    let held = CallRef::joins(&dropping, request, |request| {
-                        request.call.map(|call| CallRef { call })
-                    });
+                    let held = request.call == Some(*call);
                     if held {
                         dropped_failed.insert(*op, *call);
                     }
@@ -535,8 +531,8 @@ impl Judge {
                 .map(|(op, call)| {
                     format!(
                         "DroppedFault: operation {op} failed with a header-peer fault whose reply \
-                     reached the reactor, and the reactor's teardown dropped call {call}, \
-                     which held it, without the harness stopping the node"
+                         reached the reactor, and the reactor's teardown dropped call {call}, \
+                         which held it, without the harness stopping the node"
                     )
                 }),
         );
@@ -680,35 +676,34 @@ pub enum CooldownFact {
 #[derive(Debug, Default)]
 struct CooldownStore {
     facts: Vec<CooldownFact>,
-}
-
-impl Snapshot for CooldownStore {
-    /// Every fact.
-    fn snapshot(&self) -> serde_json::Value {
-        debug_snapshot(self)
-    }
+    /// Set when the run's log froze. Facts after it are dropped.
+    frozen: bool,
 }
 
 /// The reactor's cooldown facts, shared by its tap and the harness's view.
 /// Cloning shares the store.
-#[derive(Clone, Debug)]
-pub struct CooldownEvidence(Registered<CooldownStore>);
+#[derive(Clone, Debug, Default)]
+pub struct CooldownEvidence(Arc<Mutex<CooldownStore>>);
 
 impl CooldownEvidence {
-    /// An empty store in `stores`, the node's.
-    pub fn new(stores: &EvidenceStores) -> CooldownEvidence {
-        CooldownEvidence(stores.register("cooldowns", CooldownStore::default()))
-    }
-
-    /// Locks the store for reading. Nothing else is called while it's
-    /// held.
-    fn store(&self) -> Guard<'_, CooldownStore> {
-        self.0.lock()
+    /// Locks the store. Every change completes under the lock, and nothing
+    /// else is called while it's held.
+    fn store(&self) -> std::sync::MutexGuard<'_, CooldownStore> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Records `fact`, unless the evidence is frozen.
     pub(super) fn record(&self, fact: CooldownFact) {
-        self.0.write(|store| store.facts.push(fact));
+        let mut store = self.store();
+        if !store.frozen {
+            store.facts.push(fact);
+        }
+    }
+
+    /// Stops recording facts, when the run's log freezes, as the adoption
+    /// evidence does.
+    pub(super) fn freeze(&self) {
+        self.store().frozen = true;
     }
 
     /// Every fact so far, in the order the reactor reported them.
@@ -726,7 +721,7 @@ impl CooldownEvidence {
 /// cooldowns its reactor started and the sessions it admitted or refused,
 /// the cooldown its config sets, and, once the run ends, whether it
 /// settled. Cloning shares all of it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct FaultEvidence {
     attributions: FaultAttributions,
     cooldowns: CooldownEvidence,
@@ -775,8 +770,7 @@ impl FaultEvidence {
             cooldowns,
             ends,
             cooldown,
-            settled: Rc::default(),
-            judge: Rc::default(),
+            ..FaultEvidence::default()
         }
     }
 
@@ -801,13 +795,7 @@ impl FaultEvidence {
                 }
             )
         });
-        let wanted = CallRef { call };
-        let dropped = stamp(&|fact| {
-            CallRef::joins(&wanted, fact, |fact| match fact {
-                EndFact::CallDropped { call } => Some(CallRef { call: *call }),
-                _ => None,
-            })
-        });
+        let dropped = stamp(&|fact| *fact == EndFact::CallDropped { call });
         self.ends.reactor_exited().is_none()
             && shutdown
                 .zip(dropped)
@@ -979,7 +967,6 @@ impl FaultEnd {
 pub(crate) mod tests {
     use super::*;
     use crate::observe::{StorageBranch, StoragePoint, WorkOwner, WorkScope};
-    use crate::refs::one_key_off::assert_one_key_off;
 
     /// The one violation in `end`, if it holds exactly one and nothing
     /// open.
@@ -1137,17 +1124,17 @@ pub(crate) mod tests {
 
     /// [`evidence`], with `ends` as the node's end facts.
     pub(crate) fn evidence_ending(blamed: &[(u64, Blame)], ends: &[EndFact]) -> FaultEvidence {
-        let attributions = FaultAttributions::new(&EvidenceStores::default());
+        let attributions = FaultAttributions::default();
         for (id, blame) in blamed {
             attributions.insert(NODE, *id, blame.clone());
         }
-        let store = EndEvidence::new(&EvidenceStores::default());
+        let store = EndEvidence::default();
         for fact in ends {
             store.record(fact.clone());
         }
         let evidence = FaultEvidence::new(
             attributions,
-            CooldownEvidence::new(&EvidenceStores::default()),
+            CooldownEvidence::default(),
             store,
             Duration::ZERO,
         );
@@ -1196,7 +1183,7 @@ pub(crate) mod tests {
             attribution: Attribution::HeaderPeer(SourceId::from_digest([blamed; 32])),
         };
         let log = failed_prepare(1, &digest(0xaa), 3, "invalid_header");
-        let projected = FaultAttributions::new(&EvidenceStores::default());
+        let projected = FaultAttributions::default();
         projected.record_result(NODE, 1, &failed(0xbb));
         assert_eq!(projected.get(NODE, 1), Some(blame(&digest(0xbb))));
         assert_eq!(owed(&log, &projected).unwrap(), Vec::new());
@@ -1343,13 +1330,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// The reply of a failure the reactor's teardown dropped with its call
-    /// is cleared only when the harness stopped the node. At the same
-    /// point, a reactor that returned by itself lost it, and so did one
-    /// whose run shows no stop at all, even if the harness's `Shutdown`
-    /// came after the reactor's own exit. Until the end it's open.
-    #[test]
-    fn only_the_harness_stop_clears_a_dropped_fault() {
+    /// The log of operation 1's failure with `aa` blamed, whose reply call
+    /// 1 held when the reactor dropped it.
+    fn dropped_with_its_call() -> Vec<Entry> {
         let mut log = failed_prepare(1, "aa", 3, "invalid_header");
         log.pop();
         log.push(reactor(ReactorFact::CallEnded {
@@ -1358,15 +1341,29 @@ pub(crate) mod tests {
             op: Some(1),
         }));
         log.push(storage(13, StorageFact::ReplyDropped { id: 1 }));
+        log
+    }
+
+    /// What a lost dropped reply's finding says.
+    const DROPPED_FINDING: &str = "DroppedFault: operation 1 failed with a header-peer fault \
+                                   whose reply reached the reactor, and the reactor's teardown \
+                                   dropped call 1, which held it, without the harness stopping \
+                                   the node";
+
+    /// The reply of a failure the reactor's teardown dropped with its call
+    /// is cleared only when the harness stopped the node. At the same
+    /// point, a reactor that returned by itself lost it, and so did one
+    /// whose run shows no stop at all, even if the harness's `Shutdown`
+    /// came after the reactor's own exit. Until the end it's open.
+    #[test]
+    fn only_the_harness_stop_clears_a_dropped_fault() {
+        let log = dropped_with_its_call();
         let blamed = [(1, blame("aa"))];
         let drop = EndFact::CallDropped { call: 1 };
         let stopped = evidence_ending(&blamed, &[shutdown(), drop.clone()]);
         assert_eq!(stopped.penalized(&log), FaultEnd::default());
         assert_eq!(stopped.check(&log), FaultCheck::Nothing);
 
-        let finding = "DroppedFault: operation 1 failed with a header-peer fault whose reply \
-                       reached the reactor, and the reactor's teardown dropped call 1, which \
-                       held it, without the harness stopping the node";
         let exited = EndFact::ReactorExited { step: 9 };
         for ends in [
             vec![drop.clone(), exited.clone()],
@@ -1376,17 +1373,20 @@ pub(crate) mod tests {
             let lost = evidence_ending(&blamed, &ends);
             assert_eq!(
                 violated(lost.penalized(&log)).as_deref(),
-                Some(finding),
+                Some(DROPPED_FINDING),
                 "{ends:?}"
             );
             assert_eq!(
                 lost.check(&log),
-                FaultCheck::Open(finding.to_owned()),
+                FaultCheck::Open(DROPPED_FINDING.to_owned()),
                 "{ends:?}"
             );
             lost.settled.set(Some(false));
             assert!(
-                matches!(open_finding(lost.penalized(&log)), Some(why) if why.ends_with(finding)),
+                matches!(
+                    open_finding(lost.penalized(&log)),
+                    Some(why) if why.ends_with(DROPPED_FINDING)
+                ),
                 "{ends:?}"
             );
         }
@@ -1400,84 +1400,31 @@ pub(crate) mod tests {
     /// A reactor that stays alive after dropping call 1 lost its failed
     /// reply, even if the harness's `Shutdown` comes later: only a drop the
     /// tap saw after the stop began clears it. A reactor that exited by
-    /// itself lost it in either order.
+    /// itself lost it in either order. A stop clears only the drop of the
+    /// call that held the reply.
     #[test]
     fn a_drop_clears_its_fault_only_after_the_stop_began() {
-        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
-        log.pop();
-        log.push(reactor(ReactorFact::CallEnded {
-            call: 1,
-            end: "dropped".to_owned(),
-            op: Some(1),
-        }));
-        log.push(storage(13, StorageFact::ReplyDropped { id: 1 }));
+        let log = dropped_with_its_call();
         let blamed = [(1, blame("aa"))];
         let drop = EndFact::CallDropped { call: 1 };
-        let finding = "DroppedFault: operation 1 failed with a header-peer fault whose reply \
-                       reached the reactor, and the reactor's teardown dropped call 1, which \
-                       held it, without the harness stopping the node";
-        let stopped = evidence_ending(&blamed, &[shutdown(), drop.clone()]);
-        assert_eq!(stopped.penalized(&log), FaultEnd::default());
-        assert_eq!(stopped.check(&log), FaultCheck::Nothing);
         let exited = EndFact::ReactorExited { step: 9 };
         for ends in [
             vec![drop.clone(), shutdown()],
-            vec![shutdown(), drop.clone(), exited],
+            vec![shutdown(), drop, exited],
+            vec![shutdown(), EndFact::CallDropped { call: 2 }],
         ] {
             let lost = evidence_ending(&blamed, &ends);
             assert_eq!(
                 violated(lost.penalized(&log)).as_deref(),
-                Some(finding),
+                Some(DROPPED_FINDING),
                 "{ends:?}"
             );
             assert_eq!(
                 lost.check(&log),
-                FaultCheck::Open(finding.to_owned()),
+                FaultCheck::Open(DROPPED_FINDING.to_owned()),
                 "{ends:?}"
             );
         }
-    }
-
-    /// The log of operation 1's failure with `aa` blamed, whose reply call
-    /// `dropped` held when the reactor dropped it.
-    fn dropped_with(dropped: u64) -> Vec<Entry> {
-        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
-        log.pop();
-        log.push(reactor(ReactorFact::CallEnded {
-            call: dropped,
-            end: "dropped".to_owned(),
-            op: Some(1),
-        }));
-        log.push(storage(13, StorageFact::ReplyDropped { id: 1 }));
-        log
-    }
-
-    /// The harness's stop clears a dropped fault only by the tap's
-    /// `CallDropped` of the call that held it, joined by its whole
-    /// [`CallRef`]: call 1's drop after the stop clears operation 1's
-    /// fault, and a drop of another call leaves it lost.
-    #[test]
-    fn a_stop_clears_only_the_dropped_call_it_names() {
-        let log = dropped_with(1);
-        let blamed = [(1, blame("aa"))];
-        assert_one_key_off::<CallRef>(&CallRef { call: 1 }, |tapped| {
-            let ends = [shutdown(), EndFact::CallDropped { call: tapped.call }];
-            evidence_ending(&blamed, &ends).check(&log) == FaultCheck::Nothing
-        });
-    }
-
-    /// A reactor's drop of a call takes the failed reply the call held,
-    /// joined by the request's whole [`CallRef`]: call 1's drop, which the
-    /// harness's stop explains, clears operation 1's fault, and the same
-    /// stop and drop of another call leave call 1's reply untaken.
-    #[test]
-    fn a_dropped_call_takes_only_the_reply_it_held() {
-        let blamed = [(1, blame("aa"))];
-        assert_one_key_off::<CallRef>(&CallRef { call: 1 }, |dropped| {
-            let ends = [shutdown(), EndFact::CallDropped { call: dropped.call }];
-            evidence_ending(&blamed, &ends).check(&dropped_with(dropped.call))
-                == FaultCheck::Nothing
-        });
     }
 
     /// A settled run's end reports every open finding, not just the
@@ -1551,17 +1498,17 @@ pub(crate) mod tests {
     /// settled end. A later check reports none of them again.
     #[test]
     fn every_break_is_reported_once() {
-        let attributions = FaultAttributions::new(&EvidenceStores::default());
+        let attributions = FaultAttributions::default();
         for id in 1..=2 {
             attributions.insert(NODE, id, blame("aa"));
         }
-        let cooldowns = CooldownEvidence::new(&EvidenceStores::default());
+        let cooldowns = CooldownEvidence::default();
         cooldowns.record(started("aa", 9, 60, 2, 99));
         cooldowns.record(admitted("aa", 4, 30));
         let evidence = FaultEvidence::new(
             attributions,
             cooldowns,
-            EndEvidence::new(&EvidenceStores::default()),
+            EndEvidence::default(),
             Duration::from_secs(60),
         );
         evidence.settled.set(Some(true));
@@ -1636,15 +1583,15 @@ pub(crate) mod tests {
     fn an_evidence_error_stops_the_judge_after_the_breaks_before_it() {
         // Operation 2 has no attribution. Operation 3's unpenalized fault
         // comes after it, so it's never read.
-        let attributions = FaultAttributions::new(&EvidenceStores::default());
+        let attributions = FaultAttributions::default();
         for id in [1, 3, 4] {
             attributions.insert(NODE, id, blame("aa"));
         }
-        let cooldowns = CooldownEvidence::new(&EvidenceStores::default());
+        let cooldowns = CooldownEvidence::default();
         let attributed = FaultEvidence::new(
             attributions,
             cooldowns.clone(),
-            EndEvidence::new(&EvidenceStores::default()),
+            EndEvidence::default(),
             Duration::from_secs(60),
         );
         attributed.settled.set(Some(true));
@@ -1733,16 +1680,16 @@ pub(crate) mod tests {
     /// Fault evidence for a settled run of a node with a 60 s cooldown,
     /// where operation 1 blamed `aa` and the reactor reported `facts`.
     fn cooled(facts: Vec<CooldownFact>) -> FaultEvidence {
-        let attributions = FaultAttributions::new(&EvidenceStores::default());
+        let attributions = FaultAttributions::default();
         attributions.insert(NODE, 1, blame("aa"));
-        let cooldowns = CooldownEvidence::new(&EvidenceStores::default());
+        let cooldowns = CooldownEvidence::default();
         for fact in facts {
             cooldowns.record(fact);
         }
         let evidence = FaultEvidence::new(
             attributions,
             cooldowns,
-            EndEvidence::new(&EvidenceStores::default()),
+            EndEvidence::default(),
             Duration::from_secs(60),
         );
         evidence.settled.set(Some(true));
@@ -1850,7 +1797,7 @@ pub(crate) mod tests {
     /// one went unpenalized, which the penalty rule calls a break.
     #[test]
     fn the_lists_go_on_past_an_unpenalized_fault() {
-        let attributions = FaultAttributions::new(&EvidenceStores::default());
+        let attributions = FaultAttributions::default();
         for id in 1..=3 {
             attributions.insert(NODE, id, blame("aa"));
         }
@@ -1862,8 +1809,8 @@ pub(crate) mod tests {
         log.extend(third);
         let evidence = FaultEvidence::new(
             attributions,
-            CooldownEvidence::new(&EvidenceStores::default()),
-            EndEvidence::new(&EvidenceStores::default()),
+            CooldownEvidence::default(),
+            EndEvidence::default(),
             Duration::ZERO,
         );
         let end = evidence.penalized(&log);
@@ -1902,21 +1849,5 @@ pub(crate) mod tests {
             FaultCheck::Broken { breaks, open: None }
                 if matches!(breaks.as_slice(), [why] if why.starts_with("ReadmittedInCooldown"))
         ));
-    }
-
-    /// A cooldown fact recorded after the node's stores froze is dropped.
-    #[test]
-    fn a_frozen_cooldown_store_drops_a_fact() {
-        crate::stores::assert_freeze_drops_writes(
-            CooldownEvidence::new,
-            |cooldowns| {
-                cooldowns.record(CooldownFact::Admitted {
-                    peer: "mirror-0".to_owned(),
-                    session_id: 1,
-                    at: Duration::ZERO,
-                });
-            },
-            CooldownEvidence::facts,
-        );
     }
 }

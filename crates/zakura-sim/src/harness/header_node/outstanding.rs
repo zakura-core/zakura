@@ -165,6 +165,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -238,8 +239,8 @@ pub fn admitted_peer_limit(max_inbound: usize, max_outbound: usize, connections:
 
 /// Each row's largest size so far, shared by the tap and whoever reads it.
 /// Cloning shares the store.
-#[derive(Clone, Debug)]
-pub struct OutstandingEvidence(Registered<Store>);
+#[derive(Clone, Debug, Default)]
+pub struct OutstandingEvidence(Arc<Mutex<Store>>);
 
 #[derive(Debug, Default)]
 struct Store {
@@ -263,49 +264,11 @@ struct Store {
     reported: Vec<(ZakuraPeerId, u64)>,
 }
 
-impl Snapshot for Store {
-    /// Everything it holds, with each running publisher's token as whether
-    /// it has one: a token is a live handle, which the scheduler's shutdown
-    /// rightly cancels, not evidence. The running publishers are sorted,
-    /// since the check lists them from a hashed set.
-    fn snapshot(&self) -> serde_json::Value {
-        let Store {
-            peaks,
-            applicable,
-            pending,
-            running,
-            shut_down,
-            at_rest,
-            reported,
-        } = self;
-        let running = sorted_snapshot(
-            running
-                .iter()
-                .map(|(peer, session_id, token)| (peer, session_id, token.is_some())),
-        );
-        serde_json::json!({
-            "fields": debug_snapshot(&(peaks, applicable, pending, shut_down, at_rest, reported)),
-            "running": running,
-        })
-    }
-}
-
 impl OutstandingEvidence {
-    /// An empty store in `stores`, the node's.
-    pub fn new(stores: &EvidenceStores) -> OutstandingEvidence {
-        OutstandingEvidence(stores.register("outstanding", Store::default()))
-    }
-
-    /// Runs `read` on the store. Nothing else is called while the lock is
-    /// held.
-    fn with<R>(&self, read: impl FnOnce(&Store) -> R) -> R {
-        self.0.read(read)
-    }
-
-    /// Runs `change` on the store, unless it's frozen, which drops the
-    /// change.
-    fn change<R>(&self, change: impl FnOnce(&mut Store) -> R) -> Option<R> {
-        self.0.write(change)
+    /// Runs `change` on the store. Nothing else is called while the lock
+    /// is held.
+    fn with<R>(&self, change: impl FnOnce(&mut Store) -> R) -> R {
+        change(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Each row's largest size so far, by name.
@@ -321,7 +284,7 @@ impl OutstandingEvidence {
     /// Records how the run ended, as [`super::adoption::settled`] judges it.
     pub fn end(&self, end: &crate::RunEnd) {
         let at_rest = super::adoption::settled(end);
-        self.change(|store| store.at_rest = at_rest);
+        self.with(|store| store.at_rest = at_rest);
     }
 
     /// The publisher tasks running now under a cancelled session token that
@@ -333,7 +296,7 @@ impl OutstandingEvidence {
     /// cancellation before the run comes to rest. The tokens are read with
     /// no preemption point.
     pub fn lingering_cancelled(&self) -> Vec<(ZakuraPeerId, u64)> {
-        let lingering = self.with(|store| {
+        self.with(|store| {
             let mut lingering: Vec<(ZakuraPeerId, u64)> = store
                 .running
                 .iter()
@@ -347,10 +310,9 @@ impl OutstandingEvidence {
                 .collect();
             lingering
                 .sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()).then(a.1.cmp(&b.1)));
+            store.reported.extend(lingering.iter().cloned());
             lingering
-        });
-        self.change(|store| store.reported.extend(lingering.iter().cloned()));
-        lingering
+        })
     }
 
     /// The publisher tasks still running when the run came to rest, if it
@@ -436,9 +398,8 @@ pub(super) struct Outstanding {
     now: Option<Duration>,
     /// Each admitted peer's current session.
     admitted: HashMap<ZakuraPeerId, u64>,
-    /// Each dispatched call with no `CallEnded`, by call, so breaks about
-    /// them come in call order.
-    calls: BTreeMap<u64, Open>,
+    /// Each dispatched call with no `CallEnded`.
+    calls: HashMap<u64, Open>,
     /// Each call holding headers by a `HeadersHeld` with no `HeadersEnded`,
     /// with how many.
     holding: HashMap<u64, usize>,
@@ -515,7 +476,7 @@ impl Outstanding {
             departed_limit,
             now: None,
             admitted: HashMap::new(),
-            calls: BTreeMap::new(),
+            calls: HashMap::new(),
             holding: HashMap::new(),
             pages: HashMap::new(),
             completed: HashSet::new(),
@@ -804,7 +765,7 @@ impl Outstanding {
                 self.cause = Some(*cause);
                 if *cause == ReactorCause::Shutdown && !self.shut_down {
                     self.shut_down = true;
-                    self.evidence.change(|store| store.shut_down = true);
+                    self.evidence.with(|store| store.shut_down = true);
                 }
             }
             ReactorEvent::Retired {
@@ -994,7 +955,7 @@ impl Outstanding {
                 (peer.clone(), *session_id, cancel)
             })
             .collect();
-        self.evidence.change(|store| store.running = running);
+        self.evidence.with(|store| store.running = running);
     }
 
     /// Judges a publisher pass's kept waits, right after their pruning, and
@@ -1079,7 +1040,7 @@ impl Outstanding {
 
     /// Notes `size` as `row`'s size now.
     fn peak(&self, row: &'static str, size: usize) {
-        self.evidence.change(|store| {
+        self.evidence.with(|store| {
             let peak = store.peaks.entry(row).or_default();
             *peak = (*peak).max(size);
         });
@@ -1160,17 +1121,12 @@ impl Outstanding {
                 ));
             }
         }
-        // Each owner's open reads, in the order of its first call, so the
-        // breaks don't follow a hash order.
-        let mut reads: Vec<(&BodyWorkOwner, usize)> = Vec::new();
+        let mut reads: HashMap<&BodyWorkOwner, usize> = HashMap::new();
         for open in self.calls.values() {
             let Open::VctContext(owner, dispatched) = open else {
                 continue;
             };
-            match reads.iter_mut().find(|(read, _)| *read == owner) {
-                Some((_, count)) => *count += 1,
-                None => reads.push((owner, 1)),
-            }
+            *reads.entry(owner).or_default() += 1;
             // See the module docs: the shutdown unit's reads aren't judged
             // by age.
             if self.shut_down {
@@ -1187,10 +1143,7 @@ impl Outstanding {
                 ));
             }
         }
-        self.peak(
-            "repair context reads",
-            reads.iter().map(|(_, count)| count).sum(),
-        );
+        self.peak("repair context reads", reads.values().sum());
         for (owner, count) in reads {
             if count > 1 {
                 found.push(format!(
@@ -1223,7 +1176,7 @@ impl Outstanding {
             completed_targets,
             repair_sources,
         } = sizes;
-        self.evidence.change(|store| store.pending = true);
+        self.evidence.with(|store| store.pending = true);
         let limit = self.peer_limit;
         let mut found = Vec::new();
         let bounds = [
@@ -1578,9 +1531,7 @@ impl Outstanding {
     /// applicable at `step` if a `Sizes` was judged since the last call.
     pub(super) fn drain(&mut self, step: u64) -> Vec<String> {
         if !self.unseen_tips.is_empty() {
-            let mut unseen: Vec<block::Hash> =
-                std::mem::take(&mut self.unseen_tips).into_iter().collect();
-            unseen.sort_unstable_by_key(|tip| tip.0);
+            let unseen = std::mem::take(&mut self.unseen_tips);
             if let Some(held) = (self.held.0)() {
                 for tip in unseen {
                     if held.contains(&tip) {
@@ -1594,7 +1545,7 @@ impl Outstanding {
                 }
             }
         }
-        self.evidence.change(|store| {
+        self.evidence.with(|store| {
             if std::mem::take(&mut store.pending) {
                 store.applicable.get_or_insert(step);
             }
@@ -1605,4 +1556,3 @@ impl Outstanding {
 
 #[cfg(test)]
 mod tests;
-use crate::stores::{debug_snapshot, sorted_snapshot, EvidenceStores, Registered, Snapshot};

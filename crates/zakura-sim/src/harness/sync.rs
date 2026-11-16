@@ -99,7 +99,6 @@ use crate::{
         header_sync::TeardownView,
     },
     property::{Capture, HasView, Property, PropertyId, Sources},
-    stores::EvidenceStores,
     ActionSource, Boundary, Identity, ObservationLog, RunConfig, Sim,
 };
 
@@ -906,7 +905,7 @@ impl WireView for SyncView {
 /// tap found broken, and its released rounds and own teardown at each
 /// drain. The tap reads the reactor's resource probe, so the teardown half
 /// covers the chunk budget and the locator permits.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct HeaderSettlement {
     claims: ClaimEvidence,
     rounds: SettlementEvidence,
@@ -1174,25 +1173,23 @@ pub(crate) fn spawn_actors(
 ) -> (Actors, Rc<RefCell<Predicates>>) {
     let anchor = ports.fixture.anchor();
     // The header side.
-    // The header node's stores, which its tap attaches to the run.
-    let stores = EvidenceStores::default();
     let header_storage = header_node::PolicySource::new(
         sim,
         ports.port.clone(),
         scenario.header_policy.clone(),
-        header_node::Effects::new(&stores),
+        header_node::Effects::default(),
     );
-    let rounds = SettlementEvidence::new(&stores);
+    let rounds = SettlementEvidence::default();
     let (header_observer, header_tap) = ReactorTap::with_evidence(
         sim,
         &ports.port,
         "node",
-        SessionEvidence::new(&stores),
-        ReservationEvidence::new(&stores),
-        CapacityEvidence::new(&stores),
+        SessionEvidence::default(),
+        ReservationEvidence::default(),
+        CapacityEvidence::default(),
         rounds.clone(),
-        StaleEvidence::new(&stores),
-        header_node::ends::EndEvidence::new(&stores),
+        StaleEvidence::default(),
+        header_node::ends::EndEvidence::default(),
     );
     let header = HeaderSettlement {
         claims: header_tap.claims(),

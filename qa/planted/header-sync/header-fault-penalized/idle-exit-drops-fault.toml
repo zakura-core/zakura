@@ -8,10 +8,8 @@
 # reaches the reactor, which returns without taking it. The tap records
 # `ReactorExited`, not a `Shutdown`, so the drop doesn't clear the owed
 # penalty (hf-3's rule): the run settles, and the end replay keeps it as
-# the required `DroppedFault`. This is C2's owed penalty concluding
-# violated at the drain's end, through a node-side abandonment. The drop
-# ends the call, so its released round still settles and
-# `teardown-returns-baseline` holds.
+# the required `DroppedFault`. The drop ends the call, so its released
+# round still settles and `teardown-returns-baseline` holds.
 # Besides reactor.rs, which the patch changes, the rest of header sync
 # decides when the node submits that preparation and when the disconnect
 # retires its round. A change there can move the script off its late fault.

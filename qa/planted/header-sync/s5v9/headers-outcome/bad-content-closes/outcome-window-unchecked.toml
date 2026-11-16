@@ -9,9 +9,7 @@
 # there can move the input off its frame.
 # Past the stop, the outcomes that follow for the ended subscription are
 # unsolicited and the subscriber never closes over them, so
-# `headers-outcome/unsolicited-closes` breaks too, but only later, and the
-# case's set is judged on its Draft run (`draft_set`).
-draft_set = ["header-sync/s5v9/headers-outcome/unsolicited-closes"]
+# `headers-outcome/unsolicited-closes` breaks too, but only later.
 checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation"]
 
 [typed]

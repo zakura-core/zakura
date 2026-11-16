@@ -55,7 +55,6 @@ fn storage_config(budget: u64) -> RunConfig {
 /// A violation of `property` at `step`.
 fn violation(property: &str, step: u64, actual: String) -> Violation {
     Violation {
-        subject: None,
         property: property.to_owned(),
         step,
         witness: vec![step],
@@ -619,7 +618,6 @@ fn shutdown_releases_everything_and_logs_nothing() {
                 )
             });
             submitted.then(|| zakura_sim::Violation {
-                subject: None,
                 property: "test/stop".to_owned(),
                 step: cx.step,
                 witness: vec![cx.step],

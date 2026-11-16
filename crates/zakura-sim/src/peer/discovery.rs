@@ -721,7 +721,6 @@ impl DiscoveryPeer {
                 payload: header.payload_len as u64,
                 prepares: None,
                 asks: own_row.then(|| Asked::of(&frame.message)).flatten(),
-                hashes: Vec::new(),
             }],
         }
     }

@@ -13,7 +13,6 @@ use zakura_chain::{block, work::difficulty::CompactDifficulty};
 use zakura_header_chain::{ErrorCategory, Frontier, SourceId};
 use zakura_node_services::header_chain::Port;
 use zakura_scheduler::SchedulerConfig;
-use zakura_sim::stores::EvidenceStores;
 use zakura_sim::{
     harness::header_node::{
         ends::EndEvidence,
@@ -89,11 +88,10 @@ fn attempt(
             });
             let storage = HeaderStorage::new(sim, port.clone());
             // No reactor runs, so nothing starts a cooldown.
-            let stores = EvidenceStores::default();
             faults = Some(FaultEvidence::new(
                 storage.attributions(),
-                CooldownEvidence::new(&stores),
-                EndEvidence::new(&stores),
+                CooldownEvidence::default(),
+                EndEvidence::default(),
                 Duration::ZERO,
             ));
             sim.add_source(Box::new(storage));

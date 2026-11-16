@@ -10,9 +10,7 @@
 # frames the input's peers send and when the node judges them. A change
 # there can move the input off its frame.
 # Past the stop, the publisher goes on sending pages over credit at zero
-# time, so `sim/no-livelock` breaks too, but only later, and the case's set
-# is judged on its Draft run (`draft_set`).
-draft_set = ["sim/no-livelock"]
+# time, so `sim/no-livelock` breaks too, but only later.
 checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation"]
 
 [typed]

@@ -30,12 +30,10 @@ pub mod plan;
 pub mod planted;
 pub mod property;
 pub mod record;
-pub mod refs;
 pub mod seed;
 mod sender;
 pub mod sim;
 pub mod storage;
-pub mod stores;
 pub mod suite;
 pub mod table;
 pub mod trace;
@@ -43,8 +41,8 @@ pub mod witness;
 
 pub use action::{Action, ActionSource, Boundary, Enabled, RecoveryOffer, SourceId};
 pub use check::{
-    Checker, FindingSubject, NaReason, NoChecks, OpenCheck, OpenKind, PropertyOutcome,
-    PropertyReport, StepCtx, Unfinished, Violation,
+    Checker, NaReason, NoChecks, OpenCheck, OpenKind, PropertyOutcome, PropertyReport, StepCtx,
+    Unfinished, Violation,
 };
 pub use end::{at_rest, HarnessFailure, IdleStatus, Outcome, RunEnd};
 pub use identity::{Category, Identity};

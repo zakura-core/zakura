@@ -69,10 +69,7 @@ use zakura_network::zakura::{
     AuxSchema, ZakuraPeerId, TREE_AUX_SCHEMA_V1_BYTES,
 };
 
-use super::{
-    finding::{spell_cursor, spell_frontier, spell_hash, spell_maybe_frontier, spell_subscription},
-    AuthorityFinding, AuthorityRule, AuthoritySubject, CursorFact, Subscription, UpdateKind,
-};
+use super::Subscription;
 use crate::observe::{StorageFact, StorageResult};
 use crate::peer::{ENTRY_BYTES, PAGE_FIXED_BYTES};
 
@@ -156,7 +153,7 @@ pub(super) struct Credit {
     /// Acceptances since the last drain, each under its apply call, for the
     /// drain to judge against the call's storage result.
     awaiting: Vec<(Subscription, u64, Frontier)>,
-    breaks: Vec<AuthorityFinding>,
+    breaks: Vec<String>,
 }
 
 impl Credit {
@@ -204,29 +201,23 @@ impl Credit {
                 totals,
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
-                let subject = AuthoritySubject::cursor(&key, CursorFact::Claim, *through);
                 let page = (*page_last, *page_headers, *page_bytes);
-                self.claim(&key, &subject, (*through, *headers, *bytes), page);
-                self.totals("claim", &key, &subject, *totals);
+                self.claim(&key, (*through, *headers, *bytes), page);
+                self.totals("claim", &key, *totals);
                 true
             }
             // Only the reactor's task holds an apply call's completion, so
             // an acceptance from any other task is outside one.
             ReactorEvent::CursorsAccepted {
-                peer,
                 session_id,
                 subscription,
                 through,
                 ..
             } if !on_reactor => {
-                let key = (peer.clone(), *session_id, *subscription);
-                self.breaks.push(credit(
-                    &AuthoritySubject::cursor(&key, CursorFact::Acceptance, *through),
-                    format!(
-                        "session {session_id} subscription {subscription} accepted through {} off \
-                         the reactor's task, outside an apply call's completion",
-                        spell_frontier(*through)
-                    ),
+                self.breaks.push(format!(
+                    "CommitOnlyAuthorized: session {session_id} subscription {subscription} \
+                     accepted through {through:?} off the reactor's task, outside an apply \
+                     call's completion"
                 ));
                 true
             }
@@ -268,16 +259,8 @@ impl Credit {
                 ..
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
-                let subject = AuthoritySubject::update(
-                    &key,
-                    match kind {
-                        CreditKind::Open => UpdateKind::Open,
-                        CreditKind::Grant => UpdateKind::Grant,
-                    },
-                    update.update_sequence,
-                );
                 if !stale_handler {
-                    self.issue(&key, &subject, *objects, *bytes, update);
+                    self.issue(&key, *objects, *bytes, update);
                 }
                 let added = (
                     u64::from(update.added_credit.objects),
@@ -288,28 +271,22 @@ impl Credit {
                     CreditKind::Grant => Operation::Grant,
                 };
                 if update.operation != operation {
-                    self.breaks.push(credit(
-                        &subject,
-                        format!(
-                            "session {session_id} subscription {subscription}'s {kind:?} credit \
-                             came in a {:?} update",
-                            update.operation
-                        ),
+                    self.breaks.push(format!(
+                        "CommitOnlyAuthorized: session {session_id} subscription {subscription}'s \
+                         {kind:?} credit came in a {:?} update",
+                        update.operation
                     ));
                 }
                 match kind {
                     CreditKind::Open => {
                         if update.subscription_id != *subscription {
-                            self.breaks.push(credit(
-                                &subject,
-                                format!(
-                                    "session {session_id} subscription {subscription}'s Open \
-                                     names subscription {}",
-                                    update.subscription_id
-                                ),
+                            self.breaks.push(format!(
+                                "CommitOnlyAuthorized: session {session_id} subscription \
+                                 {subscription}'s Open names subscription {}",
+                                update.subscription_id
                             ));
                         }
-                        self.start(&key, &subject, update);
+                        self.start(&key, update);
                         self.live.insert(
                             key.clone(),
                             Live {
@@ -331,7 +308,7 @@ impl Credit {
                             live.sequence = update.update_sequence;
                         }
                     }
-                    CreditKind::Grant => self.update("Grant", &key, &subject, update),
+                    CreditKind::Grant => self.update("Grant", &key, update),
                 }
                 if let Some(live) = self.live.get_mut(&key) {
                     live.granted = (
@@ -339,7 +316,7 @@ impl Credit {
                         live.granted.1.saturating_add(added.1),
                     );
                 }
-                self.totals("credit", &key, &subject, *totals);
+                self.totals("credit", &key, *totals);
                 !stale_handler
             }
             ReactorEvent::CloseBuilt {
@@ -350,34 +327,28 @@ impl Credit {
                 totals,
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
-                let subject =
-                    AuthoritySubject::update(&key, UpdateKind::Close, update.update_sequence);
-                self.totals("Close", &key, &subject, *totals);
+                self.totals("Close", &key, *totals);
                 if update.operation != Operation::Close
                     || update.added_credit.objects != 0
                     || update.added_credit.bytes != 0
                 {
-                    self.breaks.push(credit(
-                        &subject,
-                        format!(
-                            "session {session_id} subscription {subscription}'s built Close is a \
-                             {:?} adding {:?}",
-                            update.operation, update.added_credit
-                        ),
+                    self.breaks.push(format!(
+                        "CommitOnlyAuthorized: session {session_id} subscription {subscription}'s \
+                         built Close is a {:?} adding {:?}",
+                        update.operation, update.added_credit
                     ));
                 }
-                self.update("Close", &key, &subject, update);
+                self.update("Close", &key, update);
                 true
             }
             ReactorEvent::PageStaged {
                 request,
+                subscription,
                 ancestor,
                 hashes,
                 ..
             } => {
-                // The page stages on its round's subscription, whatever ID a
-                // foreign page carries.
-                let key = (request.peer.clone(), request.session_id, request.request_id);
+                let key = (request.peer.clone(), request.session_id, *subscription);
                 if let (Some(live), Some(last)) = (self.live.get_mut(&key), hashes.last()) {
                     // A page holds at most a few thousand headers.
                     let count = u32::try_from(hashes.len()).expect("a page's count fits u32");
@@ -401,22 +372,16 @@ impl Credit {
                 totals,
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
-                let subject = AuthoritySubject::cursor(&key, CursorFact::Acceptance, *through);
                 let cursor = (*through, *headers, *bytes);
                 if *stored != cursor {
-                    self.breaks.push(credit(
-                        &subject,
-                        format!(
-                            "session {session_id} subscription {subscription}'s primitive stored \
-                             {} accepted, not the {} asked for",
-                            spell_acknowledged(*stored),
-                            spell_acknowledged(cursor)
-                        ),
+                    self.breaks.push(format!(
+                        "CommitOnlyAuthorized: session {session_id} subscription {subscription}'s \
+                         primitive stored {stored:?} accepted, not the {cursor:?} asked for"
                     ));
                 }
                 // The next update acknowledges what the primitive stored.
                 let cursor = *stored;
-                self.totals("acceptance", &key, &subject, *totals);
+                self.totals("acceptance", &key, *totals);
                 if stale_handler {
                     if let Some(live) = self.live.get_mut(&key) {
                         live.accepted = Some(cursor.0);
@@ -424,7 +389,7 @@ impl Credit {
                     }
                     return false;
                 }
-                self.accept(&key, &subject, cursor);
+                self.accept(&key, cursor);
                 true
             }
             _ => false,
@@ -433,7 +398,7 @@ impl Credit {
 
     /// The breaks found since the last call, judging first each acceptance
     /// since the last call against its apply's storage result.
-    pub(super) fn take_breaks(&mut self) -> Vec<AuthorityFinding> {
+    pub(super) fn take_breaks(&mut self) -> Vec<String> {
         self.judge_awaited();
         std::mem::take(&mut self.breaks)
     }
@@ -444,33 +409,26 @@ impl Credit {
     fn judge_awaited(&mut self) {
         for (key, call, through) in std::mem::take(&mut self.awaiting) {
             let (_, session, subscription) = &key;
-            let why = match self.applied.get(&call) {
-                None => "reported no storage result",
-                Some(true) => continue,
-                Some(false) => "didn't succeed",
-            };
-            self.breaks.push(credit(
-                &AuthoritySubject::cursor(&key, CursorFact::Acceptance, through),
-                format!(
-                    "session {session} subscription {subscription} accepted through {} in \
-                     apply call {call}'s completion, whose apply {why}",
-                    spell_frontier(through)
-                ),
-            ));
+            match self.applied.get(&call) {
+                None => self.breaks.push(format!(
+                    "CommitOnlyAuthorized: session {session} subscription {subscription} \
+                     accepted through {through:?} in apply call {call}'s completion, whose \
+                     apply reported no storage result"
+                )),
+                Some(true) => {}
+                Some(false) => self.breaks.push(format!(
+                    "CommitOnlyAuthorized: session {session} subscription {subscription} \
+                     accepted through {through:?} in apply call {call}'s completion, whose \
+                     apply didn't succeed"
+                )),
+            }
         }
     }
 
     /// Judges the credit `update` adds to `key`'s subscription against its
     /// peer's unbacked reservations and its schema's byte bound, then marks
     /// those reservations backed.
-    fn issue(
-        &mut self,
-        key: &Subscription,
-        subject: &AuthoritySubject,
-        objects: u32,
-        bytes: u32,
-        update: &SubscribeHeaders,
-    ) {
+    fn issue(&mut self, key: &Subscription, objects: u32, bytes: u32, update: &SubscribeHeaders) {
         let (peer, session, subscription) = key;
         let reserved: usize = self
             .unbacked
@@ -478,45 +436,30 @@ impl Credit {
             .map_or(0, |reservations| reservations.values().sum());
         // Widening u32 to usize is lossless on supported targets.
         if objects as usize > reserved {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} was granted \
-                     {objects} headers, but its peer's unbacked reservations hold {reserved}"
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} was granted \
+                 {objects} headers, but its peer's unbacked reservations hold {reserved}"
             ));
         }
         let limit =
             (u64::from(objects) * smallest_page(update.tree_aux_schema)).min(MAX_CREDIT_BYTES);
         if u64::from(bytes) > limit {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} was granted \
-                     {bytes} bytes for {objects} headers under {:?}, above {limit}",
-                    update.tree_aux_schema
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} was granted \
+                 {bytes} bytes for {objects} headers under {:?}, above {limit}",
+                update.tree_aux_schema
             ));
         }
     }
 
     /// Judges a built `Grant` or `Close`, named `operation`, against `key`'s
-    /// subscription, then records its sequence. Its breaks name `subject`.
-    fn update(
-        &mut self,
-        operation: &str,
-        key: &Subscription,
-        subject: &AuthoritySubject,
-        update: &SubscribeHeaders,
-    ) {
+    /// subscription, then records its sequence.
+    fn update(&mut self, operation: &str, key: &Subscription, update: &SubscribeHeaders) {
         let (_, session, subscription) = key;
         let Some(live) = self.live.get_mut(key) else {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "a {operation} names session {session} subscription \
-                     {subscription}, which the subscriber never opened"
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: a {operation} names session {session} subscription \
+                 {subscription}, which the subscriber never opened"
             ));
             return;
         };
@@ -527,8 +470,7 @@ impl Credit {
         if update.initial_target_tip_hash != live.target {
             found.push(format!(
                 "names target {}, not its Open's {}",
-                spell_hash(update.initial_target_tip_hash),
-                spell_hash(live.target)
+                update.initial_target_tip_hash, live.target
             ));
         }
         if update.tree_aux_schema != live.schema {
@@ -546,52 +488,37 @@ impl Credit {
         }
         if acknowledged(update) != live.acknowledged {
             found.push(format!(
-                "acknowledges {}, not {}",
-                spell_acknowledged(acknowledged(update)),
-                spell_acknowledged(live.acknowledged)
+                "acknowledges {:?}, not {:?}",
+                acknowledged(update),
+                live.acknowledged
             ));
         }
         live.sequence = update.update_sequence;
         for detail in found {
-            self.breaks.push(credit(
-                subject,
-                format!("session {session} subscription {subscription}'s {operation} {detail}"),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription}'s \
+                 {operation} {detail}"
             ));
         }
     }
 
-    /// Judges a claim of `key`'s subscription, `subject`, that recorded
-    /// `cursor` for a page ending at `page.0`, of `page.1` entries, charged
-    /// `page.2` bytes.
-    fn claim(
-        &mut self,
-        key: &Subscription,
-        subject: &AuthoritySubject,
-        cursor: Acknowledged,
-        page: Acknowledged,
-    ) {
+    /// Judges a claim of `key`'s subscription that recorded `cursor` for a
+    /// page ending at `page.0`, of `page.1` entries, charged `page.2` bytes.
+    fn claim(&mut self, key: &Subscription, cursor: Acknowledged, page: Acknowledged) {
         let (page_last, page_headers, charged) = page;
         let (_, session, subscription) = key;
         let Some(live) = self.live.get_mut(key) else {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} claimed a \
-                     page, but the subscriber never opened it"
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} claimed a \
+                 page, but the subscriber never opened it"
             ));
             return;
         };
         let page_bytes = page_size(page_headers, live.schema);
         if charged != page_bytes {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} charged \
-                     {charged} bytes for a page of {page_headers} headers under {:?}, which takes \
-                     {page_bytes}",
-                    live.schema
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} charged                  {charged} bytes for a page of {page_headers} headers under {:?}, which takes                  {page_bytes}",
+                live.schema
             ));
         }
         live.consumed = (
@@ -599,36 +526,25 @@ impl Credit {
             live.consumed.1.saturating_add(page_bytes),
         );
         if live.consumed.0 > live.granted.0 || live.consumed.1 > live.granted.1 {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription}'s pages \
-                     consumed {:?} headers and bytes, above the {:?} its updates granted",
-                    live.consumed, live.granted
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription}'s pages \
+                 consumed {:?} headers and bytes, above the {:?} its updates granted",
+                live.consumed, live.granted
             ));
         }
         let (through, headers, bytes) = cursor;
-        let shown = spell_frontier(through);
         if through != page_last {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} recorded \
-                     cursor {shown} for a page ending at {}",
-                    spell_frontier(page_last)
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} recorded \
+                 cursor {through:?} for a page ending at {page_last:?}"
             ));
         }
         if (headers, bytes) != live.consumed {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} recorded \
-                     cursor {shown} at {headers} headers and {bytes} bytes, but its pages \
-                     consumed {:?}",
-                    live.consumed
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} recorded \
+                 cursor {through:?} at {headers} headers and {bytes} bytes, but its pages \
+                 consumed {:?}",
+                live.consumed
             ));
         }
         live.claimed.insert(cursor);
@@ -679,16 +595,10 @@ impl Credit {
         self.read_heights.insert(hash, height);
     }
 
-    /// Judges the primitive `totals` a `fact` of `key`'s subscription,
-    /// `subject`, reported against every built update's credit and every
-    /// claimed page's.
-    fn totals(
-        &mut self,
-        fact: &str,
-        key: &Subscription,
-        subject: &AuthoritySubject,
-        totals: CreditTotals,
-    ) {
+    /// Judges the primitive `totals` a `fact` of `key`'s subscription
+    /// reported against every built update's credit and every claimed
+    /// page's.
+    fn totals(&mut self, fact: &str, key: &Subscription, totals: CreditTotals) {
         let (_, session, subscription) = key;
         let Some(live) = self.live.get(key) else {
             return;
@@ -698,31 +608,23 @@ impl Credit {
             (totals.consumed_headers, totals.consumed_bytes),
         );
         if reported != (live.granted, live.consumed) {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription}'s primitive \
-                     counts {totals:?} after a {fact}, but its updates granted {:?} and its pages \
-                     consumed {:?}",
-                    live.granted, live.consumed
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription}'s primitive \
+                 counts {totals:?} after a {fact}, but its updates granted {:?} and its pages \
+                 consumed {:?}",
+                live.granted, live.consumed
             ));
         }
     }
 
     /// Judges an `Open`'s start: sequence 0, and its first locator, at the
-    /// height the node's locator read gave it, with nothing consumed. Its
-    /// breaks name `subject`.
-    fn start(&mut self, key: &Subscription, subject: &AuthoritySubject, update: &SubscribeHeaders) {
+    /// height the node's locator read gave it, with nothing consumed.
+    fn start(&mut self, key: &Subscription, update: &SubscribeHeaders) {
         let (_, session, subscription) = key;
         if update.update_sequence != 0 {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription}'s Open has \
-                     sequence {}, not 0",
-                    update.update_sequence
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription}'s Open has                  sequence {}, not 0",
+                update.update_sequence
             ));
         }
         let start = update.acknowledged;
@@ -733,69 +635,45 @@ impl Credit {
             || start.bytes != 0
             || height != Some(start.height)
         {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription}'s Open \
-                     starts at {}, not its first locator {} at {height:?} with \
-                     nothing consumed",
-                    spell_cursor(
-                        Frontier::new(start.height, start.hash),
-                        start.headers,
-                        start.bytes
-                    ),
-                    first.map_or_else(|| "none".to_owned(), spell_hash)
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription}'s Open \
+                 starts at {start:?}, not its first locator {first:?} at {height:?} with \
+                 nothing consumed"
             ));
         }
     }
 
-    /// Judges an acceptance of `key`'s subscription through `cursor`, which
-    /// `subject` names.
-    fn accept(&mut self, key: &Subscription, subject: &AuthoritySubject, cursor: Acknowledged) {
+    /// Judges an acceptance of `key`'s subscription through `cursor`.
+    fn accept(&mut self, key: &Subscription, cursor: Acknowledged) {
         let (through, ..) = cursor;
-        let shown = spell_frontier(through);
         let (_, session, subscription) = key;
         let Some(live) = self.live.get_mut(key) else {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} accepted \
-                     through {shown}, but the subscriber never opened it"
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} accepted \
+                 through {through:?}, but the subscriber never opened it"
             ));
             return;
         };
         if !live.claimed.contains(&cursor) {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} accepted \
-                     {}, which no claim recorded",
-                    spell_acknowledged(cursor)
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} accepted \
+                 {cursor:?}, which no claim recorded"
             ));
         }
         if !live.staged.contains(&through) {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} accepted \
-                     through {shown}, which no staged page ends at"
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} accepted \
+                 through {through:?}, which no staged page ends at"
             ));
         }
         if live
             .accepted
             .is_some_and(|accepted| through.height < accepted.height)
         {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} accepted \
-                     through {shown}, below its earlier acceptance {}",
-                    spell_maybe_frontier(live.accepted)
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} accepted \
+                 through {through:?}, below its earlier acceptance {:?}",
+                live.accepted
             ));
         }
         live.accepted = Some(through);
@@ -809,51 +687,28 @@ impl Credit {
                 .map(|apply| (call, &apply.subscription, apply.last_staged))
         });
         let Some((call, applied, before)) = apply else {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} accepted \
-                     through {shown} outside an apply call's completion"
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} accepted \
+                 through {through:?} outside an apply call's completion"
             ));
             return;
         };
         if applied != key {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} accepted through \
-                     {shown} in apply call {call}'s completion, an apply for {}",
-                    spell_subscription(applied)
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} accepted \
+                 through {through:?} in apply call {call}'s completion, an apply for {applied:?}"
             ));
             return;
         }
         if before != Some(through) {
-            self.breaks.push(credit(
-                subject,
-                format!(
-                    "session {session} subscription {subscription} accepted \
-                     through {shown} in apply call {call}'s completion, not its round's last \
-                     page staged before that apply, {} (now {})",
-                    spell_maybe_frontier(before),
-                    spell_maybe_frontier(last_staged)
-                ),
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} accepted \
+                 through {through:?} in apply call {call}'s completion, not its round's last \
+                 page staged before that apply, {before:?} (now {last_staged:?})"
             ));
         }
         self.awaiting.push((key.clone(), call, through));
     }
-}
-
-/// A credit-rule break by `subject`, as `detail` says.
-fn credit(subject: &AuthoritySubject, detail: String) -> AuthorityFinding {
-    AuthorityFinding::new(AuthorityRule::Credit, subject.clone(), detail)
-}
-
-/// `cursor` as a finding spells it ([`spell_cursor`]).
-fn spell_acknowledged(cursor: Acknowledged) -> String {
-    let (through, headers, bytes) = cursor;
-    spell_cursor(through, headers, bytes)
 }
 
 /// The cursor `update` acknowledges.

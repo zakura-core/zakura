@@ -10,9 +10,8 @@ mod support;
 use std::{cell::RefCell, io::Write, path::Path, process::Command};
 
 use serde_json::Value;
-use support::{inputs, one_key_off::assert_one_key_off};
+use support::inputs;
 use tempfile::TempDir;
-use zakura_sim::refs::{CallRef, Ref, StampRef};
 use zakura_sim::{
     harness::{
         self,
@@ -32,12 +31,10 @@ use zakura_sim::{
 };
 
 /// What [`run`] returns: the report, the node's end facts with their
-/// stamps and the control steps that caused them, its session facts, and
-/// every stamp the node handed out.
+/// stamps, its session facts, and every stamp the node handed out.
 struct Ran {
     report: RunReport,
     ends: Vec<(u64, EndFact)>,
-    causes: Vec<(u64, usize)>,
     sessions: Vec<SessionFact>,
     stamped: Vec<u64>,
 }
@@ -55,7 +52,6 @@ fn run(scenario: &StorageScenario, input: PlanInput) -> Ran {
     Ran {
         report,
         ends: ends.facts(),
-        causes: ends.causes(),
         sessions: sessions.facts(),
         stamped: ends.stamps().after(None),
     }
@@ -255,100 +251,6 @@ fn overlapping_relinks_each_name_their_own_connection() {
     }
 }
 
-/// Two churn steps relink two mirrors at once, and each churn's relinks
-/// and closes reach scheduling points while they record. Every environment
-/// fact still names the churn step that made it, by the mirror it churns,
-/// and no fact goes without one. Before round-8 A1, one shared cell held
-/// the acting step, so an overlapping churn's facts took the other step's
-/// position or none.
-#[test]
-fn overlapping_churns_each_name_their_own_step() {
-    let mirror = || zakura_sim::harness::header_sync::MirrorSpec {
-        chain: zakura_sim::harness::header_node::Chain::main(4),
-        dialer: zakura_sim::harness::header_sync::Dialer::Mirror,
-        max_headers_per_response: None,
-    };
-    let churn = |peer: &str| ControlStep {
-        peer: peer.to_owned(),
-        action: ControlAction::Churn,
-        when: None,
-    };
-    let scenario = StorageScenario {
-        node: zakura_sim::harness::header_node::Chain::main(4),
-        mirrors: vec![mirror(), mirror()],
-        controls: vec![churn("mirror-0"), churn("mirror-1")],
-        ..StorageScenario::default()
-    };
-    let mut overlapped = 0;
-    for input in inputs(32, 256) {
-        let ran = run(&scenario, input);
-        let mut steps = Vec::new();
-        for (stamp, fact) in &ran.ends {
-            let EndFact::Environment { peer, .. } = fact else {
-                continue;
-            };
-            let expected = match peer.as_str() {
-                "mirror-0" => 0,
-                "mirror-1" => 1,
-                other => panic!("only the churns act, not on {other}"),
-            };
-            let cause = cause_of(&ran.causes, &StampRef { stamp: *stamp });
-            assert_eq!(cause, Some(expected), "{fact:?}: {:#?}", ran.causes);
-            steps.push(expected);
-        }
-        assert_eq!(
-            ran.causes.len(),
-            steps.len(),
-            "only environment facts have causes"
-        );
-        // One switch is two churns in turn. More is them interleaved.
-        if steps.windows(2).filter(|pair| pair[0] != pair[1]).count() > 1 {
-            overlapped += 1;
-        }
-    }
-    assert!(overlapped > 0, "no plan interleaved the two churns");
-}
-
-/// The control step `causes`, as `(stamp, position)`, names for the fact
-/// `fact` stamps, joined by its whole [`StampRef`].
-fn cause_of(causes: &[(u64, usize)], fact: &StampRef) -> Option<usize> {
-    StampRef::joined(fact, causes, |(at, _)| Some(StampRef { stamp: *at }))
-        .first()
-        .map(|(_, step)| *step)
-}
-
-/// Each environment fact takes the cause its own stamp names: a fact
-/// stamped 5 takes the cause recorded under stamp 5, and none under a
-/// moved stamp.
-#[test]
-fn a_fact_takes_the_cause_of_its_whole_stamp() {
-    assert_one_key_off::<StampRef>(&StampRef { stamp: 5 }, |caused| {
-        cause_of(&[(caused.stamp, 1)], &StampRef { stamp: 5 }) == Some(1)
-    });
-}
-
-/// Whether `recorded`, the tap's `CallDropped` facts as `(stamp, call)`,
-/// names the calls the log's `CallEnded` `dropped` names, `logged`, one
-/// for one and in order, each joined by its whole [`CallRef`].
-fn recorded_as_logged(recorded: &[(u64, u64)], logged: &[u64]) -> bool {
-    recorded.len() == logged.len()
-        && recorded.iter().zip(logged).all(|((_, call), logged)| {
-            CallRef::joins(&CallRef { call: *logged }, call, |call| {
-                Some(CallRef { call: *call })
-            })
-        })
-}
-
-/// A recorded drop matches the log's only by its whole call: the tap's
-/// drops of calls 3 and 4 match the log's, and with call 4 moved they
-/// don't.
-#[test]
-fn a_recorded_drop_joins_the_logged_call() {
-    assert_one_key_off::<CallRef>(&CallRef { call: 4 }, |tapped| {
-        recorded_as_logged(&[(7, 3), (8, tapped.call)], &[3, 4])
-    });
-}
-
 /// A `Shutdown` step records one end for the node under test, with no
 /// connection, at its pick. The links its stop closes record nothing more,
 /// and a reactor the harness stopped isn't recorded as exited. The calls
@@ -385,7 +287,6 @@ fn a_shutdown_records_one_end_at_its_pick() {
 /// The tap records each call the reactor drops, as the log's `CallEnded`
 /// `dropped` shows, once and in the log's order, as a `CallDropped` whose
 /// stamp orders it against the `Shutdown`. A stop's drops come after it.
-/// The run's log is unchanged: the fact is view-side only.
 #[test]
 fn each_dropped_call_is_recorded_after_the_shutdown_it_follows() {
     let scenario = StorageScenario {
@@ -420,9 +321,10 @@ fn each_dropped_call_is_recorded_after_the_shutdown_it_follows() {
                 _ => None,
             })
             .collect();
-        assert!(
-            recorded_as_logged(&recorded, &logged),
-            "{recorded:?} {logged:?}"
+        assert_eq!(
+            recorded.iter().map(|(_, call)| *call).collect::<Vec<_>>(),
+            logged,
+            "{recorded:?}"
         );
         let shutdown = ran
             .ends

@@ -25,7 +25,6 @@ pub mod claim;
 pub mod ends;
 pub mod fault;
 pub mod fork_choice;
-pub mod grown;
 pub mod hold_wake;
 pub mod outstanding;
 mod pair;
@@ -47,7 +46,7 @@ use std::{
     future::Future,
     pin::pin,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -93,7 +92,6 @@ use crate::{
     observe::StorageFact,
     sim::Generators,
     storage::{FaultAttributions, HeaderStorage, StorageAction, HEADER_SERVICE},
-    stores::{debug_snapshot, EvidenceStores, Registered, Snapshot},
     ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, Sim,
 };
 
@@ -280,7 +278,7 @@ impl Policy {
 /// [`Trigger::Closed`], [`Trigger::Grown`], [`Trigger::Reset`] and
 /// [`Trigger::Released`], and the names it counts tapped reactor facts
 /// under.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Effects {
     /// Each node's peer identity and name, which [`Topology::new`] fills,
     /// so [`Trigger::ReservationOpened`] and [`Trigger::SessionAdmitted`]
@@ -305,49 +303,8 @@ pub struct Effects {
     /// When the node under test's header-sync session on each link ended,
     /// since the run's start, by connection ID. Each link's cancellation
     /// hooks record it, inside the `cancel` that ends the session, so no
-    /// harness read touches a token. It's evidence, kept in the node's
-    /// stores, so the scheduler's shutdown, which cancels every link, adds
-    /// nothing.
-    pub ended: Registered<SessionEnds>,
-}
-
-/// What [`Effects::ended`] holds: when each link's session ended, by
-/// connection ID.
-#[derive(Debug, Default)]
-pub struct SessionEnds(BTreeMap<u64, Duration>);
-
-impl Snapshot for SessionEnds {
-    /// Every end, by connection.
-    fn snapshot(&self) -> serde_json::Value {
-        debug_snapshot(&self.0)
-    }
-}
-
-impl Effects {
-    /// No effects yet, with the session ends kept in `stores`, the node's.
-    pub fn new(stores: &EvidenceStores) -> Effects {
-        Effects {
-            names: Rc::default(),
-            links: Rc::default(),
-            grown: Rc::default(),
-            reset: Rc::default(),
-            released: Rc::default(),
-            owned: Rc::default(),
-            failure: Rc::default(),
-            ended: stores.register("session_ends", SessionEnds::default()),
-        }
-    }
-
-    /// The node's stores, which keep its session ends.
-    pub fn stores(&self) -> &EvidenceStores {
-        self.ended.stores()
-    }
-
-    /// When each link's session ended, by connection ID, as
-    /// [`Effects::ended`] holds it now.
-    pub fn session_ends(&self) -> BTreeMap<u64, Duration> {
-        self.ended.read(|ended| ended.0.clone())
-    }
+    /// harness read touches a token.
+    pub ended: Arc<Mutex<BTreeMap<u64, Duration>>>,
 }
 
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
@@ -387,9 +344,8 @@ impl PolicySource {
     /// `port`'s storage under `policy`, with its checkpoint registered with
     /// `sim`. Its predicates count `effects` too.
     pub fn new(sim: &mut Sim, port: Arc<ControlledPort>, policy: Policy, effects: Effects) -> Self {
-        let stores = effects.stores().clone();
         PolicySource {
-            storage: HeaderStorage::in_stores(sim, port.clone(), &stores),
+            storage: HeaderStorage::new(sim, port.clone()),
             tap: None,
             hold_wake: None,
             port,
@@ -404,7 +360,7 @@ impl PolicySource {
             grown: 0,
             reset: 0,
             released: 0,
-            recovery: RecoveryEvidence::new(&stores),
+            recovery: RecoveryEvidence::default(),
             drained: false,
         }
     }
@@ -965,8 +921,6 @@ pub struct Topology {
     tap: Option<TapShutdown>,
     /// The node under test's session view, told of each link.
     sessions: Option<SessionEvidence>,
-    /// Where each completed growth is recorded, with its control step.
-    grown: Option<grown::GrowEvidence>,
     /// Set once a `Shutdown` step was picked, which stops any churn.
     stopping: Cell<bool>,
     /// The mirror whose pages the harness holds back, if any.
@@ -1114,8 +1068,8 @@ pub const CHURN_RELINKS: u32 = 8;
 /// it, so a relink that returns after the pick closes its own link and
 /// stops. The pick sets [`Topology::stopping`] before the sweep runs, so a
 /// link the check passes is already in the sweep's copy.
-async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<(usize, usize)>) {
-    let Some((index, position)) = start.recv().await else {
+async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<usize>) {
+    let Some(index) = start.recv().await else {
         return;
     };
     drop(start);
@@ -1123,9 +1077,8 @@ async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<(usize, usize)>
         if topology.stopping() {
             return;
         }
-        // Each relink and close is the churn step's own.
-        let (link, _far) = topology.open(index, 0, true, Some(position));
-        topology.close(&link, Some(position));
+        let (link, _far) = topology.open(index, 0, true);
+        topology.close(&link);
         if topology.stopping() {
             return;
         }
@@ -1148,7 +1101,6 @@ impl Topology {
             last_id: Cell::new(0),
             tap: None,
             sessions: None,
-            grown: None,
             stopping: Cell::new(false),
             delayed_page: None,
         }
@@ -1201,15 +1153,6 @@ impl Topology {
         }
     }
 
-    /// This topology, recording each completed growth in `grown`, naming
-    /// the control step that made it.
-    pub fn with_grown(self, grown: grown::GrowEvidence) -> Self {
-        Topology {
-            grown: Some(grown),
-            ..self
-        }
-    }
-
     /// Records why a `Control` step couldn't take effect, which ends the
     /// run as a harness failure.
     pub(crate) fn fail(&self, why: String) {
@@ -1218,46 +1161,27 @@ impl Topology {
 
     /// Tells the node under test's tap that a `Shutdown` step was picked, so
     /// a run that ends before the step takes effect fails as an unfinished
-    /// stop. `cause` is as [`Topology::environment`] takes it.
-    fn expect_shutdown(&self, cause: Option<usize>) {
+    /// stop.
+    fn expect_shutdown(&self) {
         self.stopping.set(true);
         if let Some(tap) = &self.tap {
             tap.begin();
         }
-        self.environment(
-            &self.nodes[0].name,
-            None,
-            EnvironmentAction::Shutdown,
-            cause,
-        );
+        self.environment(&self.nodes[0].name, None, EnvironmentAction::Shutdown);
     }
 
     /// Records in the node under test's tap that the harness's `action` on
-    /// `peer` ends `connection`, as [`ends`] describes, naming `cause`, the
-    /// position in the control script of the step carrying it out, if one
-    /// is. The cause is passed, not held by the topology: steps run in
-    /// their own tasks and overlap at scheduling points.
-    fn environment(
-        &self,
-        peer: &str,
-        connection: Option<u64>,
-        action: EnvironmentAction,
-        cause: Option<usize>,
-    ) {
+    /// `peer` ends `connection`, as [`ends`] describes.
+    fn environment(&self, peer: &str, connection: Option<u64>, action: EnvironmentAction) {
         if let Some(tap) = &self.tap {
-            tap.environment(peer, connection, action, cause);
+            tap.environment(peer, connection, action);
         }
     }
 
     /// Closes `link` as the harness's own action, which the node under
-    /// test's tap records first, naming `cause` ([`Topology::environment`]).
-    fn close(&self, link: &Link, cause: Option<usize>) {
-        self.environment(
-            &link.peer,
-            Some(link.conn_id),
-            EnvironmentAction::Close,
-            cause,
-        );
+    /// test's tap records first.
+    fn close(&self, link: &Link) {
+        self.environment(&link.peer, Some(link.conn_id), EnvironmentAction::Close);
         link.close();
     }
 
@@ -1290,9 +1214,7 @@ impl Topology {
     /// grows the new tip instead. Anything else, such as a resource stall
     /// that leaves the target unadmitted while the tip stays put, is
     /// recorded as a failure. The node must be a mirror, on an engine port.
-    /// A completed growth is recorded in the topology's [`grown`] store,
-    /// naming `cause`, the control step's position, if a step made it.
-    async fn grow(&self, peer: &str, fixture: &HeaderFixture, len: u32, cause: Option<usize>) {
+    async fn grow(&self, peer: &str, fixture: &HeaderFixture, len: u32) {
         let node = self
             .nodes
             .iter()
@@ -1322,9 +1244,6 @@ impl Topology {
             match (applied, now) {
                 (Ok(ApplyHeaderTargetOutcome::Applied), Some(now)) if now == target => {
                     self.effects.grown.borrow_mut().push(peer.to_owned());
-                    if let Some(grown) = &self.grown {
-                        grown.record(peer, cause);
-                    }
                     return;
                 }
                 // The mirror moved its tip during the growth.
@@ -1344,36 +1263,24 @@ impl Topology {
     /// Each side's peer carries the link's counter as its origin's
     /// connection and generation. The session view hears of the link first.
     pub fn link(&self, dialer: usize, listener: usize) -> Link {
-        self.open(dialer, listener, false, None).0
+        self.open(dialer, listener, false).0
     }
 
     /// [`Topology::link`], with the dialer's side handed back as its
     /// streams, from the node and to it, instead of joining the dialer's
-    /// service, when `far_end` is set. A relink's record names `cause`
-    /// ([`Topology::environment`]).
+    /// service, when `far_end` is set.
     ///
     /// A link to a peer that was linked before is a relink, which the node
     /// under test's tap records ([`ends`]) before the link exists, naming
     /// the new connection. Two relinks of one peer can overlap at the
     /// service's scheduling points, so the earlier session the node replaces
     /// is the admission's to say, not this record's.
-    fn open(
-        &self,
-        dialer: usize,
-        listener: usize,
-        far_end: bool,
-        cause: Option<usize>,
-    ) -> (Link, Option<FarEnd>) {
+    fn open(&self, dialer: usize, listener: usize, far_end: bool) -> (Link, Option<FarEnd>) {
         let peer = if dialer == 0 { listener } else { dialer };
         let id = self.last_id.get() + 1;
         self.last_id.set(id);
         if self.link_to(&self.nodes[peer].name).is_some() {
-            self.environment(
-                &self.nodes[peer].name,
-                Some(id),
-                EnvironmentAction::Relink,
-                cause,
-            );
+            self.environment(&self.nodes[peer].name, Some(id), EnvironmentAction::Relink);
         }
         let (to_listener, from_dialer) = framed_channel(LINK_DEPTH);
         let (to_dialer, from_listener) = framed_channel(LINK_DEPTH);
@@ -1415,18 +1322,18 @@ impl Topology {
         // cancelled, or when the node cancels its own session token alone, as
         // it does to refuse or retire the session. A hook runs inside that
         // `cancel` and is no scheduling point, so it records the instant.
-        // It holds the store weakly: a store can hold the token, and so the
-        // hook, which would otherwise own the registry that owns the store.
         let ended = |token: &CancellationToken| {
-            let ended = self.effects.ended.downgrade();
+            let ended = self.effects.ended.clone();
             token.on_cancel(move || {
                 // The run's own teardown cancels after its evidence froze.
                 let Some(now) = zakura_scheduler::hooks::now() else {
                     return;
                 };
-                ended.write(|ended| {
-                    ended.0.entry(id).or_insert(now.since_start());
-                });
+                ended
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(id)
+                    .or_insert(now.since_start());
             });
         };
         for token in &tokens {
@@ -1503,15 +1410,14 @@ impl Topology {
     /// Links the mirror named `peer` to the node under test again, as its
     /// dialer, with a flooding task at the mirror's end in place of its
     /// service ([`flood`]), registered with `generators`. The node replaces
-    /// the mirror's earlier session. The relink's record names `cause`
-    /// ([`Topology::environment`]).
+    /// the mirror's earlier session.
     ///
     /// The task's token is a child of the far end's connection token: the
     /// connection's close still stops it, and its retirement cancels only
     /// the child, so the connection stays open. One token keeps the loop's
     /// preemption points as they were.
-    fn flood(&self, peer: &str, generators: &Generators, cause: Option<usize>) {
-        let (_, far) = self.open(self.index(peer), 0, true, cause);
+    fn flood(&self, peer: &str, generators: &Generators) {
+        let (_, far) = self.open(self.index(peer), 0, true);
         let far = far.expect("an open with a far end hands it back");
         let link = far.cancel.clone();
         let stop = link.child_token();
@@ -1534,7 +1440,7 @@ impl Topology {
     /// out.
     pub(crate) fn begin_finish(&self) {
         if !self.shutdown_picked() {
-            self.expect_shutdown(None);
+            self.expect_shutdown();
         }
     }
 
@@ -1563,7 +1469,11 @@ impl Topology {
     /// admitted.
     pub fn sessions(&self) -> Vec<SessionLife> {
         let links = self.effects.links.borrow();
-        let ended = self.effects.session_ends();
+        let ended = self
+            .effects
+            .ended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         links
             .iter()
             .enumerate()
@@ -1698,7 +1608,7 @@ pub enum Reset {
 
 impl ControlAction {
     /// The action's name in its identity.
-    pub fn name(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             ControlAction::Close => "close",
             ControlAction::Relink => "relink",
@@ -1775,9 +1685,7 @@ pub struct Control {
     next: usize,
     /// Set once a `Shutdown` step was picked.
     shut_down: bool,
-    /// Each queued step, with its position in the script, or `None` for a
-    /// recovery's relink, which no script step names.
-    to_task: mpsc::Sender<(Option<usize>, ControlStep)>,
+    to_task: mpsc::Sender<ControlStep>,
     /// How many queued steps the task hasn't carried out yet.
     queued: Rc<Cell<usize>>,
     /// The node under test's port, for the steps the step loop carries out.
@@ -1800,18 +1708,17 @@ impl Control {
         script: Vec<ControlStep>,
         predicates: Rc<RefCell<Predicates>>,
     ) -> Self {
-        let (to_task, mut steps) =
-            mpsc::channel::<(Option<usize>, ControlStep)>(script.len().max(1));
+        let (to_task, mut steps) = mpsc::channel::<ControlStep>(script.len().max(1));
         let task_topology = topology.clone();
         let queued = Rc::new(Cell::new(0));
         let task_queued = queued.clone();
         // One task per churn step, so each churned mirror competes for
         // steps on its own. The control task starts them in script order.
-        let mut to_churn: VecDeque<mpsc::Sender<(usize, usize)>> = script
+        let mut to_churn: VecDeque<mpsc::Sender<usize>> = script
             .iter()
             .filter(|step| step.action == ControlAction::Churn)
             .map(|_| {
-                let (start, started) = mpsc::channel::<(usize, usize)>(1);
+                let (start, started) = mpsc::channel::<usize>(1);
                 sim.scheduler()
                     .spawn_root("churn", churn(topology.clone(), started));
                 start
@@ -1822,33 +1729,30 @@ impl Control {
         sim.scheduler().spawn_root("control", async move {
             let fixture = task_fixture;
             let topology = task_topology;
-            while let Some((position, step)) = steps.recv().await {
+            while let Some(step) = steps.recv().await {
                 let link = || {
                     topology
                         .link_to(&step.peer)
                         .unwrap_or_else(|| panic!("the scenario links `{}`", step.peer))
                 };
                 match step.action {
-                    ControlAction::Close => topology.close(&link(), position),
+                    ControlAction::Close => topology.close(&link()),
                     ControlAction::Relink => {
                         let link = link();
-                        topology.open(link.dialer, link.listener, false, position);
+                        topology.link(link.dialer, link.listener);
                     }
-                    ControlAction::Grow { len } => {
-                        topology.grow(&step.peer, &fixture, len, position).await
-                    }
+                    ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
                     ControlAction::Shutdown => topology.shutdown(),
-                    ControlAction::Flood => topology.flood(&step.peer, &generators, position),
+                    ControlAction::Flood => topology.flood(&step.peer, &generators),
                     ControlAction::Churn => {
                         let index = topology.index(&step.peer);
                         let start = to_churn
                             .pop_front()
                             .expect("each churn step has its own task");
-                        let position = position.expect("a churn is a script step");
                         // The churn task gives up at a shutdown, which can be
                         // picked while this step waits in the queue. Its
                         // mirror then has nothing left to churn.
-                        let _ = start.send((index, position)).await;
+                        let _ = start.send(index).await;
                     }
                     ControlAction::Reset(_)
                     | ControlAction::Release { .. }
@@ -2258,7 +2162,7 @@ impl ActionSource for Control {
                     };
                     self.queued.set(self.queued.get() + 1);
                     self.to_task
-                        .try_send((None, step))
+                        .try_send(step)
                         .expect("recovery relinks only once the task took every step");
                     return;
                 }
@@ -2337,11 +2241,11 @@ impl ActionSource for Control {
         }
         if step.action == ControlAction::Shutdown {
             self.shut_down = true;
-            self.topology.expect_shutdown(Some(index));
+            self.topology.expect_shutdown();
         }
         self.queued.set(self.queued.get() + 1);
         self.to_task
-            .try_send((Some(index), step))
+            .try_send(step)
             .expect("the channel holds the whole script, and the task outlives the run");
     }
 }
@@ -2356,27 +2260,5 @@ impl HeaderNode {
     /// Cancels the reactor, as zakurad's shutdown ends header sync.
     pub(crate) fn cancel(&self) {
         self.shutdown.cancel();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use super::Effects;
-    use crate::stores::assert_freeze_drops_writes;
-
-    /// A session end recorded after the node's stores froze is dropped.
-    #[test]
-    fn a_frozen_session_ends_store_drops_an_end() {
-        assert_freeze_drops_writes(
-            Effects::new,
-            |effects| {
-                effects
-                    .ended
-                    .write(|ended| ended.0.insert(1, Duration::ZERO));
-            },
-            |effects| effects.ended.read(|ended| ended.0.clone()),
-        );
     }
 }

@@ -170,6 +170,21 @@ const fn header(property: &'static str, passing: &'static str) -> Coverage {
     }
 }
 
+/// A header-sync generated property's row whose bypass is its planted
+/// case `case`, under `qa/planted/<property>/`, rather than
+/// [`HEADER_BYPASS`].
+const fn header_caught(
+    property: &'static str,
+    passing: &'static str,
+    case: &'static str,
+) -> Coverage {
+    Coverage {
+        property,
+        passing: passes(HEADER_WITNESSES, passing),
+        bypass: Bypass::Planted(case),
+    }
+}
+
 /// A header-sync generated property no scenario reaches, for `reason`:
 /// `witness` shows it stays `NotApplicable`, and the scripted bypass still
 /// violates it.
@@ -432,7 +447,7 @@ pub static COVERAGE: &[Coverage] = &[
         property: super::super::domain::header_sync::STALE_COMPLETION_INERT,
         passing: passes(
             "tests/header_stale.rs",
-            "the_close_relink_input_holds_stale_completion_inert",
+            "the_stale_prepare_input_holds_stale_completion_inert",
         ),
         bypass: Bypass::Planted("stale-release"),
     },
@@ -648,80 +663,151 @@ pub static COVERAGE: &[Coverage] = &[
         "block-sync/s6v3/range-unavailable/receiver-work-authorized",
         "an ending carries no body, so the node admits no work from it",
     ),
-    header("header-sync/s5v9/conformant-never-closes", EVERY),
-    header("header-sync/s5v9/status/sender-cadence", EVERY),
-    header(
+    header_caught(
+        "header-sync/s5v9/conformant-never-closes",
+        EVERY,
+        "target-page-refused",
+    ),
+    header_caught(
+        "header-sync/s5v9/status/sender-cadence",
+        EVERY,
+        "pacing-floors-cut",
+    ),
+    header_caught(
         "header-sync/s5v9/subscribe-headers/sender-within-live",
         EVERY,
+        "open-repeated",
     ),
-    header(
+    header_caught(
         "header-sync/s5v9/subscribe-headers/sender-within-credit",
         EVERY,
+        "page-past-credit",
     ),
-    header("header-sync/s5v9/headers/sender-answers-open", EVERY),
-    header("header-sync/s5v9/headers-outcome/sender-ends-once", EVERY),
-    header("header-sync/s5v9/undeclared-type-closes", STATUS),
-    header("header-sync/s5v9/status/reserved-flags-closes", STATUS),
-    header("header-sync/s5v9/status/short-payload-closes", STATUS),
-    header("header-sync/s5v9/status/long-payload-closes", STATUS),
-    header("header-sync/s5v9/status/bad-content-closes", STATUS),
-    header("header-sync/s5v9/status/cadence-never-closes", STATUS),
-    header(
+    header_caught(
+        "header-sync/s5v9/headers/sender-answers-open",
+        EVERY,
+        "page-misnamed",
+    ),
+    header_caught(
+        "header-sync/s5v9/headers-outcome/sender-ends-once",
+        EVERY,
+        "outcome-misnamed",
+    ),
+    header_caught(
+        "header-sync/s5v9/undeclared-type-closes",
+        STATUS,
+        "undeclared-type-skipped",
+    ),
+    header_caught(
+        "header-sync/s5v9/status/reserved-flags-closes",
+        STATUS,
+        "reserved-flags-skipped",
+    ),
+    header_caught(
+        "header-sync/s5v9/status/short-payload-closes",
+        STATUS,
+        "short-payload-skipped",
+    ),
+    header_caught(
+        "header-sync/s5v9/status/long-payload-closes",
+        STATUS,
+        "oversize-skipped",
+    ),
+    header_caught(
+        "header-sync/s5v9/status/bad-content-closes",
+        STATUS,
+        "work-anchor-unchecked",
+    ),
+    header_caught(
+        "header-sync/s5v9/status/cadence-never-closes",
+        STATUS,
+        "exhausted-cadence-throttled",
+    ),
+    header_caught(
         "header-sync/s5v9/subscribe-headers/reserved-flags-closes",
         SUBSCRIBE,
+        "reserved-flags-skipped",
     ),
-    header(
+    header_caught(
         "header-sync/s5v9/subscribe-headers/short-payload-closes",
         SUBSCRIBE,
+        "short-payload-skipped",
     ),
-    header(
+    header_caught(
         "header-sync/s5v9/subscribe-headers/long-payload-closes",
         SUBSCRIBE,
+        "oversize-skipped",
     ),
-    header(
+    header_caught(
         "header-sync/s5v9/subscribe-headers/over-live-closes",
         SUBSCRIBE,
+        "no-slot-dropped",
     ),
-    header(
+    header_caught(
         "header-sync/s5v9/subscribe-headers/over-credit-closes",
         SUBSCRIBE,
+        "above-reservation-skipped",
     ),
-    header(
+    header_caught(
         "header-sync/s5v9/subscribe-headers/after-close-closes",
         SUBSCRIBE,
+        "after-close-dropped",
     ),
-    header(
+    header_caught(
         "header-sync/s5v9/subscribe-headers/bad-cursor-closes",
         SUBSCRIBE,
+        "unknown-acknowledgement-dropped",
     ),
-    header(
+    header_caught(
         "header-sync/s5v9/subscribe-headers/bad-content-closes",
         SUBSCRIBE,
+        "repeated-locator-unchecked",
     ),
-    header("header-sync/s5v9/headers/reserved-flags-closes", HEADERS),
-    header("header-sync/s5v9/headers/short-payload-closes", HEADERS),
+    header_caught(
+        "header-sync/s5v9/headers/reserved-flags-closes",
+        HEADERS,
+        "reserved-flags-skipped",
+    ),
+    header_caught(
+        "header-sync/s5v9/headers/short-payload-closes",
+        HEADERS,
+        "short-payload-skipped",
+    ),
     header("header-sync/s5v9/headers/long-payload-closes", HEADERS),
-    header("header-sync/s5v9/headers/unsolicited-closes", HEADERS),
-    header("header-sync/s5v9/headers/bad-content-closes", HEADERS),
-    header(
+    header_caught(
+        "header-sync/s5v9/headers/unsolicited-closes",
+        HEADERS,
+        "unsolicited-skipped",
+    ),
+    header_caught(
+        "header-sync/s5v9/headers/bad-content-closes",
+        HEADERS,
+        "unlinked-page-dropped",
+    ),
+    header_caught(
         "header-sync/s5v9/headers-outcome/reserved-flags-closes",
         OUTCOME,
+        "reserved-flags-skipped",
     ),
-    header(
+    header_caught(
         "header-sync/s5v9/headers-outcome/short-payload-closes",
         OUTCOME,
+        "short-payload-skipped",
     ),
-    header(
+    header_caught(
         "header-sync/s5v9/headers-outcome/long-payload-closes",
         OUTCOME,
+        "oversize-skipped",
     ),
-    header(
+    header_caught(
         "header-sync/s5v9/headers-outcome/unsolicited-closes",
         OUTCOME,
+        "unsolicited-skipped",
     ),
-    header(
+    header_caught(
         "header-sync/s5v9/headers-outcome/bad-content-closes",
         OUTCOME,
+        "outcome-window-unchecked",
     ),
     header_unreachable(
         "header-sync/s5v9/headers/over-owed-closes",

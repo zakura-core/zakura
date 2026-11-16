@@ -11,7 +11,6 @@ use std::{cell::RefCell, collections::HashSet, fs, path::PathBuf, process::Comma
 use support::{byte_inputs, inputs};
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::Frontier;
-use zakura_sim::harness::header_acceptance::history::run_declared;
 use zakura_sim::{
     check::{after_step, PropertyOutcome},
     domain::header_sync::{
@@ -294,15 +293,6 @@ struct Ran {
 /// Runs `scenario` under `input`, which must end without a violation or
 /// harness failure.
 fn run(scenario: &StorageScenario, input: PlanInput) -> Ran {
-    run_into(scenario, input, &mut MemorySink::default())
-}
-
-/// [`run`], recording into `sink`.
-fn run_into(
-    scenario: &StorageScenario,
-    input: PlanInput,
-    sink: &mut dyn zakura_sim::RecordSink,
-) -> Ran {
     let ports = Storage::prepare(scenario);
     let port = ports.node.clone();
     let evidence = ports.fork_choice.clone();
@@ -325,8 +315,14 @@ fn run_into(
         }
         None
     });
-    let report = run_prepared::<Storage>(scenario, ports, input, sink, Some(&mut watch))
-        .unwrap_or_else(|error| panic!("{error}"));
+    let report = run_prepared::<Storage>(
+        scenario,
+        ports,
+        input,
+        &mut MemorySink::default(),
+        Some(&mut watch),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     drop(watch);
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
@@ -359,16 +355,8 @@ fn outcome<'r>(report: &'r RunReport, property: &str) -> &'r PropertyOutcome {
 #[test]
 fn every_witness_holds_and_applies() {
     for (name, scenario) in witnesses() {
-        for (index, input) in inputs(8, 256).into_iter().enumerate() {
-            // Each run is a manifest history, which the acceptance tool
-            // records from this declaration (C18).
-            let ran = run_declared(
-                Storage::NAME,
-                &format!("{name} plan {index} of inputs(8, 256)"),
-                &scenario,
-                input,
-                run_into,
-            );
+        for input in inputs(8, 256) {
+            let ran = run(&scenario, input);
             assert!(
                 matches!(
                     outcome(&ran.report, EXPECTED_CHAIN_SELECTED),

@@ -58,8 +58,9 @@
 //! reset run with no `Reset` fact is missing evidence, which fails the run.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -74,7 +75,6 @@ use zakura_storage::header::{
     fixture::HeaderFixture,
 };
 
-use crate::stores::{debug_snapshot, EvidenceStores, Registered, Snapshot, WeakRegistered};
 use crate::{observe::StorageFact, storage::hash};
 
 /// What [`ForkChoiceEvidence`] keeps.
@@ -95,7 +95,7 @@ struct Store {
     settled_points: u64,
     /// The mirrors whose own reactors decided on a session with the node
     /// ([`MirrorDecisions`]).
-    mirrors_decided: BTreeSet<String>,
+    mirrors_decided: HashSet<String>,
     /// Each mirror's links with the node, by connection ID, and when the
     /// session on each ended, as the topology's cancellation hooks record
     /// it ([`ForkChoiceEvidence::watch_link_ends`]).
@@ -103,43 +103,23 @@ struct Store {
 }
 
 /// The topology's record of when each link's session ended, by connection
-/// ID, and which mirror each of the node's links joins. The record is
-/// another of the node's stores, held weakly so this store doesn't own the
-/// registry that owns it.
+/// ID, and which mirror each of the node's links joins.
 #[derive(Debug)]
 struct LinkEnds {
-    ended: WeakRegistered<super::SessionEnds>,
+    ended: Arc<Mutex<BTreeMap<u64, Duration>>>,
     mirrors: Vec<(u64, String)>,
-}
-
-impl Snapshot for Store {
-    /// Everything it holds.
-    fn snapshot(&self) -> serde_json::Value {
-        debug_snapshot(self)
-    }
 }
 
 /// When the fork-choice check first applied, shared by the tap and whoever
 /// reads it. Cloning shares the store.
-#[derive(Clone, Debug)]
-pub struct ForkChoiceEvidence(Registered<Store>);
+#[derive(Clone, Debug, Default)]
+pub struct ForkChoiceEvidence(Arc<Mutex<Store>>);
 
 impl ForkChoiceEvidence {
-    /// An empty store in `stores`, the node's.
-    pub fn new(stores: &EvidenceStores) -> ForkChoiceEvidence {
-        ForkChoiceEvidence(stores.register("fork_choice", Store::default()))
-    }
-
-    /// Runs `read` on the store. Nothing else is called while the lock is
-    /// held.
-    fn with<R>(&self, read: impl FnOnce(&Store) -> R) -> R {
-        self.0.read(read)
-    }
-
-    /// Runs `change` on the store, unless it's frozen, which drops the
-    /// change.
-    fn change<R>(&self, change: impl FnOnce(&mut Store) -> R) -> Option<R> {
-        self.0.write(change)
+    /// Runs `change` on the store. Nothing else is called while the lock
+    /// is held.
+    fn with<R>(&self, change: impl FnOnce(&mut Store) -> R) -> R {
+        change(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Whether a drain up to and including `step`'s found the check
@@ -196,11 +176,10 @@ impl ForkChoiceEvidence {
     /// decision.
     pub fn watch_link_ends(
         &self,
-        ended: &Registered<super::SessionEnds>,
+        ended: Arc<Mutex<BTreeMap<u64, Duration>>>,
         mirrors: Vec<(u64, String)>,
     ) {
-        let ended = ended.downgrade();
-        self.change(|store| store.link_ends = Some(LinkEnds { ended, mirrors }));
+        self.with(|store| store.link_ends = Some(LinkEnds { ended, mirrors }));
     }
 
     /// How many mirrors have had their chance to connect: their own
@@ -216,15 +195,12 @@ impl ForkChoiceEvidence {
         // The topology's hooks take the ended map's lock inside a `cancel`,
         // so it's read with the store's lock released.
         let ended: Vec<String> = link_ends.map_or_else(Vec::new, |(ended, mirrors)| {
-            ended
-                .read(|ended| {
-                    mirrors
-                        .into_iter()
-                        .filter(|(connection, _)| ended.0.contains_key(connection))
-                        .map(|(_, mirror)| mirror)
-                        .collect()
-                })
-                .expect("the node's registry owns its session ends while this store is read")
+            let ended = ended.lock().unwrap_or_else(PoisonError::into_inner);
+            mirrors
+                .into_iter()
+                .filter(|(connection, _)| ended.contains_key(connection))
+                .map(|(_, mirror)| mirror)
+                .collect()
         });
         self.with(|store| {
             store
@@ -264,7 +240,7 @@ impl HeaderSyncObserver for MirrorDecisions {
             return;
         };
         if peer == self.node {
-            self.evidence.change(|store| {
+            self.evidence.with(|store| {
                 store.mirrors_decided.insert(self.mirror.clone());
             });
         }
@@ -384,7 +360,7 @@ impl ForkChoice {
             }
             _ => None,
         };
-        self.evidence.change(|store| {
+        self.evidence.with(|store| {
             store.settled = verdict.map(|verdict| (step, verdict));
             if store.settled.is_some() {
                 store.settled_points = store.settled_points.saturating_add(1);
@@ -408,7 +384,7 @@ impl ForkChoice {
     pub(super) fn run(&mut self, run: &EngineRun, corrupt: bool) {
         if corrupt && !self.tainted {
             self.tainted = true;
-            self.evidence.change(|store| store.taint_pending = true);
+            self.evidence.with(|store| store.taint_pending = true);
         }
         let what = match &run.kind {
             RunKind::Apply(id, _) => format!("apply operation {}", id.0),
@@ -448,7 +424,7 @@ impl ForkChoice {
         }
         // Marked even with evidence missing, so a break the tap takes ahead
         // of that failure keeps its trigger history.
-        self.evidence.change(|store| {
+        self.evidence.with(|store| {
             if std::mem::take(&mut store.pending) {
                 store.applicable.get_or_insert(step);
             }
@@ -488,7 +464,7 @@ impl ForkChoice {
         let Some(placed) = self.place(state, clock) else {
             return;
         };
-        self.evidence.change(|store| store.pending = true);
+        self.evidence.with(|store| store.pending = true);
         let best = placed
             .values()
             .filter(|at| at.eligible)

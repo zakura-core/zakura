@@ -12,7 +12,6 @@ use std::{
 
 use super::steer::{before, Steer};
 use zakura_network::zakura::ZakuraHeaderSyncConfig;
-use zakura_sim::stores::EvidenceStores;
 use zakura_sim::{
     harness::{
         header_node::{
@@ -170,7 +169,7 @@ impl<const UNCOOLED: bool> HasView for Watching<UNCOOLED> {
                 .get_or_init(|| {
                     FaultEvidence::new(
                         view.faults.attributions().clone(),
-                        CooldownEvidence::new(&EvidenceStores::default()),
+                        CooldownEvidence::default(),
                         view.faults.ends().clone(),
                         ZakuraHeaderSyncConfig::default().unproductive_peer_cooldown,
                     )

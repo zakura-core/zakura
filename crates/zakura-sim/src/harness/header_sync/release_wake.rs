@@ -280,11 +280,6 @@ impl HasView for ReleaseWake {
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
         self.0.stamps_after(after)
     }
-
-    /// The storage harness's store snapshot.
-    fn snapshot(&self) -> Option<serde_json::Value> {
-        self.0.snapshot()
-    }
 }
 
 impl Subsystem for ReleaseWake {
@@ -305,11 +300,12 @@ impl Subsystem for ReleaseWake {
     /// The storage harness's ports for the fixture, with the fixture
     /// declared.
     fn prepare(scenario: &WakeScenario) -> Ports {
-        let ports = Storage::prepare(&scenario.storage());
-        ports.wake.declare(WakeFixture {
-            body_window: BODY_WINDOW,
-        });
-        ports
+        Ports {
+            wake: WakeEvidence::new(Some(WakeFixture {
+                body_window: BODY_WINDOW,
+            })),
+            ..Storage::prepare(&scenario.storage())
+        }
     }
 
     /// The storage harness on the fixture, with its [`Settle`] source.

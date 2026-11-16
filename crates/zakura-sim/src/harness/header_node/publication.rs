@@ -69,8 +69,8 @@
 //! ([`super::fork_choice`]).
 
 use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
+    collections::HashMap,
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -87,10 +87,7 @@ use super::{
     adoption::{Adoption, STATUS_CHANGE_BOUND},
     stamp::Stamps,
 };
-use crate::{
-    observe::StorageFact,
-    stores::{debug_snapshot, EvidenceStores, Registered, Snapshot},
-};
+use crate::observe::StorageFact;
 
 /// How long a session in a status fixture may be owed its `Status`: the
 /// publisher's change bound ([`STATUS_CHANGE_BOUND`], its
@@ -169,6 +166,8 @@ struct Store {
     stamps: Stamps,
     /// Each stamped fact, in stamp order.
     facts: Vec<(u64, PublicationFact)>,
+    /// Set when the run's log froze. Facts after it are dropped.
+    frozen: bool,
     /// Each node's peer ID and harness name, which the harness's
     /// environment facts name it by.
     names: Vec<(ZakuraPeerId, String)>,
@@ -177,13 +176,6 @@ struct Store {
     /// Each refusal a mirror reported since the last drain
     /// ([`MirrorRefusals`]).
     refused: Vec<String>,
-}
-
-impl Snapshot for Store {
-    /// Everything it holds.
-    fn snapshot(&self) -> serde_json::Value {
-        debug_snapshot(self)
-    }
 }
 
 /// A page the served-page rule judged: what a witness reads of it.
@@ -205,27 +197,17 @@ pub struct ServedPage {
 
 /// When the publication check first applied, and the tip it still owes,
 /// shared by the tap and whoever reads it. Cloning shares the store.
-#[derive(Clone, Debug)]
-pub struct PublicationEvidence(Registered<Store>);
+#[derive(Clone, Debug, Default)]
+pub struct PublicationEvidence(Arc<Mutex<Store>>);
 
 impl PublicationEvidence {
-    /// An empty store in `stores`, the node's.
-    pub fn new(stores: &EvidenceStores) -> PublicationEvidence {
-        PublicationEvidence(stores.register("publication", Store::default()))
-    }
-
     /// Evidence that also keeps the stamped facts `arming` asks for. The
     /// default keeps none.
-    pub fn armed(stores: &EvidenceStores, arming: Arming) -> PublicationEvidence {
-        let evidence = PublicationEvidence::new(stores);
-        evidence.arm(arming);
-        evidence
-    }
-
-    /// Keeps the stamped facts `arming` asks for from now on, as
-    /// [`PublicationEvidence::armed`] does, on prepared ports.
-    pub fn arm(&self, arming: Arming) {
-        self.change(|store| store.arming = arming);
+    pub fn armed(arming: Arming) -> PublicationEvidence {
+        PublicationEvidence(Arc::new(Mutex::new(Store {
+            arming,
+            ..Store::default()
+        })))
     }
 
     /// What the evidence keeps stamped facts for.
@@ -235,18 +217,24 @@ impl PublicationEvidence {
 
     /// Stamps facts from `stamps`, the node's, from now on.
     pub(super) fn stamp_with(&self, stamps: Stamps) {
-        self.change(|store| store.stamps = stamps);
+        self.with(|store| store.stamps = stamps);
+    }
+
+    /// Stops keeping facts. The harness calls it when the run's log
+    /// freezes, as [`super::adoption::AdoptionEvidence`] does.
+    pub fn freeze(&self) {
+        self.with(|store| store.frozen = true);
     }
 
     /// Keeps `fact` with the next stamp, if the evidence is armed, `status`
     /// facts only in a status fixture, and the log hasn't frozen.
     fn keep(&self, fact: PublicationFact) {
-        self.change(|store| {
+        self.with(|store| {
             let status = matches!(
                 fact,
                 PublicationFact::StatusOwed { .. } | PublicationFact::StatusPaid { .. }
             );
-            if store.arming.armed && (store.arming.status || !status) {
+            if store.arming.armed && (store.arming.status || !status) && !store.frozen {
                 let stamp = store.stamps.next();
                 store.facts.push((stamp, fact));
             }
@@ -287,7 +275,7 @@ impl PublicationEvidence {
     /// Notes each node's peer ID and harness name, so a debt's peer can be
     /// matched with the harness's environment facts, which name peers.
     pub fn name_peers(&self, names: Vec<(ZakuraPeerId, String)>) {
-        self.change(|store| store.names = names);
+        self.with(|store| store.names = names);
     }
 
     /// The harness name of the node with peer ID `peer`, if the harness
@@ -332,16 +320,10 @@ impl PublicationEvidence {
         })
     }
 
-    /// Runs `read` on the store. Nothing else is called while the lock is
-    /// held.
-    fn with<R>(&self, read: impl FnOnce(&Store) -> R) -> R {
-        self.0.read(read)
-    }
-
-    /// Runs `change` on the store, unless it's frozen, which drops the
-    /// change.
-    fn change<R>(&self, change: impl FnOnce(&mut Store) -> R) -> Option<R> {
-        self.0.write(change)
+    /// Runs `change` on the store. Nothing else is called while the lock
+    /// is held.
+    fn with<R>(&self, change: impl FnOnce(&mut Store) -> R) -> R {
+        change(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Whether a drain up to and including `step`'s found the check
@@ -370,7 +352,7 @@ impl PublicationEvidence {
     /// Notes how the run ended: whether it settled, with no task left
     /// partway through a synchronous call ([`super::adoption::settled`]).
     pub fn end(&self, settled: bool) {
-        self.change(|store| store.settled = Some(settled));
+        self.with(|store| store.settled = Some(settled));
     }
 
     /// The adopted tip a settled run ended still owing on the tip watch, if
@@ -420,7 +402,7 @@ impl HeaderSyncObserver for MirrorRefusals {
              `{reason}`",
             self.mirror
         );
-        self.evidence.change(|store| {
+        self.evidence.with(|store| {
             store.refused.push(detail);
             store.pending = true;
         });
@@ -445,9 +427,8 @@ pub(super) struct Publication {
     adopted: Option<Adoption>,
     /// The state version of an adoption not yet stored.
     unstored: Option<u64>,
-    /// Each admitted session the node still holds, in a status fixture, by
-    /// ID, so an adoption stamps the debts it opens in session order.
-    sessions: BTreeMap<u64, Session>,
+    /// Each admitted session the node still holds, in a status fixture.
+    sessions: HashMap<u64, Session>,
     /// The served-page rule's state.
     served: served::ServedPages,
     /// Whether the commit-contents check found a run corrupt, after which
@@ -468,7 +449,7 @@ impl Publication {
             committed: Vec::new(),
             adopted: None,
             unstored: None,
-            sessions: BTreeMap::new(),
+            sessions: HashMap::new(),
             served: served::ServedPages::default(),
             tainted: false,
             breaks: Vec::new(),
@@ -484,7 +465,7 @@ impl Publication {
         if corrupt && !self.tainted {
             self.tainted = true;
             self.committed.clear();
-            self.evidence.change(|store| store.taint_pending = true);
+            self.evidence.with(|store| store.taint_pending = true);
             self.evidence.keep(PublicationFact::Tainted);
         }
         if self.tainted {
@@ -572,7 +553,7 @@ impl Publication {
                     reaches_target: *reaches_target,
                     state_version: self.newest,
                 };
-                self.evidence.change(|store| store.pages.push(page));
+                self.evidence.with(|store| store.pages.push(page));
             }
             self.applies();
             self.breaks.extend(breaks);
@@ -640,7 +621,7 @@ impl Publication {
                         adopted.header_best
                     ));
                 }
-                self.evidence.change(|store| store.owed = None);
+                self.evidence.with(|store| store.owed = None);
             }
             _ => {}
         }
@@ -710,7 +691,7 @@ impl Publication {
             .is_none_or(|adopted| adopted.header_best != adoption.header_best);
         if changed {
             self.evidence
-                .change(|store| store.owed = Some(adoption.header_best));
+                .with(|store| store.owed = Some(adoption.header_best));
         }
         self.evidence.keep(PublicationFact::Adopted {
             state_version: version,
@@ -817,18 +798,15 @@ impl Publication {
         if step == 0 {
             return Vec::new();
         }
-        let refused = self
-            .evidence
-            .change(|store| {
-                if std::mem::take(&mut store.pending) {
-                    store.applicable.get_or_insert(step);
-                }
-                if std::mem::take(&mut store.taint_pending) {
-                    store.tainted.get_or_insert(step);
-                }
-                std::mem::take(&mut store.refused)
-            })
-            .unwrap_or_default();
+        let refused = self.evidence.with(|store| {
+            if std::mem::take(&mut store.pending) {
+                store.applicable.get_or_insert(step);
+            }
+            if std::mem::take(&mut store.taint_pending) {
+                store.tainted.get_or_insert(step);
+            }
+            std::mem::take(&mut store.refused)
+        });
         if !self.tainted {
             self.breaks.extend(refused);
         }
@@ -837,7 +815,7 @@ impl Publication {
 
     /// Notes that a fact made the check applicable.
     fn applies(&self) {
-        self.evidence.change(|store| store.pending = true);
+        self.evidence.with(|store| store.pending = true);
     }
 }
 

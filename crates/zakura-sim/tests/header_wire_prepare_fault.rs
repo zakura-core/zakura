@@ -22,15 +22,12 @@ use std::{fs, path::PathBuf, process::Command};
 
 use support::{
     inputs,
-    one_key_off::assert_one_key_off,
     prepare_fault::{disconnect_mid_prepare, scenario, LastView, Uncooled, Watched, CHAIN},
     steer::steer,
 };
-use zakura_sim::refs::{ConnectionRef, Ref, SessionIdRef};
 use zakura_sim::{
     domain::header_sync::STALE_COMPLETION_INERT,
     harness::{
-        header_acceptance::history::run_declared,
         header_node::{
             fault::FaultEnd,
             stale::{StaleWindow, Staleness},
@@ -38,13 +35,13 @@ use zakura_sim::{
         header_sync::{HeaderWire, StorageView, WirePorts, WireScenario, HEADER_FAULT_PENALIZED},
         run_prepared, HarnessError, Subsystem, WITNESS_FILE,
     },
-    model::{is_fault_cause, Label},
-    observe::{Entry, ReactorFact, StorageFact, StorageRequest, StorageResult, StreamId},
+    model::Label,
+    observe::{ReactorFact, StorageFact, StorageRequest, StorageResult},
     peer::{honest::HonestChain, PeerAction},
     property::HasView,
     witness::{check_witness, Expect, WitnessScenario},
-    Checker, MemorySink, NoChecks, Observation, ObservationLog, Plan, PlanInput, PropertyOutcome,
-    RecordSink, RunReport,
+    Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RecordSink,
+    RunReport,
 };
 use zakura_storage::header::fixture::HeaderFixture;
 
@@ -117,35 +114,6 @@ struct Shape {
     misbehavior: Vec<(Option<u64>, Option<u64>)>,
     /// Where each `FrameJudged` of a `BadContent` page sits in the log.
     judged_bad: Vec<usize>,
-}
-
-/// Whether `shape` holds a `Misbehavior` from session `session`, joined
-/// by its origin's whole [`SessionIdRef`], that the node reported after
-/// the session ended, with no current session.
-fn penalized_late(shape: &Shape, session: u64) -> bool {
-    let sent = SessionIdRef {
-        session_id: session,
-    };
-    shape.misbehavior.iter().any(|(origin, current)| {
-        current.is_none()
-            && SessionIdRef::joins(&sent, origin, |origin| {
-                origin.map(|session_id| SessionIdRef { session_id })
-            })
-    })
-}
-
-/// A late penalty joins the session that sent the page by its whole
-/// origin: a `Misbehavior` from session 3 after it ended is session 3's,
-/// and one from another session isn't.
-#[test]
-fn a_late_penalty_joins_its_origin_session() {
-    assert_one_key_off::<SessionIdRef>(&SessionIdRef { session_id: 3 }, |origin| {
-        let shape = Shape {
-            misbehavior: vec![(Some(origin.session_id), None)],
-            ..Shape::default()
-        };
-        penalized_late(&shape, 3)
-    });
 }
 
 /// Reads `report`'s shape.
@@ -241,90 +209,9 @@ fn assert_penalized(label: &str, report: &RunReport, view: &StorageView) -> Shap
     shape
 }
 
-/// The causes the node closed each connection that carried a `BadContent`
-/// page in `entries` with, in log order, by that connection, each close
-/// joined to its page by its [`ConnectionRef`].
-fn bad_page_closes(entries: &[Entry]) -> Vec<(u64, Vec<String>)> {
-    let mut connections: Vec<u64> = entries
-        .iter()
-        .filter_map(|entry| match &entry.obs {
-            Observation::PeerFrame {
-                connection, label, ..
-            } if *label == Label::BadContent => Some(*connection),
-            _ => None,
-        })
-        .collect();
-    connections.dedup();
-    connections
-        .into_iter()
-        .map(|connection| {
-            let page = ConnectionRef { connection };
-            let causes = entries
-                .iter()
-                .filter(|entry| {
-                    ConnectionRef::joins(&page, *entry, |entry| match &entry.obs {
-                        Observation::ConnectionClosed { connection, .. } => Some(ConnectionRef {
-                            connection: *connection,
-                        }),
-                        _ => None,
-                    })
-                })
-                .filter_map(|entry| match &entry.obs {
-                    Observation::ConnectionClosed { cause, .. } => Some(cause.clone()),
-                    _ => None,
-                })
-                .collect();
-            (connection, causes)
-        })
-        .collect()
-}
-
-/// A bad page's close joins it by its connection: connection 1's
-/// `BadContent` page and a fault close of connection 1 are a close of the
-/// page's connection, and the same close of another connection isn't.
-#[test]
-fn a_bad_page_joins_the_close_of_its_own_connection() {
-    let page = ConnectionRef { connection: 1 };
-    let closes = |closed: &ConnectionRef| {
-        let mut log = ObservationLog::default();
-        log.push(Observation::PeerFrame {
-            connection: page.connection,
-            stream: StreamId {
-                kind: 64,
-                version: 1,
-            },
-            quic_stream: None,
-            seq: 0,
-            row: Some("headers".to_owned()),
-            rule_stream: StreamId {
-                kind: 64,
-                version: 1,
-            },
-            label: Label::BadContent,
-            exhausted: false,
-            exchange: None,
-            payload: 8,
-        });
-        log.push(Observation::ConnectionClosed {
-            connection: closed.connection,
-            cause: "service_protocol_reject".to_owned(),
-        });
-        bad_page_closes(log.entries())
-    };
-    assert_eq!(
-        closes(&page),
-        [(1, vec!["service_protocol_reject".to_owned()])]
-    );
-    assert_one_key_off::<ConnectionRef>(&page, |closed| {
-        closes(closed).iter().any(|(_, causes)| !causes.is_empty())
-    });
-}
-
 /// The node prepares the invalid tip, penalizes the peer and closes it. The
 /// close isn't one `conformant-never-closes` flags, since the page was judged
-/// at its preparation. The fault's session is still current, so its close
-/// is owed, and it closes the page's connection with a fault cause, as a
-/// subscriber's content rejection does.
+/// at its preparation.
 #[test]
 fn an_invalid_page_is_judged_at_prepare_and_penalized() {
     for (index, plan) in plans().into_iter().enumerate() {
@@ -336,14 +223,6 @@ fn an_invalid_page_is_judged_at_prepare_and_penalized() {
                 .iter()
                 .all(|(origin, current)| origin == current),
             "plan {index}: the session that sent the page was still current: {shape:?}"
-        );
-        let closes = bad_page_closes(report.log.entries());
-        assert!(
-            !closes.is_empty()
-                && closes
-                    .iter()
-                    .all(|(_, causes)| causes.first().is_some_and(|cause| is_fault_cause(cause))),
-            "plan {index}: the page's connection closed with a fault cause: {closes:?}"
         );
     }
 }
@@ -366,7 +245,7 @@ fn a_disconnect_mid_prepare_is_still_penalized() {
         let shape = assert_penalized(&format!("plan {index}"), &report, &view);
         let (_, session, _) = shape.prepare.expect("checked above");
         assert!(
-            penalized_late(&shape, session),
+            shape.misbehavior.contains(&(Some(session), None)),
             "plan {index}: the penalty came after the session ended: {shape:?}"
         );
         assert_stale_fault_inert(index, &report, &view, &shape);
@@ -638,16 +517,14 @@ fn regenerate_late_fault_fixture() {
     );
     write(
         LATE_FAULT_SCRIPT,
-        serde_json::to_string_pretty(&late_fault_script()).expect("Plans serialize"),
+        serde_json::to_string(&late_fault_script()).expect("Plans serialize"),
     );
 }
 
 /// On `header-sync/wire` itself, the committed late fault holds
 /// `header-sync/header-fault-penalized` with its trigger history and no
-/// violation, and the property applies. The fault is late: the node
-/// penalized the session that sent the invalid page after it ended. The
-/// run is the penalty's counted history, `committed late-fault input`,
-/// which the acceptance tool records from this declaration (C18).
+/// violation. The fault is late: the node penalized the session that sent
+/// the invalid page after it ended.
 #[test]
 fn the_late_fault_fixture_penalizes_after_the_session_ended() {
     let (scenario, script) = committed_late_fault();
@@ -659,27 +536,7 @@ fn the_late_fault_fixture_penalizes_after_the_session_ended() {
         HEADER_FAULT_PENALIZED,
         Expect::Holds,
     );
-    let report = run_declared(
-        HeaderWire::NAME,
-        "committed late-fault input",
-        &scenario,
-        PlanInput::Script(script),
-        |scenario, plan, sink| run_wire_into(scenario, plan, sink, None),
-    );
-    assert!(
-        report.end.violation.is_none() && report.end.harness.is_none(),
-        "{:?}",
-        report.end
-    );
-    let outcome = report
-        .properties
-        .iter()
-        .find(|property| property.property == HEADER_FAULT_PENALIZED)
-        .map(|property| property.outcome.clone());
-    assert!(
-        matches!(outcome, Some(PropertyOutcome::Held { applicable }) if applicable > 0),
-        "{outcome:?}"
-    );
+    let (report, _) = run_wire(&scenario, PlanInput::Script(script), None);
     let shape = shape(&report);
     let (_, session, _) = shape.prepare.expect("the node prepared the invalid tip");
     assert_eq!(
@@ -689,7 +546,7 @@ fn the_late_fault_fixture_penalizes_after_the_session_ended() {
         })
     );
     assert!(
-        penalized_late(&shape, session),
+        shape.misbehavior.contains(&(Some(session), None)),
         "the penalty came after the session ended: {shape:?}"
     );
 }

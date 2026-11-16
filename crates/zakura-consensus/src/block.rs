@@ -362,10 +362,12 @@ async fn confirm_auth_data_binding<S>(
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone,
 {
-    // Commit already checked the binding, and only a deterministic verdict needs it.
+    // Commit, or the early-relay eligibility check for a rejected hash, already checked the
+    // binding, and only a deterministic verdict needs it.
     if matches!(
         error,
         VerifyBlockError::Commit(_)
+            | VerifyBlockError::EarlyRelayRejected(_)
             | VerifyBlockError::Transaction(
                 TransactionError::DuplicateTransparentSpend(_)
                     | TransactionError::DuplicateSproutNullifier(_)
@@ -506,16 +508,6 @@ where
         let network = self.network.clone();
         let prepared_candidates = self.prepared_candidates.clone();
         let early_relay = self.early_relay.clone();
-
-        // A negotiated peer cannot be scored for an authenticated block that failed later, so a
-        // recently rejected one is not verified again.
-        if matches!(request, Request::CommitEarlyRelay(_))
-            && early_relay
-                .as_ref()
-                .is_some_and(|relay| relay.is_rejected(hash))
-        {
-            return async move { Err(VerifyBlockError::EarlyRelayRejected(hash)) }.boxed();
-        }
 
         // We don't include the block hash, because it's likely already in a parent span
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
@@ -683,6 +675,30 @@ where
                 // and the state's authorizing-data check.
                 let auth_data_digests = block.view().auth_data_digests();
                 auth_data_root = Some(auth_data_digests.root);
+
+                // A negotiated peer cannot be scored for an authenticated block that failed
+                // later, so a recently rejected one is not verified again. The block hash covers
+                // only the header, so the delivered body must first match the header's
+                // commitments. A body that doesn't is verified normally and scored for its fault.
+                if matches!(request, Request::CommitEarlyRelay(_))
+                    && early_relay
+                        .as_ref()
+                        .is_some_and(|relay| relay.is_rejected(hash))
+                    && matches!(
+                        relay_eligibility(
+                            state_service.clone(),
+                            zs::BlockCommitmentData {
+                                block: request.block(),
+                                auth_data_root,
+                            },
+                        )
+                        .await,
+                        Ok(zs::PreparedMinedRelayEligibility::Authorized
+                            | zs::PreparedMinedRelayEligibility::CommitFirst)
+                    )
+                {
+                    return Err(VerifyBlockError::EarlyRelayRejected(hash));
+                }
 
                 // ZIP 234 derives the block subsidy from the NSM value balance after the parent
                 // block, so a block at or above the start height needs its parent's chain

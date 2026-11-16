@@ -4549,3 +4549,68 @@ async fn pre_nu5_early_relay_failure_keeps_its_score() {
     ));
     assert_eq!(error.misbehavior_score(), 100);
 }
+
+/// A recently rejected hash skips verification only for a body that matches the header. The
+/// block hash covers only the header, so a different body under the same hash is verified and
+/// scored for its own fault.
+#[tokio::test(start_paused = true)]
+async fn rejected_early_relay_hash_skips_only_an_authenticated_body() {
+    use zakura_header_chain::{BodyCommitmentKind, BodyVerificationClass};
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let block = nu5_prepared_test_block(&network, Some(LockTime::unlocked()));
+    let hash = block.hash();
+
+    let verifier = |relay: EarlyRelay| {
+        let state = service_fn(|request: zs::Request| async move {
+            let response = match request {
+                zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                zs::Request::CheckPreparedMinedRelayEligibility(_) => {
+                    zs::Response::PreparedMinedRelayEligibility(
+                        zs::PreparedMinedRelayEligibility::Authorized,
+                    )
+                }
+                _ => panic!("a rejected redelivery needs no other state request: {request:?}"),
+            };
+            Ok::<_, BoxError>(response)
+        });
+        let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+            panic!("a rejected redelivery must not verify transactions");
+        });
+        SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        )
+        .with_early_relay(Some(relay))
+    };
+
+    let relay = EarlyRelay::default();
+    relay.reject(hash);
+    let error = verifier(relay.clone())
+        .oneshot(Request::CommitEarlyRelay(Arc::new(block.clone()).into()))
+        .await
+        .expect_err("the hash was rejected");
+    assert!(
+        matches!(error, VerifyBlockError::EarlyRelayRejected(rejected) if rejected == hash),
+        "{error:?}"
+    );
+    assert_eq!(error.misbehavior_score(), 0);
+
+    // The same header with a different body is a payload mismatch, not a rejected redelivery.
+    let mut tampered = block;
+    tampered
+        .transactions
+        .push(shielded_spend_without_transparent_inputs());
+    assert_eq!(tampered.hash(), hash);
+    let error = verifier(relay)
+        .oneshot(Request::CommitEarlyRelay(Arc::new(tampered).into()))
+        .await
+        .expect_err("the body doesn't match the header");
+    assert_eq!(
+        error.body_verification_class(),
+        BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
+    );
+    assert!(error.misbehavior_score() > 0, "{error:?}");
+}

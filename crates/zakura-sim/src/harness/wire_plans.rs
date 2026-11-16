@@ -251,6 +251,7 @@ pub fn progress_scenario() -> WireScenario {
             reply_holds: Vec::new(),
             disruptions: Vec::new(),
         },
+        budget: None,
     }
 }
 
@@ -373,6 +374,7 @@ pub fn act_scenario(act: Act) -> WireScenario {
         node: Chain::main(node),
         peers: vec![peer],
         policy: Policy::converging(),
+        budget: None,
     }
 }
 

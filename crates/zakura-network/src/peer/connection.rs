@@ -19,7 +19,10 @@ use zakura_node_services::block_memory::BlockHandle;
 
 use futures::{future::Either, prelude::*};
 use rand_10::{rng as thread_rng, seq::SliceRandom, RngExt};
-use tokio::time::{sleep, Sleep};
+use tokio::{
+    sync::Semaphore,
+    time::{sleep, Sleep},
+};
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
@@ -55,6 +58,7 @@ use crate::{
 
 use InventoryResponse::*;
 
+mod compact_relay;
 mod peer_tx;
 
 #[cfg(test)]
@@ -607,6 +611,8 @@ pub(crate) struct ConnectionRequests<C> {
     pub(crate) block_advert_rx: tokio::sync::mpsc::Receiver<BlockAdvert>,
     /// Warm-up pings, written only when nothing else is ready.
     pub(crate) warmup_rx: tokio::sync::mpsc::Receiver<WarmupChunk>,
+    /// The peer set's high-bandwidth compact block source selection for this connection.
+    pub(crate) compact_receive_rx: tokio::sync::watch::Receiver<Option<Arc<Semaphore>>>,
     pub(crate) minimum_peer_version: MinimumPeerVersion<C>,
     pub(crate) bans: BannedIps,
 }
@@ -671,6 +677,14 @@ where
     /// The last warm-up ping, until its `pong` arrives. The warm-up task waits for each `pong`
     /// before it sends the next ping.
     pending_warmup: Option<PendingWarmup>,
+
+    /// Holds `Some(slots)` while the peer set selects this connection as a high-bandwidth
+    /// compact block source, and `None` otherwise. Only a connection that negotiated compact
+    /// blocks reads it.
+    compact_receive_rx: tokio::sync::watch::Receiver<Option<Arc<Semaphore>>>,
+
+    /// The compact block relay state of a connection that negotiated compact blocks.
+    compact: compact_relay::CompactRelay,
 
     /// Live authorization, rechecked immediately before advert writes.
     minimum_peer_version: MinimumPeerVersion<C>,
@@ -804,6 +818,7 @@ where
             client_rx,
             block_advert_rx,
             warmup_rx,
+            compact_receive_rx,
             minimum_peer_version,
             bans,
         }: ConnectionRequests<C>,
@@ -826,6 +841,8 @@ where
             advert_waiting_since: None,
             warmup_rx,
             pending_warmup: None,
+            compact_receive_rx,
+            compact: Default::default(),
             minimum_peer_version,
             bans,
             error_slot,
@@ -867,6 +884,13 @@ where
     where
         Rx: Stream<Item = Result<Message, SerializationError>> + Unpin,
     {
+        // A connection that negotiated compact blocks first tells the peer whether to
+        // announce new blocks with `cmpctblock`.
+        if self.connection_info.early_block_relay {
+            let permit = self.try_take_receive_slot();
+            self.set_compact_receive(permit).await;
+        }
+
         // At a high level, the event loop we want is as follows: we check for any
         // incoming messages from the remote peer, check if they should be interpreted
         // as a response to a pending client request, and if not, interpret them as a
@@ -889,6 +913,23 @@ where
         //
         // TODO: turn this comment into a module-level comment, after splitting the module.
         loop {
+            // A demoted connection writes `sendcmpct(0, 1)` before anything else, then
+            // releases its slot. A failed write fails the connection.
+            let compact_negotiated = self.connection_info.early_block_relay;
+            let receive_slots = if compact_negotiated {
+                let slots = self.compact_receive_rx.borrow_and_update().clone();
+                if slots.is_none() && self.compact.receive_permit.is_some() {
+                    self.set_compact_receive(None).await;
+                }
+                slots
+            } else {
+                None
+            };
+            // A selected connection without a slot waits for one, then writes `sendcmpct(1, 1)`.
+            let awaits_receive_slot = compact_negotiated && self.compact.receive_permit.is_none();
+            let receive_slot = compact_relay::acquire_receive_slot(receive_slots);
+            tokio::pin!(receive_slot);
+
             self.update_state_metrics(None);
 
             // Each way out of a client request reaches this point before the next one
@@ -959,6 +1000,11 @@ where
                     // the wire, and which costs it one unsolicited `inv` later.
                     let incoming = tokio::select! {
                         biased;
+                        Ok(()) = self.compact_receive_rx.changed(), if compact_negotiated => continue,
+                        permit = &mut receive_slot, if awaits_receive_slot => {
+                            self.set_compact_receive(Some(permit)).await;
+                            continue;
+                        }
                         msg = peer_rx.next(), if !advert_due => Either::Left(msg),
                         // A closed advert channel disables only this branch.
                         Some(advert) = self.block_advert_rx.recv() => {
@@ -1035,6 +1081,7 @@ where
                     // connection to be:
                     // - cancellation, then
                     // - timeout, then
+                    // - compact block source selection changes, then
                     // - peer messages, then
                     // - block adverts, then
                     // - warm-up pings.
@@ -1086,6 +1133,11 @@ where
                                     self.client_rx
                                 ),
                             };
+                            continue;
+                        }
+                        Ok(()) = self.compact_receive_rx.changed(), if compact_negotiated => continue,
+                        permit = &mut receive_slot, if awaits_receive_slot => {
+                            self.set_compact_receive(Some(permit)).await;
                             continue;
                         }
                         msg = peer_rx.next().instrument(span.clone()), if !advert_due => msg,
@@ -1748,10 +1800,14 @@ where
             }
             .into(),
             Message::Mempool => Request::MempoolTransactionIds.into(),
-            // Compact block relay isn't used yet. The codec drops these messages unless they
-            // were negotiated, so a peer that sends them is not misbehaving.
-            Message::SendCompact { .. }
-            | Message::CompactBlock(_)
+            // The codec drops `sendcmpct` unless the connection negotiated compact blocks.
+            Message::SendCompact { announce, version } => {
+                self.compact.received_send_compact(announce, version);
+                Consumed
+            }
+            // Compact block announcements and recovery aren't used yet. The codec drops these
+            // messages unless they were negotiated, so a peer that sends them is not misbehaving.
+            Message::CompactBlock(_)
             | Message::GetBlockTransactions(_)
             | Message::BlockTransactions(_) => {
                 debug!(%msg, "ignoring compact block relay message");
@@ -2285,6 +2341,8 @@ where
         self.block_advert_rx.close();
         self.block_uploads.disconnected();
         self.request_slot.set_busy(true);
+        // A failed connection can't receive announcements, even if closing its writer stalls.
+        self.compact.receive_permit = None;
 
         // Update the shared error slot
         //

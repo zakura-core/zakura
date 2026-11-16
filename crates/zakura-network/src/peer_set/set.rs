@@ -819,6 +819,11 @@ where
                         continue;
                     }
 
+                    if let Some(compact_source) = svc.compact_source() {
+                        self.inventory_registry
+                            .add_compact_source(key, compact_source.clone());
+                    }
+
                     self.push_unready(key, svc);
                 }
             }
@@ -1644,7 +1649,8 @@ where
     /// poll, so its wakeups are registered when this returns `Poll::Pending`.
     ///
     /// Refreshes the inventory registry here rather than in maintenance, because only request
-    /// routing reads it, and asks the crawler for more peers when none is ready.
+    /// routing reads it, then selects the high-bandwidth compact block sources from it. Asks the
+    /// crawler for more peers when none is ready.
     ///
     /// A syncing node also waits while the peers it downloads old blocks from are all busy,
     /// although pruned peers may be ready: see [`Self::awaits_archive_block_source`].
@@ -1653,6 +1659,10 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), BoxError>> {
         let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
+        self.inventory_registry.select_compact_sources(
+            self.minimum_peer_version.chain_tip().best_tip_hash(),
+            |peer| self.ready_services.contains_key(peer) || self.cancel_handles.contains_key(peer),
+        );
 
         if self.ready_services.is_empty() || self.awaits_archive_block_source() {
             // # Correctness

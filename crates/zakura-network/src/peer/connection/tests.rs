@@ -27,6 +27,7 @@ use crate::{
     Request, Response, VersionMessage,
 };
 
+mod compact_relay;
 mod prop;
 mod vectors;
 mod warmup;
@@ -203,17 +204,20 @@ fn new_test_connection_with_protection<A>(
 /// Returns the request channel and authorization for a test connection.
 ///
 /// The block advert channel is closed, which disables it; tests that send adverts replace
-/// `block_advert_rx`.
+/// `block_advert_rx`. The compact block source watch is closed and holds `None`; tests that
+/// select the connection as a source replace `compact_receive_rx`.
 fn test_connection_channels(
     client_rx: mpsc::Receiver<ClientRequest>,
 ) -> super::ConnectionRequests<zakura_chain::chain_tip::NoChainTip> {
     let (_block_advert_tx, block_advert_rx) =
         tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
     let (_warmup_tx, warmup_rx) = tokio::sync::mpsc::channel(crate::peer::tcp_warmup::WARMUP_QUEUE);
+    let (_compact_receive_tx, compact_receive_rx) = tokio::sync::watch::channel(None);
     super::ConnectionRequests {
         client_rx,
         block_advert_rx,
         warmup_rx,
+        compact_receive_rx,
         minimum_peer_version: crate::peer::MinimumPeerVersion::new(
             zakura_chain::chain_tip::NoChainTip,
             &zakura_chain::parameters::Network::Mainnet,

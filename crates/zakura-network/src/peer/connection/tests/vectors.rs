@@ -3068,6 +3068,13 @@ async fn early_relay_connection_tags_block_requests_and_deliveries() {
         super::new_early_relay_test_connection::<PanicAssertion>();
     let connection_task = tokio::spawn(connection.run(peer_rx));
     let (_tx, block) = response_vectors();
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::SendCompact {
+            announce: false,
+            version: 1
+        }),
+    );
 
     peer_tx
         .send(Ok(Message::GetData(vec![block.hash().into()])))
@@ -3153,9 +3160,16 @@ async fn outbound_early_block_request_is_rejected() {
     let _init_guard = zakura_test::init();
 
     let (_peer_tx, peer_rx) = mpsc::channel(4);
-    let (connection, mut client_tx, _inbound, _outbound, _error_slot) =
+    let (connection, mut client_tx, _inbound, mut outbound, _error_slot) =
         super::new_early_relay_test_connection::<PanicAssertion>();
     let connection_task = tokio::spawn(connection.run(peer_rx));
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::SendCompact {
+            announce: false,
+            version: 1
+        }),
+    );
 
     let (request, response) =
         client_request(Request::EarlyBlocksByHash([block::Hash([1; 32])].into()));

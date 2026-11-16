@@ -164,6 +164,9 @@ cookie_dir = "@RPC_COOKIE_DIR@"
 cookie_file_name = ".cookie"
 debug_force_finished_sync = false
 enable_cookie_auth = true
+# Requires cookie authentication. Validate the exact final block on a trusted
+# full node before submitting it here; peers can ban relays of invalid blocks.
+enable_trusted_block_submission = false
 max_response_body_size = 52428800
 parallel_cpu_threads = 0
 

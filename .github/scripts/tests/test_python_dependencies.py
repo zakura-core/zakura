@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import yaml
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 SETUP = "./.github/actions/setup-python"
 
 
@@ -156,12 +156,12 @@ class AuditIntegrationTests(unittest.TestCase):
         for name in ("pyproject.toml", "uv.lock"):
             shutil.copyfile(ROOT / name, self.project / name)
 
-    def audit(self, server, platform="x86_64-unknown-linux-gnu"):
+    def audit(self, server, platform="x86_64-unknown-linux-gnu", *, frozen=False):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
             return subprocess.run(
-                ["uv", "audit", "--locked", "--no-build", "--no-cache", "--python-version", "3.12", "--python-platform", platform,
+                ["uv", "audit", "--frozen" if frozen else "--locked", "--no-build", "--no-cache", "--python-version", "3.12", "--python-platform", platform,
                  "--service-url", f"http://127.0.0.1:{server.server_port}/v1"],
                 cwd=self.project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 env={**os.environ, "UV_HTTP_RETRIES": "0", "UV_HTTP_TIMEOUT": "5"}, timeout=30,
@@ -196,18 +196,24 @@ class AuditIntegrationTests(unittest.TestCase):
         manifest.write_text(manifest.read_text().replace(
             json.dumps(requirement), json.dumps(requirement + "; sys_platform == 'darwin'"),
         ))
-        locked = subprocess.run(
-            ["uv", "lock", "--offline", "--no-build"], cwd=self.project,
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
-        )
-        self.assertEqual(locked.returncode, 0, locked.stdout)
+        # Make an audit fixture without resolving or relying on cached PyPI
+        # metadata. Frozen mode checks the supplied graph; separate tests check
+        # that the production command rejects a stale lock.
+        lock = self.project / "uv.lock"
+        lock.write_text(lock.read_text().replace(
+            '{ name = "codespell" }',
+            '{ name = "codespell", marker = "sys_platform == \'darwin\'" }',
+        ).replace(
+            '{ name = "codespell", specifier =',
+            '{ name = "codespell", marker = "sys_platform == \'darwin\'", specifier =',
+        ))
         # uv 0.11.8 conservatively queries all reachable locked packages even
         # when target selectors are provided. Require coverage on both Macs;
         # do not require the audit to omit the package on Linux.
         for platform in ("x86_64-apple-darwin", "aarch64-apple-darwin"):
             with self.subTest(platform=platform):
                 server = AdvisoryServer(vulnerable="codespell")
-                result = self.audit(server, platform)
+                result = self.audit(server, platform, frozen=True)
                 self.assertIn("codespell", server.queried)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("TEST-2026-0001", result.stdout)

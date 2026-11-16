@@ -84,7 +84,7 @@ jobs:
         with:
           group: test
       - name: Check dependency policy and audit failures
-        run: python3 -m unittest discover -s scripts/tests -p 'test_python_dependencies.py'
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_python_dependencies.py'
       - name: Audit every Python dependency group
         if: ${{ !cancelled() }}
         shell: bash

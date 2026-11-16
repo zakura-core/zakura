@@ -23,7 +23,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use siphasher::sip::SipHasher24;
 
 use zakura_chain::{
-    block::{self, BlockRef, MAX_BLOCK_BYTES},
+    block::{self, Block, BlockRef, MAX_BLOCK_BYTES},
     serialization::{
         CompactSizeMessage, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashReader,
         ZcashSerialize,

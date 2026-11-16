@@ -409,6 +409,10 @@ pub struct Inbound {
 
     /// Verified tip children served to negotiated early-relay peers before their commit.
     early_relay: Option<EarlyRelay>,
+
+    /// Answers the compact block relay checks of negotiated connections, if compact block
+    /// relay is on.
+    compact_relay: Option<compact::CompactRelay>,
 }
 
 impl Inbound {
@@ -439,12 +443,21 @@ impl Inbound {
             )),
             pending_blocks: PendingBlockRegistry::default(),
             early_relay: None,
+            compact_relay: None,
         }
     }
 
     /// Serves `early_relay` blocks to connections that negotiated early block relay.
     pub fn with_early_relay(mut self, early_relay: Option<EarlyRelay>) -> Self {
         self.early_relay = early_relay;
+        self
+    }
+
+    /// Answers the compact block relay checks of negotiated connections with `compact_relay`.
+    ///
+    /// Without it, every compact block relay check fails, so connections download whole blocks.
+    pub fn with_compact_relay(mut self, compact_relay: Option<compact::CompactRelay>) -> Self {
+        self.compact_relay = compact_relay;
         self
     }
 
@@ -907,6 +920,32 @@ impl Service<zn::Request> for Inbound {
                     _ => unreachable!("Mempool component should always respond to a `TransactionIds` request with a `TransactionIds` response"),
                 })
                     .boxed()
+            }
+            request @ (zn::Request::CheckCompactHeader(_)
+            | zn::Request::CompactBlockTransactions(_)
+            | zn::Request::CheckCompactBlock(_)) => {
+                let Some(compact_relay) = self.compact_relay.clone() else {
+                    return async { Err("compact block relay is off".into()) }.boxed();
+                };
+                let mempool = mempool.clone();
+
+                async move {
+                    match request {
+                        zn::Request::CheckCompactHeader(compact) => compact_relay
+                            .check_header(compact)
+                            .await
+                            .map(|()| zn::Response::Nil),
+                        zn::Request::CompactBlockTransactions(compact) => compact_relay
+                            .block_transactions(compact, mempool)
+                            .await
+                            .map(zn::Response::CompactBlockTransactions),
+                        zn::Request::CheckCompactBlock(block) => compact_relay
+                            .check_block(block)
+                            .await
+                            .map(|()| zn::Response::Nil),
+                        _ => unreachable!("matched compact block relay request"),
+                    }
+                }.boxed()
             }
             zn::Request::DisconnectPeer(_) => unreachable!("disconnect requests are local to the peer set"),
             zn::Request::Ping(_) => {

@@ -1468,7 +1468,13 @@ where
                 | AdvertiseMinedBlock(_)
                 | AdvertiseEarlyBlock(_),
             ) => Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService))),
-            (_, EarlyBlocksByHash(_)) => Ok(Handler::Finished(Err(PeerError::InboundOnlyRequest))),
+            (
+                _,
+                EarlyBlocksByHash(_)
+                | CheckCompactHeader(_)
+                | CompactBlockTransactions(_)
+                | CheckCompactBlock(_),
+            ) => Ok(Handler::Finished(Err(PeerError::InboundOnlyRequest))),
             (Failed, request) => panic!(
                 "failed connection cannot handle new request: {:?}, client_receiver: {:?}",
                 request,
@@ -2085,6 +2091,9 @@ where
         // TODO: split response handler into its own method
         match rsp.clone() {
             Response::Nil => { /* generic success, do nothing */ }
+            Response::CompactBlockTransactions(_) => {
+                error!("inbound service answered a peer message with compact block candidates");
+            }
             Response::Peers(addrs) => {
                 if let Err(e) = self.peer_tx.send(Message::Addr(addrs)).await {
                     self.fail_with(e).await;

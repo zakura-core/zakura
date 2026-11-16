@@ -116,6 +116,13 @@ pub enum Response {
     //
     // TODO: make this into a HashMap<UnminedTxId, InventoryResponse<UnminedTx, ()>> - a unique list (#2244)
     Transactions(Vec<InventoryResponse<(UnminedTx, Option<PeerSocketAddr>), UnminedTxId>>),
+
+    /// The mempool transactions that match the short IDs of a `cmpctblock`, in no particular
+    /// order. Their total size is at most the block size limit.
+    ///
+    /// Only the inbound service creates this variant, in response to
+    /// [`Request::CompactBlockTransactions`](super::Request::CompactBlockTransactions).
+    CompactBlockTransactions(Vec<UnminedTx>),
 }
 
 impl fmt::Display for Response {
@@ -160,6 +167,11 @@ impl fmt::Display for Response {
                 transactions.iter().filter(|r| r.is_available()).count(),
                 transactions.iter().filter(|r| r.is_missing()).count()
             ),
+
+            Response::CompactBlockTransactions(transactions) => format!(
+                "CompactBlockTransactions {{ transactions: {} }}",
+                transactions.len()
+            ),
         })
     }
 }
@@ -181,6 +193,7 @@ impl Response {
             Response::Blocks(_) => "Blocks",
             Response::EarlyBlocks(_) => "EarlyBlocks",
             Response::Transactions(_) => "Transactions",
+            Response::CompactBlockTransactions(_) => "CompactBlockTransactions",
         }
     }
 

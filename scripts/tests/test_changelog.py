@@ -106,6 +106,82 @@ class ChangelogTests(unittest.TestCase):
                     self.root, "base", "head", "123", False, False
                 )
 
+    def test_revert_may_delete_the_fragment_its_reverted_commit_added(self):
+        """A revert of an unreleased PR takes that PR's fragment with it."""
+        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
+        path.write_text("<!-- changelog: none -->\n\nThis PR reverts PR 122.\n")
+        reverted = "a" * 40
+
+        with mock.patch.object(
+            changelog,
+            "run_git",
+            side_effect=[
+                "A\tdocs/changelog/unreleased/123.md\n"
+                "D\tdocs/changelog/unreleased/122.md\n"
+                "M\tzakura-chain/src/lib.rs\n",
+                f'Revert "feat: add a thing"\n\nThis reverts commit {reverted}.\n',
+                "docs/changelog/unreleased/122.md\n",
+            ],
+        ) as run_git:
+            changelog.check_pull_request(self.root, "base", "head", "123", False, False)
+
+        run_git.assert_has_calls(
+            [
+                mock.call(self.root, ["log", "--format=%B", "base..head"]),
+                mock.call(
+                    self.root,
+                    [
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        "--diff-filter=A",
+                        reverted,
+                        "--",
+                        "docs/changelog/unreleased",
+                    ],
+                ),
+            ]
+        )
+
+    def test_revert_cannot_delete_a_fragment_its_reverted_commit_did_not_add(self):
+        """Only the reverted commit's own fragments may go."""
+        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
+        path.write_text("<!-- changelog: none -->\n\nThis PR reverts PR 122.\n")
+
+        with mock.patch.object(
+            changelog,
+            "run_git",
+            side_effect=[
+                "A\tdocs/changelog/unreleased/123.md\n"
+                "D\tdocs/changelog/unreleased/121.md\n",
+                f"This reverts commit {'a' * 40}.\n",
+                "docs/changelog/unreleased/122.md\n",
+            ],
+        ):
+            with self.assertRaisesRegex(changelog.ChangelogError, "unexpected.*121.md"):
+                changelog.check_pull_request(
+                    self.root, "base", "head", "123", False, False
+                )
+
+    def test_revert_cannot_edit_the_fragment_its_reverted_commit_added(self):
+        """The exemption covers deletion only, so no revert lookup runs."""
+        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
+        path.write_text("<!-- changelog: none -->\n\nThis PR reverts PR 122.\n")
+
+        with mock.patch.object(
+            changelog,
+            "run_git",
+            return_value=(
+                "A\tdocs/changelog/unreleased/123.md\nM\tdocs/changelog/unreleased/122.md\n"
+            ),
+        ) as run_git:
+            with self.assertRaisesRegex(changelog.ChangelogError, "unexpected.*122.md"):
+                changelog.check_pull_request(
+                    self.root, "base", "head", "123", False, False
+                )
+        run_git.assert_called_once()
+
     def test_pull_request_may_move_fragments_without_content_changes(self):
         with mock.patch.object(
             changelog,

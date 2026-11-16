@@ -92,10 +92,6 @@ impl From<block::Hash> for AdvertisedBlock {
 pub enum Request {
     /// Disconnect a legacy peer without changing its misbehavior score or ban status.
     /// The peer set handles this request locally and returns [`super::Response::Nil`].
-    ///
-    /// The peer set leaves an unconditional peer connected. It checks when it handles
-    /// the request, so a peer that a DNS answer makes unconditional while the request
-    /// waits also stays connected.
     DisconnectPeer(PeerSocketAddr),
 
     /// Requests additional peers from the server.

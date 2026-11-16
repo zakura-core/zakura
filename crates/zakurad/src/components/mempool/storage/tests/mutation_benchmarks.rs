@@ -88,8 +88,7 @@ impl Fixture {
         let root = self.package[0].0.transaction.id().mined_id();
         let mined = [root].into_iter().collect();
         let start = Instant::now();
-        self.storage.clear_mined_dependencies(black_box(&mined));
-        let removed = black_box(self.storage.verified.remove_all(black_box([root])));
+        let removed = black_box(self.storage.verified.remove_mined(black_box(&mined)));
         let elapsed = start.elapsed();
         assert_eq!(removed.len(), 1);
 
@@ -240,7 +239,6 @@ fn benchmark_mempool_full_block_deletion() {
         let mut sample = || {
             let transactions = block.transactions.clone();
             let start = Instant::now();
-            storage.clear_mined_dependencies(black_box(&mined));
             let removed = black_box(
                 storage.reject_and_remove_same_effects(black_box(&mined), black_box(transactions)),
             );

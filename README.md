@@ -111,6 +111,20 @@ Alternatively, you can install it from GitHub:
 cargo install --git https://github.com/zakura-core/zakura --tag v1.8.7 zakura
 ```
 
+Sprout JoinSplit proof and signature verification is disabled by default. When
+bootstrapping from a [snapshot](https://zakura.com/snapshots/), choose one at or
+after NU7 activation for your network. To fully verify pre-NU7 blocks above the
+last checkpoint, including Testnet sync from genesis with the current
+checkpoints, enable the `sprout` Cargo feature:
+
+```sh
+cargo build --locked --release --package zakura --features sprout
+```
+
+Builds without `sprout` stall if they encounter such a block with a JoinSplit;
+they do not mark it as consensus-invalid. You can also add `--features sprout`
+to `cargo install` when installing a build with historical verification support.
+
 Standard x86-64 builds enable Pasta field assembly through the default
 `x86_64-asm` Cargo feature. Both BMI2 and ADX CPU extensions are required;
 `RUSTFLAGS` is not needed:

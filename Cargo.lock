@@ -2825,6 +2825,7 @@ dependencies = [
  "rand_core 0.6.4",
  "rayon",
  "ref-cast",
+ "ring",
  "ripemd",
  "secp256k1",
  "serde",

@@ -22,7 +22,7 @@ use futures::{
 use indexmap::IndexSet;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc, oneshot},
+    sync::{broadcast, mpsc},
     time::Instant,
 };
 use tokio_stream::wrappers::IntervalStream;
@@ -53,7 +53,6 @@ use crate::{
     peer_registry::PeerRegistry,
     peer_set::{set::MorePeers, ActiveConnectionCounter, CandidateSet, ConnectionTracker, PeerSet},
     protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
-    unconditional_peer_set::UnconditionalPeerSet,
     zakura::{CustomService, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup},
     AddressBook, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
 };
@@ -65,8 +64,8 @@ mod recent_by_ip;
 mod unconditional_peers;
 
 use unconditional_peers::{
-    keep_unconditional_peers_connected, leave_out_undialable_unconditional_peers, resolve_host,
-    unconditional_peer_dial_targets,
+    keep_unconditional_peers_connected, leave_out_undialable_unconditional_peers,
+    unconditional_peer_dial_addrs,
 };
 
 /// A successful outbound peer connection attempt or inbound connection handshake.
@@ -287,16 +286,12 @@ where
         .as_ref()
         .map(|endpoint| endpoint.background_shutdown_token().drop_guard());
 
-    let (unconditional_peers, resolved_unconditional_peers) =
-        UnconditionalPeerSet::new(config.unconditional_peers.clone());
-
     let (address_book, bans, address_book_updater, address_metrics, address_book_updater_guard) =
         AddressBookUpdater::spawn_with_peer_registry(
             &config,
             listen_addr,
             advertised_services,
             peer_registry.clone(),
-            unconditional_peers.clone(),
         );
 
     let (misbehavior_tx, misbehavior_rx) = mpsc::channel(
@@ -402,7 +397,6 @@ where
         handle_rx,
         inv_receiver,
         bans.clone(),
-        unconditional_peers.clone(),
         address_metrics,
         MinimumPeerVersion::new(latest_chain_tip, &config.network),
         None,
@@ -433,30 +427,20 @@ where
             constants::MIN_INBOUND_PEER_CONNECTION_INTERVAL,
             listen_handshaker,
             peerset_tx.clone(),
-            bans.clone(),
+            bans,
             block_gossip_peer_ips,
-            unconditional_peers,
         );
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             listen_fut.in_current_span(),
         ))));
 
         // 2. Unconditional peers, which are dialed again whenever they are not connected.
-        let unconditional_dial_targets = unconditional_peer_dial_targets(&config, listen_addr);
-        let (first_name_addrs_tx, first_name_addrs_rx) = oneshot::channel();
-        if unconditional_dial_targets.is_empty() {
-            // Nothing will look a name up, so the startup dials need not wait.
-            std::mem::drop(first_name_addrs_tx);
-        } else {
+        let unconditional_dial_addrs = unconditional_peer_dial_addrs(&config, listen_addr);
+        if !unconditional_dial_addrs.is_empty() {
             let unconditional_peers_fut = keep_unconditional_peers_connected(
                 config.clone(),
-                listen_addr,
-                unconditional_dial_targets,
+                unconditional_dial_addrs,
                 peer_registry,
-                resolved_unconditional_peers,
-                first_name_addrs_tx,
-                bans,
-                tower::service_fn(resolve_host),
                 outbound_connector.clone(),
                 peerset_tx.clone(),
             );
@@ -466,22 +450,11 @@ where
         }
 
         // 3. Initial peers, specified in the config and cached on disk.
-        let first_name_addrs = async move {
-            tokio::time::timeout(
-                constants::UNCONDITIONAL_PEER_STARTUP_LOOKUP_WAIT,
-                first_name_addrs_rx,
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
-        };
         let initial_peers_fut = add_initial_peers(
             config.clone(),
             outbound_connector.clone(),
             peerset_tx.clone(),
             address_book_updater.clone(),
-            first_name_addrs,
         );
         let initial_peers_join =
             AbortOnDropHandle::new(tokio::spawn(erased(initial_peers_fut.in_current_span())));
@@ -626,19 +599,12 @@ where
 /// disk cache initial peers, then send the resulting peer connections over `peerset_tx`.
 ///
 /// Also sends every initial peer address to the `address_book_updater`.
-#[instrument(skip(
-    config,
-    outbound_connector,
-    peerset_tx,
-    address_book_updater,
-    first_name_addrs
-))]
+#[instrument(skip(config, outbound_connector, peerset_tx, address_book_updater))]
 async fn add_initial_peers<S>(
     config: Config,
     outbound_connector: S,
     mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-    first_name_addrs: impl Future<Output = Vec<Vec<PeerSocketAddr>>> + Send,
 ) -> Result<ActiveConnectionCounter, BoxError>
 where
     S: Service<
@@ -650,7 +616,7 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let initial_peers = limit_initial_peers(&config, address_book_updater, first_name_addrs).await;
+    let initial_peers = limit_initial_peers(&config, address_book_updater).await;
 
     let mut handshake_success_total: usize = 0;
     let mut handshake_error_total: usize = 0;
@@ -777,34 +743,23 @@ where
 ///
 /// Returns the first candidates in the order provided by [`Config::initial_peers`],
 /// skipping the addresses of dialed unconditional peers, which have slots of their own,
-/// and addresses that exceed the per-IP connection limit. Each dialed address counts
-/// against the limit of its IP, and each listed name against the limit of every IP it
-/// resolved to, since it can be dialed at any of them, so a startup dial never takes the
-/// room they need. `first_name_addrs` gives each name's addresses, and is awaited along
-/// with the seed lookups. Skipped addresses do not consume a startup slot; later
-/// candidates can fill it.
+/// and addresses that exceed the per-IP connection limit. Each dialed unconditional peer
+/// counts against the limit of its IP, so a startup dial never takes the room it needs.
+/// Skipped addresses do not consume a startup slot; later candidates can fill it.
 ///
 /// Also sends every initial peer to the `address_book_updater`.
 async fn limit_initial_peers(
     config: &Config,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
-    first_name_addrs: impl Future<Output = Vec<Vec<PeerSocketAddr>>>,
 ) -> IndexSet<PeerSocketAddr> {
-    let (all_peers, name_addrs) = future::join(config.initial_peers(), first_name_addrs).await;
+    let all_peers = config.initial_peers().await;
     let mut initial_peers = IndexSet::new();
-    let mut unconditional_dial_addrs = config
+    let unconditional_dial_addrs = config
         .unconditional_peers
         .dial_addrs(config.network.default_port());
     let mut selected_per_ip = HashMap::new();
     for addr in &unconditional_dial_addrs {
         *selected_per_ip.entry(addr.ip()).or_insert(0) += 1;
-    }
-    for addrs in name_addrs {
-        let ips: HashSet<IpAddr> = addrs.iter().map(|addr| addr.ip()).collect();
-        for ip in ips {
-            *selected_per_ip.entry(ip).or_insert(0) += 1;
-        }
-        unconditional_dial_addrs.extend(addrs);
     }
 
     // Config has validated and interleaved cached peers with shuffled seeds.
@@ -896,8 +851,7 @@ const MIN_INBOUND_ACCEPT_BURST_INTERVAL: Duration = Duration::from_millis(100);
 /// A bounded accept burst drains connections that are already queued by the
 /// kernel. Without it, the normal one-second handshake pacing can keep a full
 /// listen backlog from ever reaching a configured local sidecar connection.
-#[allow(clippy::too_many_arguments)]
-#[instrument(skip(config, listener, handshaker, peerset_tx, unconditional_peers), fields(listener_addr = ?listener.local_addr()))]
+#[instrument(skip(config, listener, handshaker, peerset_tx), fields(listener_addr = ?listener.local_addr()))]
 async fn accept_inbound_connections<S>(
     config: Config,
     listener: TcpListener,
@@ -906,7 +860,6 @@ async fn accept_inbound_connections<S>(
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     bans: BannedIps,
     zcashd_compat_peer_ips: Vec<IpAddr>,
-    unconditional_peers: UnconditionalPeerSet,
 ) -> Result<(), BoxError>
 where
     S: Service<peer::HandshakeRequest<TcpStream>, Response = peer::Client, Error = BoxError>
@@ -994,7 +947,7 @@ where
                 && active_total_inbound_connections < config.peerset_inbound_connection_limit()
             {
                 active_zcashd_compat_connections.track_connection()
-            } else if unconditional_peers.is_kept_connected(addr.ip())
+            } else if config.unconditional_peers.is_dial_address(addr.ip())
                 && active_unconditional_inbound_connections
                     < config.unconditional_peer_connection_limit()
                 && active_unconditional_connections.connections_from(canonical_ip)

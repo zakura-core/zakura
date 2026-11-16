@@ -288,19 +288,6 @@ pub const MAX_UNCONDITIONAL_PEER_REDIAL_DELAY: Duration = Duration::from_secs(10
 /// The delay must be much longer than a round trip between two such nodes.
 pub const MAX_UNCONDITIONAL_PEER_REDIAL_JITTER: Duration = Duration::from_secs(2);
 
-/// The longest time that the startup dials wait for the first lookups of the DNS names
-/// in `network.unconditional_peers`, so that they leave the names' addresses the room
-/// they need. Each lookup gives up after [`DNS_LOOKUP_TIMEOUT`].
-pub const UNCONDITIONAL_PEER_STARTUP_LOOKUP_WAIT: Duration =
-    Duration::from_secs(DNS_LOOKUP_TIMEOUT.as_secs() + 1);
-
-/// The most addresses that Zakura takes from one lookup of an unconditional peer's DNS
-/// name.
-///
-/// These addresses are exempt from scoring and bans, and dialed in turn. A node has a
-/// few addresses at most, so a longer answer is not one node.
-pub const MAX_UNCONDITIONAL_PEER_RESOLVED_ADDRS: usize = 16;
-
 /// How long a connection to an unconditional peer must last to reset its redial delay.
 ///
 /// A peer that keeps dropping new connections is dialed at the maximum delay, instead of

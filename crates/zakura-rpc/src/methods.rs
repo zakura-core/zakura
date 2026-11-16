@@ -1060,6 +1060,9 @@ where
     /// The estimated last height this release supports, if enforced.
     end_of_support_height: Option<Height>,
 
+    /// The services this node sends in its legacy P2P handshake, reported by `getnetworkinfo`.
+    local_services: PeerServices,
+
     // Services
     //
     /// A handle to the mempool service.
@@ -1364,6 +1367,7 @@ where
             .field("user_agent", &self.user_agent)
             .field("network", &self.network)
             .field("debug_force_finished_sync", &self.debug_force_finished_sync)
+            .field("local_services", &self.local_services)
             .field("getblocktemplate", &self.gbt)
             .finish()
     }
@@ -1430,6 +1434,7 @@ where
             debug_force_finished_sync,
             rpc_surface: RpcSurface::Full,
             end_of_support_height: None,
+            local_services: PeerServices::NODE_NETWORK,
             mempool: mempool.clone(),
             state: state.clone(),
             read_state: read_state.clone(),
@@ -2048,6 +2053,15 @@ where
     /// `getblocktemplate` path from a new tip to a returned template.
     pub fn with_template_trace(mut self, trace: JsonlEventEmitter) -> Self {
         self.gbt.trace = MiningTemplateTrace(trace);
+        self
+    }
+
+    /// Sets the services reported by `getnetworkinfo`, which must be the services this node sends
+    /// in its legacy P2P handshake.
+    ///
+    /// When unset, `getnetworkinfo` reports [`PeerServices::NODE_NETWORK`].
+    pub fn with_local_services(mut self, local_services: PeerServices) -> Self {
+        self.local_services = local_services;
         self
     }
 
@@ -4110,8 +4124,7 @@ where
 
         let protocol_version = zakura_network::constants::CURRENT_NETWORK_PROTOCOL_VERSION.0;
 
-        // TODO: return actual supported local services when Zebra exposes them
-        let local_services = format!("{:016x}", PeerServices::NODE_NETWORK);
+        let local_services = format!("{:016x}", self.local_services);
 
         // Deprecated: zcashd always returns 0.
         let timeoffset = 0;

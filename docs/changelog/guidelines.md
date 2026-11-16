@@ -71,6 +71,11 @@ the pending fragments. The `C-exclude-from-changelog` label remains useful
 release metadata, but does not replace the explicit fragment for Rust or
 `Cargo.toml` PRs.
 
+A revert of an unreleased PR deletes that PR's fragment along with its change
+and adds its own fragment. The check allows the deletion when one of the PR's
+commits names, in git's `This reverts commit <sha>.` line, the commit that
+added the fragment.
+
 Run `./scripts/changelog.py check` locally. CI validates the syntax and checks
 that the fragment filename matches the PR number. The concise format reference
 is in

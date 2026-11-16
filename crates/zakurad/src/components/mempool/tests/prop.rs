@@ -587,7 +587,7 @@ fn setup(
         chain_tip_change,
         tokio::sync::mpsc::channel(1).0,
         Vec::new(),
-        zn::UnconditionalPeerSet::default(),
+        zn::UnconditionalPeers::default(),
     );
 
     let mut transaction_receiver = mempool_transaction_subscriber.subscribe();

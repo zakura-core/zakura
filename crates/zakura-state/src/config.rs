@@ -113,7 +113,7 @@ pub struct Config {
     /// outside the state directory.
     ///
     /// Set to `None` by default, which keeps them in a `static_files` directory inside each
-    /// state directory, for example `state/v31/mainnet/static_files`. Set it to put the bodies,
+    /// state directory, for example `state/v32/mainnet/static_files`. Set it to put the bodies,
     /// most of an archive node's disk usage, on a different disk, like reth's
     /// `--datadir.static-files`. Zakura doesn't follow a `static_files` link, so use this setting
     /// or mount the other disk at the default path instead.

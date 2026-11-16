@@ -471,6 +471,24 @@ fn wrapper_failed(
     write_report(request, report, started).map_err(|_| error)
 }
 
+/// `cargo build` of `repo_root`'s `zakura-sim` binary, with the simulator's
+/// flags, in `target`. Like [`FuzzBuild::command`], it warns rather than
+/// fails on warnings (`crate::planted::cargo_sim` says why).
+fn sim_build(repo_root: &Path, target: &Path) -> Command {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let mut command = Command::new(cargo);
+    command
+        .env("RUSTFLAGS", SIM_RUSTFLAGS)
+        .env("CARGO_TARGET_DIR", target)
+        .env("CARGO_BUILD_WARNINGS", "warn")
+        .arg("build")
+        .arg("--locked")
+        .arg("--manifest-path")
+        .arg(repo_root.join("Cargo.toml"))
+        .args(["-p", "zakura-sim", "--bin", "zakura-sim"]);
+    command
+}
+
 /// A report for a run interrupted before its tools were ready.
 fn interrupted_before_start(request: &Request, original: Original, started: Instant) -> Report {
     Report::new(request, original, Status::Interrupted, started)
@@ -488,17 +506,8 @@ fn build_tools(
 ) -> Result<Result<Tools, Stop>, BoxError> {
     let logs = request.out.join(LOGS_DIR);
     fs::create_dir_all(&logs)?;
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let sim_target = builds.join("sim");
-    let mut build_sim = Command::new(&cargo);
-    build_sim
-        .env("RUSTFLAGS", SIM_RUSTFLAGS)
-        .env("CARGO_TARGET_DIR", &sim_target)
-        .arg("build")
-        .arg("--locked")
-        .arg("--manifest-path")
-        .arg(repo_root.join("Cargo.toml"))
-        .args(["-p", "zakura-sim", "--bin", "zakura-sim"]);
+    let mut build_sim = sim_build(repo_root, &sim_target);
     if let Err(stop) = build(&mut build_sim, &logs.join("build-sim.log"), interrupt)? {
         return Ok(Err(stop));
     }
@@ -548,11 +557,14 @@ struct FuzzBuild {
 }
 
 impl FuzzBuild {
-    /// `cargo +<nightly> fuzz <verb>` with the build's flags.
+    /// `cargo +<nightly> fuzz <verb>` with the build's flags. It warns
+    /// rather than fails on warnings, so a planted patch that leaves code
+    /// unused still builds (`crate::planted::cargo_sim`).
     fn command(&self, verb: &str) -> Command {
         let mut command = Command::new("cargo");
         command
             .env("RUSTFLAGS", SIM_RUSTFLAGS)
+            .env("CARGO_BUILD_WARNINGS", "warn")
             .arg(format!("+{PINNED_NIGHTLY}"))
             .arg("fuzz")
             .arg(verb)

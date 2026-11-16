@@ -1180,3 +1180,28 @@ fn an_exited_child_leaves_no_descendant() {
         "descendant {pid} still runs after run_child returned"
     );
 }
+
+/// The confirmation's builds warn rather than fail on warnings, so a
+/// planted patch that leaves code unused still builds where CI's Rust setup
+/// sets `CARGO_BUILD_WARNINGS=deny`.
+#[test]
+fn tool_builds_override_denied_warnings() {
+    let warnings = |command: &Command| {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == "CARGO_BUILD_WARNINGS")
+            .and_then(|(_, value)| value)
+            .map(ToOwned::to_owned)
+    };
+    let fuzz = FuzzBuild {
+        fuzz_dir: PathBuf::from("fuzz"),
+        target_dir: PathBuf::from("target"),
+        sanitizer: Sanitizer::Address,
+    };
+    for command in [
+        sim_build(Path::new("repo"), Path::new("target")),
+        fuzz.command("build"),
+    ] {
+        assert_eq!(warnings(&command), Some(OsString::from("warn")));
+    }
+}

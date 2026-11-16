@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -107,6 +107,8 @@ pub enum MinedBlockSubmission {
     FullBlock,
     /// The miner submitted a compact solved header.
     CompactHeader,
+    /// An authenticated caller requested relay before local verification.
+    TrustedBlock,
 }
 
 impl MinedBlockSubmission {
@@ -115,15 +117,25 @@ impl MinedBlockSubmission {
         match self {
             Self::FullBlock => "submitblock",
             Self::CompactHeader => "submitsolution",
+            Self::TrustedBlock => "submittrustedblock",
         }
     }
 }
 
-/// An admitted local block eligible for optimistic announcement before commit.
+/// The authority for relaying a local submission before commit.
+#[derive(Debug)]
+pub enum EarlyBlockRelay {
+    /// Consensus authorized relay and state admitted the candidate.
+    StateAdmission(zakura_state::BlockAdmission),
+    /// An authenticated operator explicitly authorized relay before validation.
+    TrustedSubmission,
+}
+
+/// A local block eligible for announcement before commit.
 #[derive(Debug)]
 pub struct EarlyMinedBlock {
-    /// State's submission lifecycle, used to suppress early dispatch after commit.
-    pub admission: zakura_state::BlockAdmission,
+    /// Relay authority and lifecycle used to suppress obsolete early dispatch.
+    pub relay: EarlyBlockRelay,
     /// Block hash.
     pub hash: block::Hash,
     /// Block height.
@@ -152,7 +164,7 @@ struct PendingBlock {
     status: watch::Sender<PendingStatus>,
 }
 
-/// Stores admitted block bodies with their registration owners.
+/// Stores pending block bodies with their registration owners.
 #[derive(Debug)]
 struct PendingBlockRegistryInner {
     entries: Mutex<HashMap<block::Hash, PendingBlock>>,
@@ -173,10 +185,34 @@ impl Default for PendingBlockRegistry {
 }
 
 /// Reports whether an early-advertised block remains valid.
-#[derive(Debug)]
-pub struct PendingBlockSignal(watch::Receiver<PendingStatus>);
+#[derive(Clone, Debug)]
+pub struct PendingBlockSignal(watch::Receiver<PendingStatus>, Arc<AtomicBool>);
 
 impl PendingBlockSignal {
+    /// Records dispatch to the peer service, without claiming peer delivery.
+    pub fn mark_dispatched(&self) {
+        self.1.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the peer service was called for this pending body.
+    pub fn was_dispatched(&self) -> bool {
+        self.1.load(Ordering::Relaxed)
+    }
+
+    /// Whether this submission is still awaiting verification and commit.
+    pub fn is_pending(&self) -> bool {
+        matches!(*self.0.borrow(), PendingStatus::Waiting)
+    }
+
+    /// Waits for commit or failure, so a queued trusted announcement can be withdrawn.
+    pub async fn wait_for_resolution(&mut self) {
+        while self.is_pending() {
+            if self.0.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Returns true unless contextual verification has rejected the block.
     pub fn is_valid(&self) -> bool {
         !matches!(*self.0.borrow(), PendingStatus::Failed)
@@ -188,7 +224,7 @@ impl PendingBlockSignal {
     pub fn valid_for_tests() -> Self {
         // Dropping the sender leaves the signal reading `Waiting`, so it stays valid and its
         // failure future never resolves.
-        Self(watch::channel(PendingStatus::Waiting).1)
+        Self(watch::channel(PendingStatus::Waiting).1, Arc::default())
     }
 
     /// Resolves when contextual verification rejects the block.
@@ -216,13 +252,14 @@ pub struct PendingBlockRegistration {
     owner_id: u64,
     /// A receiver for this registration's own entry, kept so `signal` needs no lookup.
     receiver: watch::Receiver<PendingStatus>,
+    dispatched: Arc<AtomicBool>,
     resolved: bool,
 }
 
 impl PendingBlockRegistration {
     /// Returns a signal that cancels stale early inventory after commit failure.
-    pub(crate) fn signal(&self) -> PendingBlockSignal {
-        PendingBlockSignal(self.receiver.clone())
+    pub fn signal(&self) -> PendingBlockSignal {
+        PendingBlockSignal(self.receiver.clone(), self.dispatched.clone())
     }
 
     /// Resolves this registration and invalidates failed early advertisements.
@@ -274,6 +311,7 @@ impl PendingBlockRegistry {
             hash,
             owner_id,
             receiver,
+            dispatched: Arc::default(),
             resolved: false,
         })
     }
@@ -302,7 +340,7 @@ impl PendingBlockRegistry {
         entry.status.send_replace(status);
     }
 
-    /// Returns an admitted body immediately while its contextual commit is pending.
+    /// Returns a pending body, which may still be awaiting consensus validation.
     pub fn get(&self, hash: block::Hash) -> Option<Arc<block::Block>> {
         let block = self
             .0

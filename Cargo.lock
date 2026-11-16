@@ -2670,6 +2670,7 @@ dependencies = [
 name = "zakura"
 version = "1.8.9"
 dependencies = [
+ "base64",
  "bytes",
  "chrono",
  "clap",
@@ -3264,7 +3265,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "18.1.0"
+version = "19.0.0"
 dependencies = [
  "anyhow",
  "async-trait",

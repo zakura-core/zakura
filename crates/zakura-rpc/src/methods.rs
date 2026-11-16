@@ -1929,7 +1929,7 @@ where
                     {
                         if let Some(registration) = pending_blocks.insert(block.clone()) {
                             let event = EarlyMinedBlock {
-                                admission: admission.clone(),
+                                relay: crate::EarlyBlockRelay::StateAdmission(admission.clone()),
                                 hash: block_hash,
                                 height,
                                 size,
@@ -1975,6 +1975,20 @@ where
             )
         })?;
 
+        Self::mined_block_response(
+            block_verifier_router_response,
+            block_hash,
+            height,
+            submission,
+        )
+    }
+
+    fn mined_block_response(
+        block_verifier_router_response: std::result::Result<block::Hash, tower::BoxError>,
+        block_hash: block::Hash,
+        height: Height,
+        submission: MinedBlockSubmission,
+    ) -> Result<SubmitBlockResponse> {
         let chain_error = match block_verifier_router_response {
             // Currently, this match arm returns `null` (Accepted) for blocks committed
             // to any chain, but Accepted is only for blocks in the best chain.
@@ -6423,3 +6437,5 @@ pub enum AddNodeCommand {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct GetTxOutResponse(Option<types::transaction::OutputObject>);
+
+mod trusted_block;

@@ -282,7 +282,7 @@ async fn delayed_completion(early_inventory: bool, ordering: RelayOrdering) {
                     delayed_sender.send(EarlyMinedBlock {
                         hash: committed, height: Height(1), size: candidate.zcash_serialized_size(),
                         submitted_at: std::time::Instant::now(), submission: MinedBlockSubmission::FullBlock,
-                        pending: PendingBlockSignal::valid_for_tests(), admission,
+                        pending: PendingBlockSignal::valid_for_tests(), relay: zakura_rpc::EarlyBlockRelay::StateAdmission(admission),
                     }).unwrap();
                     assert_no_advertisement(gossip.as_mut(), &mut advertisements).await;
                 }

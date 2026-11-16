@@ -115,11 +115,11 @@ where
                     None => std::future::pending().await,
                 }
             } => {
-                let Some(EarlyMinedBlock { hash, height, size, submitted_at, submission, pending, admission }) = early else {
+                let Some(EarlyMinedBlock { hash, height, size, submitted_at, submission, pending, relay }) = early else {
                     mined_block_receiver = None;
                     continue;
                 };
-                (hash, height, true, Some((pending, submitted_at, submission, admission)), Some(size))
+                (hash, height, true, Some((pending, submitted_at, submission, relay)), Some(size))
             }
             committed = announcements.recv(close_to_tip) => {
                 let committed = committed.ok_or(AnnouncementsClosed)?;
@@ -178,14 +178,20 @@ where
                 zn::Request::AdvertiseBlock(block, None)
             };
             let succeeded = match early {
-                Some((mut pending, submitted_at, submission, admission)) => {
+                Some((mut pending, submitted_at, submission, relay)) => {
                     if !pending.is_valid() {
                         false
                     } else {
+                        let relay_pending = pending.clone();
                         let succeeded = tokio::select! {
                             biased;
                             _ = pending.wait_for_failure() => false,
-                            succeeded = broadcast_early_with_timeout(network, request, admission) => succeeded,
+                            succeeded = async {
+                                match relay {
+                                    zakura_rpc::EarlyBlockRelay::StateAdmission(admission) => broadcast_early_with_timeout(network, request, admission).await,
+                                    zakura_rpc::EarlyBlockRelay::TrustedSubmission => broadcast_trusted_with_timeout(network, request, relay_pending).await,
+                                }
+                            } => succeeded,
                         };
                         if succeeded {
                             metrics::counter!("mining.optimistic_inventory.early_inventories")
@@ -238,6 +244,49 @@ where
     tokio::time::timeout(BLOCK_GOSSIP_TIMEOUT, network.oneshot(request))
         .await
         .is_ok_and(|result| result.is_ok())
+}
+
+/// Withdraws a trusted announcement if validation finishes before peer readiness.
+async fn broadcast_trusted_with_timeout<ZN>(
+    mut network: ZN,
+    request: zn::Request,
+    mut pending: zakura_rpc::PendingBlockSignal,
+) -> bool
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
+{
+    tokio::time::timeout(BLOCK_GOSSIP_TIMEOUT, async {
+        let ready = tokio::select! {
+            biased;
+            _ = pending.wait_for_resolution() => return false,
+            ready = network.ready() => ready,
+        };
+        let Ok(ready) = ready else {
+            return false;
+        };
+        if !pending.is_pending() {
+            return false;
+        }
+        let dispatched_at = std::time::Instant::now();
+        let dispatch_signal = pending.clone();
+        let succeeded = tokio::select! {
+            biased;
+            _ = pending.wait_for_resolution() => return false,
+            result = async {
+                dispatch_signal.mark_dispatched();
+                metrics::counter!("rpc.trusted_submission.relay_dispatched").increment(1);
+                ready.call(request).await
+            } => result.is_ok(),
+        };
+        metrics::histogram!("rpc.trusted_submission.relay.duration_seconds")
+            .record(dispatched_at.elapsed().as_secs_f64());
+        if !succeeded {
+            metrics::counter!("rpc.trusted_submission.relay_failed").increment(1);
+        }
+        succeeded
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Dispatches early inventory only while the submission has not committed.

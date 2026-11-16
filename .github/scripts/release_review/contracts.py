@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass
 from typing import Protocol
 
+PROVIDERS = ("openai", "abliterated")
+SEVERITIES = ("Critical", "High", "Medium")
 
 class ReviewError(RuntimeError):
     """A review could not finish; its partial evidence must remain visible."""
@@ -33,6 +35,52 @@ class ModelReply:
     cached_input_tokens: int = 0
 
 
+@dataclass(frozen=True)
+class SourceReference:
+    revision: str
+    path: str
+    start: int
+    end: int
+    quote: str
+
+
+@dataclass(frozen=True)
+class Finding:
+    severity: str
+    category: str
+    title: str
+    trigger: str
+    impact: str
+    explanation: str
+    change_path: str
+    release_connection: str
+    verification: str
+    reference: SourceReference
+
+    @classmethod
+    def from_validated(cls, value: dict) -> Finding:
+        """Convert a schema-validated finding without changing its wire fields."""
+        return cls(**(value | {"reference": SourceReference(**value["reference"])}))
+
+
+@dataclass(frozen=True)
+class RepositoryAction:
+    kind: str
+    revision: str
+    path: str
+    start: int
+    end: int
+    query: str
+
+
+@dataclass(frozen=True)
+class ModelTurn:
+    complete: bool
+    summary: str
+    actions: list[RepositoryAction]
+    findings: list[Finding]
+
+
 class ModelProvider(Protocol):
     def complete(self, request: ModelRequest) -> ModelReply:
         """Return a completed response with billable usage, or a sanitized error."""
@@ -53,15 +101,15 @@ def string_schema(*, maximum: int = 4000, choices: list[str] | None = None) -> d
     return schema
 
 
-REFERENCE_SCHEMA = object_schema({
+LOCATION_PROPERTIES = {
     "revision": string_schema(choices=["base", "head"]),
     "path": string_schema(maximum=1024),
     "start": {"type": "integer", "minimum": 1},
     "end": {"type": "integer", "minimum": 1},
-    "quote": string_schema(maximum=2000),
-})
+}
+REFERENCE_SCHEMA = object_schema({**LOCATION_PROPERTIES, "quote": string_schema(maximum=2000)})
 FINDING_SCHEMA = object_schema({
-    "severity": string_schema(choices=["Critical", "High", "Medium"]),
+    "severity": string_schema(choices=list(SEVERITIES)),
     "category": string_schema(choices=["consensus", "cryptography", "mining", "propagation"]),
     "title": string_schema(maximum=160),
     "trigger": string_schema(),
@@ -74,10 +122,7 @@ FINDING_SCHEMA = object_schema({
 })
 ACTION_SCHEMA = object_schema({
     "kind": string_schema(choices=["read", "search"]),
-    "revision": string_schema(choices=["base", "head"]),
-    "path": string_schema(maximum=1024),
-    "start": {"type": "integer", "minimum": 1},
-    "end": {"type": "integer", "minimum": 1},
+    **LOCATION_PROPERTIES,
     "query": string_schema(maximum=200),
 })
 TURN_SCHEMA = object_schema({
@@ -86,6 +131,9 @@ TURN_SCHEMA = object_schema({
     "actions": {"type": "array", "maxItems": 4, "items": ACTION_SCHEMA},
     "findings": {"type": "array", "maxItems": 12, "items": FINDING_SCHEMA},
 })
+# Free-text finding fields; each must carry evidence, not only whitespace.
+EVIDENCE_FIELDS = tuple(key for key, child in FINDING_SCHEMA["properties"].items()
+                        if child["type"] == "string" and "enum" not in child)
 
 
 def validate_schema(value, schema: dict) -> None:
@@ -117,7 +165,7 @@ def validate_schema(value, schema: dict) -> None:
         raise ReviewError("model output has an invalid line number")
 
 
-def parse_turn(text: str) -> dict:
+def parse_turn(text: str) -> ModelTurn:
     try:
         turn = json.loads(text)
     except (ValueError, TypeError) as error:
@@ -128,10 +176,13 @@ def parse_turn(text: str) -> dict:
     if not turn["complete"] and (not turn["actions"] or turn["findings"]):
         raise ReviewError("unfinished model turns must request context, not report findings")
     for finding in turn["findings"]:
-        for key in ("title", "trigger", "impact", "explanation", "change_path",
-                    "release_connection", "verification"):
-            if not finding[key].strip():
-                raise ReviewError("a finding lacks required evidence")
+        if not all(finding[key].strip() for key in EVIDENCE_FIELDS):
+            raise ReviewError("a finding lacks required evidence")
         if not finding["reference"]["quote"].strip():
             raise ReviewError("a finding lacks a source quotation")
-    return turn
+    return ModelTurn(
+        complete=turn["complete"],
+        summary=turn["summary"],
+        actions=[RepositoryAction(**action) for action in turn["actions"]],
+        findings=[Finding.from_validated(finding) for finding in turn["findings"]],
+    )

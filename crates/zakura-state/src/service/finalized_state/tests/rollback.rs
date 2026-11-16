@@ -55,7 +55,7 @@ fn proptest_cases() -> u32 {
 
 /// A persistent (non-ephemeral) state config rooted at `dir`, so the rollback utility can reopen
 /// the same database by path after the syncing handle is dropped.
-fn config_at(dir: &Path) -> Config {
+pub(super) fn config_at(dir: &Path) -> Config {
     Config {
         cache_dir: dir.to_path_buf(),
         ephemeral: false,
@@ -69,7 +69,7 @@ fn height(n: usize) -> Height {
 
 /// Syncs a fresh finalized state at `config` by committing `blocks` in order, then drops it so the
 /// database lock is released for the rollback utility to reopen.
-fn sync_to(config: &Config, network: &Network, blocks: &[SemanticallyVerifiedBlock]) {
+pub(super) fn sync_to(config: &Config, network: &Network, blocks: &[SemanticallyVerifiedBlock]) {
     let mut state =
         FinalizedState::new(config, network).expect("opening an ephemeral database should succeed");
 
@@ -89,7 +89,7 @@ fn reopen(config: &Config, network: &Network) -> FinalizedState {
 /// Opens the database at `config` directly, skipping format upgrades and their validation. The
 /// subtree test writes synthetic subtree entries that don't correspond to real notes, which the
 /// add-subtrees format check would reject.
-fn open_unchecked_db(config: &Config, network: &Network) -> ZakuraDb {
+pub(super) fn open_unchecked_db(config: &Config, network: &Network) -> ZakuraDb {
     ZakuraDb::new(
         config,
         STATE_DATABASE_KIND,
@@ -554,7 +554,7 @@ pub(super) fn child_block(
 /// A V4 transaction with one dummy Sprout JoinSplit whose two commitments grow the Sprout note
 /// commitment tree. The checkpoint commit path doesn't validate the JoinSplit, so the rest is
 /// zeroed.
-fn sprout_joinsplit_tx() -> Arc<Transaction> {
+pub(super) fn sprout_joinsplit_tx() -> Arc<Transaction> {
     let joinsplit = zakura_chain::sprout::JoinSplit::<zakura_chain::primitives::Groth16Proof> {
         vpub_old: Amount::zero(),
         vpub_new: Amount::zero(),
@@ -832,6 +832,8 @@ fn rollback_crosses_the_nsm_reissuance_height() {
 
 /// When a rolled-back block grew the Sprout tree, rollback must reset the Sprout tip to the target
 /// height's tree, not leave it at the later tip.
+// Needs a Sprout tree that the rolled-back JoinSplit grew.
+#[cfg(feature = "sprout")]
 #[test]
 fn rollback_resets_sprout_tree_changed_in_range() {
     let _init_guard = zakura_test::init();
@@ -1087,6 +1089,8 @@ fn modern_rollback_does_not_rebuild_note_trees_from_genesis() -> Result<()> {
 
 /// The same Sprout fallback must work for a modern target. If the removed range contains a Sprout
 /// JoinSplit, rollback cannot use the Sprout tip tree as the target tree.
+// Needs a Sprout tree that the rolled-back JoinSplit grew.
+#[cfg(feature = "sprout")]
 #[test]
 fn modern_rollback_resets_sprout_tree_changed_in_range() -> Result<()> {
     let _init_guard = zakura_test::init();

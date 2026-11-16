@@ -225,7 +225,7 @@ pub fn benchmark_transparent_indexes(
     samples
 }
 
-fn contextual(network: &Network, block: Arc<Block>) -> ContextuallyVerifiedBlock {
+pub(super) fn contextual(network: &Network, block: Arc<Block>) -> ContextuallyVerifiedBlock {
     ContextuallyVerifiedBlock::with_block_and_spent_utxos(
         network,
         SemanticallyVerifiedBlock::from(block),
@@ -235,7 +235,7 @@ fn contextual(network: &Network, block: Arc<Block>) -> ContextuallyVerifiedBlock
 }
 
 /// Returns a child of `parent` with the next coinbase height.
-fn child_of(parent: &Arc<Block>) -> Arc<Block> {
+pub(super) fn child_of(parent: &Arc<Block>) -> Arc<Block> {
     let mut child = Block::clone(parent);
     let coinbase = Arc::make_mut(&mut child.transactions[0]);
     let input = match coinbase {
@@ -254,7 +254,7 @@ fn child_of(parent: &Arc<Block>) -> Arc<Block> {
 ///
 /// With an `address_pool`, output `i` pays address `i % address_pool`. Otherwise `tag` and
 /// `index` keep the script hashes distinct across blocks and siblings.
-fn stuffed(
+pub(super) fn stuffed(
     block: &Arc<Block>,
     tag: u8,
     index: usize,

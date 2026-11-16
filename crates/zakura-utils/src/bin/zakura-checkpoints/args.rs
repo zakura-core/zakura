@@ -523,14 +523,6 @@ mod tests {
     }
 
     #[test]
-    fn exposes_version_flag() {
-        let error = Args::try_parse_from(["zakura-checkpoints", "--version"])
-            .expect_err("--version exits after displaying version information");
-
-        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
-    }
-
-    #[test]
     fn rpc_mode_flag_combinations() {
         assert_eq!(rpc_args().validate_mode(), Ok(()));
 

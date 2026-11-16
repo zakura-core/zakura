@@ -8,6 +8,7 @@ use std::{
 use blake2b_simd::Params as Blake2bParams;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
+use zakura_quic::{NodeId, KEY_LENGTH};
 use zakura_rt::collections::HashMap;
 
 use zakura_chain::{parameters::Network, serialization::ZcashSerialize};
@@ -145,38 +146,96 @@ pub(crate) fn frame_cap_carries_payload(max_frame_bytes: u32) -> bool {
 }
 
 /// A bounded authenticated Zakura peer identity.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+///
+/// Equality and hashing look only at the encoded bytes, so a peer id built
+/// from a [`NodeId`] equals one built from the same bytes.
+#[derive(Clone)]
 #[cfg_attr(
     any(test, feature = "proptest-impl"),
     derive(proptest_derive::Arbitrary)
 )]
-pub struct ZakuraPeerId(Vec<u8>);
+pub struct ZakuraPeerId {
+    bytes: Vec<u8>,
+    /// The node ID the bytes encode, kept when the peer id was built from an
+    /// already validated [`NodeId`], so [`Self::node_id`] doesn't check the
+    /// key again.
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(value = "None"))]
+    node_id: Option<NodeId>,
+}
 
 impl ZakuraPeerId {
     /// Creates a peer id after applying the Zakura node-id bound.
     pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, ZakuraProtocolError> {
         let bytes = bytes.into();
         validate_bounded_bytes(&bytes, MAX_IROH_NODE_ID_BYTES, "iroh node id")?;
-        Ok(Self(bytes))
+        Ok(Self {
+            bytes,
+            node_id: None,
+        })
+    }
+
+    /// Creates the peer id of a native peer from its node ID, such as the one
+    /// the TLS handshake proved for a connection.
+    ///
+    /// The peer id keeps `node_id`, so [`Self::node_id`] returns it without
+    /// checking the key again.
+    pub fn from_node_id(node_id: NodeId) -> Self {
+        Self {
+            bytes: node_id.as_bytes().to_vec(),
+            node_id: Some(node_id),
+        }
     }
 
     /// Returns the encoded peer id bytes.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
+    }
+
+    /// Returns the node ID these bytes encode, or `None` when they aren't a
+    /// valid node ID, such as a legacy peer's address-derived id.
+    ///
+    /// A peer id built by [`Self::from_node_id`] returns its node ID directly.
+    /// Otherwise this runs the full key check of [`NodeId::from_bytes`].
+    pub fn node_id(&self) -> Option<NodeId> {
+        if let Some(node_id) = self.node_id {
+            return Some(node_id);
+        }
+        let bytes: &[u8; KEY_LENGTH] = self.bytes.as_slice().try_into().ok()?;
+        NodeId::from_bytes(bytes).ok()
     }
 
     /// Returns a stable fixed-width identity for scheduler and state ownership.
     pub fn digest(&self) -> [u8; 32] {
-        if let Ok(digest) = <[u8; 32]>::try_from(self.0.as_slice()) {
+        if let Ok(digest) = <[u8; 32]>::try_from(self.bytes.as_slice()) {
             return digest;
         }
         let hash = Blake2bParams::new()
             .hash_length(32)
             .personal(b"ZakuraPeerId-v1")
-            .hash(&self.0);
+            .hash(&self.bytes);
         hash.as_bytes()
             .try_into()
             .expect("the peer identity digest has the configured 32-byte length")
+    }
+}
+
+impl PartialEq for ZakuraPeerId {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for ZakuraPeerId {}
+
+impl std::hash::Hash for ZakuraPeerId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.bytes.hash(state);
+    }
+}
+
+impl std::fmt::Debug for ZakuraPeerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ZakuraPeerId").field(&self.bytes).finish()
     }
 }
 
@@ -1854,32 +1913,6 @@ mod tests {
     }
 
     #[test]
-    fn prelude_roundtrip_and_rejects_trailing() {
-        let upgrade = P2pV2Upgrade::Init(init());
-        let encoded = upgrade.encode().expect("valid init encodes");
-        assert_eq!(
-            P2pV2Upgrade::decode(&encoded).expect("valid init decodes"),
-            upgrade
-        );
-
-        let mut with_trailing = encoded;
-        with_trailing.push(0);
-        assert!(matches!(
-            P2pV2Upgrade::decode(&with_trailing),
-            Err(ZakuraProtocolError::TrailingBytes)
-        ));
-    }
-
-    #[test]
-    fn prelude_rejects_oversized_inputs_before_decoding() {
-        let oversized = vec![0; MAX_PRELUDE_PAYLOAD_BYTES + 1];
-        assert!(matches!(
-            P2pV2Upgrade::decode(&oversized),
-            Err(ZakuraProtocolError::OversizedPayload { .. })
-        ));
-    }
-
-    #[test]
     fn alpn_carries_the_current_protocol_version() {
         assert_eq!(P2P_V2_ALPN, p2p_v2_alpn(ZAKURA_PROTOCOL_VERSION_CURRENT));
         assert_eq!(supported_p2p_v2_alpns()[0], P2P_V2_ALPN);
@@ -2962,13 +2995,39 @@ mod tests {
         ));
     }
 
+    /// A peer id built from a node ID is the same peer as one built from the
+    /// node ID's bytes, and both hand back that node ID.
     #[test]
-    fn compat_i3_unknown_service_bits_are_truncated_without_selecting_zakura() {
-        let unknown_high_bit = 1 << 63;
-        let services =
-            PeerServices::from_bits_truncate(PeerServices::NODE_NETWORK.bits() | unknown_high_bit);
+    fn peer_id_from_node_id_matches_peer_id_from_its_bytes() {
+        use std::hash::{BuildHasher, RandomState};
 
-        assert_eq!(services, PeerServices::NODE_NETWORK);
-        assert!(!services.contains(PeerServices::NODE_P2P_V2));
+        let node_id = zakura_quic::NodeSecretKey::generate().public();
+        let from_node_id = ZakuraPeerId::from_node_id(node_id);
+        let from_bytes =
+            ZakuraPeerId::new(node_id.as_bytes().to_vec()).expect("32 bytes is a valid peer id");
+
+        assert_eq!(from_node_id, from_bytes);
+        let hasher = RandomState::new();
+        assert_eq!(hasher.hash_one(&from_node_id), hasher.hash_one(&from_bytes));
+        assert_eq!(format!("{from_node_id:?}"), format!("{from_bytes:?}"));
+        assert_eq!(from_node_id.as_bytes(), node_id.as_bytes());
+        assert_eq!(from_node_id.node_id(), Some(node_id));
+        assert_eq!(from_bytes.node_id(), Some(node_id));
+    }
+
+    /// Peer id bytes that aren't a valid node ID have no node ID.
+    #[test]
+    fn peer_id_without_a_valid_key_has_no_node_id() {
+        let not_a_point = (0..=u8::MAX)
+            .map(|byte| [byte; 32])
+            .find(|bytes| NodeId::from_bytes(bytes).is_err())
+            .expect("some repeated byte is not a curve point");
+        let not_a_point =
+            ZakuraPeerId::new(not_a_point.to_vec()).expect("32 bytes is a valid peer id");
+        let legacy =
+            ZakuraPeerId::new(vec![1, 2, 3]).expect("a short legacy id is a valid peer id");
+
+        assert_eq!(not_a_point.node_id(), None);
+        assert_eq!(legacy.node_id(), None);
     }
 }

@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_in_result)]
 
+mod deep_reorg;
 mod prop;
 mod shared_outputs;
 mod vectors;

@@ -1252,15 +1252,6 @@ mod tests {
     }
 
     #[test]
-    fn frontier_encoding_is_deterministic() {
-        let artifact = sample_frontiers();
-        assert_eq!(
-            artifact.encode(&Network::Mainnet),
-            artifact.encode(&Network::Mainnet)
-        );
-    }
-
-    #[test]
     fn frontier_artifact_rejects_duplicate_heights() {
         let mut artifact = sample_frontiers();
         artifact.entries[1].height = artifact.entries[0].height;

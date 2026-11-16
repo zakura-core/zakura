@@ -11,7 +11,7 @@ use reddsa::{orchard::Binding, orchard::SpendAuth, Signature};
 
 use crate::{
     amount,
-    block::MAX_BLOCK_BYTES,
+    block::{check_max_block_bytes, MAX_BLOCK_BYTES},
     parameters::{OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID, TX_V5_VERSION_GROUP_ID},
     primitives::{Halo2Proof, ZkSnarkProof},
     serialization::{
@@ -894,6 +894,31 @@ impl ZcashSerialize for Transaction {
     }
 }
 
+impl Transaction {
+    /// Decode a transaction from untrusted bytes, such as a peer message or an RPC request.
+    ///
+    /// # Consensus
+    ///
+    /// > [Pre-Sapling] The encoded size of the transaction MUST be less than or
+    /// > equal to 100000 bytes.
+    ///
+    /// <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
+    ///
+    /// Zebra does not verify this rule because we checkpoint up to Canopy blocks, but
+    /// since transactions must get mined into a block to be useful, we reject
+    /// transactions that are larger than blocks.
+    ///
+    /// The transaction parser does not enforce this limit. This method does, by rejecting
+    /// `bytes` longer than [`MAX_BLOCK_BYTES`] before parsing anything, so `bytes` must
+    /// hold the transaction's encoding and nothing after it. Like
+    /// [`ZcashDeserialize::zcash_deserialize_from_slice`], it leaves `bytes` pointing to
+    /// any unread bytes.
+    pub fn zcash_deserialize_bounded(bytes: &mut &[u8]) -> Result<Self, SerializationError> {
+        check_max_block_bytes(bytes.len(), "transaction is larger than MAX_BLOCK_BYTES")?;
+        Self::zcash_deserialize_from_slice(bytes)
+    }
+}
+
 impl ZcashDeserialize for Transaction {
     crate::serialization::compile_deserialize_entry_points_here!();
 
@@ -901,24 +926,10 @@ impl ZcashDeserialize for Transaction {
     fn zcash_deserialize_from<R: io::Read>(
         reader: &mut ZcashReader<R>,
     ) -> Result<Self, SerializationError> {
-        // # Consensus
-        //
-        // > [Pre-Sapling] The encoded size of the transaction MUST be less than or
-        // > equal to 100000 bytes.
-        //
-        // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
-        //
-        // Zebra does not verify this rule because we checkpoint up to Canopy blocks, but:
-        // Since transactions must get mined into a block to be useful,
-        // we reject transactions that are larger than blocks.
-        //
-        // If the limit is reached, we'll get an UnexpectedEof error.
-        let mut limited_reader = reader.with_limit(MAX_BLOCK_BYTES);
-
         let (version, overwintered) = {
             const LOW_31_BITS: u32 = (1 << 31) - 1;
             // Denoted as `header` in the spec, contains the `fOverwintered` flag and the `version` field.
-            let header = limited_reader.read_u32::<LittleEndian>()?;
+            let header = reader.read_u32::<LittleEndian>()?;
             (header & LOW_31_BITS, header >> 31 != 0)
         };
 
@@ -959,30 +970,30 @@ impl ZcashDeserialize for Transaction {
         match (version, overwintered) {
             (1, false) => Ok(Transaction::V1 {
                 // Denoted as `tx_in_count` and `tx_in` in the spec.
-                inputs: limited_reader.read_value::<Vec<_>>()?,
+                inputs: reader.read_value::<Vec<_>>()?,
                 // Denoted as `tx_out_count` and `tx_out` in the spec.
-                outputs: limited_reader.read_value::<Vec<_>>()?,
+                outputs: reader.read_value::<Vec<_>>()?,
                 // Denoted as `lock_time` in the spec.
-                lock_time: limited_reader.read_value::<LockTime>()?,
+                lock_time: reader.read_value::<LockTime>()?,
             }),
             (2, false) => {
                 // Version 2 transactions use Sprout-on-BCTV14.
                 type OptV2Jsd = Option<JoinSplitData<Bctv14Proof>>;
                 Ok(Transaction::V2 {
                     // Denoted as `tx_in_count` and `tx_in` in the spec.
-                    inputs: limited_reader.read_value::<Vec<_>>()?,
+                    inputs: reader.read_value::<Vec<_>>()?,
                     // Denoted as `tx_out_count` and `tx_out` in the spec.
-                    outputs: limited_reader.read_value::<Vec<_>>()?,
+                    outputs: reader.read_value::<Vec<_>>()?,
                     // Denoted as `lock_time` in the spec.
-                    lock_time: limited_reader.read_value::<LockTime>()?,
+                    lock_time: reader.read_value::<LockTime>()?,
                     // A bundle of fields denoted in the spec as `nJoinSplit`, `vJoinSplit`,
                     // `joinSplitPubKey` and `joinSplitSig`.
-                    joinsplit_data: limited_reader.read_value::<OptV2Jsd>()?.map(Box::new),
+                    joinsplit_data: reader.read_value::<OptV2Jsd>()?.map(Box::new),
                 })
             }
             (3, true) => {
                 // Denoted as `nVersionGroupId` in the spec.
-                let id = limited_reader.read_u32::<LittleEndian>()?;
+                let id = reader.read_u32::<LittleEndian>()?;
                 if id != OVERWINTER_VERSION_GROUP_ID {
                     return Err(SerializationError::Parse(
                         "expected OVERWINTER_VERSION_GROUP_ID",
@@ -992,16 +1003,16 @@ impl ZcashDeserialize for Transaction {
                 type OptV3Jsd = Option<JoinSplitData<Bctv14Proof>>;
                 Ok(Transaction::V3 {
                     // Denoted as `tx_in_count` and `tx_in` in the spec.
-                    inputs: limited_reader.read_value::<Vec<_>>()?,
+                    inputs: reader.read_value::<Vec<_>>()?,
                     // Denoted as `tx_out_count` and `tx_out` in the spec.
-                    outputs: limited_reader.read_value::<Vec<_>>()?,
+                    outputs: reader.read_value::<Vec<_>>()?,
                     // Denoted as `lock_time` in the spec.
-                    lock_time: limited_reader.read_value::<LockTime>()?,
+                    lock_time: reader.read_value::<LockTime>()?,
                     // Denoted as `nExpiryHeight` in the spec.
-                    expiry_height: block::Height(limited_reader.read_u32::<LittleEndian>()?),
+                    expiry_height: block::Height(reader.read_u32::<LittleEndian>()?),
                     // A bundle of fields denoted in the spec as `nJoinSplit`, `vJoinSplit`,
                     // `joinSplitPubKey` and `joinSplitSig`.
-                    joinsplit_data: limited_reader.read_value::<OptV3Jsd>()?.map(Box::new),
+                    joinsplit_data: reader.read_value::<OptV3Jsd>()?.map(Box::new),
                 })
             }
             (4, true) => {
@@ -1009,7 +1020,7 @@ impl ZcashDeserialize for Transaction {
                 // https://zips.z.cash/protocol/protocol.pdf#txnencoding
 
                 // Denoted as `nVersionGroupId` in the spec.
-                let id = limited_reader.read_u32::<LittleEndian>()?;
+                let id = reader.read_u32::<LittleEndian>()?;
                 if id != SAPLING_VERSION_GROUP_ID {
                     return Err(SerializationError::Parse(
                         "expected SAPLING_VERSION_GROUP_ID",
@@ -1027,25 +1038,25 @@ impl ZcashDeserialize for Transaction {
                 // then assemble them.
 
                 // Denoted as `tx_in_count` and `tx_in` in the spec.
-                let inputs: Vec<transparent::Input> = limited_reader.read_value::<Vec<_>>()?;
+                let inputs: Vec<transparent::Input> = reader.read_value::<Vec<_>>()?;
 
                 // Denoted as `tx_out_count` and `tx_out` in the spec.
-                let outputs = limited_reader.read_value::<Vec<_>>()?;
+                let outputs = reader.read_value::<Vec<_>>()?;
 
                 let is_coinbase = inputs.len() == 1
                     && matches!(inputs.first(), Some(transparent::Input::Coinbase { .. }));
 
                 // Denoted as `lock_time` in the spec.
-                let lock_time = limited_reader.read_value::<LockTime>()?;
+                let lock_time = reader.read_value::<LockTime>()?;
 
                 // Denoted as `nExpiryHeight` in the spec.
-                let expiry_height = block::Height(limited_reader.read_u32::<LittleEndian>()?);
+                let expiry_height = block::Height(reader.read_u32::<LittleEndian>()?);
 
                 // Denoted as `valueBalanceSapling` in the spec.
-                let value_balance = limited_reader.read_value()?;
+                let value_balance = reader.read_value()?;
 
                 // Denoted as `nSpendsSapling` — read count before allocating.
-                let spend_count: CompactSizeMessage = limited_reader.read_value()?;
+                let spend_count: CompactSizeMessage = reader.read_value()?;
                 let spend_count: usize = spend_count.into();
 
                 // # Consensus
@@ -1061,10 +1072,10 @@ impl ZcashDeserialize for Transaction {
 
                 // Denoted as `vSpendsSapling` in the spec.
                 let shielded_spends: Vec<sapling::Spend<sapling::PerSpendAnchor>> =
-                    limited_reader.read_external_count(spend_count)?;
+                    reader.read_external_count(spend_count)?;
 
                 // Denoted as `nOutputsSapling` and `vOutputsSapling` in the spec.
-                let shielded_outputs = limited_reader
+                let shielded_outputs = reader
                     .read_value::<Vec<sapling::OutputInTransactionV4>>()?
                     .into_iter()
                     .map(sapling::Output::from_v4)
@@ -1072,7 +1083,7 @@ impl ZcashDeserialize for Transaction {
 
                 // A bundle of fields denoted in the spec as `nJoinSplit`, `vJoinSplit`,
                 // `joinSplitPubKey` and `joinSplitSig`.
-                let joinsplit_data = limited_reader.read_value::<OptV4Jsd>()?;
+                let joinsplit_data = reader.read_value::<OptV4Jsd>()?;
 
                 let sapling_transfers = if !shielded_spends.is_empty() {
                     Some(sapling::TransferData::SpendsAndMaybeOutputs {
@@ -1102,7 +1113,7 @@ impl ZcashDeserialize for Transaction {
                         value_balance,
                         transfers,
                         // Denoted as `bindingSigSapling` in the spec.
-                        binding_sig: limited_reader.read_64_bytes()?.into(),
+                        binding_sig: reader.read_64_bytes()?.into(),
                     }),
                     None => None,
                 };
@@ -1121,14 +1132,13 @@ impl ZcashDeserialize for Transaction {
                 // https://zips.z.cash/protocol/protocol.pdf#txnencoding
 
                 // Denoted as `nVersionGroupId` in the spec.
-                let id = limited_reader.read_u32::<LittleEndian>()?;
+                let id = reader.read_u32::<LittleEndian>()?;
                 if id != TX_V5_VERSION_GROUP_ID {
                     return Err(SerializationError::Parse("expected TX_V5_VERSION_GROUP_ID"));
                 }
                 // Denoted as `nConsensusBranchId` in the spec.
                 // Convert it to a NetworkUpgrade
-                let network_upgrade =
-                    NetworkUpgrade::try_from(limited_reader.read_u32::<LittleEndian>()?)?;
+                let network_upgrade = NetworkUpgrade::try_from(reader.read_u32::<LittleEndian>()?)?;
 
                 // # Consensus
                 //
@@ -1143,16 +1153,16 @@ impl ZcashDeserialize for Transaction {
                 }
 
                 // Denoted as `lock_time` in the spec.
-                let lock_time = limited_reader.read_value::<LockTime>()?;
+                let lock_time = reader.read_value::<LockTime>()?;
 
                 // Denoted as `nExpiryHeight` in the spec.
-                let expiry_height = block::Height(limited_reader.read_u32::<LittleEndian>()?);
+                let expiry_height = block::Height(reader.read_u32::<LittleEndian>()?);
 
                 // Denoted as `tx_in_count` and `tx_in` in the spec.
-                let inputs: Vec<transparent::Input> = limited_reader.read_value::<Vec<_>>()?;
+                let inputs: Vec<transparent::Input> = reader.read_value::<Vec<_>>()?;
 
                 // Denoted as `tx_out_count` and `tx_out` in the spec.
-                let outputs = limited_reader.read_value::<Vec<_>>()?;
+                let outputs = reader.read_value::<Vec<_>>()?;
 
                 let is_coinbase = inputs.len() == 1
                     && matches!(inputs.first(), Some(transparent::Input::Coinbase { .. }));
@@ -1162,15 +1172,13 @@ impl ZcashDeserialize for Transaction {
                 // `vSpendProofsSapling`, `vSpendAuthSigsSapling`, `vOutputProofsSapling` and
                 // `bindingSigSapling`.
                 let sapling_shielded_data =
-                    deserialize_v5_sapling_shielded_data(&mut limited_reader, is_coinbase)?;
+                    deserialize_v5_sapling_shielded_data(reader, is_coinbase)?;
 
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
-                let orchard_shielded_data = deserialize_orchard_shielded_data_with_flags(
-                    &mut limited_reader,
-                    !ALLOW_CROSS_ADDRESS_BIT,
-                )?;
+                let orchard_shielded_data =
+                    deserialize_orchard_shielded_data_with_flags(reader, !ALLOW_CROSS_ADDRESS_BIT)?;
 
                 Ok(Transaction::V5 {
                     network_upgrade,
@@ -1187,30 +1195,29 @@ impl ZcashDeserialize for Transaction {
                 // https://zips.z.cash/zip-0229
 
                 // Denoted as `nVersionGroupId` in the spec.
-                let id = limited_reader.read_u32::<LittleEndian>()?;
+                let id = reader.read_u32::<LittleEndian>()?;
                 if id != TX_V6_VERSION_GROUP_ID {
                     return Err(SerializationError::Parse("expected TX_V6_VERSION_GROUP_ID"));
                 }
                 // Denoted as `nConsensusBranchId` in the spec.
                 // Convert it to a NetworkUpgrade
-                let network_upgrade =
-                    NetworkUpgrade::try_from(limited_reader.read_u32::<LittleEndian>()?)?;
+                let network_upgrade = NetworkUpgrade::try_from(reader.read_u32::<LittleEndian>()?)?;
                 if network_upgrade < NetworkUpgrade::Nu6_3 {
                     return Err(SerializationError::Parse(
                         "v6 transaction must have a NU6.3 or later consensus branch ID",
                     ));
                 }
                 // Denoted as `lock_time` in the spec.
-                let lock_time = limited_reader.read_value::<LockTime>()?;
+                let lock_time = reader.read_value::<LockTime>()?;
 
                 // Denoted as `nExpiryHeight` in the spec.
-                let expiry_height = block::Height(limited_reader.read_u32::<LittleEndian>()?);
+                let expiry_height = block::Height(reader.read_u32::<LittleEndian>()?);
 
                 // Denoted as `tx_in_count` and `tx_in` in the spec.
-                let inputs: Vec<transparent::Input> = limited_reader.read_value::<Vec<_>>()?;
+                let inputs: Vec<transparent::Input> = reader.read_value::<Vec<_>>()?;
 
                 // Denoted as `tx_out_count` and `tx_out` in the spec.
-                let outputs = limited_reader.read_value::<Vec<_>>()?;
+                let outputs = reader.read_value::<Vec<_>>()?;
 
                 let is_coinbase = inputs.len() == 1
                     && matches!(inputs.first(), Some(transparent::Input::Coinbase { .. }));
@@ -1221,25 +1228,21 @@ impl ZcashDeserialize for Transaction {
                 // `vSpendAuthSigsSapling`, `vOutputProofsSapling` and
                 // `bindingSigSapling`.
                 let sapling_shielded_data =
-                    deserialize_v5_sapling_shielded_data(&mut limited_reader, is_coinbase)?;
+                    deserialize_v5_sapling_shielded_data(reader, is_coinbase)?;
 
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
                 // V6 Orchard still reserves bit 2; only the Ironwood slot below permits it.
-                let orchard_shielded_data = deserialize_orchard_shielded_data_with_flags(
-                    &mut limited_reader,
-                    !ALLOW_CROSS_ADDRESS_BIT,
-                )?;
+                let orchard_shielded_data =
+                    deserialize_orchard_shielded_data_with_flags(reader, !ALLOW_CROSS_ADDRESS_BIT)?;
 
                 // A bundle of fields denoted in the spec as `nActionsIronwood`,
                 // `vActionsIronwood`, `flagsIronwood`, `valueBalanceIronwood`,
                 // `anchorIronwood`, `sizeProofsIronwood`, `proofsIronwood`,
                 // `vSpendAuthSigsIronwood`, and `bindingSigIronwood`.
-                let ironwood_shielded_data = deserialize_orchard_shielded_data_with_flags(
-                    &mut limited_reader,
-                    ALLOW_CROSS_ADDRESS_BIT,
-                )?;
+                let ironwood_shielded_data =
+                    deserialize_orchard_shielded_data_with_flags(reader, ALLOW_CROSS_ADDRESS_BIT)?;
 
                 Ok(Transaction::V6 {
                     network_upgrade,

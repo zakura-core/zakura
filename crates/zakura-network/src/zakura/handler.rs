@@ -2094,7 +2094,7 @@ impl ZakuraSupervisorHandle {
                 set_active_connection_gauge(registered_ids.len());
                 self.peer_set_tx.send_replace(registered_ids);
                 if let Some(peer_registry) = &self.peer_registry {
-                    peer_registry.register_native_connection(peer_id.clone(), conn_id);
+                    peer_registry.register_native_connection(peer_id.clone(), conn_id, remote_ip);
                 }
                 let _ = self.registration_tx.send(ZakuraConnectionRegistration {
                     peer_id: peer_id.clone(),
@@ -3187,14 +3187,7 @@ impl ZakuraProtocolHandler {
         };
 
         let remote_node_id = connection.remote_id();
-        let remote_peer_id = match ZakuraPeerId::new(remote_node_id.as_bytes().to_vec()) {
-            Ok(remote_peer_id) => remote_peer_id,
-            Err(error) => {
-                debug!(?error, "Zakura peer id rejected");
-                connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"peer id");
-                return;
-            }
-        };
+        let remote_peer_id = ZakuraPeerId::from_node_id(remote_node_id);
         let conn = ZakuraConnTrace::new(&self.trace, conn_id, &remote_peer_id);
 
         let negotiated = match self
@@ -5461,14 +5454,14 @@ pub(crate) async fn serve_reported_native_dial_connection(
         report.registration
     });
     let remote_node_id = connection.remote_id();
-    let peer_id = ZakuraPeerId::new(remote_node_id.as_bytes().to_vec())?;
+    let peer_id = ZakuraPeerId::from_node_id(remote_node_id);
     let conn = ZakuraConnTrace::new(
         &endpoint.handler.trace,
         trace_conn_id(&connection),
         &peer_id,
     );
     let local_node_id = endpoint.local_node_id();
-    let local_peer_id = ZakuraPeerId::new(local_node_id.as_bytes().to_vec())?;
+    let local_peer_id = ZakuraPeerId::from_node_id(local_node_id);
     let negotiated = {
         let _handshake = sim_chain!(endpoint
             .handler
@@ -7277,10 +7270,10 @@ impl LegacyResponseReadState {
     ) -> Result<LegacyResponseItem, OutboundRequestError> {
         let mut remaining = self.active_chunk.as_slice();
         let item = match kind {
-            LegacyResponseKind::Blocks => Block::zcash_deserialize_from_slice(&mut remaining)
+            LegacyResponseKind::Blocks => Block::zcash_deserialize_bounded(&mut remaining)
                 .map(|block| LegacyResponseItem::Block(Arc::new(block))),
             LegacyResponseKind::Transactions => {
-                Transaction::zcash_deserialize_from_slice(&mut remaining)
+                Transaction::zcash_deserialize_bounded(&mut remaining)
                     .map(|transaction| LegacyResponseItem::Transaction(transaction.into()))
             }
             LegacyResponseKind::BlockHashes

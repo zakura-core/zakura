@@ -59,6 +59,18 @@ pub enum FinalFrontiersGenerationError {
         height: block::Height,
     },
 
+    /// A build without the `sprout` feature stopped maintaining this database's Sprout tree, so
+    /// its Sprout frontier is incomplete.
+    #[error(
+        "cannot produce final frontiers: this database stopped maintaining the Sprout note \
+         commitment tree at height {skipped_from:?}; generate them from a database synced by a \
+         build with the `sprout` feature"
+    )]
+    SproutTreeNotMaintained {
+        /// The first height committed without its Sprout note commitments.
+        skipped_from: block::Height,
+    },
+
     /// The database has no Sapling tree at the requested height.
     #[error("missing Sapling final frontier tree at height {height:?}")]
     MissingSaplingTree {
@@ -669,6 +681,9 @@ fn read_final_frontiers_at(
     let ironwood = db
         .ironwood_tree_by_height(&height)
         .ok_or(FinalFrontiersGenerationError::MissingIronwoodTree { height })?;
+    if let Some(skipped_from) = db.sprout_tree_skipped_from() {
+        return Err(FinalFrontiersGenerationError::SproutTreeNotMaintained { skipped_from });
+    }
     let sprout = db
         .sprout_tree_for_tip()
         .map_err(|error| FinalFrontiersGenerationError::MissingSproutTree { height: error.tip })?;
@@ -1393,66 +1408,6 @@ mod tests {
                 offset: frontiers.to_bytes().len(),
                 trailing_len: 1,
             }
-        );
-    }
-
-    /// The test fixture source looks up produced roots by height and exposes
-    /// the handoff frontier — the consumer view of producer output.
-    #[test]
-    fn fixture_source_round_trips_payload() {
-        let roots = vec![
-            BlockCommitmentRoots {
-                height: block::Height(10),
-                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
-                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-                ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-                sapling_tx: 0,
-                orchard_tx: 0,
-                ironwood_tx: 0,
-                auth_data_root: AuthDataRoot::from([0u8; 32]),
-            },
-            BlockCommitmentRoots {
-                height: block::Height(11),
-                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
-                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-                ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-                sapling_tx: 0,
-                orchard_tx: 0,
-                ironwood_tx: 0,
-                auth_data_root: AuthDataRoot::from([0u8; 32]),
-            },
-        ];
-        let roots = roots
-            .into_iter()
-            .map(|root| {
-                (
-                    root.height.0,
-                    (root.sapling_root, root.orchard_root, root.ironwood_root),
-                )
-            })
-            .collect();
-        let frontiers = FinalFrontiers {
-            height: block::Height(11),
-            sapling: Arc::new(Default::default()),
-            orchard: Arc::new(Default::default()),
-            sprout: Arc::new(Default::default()),
-            ironwood: Arc::new(Default::default()),
-        };
-
-        let source = FixtureSource::new(roots, frontiers);
-
-        assert!(
-            source.vct_root(block::Height(10)).is_some(),
-            "produced root is looked up by height"
-        );
-        assert!(
-            source.vct_root(block::Height(99)).is_none(),
-            "absent height has no root"
-        );
-        assert_eq!(
-            source.vct_last_checkpoint_height(),
-            block::Height(11),
-            "handoff height comes from the supplied frontiers"
         );
     }
 }

@@ -890,7 +890,11 @@ where
 
             let now = Instant::now();
             let active_public_inbound_connections = active_inbound_connections
-                .update_count_with_closed(|closed| held_seats.hold(closed, now));
+                .update_count_with_closed(|closed| {
+                    if !bans.contains(closed.ip) {
+                        held_seats.hold(closed, now);
+                    }
+                });
             let active_zcashd_compat_inbound_connections =
                 active_zcashd_compat_connections.update_count();
             let active_unconditional_inbound_connections =
@@ -901,6 +905,7 @@ where
             let is_zcashd_compat_peer = zcashd_compat_peer_ips.contains(&canonical_ip);
             // A full listener keeps the seats of long-lived peers that just left for
             // those peers, so a peer that restarts finds its seat free when it dials back.
+            held_seats.release_banned(|ip| bans.contains(ip));
             let seats_held_for_others = held_seats.held_for_others(canonical_ip, now);
             let is_refused_for_held_seats = active_public_inbound_connections
                 < public_inbound_connection_limit

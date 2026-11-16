@@ -20,8 +20,7 @@ use crate::{constants, peer_set::limit::ClosedConnection};
 /// A hold does not depend on why the connection closed. A peer that this node dropped,
 /// for example because it stalled, also gets one. That peer could already take the free
 /// seat back by dialing again at once, because the listener keeps no record of dropped
-/// peers. A banned peer is refused before it reaches its held seat, so that seat stays
-/// empty until the hold is over.
+/// peers. A banned peer is the exception, see [`HeldSeats::release_banned`].
 #[derive(Debug)]
 pub struct HeldSeats {
     /// When each held seat is released, by the IP it is held for.
@@ -68,6 +67,15 @@ impl HeldSeats {
     /// Releases the seats whose hold is over at `now`.
     fn release_expired(&mut self, now: Instant) {
         self.release_at.retain(|_ip, release_at| now < *release_at);
+    }
+
+    /// Releases the seats held for the IPs that `is_banned`.
+    ///
+    /// A banned peer is refused before it reaches its seat, so the seat would stay empty
+    /// until its hold is over. A peer can be banned after its connection closed, when its
+    /// misbehavior is reported late, so the listener checks the holds it already has.
+    pub fn release_banned(&mut self, is_banned: impl Fn(IpAddr) -> bool) {
+        self.release_at.retain(|ip, _release_at| !is_banned(*ip));
     }
 
     /// Releases the seat held for `ip`, because its peer took it back.
@@ -166,6 +174,23 @@ mod tests {
                 "unexpected held seats with an inbound limit of {inbound_limit}"
             );
         }
+    }
+
+    /// A banned IP's seat is not held, whether it was banned before or after the hold.
+    #[test]
+    fn banned_ips_hold_no_seat() {
+        let now = Instant::now();
+        let peer = closed(1, constants::MIN_HELD_SEAT_CONNECTION, now);
+        let other = closed(2, constants::MIN_HELD_SEAT_CONNECTION, now);
+        let newcomer_ip = closed(3, Duration::ZERO, now).ip;
+        let mut seats = HeldSeats::new(100);
+
+        seats.hold(peer, now);
+        seats.hold(other, now);
+        seats.release_banned(|ip| ip == peer.ip);
+
+        assert_eq!(seats.held_for_others(newcomer_ip, now), 1);
+        assert_eq!(seats.held_for_others(other.ip, now), 0);
     }
 
     /// A hold that is over frees its place under the limit for the next peer that

@@ -3259,6 +3259,43 @@ async fn listener_releases_the_held_seat_of_an_unconditional_peer_that_returns()
     listener.stop().await;
 }
 
+/// A listener holds no seat for a peer that is banned, even when the ban comes after
+/// the peer's connection closed.
+#[tokio::test]
+async fn listener_releases_the_held_seat_of_a_banned_peer() {
+    let _init_guard = zakura_test::init();
+
+    // A target size of 4 gives 12 inbound seats, so one seat can be held.
+    let Some(mut listener) = UnconditionalPeerListener::spawn("[]", &[], 4).await else {
+        return;
+    };
+    const BANNED_PEER_IP: IpAddr = LISTENER_UNCONDITIONAL_IP;
+
+    let mut banned_peer = listener
+        .offer(BANNED_PEER_IP)
+        .await
+        .expect("the listener has free seats");
+    banned_peer.2.mark_open();
+    age_open_connections().await;
+    let mut other_peers = listener.offer_until_refused(LISTENER_PUBLIC_IP).await;
+
+    std::mem::drop(banned_peer);
+    assert!(
+        listener.offer(LISTENER_PUBLIC_IP).await.is_none(),
+        "the seat is held while the peer is not banned",
+    );
+
+    listener.bans.ban(BANNED_PEER_IP);
+    other_peers.push(
+        listener
+            .offer(LISTENER_PUBLIC_IP)
+            .await
+            .expect("a banned peer's seat is not held"),
+    );
+
+    listener.stop().await;
+}
+
 /// Advances the test clock by [`constants::MIN_HELD_SEAT_CONNECTION`], so that the
 /// connections that are open now are long-lived when they close.
 async fn age_open_connections() {
@@ -4709,6 +4746,9 @@ struct UnconditionalPeerListener {
     /// The peer changes that the listener sends to the peer set.
     _peerset_rx: mpsc::Receiver<DiscoveredPeer>,
 
+    /// The listener's ban list.
+    bans: BannedIps,
+
     /// The listener task.
     listen_task_handle: JoinHandle<Result<(), BoxError>>,
 }
@@ -4789,13 +4829,14 @@ impl UnconditionalPeerListener {
         // Room for every peer change that a test can cause.
         let (peerset_tx, peerset_rx) =
             mpsc::channel::<DiscoveredPeer>(config.peerset_total_connection_limit() * 4);
+        let bans = BannedIps::default();
         let listen_task_handle = tokio::spawn(accept_inbound_connections(
             config,
             tcp_listener,
             MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
             tower::util::BoxCloneService::new(open_inbound_handshaker),
             peerset_tx,
-            BannedIps::default(),
+            bans.clone(),
             zcashd_compat_peer_ips
                 .iter()
                 .map(|ip| ip.parse().expect("test address parses"))
@@ -4807,6 +4848,7 @@ impl UnconditionalPeerListener {
             inbound_limit,
             accepted_rx,
             _peerset_rx: peerset_rx,
+            bans,
             listen_task_handle,
         })
     }

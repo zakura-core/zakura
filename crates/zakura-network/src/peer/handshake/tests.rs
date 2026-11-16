@@ -122,16 +122,24 @@ async fn negotiate_test_pair(
 ) -> (Arc<ConnectionInfo>, Arc<ConnectionInfo>) {
     let local_services = local_config.handshake_services(PeerServices::NODE_NETWORK);
     let remote_services = remote_config.handshake_services(PeerServices::NODE_NETWORK);
-    negotiate_test_pair_with_services(local_config, local_services, remote_config, remote_services)
-        .await
+    negotiate_test_pair_with_services(
+        local_config,
+        local_services,
+        remote_config,
+        remote_services,
+        false,
+    )
+    .await
 }
 
-/// Like [`negotiate_test_pair`], with each end advertising exactly the given services.
+/// Like [`negotiate_test_pair`], with each end advertising exactly the given services. The
+/// remote end treats the local end as a protected peer if `local_is_protected`.
 async fn negotiate_test_pair_with_services(
     local_config: Config,
     local_services: PeerServices,
     remote_config: Config,
     remote_services: PeerServices,
+    local_is_protected: bool,
 ) -> (Arc<ConnectionInfo>, Arc<ConnectionInfo>) {
     let (local_stream, remote_stream) = duplex(16 * 1024);
     let mut local_conn = Framed::new(
@@ -182,7 +190,7 @@ async fn negotiate_test_pair_with_services(
             remote_services,
             true,
             remote_min_version,
-            false,
+            local_is_protected,
         )
         .await
     });
@@ -1151,11 +1159,22 @@ async fn early_block_relay_requires_both_ends_to_advertise_compact_blocks() {
     };
     let config = || test_config(P2pStack::Legacy);
 
-    let (local, remote) =
-        negotiate_test_pair_with_services(config(), services(true), config(), services(true))
-            .await;
+    let (local, remote) = negotiate_test_pair_with_services(
+        config(),
+        services(true),
+        config(),
+        services(true),
+        false,
+    )
+    .await;
     assert!(local.early_block_relay);
     assert!(remote.early_block_relay);
+
+    // A protected peer's block requests can't be served early, so it never negotiates.
+    let (_, remote) =
+        negotiate_test_pair_with_services(config(), services(true), config(), services(true), true)
+            .await;
+    assert!(!remote.early_block_relay);
 
     for (local_enabled, remote_enabled) in [(true, false), (false, true), (false, false)] {
         let (local, remote) = negotiate_test_pair_with_services(
@@ -1163,6 +1182,7 @@ async fn early_block_relay_requires_both_ends_to_advertise_compact_blocks() {
             services(local_enabled),
             config(),
             services(remote_enabled),
+            false,
         )
         .await;
         assert!(
@@ -1184,6 +1204,7 @@ async fn pruned_peers_do_not_negotiate_early_block_relay() {
         pruned,
         test_config(P2pStack::Legacy),
         pruned,
+        false,
     )
     .await;
     assert!(!local.early_block_relay && !remote.early_block_relay);

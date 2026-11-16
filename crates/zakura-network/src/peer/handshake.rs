@@ -219,7 +219,8 @@ pub struct ConnectionInfo {
     /// severed). See [`Connection::handle_inbound_overload`].
     pub is_protected_peer: bool,
 
-    /// Whether both ends advertised [`PeerServices::NODE_COMPACT_BLOCKS`].
+    /// Whether both ends advertised [`PeerServices::NODE_COMPACT_BLOCKS`], and the peer is not
+    /// protected.
     ///
     /// On these connections, inbound `getdata` may be served early bodies, and blocks this
     /// node downloads are verified as early-relay deliveries.
@@ -1020,7 +1021,10 @@ where
     let negotiated_version = min(constants::CURRENT_NETWORK_PROTOCOL_VERSION, remote.version);
 
     // Limit containing struct size, and avoid multiple duplicates of 300+ bytes of data.
-    let early_block_relay = negotiated_early_block_relay(&our_version, &remote);
+    // A protected peer's block requests use the source-routed path, which serves only committed
+    // and pending blocks, so it never negotiates early relay.
+    let early_block_relay =
+        !is_protected_peer && negotiated_early_block_relay(&our_version, &remote);
     if early_block_relay {
         metrics::counter!("zakura.p2p.handshake.early_block_relay.negotiated").increment(1);
     }

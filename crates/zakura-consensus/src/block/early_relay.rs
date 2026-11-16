@@ -78,10 +78,14 @@ impl Slots {
 
     /// Returns the reservation if it still holds the slot: before its deadline, while its parent
     /// is the best tip.
-    fn live_reservation(&self, best_tip: Option<block::Hash>, now: Instant) -> Option<&Reservation> {
-        self.reservation
-            .as_ref()
-            .filter(|reservation| now < reservation.deadline && best_tip == Some(reservation.parent))
+    fn live_reservation(
+        &self,
+        best_tip: Option<block::Hash>,
+        now: Instant,
+    ) -> Option<&Reservation> {
+        self.reservation.as_ref().filter(|reservation| {
+            now < reservation.deadline && best_tip == Some(reservation.parent)
+        })
     }
 }
 
@@ -335,10 +339,14 @@ mod tests {
         assert!(!withdrawn.is_finished());
 
         // Any other committed tip, here the block itself, ends early relay for this parent.
-        tip.set_finalized_tip(tip_block(&decode(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES)));
+        tip.set_finalized_tip(tip_block(&decode(
+            &zakura_test::vectors::BLOCK_MAINNET_1_BYTES,
+        )));
 
         assert!(relay.get(hash).is_none(), "the parent is no longer the tip");
-        withdrawn.await.expect("the wait finishes after the tip changes");
+        withdrawn
+            .await
+            .expect("the wait finishes after the tip changes");
     }
 
     /// After a withdrawal, the slot stays reserved for the same parent until the deadline, so one

@@ -320,7 +320,15 @@ async fn only_early_block_requests_see_the_early_relay_block() -> Result<(), cra
         zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.zcash_deserialize_into()?;
     let hash = block.hash();
 
-    let early_relay = zakura_consensus::EarlyRelay::default();
+    // Early relay serves the block only while its parent is the best tip.
+    let mut parent_tip =
+        zakura_state::ChainTipBlock::from(zakura_state::SemanticallyVerifiedBlock::from(
+            block.clone(),
+        ));
+    parent_tip.hash = block.header.previous_block_hash;
+    let (_parent_tip_sender, parent_tip, _parent_tip_change) =
+        zakura_state::ChainTipSender::new(parent_tip, &network);
+    let early_relay = zakura_consensus::EarlyRelay::new(parent_tip);
     let _published = early_relay
         .publish(block.clone().into(), hash)
         .expect("the early-relay slot is free");

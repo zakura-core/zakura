@@ -647,7 +647,7 @@ impl StartCmd {
         let early_relay = config
             .network
             .compact_block_relay
-            .then(zakura_consensus::EarlyRelay::default);
+            .then(|| zakura_consensus::EarlyRelay::new(latest_chain_tip.clone()));
         let inbound = LoadShed::new(spawn_buffer(
             Timeout::new(
                 Inbound::new(

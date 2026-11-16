@@ -212,7 +212,8 @@ where
 /// negotiated early block relay.
 ///
 /// The verifier publishes a block after full semantic verification, before its contextual
-/// commit finishes. Committed-tip gossip still advertises the block to every peer afterward.
+/// commit finishes. Each fan-out stops when the block is withdrawn, for example by its commit or
+/// a tip change. Committed-tip gossip still advertises the block to every peer afterward.
 /// Nothing is advertised while the node is far from the tip, because its peers already have
 /// those blocks.
 pub async fn gossip_early_relay_blocks<ZN>(
@@ -242,11 +243,16 @@ where
         let advert = zn::AdvertisedBlock::new(hash, block.zcash_serialized_size());
         debug!(?hash, "sending early-relay block broadcast");
         let network = broadcast_network.clone();
+        let early_relay = early_relay.clone();
         tokio::spawn(async move {
             let request = zn::Request::AdvertiseEarlyBlock(advert);
-            let sent = tokio::time::timeout(EARLY_RELAY_LIFETIME, network.oneshot(request))
-                .await
-                .is_ok_and(|result| result.is_ok());
+            let broadcast = tokio::time::timeout(EARLY_RELAY_LIFETIME, network.oneshot(request));
+            // A withdrawn block is no longer served, so the fan-out stops: delayed peers
+            // would only request it and receive `notfound`.
+            let sent = tokio::select! {
+                result = broadcast => result.is_ok_and(|result| result.is_ok()),
+                () = early_relay.withdrawn(hash) => false,
+            };
             if sent {
                 metrics::counter!("sync.gossip.early_relay.broadcasts").increment(1);
             }

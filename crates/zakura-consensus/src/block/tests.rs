@@ -4323,6 +4323,12 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
     .expect("duplicate receipt regression must finish");
 }
 
+/// An early-relay cache with no best tip, for tests that never publish a block.
+fn test_early_relay() -> EarlyRelay {
+    let (_sender, tip, _change) = zs::ChainTipSender::new(None, &Network::Mainnet);
+    EarlyRelay::new(tip)
+}
+
 /// A deterministic failure that early relay can exempt: an input missing from the parent.
 fn post_auth_failure() -> VerifyBlockError {
     VerifyBlockError::MissingTransparentInput {
@@ -4377,7 +4383,7 @@ async fn authenticated_early_relay_failure_is_unscored_and_rejected() {
         .expect("test vector decodes")
         .hash();
     for eligibility in [Authorized, CommitFirst] {
-        let relay = EarlyRelay::default();
+        let relay = test_early_relay();
         let error =
             classify_early_relay_failure(block_bytes, &relay, Ok(eligibility), post_auth_failure())
                 .await;
@@ -4420,7 +4426,7 @@ async fn authenticated_unscored_deterministic_failure_is_rejected() {
         (CommitFirst, true),
         (Unavailable, false),
     ] {
-        let relay = EarlyRelay::default();
+        let relay = test_early_relay();
         let error =
             classify_early_relay_failure(block_bytes, &relay, Ok(eligibility), duplicate_spend())
                 .await;
@@ -4436,7 +4442,7 @@ async fn authenticated_unscored_deterministic_failure_is_rejected() {
     }
 
     // An authentication failure doesn't give an unscored failure a score.
-    let relay = EarlyRelay::default();
+    let relay = test_early_relay();
     let error = classify_early_relay_failure(
         block_bytes,
         &relay,
@@ -4470,7 +4476,7 @@ async fn unscored_retryable_early_relay_failure_skips_the_state_check() {
         &Network::Mainnet,
         block.into(),
         None,
-        Some(&EarlyRelay::default()),
+        Some(&test_early_relay()),
         VerifyBlockError::ParentUnavailable {
             parent: block::Hash([3; 32]),
         },
@@ -4484,7 +4490,7 @@ async fn unscored_retryable_early_relay_failure_skips_the_state_check() {
 #[tokio::test(start_paused = true)]
 async fn unauthenticated_early_relay_failure_without_context_is_unscored() {
     let block_bytes = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice();
-    let relay = EarlyRelay::default();
+    let relay = test_early_relay();
     let error = classify_early_relay_failure(
         block_bytes,
         &relay,
@@ -4501,7 +4507,7 @@ async fn unauthenticated_early_relay_failure_without_context_is_unscored() {
 #[tokio::test(start_paused = true)]
 async fn failed_early_relay_authentication_is_scored() {
     let block_bytes = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice();
-    let relay = EarlyRelay::default();
+    let relay = test_early_relay();
     let error = classify_early_relay_failure(
         block_bytes,
         &relay,
@@ -4539,7 +4545,7 @@ async fn pre_nu5_early_relay_failure_keeps_its_score() {
         &Network::Mainnet,
         block.into(),
         None,
-        Some(&EarlyRelay::default()),
+        Some(&test_early_relay()),
         post_auth_failure(),
     )
     .await;
@@ -4586,7 +4592,7 @@ async fn rejected_early_relay_hash_skips_only_an_authenticated_body() {
         .with_early_relay(Some(relay))
     };
 
-    let relay = EarlyRelay::default();
+    let relay = test_early_relay();
     relay.reject(hash);
     let error = verifier(relay.clone())
         .oneshot(Request::CommitEarlyRelay(Arc::new(block.clone()).into()))

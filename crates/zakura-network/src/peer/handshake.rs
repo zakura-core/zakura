@@ -1789,6 +1789,7 @@ where
             let bare_codec = peer_conn.codec_mut();
             bare_codec.reconfigure_version(connection_info.negotiated_version);
             bare_codec.reconfigure_full_body_len();
+            bare_codec.reconfigure_compact_blocks(connection_info.early_block_relay);
 
             debug!("constructing client, spawning server");
 

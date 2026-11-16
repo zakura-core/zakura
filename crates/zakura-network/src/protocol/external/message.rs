@@ -5,7 +5,6 @@ use zakura_node_services::block_memory::BlockHandle;
 
 use chrono::{DateTime, Utc};
 
-#[cfg(any(test, feature = "proptest-impl"))]
 use std::sync::Arc;
 #[cfg(any(test, feature = "proptest-impl"))]
 use zakura_chain::block::Block;
@@ -17,7 +16,12 @@ use zakura_chain::{
 
 use crate::{meta_addr::MetaAddr, BoxError};
 
-use super::{addr::AddrInVersion, inv::InventoryHash, types::*};
+use super::{
+    addr::AddrInVersion,
+    compact::{BlockTransactions, BlockTransactionsRequest, CompactBlock},
+    inv::InventoryHash,
+    types::*,
+};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest::prelude::*;
@@ -273,6 +277,35 @@ pub enum Message {
     ///
     /// [BIP35]: https://github.com/bitcoin/bips/blob/master/bip-0035.mediawiki
     Mempool,
+
+    /// A `sendcmpct` message, from the draft Compact Block Relay ZIP.
+    ///
+    /// Asks the peer to start or stop announcing blocks with `cmpctblock`. The codec drops it
+    /// unless both peers set `NODE_COMPACT_BLOCKS`.
+    SendCompact {
+        /// Whether the sender wants `cmpctblock` announcements.
+        announce: bool,
+        /// The compact block encoding version. The ZIP defines version 1.
+        version: u64,
+    },
+
+    /// A `cmpctblock` message, from the draft Compact Block Relay ZIP.
+    ///
+    /// Announces a block with short IDs in place of most of its transactions. The codec drops
+    /// it unless announcements were negotiated and requested.
+    CompactBlock(Arc<CompactBlock>),
+
+    /// A `getblocktxn` message, from the draft Compact Block Relay ZIP.
+    ///
+    /// Requests transactions of a block that this node announced with `cmpctblock`. The codec
+    /// drops it unless this connection sent a `cmpctblock`.
+    GetBlockTransactions(BlockTransactionsRequest),
+
+    /// A `blocktxn` message, from the draft Compact Block Relay ZIP.
+    ///
+    /// Answers a `getblocktxn` request. The codec drops it unless it answers this node's
+    /// outstanding request before its deadline.
+    BlockTransactions(BlockTransactions),
 }
 
 /// The maximum size of the user agent string.
@@ -502,6 +535,26 @@ impl fmt::Display for Message {
             Message::NotFound(invs) => format!("notfound {{ invs: {} }}", invs.len()),
 
             Message::Mempool => "mempool".to_string(),
+
+            Message::SendCompact { announce, version } => {
+                format!("sendcmpct {{ announce: {announce}, version: {version} }}")
+            }
+            Message::CompactBlock(compact) => format!(
+                "cmpctblock {{ hash: {}, short_ids: {}, prefilled: {} }}",
+                compact.block_hash(),
+                compact.short_ids.len(),
+                compact.prefilled.len(),
+            ),
+            Message::GetBlockTransactions(request) => format!(
+                "getblocktxn {{ hash: {}, indexes: {} }}",
+                request.block_hash,
+                request.indexes.len(),
+            ),
+            Message::BlockTransactions(response) => format!(
+                "blocktxn {{ hash: {}, transactions: {} }}",
+                response.block_hash,
+                response.transactions.len(),
+            ),
         })
     }
 }
@@ -527,6 +580,10 @@ impl Message {
             Message::Tx(_) => "tx",
             Message::NotFound(_) => "notfound",
             Message::Mempool => "mempool",
+            Message::SendCompact { .. } => "sendcmpct",
+            Message::CompactBlock(_) => "cmpctblock",
+            Message::GetBlockTransactions(_) => "getblocktxn",
+            Message::BlockTransactions(_) => "blocktxn",
         }
     }
 }

@@ -1,5 +1,7 @@
 //! Randomised property tests for Zebra's Zcash network protocol types.
 
+use std::sync::Arc;
+
 use bytes::BytesMut;
 use proptest::{collection::vec, prelude::*};
 use tokio_util::codec::{Decoder, Encoder};
@@ -10,12 +12,14 @@ use zakura_chain::{
         SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
         MAX_PROTOCOL_MESSAGE_LEN,
     },
+    transaction::Transaction,
 };
 
 use crate::{
     meta_addr::{tests::check, MetaAddr},
     protocol::external::{
         addr::{AddrV1, AddrV2},
+        compact::{BlockTransactions, BlockTransactionsRequest, CompactBlock},
         Codec, InventoryHash, Message,
     },
 };
@@ -249,5 +253,44 @@ proptest! {
             deserialized_addr,
             hex::encode(&addr_bytes2),
         );
+    }
+}
+
+/// Returns whether `transactions` includes a coinbase transaction with Sapling spends, which
+/// arbitrary transactions can have but the parser rejects (GHSA-rgwx-8r98-p34c).
+fn has_coinbase_sapling_spends<'a>(
+    mut transactions: impl Iterator<Item = &'a Arc<Transaction>>,
+) -> bool {
+    transactions.any(|tx| tx.is_coinbase() && tx.sapling_spends_per_anchor().count() > 0)
+}
+
+proptest! {
+    /// Compact block relay messages are unchanged after encoding and decoding them.
+    #[test]
+    fn compact_block_relay_messages_roundtrip(
+        compact in any::<CompactBlock>(),
+        request in any::<BlockTransactionsRequest>(),
+        response in any::<BlockTransactions>(),
+    ) {
+        let _init_guard = zakura_test::init();
+
+        let bytes = compact.zcash_serialize_to_vec()?;
+        let decoded = CompactBlock::zcash_deserialize_bounded(&mut &bytes[..]);
+        if has_coinbase_sapling_spends(compact.prefilled.iter().map(|p| &p.transaction)) {
+            prop_assert!(decoded.is_err());
+        } else {
+            prop_assert_eq!(decoded?, compact);
+        }
+
+        let bytes = request.zcash_serialize_to_vec()?;
+        prop_assert_eq!(BlockTransactionsRequest::zcash_deserialize(&bytes[..])?, request);
+
+        let bytes = response.zcash_serialize_to_vec()?;
+        let decoded = BlockTransactions::zcash_deserialize_bounded(&mut &bytes[..]);
+        if has_coinbase_sapling_spends(response.transactions.iter()) {
+            prop_assert!(decoded.is_err());
+        } else {
+            prop_assert_eq!(decoded?, response);
+        }
     }
 }

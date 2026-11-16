@@ -195,7 +195,13 @@ pub use crate::{
     peer_registry::ConnectedPeer,
     peer_set::init_with_zakura,
     protocol::{
-        external::{Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE},
+        external::{
+            compact::{
+                BlockTransactions, BlockTransactionsRequest, CompactBlock, PrefilledTransaction,
+                ShortId, ShortIdKeys, MAX_COMPACT_TRANSACTIONS,
+            },
+            Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE,
+        },
         internal::{AdvertisedBlock, InventoryResponse, PeerSource, Request, Response},
     },
 };

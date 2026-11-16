@@ -2,6 +2,7 @@
 
 use super::*;
 
+mod compact;
 mod resource_inventory;
 mod vectors;
 

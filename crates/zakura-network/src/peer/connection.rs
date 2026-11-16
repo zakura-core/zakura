@@ -1748,6 +1748,15 @@ where
             }
             .into(),
             Message::Mempool => Request::MempoolTransactionIds.into(),
+            // Compact block relay isn't used yet. The codec drops these messages unless they
+            // were negotiated, so a peer that sends them is not misbehaving.
+            Message::SendCompact { .. }
+            | Message::CompactBlock(_)
+            | Message::GetBlockTransactions(_)
+            | Message::BlockTransactions(_) => {
+                debug!(%msg, "ignoring compact block relay message");
+                Unused
+            }
         };
 
         // Handle the request, and return unused messages.

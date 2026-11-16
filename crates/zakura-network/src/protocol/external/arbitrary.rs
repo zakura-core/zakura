@@ -1,15 +1,21 @@
 //! Randomised test data generation for external protocol types.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use proptest::{collection::vec, prelude::*};
 
-use zakura_chain::{block, transaction};
+use zakura_chain::{
+    block::{self, Block},
+    transaction::{self, Transaction},
+};
 
 use crate::PeerSocketAddr;
 
 use super::{
     addr::canonical_peer_addr,
+    compact::{
+        BlockTransactions, BlockTransactionsRequest, CompactBlock, MAX_COMPACT_TRANSACTIONS,
+    },
     types::{PeerServices, Version},
     InventoryHash, Message,
 };
@@ -111,6 +117,56 @@ impl Message {
             .prop_map(Message::GetData)
             .boxed()
     }
+}
+
+/// Generates the compact form of an arbitrary block, which is valid by construction.
+impl Arbitrary for CompactBlock {
+    type Parameters = ();
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        (any::<Block>(), any::<u64>())
+            .prop_filter_map(
+                "block exceeds the compact block limits",
+                |(block, nonce)| CompactBlock::from_block(&block, nonce).ok(),
+            )
+            .boxed()
+    }
+
+    type Strategy = BoxedStrategy<Self>;
+}
+
+/// Generates a request with strictly increasing indexes below the transaction limit.
+impl Arbitrary for BlockTransactionsRequest {
+    type Parameters = ();
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        (
+            any::<[u8; 32]>(),
+            proptest::collection::btree_set(0..MAX_COMPACT_TRANSACTIONS, 0..16),
+        )
+            .prop_map(|(hash, indexes)| BlockTransactionsRequest {
+                block_hash: block::Hash(hash),
+                indexes: indexes.into_iter().collect(),
+            })
+            .boxed()
+    }
+
+    type Strategy = BoxedStrategy<Self>;
+}
+
+impl Arbitrary for BlockTransactions {
+    type Parameters = ();
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        (any::<[u8; 32]>(), vec(any::<Arc<Transaction>>(), 0..4))
+            .prop_map(|(hash, transactions)| BlockTransactions {
+                block_hash: block::Hash(hash),
+                transactions,
+            })
+            .boxed()
+    }
+
+    type Strategy = BoxedStrategy<Self>;
 }
 
 impl Arbitrary for Version {

@@ -2,8 +2,8 @@
 
 use super::*;
 
-/// The 18 dispatched commands, by their on-wire names.
-const DISPATCHED_COMMANDS: [&[u8; 12]; 18] = [
+/// The 22 dispatched commands, by their on-wire names.
+const DISPATCHED_COMMANDS: [&[u8; 12]; 22] = [
     b"version\0\0\0\0\0",
     b"verack\0\0\0\0\0\0",
     b"ping\0\0\0\0\0\0\0\0",
@@ -22,9 +22,14 @@ const DISPATCHED_COMMANDS: [&[u8; 12]; 18] = [
     b"notfound\0\0\0\0",
     b"tx\0\0\0\0\0\0\0\0\0\0",
     b"mempool\0\0\0\0\0",
+    b"sendcmpct\0\0\0",
+    b"cmpctblock\0\0",
+    b"getblocktxn\0",
+    b"blocktxn\0\0\0\0",
 ];
 
-const UNKNOWN_COMMAND: &[u8; 12] = b"sendcmpct\0\0\0";
+/// BIP 133's fee filter, which this node doesn't implement.
+const UNKNOWN_COMMAND: &[u8; 12] = b"feefilter\0\0\0";
 
 fn header(command: &[u8; 12], body: &[u8], claimed_len: u32) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(HEADER_LEN);

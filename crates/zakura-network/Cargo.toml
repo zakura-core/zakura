@@ -73,6 +73,7 @@ rayon = { workspace = true }
 ring = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 serde_json = { workspace = true }
+siphasher = { workspace = true }
 thiserror = { workspace = true }
 
 futures = { workspace = true }

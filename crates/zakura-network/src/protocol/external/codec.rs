@@ -14,6 +14,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use chrono::{TimeZone, Utc};
 use indexmap::IndexMap;
+use tokio::{sync::watch, time::Instant};
 use tokio_util::codec::{Decoder, Encoder};
 
 use zakura_chain::{
@@ -31,6 +32,7 @@ use crate::constants;
 
 use super::{
     addr::{AddrInVersion, AddrV1, AddrV2},
+    compact::{BlockTransactions, BlockTransactionsRequest, CompactBlock},
     message::{
         Message, RejectReason, VersionMessage, MAX_REJECT_MESSAGE_LENGTH, MAX_REJECT_REASON_LENGTH,
         MAX_USER_AGENT_LENGTH,
@@ -167,10 +169,72 @@ impl BlockChecksums {
     }
 }
 
+/// The compact block relay messages a connection accepts.
+///
+/// The draft Compact Block Relay ZIP requires a node to ignore these messages unless both
+/// peers negotiated them, and to ignore `cmpctblock` and `blocktxn` messages it did not ask
+/// for. The decoder drops a refused message before it checks the checksum or decodes the
+/// body, so a peer can't make this node hash or parse messages it never wanted.
+#[derive(Debug, Default)]
+struct CompactRelayGate {
+    /// Both peers set `NODE_COMPACT_BLOCKS`, and the peer isn't protected.
+    negotiated: bool,
+
+    /// The most recent `sendcmpct` this codec encoded asked for version 1 announcements.
+    announcements_requested: bool,
+
+    /// This codec has encoded a `cmpctblock`, so the peer may request its transactions.
+    compact_block_sent: bool,
+
+    /// The block hash and deadline of this connection's outstanding `getblocktxn` request.
+    recovery: Option<watch::Receiver<Option<(block::Hash, Instant)>>>,
+}
+
+impl CompactRelayGate {
+    /// Records the compact block relay state that encoding `msg` changes.
+    fn record_sent(&mut self, msg: &Message) {
+        match msg {
+            Message::SendCompact { announce, version } => {
+                self.announcements_requested = *announce && *version == 1;
+            }
+            Message::CompactBlock(_) => self.compact_block_sent = true,
+            _ => {}
+        }
+    }
+
+    /// Returns whether the decoder reads a `command` message with `body`. Every command
+    /// outside compact block relay is accepted.
+    fn accepts(&self, command: &[u8; 12], body: &[u8]) -> bool {
+        match command {
+            b"sendcmpct\0\0\0" => self.negotiated,
+            b"cmpctblock\0\0" => self.negotiated && self.announcements_requested,
+            b"getblocktxn\0" => self.negotiated && self.compact_block_sent,
+            b"blocktxn\0\0\0\0" => self.negotiated && self.answers_recovery(body),
+            _ => true,
+        }
+    }
+
+    /// Returns whether a `blocktxn` `body` names the block of the outstanding `getblocktxn`
+    /// request, before that request's deadline.
+    fn answers_recovery(&self, body: &[u8]) -> bool {
+        let Some(recovery) = &self.recovery else {
+            return false;
+        };
+        // A dropped sender has no outstanding request.
+        if recovery.has_changed().is_err() {
+            return false;
+        }
+        recovery.borrow().is_some_and(|(hash, deadline)| {
+            Instant::now() < deadline && body.get(..32) == Some(&hash.0[..])
+        })
+    }
+}
+
 /// A codec which produces Bitcoin messages from byte streams and vice versa.
 pub struct Codec {
     builder: Builder,
     state: DecodeState,
+    compact_relay: CompactRelayGate,
     #[cfg(test)]
     body_decode_panic: Cell<Option<BodyDecodePanic>>,
 }
@@ -210,6 +274,23 @@ impl Codec {
     pub fn reconfigure_full_body_len(&mut self) {
         self.builder.max_len = MAX_PROTOCOL_MESSAGE_LEN;
     }
+
+    /// Accept compact block relay messages if `negotiated`, which means both peers set
+    /// `NODE_COMPACT_BLOCKS` and the peer isn't protected. Called after the handshake.
+    pub(crate) fn reconfigure_compact_blocks(&mut self, negotiated: bool) {
+        self.compact_relay.negotiated = negotiated;
+    }
+
+    /// Accept a `blocktxn` message only while `recovery` holds the hash and deadline of the
+    /// connection's outstanding `getblocktxn` request.
+    // Nothing sends `getblocktxn` yet, so only tests set a recovery request.
+    #[allow(dead_code)]
+    pub(crate) fn reconfigure_compact_recovery(
+        &mut self,
+        recovery: watch::Receiver<Option<(block::Hash, Instant)>>,
+    ) {
+        self.compact_relay.recovery = Some(recovery);
+    }
 }
 
 impl Builder {
@@ -218,6 +299,7 @@ impl Builder {
         Codec {
             builder: self,
             state: DecodeState::Head,
+            compact_relay: CompactRelayGate::default(),
             #[cfg(test)]
             body_decode_panic: Cell::new(None),
         }
@@ -268,11 +350,12 @@ impl Encoder<Message> for Codec {
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
         use Error::Parse;
 
-        let body_length = self.body_length(&item);
+        let body_length = self.body_length(&item)?;
 
         if body_length > self.builder.max_len {
             return Err(Parse("body length exceeded maximum size"));
         }
+        self.compact_relay.record_sent(&item);
 
         // Aggregate totals only: per-addr labels are never pruned by the Prometheus
         // exporter and grow without bound on public listeners.
@@ -302,6 +385,10 @@ impl Encoder<Message> for Codec {
             NotFound { .. } => b"notfound\0\0\0\0",
             Tx { .. } => b"tx\0\0\0\0\0\0\0\0\0\0",
             Mempool => b"mempool\0\0\0\0\0",
+            SendCompact { .. } => b"sendcmpct\0\0\0",
+            CompactBlock(_) => b"cmpctblock\0\0",
+            GetBlockTransactions(_) => b"getblocktxn\0",
+            BlockTransactions(_) => b"blocktxn\0\0\0\0",
         };
         trace!(?item, len = body_length);
 
@@ -334,12 +421,12 @@ impl Codec {
     //
     // If this code shows up in profiles, replace with a size estimate or cached size,
     // to avoid multiple serializations for large data structures like lists, blocks, and transactions.
-    fn body_length(&self, msg: &Message) -> usize {
+    //
+    // Fails if the message can't be encoded, such as a `cmpctblock` that breaks the ZIP's rules.
+    fn body_length(&self, msg: &Message) -> Result<usize, Error> {
         let mut writer = FakeWriter(0);
-
-        self.write_body(msg, &mut writer)
-            .expect("writer should never fail");
-        writer.0
+        self.write_body(msg, &mut writer)?;
+        Ok(writer.0)
     }
 
     /// Returns the checksum of `body`, the serialized body of `msg`.
@@ -480,6 +567,13 @@ impl Codec {
             Message::NotFound(hashes) => hashes.zcash_serialize(writer)?,
             Message::Tx(transaction) => transaction.transaction().zcash_serialize(writer)?,
             Message::Mempool => { /* Empty payload -- no-op */ }
+            Message::SendCompact { announce, version } => {
+                writer.write_u8(u8::from(*announce))?;
+                writer.write_u64::<LittleEndian>(*version)?;
+            }
+            Message::CompactBlock(compact) => compact.zcash_serialize(writer)?,
+            Message::GetBlockTransactions(request) => request.zcash_serialize(writer)?,
+            Message::BlockTransactions(response) => response.zcash_serialize(writer)?,
         }
         Ok(())
     }
@@ -599,6 +693,18 @@ impl Decoder for Codec {
                     let body = src.split_to(body_len);
                     self.state = DecodeState::Head;
 
+                    // Drop unnegotiated and unrequested compact block relay messages before
+                    // hashing or decoding their bodies.
+                    if !self.compact_relay.accepts(&command, &body) {
+                        metrics::counter!("zcash.net.in.discarded", "reason" => "unnegotiated")
+                            .increment(1);
+                        debug!(
+                            command = %escape_command(&command),
+                            "ignored unnegotiated compact block relay message"
+                        );
+                        continue 'messages;
+                    }
+
                     if checksum != message_checksum(&body[..]) {
                         return Err(Parse(
                             "supplied message checksum does not match computed checksum",
@@ -647,6 +753,10 @@ impl Decoder for Codec {
                             b"notfound\0\0\0\0" => self.read_notfound(&mut body_reader),
                             b"tx\0\0\0\0\0\0\0\0\0\0" => self.read_tx(&mut body_reader),
                             b"mempool\0\0\0\0\0" => self.read_mempool(&mut body_reader),
+                            b"sendcmpct\0\0\0" => self.read_sendcmpct(&mut body_reader),
+                            b"cmpctblock\0\0" => self.read_cmpctblock(&mut body_reader),
+                            b"getblocktxn\0" => self.read_getblocktxn(&mut body_reader),
+                            b"blocktxn\0\0\0\0" => self.read_blocktxn(&mut body_reader),
                             _ => {
                                 // # Security
                                 //
@@ -975,6 +1085,36 @@ impl Codec {
         Ok(Message::Mempool)
     }
 
+    fn read_sendcmpct<R: Read>(&self, mut reader: R) -> Result<Message, Error> {
+        let announce = match reader.read_u8()? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(Error::Parse(
+                    "non-bool value supplied in sendcmpct announce",
+                ))
+            }
+        };
+        let version = reader.read_u64::<LittleEndian>()?;
+        Ok(Message::SendCompact { announce, version })
+    }
+
+    fn read_cmpctblock(&self, reader: &mut &[u8]) -> Result<Message, Error> {
+        let compact = self.deserialize_spawning(reader, CompactBlock::zcash_deserialize_bounded)?;
+        Ok(Message::CompactBlock(compact.into()))
+    }
+
+    fn read_getblocktxn(&self, reader: &mut &[u8]) -> Result<Message, Error> {
+        let request = BlockTransactionsRequest::zcash_deserialize_from_slice(reader)?;
+        Ok(Message::GetBlockTransactions(request))
+    }
+
+    fn read_blocktxn(&self, reader: &mut &[u8]) -> Result<Message, Error> {
+        let response =
+            self.deserialize_spawning(reader, BlockTransactions::zcash_deserialize_bounded)?;
+        Ok(Message::BlockTransactions(response))
+    }
+
     #[cfg(test)]
     fn inject_body_decode_panic(&self, panic_point: BodyDecodePanic) {
         self.body_decode_panic.set(Some(panic_point));
@@ -989,30 +1129,22 @@ impl Codec {
     }
 
     /// Given the reader, deserialize the transaction in the rayon thread pool.
-    #[allow(clippy::unwrap_in_result)]
     fn deserialize_transaction_spawning(&self, reader: &mut &[u8]) -> Result<Transaction, Error> {
-        let mut result = None;
-
-        // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
-        //
-        // Since we use `block_in_place()`, other futures running on the connection task will be blocked:
-        // https://docs.rs/tokio/latest/tokio/task/fn.block_in_place.html
-        //
-        // We can't use `spawn_blocking()` because:
-        // - The `reader` has a lifetime (but we could replace it with a `Vec` of message data)
-        // - There is no way to check the blocking task's future for panics
-        tokio::task::block_in_place(|| {
-            rayon::in_place_scope_fifo(|s| {
-                s.spawn_fifo(|_s| result = Some(Transaction::zcash_deserialize_bounded(reader)))
-            })
-        });
-
-        result.expect("scope has already finished")
+        self.deserialize_spawning(reader, Transaction::zcash_deserialize_bounded)
     }
 
     /// Given the reader, deserialize the block in the rayon thread pool.
-    #[allow(clippy::unwrap_in_result)]
     fn deserialize_block_spawning(&self, reader: &mut &[u8]) -> Result<Block, Error> {
+        self.deserialize_spawning(reader, Block::zcash_deserialize_bounded)
+    }
+
+    /// Runs `decode` on the reader in the rayon thread pool.
+    #[allow(clippy::unwrap_in_result)]
+    fn deserialize_spawning<T: Send>(
+        &self,
+        reader: &mut &[u8],
+        decode: fn(&mut &[u8]) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         let mut result = None;
 
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
@@ -1024,9 +1156,7 @@ impl Codec {
         // - The `reader` has a lifetime (but we could replace it with a `Vec` of message data)
         // - There is no way to check the blocking task's future for panics
         tokio::task::block_in_place(|| {
-            rayon::in_place_scope_fifo(|s| {
-                s.spawn_fifo(|_s| result = Some(Block::zcash_deserialize_bounded(reader)))
-            })
+            rayon::in_place_scope_fifo(|s| s.spawn_fifo(|_s| result = Some(decode(reader))))
         });
 
         result.expect("scope has already finished")

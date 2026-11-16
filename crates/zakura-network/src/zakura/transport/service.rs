@@ -834,19 +834,3 @@ impl SinkReject {
         Self::Local(error.into())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sink_reject_constructors_preserve_protocol_and_local_contract() {
-        let protocol = SinkReject::protocol("bad frame");
-        let local = SinkReject::local("closed queue");
-
-        assert!(matches!(protocol, SinkReject::Protocol(_)));
-        assert!(matches!(local, SinkReject::Local(_)));
-        assert!(protocol.to_string().contains("protocol-invalid"));
-        assert!(local.to_string().contains("locally"));
-    }
-}

@@ -2094,7 +2094,7 @@ impl ZakuraSupervisorHandle {
                 set_active_connection_gauge(registered_ids.len());
                 self.peer_set_tx.send_replace(registered_ids);
                 if let Some(peer_registry) = &self.peer_registry {
-                    peer_registry.register_native_connection(peer_id.clone(), conn_id);
+                    peer_registry.register_native_connection(peer_id.clone(), conn_id, remote_ip);
                 }
                 let _ = self.registration_tx.send(ZakuraConnectionRegistration {
                     peer_id: peer_id.clone(),

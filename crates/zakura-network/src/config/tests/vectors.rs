@@ -2000,6 +2000,180 @@ fn unconditional_peers_parse_ports_and_roundtrip() {
     assert!(!config.unconditional_peers.contains(ip("192.0.2.2")));
 }
 
+/// A DNS name with a port is a dialed entry. It round-trips, after the addresses and
+/// ranges, and matches no address until it resolves.
+#[test]
+fn unconditional_peers_parse_dns_names_and_roundtrip() {
+    let config: Config = toml::from_str(
+        "unconditional_peers = ['peer.example.com:8233', '192.0.2.1', 'localhost:18233', 'a.b.:1']",
+    )
+    .expect("unconditional peers parse");
+    let peers = &config.unconditional_peers;
+
+    assert_eq!(peers.len(), 4);
+    assert_eq!(
+        peers
+            .dial_names()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["peer.example.com:8233", "localhost:18233", "a.b.:1"],
+    );
+    assert!(peers.dial_names().all(|name| name.node_id.is_none()));
+    assert_eq!(peers.dial_limit(), 4);
+    assert_eq!(config.unconditional_peer_connection_limit(), 4);
+    assert_eq!(peers.dial_addrs(8233).len(), 1);
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    assert!(
+        serialized.contains(
+            r#"unconditional_peers = ["192.0.2.1", "peer.example.com:8233", "localhost:18233", "a.b.:1"]"#
+        ),
+        "serialized config should include unconditional peers:\n{serialized}"
+    );
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip.unconditional_peers, config.unconditional_peers);
+
+    let only_names: Config =
+        toml::from_str("unconditional_peers = ['peer.example.com:8233']").unwrap();
+    assert!(!only_names.unconditional_peers.is_empty());
+    assert_ne!(only_names.unconditional_peers, config.unconditional_peers);
+}
+
+/// A DNS name can be pinned to a node ID. The pin round-trips, makes the entry differ
+/// from the same name without a pin, and needs a node that runs both P2P stacks.
+#[test]
+fn unconditional_peers_parse_pinned_dns_names_and_roundtrip() {
+    let (node_id, _addr) = DEFAULT_ZAKURA_BOOTSTRAP_PEERS[0]
+        .split_once('@')
+        .expect("a bootstrap peer starts with its node ID");
+    let pinned = format!("{node_id}@peer.example.com:8233");
+
+    let config: Config = toml::from_str(&format!(
+        "p2p_stack = 'dual'\nunconditional_peers = ['{pinned}', 'other.example.com:8233']"
+    ))
+    .expect("a pinned DNS name parses on a node that runs both stacks");
+    let peers = &config.unconditional_peers;
+
+    assert_eq!(peers.len(), 2);
+    assert_eq!(peers.dial_limit(), 2);
+    let names: Vec<_> = peers.dial_names().collect();
+    assert_eq!(names[0].to_string(), pinned);
+    assert_eq!(
+        names[0]
+            .node_id
+            .map(|node_id| node_id.to_string())
+            .as_deref(),
+        Some(node_id),
+    );
+    assert_eq!(names[1].node_id, None);
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    assert!(
+        serialized.contains(&format!(
+            r#"unconditional_peers = ["{pinned}", "other.example.com:8233"]"#
+        )),
+        "the pin is kept:\n{serialized}"
+    );
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip.unconditional_peers, config.unconditional_peers);
+
+    let unpinned: Config = toml::from_str(
+        "p2p_stack = 'dual'\nunconditional_peers = ['peer.example.com:8233', 'other.example.com:8233']",
+    )
+    .unwrap();
+    assert_ne!(unpinned.unconditional_peers, config.unconditional_peers);
+
+    for p2p_stack in ["legacy", "zakura"] {
+        let error = toml::from_str::<Config>(&format!(
+            "p2p_stack = '{p2p_stack}'\nunconditional_peers = ['{pinned}']"
+        ))
+        .expect_err("a pin needs both stacks");
+        assert!(error.to_string().contains("dual"), "{error}");
+    }
+    // Mainnet runs only the legacy stack by default.
+    toml::from_str::<Config>(&format!("unconditional_peers = ['{pinned}']"))
+        .expect_err("a pin needs both stacks");
+}
+
+/// A node ID can only pin a DNS name with a port, and must be a valid node ID.
+#[test]
+fn unconditional_peers_reject_invalid_pins() {
+    let (node_id, _addr) = DEFAULT_ZAKURA_BOOTSTRAP_PEERS[0]
+        .split_once('@')
+        .expect("a bootstrap peer starts with its node ID");
+
+    for (entry, reason) in [
+        (format!("{node_id}@192.0.2.1:8233"), "only pins a DNS name"),
+        (format!("{node_id}@2001:db8::/32"), "only pins a DNS name"),
+        (format!("{node_id}@peer.example.com"), "needs a port"),
+        (format!("{node_id}@"), "needs a name"),
+        ("abcd@peer.example.com:8233".to_string(), "not a node ID"),
+        (
+            format!("{node_id}@{node_id}@peer.example.com:8233"),
+            "has one pin",
+        ),
+    ] {
+        let error = toml::from_str::<Config>(&format!(
+            "p2p_stack = 'dual'\nunconditional_peers = ['{entry}']"
+        ))
+        .expect_err(reason);
+        assert!(
+            error.to_string().contains("network.unconditional_peers"),
+            "{entry} {reason}: {error}"
+        );
+    }
+}
+
+/// The address that a DNS name last resolved to is treated like a listed address, in
+/// every copy of the list. A new address replaces it.
+#[test]
+fn unconditional_peers_follow_the_resolved_addresses_of_dns_names() {
+    let peers = toml::from_str::<Config>(
+        "unconditional_peers = ['a.example.com:8233', '198.51.100.0/24', 'b.example.com:8233']",
+    )
+    .unwrap()
+    .unconditional_peers;
+    // The copies that the address book, the listener and the mempool hold.
+    let copy = peers.clone();
+    let filtered_copy = peers.leave_out_undialable(8233, |_addr| true);
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+
+    assert!(!peers.contains(ip("192.0.2.1")));
+
+    peers.set_resolved_ip(0, Some(ip("192.0.2.1")));
+    peers.set_resolved_ip(1, Some(ip("::ffff:192.0.2.2")));
+    for peers in [&peers, &copy, &filtered_copy] {
+        for resolved in ["192.0.2.1", "::ffff:192.0.2.1", "192.0.2.2"] {
+            assert!(peers.contains(ip(resolved)), "{resolved} is exempt");
+            assert!(peers.is_dial_address(ip(resolved)), "{resolved} is dialed");
+        }
+        assert!(!peers.contains(ip("192.0.2.3")));
+        assert!(peers.contains(ip("198.51.100.7")), "ranges still match");
+        assert!(!peers.is_dial_address(ip("198.51.100.7")));
+    }
+
+    peers.set_resolved_ip(0, Some(ip("192.0.2.3")));
+    assert!(copy.contains(ip("192.0.2.3")));
+    assert!(
+        !copy.contains(ip("192.0.2.1")),
+        "the old address is replaced"
+    );
+    assert!(
+        copy.contains(ip("192.0.2.2")),
+        "the other name is unchanged"
+    );
+
+    assert!(peers.set_resolved_ip(0, None), "the address changed");
+    assert!(!peers.set_resolved_ip(0, None), "the address is unchanged");
+    assert!(
+        !copy.contains(ip("192.0.2.3")),
+        "a name can stand for no address"
+    );
+    assert!(copy.contains(ip("192.0.2.2")));
+
+    assert_eq!(peers, copy, "resolved addresses are not part of the config");
+}
+
 /// An entry that this node cannot dial stays exempt, but is no longer a dial address,
 /// is not dialed and adds no slots. The config still serializes as written.
 #[test]
@@ -2129,8 +2303,18 @@ fn unconditional_peer_dials_raise_the_total_connection_limit() {
 fn unconditional_peers_reject_invalid_entries() {
     for entry in [
         "not an ip",
+        // A DNS name needs a port, and a mistyped IP address is not a name.
         "zakura.example.com",
-        "zakura.example.com:8233",
+        "zakura.example.com:0",
+        "zakura.example.com:65536",
+        "192.0.2.300:8233",
+        "192.0.2.1.:8233",
+        "zakura..example.com:8233",
+        "-zakura.example.com:8233",
+        "zakura_1.example.com:8233",
+        "http://zakura.example.com:8233",
+        ":8233",
+        "2001:db8::zz",
         "192.0.2.1:0",
         "192.0.2.1:65536",
         "192.0.2.0/24:8233",

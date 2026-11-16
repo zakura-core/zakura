@@ -383,11 +383,12 @@ jobs:
           cargo test --locked -p zakura-state balance_rollback_replay_and_fork_equivalence
 
   sprout-enabled:
-    name: consensus with sprout
+    name: consensus and state with sprout
     needs: changes
     # The shared archive now tests the default build without `sprout`. Opt in
-    # here so historical JoinSplit proof and signature verification keeps
-    # coverage alongside the default retryable verifier-unavailable path.
+    # here so historical JoinSplit proof and signature verification, and the
+    # Sprout note commitment tree that zakura-state maintains for it, keep
+    # coverage alongside the default paths.
     if: vars.TEMPORARY_PR_CI != 'true' && (needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request')
     permissions:
       contents: read
@@ -403,6 +404,8 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       - name: Test zakura-consensus with Sprout verification
         run: cargo test --locked -p zakura-consensus --features sprout
+      - name: Test zakura-state with the Sprout note commitment tree
+        run: cargo test --locked -p zakura-state --features sprout
 
   network-dependent:
     name: network-dependent acceptance tests

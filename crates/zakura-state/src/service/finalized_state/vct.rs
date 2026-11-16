@@ -11,8 +11,6 @@ use std::sync::{
 };
 
 use thiserror::Error;
-#[cfg(test)]
-use zakura_chain::parallel::tree::NoteCommitmentTrees;
 use zakura_chain::{
     block::{self, merkle::AuthDataRoot, Header},
     ironwood, orchard,
@@ -706,20 +704,6 @@ pub fn validate_final_frontiers_bytes(
     parse_final_frontiers_bytes(bytes, expected_height).map(|_| ())
 }
 
-/// Test/developer helper for producing embedded final-frontier bytes from a
-/// legacy-computed final frontier.
-#[cfg(test)]
-fn final_frontiers_bytes(height: block::Height, trees: &NoteCommitmentTrees) -> Vec<u8> {
-    FinalFrontiers {
-        height,
-        sapling: trees.sapling.clone(),
-        orchard: trees.orchard.clone(),
-        sprout: trees.sprout.clone(),
-        ironwood: trees.ironwood.clone(),
-    }
-    .to_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{io::Write, num::NonZeroU64};
@@ -1136,37 +1120,6 @@ mod tests {
                 "frontiers below the Ironwood activation height carry the empty Ironwood tree"
             );
         }
-    }
-
-    #[test]
-    fn final_frontiers_capture_helper_serializes_tip_trees() {
-        let height = block::Height(3_358_006);
-        let trees = NoteCommitmentTrees::default();
-
-        let parsed = FinalFrontiers::from_bytes(&final_frontiers_bytes(height, &trees))
-            .expect("captured final frontiers should parse");
-
-        assert_eq!(parsed.height, height, "captured height round-trips");
-        assert_eq!(
-            parsed.sapling.root(),
-            trees.sapling.root(),
-            "captured sapling frontier round-trips"
-        );
-        assert_eq!(
-            parsed.orchard.root(),
-            trees.orchard.root(),
-            "captured orchard frontier round-trips"
-        );
-        assert_eq!(
-            parsed.sprout.root(),
-            trees.sprout.root(),
-            "captured sprout frontier round-trips"
-        );
-        assert_eq!(
-            parsed.ironwood.root(),
-            trees.ironwood.root(),
-            "captured ironwood frontier round-trips"
-        );
     }
 
     #[test]

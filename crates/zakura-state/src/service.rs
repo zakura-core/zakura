@@ -453,6 +453,7 @@ impl StateService {
                         // This database cannot be repaired, and the generic hint below would
                         // send the operator looking at permissions and disk space instead.
                         error @ (StateInitError::VctSproutHistoryUnrepairable
+                        | StateInitError::SproutTreeNotMaintained { .. }
                         | StateInitError::TransparentIndexesMissingInArchiveMode {
                             ..
                         }) => {

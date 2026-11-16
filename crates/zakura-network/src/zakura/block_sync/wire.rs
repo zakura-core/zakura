@@ -171,14 +171,9 @@ impl BlockSyncMessage {
     }
 
     /// Decode this message and return the raw frame payload for block bodies.
-    ///
-    /// The returned raw payload includes the stream-6 message type byte. The
-    /// decoder copies the payload once into an `Arc<[u8]>`, which the reorder
-    /// buffer then shares without further copies; consumers skip
-    /// [`BLOCK_SYNC_MESSAGE_TYPE_BYTES`] before deserializing the block body.
     pub(super) fn decode_frame_with_raw_block_payload(
         frame: Frame,
-    ) -> Result<(Self, Option<Arc<[u8]>>), BlockSyncWireError> {
+    ) -> Result<(Self, Option<DecodedBlockPayload>), BlockSyncWireError> {
         if frame.flags != 0 {
             return Err(BlockSyncWireError::UnsupportedFlags(frame.flags));
         }
@@ -206,17 +201,49 @@ impl BlockSyncMessage {
     }
 }
 
+/// A `Block` message payload, type byte included, whose block
+/// [`decode_block_payload`] decoded.
+///
+/// Only that function builds one. So the block in it is within the block size
+/// limit and decodes again, and holders can keep the payload in place of the
+/// decoded block. Clones share the one copy of the bytes.
+#[derive(Clone, Debug)]
+pub(super) struct DecodedBlockPayload(Arc<[u8]>);
+
+impl DecodedBlockPayload {
+    /// The length of the encoded block, which is the payload after its type byte.
+    pub(super) fn block_len(&self) -> usize {
+        self.block_bytes().len()
+    }
+
+    /// The encoded block. The payload starts with its type byte, which
+    /// `decode_block_payload` checked.
+    fn block_bytes(&self) -> &[u8] {
+        &self.0[BLOCK_SYNC_MESSAGE_TYPE_BYTES..]
+    }
+
+    /// Decodes the block again.
+    pub(super) fn decode_block(&self) -> block::Block {
+        block::Block::zcash_deserialize_bounded(&mut self.block_bytes())
+            .expect("the block decodes because decode_block_payload decoded these bytes")
+    }
+
+    /// The address of the allocation that holds the payload.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn allocation(&self) -> usize {
+        Arc::as_ptr(&self.0).cast::<u8>().addr()
+    }
+}
+
 /// Decode a `Block` payload, including its type byte, and keep the raw payload.
 ///
-/// The payload is copied once into an `Arc<[u8]>`, which the reorder buffer
-/// then shares without further copies; consumers skip
-/// [`BLOCK_SYNC_MESSAGE_TYPE_BYTES`] before deserializing the block body.
+/// The payload is copied once, and the reorder buffer then shares that copy.
 pub(super) fn decode_block_payload(
     payload: Vec<u8>,
-) -> Result<(Arc<block::Block>, Arc<[u8]>), BlockSyncWireError> {
+) -> Result<(Arc<block::Block>, DecodedBlockPayload), BlockSyncWireError> {
     let raw = Arc::<[u8]>::from(payload.into_boxed_slice());
     validate_payload_len(raw.len())?;
-    Ok((decode_block(&raw)?, raw))
+    Ok((decode_block(&raw)?, DecodedBlockPayload(raw)))
 }
 
 /// [`decode_block_payload`] for controlled storage, which decodes fixture
@@ -225,7 +252,7 @@ pub(super) fn decode_block_payload(
 pub fn decode_block_payload_for_test(
     payload: Vec<u8>,
 ) -> Result<(Arc<block::Block>, Arc<[u8]>), BlockSyncWireError> {
-    decode_block_payload(payload)
+    decode_block_payload(payload).map(|(block, payload)| (block, payload.0))
 }
 
 /// Decode a complete block after its type byte and reject trailing bytes.

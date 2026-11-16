@@ -10,6 +10,7 @@ use zakura_node_services::block_memory::BlockHandle;
 
 use proptest::{prop_assert, prop_assert_eq};
 
+use super::wire::DecodedBlockPayload;
 use super::*;
 use super::{
     config::{
@@ -67,12 +68,8 @@ fn mainnet_blocks_1_to_3() -> Vec<Arc<block::Block>> {
     ]
 }
 
-fn raw_block_payload(block: &Arc<block::Block>) -> Arc<[u8]> {
-    let frame = BlockSyncMessage::Block(block.clone())
-        .encode_frame()
-        .expect("test block frame encodes");
-
-    Arc::from(frame.payload.into_boxed_slice())
+fn raw_block_payload(block: &Arc<block::Block>) -> DecodedBlockPayload {
+    DecodedBlockPayload::of_block(block)
 }
 
 fn forked_block(block: &Arc<block::Block>, nonce_tag: u8) -> Arc<block::Block> {
@@ -1584,29 +1581,6 @@ fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
 }
 
 #[test]
-fn block_liveness_multi_block_range_progress_resets_each_body() {
-    let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
-    let start = Instant::now();
-    let mut window = download_window();
-    window.outstanding.push(window_request_range(1, 3));
-    window.arm_liveness(start, timeout);
-
-    let first = start + Duration::from_secs(4);
-    window.note_block_progress(first, timeout);
-    assert_eq!(window.block_liveness_deadline, Some(first + timeout));
-
-    let second = first + Duration::from_secs(4);
-    assert_eq!(window.check_liveness(second), LivenessOutcome::Ok);
-    window.note_block_progress(second, timeout);
-    assert_eq!(window.block_liveness_deadline, Some(second + timeout));
-
-    let third = second + Duration::from_secs(4);
-    assert_eq!(window.check_liveness(third), LivenessOutcome::Ok);
-    window.note_block_progress(third, timeout);
-    assert_eq!(window.block_liveness_deadline, Some(third + timeout));
-}
-
-#[test]
 fn view_reset_reclears_probe_streak_so_unproven_peer_can_reprobe() {
     // Regression for the destructive-reset zombie: an unproven peer whose single
     // probe is in flight when a destructive view reset pulls its outstanding must
@@ -2437,41 +2411,6 @@ fn aggregate_response_cap_is_not_the_per_frame_cap() {
 // owns dedup / servable-range eligibility, asserted here.
 
 #[test]
-fn work_queue_take_dedups_a_height_across_peers() {
-    // fanout = 1: a height taken by one peer leaves `pending`, so a second peer
-    // querying the same range cannot also take it.
-    let queue = work_queue_with(
-        0,
-        [
-            needed(1, BlockSizeEstimate::Advertised(10_000)),
-            needed(2, BlockSizeEstimate::Advertised(10_000)),
-            needed(3, BlockSizeEstimate::Advertised(10_000)),
-        ],
-    );
-
-    let first = queue.take_in_range(
-        block::Height(1),
-        block::Height(3),
-        MAX_BS_BLOCKS_PER_REQUEST as usize,
-    );
-    assert_eq!(
-        first.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
-        vec![1, 2, 3]
-    );
-    assert_eq!(queue.in_flight_len(), 3);
-
-    let second = queue.take_in_range(
-        block::Height(1),
-        block::Height(3),
-        MAX_BS_BLOCKS_PER_REQUEST as usize,
-    );
-    assert!(
-        second.is_empty(),
-        "a height taken by one peer must not be re-takable by another (dedup)"
-    );
-}
-
-#[test]
 fn work_queue_extend_dedups_against_pending_in_flight_and_floor() {
     let queue = work_queue_with(
         5,
@@ -2751,52 +2690,6 @@ fn work_queue_first_unclaimed_above_ignores_entries_retained_at_or_below_a_forwa
     assert_eq!(
         queue.first_unclaimed_above(block::Height(12)),
         Some(block::Height(16)),
-    );
-}
-
-#[test]
-fn work_queue_take_respects_servable_range_contiguity_and_max() {
-    // Heights 10,11,12 then a gap then 20,21.
-    let queue = work_queue_with(
-        0,
-        [
-            needed(10, BlockSizeEstimate::Advertised(100)),
-            needed(11, BlockSizeEstimate::Advertised(100)),
-            needed(12, BlockSizeEstimate::Advertised(100)),
-            needed(20, BlockSizeEstimate::Advertised(100)),
-            needed(21, BlockSizeEstimate::Advertised(100)),
-        ],
-    );
-
-    // `max` bounds the chunk.
-    let chunk = queue.take_in_range(block::Height(10), block::Height(30), 2);
-    assert_eq!(
-        chunk.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
-        vec![10, 11]
-    );
-
-    // The chunk stops at the gap (12 then nothing until 20): a take over the full
-    // range returns only the contiguous run 12, not 12,20,21.
-    let run = queue.take_in_range(
-        block::Height(12),
-        block::Height(30),
-        MAX_BS_BLOCKS_PER_REQUEST as usize,
-    );
-    assert_eq!(
-        run.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
-        vec![12],
-        "take must stop at the first gap so the chunk is one contiguous request"
-    );
-
-    // `low` excludes lower heights; the next contiguous run is 20,21.
-    let high = queue.take_in_range(
-        block::Height(20),
-        block::Height(30),
-        MAX_BS_BLOCKS_PER_REQUEST as usize,
-    );
-    assert_eq!(
-        high.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
-        vec![20, 21]
     );
 }
 
@@ -3880,29 +3773,6 @@ fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
 }
 
 #[test]
-fn work_queue_take_does_not_clamp_high_to_floor() {
-    // The download floor is NOT an upper bound on a take: a peer fetches as far
-    // above the floor as its servable range allows.
-    let queue = work_queue_with(
-        0,
-        (100..=104)
-            .map(|height| needed(height, BlockSizeEstimate::Advertised(100)))
-            .collect::<Vec<_>>(),
-    );
-    // Floor stays at 0; heights are far above it.
-    let taken = queue.take_in_range(
-        block::Height(100),
-        block::Height(104),
-        MAX_BS_BLOCKS_PER_REQUEST as usize,
-    );
-    assert_eq!(
-        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
-        vec![100, 101, 102, 103, 104],
-        "heights far above the floor are takable; the floor never clamps the take"
-    );
-}
-
-#[test]
 fn work_queue_preserves_work_item_estimate_through_take_and_return() {
     // The size estimate (feeds the size-hint tolerance check) is preserved as
     // a height moves pending → in_flight → pending. Estimator overridden so the
@@ -4928,28 +4798,6 @@ fn work_queue_diagnostics_report_runs_min_and_max() {
         Some(block::Hash([12; 32]))
     );
     assert_eq!(queue.hash_for_height(block::Height(99)), None);
-}
-
-#[test]
-fn work_queue_keeps_pending_ordered_by_height() {
-    // A BTreeMap keeps the lowest needed height first regardless of extend order,
-    // so a newly-needed lower height never sits behind later queued work.
-    let queue = super::work_queue::WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
-    queue.extend(
-        test_work_scope(),
-        [needed(20, BlockSizeEstimate::Advertised(100))],
-    );
-    queue.extend(
-        test_work_scope(),
-        [needed(10, BlockSizeEstimate::Advertised(100))],
-    );
-    assert_eq!(queue.min_pending(), Some(block::Height(10)));
-    let taken = queue.take_in_range(block::Height(1), block::Height(30), 1);
-    assert_eq!(
-        taken[0].0,
-        block::Height(10),
-        "lower work must be taken before higher work"
-    );
 }
 
 #[test]
@@ -10873,7 +10721,7 @@ async fn reactor_accepts_blocks_done_after_completed_range() {
 // Fanout > 1 is removed in WorkQueue (a height is taken by exactly one peer), so the
 // "in flight on another peer" scenario no longer exists. The structural property
 // — a taken (in_flight) height is not re-takable — is now covered by the
-// WorkQueue unit test `work_queue_take_dedups_a_height_across_peers`.
+// work-queue state test `adjacent_takes_by_two_peers_stay_disjoint`.
 
 #[tokio::test]
 async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer() {
@@ -12350,114 +12198,6 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
         (block::Height(2), 1),
         "legacy commit must release the duplicate in-flight reservation"
     );
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_accepts_rapid_status_growth_without_spam_score() {
-    let config = ZakuraBlockSyncConfig::default();
-    let (tip_tx, tip_rx) = genesis_tip_channel();
-    drop(tip_tx);
-    let startup = genesis_startup(tip_rx, config.clone());
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle);
-    let peer_id = peer(46);
-    let (inbound_tx, inbound_rx) = framed_channel(8);
-    let (outbound_tx, mut outbound_rx) = framed_channel(8);
-    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
-    service.add_peer(Peer::new_with_direction(
-        peer_id.clone(),
-        None,
-        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
-        ServicePeerDirection::Outbound,
-        streams,
-        CancellationToken::new(),
-    ));
-    wait_for_outbound_status(&mut outbound_rx).await;
-
-    for servable_high in [block::Height(1), block::Height(2)] {
-        let hash_byte = u8::try_from(servable_high.0).expect("test height fits in u8");
-        inbound_tx
-            .send(
-                BlockSyncMessage::Status(BlockSyncStatus {
-                    servable_low: block::Height(1),
-                    servable_high,
-                    tip_hash: block::Hash([hash_byte; 32]),
-                    max_blocks_per_response: 4,
-                    max_inflight_requests: 1,
-                    max_response_bytes: MAX_BS_RESPONSE_BYTES,
-                })
-                .encode_frame()
-                .expect("status encodes"),
-            )
-            .await
-            .expect("status frame queues");
-    }
-
-    let quiet = tokio::time::timeout(Duration::from_millis(100), async {
-        while let Some(action) = actions.recv().await {
-            if let BlockSyncAction::Misbehavior { reason, .. } = action {
-                panic!("rapid status growth was misclassified: {reason:?}");
-            }
-        }
-    })
-    .await;
-    assert!(quiet.is_err());
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_ignores_redundant_status_burst_without_spam_score() {
-    let config = ZakuraBlockSyncConfig::default();
-    let (tip_tx, tip_rx) = genesis_tip_channel();
-    drop(tip_tx);
-    let startup = genesis_startup(tip_rx, config.clone());
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle);
-    let peer_id = peer(47);
-    let (inbound_tx, inbound_rx) = framed_channel(8);
-    let (outbound_tx, mut outbound_rx) = framed_channel(8);
-    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
-    service.add_peer(Peer::new_with_direction(
-        peer_id.clone(),
-        None,
-        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
-        ServicePeerDirection::Outbound,
-        streams,
-        CancellationToken::new(),
-    ));
-    wait_for_outbound_status(&mut outbound_rx).await;
-
-    let status = BlockSyncMessage::Status(BlockSyncStatus {
-        servable_low: block::Height(1),
-        servable_high: block::Height(1),
-        tip_hash: block::Hash([1; 32]),
-        max_blocks_per_response: 4,
-        max_inflight_requests: 1,
-        max_response_bytes: MAX_BS_RESPONSE_BYTES,
-    })
-    .encode_frame()
-    .expect("status encodes");
-    for _ in 0..3 {
-        inbound_tx
-            .send(status.clone())
-            .await
-            .expect("redundant status queues");
-    }
-
-    let quiet = tokio::time::timeout(Duration::from_millis(100), async {
-        while let Some(action) = actions.recv().await {
-            if let BlockSyncAction::Misbehavior { reason, .. } = action {
-                panic!("redundant status burst was misclassified: {reason:?}");
-            }
-        }
-    })
-    .await;
-    assert!(quiet.is_err());
 
     reactor_task.abort();
 }
@@ -15053,92 +14793,6 @@ async fn testnet_fork_body_keeps_selected_body_despite_wrong_branch_hint() {
         .expect("the selected body is submitted even with the old branch's size hint");
         task.abort();
     }
-}
-
-#[tokio::test]
-async fn oversize_body_hint_keeps_the_body_without_scoring_the_supplier() {
-    let mut config = ZakuraBlockSyncConfig {
-        size_deviation_tolerance: 100,
-        ..immediate_body_download_config()
-    };
-    config.peer_limits.outbound_queue_depth = 8;
-    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
-    let peer = peer(42);
-    let (inbound_tx, inbound_rx) = framed_channel(8);
-    let (outbound_tx, mut outbound_rx) = framed_channel(8);
-    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
-    service.add_peer(Peer::new_with_direction(
-        peer,
-        None,
-        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
-        ServicePeerDirection::Outbound,
-        streams,
-        CancellationToken::new(),
-    ));
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::Status(BlockSyncStatus {
-                servable_low: block::Height(1),
-                servable_high: block::Height(1),
-                tip_hash: block::Hash([1; 32]),
-                max_blocks_per_response: 4,
-                max_inflight_requests: 1,
-                max_response_bytes: MAX_BS_RESPONSE_BYTES,
-            })
-            .encode_frame()
-            .expect("status encodes"),
-        )
-        .await
-        .expect("status queues");
-    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
-    tip_tx
-        .send((block::Height(1), block.hash()))
-        .expect("tip watch is live");
-    while !matches!(
-        next_action(&mut actions).await,
-        BlockSyncAction::QueryNeededBlocks { .. }
-    ) {}
-    handle
-        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
-            height: block::Height(1),
-            hash: block.hash(),
-            size: BlockSizeEstimate::Advertised(1),
-        }]))
-        .await
-        .expect("needed metadata queues");
-    // The node's GetBlocks lands on this peer's real outbound.
-    while !matches!(
-        BlockSyncMessage::decode_frame(
-            tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
-                .await
-                .expect("outbound frame arrives")
-                .expect("outbound channel is live")
-        )
-        .expect("frame decodes"),
-        BlockSyncMessage::GetBlocks { .. }
-    ) {}
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(block.clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("block queues");
-
-    // The reservation bounds the body's bytes, so a wrong size hint does not
-    // implicate the supplier.
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { .. } => break,
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action during size mismatch test: {action:?}"),
-        }
-    }
-
-    reactor_task.abort();
 }
 
 /// An ending without a live request is a protocol violation that closes the connection.

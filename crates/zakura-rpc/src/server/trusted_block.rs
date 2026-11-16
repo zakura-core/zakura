@@ -132,7 +132,6 @@ impl<S> TrustedBlockHttpService<S> {
         {
             Err(_) => return response(StatusCode::REQUEST_TIMEOUT, "body receipt timed out"),
             Ok(Err(error)) => {
-                let error: BoxError = error.into();
                 return if error.is::<http_body_util::LengthLimitError>() {
                     response(StatusCode::PAYLOAD_TOO_LARGE, "block too large")
                 } else {

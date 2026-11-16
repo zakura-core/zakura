@@ -86,6 +86,7 @@ struct Node {
     endpoint: Option<zakura_network::zakura::ZakuraEndpoint>,
     native_startup: Option<zakura_network::zakura::ZakuraHeaderSyncDriverStartup>,
     native_violations: mpsc::UnboundedReceiver<zakura_network::zakura::BlockSyncMisbehavior>,
+    advertisements: mpsc::UnboundedReceiver<zakura_chain::block::Hash>,
     state: State,
     verifier: Verifier,
     tip: zakura_state::LatestChainTip,
@@ -178,6 +179,17 @@ impl Node {
             ),
             16,
         );
+        let (advertisement_tx, advertisements) = mpsc::unbounded_channel();
+        let genesis_hash = network.genesis_hash();
+        let inbound = tower::service_fn(move |request: Request| {
+            if let Request::AdvertiseBlock(block, _) = &request {
+                // Fixture bootstrap can advertise genesis before the submitted block.
+                if block.hash != genesis_hash {
+                    let _ = advertisement_tx.send(block.hash);
+                }
+            }
+            inbound.clone().oneshot(request)
+        });
         let directory = tempfile::tempdir().unwrap();
         let config = zakura_network::Config {
             network: network.clone(),
@@ -378,6 +390,7 @@ impl Node {
             endpoint,
             native_startup,
             native_violations,
+            advertisements,
             state,
             verifier: gated,
             tip,
@@ -603,7 +616,7 @@ async fn recommended_sequence(separate_validator: bool, faulty: bool) {
         builder
     };
     let mut relay = Node::new(None).await;
-    let receiver = Node::new(Some(relay.p2p)).await;
+    let mut receiver = Node::new(Some(relay.p2p)).await;
     relay.connected().await;
     receiver.connected().await;
     upstream.gate.hold();
@@ -624,6 +637,8 @@ async fn recommended_sequence(separate_validator: bool, faulty: bool) {
         assert!(relay.pending.get(block.hash()).is_none());
         assert_eq!(receiver.tip.best_tip_height(), Some(Height(0)));
         assert!(!receiver.bans.is_banned(relay.p2p.ip()));
+        assert!(receiver.advertisements.try_recv().is_err());
+        assert!(receiver.gate.entered.try_recv().is_err());
     } else {
         assert_eq!(relay.gate.entered().await, block.hash());
         assert_eq!(upstream.tip.best_tip_hash(), Some(block.hash()));
@@ -649,7 +664,20 @@ async fn recommended_sequence(separate_validator: bool, faulty: bool) {
         assert_eq!(workflow.await.unwrap(), "accepted");
         assert!(relay.pending.get(block.hash()).is_none());
         assert!(!receiver.bans.is_banned(relay.p2p.ip()));
+        assert_eq!(
+            timeout(Duration::from_secs(20), receiver.advertisements.recv())
+                .await
+                .unwrap(),
+            Some(block.hash())
+        );
     }
+    timeout(
+        Duration::from_secs(20),
+        receiver.peers.clone().oneshot(Request::Peers),
+    )
+    .await
+    .unwrap()
+    .expect("the downstream peer connection remains usable");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -717,7 +745,7 @@ async fn faulty_trusted_block_over_v2_compatibility_is_rejected_without_legacy_i
     assert!(receiver
         .verifier
         .clone()
-        .oneshot(VerifyRequest::Commit(fetched.clone().into()))
+        .oneshot(VerifyRequest::Commit(fetched.clone()))
         .await
         .is_err());
     let verified = timeout(Duration::from_secs(20), receiver.gate.finished.recv())
@@ -1034,7 +1062,7 @@ async fn submit(address: SocketAddr, auth: String, bytes: Vec<u8>, trusted: bool
 async fn trusted_block_is_relayed_before_real_validation_and_commits_afterward() {
     let _init = zakura_test::init();
     let mut relay = Node::new(None).await;
-    let receiver = Node::new(Some(relay.p2p)).await;
+    let mut receiver = Node::new(Some(relay.p2p)).await;
     relay.connected().await;
     receiver.connected().await;
     let block = relay.template().await;
@@ -1042,6 +1070,12 @@ async fn trusted_block_is_relayed_before_real_validation_and_commits_afterward()
     relay.gate.hold();
     let submission = tokio::spawn(submit(relay.rpc, relay.auth.clone(), bytes.clone(), true));
     assert_eq!(relay.gate.entered().await, block.hash());
+    assert_eq!(
+        timeout(Duration::from_secs(20), receiver.advertisements.recv())
+            .await
+            .unwrap(),
+        Some(block.hash())
+    );
     timeout(Duration::from_secs(20), async {
         while receiver.tip.best_tip_hash() != Some(block.hash()) {
             tokio::task::yield_now().await;
@@ -1080,4 +1114,11 @@ async fn trusted_block_is_relayed_before_real_validation_and_commits_afterward()
     assert_eq!(relay.tip.best_tip_hash(), Some(block.hash()));
     assert!(relay.pending.get(block.hash()).is_none());
     assert!(!receiver.bans.is_banned(relay.p2p.ip()));
+    timeout(
+        Duration::from_secs(20),
+        receiver.peers.clone().oneshot(Request::Peers),
+    )
+    .await
+    .unwrap()
+    .expect("the downstream peer connection remains usable");
 }

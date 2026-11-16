@@ -96,6 +96,7 @@ async fn native_invalid_body(tampered: bool) {
     let bytes = invalid.zcash_serialize_to_vec().unwrap();
     select_header(&receiver, header_block, bytes.len()).await;
     let supplier = ZakuraTestNode::builder(930)
+        .handshake_network(receiver.network.clone())
         .header_sync_driver(
             receiver.network.clone(),
             (Height(0), receiver.network.genesis_hash()),

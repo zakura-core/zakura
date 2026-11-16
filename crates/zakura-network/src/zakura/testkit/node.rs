@@ -228,6 +228,7 @@ pub struct ZakuraTestNodeBuilder {
     max_connections_per_ip: usize,
     quic_config: Option<QuicConfig>,
     legacy_upgrade: bool,
+    handshake_network: Network,
     tracer: JsonlTracer,
     service: Option<Arc<dyn Service>>,
     service_factory: Option<Box<dyn FnOnce(ZakuraSupervisorHandle) -> Arc<dyn Service> + Send>>,
@@ -295,6 +296,7 @@ impl ZakuraTestNodeBuilder {
             max_connections_per_ip: config.zakura.max_connections_per_ip(),
             quic_config: None,
             legacy_upgrade: false,
+            handshake_network: config.network.clone(),
             tracer: JsonlTracer::noop(),
             service: None,
             service_factory: None,
@@ -380,6 +382,15 @@ impl ZakuraTestNodeBuilder {
         factory: impl FnOnce(ZakuraSupervisorHandle) -> Arc<dyn Service> + Send + 'static,
     ) -> Self {
         self.service_factory = Some(Box::new(factory));
+        self
+    }
+
+    /// Select the network authenticated by the transport handshake.
+    ///
+    /// This is separate from header-validation parameters because some fixtures
+    /// validate existing Mainnet vectors with custom activation rules.
+    pub fn handshake_network(mut self, network: Network) -> Self {
+        self.handshake_network = network;
         self
     }
 
@@ -490,11 +501,7 @@ impl ZakuraTestNodeBuilder {
         } else {
             self.service.unwrap_or_else(|| Arc::new(recorder.clone()))
         };
-        let network = self
-            .header_sync
-            .as_ref()
-            .map(|startup| startup.network.clone())
-            .unwrap_or_else(|| Config::default().network);
+        let network = self.handshake_network;
         let handshake_config = ZakuraHandshakeConfig::for_network(&network);
         let mut advertised_services = crate::zakura::discovery::default_advertised_services();
         advertised_services.extend(self.extra_advertised_services.clone());
